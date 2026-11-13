@@ -1450,9 +1450,11 @@ fn networking_renders_leg_egress_pool_and_tunnel_families() {
     let network = sample_network();
     let tunnel = sample_tunnel();
     let (snapshot, block) = (populated_metrics_snapshot(), DownloadBlockState::default());
+    let server_health = vec![sample_server_health()];
     let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
     input.network = Some(&network);
     input.tunnel = Some(&tunnel);
+    input.server_health = &server_health;
     let rendered = render_area(&input);
 
     assert_label_set(
@@ -1521,6 +1523,128 @@ fn networking_renders_leg_egress_pool_and_tunnel_families() {
     assert!(!rendered.contains("member_id=\"12\""));
     assert!(rendered.contains("weaver_network_proxies{kind=\"wireguard\",enabled=\"true\"} 1"));
     assert!(rendered.contains("weaver_network_leg_revocations_total 3"));
+}
+
+// Samples written one server at a time come out exactly as if they had been
+// written one family at a time: the same lines, each family one group, the
+// families in first-seen order.
+#[test]
+fn the_encoder_groups_each_familys_lines_whatever_the_write_order() {
+    use metrics::encode::{Encoder, MetricFamily, MetricKind};
+    static FIRST: MetricFamily = MetricFamily {
+        name: "weaver_example_first",
+        kind: MetricKind::Gauge,
+        labels: &["server_id"],
+        help: "First.",
+        deprecated_by: None,
+    };
+    static SECOND: MetricFamily = MetricFamily {
+        name: "weaver_example_second",
+        kind: MetricKind::Counter,
+        labels: &["server_id"],
+        help: "Second.",
+        deprecated_by: None,
+    };
+    let servers = ["1", "2", "3"];
+
+    let mut by_server = Encoder::new();
+    for server in servers {
+        by_server.sample(&FIRST, &[("server_id", server)], 1);
+        by_server.sample(&SECOND, &[("server_id", server)], 2);
+    }
+    let mut by_family = Encoder::new();
+    for server in servers {
+        by_family.sample(&FIRST, &[("server_id", server)], 1);
+    }
+    for server in servers {
+        by_family.sample(&SECOND, &[("server_id", server)], 2);
+    }
+
+    let rendered = by_server.finish();
+    assert_eq!(rendered, by_family.finish());
+    assert_eq!(interleaved_family(&rendered), None, "{rendered}");
+    assert_eq!(rendered.matches("# HELP weaver_example_first ").count(), 1);
+}
+
+// Every per-server family stays one group when the pool runs more than one
+// server: health, address plan, transfers, article outcomes and network legs.
+#[test]
+fn per_server_families_stay_whole_across_servers() {
+    let mut network = sample_network();
+    let mut second_leg = network.legs[0].clone();
+    second_leg.consumer = "server:8".into();
+    network.legs.push(second_leg);
+    let mut second_health = sample_server_health();
+    second_health.server_id = "8".into();
+    second_health.label = "news2.example:563".into();
+    let server_health = vec![sample_server_health(), second_health];
+    let mut second_transfer = sample_transfer_snapshot();
+    second_transfer.stable_server_id = weaver_nntp::transfer::StableServerId(8);
+    let transfers = vec![sample_transfer_snapshot(), second_transfer];
+    let mut second_articles = sample_server_metrics();
+    second_articles.stable_server_id = 8;
+    let articles = vec![sample_server_metrics(), second_articles];
+    let jobs = vec![
+        sample_job(42, "Silver Horizon", JobStatus::Downloading),
+        sample_job(43, "Copper Valley", JobStatus::Queued),
+    ];
+    let (snapshot, block) = (populated_metrics_snapshot(), DownloadBlockState::default());
+    let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
+    input.network = Some(&network);
+    input.server_health = &server_health;
+    input.server_transfers = &transfers;
+    input.egress_transfers = &transfers;
+    input.server_metrics = &articles;
+    input.jobs = &jobs;
+    input.per_job_series = weaver_server_core::settings::PerJobSeries::All;
+    let rendered = render_area(&input);
+
+    for server in ["7", "8"] {
+        for family in [
+            "weaver_server_info",
+            "weaver_server_address_info",
+            "weaver_server_address_connect_seconds",
+            "weaver_server_download_bytes_total",
+            "weaver_server_article_attempts_total",
+        ] {
+            assert!(
+                rendered.contains(&format!("{family}{{server_id=\"{server}\"")),
+                "{family} for {server}"
+            );
+        }
+        assert!(rendered.contains(&format!("consumer=\"server:{server}\"")));
+    }
+}
+
+// A server the pool does not run (in the transfer registry, the article
+// counters or a network leg, but not in the health list) sends no series: no
+// empty `server` label, no leg reported up for a server nothing connects to.
+#[test]
+fn a_server_the_pool_does_not_run_sends_no_series() {
+    let mut network = sample_network();
+    let mut idle_leg = network.legs[0].clone();
+    idle_leg.consumer = "server:9".into();
+    network.legs.push(idle_leg);
+    let mut idle_transfer = sample_transfer_snapshot();
+    idle_transfer.stable_server_id = weaver_nntp::transfer::StableServerId(9);
+    let transfers = vec![sample_transfer_snapshot(), idle_transfer];
+    let mut idle_articles = sample_server_metrics();
+    idle_articles.stable_server_id = 9;
+    let articles = vec![sample_server_metrics(), idle_articles];
+    let (snapshot, block) = (populated_metrics_snapshot(), DownloadBlockState::default());
+    let server_health = vec![sample_server_health()];
+    let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
+    input.network = Some(&network);
+    input.server_health = &server_health;
+    input.server_transfers = &transfers;
+    input.server_metrics = &articles;
+    let rendered = render_area(&input);
+
+    assert!(!rendered.contains("server=\"\""), "{rendered}");
+    assert!(!rendered.contains("server_id=\"9\""));
+    assert!(!rendered.contains("consumer=\"server:9\""));
+    assert!(rendered.contains("server_id=\"7\",server=\"news.example:563\""));
+    assert!(rendered.contains("consumer=\"server:7\""));
 }
 
 #[test]

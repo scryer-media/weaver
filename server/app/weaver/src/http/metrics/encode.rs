@@ -10,8 +10,15 @@
 // [`MetricFamily`], and the encoder emits the descriptor the first time it
 // sees one — so "sample without HELP/TYPE" and "duplicate HELP/TYPE" are both
 // unrepresentable.
+//
+// Each family's lines are kept in a text of their own and joined, in the
+// order the families were first seen, when the page is finished. A renderer
+// that walks servers, jobs or egresses and writes several families for each
+// one therefore still sends every family as one uninterrupted group, as the
+// exposition format requires; a scraper that keeps one group per family name
+// would otherwise see only the last server's lines.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fmt::Display;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -52,42 +59,27 @@ pub(crate) struct MetricFamily {
 }
 
 pub(crate) struct Encoder {
-    out: String,
-    declared: HashSet<&'static str>,
+    // One text per family, HELP and TYPE first, in first-seen order.
+    groups: Vec<String>,
+    index: HashMap<&'static str, usize>,
 }
 
 impl Encoder {
     pub(crate) fn new() -> Self {
         Self {
-            out: String::with_capacity(32 * 1024),
-            declared: HashSet::with_capacity(256),
+            groups: Vec::with_capacity(256),
+            index: HashMap::with_capacity(256),
         }
     }
 
-    // Emit `# HELP`/`# TYPE` for `family` unless they were already written.
-    //
-    // Callers rarely need this: every `sample*` entry point calls it. It is
-    // public so a family whose samples are all conditional can still be
-    // declared deliberately.
-    pub(crate) fn family(&mut self, family: &'static MetricFamily) {
-        if !self.declared.insert(family.name) {
-            return;
+    // The text of `family`, its descriptor written the first time.
+    fn group(&mut self, family: &'static MetricFamily) -> &mut String {
+        let next = self.groups.len();
+        let slot = *self.index.entry(family.name).or_insert(next);
+        if slot == next {
+            self.groups.push(descriptor(family));
         }
-        self.out.push_str("# HELP ");
-        self.out.push_str(family.name);
-        self.out.push(' ');
-        self.out.push_str(family.help);
-        if let Some(replacement) = family.deprecated_by {
-            self.out.push_str(" (deprecated: use ");
-            self.out.push_str(replacement);
-            self.out.push(')');
-        }
-        self.out.push('\n');
-        self.out.push_str("# TYPE ");
-        self.out.push_str(family.name);
-        self.out.push(' ');
-        self.out.push_str(family.kind.as_str());
-        self.out.push('\n');
+        &mut self.groups[slot]
     }
 
     // Write one sample whose value renders through [`Display`] — integers and
@@ -99,8 +91,13 @@ impl Encoder {
         labels: &[(&str, &str)],
         value: T,
     ) {
-        self.family(family);
-        self.write_line(family.name, "", labels, &value.to_string());
+        write_line(
+            self.group(family),
+            family.name,
+            "",
+            labels,
+            &value.to_string(),
+        );
     }
 
     pub(crate) fn sample_f64(
@@ -109,8 +106,13 @@ impl Encoder {
         labels: &[(&str, &str)],
         value: f64,
     ) {
-        self.family(family);
-        self.write_line(family.name, "", labels, &format_prometheus_f64(value));
+        write_line(
+            self.group(family),
+            family.name,
+            "",
+            labels,
+            &format_prometheus_f64(value),
+        );
     }
 
     // Emit a histogram family from a bucketed snapshot.
@@ -131,7 +133,7 @@ impl Encoder {
     ) {
         debug_assert_eq!(family.kind, MetricKind::Histogram);
         debug_assert_eq!(counts.len(), bounds.len() + 1);
-        self.family(family);
+        let out = self.group(family);
 
         // Render the bounds up front: the `le` label borrows these strings, so
         // they have to outlive the loop that pushes them into the label slice.
@@ -147,7 +149,8 @@ impl Encoder {
             bucket_labels.clear();
             bucket_labels.extend_from_slice(labels);
             bucket_labels.push(("le", le.as_str()));
-            self.write_line(
+            write_line(
+                out,
                 family.name,
                 "_bucket",
                 &bucket_labels,
@@ -158,28 +161,56 @@ impl Encoder {
         bucket_labels.clear();
         bucket_labels.extend_from_slice(labels);
         bucket_labels.push(("le", "+Inf"));
-        self.write_line(
+        write_line(
+            out,
             family.name,
             "_bucket",
             &bucket_labels,
             &cumulative.to_string(),
         );
-        self.write_line(family.name, "_sum", labels, &format_prometheus_f64(sum));
-        self.write_line(family.name, "_count", labels, &count.to_string());
+        write_line(
+            out,
+            family.name,
+            "_sum",
+            labels,
+            &format_prometheus_f64(sum),
+        );
+        write_line(out, family.name, "_count", labels, &count.to_string());
     }
 
     pub(crate) fn finish(self) -> String {
-        self.out
+        self.groups.concat()
     }
+}
 
-    fn write_line(&mut self, name: &str, suffix: &str, labels: &[(&str, &str)], value: &str) {
-        self.out.push_str(name);
-        self.out.push_str(suffix);
-        append_labels(&mut self.out, labels);
-        self.out.push(' ');
-        self.out.push_str(value);
-        self.out.push('\n');
+// A family's `# HELP` and `# TYPE` lines.
+fn descriptor(family: &MetricFamily) -> String {
+    let mut out = String::with_capacity(family.help.len() + 2 * family.name.len() + 32);
+    out.push_str("# HELP ");
+    out.push_str(family.name);
+    out.push(' ');
+    out.push_str(family.help);
+    if let Some(replacement) = family.deprecated_by {
+        out.push_str(" (deprecated: use ");
+        out.push_str(replacement);
+        out.push(')');
     }
+    out.push('\n');
+    out.push_str("# TYPE ");
+    out.push_str(family.name);
+    out.push(' ');
+    out.push_str(family.kind.as_str());
+    out.push('\n');
+    out
+}
+
+fn write_line(out: &mut String, name: &str, suffix: &str, labels: &[(&str, &str)], value: &str) {
+    out.push_str(name);
+    out.push_str(suffix);
+    append_labels(out, labels);
+    out.push(' ');
+    out.push_str(value);
+    out.push('\n');
 }
 
 fn append_labels(out: &mut String, labels: &[(&str, &str)]) {

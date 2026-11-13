@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::{RwLock, broadcast};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{heartbeat, http, restart, shutdown, wiring};
 use weaver_server_core::events::model::PipelineEvent;
@@ -695,17 +695,28 @@ pub(crate) async fn run(
     Ok(stop)
 }
 
+// Start-up says once how many jobs it queued for restoration; each job's own
+// line is DEBUG. A job that could not be queued is an error of its own.
 async fn enqueue_restore_tickets(
     handle: &SchedulerHandle,
     candidates: Vec<weaver_server_core::operations::RestoreCandidate>,
 ) {
+    let total = candidates.len();
+    let mut failed = 0usize;
     for candidate in candidates {
         match handle.restore_job(candidate.request).await {
-            Ok(()) => info!(job_id = candidate.job_id.0, "job queued for restoration"),
+            Ok(()) => debug!(job_id = candidate.job_id.0, "job queued for restoration"),
             Err(e) => {
+                failed += 1;
                 error!(job_id = candidate.job_id.0, error = %e, "failed to queue job restoration")
             }
         }
+    }
+    if total > 0 {
+        info!(
+            queued = total - failed,
+            failed, "jobs queued for restoration"
+        );
     }
 }
 
