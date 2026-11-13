@@ -20,9 +20,16 @@ pub(crate) struct Volume {
     pub(crate) write_seeks: AtomicU64,
     // Bytes waiting in memory for its writer.
     pub(crate) buffered_bytes: AtomicU64,
-    // What the volume takes, in bytes per second inside write calls, over
-    // the last window; zero until measured.
+    // Times its writer found nothing waiting. A sample across which this
+    // did not move is one in which the writer never ran out of work.
+    pub(crate) idle_turns: AtomicU64,
+    // What the volume takes, in bytes per second; zero until measured. A
+    // synced probe sets it when the volume is first seen, and samples taken
+    // while its writer never ran out of work replace it.
     pub(crate) write_rate: AtomicU64,
+    // Bytes per second of wall time its writer wrote over the last window,
+    // whether or not the volume was the limit; zero when nothing was written.
+    pub(crate) throughput: AtomicU64,
 }
 
 impl Volume {
@@ -35,7 +42,9 @@ impl Volume {
             write_calls: AtomicU64::new(0),
             write_seeks: AtomicU64::new(0),
             buffered_bytes: AtomicU64::new(0),
+            idle_turns: AtomicU64::new(0),
             write_rate: AtomicU64::new(0),
+            throughput: AtomicU64::new(0),
         }
     }
 }
