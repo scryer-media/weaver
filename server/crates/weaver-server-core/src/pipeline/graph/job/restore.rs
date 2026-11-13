@@ -125,6 +125,8 @@ impl GraphJob {
             notes: Vec::new(),
             fed: super::runs::Fed::default(),
             sealed_at: None,
+            moved: 0,
+            indexes_kept: None,
         };
         for (node, index) in &snapshot.passwords {
             job.offer_again(*node, *index)?;

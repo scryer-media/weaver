@@ -545,14 +545,18 @@ async fn work_follows_a_quota_that_runs_out_and_comes_back() {
 // on and with every walk whole. Between asks the run moves everything a
 // floor's memo may depend on: not-founds and plain retries, rotation hints,
 // a quota that downloads, runs out and comes back, a server that starts
-// refusing its credentials (out of the policy for good), and the restart
-// checkpoint coming into force with a progress article and lifting again.
+// refusing its credentials (out of the policy for good), the restart
+// checkpoint coming into force with a progress article and lifting again, a
+// declared recovery index settling under a job whose payload waited for it,
+// and the cursor of a uuencoded file moving under a capped spool.
 #[tokio::test]
 async fn the_scan_floors_hand_out_what_a_whole_walk_does() {
     let levels: Vec<(u32, bool)> = vec![(0, false), (0, false), (1, false), (2, true)];
     const METERED: usize = 1;
     const REFUSES_LATER: usize = 2;
     let jobs = [JobId(42010), JobId(42011)];
+    const WAITS_FOR_INDEX: JobId = JobId(42012);
+    const UUENCODED: JobId = JobId(42013);
     let mut runs = Vec::new();
     for floors_off in [true, false] {
         set_scan_floors_off(floors_off);
@@ -576,9 +580,69 @@ async fn the_scan_floors_hand_out_what_a_whole_walk_does() {
             .await;
             pipeline.active_download_passes.insert(job_id);
         }
+        // A job whose payload waits for its declared recovery index, and a
+        // uuencoded job under a capped spool, which hands out only the
+        // article its cursor waits on.
+        let index = build_test_par2_index("payload.mkv", &[7u8; 256], 64);
+        insert_active_job(
+            &mut pipeline,
+            WAITS_FOR_INDEX,
+            JobSpec {
+                name: "Seeded Index".to_string(),
+                password: None,
+                total_bytes: index.len() as u64 + 40 * 128,
+                category: None,
+                metadata: vec![],
+                files: vec![
+                    FileSpec {
+                        filename: "00-index.par2".to_string(),
+                        role: FileRole::Par2 {
+                            is_index: true,
+                            recovery_block_count: 0,
+                        },
+                        groups: vec!["alt.binaries.test".to_string()],
+                        posted_at_epoch: None,
+                        segments: vec![segment_spec! {
+                            number: 0,
+                            bytes: index.len() as u32,
+                            message_id: "seeded-index@example.com".to_string(),
+                        }],
+                    },
+                    FileSpec {
+                        filename: "payload.mkv".to_string(),
+                        role: FileRole::Standalone,
+                        groups: vec!["alt.binaries.test".to_string()],
+                        posted_at_epoch: None,
+                        segments: (0..40)
+                            .map(|number| {
+                                segment_spec! {
+                                    number: number,
+                                    bytes: 128,
+                                    message_id: format!("seeded-payload-{number}@example.com"),
+                                }
+                            })
+                            .collect(),
+                    },
+                ],
+            },
+        )
+        .await;
+        pipeline.active_download_passes.insert(WAITS_FOR_INDEX);
+        insert_active_job(
+            &mut pipeline,
+            UUENCODED,
+            segmented_job_spec("Seeded Uu", "payload.bin", &vec![128u32; 40]),
+        )
+        .await;
+        pipeline.active_download_passes.insert(UUENCODED);
+        let index_file = held_segment(WAITS_FOR_INDEX, 0, 0).file_id;
+        let uu_file = held_segment(UUENCODED, 0, 0).file_id;
+        pipeline.uu_files.insert(uu_file, UuFileAssembly::default());
+        pipeline.uu_spool_max_segments = 0;
+        pipeline.uu_spool_available_bytes_for_test = Some(Some(u64::MAX));
         let mut rng = Lcg(0x001a_dde7_5eed);
         let mut handouts = Vec::new();
-        let mut changes = [0usize; 5];
+        let mut changes = [0usize; 7];
         for step in 0..900 {
             // Something a memo may depend on moves, about one step in four.
             match rng.below(16) {
@@ -657,8 +721,34 @@ async fn the_scan_floors_hand_out_what_a_whole_walk_does() {
                         changes[4] += 1;
                         pipeline.enqueue_download_work(work);
                     }
-                    // Delivered.
-                    _ => {}
+                    // Delivered. A uuencoded part moves its file's cursor
+                    // on; the recovery index settles, which lets the
+                    // payload it held go.
+                    _ => {
+                        let delivered = work.segment_id;
+                        if delivered.file_id == uu_file {
+                            pipeline
+                                .uu_files
+                                .get_mut(&uu_file)
+                                .unwrap()
+                                .next_index
+                                .set(delivered.segment_number + 1);
+                            changes[5] += 1;
+                        } else if delivered.file_id == index_file {
+                            pipeline
+                                .graph_jobs
+                                .get_mut(&WAITS_FOR_INDEX)
+                                .unwrap()
+                                .lost(
+                                    weaver_graph::VolumeIndex(0),
+                                    0,
+                                    &mut crate::pipeline::graph::status::RepairSlots::default(),
+                                    0,
+                                )
+                                .unwrap();
+                            changes[6] += 1;
+                        }
+                    }
                 }
             }
         }

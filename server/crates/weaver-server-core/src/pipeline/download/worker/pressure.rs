@@ -246,15 +246,6 @@ impl Pipeline {
         self.uu_spool_debits.apply(self.uu_spool_capacity.current())
     }
 
-    pub(in crate::pipeline::download::worker) fn uu_spool_cursor_ordinals(
-        &self,
-    ) -> HashMap<NzbFileId, u32> {
-        self.uu_files
-            .iter()
-            .map(|(file_id, uu)| (*file_id, uu.next_index))
-            .collect()
-    }
-
     pub(in crate::pipeline::download::worker) fn uu_work_closes_cursor(
         cursors: &HashMap<NzbFileId, u32>,
         work: &QueuedWork<'_>,

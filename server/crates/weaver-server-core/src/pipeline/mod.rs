@@ -26,6 +26,7 @@ mod progress;
 pub mod queue;
 mod queue_window;
 pub(crate) use queue_window::waits_its_turn;
+mod scan_inputs;
 mod server_attribution;
 mod support_facts;
 #[cfg(any(test, feature = "test-support"))]
@@ -1132,7 +1133,7 @@ impl std::ops::Index<&NzbFileId> for UnanchoredPark {
 #[derive(Default)]
 pub(super) struct UuFileAssembly {
     // The next segment ordinal the cursor will place.
-    pub(super) next_index: u32,
+    pub(super) next_index: scan_inputs::UuCursor,
     // The decoded byte offset that ordinal will be placed at.
     pub(super) next_offset: u64,
     // Parts that arrived ahead of the cursor, keyed by ordinal.
@@ -1163,11 +1164,11 @@ impl Pipeline {
     // cursor starts where they end.
     pub(in crate::pipeline) fn uu_file(&mut self, file_id: NzbFileId) -> &mut UuFileAssembly {
         let graph_jobs = &self.graph_jobs;
-        self.uu_files.entry(file_id).or_insert_with(|| {
+        self.uu_files.get_or_insert_with(file_id, || {
             let (next_index, next_offset, damaged) =
                 Self::graph_ordered_front(graph_jobs, file_id).unwrap_or_default();
             UuFileAssembly {
-                next_index,
+                next_index: scan_inputs::UuCursor::at(next_index),
                 next_offset,
                 damaged,
                 ..UuFileAssembly::default()
@@ -1180,7 +1181,7 @@ impl Pipeline {
     // early and the file is damaged from there. The repair, or the file's
     // verdict, rules on what that leaves.
     pub(in crate::pipeline) fn pass_given_up_uu(&mut self, file_id: NzbFileId) {
-        let Some(mut next) = self.uu_files.get(&file_id).map(|uu| uu.next_index) else {
+        let Some(mut next) = self.uu_files.get(&file_id).map(|uu| uu.next_index.get()) else {
             return;
         };
         let from = next;
@@ -1194,7 +1195,7 @@ impl Pipeline {
             && let Some(uu) = self.uu_files.get_mut(&file_id)
         {
             uu.damaged = true;
-            uu.next_index = next;
+            uu.next_index.set(next);
         }
     }
 }
@@ -1581,7 +1582,7 @@ pub struct Pipeline {
     pub(super) jobs: HashMap<JobId, JobState>,
     // The graph runtime of each job holding its articles, given when they
     // are built.
-    pub(super) graph_jobs: HashMap<JobId, graph::job::GraphJob>,
+    pub(super) graph_jobs: scan_inputs::GraphJobs,
     // The graph runtimes of jobs that dropped their articles while something
     // of them was still out on a thread: each is stopped, and kept only until
     // the last of its mail is heard.
@@ -2062,7 +2063,7 @@ pub struct Pipeline {
     pub(super) uu_spool_available_bytes_for_test: Option<Option<u64>>,
     // Sequential-assembly state for uuencode files, created on the first
     // uuencode part of a file and dropped with that file's write buffer.
-    pub(super) uu_files: HashMap<NzbFileId, UuFileAssembly>,
+    pub(super) uu_files: scan_inputs::UuFiles,
     // How often each uuencode segment has been displaced by park pressure and
     // requeued while its file's cursor stood still, paired with the cursor
     // position that count was taken at. Purely a livelock bound — deliberately

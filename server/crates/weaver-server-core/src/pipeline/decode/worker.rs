@@ -950,15 +950,15 @@ impl Pipeline {
             return UuPlacement::Place(offset);
         }
 
-        if segment_number == uu.next_index {
+        if segment_number == uu.next_index.get() {
             let offset = uu.next_offset;
-            uu.next_index = uu.next_index.saturating_add(1);
+            uu.next_index.set(uu.next_index.get().saturating_add(1));
             uu.next_offset = uu.next_offset.saturating_add(decoded_len as u64);
             self.pass_given_up_uu(file_id);
             return UuPlacement::Place(offset);
         }
 
-        if segment_number < uu.next_index {
+        if segment_number < uu.next_index.get() {
             // Behind the cursor with no recorded placement: the cursor was
             // advanced past this ordinal because it failed permanently, and the
             // file was shifted to close the gap. Its bytes no longer have a
@@ -1513,7 +1513,7 @@ impl Pipeline {
         let cursor = self
             .uu_files
             .get(&segment_id.file_id)
-            .map(|uu| uu.next_index)
+            .map(|uu| uu.next_index.get())
             .unwrap_or(0);
         let (attempts, seen_at) = self
             .uu_park_requeues
@@ -1572,7 +1572,7 @@ impl Pipeline {
         file_id: NzbFileId,
     ) -> Result<Option<(u32, UuSegmentFacts, DecodedChunk, SegmentSource)>, SegmentWriteError> {
         let next = self.uu_files.get_mut(&file_id).and_then(|uu| {
-            let index = uu.next_index;
+            let index = uu.next_index.get();
             uu.parked.remove(&index).map(|entry| (index, entry))
         });
         let Some((index, entry)) = next else {

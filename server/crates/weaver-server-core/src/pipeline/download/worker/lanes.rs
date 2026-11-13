@@ -279,7 +279,7 @@ impl Pipeline {
         let Some(uu) = self.uu_files.get(&seg_id.file_id) else {
             return false;
         };
-        if seg_id.segment_number != uu.next_index {
+        if seg_id.segment_number != uu.next_index.get() {
             // Only the ordinal the cursor is actually waiting on can wedge it.
             // A later failure is passed when the cursor reaches it.
             return false;
@@ -287,7 +287,7 @@ impl Pipeline {
         self.pass_given_up_uu(seg_id.file_id);
         self.uu_files
             .get(&seg_id.file_id)
-            .is_some_and(|uu| uu.parked.contains_key(&uu.next_index))
+            .is_some_and(|uu| uu.parked.contains_key(&uu.next_index.get()))
     }
 
     // Drop the job's terminal states, and the ledger derived from them.

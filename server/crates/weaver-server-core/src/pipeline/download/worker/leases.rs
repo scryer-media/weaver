@@ -28,6 +28,15 @@ impl BlockedBy {
     }
 }
 
+// Whether a memo's list and a filter's are the one list, or both absent.
+fn same_list<T: ?Sized>(kept: Option<&Arc<T>>, now: Option<&Arc<T>>) -> bool {
+    match (kept, now) {
+        (None, None) => true,
+        (Some(kept), Some(now)) => Arc::ptr_eq(kept, now),
+        _ => false,
+    }
+}
+
 // One sampled answer to "may this server fetch this article of this job?",
 // reusable across a whole queue scan and across every article of one
 // handout. Built by [`Pipeline::servable_work_filter`], which is the only
@@ -263,8 +272,13 @@ impl ServableWorkFilter<'_> {
                     conditions.weighed,
                 ))
             && conditions.retention_excludes == self.retention_excludes
-            && conditions.bootstrap_files.as_ref() == self.bootstrap_files
-            && conditions.uu_cursor_ordinals.as_ref() == self.uu_cursor_ordinals
+            // Each list is the one its owner keeps until its answer changes,
+            // so the same list is the same answer and no content is read.
+            && same_list(conditions.bootstrap_files.as_ref(), self.bootstrap_files)
+            && same_list(
+                conditions.uu_cursor_ordinals.as_ref(),
+                self.uu_cursor_ordinals,
+            )
             && conditions
                 .hint_alternatives
                 .as_ref()
@@ -395,8 +409,8 @@ impl Pipeline {
     // The recovery indexes the post declares that a graph job's root namespace
     // holds its payload for. Root members are numbered as the posted files
     // they are.
-    fn graph_indexes_to_come(&self, job_id: JobId) -> Option<Arc<[u32]>> {
-        let (graph, state) = (self.graph_jobs.get(&job_id)?, self.jobs.get(&job_id)?);
+    fn graph_indexes_to_come(&mut self, job_id: JobId) -> Option<Arc<[u32]>> {
+        let state = self.jobs.get(&job_id)?;
         let declared = state
             .spec
             .files
@@ -406,9 +420,7 @@ impl Pipeline {
                 crate::pipeline::graph::metadata::RecoveryFormat::declared_index(&file.role)
                     .map(|format| (weaver_graph::MemberId(index), format))
             });
-        graph
-            .indexes_to_come(declared)
-            .map(|held| held.into_iter().map(|member| member.0).collect())
+        self.graph_jobs.indexes_to_come(&job_id, declared)
     }
 
     // The single definition of "this server may fetch this queued article
@@ -561,14 +573,15 @@ impl Pipeline {
     // The UU spool cursors a selection pass must respect, sampled once.
     //
     // Only a capped spool constrains selection; below the cap every encoding
-    // dispatches freely and the map is not worth building.
+    // dispatches freely and the map is not asked for. The files' owner hands
+    // out the one map it keeps until a cursor moves or a file comes or goes.
     pub(in crate::pipeline::download) fn selection_uu_cursor_ordinals(
-        &self,
+        &mut self,
         pressure: DownloadPressure,
     ) -> Option<Arc<HashMap<NzbFileId, u32>>> {
         pressure
             .uu_spool_admission_capped
-            .then(|| Arc::new(self.uu_spool_cursor_ordinals()))
+            .then(|| self.uu_files.cursor_ordinals())
     }
 
     pub(in crate::pipeline::download) fn actual_download_lane_mode(

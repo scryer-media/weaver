@@ -1025,7 +1025,10 @@ async fn uu_missing_middle_shifts_survivors_and_marks_damage() {
     // Everything from the hole onward is still parked: the cursor cannot know
     // where part 4 begins until part 3's decoded length is known.
     assert_eq!(
-        pipeline.uu_files.get(&file_id).map(|uu| uu.next_index),
+        pipeline
+            .uu_files
+            .get(&file_id)
+            .map(|uu| uu.next_index.get()),
         Some(HOLE),
         "the cursor waits at the hole"
     );
@@ -1268,7 +1271,7 @@ async fn uu_park_tail_bounces_behind_a_moving_cursor_without_failing() {
         let cursor = pipeline
             .uu_files
             .get(&file_id)
-            .map_or(0, |uu| uu.next_index);
+            .map_or(0, |uu| uu.next_index.get());
         if cursor as usize >= parts.len() {
             break;
         }
@@ -1358,7 +1361,10 @@ async fn uu_stale_arrival_after_a_shift_is_dropped_without_retry() {
         "damage state is unchanged by a stale arrival"
     );
     assert_eq!(
-        pipeline.uu_files.get(&file_id).map(|uu| uu.next_index),
+        pipeline
+            .uu_files
+            .get(&file_id)
+            .map(|uu| uu.next_index.get()),
         Some(2),
         "the cursor must not move for a stale arrival"
     );

@@ -403,13 +403,7 @@ async fn capped_uu_spool_dispatches_only_the_missing_cursor_prefix() {
         .unwrap()
         .download_queue
         .push(work(0, "uu-prefix@example.invalid"));
-    pipeline.uu_files.insert(
-        file_id,
-        UuFileAssembly {
-            next_index: 0,
-            ..UuFileAssembly::default()
-        },
-    );
+    pipeline.uu_files.insert(file_id, UuFileAssembly::default());
     pipeline.uu_spool_max_segments = 0;
     pipeline.uu_spool_available_bytes_for_test = Some(Some(u64::MAX));
 
