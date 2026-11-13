@@ -28,8 +28,11 @@ pub use persistence::{DhtPersistenceConfig, PersistentDht, dht_listen_addr};
 
 pub type Dht = Arc<DhtState>;
 
-// How long do we wait for a response from a DHT node.
-pub(crate) const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+// How long a query waits for its answer, counted from the moment it is sent
+// (libtorrent `rpc_manager::tick`, rpc_manager.cpp:397 and 420-421, v2.0.15,
+// against the send time `observer::set_target` stamps as `invoke` sends it,
+// rpc_manager.cpp:87-89 and 497-508).
+pub(crate) const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 // How often a torrent searches the DHT for peers and announces itself, at
 // the end of that search: libtorrent's `dht_announce_interval`
 // (settings_pack.cpp), the period `session_impl::update_dht_announce_interval`
