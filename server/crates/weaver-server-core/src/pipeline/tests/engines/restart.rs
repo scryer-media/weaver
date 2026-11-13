@@ -129,7 +129,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
                 from_disk.insert(article);
             }
             let server = (0..)
-                .find(|server| !work.exclude_servers.contains(server))
+                .find(|server| !work.exclude_servers.contains(*server))
                 .unwrap();
             if scenario.spoils(server, article) {
                 spoiled.insert(article);

@@ -39,8 +39,8 @@ fn lease_works_to_new_lane(
         lane_mode: DownloadLaneMode::Sequential,
         server_modes: vec![(0, DownloadLaneMode::Sequential)],
         completion_critical: false,
-        effective_exclude_servers: Vec::new(),
-        dial_exclude_servers: Vec::new(),
+        effective_exclude_servers: weaver_nntp::ServerSet::EMPTY,
+        dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
         works,
@@ -66,7 +66,7 @@ fn transport_failure(lane_id: u64, segment_id: SegmentId) -> DownloadResult {
         source_server_idx: Some(0),
         origin: DownloadResultOrigin::NormalPrimary,
         retry_count: 0,
-        exclude_servers: Vec::new(),
+        exclude_servers: weaver_nntp::ServerSet::EMPTY,
         release_connection_slot: false,
     }
 }
@@ -109,7 +109,7 @@ fn decoded_whole_file(
         source_server_idx: Some(0),
         origin: DownloadResultOrigin::NormalPrimary,
         retry_count: 0,
-        exclude_servers: Vec::new(),
+        exclude_servers: weaver_nntp::ServerSet::EMPTY,
         release_connection_slot: true,
     }
 }

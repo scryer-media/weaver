@@ -69,13 +69,23 @@ pub(crate) fn build_nntp_client(
         .unwrap_or(profile.memory.available_bytes);
     let buffer_profile =
         weaver_nntp::connection::NntpBufferProfile::adaptive(effective_memory, total_connections);
+    // A list the load-time trim could not bring within the limit (primary
+    // and backfill-only servers alone pass it) starts with no pool, so the
+    // operator can reach the UI and delete servers; a rebuild then puts the
+    // trimmed list in force.
+    if let Some(refusal) =
+        weaver_server_core::runtime::reload::server_list_past_limit(&config.servers)
+    {
+        tracing::error!("{refusal}");
+        return weaver_server_core::runtime::reload::nntp_client(Vec::new());
+    }
     let servers = weaver_server_core::runtime::reload::nntp_server_pool_configs(
         &config.servers,
         proxies,
         &policy_registry.transfer_registry(),
         buffer_profile,
     )?;
-    Ok(weaver_server_core::runtime::reload::nntp_client(servers))
+    weaver_server_core::runtime::reload::nntp_client(servers)
 }
 
 pub(crate) async fn flush_server_transfer_usage(

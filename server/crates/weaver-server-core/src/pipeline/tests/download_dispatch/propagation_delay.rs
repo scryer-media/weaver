@@ -37,8 +37,8 @@ async fn owned_download_lane_capacity_failure_requeues_without_failing_the_artic
         lane_mode: DownloadLaneMode::Sequential,
         server_modes: Vec::new(),
         completion_critical: false,
-        effective_exclude_servers: Vec::new(),
-        dial_exclude_servers: Vec::new(),
+        effective_exclude_servers: weaver_nntp::ServerSet::EMPTY,
+        dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
         works: vec![work],
@@ -126,8 +126,8 @@ async fn owned_download_lane_selection_contention_requeues_without_failing_the_a
         lane_mode: DownloadLaneMode::Sequential,
         server_modes: Vec::new(),
         completion_critical: false,
-        effective_exclude_servers: Vec::new(),
-        dial_exclude_servers: Vec::new(),
+        effective_exclude_servers: weaver_nntp::ServerSet::EMPTY,
+        dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
         works: vec![work],
@@ -1782,7 +1782,7 @@ async fn download_done_refunds_rate_limit_estimate_to_actual_raw_bytes() {
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: vec![],
+            exclude_servers: weaver_nntp::ServerSet::from([]),
             release_connection_slot: true,
         })
         .await;
@@ -1821,7 +1821,7 @@ async fn download_done_charges_rate_limit_for_raw_bytes_above_estimate() {
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: vec![],
+            exclude_servers: weaver_nntp::ServerSet::from([]),
             release_connection_slot: true,
         })
         .await;
@@ -1873,7 +1873,7 @@ async fn auto_pause_stalled_download_releases_blocking_runtime() {
                     retry_count: 0,
                     is_recovery: false,
                     completion_critical: false,
-                    exclude_servers: vec![],
+                    exclude_servers: weaver_nntp::ServerSet::from([]),
                     avoid_server: None,
                 },
             )]),

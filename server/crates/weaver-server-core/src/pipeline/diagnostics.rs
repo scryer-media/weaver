@@ -276,7 +276,7 @@ impl Pipeline {
                 let group = next.and_then(|work| {
                     provider_policy.as_ref()?.eligible_group(
                         work.exclude_servers,
-                        &self.compute_job_retention_excludes(*job_id),
+                        self.compute_job_retention_excludes(*job_id),
                         Self::bandwidth_reservation_estimate(work.byte_estimate),
                     )
                 });

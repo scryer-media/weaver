@@ -278,3 +278,25 @@ fn migrate_journal_to_sqlite() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// A settings file listing more servers than the limit is imported trimmed
+// by the rule the trim on load applies.
+#[test]
+fn a_settings_file_past_the_server_limit_is_imported_trimmed() {
+    use crate::servers::persistence::past_limit_fixture::{ids, kept, sixty_on_ten_levels};
+    let dir = tempfile::tempdir().unwrap();
+    let toml_path = dir.path().join("weaver.toml");
+    let mut text = String::from("data_dir = \"/tmp/weaver-data\"\n");
+    for server in sixty_on_ten_levels() {
+        text.push_str(&format!(
+            "\n[[servers]]\nid = {}\nhost = \"{}\"\nport = 563\ntls = true\n\
+             connections = 2\nactive = {}\npriority = {}\nbackfill = {}\n",
+            server.id, server.host, server.active, server.priority, server.backfill
+        ));
+    }
+    std::fs::write(&toml_path, text).unwrap();
+
+    let db = Database::open_in_memory().unwrap();
+    assert!(db.migrate_from_toml(&toml_path).unwrap());
+    assert_eq!(ids(&db.list_servers().unwrap()), kept());
+}

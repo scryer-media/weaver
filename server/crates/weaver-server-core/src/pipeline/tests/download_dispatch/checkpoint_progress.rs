@@ -160,7 +160,7 @@ async fn checkpoint_abandoned_lane_requeues_once_and_fences_late_events() {
         source_server_idx: None,
         origin: DownloadResultOrigin::NormalPrimary,
         retry_count: original.retry_count,
-        exclude_servers: original.exclude_servers.clone(),
+        exclude_servers: original.exclude_servers,
         release_connection_slot: false,
     };
     let late_success = late_result(Ok(DownloadPayload::Raw(Bytes::from_static(
@@ -289,7 +289,7 @@ async fn checkpoint_teardown_refunds_before_clearing_and_leaves_no_activity() {
                     source_server_idx: None,
                     origin: DownloadResultOrigin::NormalPrimary,
                     retry_count: original.retry_count,
-                    exclude_servers: original.exclude_servers.clone(),
+                    exclude_servers: original.exclude_servers,
                     release_connection_slot: true,
                 })
                 .await;
@@ -374,7 +374,7 @@ async fn checkpoint_accepted_result_survives_pause_and_lane_retirement() {
                 source_server_idx: None,
                 origin: DownloadResultOrigin::NormalPrimary,
                 retry_count: 0,
-                exclude_servers: vec![],
+                exclude_servers: weaver_nntp::ServerSet::from([]),
                 release_connection_slot: false,
             }],
             unrequested_works: vec![],

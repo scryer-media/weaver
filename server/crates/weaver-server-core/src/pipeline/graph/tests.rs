@@ -120,8 +120,11 @@ async fn decode_as(
                 }],
             },
             SegmentSource {
-                source_server_idx: Some(0),
-                exclude_servers: Vec::new(),
+                servers: crate::pipeline::PoolServers::stamped(
+                    pipeline.pool_generation,
+                    Some(0),
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
             },
         )
         .await;
@@ -1946,8 +1949,11 @@ async fn decode_declaring(
                 }],
             },
             SegmentSource {
-                source_server_idx: Some(0),
-                exclude_servers: Vec::new(),
+                servers: crate::pipeline::PoolServers::stamped(
+                    pipeline.pool_generation,
+                    Some(0),
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
             },
         )
         .await;

@@ -85,6 +85,7 @@ impl Pipeline {
 
     // A wire outcome retired this segment: no server has it, or the budget
     // for asking ran out.
+    #[cfg(test)]
     pub(in crate::pipeline) fn book_failed_segment(&mut self, seg_id: SegmentId) -> bool {
         self.book_terminal_segment(seg_id, SegmentTerminalState::Missing)
     }
@@ -730,8 +731,8 @@ impl Pipeline {
         &mut self,
         lease: DownloadBatchLease,
     ) {
-        for work in lease.works {
-            if !self.accept_lane_work(lease.lane_id, work.segment_id) {
+        for mut work in lease.works {
+            if !self.accept_returned_lane_work(lease.lane_id, &mut work) {
                 continue;
             }
             self.restore_owned_lane_unrequested_work(lease.lane_id, work);
@@ -794,8 +795,8 @@ impl Pipeline {
                         "download.owned_lane.acquire_failed_capacity_requeue",
                         1,
                     );
-                    for work in works {
-                        if self.accept_lane_work(lane_id, work.segment_id) {
+                    for mut work in works {
+                        if self.accept_returned_lane_work(lane_id, &mut work) {
                             self.restore_owned_lane_unrequested_work(lane_id, work);
                         }
                     }
@@ -877,7 +878,7 @@ impl Pipeline {
                             work.completion_critical,
                         ),
                         retry_count: work.retry_count,
-                        exclude_servers: work.exclude_servers.clone(),
+                        exclude_servers: work.exclude_servers,
                         release_connection_slot: false,
                     };
                     if !self.release_download_result(&result) {
@@ -958,8 +959,8 @@ impl Pipeline {
                     );
                     pending.push_back(result);
                 }
-                for work in unrequested_works {
-                    if !self.accept_lane_work(lane_id, work.segment_id) {
+                for mut work in unrequested_works {
+                    if !self.accept_returned_lane_work(lane_id, &mut work) {
                         continue;
                     }
                     self.restore_owned_lane_unrequested_work(lane_id, work);

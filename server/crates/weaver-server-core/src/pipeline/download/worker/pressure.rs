@@ -79,6 +79,12 @@ impl CheckpointLease {
 }
 
 impl CheckpointAdmission {
+    // Whether the checkpoint refuses no article at all.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn admits_every_article(self) -> bool {
+        !self.enforced || self.limit == 0
+    }
+
     // Whether the checkpoint refuses every payload article of the job, of
     // any size, until its durable floor moves: an article sent to close the
     // gap is still out, or the lead is already past the limit while the

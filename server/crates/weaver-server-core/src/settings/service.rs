@@ -41,7 +41,12 @@ impl Database {
                 self.delete_setting(key)?;
             }
         }
-        let servers = self.list_servers()?;
+        let mut servers = self.list_servers()?;
+        // A list past the server limit (an older version's, or a restored
+        // backup's) is trimmed here, before any pool is built from it.
+        if self.trim_servers_past_limit(&servers)? > 0 {
+            servers = self.list_servers()?;
+        }
         let categories = self.list_categories()?;
 
         let data_dir = settings.get("data_dir").cloned().unwrap_or_default();

@@ -30,6 +30,9 @@ pub fn nntp_server_pool_configs(
 ) -> Result<Vec<weaver_nntp::pool::ServerPoolConfig>, String> {
     use weaver_nntp::transfer::StableServerId;
 
+    if let Some(refusal) = server_list_past_limit(configured_servers) {
+        return Err(refusal);
+    }
     let mut active: Vec<&crate::servers::ServerConfig> = configured_servers
         .iter()
         .filter(|server| server.active)
@@ -72,16 +75,37 @@ pub fn nntp_server_pool_configs(
         .collect()
 }
 
-// The NNTP client for one generation of pool settings.
+// Why a stored server list cannot be put in force, if it cannot: more than
+// `MAX_PROVIDERS` servers. Loading trims a list past the limit, but never
+// deletes a primary or a backfill-only server, so those alone can still
+// leave it past the limit; no pool is built for it.
+pub fn server_list_past_limit(
+    configured_servers: &[crate::servers::ServerConfig],
+) -> Option<String> {
+    let stored = configured_servers.len();
+    let max = weaver_nntp::MAX_PROVIDERS;
+    (stored > max).then(|| {
+        format!(
+            "{stored} servers are stored and Weaver takes at most {max}; primary and \
+             backfill-only servers are never deleted for you, so delete {} of them",
+            stored - max
+        )
+    })
+}
+
+// The NNTP client for one generation of pool settings. A server list past
+// `MAX_PROVIDERS` is refused in words; the stored list is trimmed to it on
+// load, so this only answers a caller that skipped the load.
 pub fn nntp_client(
     servers: Vec<weaver_nntp::pool::ServerPoolConfig>,
-) -> weaver_nntp::client::NntpClient {
-    weaver_nntp::client::NntpClient::new(weaver_nntp::client::NntpClientConfig {
+) -> Result<weaver_nntp::client::NntpClient, String> {
+    weaver_nntp::client::NntpClient::try_new(weaver_nntp::client::NntpClientConfig {
         servers,
         max_idle_age: std::time::Duration::from_mins(5),
         max_retries_per_server: 1,
         soft_timeout: std::time::Duration::from_secs(15),
     })
+    .map_err(|error| error.to_string())
 }
 
 pub async fn rebuild_nntp_from_config(
@@ -136,7 +160,7 @@ pub async fn rebuild_nntp_from_config(
         total_connections = total,
         "building NNTP runtime generation"
     );
-    let client = nntp_client(servers);
+    let client = nntp_client(servers).map_err(SchedulerError::Internal)?;
 
     let activation = handle.rebuild_nntp(client, total).await?;
     let mut changes = handle.subscribe_job_changes();
@@ -663,5 +687,38 @@ mod tests {
         assert_eq!(db.load_config().unwrap().servers[0].id, 43);
         assert!(db.save_schedules(&rules).is_err());
         assert_eq!(db.list_schedules().unwrap(), rules[1..]);
+    }
+
+    // A stored list past the limit builds its pool once loading has trimmed
+    // it; the same list untrimmed is refused in words, never a panic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_trimmed_server_list_builds_its_pool() {
+        use crate::servers::persistence::past_limit_fixture::sixty_on_ten_levels;
+        let db = Database::open_in_memory().unwrap();
+        for server in sixty_on_ten_levels() {
+            db.insert_server_past_limit(&server).unwrap();
+        }
+        let proxies =
+            crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current())
+                .unwrap();
+        let registry = weaver_nntp::transfer::ServerTransferRegistry::new();
+        let profile = weaver_nntp::connection::NntpBufferProfile::adaptive(1 << 30, 100);
+
+        let Err(refused) =
+            nntp_server_pool_configs(&sixty_on_ten_levels(), &proxies, &registry, profile)
+        else {
+            panic!("a list past the limit builds no pool");
+        };
+        assert!(refused.starts_with("60 servers are stored"), "{refused}");
+
+        let config = db.load_config().unwrap();
+        assert_eq!(config.servers.len(), weaver_nntp::MAX_PROVIDERS);
+        let servers =
+            nntp_server_pool_configs(&config.servers, &proxies, &registry, profile).unwrap();
+        let client = nntp_client(servers).unwrap();
+        // The pool holds the enabled servers of the kept list.
+        let enabled = config.servers.iter().filter(|server| server.active).count();
+        assert!(enabled > 0 && enabled < weaver_nntp::MAX_PROVIDERS);
+        assert_eq!(client.pool().server_count(), enabled);
     }
 }

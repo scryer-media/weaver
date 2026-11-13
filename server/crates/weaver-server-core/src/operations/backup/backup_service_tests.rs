@@ -2343,3 +2343,56 @@ fn a_finished_jobs_stored_nzb_travels_with_its_history() {
     assert_eq!(none, None);
     assert_eq!(query_count(&restored, "job_nzbs"), 1);
 }
+
+// A backup holding more servers than the limit, as an older version could
+// have written, restores trimmed by the rule the trim on load applies: the
+// restored database is read through it before anything runs.
+#[tokio::test]
+async fn a_restored_server_list_past_the_limit_is_trimmed_on_load() {
+    use crate::servers::persistence::past_limit_fixture::{ids, kept, sixty_on_ten_levels};
+    let source_db = open_temp_db();
+    populate_source_db(&source_db);
+    let source_config = sample_config();
+    source_db.save_config(&source_config).unwrap();
+    for server in sixty_on_ten_levels() {
+        source_db.insert_server_past_limit(&server).unwrap();
+    }
+    let (source_service, _, _) = build_service(source_db, source_config);
+    let artifact = source_service
+        .create_backup(Some("limit-secret".into()))
+        .await
+        .unwrap();
+
+    let target_root = tempfile::tempdir().unwrap();
+    let restored_root = target_root.path().join("restored");
+    let target_db = open_temp_db();
+    let mut target_config = sample_config();
+    target_config.data_dir = target_root.path().to_string_lossy().into_owned();
+    let (target_service, _, _) = build_service(target_db.clone(), target_config);
+    target_service
+        .restore_backup(
+            &artifact.path,
+            Some("limit-secret".into()),
+            RestoreOptions {
+                data_dir: restored_root.to_string_lossy().into_owned(),
+                intermediate_dir: None,
+                complete_dir: None,
+                category_remaps: vec![CategoryRemapInput {
+                    category_name: "movies".into(),
+                    new_dest_dir: target_root
+                        .path()
+                        .join("movies")
+                        .to_string_lossy()
+                        .into_owned(),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    drop(target_service);
+
+    let (restored_db, outcome) = apply_pending_restore(target_db, target_root.path()).unwrap();
+    assert!(outcome.is_some());
+    assert_eq!(ids(&restored_db.load_config().unwrap().servers), kept());
+    assert_eq!(ids(&restored_db.list_servers().unwrap()), kept());
+}

@@ -30,7 +30,7 @@ pub struct DownloadWork {
     // ordinary queue. The flag changes dispatch eligibility only.
     pub completion_critical: bool,
     // Servers to skip for this download (e.g. after decode failure from that server).
-    pub exclude_servers: Vec<usize>,
+    pub exclude_servers: weaver_nntp::ServerSet,
     // Transport-rotation hint: the server whose established connection just
     // failed for this segment. Selection avoids it on the next attempt so the
     // retry lands elsewhere when an alternative exists. Unlike `exclude_servers`, it
@@ -51,8 +51,9 @@ impl DownloadWork {
             retry_count: self.retry_count,
             is_recovery: self.is_recovery,
             completion_critical: self.completion_critical,
-            exclude_servers: &self.exclude_servers,
+            exclude_servers: self.exclude_servers,
             avoid_server: self.avoid_server,
+            item: std::marker::PhantomData,
         }
     }
 }
@@ -68,8 +69,10 @@ pub struct QueuedWork<'a> {
     pub retry_count: u32,
     pub is_recovery: bool,
     pub completion_critical: bool,
-    pub exclude_servers: &'a [usize],
+    pub exclude_servers: weaver_nntp::ServerSet,
     pub avoid_server: Option<usize>,
+    // Read in place from a queued item, which it may not outlive.
+    pub(crate) item: std::marker::PhantomData<&'a ()>,
 }
 
 impl QueuedWork<'_> {
@@ -94,7 +97,7 @@ pub struct QueueItem {
     pub retry_count: u32,
     pub is_recovery: bool,
     pub completion_critical: bool,
-    pub exclude_servers: Vec<usize>,
+    pub exclude_servers: weaver_nntp::ServerSet,
     pub avoid_server: Option<usize>,
     message_id: Option<MessageId>,
     counters: Option<Arc<crate::pipeline::queue::JobCounters>>,
@@ -198,10 +201,22 @@ fn completion_rank_for(completion_critical: bool, is_recovery: bool, first_artic
 // hi: class (2 bits) | priority (32) | rank, high 30 bits
 // lo: rank, low 2 bits | sequence (61) | ranked (1)
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
-struct Key(u64, u64);
+pub(crate) struct Key(u64, u64);
 
 const SEQUENCE_BITS: u32 = 61;
 const SEQUENCE_MASK: u64 = (1 << SEQUENCE_BITS) - 1;
+
+// Where insertion order starts. A first article some server has already
+// said "not found" for goes back ahead of every first article none has
+// asked, with a sequence counted down from here, so its walk to the next
+// level starts as soon as a server of that level is free instead of after
+// every untried first article has been asked once.
+pub(crate) const SEQUENCE_START: u64 = 1 << 59;
+
+// Whether a first article goes back ahead of the untried ones.
+pub(crate) fn walks_ahead(first_article: bool, exclude_servers: weaver_nntp::ServerSet) -> bool {
+    first_article && !exclude_servers.is_empty()
+}
 
 impl Key {
     // No item: a sequence no queue reaches.
@@ -280,7 +295,7 @@ struct Extra {
     groups: Option<Arc<[String]>>,
     counters: Option<Arc<crate::pipeline::queue::JobCounters>>,
     retry_count: u32,
-    exclude_servers: Vec<usize>,
+    exclude_servers: weaver_nntp::ServerSet,
     avoid_server: Option<usize>,
 }
 
@@ -418,6 +433,8 @@ pub struct DownloadQueue {
     // Items in the completion-critical class.
     critical_len: usize,
     next_sequence: u64,
+    // Counted down from SEQUENCE_START for first articles walking on.
+    next_ahead_sequence: u64,
     // The job of the first item queued: an item of it names only its file
     // index.
     job_id: Option<JobId>,
@@ -439,6 +456,30 @@ pub struct DownloadQueue {
     // back, including a requeue after a lane gave one up, lands it in the
     // leading class again without having to know it was a first article.
     first_articles: HashSet<SegmentId>,
+    // Per server, where its last walk of this queue left off: every item
+    // keyed below the floor was refused it, under the conditions its memo
+    // names. An item put in below a floor lowers it, and a change to the
+    // steering every item carries drops them all, so a floor never hides an
+    // item the server may take. Indexed by server; empty until one walks.
+    scan_floors: Vec<Option<ScanFloor>>,
+}
+
+// Where a walk of the queue starts or stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScanPoint {
+    // Before the first item.
+    Head,
+    // At an item: the one a walk stopped at, or the lowest put in since.
+    At(Key),
+    // Past the last item.
+    End,
+}
+
+// One server's floor: the walk starts at `from`, and `memo` says under
+// which conditions the items below it were refused.
+struct ScanFloor {
+    from: ScanPoint,
+    memo: crate::pipeline::download::worker::ScanMemo,
 }
 
 impl DownloadQueue {
@@ -446,13 +487,77 @@ impl DownloadQueue {
         Self {
             order: BTreeMap::new(),
             critical_len: 0,
-            next_sequence: 0,
+            next_sequence: SEQUENCE_START,
+            next_ahead_sequence: SEQUENCE_START,
             job_id: None,
             extras: Extras::default(),
             excluded_work: 0,
             recovery_work: 0,
             files: HashMap::new(),
             first_articles: HashSet::new(),
+            scan_floors: Vec::new(),
+        }
+    }
+
+    // Takes `server`'s floor, leaving it none: where its walk may start, and
+    // the memo it was recorded under.
+    pub(in crate::pipeline::download) fn take_scan_floor(
+        &mut self,
+        server: usize,
+    ) -> Option<(ScanPoint, crate::pipeline::download::worker::ScanMemo)> {
+        let floor = self.scan_floors.get_mut(server)?.take()?;
+        Some((floor.from, floor.memo))
+    }
+
+    // Records that every item below `from` was refused `server` under the
+    // conditions `memo` names.
+    pub(in crate::pipeline::download) fn set_scan_floor(
+        &mut self,
+        server: usize,
+        from: ScanPoint,
+        memo: crate::pipeline::download::worker::ScanMemo,
+    ) {
+        if self.scan_floors.len() <= server {
+            self.scan_floors.resize_with(server + 1, || None);
+        }
+        self.scan_floors[server] = Some(ScanFloor { from, memo });
+    }
+
+    // An item keyed `key` was put in: no floor may stand above it.
+    fn lower_scan_floors(&mut self, key: Key) {
+        for floor in self.scan_floors.iter_mut().flatten() {
+            match floor.from {
+                ScanPoint::At(from) if from <= key => {}
+                ScanPoint::Head => {}
+                _ => floor.from = ScanPoint::At(key),
+            }
+        }
+    }
+
+    // The first item at or after `from` that `matches` takes, in dispatch
+    // order; `End` when there is none. Only the items walked are read.
+    pub(crate) fn find_from(
+        &self,
+        from: ScanPoint,
+        mut matches: impl FnMut(&QueuedWork<'_>) -> bool,
+    ) -> ScanPoint {
+        let (job_id, extras) = (self.job_id, &self.extras);
+        let range = match from {
+            ScanPoint::Head => self.order.range(..),
+            ScanPoint::At(key) => self.order.range(key..),
+            ScanPoint::End => return ScanPoint::End,
+        };
+        range
+            .map(|(key, entry)| (*key, Self::view(job_id, extras, *key, *entry)))
+            .find_map(|(key, work)| matches(&work).then_some(ScanPoint::At(key)))
+            .unwrap_or(ScanPoint::End)
+    }
+
+    // Takes the item a walk stopped at.
+    pub(crate) fn take_at(&mut self, at: ScanPoint) -> Option<QueueItem> {
+        match at {
+            ScanPoint::At(key) => self.take(key),
+            ScanPoint::Head | ScanPoint::End => None,
         }
     }
 
@@ -509,7 +614,7 @@ impl DownloadQueue {
                 retry_count: 0,
                 is_recovery: false,
                 completion_critical: false,
-                exclude_servers: Vec::new(),
+                exclude_servers: weaver_nntp::ServerSet::EMPTY,
                 avoid_server: None,
                 message_id: None,
                 counters: None,
@@ -524,6 +629,7 @@ impl DownloadQueue {
             None,
             sequence,
         );
+        self.lower_scan_floors(key);
         let slots = self.files.entry(segment_id.file_id).or_default();
         if slots.groups.is_none() {
             slots.groups = Some(Arc::clone(groups));
@@ -548,13 +654,19 @@ impl DownloadQueue {
 
     pub fn push(&mut self, item: impl Into<QueueItem>) {
         let item = item.into();
-        let sequence = self.take_sequence();
+        let first_article = self.first_articles.contains(&item.segment_id);
+        let sequence =
+            if walks_ahead(first_article, item.exclude_servers) && self.next_ahead_sequence > 0 {
+                self.next_ahead_sequence -= 1;
+                self.next_ahead_sequence
+            } else {
+                self.take_sequence()
+            };
         let steered = item.is_steered();
         if steered {
             self.excluded_work += 1;
         }
         self.recovery_work += usize::from(item.is_recovery);
-        let first_article = self.first_articles.contains(&item.segment_id);
         let key = Key::new(
             completion_rank_for(item.completion_critical, item.is_recovery, first_article),
             item.priority,
@@ -564,6 +676,7 @@ impl DownloadQueue {
         if item.completion_critical {
             self.critical_len += 1;
         }
+        self.lower_scan_floors(key);
         let file_id = item.segment_id.file_id;
         let job_id = *self.job_id.get_or_insert(file_id.job_id);
         let slots = self.files.entry(file_id).or_default();
@@ -627,8 +740,10 @@ impl DownloadQueue {
             retry_count: extra.map_or(0, |extra| extra.retry_count),
             is_recovery: entry.is_recovery(),
             completion_critical: key.completion_critical(),
-            exclude_servers: extra.map_or(&[], |extra| extra.exclude_servers.as_slice()),
+            exclude_servers: extra
+                .map_or(weaver_nntp::ServerSet::EMPTY, |extra| extra.exclude_servers),
             avoid_server: extra.and_then(|extra| extra.avoid_server),
+            item: std::marker::PhantomData,
         }
     }
 
@@ -676,7 +791,7 @@ impl DownloadQueue {
                 retry_count: 0,
                 is_recovery: entry.is_recovery(),
                 completion_critical,
-                exclude_servers: Vec::new(),
+                exclude_servers: weaver_nntp::ServerSet::EMPTY,
                 avoid_server: None,
                 message_id: None,
                 counters: None,
@@ -719,19 +834,27 @@ impl DownloadQueue {
         self.excluded_work
     }
 
-    // Drop failure exclusions from all queued work. Used when the server
-    // config is rebuilt: exclusion indices refer to the old pool layout and
-    // would mis-target (or spuriously exhaust) servers in the new one.
-    pub fn clear_exclude_servers(&mut self) {
+    // Carry every queued item's tried servers and hint into a rebuilt pool:
+    // a server still in the pool keeps its bit under its new index, one that
+    // left or is no longer the same server drops out. One pass over the
+    // items with extras; no allocation.
+    pub fn remap_servers(&mut self, remap: &weaver_nntp::ServerRemap) {
         if self.excluded_work == 0 {
             return;
         }
+        // Floors were taken against the old numbering; items refused for
+        // their steering may now pass.
+        self.scan_floors.clear();
+        let mut steered = 0;
         // Only an item with extras can hold either; neither is in the key.
         for extra in self.extras.iter_mut() {
-            extra.exclude_servers.clear();
-            extra.avoid_server = None;
+            extra.exclude_servers = remap.set(extra.exclude_servers);
+            extra.avoid_server = extra.avoid_server.and_then(|server| remap.index(server));
+            if !extra.exclude_servers.is_empty() || extra.avoid_server.is_some() {
+                steered += 1;
+            }
         }
-        self.excluded_work = 0;
+        self.excluded_work = steered;
     }
 
     // Drop the rotation hint from all queued work, keeping exclusions: a 430
@@ -741,6 +864,7 @@ impl DownloadQueue {
         if self.excluded_work == 0 {
             return 0;
         }
+        self.scan_floors.clear();
         let mut cleared = 0;
         for extra in self.extras.iter_mut() {
             if extra.avoid_server.take().is_some() {
@@ -984,6 +1108,7 @@ impl DownloadQueue {
         let Some(entry) = self.order.remove(&old) else {
             return;
         };
+        self.lower_scan_floors(new);
         self.order.insert(new, entry);
         let job_id = entry
             .extra()
@@ -1137,7 +1262,7 @@ impl DownloadQueue {
                         groups: None,
                         counters: None,
                         retry_count: 0,
-                        exclude_servers: Vec::new(),
+                        exclude_servers: weaver_nntp::ServerSet::EMPTY,
                         avoid_server: None,
                     });
                     entry.meta |= (index + 1) << 1;

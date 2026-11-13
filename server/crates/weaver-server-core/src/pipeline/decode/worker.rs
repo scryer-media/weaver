@@ -117,14 +117,12 @@ impl Pipeline {
     }
 
     pub(in crate::pipeline) fn decode_retry_exclude_servers(
-        existing_excludes: &[usize],
+        existing_excludes: weaver_nntp::ServerSet,
         source_server_idx: Option<usize>,
-    ) -> Vec<usize> {
-        let mut exclude_servers = existing_excludes.to_vec();
-        if let Some(source_server_idx) = source_server_idx
-            && !exclude_servers.contains(&source_server_idx)
-        {
-            exclude_servers.push(source_server_idx);
+    ) -> weaver_nntp::ServerSet {
+        let mut exclude_servers = existing_excludes;
+        if let Some(source_server_idx) = source_server_idx {
+            exclude_servers.insert(source_server_idx);
         }
         exclude_servers
     }
@@ -152,11 +150,10 @@ impl Pipeline {
                 segment_id,
                 raw_size: _,
                 error,
-                source_server_idx,
-                exclude_servers,
+                servers,
             } => {
                 let _job = crate::runtime::panic_trap::JobScope::enter(segment_id.file_id.job_id);
-                self.handle_decode_failure(segment_id, &error, &exclude_servers, source_server_idx);
+                self.handle_decode_failure(segment_id, &error, servers);
             }
         }
 
@@ -204,7 +201,11 @@ impl Pipeline {
     // downloads, and the article holds another message-id, or has decode
     // retries left and a server that has not served it. With neither, none
     // configured among them, the damage stands as it came.
-    pub(crate) fn decode_retry_left(&mut self, segment_id: SegmentId, exclude: &[usize]) -> bool {
+    pub(crate) fn decode_retry_left(
+        &mut self,
+        segment_id: SegmentId,
+        exclude: weaver_nntp::ServerSet,
+    ) -> bool {
         let job_id = segment_id.file_id.job_id;
         if self
             .jobs
@@ -229,14 +230,19 @@ impl Pipeline {
     // body (immediately on a one-server setup) or `MAX_SEGMENT_RETRIES`
     // decode failures have accrued, the segment is marked permanently
     // failed and health is updated so repair can take over.
+    //
+    // `servers` are read as the current pool numbers them: a body fetched
+    // before a rebuild names no server, so its failure is retried on every
+    // server of the new pool rather than judged against old indices.
     pub(crate) fn handle_decode_failure(
         &mut self,
         segment_id: SegmentId,
         error: &str,
-        exclude_servers: &[usize],
-        source_server_idx: Option<usize>,
+        servers: PoolServers,
     ) {
         let job_id = segment_id.file_id.job_id;
+        let (source_server_idx, exclude_servers) =
+            servers.under(&self.pool_layouts, self.pool_generation);
 
         if !self.job_takes_results(job_id) {
             debug!(
@@ -276,7 +282,7 @@ impl Pipeline {
         // Re-queuing it would leave work no lane may serve sitting in the
         // queue forever while the job reports downloading at 0 B/s.
         let exclude = Self::decode_retry_exclude_servers(exclude_servers, source_server_idx);
-        let no_server_left = self.no_server_can_serve(job_id, &exclude);
+        let no_server_left = self.no_server_can_serve(job_id, exclude);
 
         if retry_count > MAX_SEGMENT_RETRIES || no_server_left {
             if no_server_left {
@@ -320,7 +326,7 @@ impl Pipeline {
                     retry_count: 0,
                     is_recovery: file_spec.role.is_recovery(),
                     completion_critical: self.segment_is_completion_critical(segment_id),
-                    exclude_servers: exclude.clone(),
+                    exclude_servers: exclude,
                     avoid_server: None,
                 };
                 self.metrics
@@ -402,7 +408,7 @@ impl Pipeline {
             segment_id.segment_number,
         );
         self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
-        self.handle_decode_failure(other_id, &error, &[], None);
+        self.handle_decode_failure(other_id, &error, PoolServers::none());
         true
     }
 
@@ -702,12 +708,7 @@ impl Pipeline {
                         );
                         self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                         drop(_cpu_scope);
-                        self.handle_decode_failure(
-                            segment_id,
-                            &error,
-                            &source.exclude_servers,
-                            source.source_server_idx,
-                        );
+                        self.handle_decode_failure(segment_id, &error, source.servers);
                         return;
                     }
                 }
@@ -823,12 +824,7 @@ impl Pipeline {
                     file_offset.saturating_add(u64::from(decoded_size)),
                 );
                 self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
-                self.handle_decode_failure(
-                    segment_id,
-                    &error,
-                    &source.exclude_servers,
-                    source.source_server_idx,
-                );
+                self.handle_decode_failure(segment_id, &error, source.servers);
                 return;
             }
 
@@ -836,13 +832,12 @@ impl Pipeline {
             // failed its checksum goes to another server while one remains,
             // and only the last server's copy stands as damage.
             if retain_damage
-                && self.decode_retry_left(
-                    segment_id,
-                    &Self::decode_retry_exclude_servers(
-                        &source.exclude_servers,
-                        source.source_server_idx,
-                    ),
-                )
+                && self.decode_retry_left(segment_id, {
+                    let (source_server_idx, excluded) = source
+                        .servers
+                        .under(&self.pool_layouts, self.pool_generation);
+                    Self::decode_retry_exclude_servers(excluded, source_server_idx)
+                })
             {
                 if !crc_valid {
                     self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
@@ -850,8 +845,7 @@ impl Pipeline {
                 self.handle_decode_failure(
                     segment_id,
                     "damaged yEnc article; another server is asked before its bytes stand",
-                    &source.exclude_servers,
-                    source.source_server_idx,
+                    source.servers,
                 );
                 return;
             }
@@ -1266,8 +1260,7 @@ impl Pipeline {
         self.handle_decode_failure(
             segment_id,
             "uuencode reorder park displaced this segment repeatedly",
-            &[],
-            None,
+            PoolServers::none(),
         );
     }
 
@@ -1509,8 +1502,7 @@ impl Pipeline {
         self.handle_decode_failure(
             segment_id,
             "article declared no usable start and its predecessor never arrived",
-            &[],
-            None,
+            PoolServers::none(),
         );
     }
 
@@ -1555,7 +1547,8 @@ impl Pipeline {
     // put, rather than because anything was wrong with what was served.
     pub(in crate::pipeline) fn push_requeued_segment(&mut self, segment_id: SegmentId) -> bool {
         let job_id = segment_id.file_id.job_id;
-        let Some(work) = self.download_retry_work(segment_id, 0, Vec::new()) else {
+        let Some(work) = self.download_retry_work(segment_id, 0, weaver_nntp::ServerSet::EMPTY)
+        else {
             return false;
         };
         if !self.jobs.contains_key(&job_id) {

@@ -16,7 +16,9 @@ mod pressure;
 mod refill;
 mod spawn;
 
-pub(in crate::pipeline::download) use leases::{BlockedBy, ServableWork, ServableWorkFilter};
+pub(in crate::pipeline::download) use leases::{
+    BlockedBy, ScanMemo, ServableWork, ServableWorkFilter,
+};
 pub(in crate::pipeline) use refill::HeldDownloadRefill;
 #[cfg(test)]
 pub(in crate::pipeline) use spawn::lane_acquire_failure_for_work;
@@ -158,11 +160,11 @@ impl<K: std::hash::Hash + Eq + Copy> KeyedLogThrottle<K> {
 // queued, before that is reported. Short enough to catch a lane that never
 // opens, long enough that ordinary refill gaps between batches say nothing.
 const DOWNLOAD_LANES_UNDER_CAP_WINDOW: Duration = Duration::from_secs(5);
-const DOWNLOAD_LANES_UNDER_CAP_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const DOWNLOAD_RESTART_DURABLE_LEAD_RETRY_DELAY: Duration = Duration::from_millis(250);
 const BODY_LANE_UNAVAILABLE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const BODY_SERVER_BLOCKED_RECHECK_DELAY: Duration = Duration::from_secs(5);
-const DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL: Duration = Duration::from_secs(10);
+pub(in crate::pipeline) const DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL: Duration =
+    Duration::from_secs(10);
 // How long a dispatch stall nothing explains may last before the watchdog
 // kicks it: every dispatch-side hold on the stalled jobs is cleared and a
 // pass runs against the result.
@@ -208,7 +210,7 @@ pub(crate) struct DispatchStallWatch {
 // the same window, read as a retry storm rather than as ordinary churn. A
 // healthy pipeline retries a handful of articles per window and finishes
 // others alongside them; a thousand retries and no completion is a loop.
-const DOWNLOAD_RETRY_STORM_THRESHOLD: u64 = 1_000;
+pub(in crate::pipeline) const DOWNLOAD_RETRY_STORM_THRESHOLD: u64 = 1_000;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DownloadPressure {
@@ -241,7 +243,10 @@ impl Pipeline {
             1
         };
         for attempt in 0..attempts {
-            if let Some(order) = self.nntp.blocking_body_server_order(&[]) {
+            if let Some(order) = self
+                .nntp
+                .blocking_body_server_order(weaver_nntp::ServerSet::EMPTY)
+            {
                 return Some(order.into_iter().map(|server| server.0).collect());
             }
             if attempt + 1 < attempts {
@@ -273,7 +278,7 @@ impl Pipeline {
         ranked: Option<&[usize]>,
         backfill_flags: &[bool],
         idle_by_server: &HashMap<usize, usize>,
-    ) -> Option<Vec<usize>> {
+    ) -> Option<weaver_nntp::ServerSet> {
         ranked.map(|order| {
             order
                 .iter()
@@ -350,10 +355,8 @@ impl Pipeline {
         // given up on: the scheduler's filter holds a backfill server to
         // articles every available fill server is excluded from.
         if !servers.iter().any(|server| backfill_flags[*server]) {
-            let fill: Vec<usize> = (0..backfill_flags.len())
-                .filter(|idx| !backfill_flags[*idx])
-                .collect();
-            if let Some(order) = self.nntp.blocking_body_server_order(&fill) {
+            let fill = self.nntp.pool().fill_servers();
+            if let Some(order) = self.nntp.blocking_body_server_order(fill) {
                 for server in order {
                     if backfill_flags[server.0] && !servers.contains(&server.0) {
                         servers.push(server.0);
@@ -521,10 +524,10 @@ impl Pipeline {
         if limit == 0 {
             return;
         }
-        let exclude_servers = self.effective_exclude_servers(job_id, &[]);
+        let exclude_servers = self.effective_exclude_servers(job_id, weaver_nntp::ServerSet::EMPTY);
         // The servers a lease for this job could be routed to, best first.
         // Provider policy is asked again at the dial.
-        let Some(order) = self.nntp.blocking_body_server_order(&exclude_servers) else {
+        let Some(order) = self.nntp.blocking_body_server_order(exclude_servers) else {
             return;
         };
         let order: Vec<usize> = order.into_iter().map(|server| server.0).collect();
@@ -551,12 +554,11 @@ impl Pipeline {
             &idle_by_server,
             limit,
         );
-        let exclude_servers: Arc<[usize]> = Arc::from(exclude_servers);
         let mut warmed = 0;
         for (server, count) in seats {
             let asked = self.owned_download_lane_pool.warm(
                 &self.nntp,
-                Arc::clone(&exclude_servers),
+                exclude_servers,
                 Self::bandwidth_reservation_estimate(byte_estimate),
                 weaver_nntp::pool::ServerId(server),
                 count,

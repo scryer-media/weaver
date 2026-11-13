@@ -327,7 +327,7 @@ async fn dispatch_downloads_counts_completed_files_for_restart_durable_lead() {
         retry_count: 0,
         is_recovery: false,
         completion_critical: false,
-        exclude_servers: vec![],
+        exclude_servers: weaver_nntp::ServerSet::from([]),
         avoid_server: None,
     };
     assert!(pipeline.primary_download_within_restart_durable_lead(job_id, &next_work));
@@ -384,7 +384,7 @@ async fn capped_uu_spool_dispatches_only_the_missing_cursor_prefix() {
         retry_count: 0,
         is_recovery: false,
         completion_critical: false,
-        exclude_servers: Vec::new(),
+        exclude_servers: weaver_nntp::ServerSet::EMPTY,
         avoid_server: None,
     };
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
@@ -700,7 +700,7 @@ async fn released_result_bytes_block_dispatch_until_processing_clears_hysteresis
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: vec![],
+            exclude_servers: weaver_nntp::ServerSet::from([]),
             release_connection_slot: false,
         })
         .await;
@@ -1642,7 +1642,7 @@ async fn released_download_result_fences_completion_until_processed() {
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: vec![],
+            exclude_servers: weaver_nntp::ServerSet::from([]),
             release_connection_slot: false,
         })
         .await;
@@ -1710,7 +1710,7 @@ async fn failed_job_retains_released_result_ledgers_until_terminal_processing() 
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: vec![],
+            exclude_servers: weaver_nntp::ServerSet::from([]),
             release_connection_slot: false,
         })
         .await;
@@ -1779,7 +1779,7 @@ async fn owned_download_lane_batch_event_releases_and_acks_results() {
                 source_server_idx: None,
                 origin: DownloadResultOrigin::NormalPrimary,
                 retry_count: 0,
-                exclude_servers: vec![],
+                exclude_servers: weaver_nntp::ServerSet::from([]),
                 release_connection_slot: false,
             }],
             unrequested_works: vec![],
@@ -1920,8 +1920,11 @@ async fn emits_download_pipeline_drained_once_before_later_completion_events() {
             segment_number: 0,
         },
         raw: Bytes::from_static(b"pending"),
-        source_server_idx: None,
-        exclude_servers: Vec::new(),
+        servers: PoolServers::stamped(
+            pipeline.pool_generation,
+            None,
+            weaver_nntp::ServerSet::EMPTY,
+        ),
     });
 
     pipeline.emit_download_finished_if_active(job_id);

@@ -54,6 +54,8 @@ impl Pipeline {
     // Bound on how long `drain` waits to join detached fire-and-forget writes.
     const FIRE_AND_FORGET_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const DOWNLOAD_COMPLETION_DRAIN_LIMIT: usize = 128;
+    // Delayed retries re-entered per busy turn: the retry channel's capacity.
+    const RETRY_DRAIN_LIMIT: usize = 256;
     // Released results processed per orchestrator turn before the turn's
     // dispatch pass, barrier poll and chase reap run again. One result per
     // turn made every lane batch of 64 articles cost 64 full dispatch passes
@@ -382,6 +384,7 @@ impl Pipeline {
             retry_rx,
             infrastructure_retries: infrastructure_retry::InfrastructureRetryQueue::default(),
             pool_generation: 0,
+            pool_layouts: Default::default(),
             server_counters,
             job_stage_started_at: HashMap::new(),
             nntp_handoff_drained_tx,
@@ -447,12 +450,13 @@ impl Pipeline {
             download_pass_fill_servers: None,
             download_pass_provider_policy: None,
             download_retry_storm_window: None,
+            download_retry_storm: None,
             owned_lane_acquire_failure_log_throttle: Default::default(),
             dispatch_ineligible_log_throttle: Default::default(),
             dispatch_slot_wait_log_throttle: Default::default(),
             last_owned_lane_acquire_failure_at: None,
             download_lanes_under_cap_since: None,
-            last_download_lanes_under_cap_log_at: None,
+            download_lanes_under_cap_reported: false,
             write_buffered_bytes: 0,
             write_buffered_segments: 0,
             uu_spooled_bytes: 0,
@@ -1215,6 +1219,9 @@ impl Pipeline {
                 // A busy turn skips the wait below: it hears a reading, room
                 // given back or a waiter left idle as the wait would.
                 self.hear_disk_on_busy_turn();
+                // It skips the retries heard there too, and a link that keeps
+                // answering would keep them waiting for as long as it does.
+                self.drain_ready_retries();
             } else {
                 // Set by the periodic arms that found nothing to do; every
                 // other arm is an event.
@@ -1662,6 +1669,22 @@ impl Pipeline {
         }
     }
 
+    // Re-enters the delayed retries whose wait is over, at most one channel's
+    // worth a turn so a burst never holds the turn up.
+    fn drain_ready_retries(&mut self) {
+        let mut jobs = HashSet::new();
+        for _ in 0..Self::RETRY_DRAIN_LIMIT {
+            let Ok(retry) = self.retry_rx.try_recv() else {
+                break;
+            };
+            jobs.insert(retry.work.segment_id.file_id.job_id);
+            self.receive_retry_work(retry);
+        }
+        for job_id in jobs {
+            self.report_job_soon(job_id);
+        }
+    }
+
     fn drain_ready_lane_control_messages(&mut self) {
         loop {
             match self.download_lane_parked_rx.try_recv() {
@@ -1704,14 +1727,20 @@ impl Pipeline {
         if scheduled_pool_generation != self.pool_generation
             && (!work.exclude_servers.is_empty() || work.avoid_server.is_some())
         {
+            // Scheduled under an older pool: carry the tried servers and the
+            // hint over by server identity, never read them unmapped.
+            work.exclude_servers = self
+                .pool_layouts
+                .set(scheduled_pool_generation, work.exclude_servers);
+            work.avoid_server = work
+                .avoid_server
+                .and_then(|server| self.pool_layouts.index(scheduled_pool_generation, server));
             debug!(
                 segment = %work.segment_id,
                 scheduled_generation = scheduled_pool_generation,
                 current_generation = self.pool_generation,
-                "dropping stale server exclusions on retry after NNTP pool rebuild"
+                "carried server exclusions on retry across an NNTP pool rebuild"
             );
-            work.exclude_servers.clear();
-            work.avoid_server = None;
         }
         if infrastructure_retry {
             self.note_infrastructure_retry_requeued(work.segment_id.file_id.job_id);
@@ -1783,7 +1812,7 @@ impl Pipeline {
             self.maybe_finish_download_pass(job_id);
             return None;
         }
-        if self.no_server_can_serve(job_id, &work.exclude_servers) {
+        if self.no_server_can_serve(job_id, work.exclude_servers) {
             return Some(work);
         }
         // The job's root classes the work.

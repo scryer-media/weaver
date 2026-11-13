@@ -69,8 +69,11 @@ async fn submit_uu_segment_named(
                 checkpoint_plan: weaver_yenc::CheckpointPlan::None,
             },
             SegmentSource {
-                source_server_idx: None,
-                exclude_servers: Vec::new(),
+                servers: PoolServers::stamped(
+                    pipeline.pool_generation,
+                    None,
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
             },
         )
         .await;

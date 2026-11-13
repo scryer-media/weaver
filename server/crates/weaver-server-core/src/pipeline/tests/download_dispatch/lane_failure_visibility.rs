@@ -12,6 +12,9 @@
 use super::*;
 
 use crate::pipeline::download::transport::DownloadLaneMode;
+use crate::pipeline::download::{
+    DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL, DOWNLOAD_RETRY_STORM_THRESHOLD,
+};
 
 fn lease_for(pipeline: &mut Pipeline, job_id: JobId) -> DownloadBatchLease {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
@@ -33,8 +36,8 @@ fn lease_for(pipeline: &mut Pipeline, job_id: JobId) -> DownloadBatchLease {
         lane_mode: DownloadLaneMode::Sequential,
         server_modes: vec![(0, DownloadLaneMode::Sequential)],
         completion_critical,
-        effective_exclude_servers: Vec::new(),
-        dial_exclude_servers: Vec::new(),
+        effective_exclude_servers: weaver_nntp::ServerSet::EMPTY,
+        dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
         works,
@@ -151,10 +154,75 @@ async fn repeated_acquire_failures_report_at_most_once_a_window() {
     );
 }
 
-// Lanes below their cap are only reported once they have stayed there, and
-// only while there is work they could be carrying.
+// The download lines that follow a state, as a test hears them: every event
+// on this thread whose message names `prefix`, message first, then each field
+// as `key=value`.
+#[derive(Clone)]
+struct StateLines {
+    prefix: &'static str,
+    heard: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl StateLines {
+    fn hear(prefix: &'static str) -> (Self, tracing::subscriber::DefaultGuard) {
+        let lines = Self {
+            prefix,
+            heard: Arc::default(),
+        };
+        let guard = tracing::subscriber::set_default(lines.clone());
+        (lines, guard)
+    }
+
+    fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.heard.lock().unwrap())
+    }
+}
+
+impl tracing::Subscriber for StateLines {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        use std::fmt::Write;
+        #[derive(Default)]
+        struct Fields {
+            message: String,
+            fields: String,
+        }
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    let _ = write!(self.message, "{value:?}");
+                } else {
+                    let _ = write!(self.fields, " {field}={value:?}");
+                }
+            }
+        }
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        if fields.message.starts_with(self.prefix) {
+            self.heard.lock().unwrap().push(format!(
+                "{} {}{}",
+                event.metadata().level(),
+                fields.message,
+                fields.fields
+            ));
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+// Lanes below their cap are only reported once they have stayed there, only
+// while there is work they could be carrying, and only as the underfill
+// starts and ends: a pass that finds it unchanged says nothing.
 #[tokio::test]
-async fn lanes_under_their_cap_are_reported_only_when_it_persists() {
+async fn lanes_under_their_cap_are_reported_once_as_it_starts_and_once_as_it_ends() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(41503);
@@ -164,6 +232,7 @@ async fn lanes_under_their_cap_are_reported_only_when_it_persists() {
         standalone_job_spec("Under Cap", &many_standalone_files("under-cap", 4)),
     )
     .await;
+    let (lines, _guard) = StateLines::hear("download lanes");
 
     let start = Instant::now();
     pipeline.active_download_connections = 1;
@@ -174,49 +243,75 @@ async fn lanes_under_their_cap_are_reported_only_when_it_persists() {
         "the window opens at the first pass that finds lanes unfilled"
     );
     assert!(
-        pipeline.last_download_lanes_under_cap_log_at.is_none(),
+        lines.take().is_empty(),
         "a momentary gap between batches is not worth a line"
     );
 
     // Still under cap a window later, with a lane that failed to open inside
-    // it: now it is worth saying.
+    // it: now it is worth one line, at debug, since the failed acquire is
+    // warned about where it happens.
     let later = start + Duration::from_secs(6);
     pipeline.log_download_lanes_under_cap(later, 8);
-    assert_eq!(
-        pipeline.last_download_lanes_under_cap_log_at,
-        Some(later),
-        "an underfill that outlives the window is reported"
+    let heard = lines.take();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert!(
+        heard[0].starts_with(
+            "DEBUG download lanes have stayed below their connection cap with work queued"
+        ),
+        "{heard:?}"
     );
+    assert!(pipeline.download_lanes_under_cap_reported);
+
+    // However many passes find it unchanged, and however long it lasts,
+    // nothing more is said while it lasts.
+    for pass in 1..=1_000u64 {
+        pipeline.last_owned_lane_acquire_failure_at = Some(later + Duration::from_secs(pass));
+        pipeline.log_download_lanes_under_cap(later + Duration::from_secs(pass), 8);
+    }
+    assert!(
+        lines.take().is_empty(),
+        "an unchanged underfill is not news"
+    );
+
+    // Filling the lanes ends it, with one line.
+    pipeline.active_download_connections = 8;
+    let filled = later + Duration::from_secs(1_001);
+    pipeline.log_download_lanes_under_cap(filled, 8);
+    pipeline.log_download_lanes_under_cap(filled + Duration::from_secs(1), 8);
+    let heard = lines.take();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert!(
+        heard[0]
+            .starts_with("DEBUG download lanes are back at their connection cap or out of work"),
+        "{heard:?}"
+    );
+    assert!(pipeline.download_lanes_under_cap_since.is_none());
+    assert!(!pipeline.download_lanes_under_cap_reported);
 
     // An underfill with no lane failure behind it is one of the ordinary
-    // kinds — a download quota, pressure, a job's tail — and stays quiet.
-    pipeline.last_download_lanes_under_cap_log_at = None;
-    pipeline.download_lanes_under_cap_since = None;
-    pipeline.last_owned_lane_acquire_failure_at = Some(start - Duration::from_secs(60));
-    let quiet = later + Duration::from_secs(30);
+    // kinds — a download quota, pressure, a job's tail — and stays quiet,
+    // both as it starts and as it ends.
+    pipeline.active_download_connections = 1;
+    pipeline.last_owned_lane_acquire_failure_at = Some(start);
+    let quiet = filled + Duration::from_secs(30);
     pipeline.log_download_lanes_under_cap(quiet, 8);
     pipeline.log_download_lanes_under_cap(quiet + Duration::from_secs(6), 8);
+    assert!(!pipeline.download_lanes_under_cap_reported);
+    pipeline.active_download_connections = 8;
+    pipeline.log_download_lanes_under_cap(quiet + Duration::from_secs(7), 8);
     assert!(
-        pipeline.last_download_lanes_under_cap_log_at.is_none(),
+        lines.take().is_empty(),
         "lanes below their cap with no failed acquire are not a fault"
     );
-    pipeline.last_owned_lane_acquire_failure_at = Some(quiet + Duration::from_secs(3));
-    pipeline.log_download_lanes_under_cap(quiet + Duration::from_secs(7), 8);
-    assert_eq!(
-        pipeline.last_download_lanes_under_cap_log_at,
-        Some(quiet + Duration::from_secs(7)),
-        "a failure inside the window is what makes it worth a line"
-    );
 
-    // Filling the lanes closes the window, so the next underfill has to earn
-    // its own.
-    pipeline.active_download_connections = 8;
-    pipeline.log_download_lanes_under_cap(later + Duration::from_secs(1), 8);
-    assert!(pipeline.download_lanes_under_cap_since.is_none());
-
-    // So does running out of work: idle lanes with an empty queue are the
-    // ordinary end of a job, not a fault.
+    // Running out of work ends a reported underfill too: idle lanes with an
+    // empty queue are the ordinary end of a job.
     pipeline.active_download_connections = 0;
+    let again = quiet + Duration::from_secs(60);
+    pipeline.last_owned_lane_acquire_failure_at = Some(again);
+    pipeline.log_download_lanes_under_cap(again, 8);
+    pipeline.log_download_lanes_under_cap(again + Duration::from_secs(6), 8);
+    assert_eq!(lines.take().len(), 1);
     pipeline
         .jobs
         .get_mut(&job_id)
@@ -225,8 +320,85 @@ async fn lanes_under_their_cap_are_reported_only_when_it_persists() {
         .active_mut()
         .unwrap()
         .download_queue = DownloadQueue::new();
-    pipeline.log_download_lanes_under_cap(later + Duration::from_secs(2), 8);
+    pipeline.log_download_lanes_under_cap(again + Duration::from_secs(7), 8);
+    let heard = lines.take();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert!(heard[0].contains("dispatchable_queue_depth=0"), "{heard:?}");
     assert!(pipeline.download_lanes_under_cap_since.is_none());
+}
+
+// A retry storm is warned about once, when the first window finds it, and
+// noted once when a later window finds articles completing again. The
+// windows between say nothing, however many there are.
+#[tokio::test]
+async fn a_retry_storm_is_warned_once_as_it_starts_and_noted_once_as_it_ends() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let (lines, _guard) = StateLines::hear("download retry storm");
+    let window = DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL;
+    let retry = |pipeline: &Pipeline, count: u64| {
+        pipeline
+            .metrics
+            .segments_retried
+            .fetch_add(count, Ordering::Relaxed);
+    };
+
+    let t0 = Instant::now();
+    pipeline.log_download_retry_storm(t0);
+    // A window with retries under the threshold is not a storm.
+    retry(&pipeline, DOWNLOAD_RETRY_STORM_THRESHOLD - 1);
+    pipeline.log_download_retry_storm(t0 + window);
+    assert!(lines.take().is_empty());
+    assert!(pipeline.download_retry_storm.is_none());
+
+    // The first window over the threshold with nothing finished starts it.
+    retry(&pipeline, DOWNLOAD_RETRY_STORM_THRESHOLD);
+    let started = t0 + window * 2;
+    pipeline.log_download_retry_storm(started);
+    let heard = lines.take();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert!(
+        heard[0].starts_with("WARN download retry storm: articles are being retried"),
+        "{heard:?}"
+    );
+    assert!(pipeline.download_retry_storm.is_some());
+
+    // 600 more storming windows, as an overnight run would see, and calls
+    // inside each window: nothing more is said.
+    for step in 1..=600u32 {
+        retry(&pipeline, DOWNLOAD_RETRY_STORM_THRESHOLD);
+        pipeline.log_download_retry_storm(started + window * step - Duration::from_millis(1));
+        pipeline.log_download_retry_storm(started + window * step);
+    }
+    assert!(lines.take().is_empty(), "a storm that goes on is not news");
+
+    // A window in which an article completes ends it, with one line.
+    pipeline
+        .metrics
+        .segments_downloaded
+        .fetch_add(1, Ordering::Relaxed);
+    let ended = started + window * 601;
+    pipeline.log_download_retry_storm(ended);
+    pipeline.log_download_retry_storm(ended + window);
+    let heard = lines.take();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert!(
+        heard[0].starts_with("INFO download retry storm over: articles are completing again"),
+        "{heard:?}"
+    );
+    assert!(
+        heard[0].contains(&format!(
+            "retries_since_start={}",
+            DOWNLOAD_RETRY_STORM_THRESHOLD * 600
+        )),
+        "{heard:?}"
+    );
+    assert!(pipeline.download_retry_storm.is_none());
+
+    // A new storm after that is news again.
+    retry(&pipeline, DOWNLOAD_RETRY_STORM_THRESHOLD);
+    pipeline.log_download_retry_storm(ended + window * 2);
+    assert_eq!(lines.take().len(), 1);
 }
 
 // Work whose only server is waiting on its recovery probe parks in its queue:

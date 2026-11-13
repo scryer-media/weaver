@@ -188,7 +188,7 @@ impl IdleOwnedLane {
             && !run
                 .initial_lease
                 .dial_exclude_servers
-                .contains(&self.server.0)
+                .contains(self.server.0)
     }
 
     // Whether this connection is the seat `probe` was given.
@@ -248,7 +248,7 @@ struct CachedOwnedLane {
 // the one server whose unclaimed seat it may fill.
 pub(crate) struct OwnedLaneWarm {
     nntp: Arc<weaver_nntp::NntpClient>,
-    exclude_servers: Arc<[usize]>,
+    exclude_servers: weaver_nntp::ServerSet,
     byte_estimate: u64,
     seat: weaver_nntp::pool::ServerId,
 }
@@ -650,7 +650,7 @@ impl OwnedDownloadLanePool {
     pub(crate) fn warm(
         &self,
         nntp: &Arc<weaver_nntp::NntpClient>,
-        exclude_servers: Arc<[usize]>,
+        exclude_servers: weaver_nntp::ServerSet,
         byte_estimate: u64,
         seat: weaver_nntp::pool::ServerId,
         limit: usize,
@@ -677,7 +677,7 @@ impl OwnedDownloadLanePool {
         for sender in senders {
             let warm = Box::new(OwnedLaneWarm {
                 nntp: Arc::clone(nntp),
-                exclude_servers: Arc::clone(&exclude_servers),
+                exclude_servers,
                 byte_estimate,
                 seat,
             });
@@ -1043,7 +1043,7 @@ impl CachedOwnedLane {
     // new sockets into a stall of every lane.
     fn matches(&self, nntp: &Arc<weaver_nntp::NntpClient>, lease: &DownloadBatchLease) -> bool {
         let server = self.lane.server_id();
-        if !Arc::ptr_eq(&self.nntp, nntp) || lease.dial_exclude_servers.contains(&server.0) {
+        if !Arc::ptr_eq(&self.nntp, nntp) || lease.dial_exclude_servers.contains(server.0) {
             return false;
         }
 
@@ -1067,10 +1067,9 @@ impl CachedOwnedLane {
         // connection. Ranking the servers again is only a second opinion on a
         // quota question; when it cannot be taken, the established connection
         // stands rather than being parked and redialled for nothing.
-        let Some(selection) = nntp.try_blocking_body_server_selection_with_estimate(
-            &lease.dial_exclude_servers,
-            estimate,
-        ) else {
+        let Some(selection) = nntp
+            .try_blocking_body_server_selection_with_estimate(lease.dial_exclude_servers, estimate)
+        else {
             return true;
         };
         cached_lane_matches_selection(server, true, &selection)
@@ -1100,18 +1099,17 @@ fn server_requires_group(nntp: &weaver_nntp::NntpClient, idx: usize) -> bool {
 }
 
 // The servers that have proven they refuse message-id fetches without a
-// selected group, one bit per server position. A server past the mask reads
-// as not requiring one, which leaves its refusals free.
-fn servers_requiring_group(nntp: &weaver_nntp::NntpClient) -> u64 {
+// selected group.
+fn servers_requiring_group(nntp: &weaver_nntp::NntpClient) -> weaver_nntp::ServerSet {
     nntp.pool()
         .server_configs()
         .iter()
-        .take(u64::BITS as usize)
         .enumerate()
         .filter(|(_, config)| {
             weaver_nntp::server_caps::requires_group_selection(&config.host, config.port)
         })
-        .fold(0, |mask, (idx, _)| mask | (1 << idx))
+        .map(|(idx, _)| idx)
+        .collect()
 }
 
 fn cached_lane_matches_selection(
@@ -1147,7 +1145,7 @@ fn warm_cached_lane(cached_lane: &mut Option<CachedOwnedLane>, warm: OwnedLaneWa
         seat,
     } = warm;
     let group_required = server_requires_group(&nntp, seat.0);
-    match nntp.try_warm_blocking_body_lane(&[], &exclude_servers, byte_estimate, seat) {
+    match nntp.try_warm_blocking_body_lane(&[], exclude_servers, byte_estimate, seat) {
         Ok(lane) => {
             *cached_lane = Some(CachedOwnedLane::dialled(nntp, lane, group_required, &[]));
         }
@@ -1178,16 +1176,15 @@ fn ask_owned_lane_probe(
     });
     if !seated {
         park_cached_lane(cached_lane);
-        let exclude: Vec<usize> = (0..probe.nntp.pool().server_count())
-            .filter(|server| *server != probe.seat.0)
-            .collect();
+        let exclude = weaver_nntp::ServerSet::first(probe.nntp.pool().server_count())
+            .difference(weaver_nntp::ServerSet::of(probe.seat.0));
         let group_required = server_requires_group(&probe.nntp, probe.seat.0);
         let dialled = acquire_owned_lane_through_contention(
             || true,
             || {
                 probe
                     .nntp
-                    .try_acquire_blocking_body_lane_with_estimate(&[], &exclude, 0)
+                    .try_acquire_blocking_body_lane_with_estimate(&[], exclude, 0)
             },
         );
         match dialled {
@@ -1268,7 +1265,7 @@ struct LaneLeaseContext {
     // The job's retention exclusions, carried from the lease. Job-derived and
     // the same for every article on the lane; each result unions it with the
     // article's own failure ledger.
-    retention_excludes: Vec<usize>,
+    retention_excludes: weaver_nntp::ServerSet,
     pressure_clear: bool,
     mode: DownloadLaneMode,
     checkpoint_plan: weaver_yenc::CheckpointPlan,
@@ -1487,13 +1484,13 @@ fn lease_is_current(
     }
     let policy = nntp.pool().provider_policy();
     (0..nntp.pool().server_count()).any(|server| {
-        !lease.dial_exclude_servers.contains(&server)
+        !lease.dial_exclude_servers.contains(server)
             && lease.works.iter().all(|work| {
                 matches!(
                     policy.eligibility(
                         server,
-                        &work.exclude_servers,
-                        &lease.effective_exclude_servers,
+                        work.exclude_servers,
+                        lease.effective_exclude_servers,
                         Pipeline::bandwidth_reservation_estimate(work.byte_estimate),
                     ),
                     weaver_nntp::provider_policy::ArticleEligibility::Eligible(_)
@@ -1563,7 +1560,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             || {
                 nntp.try_acquire_blocking_body_lane_with_estimate(
                     lease_groups(&lease),
-                    &lease.dial_exclude_servers,
+                    lease.dial_exclude_servers,
                     initial_estimate,
                 )
             },
@@ -1571,7 +1568,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         match dialled {
             Ok(lane) => {
                 let server = lane.server_id().0;
-                let required = server < u64::BITS as usize && group_required & (1 << server) != 0;
+                let required = group_required.contains(server);
                 *cached_lane = Some(CachedOwnedLane::dialled(
                     Arc::clone(&nntp),
                     lane,
@@ -1716,8 +1713,8 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 || !matches!(
                     nntp.pool().provider_policy().eligibility(
                         server_idx,
-                        &work.exclude_servers,
-                        &work_context.retention_excludes,
+                        work.exclude_servers,
+                        work_context.retention_excludes,
                         Pipeline::bandwidth_reservation_estimate(work.byte_estimate),
                     ),
                     weaver_nntp::provider_policy::ArticleEligibility::Eligible(_)
@@ -1773,7 +1770,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                     unresolved_count: 0,
                     connection_discarded: discarded,
                 },
-                &work_context.retention_excludes,
+                work_context.retention_excludes,
                 group_selected,
             );
             if matches!(stop, Some(LaneStop::PolicyBlocked)) && egress_quota_refused(&result.data) {
@@ -1937,7 +1934,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 unresolved_count: meta.unresolved_count,
                 connection_discarded: meta.connection_discarded,
             },
-            &work_context.retention_excludes,
+            work_context.retention_excludes,
             group_selected,
         );
         let keeps_connection = download_outcome_keeps_connection(&result.data);
@@ -1977,7 +1974,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                     lane.transfer_ewma(),
                     work_context.pressure_clear,
                     unresolved_count,
-                    &work_context.retention_excludes,
+                    work_context.retention_excludes,
                     "lane pipeline faulted before this article's response",
                 );
                 if stream_owned_result(&event_tx, lane, &mut stats_mark, result).is_err() {
@@ -2180,13 +2177,11 @@ fn send_owned_batch(
 // The rotation hint (`avoid_server`) deliberately stays out: it only shapes
 // selection, and counting it here would let a transient timeout help declare
 // an article missing.
-//
-// The result owns the work, so the union grows the work's own ledger in
-// place: an article whose lease excludes nothing new allocates nothing here.
-fn result_exclude_servers(work: &mut DownloadWork, retention_excludes: &[usize]) -> Vec<usize> {
-    let mut excludes = std::mem::take(&mut work.exclude_servers);
-    Pipeline::extend_exclude_servers(&mut excludes, retention_excludes);
-    excludes
+fn result_exclude_servers(
+    work: &DownloadWork,
+    retention_excludes: weaver_nntp::ServerSet,
+) -> weaver_nntp::ServerSet {
+    work.exclude_servers.union(retention_excludes)
 }
 
 // Credit one fetched article's wire bytes to its job and, beside it, to the
@@ -2227,18 +2222,18 @@ pub(in crate::pipeline) fn credit_transfer(
 
 #[allow(clippy::too_many_arguments)]
 fn result_from_trace(
-    mut work: DownloadWork,
+    work: DownloadWork,
     runtime_generation: u64,
     lane_id: u64,
     job_id: JobId,
     trace: weaver_nntp::client::DecodedBodyTrace,
     mut observation: DownloadLaneObservation,
-    retention_excludes: &[usize],
+    retention_excludes: weaver_nntp::ServerSet,
     group_selected: bool,
 ) -> DownloadResult {
     let segment_id = work.segment_id;
     let retry_count = work.retry_count;
-    let exclude_servers = result_exclude_servers(&mut work, retention_excludes);
+    let exclude_servers = result_exclude_servers(&work, retention_excludes);
     // The work's own flags, never the lease's: a lane may be refilled with the
     // other class's work, and the origin books the article that was actually
     // fetched.
@@ -2278,7 +2273,7 @@ fn result_from_trace(
 
 #[allow(clippy::too_many_arguments)]
 fn unresolved_result(
-    mut work: DownloadWork,
+    work: DownloadWork,
     runtime_generation: u64,
     lane_id: u64,
     job_id: JobId,
@@ -2288,12 +2283,12 @@ fn unresolved_result(
     transfer: Option<std::time::Duration>,
     pressure_clear: bool,
     unresolved_count: u64,
-    retention_excludes: &[usize],
+    retention_excludes: weaver_nntp::ServerSet,
     message: &'static str,
 ) -> DownloadResult {
     let is_recovery = work.is_recovery;
     let completion_critical = work.completion_critical;
-    let exclude_servers = result_exclude_servers(&mut work, retention_excludes);
+    let exclude_servers = result_exclude_servers(&work, retention_excludes);
     DownloadResult {
         lane_id,
         job_id,
@@ -2349,7 +2344,7 @@ fn tail_work(segment_number: u32, retry_count: u32) -> DownloadWork {
         retry_count,
         is_recovery: false,
         completion_critical: false,
-        exclude_servers: Vec::new(),
+        exclude_servers: weaver_nntp::ServerSet::EMPTY,
         avoid_server: None,
     }
 }
@@ -2406,7 +2401,7 @@ fn test_admitted_state(job_id: JobId) -> crate::jobs::handle::SharedPipelineStat
 fn test_lease(
     job_id: JobId,
     runtime_generation: u64,
-    exclude_servers: Vec<usize>,
+    exclude_servers: weaver_nntp::ServerSet,
     works: Vec<DownloadWork>,
 ) -> DownloadBatchLease {
     DownloadBatchLease {
@@ -2417,7 +2412,7 @@ fn test_lease(
         lane_mode: DownloadLaneMode::Pipelined { depth: 4 },
         server_modes: vec![(0, DownloadLaneMode::Pipelined { depth: 4 })],
         completion_critical: false,
-        effective_exclude_servers: exclude_servers.clone(),
+        effective_exclude_servers: exclude_servers,
         dial_exclude_servers: exclude_servers,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
@@ -2447,12 +2442,22 @@ mod tests {
     #[test]
     fn a_result_is_attributed_to_the_lease_its_work_came_from() {
         let old = Arc::new(LaneLeaseContext::from_lease(
-            &mut test_lease(JobId(7), 3, vec![1], vec![tail_work(1, 0)]),
+            &mut test_lease(
+                JobId(7),
+                3,
+                weaver_nntp::ServerSet::from([1]),
+                vec![tail_work(1, 0)],
+            ),
             0,
             true,
         ));
         let new = Arc::new(LaneLeaseContext::from_lease(
-            &mut test_lease(JobId(7), 4, vec![2, 5], vec![tail_work(2, 0)]),
+            &mut test_lease(
+                JobId(7),
+                4,
+                weaver_nntp::ServerSet::from([2, 5]),
+                vec![tail_work(2, 0)],
+            ),
             0,
             true,
         ));
@@ -2485,7 +2490,7 @@ mod tests {
                 )),
             },
             observation,
-            &old.retention_excludes,
+            old.retention_excludes,
             false,
         );
 
@@ -2514,12 +2519,17 @@ mod tests {
     #[test]
     fn a_result_reports_the_article_s_own_failure_ledger() {
         let context = Arc::new(LaneLeaseContext::from_lease(
-            &mut test_lease(JobId(7), 3, Vec::new(), vec![tail_work(1, 0)]),
+            &mut test_lease(
+                JobId(7),
+                3,
+                weaver_nntp::ServerSet::EMPTY,
+                vec![tail_work(1, 0)],
+            ),
             1,
             true,
         ));
         let mut work = tail_work(1, 1);
-        work.exclude_servers = vec![0];
+        work.exclude_servers = weaver_nntp::ServerSet::from([0]);
 
         let result = result_from_trace(
             work,
@@ -2548,7 +2558,7 @@ mod tests {
                 unresolved_count: 0,
                 connection_discarded: false,
             },
-            &context.retention_excludes,
+            context.retention_excludes,
             false,
         );
 
@@ -2560,12 +2570,11 @@ mod tests {
         );
     }
 
-    // The result owns its work, so the union of the article's ledger and the
-    // lease's retention exclusions is grown in the ledger's own buffer: the
-    // same servers in the same order, and no new list per article.
+    // The result carries the union of the article's ledger and the lease's
+    // retention exclusions.
     #[test]
-    fn a_result_grows_the_article_s_own_ledger_in_place() {
-        let unresolved = |work: DownloadWork, retention: &[usize]| {
+    fn a_result_carries_the_ledger_and_the_retention_exclusions() {
+        let unresolved = |work: DownloadWork, retention: weaver_nntp::ServerSet| {
             unresolved_result(
                 work,
                 3,
@@ -2583,48 +2592,37 @@ mod tests {
         };
 
         let mut work = tail_work(1, 1);
-        work.exclude_servers = Vec::with_capacity(4);
-        work.exclude_servers.extend([3, 0]);
-        let ledger = work.exclude_servers.as_ptr();
-        let result = unresolved(work, &[0, 2, 3, 5]);
-        assert_eq!(result.exclude_servers, vec![3, 0, 2, 5]);
-        assert_eq!(
-            result.exclude_servers.as_ptr(),
-            ledger,
-            "the union reuses the article's ledger rather than copying it"
-        );
+        work.exclude_servers = weaver_nntp::ServerSet::from([3, 0]);
+        let result = unresolved(work, weaver_nntp::ServerSet::from([0, 2, 3, 5]));
+        assert_eq!(result.exclude_servers, [0, 2, 3, 5]);
 
         let mut work = tail_work(2, 1);
-        work.exclude_servers = vec![4];
-        let ledger = work.exclude_servers.as_ptr();
-        let result = unresolved(work, &[]);
-        assert_eq!(result.exclude_servers, vec![4]);
-        assert_eq!(result.exclude_servers.as_ptr(), ledger);
+        work.exclude_servers = weaver_nntp::ServerSet::from([4]);
+        let result = unresolved(work, weaver_nntp::ServerSet::EMPTY);
+        assert_eq!(result.exclude_servers, [4]);
 
-        let result = unresolved(tail_work(3, 0), &[1]);
-        assert_eq!(result.exclude_servers, vec![1]);
+        let result = unresolved(tail_work(3, 0), weaver_nntp::ServerSet::from([1]));
+        assert_eq!(result.exclude_servers, [1]);
     }
 
-    // The context takes the lease's retention exclusions and checkpoint plan
-    // instead of copying them; nothing reads either off the lease afterwards.
+    // The context takes the lease's retention exclusions and checkpoint plan.
     #[test]
-    fn a_lease_context_takes_the_lease_s_exclusions_without_copying() {
-        let mut lease = test_lease(JobId(7), 3, vec![2, 5], vec![tail_work(1, 0)]);
+    fn a_lease_context_takes_the_lease_s_exclusions() {
+        let mut lease = test_lease(
+            JobId(7),
+            3,
+            weaver_nntp::ServerSet::from([2, 5]),
+            vec![tail_work(1, 0)],
+        );
         lease.checkpoint_plan =
             weaver_yenc::CheckpointPlan::Single(std::num::NonZeroU64::new(4096).unwrap());
-        let retention = lease.effective_exclude_servers.as_ptr();
         let context = LaneLeaseContext::from_lease(&mut lease, 0, true);
-        assert_eq!(context.retention_excludes, vec![2, 5]);
-        assert_eq!(
-            context.retention_excludes.as_ptr(),
-            retention,
-            "the context holds the lease's own list, not a copy"
-        );
+        assert_eq!(context.retention_excludes, [2, 5]);
         assert_eq!(
             context.checkpoint_plan,
             weaver_yenc::CheckpointPlan::Single(std::num::NonZeroU64::new(4096).unwrap())
         );
-        assert_eq!(lease.dial_exclude_servers, vec![2, 5]);
+        assert_eq!(lease.dial_exclude_servers, [2, 5]);
         assert_eq!(lease.works.len(), 1);
     }
 
@@ -2647,7 +2645,7 @@ mod tests {
             None,
             true,
             3,
-            &[],
+            weaver_nntp::ServerSet::EMPTY,
             "lane pipeline faulted before this article's response",
         );
         let Err(DownloadError::Fetch(failure)) = &result.data else {
@@ -2681,7 +2679,7 @@ mod tests {
                     None,
                     true,
                     0,
-                    &[],
+                    weaver_nntp::ServerSet::EMPTY,
                     "streamed",
                 );
                 send_owned_batch(&sender_tx, 0, vec![result], Vec::new(), stats, false)?;
@@ -2893,7 +2891,7 @@ mod tests {
                 unresolved_count: 0,
                 connection_discarded: false,
             },
-            &[],
+            weaver_nntp::ServerSet::EMPTY,
             false,
         );
 
@@ -2995,7 +2993,7 @@ mod tests {
                 unresolved_count: 0,
                 connection_discarded: false,
             },
-            &[],
+            weaver_nntp::ServerSet::EMPTY,
             false,
         );
 
@@ -3040,7 +3038,7 @@ mod tests {
                 unresolved_count: 0,
                 connection_discarded: false,
             },
-            &[],
+            weaver_nntp::ServerSet::EMPTY,
             group_selected,
         );
         let observation = result.lane_observation.unwrap();
@@ -3117,12 +3115,15 @@ mod tests {
             ],
             ..weaver_nntp::client::NntpClientConfig::single(weaver_nntp::ServerConfig::default(), 1)
         });
-        assert_eq!(servers_requiring_group(&nntp), 0);
+        assert_eq!(
+            servers_requiring_group(&nntp),
+            weaver_nntp::ServerSet::EMPTY
+        );
         assert!(!server_requires_group(&nntp, 1));
 
         weaver_nntp::server_caps::note_group_required("group-required.owned-lane.invalid", 1);
 
-        assert_eq!(servers_requiring_group(&nntp), 0b10);
+        assert_eq!(servers_requiring_group(&nntp), [1]);
         assert!(!server_requires_group(&nntp, 0));
         assert!(server_requires_group(&nntp, 1));
         assert!(
@@ -3206,7 +3207,12 @@ mod routing_tests {
     fn queued_lease_requires_current_admission_and_runtime() {
         let nntp = test_client();
         let state = test_admitted_state(JobId(42));
-        let mut lease = test_lease(JobId(42), 0, Vec::new(), vec![tail_work(1, 0)]);
+        let mut lease = test_lease(
+            JobId(42),
+            0,
+            weaver_nntp::ServerSet::EMPTY,
+            vec![tail_work(1, 0)],
+        );
         assert!(lease_is_current(&state, &nntp, &lease));
         state.queue.write(|inner| {
             inner.jobs[0].report.nzb_admitted = false;
@@ -3258,11 +3264,11 @@ mod routing_tests {
         ));
         let state = test_admitted_state(JobId(42));
         let mut not_found_on_zero = tail_work(1, 1);
-        not_found_on_zero.exclude_servers = vec![0];
+        not_found_on_zero.exclude_servers = weaver_nntp::ServerSet::from([0]);
         let lease = test_lease(
             JobId(42),
             0,
-            vec![0],
+            weaver_nntp::ServerSet::from([0]),
             vec![not_found_on_zero, tail_work(2, 0)],
         );
         assert!(lease_is_current(&state, &nntp, &lease));
@@ -3270,13 +3276,18 @@ mod routing_tests {
 
     fn test_run(
         nntp: &Arc<weaver_nntp::NntpClient>,
-        exclude_servers: Vec<usize>,
+        exclude_servers: weaver_nntp::ServerSet,
     ) -> Box<OwnedLaneRun> {
         let (event_tx, _event_rx) = mpsc::channel(4);
         let (refill_tx, _refill_rx) = mpsc::channel(4);
         let (parked_tx, _parked_rx) = mpsc::channel(4);
         // The receivers are dropped with the run; routing never sends on them.
-        let mut lease = test_lease(JobId(7), 1, Vec::new(), vec![tail_work(1, 0)]);
+        let mut lease = test_lease(
+            JobId(7),
+            1,
+            weaver_nntp::ServerSet::EMPTY,
+            vec![tail_work(1, 0)],
+        );
         lease.dial_exclude_servers = exclude_servers;
         Box::new(OwnedLaneRun {
             nntp: Arc::clone(nntp),
@@ -3347,7 +3358,7 @@ mod routing_tests {
     #[test]
     fn a_lease_goes_to_the_worker_that_can_start_it_soonest() {
         let nntp = test_client();
-        let run = test_run(&nntp, vec![3]);
+        let run = test_run(&nntp, weaver_nntp::ServerSet::from([3]));
         let mut shared = shared_with(vec![
             // 0: busy on a lease.
             None,
@@ -3386,7 +3397,7 @@ mod routing_tests {
     #[test]
     fn claiming_a_worker_takes_it_out_of_the_running() {
         let nntp = test_client();
-        let run = test_run(&nntp, Vec::new());
+        let run = test_run(&nntp, weaver_nntp::ServerSet::EMPTY);
         let mut shared = shared_with(vec![idle_with(Some(idle_lane(&nntp, 0)))]);
 
         assert_eq!(shared.claim_worker_for(&run), Some(0));
@@ -3398,7 +3409,7 @@ mod routing_tests {
     #[test]
     fn an_excluded_server_is_not_a_match() {
         let nntp = test_client();
-        let run = test_run(&nntp, vec![1]);
+        let run = test_run(&nntp, weaver_nntp::ServerSet::from([1]));
         let lane = idle_lane(&nntp, 1);
 
         assert!(!lane.serves(&run));
@@ -3411,7 +3422,7 @@ mod routing_tests {
     #[test]
     fn a_connection_opened_for_other_newsgroups_still_serves() {
         let nntp = test_client();
-        let run = test_run(&nntp, Vec::new());
+        let run = test_run(&nntp, weaver_nntp::ServerSet::EMPTY);
 
         assert!(idle_lane(&nntp, 0).serves(&run));
         let mut shared = shared_with(vec![idle_with(None), idle_with(Some(idle_lane(&nntp, 0)))]);
@@ -3428,14 +3439,19 @@ mod routing_tests {
     // fresh dial has no candidate for its initial group probe.
     #[test]
     fn a_lease_carries_the_newsgroups_its_work_was_posted_to() {
-        let lease = test_lease(JobId(7), 1, Vec::new(), vec![tail_work(1, 0)]);
+        let lease = test_lease(
+            JobId(7),
+            1,
+            weaver_nntp::ServerSet::EMPTY,
+            vec![tail_work(1, 0)],
+        );
         assert_eq!(
             lease_groups(&lease),
             ["alt.binaries.test".to_string()],
             "the lane is opened for the lease's groups"
         );
 
-        let run = test_run(&test_client(), Vec::new());
+        let run = test_run(&test_client(), weaver_nntp::ServerSet::EMPTY);
         assert_eq!(
             lease_groups(&run.initial_lease),
             ["alt.binaries.test".to_string()],
@@ -3449,7 +3465,7 @@ mod routing_tests {
     fn a_connection_from_another_client_is_not_a_match() {
         let nntp = test_client();
         let other = test_client();
-        let run = test_run(&nntp, Vec::new());
+        let run = test_run(&nntp, weaver_nntp::ServerSet::EMPTY);
 
         assert!(!idle_lane(&other, 0).serves(&run));
         assert!(!test_idle_lane(0).serves(&run));
@@ -3461,7 +3477,7 @@ mod routing_tests {
     #[test]
     fn a_run_with_no_idle_worker_waits_for_whichever_finishes_first() {
         let nntp = test_client();
-        let run = test_run(&nntp, Vec::new());
+        let run = test_run(&nntp, weaver_nntp::ServerSet::EMPTY);
         let mut shared = shared_with(vec![None, None]);
 
         assert!(shared.claim_worker_for(&run).is_none());
@@ -3493,7 +3509,7 @@ mod routing_tests {
         let mut shared = shared_with(vec![None]);
         shared.workers[0].as_mut().unwrap().sender = sender;
         for segment_number in 0..3 {
-            let mut run = test_run(&nntp, Vec::new());
+            let mut run = test_run(&nntp, weaver_nntp::ServerSet::EMPTY);
             run.initial_lease.works[0].segment_id.segment_number = segment_number;
             shared.queued_runs.push_back(QueuedOwnedLaneWork::Run(run));
         }
@@ -3580,7 +3596,7 @@ mod routing_tests {
     fn warm_for(nntp: &Arc<weaver_nntp::NntpClient>, seat: usize) -> OwnedLaneWarm {
         OwnedLaneWarm {
             nntp: Arc::clone(nntp),
-            exclude_servers: Arc::from(Vec::new()),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             byte_estimate: 750_000,
             seat: weaver_nntp::pool::ServerId(seat),
         }
@@ -3603,7 +3619,7 @@ mod routing_tests {
             ),
         ));
         let shared = Arc::new(std::sync::Mutex::new(shared_with(vec![idle_with(None)])));
-        let run = test_run(&nntp, Vec::new());
+        let run = test_run(&nntp, weaver_nntp::ServerSet::EMPTY);
         let mut cached = None;
 
         let started = answer_idle_command(
@@ -3800,7 +3816,7 @@ mod routing_tests {
     fn a_claimed_worker_is_not_republished_as_idle() {
         let nntp = test_client();
         let mut shared = shared_with(vec![idle_with(None)]);
-        let run = test_run(&nntp, Vec::new());
+        let run = test_run(&nntp, weaver_nntp::ServerSet::EMPTY);
 
         assert_eq!(shared.claim_worker_for(&run), Some(0));
         shared.note_idle_lane(seat(0), Some(idle_lane(&nntp, 0)));
@@ -3830,14 +3846,24 @@ mod routing_tests {
             events.clone(),
             refill_tx,
             parked_tx,
-            test_lease(JobId(7), 1, Vec::new(), vec![tail_work(1, 0)]),
+            test_lease(
+                JobId(7),
+                1,
+                weaver_nntp::ServerSet::EMPTY,
+                vec![tail_work(1, 0)],
+            ),
         )
         .unwrap_or_else(|_| panic!("a pool with room takes the run"));
     }
 
     fn obsolete_report() -> OwnedDownloadLaneEvent {
         OwnedDownloadLaneEvent::LeaseObsolete {
-            lease: test_lease(JobId(9), 1, Vec::new(), vec![tail_work(1, 0)]),
+            lease: test_lease(
+                JobId(9),
+                1,
+                weaver_nntp::ServerSet::EMPTY,
+                vec![tail_work(1, 0)],
+            ),
         }
     }
 
@@ -3927,7 +3953,7 @@ mod routing_tests {
             shared.begin_release(seat(0)),
             OwnedLaneRelease::Withdrawn
         ));
-        let run = test_run(&nntp, Vec::new());
+        let run = test_run(&nntp, weaver_nntp::ServerSet::EMPTY);
         assert!(
             shared.claim_worker_for(&run).is_none(),
             "a withdrawn worker is offered nothing"
@@ -3962,7 +3988,10 @@ mod routing_tests {
         let mut shared = shared_with(vec![idle_with(None)]);
         shared
             .queued_runs
-            .push_back(QueuedOwnedLaneWork::Run(test_run(&nntp, Vec::new())));
+            .push_back(QueuedOwnedLaneWork::Run(test_run(
+                &nntp,
+                weaver_nntp::ServerSet::EMPTY,
+            )));
 
         assert!(matches!(
             shared.begin_release(seat(0)),
@@ -3979,7 +4008,7 @@ mod routing_tests {
         let mut shared = shared_with(vec![idle_with(None)]);
 
         assert_eq!(
-            shared.claim_worker_for(&test_run(&nntp, Vec::new())),
+            shared.claim_worker_for(&test_run(&nntp, weaver_nntp::ServerSet::EMPTY)),
             Some(0)
         );
         assert!(matches!(

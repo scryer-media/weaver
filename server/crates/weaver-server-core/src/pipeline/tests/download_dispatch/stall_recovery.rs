@@ -38,7 +38,7 @@ async fn stalled_pipeline(temp_dir: &tempfile::TempDir) -> Pipeline {
     assert_eq!(
         pipeline
             .nntp
-            .blocking_body_server_order(&[])
+            .blocking_body_server_order(weaver_nntp::ServerSet::EMPTY)
             .map(|order| order.len()),
         Some(1)
     );
@@ -228,7 +228,7 @@ async fn an_unexplained_stall_is_kicked_once_at_the_kick_window() {
             .download_queue;
         let mut works = queue.drain_all();
         works[0].avoid_server = Some(0);
-        works[1].exclude_servers = vec![1];
+        works[1].exclude_servers = weaver_nntp::ServerSet::from([1]);
         for work in works {
             queue.push(work);
         }
@@ -418,7 +418,7 @@ async fn a_stall_with_no_server_to_dispatch_to_waits_for_one() {
     assert_eq!(
         pipeline
             .nntp
-            .blocking_body_server_order(&[])
+            .blocking_body_server_order(weaver_nntp::ServerSet::EMPTY)
             .map(|order| order.len()),
         Some(0)
     );
@@ -610,7 +610,7 @@ async fn verification_exclude_healthy_and_cool_remaining(pipeline: &mut Pipeline
         .download_queue;
     let mut works = queue.drain_all();
     for work in &mut works {
-        work.exclude_servers = vec![0];
+        work.exclude_servers = weaver_nntp::ServerSet::from([0]);
     }
     for work in works {
         queue.push(work);
@@ -627,7 +627,7 @@ async fn verification_exclude_healthy_and_cool_remaining(pipeline: &mut Pipeline
     assert_eq!(
         pipeline
             .nntp
-            .blocking_body_server_order(&[])
+            .blocking_body_server_order(weaver_nntp::ServerSet::EMPTY)
             .unwrap()
             .iter()
             .map(|id| id.0)
@@ -637,7 +637,7 @@ async fn verification_exclude_healthy_and_cool_remaining(pipeline: &mut Pipeline
     assert!(
         pipeline
             .nntp
-            .blocking_body_server_order(&[0])
+            .blocking_body_server_order(weaver_nntp::ServerSet::from([0]))
             .unwrap()
             .is_empty()
     );

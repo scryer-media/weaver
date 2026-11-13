@@ -249,6 +249,42 @@ impl Pipeline {
     // nothing is lowered, because whatever took the article off the lane's
     // record lowered them already.
     pub(super) fn accept_lane_work(&mut self, lane_id: u64, segment: SegmentId) -> bool {
+        self.accept_lane_work_with(lane_id, segment, |_| {})
+    }
+
+    // Take back an article a lane returns unasked, as `accept_lane_work`
+    // does, with the tried servers and hint from the lane's record rather
+    // than the lease's copy: the record is carried across a pool rebuild,
+    // the copy a lane holds is numbered by the pool that leased it.
+    pub(super) fn accept_returned_lane_work(
+        &mut self,
+        lane_id: u64,
+        work: &mut DownloadWork,
+    ) -> bool {
+        let segment = work.segment_id;
+        self.accept_lane_work_with(lane_id, segment, |held| {
+            work.exclude_servers = held.exclude_servers;
+            work.avoid_server = held.avoid_server;
+        })
+    }
+
+    // Carry the tried servers and hint of every article a lane holds into
+    // a rebuilt pool. One pass over the held articles per rebuild.
+    pub(in crate::pipeline) fn remap_lane_holdings(&mut self, remap: &weaver_nntp::ServerRemap) {
+        for owner in self.download_lane_owners.values_mut() {
+            for work in owner.outstanding.values_mut() {
+                work.exclude_servers = remap.set(work.exclude_servers);
+                work.avoid_server = work.avoid_server.and_then(|server| remap.index(server));
+            }
+        }
+    }
+
+    fn accept_lane_work_with(
+        &mut self,
+        lane_id: u64,
+        segment: SegmentId,
+        held: impl FnOnce(&DownloadWork),
+    ) -> bool {
         let Some(owner) = self.download_lane_owners.get_mut(&lane_id) else {
             // Standalone fixtures inject outcomes from lane 0 without
             // booking it; such an outcome was never counted.
@@ -265,6 +301,7 @@ impl Pipeline {
         let Some(work) = work else {
             return false;
         };
+        held(&work);
         self.note_lane_work_left(&work);
         true
     }
