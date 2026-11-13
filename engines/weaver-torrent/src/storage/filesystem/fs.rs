@@ -73,6 +73,24 @@ impl TorrentStorage for FilesystemStorage {
             .pread_exact(offset, buf)
     }
 
+    // A run of buffers is read with one positional read where the platform
+    // has a vectored one, not one read per buffer.
+    fn preadv_exact(
+        &self,
+        file_id: usize,
+        offset: u64,
+        bufs: &mut [&mut [u8]],
+    ) -> anyhow::Result<()> {
+        let file = self
+            .opened_files
+            .get(file_id)
+            .context("no such file")?
+            .lock_read()?;
+        Ok(super::opened_file::pread_exact_vectored(
+            &file, offset, bufs,
+        )?)
+    }
+
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
         let of = self.opened_files.get(file_id).context("no such file")?;
         #[cfg(windows)]
@@ -185,5 +203,51 @@ impl TorrentStorage for FilesystemStorage {
 
         self.opened_files = files;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::{FilesystemStorage, OpenedFile};
+    use crate::storage::TorrentStorage;
+
+    // A run of buffers read in one go holds the bytes the same buffers read
+    // one at a time hold, and a run past the file's end fails as they do.
+    #[test]
+    fn a_run_of_buffers_reads_what_they_read_one_at_a_time() {
+        let dir = TempDir::with_prefix("fs_preadv").unwrap();
+        let path = dir.path().join("payload");
+        let mut payload = vec![0u8; 100_000];
+        rand::fill(&mut payload[..]);
+        std::fs::write(&path, &payload).unwrap();
+        let storage = FilesystemStorage {
+            output_folder: dir.path().to_owned(),
+            opened_files: vec![OpenedFile::new(
+                path.clone(),
+                std::fs::File::open(&path).unwrap(),
+            )],
+        };
+        let lens = [16384usize, 16384, 1, 0, 30_000];
+        let offset = 5_000u64;
+
+        let mut together: Vec<Vec<u8>> = lens.iter().map(|len| vec![0u8; *len]).collect();
+        let mut bufs: Vec<&mut [u8]> = together.iter_mut().map(Vec::as_mut_slice).collect();
+        storage.preadv_exact(0, offset, &mut bufs).unwrap();
+
+        let mut at = offset;
+        for (len, read) in lens.iter().zip(&together) {
+            let mut alone = vec![0u8; *len];
+            storage.pread_exact(0, at, &mut alone).unwrap();
+            assert_eq!(read, &alone, "the buffer at {at}");
+            assert_eq!(alone, payload[at as usize..at as usize + len]);
+            at += *len as u64;
+        }
+
+        let mut long = [vec![0u8; 60_000], vec![0u8; 60_000]];
+        let mut bufs: Vec<&mut [u8]> = long.iter_mut().map(Vec::as_mut_slice).collect();
+        assert!(storage.preadv_exact(0, 0, &mut bufs).is_err());
+        assert!(storage.preadv_exact(1, 0, &mut bufs).is_err());
     }
 }
