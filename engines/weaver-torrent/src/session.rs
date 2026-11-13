@@ -2376,7 +2376,13 @@ impl Session {
                         }
                     }
                 },
-                Some(Ok((live, checked, slot))) = futs.next(), if !futs.is_empty() => {
+                // Every finished check is taken here, a failed one too. A
+                // pattern that refuses a value turns its branch off for the
+                // rest of this select!, so a failed check would leave every
+                // other check unpolled until the next accept. The failure is
+                // logged where the check is pushed.
+                Some(r) = futs.next(), if !futs.is_empty() => {
+                    let Ok((live, checked, slot)) = r else { continue };
                     let (addr, kind) = (checked.addr, checked.kind);
                     match live.add_incoming_peer(checked, slot) {
                         Ok(AddIncomingPeerResult::Added) => {
@@ -6841,6 +6847,115 @@ mod tests {
         assert!(is_handshake_for(&answer, &handle));
         assert!(tokio::time::Instant::now() < rest_ends);
         assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        session.stop().await;
+    }
+
+    // Two connections are taken, then the listener has no more to accept.
+    // The first asks for a torrent the session does not have and is closed.
+    // The second, still in hand when that check failed, is answered all the
+    // same: a failed check does not stop the listener looking at the others.
+    // libtorrent runs each incoming connection on its own
+    // (`session_impl::incoming_connection`), so one that fails holds up no
+    // other.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_incoming_check_does_not_hold_up_the_checks_in_hand() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = crate::tests::test_util::create_default_random_dir_with_torrents(
+            1,
+            16384,
+            Some("failed_check"),
+        );
+        let torrent = crate::create_torrent(
+            dir.path(),
+            crate::CreateTorrentOptions {
+                piece_length: Some(16384),
+                ..Default::default()
+            },
+            &crate::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap()
+        .as_bytes()
+        .unwrap();
+        let (stray_ours, mut stray) = tokio::io::duplex(1 << 16);
+        let (ours, mut theirs) = tokio::io::duplex(1 << 16);
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let scripted = std::sync::Arc::new(Scripted {
+            accepts: std::sync::Mutex::new([Ok(stray_ours), Ok(ours)].into()),
+            asked: asked.clone(),
+            fail_when: Default::default(),
+            errored: Default::default(),
+            listener: std::sync::Mutex::new(None),
+        });
+        let factory = std::sync::Arc::new(Scripted {
+            accepts: Default::default(),
+            asked: Default::default(),
+            fail_when: Default::default(),
+            errored: Default::default(),
+            listener: std::sync::Mutex::new(Some(Box::new(scripted))),
+        });
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                listen: Some(crate::ListenerOptions {
+                    mode: crate::ListenerMode::TcpOnly,
+                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                    ..Default::default()
+                }),
+                socket_factory: factory,
+                ..crate::test_support::session_options()
+            },
+        )
+        .await
+        .unwrap();
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent),
+                Some(AddTorrentOptions {
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        handle.wait_until_completed().await.unwrap();
+
+        // Both connections are in hand: the listener is on its third accept,
+        // which never returns.
+        while asked.load(std::sync::atomic::Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+
+        // The stray's check fails, and its connection is closed.
+        let mut handshake = [0u8; 68];
+        let len = crate::peer_protocol::Handshake::new(
+            super::Id20::new([0xa3; 20]),
+            super::Id20::new([6; 20]),
+        )
+        .serialize_unchecked_len(&mut handshake);
+        stray.write_all(&handshake[..len]).await.unwrap();
+        let mut rest = Vec::new();
+        let _ = stray.read_to_end(&mut rest).await;
+        assert!(rest.is_empty());
+
+        // The other is still answered; no new connection comes to wake the
+        // listener.
+        let len =
+            crate::peer_protocol::Handshake::new(handle.info_hash(), super::Id20::new([7; 20]))
+                .serialize_unchecked_len(&mut handshake);
+        theirs.write_all(&handshake[..len]).await.unwrap();
+        let mut answer = [0u8; 68];
+        theirs.read_exact(&mut answer).await.unwrap();
+        assert!(is_handshake_for(&answer, &handle));
 
         session.stop().await;
     }
