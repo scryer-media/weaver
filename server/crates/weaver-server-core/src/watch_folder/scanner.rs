@@ -1475,9 +1475,12 @@ mod tests {
             assert!(rig.folder.path().join("tv/again.nzb.error").exists());
         }
 
-        // A magnet the route cannot fetch yet waits in the folder for the next scan.
+        // A magnet waits in the folder while there is no torrent client to
+        // take it. The client takes it whatever its route's state: on a
+        // route that is down the torrent is held there, not left in the
+        // folder.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn a_magnet_file_goes_to_the_torrent_client_and_waits_while_it_refuses() {
+        async fn a_magnet_file_waits_for_the_torrent_client_and_is_taken_on_a_route_that_is_down() {
             let rig = rig().await;
             let hash = "0123456789abcdef0123456789abcdef01234567";
             let source = rig.put(
@@ -1499,9 +1502,9 @@ mod tests {
             rig.scanner.use_torrents(rig.torrents.clone());
             rig.routes.set_down(Some("tunnel gone"));
             let report = rig.scan().await;
-            assert!(source.exists(), "{report:?}");
-            assert!(report.queued_nzbs.is_empty());
-            assert!(rig.db.list_torrents().unwrap().is_empty());
+            assert!(!source.exists(), "{report:?}");
+            assert_eq!(report.queued_nzbs.len(), 1, "{report:?}");
+            assert_eq!(rig.db.list_torrents().unwrap().len(), 1);
         }
     }
 }

@@ -657,38 +657,113 @@ async fn admission_leaves_out_unwanted_files_and_refuses_nothing_wanted_and_exec
     rig.service.stop().await;
 }
 
+// The magnet of `job_id` once its fetch has ended and left it held: a fetch
+// publishes as it ends.
+async fn magnet_held(service: &TorrentService, job_id: JobId) {
+    let mut published = service.inner.published.subscribe();
+    loop {
+        published.borrow_and_update();
+        {
+            let live = service.inner.live.lock().await;
+            if live[&job_id].held.is_some() && live[&job_id].resolving.is_none() {
+                return;
+            }
+        }
+        published.changed().await.unwrap();
+    }
+}
+
+// A magnet is added whatever its route's state (libtorrent
+// `session_impl::add_torrent` starts a magnet at once): on a route that is
+// down it is held, as a torrent file's is, and fetches nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_magnet_is_refused_without_a_network_to_fetch_it_on() {
+async fn a_magnet_added_on_a_route_that_is_down_is_held() {
     let rig = rig(set_clock());
     rig.service.open().await.unwrap();
     let hash = "0123456789abcdef0123456789abcdef01234567";
     rig.routes.set_down(Some("tunnel gone"));
     let magnet = format!("magnet:?xt=urn:btih:{hash}&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce");
-    assert!(matches!(
-        rig.service
-            .add_opened(request(AddSource::Magnet(magnet)))
-            .await,
-        Err(AddError::NoNetwork(_))
-    ));
+    let job_id = rig
+        .service
+        .add(request(AddSource::Magnet(magnet)))
+        .await
+        .unwrap();
+    magnet_held(&rig.service, job_id).await;
+    assert_eq!(rig.routes.opened.load(Ordering::SeqCst), 0);
     // A base32 hash names the same torrent as its hex form.
     let base32 = "AERUKZ4JVPG66AJDIVTYTK6N54ASGRLH";
     let magnet = format!("magnet:?xt=urn:btih:{base32}&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce");
+    assert_eq!(
+        rig.service.add(request(AddSource::Magnet(magnet))).await,
+        Err(AddError::Duplicate(job_id))
+    );
+    assert_eq!(rig.db.list_torrents().unwrap().len(), 1);
+    rig.service.stop().await;
+}
+
+// A magnet's add is answered while its route's session is still opening: it
+// does not wait on the route, and its fetch does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_magnets_add_is_answered_before_its_routes_session_opens() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    rig.routes.unanswered.send_replace(true);
+    let mut asked = rig.routes.asked.subscribe();
+    let before = *asked.borrow_and_update();
+
+    // The route's open is held unanswered, and the add still answers.
+    let hash = "0123456789abcdef0123456789abcdef01234567";
+    let magnet = format!("magnet:?xt=urn:btih:{hash}&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce");
+    let job_id = rig
+        .service
+        .add(request(AddSource::Magnet(magnet)))
+        .await
+        .unwrap();
+    asked.wait_for(|asked| *asked > before).await.unwrap();
+    assert_eq!(rig.routes.opened.load(Ordering::SeqCst), 0);
     assert!(matches!(
-        rig.service
-            .add_opened(request(AddSource::Magnet(magnet)))
-            .await,
-        Err(AddError::NoNetwork(_))
+        rig.service.inner.live.lock().await[&job_id].resolving,
+        Some(Resolving::Fetching(_))
     ));
-    // A route with no DHT cannot find peers for a magnet with no trackers.
-    rig.routes.set_down(None);
-    let bare = format!("magnet:?xt=urn:btih:{hash}");
-    assert!(matches!(
+    rig.service.stop().await;
+}
+
+// A route with no DHT cannot find peers for a magnet with no trackers. The
+// add says so when the route's session runs; one added before the route
+// opened fails with the same words once it has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_magnet_with_no_trackers_is_turned_away_on_a_route_with_no_dht() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let bare = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+
+    // No session runs on the route yet: the add answers, and the fetch
+    // fails the job once the route is open.
+    let mut retired = rig.service.retired();
+    let before = *retired.borrow_and_update();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Magnet(bare.to_owned())))
+        .await
+        .unwrap();
+    retired.wait_for(|retired| *retired > before).await.unwrap();
+    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert_eq!(history.status, "failed");
+    assert_eq!(history.error_message.as_deref(), Some(NEEDS_DHT));
+
+    // The route's session runs: the add is refused.
+    rig.service
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    let other = "magnet:?xt=urn:btih:89abcdef0123456789abcdef0123456789abcdef";
+    assert_eq!(
         rig.service
-            .add_opened(request(AddSource::Magnet(bare)))
+            .add(request(AddSource::Magnet(other.to_owned())))
             .await,
-        Err(AddError::NoNetwork(_))
-    ));
-    assert!(rig.db.list_torrents().unwrap().is_empty());
+        Err(AddError::NoNetwork(NEEDS_DHT.into()))
+    );
+    rig.service.stop().await;
 }
 
 const V2_ONLY: &[u8] = include_bytes!(concat!(

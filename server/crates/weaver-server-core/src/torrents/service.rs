@@ -96,6 +96,9 @@ pub use scripts::ScriptDirs;
 mod tests;
 pub mod updates;
 
+// Why a magnet with no trackers is turned away on a route with no DHT.
+const NEEDS_DHT: &str = "a magnet with no trackers needs DHT, which this route does not carry";
+
 /// How often torrents are read and their routes checked.
 pub const TICK: Duration = Duration::from_secs(10);
 
@@ -4061,17 +4064,17 @@ impl TorrentService {
                 let scope = settings.scope(category.as_ref().map(|category| category.id), rule);
                 let plan = self.inner.sessions.routes().plan(scope);
                 let (plan, pin) = self.placed(&plan, None).await;
-                let session = self
-                    .inner
-                    .sessions
-                    .session(&plan, &client_of(rule).identity())
-                    .await
-                    .map_err(|error| AddError::NoNetwork(error.to_string()))?;
-                if magnet.trackers.is_empty() && session.get_dht().is_none() {
-                    return Err(AddError::NoNetwork(
-                        "a magnet with no trackers needs DHT, which this route does not carry"
-                            .into(),
-                    ));
+                // Answered without waiting on its route (libtorrent
+                // `session_impl::add_torrent` starts a magnet at once): the
+                // fetch opens the route's session by itself. A magnet with
+                // no trackers is refused here when the route's session runs
+                // and carries no DHT; one whose route is not open yet is
+                // told so by its fetch, once the route is.
+                if magnet.trackers.is_empty()
+                    && let Some(session) = self.inner.sessions.running_session(&plan).await
+                    && session.get_dht().is_none()
+                {
+                    return Err(AddError::NoNetwork(NEEDS_DHT.into()));
                 }
                 let job_id = self.reserve()?;
                 let name = magnet
@@ -4447,6 +4450,19 @@ impl TorrentService {
                 return self.held(job_id, Some(plan.key), held_by(error)).await;
             }
         };
+        // A magnet with no trackers finds its peers on the DHT alone: on a
+        // route that carries none it can never fetch.
+        let trackerless = tracker_tiers
+            .as_ref()
+            .is_none_or(|tiers| tiers.iter().all(Vec::is_empty))
+            && Magnet::parse(&uri).is_ok_and(|magnet| magnet.trackers.is_empty());
+        if trackerless && session.get_dht().is_none() {
+            if self.fetch_ended(job_id).await {
+                self.inner.counters.fetch(FetchOutcome::Failed);
+                self.fail(job_id, NEEDS_DHT.into()).await;
+            }
+            return;
+        }
         let mut options = AddTorrentOptions {
             list_only: true,
             tracker_tiers,
