@@ -17,6 +17,7 @@ use crate::core::{
     peer_id::{generate_azereus_style, url_random},
 };
 use crate::crate_version;
+use crate::torrent_state::stats::TorrentTotals;
 use crate::tracker::AnnounceShape;
 
 /// How a torrent names itself to its peers and trackers. A torrent keeps one
@@ -38,6 +39,9 @@ pub struct Identity {
     pub tracker_ids: TrackerIds,
     /// Whether a tracker has been told it completed.
     pub completion: Completion,
+    /// Where its announces stood when a route move took it from its last
+    /// session.
+    pub announcing: Announcing,
     /// How its announces are written.
     pub shape: &'static AnnounceShape,
 }
@@ -135,6 +139,86 @@ impl std::fmt::Debug for Completion {
     }
 }
 
+/// Where a torrent's announces stood when a route move took it out of one
+/// session to add it to another: a move is not a start, so the new session's
+/// announces go on from there. Its counters go on from the totals its last
+/// start counted from, and a tracker that answered `started` hears no other
+/// one. Kept as [`TrackerIds`] is; the session the torrent is added to takes
+/// it, and a run that is a start forgets it.
+#[derive(Clone, Default)]
+pub struct Announcing(Arc<Mutex<Option<Handed>>>);
+
+/// The trackers that answered `started` under each hash, with the corrupt
+/// and redundant bytes the torrent had counted when it was sent.
+pub(crate) type Started = HashMap<(Id20, Url), (u64, u64)>;
+
+/// What [`Announcing`] holds between two sessions.
+#[derive(Default)]
+struct Handed {
+    /// What the torrent had moved when its announces began counting, in the
+    /// totals the new session is added with.
+    from: Option<TorrentTotals>,
+    /// The trackers that answered `started`, under each hash.
+    started: Started,
+}
+
+impl Announcing {
+    /// A route move takes the torrent from its session: its announces
+    /// counted from `from`, and `started` answered `started`.
+    pub(crate) fn hand_over(&self, from: TorrentTotals, started: Started) {
+        *self.0.lock() = Some(Handed {
+            from: Some(from),
+            started,
+        });
+    }
+
+    /// The torrent left its session by any other way than a move, or joins
+    /// the next one paused: its next announces are a start.
+    pub(crate) fn forget(&self) {
+        *self.0.lock() = None;
+    }
+
+    /// What the announces of the session taking the torrent count from,
+    /// if a move handed it over.
+    pub(crate) fn take_from(&self) -> Option<TorrentTotals> {
+        self.0.lock().as_mut().and_then(|h| h.from.take())
+    }
+
+    /// The trackers that answered `started` under `info_hash` before the
+    /// move, taken by the announces that go on under it.
+    pub(crate) fn take_started(&self, info_hash: Id20) -> HashMap<Url, (u64, u64)> {
+        let mut handed = self.0.lock();
+        let Some(handed) = handed.as_mut() else {
+            return HashMap::new();
+        };
+        let mut taken = HashMap::new();
+        handed.started.retain(|(hash, url), at| {
+            let ours = *hash == info_hash;
+            if ours {
+                taken.insert(url.clone(), *at);
+            }
+            !ours
+        });
+        taken
+    }
+}
+
+impl PartialEq for Announcing {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Announcing {}
+
+impl std::fmt::Debug for Announcing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Announcing")
+            .field(&self.0.lock().as_ref().map(|h| h.started.len()))
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for TrackerIds {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("TrackerIds")
@@ -158,6 +242,7 @@ impl Identity {
             user_agent: self.user_agent.clone(),
             tracker_ids: TrackerIds::default(),
             completion: Completion::default(),
+            announcing: Announcing::default(),
             shape: self.shape,
         }
     }
@@ -173,6 +258,7 @@ impl Default for Identity {
             user_agent: crate::client_name_and_version().to_owned(),
             tracker_ids: TrackerIds::default(),
             completion: Completion::default(),
+            announcing: Announcing::default(),
             shape: &AnnounceShape::WEAVER,
         }
     }
@@ -191,6 +277,7 @@ mod tests {
             user_agent: "qBittorrent/5.2.3".into(),
             tracker_ids: TrackerIds::default(),
             completion: Completion::default(),
+            announcing: Announcing::default(),
             shape: &crate::tracker::qbittorrent::SHAPE,
         };
         let same = identity.same_client();

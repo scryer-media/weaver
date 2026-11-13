@@ -127,7 +127,7 @@ pub use crate::core::net::{
 };
 pub use crate::core::peer_id::*;
 pub use crate::core::torrent_metainfo::*;
-pub use crate::identity::{Completion, Identity, TrackerIds};
+pub use crate::identity::{Announcing, Completion, Identity, TrackerIds};
 
 #[cfg(test)]
 pub(crate) mod test_support;

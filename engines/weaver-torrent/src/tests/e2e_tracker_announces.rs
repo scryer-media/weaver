@@ -2020,3 +2020,135 @@ async fn test_a_resumed_run_announces_from_its_own_start() -> anyhow::Result<()>
     respond(conn, ANSWER).await?;
     Ok(())
 }
+
+// A route move is not a start. The session the torrent leaves sends no
+// `stopped`, and the session it joins goes on: a tracker that answered
+// `started` hears a plain announce whose counters run on from the last run's
+// start. Here run 1 fetched one file and a pause ended it; run 2 fetched the
+// second. The announce after the move reports run 2's file, not both (the
+// totals since the add) and not nothing (a new start).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_moved_torrent_announces_on_from_where_it_stood() -> anyhow::Result<()> {
+    setup_test_logging();
+    const PIECE_LENGTH: u32 = 1024;
+    const FILE: usize = 4 * PIECE_LENGTH as usize;
+    let dir = create_default_random_dir_with_torrents(2, FILE, Some("moved_on"));
+    let torrent = create_torrent(
+        dir.path(),
+        CreateTorrentOptions {
+            name: None,
+            piece_length: Some(PIECE_LENGTH),
+            ..Default::default()
+        },
+        &BlockingSpawner::new(1),
+    )
+    .await?
+    .as_bytes()?;
+    let t = TestTorrent {
+        dir,
+        torrent,
+        content: Vec::new(),
+    };
+    let (_seeder, seeder_addr) = t.seed().await?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+    let out = TempDir::with_prefix("test_moved_on_out")?;
+    let output_folder = out.path().to_str().context("utf-8 path")?.to_owned();
+    let add = |identity: Option<crate::Identity>,
+               totals: crate::TorrentTotals,
+               file_priorities: Vec<FilePriority>| AddTorrentOptions {
+        output_folder: Some(output_folder.clone()),
+        overwrite: true,
+        trackers: Some(vec![url.clone()]),
+        file_priorities: Some(file_priorities),
+        identity,
+        totals,
+        ..Default::default()
+    };
+    let file = FILE.to_string();
+
+    let session = Session::new_with_opts(out.path().into(), tracker_session_opts()?).await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(add(
+                None,
+                Default::default(),
+                vec![FilePriority::Normal, FilePriority::Ignored],
+            )),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+
+    // Run 1 fetches the first file; a pause ends it.
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("started"));
+    respond_bytes(conn, &answer_with_peer(seeder_addr)?).await?;
+    handle.wait_until_completed().await?;
+    session.pause(&handle).await?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("stopped"));
+    assert_eq!(param(&query, "downloaded"), Some(file.as_str()));
+    respond(conn, ANSWER).await?;
+
+    // Run 2 starts from nothing and fetches the second file.
+    session.unpause(&handle).await?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("started"));
+    assert_eq!(param(&query, "downloaded"), Some("0"));
+    handle.set_file_priorities(&[(1, FilePriority::Normal)])?;
+    let (_second_seeder, second_addr) = t.seed().await?;
+    respond_bytes(conn, &answer_with_peer(second_addr)?).await?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("completed"));
+    assert_eq!(param(&query, "downloaded"), Some(file.as_str()));
+    respond(conn, ANSWER).await?;
+    announce_ended(&handle, |l| l.result.is_ok()).await?;
+
+    // The move: out of this session, its tracker task ended and whatever
+    // `stopped` it would send sent or timed out, then into another.
+    let identity = handle.shared().identity();
+    let totals = handle.totals();
+    assert_eq!(totals.downloaded_bytes, 2 * FILE as u64);
+    handle.hand_over();
+    session
+        .delete(crate::api::TorrentIdOrHash::Id(handle.id()), false)
+        .await?;
+    session.stopped_announces().wait_idle().await;
+
+    let next = Session::new_with_opts(out.path().into(), tracker_session_opts()?).await?;
+    let moved = next
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(add(
+                Some(identity),
+                totals,
+                vec![FilePriority::Normal, FilePriority::Normal],
+            )),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), None);
+    assert_eq!(param(&query, "downloaded"), Some(file.as_str()));
+    assert_eq!(param(&query, "uploaded"), Some("0"));
+    respond(conn, ANSWER).await?;
+    announce_ended(&moved, |l| l.result.is_ok()).await?;
+
+    // A pause in the new session is a stop as any is, counted on.
+    next.pause(&moved).await?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("stopped"));
+    assert_eq!(param(&query, "downloaded"), Some(file.as_str()));
+    respond(conn, ANSWER).await?;
+
+    // And the start after it counts from nothing again.
+    next.unpause(&moved).await?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("started"));
+    assert_eq!(param(&query, "downloaded"), Some("0"));
+    respond(conn, ANSWER).await?;
+    Ok(())
+}

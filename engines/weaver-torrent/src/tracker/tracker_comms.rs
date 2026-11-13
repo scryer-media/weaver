@@ -429,6 +429,9 @@ struct TrackerList {
     /// The run announces until it stops (libtorrent
     /// `torrent::m_announcing`); after that no tracker is due again.
     announcing: bool,
+    /// A route move took the torrent to another session, where these
+    /// announces go on: it stops with no `stopped`.
+    handed_over: bool,
     /// How the torrent's announces are written.
     shape: &'static AnnounceShape,
 }
@@ -457,8 +460,19 @@ impl TrackerList {
             completion,
             forced: Vec::new(),
             announcing: true,
+            handed_over: false,
             shape,
         }
+    }
+
+    /// The announces go on from a session a route move took the torrent
+    /// from: each tracker of `started` answered `started` there, so it is
+    /// sent no other.
+    fn going_on(mut self, started: &HashMap<Url, (u64, u64)>) -> Self {
+        for entry in &mut self.entries {
+            entry.start_sent |= started.contains_key(&entry.tracker.url);
+        }
+        self
     }
 
     /// The trackers become `tiers`, in the order given, a tracker named
@@ -732,9 +746,13 @@ impl TrackerList {
     /// (`announce_infohash::can_announce` with `updating`, as
     /// `torrent::announce_with_tracker` asks it for `stopped` too,
     /// torrent.cpp:3308, v2.0.15). A working tracker passed over still
-    /// stands for its tier.
+    /// stands for its tier. A run whose announces a route move handed over
+    /// owes none: the session it went to announces on.
     fn stop(&mut self) -> Vec<SupportedTracker> {
         self.announcing = false;
+        if self.handed_over {
+            return Vec::new();
+        }
         self.walk(|e| e.start_sent, |e| !e.updating)
             .into_iter()
             .map(|i| self.entries[i].tracker.clone())
@@ -1251,6 +1269,29 @@ impl TrackerStatus {
             },
             runs: Default::default(),
         }))
+    }
+
+    /// A route move takes the torrent to another session, where its
+    /// announces go on: no hash that still announces sends `stopped` as it
+    /// stops. The trackers each hash's tracker answered `started` from, or
+    /// None when no hash announces any more.
+    pub(crate) fn hand_over(&self) -> Option<crate::identity::Started> {
+        let mut started = crate::identity::Started::new();
+        let mut announcing = false;
+        for comms in self.0.runs.lock().iter().filter_map(|run| run.upgrade()) {
+            let mut list = comms.list.lock();
+            if !list.announcing {
+                continue;
+            }
+            announcing = true;
+            list.handed_over = true;
+            let started_at = comms.started_at.lock();
+            started.extend(list.entries.iter().filter(|e| e.start_sent).map(|e| {
+                let at = started_at.get(&e.tracker.url).copied().unwrap_or_default();
+                ((comms.info_hash, e.tracker.url.clone()), at)
+            }));
+        }
+        announcing.then_some(started)
     }
 
     /// The trackers become `tiers`, each with who named it: the table lists
@@ -1955,6 +1996,8 @@ impl TrackerComms {
         let comms = info_hashes
             .ids20()
             .map(|info_hash| {
+                // What a route move handed over under this hash goes on here.
+                let started = identity.announcing.take_started(info_hash);
                 Arc::new(Self {
                     info_hash,
                     identity: identity.clone(),
@@ -1967,13 +2010,16 @@ impl TrackerComms {
                     reachable: reachable.clone(),
                     udp_client: udp_client.clone(),
                     allow_idna,
-                    list: Mutex::new(TrackerList::new(
-                        &tiers,
-                        Instant::now(),
-                        identity.shape,
-                        identity.completion.clone(),
-                    )),
-                    started_at: Default::default(),
+                    list: Mutex::new(
+                        TrackerList::new(
+                            &tiers,
+                            Instant::now(),
+                            identity.shape,
+                            identity.completion.clone(),
+                        )
+                        .going_on(&started),
+                    ),
+                    started_at: Mutex::new(started),
                     status: status.clone(),
                     poke: tokio::sync::Notify::new(),
                     stopped: stopped.clone(),
@@ -2035,6 +2081,7 @@ impl TrackerComms {
     /// torrent: the same key, identity, counters and peer stream, in the
     /// same task, stopped with it.
     fn grow(&self, info_hash: Id20, tiers: &[Vec<SupportedTracker>]) {
+        let started = self.identity.announcing.take_started(info_hash);
         let comms = Arc::new(Self {
             info_hash,
             identity: self.identity.clone(),
@@ -2047,13 +2094,16 @@ impl TrackerComms {
             reachable: self.reachable.clone(),
             udp_client: self.udp_client.clone(),
             allow_idna: self.allow_idna,
-            list: Mutex::new(TrackerList::new(
-                tiers,
-                Instant::now(),
-                self.identity.shape,
-                self.identity.completion.clone(),
-            )),
-            started_at: Default::default(),
+            list: Mutex::new(
+                TrackerList::new(
+                    tiers,
+                    Instant::now(),
+                    self.identity.shape,
+                    self.identity.completion.clone(),
+                )
+                .going_on(&started),
+            ),
+            started_at: Mutex::new(started),
             status: self.status.clone(),
             poke: tokio::sync::Notify::new(),
             stopped: self.stopped.clone(),
@@ -3810,6 +3860,7 @@ mod tests {
             user_agent: "Test/1.0".into(),
             tracker_ids: Default::default(),
             completion: Default::default(),
+            announcing: Default::default(),
             shape: &crate::tracker::AnnounceShape::WEAVER,
         }
     }
@@ -6002,6 +6053,7 @@ mod tests {
             completion: short_of_a_seed(),
             forced: Vec::new(),
             announcing: true,
+            handed_over: false,
             shape: &crate::tracker::AnnounceShape::WEAVER,
         }
     }
