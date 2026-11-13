@@ -452,10 +452,10 @@ impl Pipeline {
             }
             self.parking_jobs.remove(&job_id);
             // A job held for a full disk has no graph to checkpoint: it parks
-            // as it is, its cursors let go, and goes on at once if a reading
+            // as it is, what it kept past its checkpoint let go, and goes on at once if a reading
             // since its write already shows room.
             if full_disk {
-                self.forget_uu_cursors(job_id);
+                self.forget_parts_past_checkpoint(job_id);
                 self.park_drained_job(job_id);
                 self.wake_full_disk();
                 continue;

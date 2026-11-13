@@ -649,6 +649,7 @@ impl Pipeline {
                 .as_ref()
                 .filter(|restart| restart.reprocess)
                 .map_or(0, |restart| restart.downloaded_bytes),
+            checkpointed_download_bytes: 0,
             restored_download_floor_bytes: 0,
             downloaded_wire_bytes: 0,
             server_attribution: Default::default(),
@@ -1082,6 +1083,7 @@ impl Pipeline {
             delivery_left_behind: Vec::new(),
             working_dir: request.working_dir.clone(),
             downloaded_bytes: 0,
+            checkpointed_download_bytes: 0,
             restored_download_floor_bytes: 0,
             downloaded_wire_bytes: 0,
             server_attribution,
@@ -1396,6 +1398,7 @@ impl Pipeline {
             delivery_left_behind: Vec::new(),
             working_dir,
             downloaded_bytes,
+            checkpointed_download_bytes: downloaded_bytes,
             restored_download_floor_bytes,
             downloaded_wire_bytes: 0,
             server_attribution,

@@ -333,6 +333,7 @@ impl Repaired {
     pub(crate) fn again(working_dir: &std::path::Path, node: NodeId) -> Result<Self, LeafError> {
         let internal = working_dir.join(weaver_graph::names::INTERNAL_DIR);
         std::fs::create_dir_all(&internal).map_err(|source| LeafError::Io {
+            device: crate::pipeline::graph::limits::Device::Working,
             path: internal.clone(),
             source,
         })?;
@@ -489,6 +490,7 @@ impl NamespaceWriter {
         match std::fs::create_dir(&access.internal) {
             Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
                 return Err(LeafError::Io {
+                    device: crate::pipeline::graph::limits::Device::Working,
                     path: access.internal,
                     source: error,
                 });

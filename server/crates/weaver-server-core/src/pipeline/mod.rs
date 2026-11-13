@@ -1589,6 +1589,10 @@ pub struct Pipeline {
     // a reading taken since shows room, and then runs on from its last
     // checkpoint.
     pub(super) full_disk: std::collections::BTreeMap<JobId, full_disk::FullDisk>,
+    // The removals of spool files a held job no longer reads, for a test to
+    // wait on.
+    #[cfg(test)]
+    pub(super) full_disk_sweeps: Vec<tokio::task::JoinHandle<()>>,
     // A `RebuildNntp` has activated a new pool whose predecessor still holds
     // sockets at the provider. Fresh dials wait until the old generation has
     // drained: the provider counts both generations against one allowance,

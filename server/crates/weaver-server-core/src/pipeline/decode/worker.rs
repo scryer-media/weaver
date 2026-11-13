@@ -50,10 +50,18 @@ impl std::error::Error for SegmentWriteError {
 
 impl Pipeline {
     // Whether a download or decode result for the job is still taken: the job
-    // is here, has not ended, and is not publishing what it delivered. Once
-    // the final move begins, cleanup has chosen what the delivery holds, and
-    // a late duplicate must not make an input file again.
+    // still downloads, and is not held for a full disk. A held job has no
+    // graph to take a result, and fetches again from its last checkpoint
+    // whatever is still out, so a result that comes back for it is dropped
+    // whole: not placed, and not counted.
     pub(in crate::pipeline) fn job_takes_results(&self, job_id: JobId) -> bool {
+        self.job_downloads(job_id) && !self.held_for_full_disk(job_id)
+    }
+
+    // Whether the job is here, has not ended, and is not publishing what it
+    // delivered. Once the final move begins, cleanup has chosen what the
+    // delivery holds, and a late duplicate must not make an input file again.
+    pub(in crate::pipeline) fn job_downloads(&self, job_id: JobId) -> bool {
         self.jobs.get(&job_id).is_some_and(|state| {
             !is_terminal_status(&state.status)
                 && !matches!(
@@ -867,6 +875,11 @@ impl Pipeline {
                 declared_part_end(expected_layout, yenc_layout),
                 segments,
             );
+            // The write of it found the disk full: the job is held, and the
+            // article is fetched and counted once the job runs on.
+            if self.held_for_full_disk(job_id) {
+                return;
+            }
             if retain_damage && !encoding.is_uu() {
                 // The damaged copy stands. Its extent, and the range its header
                 // named, still say where the part behind it begins.
@@ -1683,7 +1696,7 @@ impl Pipeline {
         let out_of_space = crate::operations::is_out_of_space(&error.source);
         // A write that found no room holds the job until the disk has room:
         // what it did not write is fetched again.
-        if out_of_space && self.job_takes_results(job_id) {
+        if out_of_space && self.job_downloads(job_id) {
             warn!(
                 job_id = job_id.0,
                 file_id = %error.file_id,

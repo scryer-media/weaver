@@ -111,6 +111,7 @@ impl Replay {
         }));
         if staged.is_err() {
             self.access.repaired.failed = Some(LeafError::Io {
+                device: crate::pipeline::graph::limits::Device::Working,
                 path: self.access.repaired.output.path().to_path_buf(),
                 source: std::io::Error::other("posted-input reconstruction worker panicked"),
             });

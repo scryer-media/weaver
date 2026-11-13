@@ -16,13 +16,16 @@
 // Nothing here runs unless a write failed for want of room: every check on
 // a path that runs often is one test of an empty map.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use tracing::info;
+use tracing::{info, warn};
 
-use super::Pipeline;
-use crate::jobs::ids::{JobId, NzbFileId};
+use super::graph::limits::Device;
+use super::{ParkedBytes, Pipeline};
+use crate::jobs::ids::JobId;
 use crate::jobs::model::JobArticles;
 use crate::operations::StorageRoot;
 
@@ -33,15 +36,22 @@ pub(crate) struct FullDisk {
     // When the reading cached as the write failed was taken: it may predate
     // what filled the disk, so it says nothing of room.
     reading: Option<Instant>,
+    // The spool files of the held parts the job's last checkpoint names:
+    // the ones its restore reads back, so the ones that stay on disk.
+    named: HashSet<PathBuf>,
 }
 
 impl Pipeline {
-    // The disk a file lies on: the complete folder's, or the working one's.
-    pub(in crate::pipeline) fn full_disk_root(&self, path: &Path) -> StorageRoot {
-        if path.starts_with(&self.complete_dir) {
-            StorageRoot::Complete
-        } else {
-            StorageRoot::Intermediate
+    // The disk a graph job's write on `device` failed on: the one the job's
+    // own storage judges a write there against, by the ledger it spends
+    // from. The working disk for a job with no graph.
+    pub(in crate::pipeline) fn full_disk_root(&self, job_id: JobId, device: Device) -> StorageRoot {
+        let complete = self.storage_capacity.ledger(StorageRoot::Complete);
+        match self.graph_jobs.get(&job_id) {
+            Some(graph) if std::ptr::eq(graph.disk_ledger(device), complete) => {
+                StorageRoot::Complete
+            }
+            _ => StorageRoot::Intermediate,
         }
     }
 
@@ -51,16 +61,39 @@ impl Pipeline {
     }
 
     // A write of the job found `root` full: the job waits for room there.
-    // Its graph goes now, so nothing more is written from what it says; the
-    // figures it showed are kept. Waiting on the ledger asks for a reading.
-    // The job parks once nothing of it is out, on a later turn.
+    // Its graph goes now, so nothing more is written from what it says, and
+    // with it everything that stood on that graph: the job is back at its
+    // last checkpoint, in what it holds and in what it counts. The figures
+    // it showed still to come are kept. Waiting on the ledger asks for a
+    // reading. The job parks once nothing of it is out, on a later turn.
     pub(in crate::pipeline) fn hold_job_for_full_disk(&mut self, job_id: JobId, root: StorageRoot) {
-        if self.full_disk.contains_key(&job_id) || !self.jobs.contains_key(&job_id) {
+        if self.full_disk.contains_key(&job_id) {
             return;
         }
-        if let (Some(graph), Some(state)) = (self.graph_jobs.get(&job_id), self.jobs.get(&job_id)) {
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        // What was counted since the checkpoint is fetched, and counted,
+        // again.
+        let ahead = state
+            .downloaded_bytes
+            .saturating_sub(state.checkpointed_download_bytes);
+        state.downloaded_bytes -= ahead;
+        if let Some(category_bytes) = state.category_bytes.as_ref() {
+            let _ = category_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
+                Some(bytes.saturating_sub(ahead))
+            });
+        }
+        let mut named = HashSet::new();
+        if let Some(graph) = self.graph_jobs.get(&job_id) {
             let figures = Self::graph_remaining(graph, &state.spec);
             self.released_remaining.insert(job_id, figures);
+            named = graph
+                .pending()
+                .held_spools()
+                .into_iter()
+                .map(|spool| state.working_dir.join(spool))
+                .collect();
         }
         self.retire_graph_job(job_id);
         let reading = self
@@ -69,33 +102,66 @@ impl Pipeline {
             .reading()
             .map(|reading| reading.sampled_at);
         self.storage_capacity.ledger(root).wait();
-        self.full_disk.insert(job_id, FullDisk { root, reading });
+        self.full_disk.insert(
+            job_id,
+            FullDisk {
+                root,
+                reading,
+                named,
+            },
+        );
+        self.forget_parts_past_checkpoint(job_id);
         self.parking_jobs.insert(job_id);
         self.download_dispatch_wake = true;
         self.report_job(job_id);
     }
 
-    // The job held for a full disk lets go of its uuencode cursors as it
-    // parks: they stand where its graph stood before it went, and its next
-    // graph, restored from the checkpoint, may stand earlier. A part held in
-    // memory is fetched again; one spooled stays on disk, for the checkpoint
-    // that names it.
-    pub(in crate::pipeline) fn forget_uu_cursors(&mut self, job_id: JobId) {
-        let files: Vec<NzbFileId> = self
-            .uu_files
-            .keys()
-            .filter(|file_id| file_id.job_id == job_id)
-            .copied()
-            .collect();
-        for file_id in files {
-            let Some(uu) = self.uu_files.remove(&file_id) else {
-                continue;
-            };
-            for part in uu.parked.into_values() {
-                self.forget_parked_bytes(part.bytes);
-                self.release_uu_parked_segment();
-            }
+    // The job held for a full disk lets go of everything kept between an
+    // article's arrival and its placement, as it is held and again as it
+    // parks: all of it stands where its graph stood before it went, and its
+    // next graph, restored from the checkpoint, may stand earlier. A part
+    // held in memory is fetched again. A spooled part the checkpoint names
+    // stays on disk for the restore to take back; any other is one nothing
+    // will read, on a disk with no room, and its file is removed, off this
+    // thread, when it lies in the job's own spool directory.
+    pub(in crate::pipeline) fn forget_parts_past_checkpoint(&mut self, job_id: JobId) {
+        let parts = self.take_job_write_backlog(job_id);
+        if parts.is_empty() {
+            return;
         }
+        let spool = self
+            .jobs
+            .get(&job_id)
+            .map(|state| super::held::held_spool_dir(&state.working_dir));
+        let mut stray = Vec::new();
+        for bytes in parts {
+            if let ParkedBytes::Spilled { path, .. } = &bytes
+                && path.parent() == spool.as_deref()
+                && self
+                    .full_disk
+                    .get(&job_id)
+                    .is_none_or(|hold| !hold.named.contains(path))
+            {
+                stray.push(path.clone());
+            }
+            self.forget_parked_bytes(bytes);
+        }
+        if stray.is_empty() {
+            return;
+        }
+        let sweep = tokio::task::spawn_blocking(move || {
+            for path in stray {
+                if let Err(error) = std::fs::remove_file(&path)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!(path = %path.display(), %error, "could not remove a held part's spool file");
+                }
+            }
+        });
+        #[cfg(test)]
+        self.full_disk_sweeps.push(sweep);
+        #[cfg(not(test))]
+        drop(sweep);
     }
 
     // A reading came, or a held job parked: each parked job held for a full

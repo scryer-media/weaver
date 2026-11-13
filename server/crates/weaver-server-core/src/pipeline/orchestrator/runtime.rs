@@ -320,6 +320,8 @@ impl Pipeline {
             admission_disk_held: false,
             disk_unadmitted: std::collections::BTreeSet::new(),
             full_disk: std::collections::BTreeMap::new(),
+            #[cfg(test)]
+            full_disk_sweeps: Vec::new(),
             nntp_handoff_draining: false,
             active_download_passes: HashSet::new(),
             jobs_finalizing_download: HashSet::new(),

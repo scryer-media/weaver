@@ -842,6 +842,17 @@ impl Pending {
             .map_or(0, |held| held.settled_bytes)
     }
 
+    // The spool files of the held parts the last checkpoint taken names,
+    // each as its row names it, under the job's working directory.
+    pub(in crate::pipeline) fn held_spools(&self) -> Vec<String> {
+        self.slot().held.as_ref().map_or_else(Vec::new, |held| {
+            held.held_parts
+                .iter()
+                .map(|row| row.spool_path.clone())
+                .collect()
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn tally(&self) -> Tally {
         self.slot().tally
@@ -875,6 +886,9 @@ impl Pipeline {
         // a new full snapshot rather than revive that obsolete replay payload.
         pending.forget();
         pending.control().resume();
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state.checkpointed_download_bytes = state.downloaded_bytes;
+        }
         pending.put_with_feed(graph, held, self.post_probes.verdicts.get(&job_id));
         let stamp = pending.stamp();
         graph.recorded(stamp);
@@ -973,6 +987,10 @@ impl Pipeline {
             if graph.working() {
                 graph.owe_checkpoint();
                 return;
+            }
+            // What the job counted downloaded is what this checkpoint holds.
+            if let Some(state) = self.jobs.get_mut(&job_id) {
+                state.checkpointed_download_bytes = state.downloaded_bytes;
             }
             pending.put_with_feed(graph, held, self.post_probes.verdicts.get(&job_id));
             graph.recorded(pending.stamp());

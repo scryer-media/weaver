@@ -535,8 +535,8 @@ impl Pipeline {
         // room holds the job until the disk has room instead: what the step
         // did not write is written again from the job's last checkpoint.
         if let Err(error) = result {
-            if let Some(path) = error.out_of_space() {
-                let root = self.full_disk_root(path);
+            if let Some(device) = error.out_of_space() {
+                let root = self.full_disk_root(job_id, device);
                 warn!(job_id = job_id.0, error = %error, "graph job write found no room");
                 self.hold_job_for_full_disk(job_id, root);
                 return;

@@ -427,6 +427,15 @@ impl NamespaceWriter {
     // member the job delivers, which no object holds, and the working
     // directory for a recovery volume, which stays in its own file for its
     // repair to read and is never delivered.
+    // The device that directory lies on.
+    pub(super) fn device_for(&self, tree: &Tree, node: NodeId, member: MemberId) -> Device {
+        if tree.child_of(node, member).is_none() {
+            Device::Output
+        } else {
+            Device::Working
+        }
+    }
+
     pub(super) fn root_for(&self, tree: &Tree, node: NodeId, member: MemberId) -> &Path {
         if tree.child_of(node, member).is_none() {
             &self.output_dir
@@ -479,6 +488,15 @@ impl NamespaceWriter {
 
     // Whether the job waits for room on a disk, and its place among those
     // that wait.
+    // The reader of the disk `device` is: the one a write there is judged
+    // against, and so the one a job whose write found it full waits on.
+    pub(crate) fn disk(&self, device: Device) -> &CapacityReader {
+        match device {
+            Device::Output => &self.output_free_disk,
+            Device::Working => &self.free_disk,
+        }
+    }
+
     pub(crate) fn disk_held(&self) -> bool {
         self.caps.disk_held()
     }
@@ -2933,7 +2951,10 @@ impl NamespaceWriter {
                 .ok_or(WriteError::UnknownMember { node, member })?;
             let held_off = tree.held_off(node, member);
             let root = self.root_for(tree, node, member).to_path_buf();
-            let leaf = self.new_leaf((node, member), &output_name, held_off, &root);
+            let device = self.device_for(tree, node, member);
+            let leaf = self
+                .new_leaf((node, member), &output_name, held_off, &root)
+                .on(device);
             self.files_mut(node).leaves.insert(member, leaf);
         }
         Ok(self

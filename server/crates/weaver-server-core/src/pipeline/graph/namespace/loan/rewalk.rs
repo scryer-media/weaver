@@ -95,6 +95,7 @@ impl NamespaceWriter {
     pub(crate) fn gone(&self) -> LeafError {
         let path = self.working_dir.join(weaver_graph::names::INTERNAL_DIR);
         LeafError::Io {
+            device: crate::pipeline::graph::limits::Device::Working,
             path,
             source: std::io::Error::from(std::io::ErrorKind::NotFound),
         }
@@ -146,6 +147,7 @@ impl NamespaceWriter {
         match std::fs::create_dir(&access.internal) {
             Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
                 return Err(LeafError::Io {
+                    device: crate::pipeline::graph::limits::Device::Working,
                     path: access.internal,
                     source: error,
                 });

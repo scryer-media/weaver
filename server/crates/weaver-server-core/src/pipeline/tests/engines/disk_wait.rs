@@ -891,3 +891,233 @@ async fn an_unpacking_job_whose_write_finds_the_disk_full_waits_for_room_and_com
         body.as_slice()
     );
 }
+
+// What the job counts downloaded, while it runs and once it has ended.
+fn counted(pipeline: &Pipeline) -> u64 {
+    pipeline
+        .jobs
+        .get(&JOB)
+        .map(|state| state.downloaded_bytes)
+        .or_else(|| {
+            pipeline
+                .shared_state
+                .get_job(JOB)
+                .map(|job| job.downloaded_bytes)
+        })
+        .expect("the job is known")
+}
+
+// Results still out as a write finds the disk full come back for a job
+// with no graph to take them: each is dropped whole, neither placed nor
+// counted, and the job counts what its last checkpoint holds. Once it has
+// run on and completed it has counted exactly what a job never held counts.
+#[tokio::test]
+async fn results_that_come_back_for_a_job_held_for_a_full_disk_are_not_counted() {
+    let body = payload(4 * ARTICLE, 97);
+    let post = || vec![Post::plain("ember.bin", body.clone())];
+
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let scenario = on_disk_posting(&room, post());
+    let (_never_held_dir, mut never_held, _) = admit(&scenario).await;
+    drive(&mut never_held, &scenario, JOB, |_| false).await;
+    assert_eq!(
+        job_status_for_assert(&never_held, JOB),
+        Some(JobStatus::Complete)
+    );
+    let whole = counted(&never_held);
+    assert!(whole >= body.len() as u64);
+
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let scenario = on_disk_posting(&room, post());
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
+    room.store(0, Ordering::Release);
+    fill_after(Some(ARTICLE as u64 + ARTICLE as u64 / 2));
+
+    // Every article is served: those after the write that failed come back
+    // for a job already held.
+    drive(&mut pipeline, &scenario, JOB, |pipeline| {
+        pipeline.held_for_full_disk(JOB)
+    })
+    .await;
+    assert!(pipeline.held_for_full_disk(JOB));
+    let state = &pipeline.jobs[&JOB];
+    assert_eq!(
+        state.downloaded_bytes, state.checkpointed_download_bytes,
+        "the job counts what its checkpoint holds"
+    );
+    assert!(
+        counted(&pipeline) <= ARTICLE as u64,
+        "nothing that came back after the write failed is counted: {}",
+        counted(&pipeline)
+    );
+    // The article written and the one whose write failed were placed; the
+    // two that came back after were not.
+    let file = state
+        .articles
+        .assembly()
+        .and_then(|assembly| {
+            assembly.file(crate::jobs::ids::NzbFileId {
+                job_id: JOB,
+                file_index: 0,
+            })
+        })
+        .expect("the job holds its articles until it parks");
+    let placed = (0..4u64)
+        .filter(|ordinal| {
+            file.placement_conflict(u32::MAX, ordinal * ARTICLE as u64, 1)
+                .is_some()
+        })
+        .count();
+    assert!(placed <= 2, "{placed} articles are placed");
+
+    pipeline.park_drained_jobs();
+    full_disk_freed(&mut pipeline, &scenario, &room).await;
+    assert_eq!(
+        file_named(&delivered(&complete_dir), "ember.bin"),
+        body.as_slice()
+    );
+    assert_eq!(
+        counted(&pipeline),
+        whole,
+        "held and run on, the job counts what a job never held counts"
+    );
+}
+
+// A job held for a full disk goes back to its last checkpoint in what it
+// keeps between an article's arrival and its placement: its cursors, its
+// requeue counts and the releases it owed all go, a spooled part that
+// checkpoint names stays on disk for the restore, and one it does not name,
+// which nothing would read again, is removed from the full disk.
+#[tokio::test]
+async fn a_job_held_for_a_full_disk_keeps_only_the_spooled_parts_its_checkpoint_names() {
+    use crate::jobs::ids::{NzbFileId, SegmentId};
+    use crate::pipeline::held::HeldPart;
+
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let scenario = on_disk_posting(
+        &room,
+        vec![Post::plain("ember.bin", payload(4 * ARTICLE, 97))],
+    );
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let file_id = NzbFileId {
+        job_id: JOB,
+        file_index: 0,
+    };
+    let part = |segment_number| SegmentId {
+        file_id,
+        segment_number,
+    };
+    let spool = crate::pipeline::held::held_spool_dir(&pipeline.jobs[&JOB].working_dir);
+    crate::pipeline::held::prepare_held_spool_dir(&spool).unwrap();
+    let spooled = |pipeline: &mut Pipeline, name: &str, segment_number| {
+        let path = spool.join(name);
+        std::fs::write(&path, b"ember").unwrap();
+        pipeline.adopt_held_parts(vec![HeldPart {
+            segment_id: part(segment_number),
+            path: path.clone(),
+            decoded_bytes: 5,
+            article: None,
+        }]);
+        path
+    };
+    // One part is spooled as the checkpoint is taken, one after it.
+    let named = spooled(&mut pipeline, "held-named", 2);
+    pipeline.checkpoint_graph_job(JOB);
+    let stray = spooled(&mut pipeline, "held-stray", 3);
+    pipeline.uu_park_requeues.insert(part(3), (1, 0));
+    pipeline.unanchored_requeues.insert(part(3), (1, 0));
+    pipeline.pending_unanchored_release.push(part(1));
+    assert_eq!(pipeline.uu_spooled_segments, 2);
+
+    pipeline.hold_job_for_full_disk(JOB, StorageRoot::Intermediate);
+    for sweep in pipeline.full_disk_sweeps.drain(..) {
+        sweep.await.unwrap();
+    }
+
+    assert!(
+        named.exists(),
+        "the checkpoint's part stays for the restore"
+    );
+    assert!(!stray.exists(), "a part no checkpoint names is removed");
+    assert!(!pipeline.uu_files.contains_key(&file_id));
+    assert!(pipeline.uu_park_requeues.is_empty());
+    assert!(pipeline.unanchored_requeues.is_empty());
+    assert!(pipeline.pending_unanchored_release.is_empty());
+    assert_eq!(
+        pipeline.uu_spooled_segments, 0,
+        "the spool is charged nothing"
+    );
+    assert_eq!(pipeline.uu_spooled_bytes, 0);
+}
+
+// A job whose destination lies outside the complete folder writes the files
+// it delivers to a staging folder there, which its storage judges against
+// the output disk. A write there that finds the disk full holds the job on
+// that disk, not on the working one: a reading of the working disk with
+// room does not let it go, and a reading of the output disk with room does.
+#[tokio::test]
+async fn a_job_delivering_outside_the_complete_folder_waits_on_the_disk_its_write_failed_on() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let body = payload(4 * ARTICLE, 97);
+    let scenario = on_disk_posting(&room, vec![Post::plain("ember.bin", body.clone())]);
+    let (temp_dir, mut pipeline, _) = admit(&scenario).await;
+    // The job is given the staging a category folder on another disk gives
+    // it, and its graph is built over that storage.
+    let library = temp_dir.path().join("library-disk");
+    let staging = crate::pipeline::queue::staging_dir_for(&library, JOB);
+    crate::pipeline::queue::make_staging_dir(&staging, JOB).unwrap();
+    assert!(!staging.starts_with(&pipeline.complete_dir));
+    pipeline.retire_graph_job(JOB);
+    pipeline.jobs.get_mut(&JOB).unwrap().staging_dir = Some(staging);
+    pipeline.admit_graph_job(JOB);
+    let output = Arc::clone(
+        pipeline
+            .storage_capacity
+            .reader(StorageRoot::Complete)
+            .ledger(),
+    );
+    let waits_before = (output.tickets(), working(&pipeline).tickets());
+
+    room.store(0, Ordering::Release);
+    fill_after(Some(ARTICLE as u64 + ARTICLE as u64 / 2));
+    drive(&mut pipeline, &scenario, JOB, |pipeline| {
+        pipeline.held_for_full_disk(JOB)
+    })
+    .await;
+    fill_after(None);
+    assert!(pipeline.held_for_full_disk(JOB));
+    assert_eq!(
+        (output.tickets(), working(&pipeline).tickets()),
+        (waits_before.0 + 1, waits_before.1),
+        "the job waits on the disk its write failed on"
+    );
+    pipeline.park_drained_jobs();
+
+    // The working disk reads room: the job's own disk has said nothing.
+    room.store(PLENTY + 1, Ordering::Release);
+    pipeline
+        .storage_capacity
+        .request_refresh(StorageRoot::Intermediate);
+    pipeline
+        .storage_capacity
+        .wait_for_reading(StorageRoot::Intermediate, |reading| {
+            reading.available_bytes == RESERVE + PLENTY + 1
+        });
+    pipeline.disk_reading();
+    assert!(
+        pipeline.held_for_full_disk(JOB),
+        "its own disk has not read"
+    );
+
+    pipeline
+        .storage_capacity
+        .request_refresh(StorageRoot::Complete);
+    pipeline
+        .storage_capacity
+        .wait_for_reading(StorageRoot::Complete, |reading| {
+            reading.available_bytes == RESERVE + PLENTY + 1
+        });
+    pipeline.disk_reading();
+    assert!(!pipeline.held_for_full_disk(JOB), "its disk has room");
+    assert!(!output.waited_on());
+}

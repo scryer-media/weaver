@@ -32,7 +32,7 @@ use self::works::Works;
 use super::checkpoint::Pending;
 use super::engine::{Runs, Said};
 use super::leaf::LeafError;
-use super::limits::Caps;
+use super::limits::{Caps, Device};
 use super::namespace::{Coming, NamespaceWriter, SetState, WriteError};
 use super::root::intake::Decoded;
 use super::root::phase::{self, Activity, RootPhase};
@@ -54,14 +54,14 @@ pub(crate) enum GraphError {
 }
 
 impl GraphError {
-    // The file a write found no room for, when that is all that failed: the
-    // job waits for room rather than failing.
-    pub(crate) fn out_of_space(&self) -> Option<&std::path::Path> {
+    // The device a write found no room on, when that is all that failed:
+    // the job waits for room there rather than failing.
+    pub(crate) fn out_of_space(&self) -> Option<Device> {
         match self {
-            Self::Write(WriteError::Leaf(LeafError::Io { path, source }))
+            Self::Write(WriteError::Leaf(LeafError::Io { source, device, .. }))
                 if crate::operations::is_out_of_space(source) =>
             {
-                Some(path)
+                Some(*device)
             }
             _ => None,
         }
@@ -951,6 +951,12 @@ impl GraphJob {
 
     // Whether the job waits for room on a disk, and its place among the
     // jobs that wait.
+    // The ledger of the disk `device` is to this job: the one its writes
+    // there spend from.
+    pub(crate) fn disk_ledger(&self, device: Device) -> &crate::operations::disk::DiskLedger {
+        self.writer.disk(device).ledger()
+    }
+
     pub(crate) fn disk_held(&self) -> bool {
         self.writer.disk_held()
     }
