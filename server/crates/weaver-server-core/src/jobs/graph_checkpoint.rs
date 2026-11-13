@@ -601,11 +601,12 @@ impl Database {
         })
     }
 
-    // Whether the job has a checkpoint, without reading it.
+    // Whether the job has a checkpoint, without reading it. A pure read: it
+    // never waits on the writer gate or the serial writer.
     pub(crate) fn has_graph_checkpoint(&self, job_id: JobId) -> Result<bool, LoadError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "has_graph_checkpoint", |tx| {
+        self.run_sql_blocking_read(async move {
+            SqlRuntime::run_read_transaction(&datastore, "has_graph_checkpoint", |tx| {
                 Box::pin(async move {
                     Ok(tx
                         .fetch_optional(
@@ -622,15 +623,16 @@ impl Database {
     }
 
     // The job's checkpoint, or `None` when it has no rows. Read in one
-    // transaction, so it is one checkpoint even beside a writer.
+    // snapshot transaction, so it is one checkpoint even beside a writer, and
+    // never behind the writer gate or the serial writer.
     pub(crate) fn load_graph_checkpoint(
         &self,
         job_id: JobId,
     ) -> Result<Option<GraphCheckpoint>, LoadError> {
         let datastore = self.datastore();
         let fetched = self
-            .run_sql_blocking(async move {
-                SqlRuntime::run_in_transaction(&datastore, "load_graph_checkpoint", |tx| {
+            .run_sql_blocking_read(async move {
+                SqlRuntime::run_read_transaction(&datastore, "load_graph_checkpoint", |tx| {
                     Box::pin(async move { fetch_checkpoint(tx, job_id).await })
                 })
                 .await
@@ -680,6 +682,26 @@ async fn write_delta(tx: &mut SqlTx<'_>, job_id: JobId, delta: &Delta) -> Result
     Ok(())
 }
 
+// Deletes `keys` rows of one job by their whole primary key. The job id is
+// in every term, so each term is a seek on the primary key: with the job id
+// outside the terms, SQLite read every row of the job, facts and all, to
+// test the terms against it.
+fn delete_keys_sql<R: Row>(keys: usize) -> String {
+    let term = format!(
+        "(job_id = {{}} AND {})",
+        R::KEY
+            .iter()
+            .map(|column| format!("{column} = {{}}"))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    );
+    format!(
+        "DELETE FROM {} WHERE {}",
+        R::TABLE,
+        vec![term.as_str(); keys].join(" OR ")
+    )
+}
+
 // One table's changes: every changed key's row is deleted, and the rows as
 // they are now inserted, a batch per statement.
 async fn write<R: Row>(
@@ -688,23 +710,14 @@ async fn write<R: Row>(
     changes: &Changes<R>,
 ) -> Result<(), StateError> {
     let keys: Vec<&R::Key> = changes.keys().collect();
-    let matches = format!(
-        "({})",
-        R::KEY
-            .iter()
-            .map(|column| format!("{column} = {{}}"))
-            .collect::<Vec<_>>()
-            .join(" AND ")
-    );
     for batch in keys.chunks(BATCH) {
-        let sql = format!(
-            "DELETE FROM {} WHERE job_id = {{}} AND ({})",
-            R::TABLE,
-            vec![matches.as_str(); batch.len()].join(" OR ")
-        );
-        let mut args = vec![SqlArg::I64(job)];
-        args.extend(batch.iter().flat_map(|key| R::key_args(key)));
-        tx.execute(&sql, &args).await?;
+        let mut args = Vec::new();
+        for key in batch {
+            args.push(SqlArg::I64(job));
+            args.extend(R::key_args(key));
+        }
+        tx.execute(&delete_keys_sql::<R>(batch.len()), &args)
+            .await?;
     }
     let rows: Vec<&R> = changes.values().flatten().collect();
     for batch in rows.chunks(BATCH) {
@@ -987,3 +1000,6 @@ fn interpret(fetched: Fetched) -> Result<GraphCheckpoint, StateError> {
         held_parts,
     })
 }
+
+#[cfg(test)]
+mod tests;

@@ -2085,6 +2085,15 @@ impl SchedulerHandle {
             .read(crate::pipeline::diagnostics::QueueStateCounts::read);
         (queue, self.state.metrics().pipeline_turn.read(now))
     }
+
+    // The pipeline's turn stamp alone, as of `now`: atomic loads, no lock,
+    // so a sampler may read it as often as it likes.
+    pub fn pipeline_turn(
+        &self,
+        now: std::time::Instant,
+    ) -> crate::operations::instrumentation::PipelineTurnReading {
+        self.state.metrics().pipeline_turn.read(now)
+    }
 }
 
 #[cfg(test)]

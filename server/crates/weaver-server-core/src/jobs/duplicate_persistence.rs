@@ -217,6 +217,8 @@ pub struct DuplicateBackfillSource {
     pub nzb_zstd: Option<Vec<u8>>,
     pub lifecycle: DuplicateJobLifecycle,
     pub created_at: i64,
+    // The job's stored metadata, which holds the release title as posted.
+    pub metadata: Vec<(String, String)>,
 }
 
 // Parser-validated evidence ready for one atomic backfill commit.
@@ -1105,9 +1107,9 @@ impl Database {
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT job_id, raw_job_hash, nzb_zstd, lifecycle, created_at FROM (
+                "SELECT job_id, raw_job_hash, nzb_zstd, lifecycle, created_at, metadata FROM (
                      SELECT a.job_id, a.nzb_hash AS raw_job_hash, n.nzb_zstd,
-                            'active' AS lifecycle, a.created_at
+                            'active' AS lifecycle, a.created_at, a.metadata
                        FROM active_jobs AS a
                        LEFT JOIN job_nzbs AS n ON n.job_id = a.job_id
                       WHERE NOT EXISTS (
@@ -1120,7 +1122,7 @@ impl Database {
                                 WHEN h.status = 'cancelled' THEN 'cancelled'
                                 ELSE 'failed'
                             END AS lifecycle,
-                            h.created_at
+                            h.created_at, h.metadata
                        FROM job_history AS h
                        LEFT JOIN job_nzbs AS hn ON hn.job_id = h.job_id
                  ) AS source
@@ -1152,6 +1154,9 @@ impl Database {
                         nzb_zstd: row.opt_bytes("nzb_zstd")?,
                         lifecycle,
                         created_at: row.i64("created_at")?,
+                        metadata: crate::parse_history_metadata(
+                            row.opt_text("metadata")?.as_deref(),
+                        ),
                     })
                 })
                 .collect()

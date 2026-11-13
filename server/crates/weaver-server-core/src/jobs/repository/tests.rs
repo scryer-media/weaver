@@ -1179,3 +1179,218 @@ fn archive_job_records_that_the_job_had_a_submitted_password() {
     );
     assert!(!history_metadata_has_password(&metadata(2)));
 }
+
+fn fetch_column(
+    db: &Database,
+    sql: String,
+    args: Vec<SqlArg>,
+    column: &'static str,
+) -> Vec<String> {
+    let datastore = db.datastore();
+    db.run_sql_blocking_read(async move {
+        SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args)
+            .await?
+            .into_iter()
+            .map(|row| match column {
+                "job_id" => row.i64(column).map(|id| id.to_string()),
+                _ => row.text(column),
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .unwrap()
+}
+
+// The orphan finder seeks each job id on the table's job-id key, in every
+// table it walks, never reading the table through.
+#[test]
+fn the_orphan_finder_seeks_job_ids_in_every_table() {
+    let db = Database::open_in_memory().unwrap();
+    for table in super::ACTIVE_JOB_CHILD_TABLES {
+        let sql = super::orphan_jobs_sql(table);
+        let binds = sql.matches("{}").count();
+        let plan = fetch_column(
+            &db,
+            format!("EXPLAIN QUERY PLAN {sql}"),
+            vec![SqlArg::I64(100); binds],
+            "detail",
+        );
+        assert!(
+            plan.iter()
+                .all(|line| !line.starts_with(&format!("SCAN {table}"))),
+            "{table} is read through: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|line| line.starts_with(&format!("SEARCH {table}"))),
+            "{table} is not sought: {plan:?}"
+        );
+    }
+}
+
+// The same jobs as the `DISTINCT` read found, over a table with many rows
+// per job: orphans below the bound, not jobs with an active row, not jobs at
+// or past the bound.
+#[test]
+fn the_orphan_finder_finds_what_the_distinct_read_did() {
+    let db = Database::open_in_memory().unwrap();
+    for id in [2, 5, 9, 40] {
+        db.create_active_job(&sample_job(id)).unwrap();
+    }
+    execute_sql(
+        &db,
+        "CREATE TABLE orphan_probe (job_id INTEGER NOT NULL, part INTEGER NOT NULL, \
+         PRIMARY KEY (job_id, part))",
+        vec![],
+    );
+    for job in [1_i64, 2, 3, 5, 7, 9, 11, 12, 30, 40, 41, 50, 51] {
+        for part in 0..20_i64 {
+            execute_sql(
+                &db,
+                "INSERT INTO orphan_probe (job_id, part) VALUES ({}, {})",
+                vec![SqlArg::I64(job), SqlArg::I64(part)],
+            );
+        }
+    }
+    let sorted = |mut ids: Vec<String>| {
+        ids.sort_by_key(|id| id.parse::<i64>().unwrap());
+        ids
+    };
+    for below in [0_i64, 1, 2, 6, 41, 50, 51, 1_000] {
+        let distinct = sorted(fetch_column(
+            &db,
+            "SELECT DISTINCT job_id FROM orphan_probe
+              WHERE job_id < {} AND NOT EXISTS (
+                  SELECT 1 FROM active_jobs WHERE active_jobs.job_id = orphan_probe.job_id
+              )"
+            .to_string(),
+            vec![SqlArg::I64(below)],
+            "job_id",
+        ));
+        let sql = super::orphan_jobs_sql("orphan_probe");
+        let binds = sql.matches("{}").count();
+        let sought = sorted(fetch_column(
+            &db,
+            sql,
+            vec![SqlArg::I64(below); binds],
+            "job_id",
+        ));
+        assert_eq!(sought, distinct, "below {below}");
+    }
+}
+
+// The start-up credential reads, each with the index it must walk.
+fn credential_reads() -> [(&'static str, &'static [(&'static str, &'static str)]); 3] {
+    [
+        (
+            crate::jobs::archive_password::VALIDATED_ARCHIVE_PASSWORD_METADATA_SQL,
+            &[
+                ("active_jobs", "idx_active_jobs_validated_archive_password"),
+                ("job_history", "idx_job_history_validated_archive_password"),
+            ],
+        ),
+        (
+            crate::persistence::connection::ACTIVE_JOB_PASSWORDS_SQL,
+            &[("active_jobs", "idx_active_jobs_password")],
+        ),
+        (
+            crate::persistence::connection::ACTIVE_JOB_PASSWORD_CANDIDATES_SQL,
+            &[("active_jobs", "idx_active_jobs_password_candidates")],
+        ),
+    ]
+}
+
+// Each credential read walks its partial index, never the whole table.
+#[test]
+fn the_credential_reads_walk_only_the_rows_that_hold_one() {
+    let db = Database::open_in_memory().unwrap();
+    for (sql, tables) in credential_reads() {
+        let plan = fetch_column(&db, format!("EXPLAIN QUERY PLAN {sql}"), vec![], "detail");
+        for (table, index) in tables {
+            let scans = plan
+                .iter()
+                .filter(|line| line.starts_with(&format!("SCAN {table}")))
+                .collect::<Vec<_>>();
+            assert!(
+                !scans.is_empty() && scans.iter().all(|line| line.contains(index)),
+                "{table} is not read through {index}: {plan:?}"
+            );
+        }
+    }
+}
+
+// The same rows, in the same order, as each read gave reading its tables
+// through, over a queue and history where only some jobs hold a credential.
+#[test]
+fn the_credential_reads_find_what_the_table_reads_did() {
+    let db = Database::open_in_memory().unwrap();
+    for id in 1..=30 {
+        db.create_active_job(&sample_job(id)).unwrap();
+    }
+    for id in 31..=60 {
+        db.insert_job_history(&finished(id)).unwrap();
+    }
+    for id in (1..=60).filter(|id| id % 3 == 0) {
+        let table = if id <= 30 {
+            "active_jobs"
+        } else {
+            "job_history"
+        };
+        execute_sql(
+            &db,
+            format!("UPDATE {table} SET metadata = {{}} WHERE job_id = {{}}"),
+            vec![
+                SqlArg::Text(format!(
+                    "[[\"__weaver_validated_archive_password\",\"sealed-{id}\"]]"
+                )),
+                SqlArg::I64(id),
+            ],
+        );
+    }
+    for id in (1..=30).filter(|id| id % 4 == 0) {
+        execute_sql(
+            &db,
+            "UPDATE active_jobs SET password = {} WHERE job_id = {}",
+            vec![
+                SqlArg::Text(format!("sealed-password-{id}")),
+                SqlArg::I64(id),
+            ],
+        );
+    }
+    for id in (1..=30).filter(|id| id % 5 == 0) {
+        execute_sql(
+            &db,
+            "UPDATE active_jobs SET password_candidates = {} WHERE job_id = {}",
+            vec![
+                SqlArg::Text(format!("sealed-candidates-{id}")),
+                SqlArg::I64(id),
+            ],
+        );
+    }
+    for (sql, tables) in credential_reads() {
+        let mut through = sql.to_string();
+        for (table, _) in tables {
+            through = through.replace(
+                &format!("FROM {table} WHERE"),
+                &format!("FROM {table} NOT INDEXED WHERE"),
+            );
+        }
+        let plan = fetch_column(
+            &db,
+            format!("EXPLAIN QUERY PLAN {through}"),
+            vec![],
+            "detail",
+        );
+        assert!(
+            plan.iter().all(|line| !line.contains("INDEX")),
+            "the old read used an index: {plan:?}"
+        );
+        let column = if sql.starts_with("SELECT metadata") {
+            "metadata"
+        } else {
+            "password"
+        };
+        let indexed = fetch_column(&db, sql.to_string(), vec![], column);
+        assert!(!indexed.is_empty(), "nothing seeded for {sql}");
+        assert_eq!(indexed, fetch_column(&db, through, vec![], column), "{sql}");
+    }
+}

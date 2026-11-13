@@ -155,6 +155,8 @@ pub struct Metrics {
     pub bytes_downloaded: u64,
     pub bytes_decoded: u64,
     pub bytes_committed: u64,
+    /// Articles still to fetch across every queued job, recovery articles
+    /// and jobs outside the queue window included; not connections or jobs.
     pub download_queue_depth: u32,
     pub active_downloads: u32,
     pub active_decodes: u32,
@@ -201,6 +203,9 @@ pub struct Metrics {
     pub segments_downloaded: u64,
     pub segments_decoded: u64,
     pub segments_committed: u64,
+    /// Articles booked missing: every server and every message id was tried
+    /// and none had it. Per-server refusals are in
+    /// `downloadFailuresArticleNotFound`.
     pub articles_not_found: u64,
     pub decode_errors: u64,
     pub verify_active: u32,
@@ -208,7 +213,11 @@ pub struct Metrics {
     pub extract_active: u32,
     pub disk_write_latency_us: u64,
     pub segments_retried: u64,
+    /// Articles that downloaded but never decoded into place and were left
+    /// to repair; articles no server had are in `articlesNotFound`.
     pub segments_failed_permanent: u64,
+    /// Article fetches a server answered as not found, one per server asked;
+    /// an article another server then delivers still counts here.
     pub download_failures_article_not_found: u64,
     pub download_failures_capacity_unavailable: u64,
     pub download_failures_transient: u64,
@@ -216,6 +225,8 @@ pub struct Metrics {
     pub download_failures_permanent: u64,
     pub current_download_speed: u64,
     pub crc_errors: u64,
+    /// Recovery articles still to fetch across the jobs in the queue window;
+    /// part of `downloadQueueDepth`.
     pub recovery_queue_depth: u32,
     pub articles_per_sec: f64,
     pub decode_rate_mbps: f64,

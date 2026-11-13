@@ -8,13 +8,33 @@
 // file, with its syncs; on network storage that is seconds. Pool
 // connections run with `wal_autocheckpoint = 0` and report the WAL's frame
 // count after each commit instead. A commit that leaves a threshold's worth
-// of frames past what the last checkpoint saw wakes the task, and the next
-// write to take the gate waits for a checkpoint started after that commit;
-// the task itself never takes it.
+// of frames past what the last checkpoint saw wakes the task; the task
+// itself never takes the gate.
 //
-// With no read open on an older snapshot, each checkpoint copies the whole
-// WAL and the write after it restarts the WAL, so the WAL holds at most the
-// threshold plus one transaction. A read that is still open keeps the frames
+// Writes do not wait for that checkpoint. A pass copies pages into the
+// database file and syncs it, and on a slow or busy disk that sync takes
+// seconds: a write that waited for it held the gate, and every write behind
+// it, that long. Writes append to the WAL while the pass runs. A pass that a
+// commit overlapped copies what it saw, but the WAL cannot restart until a
+// pass has copied every frame, so under steady writes it keeps growing.
+// Once a commit that asks for a pass finds the WAL at `WRITE_WAIT_THRESHOLDS`
+// thresholds or more, the next write waits, holding the gate, until a pass
+// has copied every frame in the WAL. The pass already running does that when
+// it read the WAL after the last commit, and the write is released when it
+// ends. Otherwise that pass read the WAL before commits it overlapped, which
+// it cannot copy, and the write also waits for the next pass. That pass has
+// no commit during it and copies only the frames left: the ones written while
+// the first pass ran. No shorter wait is sound, since SQLite restarts the WAL
+// only once a pass has copied every frame, and only a pass with no commit
+// during it can.
+//
+// Once every frame is copied, the waiting write restarts the WAL, unless a
+// read is still open on it with a read mark past 0: SQLite cannot restart
+// under such a read, and the write after the read ends does. With no read
+// open on an older snapshot the WAL holds at most the wait bound, one
+// threshold and one transaction.
+//
+// A read that is still open keeps the frames
 // committed after its snapshot from being copied (one holding read-mark 0
 // keeps all of them), and SQLite cannot restart the WAL while any read is
 // open on it, so the WAL then grows by every write made while that read
@@ -42,6 +62,21 @@ use crate::persistence::StateError;
 // many small commits into fewer, longer checkpoint writes.
 pub(crate) const WAL_CHECKPOINT_FRAMES: u32 = 4000;
 
+// How many thresholds of frames a WAL reaches before a write that finds a
+// pass asked for waits for one. The WAL then peaks at this bound, one more
+// threshold and one transaction: 12,000 frames of 4,120 bytes (a 4 KiB page
+// and its frame header) is about 49 MB, so the peak stays under the 64 MiB
+// `journal_size_limit` for any transaction under about 17 MB, and the file
+// is reused rather than grown and trimmed each cycle.
+pub(crate) const WRITE_WAIT_THRESHOLDS: u32 = 2;
+
+// Statement times come from SQLite's profile trace, which takes the
+// difference of two millisecond wall-clock readings: a statement under a
+// millisecond reads as 0 or 1 ms, so no bucket finer than a millisecond can
+// tell anything apart.
+const STATEMENT_DURATION_BOUNDS: &[f64] =
+    &[0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 10.0];
+
 unsafe extern "C" {
     // Part of the SQLite library sqlx links; replaces the connection's
     // autocheckpoint hook. Declared here because sqlx exposes the raw handle
@@ -53,7 +88,19 @@ unsafe extern "C" {
         >,
         arg: *mut c_void,
     ) -> *mut c_void;
+
+    // Also part of that library; sqlx installs no trace callback of its own.
+    fn sqlite3_trace_v2(
+        db: *mut c_void,
+        mask: u32,
+        callback: Option<unsafe extern "C" fn(u32, *mut c_void, *mut c_void, *mut c_void) -> c_int>,
+        context: *mut c_void,
+    ) -> c_int;
 }
+
+// `SQLITE_TRACE_PROFILE`: called as each statement finishes, with the
+// nanoseconds it ran.
+const SQLITE_TRACE_PROFILE: u32 = 0x02;
 
 // A pass at or past this is logged.
 const SLOW_PASS: Duration = Duration::from_secs(1);
@@ -104,6 +151,8 @@ pub struct WalCheckpointMetricsSnapshot {
     pub checkpointed_frames: u64,
     pub copied_frames: u64,
     pub wal_bytes: u64,
+    // Every statement on a pool connection, reads and writes alike.
+    pub statement_duration: HistogramSnapshot,
 }
 
 // What commits tell the checkpoint task, and what the task tells writes.
@@ -121,17 +170,36 @@ pub(crate) struct WalSignal {
     last_pass: AtomicU64,
     // Commits that left a threshold of frames past the latest checkpoint.
     requested: AtomicU64,
+    // The `requested` count of the latest commit that asked for a checkpoint
+    // with the WAL at or past the write-wait bound. Writes wait for a
+    // checkpoint started after it, or one that copied every frame.
+    write_waits_for: AtomicU64,
+    // The highest `write_waits_for` a waiting write saw met by a checkpoint
+    // that copied every frame in the WAL.
+    write_wait_met: AtomicU64,
+    // The frames the latest checkpoint copied, tagged as `last_pass` is.
+    backfilled: AtomicU64,
     // The highest `requested` a finished checkpoint started after.
     completed: watch::Sender<u64>,
     wake: Notify,
     stopping: AtomicBool,
     metrics: WalCheckpointMetrics,
+    // How long each statement on a pool connection ran, as SQLite times it
+    // from its first step to its reset: the statements the slow-statement
+    // log reports, and the ones inside a transaction, its commit included.
+    statements: AtomicHistogram,
     // A test holds the task back to see a commit cross the threshold with
     // no checkpoint anywhere.
     #[cfg(test)]
     held: watch::Sender<bool>,
     #[cfg(test)]
     runs: watch::Sender<u64>,
+    // A test holds a pass after it has taken its target and before it reads
+    // the WAL, as a pass that has begun but not yet copied.
+    #[cfg(test)]
+    pass_held: watch::Sender<bool>,
+    #[cfg(test)]
+    started: watch::Sender<u64>,
 }
 
 impl WalSignal {
@@ -145,14 +213,22 @@ impl WalSignal {
             restarts: AtomicU64::new(0),
             last_pass: AtomicU64::new(0),
             requested: AtomicU64::new(0),
+            write_waits_for: AtomicU64::new(0),
+            write_wait_met: AtomicU64::new(0),
+            backfilled: AtomicU64::new(0),
             completed: watch::channel(0).0,
             wake: Notify::new(),
             stopping: AtomicBool::new(false),
             metrics: WalCheckpointMetrics::new(),
+            statements: AtomicHistogram::new(STATEMENT_DURATION_BOUNDS),
             #[cfg(test)]
             held: watch::channel(false).0,
             #[cfg(test)]
             runs: watch::channel(0).0,
+            #[cfg(test)]
+            pass_held: watch::channel(false).0,
+            #[cfg(test)]
+            started: watch::channel(0).0,
         }))
     }
 
@@ -172,42 +248,77 @@ impl WalSignal {
         } else {
             self.restarts.load(Ordering::Acquire)
         };
-        if frames.saturating_sub(self.seen_by_last_pass(restarts)) >= self.threshold {
-            self.requested.fetch_add(1, Ordering::AcqRel);
+        let unseen = frames.saturating_sub(self.seen_by_last_pass(restarts));
+        if unseen >= self.threshold {
+            let requested = self.requested.fetch_add(1, Ordering::AcqRel) + 1;
+            // The whole WAL, not what the latest pass left: a pass that a
+            // commit overlapped copied what it saw but cannot restart the
+            // WAL, so passes alone do not bound it under steady writes. A
+            // pass that a waiting write holds the gate for has no commit
+            // during it.
+            if frames >= self.write_wait_frames() {
+                self.write_waits_for.fetch_max(requested, Ordering::AcqRel);
+            }
             self.wake.notify_one();
         }
+    }
+
+    fn write_wait_frames(&self) -> u32 {
+        self.threshold.saturating_mul(WRITE_WAIT_THRESHOLDS)
     }
 
     // The frames the latest checkpoint saw, or none when the WAL restarted
     // after it. A tag that cannot be matched counts as none, which only asks
     // for a checkpoint sooner.
     fn seen_by_last_pass(&self, restarts: u64) -> u32 {
-        let last_pass = self.last_pass.load(Ordering::Acquire);
-        if last_pass >> 32 == restarts & u64::from(u32::MAX) {
-            u32::try_from(last_pass & u64::from(u32::MAX)).unwrap_or(0)
-        } else {
-            0
-        }
+        tagged_frames(self.last_pass.load(Ordering::Acquire), restarts)
     }
 
-    // Records what a checkpoint saw. `restarts` is read before it began, so
-    // a restart during or after it leaves the tag behind and the count
-    // unused.
-    fn passed(&self, restarts: u64, log: u32) {
-        let tag = restarts & u64::from(u32::MAX);
+    // Records what a checkpoint saw and copied. `restarts` is read before it
+    // began, so a restart during or after it leaves the tag behind and the
+    // counts unused.
+    fn passed(&self, restarts: u64, log: u32, checkpointed: u32) {
+        let tag = (restarts & u64::from(u32::MAX)) << 32;
+        self.backfilled
+            .store(tag | u64::from(checkpointed), Ordering::Release);
         self.last_pass
-            .store((tag << 32) | u64::from(log), Ordering::Release);
+            .store(tag | u64::from(log), Ordering::Release);
     }
 
     // A write that holds the writer gate waits here while a commit that
-    // crossed the threshold has no finished checkpoint after it.
+    // asked for a checkpoint with the WAL past the write-wait bound has no
+    // finished checkpoint started after it, and no finished checkpoint has
+    // copied every frame now in the WAL. The gate keeps the WAL at the
+    // frames read on entry while it waits. Below the bound it does not wait.
     pub(crate) async fn caught_up(&self) {
-        let needed = self.requested.load(Ordering::Acquire);
+        let needed = self.write_waits_for.load(Ordering::Acquire);
+        let met =
+            |done: u64| done >= needed || self.write_wait_met.load(Ordering::Acquire) >= needed;
+        if met(*self.completed.borrow()) {
+            return;
+        }
+        let restarts = self.restarts.load(Ordering::Acquire);
+        let frames = self.frames.load(Ordering::Acquire);
+        // Every pass end notifies `completed`, whether or not it raised it,
+        // and records what it copied first.
         let mut completed = self.completed.subscribe();
-        let _ = completed.wait_for(|done| *done >= needed).await;
+        let _ = completed
+            .wait_for(|done| {
+                if met(*done) {
+                    return true;
+                }
+                let copied_all =
+                    tagged_frames(self.backfilled.load(Ordering::Acquire), restarts) >= frames;
+                if copied_all {
+                    self.write_wait_met.fetch_max(needed, Ordering::AcqRel);
+                }
+                copied_all
+            })
+            .await;
     }
 
-    // Has every pool connection report its commits here.
+    // Has every pool connection report its commits and how long each of its
+    // statements ran here.
     pub(crate) async fn report_commits(
         &'static self,
         connection: &mut SqliteConnection,
@@ -219,6 +330,7 @@ impl WalSignal {
         // `arg` points at a leaked `WalSignal`, valid for the whole process.
         unsafe {
             sqlite3_wal_hook(db, Some(on_commit), arg);
+            sqlite3_trace_v2(db, SQLITE_TRACE_PROFILE, Some(on_statement), arg);
         }
         Ok(())
     }
@@ -235,7 +347,17 @@ impl WalSignal {
             checkpointed_frames: metrics.checkpointed_frames.load(Ordering::Relaxed),
             copied_frames: metrics.copied_frames.load(Ordering::Relaxed),
             wal_bytes: metrics.wal_bytes.load(Ordering::Relaxed),
+            statement_duration: self.statements.snapshot(),
         }
+    }
+
+    // Waits until every checkpoint asked for so far has run, whether or not
+    // a write would wait for it.
+    #[cfg(test)]
+    pub(crate) async fn settled(&self) {
+        let needed = self.requested.load(Ordering::Acquire);
+        let mut completed = self.completed.subscribe();
+        let _ = completed.wait_for(|done| *done >= needed).await;
     }
 
     #[cfg(test)]
@@ -252,6 +374,34 @@ impl WalSignal {
     pub(crate) fn runs(&self) -> u64 {
         *self.runs.borrow()
     }
+
+    #[cfg(test)]
+    pub(crate) fn hold_pass(&self, held: bool) {
+        self.pass_held.send_replace(held);
+    }
+
+    // Passes that have taken their target, whether or not they have run.
+    #[cfg(test)]
+    pub(crate) fn started(&self) -> u64 {
+        *self.started.borrow()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn until_started(&self, passes: u64) {
+        let mut started = self.started.subscribe();
+        let _ = started.wait_for(|started| *started >= passes).await;
+    }
+}
+
+// A frame count tagged with the restart count it was taken under, or none
+// when the WAL has restarted since. A tag that cannot be matched counts as
+// none.
+fn tagged_frames(tagged: u64, restarts: u64) -> u32 {
+    if tagged >> 32 == restarts & u64::from(u32::MAX) {
+        u32::try_from(tagged & u64::from(u32::MAX)).unwrap_or(0)
+    } else {
+        0
+    }
 }
 
 unsafe extern "C" fn on_commit(
@@ -263,6 +413,25 @@ unsafe extern "C" fn on_commit(
     // SAFETY: `arg` is the leaked `WalSignal` installed by `report_commits`.
     let signal = unsafe { &*arg.cast::<WalSignal>() };
     signal.committed(u32::try_from(frames).unwrap_or(0));
+    0
+}
+
+// One histogram observation per statement: atomics only, no allocation.
+unsafe extern "C" fn on_statement(
+    mask: u32,
+    context: *mut c_void,
+    _statement: *mut c_void,
+    nanos: *mut c_void,
+) -> c_int {
+    if mask == SQLITE_TRACE_PROFILE && !nanos.is_null() {
+        // SAFETY: `context` is the leaked `WalSignal` installed by
+        // `report_commits`; for a profile event SQLite passes a pointer to
+        // the statement's run time as a 64-bit count of nanoseconds.
+        let (signal, nanos) = unsafe { (&*context.cast::<WalSignal>(), *nanos.cast::<i64>()) };
+        signal
+            .statements
+            .observe(Duration::from_nanos(u64::try_from(nanos).unwrap_or(0)));
+    }
     0
 }
 
@@ -389,6 +558,17 @@ async fn run(
         }
         let stopping = signal.stopping.load(Ordering::Acquire);
         let target = signal.requested.load(Ordering::Acquire);
+        // A request made between the last wake and the last pass's start
+        // leaves a wake behind that the pass already served.
+        if !stopping && target <= *signal.completed.borrow() {
+            continue;
+        }
+        #[cfg(test)]
+        {
+            signal.started.send_modify(|started| *started += 1);
+            let mut held = signal.pass_held.subscribe();
+            let _ = held.wait_for(|held| !*held).await;
+        }
         let restarts = signal.restarts.load(Ordering::Acquire);
         let started = Instant::now();
         // PASSIVE never waits on a reader or a writer and never takes the
@@ -402,7 +582,7 @@ async fn run(
             Ok((busy, log, checkpointed)) => {
                 let log = u32::try_from(log).unwrap_or(0);
                 let checkpointed = u32::try_from(checkpointed).unwrap_or(0);
-                signal.passed(restarts, log);
+                signal.passed(restarts, log, checkpointed);
                 let copied = match previous {
                     Some((before, done)) if before == restarts => checkpointed.saturating_sub(done),
                     _ => checkpointed,
@@ -423,7 +603,9 @@ async fn run(
             }
         }
         // Counted before completion wakes anyone, so a writer released by
-        // `caught_up` already sees the run that released it.
+        // `caught_up` already sees the run that released it. The send below
+        // notifies even when it leaves `completed` unchanged, so a waiting
+        // write checks every pass's copy.
         #[cfg(test)]
         signal.runs.send_modify(|runs| *runs += 1);
         signal

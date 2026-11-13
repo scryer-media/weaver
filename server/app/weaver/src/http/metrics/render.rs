@@ -297,7 +297,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         render_schedules(&mut out, metrics);
     }
     if let Some(metrics) = network {
-        render_network(&mut out, metrics);
+        render_network(&mut out, metrics, server_health);
     }
     if let Some(metrics) = tunnel {
         render_tunnel(&mut out, metrics);
@@ -1254,10 +1254,12 @@ fn render_server_transfers(
 
     for transfer in server_transfers {
         let server_id = transfer.stable_server_id.0.to_string();
-        let label = labels_by_id
-            .get(server_id.as_str())
-            .copied()
-            .unwrap_or_default();
+        // A server the pool does not run has no `server` label to give and
+        // nothing moving to report: its series are left out, not sent with
+        // an empty label.
+        let Some(&label) = labels_by_id.get(server_id.as_str()) else {
+            continue;
+        };
         let id: &[(&str, &str)] = &[("server_id", server_id.as_str()), ("server", label)];
 
         out.sample(
@@ -1375,10 +1377,10 @@ fn render_server_articles(
 
     for server in server_metrics {
         let server_id = server.stable_server_id.to_string();
-        let label = labels_by_id
-            .get(server_id.as_str())
-            .copied()
-            .unwrap_or_default();
+        // As for transfers: only the servers the pool runs.
+        let Some(&label) = labels_by_id.get(server_id.as_str()) else {
+            continue;
+        };
         let id: &[(&str, &str)] = &[("server_id", server_id.as_str()), ("server", label)];
 
         for attempt in &server.attempts {
@@ -1499,6 +1501,7 @@ fn render_wal_checkpoint(out: &mut Encoder, wal: &WalCheckpointMetricsSnapshot) 
     out.sample(&f::DB_WAL_CHECKPOINTED_FRAMES, &[], wal.checkpointed_frames);
     out.sample(&f::DB_WAL_CHECKPOINT_COPIED_FRAMES, &[], wal.copied_frames);
     out.sample(&f::DB_WAL_BYTES, &[], wal.wal_bytes);
+    render_histogram(out, &f::DB_STATEMENT_DURATION, &[], &wal.statement_duration);
 }
 
 // Standard `process_*` collector series.
@@ -1904,10 +1907,25 @@ pub(crate) fn render_schedules(out: &mut Encoder, metrics: &ScheduleMetricsSnaps
 // One per-leg gauge's value, or `None` to leave the leg's series out.
 type LegValue = fn(&LegMetrics) -> Option<f64>;
 
-pub(crate) fn render_network(out: &mut Encoder, metrics: &NetworkMetricsSnapshot) {
+// A leg of a server the pool does not run is left out: no connection is made
+// on it, so its state (`up` until something says otherwise) says nothing.
+pub(crate) fn render_network(
+    out: &mut Encoder,
+    metrics: &NetworkMetricsSnapshot,
+    server_health: &[ServerHealthInfo],
+) {
+    let running: std::collections::HashSet<&str> = server_health
+        .iter()
+        .map(|srv| srv.server_id.as_str())
+        .collect();
     let legs: Vec<(String, String, &LegMetrics)> = metrics
         .legs
         .iter()
+        .filter(|leg| {
+            leg.consumer
+                .strip_prefix("server:")
+                .is_none_or(|id| running.contains(id))
+        })
         .map(|leg| (leg.position.to_string(), leg.egress_id.to_string(), leg))
         .collect();
     for (position, egress, leg) in &legs {

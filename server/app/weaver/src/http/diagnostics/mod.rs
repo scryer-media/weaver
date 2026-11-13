@@ -227,75 +227,94 @@ async fn collect_components(
         exporter.render(disk_space, http_metrics).await,
     ));
 
-    // These wait on the pipeline or the database only until their own short
-    // deadlines, and together: a stall costs the package that wait once.
-    let (graphql, pipeline, database) = tokio::join!(
-        collect_graphql_components(schema, &caller),
-        pipeline_internals::collect_pipeline_internals(handle),
-        database_facts::collect_database_facts(db),
-    );
-    components.extend(graphql);
-    components.extend(pipeline);
-    components.extend(database);
-    // The support reports name nothing to begin with, so they join the
-    // package as their report code wrote them, after the stand-in pass.
-    let nzb_reports = nzb_reports::collect_nzb_reports(db, handle).await;
+    // The pipeline's turns are sampled from its stamp for as long as the rest
+    // is collected, up to the second Prometheus sample.
+    let gather = async {
+        // These wait on the pipeline or the database only until their own short
+        // deadlines, and together: a stall costs the package that wait once.
+        let (graphql, pipeline, database) = tokio::join!(
+            collect_graphql_components(schema, &caller),
+            pipeline_internals::collect_pipeline_internals(handle),
+            database_facts::collect_database_facts(db),
+        );
+        components.extend(graphql);
+        components.extend(pipeline);
+        components.extend(database);
+        // The support reports name nothing to begin with, so they join the
+        // package as their report code wrote them, after the stand-in pass.
+        let nzb_reports = nzb_reports::collect_nzb_reports(db, handle).await;
 
-    let (data_dir, intermediate_dir, complete_dir, watch_dir) = {
-        let config = config.read().await;
+        let (data_dir, intermediate_dir, complete_dir, watch_dir) = {
+            let config = config.read().await;
+            (
+                PathBuf::from(&config.data_dir),
+                PathBuf::from(config.intermediate_dir()),
+                PathBuf::from(config.complete_dir()),
+                config
+                    .watch_folder
+                    .path
+                    .as_deref()
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from),
+            )
+        };
+
+        let host_dirs = (
+            data_dir.clone(),
+            intermediate_dir.clone(),
+            complete_dir.clone(),
+        );
+        // Each directory's space and storage class come from the disk owner,
+        // looked at together, each within the owner's time limit.
+        let host_paths = [
+            data_dir.clone(),
+            intermediate_dir.clone(),
+            complete_dir.clone(),
+        ];
+        let host_asks = [
+            (data_dir.clone(), Reach::Exact),
+            (intermediate_dir.clone(), Reach::Exact),
+            (complete_dir.clone(), Reach::Exact),
+        ];
+        let (host_spaces, host_classes) = tokio::join!(
+            StorageCapacity::spaces(Some(disk_space.as_ref()), &host_asks),
+            disk_space.classifications(&host_paths),
+        );
+        let host = tokio::task::spawn_blocking(move || {
+            collect_host_facts(host_dirs, host_spaces, host_classes)
+        })
+        .await;
+        components.push(match host {
+            Ok(facts) => Component::json("host.json", &facts),
+            Err(error) => Component::failed("host.json", error),
+        });
+
+        components.extend(collect_log_files().await);
+        components.extend(collect_config_files(&data_dir).await);
+
+        // The second Prometheus sample is the last thing collected, so the gap
+        // between the two is at least the configured one no matter how long the
+        // rest of the collection took.
+        let elapsed = started.elapsed();
+        if let Some(remaining) = METRICS_SAMPLE_GAP.checked_sub(elapsed) {
+            tokio::time::sleep(remaining).await;
+        }
         (
-            PathBuf::from(&config.data_dir),
-            PathBuf::from(config.intermediate_dir()),
-            PathBuf::from(config.complete_dir()),
-            config
-                .watch_folder
-                .path
-                .as_deref()
-                .filter(|path| !path.is_empty())
-                .map(PathBuf::from),
+            nzb_reports,
+            data_dir,
+            intermediate_dir,
+            complete_dir,
+            watch_dir,
         )
     };
-
-    let host_dirs = (
-        data_dir.clone(),
-        intermediate_dir.clone(),
-        complete_dir.clone(),
-    );
-    // Each directory's space and storage class come from the disk owner,
-    // looked at together, each within the owner's time limit.
-    let host_paths = [
-        data_dir.clone(),
-        intermediate_dir.clone(),
-        complete_dir.clone(),
-    ];
-    let host_asks = [
-        (data_dir.clone(), Reach::Exact),
-        (intermediate_dir.clone(), Reach::Exact),
-        (complete_dir.clone(), Reach::Exact),
-    ];
-    let (host_spaces, host_classes) = tokio::join!(
-        StorageCapacity::spaces(Some(disk_space.as_ref()), &host_asks),
-        disk_space.classifications(&host_paths),
-    );
-    let host = tokio::task::spawn_blocking(move || {
-        collect_host_facts(host_dirs, host_spaces, host_classes)
-    })
-    .await;
-    components.push(match host {
-        Ok(facts) => Component::json("host.json", &facts),
-        Err(error) => Component::failed("host.json", error),
-    });
-
-    components.extend(collect_log_files().await);
-    components.extend(collect_config_files(&data_dir).await);
-
-    // The second Prometheus sample is the last thing collected, so the gap
-    // between the two is at least the configured one no matter how long the
-    // rest of the collection took.
-    let elapsed = started.elapsed();
-    if let Some(remaining) = METRICS_SAMPLE_GAP.checked_sub(elapsed) {
-        tokio::time::sleep(remaining).await;
-    }
+    let ((nzb_reports, data_dir, intermediate_dir, complete_dir, watch_dir), phases) =
+        pipeline_internals::sample_turn_phases_while(
+            |now| handle.pipeline_turn(now),
+            pipeline_internals::PHASE_SAMPLE_EVERY,
+            gather,
+        )
+        .await;
+    components.push(phases.component());
     components.push(Component::text(
         "metrics-2.txt",
         exporter.render(disk_space, http_metrics).await,

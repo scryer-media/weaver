@@ -19,25 +19,42 @@
 //   derives from each name; and the host's directories, user and host name.
 //   Older history is only counted, in the manifest. Any read, parse or build
 //   failure leaves every component out.
-// - The rule is by kind. A name (a host, login, account, directory, job,
-//   file or title) of four characters or more is replaced wherever it stands
-//   as a word of its own, in any ASCII case; a shorter one only as a whole
-//   JSON or TOML string. A value (a category, a metadata field, a number) is
-//   replaced only as a whole JSON or TOML string. A directory is replaced only
-//   up to a path boundary. When two names share a spelling, the first
-//   stand-in wins. Every other URL host in the package is a name, `host-N`.
-// - The pass: one leftmost-longest automaton over every text component
-//   (logs, opened gzip, JSON and TOML values and free keys). A JSON key the
-//   GraphQL schema declares is kept. After it, IP and MAC addresses, e-mail
+// - The structure decides first. A string under a field that carries a name
+//   (its field name ends in `name`, `file`, `path`, `dir`, `member`, `set`,
+//   `title`, `volume`, `archive`, `release`, `label`, `user`, `host` and the
+//   like, in a JSON file, a JSON log record, a Prometheus label or a
+//   `key=value` text field) is replaced whole, whether the table holds the
+//   name or not: one the table does not hold gets a `name-N` (`host-N` for a
+//   host) the first time any field shows it. A file keeps the segments that
+//   name its kind on a stand-in for its stem, so one set reads as one name in
+//   every recovery and archive kind (`name-3.part02.rar`, `name-3.r04`,
+//   `name-3.vol01+02.par2`, `name-3.vol0-1.par3`, `name-3.part01.rev`,
+//   `name-3.sfv`, `name-3.7z.001`). A path is replaced component by
+//   component, and so is every component after a download directory in
+//   running text, and every path under a drive no directory names.
+// - Then running text, by kind. A distinctive name (two words or more, or
+//   letters and digits mixed) is replaced wherever it stands as a word of
+//   its own, in any ASCII case. A plain one-word name ("runtime", "Audio")
+//   reads like Weaver's own prose, so it is replaced only where the
+//   structure puts a name. A value (a category, a metadata field) is
+//   replaced only as a whole string. A directory is replaced only up to a
+//   path boundary. When two names share a spelling, the first stand-in
+//   wins; jobs that share a name get one stand-in naming every one of them
+//   (`job-12+40`). Every other URL host in the package is a name, `host-N`.
+// - The pass: one leftmost-longest automaton over every text component; a
+//   JSON log line is rewritten value by value so it stays valid JSON. A JSON
+//   key is matched as text but never as a plain name, and a key the GraphQL
+//   schema declares is kept. After it, IP and MAC addresses, e-mail
 //   addresses, and URL credentials, query strings and paths after a
 //   replaced host become their shape.
 //
-// What it cannot catch: a finished job past the 2,000, a deleted job, and a
-// member name a finished job no longer stores, that a log still names; a
-// category or metadata value inside running text; a name written in another
-// Unicode normal form or a non-ASCII case; a name under four characters
-// inside running text; a message-ID whose domain has no dot.
+// What it cannot catch: a plain one-word name, or a name the table does not
+// hold, inside running text outside any field or path; a category or
+// metadata value inside running text; a name written in another Unicode
+// normal form or a non-ASCII case; a path written from an unknown root
+// other than a drive; a message-ID whose domain has no dot.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -79,10 +96,13 @@ pub(super) const SANITIZED_NOTE: &str = "Provider, proxy, egress, schedule, scri
      job, file, title, category, metadata, directory, login, user and host names are stable \
      stand-ins: the same name is the same stand-in in every file, and a spelling two names \
      share is the first one's stand-in. Names are read for every active job and the 2,000 most \
-     recently finished; history_jobs_total counts the whole history. A log can still name an \
-     older or deleted job, or a member name a finished job no longer stores. A category or \
+     recently finished; history_jobs_total counts the whole history. Every field that carries \
+     a name is replaced whole, and a name the table does not hold there becomes a name-N \
+     (host-N for a host) stand-in; jobs sharing one name share a job-A+B stand-in. A one-word \
+     name is replaced only in such fields and in paths, never in running text. A category or \
      metadata value is replaced only where it is a whole string value; any other URL host is \
-     a host-N stand-in. A file stand-in keeps only an extension the engines act on. IP, MAC \
+     a host-N stand-in. A file stand-in keeps the segments that name its kind (extension, \
+     part, volume and recovery markers), so one set reads as one stand-in. IP, MAC \
      and e-mail addresses, and URL credentials, query strings and paths after a replaced host \
      are replaced by their shape. Configuration \
      files are numbered, and a log starts at its first whole line when truncated and ends at \
@@ -342,7 +362,7 @@ pub(super) fn sanitize_package(
     for component in components.iter_mut() {
         table.apply(component);
     }
-    Ok(table.table.stand_ins.len())
+    Ok(table.stand_in_count())
 }
 
 // Every component left out because the table could not be built, named
@@ -466,43 +486,6 @@ fn gunzip_tail(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(text)
 }
 
-// The trailing part of a file name the engines act on: an extension they
-// know, and the volume marker or container extension in front of a numbered
-// one (`.part01.rar`, `.vol03+04.par2`, `.7z.001`). Any other suffix names
-// the file rather than its kind, so it is dropped.
-fn file_suffix(name: &str) -> String {
-    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    let segments: Vec<&str> = base.split('.').collect();
-    let Some((&last, rest)) = segments.split_last() else {
-        return String::new();
-    };
-    let known = |segment: &str| {
-        let kind = weaver_nzb::analysis::file_ext(&format!(".{segment}"));
-        kind != weaver_nzb::analysis::FileExt::NONE && kind != weaver_nzb::analysis::FileExt::OTHER
-    };
-    if rest.is_empty() || !known(last) {
-        return String::new();
-    }
-    let Some((&previous, stem)) = rest.split_last() else {
-        return format!(".{last}");
-    };
-    let lowered = previous.to_ascii_lowercase();
-    let volume_marker = ["part", "vol"].iter().any(|marker| {
-        lowered.strip_prefix(marker).is_some_and(|number| {
-            !number.is_empty()
-                && number
-                    .chars()
-                    .all(|character| character.is_ascii_digit() || matches!(character, '+' | '-'))
-        })
-    });
-    let numbered = last.chars().all(|character| character.is_ascii_digit());
-    if !stem.is_empty() && (volume_marker || (numbered && known(previous))) {
-        format!(".{previous}.{last}")
-    } else {
-        format!(".{last}")
-    }
-}
-
 // The domain a host is registered under: its last two labels, or three
 // under a two-letter country code with a short second level (`co.uk`).
 // `None` when the host is that domain already, or an address.
@@ -568,44 +551,349 @@ fn url_hosts(text: &[u8]) -> Vec<String> {
     hosts
 }
 
+// Whether a spelling is safe to match inside running text. A name that is one
+// plain word ("runtime", "System", "Audio") or shorter than `MIN_WORD_CHARS`
+// reads the same as Weaver's own prose, so it is replaced only where the
+// structure says a name stands: a field that carries names, or a path
+// component. A name of two or more words, or one that mixes letters and
+// digits, is matched as a word anywhere.
+fn is_distinctive(name: &str) -> bool {
+    if name.chars().count() < MIN_WORD_CHARS {
+        return false;
+    }
+    let runs = name
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|run| !run.is_empty())
+        .count();
+    let letters = name.chars().any(char::is_alphabetic);
+    let digits = name.chars().any(|character| character.is_ascii_digit());
+    runs >= 2 || (letters && digits)
+}
+
+// What a field's string value is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FieldKind {
+    // A release, file, folder, path, account or other operator name.
+    Name,
+    // A host name, with or without a port.
+    Host,
+}
+
+// The last word of a field name that says its value is a name. Every field
+// that carries a release, file, folder, path, account, script or feed name is
+// named after what it holds, so the field, not the value, decides.
+const NAME_HEADS: &[&str] = &[
+    "name",
+    "names",
+    "filename",
+    "filenames",
+    "file",
+    "files",
+    "path",
+    "paths",
+    "dir",
+    "dirs",
+    "directory",
+    "folder",
+    "member",
+    "members",
+    "title",
+    "set",
+    "sets",
+    "volume",
+    "volumes",
+    "archive",
+    "archives",
+    "release",
+    "dest",
+    "destination",
+    "src",
+    "root",
+    "label",
+    "labels",
+    "user",
+    "username",
+    "login",
+    "account",
+    "script",
+    "scripts",
+    "feed",
+    "egress",
+    "output",
+    "stem",
+    "basename",
+    "group",
+    "service",
+    "executable",
+];
+
+// Whole field names that carry names without saying so: a recovery record's
+// `as`, `over` and the member lists of a repair verdict.
+const NAME_KEYS: &[&str] = &[
+    "as",
+    "over",
+    "from",
+    "to",
+    "whole",
+    "damaged",
+    "unrepaired",
+    "withheld",
+    "normalizedkey",
+];
+
+const HOST_HEADS: &[&str] = &["host", "hostname", "address", "addr", "peer", "server"];
+
+// A field name's words, lowercased: `outputDir`, `output_dir` and
+// `output-dir` are all `output dir`.
+fn key_words(key: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut previous_lower = false;
+    for character in key.chars() {
+        if !character.is_alphanumeric() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            previous_lower = false;
+            continue;
+        }
+        if character.is_uppercase() && previous_lower && !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+        }
+        previous_lower = character.is_lowercase() || character.is_ascii_digit();
+        word.extend(character.to_lowercase());
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+fn field_kind(key: &str) -> Option<FieldKind> {
+    let words = key_words(key);
+    if NAME_KEYS.contains(&words.concat().as_str()) {
+        return Some(FieldKind::Name);
+    }
+    let last = words.last()?.as_str();
+    if HOST_HEADS.contains(&last) {
+        Some(FieldKind::Host)
+    } else if NAME_HEADS.contains(&last) {
+        Some(FieldKind::Name)
+    } else {
+        None
+    }
+}
+
+// Whether a field value is a name at all: a number, an address, a word of no
+// letters, a boolean or a stand-in already is not.
+fn worth_a_stand_in(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().any(char::is_alphabetic)
+        && trimmed.parse::<IpAddr>().is_err()
+        && trimmed.parse::<std::net::SocketAddr>().is_err()
+        && !(trimmed.starts_with('<') && trimmed.ends_with('>'))
+        && !["true", "false", "none", "null"]
+            .iter()
+            .any(|word| trimmed.eq_ignore_ascii_case(word))
+}
+
+fn is_host_shaped(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
+fn is_drive(component: &str) -> bool {
+    let bytes = component.as_bytes();
+    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+// Whether a path is written from a root: `/x`, `\x`, `C:\x` or `C:/x`.
+fn is_rooted(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    matches!(bytes.first(), Some(b'/' | b'\\'))
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
+}
+
+// One segment of a file name that names its kind rather than the file: an
+// extension the engines know, a recovery volume (`.rev`), a split part
+// (`.z01`, `.001`), or a volume marker (`.part02`, `.vol003+04`,
+// `.vol003-04`).
+fn is_kind_segment(segment: &str) -> bool {
+    let lowered = segment.to_ascii_lowercase();
+    let numbered_after = |prefix: &str| {
+        lowered.strip_prefix(prefix).is_some_and(|number| {
+            !number.is_empty()
+                && number.starts_with(|character: char| character.is_ascii_digit())
+                && number
+                    .chars()
+                    .all(|character| character.is_ascii_digit() || matches!(character, '+' | '-'))
+        })
+    };
+    if lowered == "rev" || numbered_after("part") || numbered_after("vol") {
+        return true;
+    }
+    if lowered.len() >= 3
+        && lowered.starts_with(['r', 's', 'z'])
+        && lowered[1..].bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return true;
+    }
+    let kind = weaver_nzb::analysis::file_ext(&format!(".{segment}"));
+    kind != weaver_nzb::analysis::FileExt::NONE && kind != weaver_nzb::analysis::FileExt::OTHER
+}
+
+// Where a file name's stem may end: after each kind segment peeled from the
+// end, longest stem first. `Name.mkv.vol003+04.par2` may end at `Name.mkv.vol003+04`,
+// `Name.mkv` or `Name`. Empty for a name with no kind segment.
+fn stem_cuts(name: &str) -> Vec<usize> {
+    let mut cuts = Vec::new();
+    let mut cut = name.len();
+    while let Some(dot) = name[..cut].rfind('.') {
+        if dot == 0 || !is_kind_segment(&name[dot + 1..cut]) {
+            break;
+        }
+        cut = dot;
+        cuts.push(cut);
+    }
+    cuts
+}
+
+// The names the structure finds that the table does not hold: a member a
+// finished job no longer stores, a recovery set, a folder under a download
+// directory. Each gets one stand-in for the package, and a file keeps its
+// kind segments on a stand-in for its stem, so every member of one set reads
+// as one name (`name-3.part02.rar`, `name-3.vol01+02.par2`, `name-3.sfv`).
+#[derive(Default)]
+struct Registry {
+    found: HashMap<String, String>,
+    stand_ins: HashSet<String>,
+    names: usize,
+    hosts: usize,
+}
+
+impl Registry {
+    fn name(&mut self, table: &Table, value: &str) -> String {
+        let lowered = value.to_ascii_lowercase();
+        if let Some(stand_in) = self.found.get(&lowered) {
+            return stand_in.clone();
+        }
+        let cuts = stem_cuts(value);
+        // A stem the table or an earlier name already holds keeps its
+        // stand-in: the job's own name, a posted file's stem.
+        let known = cuts.iter().find_map(|cut| {
+            let stem = &lowered[..*cut];
+            table
+                .names
+                .get(stem)
+                .or_else(|| self.found.get(stem))
+                .map(|stand_in| format!("{stand_in}{}", &value[*cut..]))
+        });
+        let stand_in = known.unwrap_or_else(|| {
+            let cut = cuts.last().copied().unwrap_or(value.len());
+            self.names += 1;
+            let stem = format!("name-{}", self.names);
+            self.found.insert(lowered[..cut].to_string(), stem.clone());
+            self.stand_ins.insert(stem.clone());
+            format!("{stem}{}", &value[cut..])
+        });
+        self.found.insert(lowered, stand_in.clone());
+        self.stand_ins.insert(stand_in.clone());
+        stand_in
+    }
+
+    fn host(&mut self, value: &str) -> String {
+        let lowered = value.to_ascii_lowercase();
+        if let Some(stand_in) = self.found.get(&lowered) {
+            return stand_in.clone();
+        }
+        self.hosts += 1;
+        let stand_in = format!("host-{}", self.hosts);
+        self.found.insert(lowered, stand_in.clone());
+        self.stand_ins.insert(stand_in.clone());
+        stand_in
+    }
+}
+
+// Where a spelling is matched.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    // A value (a category, a metadata field): only as a whole string.
+    Value,
+    // A name: wherever a name stands, and as a word of running text when it
+    // is distinctive.
+    Name,
+    // A login, user, account or host name: as a name, and as a word of
+    // running text from `MIN_WORD_CHARS` on even when it is one plain word,
+    // since it names the operator and its stand-in (`<login>`) cannot be
+    // mistaken for a job.
+    Identity,
+    // A directory whose contents are Weaver's own (the data, log and
+    // scripts directories): up to a path boundary.
+    Dir,
+    // A directory that holds downloads: up to a path boundary, and every
+    // component after it is a name.
+    ContentDir,
+}
+
 // The one table: every name's spelling, ASCII-lowercased, and its stand-in.
 #[derive(Default)]
 struct Table {
     // The spellings the automaton matches, and for each its stand-in and
-    // whether it is a directory.
+    // scope (`Name`, `Dir` or `ContentDir`).
     keys: Vec<String>,
-    names: Vec<(String, bool)>,
+    matched: Vec<(String, Scope)>,
     index: HashSet<String>,
-    // The names matched only as a whole JSON or TOML string.
-    whole: HashMap<String, String>,
+    // Every spelling's first stand-in, whatever its scope.
+    first: HashMap<String, String>,
+    // The names, matched where a name stands.
+    names: HashMap<String, String>,
+    // The values, matched only as a whole string.
+    values: HashMap<String, String>,
     stand_ins: HashSet<String>,
-    // Every directory spelling, and how many were numbered `dir-N`.
-    dir_keys: Vec<String>,
+    // Every directory spelling with its stand-in and whether it holds
+    // downloads, and how many were numbered `dir-N`.
+    dir_keys: Vec<(String, String, bool)>,
     dirs: usize,
 }
 
 impl Table {
-    // Adds a name under the one rule, and says whether it was new.
     fn name(&mut self, value: &str, stand_in: &str) -> bool {
-        if value.chars().count() < MIN_WORD_CHARS {
-            self.insert(value, stand_in, Scope::Whole)
-        } else {
-            self.insert(value, stand_in, Scope::Word)
-        }
+        self.insert(value, stand_in, Scope::Name)
     }
 
-    fn dir(&mut self, value: &str, stand_in: &str) -> bool {
-        self.insert(value, stand_in, Scope::Dir)
+    fn identity(&mut self, value: &str, stand_in: &str) -> bool {
+        self.insert(value, stand_in, Scope::Identity)
+    }
+
+    fn dir(&mut self, value: &str, stand_in: &str, content: bool) -> bool {
+        let scope = if content {
+            Scope::ContentDir
+        } else {
+            Scope::Dir
+        };
+        self.insert(value, stand_in, scope)
     }
 
     fn whole(&mut self, value: &str, stand_in: &str) -> bool {
-        self.insert(value, stand_in, Scope::Whole)
+        self.insert(value, stand_in, Scope::Value)
     }
 
-    // A directory outside every other the table holds, as `dir-N`.
+    // A directory outside every other the table holds, as `dir-N`. Only a
+    // directory written from a root: a relative "parent" is a piece of a
+    // name, not a place (`[1` of a name holding `[1/5]`).
     fn numbered_dir(&mut self, dir: &Path) {
-        let lowered = dir.to_string_lossy().to_ascii_lowercase();
-        if self.dir_keys.iter().any(|key| {
+        let spelling = dir.to_string_lossy();
+        if !is_rooted(&spelling) {
+            return;
+        }
+        let lowered = spelling.to_ascii_lowercase();
+        if self.dir_keys.iter().any(|(key, _, _)| {
             lowered
                 .strip_prefix(key.as_str())
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', '\\']))
@@ -615,49 +903,67 @@ impl Table {
         let stand_in = format!("dir-{}", self.dirs + 1);
         let mut added = false;
         for spelling in dir_spellings(dir) {
-            added |= self.dir(&spelling, &stand_in);
+            added |= self.dir(&spelling, &stand_in, true);
         }
         self.dirs += usize::from(added);
     }
 
-    // A spelling's stand-in is the first one stored for it, as a whole
-    // string or in the automaton; where it matches is the entry's own scope.
-    // Says whether the spelling was new.
+    // A spelling's stand-in is the first one stored for it; where it matches
+    // is the entry's own scope. Says whether the spelling was new.
     fn insert(&mut self, value: &str, stand_in: &str, scope: Scope) -> bool {
         let key = value.to_ascii_lowercase();
-        if value.trim().is_empty() || value == stand_in || self.index.contains(&key) {
+        if value.trim().is_empty() || value == stand_in {
             return false;
         }
-        let first = self.whole.get(&key).cloned();
+        let first = self.first.get(&key).cloned();
         let new = first.is_none();
         let stand_in = first.unwrap_or_else(|| stand_in.to_string());
+        self.first.insert(key.clone(), stand_in.clone());
+        self.stand_ins.insert(stand_in.clone());
         match scope {
-            Scope::Whole if new => {
-                self.whole.insert(key, stand_in.clone());
+            Scope::Value => {
+                self.values.entry(key).or_insert(stand_in);
             }
-            Scope::Whole => return false,
-            Scope::Word | Scope::Dir => {
-                let dir = scope == Scope::Dir;
-                if dir {
-                    self.dir_keys.push(key.clone());
+            Scope::Name | Scope::Identity => {
+                self.names.entry(key.clone()).or_insert(stand_in.clone());
+                let identity = scope == Scope::Identity && value.chars().count() >= MIN_WORD_CHARS;
+                if identity || is_distinctive(value) {
+                    self.automaton_key(key, &stand_in, Scope::Name);
                 }
-                // A log record writes the name JSON-escaped, and its text line
-                // quotes a value holding a space with Rust's escapes: a
-                // backslash doubled, a quote escaped. Each spelling gets the
-                // same stand-in.
-                for spelling in escaped_spellings(&key) {
-                    if self.index.insert(spelling.clone()) {
-                        self.keys.push(spelling);
-                        self.names.push((stand_in.clone(), dir));
-                    }
-                }
-                self.index.insert(key.clone());
-                self.keys.push(key);
-                self.names.push((stand_in.clone(), dir));
+            }
+            Scope::Dir | Scope::ContentDir => {
+                self.dir_keys
+                    .push((key.clone(), stand_in.clone(), scope == Scope::ContentDir));
+                self.automaton_key(key, &stand_in, scope);
             }
         }
-        self.stand_ins.insert(stand_in);
         new
+    }
+
+    // A log record writes the name JSON-escaped, and its text line quotes a
+    // value holding a space with Rust's escapes: a backslash doubled, a quote
+    // escaped. Each spelling gets the same stand-in.
+    fn automaton_key(&mut self, key: String, stand_in: &str, scope: Scope) {
+        for spelling in escaped_spellings(&key).into_iter().chain([key]) {
+            if self.index.insert(spelling.clone()) {
+                self.keys.push(spelling);
+                self.matched.push((stand_in.to_string(), scope));
+            }
+        }
+    }
+
+    // The longest directory a path starts with, up to a path boundary: how
+    // long its spelling is, its stand-in, and whether it holds downloads.
+    fn dir_prefix(&self, lowered: &str) -> Option<(usize, &str, bool)> {
+        self.dir_keys
+            .iter()
+            .filter(|(key, _, _)| {
+                lowered
+                    .strip_prefix(key.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', '\\']))
+            })
+            .max_by_key(|(key, _, _)| key.len())
+            .map(|(key, stand_in, content)| (key.len(), stand_in.as_str(), *content))
     }
 }
 
@@ -677,19 +983,12 @@ fn escaped_spellings(key: &str) -> Vec<String> {
     spellings
 }
 
-// Where a spelling is matched: only as a whole JSON or TOML string, as a
-// word of running text, or as a directory up to a path boundary.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Scope {
-    Whole,
-    Word,
-    Dir,
-}
-
 // The table for one package, its automaton, and the pass that applies it.
 pub(super) struct StandIns {
     table: Table,
     automaton: Option<AhoCorasick>,
+    // The names the structure found that the table does not hold.
+    registry: RefCell<Registry>,
     // The log file's own name and stem, which the log members are named by.
     log_names: Vec<(String, &'static str)>,
     // The field names the GraphQL schema declares, kept as JSON keys.
@@ -699,13 +998,16 @@ pub(super) struct StandIns {
 impl StandIns {
     // Builds the table from every source, in a fixed order, each numbered by
     // its own id where it has one, so a spelling two names share goes to the
-    // same one every time.
+    // same one every time. Then reads every field that carries a name in the
+    // package, so a name the table does not hold gets its stand-in before any
+    // running text is matched, and is matched there too.
     fn build(
         components: &[Component],
         local: &LocalNames,
         stored: &StoredNames,
     ) -> Result<Self, String> {
         let mut table = Table::default();
+        let mut registry = Registry::default();
 
         // Providers, by server id, also known by `host:port` and the domain
         // their host is registered under.
@@ -715,26 +1017,27 @@ impl StandIns {
             let stand_in = format!("provider-{}", server.id);
             let host = server.host.as_str();
             table.name(&format!("{host}:{}", server.port), &stand_in);
-            table.name(host, &stand_in);
+            table.identity(host, &stand_in);
             if let Some(domain) = registrable_domain(host) {
-                table.name(&domain, &stand_in);
+                table.identity(&domain, &stand_in);
             }
             let certificate = format!("{stand_in}/certificate");
             if let Some(der) = &server.tls_name_mismatch_certificate_der {
                 table.name(&certificate_fingerprint(der), &certificate);
             }
             if let Some(path) = &server.tls_ca_cert {
-                table.dir(&path.to_string_lossy(), &certificate);
+                table.dir(&path.to_string_lossy(), &certificate, false);
             }
             if let Some(username) = &server.username {
-                table.name(username, &format!("{stand_in}/account"));
+                table.identity(username, &format!("{stand_in}/account"));
             }
         }
 
         // The host's directories, then each category's.
         for (dir, stand_in) in local.dirs() {
+            let content = !matches!(stand_in, "<data>" | "<logs>");
             for spelling in dir_spellings(dir) {
-                table.dir(&spelling, stand_in);
+                table.dir(&spelling, stand_in, content);
             }
         }
         let mut next_category = 1u64;
@@ -755,19 +1058,43 @@ impl StandIns {
             }
         }
 
-        // Jobs, by id.
+        // Jobs, by id. Jobs that share a name share its stand-in, and it
+        // names every one of them, so neither reads as the other.
         let ids: BTreeSet<u64> = stored
             .jobs
             .keys()
             .chain(stored.posted.keys())
             .copied()
             .collect();
+        let mut owners: HashMap<String, Vec<u64>> = HashMap::new();
+        for id in &ids {
+            if let Some(name) = stored.jobs.get(id).and_then(|record| record.name.as_ref()) {
+                owners
+                    .entry(name.to_ascii_lowercase())
+                    .or_default()
+                    .push(*id);
+            }
+        }
         let no_record = JobNameRecord::default();
         let no_nzb = NzbNames::default();
         for id in ids {
             let record = stored.jobs.get(&id).unwrap_or(&no_record);
             let nzb = stored.posted.get(&id).unwrap_or(&no_nzb);
-            let job = format!("job-{id}");
+            let job = match record
+                .name
+                .as_ref()
+                .and_then(|name| owners.get(&name.to_ascii_lowercase()))
+            {
+                Some(sharing) if sharing.len() > 1 => format!(
+                    "job-{}",
+                    sharing
+                        .iter()
+                        .map(u64::to_string)
+                        .collect::<Vec<_>>()
+                        .join("+")
+                ),
+                _ => format!("job-{id}"),
+            };
 
             let nzb_path = record.nzb_path.as_deref().map(Path::new);
             let output_dir = record.output_dir.as_deref().map(Path::new);
@@ -818,18 +1145,38 @@ impl StandIns {
             }
 
             // Posted names first, so a file is numbered by its place in the
-            // NZB; a file is named both with and without the folder the NZB
-            // or the archive put it in.
+            // NZB. A file is named by its stem with its kind segments kept,
+            // so every volume and recovery file of one set reads as one name
+            // (`job-17/file-1.part02.rar`, `job-17/file-1.vol01+02.par2`),
+            // and a stem that is the job's own name reads as the job
+            // (`job-17.mkv`). A file is named both with and without the
+            // folder the NZB or the archive put it in.
             let mut seen = HashSet::new();
+            let mut stems = 0;
             for file in nzb.file_names.iter().chain(&record.files) {
                 if !seen.insert(file.as_str()) {
                     continue;
                 }
-                let stand_in = format!("{job}/file-{}{}", seen.len(), file_suffix(file));
+                let base = file.rsplit(['/', '\\']).next().unwrap_or(file);
+                let cuts = stem_cuts(base);
+                let known = cuts.iter().find_map(|cut| {
+                    table
+                        .names
+                        .get(&base[..*cut].to_ascii_lowercase())
+                        .map(|stand_in| (*cut, stand_in.clone()))
+                });
+                let (cut, stem) = known.unwrap_or_else(|| {
+                    let cut = cuts.last().copied().unwrap_or(base.len());
+                    stems += 1;
+                    let stem = format!("{job}/file-{stems}");
+                    if cut < base.len() {
+                        table.name(&base[..cut], &stem);
+                    }
+                    (cut, stem)
+                });
+                let stand_in = format!("{stem}{}", &base[cut..]);
                 table.name(file, &stand_in);
-                if let Some(base) = file.rsplit(['/', '\\']).next() {
-                    table.name(base, &stand_in);
-                }
+                table.name(base, &stand_in);
             }
             if let Some(hash) = &record.hash {
                 table.name(hash, &format!("{job}/hash"));
@@ -866,9 +1213,9 @@ impl StandIns {
         for proxy in &stored.proxies {
             let stand_in = format!("proxy-{}", proxy.id);
             table.name(&proxy.name, &stand_in);
-            table.name(&proxy.host, &stand_in);
+            table.identity(&proxy.host, &stand_in);
             if let Some(username) = &proxy.secrets.username {
-                table.name(username, &format!("{stand_in}/account"));
+                table.identity(username, &format!("{stand_in}/account"));
             }
             let tunnel_key = proxy.wireguard_spec().ok().map(|spec| spec.public_key());
             for key in [
@@ -891,14 +1238,14 @@ impl StandIns {
         }
         for dir in &stored.script_dirs {
             for spelling in dir_spellings(Path::new(dir)) {
-                table.dir(&spelling, "<scripts>");
+                table.dir(&spelling, "<scripts>", false);
             }
         }
         for feed in &stored.feeds {
             let stand_in = format!("feed-{}", feed.id);
             table.name(&feed.name, &stand_in);
             if let Some(username) = &feed.username {
-                table.name(username, &format!("{stand_in}/account"));
+                table.identity(username, &format!("{stand_in}/account"));
             }
             if let Some(host) = feed
                 .url
@@ -911,10 +1258,10 @@ impl StandIns {
 
         // The login, the user, the log file's name and the host name.
         for login in &stored.logins {
-            table.name(login, "<login>");
+            table.identity(login, "<login>");
         }
         if let Some(user) = &local.user {
-            table.name(user, "<user>");
+            table.identity(user, "<user>");
         }
         let mut log_names = Vec::new();
         if let Some(log_file) = &local.log_file {
@@ -929,24 +1276,56 @@ impl StandIns {
             table.name(name, stand_in);
         }
         if let Some(hostname) = &local.hostname {
-            table.name(hostname, "<hostname>");
+            table.identity(hostname, "<hostname>");
             if let Some((short, _)) = hostname.split_once('.') {
-                table.name(short, "<hostname>");
+                table.identity(short, "<hostname>");
             }
         }
 
         // Every other URL host the package names.
-        let mut hosts = 0;
         for data in components
             .iter()
             .filter_map(|component| component.outcome.as_ref().ok())
         {
             for host in url_hosts(data) {
-                hosts += usize::from(table.name(&host, &format!("host-{}", hosts + 1)));
+                if !table.first.contains_key(&host.to_ascii_lowercase()) {
+                    let stand_in = registry.host(&host);
+                    table.name(&host, &stand_in);
+                }
             }
         }
 
-        let automaton = if table.keys.is_empty() {
+        // Every field that carries a name, read once with no automaton, so
+        // each name the table does not hold has its stand-in before the pass.
+        let mut stand_ins = Self {
+            table,
+            automaton: None,
+            registry: RefCell::new(registry),
+            log_names,
+            schema_keys: HashSet::new(),
+        };
+        for component in components {
+            if let Ok(data) = &component.outcome {
+                let _ = stand_ins.sanitize_form(component.form, data);
+            }
+        }
+        // A found name that is distinctive is matched in running text too.
+        let mut found: Vec<(String, String)> = stand_ins
+            .registry
+            .borrow()
+            .found
+            .iter()
+            .map(|(name, stand_in)| (name.clone(), stand_in.clone()))
+            .collect();
+        found.sort();
+        for (name, stand_in) in found {
+            if !stand_ins.table.first.contains_key(&name) && is_distinctive(&name) {
+                stand_ins.table.name(&name, &stand_in);
+            }
+        }
+
+        let table = &stand_ins.table;
+        stand_ins.automaton = if table.keys.is_empty() {
             None
         } else {
             Some(
@@ -958,12 +1337,18 @@ impl StandIns {
                     .map_err(|error| format!("the stand-in table could not be built: {error}"))?,
             )
         };
-        Ok(Self {
-            table,
-            automaton,
-            log_names,
-            schema_keys: HashSet::new(),
-        })
+        Ok(stand_ins)
+    }
+
+    // How many stand-ins the package allocated.
+    fn stand_in_count(&self) -> usize {
+        let registry = self.registry.borrow();
+        self.table.stand_ins.len()
+            + registry
+                .stand_ins
+                .iter()
+                .filter(|stand_in| !self.table.stand_ins.contains(*stand_in))
+                .count()
     }
 
     // A member is named by the package, or for a log, by the log file: only
@@ -987,15 +1372,19 @@ impl StandIns {
         let outcome = std::mem::replace(&mut component.outcome, Ok(Vec::new()));
         component.outcome = match outcome {
             Err(error) => Err(self.sanitize_str(&error)),
-            Ok(data) => match component.form {
-                Form::Text => Ok(self.sanitize_bytes(&data)),
-                Form::Json => self.sanitize_json(&data),
-                Form::Toml => self.sanitize_toml(&data),
-                Form::GzipText => self.sanitize_gzip(&data),
-                // Only text is sanitized; a stream not opened is not sent.
-                Form::Gzip => Err("left out because it was not decompressed for sanitizing".into()),
-            },
+            Ok(data) => self.sanitize_form(component.form, &data),
         };
+    }
+
+    fn sanitize_form(&self, form: Form, data: &[u8]) -> Result<Vec<u8>, String> {
+        match form {
+            Form::Text => Ok(self.sanitize_text(data)),
+            Form::Json => self.sanitize_json(data),
+            Form::Toml => self.sanitize_toml(data),
+            Form::GzipText => self.sanitize_gzip(data),
+            // Only text is sanitized; a stream not opened is not sent.
+            Form::Gzip => Err("left out because it was not decompressed for sanitizing".into()),
+        }
     }
 
     fn sanitize_json(&self, data: &[u8]) -> Result<Vec<u8>, String> {
@@ -1004,20 +1393,22 @@ impl StandIns {
                 "left out because it could not be read for sanitizing: {error}"
             ))
         })?;
-        self.sanitize_json_value(&mut value);
+        self.sanitize_json_value(&mut value, None);
         serde_json::to_vec_pretty(&value).map_err(|error| self.sanitize_str(&error.to_string()))
     }
 
-    fn sanitize_json_value(&self, value: &mut Value) {
+    // A value is read in the light of the field that holds it: an array's
+    // items are its field's.
+    fn sanitize_json_value(&self, value: &mut Value, key: Option<&str>) {
         match value {
-            Value::String(text) => *text = self.sanitize_string(text),
+            Value::String(text) => *text = self.sanitize_value(key, text),
             Value::Array(items) => items
                 .iter_mut()
-                .for_each(|item| self.sanitize_json_value(item)),
+                .for_each(|item| self.sanitize_json_value(item, key)),
             Value::Object(map) => {
                 let fields = std::mem::take(map);
                 for (key, mut child) in fields {
-                    self.sanitize_json_value(&mut child);
+                    self.sanitize_json_value(&mut child, Some(&key));
                     let key = self.sanitize_key(key, |key| map.contains_key(key));
                     map.insert(key, child);
                 }
@@ -1026,13 +1417,159 @@ impl StandIns {
         }
     }
 
-    // A whole JSON or TOML string: a whole-string name it is, or the text
-    // pass.
-    fn sanitize_string(&self, text: &str) -> String {
-        match self.table.whole.get(&text.to_ascii_lowercase()) {
-            Some(stand_in) => stand_in.clone(),
-            None => self.sanitize_str(text),
+    // A string under its field: a field that carries a name is replaced by
+    // the name's stand-in whole, whether the table holds the name or not;
+    // any other string by the value rule and the text pass.
+    fn sanitize_value(&self, key: Option<&str>, text: &str) -> String {
+        match key.and_then(field_kind) {
+            Some(kind) => match self.resolve_field(text, kind) {
+                Some(resolved) => self.shapes(resolved.as_bytes()),
+                None => self.sanitize_string(text),
+            },
+            None => self.sanitize_string(text),
         }
+    }
+
+    // A whole string outside a name field: a whole-string value it is
+    // (`Some("x")` included), or the text pass.
+    fn sanitize_string(&self, text: &str) -> String {
+        if let Some(inner) = text
+            .strip_prefix("Some(\"")
+            .and_then(|rest| rest.strip_suffix("\")"))
+            && let Some(stand_in) = self.table.values.get(&inner.to_ascii_lowercase())
+        {
+            return format!("Some({stand_in:?})");
+        }
+        match self.table.values.get(&text.to_ascii_lowercase()) {
+            Some(stand_in) => stand_in.clone(),
+            // A value can carry rendered fields of its own, as a replayed
+            // line does: each is rewritten under its key.
+            None => String::from_utf8(self.sanitize_fields_line(text.as_bytes()))
+                .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()),
+        }
+    }
+
+    // A name field's value: its stand-in, built through the wrappers a log
+    // field writes (`Some(..)`, a quoted string, a list of names), a path
+    // component by component, or `None` when the value is not a name at all
+    // (a number, an address, a sentence in a host field).
+    fn resolve_field(&self, value: &str, kind: FieldKind) -> Option<String> {
+        if let Some(inner) = value
+            .strip_prefix("Some(")
+            .and_then(|rest| rest.strip_suffix(')'))
+        {
+            return self
+                .resolve_field(inner, kind)
+                .map(|inner| format!("Some({inner})"));
+        }
+        if value.len() >= 2
+            && value.starts_with('"')
+            && value.ends_with('"')
+            && let Ok(inner) = serde_json::from_str::<String>(value)
+        {
+            let resolved = self
+                .resolve_field(&inner, kind)
+                .unwrap_or_else(|| self.sanitize_string(&inner));
+            return Some(format!("{resolved:?}"));
+        }
+        if value.starts_with('[')
+            && value.ends_with(']')
+            && let Ok(items) = serde_json::from_str::<Vec<String>>(value)
+        {
+            let items: Vec<String> = items
+                .iter()
+                .map(|item| {
+                    let resolved = self
+                        .resolve_field(item, kind)
+                        .unwrap_or_else(|| self.sanitize_string(item));
+                    format!("{resolved:?}")
+                })
+                .collect();
+            return Some(format!("[{}]", items.join(", ")));
+        }
+        let lowered = value.to_ascii_lowercase();
+        if let Some(stand_in) = self.table.first.get(&lowered) {
+            return Some(stand_in.clone());
+        }
+        if let Some(stand_in) = self.registry.borrow().found.get(&lowered) {
+            return Some(stand_in.clone());
+        }
+        if !worth_a_stand_in(value) {
+            return None;
+        }
+        match kind {
+            FieldKind::Host => self.resolve_host(value),
+            FieldKind::Name if value.contains(['/', '\\']) => Some(self.resolve_path(value)),
+            FieldKind::Name => Some(self.registry.borrow_mut().name(&self.table, value)),
+        }
+    }
+
+    // A host field: a host name's stand-in, its port kept. A value that is
+    // not shaped like a host (`server:2 leg 0`) is left to the text pass.
+    fn resolve_host(&self, value: &str) -> Option<String> {
+        if let Some((host, port)) = value.rsplit_once(':')
+            && !host.contains(':')
+            && !port.is_empty()
+            && port.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return self.resolve_host(host).map(|host| format!("{host}:{port}"));
+        }
+        if !is_host_shaped(value) || !worth_a_stand_in(value) {
+            return None;
+        }
+        if let Some(stand_in) = self.table.first.get(&value.to_ascii_lowercase()) {
+            return Some(stand_in.clone());
+        }
+        Some(self.registry.borrow_mut().host(value))
+    }
+
+    // A path: the directory it starts in, then every component after it. A
+    // component under a download directory, or under no directory the table
+    // holds, is a name; under Weaver's own directories only a name the table
+    // holds is replaced.
+    fn resolve_path(&self, value: &str) -> String {
+        let lowered = value.to_ascii_lowercase();
+        let (mut out, rest, content) = match self.table.dir_prefix(&lowered) {
+            Some((length, stand_in, content)) => (stand_in.to_string(), &value[length..], content),
+            None => (String::new(), value, true),
+        };
+        let mut first = out.is_empty();
+        let mut piece = String::new();
+        for character in rest.chars() {
+            if matches!(character, '/' | '\\') {
+                out.push_str(&self.resolve_component(&piece, content, first));
+                piece.clear();
+                first = false;
+                out.push(character);
+            } else {
+                piece.push(character);
+            }
+        }
+        out.push_str(&self.resolve_component(&piece, content, first));
+        out
+    }
+
+    // One path component: its stand-in, or as it stands when it is a drive,
+    // `.` or `..`, not a name, or under Weaver's own directories.
+    fn resolve_component(&self, component: &str, content: bool, first: bool) -> String {
+        if component.is_empty()
+            || component == "."
+            || component == ".."
+            || (first && is_drive(component))
+        {
+            return component.to_string();
+        }
+        let lowered = component.to_ascii_lowercase();
+        if let Some(stand_in) = self.table.first.get(&lowered) {
+            return stand_in.clone();
+        }
+        if let Some(stand_in) = self.registry.borrow().found.get(&lowered) {
+            return stand_in.clone();
+        }
+        if !content || !worth_a_stand_in(component) {
+            return component.to_string();
+        }
+        self.registry.borrow_mut().name(&self.table, component)
     }
 
     fn sanitize_toml(&self, data: &[u8]) -> Result<Vec<u8>, String> {
@@ -1046,7 +1583,7 @@ impl StandIns {
                 error.message()
             ))
         })?;
-        self.sanitize_toml_value(&mut value);
+        self.sanitize_toml_value(&mut value, None);
         toml::to_string_pretty(&value)
             .map(String::into_bytes)
             .map_err(|error| {
@@ -1056,16 +1593,16 @@ impl StandIns {
             })
     }
 
-    fn sanitize_toml_value(&self, value: &mut toml::Value) {
+    fn sanitize_toml_value(&self, value: &mut toml::Value, key: Option<&str>) {
         match value {
-            toml::Value::String(text) => *text = self.sanitize_string(text),
+            toml::Value::String(text) => *text = self.sanitize_value(key, text),
             toml::Value::Array(items) => items
                 .iter_mut()
-                .for_each(|item| self.sanitize_toml_value(item)),
+                .for_each(|item| self.sanitize_toml_value(item, key)),
             toml::Value::Table(table) => {
                 let fields = std::mem::take(table);
                 for (key, mut child) in fields {
-                    self.sanitize_toml_value(&mut child);
+                    self.sanitize_toml_value(&mut child, Some(&key));
                     let key = self.sanitize_key(key, |key| table.contains_key(key));
                     table.insert(key, child);
                 }
@@ -1095,7 +1632,7 @@ impl StandIns {
     }
 
     fn sanitize_gzip(&self, text: &[u8]) -> Result<Vec<u8>, String> {
-        let sanitized = self.sanitize_bytes(text);
+        let sanitized = self.sanitize_text(text);
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder
             .write_all(&sanitized)
@@ -1103,22 +1640,230 @@ impl StandIns {
             .map_err(|error| format!("left out because it could not be compressed again: {error}"))
     }
 
+    // A text file, a line at a time, by the line's own structure: a JSON log
+    // record value by value under its field, so the line stays valid JSON; a
+    // Prometheus sample label by label; any other line its `key=value`
+    // fields, then the text pass.
+    fn sanitize_text(&self, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(data.len());
+        for line in data.split_inclusive(|byte| *byte == b'\n') {
+            let (body, ending) = match line.strip_suffix(b"\n") {
+                Some(body) => match body.strip_suffix(b"\r") {
+                    Some(body) => (body, &b"\r\n"[..]),
+                    None => (body, &b"\n"[..]),
+                },
+                None => (line, &b""[..]),
+            };
+            let structured = std::str::from_utf8(body).ok().and_then(|text| {
+                self.sanitize_json_line(text)
+                    .or_else(|| self.sanitize_prometheus_line(text))
+            });
+            match structured {
+                Some(text) => out.extend_from_slice(text.as_bytes()),
+                None => out.extend_from_slice(&self.sanitize_fields_line(body)),
+            }
+            out.extend_from_slice(ending);
+        }
+        out
+    }
+
+    // A JSON object on one line, its string values rewritten in place under
+    // their fields; keys, numbers, order and layout as they were. `None` when
+    // the line is not one valid JSON object.
+    fn sanitize_json_line(&self, line: &str) -> Option<String> {
+        if !line.trim_start().starts_with('{') {
+            return None;
+        }
+        serde_json::from_str::<serde::de::IgnoredAny>(line).ok()?;
+        let bytes = line.as_bytes();
+        let mut out = String::with_capacity(line.len());
+        let mut copied = 0;
+        let mut index = 0;
+        // Each open object or array, and the field its values are under.
+        let mut frames: Vec<Option<String>> = Vec::new();
+        while index < bytes.len() {
+            match bytes[index] {
+                b'{' => frames.push(None),
+                b'[' => {
+                    let key = frames.last().cloned().flatten();
+                    frames.push(key);
+                }
+                b'}' | b']' => {
+                    frames.pop();
+                }
+                b'"' => {
+                    let end = json_string_end(bytes, index)?;
+                    let text: String = serde_json::from_str(&line[index..end]).ok()?;
+                    let mut next = end;
+                    while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                        next += 1;
+                    }
+                    if bytes.get(next) == Some(&b':') {
+                        if let Some(frame) = frames.last_mut() {
+                            *frame = Some(text);
+                        }
+                    } else {
+                        let key = frames.last().cloned().flatten();
+                        let sanitized = self.sanitize_value(key.as_deref(), &text);
+                        if sanitized != text {
+                            out.push_str(&line[copied..index]);
+                            out.push_str(&serde_json::to_string(&sanitized).ok()?);
+                            copied = end;
+                        }
+                    }
+                    index = end;
+                    continue;
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        out.push_str(&line[copied..]);
+        Some(out)
+    }
+
+    // A Prometheus sample, each label value under its label name. `None`
+    // for any other line, a comment included.
+    fn sanitize_prometheus_line(&self, line: &str) -> Option<String> {
+        let open = line.find('{')?;
+        let name = &line[..open];
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':'))
+        {
+            return None;
+        }
+        let bytes = line.as_bytes();
+        let mut out = String::with_capacity(line.len());
+        out.push_str(&line[..=open]);
+        let mut index = open + 1;
+        loop {
+            match bytes.get(index)? {
+                b'}' => break,
+                b',' => {
+                    out.push(',');
+                    index += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            let equals = index + line[index..].find('=')?;
+            let label = &line[index..equals];
+            if bytes.get(equals + 1) != Some(&b'"') {
+                return None;
+            }
+            let mut value = String::new();
+            let mut cursor = equals + 2;
+            loop {
+                match bytes.get(cursor)? {
+                    b'"' => break,
+                    b'\\' => {
+                        match bytes.get(cursor + 1)? {
+                            b'n' => value.push('\n'),
+                            other => value.push(char::from(*other)),
+                        }
+                        cursor += 2;
+                    }
+                    _ => {
+                        let character = line[cursor..].chars().next()?;
+                        value.push(character);
+                        cursor += character.len_utf8();
+                    }
+                }
+            }
+            let sanitized = self.sanitize_value(Some(label), &value);
+            out.push_str(label);
+            out.push_str("=\"");
+            out.push_str(
+                &sanitized
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n"),
+            );
+            out.push('"');
+            index = cursor + 1;
+        }
+        out.push_str(&line[index..]);
+        Some(out)
+    }
+
+    // A text's `key=value` and `key="value"` fields under their keys, a key
+    // standing after whitespace or at the start; everything between them
+    // through the text pass.
+    fn sanitize_fields_line(&self, line: &[u8]) -> Vec<u8> {
+        let Ok(text) = std::str::from_utf8(line) else {
+            return self.sanitize_bytes(line);
+        };
+        let bytes = text.as_bytes();
+        let mut out = Vec::with_capacity(line.len());
+        let mut copied = 0;
+        let mut index = 0;
+        while let Some(offset) = text[index..].find('=') {
+            let equals = index + offset;
+            index = equals + 1;
+            let key_start = text[..equals]
+                .rfind(|character: char| {
+                    !(character.is_ascii_alphanumeric() || matches!(character, '_' | '.'))
+                })
+                .map_or(0, |space| space + 1);
+            if key_start == equals
+                || key_start < copied
+                || (key_start > 0 && !bytes[key_start - 1].is_ascii_whitespace())
+            {
+                continue;
+            }
+            let Some(kind) = field_kind(&text[key_start..equals]) else {
+                continue;
+            };
+            let (value, end) = if bytes.get(equals + 1) == Some(&b'"') {
+                let Some(end) = json_string_end(bytes, equals + 1) else {
+                    continue;
+                };
+                (&text[equals + 1..end], end)
+            } else {
+                let end = text[equals + 1..]
+                    .find(char::is_whitespace)
+                    .map_or(text.len(), |space| equals + 1 + space);
+                (&text[equals + 1..end], end)
+            };
+            if let Some(resolved) = self.resolve_field(value, kind) {
+                out.extend_from_slice(&self.sanitize_bytes(&bytes[copied..equals + 1]));
+                out.extend_from_slice(self.shapes(resolved.as_bytes()).as_bytes());
+                copied = end;
+                index = end;
+            }
+        }
+        out.extend_from_slice(&self.sanitize_bytes(&bytes[copied..]));
+        out
+    }
+
     fn sanitize_str(&self, text: &str) -> String {
-        // Every substitution replaces whole names with ASCII, and every shape
-        // rule matches and replaces ASCII only, so valid UTF-8 stays valid.
+        // Every substitution replaces whole names with valid UTF-8, and every
+        // shape rule matches and replaces ASCII only, so valid UTF-8 stays
+        // valid.
         String::from_utf8(self.sanitize_bytes(text.as_bytes()))
             .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
     }
 
-    // The text pass: the table, then the shapes.
+    // The text pass: the table, the paths under a drive no directory names,
+    // then the shapes.
     fn sanitize_bytes(&self, text: &[u8]) -> Vec<u8> {
-        redact_ips(&redact_macs(&redact_emails(
-            &self.redact_url_parts(&self.substitute(text)),
-        )))
+        let shaped = self.shapes(&self.drive_paths(&self.substitute(text)));
+        shaped.into_bytes()
+    }
+
+    // IP and MAC addresses, e-mail addresses, and URL credentials, query
+    // strings and paths after a replaced host, as their shape.
+    fn shapes(&self, text: &[u8]) -> String {
+        let shaped = redact_ips(&redact_macs(&redact_emails(&self.redact_url_parts(text))));
+        String::from_utf8(shaped)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
     }
 
     // Replaces every name in `text`: the longest at the leftmost place that
-    // the rule lets stand.
+    // the rule lets stand. After a download directory, each path component
+    // that follows is a name.
     fn substitute(&self, text: &[u8]) -> Vec<u8> {
         let Some(automaton) = &self.automaton else {
             return text.to_vec();
@@ -1142,12 +1887,77 @@ impl StandIns {
                 continue;
             };
             out.extend_from_slice(&text[copied..start]);
-            out.extend_from_slice(self.table.names[name].0.as_bytes());
+            let (stand_in, scope) = &self.table.matched[name];
+            out.extend_from_slice(stand_in.as_bytes());
+            let end = if *scope == Scope::ContentDir {
+                self.path_tail(text, end, &mut out)
+            } else {
+                end
+            };
             copied = end;
             at = end;
         }
         out.extend_from_slice(&text[copied..]);
         out
+    }
+
+    // Every path under a drive that no directory in the table names
+    // (`D:\Other\Some.Name\x.mkv`): the drive kept, each component a name.
+    fn drive_paths(&self, text: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(text.len());
+        let mut copied = 0;
+        let mut index = 0;
+        while index + 2 < text.len() {
+            let rooted = text[index].is_ascii_alphabetic()
+                && text[index + 1] == b':'
+                && matches!(text[index + 2], b'/' | b'\\')
+                && (index == 0 || !is_word_byte(text[index - 1]));
+            if !rooted {
+                index += 1;
+                continue;
+            }
+            out.extend_from_slice(&text[copied..index + 2]);
+            let end = self.path_tail(text, index + 2, &mut out);
+            copied = end;
+            index = end.max(index + 1);
+        }
+        out.extend_from_slice(&text[copied..]);
+        out
+    }
+
+    // The components of a path that goes on at `at` in running text, each
+    // written to `out` as a name, up to where the path ends: a quote, a
+    // control character, `: `, `, `, `; `, or a full stop before a space or
+    // the end. Returns where it ended.
+    fn path_tail(&self, text: &[u8], mut at: usize, out: &mut Vec<u8>) -> usize {
+        loop {
+            let mut component_start = at;
+            while component_start < text.len() && matches!(text[component_start], b'/' | b'\\') {
+                component_start += 1;
+            }
+            if component_start == at {
+                return at;
+            }
+            let mut end = component_start;
+            while end < text.len() && !ends_path(text, end) {
+                end += 1;
+            }
+            if end > component_start
+                && text[end - 1] == b'.'
+                && (end == text.len() || text[end].is_ascii_whitespace())
+            {
+                end -= 1;
+            }
+            if end == component_start {
+                return at;
+            }
+            let Ok(component) = std::str::from_utf8(&text[component_start..end]) else {
+                return at;
+            };
+            out.extend_from_slice(&text[at..component_start]);
+            out.extend_from_slice(self.resolve_component(component, true, false).as_bytes());
+            at = end;
+        }
     }
 
     // The longest match at `start` that the rule lets stand, and where it
@@ -1161,11 +1971,11 @@ impl StandIns {
         mut name: usize,
     ) -> Option<(usize, usize)> {
         loop {
-            let stands = if self.table.names[name].1 {
-                !path_glued_before(text, start) && !path_glued_after(text, end)
-            } else {
+            let stands = if self.table.matched[name].1 == Scope::Name {
                 !(word_after(text, start) && word_before(text, start))
                     && !(word_before(text, end) && word_after(text, end))
+            } else {
+                !path_glued_before(text, start) && !path_glued_after(text, end)
             };
             if stands {
                 return Some((end, name));
@@ -1196,7 +2006,9 @@ impl StandIns {
                 _ => authority,
             }
         };
-        self.table.stand_ins.contains(host) || host.parse::<IpAddr>().is_ok()
+        self.table.stand_ins.contains(host)
+            || self.registry.borrow().stand_ins.contains(host)
+            || host.parse::<IpAddr>().is_ok()
     }
 
     // Replaces the credentials (`user:pass@`) and the query string of every
@@ -1312,6 +2124,30 @@ fn path_glued_after(text: &[u8], at: usize) -> bool {
 // pass runs first, and its stand-ins (`<home>`) may already sit inside it.
 fn ends_url(byte: u8) -> bool {
     byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\'' | b'`')
+}
+
+// Where a path component in running text ends: at a separator, a quote, a
+// control character, or `: `, `, ` and `; ` (an error's own text follows a
+// path that way; a Windows name holds no colon).
+fn ends_path(text: &[u8], at: usize) -> bool {
+    let byte = text[at];
+    byte < 0x20
+        || matches!(byte, b'/' | b'\\' | b'"' | b'\'' | b'`')
+        || (matches!(byte, b':' | b',' | b';') && text.get(at + 1) == Some(&b' '))
+}
+
+// Where the JSON or `{:?}` string that opens at `open` ends, after its
+// closing quote.
+fn json_string_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut index = open + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'"' => return Some(index + 1),
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 fn is_email_local(byte: u8) -> bool {
@@ -1521,6 +2357,11 @@ mod tests {
         table(&StoredNames::default()).sanitize_str(text)
     }
 
+    // A text component's lines, as the package sanitizes them.
+    fn lines(table: &StandIns, text: &str) -> String {
+        String::from_utf8(table.sanitize_text(text.as_bytes())).expect("utf-8")
+    }
+
     // Rule 1: a name of four or more characters, in any ASCII case, where it
     // stands as a word of its own.
     #[test]
@@ -1676,8 +2517,249 @@ mod tests {
             .expect("schema")
             .field_names();
         assert!(table.schema_keys.contains("progress"));
-        let value = json(&table, r#"{"progress": "progress", "progress of x": 1}"#);
-        assert_eq!(value["progress"], "job-1");
+        let value = json(
+            &table,
+            r#"{"name": "progress", "progress": "progress", "progress of x": 1}"#,
+        );
+        // A plain word is replaced only where a name stands, never in a key,
+        // a schema value or running text.
+        assert_eq!(value["name"], "job-1");
+        assert_eq!(value["progress"], "progress");
+        assert_eq!(value["progress of x"], 1);
+    }
+
+    const RELEASE: &str = "Brindle.Quay.S02E07.1080p-GRPX";
+
+    fn release_job() -> StoredNames {
+        let files = [
+            // PAR2 index and volumes, plus and dash forms.
+            "Brindle.Quay.S02E07.1080p-GRPX.par2",
+            "Brindle.Quay.S02E07.1080p-GRPX.vol000+01.par2",
+            "Brindle.Quay.S02E07.1080p-GRPX.vol03-07.par2",
+            // PAR3 index and volume.
+            "Brindle.Quay.S02E07.1080p-GRPX.par3",
+            "Brindle.Quay.S02E07.1080p-GRPX.vol00+04.par3",
+            // RAR volumes, new and old naming, which carry recovery records,
+            // and their .rev volumes in both namings.
+            "Brindle.Quay.S02E07.1080p-GRPX.part01.rar",
+            "Brindle.Quay.S02E07.1080p-GRPX.part02.rar",
+            "Brindle.Quay.S02E07.1080p-GRPX.part02.rev",
+            "brq-s02e07.rar",
+            "brq-s02e07.r00",
+            "brq-s02e07.rev",
+            // SFV.
+            "Brindle.Quay.S02E07.1080p-GRPX.sfv",
+            // 7z, zip and split sets.
+            "brq-s02e07.7z.001",
+            "brq-s02e07.zip",
+            "brq-s02e07.z01",
+            "Brindle.Quay.S02E07.1080p-GRPX.mkv.001",
+        ];
+        job(
+            9,
+            JobNameRecord {
+                name: Some(RELEASE.to_string()),
+                files: files.iter().map(|file| file.to_string()).collect(),
+                ..JobNameRecord::default()
+            },
+        )
+    }
+
+    // Every recovery kind and archive set takes the one stand-in of the name
+    // it is built from, its kind suffix kept, in every form it reaches the
+    // bundle: a log field, a JSON value, running text, a path, and the names
+    // an SFV lists.
+    #[test]
+    fn every_recovery_kind_takes_the_release_stand_in() {
+        let table = table(&release_job());
+        let text = lines(
+            &table,
+            concat!(
+                "INFO verifying set=Brindle.Quay.S02E07.1080p-GRPX.par2 ",
+                "file=Brindle.Quay.S02E07.1080p-GRPX.vol000+01.par2\n",
+                "INFO recovery volume Brindle.Quay.S02E07.1080p-GRPX.vol03-07.par2 arrived\n",
+                "INFO par3 index member=\"Brindle.Quay.S02E07.1080p-GRPX.par3\" ",
+                "over=Brindle.Quay.S02E07.1080p-GRPX.vol00+04.par3\n",
+                "INFO recovery record in Brindle.Quay.S02E07.1080p-GRPX.part02.rar repaired ",
+                "/srv/weaver-data/complete/Brindle.Quay.S02E07.1080p-GRPX/",
+                "Brindle.Quay.S02E07.1080p-GRPX.part01.rar\n",
+                "INFO rev rebuilt as=Brindle.Quay.S02E07.1080p-GRPX.part02.rev ",
+                "from=brq-s02e07.rev whole=brq-s02e07.r00 dest=brq-s02e07.rar\n",
+                "; Brindle.Quay.S02E07.1080p-GRPX.sfv\n",
+                "Brindle.Quay.S02E07.1080p-GRPX.part01.rar 0a1b2c3d\n",
+                "brq-s02e07.r00 4e5f6a7b\n",
+                "INFO sets 7z=brq-s02e07.7z.001 zip=brq-s02e07.zip z=brq-s02e07.z01 ",
+                "split=Brindle.Quay.S02E07.1080p-GRPX.mkv.001\n",
+                r#"{"level":"INFO","fields":{"message":"repaired","set":"brq-s02e07.7z.001","#,
+                r#""volume":"Brindle.Quay.S02E07.1080p-GRPX.vol00+04.par3"}}"#,
+            ),
+        );
+        for real in [
+            "Brindle", "brindle", "Quay", "GRPX", "brq", "s02e07", "S02E07",
+        ] {
+            assert!(!text.contains(real), "{real} survived:\n{text}");
+        }
+        for kept in [
+            "job-9.par2",
+            "job-9.vol000+01.par2",
+            "job-9.vol03-07.par2",
+            "job-9.par3",
+            "job-9.vol00+04.par3",
+            "job-9.part01.rar",
+            "job-9.part02.rar",
+            "job-9.part02.rev",
+            "job-9.sfv",
+            "job-9.mkv.001",
+            "<complete>/job-9/job-9.part01.rar",
+        ] {
+            assert!(text.contains(kept), "{kept} missing:\n{text}");
+        }
+        // The second set's stem has one stand-in across its volumes, its
+        // .rev, its SFV entry and the 7z, zip and split sets built on it.
+        let stem = text
+            .split("dest=")
+            .nth(1)
+            .and_then(|tail| tail.split(".rar").next())
+            .expect("dest")
+            .to_string();
+        assert!(stem.starts_with("job-9/file-"), "{stem}");
+        for kept in [".rev", ".r00", ".7z.001", ".zip", ".z01"] {
+            assert!(
+                text.contains(&format!("{stem}{kept}")),
+                "{stem}{kept}:\n{text}"
+            );
+        }
+        assert!(text.contains(&format!("{stem}.r00 4e5f6a7b")), "{text}");
+        let json_line = text.lines().last().expect("json line");
+        let value: Value = serde_json::from_str(json_line).expect("valid JSON");
+        assert_eq!(value["fields"]["set"], format!("{stem}.7z.001"));
+        assert_eq!(value["fields"]["volume"], "job-9.vol00+04.par3");
+    }
+
+    // A recovery or archive file the table never saw, named in a field, takes
+    // the stand-in of the stem it shares with a known file.
+    #[test]
+    fn an_unseen_volume_takes_its_set_stand_in() {
+        let table = table(&release_job());
+        let text = lines(
+            &table,
+            "INFO fetched file=Brindle.Quay.S02E07.1080p-GRPX.vol127+64.par2 \
+             other=brq-s02e07.part09.rev",
+        );
+        assert!(text.contains("file=job-9.vol127+64.par2"), "{text}");
+        assert!(!text.contains("brq"), "{text}");
+        assert!(text.contains(".part09.rev"), "{text}");
+    }
+
+    // Ordinary text stays as it was: a job named with a plain word does not
+    // touch prose, keys, enum values or numbers, and a bracket list stays.
+    #[test]
+    fn a_plain_job_name_leaves_ordinary_text_alone() {
+        let mut stored = job(
+            1,
+            JobNameRecord {
+                name: Some("runtime".to_string()),
+                ..JobNameRecord::default()
+            },
+        );
+        stored.jobs.insert(
+            2,
+            JobNameRecord {
+                name: Some("System".to_string()),
+                nzb_path: Some("/srv/weaver-data/watch/[1/5] System.nzb".to_string()),
+                ..JobNameRecord::default()
+            },
+        );
+        let table = table(&stored);
+        let line = concat!(
+            r#"{"level":"WARN","fields":{"message":"runtime pressure on System egress","#,
+            r#""runtime_ms":12,"state":"up","ids":"[1, 2]","name":"runtime"}}"#,
+        );
+        let text = lines(&table, line);
+        let value: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(
+            value["fields"]["message"],
+            "runtime pressure on System egress"
+        );
+        assert_eq!(value["fields"]["runtime_ms"], 12);
+        assert_eq!(value["fields"]["state"], "up");
+        assert_eq!(value["fields"]["ids"], "[1, 2]");
+        assert_eq!(value["fields"]["name"], "job-1");
+        assert_eq!(
+            lines(&table, "INFO egress System up, runtime 3 s, picks [1, 2]"),
+            "INFO egress System up, runtime 3 s, picks [1, 2]"
+        );
+    }
+
+    // Two jobs that share a name share one stand-in naming both.
+    #[test]
+    fn jobs_sharing_a_name_share_one_stand_in() {
+        let mut stored = job(
+            17640,
+            JobNameRecord {
+                name: Some("Olaf.Twin.S01E02".to_string()),
+                ..JobNameRecord::default()
+            },
+        );
+        stored.jobs.insert(
+            17635,
+            JobNameRecord {
+                name: Some("Olaf.Twin.S01E02".to_string()),
+                ..JobNameRecord::default()
+            },
+        );
+        let table = table(&stored);
+        let text = lines(&table, "INFO name=Olaf.Twin.S01E02 again Olaf.Twin.S01E02");
+        assert_eq!(text, "INFO name=job-17635+17640 again job-17635+17640");
+    }
+
+    // Names the table never saw, in the fields that carry them, are replaced
+    // with generated stand-ins, one per name, used for every later mention.
+    #[test]
+    fn an_unseen_name_in_a_name_field_gets_one_stand_in() {
+        let log = concat!(
+            "INFO set=Zephyr.Lantern.2019 member=\"Zephyr Lantern.mkv\" ",
+            "releaseGroup=QRKS streamingService=NFLXQ\n",
+            "INFO again Zephyr.Lantern.2019 failed: ",
+            "/srv/weaver-data/complete/Zephyr.Lantern.2019/Zephyr Lantern.mkv: short\n",
+            "weaver_job_bytes{job_name=\"Zephyr.Lantern.2019\",state=\"up\"} 3\n",
+        );
+        // The package reads every component once to find the names its
+        // fields carry, then replaces them wherever they stand.
+        let table = StandIns::build(
+            &[Component::text("weaver.log", log)],
+            &local("host-name", "/srv/weaver-data"),
+            &StoredNames::default(),
+        )
+        .expect("table");
+        let text = lines(&table, log);
+        for real in ["Zephyr", "Lantern", "QRKS", "NFLXQ"] {
+            assert!(!text.contains(real), "{real} survived:\n{text}");
+        }
+        let stand_in = text
+            .split("set=")
+            .nth(1)
+            .and_then(|tail| tail.split(' ').next())
+            .expect("set")
+            .to_string();
+        assert!(stand_in.starts_with("name-"), "{stand_in}");
+        assert!(text.contains(&format!("again {stand_in} failed")), "{text}");
+        assert!(text.contains(&format!("job_name=\"{stand_in}\"")), "{text}");
+        assert!(text.contains("state=\"up\"} 3"), "{text}");
+        assert!(text.contains(": short"), "{text}");
+    }
+
+    #[test]
+    fn a_distinctive_name_is_replaced_in_a_free_key() {
+        let stored = job(
+            1,
+            JobNameRecord {
+                name: Some("Olaf.Progress.S01".to_string()),
+                ..JobNameRecord::default()
+            },
+        );
+        let table = table(&stored);
+        let value = json(&table, r#"{"Olaf.Progress.S01 of x": 1}"#);
         assert_eq!(value["job-1 of x"], 1);
     }
 
@@ -1767,6 +2849,14 @@ mod tests {
 
     #[test]
     fn file_suffix_keeps_only_what_the_engines_act_on() {
+        // What a stand-in keeps of a name: every kind segment, so the shape
+        // of a set stays readable. Any other suffix names the file rather
+        // than its kind, so it is dropped.
+        fn file_suffix(name: &str) -> String {
+            stem_cuts(name)
+                .last()
+                .map_or_else(String::new, |cut| name[*cut..].to_string())
+        }
         assert_eq!(file_suffix("Some.Name.part01.rar"), ".part01.rar");
         assert_eq!(file_suffix("Some.Name.vol03+04.par2"), ".vol03+04.par2");
         assert_eq!(file_suffix("Some.Name.7z.001"), ".7z.001");
@@ -1842,7 +2932,7 @@ mod json_log_spellings {
         let text = table.sanitize_str(&line);
         assert!(!text.contains("WeaverData"), "text line: {text}");
         assert!(
-            text.contains(r#"path="<complete>\\Some.Show""#),
+            text.contains(r#"path="<complete>\\name-1""#),
             "text line: {text}"
         );
     }

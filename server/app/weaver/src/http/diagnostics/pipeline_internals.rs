@@ -202,3 +202,130 @@ fn unanswered(
         },
     }
 }
+
+// `pipeline-turn-phases.json`: what the pipeline's turns spent their time on
+// while the package was collected, sampled from its turn stamp. The stamp is
+// a few atomics the pipeline writes anyway, so the pipeline does no work for
+// this: the sampler reads the current phase every `sample_every_ms` and counts
+// it. A phase's share of `samples` is its share of the window, to within one
+// sample interval per phase change. Numbers and fixed codes only.
+pub(super) const PHASES_FILE: &str = "pipeline-turn-phases.json";
+
+// How often the sampler reads the stamp. The timer may fire less often than
+// asked on some systems; `samples` says how many readings were taken.
+pub(super) const PHASE_SAMPLE_EVERY: Duration = Duration::from_millis(1);
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub(super) struct TurnPhaseSamples {
+    sample_every_ms: u64,
+    samples: u64,
+    window_ms: u64,
+    turns_completed_in_window: u64,
+    // Readings per phase, in the phase codes `pipeline-internals.json` uses.
+    samples_by_phase: BTreeMap<&'static str, u64>,
+}
+
+impl TurnPhaseSamples {
+    pub(super) fn component(&self) -> Component {
+        Component::json(PHASES_FILE, self).names_nothing()
+    }
+}
+
+// Runs `work` to completion while sampling the turn stamp through `read`
+// every `every`, and returns both. The first reading is taken at once.
+pub(super) async fn sample_turn_phases_while<T>(
+    mut read: impl FnMut(Instant) -> PipelineTurnReading,
+    every: Duration,
+    work: impl std::future::Future<Output = T>,
+) -> (T, TurnPhaseSamples) {
+    let started = tokio::time::Instant::now();
+    let first = read(Instant::now());
+    let mut last_turns = first.turns_completed;
+    let mut samples = TurnPhaseSamples {
+        sample_every_ms: millis(every),
+        samples: 1,
+        window_ms: 0,
+        turns_completed_in_window: 0,
+        samples_by_phase: BTreeMap::from([(first.phase.as_str(), 1)]),
+    };
+    let mut ticks = tokio::time::interval_at(started + every, every);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tokio::pin!(work);
+    let output = loop {
+        tokio::select! {
+            biased;
+            output = &mut work => break output,
+            _ = ticks.tick() => {
+                let reading = read(Instant::now());
+                samples.samples += 1;
+                *samples.samples_by_phase.entry(reading.phase.as_str()).or_default() += 1;
+                last_turns = reading.turns_completed;
+            }
+        }
+    };
+    samples.window_ms = millis(started.elapsed());
+    samples.turns_completed_in_window = last_turns.saturating_sub(first.turns_completed);
+    (output, samples)
+}
+
+#[cfg(test)]
+mod phase_sampler_tests {
+    use super::*;
+    use weaver_server_core::operations::instrumentation::PipelinePhase;
+
+    fn reading(phase: PipelinePhase, turns_completed: u64) -> PipelineTurnReading {
+        PipelineTurnReading {
+            phase,
+            busy_for: None,
+            turns_completed,
+            since_last_turn_ended: None,
+            installed_jobs: None,
+        }
+    }
+
+    // Every reading is counted under its phase, and the work's end, not a
+    // clock, ends the sampling: the script finishes the work on its last
+    // reading.
+    #[tokio::test(start_paused = true)]
+    async fn each_reading_counts_under_its_phase_until_the_work_ends() {
+        let script = [
+            reading(PipelinePhase::WaitingForWork, 10),
+            reading(PipelinePhase::Dispatch, 10),
+            reading(PipelinePhase::Dispatch, 11),
+            reading(PipelinePhase::DbReply, 12),
+            reading(PipelinePhase::WaitingForWork, 14),
+        ];
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<&'static str>();
+        let mut done_tx = Some(done_tx);
+        let mut next = 0;
+        let read = |_now: Instant| {
+            let current = script[next];
+            next += 1;
+            if next == script.len() {
+                done_tx
+                    .take()
+                    .expect("one finish")
+                    .send("collected")
+                    .unwrap();
+            }
+            current
+        };
+
+        let (output, samples) =
+            sample_turn_phases_while(
+                read,
+                PHASE_SAMPLE_EVERY,
+                async move { done_rx.await.unwrap() },
+            )
+            .await;
+
+        assert_eq!(output, "collected");
+        assert_eq!(samples.samples, 5);
+        assert_eq!(samples.turns_completed_in_window, 4);
+        assert_eq!(
+            samples.samples_by_phase,
+            BTreeMap::from([("db_reply", 1), ("dispatch", 2), ("waiting_for_work", 2)])
+        );
+        assert_eq!(samples.sample_every_ms, 1);
+    }
+}

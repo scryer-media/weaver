@@ -1158,3 +1158,20 @@ scope = "all"
 kind = "rust"
 hook_id = "seed_history_retention_v89"
 scope = "all"
+
+[[migration]]
+version = 90
+description = "index the rows that hold credentials, for the start-up credential checks"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0090_credential_scan_indexes/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0090_credential_scan_indexes/postgres.sql"
+engine = "postgres"
+scope = "all"
