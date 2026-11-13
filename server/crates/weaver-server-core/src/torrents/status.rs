@@ -290,10 +290,13 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
     }
 }
 
-/// Uploaded over downloaded; over the torrent's size while less than 1% of
-/// it was downloaded here, as for a torrent added complete.
-pub fn ratio(counters: &TorrentCounters, size: u64) -> f64 {
-    let over = ratio_base(counters.downloaded_bytes, size);
+/// Uploaded over downloaded; over the bytes the torrent holds while less
+/// than 1% of them were downloaded here, as for a torrent added complete
+/// (qBittorrent `TorrentImpl::realRatio`, over libtorrent's `total_done`).
+/// Never over the torrent's size: one file taken from a large torrent owes
+/// a ratio on that file.
+pub fn ratio(counters: &TorrentCounters, held: u64) -> f64 {
+    let over = ratio_base(counters.downloaded_bytes, held);
     if over == 0 {
         0.0
     } else {
@@ -301,11 +304,11 @@ pub fn ratio(counters: &TorrentCounters, size: u64) -> f64 {
     }
 }
 
-/// The bytes a ratio is taken over: those downloaded, or the torrent's size
-/// while less than 1% of it was downloaded here.
-pub fn ratio_base(downloaded_bytes: u64, size: u64) -> u64 {
-    if downloaded_bytes.saturating_mul(100) < size {
-        size
+/// The bytes a ratio is taken over: those downloaded, or those the torrent
+/// holds while less than 1% of them were downloaded here.
+pub fn ratio_base(downloaded_bytes: u64, held: u64) -> u64 {
+    if downloaded_bytes.saturating_mul(100) < held {
+        held
     } else {
         downloaded_bytes
     }
@@ -316,12 +319,12 @@ pub fn ratio_base(downloaded_bytes: u64, size: u64) -> u64 {
 pub fn goal_left(
     policy: &Seeding,
     counters: &TorrentCounters,
-    total_bytes: u64,
+    held_bytes: u64,
     now_ms: i64,
 ) -> Option<String> {
     let mut goals: Vec<(bool, String)> = Vec::new();
     if let Some(goal) = policy.ratio_goal {
-        let ratio = ratio(counters, total_bytes);
+        let ratio = ratio(counters, held_bytes);
         goals.push((
             ratio >= f64::from(goal),
             format!("ratio {ratio:.2} of {goal:.2}"),
@@ -1405,20 +1408,27 @@ mod tests {
     }
 
     #[test]
-    fn the_ratio_is_over_what_was_downloaded_or_over_the_size_until_one_percent() {
+    fn the_ratio_is_over_what_was_downloaded_or_over_what_is_held_until_one_percent() {
         let counters = |uploaded_bytes, downloaded_bytes| TorrentCounters {
             uploaded_bytes,
             downloaded_bytes,
             ..TorrentCounters::default()
         };
         assert_eq!(ratio(&counters(500, 250), 1000), 2.0);
-        // Added complete: nothing downloaded, so the size stands in.
+        // Added complete: nothing downloaded, so what it holds stands in.
         assert_eq!(ratio(&counters(500, 0), 1000), 0.5);
         assert_eq!(ratio(&counters(500, 9), 1000), 0.5);
         assert_eq!(ratio(&counters(500, 10), 1000), 50.0);
         assert_eq!(ratio(&counters(0, 0), 0), 0.0);
         let policy = policy(Some(2.0), None, SeedingGoalMode::Any);
         assert_eq!(goal_left(&policy, &counters(500, 250), 1000, 0), None);
+        // One 400 MiB file of a 100 GiB torrent, downloaded here: the ratio
+        // is over the 400 MiB held, never over the torrent's size.
+        const MIB: u64 = 1 << 20;
+        let one_file = counters(400 * MIB, 400 * MIB);
+        assert_eq!(ratio(&one_file, 400 * MIB), 1.0);
+        let policy = self::policy(Some(1.0), None, SeedingGoalMode::Any);
+        assert_eq!(goal_left(&policy, &one_file, 400 * MIB, 0), None);
     }
 
     // An announce that ended at 1,000 s, and the next as the engine sets it:

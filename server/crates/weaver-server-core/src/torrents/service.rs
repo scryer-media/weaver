@@ -1418,6 +1418,9 @@ struct Live {
     // Each file's bytes in hand: the checkpoint's until the session has
     // checked the files, then the session's.
     file_have: Vec<u64>,
+    // Their sum, padding left out: the bytes it holds, kept with them so a
+    // goal check walks no file.
+    have_bytes: u64,
     // The pieces it kept, until its store is back.
     kept_pieces: u32,
     // Why unpacking refused it, as its history kept it when it was
@@ -1456,7 +1459,7 @@ fn queued(settings: &TorrentSettings, rules: &[TrackerRule], torrent: &Live, now
             || status::goal_left(
                 &settings.policy(&torrent.record, rule),
                 &torrent.counters,
-                torrent.total,
+                torrent.have_bytes,
                 now,
             )
             .is_some());
@@ -1567,6 +1570,7 @@ impl Live {
             copy_error: None,
             seed_verified: 0,
             file_have: Vec::new(),
+            have_bytes: 0,
             kept_pieces: 0,
             failed: None,
             kept_at_boot: None,
@@ -1594,7 +1598,7 @@ impl Live {
     fn kept(&mut self, failed: Option<String>, kept: Option<&Kept>) {
         if let (Some(kept), Some(layout)) = (kept, &self.layout) {
             let (count, file_have) = kept.had(layout);
-            self.file_have = file_have;
+            self.hold(file_have);
             self.kept_pieces = count;
         }
         self.failed = failed;
@@ -1609,6 +1613,12 @@ impl Live {
         self.keep(reading);
     }
 
+    // Keep each file's bytes in hand, and their sum.
+    fn hold(&mut self, file_have: Vec<u64>) {
+        self.have_bytes = on_disk(self.layout.as_deref(), &file_have);
+        self.file_have = file_have;
+    }
+
     // Keep a reading as what the session last said; the bytes it moved
     // since the reading before are counted on the egress its leg runs on.
     fn keep(&mut self, reading: Reading) {
@@ -1617,7 +1627,7 @@ impl Live {
             leg.network
                 .record_torrent_bytes(leg.egress_id, received, sent);
         }
-        self.file_have = reading.file_have;
+        self.hold(reading.file_have);
         self.counters = reading.counters;
         self.seen = reading.seen;
         self.timed = reading.timed;
@@ -3590,7 +3600,7 @@ impl TorrentService {
             Room::new(Arc::clone(&env.limits), env.free_disk.clone()),
             Box::new(move |heard| signal.heard(job_id, heard)),
         ));
-        torrent.file_have = store.file_have();
+        torrent.hold(store.file_have());
         if let Some(tee) = store.tee() {
             tee.hold_own_clock(torrent.record.intent == TorrentIntent::Paused);
         }
@@ -5309,7 +5319,7 @@ impl TorrentService {
         let torrent = live.get(&job_id).ok_or(ActionError::NotFound(job_id))?;
         if torrent.private && !confirm_unmet_goal {
             let policy = settings.policy(&torrent.record, torrent.rule(&self.rules()));
-            if let Some(left) = status::goal_left(&policy, &torrent.counters, torrent.total, now) {
+            if let Some(left) = status::goal_left(&policy, &torrent.counters, torrent.have_bytes, now) {
                 return Err(ActionError::UnmetGoal(left));
             }
         }
@@ -5770,7 +5780,7 @@ impl TorrentService {
             self.inner.signal.marked(job_id, lost);
         }
         torrent.files_missing = false;
-        torrent.file_have = store.file_have();
+        torrent.hold(store.file_have());
         true
     }
 
@@ -6068,7 +6078,7 @@ impl TorrentService {
                 if let Some(store) = &torrent.store {
                     Pieces::checking(&**store)
                         .map_err(|error| ActionError::State(format!("{error:#}")))?;
-                    torrent.file_have = store.file_have();
+                    torrent.hold(store.file_have());
                 }
                 torrent.files_missing = false;
                 Ok(true)
@@ -6786,7 +6796,7 @@ impl TorrentService {
                     continue;
                 }
                 let policy = settings.policy(&torrent.record, torrent.rule(&rules));
-                if status::goal_left(&policy, &torrent.counters, torrent.total, now).is_some() {
+                if status::goal_left(&policy, &torrent.counters, torrent.have_bytes, now).is_some() {
                     continue;
                 }
                 let finished = self.script_event(
@@ -7301,7 +7311,7 @@ impl TorrentService {
             downloaded_bytes: counters.downloaded_bytes,
             run_uploaded_bytes: reading.run.1,
             run_downloaded_bytes: reading.run.0,
-            ratio: status::ratio(counters, total),
+            ratio: status::ratio(counters, have),
             download_bps: reading.speeds.0,
             upload_bps: reading.speeds.1,
             upload_limit: record.upload_limit,
@@ -7331,7 +7341,7 @@ impl TorrentService {
             storage_dir: record.storage_dir.clone(),
             files_dir: record.files_dir.clone(),
             queue_position: torrent.queue_rank,
-            seeding_left: status::goal_left(&policy, counters, total, now),
+            seeding_left: status::goal_left(&policy, counters, have, now),
             seeding_override: record.policy_override,
             seeding_policy: policy,
             seeding_levels,
@@ -7613,7 +7623,7 @@ impl TorrentService {
                 .and_then(|attached| attached.leg.as_ref())
                 .map(|leg| leg.tenancy.leg().clone()),
             fetch: torrent.fetching.as_ref().map(|fetch| *fetch.phase.borrow()),
-            seeding: SeedingSeries::of(&policy, &reading.counters, torrent.total, now),
+            seeding: SeedingSeries::of(&policy, &reading.counters, torrent.have_bytes, now),
         }
     }
 

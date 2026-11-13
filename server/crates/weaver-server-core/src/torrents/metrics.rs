@@ -280,12 +280,12 @@ pub struct SeedingSeries {
 impl SeedingSeries {
     /// The goals of `policy` against `counters` at `now_ms`; met as
     /// [`status::goal_left`] says.
-    pub fn of(policy: &Seeding, counters: &TorrentCounters, total_bytes: u64, now_ms: i64) -> Self {
-        let met = status::goal_left(policy, counters, total_bytes, now_ms).is_none();
+    pub fn of(policy: &Seeding, counters: &TorrentCounters, held_bytes: u64, now_ms: i64) -> Self {
+        let met = status::goal_left(policy, counters, held_bytes, now_ms).is_none();
         let mut goals = Vec::new();
         if let Some(goal) = policy.ratio_goal {
             let goal = f64::from(goal);
-            let ratio = status::ratio(counters, total_bytes);
+            let ratio = status::ratio(counters, held_bytes);
             goals.push((SeedingGoal::Ratio, goal, (goal - ratio).max(0.0)));
         }
         if let Some(minutes) = policy.seed_time_goal_minutes {

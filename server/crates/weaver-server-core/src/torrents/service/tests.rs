@@ -6299,16 +6299,14 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
     queue.state().restore_holds(HoldSet::default());
     wait(kept, None).await;
 
-    // Its ratio goal met, it pauses with the rest.
-    rig.service
-        .inner
-        .live
-        .lock()
-        .await
-        .get_mut(&kept)
-        .unwrap()
-        .counters
-        .uploaded_bytes = 6000;
+    // Its ratio goal met, it pauses with the rest: twice the 3,000 bytes
+    // it downloaded.
+    {
+        let mut live = rig.service.inner.live.lock().await;
+        let torrent = live.get_mut(&kept).unwrap();
+        torrent.counters.downloaded_bytes = 3000;
+        torrent.counters.uploaded_bytes = 6000;
+    }
     hold(schedule);
     wait(kept, Some(HoldOrigin::Scheduled)).await;
     assert!(rig.service.schedule_seeding().await.is_empty());
