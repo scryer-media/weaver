@@ -1382,6 +1382,10 @@ pub struct VolumeSnapshot {
     pub written_bytes: u64,
     // Time spent inside write calls.
     pub write_nanos: u64,
+    // Write calls made, and how many of them did not start where the
+    // previous write to the same file ended.
+    pub write_calls: u64,
+    pub write_seeks: u64,
     // Bytes per second inside write calls; zero until measured.
     pub write_rate: u64,
     // Bytes waiting in memory for the volume's writer.

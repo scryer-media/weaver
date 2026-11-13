@@ -164,7 +164,11 @@ impl StorageCapacity {
     // One row per volume, from what is held: the counters are read where
     // they stand and no disk is looked at.
     pub fn volume_snapshots(&self) -> Vec<VolumeSnapshot> {
-        self.volumes()
+        self.snapshots_of(&self.volumes())
+    }
+
+    fn snapshots_of(&self, volumes: &[Arc<Volume>]) -> Vec<VolumeSnapshot> {
+        volumes
             .iter()
             .map(|volume| VolumeSnapshot {
                 label: volume.label.clone(),
@@ -172,6 +176,8 @@ impl StorageCapacity {
                 device: volume.device,
                 written_bytes: volume.written_bytes.load(Ordering::Relaxed),
                 write_nanos: volume.write_nanos.load(Ordering::Relaxed),
+                write_calls: volume.write_calls.load(Ordering::Relaxed),
+                write_seeks: volume.write_seeks.load(Ordering::Relaxed),
                 write_rate: volume.write_rate.load(Ordering::Relaxed),
                 buffered_bytes: volume.buffered_bytes.load(Ordering::Relaxed),
             })
@@ -415,7 +421,44 @@ mod tests {
         assert_eq!(storage.kind_on_device(Some(7)), StorageKind::Solid);
         assert_eq!(storage.kind_on_device(Some(8)), StorageKind::Unknown);
         assert_eq!(storage.kind_on_device(None), StorageKind::Unknown);
-        // The placeholder registry lists no volume.
-        assert!(storage.volume_snapshots().is_empty());
+
+        // A row carries each counter where it stands, and the kind held for
+        // the volume's device.
+        let written = Volume::new(Some(7), "/mnt/pool".into());
+        written.written_bytes.store(8_000_000, Ordering::Relaxed);
+        written.write_nanos.store(2_500_000_000, Ordering::Relaxed);
+        written.write_calls.store(120, Ordering::Relaxed);
+        written.write_seeks.store(9, Ordering::Relaxed);
+        written.write_rate.store(3_200_000, Ordering::Relaxed);
+        written.buffered_bytes.store(65_536, Ordering::Relaxed);
+        let unseen = Volume::new(None, "/mnt/scratch".into());
+        let rows = storage.snapshots_of(&[Arc::new(written), Arc::new(unseen)]);
+        assert_eq!(
+            rows,
+            vec![
+                VolumeSnapshot {
+                    label: "/mnt/pool".into(),
+                    kind: "ssd",
+                    device: Some(7),
+                    written_bytes: 8_000_000,
+                    write_nanos: 2_500_000_000,
+                    write_calls: 120,
+                    write_seeks: 9,
+                    write_rate: 3_200_000,
+                    buffered_bytes: 65_536,
+                },
+                VolumeSnapshot {
+                    label: "/mnt/scratch".into(),
+                    kind: "unknown",
+                    device: None,
+                    written_bytes: 0,
+                    write_nanos: 0,
+                    write_calls: 0,
+                    write_seeks: 0,
+                    write_rate: 0,
+                    buffered_bytes: 0,
+                },
+            ]
+        );
     }
 }

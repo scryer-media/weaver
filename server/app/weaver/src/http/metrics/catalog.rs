@@ -623,6 +623,10 @@ metric_families! {
         "Bytes written to a volume by its writer.");
     VOLUME_WRITE_SECONDS = ("weaver_volume_write_seconds_total", Counter, ["volume"],
         "Time a volume's writer has spent inside write calls.");
+    VOLUME_WRITE_CALLS = ("weaver_volume_write_calls_total", Counter, ["volume"],
+        "Write calls a volume's writer has made.");
+    VOLUME_WRITE_SEEKS = ("weaver_volume_write_seeks_total", Counter, ["volume"],
+        "Write calls to a volume that did not start where the previous write to the same file ended.");
     VOLUME_WRITE_RATE = ("weaver_volume_write_rate_bytes_per_second", Gauge, ["volume"],
         "What a volume takes while a write call is inside it, over the last 30 seconds that had writes. Conditional: emitted only once the volume has been measured.");
     VOLUME_BUFFERED_BYTES = ("weaver_volume_buffered_bytes", Gauge, ["volume"],

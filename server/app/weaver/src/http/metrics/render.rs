@@ -1559,6 +1559,8 @@ fn render_volumes(out: &mut Encoder, volumes: &[VolumeSnapshot]) {
             labels,
             volume.write_nanos as f64 / 1e9,
         );
+        out.sample(&f::VOLUME_WRITE_CALLS, labels, volume.write_calls);
+        out.sample(&f::VOLUME_WRITE_SEEKS, labels, volume.write_seeks);
         // Zero is "not measured", which is told by the series being absent.
         if volume.write_rate > 0 {
             out.sample(&f::VOLUME_WRITE_RATE, labels, volume.write_rate);

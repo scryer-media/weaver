@@ -14,6 +14,10 @@ pub(crate) struct Volume {
     // write calls.
     pub(crate) written_bytes: AtomicU64,
     pub(crate) write_nanos: AtomicU64,
+    // Write calls its writer has made, and how many of them did not start
+    // where the previous write to the same file ended.
+    pub(crate) write_calls: AtomicU64,
+    pub(crate) write_seeks: AtomicU64,
     // Bytes waiting in memory for its writer.
     pub(crate) buffered_bytes: AtomicU64,
     // What the volume takes, in bytes per second inside write calls, over
@@ -28,6 +32,8 @@ impl Volume {
             label,
             written_bytes: AtomicU64::new(0),
             write_nanos: AtomicU64::new(0),
+            write_calls: AtomicU64::new(0),
+            write_seeks: AtomicU64::new(0),
             buffered_bytes: AtomicU64::new(0),
             write_rate: AtomicU64::new(0),
         }

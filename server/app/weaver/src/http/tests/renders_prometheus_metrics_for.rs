@@ -933,6 +933,9 @@ fn renders_collected_instrumentation_snapshots() {
             .contains("weaver_volume_write_rate_bytes_per_second{volume=\"/mnt/nas\"} 3200000")
     );
     assert!(rendered.contains("weaver_volume_buffered_bytes{volume=\"/mnt/nas\"} 65536"));
+    assert!(rendered.contains("weaver_volume_write_calls_total{volume=\"/mnt/nas\"} 120"));
+    assert!(rendered.contains("weaver_volume_write_seeks_total{volume=\"/mnt/nas\"} 9"));
+    assert!(rendered.contains("weaver_volume_write_seeks_total{volume=\"/mnt/scratch\"} 0"));
     assert!(rendered.contains("weaver_volume_written_bytes_total{volume=\"/mnt/scratch\"} 0"));
     assert!(!rendered.contains("weaver_volume_write_rate_bytes_per_second{volume=\"/mnt/scratch\"}"));
 
