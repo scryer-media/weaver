@@ -463,6 +463,70 @@ async fn an_intermediate_folder_change_moves_only_the_jobs_that_never_started() 
     drop(pipeline);
 }
 
+// A job that never started is sent for, let go, and sent for again while the
+// first read is still moving its working directory. The second ask waits
+// for that move to be heard, so the job gets one new directory, not two.
+#[tokio::test]
+async fn a_job_sent_for_twice_moves_its_working_directory_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, old_root, complete) = new_direct_pipeline(&temp).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let id = JobId(1);
+    enqueue(&mut pipeline, id.0).await;
+    settle(&mut pipeline).await;
+    let queued = |pipeline: &Pipeline| {
+        matches!(
+            pipeline.jobs[&id].articles,
+            crate::jobs::model::JobArticles::Queued(_)
+        )
+    };
+    assert!(queued(&pipeline));
+    let old_dir = pipeline.jobs[&id].working_dir.clone();
+    assert_eq!(old_dir.parent(), Some(old_root.as_path()));
+
+    let new_root = temp.path().join("moved-intermediate");
+    handle
+        .update_runtime_paths(temp.path().join("data"), new_root.clone(), complete)
+        .await
+        .unwrap();
+    settle(&mut pipeline).await;
+    assert_eq!(pipeline.intermediate_dir, new_root);
+
+    // The first ask has the move; the job is let go before its reply.
+    pipeline.request_job_activation(id);
+    assert!(pipeline.moving_jobs.contains_key(&id));
+    pipeline.release_job_articles(id);
+    assert!(queued(&pipeline));
+    // The second ask sends nothing while the move is out.
+    pipeline.request_job_activation(id);
+    assert!(queued(&pipeline));
+    assert!(pipeline.awaits_job_articles(id));
+
+    // The first reply is no longer the job's activation, and its move
+    // stands all the same.
+    let done = pipeline.job_activated_rx.recv().await.unwrap();
+    pipeline.handle_job_activated(done);
+    assert!(queued(&pipeline));
+    assert!(pipeline.moving_jobs.is_empty());
+    let moved = pipeline.jobs[&id].working_dir.clone();
+    assert_eq!(moved.parent(), Some(new_root.as_path()));
+    assert!(!old_dir.exists(), "the old folder is left behind");
+
+    // Sent for again, the job starts in the directory it moved to.
+    activate_job(&mut pipeline, id).await;
+    assert!(matches!(
+        pipeline.jobs[&id].articles,
+        crate::jobs::model::JobArticles::Active(_)
+    ));
+    assert_eq!(pipeline.jobs[&id].working_dir, moved);
+    assert!(pipeline.moving_jobs.is_empty());
+    let dirs = std::fs::read_dir(&new_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(dirs, vec![moved]);
+}
+
 // A reorder among jobs out of the window changes no installed job, and is
 // stored all the same: a restart before they enter keeps it.
 #[tokio::test]
