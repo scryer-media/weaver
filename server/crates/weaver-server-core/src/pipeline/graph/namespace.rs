@@ -309,8 +309,9 @@ pub(crate) struct NamespaceWriter {
     // What the deliveries that bound members gave their new objects, while
     // those members are handed over, innermost last: it is in each member's
     // record and with its object, but in no file or hold, so the hand-over
-    // reads none of it from the member's file.
-    reached_now: Vec<(NodeId, MemberId, NodeId, ByteRange)>,
+    // reads none of it from the member's file. Each names the object and
+    // the volume of it the bytes went to.
+    reached_now: Vec<(NodeId, MemberId, (NodeId, VolumeIndex), ByteRange)>,
     // How many requests are being answered at once, and the most there
     // ever were.
     #[cfg(test)]
@@ -834,20 +835,21 @@ impl NamespaceWriter {
         // What the delivery that bound a member gave its new object went to
         // the object, not to the member's file or holds: the hand-over
         // reads the file around it.
-        let reached: Vec<(NodeId, MemberId, NodeId, ByteRange)> = effects
+        let reached: Vec<(NodeId, MemberId, (NodeId, VolumeIndex), ByteRange)> = effects
             .iter()
             .filter_map(|effect| match effect {
                 Effect::Reached {
                     node,
                     member,
                     child,
+                    volume,
                     offset,
                     bytes,
                     ..
                 } if bound.contains(&(*node, *member, *child)) => Some((
                     *node,
                     *member,
-                    *child,
+                    (*child, *volume),
                     ByteRange::at(*offset, bytes.len() as u64),
                 )),
                 _ => None,
@@ -2107,11 +2109,12 @@ impl NamespaceWriter {
 
     // What of the member is out of its file and not for the file to give:
     // its holds, and what the delivery that bound it gave its object, while
-    // that object still has the member. An object that gave the member up
-    // gave those bytes up with it, and whoever takes the member next reads
-    // them from the file like the rest.
+    // that object still has the member as the volume they went to. An
+    // object that gave the member up gave those bytes up with it, and
+    // whoever takes the member next reads them from the file like the rest,
+    // the same object taking it again as another volume included.
     fn not_in_file(&self, tree: &Tree, node: NodeId, member: MemberId) -> Vec<ByteRange> {
-        let owner = tree.child_of(node, member).map(|(child, _)| child);
+        let owner = tree.child_of(node, member);
         let mut ranges = self
             .files
             .get(&node)
