@@ -59,7 +59,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
 use weaver_server_api::WeaverSchema;
-use weaver_server_core::operations::disk::StorageCapacity;
+use weaver_server_core::operations::disk::{OnDemandSpace, Reach, StorageCapacity};
 use weaver_server_core::settings::model::SharedConfig;
 use weaver_server_core::{Database, SchedulerHandle};
 
@@ -261,7 +261,28 @@ async fn collect_components(
         intermediate_dir.clone(),
         complete_dir.clone(),
     );
-    let host = tokio::task::spawn_blocking(move || collect_host_facts(host_dirs)).await;
+    // Each directory's space and storage class come from the disk owner,
+    // looked at together, each within the owner's time limit.
+    let host_paths = [
+        data_dir.clone(),
+        intermediate_dir.clone(),
+        complete_dir.clone(),
+    ];
+    let (host_spaces, host_classes) = tokio::join!(
+        StorageCapacity::spaces(
+            Some(disk_space.as_ref()),
+            &[
+                (data_dir.clone(), Reach::Exact),
+                (intermediate_dir.clone(), Reach::Exact),
+                (complete_dir.clone(), Reach::Exact),
+            ],
+        ),
+        disk_space.classifications(&host_paths),
+    );
+    let host = tokio::task::spawn_blocking(move || {
+        collect_host_facts(host_dirs, host_spaces, host_classes)
+    })
+    .await;
     components.push(match host {
         Ok(facts) => Component::json("host.json", &facts),
         Err(error) => Component::failed("host.json", error),
@@ -542,14 +563,24 @@ fn service_log_text(data: &serde_json::Value) -> String {
 }
 
 // Host facts, including a storage classification per configured directory.
-fn collect_host_facts(dirs: (PathBuf, PathBuf, PathBuf)) -> HostFacts {
+// Each directory's space and classification are the disk owner's answers,
+// in `spaces` and `classes`, given in the order data, intermediate,
+// complete. A classification that did not answer in time is left out.
+fn collect_host_facts(
+    dirs: (PathBuf, PathBuf, PathBuf),
+    spaces: Vec<OnDemandSpace>,
+    classes: Vec<
+        Option<(
+            weaver_server_core::runtime::system_profile::StorageClass,
+            weaver_server_core::runtime::system_profile::FilesystemType,
+        )>,
+    >,
+) -> HostFacts {
     use weaver_server_core::runtime::{environment, system_probe};
 
     let (data_dir, intermediate_dir, complete_dir) = dirs;
-    // The startup profile is the cheap half of the probe: it classifies the
-    // filesystem behind the path it is given and reads CPU and memory, with no
-    // benchmark attached.
-    let profile = system_probe::detect_startup_profile(&data_dir);
+    // CPU and memory only: storage comes from the disk owner.
+    let (cpu, memory) = system_probe::detect_cpu_and_memory();
     let deployment = environment::detect_runtime_environment();
 
     let storage = [
@@ -558,25 +589,33 @@ fn collect_host_facts(dirs: (PathBuf, PathBuf, PathBuf)) -> HostFacts {
         ("complete", complete_dir),
     ]
     .into_iter()
-    .map(|(role, path)| {
-        let (storage_class, filesystem) = system_probe::classify_storage(&path);
+    .zip(spaces)
+    .zip(classes)
+    .map(|(((role, path), space), class)| {
         let mut entry = HostStorage {
             role,
             path: path.display().to_string(),
-            storage_class: Some(format!("{storage_class:?}")),
-            filesystem: Some(format!("{filesystem:?}")),
+            storage_class: class
+                .as_ref()
+                .map(|(storage_class, _)| format!("{storage_class:?}")),
+            filesystem: class
+                .as_ref()
+                .map(|(_, filesystem)| format!("{filesystem:?}")),
             total_bytes: None,
             used_bytes: None,
             free_bytes: None,
             error: None,
         };
-        match weaver_server_core::operations::probe_disk_space(&path) {
-            Ok(space) => {
+        match space {
+            OnDemandSpace::Read(space) => {
                 entry.total_bytes = Some(space.total_bytes);
                 entry.used_bytes = Some(space.used_bytes());
                 entry.free_bytes = Some(space.available_bytes);
             }
-            Err(error) => entry.error = Some(error.to_string()),
+            OnDemandSpace::Failed(error) | OnDemandSpace::Lost(error) => entry.error = Some(error),
+            OnDemandSpace::TimedOut => {
+                entry.error = Some("filesystem capacity did not answer in time".to_string());
+            }
         }
         entry
     })
@@ -586,12 +625,12 @@ fn collect_host_facts(dirs: (PathBuf, PathBuf, PathBuf)) -> HostFacts {
         operating_system: std::env::consts::OS,
         architecture: std::env::consts::ARCH,
         deployment: format!("{:?}", deployment.deployment),
-        physical_cores: profile.cpu.physical_cores,
-        logical_cores: profile.cpu.logical_cores,
-        cpu_cgroup_limit: profile.cpu.cgroup_limit,
-        memory_total_bytes: profile.memory.total_bytes,
-        memory_available_bytes: profile.memory.available_bytes,
-        memory_cgroup_limit_bytes: profile.memory.cgroup_limit,
+        physical_cores: cpu.physical_cores,
+        logical_cores: cpu.logical_cores,
+        cpu_cgroup_limit: cpu.cgroup_limit,
+        memory_total_bytes: memory.total_bytes,
+        memory_available_bytes: memory.available_bytes,
+        memory_cgroup_limit_bytes: memory.cgroup_limit,
         storage,
     }
 }

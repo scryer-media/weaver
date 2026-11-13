@@ -66,6 +66,10 @@ pub struct SharedPipelineState {
     segment_events: broadcast::Sender<PipelineEvent>,
     // The speed test service, held weakly: the service holds this handle.
     speed_test: Arc<std::sync::Mutex<std::sync::Weak<crate::speed_test::ServiceInner>>>,
+    // The pipeline's free-space samplers, set once it starts: requests read
+    // their cached readings and never look at the disk themselves. Held
+    // weakly, so the samplers stop with the pipeline that owns them.
+    storage_capacity: Arc<RwLock<std::sync::Weak<crate::operations::StorageCapacity>>>,
 }
 
 // Bounded like the job-level broadcast; a lagging listener drops articles,
@@ -99,6 +103,7 @@ impl SharedPipelineState {
             sevenz_decode_memory_bytes: Arc::new(AtomicU64::new(u64::MAX)),
             segment_events,
             speed_test: Arc::new(std::sync::Mutex::new(std::sync::Weak::new())),
+            storage_capacity: Arc::default(),
         }
     }
 
@@ -537,6 +542,23 @@ impl SharedPipelineState {
 
     pub fn nntp_pool(&self) -> Option<Arc<weaver_nntp::pool::NntpPool>> {
         self.nntp_pool.read().unwrap().clone()
+    }
+
+    // The samplers of the pipeline that runs over this state.
+    pub(crate) fn set_storage_capacity(&self, storage: &Arc<crate::operations::StorageCapacity>) {
+        *self
+            .storage_capacity
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::downgrade(storage);
+    }
+
+    // The pipeline's free-space samplers, once it has started. Reading their
+    // cache looks at no disk.
+    pub fn storage_capacity(&self) -> Option<Arc<crate::operations::StorageCapacity>> {
+        self.storage_capacity
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .upgrade()
     }
 
     pub fn set_nntp_runtime_activation(&self, activation: NntpRuntimeActivation) {

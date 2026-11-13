@@ -24,9 +24,8 @@ pub use backup::{
     RestoreOptions, RestoreReport, StableStateExport, apply_pending_restore,
 };
 pub use disk::{
-    Capacity, CapacityDebits, CapacityReader, CapacityReading, CapacitySampler, DiskProbeError,
-    DiskSpace, StorageCapacity, StorageRoot, disk_space, is_out_of_space, probe_disk_space,
-    probe_nearest_disk_space,
+    Capacity, CapacityDebits, CapacityReader, CapacityReading, DiskProbeError, DiskSpace,
+    OnDemandSpace, Reach, StorageCapacity, StorageRoot, is_out_of_space,
 };
 pub use health::{
     BrowseDirectoryError, CreateDirectoryError, DirectoryBrowseEntry, DirectoryBrowseListing,
