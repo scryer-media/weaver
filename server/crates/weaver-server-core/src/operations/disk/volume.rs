@@ -33,6 +33,24 @@ pub(crate) struct Volume {
     // Bytes per second of wall time its writer wrote over the last window,
     // whether or not the volume was the limit; zero when nothing was written.
     pub(crate) throughput: AtomicU64,
+    // What its writer did and what waiting on it cost, for the metrics.
+    pub(crate) writer: WriterCounts,
+}
+
+// A volume writer's own counts. Each is one relaxed add per event.
+#[derive(Default)]
+pub(crate) struct WriterCounts {
+    // Batches the writer ran, and the operations in them it ran.
+    pub(crate) batches: AtomicU64,
+    pub(crate) operations: AtomicU64,
+    // Times the pipeline loop stood still for the writer, and for how long.
+    pub(crate) loop_waits: AtomicU64,
+    pub(crate) loop_wait_nanos: AtomicU64,
+    // Operations that came back with an error.
+    pub(crate) failed_operations: AtomicU64,
+    // Operations not run: their caller gave its files up, or an earlier
+    // operation of the same caller failed.
+    pub(crate) abandoned_operations: AtomicU64,
 }
 
 impl Volume {
@@ -48,6 +66,7 @@ impl Volume {
             idle_turns: AtomicU64::new(0),
             write_rate: AtomicU64::new(0),
             throughput: AtomicU64::new(0),
+            writer: WriterCounts::default(),
         }
     }
 }
