@@ -24,6 +24,14 @@
 //! keystream discarded. ENCRYPT2 is that same RC4 stream when crypto_select is
 //! RC4, and nothing when it is the plaintext method. IA carries the
 //! initiator's BitTorrent handshake.
+//!
+//! The responder picks the method. Weaver as responder picks plaintext
+//! whenever the initiator offered it and the torrent's policy allows it, and
+//! RC4 only when RC4 is the one method both sides allow: under
+//! [`EncryptionPolicy::Prefer`] the handshake is always encrypted and the
+//! payload after it is RC4 only when the peer asks for nothing else; under
+//! [`EncryptionPolicy::Require`] it is always RC4. Weaver as initiator offers
+//! every method its policy allows and takes the one the responder picks.
 
 mod dh;
 mod rc4;
@@ -56,8 +64,15 @@ pub enum EncryptionPolicy {
     /// completed one with, encrypted until it has; one that fails makes the
     /// next connection try the other. Incoming: accept encrypted and
     /// plaintext.
+    ///
+    /// An encrypted handshake offers or accepts both payload methods, and
+    /// plaintext wins whenever both sides allow it: the payload after the
+    /// handshake is RC4-encrypted only when the peer offers or selects RC4
+    /// alone.
     Prefer,
-    /// Every connection is RC4-encrypted; plaintext is never sent or accepted.
+    /// Every connection uses the encrypted handshake and an RC4-encrypted
+    /// payload; a plain BitTorrent handshake and the plaintext payload method
+    /// are never sent or accepted.
     Require,
 }
 
@@ -72,7 +87,9 @@ impl EncryptionPolicy {
         }
     }
 
-    /// The crypto methods this policy allows after the encrypted handshake.
+    /// The crypto methods this policy allows after the encrypted handshake
+    /// (libtorrent `allowed_enc_level`: `pe_both` under Prefer, `pe_rc4`
+    /// under Require).
     fn methods(self) -> u32 {
         match self {
             EncryptionPolicy::Disabled => 0,
@@ -533,10 +550,8 @@ pub(crate) async fn respond(
         .to_vec();
     pos += ia_len;
 
-    let selected = [CRYPTO_RC4, CRYPTO_PLAINTEXT]
-        .into_iter()
-        .find(|m| offered & allowed & m != 0)
-        .ok_or(MseError::NoCommonMethod { offered, allowed })?;
+    let selected =
+        select_method(offered, allowed).ok_or(MseError::NoCommonMethod { offered, allowed })?;
 
     let mut msg = Vec::with_capacity(14);
     msg.extend_from_slice(&VC);
@@ -553,6 +568,16 @@ pub(crate) async fn respond(
         establish(reader, writer, ia, rest, selected, dec, enc),
         Some(skey),
     ))
+}
+
+/// The crypto_select a responder sends for an initiator's `offered` methods
+/// when it allows `allowed`: the least significant method both have, so
+/// plaintext over RC4 (libtorrent 2.0.15 `bt_peer_connection::on_receive_impl`,
+/// src/bt_peer_connection.cpp:3139-3161, with `prefer_rc4` at its default
+/// of false, src/settings_pack.cpp:222). `None` when they share none.
+fn select_method(offered: u32, allowed: u32) -> Option<u32> {
+    let common = offered & allowed & (CRYPTO_PLAINTEXT | CRYPTO_RC4);
+    (common != 0).then(|| common & common.wrapping_neg())
 }
 
 /// Upgrade an accepted connection as `incoming` allows: an encrypted
@@ -582,7 +607,11 @@ pub(crate) async fn upgrade_incoming(
     Ok((established.encryption, established.writer, skey))
 }
 
-/// The crypto_provide bitmask an outgoing connection offers under `policy`.
+/// The crypto_provide bitmask an outgoing connection offers under `policy`:
+/// every method it allows, the responder choosing (libtorrent 2.0.15
+/// `bt_peer_connection::write_pe3_sync`, src/bt_peer_connection.cpp:646-649,
+/// offers `allowed_enc_level`, and `on_receive_impl`, :3175-3188, takes the
+/// selection if it is one of them).
 pub(crate) fn outgoing_offer(policy: EncryptionPolicy) -> u32 {
     policy.methods()
 }

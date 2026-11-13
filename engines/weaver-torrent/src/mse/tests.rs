@@ -140,6 +140,108 @@ async fn run_pair(
     }
 }
 
+/// A writer that keeps a copy of every byte it puts on the wire.
+struct Tap {
+    inner: BoxAsyncWrite,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl tokio::io::AsyncWrite for Tap {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &polled {
+            self.seen.lock().unwrap().extend_from_slice(&buf[..*n]);
+        }
+        polled
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// What the initiator put on the wire over a whole connection: its side
+/// of the handshake, then [`exchange`]'s stream.
+struct Wiretap {
+    initiator: Encryption,
+    responder: Encryption,
+    sent: Vec<u8>,
+}
+
+impl Wiretap {
+    /// Whether [`exchange`]'s stream crossed the wire as it was written.
+    fn payload_in_clear(&self) -> bool {
+        let needle = &stream_data()[..4096];
+        self.sent.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Whether the initiator's BitTorrent handshake, sent in IA, crossed
+    /// the wire as it was written.
+    fn handshake_in_clear(&self) -> bool {
+        self.sent
+            .windows(PLAINTEXT_HANDSHAKE_PREFIX.len())
+            .any(|w| w == PLAINTEXT_HANDSHAKE_PREFIX)
+    }
+}
+
+/// A Weaver initiator offering `offer` to a Weaver responder whose torrent
+/// is under `policy`, then [`exchange`] over the result, the initiator's
+/// bytes recorded.
+async fn tapped(offer: u32, policy: EncryptionPolicy) -> Wiretap {
+    let ih = Id20::new([7; 20]);
+    let torrents = by_obfuscated(&[ih], policy);
+    let ((ar, aw), (br, bw)) = pipe();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let aw: BoxAsyncWrite = Box::new(Tap {
+        inner: aw,
+        seen: seen.clone(),
+    });
+    let ia = bt_handshake(ih, 1);
+    let mut reader = br;
+    let (a, b) = tokio::join!(
+        initiate(ar, aw, &ih, offer, &ia),
+        upgrade_incoming(incoming(policy), &mut reader, bw, Duration::MAX, |o| {
+            torrents.get(o).copied()
+        }),
+    );
+    let a = a.unwrap();
+    let (responder, writer, skey) = b.unwrap();
+    assert_eq!(skey, Some(ih));
+    let initiator = a.encryption;
+    let b = Established {
+        reader,
+        writer,
+        encryption: responder,
+    };
+    exchange(a, b, ih).await;
+    let sent = std::mem::take(&mut *seen.lock().unwrap());
+    Wiretap {
+        initiator,
+        responder,
+        sent,
+    }
+}
+
+fn stream_data() -> Vec<u8> {
+    (0..200_000u32)
+        .map(|i| u8::try_from(i % 241).unwrap())
+        .collect()
+}
+
 async fn exchange(mut a: Established, mut b: Established, info_hash: Id20) {
     // The responder finds the initiator's handshake (sent in IA) first.
     let h = read_bt_handshake(&mut b.reader).await;
@@ -153,9 +255,7 @@ async fn exchange(mut a: Established, mut b: Established, info_hash: Id20) {
     assert_eq!(h.peer_id, Id20::new([2; 20]));
 
     // Then a stream larger than the pipe both ways at once.
-    let data: Vec<u8> = (0..200_000u32)
-        .map(|i| u8::try_from(i % 241).unwrap())
-        .collect();
+    let data = stream_data();
     let (mut out_a, mut out_b) = (data.clone(), data.clone());
     let (sent_a, sent_b, got_a, got_b) = tokio::join!(
         a.writer.write_all(&mut out_a),
@@ -349,7 +449,11 @@ async fn read_vectored_exact(r: &mut BoxAsyncReadVectored, len: usize) -> Vec<u8
 
 /// The encrypted handshake and then a stream larger than one read, both ways,
 /// over uTP, read with vectored reads: what the peer connection does.
-async fn mse_over_utp(offer_policy: EncryptionPolicy, responder_policy: EncryptionPolicy) {
+async fn mse_over_utp(
+    offer_policy: EncryptionPolicy,
+    responder_policy: EncryptionPolicy,
+    expected: Encryption,
+) {
     let ih = Id20::new([7; 20]);
     let ((ar, aw), (br, bw), _sockets) = utp_pipe().await;
     let ia = bt_handshake(ih, 1);
@@ -367,8 +471,8 @@ async fn mse_over_utp(offer_policy: EncryptionPolicy, responder_policy: Encrypti
     );
     let (encryption, writer, _) = b.unwrap();
     let mut a = a.unwrap();
-    assert_eq!(encryption, Encryption::Rc4);
-    assert_eq!(a.encryption, Encryption::Rc4);
+    assert_eq!(encryption, expected);
+    assert_eq!(a.encryption, expected);
     let mut b = Established {
         reader,
         writer,
@@ -395,12 +499,108 @@ async fn mse_over_utp(offer_policy: EncryptionPolicy, responder_policy: Encrypti
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_rc4_over_utp_moves_data_under_require() {
-    mse_over_utp(EncryptionPolicy::Require, EncryptionPolicy::Require).await;
+    mse_over_utp(
+        EncryptionPolicy::Require,
+        EncryptionPolicy::Require,
+        Encryption::Rc4,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_rc4_over_utp_moves_data_under_prefer() {
-    mse_over_utp(EncryptionPolicy::Prefer, EncryptionPolicy::Prefer).await;
+async fn test_header_only_over_utp_moves_data_under_prefer() {
+    mse_over_utp(
+        EncryptionPolicy::Prefer,
+        EncryptionPolicy::Prefer,
+        Encryption::HeaderOnly,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_rc4_over_utp_moves_data_from_prefer_to_require() {
+    mse_over_utp(
+        EncryptionPolicy::Prefer,
+        EncryptionPolicy::Require,
+        Encryption::Rc4,
+    )
+    .await;
+}
+
+/// libtorrent 2.0.15 `bt_peer_connection::on_receive_impl`
+/// (src/bt_peer_connection.cpp:3139-3161): without `prefer_rc4` the
+/// responder keeps the least significant method both sides allow.
+#[test]
+fn test_select_method_keeps_the_least_significant_common_method() {
+    let both = CRYPTO_RC4 | CRYPTO_PLAINTEXT;
+    let prefer = EncryptionPolicy::Prefer.methods();
+    let require = EncryptionPolicy::Require.methods();
+    assert_eq!(select_method(both, prefer), Some(CRYPTO_PLAINTEXT));
+    assert_eq!(select_method(CRYPTO_RC4, prefer), Some(CRYPTO_RC4));
+    assert_eq!(
+        select_method(CRYPTO_PLAINTEXT, prefer),
+        Some(CRYPTO_PLAINTEXT)
+    );
+    assert_eq!(select_method(both, require), Some(CRYPTO_RC4));
+    assert_eq!(select_method(CRYPTO_RC4, require), Some(CRYPTO_RC4));
+    assert_eq!(select_method(CRYPTO_PLAINTEXT, require), None);
+    // Methods neither side knows are never selected.
+    assert_eq!(select_method(0xfc, prefer), None);
+    assert_eq!(select_method(0xfc | both, prefer), Some(CRYPTO_PLAINTEXT));
+}
+
+#[tokio::test]
+async fn test_prefer_responder_selects_plaintext_from_an_offer_of_both() {
+    let tap = tapped(CRYPTO_RC4 | CRYPTO_PLAINTEXT, EncryptionPolicy::Prefer).await;
+    assert_eq!(tap.initiator, Encryption::HeaderOnly);
+    assert_eq!(tap.responder, Encryption::HeaderOnly);
+    assert!(!tap.handshake_in_clear(), "the handshake went out in clear");
+    assert!(tap.payload_in_clear(), "the payload went out enciphered");
+}
+
+#[tokio::test]
+async fn test_prefer_responder_selects_rc4_from_an_rc4_only_offer() {
+    let tap = tapped(CRYPTO_RC4, EncryptionPolicy::Prefer).await;
+    assert_eq!(tap.initiator, Encryption::Rc4);
+    assert_eq!(tap.responder, Encryption::Rc4);
+    assert!(!tap.handshake_in_clear(), "the handshake went out in clear");
+    assert!(!tap.payload_in_clear(), "the payload went out in clear");
+}
+
+#[tokio::test]
+async fn test_two_prefer_ends_are_header_only() {
+    let tap = tapped(
+        outgoing_offer(EncryptionPolicy::Prefer),
+        EncryptionPolicy::Prefer,
+    )
+    .await;
+    assert_eq!(tap.initiator, Encryption::HeaderOnly);
+    assert_eq!(tap.responder, Encryption::HeaderOnly);
+    assert!(!tap.handshake_in_clear(), "the handshake went out in clear");
+    assert!(tap.payload_in_clear(), "the payload went out enciphered");
+}
+
+#[tokio::test]
+async fn test_prefer_initiator_runs_rc4_when_the_responder_selects_it() {
+    let tap = tapped(
+        outgoing_offer(EncryptionPolicy::Prefer),
+        EncryptionPolicy::Require,
+    )
+    .await;
+    assert_eq!(tap.initiator, Encryption::Rc4);
+    assert_eq!(tap.responder, Encryption::Rc4);
+    assert!(!tap.handshake_in_clear(), "the handshake went out in clear");
+    assert!(!tap.payload_in_clear(), "the payload went out in clear");
+}
+
+#[tokio::test]
+async fn test_require_initiator_runs_rc4_against_either_responder() {
+    for policy in [EncryptionPolicy::Prefer, EncryptionPolicy::Require] {
+        let tap = tapped(outgoing_offer(EncryptionPolicy::Require), policy).await;
+        assert_eq!(tap.initiator, Encryption::Rc4, "{policy:?}");
+        assert_eq!(tap.responder, Encryption::Rc4, "{policy:?}");
+        assert!(!tap.payload_in_clear(), "{policy:?}: payload in clear");
+    }
 }
 
 #[tokio::test]
