@@ -1480,17 +1480,23 @@ impl TorrentStateLive {
     /// and holds the peer id it sent. False when another connection holds
     /// that id and this one is to close; see [`PeerStates::claim_peer_id`].
     /// A web seed sends no peer id.
+    ///
+    /// The connection's send buffer is bound to `upload` here, under the
+    /// hold of the peer that makes it live: the writer of this connection
+    /// never looks it up by address, where a later connection could stand.
     fn set_peer_live(
         &self,
         handle: PeerHandle,
         h: Handshake,
         connection_kind: ConnectionKind,
+        upload: &std::sync::OnceLock<Arc<UploadLedger>>,
     ) -> bool {
         let claim = self.peers.with_peer_mut(handle, "set_peer_live", |p| {
             p.connecting_to_live(h.peer_id, &self.peers, connection_kind);
             // An incoming connection is live before its handshake gets here.
             if let Some(live) = p.get_live_mut() {
                 live.fast = h.supports_fast();
+                upload.get_or_init(|| live.upload_ledger());
             }
             let outgoing = p.connected_out() == Some(true);
             match p.get_live() {
@@ -2452,7 +2458,8 @@ struct PeerHandler {
     // The connection's writes queued for the disk threads.
     disk: Arc<PeerDisk>,
     // The peer's send buffer, which the writer takes blocks from and
-    // settles them in without the peer map; had from the live peer once.
+    // settles them in without the peer map; bound when the connection goes
+    // live, and empty before.
     upload: std::sync::OnceLock<Arc<UploadLedger>>,
     // Semantically, we don't need a lock here, as this is only requested from
     // one future (requester + manage_peer).
@@ -2709,7 +2716,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         // failure (libtorrent disconnects with `duplicate_peer_id` at normal
         // severity).
         let supports_dht = handshake.supports_dht();
-        if !self.state.set_peer_live(self.addr, handshake, ckind) {
+        if !self.state.set_peer_live(self.addr, handshake, ckind, &self.upload) {
             return Err(crate::Error::Disconnect.into());
         }
         if supports_dht {
@@ -2851,21 +2858,23 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     // A seed-mode piece is checked on a blocking thread, and the peer's
     // writer waits for it (libtorrent `peer_connection::fill_send_buffer`
     // queues `disk_interface::async_hash` and keeps the request until
-    // `on_seed_mode_hashed`): the hash holds none of the permits the reads
-    // of blocks share.
+    // `on_seed_mode_hashed`). The check holds a blocking permit like any
+    // other read of the torrent's files, so however many peers ask for
+    // unchecked pieces at once, no more checks run than there are permits.
     async fn serves(&self, chunk: &ChunkInfo) -> anyhow::Result<bool> {
         let piece = chunk.piece_index;
         if !self.state.shared.options.seed.unchecked(piece) {
             return Ok(true);
         }
         let state = Arc::clone(&self.state);
-        // On the session's pool: a uTP thread's runtime has a pool of its
-        // own, which nothing bounds.
+        // On the session's pool: a uTP thread may not block, and its
+        // runtime has a pool of its own, which nothing bounds.
         self.state
             .shared
             .spawner
-            .spawn_blocking(move || state.check_seeded(piece))
-            .await?
+            .spawn_blocking_with_permit(move || state.check_seeded(piece))
+            .await
+            .context("the session ended before a seed-mode check ran")?
     }
 
     fn read_chunk(&self, chunk: &ChunkInfo, buf: &mut [u8]) -> anyhow::Result<()> {
@@ -3076,16 +3085,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
 }
 
 impl PeerHandler {
-    // The peer's send buffer, once the peer is live.
+    // The peer's send buffer, once the connection is live.
     fn upload_ledger(&self) -> Option<&Arc<UploadLedger>> {
-        if let Some(upload) = self.upload.get() {
-            return Some(upload);
-        }
-        let upload = self
-            .state
-            .peers
-            .with_live(self.addr, |live| live.upload_ledger())?;
-        Some(self.upload.get_or_init(|| upload))
+        self.upload.get()
     }
 
     /// Queues `answer` for the writer, counted until it is written. False

@@ -153,15 +153,28 @@ impl BlockingSpawner {
         self.concurrent_block_in_place_semaphore.clone()
     }
 
-    /// Runs `f` on one of the session's blocking threads, with no permit:
-    /// from any thread, a uTP thread too, the work runs on the session's
-    /// pool, never on the calling runtime's own.
-    pub(crate) fn spawn_blocking<F, R>(&self, f: F) -> tokio::task::JoinHandle<R>
+    /// Runs `f` on one of the session's blocking threads once it holds a
+    /// blocking permit, from any thread, a uTP thread too: the work runs on
+    /// the session's pool, never on the calling runtime's own, and disk
+    /// work that cannot run in place counts against the same bound as the
+    /// work that does. None when the session's runtime shut down before it ran, or it
+    /// panicked.
+    pub(crate) async fn spawn_blocking_with_permit<F, R>(&self, f: F) -> Option<R>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        self.handle.spawn_blocking(f)
+        let permit = Arc::clone(&self.concurrent_block_in_place_semaphore)
+            .acquire_owned()
+            .await
+            .ok()?;
+        self.handle
+            .spawn_blocking(move || {
+                let _permit = permit;
+                f()
+            })
+            .await
+            .ok()
     }
 
     /// Runs `fut` on the session's runtime, from any thread: a task that
@@ -270,7 +283,7 @@ mod tests {
                 .await
                 .unwrap();
             let flavor = spawner
-                .spawn_blocking(|| tokio::runtime::Handle::current().runtime_flavor())
+                .spawn_blocking_with_permit(|| tokio::runtime::Handle::current().runtime_flavor())
                 .await
                 .unwrap();
             (in_place, flavor)
@@ -278,6 +291,52 @@ mod tests {
         assert_eq!(in_place, 7);
         assert_eq!(flavor, tokio::runtime::RuntimeFlavor::MultiThread);
     }
+
+    // Blocking work handed off with a permit holds it while it runs: with
+    // every permit held, the next does not start until one comes back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn work_handed_off_with_a_permit_counts_against_the_blocking_bound() {
+        use std::sync::mpsc::channel;
+
+        let spawner = BlockingSpawner::new(2);
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel::<()>();
+        let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+        let job = |n: u32| {
+            let (started, release) = (started_tx.clone(), release_rx.clone());
+            let spawner = spawner.clone();
+            tokio::spawn(async move {
+                spawner
+                    .spawn_blocking_with_permit(move || {
+                        started.send(n).unwrap();
+                        release.lock().unwrap().recv().unwrap();
+                        n
+                    })
+                    .await
+            })
+        };
+        let (first, second) = (job(1), job(2));
+        let started = tokio::task::spawn_blocking(move || {
+            let two = [started_rx.recv().unwrap(), started_rx.recv().unwrap()];
+            (two, started_rx)
+        });
+        let (mut two, started_rx) = started.await.unwrap();
+        two.sort_unstable();
+        assert_eq!(two, [1, 2]);
+        assert_eq!(spawner.semaphore().available_permits(), 0);
+
+        // The third waits for a permit, which only a finished job gives.
+        let third = job(3);
+        for _ in 0..3 {
+            release_tx.send(()).unwrap();
+        }
+        assert_eq!(first.await.unwrap(), Some(1));
+        assert_eq!(second.await.unwrap(), Some(2));
+        assert_eq!(third.await.unwrap(), Some(3));
+        assert_eq!(started_rx.try_recv(), Ok(3));
+        assert_eq!(spawner.semaphore().available_permits(), 2);
+    }
+
     // Says, when dropped, whether it was dropped on a uTP thread.
     struct Dropped(Option<tokio::sync::oneshot::Sender<bool>>);
 

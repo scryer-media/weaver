@@ -229,6 +229,13 @@ impl Harness {
             .peers
             .add_incoming(addr, client_id(addr), tx.clone(), ConnectionKind::Tcp, 6881)
             .unwrap();
+        // The connection is live: its send buffer is bound, as the
+        // handshake binds it.
+        let upload = self
+            .live
+            .peers
+            .with_live(addr, peer::LivePeerState::upload_ledger)
+            .unwrap();
         let handler = PeerHandler {
             addr,
             incoming: true,
@@ -243,7 +250,7 @@ impl Harness {
             counters,
             first_message_received: AtomicBool::new(false),
             disk: Default::default(),
-            upload: Default::default(),
+            upload: upload.into(),
             cancel_token: self.live.cancellation_token.child_token(),
             client_name_and_version: String::new(),
         };
@@ -1408,6 +1415,42 @@ async fn a_cancel_of_an_unsent_block_is_answered_with_a_reject_on_a_fast_connect
         .await
         .unwrap();
     assert!(rx.is_empty());
+}
+
+// The writer's send buffer is the one of the connection that went live with
+// it, bound by the handshake and by nothing later: a writer whose
+// connection has not gone live takes no block, whoever is live at its
+// address.
+#[tokio::test]
+async fn a_writer_holds_the_send_buffer_its_handshake_bound() {
+    let h = Harness::seeding_bytes("upload_ledger_bound", 4).await;
+    let (mut peer, mut rx) = h.peer("127.0.0.1:6881");
+    let addr = peer.addr;
+    let live_ledger = || {
+        h.live
+            .peers
+            .with_live(addr, peer::LivePeerState::upload_ledger)
+            .unwrap()
+    };
+    peer.upload = Default::default();
+    let peer = &peer;
+    peer.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+    peer.on_received_message(Message::Request(request(0, 0)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Block(0, 0));
+
+    // A peer is live at the address and its send buffer holds the block,
+    // and the writer has no send buffer to take it from.
+    assert!(peer.upload.get().is_none());
+    assert!(!peer.claim_upload(&h.chunk(0, 0)));
+
+    peer.on_handshake(handshake(true), ConnectionKind::Tcp, false)
+        .unwrap();
+    assert!(Arc::ptr_eq(peer.upload.get().unwrap(), &live_ledger()));
+    assert!(peer.claim_upload(&h.chunk(0, 0)));
+    peer.upload_done(&h.chunk(0, 0));
 }
 
 // libtorrent `peer_connection::fill_send_buffer`: each peer is served from

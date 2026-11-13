@@ -625,20 +625,34 @@ impl Framed {
 /// longer run is framed in a buffer lent for the write.
 const BATCH_BLOCKS: usize = 32;
 const BATCH_LEN: usize = BATCH_BLOCKS * PIECE_MESSAGE_DEFAULT_LEN;
-// The batch buffers kept for the next writer once returned; any more are
-// let go.
-const BATCH_BUFS_KEPT: usize = 16;
 
-/// The batch buffers between writes: a writer holds one only from framing
-/// its blocks to their write, so a connection at rest holds none.
-static BATCH_BUFS: std::sync::Mutex<Vec<Box<[u8]>>> = std::sync::Mutex::new(Vec::new());
+/// A writer's batch buffer. It is made at the writer's first run of blocks
+/// and kept while the writer has something to send within every keep-alive
+/// interval, so a write allocates nothing however many peers are served; a
+/// writer with nothing to send for a whole interval lets it go. The memory
+/// is 512 KiB for each connection that sent a run of blocks within the last
+/// interval, which is what libtorrent holds for each peer it uploads to (a
+/// send buffer filled to `send_buffer_watermark`, 500 KiB by default).
+#[derive(Default)]
+struct BatchBuf(Option<Box<[u8]>>);
 
-fn lend_batch_buf() -> Box<[u8]> {
-    BATCH_BUFS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .pop()
-        .unwrap_or_else(|| vec![0u8; BATCH_LEN].into_boxed_slice())
+impl BatchBuf {
+    /// The buffer, for one write: it leaves the writer while its blocks are
+    /// read, and comes back with [`Self::keep`].
+    fn lend(&mut self) -> Box<[u8]> {
+        self.0
+            .take()
+            .unwrap_or_else(|| vec![0u8; BATCH_LEN].into_boxed_slice())
+    }
+
+    fn keep(&mut self, buf: Box<[u8]>) {
+        self.0 = Some(buf);
+    }
+
+    /// The writer had nothing to send for a keep-alive interval.
+    fn rest(&mut self) {
+        self.0 = None;
+    }
 }
 
 /// The payloads of `buf` at `spans`, each a start and an end, in order and
@@ -655,15 +669,6 @@ fn payloads_in<'a>(buf: &'a mut [u8], spans: &[(usize, usize)]) -> Vec<&'a mut [
         at = end;
     }
     payloads
-}
-
-fn return_batch_buf(buf: Box<[u8]>) {
-    let mut kept = BATCH_BUFS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if kept.len() < BATCH_BUFS_KEPT {
-        kept.push(buf);
-    }
 }
 
 /// Writes `buf` once its bytes are paid for. The timeout runs only while the
@@ -1033,6 +1038,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             let mut carried: Option<WriterRequest> = None;
             let mut batch: Vec<Framed> = Vec::new();
             let mut sent: Vec<ChunkInfo> = Vec::new();
+            let mut batch_buf = BatchBuf::default();
             loop {
                 let first = match carried.take() {
                     Some(req) => req,
@@ -1041,7 +1047,10 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                         Ok(None) => {
                             return Err(Error::TorrentIsNotLive);
                         }
-                        Err(_) => WriterRequest::Message(Message::KeepAlive),
+                        Err(_) => {
+                            batch_buf.rest();
+                            WriterRequest::Message(Message::KeepAlive)
+                        }
                     },
                 };
 
@@ -1062,7 +1071,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 let mut lent = (matches!(first, WriterRequest::ReadChunkRequest(_))
                     && outgoing_chan.len() >= 2
                     && BATCH_LEN > write_buf.len())
-                .then(lend_batch_buf);
+                .then(|| batch_buf.lend());
                 let buf: &mut [u8] = match &mut lent {
                     Some(lent) => lent,
                     None => &mut write_buf,
@@ -1259,7 +1268,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     answers.written(answered);
                 }
                 if let Some(lent) = lent {
-                    return_batch_buf(lent);
+                    batch_buf.keep(lent);
                 }
 
                 let mut sent_payload = 0u64;
@@ -2630,6 +2639,31 @@ mod tests {
         assert!(matches!(result, Err(Error::TorrentIsNotLive)), "{result:?}");
         let told = recorder.told.lock().clone();
         (told, wire, plain, meter.sent())
+    }
+
+    // A writer's batch buffer is made once and lent again for every write,
+    // however many writers hold one at the same time, and a writer at rest
+    // holds none.
+    #[test]
+    fn a_writer_lends_the_same_batch_buffer_for_every_write() {
+        let mut writers: Vec<super::BatchBuf> = (0..64).map(|_| Default::default()).collect();
+        let lent: Vec<Box<[u8]>> = writers.iter_mut().map(super::BatchBuf::lend).collect();
+        let made: Vec<*const u8> = lent.iter().map(|buf| buf.as_ptr()).collect();
+        assert!(lent.iter().all(|buf| buf.len() == super::BATCH_LEN));
+        for (writer, buf) in writers.iter_mut().zip(lent) {
+            writer.keep(buf);
+        }
+        for _ in 0..3 {
+            for (writer, made) in writers.iter_mut().zip(&made) {
+                let buf = writer.lend();
+                assert_eq!(buf.as_ptr(), *made);
+                writer.keep(buf);
+            }
+        }
+        for writer in &mut writers {
+            writer.rest();
+            assert!(writer.0.is_none());
+        }
     }
 
     // A run of blocks queued together goes out in writes of at most
