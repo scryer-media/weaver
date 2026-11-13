@@ -135,6 +135,11 @@ pub fn pread_exact_vectored(
     {
         use std::io::IoSliceMut;
         let total: u64 = bufs.iter().map(|buf| buf.len() as u64).sum();
+        // Nothing to fill: a preadv of no bytes returns 0, which is also
+        // how it says the file has ended.
+        if total == 0 {
+            return Ok(());
+        }
         // off_t is 32 bits on some 32-bit targets: past it, read the buffers
         // one after the other, as pwrite_all_vectored() writes them.
         if nix::libc::off_t::try_from(offset.saturating_add(total)).is_ok() {
@@ -404,5 +409,11 @@ mod tests {
         let mut past: Vec<&mut [u8]> = vec![&mut e, &mut f];
         let err = super::pread_exact_vectored(&file, 49_850, &mut past).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+
+        // Buffers that hold nothing are filled by reading nothing, at the
+        // end of the file as anywhere.
+        let mut none: Vec<&mut [u8]> = vec![&mut c, &mut []];
+        super::pread_exact_vectored(&file, 50_000, &mut none).unwrap();
+        super::pread_exact_vectored(&file, 77, &mut []).unwrap();
     }
 }
