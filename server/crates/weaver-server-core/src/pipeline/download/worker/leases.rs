@@ -336,6 +336,11 @@ impl Pipeline {
         if checkpoint.holds_every_payload_article() && queue.recovery_work_count() == 0 {
             return Err(BlockedBy::only(SchedulerBlockClause::Checkpoint));
         }
+        // A volume the job writes to holds its budget of bytes for its
+        // writer: nothing more is fetched for the job until it is below.
+        if self.volume_holds_budget(job_id) {
+            return Err(BlockedBy::only(SchedulerBlockClause::Checkpoint));
+        }
         let Some(bootstrap_files) = bootstrap_files else {
             return Ok(());
         };

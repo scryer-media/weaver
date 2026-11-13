@@ -109,6 +109,9 @@ pub(crate) struct Storage {
     pub(crate) hardware: super::hardware::Hardware,
     // Where the job's writes publish what they take, in a pipeline.
     pub(crate) metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
+    // The volume writers the job's files are written through; `None` for a
+    // job that writes its files itself as each byte is placed.
+    pub(crate) disk: Option<super::disk::JobDisk>,
     // Weaver's data folder and the free space of its disk: where a decode
     // window goes when the working directory cannot hold it.
     pub(crate) data_dir: Option<(PathBuf, CapacityReader, super::window::ScratchLedger)>,
@@ -204,6 +207,7 @@ impl GraphJob {
             storage.free_disk,
         )
         .delivering(storage.output)
+        .writing_through(storage.disk)
         .capped(storage.caps)
         .metered(storage.metrics);
         Self::new(
@@ -380,6 +384,20 @@ impl GraphJob {
         self.runs.in_flight() || self.loans.out() || self.works.out() || self.mail_owed.is_some()
     }
 
+    // Whether a stopped job must be kept: mail of it is still to come, or a
+    // volume's writer still holds an operation on its files. Nothing may
+    // remove, move or hand on those files before both are over.
+    pub(in crate::pipeline) fn holds_retirement(&self) -> bool {
+        self.awaits_mail() || self.writer.disk().is_some_and(|disk| !disk.quiet())
+    }
+
+    // The job's files are given up: nothing still queued for them runs.
+    pub(in crate::pipeline) fn abandon_disk(&self) {
+        if let Some(disk) = self.writer.disk() {
+            disk.abandon();
+        }
+    }
+
     // The checkpoint `stamp` records every name the job's files want and
     // every name they left so far.
     pub(crate) fn recorded(&mut self, stamp: u64) {
@@ -453,6 +471,21 @@ impl GraphJob {
         Ok(())
     }
 
+    // The file system refused the name of a file a volume's writer was to
+    // make: its member is skipped as damaged, as a refusal met while
+    // writing it would skip it.
+    pub(crate) fn name_refused(&mut self, file: u64) -> Result<(), GraphError> {
+        let mut out = Vec::new();
+        self.writer.name_refused(
+            &mut self.tree,
+            &mut *self.builder,
+            &self.root,
+            file,
+            &mut out,
+        )?;
+        self.heard(out)
+    }
+
     // Keep ownership until stopped workers report that they ended.
     pub(in crate::pipeline) fn request_stop(&self) {
         self.runs.request_stop();
@@ -524,6 +557,16 @@ impl GraphJob {
     // names that waited for it.
     pub(crate) fn learn_policy(&mut self) -> Result<(), String> {
         self.writer.learn_policy()
+    }
+
+    // Everything the job has submitted to its volumes' writers so far;
+    // `None` for a job that writes its files itself.
+    pub(crate) fn disk_barrier(&self) -> Option<super::disk::JobBarrier> {
+        self.writer.disk().map(|disk| disk.barrier())
+    }
+
+    pub(crate) fn disk(&self) -> Option<&super::disk::JobDisk> {
+        self.writer.disk()
     }
 
     pub(crate) fn pending(&self) -> &Pending {

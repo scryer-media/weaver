@@ -16,10 +16,11 @@ use crate::runtime::system_profile::{FilesystemType, StorageClass};
 
 mod storage_kind;
 pub(crate) mod volume;
-mod volume_seam;
 pub(crate) mod volume_label;
 pub(crate) mod volume_rate;
 mod volume_view;
+mod volumes;
+pub(crate) mod writer;
 
 pub(crate) use storage_kind::StorageKind;
 pub use volume_view::VolumeWriteRate;
@@ -1587,6 +1588,8 @@ pub struct StorageCapacity {
     readings: Arc<tokio::sync::Notify>,
     // Every other path asked after, looked at on demand.
     paths: Arc<Mutex<PathCache>>,
+    // The volumes asked after, one per device.
+    volumes: volumes::Volumes,
     interval: Duration,
     probe: SharedProbeFn,
     clock: Arc<Clock>,
@@ -1707,6 +1710,7 @@ impl StorageCapacity {
             slots,
             readings,
             paths: Arc::default(),
+            volumes: volumes::Volumes::default(),
             interval,
             probe,
             clock,

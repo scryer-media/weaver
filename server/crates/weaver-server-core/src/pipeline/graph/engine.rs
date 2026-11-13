@@ -98,6 +98,13 @@ pub(crate) enum Heard {
     CheckpointDue {
         control: crate::persistence::checkpoint_write::CheckpointControl,
     },
+    // The volumes' writers returned everything the job had submitted when
+    // a checkpoint or the job's end began to wait for it. Addressed to the
+    // root, under no run's generation.
+    DiskReturned,
+    // A volume's writer could not complete an operation on one of the
+    // job's files. Addressed to the root, under no run's generation.
+    DiskFailed(Box<crate::operations::disk::writer::Failure>),
 }
 
 // Where every graph job's runs speak, and where the database says a

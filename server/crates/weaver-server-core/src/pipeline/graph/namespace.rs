@@ -295,6 +295,9 @@ pub(crate) struct NamespaceWriter {
     // Where the time a member write takes on disk is published, when the
     // job runs in a pipeline.
     metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
+    // The volume writers the job's files are written through; `None` for a
+    // job whose leaves run their own file operations as they are asked.
+    disk: Option<crate::pipeline::graph::disk::JobDisk>,
     // The nodes whose bytes are being said again, and the requests their
     // objects raised meanwhile that wait for that replay to end
     // (`Object::again_waits`), in the order raised.
@@ -398,6 +401,7 @@ impl NamespaceWriter {
             placements: Vec::new(),
             asked: BTreeMap::new(),
             metrics: None,
+            disk: None,
             replaying: BTreeSet::new(),
             again_held: Vec::new(),
             held_want: None,
@@ -414,6 +418,38 @@ impl NamespaceWriter {
         self.output_dir = output_dir;
         self.output_free_disk = free_disk;
         self
+    }
+
+    // The job's files are written through the volume writers of `disk`.
+    pub(crate) fn writing_through(
+        mut self,
+        disk: Option<crate::pipeline::graph::disk::JobDisk>,
+    ) -> Self {
+        self.envelopes
+            .write_through(disk.as_ref().map(|disk| Arc::clone(disk.working())));
+        self.disk = disk;
+        self
+    }
+
+    // The writer of the volume a file under `root` lies on, when the job
+    // writes through one.
+    pub(super) fn disk_under(
+        &self,
+        root: &Path,
+    ) -> Option<Arc<crate::operations::disk::writer::Submitter>> {
+        self.disk.as_ref().map(|disk| Arc::clone(disk.under(root)))
+    }
+
+    // Wait until everything the job submitted for its files has returned:
+    // what follows reads or names them where they lie.
+    pub(crate) fn settle_disk(&self) {
+        if let Some(disk) = &self.disk {
+            disk.barrier().wait();
+        }
+    }
+
+    pub(crate) fn disk(&self) -> Option<&crate::pipeline::graph::disk::JobDisk> {
+        self.disk.as_ref()
     }
 
     pub(crate) fn delivering(self, output: Option<(PathBuf, CapacityReader)>) -> Self {
@@ -1065,6 +1101,8 @@ impl NamespaceWriter {
         write: Write,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        // What is written of the arrival shares its buffer.
+        let _lent = crate::pipeline::graph::leaf::lend(arrival.bytes.bytes());
         self.place_as(tree, builder, segments, (arrival, false), write, out)
             .map(|_| ())
     }
@@ -1922,9 +1960,10 @@ impl NamespaceWriter {
     // leaf from then on, as `Files::spills` says.
     fn spill_file(&mut self, node: NodeId, member: MemberId) -> Result<&mut Leaf, WriteError> {
         let dir = self.working_dir.clone();
+        let to = self.disk_under(&dir);
         let files = self.files_mut(node);
         if let std::collections::btree_map::Entry::Vacant(vacant) = files.spills.entry(member) {
-            let mut spill = Leaf::at(&dir, &spill_name(node, member));
+            let mut spill = Leaf::at(&dir, &spill_name(node, member)).through(to.as_ref());
             spill.truncate()?;
             vacant.insert(spill);
             files.spills_empty.insert(member);
@@ -2455,6 +2494,34 @@ impl NamespaceWriter {
     // same way. Any other error stands: a full disk, a permission, a
     // read-only volume, a file already on disk, and a member an object
     // reads, such as a recovery volume, still fail the job.
+    // A volume's writer could not make the file of the leaf `file`: the
+    // file system refused its name. The member is skipped as `write_file`
+    // skips one whose name is refused as it writes.
+    pub(crate) fn name_refused(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        file: u64,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let found = self.files.iter().find_map(|(node, files)| {
+            files
+                .leaves
+                .iter()
+                .find(|(_, leaf)| leaf.revision().0 == file)
+                .map(|(member, _)| (*node, *member))
+        });
+        let Some((node, member)) = found else {
+            return Ok(());
+        };
+        if tree.child_of(node, member).is_some() {
+            return Ok(());
+        }
+        self.skip_named(tree, (node, member));
+        self.release_held(tree, builder, segments, out)
+    }
+
     fn skip_unnamable(
         &mut self,
         tree: &mut Tree,
@@ -2472,12 +2539,18 @@ impl NamespaceWriter {
         if !error.names_unusable() || !creating || tree.child_of(node, member).is_some() {
             return result;
         }
+        self.skip_named(tree, (node, member));
+        Ok(())
+    }
+
+    // The member's name was refused: its leaf goes and it is damaged.
+    fn skip_named(&mut self, tree: &mut Tree, (node, member): (NodeId, MemberId)) {
         if let Some(leaf) = self.files_mut(node).leaves.remove(&member) {
             drop(leaf);
         }
         self.caps.forget(tree, node, member);
         if !self.unnamable.insert((node, member)) {
-            return Ok(());
+            return;
         }
         let name_bytes = tree
             .namespace(node)
@@ -2507,7 +2580,6 @@ impl NamespaceWriter {
             "a refused leaf raised more than its own damage: {:?}",
             &self.unnamed_damage[from..]
         );
-        Ok(())
     }
 
     // A file whose bytes fail the checksum its object states for them is
@@ -2956,9 +3028,10 @@ impl NamespaceWriter {
     // directory finalize never delivers.
     fn scratch(&mut self, node: NodeId) -> Result<&mut Leaf, WriteError> {
         let dir = self.working_dir.clone();
+        let to = self.disk_under(&dir);
         let files = self.files_mut(node);
         if files.scratch.is_none() {
-            let mut scratch = Leaf::at(&dir, &scratch_name(node));
+            let mut scratch = Leaf::at(&dir, &scratch_name(node)).through(to.as_ref());
             scratch.truncate()?;
             files.scratch = Some(scratch);
         }

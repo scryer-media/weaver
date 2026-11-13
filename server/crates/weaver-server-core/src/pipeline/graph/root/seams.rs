@@ -18,7 +18,7 @@ use weaver_graph::{ByteRange, Segment, VolumeIndex};
 use super::intake::Decoded;
 use super::source::{Class, Move};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
-use crate::jobs::model::{JobState, JobStatus};
+use crate::jobs::model::JobState;
 use crate::pipeline::download::queue::{DownloadWork, QueueItem};
 use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::graph::job::{GraphError, GraphJob, RootFile, Storage};
@@ -91,6 +91,13 @@ impl Pipeline {
                 crate::history::attributes::no_memory_limit(&state.spec.metadata),
             ),
             metrics: Some(Arc::clone(&self.metrics)),
+            disk: Some(crate::pipeline::graph::disk::job_disk(
+                &self.volume_writers,
+                &self.storage_capacity,
+                job_id.0,
+                &state.working_dir,
+                state.staging_dir.as_deref(),
+            )),
             data_dir: Some(data_dir),
             window_ledger: self.window_ledgers.intermediate.clone(),
         };
@@ -344,6 +351,13 @@ impl Pipeline {
     // job's next graph may be built from then on.
     pub(in crate::pipeline) fn graph_run_said(&mut self, said: Said) {
         let job_id = JobId(said.scope);
+        let said = match said.heard {
+            Heard::DiskFailed(failure) => {
+                self.graph_disk_failed(*failure);
+                return;
+            }
+            heard => Said { heard, ..said },
+        };
         if let Heard::CheckpointBlocked {
             control,
             revision,
@@ -351,6 +365,10 @@ impl Pipeline {
         } = &said.heard
         {
             self.pause_graph_checkpoint(job_id, control, *revision, error);
+            return;
+        }
+        if matches!(said.heard, Heard::DiskReturned) {
+            self.graph_disk_returned(job_id);
             return;
         }
         if let Heard::CheckpointDue { control } = &said.heard {
@@ -374,50 +392,8 @@ impl Pipeline {
             } else {
                 let _ = graph.run_said(said, &mut self.graph_status.repairs, 0);
             }
-            if !graph.awaits_mail() {
-                let mut graph = self.retiring_graph_jobs.remove(&job_id);
-                if let Some(ticket) = graph.as_mut().and_then(GraphJob::forget_slot) {
-                    self.graph_status.repairs.release(ticket);
-                }
-                match self.pending_graph_terminals.remove(&job_id) {
-                    Some(crate::pipeline::health::PendingGraphTerminal::Failed(failure)) => {
-                        let cancelling = self.shared_state.queue.read(|inner| {
-                            inner
-                                .jobs
-                                .iter()
-                                .any(|row| row.id == job_id && row.intents.cancelled.is_some())
-                        });
-                        // Retirement blocks readmission; never apply an old
-                        // failure to a job that no longer has its failed state.
-                        if self.jobs.get(&job_id).is_some_and(|state| {
-                            matches!(&state.status, JobStatus::Failed { error } if error == &failure.error)
-                        }) {
-                            if let Some(graph) = graph {
-                                self.graph_jobs.insert(job_id, graph);
-                            }
-                            if cancelling {
-                                // The archive reply decides whether cancellation
-                                // wins. Worker completion must not race it into
-                                // failure cleanup or a second history write.
-                                self.pending_graph_terminals.insert(
-                                    job_id,
-                                    crate::pipeline::health::PendingGraphTerminal::Failed(failure),
-                                );
-                            } else {
-                                self.continue_job_failure(job_id, failure);
-                            }
-                        }
-                    }
-                    Some(crate::pipeline::health::PendingGraphTerminal::Cancelled {
-                        cleanup,
-                        keep_files,
-                    }) => {
-                        drop(graph);
-                        self.finish_cancelled_job(cleanup, keep_files);
-                    }
-                    None => {}
-                }
-                self.download_dispatch_wake = true;
+            if !graph.holds_retirement() {
+                self.finish_graph_retirement(job_id);
             }
             self.wake_repair_waiters();
             self.wake_memory_waiters();
@@ -730,7 +706,7 @@ impl Pipeline {
 
     // A slot a step gave back, or one that went to a job waiting for it,
     // wakes that job's completion gate, which lends for it in turn.
-    fn wake_repair_waiters(&mut self) {
+    pub(in crate::pipeline) fn wake_repair_waiters(&mut self) {
         for woken in self.graph_status.repairs.take_woken() {
             self.schedule_job_completion_check(JobId(woken.0));
         }

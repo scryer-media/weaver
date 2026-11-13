@@ -204,6 +204,18 @@ struct Slot {
     feed_verdict: Option<crate::jobs::feed_verdict::FeedVerdict>,
     // The change waiting for its barrier or for a queued write to take it.
     queued: Option<Delta>,
+    // Changes that record bytes, closed files or names a volume's writer
+    // had not yet put on disk when they were taken, oldest first. Each
+    // joins `queued` once everything the job had submitted when it was
+    // taken has returned, so the database never holds a row the disk does
+    // not bear out. Two at most: the first waits on a barrier that does
+    // not move, the second takes every later change and the latest
+    // barrier, so a job that keeps writing still gets its checkpoints out.
+    gated: std::collections::VecDeque<Gated>,
+    // The stamp of the last checkpoint that reached `queued`.
+    released: u64,
+    // A write was asked for at once while every change was still gated.
+    forced: bool,
     oldest: Option<tokio::time::Instant>,
     dirty_bytes: u64,
     enqueued: bool,
@@ -228,6 +240,19 @@ struct Slot {
     owed: Option<Owed>,
     #[cfg(test)]
     named: Named,
+}
+
+// A change held until the disk bears it out.
+struct Gated {
+    delta: Delta,
+    stamp: u64,
+    // `None` for a change that a later checkpoint must correct before it
+    // may be written: it takes that checkpoint's barrier.
+    barrier: Option<super::disk::JobBarrier>,
+    // The job is told when `barrier` returns.
+    told: bool,
+    #[cfg(test)]
+    named: std::collections::BTreeSet<(u32, u32)>,
 }
 
 // The articles on disk that a checkpoint names, as a restore after a crash
@@ -589,13 +614,55 @@ impl Pending {
         if delta.is_empty() {
             return false;
         }
+        slot.asked += 1;
+        slot.oldest
+            .get_or_insert_with(|| since.unwrap_or_else(tokio::time::Instant::now));
+        Self::release(slot);
+        let barrier = job.disk_barrier().filter(|barrier| !barrier.passed());
+        let corrects = slot
+            .gated
+            .back()
+            .is_some_and(|gated| gated.barrier.is_none());
+        if barrier.is_some() || corrects {
+            let barrier = barrier.or_else(|| job.disk_barrier());
+            let joins = corrects || slot.gated.len() >= 2;
+            // What reads back is asked of the disk, which waits for the
+            // volume's writer; a test that holds the writer is not made to
+            // wait for it.
+            #[cfg(test)]
+            let named = if barrier.as_ref().is_some_and(|barrier| barrier.test_held()) {
+                slot.named.put.clone()
+            } else {
+                job.on_disk()
+            };
+            match slot.gated.back_mut() {
+                Some(last) if joins => {
+                    last.delta.absorb(delta);
+                    last.stamp = slot.asked;
+                    last.barrier = barrier;
+                    last.told = false;
+                    #[cfg(test)]
+                    {
+                        last.named = named;
+                    }
+                }
+                _ => slot.gated.push_back(Gated {
+                    delta,
+                    stamp: slot.asked,
+                    barrier,
+                    told: false,
+                    #[cfg(test)]
+                    named,
+                }),
+            }
+            Self::release(slot);
+            return false;
+        }
         #[cfg(test)]
         {
             slot.named.put = job.on_disk();
         }
-        slot.asked += 1;
-        slot.oldest
-            .get_or_insert_with(|| since.unwrap_or_else(tokio::time::Instant::now));
+        slot.released = slot.asked;
         match &mut slot.queued {
             Some(queued) => {
                 queued.absorb(delta);
@@ -613,7 +680,10 @@ impl Pending {
     // write commits.
     pub(super) fn take(&self) -> (Option<Delta>, u64) {
         let mut slot = self.slot();
-        slot.oldest = None;
+        Self::release(&mut slot);
+        if slot.gated.is_empty() {
+            slot.oldest = None;
+        }
         slot.dirty_bytes = 0;
         slot.enqueued = false;
         if let Some(timer) = slot.timer.take() {
@@ -623,7 +693,53 @@ impl Pending {
         {
             slot.named.taken = slot.named.put.clone();
         }
-        (slot.queued.take(), slot.asked)
+        (slot.queued.take(), slot.released)
+    }
+
+    // Every gated change the disk now bears out joins `queued`, in order.
+    fn release(slot: &mut Slot) {
+        while slot
+            .gated
+            .front()
+            .is_some_and(|gated| gated.barrier.as_ref().is_some_and(|barrier| barrier.passed()))
+        {
+            let gated = slot.gated.pop_front().expect("checked above");
+            slot.released = gated.stamp;
+            #[cfg(test)]
+            {
+                slot.named.put = gated.named;
+            }
+            match &mut slot.queued {
+                Some(queued) => queued.absorb(gated.delta),
+                None => slot.queued = Some(gated.delta),
+            }
+        }
+    }
+
+    // Whether a change waits for a volume's writer.
+    pub(in crate::pipeline) fn gated(&self) -> bool {
+        !self.slot().gated.is_empty()
+    }
+
+    // What the gated changes say of a file is no longer so: they are one
+    // change now, written only together with the next checkpoint, which
+    // corrects it.
+    pub(in crate::pipeline) fn await_correction(&self) {
+        let mut slot = self.slot();
+        let mut all = std::mem::take(&mut slot.gated).into_iter();
+        let Some(mut first) = all.next() else {
+            return;
+        };
+        for later in all {
+            first.delta.absorb(later.delta);
+            first.stamp = later.stamp;
+            #[cfg(test)]
+            {
+                first.named = later.named;
+            }
+        }
+        first.barrier = None;
+        slot.gated.push_back(first);
     }
 
     // The articles on disk the database names once the writes queued for
@@ -757,6 +873,8 @@ impl Pending {
         slot.control.cancel();
         slot.held = None;
         slot.queued = None;
+        slot.gated.clear();
+        slot.forced = false;
         slot.oldest = None;
         slot.dirty_bytes = 0;
         slot.enqueued = false;
@@ -1055,6 +1173,18 @@ impl Pipeline {
 }
 
 impl Pending {
+    // The disk bears out a change that waited for it: queue its write.
+    pub(in crate::pipeline) fn queue_released(
+        &self,
+        db: &crate::Database,
+        job_id: JobId,
+        mail: &UnboundedSender<Said>,
+    ) {
+        if self.gated() || self.slot().queued.is_some() {
+            self.queue(db, job_id, mail, false);
+        }
+    }
+
     // Queue the write that takes the job's waiting change, if any, and says
     // what it committed. A write dropped before it runs has failed.
     fn queue(
@@ -1070,12 +1200,27 @@ impl Pending {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let mut slot = self.slot();
+        Self::release(&mut slot);
         let Some(oldest) = slot.oldest else {
             return;
         };
         if slot.enqueued || slot.control.cancelled() {
             return;
         }
+        // The job hears when the writes a held change waits for returned,
+        // and its write is queued then.
+        for gated in slot.gated.iter_mut().filter(|gated| !gated.told) {
+            if let Some(barrier) = &gated.barrier {
+                gated.told = true;
+                barrier.then_tell(job_id, mail);
+            }
+        }
+        // Nothing may be written yet.
+        if slot.queued.is_none() && !slot.gated.is_empty() {
+            slot.forced |= force;
+            return;
+        }
+        let force = force || std::mem::take(&mut slot.forced);
         let due = force
             || slot.dirty_bytes >= CHECKPOINT_BYTES
             || oldest.elapsed() >= CHECKPOINT_AGE

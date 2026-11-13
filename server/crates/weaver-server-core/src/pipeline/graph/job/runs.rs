@@ -54,7 +54,9 @@ impl GraphJob {
             Heard::Emit(_)
             | Heard::Ended
             | Heard::CheckpointBlocked { .. }
-            | Heard::CheckpointDue { .. } => {}
+            | Heard::CheckpointDue { .. }
+            | Heard::DiskReturned
+            | Heard::DiskFailed(_) => {}
         }
         Ok(())
     }
@@ -192,7 +194,10 @@ impl GraphJob {
                     Ok(())
                 };
             }
-            Heard::CheckpointBlocked { .. } | Heard::CheckpointDue { .. } => return Ok(()),
+            Heard::CheckpointBlocked { .. }
+            | Heard::CheckpointDue { .. }
+            | Heard::DiskReturned
+            | Heard::DiskFailed(_) => return Ok(()),
             _ if !self.runs.current(node, said.generation) => return Ok(()),
             // A run widened is ending, to start again at the wider window.
             Heard::Emit(_) if self.runs.rerunning(node) => return Ok(()),

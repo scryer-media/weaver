@@ -22,6 +22,9 @@ pub(crate) struct Verification {
     stated: u32,
     coverage: Coverage,
     folded: Option<u32>,
+    // Everything submitted for the file when the check was lent: the
+    // worker reads once it has returned.
+    settled: Option<crate::operations::disk::writer::Barrier>,
     pub(crate) stop: Arc<AtomicBool>,
     #[cfg(test)]
     barrier: Option<ReadBarrier>,
@@ -88,6 +91,9 @@ impl Verification {
             }
             if let Some(folded) = self.folded {
                 return Ok(Some(folded));
+            }
+            if let Some(settled) = &self.settled {
+                settled.wait();
             }
             let file = File::open(&self.path).map_err(io)?;
             let mut bytes = vec![0; READ_BACK as usize];
@@ -205,6 +211,7 @@ impl NamespaceWriter {
             folded: leaf
                 .folded(length, Algorithm::Crc32)
                 .map(|folded| folded as u32),
+            settled: leaf.settled(),
             stop: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             barrier: None,

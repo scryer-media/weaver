@@ -1914,6 +1914,13 @@ pub struct Pipeline {
     // One background free-space sampler per configured root. Everything on
     // the pipeline that gates work on free space reads these readings.
     pub(super) storage_capacity: Arc<crate::operations::StorageCapacity>,
+    // The writer threads of the volumes graph jobs write to, what each says
+    // once per batch, and whether a job was refused dispatch because a
+    // volume held its budget of bytes, so the next batch wakes dispatch.
+    pub(super) volume_writers: Arc<crate::operations::disk::writer::VolumeWriters>,
+    pub(super) volume_reports:
+        tokio::sync::mpsc::UnboundedReceiver<crate::operations::disk::writer::Report>,
+    pub(super) volume_budget_held: std::sync::atomic::AtomicBool,
     // What decode windows took from each disk they go on, for every graph
     // job together.
     pub(super) window_ledgers: graph::window::WindowLedgers,

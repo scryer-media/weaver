@@ -120,6 +120,12 @@ pub(crate) struct RestoreSeat {
     spec_password: Option<String>,
     data_dir: Option<(PathBuf, CapacityReader, super::window::ScratchLedger)>,
     window_ledger: super::window::ScratchLedger,
+    // The volume writers and the disk owner the restored job's files are
+    // written through.
+    volumes: (
+        Arc<crate::operations::disk::writer::VolumeWriters>,
+        Arc<crate::operations::StorageCapacity>,
+    ),
 }
 
 impl Pipeline {
@@ -151,6 +157,10 @@ impl Pipeline {
             spec_password,
             data_dir: Some(self.window_data_dir()),
             window_ledger: self.window_ledgers.intermediate.clone(),
+            volumes: (
+                Arc::clone(&self.volume_writers),
+                Arc::clone(&self.storage_capacity),
+            ),
         }
     }
 }
@@ -256,7 +266,15 @@ impl RestoreSeat {
             sweep_unnamed(output_dir, &snapshot, &rows.held_parts)?;
         }
         let held = held_parts_from_rows(job_id, &self.working_dir, &rows.held_parts);
+        let disk = super::disk::job_disk(
+            &self.volumes.0,
+            &self.volumes.1,
+            job_id.0,
+            &self.working_dir,
+            self.output.as_ref().map(|(dir, _)| dir.as_path()),
+        );
         let storage = Storage {
+            disk: Some(disk),
             passwords: restore_passwords(&self.db, job_id, self.spec_password.as_deref())?,
             caps: caps_for(&self.db, &self.extraction_limits, &files),
             working_dir: self.working_dir,
