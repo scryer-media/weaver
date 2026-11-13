@@ -10,7 +10,7 @@ use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
     },
     task::Poll,
     time::{Duration, Instant},
@@ -578,10 +578,12 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
         }
     }
 
-    // One search at a time, from the table (see `start`): the
-    // first as soon as the torrent asks for peers and one of the DHT's
-    // WALKS_AT_ONCE turns is free, that is when the stream starts, then one at the torrent's own point in the interval (see
-    // `announce_slot`) and one every DHT_ANNOUNCE_INTERVAL after. Each announces us when it
+    // One search at a time, from the table (see `start`): the first as soon
+    // as the torrent asks for peers, the family's first bootstrap has been
+    // sent (see `DhtState::bootstrap_sent_v4`) and one of the DHT's
+    // WALKS_AT_ONCE turns is free, then one at the torrent's own point in
+    // the interval (see `announce_slot`) and one every
+    // DHT_ANNOUNCE_INTERVAL after. Each announces us when it
     // ends (libtorrent `torrent::start_announcing` asks
     // `session_impl::prioritize_dht` for a search at once, and
     // `session_impl::on_dht_announce` gives every torrent its
@@ -607,6 +609,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
                 let entered = self.table(is_v4).read().entered();
                 let growth = self.dht.growth(is_v4);
                 let mut wait = announce_slot(&self.info_hash);
+                self.dht.bootstrap_sent(is_v4).opened().await;
                 // When the next search is due: set as a search ends, kept
                 // when a short one is made again early.
                 let mut due = None;
@@ -868,6 +871,54 @@ impl Growth {
     }
 }
 
+// Shut until opened, then open for good: what waits on it waits for the
+// opening, never on a timer.
+struct Latch {
+    open: AtomicBool,
+    opened: tokio::sync::Notify,
+}
+
+impl Latch {
+    fn new() -> Self {
+        Self {
+            open: AtomicBool::new(false),
+            opened: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn open(&self) {
+        if !self.open.swap(true, Ordering::AcqRel) {
+            self.opened.notify_waiters();
+        }
+    }
+
+    async fn opened(&self) {
+        loop {
+            let mut opened = std::pin::pin!(self.opened.notified());
+            opened.as_mut().enable();
+            if self.open.load(Ordering::Acquire) {
+                return;
+            }
+            opened.await;
+        }
+    }
+}
+
+// Runs `future`, and calls `then` once its first poll is over: for a search,
+// once the queries it starts with are sent.
+async fn after_first_poll<F: std::future::Future>(future: F, then: impl FnOnce()) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut then = Some(then);
+    std::future::poll_fn(|cx| {
+        let polled = future.as_mut().poll(cx);
+        if let Some(then) = then.take() {
+            then();
+        }
+        polled
+    })
+    .await
+}
+
 pub struct DhtState {
     id: Id20,
     next_transaction_id: AtomicU16,
@@ -884,6 +935,22 @@ pub struct DhtState {
     // Rings as a router address becomes known: a bootstrap or a search that
     // had nothing to ask has something now.
     routers_known: tokio::sync::Notify,
+    // Opens once every bootstrap name has been looked up once, whether it
+    // resolved or not; no search starts before. libtorrent's
+    // `session_impl::start_dht` starts nothing while
+    // `m_outstanding_router_lookups` is above zero, and each lookup's end,
+    // an error too, takes one off (session_impl.cpp:5897-5904, 6120-6145,
+    // v2.0.15). So the first search of each family starts from every
+    // router, not only from the one whose name resolved first.
+    routers_looked_up: Latch,
+    // Open once the first bootstrap of the family has sent the queries it
+    // starts with; a torrent's search starts only after. libtorrent's
+    // `start_dht` sends each node's bootstrap as it starts the DHT
+    // (`dht_tracker::start`, dht_tracker.cpp:174-195), and a torrent's
+    // search starts later, from the announce timer
+    // (`session_impl::prioritize_dht`, session_impl.cpp:3823-3845).
+    bootstrap_sent_v4: Latch,
+    bootstrap_sent_v6: Latch,
     // How the table of each family has grown (see `grow`): what a torrent's
     // search that fell short waits on to search again.
     growth_v4: Growth,
@@ -941,6 +1008,9 @@ impl DhtState {
             routing_table_v6: RwLock::new(routing_table_v6),
             routers: RwLock::default(),
             routers_known: tokio::sync::Notify::new(),
+            routers_looked_up: Latch::new(),
+            bootstrap_sent_v4: Latch::new(),
+            bootstrap_sent_v6: Latch::new(),
             growth_v4: Growth::new(),
             growth_v6: Growth::new(),
             worker_sender: sender,
@@ -972,6 +1042,24 @@ impl DhtState {
         } else {
             &self.growth_v6
         }
+    }
+
+    fn bootstrap_sent(&self, is_v4: bool) -> &Latch {
+        if is_v4 {
+            &self.bootstrap_sent_v4
+        } else {
+            &self.bootstrap_sent_v6
+        }
+    }
+
+    // As a DHT whose bootstrap names have all been looked up and whose
+    // bootstraps have been sent: what a test that drives the searches itself
+    // starts from.
+    #[cfg(test)]
+    fn started_for_test(&self) {
+        self.routers_looked_up.open();
+        self.bootstrap_sent_v4.open();
+        self.bootstrap_sent_v6.open();
     }
 
     // The `is_v4` table has grown: nodes that answered have entered it (see
@@ -1013,7 +1101,9 @@ impl DhtState {
 
     // Keep the `is_v4` table filled: a find_node search for our own id,
     // from the table and, while it holds fewer than SEARCH_MIN_SEEDS nodes
-    // that answer, the routers (see `start`). The first runs at once. While
+    // that answer, the routers (see `start`). The first runs once every
+    // bootstrap name has been looked up, as libtorrent starts its DHT and
+    // its bootstrap only then (see `routers_looked_up`). While
     // the table is shallow, under SHALLOW_DEPTH deep, the next runs after a
     // backoff, from BOOTSTRAP_RETRY_MIN doubling to SELF_REFRESH_INTERVAL,
     // back to the start as a round adds nodes; once it is deep, one every
@@ -1066,24 +1156,28 @@ impl DhtState {
         }
     }
 
+    // The first round waits for every bootstrap name to be looked up once
+    // (see `routers_looked_up`), and torrents' searches of the family wait
+    // for its first queries to be sent (see `bootstrap_sent`).
     async fn refresh_self_rounds(self: Arc<Self>, is_v4: bool) -> crate::dht::Result<()> {
         let entered = self.table(is_v4).read().entered();
         let mut retry = BOOTSTRAP_RETRY_MIN;
         let mut deep = false;
+        self.routers_looked_up.opened().await;
         loop {
             let mut next_entered = std::pin::pin!(entered.notified());
             next_entered.as_mut().enable();
             let mut next_router = std::pin::pin!(self.routers_known.notified());
             next_router.as_mut().enable();
             let before = self.table(is_v4).read().entries();
-            let outcome = RecursiveRequest::find_node_for_routing_table(
+            let round = RecursiveRequest::find_node_for_routing_table(
                 self.clone(),
                 self.id,
                 is_v4,
                 std::iter::empty(),
             )
-            .instrument(debug_span!("refresh_self"))
-            .await?;
+            .instrument(debug_span!("refresh_self"));
+            let outcome = after_first_poll(round, || self.bootstrap_sent(is_v4).open()).await?;
             let (nodes, entries, depth) = {
                 let table = self.table(is_v4).read();
                 (table.len(), table.entries(), table.depth(now()))
@@ -1643,8 +1737,22 @@ impl DhtWorker {
     // `dht_tracker::add_router_node` for each address). A name that cannot
     // give an address, a malformed one or one resolved where a leg exits, is
     // not tried again. The first failure of all the routers is logged at
-    // WARN, every later one at DEBUG: `warned` is shared by them.
-    async fn resolve_router(&self, hostname: &str, warned: &AtomicBool) {
+    // WARN, every later one at DEBUG: `warned` is shared by them. The first
+    // lookup's end, an error too, takes one off `outstanding`, after the
+    // addresses it gave are known; the last opens `routers_looked_up`
+    // (libtorrent `session_impl::on_dht_router_name_lookup`,
+    // session_impl.cpp:6120-6145, v2.0.15). A name that resolves only on a
+    // later try joins the routers then, as `add_router_node` adds a router
+    // to a running DHT.
+    async fn resolve_router(&self, hostname: &str, warned: &AtomicBool, outstanding: &AtomicUsize) {
+        let first = AtomicBool::new(true);
+        let looked_up = || {
+            if first.swap(false, Ordering::Relaxed)
+                && outstanding.fetch_sub(1, Ordering::AcqRel) == 1
+            {
+                self.dht.routers_looked_up.open();
+            }
+        };
         let backoff = ExponentialBuilder::new()
             .with_max_delay(Duration::from_secs(60))
             .with_jitter()
@@ -1667,6 +1775,7 @@ impl DhtWorker {
                         "error looking up {hostname}: {err:#}; the DHT runs from its saved nodes and the nodes peers name, and keeps retrying"
                     );
                 }
+                looked_up();
             })
             .instrument(debug_span!("bootstrap", hostname))
             .await;
@@ -1677,23 +1786,27 @@ impl DhtWorker {
             }
             Err(err) => warn!("error looking up {hostname}: {err:#}; it is not tried again"),
         }
+        looked_up();
     }
 
     // Routers are one way to seed the routing table; the table saved from an
     // earlier run and the nodes peers name (`add_node`) are the others. Each
     // router's name is resolved until it resolves; `refresh_self` asks the
-    // routers, as many times as the table needs them.
+    // routers, as many times as the table needs them. The searches start
+    // once each name has been looked up once (see `resolve_router`).
     async fn bootstrap(&self, bootstrap_addrs: &[String]) {
         if bootstrap_addrs.is_empty() {
             info!(
                 "no DHT bootstrap hosts: the DHT runs from its saved nodes and the nodes peers name"
             );
+            self.dht.routers_looked_up.open();
             return;
         }
         let warned = AtomicBool::new(false);
+        let outstanding = AtomicUsize::new(bootstrap_addrs.len());
         let mut futs = bootstrap_addrs
             .iter()
-            .map(|addr| self.resolve_router(addr, &warned))
+            .map(|addr| self.resolve_router(addr, &warned, &outstanding))
             .collect::<FuturesUnordered<_>>();
         while futs.next().await.is_some() {}
     }
@@ -2612,7 +2725,27 @@ mod tests {
             tokio_util::sync::CancellationToken::new(),
             None,
         );
+        dht.started_for_test();
         (dht, rx)
+    }
+
+    // `fixture_dht`, before its bootstrap names are looked up: nothing is
+    // started.
+    fn unstarted_fixture_dht() -> (
+        std::sync::Arc<DhtState>,
+        tokio::sync::mpsc::UnboundedReceiver<super::WorkerSendRequest>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let dht = DhtState::new_internal(
+            crate::core::hash_id::Id20::new([0x11; 20]),
+            tx,
+            None,
+            None,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        );
+        (std::sync::Arc::new(dht), rx)
     }
 
     fn get_peers_search(
@@ -3195,6 +3328,7 @@ mod tests {
             .resolve_router(
                 "router.invalid:6881",
                 &std::sync::atomic::AtomicBool::new(false),
+                &std::sync::atomic::AtomicUsize::new(1),
             )
             .await;
         let mut refresh = std::pin::pin!(dht.clone().refresh_self(true));
@@ -3883,6 +4017,7 @@ mod tests {
                 tokio_util::sync::CancellationToken::new(),
                 None,
             ));
+            dht.started_for_test();
             dht.add_routers(&[router]);
             let task = if refresh {
                 tokio::spawn(dht.clone().refresh_self(true)).abort_handle()
@@ -4927,6 +5062,7 @@ mod tests {
             tokio_util::sync::CancellationToken::new(),
             None,
         ));
+        dht.started_for_test();
         let start = tokio::time::Instant::now();
         let task = tokio::spawn(dht.clone().refresh_self(true));
 
@@ -4980,5 +5116,195 @@ mod tests {
         }
         drop(table);
         task.abort();
+    }
+
+    // The two routers of `cold_start`, and the node and peer the second one
+    // leads to.
+    const ROUTER_A: ([u8; 4], u16) = ([10, 200, 0, 1], 6881);
+    const ROUTER_B: ([u8; 4], u16) = ([10, 200, 0, 2], 6881);
+    const NODE_N: ([u8; 4], u16) = ([10, 0, 1, 1], 6881);
+    const PEER_P: ([u8; 4], u16) = ([10, 9, 9, 9], 51413);
+
+    // A fresh DHT's start on a fake network. Its bootstrap names are
+    // `a.invalid` and `b.invalid`: A's resolves at once, B's `b_late` in, on
+    // the paused clock. Router A never answers, or, when
+    // `a_answers_first_only`, answers the first query it gets and no other.
+    // Router B answers every query: a get_peers naming the node N, which
+    // answers a get_peers with the peer P. The self-lookup and one torrent's
+    // search run beside the bootstrap, as a session starts them together.
+    // Returns the queries sent until P is found, each with when and what,
+    // and when P was found.
+    async fn cold_start(
+        b_late: Duration,
+        a_answers_first_only: bool,
+    ) -> (Vec<(Duration, SocketAddr, &'static str)>, Duration) {
+        use crate::core::hash_id::Id20;
+        use crate::core::net::{BoxFuture, Resolved, Resolver};
+        use std::sync::Arc;
+
+        struct Names {
+            start: tokio::time::Instant,
+            b_late: Duration,
+        }
+
+        impl Resolver for Names {
+            fn resolve<'a>(
+                &'a self,
+                host: &'a str,
+                _port: u16,
+            ) -> BoxFuture<'a, std::io::Result<Resolved>> {
+                Box::pin(async move {
+                    match host {
+                        "a.invalid" => Ok(Resolved::Addresses(vec![ROUTER_A.into()])),
+                        "b.invalid" => {
+                            tokio::time::sleep_until(self.start + self.b_late).await;
+                            Ok(Resolved::Addresses(vec![ROUTER_B.into()]))
+                        }
+                        host => panic!("unexpected name {host}"),
+                    }
+                })
+            }
+        }
+
+        let (a, b, n) = (
+            SocketAddr::from(ROUTER_A),
+            SocketAddr::from(ROUTER_B),
+            SocketAddr::from(NODE_N),
+        );
+        let peer = SocketAddr::from(PEER_P);
+        let start = tokio::time::Instant::now();
+        let (dht, mut sent) = unstarted_fixture_dht();
+        let worker = Arc::new(super::DhtWorker {
+            socket: crate::test_support::loopback_udp().await,
+            resolver: Arc::new(Names { start, b_late }),
+            dht: dht.clone(),
+        });
+        let bootstrap = tokio::spawn({
+            let worker = worker.clone();
+            async move {
+                worker
+                    .bootstrap(&["a.invalid:6881".into(), "b.invalid:6881".into()])
+                    .await
+            }
+        });
+        // The torrent's search is started ahead of the self-lookup: the order
+        // its queries go out in is the DHT's, not the order the two began in.
+        let (peer_tx, mut peers) = tokio::sync::mpsc::unbounded_channel();
+        let search = Arc::new(super::RecursiveRequest::get_peers(
+            dht.clone(),
+            Id20::new([0x22; 20]),
+            None,
+            peer_tx,
+        ))
+        .request_peers_forever(true);
+        let refresh = tokio::spawn(dht.clone().refresh_self(true));
+
+        let mut queries = Vec::new();
+        let mut a_answered = false;
+        let found_at = loop {
+            let request = tokio::select! {
+                biased;
+                found = peers.recv() => {
+                    assert_eq!(found, Some(peer));
+                    break tokio::time::Instant::now() - start;
+                }
+                request = sent.recv() => request.unwrap(),
+            };
+            let kind = match request.message.kind {
+                MessageKind::FindNodeRequest(_) => "find_node",
+                MessageKind::GetPeersRequest(_) => "get_peers",
+                _ => "other",
+            };
+            queries.push((tokio::time::Instant::now() - start, request.addr, kind));
+            match (request.addr, kind) {
+                (addr, _) if addr == a => {
+                    if a_answers_first_only && !a_answered {
+                        a_answered = true;
+                        reply(&dht, &request, Id20::new([0xa0; 20]), &[], &[]);
+                    }
+                }
+                (addr, "find_node") if addr == b => {
+                    reply(&dht, &request, Id20::new([0xb0; 20]), &[], &[]);
+                }
+                (addr, "get_peers") if addr == b => {
+                    let named = (
+                        Id20::new([0x23; 20]),
+                        std::net::SocketAddrV4::new(NODE_N.0.into(), NODE_N.1),
+                    );
+                    reply(&dht, &request, Id20::new([0xb0; 20]), &[named], &[]);
+                }
+                (addr, "get_peers") if addr == n => {
+                    reply(&dht, &request, Id20::new([0x23; 20]), &[], &[peer]);
+                }
+                _ => {}
+            }
+        };
+        search.abort();
+        refresh.abort();
+        bootstrap.abort();
+        (queries, found_at)
+    }
+
+    // The queries in `queries` sent to `addr`, by kind, in order.
+    fn kinds_to(
+        queries: &[(Duration, SocketAddr, &'static str)],
+        addr: SocketAddr,
+    ) -> Vec<&'static str> {
+        queries
+            .iter()
+            .filter(|q| q.1 == addr)
+            .map(|q| q.2)
+            .collect()
+    }
+
+    // A router name that resolves after another: nothing is asked until
+    // both have resolved (libtorrent `session_impl::start_dht` waits for
+    // every router lookup), and then the bootstrap and the torrent's first
+    // search each ask both routers, the bootstrap first. Router A never
+    // answers; the torrent's search reaches P through router B at once,
+    // with no timeout and no second search.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_router_resolving_late_joins_the_first_search() {
+        let late = Duration::from_millis(3_100);
+        let (queries, found_at) = cold_start(late, false).await;
+        let (a, b) = (SocketAddr::from(ROUTER_A), SocketAddr::from(ROUTER_B));
+
+        assert_eq!(
+            queries[0].0, late,
+            "asked before every router name was looked up"
+        );
+        let first: Vec<_> = queries[..4].iter().map(|q| (q.1, q.2)).collect();
+        let mut bootstrap: Vec<_> = first[..2].to_vec();
+        bootstrap.sort();
+        let mut search: Vec<_> = first[2..].to_vec();
+        search.sort();
+        assert_eq!(bootstrap, vec![(a, "find_node"), (b, "find_node")]);
+        assert_eq!(search, vec![(a, "get_peers"), (b, "get_peers")]);
+        assert_eq!(found_at, late);
+        assert_eq!(kinds_to(&queries, a), vec!["find_node", "get_peers"]);
+    }
+
+    // Two queries reaching one router at once, of which the router answers
+    // only the first: the bootstrap's goes first, every time, so it is the
+    // one answered (libtorrent's `start_dht` sends the bootstrap before any
+    // torrent's search). The torrent's search, unanswered by that router,
+    // reaches P through the other router at once.
+    #[tokio::test(start_paused = true)]
+    async fn test_the_bootstrap_reaches_a_router_before_a_torrents_search() {
+        let (queries, found_at) = cold_start(Duration::ZERO, true).await;
+        let (a, b) = (SocketAddr::from(ROUTER_A), SocketAddr::from(ROUTER_B));
+
+        assert_eq!(kinds_to(&queries, a), vec!["find_node", "get_peers"]);
+        assert_eq!(kinds_to(&queries, b)[..2], ["find_node", "get_peers"]);
+        let first_search = queries.iter().position(|q| q.2 == "get_peers").unwrap();
+        assert!(
+            queries[..first_search]
+                .iter()
+                .filter(|q| q.2 == "find_node")
+                .count()
+                == 2,
+            "the torrent searched before the bootstrap asked both routers"
+        );
+        assert_eq!(found_at, Duration::ZERO);
     }
 }
