@@ -800,6 +800,8 @@ pub struct RestartRead {
     // installs wherever it stands, so its row says what it holds; one out
     // of the window leaves it again once read.
     pub(crate) outline_pending: bool,
+    // The job has a checkpoint: some of its bytes are on disk.
+    pub(crate) on_disk: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

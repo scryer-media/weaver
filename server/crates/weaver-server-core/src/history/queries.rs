@@ -304,28 +304,89 @@ impl Database {
         })
     }
 
-    // Every failed job whose record says it finished at or before
-    // `finished_by`, in epoch seconds, with the output directory it records.
-    pub(crate) fn failed_job_history_finished_by(
+    // One page of the failed jobs whose record says they finished at or
+    // before `finished_by`, in epoch seconds, and that no sweep has yet left
+    // nothing of, newest first, at most `limit` of them, each with its
+    // finish time and the output directory it records. `after` is the last
+    // `(completed_at, job_id)` of the page before. The predicate is spelled
+    // out literally so the partial unswept-failed index serves the filter
+    // and the sort.
+    pub(crate) fn failed_job_history_page(
         &self,
         finished_by: i64,
-    ) -> Result<std::collections::BTreeMap<crate::JobId, Option<String>>, StateError> {
+        after: Option<(i64, crate::JobId)>,
+        limit: usize,
+    ) -> Result<Vec<(i64, crate::JobId, Option<String>)>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT job_id, output_dir FROM job_history WHERE status = 'failed' AND completed_at <= {}",
-                &[SqlArg::I64(finished_by)],
-            )
-            .await?;
-            let mut dirs = std::collections::BTreeMap::new();
-            for row in rows {
-                dirs.insert(
-                    crate::JobId(row.i64("job_id")? as u64),
-                    row.opt_text("output_dir")?,
-                );
+            let limit = SqlArg::I64(limit as i64);
+            let (sql, args) = match after {
+                None => (
+                    "SELECT job_id, completed_at, output_dir FROM job_history \
+                     WHERE status = 'failed' AND files_swept_at IS NULL AND completed_at <= {} \
+                     ORDER BY completed_at DESC, job_id DESC LIMIT {}",
+                    vec![SqlArg::I64(finished_by), limit],
+                ),
+                Some((completed_at, job_id)) => (
+                    "SELECT job_id, completed_at, output_dir FROM job_history \
+                     WHERE status = 'failed' AND files_swept_at IS NULL AND completed_at <= {} \
+                     AND (completed_at < {} OR (completed_at = {} AND job_id < {})) \
+                     ORDER BY completed_at DESC, job_id DESC LIMIT {}",
+                    vec![
+                        SqlArg::I64(finished_by),
+                        SqlArg::I64(completed_at),
+                        SqlArg::I64(completed_at),
+                        SqlArg::I64(job_id.0 as i64),
+                        limit,
+                    ],
+                ),
+            };
+            let rows = SqlRuntime::fetch_all(datastore.read_exec(), sql, &args).await?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok((
+                        row.i64("completed_at")?,
+                        crate::JobId(row.i64("job_id")? as u64),
+                        row.opt_text("output_dir")?,
+                    ))
+                })
+                .collect()
+        })
+    }
+
+    // Which of `job_ids` are still failed jobs that finished at or before
+    // `finished_by`, not yet swept: one statement per bind-sized chunk.
+    pub(crate) fn failed_jobs_finished_by(
+        &self,
+        finished_by: i64,
+        job_ids: &[crate::JobId],
+    ) -> Result<std::collections::HashSet<crate::JobId>, StateError> {
+        if job_ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let datastore = self.datastore();
+        let ids = job_ids.iter().map(|id| id.0 as i64).collect::<Vec<_>>();
+        self.run_sql_blocking_read(async move {
+            let mut failed = std::collections::HashSet::new();
+            for chunk in ids.chunks(max_rows_for_engine(datastore.engine(), 1) - 1) {
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let args = std::iter::once(SqlArg::I64(finished_by))
+                    .chain(chunk.iter().copied().map(SqlArg::I64))
+                    .collect::<Vec<_>>();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT job_id FROM job_history WHERE status = 'failed' AND files_swept_at IS NULL \
+                         AND completed_at <= {{}} AND job_id IN ({placeholders})"
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    failed.insert(crate::JobId(row.i64("job_id")? as u64));
+                }
             }
-            Ok(dirs)
+            Ok(failed)
         })
     }
 

@@ -1158,3 +1158,20 @@ scope = "all"
 kind = "rust"
 hook_id = "seed_history_retention_v89"
 scope = "all"
+
+[[migration]]
+version = 90
+description = "a history entry keeps when housekeeping swept a failed job's files, with an index for the sweep's page"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0090_history_swept/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0090_history_swept/postgres.sql"
+engine = "postgres"
+scope = "all"

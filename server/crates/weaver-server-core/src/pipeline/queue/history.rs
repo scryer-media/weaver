@@ -6,6 +6,9 @@ use crate::{HistoryDeleteBatchOutcome, JobId, SchedulerError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+// How many failed jobs one read of the failed-job sweep lists.
+pub(crate) const FAILED_SWEEP_PAGE: usize = 128;
+
 pub(crate) async fn clear_restart_artifacts(
     resources: &super::AdmissionResources,
     id: JobId,
@@ -15,13 +18,15 @@ pub(crate) async fn clear_restart_artifacts(
     // alone are never permission to remove an arbitrary directory.
     crate::post_processing::events::wait_for_job_events_stopped(&resources.db, id.0).await?;
     if tokio::fs::try_exists(working_dir).await? {
-        // A folder the job delivered to is never taken for its working
-        // directory, even when the complete folder is the intermediate one.
-        let delivered = crate::history::delete_files::is_delivery_dir(
+        // A folder the job delivered to, or a destination root, is never
+        // taken for its working directory, even when the complete folder is
+        // the intermediate one: it goes only on its own output marker.
+        let working = crate::history::delete_files::working_dir_on_record(
+            &resources.intermediate_dir,
             working_dir,
             &resources.staging_roots().await,
         );
-        if working_dir.starts_with(&resources.intermediate_dir) && !delivered {
+        if working.is_some() {
             use crate::jobs::working_dir::{
                 HistoryWorkingDir, prepare_history_working_dir, remove_job_working_dir,
             };
@@ -423,27 +428,103 @@ impl Queue {
             resources.intermediate_dir = paths.intermediate;
             resources.complete_dir = paths.complete;
         }
+        let staging_roots = resources.staging_roots().await;
+        let mut after = None;
+        loop {
+            let db = resources.db.clone();
+            let page = match tokio::task::spawn_blocking(move || {
+                db.failed_job_history_page(finished_by, after, FAILED_SWEEP_PAGE)
+            })
+            .await
+            {
+                Ok(Ok(page)) => page,
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "could not list failed jobs for housekeeping");
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "could not list failed jobs for housekeeping");
+                    return;
+                }
+            };
+            let Some(&(completed_at, last, _)) = page.last() else {
+                return;
+            };
+            after = Some((completed_at, last));
+            let full = page.len() == FAILED_SWEEP_PAGE;
+            if !self
+                .clone()
+                .sweep_failed_page(&resources, &staging_roots, finished_by, page)
+                .await
+                || !full
+            {
+                return;
+            }
+        }
+    }
+
+    // One page of the failed-job sweep: the jobs no one holds are held, read
+    // again in one statement, and swept one by one. False when the sweep
+    // stops here.
+    async fn sweep_failed_page(
+        self: Arc<Self>,
+        resources: &super::AdmissionResources,
+        staging_roots: &[std::path::PathBuf],
+        finished_by: i64,
+        page: Vec<(i64, JobId, Option<String>)>,
+    ) -> bool {
+        let held: Vec<(JobId, Option<String>)> = self.write(|inner| {
+            Change::unchanged(
+                page.into_iter()
+                    .filter(|(_, id, _)| {
+                        !inner.contains_job(*id)
+                            && !inner.admissions.contains(id)
+                            && inner.history_operations.insert(*id)
+                    })
+                    .map(|(_, id, recorded)| (id, recorded))
+                    .collect(),
+            )
+        });
+        // Each hold goes as its job is done with.
+        let mut guards: BTreeMap<JobId, HistoryOperation> = held
+            .iter()
+            .map(|(id, _)| {
+                (
+                    *id,
+                    HistoryOperation {
+                        queue: self.clone(),
+                        ids: BTreeSet::from([*id]),
+                    },
+                )
+            })
+            .collect();
+        if held.is_empty() {
+            return true;
+        }
+        // The records are read again under the holds: a restart or a delete
+        // that ran since the listing has the last word.
         let db = resources.db.clone();
-        let failed = match tokio::task::spawn_blocking(move || {
-            db.failed_job_history_finished_by(finished_by)
+        let ids: Vec<JobId> = held.iter().map(|(id, _)| *id).collect();
+        let still_failed = match tokio::task::spawn_blocking(move || {
+            db.failed_jobs_finished_by(finished_by, &ids)
         })
         .await
         {
-            Ok(Ok(failed)) => failed,
+            Ok(Ok(still_failed)) => still_failed,
             Ok(Err(error)) => {
                 tracing::warn!(error = %error, "could not list failed jobs for housekeeping");
-                return;
+                return false;
             }
             Err(error) => {
                 tracing::warn!(error = %error, "could not list failed jobs for housekeeping");
-                return;
+                return false;
             }
         };
-        if failed.is_empty() {
-            return;
-        }
         let root = resources.intermediate_dir.clone();
-        let owners = failed.keys().copied().collect::<BTreeSet<_>>();
+        let owners = still_failed.iter().copied().collect::<BTreeSet<_>>();
+        if owners.is_empty() {
+            return true;
+        }
         let mut marked = match tokio::task::spawn_blocking(move || {
             crate::jobs::working_dir::job_working_dirs(&root, &owners)
         })
@@ -452,57 +533,69 @@ impl Queue {
             Ok(Ok(marked)) => marked,
             Ok(Err(error)) => {
                 tracing::warn!(error = %error, "could not scan the intermediate directory for housekeeping");
-                return;
+                return false;
             }
             Err(error) => {
                 tracing::warn!(error = %error, "could not scan the intermediate directory for housekeeping");
-                return;
+                return false;
             }
         };
-        for (id, recorded) in failed {
-            let held = self.write(|inner| {
-                Change::unchanged(
-                    !inner.contains_job(id)
-                        && !inner.admissions.contains(&id)
-                        && inner.history_operations.insert(id),
-                )
-            });
-            if !held {
+        // The jobs swept whole, nothing of them left on disk, get the
+        // internal swept stamp together once the page is done, so no later
+        // sweep walks or writes for them again; nothing the entry shows
+        // changes. A job with a folder left in place, or whose recorded
+        // folder is still there, is not stamped, and the next sweep tries it
+        // again. A job keeps its hold until its stamp: a retry cannot finish
+        // it anew in between.
+        let mut swept = Vec::new();
+        for (id, recorded) in held {
+            if !still_failed.contains(&id) {
+                guards.remove(&id);
                 continue;
             }
-            let _guard = HistoryOperation {
-                queue: self.clone(),
-                ids: BTreeSet::from([id]),
-            };
-            // The job's record is read again under the hold: a restart or a
-            // delete that ran since the listing has the last word.
-            let db = resources.db.clone();
-            let still_failed = tokio::task::spawn_blocking(move || {
-                db.get_job_history(id.0).map(|row| {
-                    row.is_some_and(|row| row.status == "failed" && row.completed_at <= finished_by)
-                })
-            })
-            .await;
-            if !matches!(still_failed, Ok(Ok(true))) {
-                continue;
-            }
-            if let Err(error) = crate::history::delete_files::sweep_failed_job_files(
+            match crate::history::delete_files::sweep_failed_job_files(
                 &resources.db,
                 &resources.intermediate_dir,
-                &resources.staging_roots().await,
+                staging_roots,
                 id,
                 recorded.map(std::path::PathBuf::from),
                 marked.remove(&id).unwrap_or_default(),
             )
             .await
             {
-                tracing::warn!(
-                    job_id = id.0,
-                    error = %error,
-                    "could not remove a failed job's files; the next housekeeping sweep tries again"
-                );
+                Ok(true) => swept.push(id),
+                Ok(false) => {
+                    guards.remove(&id);
+                }
+                Err(error) => {
+                    guards.remove(&id);
+                    tracing::warn!(
+                        job_id = id.0,
+                        error = %error,
+                        "could not remove a failed job's files; the next housekeeping sweep tries again"
+                    );
+                }
             }
         }
+        if !swept.is_empty() {
+            let db = resources.db.clone();
+            let swept_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs() as i64);
+            match tokio::task::spawn_blocking(move || db.stamp_history_swept(&swept, swept_at))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "could not record the failed jobs housekeeping swept; the next sweep tries them again");
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "could not record the failed jobs housekeeping swept; the next sweep tries them again");
+                }
+            }
+        }
+        drop(guards);
+        true
     }
 
     // Housekeeping: a working directory whose matching marker names a job

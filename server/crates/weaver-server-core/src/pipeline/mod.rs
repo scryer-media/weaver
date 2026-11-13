@@ -1488,6 +1488,9 @@ pub struct Pipeline {
     // work drains.
     pub(crate) nzb_retired_busy: HashSet<JobId>,
     pub(crate) nzb_pause_releases: HashSet<JobId>,
+    // The paused jobs whose resume waits for a download slot and is stored
+    // already: each is written once, when the resume is asked for.
+    pub(crate) resumes_stored: HashSet<JobId>,
     pub(crate) nzb_reprocess_pending: HashSet<JobId>,
     // The slots whose take or release is out on the writer, not yet
     // committed. Both count as held.

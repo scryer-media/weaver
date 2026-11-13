@@ -181,7 +181,13 @@ pub(crate) fn job_working_dirs(
 }
 
 fn open_working_directory(root: &Path, path: &Path) -> std::io::Result<Dir> {
-    let relative = path.strip_prefix(root).map_err(std::io::Error::other)?;
+    let relative = path.strip_prefix(root).map_err(|_| {
+        std::io::Error::other(format!(
+            "working directory {} is not inside the intermediate folder {}",
+            path.display(),
+            root.display()
+        ))
+    })?;
     let mut components = relative.components();
     if !matches!(components.next(), Some(std::path::Component::Normal(_)))
         || components.next().is_some()
@@ -196,7 +202,7 @@ fn open_working_directory(root: &Path, path: &Path) -> std::io::Result<Dir> {
 const MARKER_V1_PREFIX: &str = "weaver-job-v1:";
 const MARKER_V2_PREFIX: &str = "weaver-job-v2:";
 
-fn rename_journal_key(id: JobId) -> String {
+pub(crate) fn rename_journal_key(id: JobId) -> String {
     format!("working_dir_rename:{}", id.0)
 }
 
@@ -231,8 +237,21 @@ pub(crate) fn recover_working_dir_rename(
     current: &Path,
     id: JobId,
 ) -> Result<PathBuf, crate::SchedulerError> {
+    let journal = db.get_setting(&rename_journal_key(id))?;
+    recover_working_dir_rename_from(db, root, current, id, journal)
+}
+
+// As `recover_working_dir_rename`, with the job's rename journal already
+// read: None when it has none.
+pub(crate) fn recover_working_dir_rename_from(
+    db: &crate::Database,
+    root: &Path,
+    current: &Path,
+    id: JobId,
+    journal: Option<String>,
+) -> Result<PathBuf, crate::SchedulerError> {
     let key = rename_journal_key(id);
-    let Some(journal) = db.get_setting(&key)? else {
+    let Some(journal) = journal else {
         return Ok(current.to_path_buf());
     };
     let (old, new): (PathBuf, PathBuf) = serde_json::from_str(&journal)
@@ -749,6 +768,48 @@ pub(crate) fn release_failed_working_dir(
         dir.remove_open_dir_all()?;
     }
     Ok(())
+}
+
+// A job that never started works under the intermediate folder set now. Its
+// working directory elsewhere is claimed again under `root` and the old one
+// removed, when that one is this job's own and holds nothing but its marker.
+// One that is another's, holds anything else, or is gone is left as it is,
+// and the job keeps it: None. A directory already under `root` is kept.
+pub(crate) fn follow_intermediate_dir(
+    root: &Path,
+    current: &Path,
+    job_id: JobId,
+    name: &str,
+) -> std::io::Result<Option<PathBuf>> {
+    let Some(old_root) = current.parent().filter(|parent| *parent != root) else {
+        return Ok(None);
+    };
+    let dir = match open_working_directory(old_root, current) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        result => result?,
+    };
+    let Ok(stored) = read_working_marker(&dir) else {
+        return Ok(None);
+    };
+    if marker_job_id(&stored) != Some(job_id)
+        || !matches!(
+            match_marker(&dir, current, &stored, job_id)?,
+            MarkerMatch::Current | MarkerMatch::Legacy
+        )
+    {
+        return Ok(None);
+    }
+    for entry in dir.entries()? {
+        if entry?.file_name() != WORKING_DIR_MARKER {
+            return Ok(None);
+        }
+    }
+    let claimed = claim_working_dir(root, job_id, name)?;
+    mark_weaver_owned_working_dir(root, &claimed.path, job_id)?;
+    if let Err(error) = dir.remove_open_dir_all() {
+        tracing::warn!(job_id = job_id.0, dir = %current.display(), %error, "could not remove the working directory a job moved out of");
+    }
+    Ok(Some(claimed.path))
 }
 
 pub async fn stamp_working_dir(root: &Path, path: &Path, job_id: JobId) -> std::io::Result<()> {

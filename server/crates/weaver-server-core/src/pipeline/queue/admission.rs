@@ -76,7 +76,7 @@ impl Queue {
             let mut info = initial_info(
                 id,
                 &request.spec,
-                request.spec.wanted_bytes(),
+                restore_wanted_bytes(&request),
                 request.job_hash,
                 &request.working_dir,
                 request.status == JobStatus::Paused,
@@ -87,6 +87,7 @@ impl Queue {
             }
             let mut row = JobRow::new(info);
             row.report.restoring = true;
+            row.report.on_disk = request.restart.as_ref().is_some_and(|read| read.on_disk);
             row.intents.restore = Some(request);
             inner.push_job(row);
             Change::changed(Ok(()))
@@ -180,6 +181,32 @@ impl PreparedAdd {
             self.options.initially_paused,
         )
     }
+}
+
+// A restore whose outline was read while it waited out of the queue window:
+// its row states the files read, as a restore read with its outline does,
+// and the ticket goes back in the row to wait its turn.
+pub(crate) fn outline_read(row: &mut JobRow, request: crate::jobs::handle::RestoreJobRequest) {
+    let spec = &request.spec;
+    let wanted_bytes = restore_wanted_bytes(&request);
+    let info = &mut row.report.job;
+    info.name = spec.name.clone();
+    info.total_bytes = spec.total_bytes;
+    info.total_files = spec.files.len() as u32;
+    info.remaining_bytes = wanted_bytes;
+    info.wanted_bytes = wanted_bytes;
+    info.password = spec.password.clone();
+    row.intents.restore = Some(request);
+}
+
+// A restart read the job from its outline, whose spec holds no articles: its
+// summaries state the bytes. Outline summaries carry nothing on disk, so the
+// row's remaining bytes start at this figure too.
+fn restore_wanted_bytes(request: &crate::jobs::handle::RestoreJobRequest) -> u64 {
+    request.restart.as_ref().map_or_else(
+        || request.spec.wanted_bytes(),
+        |read| read.summaries.wanted_bytes(&request.spec),
+    )
 }
 
 pub(super) fn initial_info(

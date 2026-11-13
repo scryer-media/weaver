@@ -202,6 +202,277 @@ async fn housekeeping_removes_an_old_failed_job_s_files_and_keeps_its_record() {
     retire_pipeline_database(pipeline).await;
 }
 
+// A failed job's recorded working directory with no marker, as one made
+// before markers were, is the job's all the same: housekeeping takes it, so
+// the next sweep finds nothing left to try.
+#[tokio::test]
+async fn housekeeping_removes_an_old_failed_job_s_unmarked_working_directory() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30050);
+    let working_dir = intermediate_dir.join("job-30050");
+    tokio::fs::create_dir_all(&working_dir).await.unwrap();
+    tokio::fs::write(working_dir.join("lantern.part01.rar"), b"partial")
+        .await
+        .unwrap();
+    pipeline
+        .db
+        .insert_job_history(&history_row_finished_at(
+            job_id,
+            "failed",
+            working_dir.clone(),
+            100,
+        ))
+        .unwrap();
+    pipeline.report_all_for_test();
+
+    pipeline
+        .shared_state
+        .queue
+        .clone()
+        .sweep_job_files(Some(100), std::time::SystemTime::UNIX_EPOCH)
+        .await;
+
+    assert!(!working_dir.exists());
+    assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_some());
+    retire_pipeline_database(pipeline).await;
+}
+
+// The sweep reads the failed jobs a page at a time and each page's records
+// again in one statement, and removes the same folders as the one unpaged
+// listing it replaced: every failed job that finished by the cutoff, finish
+// times tied across page edges included, and no other.
+#[tokio::test]
+async fn housekeeping_pages_remove_what_the_unpaged_listing_named() {
+    use crate::persistence::sql_runtime::SqlRuntime;
+    use crate::pipeline::queue::FAILED_SWEEP_PAGE;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let count = FAILED_SWEEP_PAGE as u64 * 3 + 37;
+    let mut dirs = BTreeMap::new();
+    for n in 0..count {
+        let job_id = JobId(40_000 + n);
+        let dir = marked_working_dir(&intermediate_dir, &format!("paged-{n}"), job_id).await;
+        // Few distinct finish times, so ties cross every page edge; every
+        // seventh job finished after the cutoff, every eleventh is partial.
+        let completed_at = if n % 7 == 0 { 500 } else { (n % 3) as i64 };
+        let status = if n % 11 == 0 { "partial" } else { "failed" };
+        pipeline
+            .db
+            .insert_job_history(&history_row_finished_at(
+                job_id,
+                status,
+                dir.clone(),
+                completed_at,
+            ))
+            .unwrap();
+        dirs.insert(job_id, dir);
+    }
+    pipeline.report_all_for_test();
+    // The listing the pages replaced, as one statement.
+    let unpaged: BTreeSet<JobId> = SqlRuntime::fetch_all(
+        pipeline.db.datastore().read_exec(),
+        "SELECT job_id, output_dir FROM job_history WHERE status = 'failed' AND completed_at <= 100",
+        &[],
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| JobId(row.i64("job_id").unwrap() as u64))
+    .collect();
+    assert!(unpaged.len() > FAILED_SWEEP_PAGE * 2);
+
+    pipeline
+        .shared_state
+        .queue
+        .clone()
+        .sweep_job_files(Some(100), std::time::SystemTime::UNIX_EPOCH)
+        .await;
+
+    let removed: BTreeSet<JobId> = dirs
+        .iter()
+        .filter(|(_, dir)| !dir.exists())
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(removed, unpaged);
+
+    // A second sweep with nothing new lists no job: no hold, no folder scan,
+    // no removal and no write. A swept job's folder made again stays.
+    assert!(
+        pipeline
+            .db
+            .failed_job_history_page(100, None, FAILED_SWEEP_PAGE)
+            .unwrap()
+            .is_empty()
+    );
+    for id in &removed {
+        marked_working_dir(&intermediate_dir, &format!("paged-{}", id.0 - 40_000), *id).await;
+    }
+    pipeline
+        .shared_state
+        .queue
+        .clone()
+        .sweep_job_files(Some(100), std::time::SystemTime::UNIX_EPOCH)
+        .await;
+    assert!(removed.iter().all(|id| dirs[id].exists()));
+    retire_pipeline_database(pipeline).await;
+}
+
+// The internal swept stamp of each job, read raw: no view selects it.
+async fn swept_at(pipeline: &Pipeline, id: JobId) -> Option<i64> {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    SqlRuntime::fetch_all(
+        pipeline.db.datastore().read_exec(),
+        "SELECT files_swept_at FROM job_history WHERE job_id = {}",
+        &[SqlArg::I64(id.0 as i64)],
+    )
+    .await
+    .unwrap()
+    .remove(0)
+    .opt_i64("files_swept_at")
+    .unwrap()
+}
+
+// Everything the history page, the job page and the API read of an entry,
+// rendered: its row, its files state, its removed-file record, and the
+// listing.
+fn views_of(pipeline: &Pipeline, ids: &[JobId]) -> String {
+    let db = &pipeline.db;
+    let mut out = format!(
+        "{:?}",
+        db.list_job_history(&crate::HistoryFilter::default(), crate::HistoryRows::All)
+            .unwrap()
+    );
+    out.push_str(&format!(
+        "{:?}",
+        db.list_job_history_file_states(ids).unwrap()
+    ));
+    for id in ids {
+        out.push_str(&format!("{:?}", db.get_job_history(id.0).unwrap()));
+        out.push_str(&format!(
+            "{:?}",
+            db.list_history_removed_files(id.0, 0, 100).unwrap()
+        ));
+    }
+    out
+}
+
+// The sweep stamps, internally, only a failed job it left nothing of. A job
+// whose delivery folder stays is not stamped and is listed again. Nothing
+// any view shows of either entry changes, "remove files" included. A job
+// stamped and then finished again as failed is swept again.
+#[tokio::test]
+async fn housekeeping_stamps_only_a_failed_job_it_left_nothing_of() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let delivered = JobId(30060);
+    let delivery = complete_dir.join("Lantern.Harbor.2024");
+    tokio::fs::create_dir_all(&delivery).await.unwrap();
+    tokio::fs::write(delivery.join("lantern.mkv"), b"partial")
+        .await
+        .unwrap();
+    let swept = JobId(30061);
+    let working = marked_working_dir(&intermediate_dir, "swept-whole", swept).await;
+    for (id, dir) in [(delivered, delivery.clone()), (swept, working.clone())] {
+        pipeline
+            .db
+            .insert_job_history(&history_row_finished_at(id, "failed", dir, 2))
+            .unwrap();
+    }
+    pipeline.report_all_for_test();
+    let before = views_of(&pipeline, &[delivered, swept]);
+
+    let sweep = || {
+        pipeline
+            .shared_state
+            .queue
+            .clone()
+            .sweep_job_files(Some(100), std::time::SystemTime::UNIX_EPOCH)
+    };
+    sweep().await;
+
+    assert!(delivery.join("lantern.mkv").exists());
+    assert!(!working.exists());
+    assert_eq!(swept_at(&pipeline, delivered).await, None);
+    assert!(swept_at(&pipeline, swept).await.is_some());
+    assert_eq!(views_of(&pipeline, &[delivered, swept]), before);
+    let listed = |pipeline: &Pipeline| -> Vec<JobId> {
+        pipeline
+            .db
+            .failed_job_history_page(100, None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(_, id, _)| id)
+            .collect()
+    };
+    assert_eq!(listed(&pipeline), vec![delivered]);
+
+    // Restarted and failed again: the archive writes the entry afresh, the
+    // stamp goes, and the next sweep takes the new working folder.
+    let again = marked_working_dir(&intermediate_dir, "swept-again", swept).await;
+    pipeline
+        .db
+        .archive_job(
+            swept,
+            &history_row_finished_at(swept, "failed", again.clone(), 3),
+        )
+        .unwrap();
+    assert_eq!(swept_at(&pipeline, swept).await, None);
+    assert_eq!(listed(&pipeline), vec![swept, delivered]);
+    sweep().await;
+    assert!(!again.exists());
+    assert!(swept_at(&pipeline, swept).await.is_some());
+    retire_pipeline_database(pipeline).await;
+}
+
+// The sweep's page is served by the unswept-failed index, filter and sort,
+// so a sweep with nothing to do reads an empty index range.
+#[tokio::test]
+async fn the_failed_sweep_page_reads_the_unswept_index() {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    for (sql, args) in [
+        (
+            "EXPLAIN QUERY PLAN SELECT job_id, completed_at, output_dir FROM job_history \
+             WHERE status = 'failed' AND files_swept_at IS NULL AND completed_at <= {} \
+             ORDER BY completed_at DESC, job_id DESC LIMIT {}",
+            vec![SqlArg::I64(100), SqlArg::I64(50)],
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT job_id, completed_at, output_dir FROM job_history \
+             WHERE status = 'failed' AND files_swept_at IS NULL AND completed_at <= {} \
+             AND (completed_at < {} OR (completed_at = {} AND job_id < {})) \
+             ORDER BY completed_at DESC, job_id DESC LIMIT {}",
+            vec![
+                SqlArg::I64(100),
+                SqlArg::I64(5),
+                SqlArg::I64(5),
+                SqlArg::I64(9),
+                SqlArg::I64(50),
+            ],
+        ),
+    ] {
+        let plan: Vec<String> =
+            SqlRuntime::fetch_all(pipeline.db.datastore().read_exec(), sql, &args)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.text("detail").unwrap())
+                .collect();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_job_history_failed_unswept")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|detail| detail.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
+    }
+    retire_pipeline_database(pipeline).await;
+}
+
 // With the setting off, a failed job's files stay however old it is.
 #[tokio::test]
 async fn housekeeping_with_the_setting_off_leaves_a_failed_job_s_files() {

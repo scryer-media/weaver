@@ -18,10 +18,12 @@ pub(crate) mod order;
 pub mod paging;
 pub(crate) use admission::{
     AdmissionResources, PreparedAdd, RestartAdmission, delivery_staging_dir, destination_root,
-    destination_roots, make_staging_dir, staging_dir_for,
+    destination_roots, make_staging_dir, outline_read, staging_dir_for,
 };
 #[cfg(test)]
 pub(crate) use counters::COUNTER_SAMPLES;
+#[cfg(test)]
+pub(crate) use history::FAILED_SWEEP_PAGE;
 pub(crate) use history::{clear_left_working_dirs, clear_restart_artifacts, remove_job_staging};
 
 /// The control plane's shared facts. A guard never leaves a synchronous
@@ -190,6 +192,9 @@ pub struct Report {
     pub download_work_pending: bool,
     pub observed_byte_at_ms: u64,
     pub propagation_until_epoch_ms: Option<f64>,
+    // A restart found a checkpoint of the job: some of its bytes are on
+    // disk, though nothing of it is installed to say how many.
+    pub(crate) on_disk: bool,
 }
 
 #[derive(Default)]
@@ -238,6 +243,7 @@ impl JobRow {
                 moving: false,
                 observed_byte_at_ms: 0,
                 propagation_until_epoch_ms: None,
+                on_disk: false,
             },
             counters: Arc::default(),
             phases: HashMap::new(),

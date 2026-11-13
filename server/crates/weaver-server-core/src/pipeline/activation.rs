@@ -30,6 +30,9 @@ pub(crate) struct JobActivated {
     pub(crate) job_id: JobId,
     // The number the job's activation was told by when the read was sent.
     pub(crate) activation: u64,
+    // The working directory a job that never started moved to, under the
+    // intermediate folder set now. It moved whatever the read found.
+    pub(crate) moved_to: Option<PathBuf>,
     pub(crate) result: Result<ReadArticles, String>,
 }
 
@@ -160,7 +163,17 @@ impl Pipeline {
             config: Arc::clone(&self.config),
             category: category.clone(),
         };
+        // A job that never started follows the intermediate folder set now;
+        // one that started keeps the working directory it has.
+        let follow = (working_dir.parent() != Some(self.intermediate_dir.as_path()))
+            .then(|| (self.intermediate_dir.clone(), state.spec.name.clone()));
         state.articles = JobArticles::Activating(summaries, activation);
+        let follow = follow.filter(|_| {
+            !self
+                .shared_state
+                .queue
+                .read(|inner| inner.row(job_id).is_none_or(|row| self.job_started(row)))
+        });
         let seat = self
             .graph_restore_seat(None, &working_dir)
             .for_job(spec_password, &working_dir, staging_dir.as_deref())
@@ -184,7 +197,19 @@ impl Pipeline {
             let _ = written_rx.await;
             let categories = staging.config.read().await.categories.clone();
             let result = tokio::task::spawn_blocking(move || {
-                read_job_articles(
+                let moved_to = follow.and_then(|(root, name)| {
+                    crate::jobs::working_dir::follow_intermediate_dir(&root, seat.working_dir(), job_id, &name)
+                        .inspect_err(|error| {
+                            warn!(job_id = job_id.0, dir = %seat.working_dir().display(), %error, "could not move the job's working directory to the intermediate folder; it keeps the one it has");
+                        })
+                        .ok()
+                        .flatten()
+                });
+                let seat = match moved_to.clone() {
+                    Some(dir) => seat.moved_to(dir),
+                    None => seat,
+                };
+                let result = read_job_articles(
                     &db, job_id, category, metadata, &expected, ahead, memory, seat,
                 )
                 .map(|mut read| {
@@ -192,14 +217,17 @@ impl Pipeline {
                         read.staging = Some(staging.choose(job_id, &categories));
                     }
                     read
-                })
+                });
+                (moved_to, result)
             })
             .await
-            .unwrap_or_else(|error| Err(format!("article read worker failed: {error}")));
+            .unwrap_or_else(|error| (None, Err(format!("article read worker failed: {error}"))));
+            let (moved_to, result) = result;
             let _ = tx
                 .send(JobActivated {
                     job_id,
                     activation,
+                    moved_to,
                     result,
                 })
                 .await;
@@ -214,8 +242,24 @@ impl Pipeline {
         let JobActivated {
             job_id,
             activation,
+            moved_to,
             result,
         } = done;
+        // A move is on disk whichever activation it came with: the job and
+        // its row name the new directory.
+        if let Some(dir) = moved_to
+            && let Some(state) = self.jobs.get_mut(&job_id)
+        {
+            state.working_dir = dir.clone();
+            if let Err(error) =
+                self.db
+                    .try_queue_job_write(job_id, "update_active_job_output_dir", move |db| {
+                        db.update_active_job_output_dir(job_id, &dir)
+                    })
+            {
+                warn!(job_id = job_id.0, error = %error, "could not record the job's working directory");
+            }
+        }
         if !self.jobs.get(&job_id).is_some_and(|state| {
             matches!(state.articles, JobArticles::Activating(_, current) if current == activation)
         }) {

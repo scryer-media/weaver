@@ -601,7 +601,9 @@ impl Database {
         })
     }
 
-    // Whether the job has a checkpoint, without reading it.
+    // Whether the job has a checkpoint, without reading it. An install reads
+    // this with its batch, through `load_install_row_facts`.
+    #[cfg(test)]
     pub(crate) fn has_graph_checkpoint(&self, job_id: JobId) -> Result<bool, LoadError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
@@ -614,6 +616,34 @@ impl Database {
                         )
                         .await?
                         .is_some())
+                })
+            })
+            .await
+        })
+        .map_err(LoadError::Read)
+    }
+
+    // Every job with a checkpoint, in one read: the jobs with bytes on disk,
+    // since a checkpoint describes only those.
+    pub(crate) fn jobs_with_graph_checkpoint(
+        &self,
+    ) -> Result<std::collections::HashSet<JobId>, LoadError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "jobs_with_graph_checkpoint", |tx| {
+                Box::pin(async move {
+                    let rows = tx
+                        .fetch_all(
+                            "SELECT job_id FROM active_jobs WHERE EXISTS \
+                             (SELECT 1 FROM graph_nodes WHERE graph_nodes.job_id = active_jobs.job_id)",
+                            &[],
+                        )
+                        .await?;
+                    let mut jobs = std::collections::HashSet::with_capacity(rows.len());
+                    for row in rows {
+                        jobs.insert(JobId(row.i64("job_id")? as u64));
+                    }
+                    Ok(jobs)
                 })
             })
             .await

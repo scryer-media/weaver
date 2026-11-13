@@ -285,6 +285,7 @@ impl Pipeline {
             nzb_retired_busy: HashSet::new(),
             pending_renames: HashMap::new(),
             nzb_pause_releases,
+            resumes_stored: HashSet::new(),
             nzb_reprocess_pending: HashSet::new(),
             nzb_admitting: HashSet::new(),
             nzb_releasing: HashSet::new(),
@@ -1848,7 +1849,7 @@ impl Pipeline {
         }
         self.flush_server_attribution();
         self.flush_support_facts();
-        if let Err(error) = self.shared_state.queue.sample_bandwidth(true) {
+        if let Err(error) = self.shared_state.queue.clone().flush_bandwidth().await {
             warn!(error = %error, "failed to flush pending bandwidth usage during drain");
         }
 

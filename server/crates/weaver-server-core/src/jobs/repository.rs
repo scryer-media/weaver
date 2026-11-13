@@ -256,6 +256,8 @@ async fn archive_job_sql(
                     files_removed_at = NULL,
                     removed_file_count = NULL,
                     removed_file_bytes = NULL,
+                    -- and is swept again once it fails again.
+                    files_swept_at = NULL,
                     -- Built afresh each time the job finishes.
                     download_summary = excluded.download_summary
                  RETURNING job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,

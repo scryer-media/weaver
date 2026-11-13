@@ -122,7 +122,7 @@ impl Queue {
                             tokio::time::Instant::now().into_std(),
                         );
                     }
-                    if let Err(error) = queue.sample_bandwidth(true) {
+                    if let Err(error) = queue.clone().flush_bandwidth().await {
                         tracing::warn!(%error, "failed to flush bandwidth usage");
                     }
                     drop(queue);
@@ -278,6 +278,16 @@ impl Queue {
                 Change::unchanged(())
             }
         });
+    }
+
+    // Write out the bandwidth the samples recorded, off the async runtime:
+    // the ledger's write is a blocking database call. The one way every
+    // caller on the runtime flushes it.
+    pub(crate) async fn flush_bandwidth(self: Arc<Self>) -> Result<(), String> {
+        tokio::task::spawn_blocking(move || self.sample_bandwidth(true))
+            .await
+            .map_err(|error| format!("the bandwidth flush task failed: {error}"))?
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn sample_bandwidth(&self, flush: bool) -> Result<(), crate::StateError> {
