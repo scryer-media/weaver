@@ -3080,16 +3080,13 @@ impl PeerHandler {
                 return Ok(());
             }
         };
-        // A connection we asked to close did not fail (libtorrent
-        // `peer_connection::failed`), nor did a connect our own side turned
-        // away before it reached the peer, nor did one to ourselves, which
-        // is banned below instead (libtorrent closes it at normal severity).
-        let failed = error.as_ref().is_some_and(|e| {
-            !matches!(
-                e,
-                crate::Error::Disconnect | crate::Error::ConnectingToOurselves
-            ) && !e.is_local_refusal()
-        });
+        // Whether the connection failed as libtorrent's would, above normal
+        // severity (`peer_connection::failed`; see `Error::is_failure`): one
+        // the peer closed or left silent once open did not, so an encrypted
+        // handshake it closed leaves no failure for the plaintext connection
+        // that follows to wait behind. A connection to ourselves did not
+        // either; it is banned below instead.
+        let failed = error.as_ref().is_some_and(crate::Error::is_failure);
         // A connection to a peer that speaks the holepunch extension failed,
         // and no holepunch asked for it: a peer that can introduce us is
         // asked to (libtorrent `peer_connection::connect_failed`).

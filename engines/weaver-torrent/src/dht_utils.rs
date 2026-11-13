@@ -109,8 +109,9 @@ pub(crate) async fn read_metainfo_from_peer_receiver<
 /// carries on into the torrent's own connections (libtorrent
 /// `torrent::set_metadata` keeps `m_peer_list`; a magnet's metadata comes
 /// from the torrent's ordinary connections). A peer that does not answer is
-/// a connection that failed: it is asked again when the list's reconnect
-/// time for it comes, until it has failed too often, and sooner when a
+/// a connection that closed, failed or not as [`crate::Error::is_failure`]
+/// says: it is asked again when the list's reconnect time for it comes,
+/// until it has failed too often, and sooner when a
 /// tracker names it again (`peer_list`). `ask` is handed the list, so the
 /// connection keeps the peer's memory there. Each peer that did not answer,
 /// or that the list did not take, joins `unable`. None once the stream has
@@ -162,8 +163,13 @@ where
                 Ok(found) => break Some(found),
                 Err(e) => {
                     debug!("{e:#}");
+                    // Counted against the peer as the torrent's own
+                    // connections are (`crate::Error::is_failure`).
+                    let failed = e
+                        .downcast_ref::<crate::Error>()
+                        .is_none_or(crate::Error::is_failure);
                     peers.with_peer_mut(addr, "metadata_failed", |peer| {
-                        peers.connection_closed(peer, Instant::now(), true, false)
+                        peers.connection_closed(peer, Instant::now(), failed, false)
                     });
                     found_unable(addr);
                 }

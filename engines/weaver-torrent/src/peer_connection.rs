@@ -1367,7 +1367,7 @@ mod tests {
         let start = Instant::now();
         let result = connection.manage_peer_outgoing(rx).await;
         assert!(
-            matches!(result, Err(Error::Timeout("connecting"))),
+            matches!(result, Err(Error::ConnectTimeout("connecting"))),
             "{result:?}"
         );
         assert_eq!(start.elapsed(), DEFAULT_CONNECT_TIMEOUT);

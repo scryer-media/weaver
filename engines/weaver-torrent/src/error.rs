@@ -51,6 +51,11 @@ pub enum Error {
     #[error("error reading: {0:#}")]
     Read(#[source] std::io::Error),
 
+    /// A step of making the connection, the dial or the TLS handshake on
+    /// it, ran out of time.
+    #[error("timeout {0}")]
+    ConnectTimeout(&'static str),
+    /// A step on the open connection ran out of time.
     #[error("timeout {0}")]
     Timeout(&'static str),
 
@@ -138,6 +143,35 @@ impl Error {
             Error::ConnectDisabled | Error::UtpDisabled | Error::TcpDisabled => true,
             Error::UtpConnect(utp) => utp.is_local_refusal(),
             _ => false,
+        }
+    }
+
+    /// Whether a connection that ends in this error counts against its
+    /// peer: libtorrent `peer_connection::disconnect` sets `m_failed` only
+    /// above `normal` severity. A connect that does not complete, timed out
+    /// or refused, its TLS handshake included (`ssl_stream::async_connect`),
+    /// fails (`connect_failed`, at `failure`), and so does a peer
+    /// that breaks the protocol: a wrong info hash or handshake at `failure`,
+    /// an encryption handshake it gets wrong at `peer_error`
+    /// (`bt_peer_connection::on_receive_impl`). A transport that is open
+    /// and that the peer closes, resets or leaves silent does not:
+    /// `on_receive_data` and `on_send_data` close at `normal`, as do the
+    /// handshake and inactivity timeouts of `second_tick`. Nor does a close
+    /// we asked for, a connection to ourselves, or a connect our own side
+    /// turned away.
+    pub fn is_failure(&self) -> bool {
+        match self {
+            Error::Disconnect
+            | Error::ConnectingToOurselves
+            | Error::Timeout(_)
+            | Error::ReadHandshake(_)
+            | Error::WriteHandshake(_)
+            | Error::Read(_)
+            | Error::Write(_)
+            | Error::PeerDisconnectedReadingHandshake
+            | Error::PeerDisconnected => false,
+            Error::Mse(e) => e.is_failure(),
+            e => !e.is_local_refusal(),
         }
     }
 }
