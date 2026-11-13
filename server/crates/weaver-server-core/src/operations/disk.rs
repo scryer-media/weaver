@@ -14,6 +14,7 @@ use crate::operations::instrumentation::DiskSpaceSnapshot;
 use crate::runtime::StartupDiskGate;
 use crate::runtime::system_profile::{FilesystemType, StorageClass};
 
+pub(crate) mod holes;
 mod storage_kind;
 pub(crate) mod volume;
 pub(crate) mod volume_label;
@@ -1594,6 +1595,8 @@ pub struct StorageCapacity {
     interval: Duration,
     probe: SharedProbeFn,
     clock: Arc<Clock>,
+    // What the volume write rate sampler waits on, and is stopped by.
+    volume_rates: Arc<volume_rate::RateSignal>,
 }
 
 impl fmt::Debug for StorageCapacity {
@@ -1715,6 +1718,7 @@ impl StorageCapacity {
             interval,
             probe,
             clock,
+            volume_rates: Arc::default(),
         }
     }
 
@@ -2184,6 +2188,7 @@ impl Drop for StorageCapacity {
             slot.lock().stopped = true;
             slot.wake.notify_all();
         }
+        self.volume_rates.stop();
     }
 }
 

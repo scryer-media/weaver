@@ -11,7 +11,10 @@ pub(crate) struct Volume {
     // The mount path or drive root shown to the user.
     pub(crate) label: String,
     // Bytes its writer has written, and the nanoseconds spent inside those
-    // write calls.
+    // write calls. After each call the writer adds the bytes first and
+    // stores the nanoseconds last, with `Release`; the rate sampler loads
+    // the nanoseconds first, with `Acquire`, and the bytes after, so it
+    // never reads a call's time without its bytes.
     pub(crate) written_bytes: AtomicU64,
     pub(crate) write_nanos: AtomicU64,
     // Write calls its writer has made, and how many of them did not start

@@ -1868,16 +1868,13 @@ fn a_member_closes_exactly_when_covered_at_its_length() {
     let member = job.member("video.mkv", Some(9));
     job.send(member, 0, b"abc", Provenance::Fresh);
     assert!(job.is_open(NodeId::ROOT, member));
-    // The file grows as written, or starts at its declared length where its
-    // filesystem makes a hole of the rest; it is never anything between.
+    // The file starts at its declared length exactly where its filesystem
+    // makes a hole of the rest, and is as long as its bytes where not.
     let length = std::fs::metadata(job.dir.path().join("video.mkv"))
         .unwrap()
         .len();
-    if crate::pipeline::graph::sparse::PRESIZES {
-        assert!(length == 3 || length == 9, "{length}");
-    } else {
-        assert_eq!(length, 3);
-    }
+    let sized = crate::pipeline::graph::sparse::sizes_files_in(job.dir.path());
+    assert_eq!(length, if sized { 9 } else { 3 });
     job.send(member, 6, b"end", Provenance::Fresh);
     assert!(job.is_open(NodeId::ROOT, member));
     job.send(member, 3, b"mid", Provenance::Fresh);
