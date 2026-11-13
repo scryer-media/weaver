@@ -535,15 +535,12 @@ impl<'a> FileOps<'a> {
         if result_buf.len() < chunk_info.size as usize {
             anyhow::bail!("read_chunk(): not enough capacity in the provided buffer")
         }
-        let mut absolute_offset = self.torrent.lengths().chunk_absolute_offset(chunk_info);
+        let (first, mut absolute_offset) =
+            self.file_at(self.torrent.lengths().chunk_absolute_offset(chunk_info));
         let mut buf = result_buf;
 
-        for (file_idx, file_info) in self.file_infos.iter().enumerate() {
+        for (file_idx, file_info) in self.file_infos.iter().enumerate().skip(first) {
             let file_len = file_info.len;
-            if absolute_offset > file_len {
-                absolute_offset -= file_len;
-                continue;
-            }
             let file_remaining_len = file_len - absolute_offset;
             let to_read_in_file = std::cmp::min(file_remaining_len, buf.len() as u64).try_into()?;
 
@@ -573,6 +570,18 @@ impl<'a> FileOps<'a> {
         Ok(())
     }
 
+    /// The file that holds the torrent's byte at `offset`, and where in
+    /// that file the byte is: found by halving, as a torrent may have many
+    /// thousands of files and this runs for every block read or written.
+    /// Past the torrent's end, the count of files.
+    fn file_at(&self, offset: u64) -> (usize, u64) {
+        let file = self
+            .file_infos
+            .partition_point(|fi| fi.offset_in_torrent + fi.len <= offset);
+        let start = self.file_infos.get(file).map_or(offset, |fi| fi.offset_in_torrent);
+        (file, offset - start)
+    }
+
     /// Each of `chunks` read into its buffer of `bufs`, sized to the block.
     /// A run of blocks one after another in one file on disk is read in one
     /// go (libtorrent `disk_io_thread::do_read` reads a cache line of blocks
@@ -590,16 +599,13 @@ impl<'a> FileOps<'a> {
         let mut i = 0;
         while i < chunks.len() {
             let start = lengths.chunk_absolute_offset(&chunks[i]);
-            let mut file_start = 0u64;
-            let mut file = None;
-            for (file_idx, file_info) in self.file_infos.iter().enumerate() {
-                if start - file_start < file_info.len {
-                    file = (!file_info.attrs.padding)
-                        .then_some((file_idx, file_start + file_info.len));
-                    break;
-                }
-                file_start += file_info.len;
-            }
+            let (file_idx, in_file) = self.file_at(start);
+            let file_start = start - in_file;
+            let file = self
+                .file_infos
+                .get(file_idx)
+                .filter(|file_info| !file_info.attrs.padding)
+                .map(|file_info| (file_idx, file_start + file_info.len));
             let mut end = start;
             let mut j = i;
             if let Some((_, file_end)) = file {
@@ -646,15 +652,12 @@ impl<'a> FileOps<'a> {
         chunk_info: &ChunkInfo,
     ) -> anyhow::Result<()> {
         self.on_disk();
-        let mut absolute_offset = self.torrent.lengths().chunk_absolute_offset(chunk_info);
+        let (first, mut absolute_offset) =
+            self.file_at(self.torrent.lengths().chunk_absolute_offset(chunk_info));
         let mut data = DoubleBufHelper::new(data.data().0, data.data().1);
 
-        for (file_idx, file_info) in self.file_infos.iter().enumerate() {
+        for (file_idx, file_info) in self.file_infos.iter().enumerate().skip(first) {
             let file_len = file_info.len;
-            if absolute_offset > file_len {
-                absolute_offset -= file_len;
-                continue;
-            }
 
             let remaining_len = file_len - absolute_offset;
             let to_write = std::cmp::min(data.len() as u64, remaining_len).try_into()?;
@@ -965,6 +968,59 @@ mod tests {
             .iter_piece_infos()
             .flat_map(|piece| lengths.iter_chunk_infos(piece.piece_index))
             .collect()
+    }
+
+    // Over many files, empty ones and padding among them, the file found
+    // for an offset is the one a walk from the first file finds, and every
+    // block reads the torrent's bytes at its place, alone or in a run.
+    #[test]
+    fn the_file_of_an_offset_is_the_one_a_walk_of_the_files_finds() {
+        let t = checking_torrent();
+        let metadata = metadata(&t.torrent_bytes());
+        let payload = t.v1_payload();
+        let files = Files::new(&metadata, &payload);
+        let ops = FileOps::new(&metadata, &files, false);
+        let walked = |offset: u64| {
+            let mut file_start = 0;
+            for (file, fi) in metadata.file_infos.iter().enumerate() {
+                if offset - file_start < fi.len {
+                    return (file, offset - file_start);
+                }
+                file_start += fi.len;
+            }
+            (metadata.file_infos.len(), 0)
+        };
+        assert!(metadata.file_infos.len() > 40);
+        let total = payload.len() as u64;
+        for fi in metadata.file_infos.iter() {
+            for offset in [fi.offset_in_torrent, fi.offset_in_torrent + fi.len] {
+                for offset in offset.saturating_sub(1)..=(offset + 1).min(total) {
+                    assert_eq!(ops.file_at(offset), walked(offset), "{offset}");
+                }
+            }
+        }
+
+        let lengths = metadata.lengths();
+        let chunks = every_block(&metadata);
+        let expected: Vec<&[u8]> = chunks
+            .iter()
+            .map(|chunk| {
+                let start = usize::try_from(lengths.chunk_absolute_offset(chunk)).unwrap();
+                &payload[start..start + chunk.size as usize]
+            })
+            .collect();
+        let mut read: Vec<Vec<u8>> = chunks
+            .iter()
+            .map(|chunk| vec![0xee; chunk.size as usize])
+            .collect();
+        for (chunk, buf) in chunks.iter().zip(&mut read) {
+            ops.read_chunk(peer(), chunk, buf).unwrap();
+        }
+        assert_eq!(read, expected);
+        read.iter_mut().for_each(|buf| buf.fill(0xee));
+        let mut bufs: Vec<&mut [u8]> = read.iter_mut().map(Vec::as_mut_slice).collect();
+        ops.read_chunks(peer(), &chunks, &mut bufs).unwrap();
+        assert_eq!(read, expected);
     }
 
     /// The blocks one after another in one file are read in one go, a block
