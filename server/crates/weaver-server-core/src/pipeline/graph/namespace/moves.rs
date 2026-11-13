@@ -156,13 +156,14 @@ impl NamespaceWriter {
         held_off: bool,
         root: &Path,
     ) -> Leaf {
+        let to = self.disk_under(root);
         if !held_off && self.free_at(name, (node, member)) {
-            return Leaf::at(root, name);
+            return Leaf::at(root, name).through(to.as_ref());
         }
         #[cfg(test)]
         count(|tally| tally.waiting_opens += 1);
         let waiting = waiting_name(root, node, member, name);
-        let mut leaf = Leaf::at(root, &waiting);
+        let mut leaf = Leaf::at(root, &waiting).through(to.as_ref());
         leaf.intend(name);
         self.moves.push(Waiting {
             node,
@@ -341,7 +342,9 @@ impl NamespaceWriter {
                 });
             if !held {
                 for root in self.roots() {
-                    Leaf::at(root, &format!("{name}/")).remove()?;
+                    Leaf::at(root, &format!("{name}/"))
+                        .through(self.disk_under(root).as_ref())
+                        .remove()?;
                 }
             }
         }
@@ -421,7 +424,7 @@ impl NamespaceWriter {
             .restored_root(root, output_name, on_disk)?
             .to_path_buf();
         let at = restored_at(&root, output_name, on_disk)?;
-        let mut leaf = Leaf::found(&root, at)?;
+        let mut leaf = Leaf::found(&root, at)?.through(self.disk_under(&root).as_ref());
         let Some(sat) = on_disk else {
             return Ok(leaf);
         };

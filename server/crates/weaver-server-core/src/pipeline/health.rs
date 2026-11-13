@@ -110,7 +110,7 @@ impl Pipeline {
         if self
             .graph_jobs
             .get(&job_id)
-            .is_some_and(|graph| graph.awaits_mail())
+            .is_some_and(|graph| graph.holds_retirement())
         {
             self.retire_graph_job(job_id);
             self.transition_postprocessing_status(

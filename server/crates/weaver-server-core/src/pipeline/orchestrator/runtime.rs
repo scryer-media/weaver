@@ -191,6 +191,33 @@ impl Pipeline {
             startup_disk_work,
         ));
         shared_state.set_storage_capacity(&storage_capacity);
+        let (volume_report_tx, volume_reports) = mpsc::unbounded_channel();
+        let graph_runs = crate::pipeline::graph::engine::RunMail::default();
+        let disk_mail = graph_runs.written();
+        // A pipeline under test reads its files right after it writes
+        // them, so its writers run each operation as it is submitted.
+        #[cfg(test)]
+        let volume_writers_of = crate::operations::disk::writer::VolumeWriters::inline;
+        #[cfg(not(test))]
+        let volume_writers_of = crate::operations::disk::writer::VolumeWriters::new;
+        let volume_writers = Arc::new(volume_writers_of(
+            move |mut report: crate::operations::disk::writer::Report| {
+                // A failure is the job's to hear, with its other mail; the
+                // batch itself only tells the loop the volume moved on. A
+                // pipeline that has gone hears nothing, and needs to.
+                for failure in report.failures.drain(..) {
+                    let _ = disk_mail.send(crate::pipeline::graph::engine::Said {
+                        scope: failure.key,
+                        node: weaver_graph::NodeId::ROOT,
+                        generation: 0,
+                        heard: crate::pipeline::graph::engine::Heard::DiskFailed(Box::new(
+                            failure,
+                        )),
+                    });
+                }
+                let _ = volume_report_tx.send(report);
+            },
+        ));
         let extraction_limits = Arc::new(ExtractionLimits::from_env_with_profile_ceiling(
             &complete_dir,
             profile_tuning.extraction_memory_bytes,
@@ -277,7 +304,7 @@ impl Pipeline {
             graph_status: Default::default(),
             graph_holds,
             graph_decode,
-            graph_runs: Default::default(),
+            graph_runs,
             #[cfg(test)]
             graph_mail_stamps: None,
             post_probes: Default::default(),
@@ -465,6 +492,9 @@ impl Pipeline {
             unanchored_requeues: HashMap::new(),
             pending_unanchored_release: Vec::new(),
             storage_capacity,
+            volume_writers,
+            volume_reports,
+            volume_budget_held: std::sync::atomic::AtomicBool::new(false),
             window_ledgers: Default::default(),
             extraction_limits,
             process_memory_budget,
@@ -1123,6 +1153,7 @@ impl Pipeline {
             self.drain_ready_download_results(&mut pending_download_results);
             self.drain_ready_lane_control_messages();
             turn_active |= self.hear_graph_runs();
+            turn_active |= self.hear_volume_reports();
             #[cfg(test)]
             self.pump_decode_queue();
 
@@ -1275,6 +1306,10 @@ impl Pipeline {
                                         turn_metrics.pipeline_turn.read(std::time::Instant::now()),
                                     );
                                 }
+                            }
+                            Some(report) = self.volume_reports.recv() => {
+                                turn_timer.resume(PipelinePhase::GraphRun);
+                                self.volume_batch_returned(report);
                             }
                             Some(mail) = self.post_probes.recv() => {
                                 turn_timer.resume(PipelinePhase::PostProbe);
@@ -1829,6 +1864,16 @@ impl Pipeline {
             };
             self.handle_failed_job_released(released);
         }
+        // Every volume's writer puts down what it holds before the last
+        // checkpoint is taken, so that checkpoint records all of it.
+        let writers = Arc::clone(&self.volume_writers);
+        if tokio::task::spawn_blocking(move || writers.settle())
+            .await
+            .is_err()
+        {
+            warn!("the volume writers could not be drained at shutdown");
+        }
+        self.hear_volume_reports();
         self.checkpoint_graph_holds();
 
         if self.active_downloads > 0 || self.has_queued_or_active_decode() {

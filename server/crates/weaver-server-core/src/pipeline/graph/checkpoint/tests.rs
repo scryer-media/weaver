@@ -1256,6 +1256,7 @@ fn restored(
             metrics: None,
             data_dir: None,
             window_ledger: Default::default(),
+            disk: None,
         },
         0,
     )

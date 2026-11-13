@@ -19,9 +19,12 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
+use bytes::Bytes;
 use weaver_graph::{Algorithm, ByteRange, Digest, Evidenced};
 
+use crate::operations::disk::writer::{Barrier, Create, Submitter};
 use crate::pipeline::graph::sparse::{PlatformMarker, create_sized, create_sparse};
 
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +44,12 @@ impl LeafError {
     // Whether the file system refused the name itself: too long for it, or
     // one it never takes. A full disk, a permission or a read-only volume
     // is another error.
+    fn into_io(self) -> io::Error {
+        match self {
+            LeafError::Io { source, .. } => source,
+        }
+    }
+
     pub(crate) fn names_unusable(&self) -> bool {
         match self {
             LeafError::Io { source, .. } => source.kind() == io::ErrorKind::InvalidFilename,
@@ -83,6 +92,77 @@ pub(crate) struct Leaf {
     // a close cut off or a start over emptied. A byte written for the first
     // time changes nothing anyone read.
     changed: BTreeMap<(u64, u64), u64>,
+    // The volume writer the file's operations go to, when the leaf does not
+    // run them itself. Everything the leaf records of its file is as it
+    // will be once what it submitted has returned; whoever needs the disk
+    // to agree waits for `settled` first.
+    queued: Option<Queued>,
+}
+
+#[derive(Debug)]
+struct Queued {
+    to: Arc<Submitter>,
+    // The leaf's identity, which names its file to the writer.
+    file: u64,
+    // Whether the writer holds the file open, as far as the leaf knows.
+    open: bool,
+    // The last operation submitted for the file.
+    last: u64,
+}
+
+impl Drop for Queued {
+    // A leaf that goes gives its handle back, as dropping its own file
+    // would.
+    fn drop(&mut self) {
+        if self.last > 0 {
+            self.to.release(self.file);
+        }
+    }
+}
+
+thread_local! {
+    // The buffer the bytes now being placed are slices of, so a write
+    // handed to a volume's writer shares it instead of copying.
+    static LENT: std::cell::RefCell<Option<Bytes>> = const { std::cell::RefCell::new(None) };
+}
+
+// While it lives, writes of slices of `bytes` on this thread share it.
+pub(crate) struct Lent(Option<Bytes>);
+
+pub(crate) fn lend(bytes: &Bytes) -> Lent {
+    Lent(LENT.with(|lent| lent.borrow_mut().replace(bytes.clone())))
+}
+
+impl Drop for Lent {
+    fn drop(&mut self) {
+        LENT.with(|lent| *lent.borrow_mut() = self.0.take());
+    }
+}
+
+// `bytes` as owned bytes: a share of the lent buffer when they lie in it,
+// else a copy.
+fn owned(bytes: &[u8]) -> Bytes {
+    LENT.with(|lent| {
+        let lent = lent.borrow();
+        match lent.as_ref() {
+            Some(whole)
+                if !bytes.is_empty()
+                    && whole.as_ptr_range().start <= bytes.as_ptr_range().start
+                    && bytes.as_ptr_range().end <= whole.as_ptr_range().end =>
+            {
+                whole.slice_ref(bytes)
+            }
+            _ => Bytes::copy_from_slice(bytes),
+        }
+    })
+}
+
+// Open the file at `path` for a volume's writer, as a leaf opens its own.
+fn open_sized(path: &Path, length: Option<u64>) -> io::Result<File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    create_sized(path, &PlatformMarker, length)
 }
 
 static NEXT_LEAF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -134,6 +214,42 @@ impl Leaf {
             on_disk,
             written: BTreeMap::new(),
             changed: BTreeMap::new(),
+            queued: None,
+        }
+    }
+
+    // The leaf's file operations go to a volume's writer from here on.
+    pub(crate) fn through(mut self, to: Option<&Arc<Submitter>>) -> Self {
+        self.queued = to.map(|to| Queued {
+            to: Arc::clone(to),
+            file: self.identity,
+            open: false,
+            last: 0,
+        });
+        self
+    }
+
+    // Everything submitted for the file so far: whoever reads the file by
+    // its path waits for this first. `None` for a leaf that runs its own
+    // operations, whose file is always as the leaf says.
+    pub(crate) fn settled(&self) -> Option<Barrier> {
+        self.queued
+            .as_ref()
+            .filter(|queued| queued.last > 0)
+            .map(|queued| queued.to.barrier_at(queued.last))
+    }
+
+    fn settle(&self) {
+        if let Some(settled) = self.settled() {
+            settled.wait();
+        }
+    }
+
+    fn create(&self, length: Option<u64>) -> Create {
+        Create {
+            path: self.path.clone(),
+            length,
+            open: open_sized,
         }
     }
 
@@ -188,7 +304,8 @@ impl Leaf {
 
     #[cfg(test)]
     pub(crate) fn is_open(&self) -> bool {
-        self.file.is_some()
+        // A handle the volume's writer holds for the leaf counts.
+        self.file.is_some() || self.queued.as_ref().is_some_and(|queued| queued.open)
     }
 
     // A directory member is a name ending in a separator. It has no bytes,
@@ -198,6 +315,14 @@ impl Leaf {
     }
 
     pub(crate) fn create_directory(&mut self) -> Result<(), LeafError> {
+        if let Some(queued) = &mut self.queued {
+            let path = self.path.clone();
+            queued.last = queued
+                .to
+                .run(None, path.clone(), move || std::fs::create_dir_all(&path));
+            self.on_disk = true;
+            return Ok(());
+        }
         std::fs::create_dir_all(&self.path).map_err(LeafError::io(&self.path))?;
         self.on_disk = true;
         Ok(())
@@ -239,15 +364,25 @@ impl Leaf {
         length: Option<u64>,
     ) -> Result<(), LeafError> {
         self.revision += 1;
-        self.open(length)?;
+        if self.queued.is_none() {
+            self.open(length)?;
+        }
         let span = (offset, offset + bytes.len() as u64);
         let overlapped = self.overlapped(span);
         for (from, to) in &overlapped {
             self.change(*from, *to);
         }
         let replaced = self.replaced(&overlapped, fold.map(|(algorithm, _)| algorithm))?;
-        let file = self.file.as_ref().expect("opened above");
-        write_all_at(file, offset, bytes).map_err(LeafError::io(&self.path))?;
+        if let Some(open) = self.queued.as_ref().map(|queued| queued.open) {
+            let create = (!open).then(|| self.create(length));
+            let queued = self.queued.as_mut().expect("checked above");
+            queued.open = true;
+            queued.last = queued.to.write(self.identity, offset, owned(bytes), create);
+            self.on_disk = true;
+        } else {
+            let file = self.file.as_ref().expect("opened above");
+            write_all_at(file, offset, bytes).map_err(LeafError::io(&self.path))?;
+        }
         self.wrote(span, fold, &overlapped, &replaced);
         Ok(())
     }
@@ -285,7 +420,7 @@ impl Leaf {
             let digest = match (fold, run.digest) {
                 (Some(algorithm), Some(digest)) if digest.algorithm == algorithm => {
                     let mut old = Vec::new();
-                    self.read(*from, index(to - from), &mut old)?;
+                    self.read_back(*from, index(to - from), &mut old)?;
                     Some(algorithm.hash(&old).value)
                 }
                 _ => None,
@@ -411,7 +546,7 @@ impl Leaf {
         let digest = match run.digest {
             Some(whole) => {
                 let mut lost = Vec::new();
-                self.read(length, index(run.end - length), &mut lost)?;
+                self.read_back(length, index(run.end - length), &mut lost)?;
                 let algorithm = whole.algorithm;
                 let lost = algorithm.hash(&lost).value;
                 algorithm
@@ -487,6 +622,7 @@ impl Leaf {
     // Create the file in the directory it lies in, which must already be
     // there: nothing above the file is made. A file already open is kept.
     pub(crate) fn create_within(&mut self) -> Result<(), LeafError> {
+        debug_assert!(self.queued.is_none(), "a queued leaf is made by its first write");
         if self.file.is_none() {
             let file =
                 create_sparse(&self.path, &PlatformMarker).map_err(LeafError::io(&self.path))?;
@@ -498,6 +634,7 @@ impl Leaf {
 
     // How far the file reaches: every byte written to it lies below.
     pub(crate) fn len(&self) -> Result<u64, LeafError> {
+        self.settle();
         match &self.file {
             Some(file) => file.metadata(),
             None => std::fs::metadata(&self.path),
@@ -514,6 +651,7 @@ impl Leaf {
         len: usize,
         into: &mut Vec<u8>,
     ) -> Result<(), LeafError> {
+        self.settle();
         let start = into.len();
         into.resize(start + len, 0);
         let read = match &self.file {
@@ -530,6 +668,23 @@ impl Leaf {
         })
     }
 
+    // The bytes a write replaces or a close cuts off, read where the file's
+    // operations run: by its volume's writer, after everything submitted
+    // before, when the leaf writes through one.
+    fn read_back(&self, offset: u64, len: usize, into: &mut Vec<u8>) -> Result<(), LeafError> {
+        match &self.queued {
+            Some(queued) => {
+                let read = queued
+                    .to
+                    .read(self.path.clone(), offset, len)
+                    .map_err(LeafError::io(&self.path))?;
+                into.extend_from_slice(&read);
+                Ok(())
+            }
+            None => self.read(offset, len, into),
+        }
+    }
+
     // Every byte is in: the file takes its final length and its handle is
     // released, so finalize can move it. A directory has no bytes to take:
     // it is made.
@@ -538,6 +693,15 @@ impl Leaf {
             return self.create_directory();
         }
         self.revision += 1;
+        if self.queued.is_some() {
+            self.cut(length)?;
+            let create = self.create(Some(length));
+            let queued = self.queued.as_mut().expect("checked above");
+            queued.last = queued.to.close(self.identity, length, create);
+            queued.open = false;
+            self.on_disk = true;
+            return Ok(());
+        }
         self.open(Some(length))?;
         self.cut(length)?;
         let file = self.file.as_ref().expect("opened above");
@@ -550,6 +714,12 @@ impl Leaf {
     // coverage. A spent or partial file need not have closed at a whole
     // length, but must still release its handle before unlink or delivery.
     pub(crate) fn release_handle(&mut self) {
+        if let Some(queued) = &mut self.queued
+            && queued.last > 0
+        {
+            queued.last = queued.to.release(self.identity);
+            queued.open = false;
+        }
         self.file = None;
     }
 
@@ -559,6 +729,12 @@ impl Leaf {
         self.revision += 1;
         self.written.clear();
         self.change(0, u64::MAX);
+        if self.queued.is_some() {
+            let create = self.create(None);
+            let queued = self.queued.as_mut().expect("checked above");
+            queued.last = queued.to.truncate(self.identity, create);
+            return Ok(());
+        }
         if self.file.is_none() && !self.path.try_exists().map_err(LeafError::io(&self.path))? {
             return Ok(());
         }
@@ -586,7 +762,22 @@ impl Leaf {
         // missing owned file must fail the move, and a file this leaf never
         // made must not be taken merely because its old name now exists.
         let had_file = self.on_disk;
-        if had_file && path != self.path && self.directory {
+        if let Some(queued) = self.queued.as_mut().filter(|_| had_file && path != self.path) {
+            // The move follows everything submitted for the file, and
+            // everything submitted after follows the move.
+            let (from, to, directory) = (self.path.clone(), path.clone(), self.directory);
+            queued.open = false;
+            queued.last = queued.to.run(Some(self.identity), from.clone(), move || {
+                if directory {
+                    std::fs::create_dir_all(&to)?;
+                    return remove_directory(&from).map_err(LeafError::into_io);
+                }
+                if let Some(parent) = to.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                crate::runtime::fs::rename_path_exclusive(&from, &to)
+            });
+        } else if had_file && path != self.path && self.directory {
             // A directory is shared and holds no bytes of its own: it is
             // made where it is wanted, whoever else already made it, and
             // the empty one it waited in goes.
@@ -605,6 +796,24 @@ impl Leaf {
     // The member is gone with its subtree. A directory goes only once
     // nothing is left in it.
     pub(crate) fn remove(mut self) -> Result<(), LeafError> {
+        if let Some(mut queued) = self.queued.take() {
+            if !self.directory && !self.on_disk {
+                return Ok(());
+            }
+            // The removal closes the handle itself.
+            queued.last = 0;
+            let (path, directory) = (self.path.clone(), self.directory);
+            queued.to.run(Some(self.identity), self.path, move || {
+                if directory {
+                    return remove_directory(&path).map_err(LeafError::into_io);
+                }
+                match std::fs::remove_file(&path) {
+                    Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+                    _ => Ok(()),
+                }
+            });
+            return Ok(());
+        }
         self.file = None;
         if self.directory {
             return remove_directory(&self.path);

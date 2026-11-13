@@ -436,6 +436,9 @@ impl NamespaceWriter {
         namespace: NodeId,
         set: NodeId,
     ) -> Result<Option<Loan>, LeafError> {
+        // The repair opens the job's files where they lie, so everything
+        // submitted for them returns first.
+        self.settle_disk();
         let mut access = Lent {
             namespace,
             set,

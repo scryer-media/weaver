@@ -579,7 +579,15 @@ impl Pipeline {
             graph.owe_mail(pending.stamp());
         }
         graph.request_stop();
-        if graph.awaits_mail() {
+        if pending.control().cancelled() {
+            graph.abandon_disk();
+        }
+        // A job kept only for its last file operation hears when it returned.
+        if let Some(disk) = graph.disk().filter(|disk| !disk.quiet()) {
+            disk.barrier()
+                .then_tell(job_id, &self.graph_runs.written());
+        }
+        if graph.holds_retirement() {
             self.retiring_graph_jobs.insert(job_id, graph);
         } else {
             // Gone with what its runs reserved: the memory goes to whoever

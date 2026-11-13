@@ -28,6 +28,9 @@ use super::leaf::{Leaf, LeafError};
 #[derive(Debug)]
 pub(crate) struct Envelopes {
     working_dir: PathBuf,
+    // The writer of the working directory's volume, when the job's files
+    // are written through one.
+    to: Option<Arc<crate::operations::disk::writer::Submitter>>,
     shelves: BTreeMap<NodeId, Arc<Shelf>>,
     // The nodes whose kept envelopes changed, under the generation of the
     // latest change: every way to change what a checkpoint says of them
@@ -39,6 +42,7 @@ pub(crate) struct Envelopes {
 #[derive(Debug)]
 pub(crate) struct Shelf {
     dir: PathBuf,
+    to: Option<Arc<crate::operations::disk::writer::Submitter>>,
     node: NodeId,
     state: Mutex<Shelved>,
     changed: Condvar,
@@ -111,6 +115,12 @@ impl Kept {
         self.leaf.path()
     }
 
+    // Everything submitted for the envelope's file so far, when it is
+    // written through a volume's writer.
+    pub(crate) fn settled(&self) -> Option<crate::operations::disk::writer::Barrier> {
+        self.leaf.settled()
+    }
+
     pub(crate) fn into_leaf(self) -> Leaf {
         self.leaf
     }
@@ -120,17 +130,30 @@ impl Envelopes {
     pub(crate) fn new(working_dir: PathBuf) -> Self {
         Self {
             working_dir,
+            to: None,
             shelves: BTreeMap::new(),
             marks: Marks::default(),
         }
     }
 
+    // Envelopes made from here on are written through `to`. Set before
+    // anything is kept.
+    pub(crate) fn write_through(
+        &mut self,
+        to: Option<Arc<crate::operations::disk::writer::Submitter>>,
+    ) {
+        debug_assert!(self.shelves.is_empty());
+        self.to = to;
+    }
+
     // The node's shelf, made empty the first time it is asked for.
     pub(crate) fn shelf(&mut self, node: NodeId) -> Arc<Shelf> {
         let dir = &self.working_dir;
+        let to = &self.to;
         Arc::clone(self.shelves.entry(node).or_insert_with(|| {
             Arc::new(Shelf {
                 dir: dir.clone(),
+                to: to.clone(),
                 node,
                 state: Mutex::default(),
                 changed: Condvar::new(),
@@ -261,7 +284,9 @@ impl Envelopes {
         let started = shelf.update(|state| match state.kept.entry(envelope) {
             Entry::Occupied(_) => false,
             Entry::Vacant(free) => {
-                free.insert(Kept::in_file(Leaf::over(&shelf.dir, name, on_disk)));
+                free.insert(Kept::in_file(
+                    Leaf::over(&shelf.dir, name, on_disk).through(shelf.to.as_ref()),
+                ));
                 true
             }
         });
@@ -444,7 +469,7 @@ impl Shelf {
             Entry::Occupied(kept) => Ok(kept.into_mut()),
             Entry::Vacant(free) => {
                 let name = free_envelope_name(&self.dir, self.node, envelope);
-                let mut leaf = Leaf::at(&self.dir, &name);
+                let mut leaf = Leaf::at(&self.dir, &name).through(self.to.as_ref());
                 leaf.truncate()?;
                 Ok(free.insert(Kept::in_file(leaf)))
             }

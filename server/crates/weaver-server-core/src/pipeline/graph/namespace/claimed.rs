@@ -158,6 +158,9 @@ impl NamespaceWriter {
         }) else {
             return;
         };
+        // The link is made of the file as it lies, so everything submitted
+        // for the job's files returns first.
+        self.settle_disk();
         let name = free_name(&self.working_dir, &envelope_name(child, envelope));
         let link = self.working_dir.join(&name);
         let linked = link

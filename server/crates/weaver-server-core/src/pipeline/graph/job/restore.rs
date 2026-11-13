@@ -78,6 +78,7 @@ impl GraphJob {
             storage.free_disk,
         )
         .delivering(storage.output)
+        .writing_through(storage.disk.clone())
         .capped(storage.caps)
         .metered(storage.metrics);
         writer.restore_verifications(&snapshot.root.pending_verifications);

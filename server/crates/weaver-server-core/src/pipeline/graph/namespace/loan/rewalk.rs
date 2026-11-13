@@ -107,6 +107,7 @@ impl NamespaceWriter {
         tree: &mut Tree,
         node: NodeId,
     ) -> Result<Option<RewalkLoan>, LeafError> {
+        self.settle_disk();
         let Some((parent, volumes)) = tree.volumes(node) else {
             let _ = tree.take_rewalk(node);
             return Ok(None);

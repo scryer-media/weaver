@@ -1342,6 +1342,24 @@ impl Pipeline {
             .transpose()
             .map_err(str::to_owned)?
             .unwrap_or_default();
+        // Those closes, and every write before them, go through the volumes'
+        // writers. Nothing is removed or moved until the last of them has
+        // returned; a failed one fails the job through its batch report.
+        if let Some(barrier) = self
+            .graph_jobs
+            .get(&job_id)
+            .and_then(|graph| graph.disk_barrier())
+            .filter(|barrier| !barrier.passed())
+        {
+            let waited = barrier.clone();
+            crate::runtime::panic_trap::spawn_blocking(move || waited.wait())
+                .await
+                .map_err(|error| format!("waiting for the job's last file operation: {error}"))?;
+            self.hear_volume_reports();
+            if !barrier.passed() {
+                return Err("a file operation of the job failed before delivery".to_string());
+            }
+        }
         #[cfg(test)]
         {
             let hook = BEFORE_SPENT_REMOVAL.lock().unwrap().take();
