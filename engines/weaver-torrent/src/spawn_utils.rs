@@ -221,9 +221,10 @@ impl BlockingSpawner {
     /// blocking permit, from any thread, a uTP thread too: the work runs on
     /// the session's pool, never on the calling runtime's own, and disk
     /// work that cannot run in place counts against the same bound as the
-    /// work that does. None when the session's runtime shut down before it ran, or it
-    /// panicked.
-    pub(crate) async fn spawn_blocking_with_permit<F, R>(&self, f: F) -> Option<R>
+    /// work that does. An error when the session's runtime shut down before
+    /// it ran, or it panicked: the error says which, and carries what the
+    /// panic said.
+    pub(crate) async fn spawn_blocking_with_permit<F, R>(&self, f: F) -> anyhow::Result<R>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
@@ -236,18 +237,18 @@ impl BlockingSpawner {
             }
             Err(_) => {
                 let since = std::time::Instant::now();
-                let permit = Arc::clone(semaphore).acquire_owned().await.ok()?;
+                let permit = Arc::clone(semaphore).acquire_owned().await?;
                 self.stats.permit_waited(since);
                 permit
             }
         };
-        self.handle
+        Ok(self
+            .handle
             .spawn_blocking(move || {
                 let _permit = permit;
                 f()
             })
-            .await
-            .ok()
+            .await?)
     }
 
     /// Runs `fut` on the session's runtime, from any thread: a task that
@@ -365,6 +366,22 @@ mod tests {
         assert_eq!(flavor, tokio::runtime::RuntimeFlavor::MultiThread);
     }
 
+    // Work handed off with a permit that panics gives its caller an error
+    // that carries what the panic said, and the permit comes back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panic_in_work_handed_off_with_a_permit_is_told_to_its_caller() {
+        let spawner = BlockingSpawner::new(1);
+        let failed = spawner
+            .spawn_blocking_with_permit(|| -> u32 { panic!("the piece could not be read") })
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{failed:#}").contains("the piece could not be read"),
+            "{failed:#}"
+        );
+        assert_eq!(spawner.semaphore().available_permits(), 1);
+    }
+
     // Blocking work handed off with a permit holds it while it runs: with
     // every permit held, the next does not start until one comes back.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -403,9 +420,9 @@ mod tests {
         for _ in 0..3 {
             release_tx.send(()).unwrap();
         }
-        assert_eq!(first.await.unwrap(), Some(1));
-        assert_eq!(second.await.unwrap(), Some(2));
-        assert_eq!(third.await.unwrap(), Some(3));
+        assert_eq!(first.await.unwrap().unwrap(), 1);
+        assert_eq!(second.await.unwrap().unwrap(), 2);
+        assert_eq!(third.await.unwrap().unwrap(), 3);
         assert_eq!(started_rx.try_recv(), Ok(3));
         assert_eq!(spawner.semaphore().available_permits(), 2);
     }

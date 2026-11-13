@@ -2879,7 +2879,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 state.check_seeded(piece)
             })
             .await
-            .context("the session ended before a seed-mode check ran")?
+            .context("a seed-mode check did not run to its end")?
     }
 
     fn read_chunk(&self, chunk: &ChunkInfo, buf: &mut [u8]) -> anyhow::Result<()> {
