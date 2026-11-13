@@ -82,6 +82,7 @@ mod dead_posts;
 mod deep;
 mod delivery;
 mod depth;
+mod download_summary;
 mod embedded;
 mod encrypted_hex;
 pub(in crate::pipeline) mod harness;

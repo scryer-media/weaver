@@ -239,6 +239,7 @@ fn archive_seeded(db: &Database, id: u64, name: &str, metadata: Option<String>) 
             completed_at: 2,
             metadata,
             server_attribution: None,
+            files_removed_at: None,
         },
     )
     .expect("archive job");
@@ -959,6 +960,7 @@ async fn an_answering_pipeline_writes_its_own_snapshot() {
             max_download_speed: None,
             cleanup_after_extract: None,
             delete_failed_job_files: None,
+            history_retention_days: None,
             propagation_delay_secs: None,
             max_concurrent_nzbs: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),

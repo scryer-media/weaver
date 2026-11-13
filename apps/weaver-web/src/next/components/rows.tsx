@@ -5,6 +5,7 @@ import { memo, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { COLS_CLASS, columnStyle, type Columns } from "./columns";
 import { Eyebrow } from "./chrome";
+import { Icon, type IconName } from "./icons";
 
 /**
  * The two row shapes the whole UI is built from.
@@ -294,6 +295,52 @@ export function GridHeader({
         ),
       )}
     </div>
+  );
+}
+
+/**
+ * A 28px icon action inside a row. Neither its click nor the keys that press
+ * it reach the row, so acting on a row never also opens it.
+ */
+export function RowIconButton({
+  icon,
+  label,
+  danger = false,
+  disabled = false,
+  testId,
+  onClick,
+}: {
+  icon: IconName;
+  /** Accessible name and tooltip. */
+  label: string;
+  danger?: boolean;
+  disabled?: boolean;
+  testId?: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      title={label}
+      aria-label={label}
+      data-testid={testId}
+      disabled={disabled}
+      onClick={(event) => {
+        event.stopPropagation();
+        onClick();
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") event.stopPropagation();
+      }}
+      className={cn(
+        "flex size-7 flex-none items-center justify-center border border-transparent text-wv-muted",
+        disabled
+          ? "cursor-default opacity-40"
+          : cn("cursor-pointer hover:border-wv-control hover:bg-wv-button", danger ? "hover:text-wv-error" : "hover:text-wv-fg"),
+      )}
+    >
+      <Icon name={icon} size={15} />
+    </button>
   );
 }
 

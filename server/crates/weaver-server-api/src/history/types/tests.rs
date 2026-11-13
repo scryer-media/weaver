@@ -35,6 +35,7 @@ fn history_item_roundtrips_attributes_and_client_request_id() {
             .unwrap(),
         ),
         server_attribution: None,
+        files_removed_at: None,
     };
 
     let item = history_item_from_row(&row, None);
@@ -69,6 +70,7 @@ fn history_item_builds_when_release_parse_is_not_media() {
         completed_at: 1_700_000_100,
         metadata: None,
         server_attribution: None,
+        files_removed_at: None,
     };
 
     let item = history_item_from_row(&row, None);
@@ -104,6 +106,7 @@ fn history_filter_supports_exact_attribute_matches() {
             .unwrap(),
         ),
         server_attribution: None,
+        files_removed_at: None,
     };
 
     let item = history_item_from_row(&row, None);
@@ -152,6 +155,7 @@ fn history_item_has_password_for_a_submitted_or_validated_password() {
         completed_at: 1_700_000_100,
         metadata: Some(serde_json::to_string(&metadata).unwrap()),
         server_attribution: None,
+        files_removed_at: None,
     };
     let marked = |key: &str| vec![(key.to_string(), "1".to_string())];
     assert!(
@@ -197,6 +201,7 @@ async fn history_item_exposes_full_file_names_but_not_as_an_attribute() {
             .unwrap(),
         ),
         server_attribution: None,
+        files_removed_at: None,
     };
 
     struct Query(HistoryItem);
@@ -267,6 +272,7 @@ async fn history_item_says_whether_it_failed_for_memory() {
             .unwrap()
         }),
         server_attribution: None,
+        files_removed_at: None,
     };
 
     struct Query(HistoryItem);

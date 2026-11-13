@@ -210,6 +210,7 @@ fn staging_cleanup_keeps_a_history_job_s_staging_until_its_record_goes() {
         completed_at: 1_700_001_000,
         metadata: None,
         server_attribution: None,
+        files_removed_at: None,
     })
     .unwrap();
     let past_the_ttl = SystemTime::now() + STALE_STAGING_TTL * 2;

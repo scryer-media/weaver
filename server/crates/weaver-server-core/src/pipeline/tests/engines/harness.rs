@@ -1025,6 +1025,8 @@ pub(in crate::pipeline::tests) struct Outcome {
     pub(in crate::pipeline::tests) validated_password: Option<String>,
     // The metadata the job's history row keeps, as stored.
     pub(in crate::pipeline::tests) history_metadata: Option<String>,
+    // The download summary the job's history row keeps, as stored.
+    pub(in crate::pipeline::tests) download_summary: Option<String>,
     // The job's history row, as stored.
     pub(in crate::pipeline::tests) history: Option<crate::JobHistoryRow>,
     // How many times each job stage's duration was observed, by stage name.
@@ -1261,6 +1263,7 @@ async fn try_run_then(
     let validated_password = pipeline.db.validated_archive_password(JOB.0).unwrap();
     let history = pipeline.db.get_job_history(JOB.0).unwrap();
     let history_metadata = history.as_ref().and_then(|row| row.metadata.clone());
+    let download_summary = pipeline.db.history_download_summary_text(JOB).unwrap();
     let stages_timed = pipeline
         .metrics
         .job_lifecycle
@@ -1288,6 +1291,7 @@ async fn try_run_then(
         metrics,
         validated_password,
         history_metadata,
+        download_summary,
         history,
         stages_timed,
     })

@@ -33,8 +33,7 @@ function snapshot(id: number) {
   return { queueItem: null, historyItem: { id, name: `Job-${id}`, displayTitle: `Job-${id}`,
     originalTitle: `Job-${id}`, status: "COMPLETED", progressPercent: 100, totalBytes: 100,
     downloadedBytes: 100, failedBytes: 0, health: 1000, category: null, metadata: [],
-    phaseProgress: [], hasPassword: false, outputDir: `/job-${id}`,
-    parsedRelease: { languagesAudio: [], languagesSubtitles: [] } },
+    phaseProgress: [], hasPassword: false, outputDir: `/job-${id}` },
     jobEvents: [], jobTimeline: null, serverAttribution: [] };
 }
 const listing = (path: string) => ({ currentPath: path, parentPath: "/", entries: [] });

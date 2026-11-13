@@ -129,6 +129,47 @@ pub async fn seed_job(pipeline: &mut Pipeline, job: crate::JobInfo) {
     });
 }
 
+/// Say a history entry's files were removed at `removed_at`, with `listing`
+/// as the record of them, as a files removal writes it.
+pub fn stamp_files_removed(
+    db: &crate::Database,
+    job_id: crate::JobId,
+    listing: crate::history::output_files::OutputFileListing,
+    removed_at: i64,
+) {
+    db.record_history_removed_files(&[(job_id, listing)])
+        .unwrap();
+    db.stamp_history_files_removed(&[job_id], removed_at)
+        .unwrap();
+}
+
+/// Put `summary` on a finished job's history row, as the archive copies it
+/// from the active row.
+pub fn put_history_download_summary(
+    db: &crate::Database,
+    job_id: crate::JobId,
+    summary: &crate::jobs::download_summary::DownloadSummary,
+) {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    let json = summary.to_storage_json().unwrap();
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        SqlRuntime::run_in_transaction(&datastore, "test_history_download_summary", |tx| {
+            let json = json.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE job_history SET download_summary = {} WHERE job_id = {}",
+                    &[SqlArg::Text(json), SqlArg::I64(job_id.0 as i64)],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+    })
+    .unwrap();
+}
+
 /// Initialize real admission resources without running the data plane.
 #[cfg(test)]
 pub(crate) fn admission_resources(
@@ -152,6 +193,7 @@ pub(crate) fn admission_resources(
             max_concurrent_nzbs: None,
             cleanup_after_extract: None,
             delete_failed_job_files: None,
+            history_retention_days: None,
             watch_folder: Default::default(),
             duplicate_policy: Default::default(),
             direct_store: None,

@@ -1,52 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-export interface ParsedEpisodeData {
-  season: number | null;
-  episodeNumbers: number[];
-  absoluteEpisode: number | null;
-  raw: string | null;
-}
-
-export interface ParsedReleaseData {
-  normalizedTitle: string;
-  releaseGroup: string | null;
-  languagesAudio: string[];
-  languagesSubtitles: string[];
-  year: number | null;
-  quality: string | null;
-  source: string | null;
-  videoCodec: string | null;
-  videoEncoding: string | null;
-  audio: string | null;
-  audioCodecs: string[];
-  audioChannels: string | null;
-  isDualAudio: boolean;
-  isAtmos: boolean;
-  isDolbyVision: boolean;
-  detectedHdr: boolean;
-  isHdr10Plus: boolean;
-  isHlg: boolean;
-  fps: number | null;
-  isProperUpload: boolean;
-  isRepack: boolean;
-  isRemux: boolean;
-  isBdDisk: boolean;
-  isAiEnhanced: boolean;
-  isHardcodedSubs: boolean;
-  streamingService: string | null;
-  edition: string | null;
-  animeVersion: number | null;
-  parseConfidence: number;
-  episode: ParsedEpisodeData | null;
-}
-
 export interface DeleteOperationData {
   operationId: number;
   state: "QUEUED" | "RUNNING" | "FAILED";
   locked: boolean;
   deleteFiles: boolean;
   errorMessage?: string | null;
+  /** Selected where it is read: the job page. */
+  action?: "DELETE" | "REMOVE_FILES";
+  filesRemovalOutcome?: "REMOVED" | "ALREADY_GONE" | "NOT_MANAGED" | "BUSY" | "NOT_FOUND" | "FAILED" | null;
 }
 
 export type JobPhase = "DOWNLOADING" | "REPAIRING" | "EXTRACTING" | "MOVING";
@@ -67,7 +30,6 @@ export interface JobData {
   name: string;
   displayTitle: string;
   originalTitle: string;
-  parsedRelease: ParsedReleaseData;
   status: string;
   downloadWaitReason?: string | null;
   downloadRetryAtEpochMs?: number | null;
@@ -92,6 +54,8 @@ export interface JobData {
   /** Failed for a decode window over the memory profile's ceiling; history rows only. */
   failedForMemory?: boolean;
   outputDir?: string | null;
+  /** When the entry's files were removed, or null while they are kept; history rows only. */
+  filesRemovedAt?: string | number | null;
   metadata: { key: string; value: string }[];
   deleteOperation?: DeleteOperationData | null;
 }

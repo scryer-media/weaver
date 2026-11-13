@@ -54,6 +54,7 @@ interface GeneralSettings {
   completeDir: string;
   cleanupAfterExtract: boolean;
   deleteFailedJobFiles: boolean;
+  historyRetentionDays: number;
   maxRetries: number;
   propagationDelaySecs: number;
   maxConcurrentNzbs: number;
@@ -72,6 +73,7 @@ interface Form extends DuplicatePolicy {
   completeDir: string;
   cleanupAfterExtract: boolean;
   deleteFailedJobFiles: boolean;
+  historyRetentionDays: number;
   maxRetries: number;
   propagationDelaySecs: number;
   maxConcurrentNzbs: number;
@@ -231,6 +233,7 @@ export function GeneralPanel() {
             completeDir: settings.completeDir,
             cleanupAfterExtract: settings.cleanupAfterExtract,
             deleteFailedJobFiles: settings.deleteFailedJobFiles,
+            historyRetentionDays: settings.historyRetentionDays,
             maxRetries: settings.maxRetries,
             propagationDelaySecs: settings.propagationDelaySecs,
             maxConcurrentNzbs: settings.maxConcurrentNzbs,
@@ -609,6 +612,21 @@ export function GeneralPanel() {
                 kind: "toggle",
                 value: values.deleteFailedJobFiles,
                 onChange: (next) => commit("deleteFailedJobFiles", next),
+              },
+            },
+            {
+              id: "historyRetentionDays",
+              label: t("next.general.historyRetentionDays"),
+              help: t("next.general.historyRetentionDaysHelp"),
+              keywords: "history retention prune keep days housekeeping",
+              control: {
+                kind: "number",
+                value: values.historyRetentionDays,
+                min: 0,
+                max: 36500,
+                step: 1,
+                onChange: (next) => commit("historyRetentionDays", next),
+                suffix: t("next.general.days"),
               },
             },
           ],

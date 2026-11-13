@@ -891,6 +891,81 @@ pub struct HistoryDeleteBatchOutcome {
     pub refused: BTreeMap<JobId, SchedulerError>,
 }
 
+// What removing one history entry's files did. The entry stays either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryFilesRemovalOutcome {
+    // Folders Weaver manages were on disk and are gone.
+    Removed,
+    // Nothing was on disk, or the entry already says its files were removed.
+    AlreadyGone,
+    // A folder of the job is on disk without proof that Weaver manages it,
+    // so it is left as it is. Folders that are proven the job's still go.
+    NotManaged,
+    // The job is in the queue, or another history operation holds it.
+    Busy,
+    // There is no history entry with this id.
+    NotFound,
+    // Removing stopped on an error. A retry removes what is left.
+    Failed,
+}
+
+impl HistoryFilesRemovalOutcome {
+    // The code an operation target keeps for the outcome.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Removed => "removed",
+            Self::AlreadyGone => "already_gone",
+            Self::NotManaged => "not_managed",
+            Self::Busy => "busy",
+            Self::NotFound => "not_found",
+            Self::Failed => "failed",
+        }
+    }
+
+    // The outcome a kept code names; `None` for any other code, such as a
+    // removal a delete superseded.
+    pub fn parse(code: &str) -> Option<Self> {
+        Some(match code {
+            "removed" => Self::Removed,
+            "already_gone" => Self::AlreadyGone,
+            "not_managed" => Self::NotManaged,
+            "busy" => Self::Busy,
+            "not_found" => Self::NotFound,
+            "failed" => Self::Failed,
+            _ => return None,
+        })
+    }
+
+    // Whether the entry ends with nothing left to remove: its target
+    // completes. Every other outcome fails the target, which the entry then
+    // shows.
+    pub fn settles(self) -> bool {
+        matches!(self, Self::Removed | Self::AlreadyGone | Self::NotFound)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryFilesRemoval {
+    pub outcome: HistoryFilesRemovalOutcome,
+    // When the entry's files were removed, in epoch seconds, once it says so.
+    pub files_removed_at: Option<i64>,
+    pub message: Option<String>,
+}
+
+impl HistoryFilesRemoval {
+    pub(crate) fn new(
+        outcome: HistoryFilesRemovalOutcome,
+        files_removed_at: Option<i64>,
+        message: Option<String>,
+    ) -> Self {
+        Self {
+            outcome,
+            files_removed_at,
+            message,
+        }
+    }
+}
+
 // One `(job, bytes per second)` pair per job whose download phase currently
 // reports a rate. The rate is the value the independent ticker published for
 // that job on the metrics tick, so it is the same estimator and the same
@@ -907,8 +982,9 @@ pub fn job_download_rates(jobs: &[JobInfo]) -> Vec<(JobId, u64)> {
         .collect()
 }
 
-// Summary info about a job (returned by queries).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// Summary info about a job (returned by queries). Its `Debug` never shows
+// the archive password.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct JobInfo {
     pub job_id: JobId,
     pub job_hash: Option<[u8; 32]>,
@@ -995,6 +1071,101 @@ pub struct JobInfo {
     pub download_retry_at_epoch_ms: Option<f64>,
     // Wall-clock creation time (Unix epoch milliseconds).
     pub created_at_epoch_ms: f64,
+}
+
+impl std::fmt::Debug for JobInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured whole, so a new field is a compile error here rather
+        // than a field missing from the output.
+        let Self {
+            job_id,
+            job_hash,
+            name,
+            status,
+            download_state,
+            finalizing_download,
+            fetching_repair_data,
+            post_state,
+            run_state,
+            progress,
+            total_bytes,
+            downloaded_bytes,
+            optional_recovery_bytes,
+            optional_recovery_downloaded_bytes,
+            phase_progress,
+            failed_bytes,
+            health,
+            terminal_discards,
+            total_files,
+            completed_files,
+            file_remaining_bytes,
+            file_parked_bytes,
+            remaining_bytes,
+            wanted_bytes,
+            remaining_par_files,
+            password,
+            category,
+            metadata,
+            output_dir,
+            server_attribution,
+            error,
+            download_wait_reason,
+            download_retry_at_epoch_ms,
+            created_at_epoch_ms,
+        } = self;
+        f.debug_struct("JobInfo")
+            .field("job_id", job_id)
+            .field("job_hash", job_hash)
+            .field("name", name)
+            .field("status", status)
+            .field("download_state", download_state)
+            .field("finalizing_download", finalizing_download)
+            .field("fetching_repair_data", fetching_repair_data)
+            .field("post_state", post_state)
+            .field("run_state", run_state)
+            .field("progress", progress)
+            .field("total_bytes", total_bytes)
+            .field("downloaded_bytes", downloaded_bytes)
+            .field("optional_recovery_bytes", optional_recovery_bytes)
+            .field(
+                "optional_recovery_downloaded_bytes",
+                optional_recovery_downloaded_bytes,
+            )
+            .field("phase_progress", phase_progress)
+            .field("failed_bytes", failed_bytes)
+            .field("health", health)
+            .field("terminal_discards", terminal_discards)
+            .field("total_files", total_files)
+            .field("completed_files", completed_files)
+            .field("file_remaining_bytes", file_remaining_bytes)
+            .field("file_parked_bytes", file_parked_bytes)
+            .field("remaining_bytes", remaining_bytes)
+            .field("wanted_bytes", wanted_bytes)
+            .field("remaining_par_files", remaining_par_files)
+            .field("password", &password.as_ref().map(|_| "[REDACTED]"))
+            .field("category", category)
+            .field(
+                "metadata",
+                &metadata
+                    .iter()
+                    .map(|(key, value)| {
+                        let value = if crate::history::attributes::is_password_attribute_key(key) {
+                            "[REDACTED]"
+                        } else {
+                            value.as_str()
+                        };
+                        (key.as_str(), value)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .field("output_dir", output_dir)
+            .field("server_attribution", server_attribution)
+            .field("error", error)
+            .field("download_wait_reason", download_wait_reason)
+            .field("download_retry_at_epoch_ms", download_retry_at_epoch_ms)
+            .field("created_at_epoch_ms", created_at_epoch_ms)
+            .finish()
+    }
 }
 
 // Handle for sending commands to the scheduler.
@@ -1271,6 +1442,31 @@ impl SchedulerHandle {
             .queue
             .clone()
             .delete_history(job_ids, delete_files)
+            .await
+    }
+
+    // Remove the files of a batch of history entries for the queued files
+    // removal `operation_id`, keeping the entries. `now` is the stamp, in
+    // epoch seconds, written on every entry whose files are gone. Each id's
+    // target is settled with its outcome before the hold on the entries is
+    // released, so the queue revision that release rings finds the result
+    // written. Callers holding more than `HISTORY_DELETE_BATCH_SIZE` ids send
+    // them in batches of that size.
+    pub async fn remove_history_files_for_operation(
+        &self,
+        operation_id: u64,
+        job_ids: BTreeSet<JobId>,
+        now: i64,
+    ) -> Result<BTreeMap<JobId, HistoryFilesRemoval>, SchedulerError> {
+        self.state
+            .queue
+            .clone()
+            .remove_history_files_settling(
+                job_ids,
+                now,
+                crate::history::output_files::REMOVED_FILES_KEPT,
+                Some(operation_id),
+            )
             .await
     }
 

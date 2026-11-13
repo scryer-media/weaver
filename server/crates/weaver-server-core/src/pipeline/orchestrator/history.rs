@@ -177,6 +177,7 @@ impl Pipeline {
                 serde_json::to_string(&state.spec.metadata).ok()
             },
             server_attribution: state.server_attribution.to_storage_json(),
+            files_removed_at: None,
         };
 
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
@@ -241,6 +242,7 @@ impl Pipeline {
             )
         });
 
+        self.persist_download_summary_before_archive(job_id);
         self.persist_support_facts_before_archive(job_id);
         let archive_started = Instant::now();
         let archived = match self.db.try_queue_archive_job_with_terminal_cause(

@@ -35,6 +35,13 @@ export interface DeleteLock {
 export interface RowDeleteOperation {
   state: string;
   locked: boolean;
+  /** A row's operation may be a files removal, which is no delete. */
+  action: "DELETE" | "REMOVE_FILES";
+}
+
+/** Whether the server already reports a delete on this row. */
+function showsDelete(row: { deleteOperation: RowDeleteOperation | null }): boolean {
+  return row.deleteOperation?.action === "DELETE";
 }
 
 export interface DeleteProgress {
@@ -47,7 +54,8 @@ export interface DeleteProgress {
 
 /**
  * Rows as they should be drawn: one this screen has handed over reads as
- * queued for deletion until the server's own page says what it is.
+ * queued for deletion until the server's own page shows the delete. A failed
+ * files removal the row still carries is replaced, as the delete replaces it.
  */
 export function withDeleteLocks<T extends { id: number; deleteOperation: RowDeleteOperation | null }>(
   rows: readonly T[],
@@ -57,15 +65,15 @@ export function withDeleteLocks<T extends { id: number; deleteOperation: RowDele
     return rows as T[];
   }
   return rows.map((row) =>
-    row.deleteOperation === null && locks.has(row.id)
-      ? { ...row, deleteOperation: { state: "QUEUED", locked: true } }
+    !showsDelete(row) && locks.has(row.id)
+      ? { ...row, deleteOperation: { state: "QUEUED", locked: true, action: "DELETE" } }
       : row,
   );
 }
 
 /**
- * The locks still worth holding: a row that has left the page, or that the
- * server now reports on itself, needs no local stand-in.
+ * The locks still worth holding: a row that has left the page, or whose
+ * delete the server now reports itself, needs no local stand-in.
  */
 export function settleDeleteLocks(
   locks: ReadonlyMap<number, DeleteLock>,
@@ -78,7 +86,7 @@ export function settleDeleteLocks(
   const next = new Map<number, DeleteLock>();
   for (const [id, lock] of locks) {
     const row = byId.get(id);
-    if (row && row.deleteOperation === null) {
+    if (row && !showsDelete(row)) {
       next.set(id, lock);
     }
   }

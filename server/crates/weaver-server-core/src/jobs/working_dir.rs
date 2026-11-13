@@ -773,7 +773,12 @@ pub async fn prepare_history_working_dir(
             }
             result => result?,
         };
-        let stored = read_working_marker(&dir)?;
+        // The caller names this as the job's own working directory, so one
+        // with no marker at all is adopted as one with an empty marker is.
+        let stored = match read_working_marker(&dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            result => result?,
+        };
         if stored.is_empty() {
             // The durable history row supplies the legacy directory's job identity.
             mark_weaver_owned_working_dir(&root, &path, job_id)?;
@@ -785,31 +790,159 @@ pub async fn prepare_history_working_dir(
     .map_err(std::io::Error::other)?
 }
 
-pub fn mark_weaver_owned_output_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::write(dir.join(OUTPUT_DIR_MARKER), output_marker_value(dir)?)
+// Who an output directory's ownership marker says delivered it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputDirOwner {
+    // The job the marker names.
+    Job(JobId),
+    // A marker written before markers named their job: it proves the
+    // directory is one Weaver delivered, not which job delivered it.
+    Legacy,
 }
 
-pub fn is_weaver_owned_output_dir(dir: &Path) -> bool {
-    let Ok(directory_metadata) = std::fs::symlink_metadata(dir) else {
-        return false;
-    };
+impl OutputDirOwner {
+    // Whether the marker lets `job_id` remove the directory: one naming that
+    // job, or a legacy one when `legacy_ok` says no other job records the
+    // same directory.
+    pub fn admits(self, job_id: JobId, legacy_ok: bool) -> bool {
+        match self {
+            Self::Job(owner) => owner == job_id,
+            Self::Legacy => legacy_ok,
+        }
+    }
+}
+
+const OUTPUT_MARKER_V1_PREFIX: &str = "weaver-output-v1:";
+const OUTPUT_MARKER_V2_PREFIX: &str = "weaver-output-v2:";
+
+// Marks `dir` as the output `job_id` delivered.
+pub fn mark_weaver_owned_output_dir(dir: &Path, job_id: JobId) -> std::io::Result<()> {
+    std::fs::write(
+        dir.join(OUTPUT_DIR_MARKER),
+        output_marker_value(dir, job_id)?,
+    )
+}
+
+// The owner `dir`'s marker names, when `dir` is a real directory holding a
+// marker made for this very directory; `None` otherwise.
+pub fn output_dir_owner(dir: &Path) -> Option<OutputDirOwner> {
+    let directory_metadata = std::fs::symlink_metadata(dir).ok()?;
     if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
-        return false;
+        return None;
     }
     let marker = dir.join(OUTPUT_DIR_MARKER);
-    let Ok(marker_metadata) = std::fs::symlink_metadata(&marker) else {
-        return false;
-    };
+    let marker_metadata = std::fs::symlink_metadata(&marker).ok()?;
     if marker_metadata.file_type().is_symlink() || !marker_metadata.is_file() {
-        return false;
+        return None;
     }
-    let Ok(expected) = output_marker_value(dir) else {
-        return false;
-    };
-    std::fs::read(&marker).is_ok_and(|stored| stored == expected)
+    let canonical = std::fs::canonicalize(dir).ok()?;
+    parse_output_marker(&std::fs::read(&marker).ok()?, &canonical)
 }
 
-pub(crate) fn is_relocated_output_dir(dir: &Path, previous: &Path) -> bool {
+// Whether `dir` carries a valid marker of any owner.
+pub fn is_weaver_owned_output_dir(dir: &Path) -> bool {
+    output_dir_owner(dir).is_some()
+}
+
+fn output_path_digest(path: &Path) -> String {
+    blake3::hash(path.as_os_str().as_encoded_bytes())
+        .to_hex()
+        .to_string()
+}
+
+// The owner a stored marker names when it was made for `path`.
+fn parse_output_marker(stored: &[u8], path: &Path) -> Option<OutputDirOwner> {
+    let text = std::str::from_utf8(stored).ok()?.strip_suffix('\n')?;
+    let digest = output_path_digest(path);
+    if let Some(rest) = text.strip_prefix(OUTPUT_MARKER_V2_PREFIX) {
+        let (job_id, hash) = rest.split_once(':')?;
+        let job_id = job_id.parse::<u64>().ok()?;
+        return (hash == digest).then_some(OutputDirOwner::Job(JobId(job_id)));
+    }
+    let hash = text.strip_prefix(OUTPUT_MARKER_V1_PREFIX)?;
+    (hash == digest).then_some(OutputDirOwner::Legacy)
+}
+
+// A marker as a build before job-named markers wrote it, for tests of how
+// one is still read.
+#[cfg(test)]
+pub(crate) fn mark_legacy_output_dir(dir: &Path) -> std::io::Result<()> {
+    let canonical = std::fs::canonicalize(dir)?;
+    std::fs::write(
+        dir.join(OUTPUT_DIR_MARKER),
+        format!(
+            "{OUTPUT_MARKER_V1_PREFIX}{}\n",
+            output_path_digest(&canonical)
+        ),
+    )
+}
+
+// Removes an output directory its marker proved Weaver's, the marker last:
+// everything else in it first, then the marker, then the directory. A
+// removal that fails part way leaves the marker, so a retry still proves the
+// rest Weaver's and finishes. A link inside is removed, never followed.
+pub fn remove_owned_output_dir(dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_name() == OUTPUT_DIR_MARKER {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            match std::fs::remove_file(&path) {
+                // A directory link on Windows goes as a directory.
+                Err(error) if file_type.is_symlink() => {
+                    std::fs::remove_dir(&path).map_err(|_| error)?;
+                }
+                result => result?,
+            }
+        }
+        #[cfg(test)]
+        injected_removal_failure(dir)?;
+    }
+    match std::fs::remove_file(dir.join(OUTPUT_DIR_MARKER)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    std::fs::remove_dir(dir)
+}
+
+// Output directories whose removal fails once one entry is gone, for tests
+// of a removal that fails part way. Keyed by directory, so tests in
+// separate temporary directories do not meet.
+#[cfg(test)]
+static INJECTED_REMOVAL_FAILURES: std::sync::Mutex<Vec<PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn inject_removal_failure(dir: &Path, fail: bool) {
+    let mut failing = INJECTED_REMOVAL_FAILURES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    failing.retain(|failing| failing != dir);
+    if fail {
+        failing.push(dir.to_path_buf());
+    }
+}
+
+#[cfg(test)]
+fn injected_removal_failure(dir: &Path) -> std::io::Result<()> {
+    let failing = INJECTED_REMOVAL_FAILURES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if failing.iter().any(|failing| failing == dir) {
+        return Err(std::io::Error::other("injected removal failure"));
+    }
+    Ok(())
+}
+
+// Whether `dir` is the output `job_id` delivered at `previous`, moved since
+// by the job's own script: its marker names `previous` and the job, or is a
+// legacy marker for `previous`, and nothing is left at `previous`.
+pub(crate) fn is_relocated_output_dir(dir: &Path, previous: &Path, job_id: JobId) -> bool {
     if !matches!(std::fs::symlink_metadata(previous), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
     {
         return false;
@@ -837,15 +970,19 @@ pub(crate) fn is_relocated_output_dir(dir: &Path, previous: &Path) -> bool {
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return false;
     }
-    let digest = blake3::hash(previous.as_os_str().as_encoded_bytes());
-    let expected = format!("weaver-output-v1:{}\n", digest.to_hex());
-    std::fs::read(&marker).is_ok_and(|stored| stored == expected.as_bytes())
+    std::fs::read(&marker).is_ok_and(|stored| {
+        parse_output_marker(&stored, &previous).is_some_and(|owner| owner.admits(job_id, true))
+    })
 }
 
-fn output_marker_value(dir: &Path) -> std::io::Result<Vec<u8>> {
+fn output_marker_value(dir: &Path, job_id: JobId) -> std::io::Result<Vec<u8>> {
     let canonical = std::fs::canonicalize(dir)?;
-    let digest = blake3::hash(canonical.as_os_str().as_encoded_bytes());
-    Ok(format!("weaver-output-v1:{}\n", digest.to_hex()).into_bytes())
+    Ok(format!(
+        "{OUTPUT_MARKER_V2_PREFIX}{}:{}\n",
+        job_id.0,
+        output_path_digest(&canonical)
+    )
+    .into_bytes())
 }
 
 #[cfg(test)]
@@ -1227,15 +1364,34 @@ mod tests {
         let copied = temp.path().join("copied");
         std::fs::create_dir(&owned).unwrap();
         std::fs::create_dir(&copied).unwrap();
-        mark_weaver_owned_output_dir(&owned).unwrap();
+        mark_weaver_owned_output_dir(&owned, JobId(7)).unwrap();
 
         assert!(is_weaver_owned_output_dir(&owned));
+        assert_eq!(
+            output_dir_owner(&owned),
+            Some(OutputDirOwner::Job(JobId(7)))
+        );
         std::fs::copy(
             owned.join(OUTPUT_DIR_MARKER),
             copied.join(OUTPUT_DIR_MARKER),
         )
         .unwrap();
         assert!(!is_weaver_owned_output_dir(&copied));
+    }
+
+    #[test]
+    fn a_marker_names_its_job_and_a_legacy_one_names_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join("legacy");
+        std::fs::create_dir(&legacy).unwrap();
+        mark_legacy_output_dir(&legacy).unwrap();
+        assert_eq!(output_dir_owner(&legacy), Some(OutputDirOwner::Legacy));
+
+        let owner = OutputDirOwner::Job(JobId(7));
+        assert!(owner.admits(JobId(7), false));
+        assert!(!owner.admits(JobId(8), true));
+        assert!(OutputDirOwner::Legacy.admits(JobId(8), true));
+        assert!(!OutputDirOwner::Legacy.admits(JobId(8), false));
     }
 
     #[test]

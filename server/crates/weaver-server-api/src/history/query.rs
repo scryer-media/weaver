@@ -24,6 +24,12 @@ enum HistoryQueryPlan {
 // capping the per-poll cost. Only the detail-view read is bounded; callers that
 // must see the full log use `get_job_events`.
 const JOB_DETAIL_EVENT_CAP: u32 = 2000;
+// How many of the newest events the job detail snapshot carries to the page.
+const JOB_DETAIL_EVENT_WINDOW: usize = 100;
+// The page `jobEvents` returns when the caller names no size: the largest,
+// `JOB_DETAIL_EVENT_CAP`, so a client that names none receives what it did
+// before the log was paged.
+const JOB_EVENTS_DEFAULT_LIMIT: u32 = JOB_DETAIL_EVENT_CAP;
 // The page `historyItems` returns when the caller names no size, and the
 // largest it returns when one does.
 const HISTORY_ITEMS_DEFAULT_FIRST: u32 = 1000;
@@ -269,25 +275,33 @@ impl HistoryQuery {
         &self,
         ctx: &Context<'_>,
         job_id: u64,
-        limit: Option<u32>,
+        #[graphql(desc = "Events per page: 2000 when absent, at most 2000.")] limit: Option<u32>,
         offset: Option<u32>,
+        #[graphql(
+            desc = "An event's `cursor`: read only events older than it, so a page holds while new events arrive."
+        )]
+        before: Option<String>,
     ) -> Result<Vec<JobEvent>> {
+        let before = decode_event_cursor(before.as_deref())
+            .map_err(|message| graphql_error("CURSOR_INVALID", message))?
+            .map(|id| id.max(0) as u64);
         let db = ctx.data::<weaver_server_core::Database>()?;
         let db = db.clone();
         // The newest events, oldest-first: `offset` counts back from the
-        // newest, and a page is at most the window the detail snapshot reads.
+        // newest, or from `before`.
         let limit = limit
-            .unwrap_or(JOB_DETAIL_EVENT_CAP)
+            .unwrap_or(JOB_EVENTS_DEFAULT_LIMIT)
             .min(JOB_DETAIL_EVENT_CAP);
         let offset = offset.unwrap_or(0);
-        let events =
-            tokio::task::spawn_blocking(move || db.get_job_events_window(job_id, limit, offset))
-                .await
-                .map_err(|e| async_graphql::Error::new(e.to_string()))?
-                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let events = tokio::task::spawn_blocking(move || {
+            db.get_job_event_records_window(job_id, limit, offset, before)
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         Ok(events
             .into_iter()
-            .filter_map(crate::history::types::job_event_from_core)
+            .filter_map(crate::history::types::job_event_from_record)
             .collect())
     }
 }
@@ -327,7 +341,7 @@ pub(crate) async fn load_job_detail_snapshot(
         // triggers, up to a few Hz per open tab). Large RAR jobs write thousands
         // of event rows, so read only the newest slice instead of scanning the
         // whole log.
-        let events = db.get_job_events_latest(job_id, JOB_DETAIL_EVENT_CAP)?;
+        let events = db.get_job_event_records_window(job_id, JOB_DETAIL_EVENT_CAP, 0, None)?;
         let history = if live_only {
             None
         } else {
@@ -382,10 +396,20 @@ pub(crate) async fn load_job_detail_snapshot(
         .as_ref()
         .cloned()
         .or_else(|| history.as_ref().map(job_info_from_history_row))
-        .map(|job| build_job_timeline(&job, history.as_ref(), &events));
+        .map(|job| {
+            let events = events
+                .iter()
+                .map(|record| record.event.clone())
+                .collect::<Vec<_>>();
+            build_job_timeline(&job, history.as_ref(), &events)
+        });
+    // The timeline reads the wider window; the page is sent only the newest
+    // events it shows, and asks for older ones by cursor.
+    let skip = events.len().saturating_sub(JOB_DETAIL_EVENT_WINDOW);
     let job_events = events
         .into_iter()
-        .filter_map(crate::history::types::job_event_from_core)
+        .skip(skip)
+        .filter_map(crate::history::types::job_event_from_record)
         .collect();
 
     let elapsed = snapshot_started.elapsed();
@@ -410,6 +434,7 @@ pub(crate) async fn load_job_detail_snapshot(
         job_timeline,
         job_events,
         server_attribution,
+        job_id,
     })
 }
 
@@ -1152,6 +1177,7 @@ mod tests {
             completed_at,
             metadata: None,
             server_attribution: None,
+            files_removed_at: None,
         }
     }
 

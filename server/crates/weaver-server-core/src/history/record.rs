@@ -26,6 +26,10 @@ pub struct JobHistoryRow {
     // `None` for a job that attributed nothing, and for every job finished
     // before this was recorded.
     pub server_attribution: Option<String>,
+    // When the operator removed the job's files and kept this entry, in epoch
+    // seconds. `None` while the files are still there to remove. A job that
+    // finishes again writes its row with `None`.
+    pub files_removed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]

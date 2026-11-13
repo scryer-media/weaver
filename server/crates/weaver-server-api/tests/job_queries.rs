@@ -34,6 +34,7 @@ fn sample_history_row(job_id: u64, name: &str, status: &str, completed_at: i64) 
         completed_at,
         metadata: None,
         server_attribution: None,
+        files_removed_at: None,
     }
 }
 
@@ -1229,8 +1230,11 @@ async fn control_scope_deletes_completed_files_through_every_history_mutation() 
             let output_dir = output_root.path().join(format!("job-{id}"));
             std::fs::create_dir(&output_dir).unwrap();
             std::fs::write(output_dir.join("payload.bin"), b"delete me").unwrap();
-            weaver_server_core::jobs::working_dir::mark_weaver_owned_output_dir(&output_dir)
-                .unwrap();
+            weaver_server_core::jobs::working_dir::mark_weaver_owned_output_dir(
+                &output_dir,
+                weaver_server_core::JobId(id),
+            )
+            .unwrap();
             let mut row =
                 sample_history_row(id, &format!("history-{id}"), "complete", 100 + id as i64);
             row.output_dir = Some(output_dir.to_string_lossy().to_string());
@@ -1301,7 +1305,11 @@ async fn admin_scope_deletes_completed_output_through_the_direct_path() {
     let output_dir = output_root.path().join("completed-job");
     std::fs::create_dir(&output_dir).unwrap();
     std::fs::write(output_dir.join("payload.bin"), b"delete me").unwrap();
-    weaver_server_core::jobs::working_dir::mark_weaver_owned_output_dir(&output_dir).unwrap();
+    weaver_server_core::jobs::working_dir::mark_weaver_owned_output_dir(
+        &output_dir,
+        weaver_server_core::JobId(1),
+    )
+    .unwrap();
     let mut row = sample_history_row(1, "admin-direct", "complete", 101);
     row.output_dir = Some(output_dir.to_string_lossy().to_string());
     h.insert_history_row(&row);
@@ -1326,7 +1334,11 @@ async fn authorized_durable_file_delete_removes_completed_output() {
     std::fs::create_dir(&output_dir).unwrap();
     std::fs::write(output_dir.join("payload.bin"), b"delete me").unwrap();
     let mut row = sample_history_row(1, "durable-local", "complete", 101);
-    weaver_server_core::jobs::working_dir::mark_weaver_owned_output_dir(&output_dir).unwrap();
+    weaver_server_core::jobs::working_dir::mark_weaver_owned_output_dir(
+        &output_dir,
+        weaver_server_core::JobId(1),
+    )
+    .unwrap();
     row.output_dir = Some(output_dir.to_string_lossy().to_string());
     h.insert_history_row(&row);
 
@@ -1807,4 +1819,626 @@ async fn a_job_past_the_queue_window_answers_from_its_row_and_installs_nothing()
         response_data(&resp)["jobDetailSnapshot"]["jobEvents"]
     );
     assert_eq!(installed_jobs(&h, WINDOW).await, ids[..WINDOW]);
+}
+
+// ---------------------------------------------------------------------------
+// Remove history files
+// ---------------------------------------------------------------------------
+
+fn error_code(resp: &async_graphql::Response) -> Option<String> {
+    resp.errors
+        .first()?
+        .extensions
+        .as_ref()?
+        .get("code")
+        .and_then(|value| match value {
+            async_graphql::Value::String(code) => Some(code.clone()),
+            _ => None,
+        })
+}
+
+// A files removal emits no pipeline event and runs on the background
+// worker; an open job page still shows the entry's removal time once the
+// files are gone.
+#[tokio::test(start_paused = true)]
+async fn an_open_job_page_sees_the_files_removed() {
+    use tokio_stream::StreamExt;
+
+    let h = TestHarness::new().await;
+    let temp = tempfile::tempdir().unwrap();
+    let owned = temp.path().join("Watched.Release");
+    std::fs::create_dir_all(&owned).unwrap();
+    std::fs::write(owned.join("movie.mkv"), b"movie").unwrap();
+    weaver_server_core::jobs::working_dir::mark_weaver_owned_output_dir(
+        &owned,
+        weaver_server_core::JobId(1),
+    )
+    .unwrap();
+    let mut row = sample_history_row(1, "Watched.Release", "complete", 1_700_000_001);
+    row.output_dir = Some(owned.to_string_lossy().into_owned());
+    h.insert_history_row(&row);
+
+    let request = async_graphql::Request::new(
+        "subscription { jobDetailUpdates(jobId: 1) { historyItem { id filesRemovedAt } } }",
+    )
+    .data(weaver_server_api::auth::CallerScope::Read);
+    let mut stream = h.schema.execute_stream(request);
+    let first = stream.next().await.expect("stream should stay open");
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+    let first = first.data.into_json().unwrap();
+    assert!(first["jobDetailUpdates"]["historyItem"]["filesRemovedAt"].is_null());
+
+    let resp = h
+        .execute("mutation { removeHistoryFiles(ids: [1]) { results { id outcome } } }")
+        .await;
+    assert_no_errors(&resp);
+    assert_eq!(
+        response_data(&resp)["removeHistoryFiles"]["results"][0]["outcome"].as_str(),
+        Some("ACCEPTED")
+    );
+
+    // Each snapshot the stream sends until the one that shows the stamp.
+    loop {
+        let next = stream.next().await.expect("stream should stay open");
+        assert!(next.errors.is_empty(), "{:?}", next.errors);
+        let next = next.data.into_json().unwrap();
+        if next["jobDetailUpdates"]["historyItem"]["filesRemovedAt"].is_string() {
+            break;
+        }
+    }
+    assert!(!owned.exists());
+}
+
+// The request only queues the work: each distinct id is answered in the
+// order given, nothing on disk is touched before the worker runs, and the
+// accepted entries show the queued removal.
+#[tokio::test]
+async fn remove_history_files_answers_each_id_once_in_the_order_given() {
+    let h = TestHarness::new_without_history_delete_worker().await;
+    let temp = tempfile::tempdir().unwrap();
+    let owned = temp.path().join("Owned.Release");
+    std::fs::create_dir_all(&owned).unwrap();
+    std::fs::write(owned.join("movie.mkv"), b"movie").unwrap();
+    weaver_server_core::jobs::working_dir::mark_weaver_owned_output_dir(
+        &owned,
+        weaver_server_core::JobId(1),
+    )
+    .unwrap();
+    let mut owned_row = sample_history_row(1, "Owned.Release", "complete", 1_700_000_001);
+    owned_row.output_dir = Some(owned.to_string_lossy().into_owned());
+    h.insert_history_row(&owned_row);
+    h.insert_history_row(&sample_history_row(
+        2,
+        "Removed.Release",
+        "failed",
+        1_700_000_002,
+    ));
+    weaver_server_core::pipeline::test_support::stamp_files_removed(
+        &h.db,
+        weaver_server_core::JobId(2),
+        Default::default(),
+        1_700_000_100,
+    );
+    h.insert_history_row(&sample_history_row(
+        3,
+        "Deleting.Release",
+        "complete",
+        1_700_000_003,
+    ));
+    h.db.insert_history_delete_operation(&[3], false, false)
+        .unwrap();
+
+    let resp = h
+        .execute(
+            r#"mutation {
+                removeHistoryFiles(ids: [3, 99, 1, 3, 2, 1]) {
+                    operationId
+                    acceptedIds
+                    totalTargets
+                    results { id outcome }
+                }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let answer = response_data(&resp)["removeHistoryFiles"].clone();
+    let answered: Vec<(u64, &str)> = answer["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| {
+            (
+                result["id"].as_u64().unwrap(),
+                result["outcome"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        answered,
+        vec![
+            (3, "BUSY"),
+            (99, "NOT_FOUND"),
+            (1, "ACCEPTED"),
+            (2, "ALREADY_REMOVED"),
+        ]
+    );
+    assert!(answer["operationId"].is_u64());
+    assert_eq!(answer["acceptedIds"], serde_json::json!([1]));
+    assert_eq!(answer["totalTargets"].as_u64(), Some(1));
+    assert!(owned.join("movie.mkv").is_file());
+
+    let resp = h
+        .execute(
+            r#"{
+              historyItem(id: 1) {
+                filesRemovedAt
+                deleteOperation { state locked action filesRemovalOutcome errorMessage }
+              }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let item = response_data(&resp)["historyItem"].clone();
+    assert!(item["filesRemovedAt"].is_null());
+    assert_eq!(
+        item["deleteOperation"],
+        serde_json::json!({
+            "state": "QUEUED",
+            "locked": true,
+            "action": "REMOVE_FILES",
+            "filesRemovalOutcome": null,
+            "errorMessage": null,
+        })
+    );
+}
+
+#[tokio::test]
+async fn remove_history_files_takes_one_to_a_hundred_distinct_ids() {
+    let h = TestHarness::new().await;
+    let too_many = (1..=101)
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    for ids in [String::new(), too_many] {
+        let resp = h
+            .execute(&format!(
+                "mutation {{ removeHistoryFiles(ids: [{ids}]) {{ operationId }} }}"
+            ))
+            .await;
+        assert_has_errors(&resp);
+        assert_eq!(error_code(&resp).as_deref(), Some("INVALID_INPUT"));
+    }
+    // A hundred distinct ids, repeated, is a hundred.
+    let hundred = (1..=100)
+        .chain(1..=100)
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let resp = h
+        .execute(&format!(
+            "mutation {{ removeHistoryFiles(ids: [{hundred}]) {{ results {{ id outcome }} }} }}"
+        ))
+        .await;
+    assert_no_errors(&resp);
+    let results = response_data(&resp)["removeHistoryFiles"]["results"]
+        .as_array()
+        .cloned()
+        .unwrap();
+    assert_eq!(results.len(), 100);
+    assert!(
+        results
+            .iter()
+            .all(|result| result["outcome"] == "NOT_FOUND")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Output files
+// ---------------------------------------------------------------------------
+
+// The listing the field gave before it was paged: every file, following
+// links, by file name ignoring ASCII case.
+fn unpaged_listing(dir: &std::path::Path) -> Vec<(String, String, u64)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<(String, String, u64)>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            let meta = std::fs::metadata(&path).unwrap();
+            if meta.is_dir() {
+                walk(&path, out);
+            } else {
+                out.push((
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    path.to_string_lossy().into_owned(),
+                    meta.len(),
+                ));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(dir, &mut files);
+    files.sort_by_key(|file| file.0.to_ascii_lowercase());
+    files
+}
+
+async fn output_files_page(h: &TestHarness, job_id: u64, args: &str) -> serde_json::Value {
+    let resp = h
+        .execute(&format!(
+            "{{ jobOutputFiles(jobId: {job_id}{args}) {{ outputDir totalBytes totalCount removed nextCursor files {{ name path sizeBytes }} }} }}"
+        ))
+        .await;
+    assert_no_errors(&resp);
+    response_data(&resp)["jobOutputFiles"].clone()
+}
+
+fn page_files(page: &serde_json::Value) -> Vec<(String, String, u64)> {
+    page["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| {
+            (
+                file["name"].as_str().unwrap().to_string(),
+                file["path"].as_str().unwrap().to_string(),
+                file["sizeBytes"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+// A folder on disk pages 100 files at a time in the order the unpaged
+// answer gave, with the totals of every file on each page; a larger page is
+// held to 1000.
+#[tokio::test]
+async fn output_files_page_through_the_folder_on_disk() {
+    let h = TestHarness::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut total_bytes = 0;
+    for n in 0..1_005u64 {
+        let folder = dir.path().join(format!("Part{}", n % 3));
+        std::fs::create_dir_all(&folder).unwrap();
+        let name = if n % 2 == 0 {
+            format!("File-{n:04}.bin")
+        } else {
+            format!("file-{n:04}.BIN")
+        };
+        std::fs::write(folder.join(name), vec![0u8; (n % 7) as usize]).unwrap();
+        total_bytes += n % 7;
+    }
+    let mut row = sample_history_row(7_101, "Paged", "complete", 1_700_000_000);
+    row.output_dir = Some(dir.path().to_string_lossy().into_owned());
+    h.insert_history_row(&row);
+    let unpaged = unpaged_listing(dir.path());
+
+    let first = output_files_page(&h, 7_101, "").await;
+    assert_eq!(page_files(&first), unpaged[..100]);
+    assert_eq!(first["totalCount"].as_u64(), Some(1_005));
+    assert_eq!(first["totalBytes"].as_u64(), Some(total_bytes));
+    assert_eq!(first["removed"].as_bool(), Some(false));
+
+    // Every page after it, to the end: each file once, in order.
+    let mut listed = page_files(&first);
+    let mut cursor = first["nextCursor"].as_str().map(str::to_string);
+    while let Some(after) = cursor {
+        let page = output_files_page(&h, 7_101, &format!(", first: 300, after: \"{after}\"")).await;
+        assert_eq!(page["totalCount"].as_u64(), Some(1_005));
+        assert_eq!(page["totalBytes"].as_u64(), Some(total_bytes));
+        listed.extend(page_files(&page));
+        cursor = page["nextCursor"].as_str().map(str::to_string);
+    }
+    assert_eq!(listed, unpaged);
+
+    let largest = output_files_page(&h, 7_101, ", first: 5000").await;
+    assert_eq!(page_files(&largest), unpaged[..1_000]);
+    assert!(largest["nextCursor"].is_string());
+
+    let exact = output_files_page(&h, 7_101, ", first: 1005").await;
+    assert_eq!(page_files(&exact).len(), 1_000);
+}
+
+// Once the files were removed the answer is the record kept of them: the
+// same paging, absolute paths under the folder, the totals of the whole
+// folder, and no page past the last file kept.
+#[tokio::test]
+async fn output_files_of_removed_files_page_through_the_record() {
+    use weaver_server_core::history::output_files::{OutputFile, OutputFileListing};
+    let h = TestHarness::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let gone = dir.path().join("Gone");
+    let mut row = sample_history_row(7_102, "Gone", "complete", 1_700_000_000);
+    row.output_dir = Some(gone.to_string_lossy().into_owned());
+    h.insert_history_row(&row);
+    let kept = ["a.nfo", "Sub/b.mkv", "c.srt"];
+    weaver_server_core::pipeline::test_support::stamp_files_removed(
+        &h.db,
+        weaver_server_core::JobId(7_102),
+        OutputFileListing {
+            files: kept
+                .iter()
+                .enumerate()
+                .map(|(n, rel)| OutputFile {
+                    rel_path: rel.to_string(),
+                    name: rel.rsplit('/').next().unwrap().to_string(),
+                    size_bytes: n as u64 + 1,
+                })
+                .collect(),
+            // The folder held more than the record kept.
+            total_count: 5,
+            total_bytes: 40,
+        },
+        1_700_000_100,
+    );
+
+    let first = output_files_page(&h, 7_102, ", first: 2").await;
+    assert_eq!(first["removed"].as_bool(), Some(true));
+    assert_eq!(first["totalCount"].as_u64(), Some(5));
+    assert_eq!(first["totalBytes"].as_u64(), Some(40));
+    assert_eq!(
+        page_files(&first),
+        vec![
+            (
+                "a.nfo".into(),
+                gone.join("a.nfo").to_string_lossy().into_owned(),
+                1
+            ),
+            (
+                "b.mkv".into(),
+                gone.join("Sub/b.mkv").to_string_lossy().into_owned(),
+                2
+            ),
+        ]
+    );
+    let after = first["nextCursor"].as_str().unwrap().to_string();
+
+    let second = output_files_page(&h, 7_102, &format!(", first: 2, after: \"{after}\"")).await;
+    assert_eq!(page_files(&second).len(), 1);
+    assert_eq!(second["files"][0]["name"].as_str(), Some("c.srt"));
+    assert!(
+        second["nextCursor"].is_null(),
+        "the record ends at its last file"
+    );
+
+    // The totals alone read no file.
+    let resp = h
+        .execute("{ jobOutputFiles(jobId: 7102) { totalCount removed nextCursor } }")
+        .await;
+    assert_no_errors(&resp);
+    assert_eq!(
+        response_data(&resp)["jobOutputFiles"]["totalCount"].as_u64(),
+        Some(5)
+    );
+}
+
+// A cursor that is not one is refused.
+#[tokio::test]
+async fn output_files_refuse_a_bad_cursor() {
+    let h = TestHarness::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut row = sample_history_row(7_103, "Bad", "complete", 1_700_000_000);
+    row.output_dir = Some(dir.path().to_string_lossy().into_owned());
+    h.insert_history_row(&row);
+    let resp = h
+        .execute("{ jobOutputFiles(jobId: 7103, after: \"not a cursor\") { totalCount } }")
+        .await;
+    assert_has_errors(&resp);
+}
+
+// The folder on disk lists no link and walks no linked folder, as the record
+// a files removal keeps does not.
+#[cfg(unix)]
+#[tokio::test]
+async fn output_files_on_disk_skip_symbolic_links() {
+    let h = TestHarness::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("real.mkv"), b"ab").unwrap();
+    std::fs::write(outside.path().join("elsewhere.mkv"), b"1234567").unwrap();
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("linked")).unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("elsewhere.mkv"),
+        dir.path().join("link.mkv"),
+    )
+    .unwrap();
+    let mut row = sample_history_row(7_104, "Linked", "complete", 1_700_000_000);
+    row.output_dir = Some(dir.path().to_string_lossy().into_owned());
+    h.insert_history_row(&row);
+
+    let page = output_files_page(&h, 7_104, "").await;
+
+    assert_eq!(
+        page_files(&page),
+        vec![(
+            "real.mkv".into(),
+            dir.path().join("real.mkv").to_string_lossy().into_owned(),
+            2
+        )]
+    );
+    assert_eq!(page["totalCount"].as_u64(), Some(1));
+    assert_eq!(page["totalBytes"].as_u64(), Some(2));
+}
+
+// A job's password is never given out: the old reveal is refused, and the
+// queue and history lists carry no password attribute.
+#[tokio::test]
+async fn no_read_returns_a_job_password() {
+    let h = TestHarness::new().await;
+    let mut row = sample_history_row(7_201, "Locked", "complete", 1_700_000_000);
+    row.metadata = Some(
+        serde_json::to_string(&vec![
+            (
+                weaver_server_core::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY,
+                "sealed-secret",
+            ),
+            ("*Unpack:Password", "hunter2"),
+            ("source", "api"),
+        ])
+        .unwrap(),
+    );
+    h.insert_history_row(&row);
+
+    // The old reveal is gone from the schema.
+    assert_has_errors(&h.execute("{ validatedArchivePassword(id: 7201) }").await);
+
+    let resp = h
+        .execute("{ historyItems(first: 10) { id hasPassword attributes { key value } } }")
+        .await;
+    assert_no_errors(&resp);
+    let text = serde_json::to_string(&response_data(&resp)).unwrap();
+    assert!(!text.contains("hunter2"), "{text}");
+    assert!(!text.contains("sealed-secret"), "{text}");
+    assert!(text.contains("\"hasPassword\":true"), "{text}");
+}
+
+// The job page's download summary: null for an entry that finished before
+// summaries were kept, and for a job still in the queue. The detail of the
+// locked entry carries no password either.
+#[tokio::test]
+async fn download_summary_is_null_for_a_legacy_entry_and_a_queued_job() {
+    let h = TestHarness::new().await;
+    let mut row = sample_history_row(7_202, "Legacy", "complete", 1_700_000_000);
+    row.metadata = Some(
+        serde_json::to_string(&vec![
+            (
+                weaver_server_core::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY,
+                "sealed-secret",
+            ),
+            ("*Unpack:Password", "hunter2"),
+        ])
+        .unwrap(),
+    );
+    h.insert_history_row(&row);
+    let resp = h
+        .execute(
+            "{ jobDetailSnapshot(jobId: 7202) { historyItem { id hasPassword attributes { key value } } \
+             jobEvents { kind message } downloadSummary { nodeCount } } }",
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert_eq!(
+        data["jobDetailSnapshot"]["historyItem"]["id"].as_u64(),
+        Some(7_202)
+    );
+    assert!(data["jobDetailSnapshot"]["downloadSummary"].is_null());
+    let text = serde_json::to_string(&data).unwrap();
+    assert!(
+        !text.contains("hunter2") && !text.contains("sealed-secret"),
+        "{text}"
+    );
+
+    let queued = h.submit_test_nzb("Queued").await;
+    let resp = h
+        .execute(&format!(
+            "{{ jobDetailSnapshot(jobId: {queued}) {{ queueItem {{ id }} downloadSummary {{ nodeCount }} }} }}"
+        ))
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert_eq!(
+        data["jobDetailSnapshot"]["queueItem"]["id"].as_u64(),
+        Some(queued)
+    );
+    assert!(data["jobDetailSnapshot"]["downloadSummary"].is_null());
+}
+
+// A finished job's stored summary reads back through the job page: its
+// layout, its nodes and where the password came from, and never the
+// password itself.
+#[tokio::test]
+async fn download_summary_reads_back_with_the_password_origin_and_never_the_password() {
+    use weaver_server_core::jobs::download_summary::{
+        DOWNLOAD_SUMMARY_VERSION, DownloadSummary, Layout, NodeMode, SummaryNode, SummaryPost,
+    };
+
+    let h = TestHarness::new().await;
+    let mut row = sample_history_row(7_203, "Locked", "complete", 1_700_000_000);
+    row.metadata = Some(
+        serde_json::to_string(&vec![(
+            weaver_server_core::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY,
+            "hunter2",
+        )])
+        .unwrap(),
+    );
+    h.insert_history_row(&row);
+    let node = |id: u32, parent: Option<u32>, depth: u32, source: Option<&str>| SummaryNode {
+        id,
+        parent,
+        kind: "rar_store".into(),
+        name: Some(format!("volume{id}.rar")),
+        volumes: 2,
+        depth,
+        mode: NodeMode::Streamed,
+        given_up: false,
+        reason: None,
+        encrypted: source.is_some(),
+        encrypted_headers: false,
+        password_needed: source.is_some(),
+        password_source: source.map(str::to_string),
+    };
+    let summary = DownloadSummary {
+        version: DOWNLOAD_SUMMARY_VERSION,
+        layout: Some(Layout::Archive),
+        nodes: vec![
+            node(1, None, 1, Some("settings")),
+            node(2, Some(1), 2, None),
+        ],
+        node_count: 2,
+        max_depth: 2,
+        recovery: Vec::new(),
+        recovery_count: 0,
+        post: SummaryPost {
+            files: 4,
+            articles: 40,
+            ..SummaryPost::default()
+        },
+    };
+    weaver_server_core::pipeline::test_support::put_history_download_summary(
+        &h.db,
+        weaver_server_core::JobId(7_203),
+        &summary,
+    );
+
+    let resp = h
+        .execute(
+            "{ jobDetailSnapshot(jobId: 7203) { historyItem { id hasPassword } \
+             downloadSummary { layout nodeCount maxDepth \
+             nodes { id parentId kind name volumes depth extracted givenUp reason \
+             encrypted encryptedHeaders passwordNeeded passwordOrigin } \
+             recovery { nodeId } recoveryCount \
+             post { files articles missingArticles failedArticles groups } } } }",
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let got = &data["jobDetailSnapshot"]["downloadSummary"];
+    assert!(!got.is_null(), "{data}");
+    assert_eq!(got["layout"], "ARCHIVE");
+    assert_eq!(got["nodeCount"], 2);
+    assert_eq!(got["maxDepth"], 2);
+    assert_eq!(
+        got["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| (
+                node["id"].as_u64().unwrap(),
+                node["parentId"].as_u64(),
+                node["depth"].as_u64().unwrap(),
+                node["extracted"].as_bool().unwrap(),
+                node["passwordNeeded"].as_bool().unwrap(),
+                node["passwordOrigin"].as_str(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (1, None, 1, false, true, Some("SETTINGS")),
+            (2, Some(1), 2, false, false, None),
+        ]
+    );
+    assert_eq!(got["post"]["files"], 4);
+    assert_eq!(got["post"]["articles"], 40);
+    assert_eq!(
+        data["jobDetailSnapshot"]["historyItem"]["hasPassword"],
+        true
+    );
+    let text = serde_json::to_string(&data).unwrap();
+    assert!(!text.contains("hunter2"), "{text}");
 }

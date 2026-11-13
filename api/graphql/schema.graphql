@@ -212,6 +212,19 @@ type ApplicationUpgradeStatus {
 	latestRun: ApplicationUpgradeRunPayload
 }
 
+"""
+Where the password that opened an archive came from. Never the password.
+"""
+enum ArchivePasswordOrigin {
+	EXPLICIT
+	INTEGRATION
+	DNZB_HEADER
+	NZB_META
+	FILENAME_CONVENTION
+	SETTINGS
+	PASSWORD_FILE
+}
+
 type ArchivePasswordSettings {
 	hasPasswords: Boolean!
 	passwordFile: String
@@ -489,6 +502,62 @@ enum DownloadBlockKindGql {
 	SERVER_QUOTA
 }
 
+enum DownloadLayout {
+	"""
+	Plain files only.
+	"""
+	PLAIN
+	"""
+	Every payload file is part of an archive.
+	"""
+	ARCHIVE
+	"""
+	Archives and plain files side by side.
+	"""
+	MIXED
+}
+
+type DownloadNode {
+	id: Int!
+	"""
+	Null for an archive inside the post itself.
+	"""
+	parentId: Int
+	"""
+	The container's kind, such as `rar_store` or `sevenz_engine`.
+	"""
+	kind: String!
+	name: String
+	volumes: Int!
+	depth: Int!
+	"""
+	Read once its volumes were on disk, rather than as they arrived.
+	"""
+	extracted: Boolean!
+	givenUp: Boolean!
+	"""
+	Why it gave up, such as `encrypted` or `compressed`.
+	"""
+	reason: String
+	encrypted: Boolean!
+	encryptedHeaders: Boolean!
+	passwordNeeded: Boolean!
+	passwordOrigin: ArchivePasswordOrigin
+}
+
+type DownloadPost {
+	files: Int!
+	articles: Int!
+	missingArticles: Int!
+	failedArticles: Int!
+	"""
+	The oldest file date in the NZB, in epoch seconds.
+	"""
+	oldestPost: Int
+	newestPost: Int
+	groups: Int!
+}
+
 enum DownloadPressureReasonGql {
 	NONE
 	DECODE
@@ -517,6 +586,53 @@ type DownloadQuotaUsage {
 	windowStartsAtEpochMs: Float
 	windowEndsAtEpochMs: Float
 	timezoneName: String!
+}
+
+type DownloadRecovery {
+	nodeId: Int!
+	"""
+	`par2`, `par3`, `sfv`, `rar_recovery` or `rar_record`.
+	"""
+	kind: String!
+	"""
+	`clean`, `repaired`, `impossible`, `waiting` or `unread`.
+	"""
+	outcome: String
+	sets: [DownloadRecoverySet!]!
+	setCount: Int!
+}
+
+type DownloadRecoverySet {
+	blocksReachable: Int!
+	damagedSlices: Int!
+	outcome: String
+	slicesRepaired: Int!
+	readBack: Boolean!
+}
+
+"""
+How a finished job's download went. Built once as the job finished.
+"""
+type DownloadSummary {
+	"""
+	Null when the archive graph did not run for the job.
+	"""
+	layout: DownloadLayout
+	"""
+	The first archive nodes, breadth first from the post: at most 200.
+	"""
+	nodes: [DownloadNode!]!
+	"""
+	Every archive node the job had, however many `nodes` holds.
+	"""
+	nodeCount: Int!
+	"""
+	The deepest an archive sat: 1 for one inside the post.
+	"""
+	maxDepth: Int!
+	recovery: [DownloadRecovery!]!
+	recoveryCount: Int!
+	post: DownloadPost!
 }
 
 enum DuplicateActionGql {
@@ -767,6 +883,11 @@ type GeneralSettings {
 	completeDir: String!
 	cleanupAfterExtract: Boolean!
 	deleteFailedJobFiles: Boolean!
+	"""
+	Days a history entry is kept after its job finished; 0 keeps history
+	forever.
+	"""
+	historyRetentionDays: Int!
 	maxDownloadSpeed: Int!
 	maxRetries: Int!
 	propagationDelaySecs: Int!
@@ -781,6 +902,10 @@ input GeneralSettingsInput {
 	completeDir: String
 	cleanupAfterExtract: Boolean
 	deleteFailedJobFiles: Boolean
+	"""
+	Days a history entry is kept, from 0 (forever) to 36500.
+	"""
+	historyRetentionDays: Int
 	maxDownloadSpeed: Int
 	maxRetries: Int
 	propagationDelaySecs: Int
@@ -928,17 +1053,111 @@ enum HistoryDeleteOperationState {
 	COMPLETED_WITH_ERRORS
 }
 
+"""
+The history operation an entry is waiting on, or the last one that
+failed for it. A files removal that succeeded shows here no more; the
+entry's `filesRemovedAt` says so instead.
+"""
 type HistoryDeleteRowState {
 	operationId: Int!
 	state: HistoryDeleteRowStateKind!
 	locked: Boolean!
+	action: HistoryOperationAction!
 	deleteFiles: Boolean!
 	errorMessage: String
+	"""
+	How a failed files removal ended; null for a delete, and while the
+	removal waits or runs.
+	"""
+	filesRemovalOutcome: HistoryFilesRemovalOutcome
 }
 
 enum HistoryDeleteRowStateKind {
 	QUEUED
 	RUNNING
+	FAILED
+}
+
+"""
+What a files removal request answered for one id, before any disk work.
+"""
+enum HistoryFilesRemovalAcceptOutcome {
+	"""
+	Queued: the files are removed in the background.
+	"""
+	ACCEPTED
+	"""
+	There is no history entry and no job with this id.
+	"""
+	NOT_FOUND
+	"""
+	Another history operation holds the entry, or the job is in the
+	queue again.
+	"""
+	BUSY
+	"""
+	The job is in the queue and has not finished.
+	"""
+	NOT_FINISHED
+	"""
+	The entry already says its files were removed.
+	"""
+	ALREADY_REMOVED
+}
+
+"""
+One id's answer to a files removal request.
+"""
+type HistoryFilesRemovalAcceptResult {
+	id: Int!
+	outcome: HistoryFilesRemovalAcceptOutcome!
+}
+
+"""
+The answer to a files removal request. The accepted ids are removed in
+the background; each entry then shows `filesRemovedAt` once its files
+are gone, or a failed `deleteOperation` with `action: REMOVE_FILES`.
+"""
+type HistoryFilesRemovalAcceptance {
+	"""
+	The operation holding the accepted ids; null when none was accepted.
+	"""
+	operationId: Int
+	acceptedIds: [Int!]!
+	totalTargets: Int!
+	"""
+	One result per distinct id, in the order given.
+	"""
+	results: [HistoryFilesRemovalAcceptResult!]!
+}
+
+"""
+What removing one history entry's files did. The entry stays either way.
+"""
+enum HistoryFilesRemovalOutcome {
+	"""
+	Folders Weaver manages were removed.
+	"""
+	REMOVED
+	"""
+	Nothing was on disk, or the files were already removed.
+	"""
+	ALREADY_GONE
+	"""
+	A folder of the job is not one Weaver manages and was left as it is.
+	"""
+	NOT_MANAGED
+	"""
+	The job is in the queue or another history operation holds it.
+	"""
+	BUSY
+	"""
+	There is no history entry with this id.
+	"""
+	NOT_FOUND
+	"""
+	Removing stopped on an error. Nothing is stamped and a retry is safe.
+	"""
 	FAILED
 }
 
@@ -969,6 +1188,11 @@ type HistoryItem {
 	deleteOperation: HistoryDeleteRowState
 	duplicateSummary: DuplicateSummaryInfo
 	"""
+	When the entry's files were removed and the entry kept; null while
+	they are still there.
+	"""
+	filesRemovedAt: DateTime
+	"""
 	The files Weaver gave a name other than their full one, each with its
 	full name. Empty when every file carries its full name.
 	"""
@@ -978,6 +1202,20 @@ type HistoryItem {
 	profile's ceiling, so `reprocessJob(noMemoryLimit: true)` may finish it.
 	"""
 	failedForMemory: Boolean!
+}
+
+"""
+What a history operation does with its entries.
+"""
+enum HistoryOperationAction {
+	"""
+	Deletes the entry, with or without its files.
+	"""
+	DELETE
+	"""
+	Removes the entry's files and keeps the entry.
+	"""
+	REMOVE_FILES
 }
 
 type HistoryPage {
@@ -1140,6 +1378,9 @@ type JobDetailSnapshot {
 	queueItem: QueueItem
 	historyItem: HistoryItem
 	jobTimeline: JobTimeline
+	"""
+	The job's newest events, oldest first: at most 100.
+	"""
 	jobEvents: [JobEvent!]!
 	"""
 	Which servers served this job's articles, highest count first.
@@ -1150,6 +1391,16 @@ type JobDetailSnapshot {
 	that finished before the counters existed.
 	"""
 	serverAttribution: [JobServerContribution!]!
+	"""
+	How many events the job has in all, however many `jobEvents` holds.
+	"""
+	jobEventCount: Int!
+	"""
+	How the download went: its archive tree, recovery and post. Null
+	while the job is queued, and for an entry that finished before
+	Weaver kept it.
+	"""
+	downloadSummary: DownloadSummary
 }
 
 """
@@ -1170,6 +1421,10 @@ type JobEvent {
 	fileId: String
 	message: String!
 	timestamp: Float!
+	"""
+	Pass as `jobEvents(before:)` to read the events older than this one.
+	"""
+	cursor: String
 }
 
 type JobOutputFile {
@@ -1178,10 +1433,31 @@ type JobOutputFile {
 	sizeBytes: Int!
 }
 
+"""
+One page of a job's output files, and the totals of all of them.
+"""
 type JobOutputResult {
 	outputDir: String!
-	files: [JobOutputFile!]!
+	"""
+	The bytes of every file, not only of this page.
+	"""
 	totalBytes: Int!
+	"""
+	How many files there are in all.
+	"""
+	totalCount: Int!
+	"""
+	True when the files were removed and this is the record kept of them.
+	"""
+	removed: Boolean!
+	"""
+	The `after` that asks for the next page; null on the last page.
+	"""
+	nextCursor: String
+	"""
+	This page of the files, in file name order.
+	"""
+	files: [JobOutputFile!]!
 }
 
 """
@@ -1733,6 +2009,15 @@ type MutationRoot {
 	Returns the remaining history jobs after deletion.
 	"""
 	deleteHistoryBatch(ids: [Int!]!, deleteFiles: Boolean! = false): [HistoryItem!]!
+	"""
+	Remove the files of up to 100 history entries and keep the entries
+	and their stored NZBs. Only folders Weaver manages are removed. The
+	request only queues the work and answers one result per distinct id,
+	in the order given; the files go in the background. Each accepted
+	entry then shows `filesRemovedAt`, or a failed `deleteOperation`
+	with `action: REMOVE_FILES`, its `filesRemovalOutcome` and message.
+	"""
+	removeHistoryFiles(ids: [Int!]!): HistoryFilesRemovalAcceptance!
 	"""
 	Delete all completed/failed/cancelled jobs from history.
 	Integration (control) scope may also delete completed output with `deleteFiles: true`.
@@ -2512,8 +2797,16 @@ type QueryRoot {
 	"""
 	Get the event log for a specific job.
 	"""
-	jobEvents(jobId: Int!, limit: Int, offset: Int): [JobEvent!]!
-	validatedArchivePassword(id: Int!): String
+	jobEvents(		jobId: Int!,
+		"""
+		Events per page: 2000 when absent, at most 2000.
+		"""
+		limit: Int,		offset: Int,
+		"""
+		An event's `cursor`: read only events older than it, so a page holds while new events arrive.
+		"""
+		before: String
+	): [JobEvent!]!
 	"""
 	A report on a queued or finished job's NZB and how the job went, with
 	every name, path, host and password left out so it can be shared.
@@ -2566,9 +2859,20 @@ type QueryRoot {
 	"""
 	duplicateSnapshot(id: Int!): DuplicateIdentitySnapshotInfo
 	"""
-	List files in a completed job's output directory.
+	List one page of the files in a job's output directory, in file name
+	order, with the totals of all of them. Once the files were removed,
+	the list is the record kept of them and `removed` is true.
 	"""
-	jobOutputFiles(jobId: Int!): JobOutputResult
+	jobOutputFiles(		jobId: Int!,
+		"""
+		Files per page: 100 when absent, at most 1000.
+		"""
+		first: Int,
+		"""
+		The `nextCursor` of the page before.
+		"""
+		after: String
+	): JobOutputResult
 	postProcessingSettings: PostProcessingSettingsGql!
 	"""
 	Every saved script job, in run order.

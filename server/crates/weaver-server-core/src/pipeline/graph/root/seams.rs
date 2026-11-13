@@ -35,12 +35,9 @@ impl Pipeline {
     // runtime. The job's state must already be in place: what its queues
     // hold says which articles this run still has to fetch.
     pub(crate) fn admit_graph_job(&mut self, job_id: JobId) {
-        // Read before the job is borrowed, in the order they are tried.
-        let passwords: Vec<String> = self
-            .archive_password_candidates_for_job(job_id)
-            .iter()
-            .map(|candidate| candidate.value().to_owned())
-            .collect();
+        // Read before the job is borrowed, in the order they are tried, each
+        // with its source for the download summary.
+        let passwords = self.archive_password_candidates_for_job(job_id);
         let slots = self.graph_slot_limit();
         let Some(state) = self.jobs.get(&job_id) else {
             return;

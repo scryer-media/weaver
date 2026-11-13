@@ -1539,7 +1539,7 @@ async fn redownload_job_rebuilds_complete_history_as_queued_download() {
         "complete",
         working_dir.clone(),
     );
-    crate::jobs::working_dir::mark_weaver_owned_output_dir(&working_dir).unwrap();
+    crate::jobs::working_dir::mark_weaver_owned_output_dir(&working_dir, job_id).unwrap();
     row.category = Some("tv".to_string());
     row.metadata = Some(serde_json::to_string(&vec![("source", "history")]).unwrap());
     insert_history_row_with_nzb_zstd(&pipeline.db, &row, &sample_nzb_zstd());
