@@ -40,6 +40,9 @@ pub struct PipelineDiagnostics {
     pub pool: Vec<PoolServerDiagnostics>,
     pub lanes: LaneDiagnostics,
     pub memory: MemoryDiagnostics,
+    // Absent from older packets, which read as no volume.
+    #[serde(default)]
+    pub volumes: Vec<VolumeDiagnostics>,
 }
 
 // Tuner-owned concurrency parameters and the connection ceiling they respect.
@@ -170,6 +173,45 @@ pub struct MemoryDiagnostics {
     pub lane_inflight_bytes: u64,
     pub jobs_eligible: usize,
     pub jobs_hot: usize,
+}
+
+// One volume the download side writes to, as the disk owner holds it: no
+// disk is looked at for a packet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeDiagnostics {
+    // The mount path or drive root.
+    pub label: String,
+    // `ssd`, `platter`, `network` or `unknown`.
+    pub storage_kind: String,
+    pub device: Option<u64>,
+    // Bytes per second inside write calls over the last window; zero until
+    // measured.
+    pub write_rate_bytes_per_second: u64,
+    // Bytes waiting in memory for the volume's writer.
+    pub buffered_bytes: u64,
+    pub written_bytes_total: u64,
+    // Time spent inside write calls.
+    pub write_seconds_total: f64,
+    // Write calls made, and how many of them did not start where the
+    // previous write to the same file ended.
+    pub write_calls_total: u64,
+    pub write_seeks_total: u64,
+}
+
+impl From<crate::operations::instrumentation::VolumeSnapshot> for VolumeDiagnostics {
+    fn from(volume: crate::operations::instrumentation::VolumeSnapshot) -> Self {
+        Self {
+            label: volume.label,
+            storage_kind: volume.kind.to_string(),
+            device: volume.device,
+            write_rate_bytes_per_second: volume.write_rate,
+            buffered_bytes: volume.buffered_bytes,
+            written_bytes_total: volume.written_bytes,
+            write_seconds_total: volume.write_nanos as f64 / 1e9,
+            write_calls_total: volume.write_calls,
+            write_seeks_total: volume.write_seeks,
+        }
+    }
 }
 
 // Download lane occupancy, taken from the published lane counters.
@@ -476,6 +518,53 @@ impl Pipeline {
                 jobs_eligible: metrics.download_jobs_eligible,
                 jobs_hot: metrics.download_jobs_hot,
             },
+            volumes: self
+                .storage_capacity
+                .volume_snapshots()
+                .into_iter()
+                .map(VolumeDiagnostics::from)
+                .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operations::instrumentation::VolumeSnapshot;
+
+    // A volume's row in the packet carries every figure the disk owner
+    // holds for it, and reads back as written.
+    #[test]
+    fn a_volume_is_listed_with_every_figure_held_for_it() {
+        let listed = VolumeDiagnostics::from(VolumeSnapshot {
+            label: "/mnt/pool".into(),
+            kind: "platter",
+            device: Some(7),
+            written_bytes: 8_000_000,
+            write_nanos: 2_500_000_000,
+            write_calls: 120,
+            write_seeks: 9,
+            write_rate: 3_200_000,
+            buffered_bytes: 65_536,
+        });
+        let json = serde_json::to_value(&listed).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "label": "/mnt/pool",
+                "storage_kind": "platter",
+                "device": 7,
+                "write_rate_bytes_per_second": 3_200_000,
+                "buffered_bytes": 65_536,
+                "written_bytes_total": 8_000_000,
+                "write_seconds_total": 2.5,
+                "write_calls_total": 120,
+                "write_seeks_total": 9,
+            })
+        );
+        let read: VolumeDiagnostics = serde_json::from_value(json).unwrap();
+        assert_eq!(read.label, "/mnt/pool");
+        assert_eq!(read.write_seeks_total, 9);
     }
 }

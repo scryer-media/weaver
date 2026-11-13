@@ -92,45 +92,57 @@ fn rotational(dev: u64) -> StorageKind {
     }
 }
 
+// The filesystem's own record of the mount `path` lies on.
 #[cfg(target_vendor = "apple")]
-fn probe(path: &Path) -> StorageKind {
+pub(super) fn mount_stat(path: &Path) -> Option<libc::statfs> {
     use std::os::unix::ffi::OsStrExt;
 
-    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statfs` fills a zeroed `libc::statfs` for a valid C string
+    // path; the return code is checked before the record is handed out.
+    unsafe {
+        let mut stat: libc::statfs = std::mem::zeroed();
+        (libc::statfs(c_path.as_ptr(), &mut stat) == 0).then_some(stat)
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn probe(path: &Path) -> StorageKind {
+    let Some(stat) = mount_stat(path) else {
         return StorageKind::Unknown;
     };
-    // SAFETY: as above; `f_fstypename` is a NUL-terminated array.
-    let name = unsafe {
-        let mut stat: libc::statfs = std::mem::zeroed();
-        if libc::statfs(c_path.as_ptr(), &mut stat) != 0 {
-            return StorageKind::Unknown;
-        }
-        std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr())
-            .to_string_lossy()
-            .into_owned()
-    };
+    // SAFETY: `f_fstypename` is a NUL-terminated array the call filled.
+    let name = unsafe { std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()) }.to_string_lossy();
     // Whether a local disk rotates needs IOKit: it is unknown.
-    match name.as_str() {
+    match name.as_ref() {
         "nfs" | "smbfs" | "afpfs" | "webdav" | "macfuse" | "osxfuse" => StorageKind::Network,
         _ => StorageKind::Unknown,
     }
 }
 
+// The root of the volume `path` lies on, such as `D:\`, NUL-terminated.
 #[cfg(windows)]
-fn probe(path: &Path) -> StorageKind {
+pub(super) fn volume_root(path: &Path) -> Option<[u16; 261]> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumePathNameW};
+    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
 
-    // What `GetDriveTypeW` returns for a network drive.
-    const DRIVE_REMOTE: u32 = 4;
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut root = [0u16; 261];
     // SAFETY: `wide` is NUL-terminated and `root` is as long as the length
-    // passed; the return code is checked before `root` is read.
+    // passed; the return code is checked before `root` is handed out.
     let found = unsafe { GetVolumePathNameW(wide.as_ptr(), root.as_mut_ptr(), root.len() as u32) };
-    if found == 0 {
+    (found != 0).then_some(root)
+}
+
+#[cfg(windows)]
+fn probe(path: &Path) -> StorageKind {
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+
+    // What `GetDriveTypeW` returns for a network drive.
+    const DRIVE_REMOTE: u32 = 4;
+    let Some(root) = volume_root(path) else {
         return StorageKind::Unknown;
-    }
+    };
     // SAFETY: `root` holds the NUL-terminated volume path just written.
     if unsafe { GetDriveTypeW(root.as_ptr()) } == DRIVE_REMOTE {
         StorageKind::Network

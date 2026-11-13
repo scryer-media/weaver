@@ -48,36 +48,46 @@ impl SparseMarker for PlatformMarker {
 // A marking failure keeps the open file, including any pre-existing bytes.
 // Only an actual open failure prevents the caller from using it.
 pub(crate) fn create_sparse<M: SparseMarker>(path: &Path, marker: &M) -> io::Result<File> {
-    create_sized_with(path, marker, None, PRESIZES)
+    create_sized_with(path, marker, None, makes_holes)
 }
 
-// Whether a file marked sparse takes its declared length when it is made.
-// On Windows a file that grows write by write across scattered offsets
-// keeps moving its end of file, and NTFS keeps the cached pages of such a
-// file out of the standby list, so the first read of a finished output goes
-// to disk; one set to its length first is written into holes inside it. On
-// Unix nothing is gained: a write past the end makes a hole as cheaply, and
-// the length stays the reach of the bytes written.
-pub(crate) const PRESIZES: bool = cfg!(windows);
+// Whether this platform can tell a filesystem that makes holes, and so ever
+// gives a file its declared length when it is made. Where it cannot, every
+// file grows as it is written. Read by tests, which accept a sized file only
+// where one can be made.
+#[cfg(test)]
+pub(crate) const PRESIZES: bool = cfg!(any(windows, target_os = "linux", target_vendor = "apple"));
 
-// Creates `path` as `create_sparse` does and, where the platform presizes,
-// gives it `length`. Only a file the mark took is sized: on a mount that
-// refuses the mark the length would be zero-filled space for bytes never
-// written. Only an empty file is sized: one that already holds bytes is a
-// restart's, whose length the restore reads as how far its bytes reach.
+// Creates `path` as `create_sparse` does and gives it `length` when its
+// filesystem is known to make holes; any other file grows as it is written.
+//
+// A file set to its length first is written into holes inside it, and its
+// end of file does not move with every write at a scattered offset. That is
+// only free where the unwritten length takes no space: on a filesystem that
+// would fill it with zeroes, or one that cannot be told, the length would be
+// space and writes for bytes never downloaded. No space is ever reserved:
+// the length is set, never allocated.
+//
+// On Windows the sparse mark is the test, taken first and the length after
+// it: a mount that refuses the mark is not sized. On Linux and macOS it is
+// the type of filesystem the open file is on; a share over the network and a
+// filesystem not known are not sized.
+//
+// Only an empty file is sized: one that already holds bytes is a restart's,
+// whose length the restore reads as how far its bytes reach.
 pub(crate) fn create_sized<M: SparseMarker>(
     path: &Path,
     marker: &M,
     length: Option<u64>,
 ) -> io::Result<File> {
-    create_sized_with(path, marker, length, PRESIZES)
+    create_sized_with(path, marker, length, makes_holes)
 }
 
 fn create_sized_with<M: SparseMarker>(
     path: &Path,
     marker: &M,
     length: Option<u64>,
-    presizes: bool,
+    makes_holes: impl FnOnce(&File) -> bool,
 ) -> io::Result<File> {
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -89,19 +99,93 @@ fn create_sized_with<M: SparseMarker>(
     if !marked {
         crate::runtime::perf_probe::record_value("graph.sparse.mark_failed", 1);
     }
-    let Some(length) = length.filter(|length| presizes && marked && *length > 0) else {
+    let Some(length) = length.filter(|length| marked && *length > 0) else {
         return Ok(file);
     };
     // Sizing is an allocation hint like the mark: a file it fails on stays
-    // usable and grows by its writes.
+    // usable and grows by its writes. The filesystem is asked about last,
+    // and only for a file that would be sized.
     let sized = file.metadata().and_then(|metadata| match metadata.len() {
-        0 => file.set_len(length),
+        0 if makes_holes(&file) => file.set_len(length),
         _ => Ok(()),
     });
     if sized.is_err() {
         crate::runtime::perf_probe::record_value("graph.sparse.presize_failed", 1);
     }
     Ok(file)
+}
+
+// Whether the filesystem `file` is on makes a hole of a length set past the
+// bytes written. On Windows a file that took the sparse mark does, and only
+// such a file is asked about.
+#[cfg(windows)]
+fn makes_holes(_file: &File) -> bool {
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn makes_holes(file: &File) -> bool {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `fstatfs` fills a zeroed `libc::statfs` for an open
+    // descriptor; the return code is checked before any field is read.
+    let magic = unsafe {
+        let mut stat: libc::statfs = std::mem::zeroed();
+        if libc::fstatfs(file.as_raw_fd(), &mut stat) != 0 {
+            return false;
+        }
+        (stat.f_type as u64) & 0xFFFF_FFFF
+    };
+    linux_makes_holes(magic)
+}
+
+#[cfg(target_vendor = "apple")]
+fn makes_holes(file: &File) -> bool {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: as above; `f_fstypename` is a NUL-terminated array.
+    let name = unsafe {
+        let mut stat: libc::statfs = std::mem::zeroed();
+        if libc::fstatfs(file.as_raw_fd(), &mut stat) != 0 {
+            return false;
+        }
+        std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    };
+    apple_makes_holes(&name)
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_vendor = "apple")))]
+fn makes_holes(_file: &File) -> bool {
+    false
+}
+
+// The filesystem magic numbers `fstatfs` reports for the local Linux
+// filesystems that keep an unwritten length as a hole: ext2 to ext4, XFS,
+// Btrfs, ZFS, F2FS, bcachefs and tmpfs. Every other, a share over the
+// network among them, is not known to.
+#[cfg(any(test, target_os = "linux"))]
+const HOLE_MAGIC: [u64; 7] = [
+    0xEF53,
+    0x5846_5342,
+    0x9123_683E,
+    0x2FC1_2FC1,
+    0xF2F5_2010,
+    0xCA45_1A4E,
+    0x0102_1994,
+];
+
+#[cfg(any(test, target_os = "linux"))]
+fn linux_makes_holes(magic: u64) -> bool {
+    HOLE_MAGIC.contains(&magic)
+}
+
+// On macOS only APFS keeps an unwritten length as a hole; HFS+ fills it with
+// zeroes, and a share is not known.
+#[cfg(any(test, target_vendor = "apple"))]
+fn apple_makes_holes(filesystem: &str) -> bool {
+    filesystem == "apfs"
 }
 
 // `FSCTL_SET_SPARSE` with no input buffer, which is the "make it sparse" form
@@ -202,20 +286,20 @@ mod tests {
         marker: &impl SparseMarker,
         held: Option<&[u8]>,
         length: Option<u64>,
-        presizes: bool,
+        makes_holes: bool,
     ) -> Vec<u8> {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("ember.bin");
         if let Some(held) = held {
             std::fs::write(&path, held).unwrap();
         }
-        let mut file = create_sized_with(&path, marker, length, presizes).unwrap();
+        let mut file = create_sized_with(&path, marker, length, |_| makes_holes).unwrap();
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
         bytes
     }
 
-    // Where the platform presizes, a new file the mark took reaches its
+    // On a filesystem that makes holes, a new file the mark took reaches its
     // declared length from the start, every byte of it a hole.
     #[test]
     fn a_marked_new_file_takes_its_declared_length() {
@@ -229,10 +313,10 @@ mod tests {
         assert!(sized(&Refusing, None, Some(4096), true).is_empty());
     }
 
-    // Where the platform does not presize, the file stays as long as what is
-    // written to it.
+    // On a filesystem not known to make holes, the file stays as long as
+    // what is written to it.
     #[test]
-    fn a_platform_that_does_not_presize_leaves_the_file_unsized() {
+    fn a_filesystem_not_known_to_make_holes_leaves_the_file_unsized() {
         assert!(sized(&Taking, None, Some(4096), false).is_empty());
     }
 
@@ -249,9 +333,88 @@ mod tests {
         assert!(sized(&Taking, None, None, true).is_empty());
     }
 
-    // Only Windows presizes.
+    // The filesystem is asked about only for a file that would be sized:
+    // never for one with no length, a refused mark, or bytes already in it.
     #[test]
-    fn only_windows_presizes() {
-        assert_eq!(PRESIZES, cfg!(windows));
+    fn the_filesystem_is_asked_about_only_for_a_file_that_would_be_sized() {
+        let asked = |marker_takes: bool, held: Option<&[u8]>, length: Option<u64>| {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("ember.bin");
+            if let Some(held) = held {
+                std::fs::write(&path, held).unwrap();
+            }
+            let asked = std::cell::Cell::new(false);
+            let makes_holes = |_: &File| {
+                asked.set(true);
+                true
+            };
+            if marker_takes {
+                create_sized_with(&path, &Taking, length, makes_holes).unwrap();
+            } else {
+                create_sized_with(&path, &Refusing, length, makes_holes).unwrap();
+            }
+            asked.get()
+        };
+        assert!(asked(true, None, Some(4096)));
+        assert!(!asked(true, None, None));
+        assert!(!asked(true, None, Some(0)));
+        assert!(!asked(false, None, Some(4096)));
+        assert!(!asked(true, Some(b"routed"), Some(4096)));
+    }
+
+    // The local Linux filesystems that make holes are sized; a share and a
+    // filesystem not known are not.
+    #[test]
+    fn linux_sizes_only_filesystems_known_to_make_holes() {
+        // ext4, XFS, Btrfs, ZFS, tmpfs.
+        for magic in [0xEF53, 0x5846_5342, 0x9123_683E, 0x2FC1_2FC1, 0x0102_1994] {
+            assert!(linux_makes_holes(magic), "{magic:#x}");
+        }
+        // NFS, SMB, CIFS, SMB2, FUSE, an overlay, FAT, and nothing at all.
+        for magic in [
+            0x6969,
+            0x517B,
+            0xFF53_4D42,
+            0xFE53_4D42,
+            0x6573_5546,
+            0x794C_7630,
+            0x4D44,
+            0,
+        ] {
+            assert!(!linux_makes_holes(magic), "{magic:#x}");
+        }
+    }
+
+    // On macOS APFS is sized; HFS+, a share and a filesystem not known are
+    // not.
+    #[test]
+    fn macos_sizes_only_apfs() {
+        assert!(apple_makes_holes("apfs"));
+        for filesystem in ["hfs", "smbfs", "nfs", "afpfs", "exfat", "msdos", "macfuse", ""] {
+            assert!(!apple_makes_holes(filesystem), "{filesystem}");
+        }
+    }
+
+    // On whatever filesystem holds the test, a new file is either given its
+    // whole declared length or left to grow: never anything between.
+    #[test]
+    fn the_platform_rule_sizes_a_file_whole_or_not_at_all() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ember.bin");
+        let file = create_sized(&path, &PlatformMarker, Some(1 << 20)).unwrap();
+        let length = file.metadata().unwrap().len();
+        assert!(length == 0 || length == 1 << 20, "{length}");
+        if !PRESIZES {
+            assert_eq!(length, 0);
+        }
+    }
+
+    // A file made with no declared length is never sized, on any platform.
+    #[test]
+    fn a_file_made_without_a_length_is_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ember.bin");
+        let file = create_sparse(&path, &PlatformMarker).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 0);
     }
 }

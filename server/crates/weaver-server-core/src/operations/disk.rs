@@ -15,6 +15,10 @@ use crate::runtime::StartupDiskGate;
 use crate::runtime::system_profile::{FilesystemType, StorageClass};
 
 mod storage_kind;
+pub(crate) mod volume;
+mod volume_seam;
+pub(crate) mod volume_label;
+pub(crate) mod volume_rate;
 
 pub(crate) use storage_kind::StorageKind;
 

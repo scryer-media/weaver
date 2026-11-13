@@ -544,8 +544,10 @@ impl SharedPipelineState {
         self.nntp_pool.read().unwrap().clone()
     }
 
-    // The samplers of the pipeline that runs over this state.
+    // The samplers of the pipeline that runs over this state. The disk owner
+    // is in use from here on, so its volumes' write rates are kept from here.
     pub(crate) fn set_storage_capacity(&self, storage: &Arc<crate::operations::StorageCapacity>) {
+        storage.watch_volume_rates();
         *self
             .storage_capacity
             .write()

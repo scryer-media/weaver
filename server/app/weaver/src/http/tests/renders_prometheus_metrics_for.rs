@@ -925,6 +925,20 @@ fn renders_collected_instrumentation_snapshots() {
         "weaver_disk_available_bytes{role=\"complete\",path=\"/var/lib/weaver/complete\"} 50000"
     ));
 
+    // Volumes: a measured one carries its rate, an unmeasured one does not.
+    assert!(rendered.contains("weaver_volume_written_bytes_total{volume=\"/mnt/nas\"} 8000000"));
+    assert!(rendered.contains("weaver_volume_write_seconds_total{volume=\"/mnt/nas\"} 2.5"));
+    assert!(
+        rendered
+            .contains("weaver_volume_write_rate_bytes_per_second{volume=\"/mnt/nas\"} 3200000")
+    );
+    assert!(rendered.contains("weaver_volume_buffered_bytes{volume=\"/mnt/nas\"} 65536"));
+    assert!(rendered.contains("weaver_volume_write_calls_total{volume=\"/mnt/nas\"} 120"));
+    assert!(rendered.contains("weaver_volume_write_seeks_total{volume=\"/mnt/nas\"} 9"));
+    assert!(rendered.contains("weaver_volume_write_seeks_total{volume=\"/mnt/scratch\"} 0"));
+    assert!(rendered.contains("weaver_volume_written_bytes_total{volume=\"/mnt/scratch\"} 0"));
+    assert!(!rendered.contains("weaver_volume_write_rate_bytes_per_second{volume=\"/mnt/scratch\"}"));
+
     // HTTP.
     assert!(rendered.contains(
         "weaver_http_requests_total{route=\"/graphql\",method=\"POST\",status=\"200\"} 42"
@@ -961,6 +975,7 @@ fn absent_instrumentation_omits_its_families() {
         "process_cpu_seconds_total",
         "process_start_time_seconds",
         "weaver_disk_total_bytes",
+        "weaver_volume_written_bytes_total",
         "weaver_http_requests_total",
     ] {
         assert!(!bare.contains(family), "{family} should be absent");

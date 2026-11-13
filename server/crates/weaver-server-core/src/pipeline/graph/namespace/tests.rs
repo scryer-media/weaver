@@ -1868,13 +1868,16 @@ fn a_member_closes_exactly_when_covered_at_its_length() {
     let member = job.member("video.mkv", Some(9));
     job.send(member, 0, b"abc", Provenance::Fresh);
     assert!(job.is_open(NodeId::ROOT, member));
-    assert_eq!(
-        std::fs::metadata(job.dir.path().join("video.mkv"))
-            .unwrap()
-            .len(),
-        3,
-        "unwritten declared bytes must not allocate space on a non-sparse mount"
-    );
+    // The file grows as written, or starts at its declared length where its
+    // filesystem makes a hole of the rest; it is never anything between.
+    let length = std::fs::metadata(job.dir.path().join("video.mkv"))
+        .unwrap()
+        .len();
+    if crate::pipeline::graph::sparse::PRESIZES {
+        assert!(length == 3 || length == 9, "{length}");
+    } else {
+        assert_eq!(length, 3);
+    }
     job.send(member, 6, b"end", Provenance::Fresh);
     assert!(job.is_open(NodeId::ROOT, member));
     job.send(member, 3, b"mid", Provenance::Fresh);
