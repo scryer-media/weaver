@@ -2147,78 +2147,59 @@ mod tests {
 
     // A recovery payload far past the memory limit is never held: its
     // packet is checked, and then read again as the repair spends it, in
-    // volume reads no longer than the limit, and the repair rebuilds the
-    // exact bytes.
+    // volume reads no longer than a chunk, whatever the limit is, and the
+    // repair rebuilds the exact bytes. The limits are one under a chunk, one
+    // over it and one over the payload, so it is the chunk that sizes the
+    // reads.
     #[test]
     fn a_recovery_payload_past_the_memory_limit_is_read_in_bounded_pieces_and_not_held() {
         const MIB: u64 = 1 << 20;
-        const LIMIT: u64 = MIB;
-        struct Volumes {
-            store: Store,
-            reads: Vec<ByteRange>,
-        }
-        impl MemberAccess for Volumes {
-            fn read(&mut self, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
-                self.store.read(member, range, into)
-            }
-            fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
-                self.store.write_repaired(member, offset, bytes);
-            }
-            fn length(&self, member: MemberId) -> Option<u64> {
-                self.store.length(member)
-            }
-            fn arrived(&self, member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {
-                self.store.arrived(member, range, out);
-            }
-            fn read_volume(
-                &mut self,
-                volume: VolumeIndex,
-                range: ByteRange,
-                into: &mut Vec<u8>,
-            ) -> bool {
-                self.reads.push(range);
-                self.store.read_volume(volume, range, into)
-            }
-        }
         let slice = 4 * MIB;
         let data = payload(91, (2 * slice + slice / 2) as usize);
         let files = par2_set("set", &[("payload.bin", &data)], slice, 1, 1);
         let mut wrong = data.clone();
         wrong[(slice + 17) as usize] ^= 0x5A;
-        let (mut job, member) = fixture(&files, &wrong);
-        job.store.holes.clear();
+        for limit in [CHUNK / 2, 2 * CHUNK, 64 * CHUNK] {
+            let (mut job, member) = fixture(&files, &wrong);
+            job.store.holes.clear();
 
-        // What the set spends is a location, not a payload.
-        let state = job.object.sets.values_mut().next().unwrap();
-        let mut slices = BTreeMap::new();
-        spend(state, slice, 1, &mut slices, &mut job.store);
-        assert_eq!(slices.len(), 1);
-        assert!(
-            slices
-                .values()
-                .all(|block| block.data.as_bytes().is_none() && block.data.len() as u64 == slice)
-        );
+            // What the set spends is a location, not a payload.
+            let state = job.object.sets.values_mut().next().unwrap();
+            let mut slices = BTreeMap::new();
+            spend(state, slice, 1, &mut slices, &mut job.store);
+            assert_eq!(slices.len(), 1);
+            assert!(
+                slices.values().all(
+                    |block| block.data.as_bytes().is_none() && block.data.len() as u64 == slice
+                )
+            );
+            let packet = state.recovery[&0];
+            let payload = payload_of(state, 0);
 
-        let mut access = Volumes {
-            store: job.store,
-            reads: Vec::new(),
-        };
-        let budget = weaver_graph::Budget {
-            memory_bytes: Some(LIMIT),
-            ..weaver_graph::Budget::default()
-        };
-        let outcome = job.object.repair(&mut access, budget);
-        assert_eq!(outcome, RepairOutcome::Repaired { slices: 1 });
-        assert!(access.store.members[&member] == data);
-        assert!(!access.reads.is_empty());
-        assert!(
-            access.reads.iter().all(|range| range.len() <= LIMIT),
-            "{:?}",
-            access.reads
-        );
-        // Checked once whole, then read again whole as it was spent.
-        let read: u64 = access.reads.iter().map(ByteRange::len).sum();
-        assert!(read >= 2 * slice, "{read}");
+            let mut access = Watched::over(std::mem::take(&mut job.store));
+            let budget = weaver_graph::Budget {
+                memory_bytes: Some(limit),
+                ..weaver_graph::Budget::default()
+            };
+            let outcome = job.object.repair(&mut access, budget);
+            assert_eq!(outcome, RepairOutcome::Repaired { slices: 1 });
+            assert!(access.store.members[&member] == data);
+            let longest = access.volumes.iter().map(|(_, range)| range.len()).max();
+            assert_eq!(longest, Some(CHUNK), "limit {limit}");
+            // Checked once whole, a chunk at a time, then every byte of the
+            // payload read again as it was spent.
+            let checked: u64 = access
+                .volumes
+                .iter()
+                .filter(|(_, range)| range.start < payload.1.start)
+                .map(|(_, range)| range.len())
+                .sum();
+            let read: u64 = access.volumes.iter().map(|(_, range)| range.len()).sum();
+            assert!(
+                checked >= CHUNK && read - packet.range.len() >= slice,
+                "{read}"
+            );
+        }
     }
 
     // The store with every read of a member or a volume written down, and
@@ -2250,6 +2231,19 @@ mod tests {
                     *of == volume && range.start <= read.start && read.end <= range.end
                 })
                 .count()
+        }
+
+        // How many reads of the member touch each of its slices.
+        fn touches(&self, slice: u64, count: u64) -> Vec<usize> {
+            (0..count)
+                .map(|at| {
+                    let (start, end) = (at * slice, (at + 1) * slice);
+                    self.members
+                        .iter()
+                        .filter(|read| read.start < end && start < read.end)
+                        .count()
+                })
+                .collect()
         }
     }
 
@@ -2361,6 +2355,131 @@ mod tests {
             assert_eq!(result.damaged, 1);
             assert!(state.recovery.is_empty());
             assert_eq!(access.errors, ["execute repair"]);
+        }
+    }
+
+    // The set of `one_bad_slice` with three blocks, the first spoiled by
+    // `spoil` before the repair: it is not used, and the repair completes
+    // with the second. The third is never read. Gives the volume reads that
+    // started where the first block's packet does.
+    fn repairs_without_the_first_block(spoil: impl Fn(&mut SetState, &mut Store)) -> usize {
+        let (mut job, member, data) = one_bad_slice(BLOCK, 8, 3);
+        let state = job.object.sets.values_mut().next().unwrap();
+        let payloads: Vec<_> = (0..3).map(|block| payload_of(state, block)).collect();
+        let first = state.recovery[&0];
+        spoil(state, &mut job.store);
+        let mut access = Watched::over(std::mem::take(&mut job.store));
+        let result = repair_set(state, &job.object.grid, 0, 1 << 20, &mut access);
+        assert_eq!(result.outcome, RepairOutcome::Repaired { slices: 1 });
+        assert!(access.store.members[&member] == data);
+        assert_eq!(state.recovery.keys().copied().collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(access.within(payloads[0]), 0);
+        assert!(access.within(payloads[1]) > 0);
+        assert_eq!(access.within(payloads[2]), 0);
+        assert!(access.errors.is_empty(), "{:?}", access.errors);
+        access
+            .volumes
+            .iter()
+            .filter(|(volume, read)| *volume == first.volume && read.start == first.range.start)
+            .count()
+    }
+
+    // The bytes of the first block's packet, to spoil.
+    fn first_packet<'a>(state: &SetState, store: &'a mut Store) -> &'a mut [u8] {
+        let at = state.recovery[&0];
+        let volume = store.volumes.get_mut(&at.volume).unwrap();
+        &mut volume[at.range.start as usize..at.range.end as usize]
+    }
+
+    // A packet that is not a header, an exponent and one slice long is not
+    // read at all.
+    #[test]
+    fn a_packet_of_the_wrong_length_is_not_spent() {
+        for longer in [false, true] {
+            let checked = repairs_without_the_first_block(|state, store| {
+                let at = state.recovery.get_mut(&0).unwrap();
+                let volume = at.volume;
+                at.range = if longer {
+                    ByteRange::new(at.range.start, at.range.end + 1)
+                } else {
+                    ByteRange::new(at.range.start, at.range.end - 1)
+                };
+                // The longer range is there to read.
+                store.volumes.get_mut(&volume).unwrap().push(0);
+            });
+            assert_eq!(checked, 0);
+        }
+    }
+
+    // A packet whose header no longer says a recovery packet of its length
+    // starts there: the magic, the length or the type changed. The length
+    // is still one a packet may have. The hash a packet carries covers its
+    // type, so that one is given the hash of what it now holds, and only
+    // the header check can refuse it.
+    #[test]
+    fn a_packet_with_a_bad_header_is_not_spent() {
+        for (field, change) in [(0, 0x01), (8, 0x04), (48 + 8, 0x01)] {
+            let checked = repairs_without_the_first_block(|state, store| {
+                let packet = first_packet(state, store);
+                packet[field] ^= change;
+                let mut hasher = FileHashState::new();
+                hasher.update(&packet[32..]);
+                packet[16..32].copy_from_slice(&hasher.finalize());
+            });
+            assert_eq!(checked, 1);
+        }
+    }
+
+    // A whole packet of another block where this one should be: its hash
+    // passes, and its exponent says it is not the block.
+    #[test]
+    fn a_packet_of_another_exponent_is_not_spent() {
+        let checked = repairs_without_the_first_block(|state, _| {
+            let second = state.recovery[&1];
+            state.recovery.insert(0, second);
+        });
+        // The spoiled entry points at the second block's packet.
+        assert_eq!(checked, 0);
+    }
+
+    // A packet whose payload changed since the scan no longer passes its
+    // hash.
+    #[test]
+    fn a_packet_that_fails_its_hash_is_not_spent() {
+        let checked = repairs_without_the_first_block(|state, store| {
+            let packet = first_packet(state, store);
+            packet[PAYLOAD + 5] ^= 0x01;
+        });
+        assert_eq!(checked, 1);
+    }
+
+    // The slices the verification keeps for the repair are at most half the
+    // limit: of fifteen good slices read back under a limit of eight, the
+    // repair takes four as kept and reads the rest from the member again. A
+    // slice longer than half the limit is not kept at all, and the repair
+    // reads every one again. Both rebuild the exact bytes.
+    #[test]
+    fn slices_kept_from_verification_are_at_most_half_the_limit() {
+        const SLICE: u64 = 64 * 1024;
+        const SLICES: u64 = 16;
+        for (limit, kept) in [(8 * SLICE, 4), (SLICE + SLICE / 2, 0)] {
+            let (mut job, member, data) = one_bad_slice(SLICE, SLICES, 2);
+            let state = job.object.sets.values_mut().next().unwrap();
+            let mut access = Watched::over(std::mem::take(&mut job.store));
+            let result = repair_set(state, &job.object.grid, 0, limit as usize, &mut access);
+            assert_eq!(result.outcome, RepairOutcome::Repaired { slices: 1 });
+            assert!(access.store.members[&member] == data);
+            // The verification read every slice once. One the repair did
+            // not read again is one it took as kept.
+            let touches = access.touches(SLICE, SLICES);
+            assert!(touches.iter().all(|reads| *reads > 0), "{touches:?}");
+            let once = touches
+                .iter()
+                .enumerate()
+                .filter(|(slice, reads)| *slice != 3 && **reads == 1)
+                .count();
+            assert_eq!(once, kept, "limit {limit}: {touches:?}");
+            assert!(once as u64 * SLICE <= limit / 2);
         }
     }
 

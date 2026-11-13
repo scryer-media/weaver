@@ -2196,9 +2196,42 @@ fn a_repair_reads_another_block_when_those_read_do_not_rebuild() {
 // Blocks 0, 4369, 8738 and 13107 all fail to tell slices 0 and 8 apart, so
 // the repair checks five blocks to rebuild two. It holds none of their
 // payloads, so a memory limit no larger than the two slices makes the same
-// repair, reading the payloads in smaller pieces.
+// repair, reading the payloads in smaller pieces. Either way it reads each
+// of the five packets once to check it, and each byte of the two payloads
+// it spends once more: seven volume reads when a payload is one piece.
 #[test]
 fn blocks_checked_past_those_spent_make_the_same_repair_under_a_tight_limit() {
+    use weaver_graph::recovery::MemberAccess;
+    // The store, with the volume reads and their bytes counted.
+    struct Counted {
+        store: crate::testing::Store,
+        reads: u64,
+        bytes: u64,
+    }
+    impl MemberAccess for Counted {
+        fn read(&mut self, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
+            self.store.read(member, range, into)
+        }
+        fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
+            self.store.write_repaired(member, offset, bytes);
+        }
+        fn length(&self, member: MemberId) -> Option<u64> {
+            self.store.length(member)
+        }
+        fn arrived(&self, member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {
+            self.store.arrived(member, range, out);
+        }
+        fn read_volume(
+            &mut self,
+            volume: weaver_graph::VolumeIndex,
+            range: ByteRange,
+            into: &mut Vec<u8>,
+        ) -> bool {
+            self.reads += 1;
+            self.bytes += range.len();
+            self.store.read_volume(volume, range, into)
+        }
+    }
     // Large enough for the repair's own workspace under the tight limit.
     const SLICE: u64 = 16 * 1024;
     let constants = par2_rs::input_slice_constants(9);
@@ -2232,17 +2265,29 @@ fn blocks_checked_past_those_spent_make_the_same_repair_under_a_tight_limit() {
             );
         }
         bind(&mut job);
-        let outcome = job.object.repair(&mut job.store, budget);
-        assert!(job.store.members[&member] == data, "{outcome:?}");
-        outcome
+        let mut access = Counted {
+            store: std::mem::take(&mut job.store),
+            reads: 0,
+            bytes: 0,
+        };
+        let outcome = job.object.repair(&mut access, budget);
+        assert!(access.store.members[&member] == data, "{outcome:?}");
+        (outcome, access.reads, access.bytes)
     };
-    let outcome = repaired(weaver_graph::Budget::default());
-    assert_eq!(outcome, RepairOutcome::Repaired { slices: 2 });
+    // A packet is its header, its exponent and one slice.
+    let packet = par2_rs::packet::HEADER_SIZE as u64 + 4 + SLICE;
+    let read = 5 * packet + 2 * SLICE;
+    let whole = repaired(weaver_graph::Budget::default());
+    assert_eq!(whole, (RepairOutcome::Repaired { slices: 2 }, 5 + 2, read));
     let tight = weaver_graph::Budget {
         memory_bytes: Some(2 * SLICE),
         ..weaver_graph::Budget::default()
     };
-    assert_eq!(repaired(tight), outcome);
+    // How small the pieces are is the repair's to choose under its limit;
+    // the bytes are the same, in more reads.
+    let (outcome, reads, bytes) = repaired(tight);
+    assert_eq!((outcome, bytes), (whole.0, read));
+    assert!(reads > whole.1, "{reads}");
 }
 
 // A file refused whole beside another the set describes with the same
