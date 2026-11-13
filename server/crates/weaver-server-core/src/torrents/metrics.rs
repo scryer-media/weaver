@@ -371,6 +371,9 @@ pub struct SessionSeries {
     pub open: bool,
     pub listen_port: Option<u16>,
     pub external_addresses: usize,
+    /// Its address as the internet sees it, IPv4 first, of each family its
+    /// vote settled on.
+    pub external_ips: Vec<std::net::IpAddr>,
     pub uptime_seconds: u64,
     pub received_payload_bytes: u64,
     pub received_protocol_bytes: u64,
@@ -419,11 +422,13 @@ impl SessionSeries {
                 ]
             };
         }
+        let external_ips = session.external_ips();
         Self {
             route: route.to_owned(),
             open: true,
             listen_port: session.listen_addr().map(|_| port),
-            external_addresses: session.external_ips().len(),
+            external_addresses: external_ips.len(),
+            external_ips,
             uptime_seconds: stats.uptime_seconds,
             received_payload_bytes: stats.counters.fetched_bytes,
             received_protocol_bytes: stats.counters.fetched_protocol_bytes,

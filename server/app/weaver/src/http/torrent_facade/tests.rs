@@ -3787,6 +3787,35 @@ async fn each_release_line_answers_as_its_client() {
 
 // `sync/maindata` carries each torrent's announce flags and the session's
 // state, which follows the hold over every torrent.
+// The server state's network fields read the open sessions as published:
+// the DHT nodes of every routing table, and the first external address of
+// each family in route order. A held session says nothing.
+#[test]
+fn the_server_state_reads_the_open_sessions_network() {
+    let session = |route: &str, open: bool, dht, ips: &[&str]| SessionSeries {
+        route: route.into(),
+        open,
+        dht,
+        external_ips: ips.iter().map(|ip| ip.parse().unwrap()).collect(),
+        ..SessionSeries::default()
+    };
+    let sessions = [
+        session("00", false, Some((500, 500, 0)), &["198.51.100.9"]),
+        session("01", true, Some((150, 20, 6)), &["2001:db8::7"]),
+        session("02", true, None, &["203.0.113.7", "2001:db8::8"]),
+        session("03", true, Some((30, 0, 1)), &["203.0.113.8"]),
+    ];
+    let state = transfer(&[], &sessions, None, None);
+    assert_eq!(state["dht_nodes"], 200);
+    assert_eq!(state["last_external_address_v4"], "203.0.113.7");
+    assert_eq!(state["last_external_address_v6"], "2001:db8::7");
+
+    let state = transfer(&[], &sessions[..1], None, None);
+    assert_eq!(state["dht_nodes"], 0);
+    assert_eq!(state["last_external_address_v4"], "");
+    assert_eq!(state["last_external_address_v6"], "");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn maindata_carries_the_announce_flags_and_the_session_state() {
     let rig = rig().await;

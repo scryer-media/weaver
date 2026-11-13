@@ -811,6 +811,7 @@ fn published_metrics() -> crate::torrents::metrics::TorrentMetrics {
                 open: true,
                 listen_port: Some(6881),
                 external_addresses: 1,
+                external_ips: vec!["203.0.113.7".parse().unwrap()],
                 uptime_seconds: 600,
                 received_payload_bytes: 2048,
                 received_protocol_bytes: 100,

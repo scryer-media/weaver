@@ -1594,6 +1594,7 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
         open: true,
         listen_port: Some(6881),
         external_addresses: 1,
+        external_ips: vec!["203.0.113.7".parse().unwrap()],
         uptime_seconds: 1200,
         received_payload_bytes: 5000,
         received_protocol_bytes: 700,

@@ -25,7 +25,7 @@ use crate::{
     bitv::BitV,
     bitv_factory::BitVFactory,
     chunk_tracker::{ChunkTracker, compute_selected_bytes},
-    file_ops::{FileOps, Verdict, inconsistent_hashes},
+    file_ops::{CheckOutcome, CheckedSoFar, FileOps, Verdict, inconsistent_hashes},
     piece_priority::PiecePriority,
     storage::FileStamp,
     type_aliases::{BF, FileStorage},
@@ -63,6 +63,10 @@ pub struct TorrentStateInitializing {
     pub(crate) only_files: Option<Vec<usize>>,
     pub(crate) checked_bytes: AtomicU64,
     pause_requested: AtomicBool,
+    // Where the last check that read every piece back was paused, and the
+    // bytes it had read: the next check goes on from there. Kept for this
+    // run only.
+    paused_at: parking_lot::Mutex<Option<(CheckedSoFar, u64)>>,
     check: AtomicU8,
     // Every piece is read back and nothing saved is trusted: after an
     // error, and on a forced recheck.
@@ -178,6 +182,7 @@ impl TorrentStateInitializing {
             files,
             checked_bytes: AtomicU64::new(0),
             pause_requested: AtomicBool::new(false),
+            paused_at: parking_lot::Mutex::new(None),
             check: AtomicU8::new(CHECK_IDLE),
             full_check,
             checkpoint,
@@ -450,8 +455,10 @@ impl TorrentStateInitializing {
 
         // Torrents hash their files one at a time by default, each waiting
         // its turn here (libtorrent `active_checking`), as checking its
-        // files, with nothing hashed yet.
-        self.checked_bytes.store(0, Ordering::Relaxed);
+        // files, with nothing hashed yet, or what a paused check had.
+        let from = self.paused_at.lock().take();
+        let read = from.as_ref().map_or(0, |(_, read)| *read);
+        self.checked_bytes.store(read, Ordering::Relaxed);
         self.check.store(CHECK_WAITING, Ordering::Release);
         waiting();
         let session = self.shared.session.upgrade();
@@ -466,7 +473,7 @@ impl TorrentStateInitializing {
             None => None,
         };
         info!("Doing initial checksum validation, this might take a while...");
-        let have_pieces = self
+        let outcome = self
             .shared
             .spawner
             .block_in_place_with_permits(
@@ -479,14 +486,23 @@ impl TorrentStateInitializing {
                         &self.files,
                         self.shared.options.disable_v1_hashes,
                     )
-                    .initial_check(
+                    .initial_check_from(
                         threads,
                         &self.checked_bytes,
                         &self.pause_requested,
+                        from.map(|(at, _)| at),
                     )
                 },
             )
             .await?;
+        let have_pieces = match outcome {
+            CheckOutcome::Done(have) => have,
+            CheckOutcome::Paused(at) => {
+                let read = self.checked_bytes.load(Ordering::Relaxed);
+                *self.paused_at.lock() = Some((at, read));
+                anyhow::bail!("initial check paused");
+            }
+        };
         bitv_factory
             .store_initial_check(id, have_pieces)
             .await
@@ -907,6 +923,7 @@ mod tests {
     mod checking_in_the_stats {
         use std::path::Path;
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
 
         use anyhow::Context;
         use parking_lot::Mutex;
@@ -1088,6 +1105,8 @@ mod tests {
             open: Mutex<bool>,
             opened: parking_lot::Condvar,
             reading: Mutex<Option<UnboundedSender<()>>>,
+            // The bytes read through the door.
+            read: AtomicU64,
         }
 
         impl Door {
@@ -1096,6 +1115,7 @@ mod tests {
                     open: Mutex::new(false),
                     opened: parking_lot::Condvar::new(),
                     reading: Mutex::new(Some(reading)),
+                    read: AtomicU64::new(0),
                 })
             }
 
@@ -1155,6 +1175,9 @@ mod tests {
                 buf: &mut [u8],
             ) -> anyhow::Result<()> {
                 self.door.pass();
+                self.door
+                    .read
+                    .fetch_add(buf.len() as u64, Ordering::Relaxed);
                 self.inner.pread_exact(file_id, offset, buf)
             }
 
@@ -1228,6 +1251,7 @@ mod tests {
                 reading = again;
                 *door.reading.lock() = Some(reading_tx);
                 *door.open.lock() = false;
+                door.read.store(0, Ordering::Relaxed);
                 session.force_recheck(&handle).await?;
             }
             reading.recv().await.context("the check read nothing")?;
@@ -1259,9 +1283,26 @@ mod tests {
                 "{:?}",
                 stats.state
             );
+            // The pause keeps the check's place: every piece before it was
+            // read once, and the progress counts them.
+            let (next, progress) = handle
+                .with_state(|state| match state {
+                    crate::ManagedTorrentState::Initializing(init) => init
+                        .paused_at
+                        .lock()
+                        .as_ref()
+                        .map(|(at, read)| (at.next, *read)),
+                    _ => None,
+                })
+                .context("the paused check kept no place")?;
+            assert!(0 < next && next < PIECES, "{next}");
+            assert_eq!(progress, next as u64 * 1024);
+            assert_eq!(door.read.load(Ordering::Relaxed), progress);
 
+            // Resumed, it goes on from there: no piece is read twice.
             session.unpause(&handle).await?;
             handle.wait_until_completed().await?;
+            assert_eq!(door.read.load(Ordering::Relaxed), PIECES as u64 * 1024);
             session.stop().await;
             Ok(())
         }

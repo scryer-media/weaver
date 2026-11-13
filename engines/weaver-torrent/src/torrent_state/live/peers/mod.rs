@@ -111,17 +111,22 @@ impl SessionBans {
 /// Where a peer stands when the list must forget one; the lowest goes first
 /// (libtorrent `peer_list::is_erase_candidate`, then `compare_peer_erase`):
 /// an erase candidate, a peer with no connection that is no connect
-/// candidate and has failed; then the most failures in a row; then one we
-/// cannot connect to; then the least trusted.
-type EraseRank = (bool, Reverse<u32>, bool, i8);
+/// candidate and has failed or was named by resume data alone; then the
+/// most failures in a row; then one resume data alone named; then one we
+/// cannot connect to; then the least trusted (peer_list.cpp:88-108,
+/// 354-364, v2.0.15).
+type EraseRank = (bool, Reverse<u32>, bool, bool, i8);
 
 fn erase_rank(peer: &Peer) -> EraseRank {
     let failcount = peer.failcount();
-    let erase_candidate =
-        peer.connected_out().is_none() && !peer.is_connect_candidate() && failcount > 0;
+    let resume_data_only = peer.sources() == PeerSourceFlag::ResumeData.into();
+    let erase_candidate = peer.connected_out().is_none()
+        && !peer.is_connect_candidate()
+        && (failcount > 0 || resume_data_only);
     (
         !erase_candidate,
         Reverse(failcount),
+        !resume_data_only,
         peer.outgoing_address == Some(peer.addr),
         peer.trust().points(),
     )
@@ -3186,6 +3191,47 @@ mod tests {
         assert_eq!(state_of(&peers, newcomer(5)), Some("live"));
         assert_eq!(state_of(&peers, live), Some("live"));
         assert_eq!(peers.listed(), MAX_PEERLIST_SIZE);
+    }
+
+    // libtorrent `peer_list::is_erase_candidate` and `compare_peer_erase`
+    // (peer_list.cpp:88-108, 354-364, v2.0.15): a peer that resume data
+    // alone named is an erase candidate once let go, failed or not, and at
+    // the same failure count it goes before a peer another source named.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_resume_data_alone_named_goes_first_at_equal_failures() {
+        let peers = make_peer_states();
+        let t0 = Instant::now();
+        let (resume_failed, tracker_failed, resume_idle, kept) =
+            (peer_addr(0), peer_addr(1), peer_addr(2), peer_addr(3));
+        peers.add_peer(resume_failed, PeerSourceFlag::ResumeData);
+        fail_at(&peers, resume_failed, t0);
+        peers
+            .with_peer_mut(resume_failed, "test", |peer| peer.set_not_needed(&peers))
+            .unwrap();
+        failed_once(&peers, tracker_failed, t0);
+        peers.add_peer(resume_idle, PeerSourceFlag::ResumeData);
+        peers
+            .with_peer_mut(resume_idle, "test", |peer| peer.set_not_needed(&peers))
+            .unwrap();
+        never_failed(&peers, kept);
+        for i in 4..MAX_PEERLIST_SIZE {
+            peers.add_peer(peer_addr(i), PeerSourceFlag::Tracker);
+        }
+        assert_eq!(peers.listed(), MAX_PEERLIST_SIZE);
+
+        let newcomer = |i| peer_addr(MAX_PEERLIST_SIZE + i);
+        for (i, erased) in [resume_failed, tracker_failed, resume_idle]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(state_of(&peers, erased).is_some());
+            peers.add_peer(newcomer(i), PeerSourceFlag::Tracker);
+            assert_eq!(state_of(&peers, erased), None);
+            assert_eq!(state_of(&peers, newcomer(i)), Some("queued"));
+        }
+        peers.add_peer(newcomer(3), PeerSourceFlag::Tracker);
+        assert_eq!(state_of(&peers, newcomer(3)), None);
+        assert_eq!(state_of(&peers, kept), Some("not needed"));
     }
 
     // libtorrent `peer_list::is_erase_candidate`: a peer with no connection

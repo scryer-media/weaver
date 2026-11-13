@@ -348,11 +348,7 @@ impl StreamConnector {
                 let (r, mut w) = tokio::time::timeout(rw_timeout, ssl.connect(r, w))
                     .await
                     .map_err(|_| Error::ConnectTimeout("TLS handshake"))
-                    .and_then(|tls| {
-                        tls.map_err(|e| {
-                            Error::Anyhow(anyhow::Error::from(e).context("TLS handshake"))
-                        })
-                    })
+                    .and_then(|tls| tls.map_err(Error::TlsConnect))
                     .inspect_err(|e| debug!(?addr, "TLS handshake failed: {e:#}"))?;
                 with_timeout(
                     "writing",

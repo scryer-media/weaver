@@ -3102,11 +3102,13 @@ impl PeerHandler {
         // that follows to wait behind. A connection to ourselves did not
         // either; it is banned below instead.
         let failed = error.as_ref().is_some_and(crate::Error::is_failure);
-        // A connection to a peer that speaks the holepunch extension failed,
+        // A connect to a peer that speaks the holepunch extension failed,
         // and no holepunch asked for it: a peer that can introduce us is
-        // asked to (libtorrent `peer_connection::connect_failed`).
+        // asked to (libtorrent `peer_connection::connect_failed`). A
+        // connection that opened and failed its handshake reached the peer,
+        // so no introduction is asked for.
         let rendezvous = matches!(pe.value().get_state(), PeerState::Connecting(_))
-            && failed
+            && error.as_ref().is_some_and(crate::Error::is_dial_failure)
             && pe.value().supports_holepunch
             && !pe.value().holepunched();
         let needed = pe.value_mut().connection_closing(
