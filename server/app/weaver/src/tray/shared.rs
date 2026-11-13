@@ -38,7 +38,9 @@ pub(crate) const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 // a console Ctrl+C on Windows — before it kills the process. The server's own
 // graceful teardown is what needs the time here; a process that ignores the
 // request must not be able to strand the wrapper. One minute on every
-// platform, so the server's drain and database flush finish before a kill.
+// platform for a stop the user asked for, so the server's drain and database
+// flush finish before a kill. A stop someone else bounds, as when the
+// Windows session ends, passes its own shorter wait to `stop_within`.
 #[cfg(any(unix, windows))]
 pub(crate) const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -992,6 +994,16 @@ impl ServerSupervisor {
     // Stop the server this wrapper started. A server it did not start is left
     // alone: it belongs to whoever ran it.
     pub(crate) fn stop(&mut self) -> Result<(), String> {
+        #[cfg(any(unix, windows))]
+        return self.stop_within(GRACEFUL_STOP_TIMEOUT);
+        #[cfg(not(any(unix, windows)))]
+        self.stop_within(Duration::ZERO)
+    }
+
+    // `stop`, giving the server `wait` to exit on its own before it is
+    // killed: for a stop someone else puts a shorter limit on.
+    #[cfg_attr(not(any(unix, windows)), allow(unused_variables))]
+    pub(crate) fn stop_within(&mut self, wait: Duration) -> Result<(), String> {
         let Some(mut child) = self.server.take() else {
             return Ok(());
         };
@@ -1002,7 +1014,7 @@ impl ServerSupervisor {
             .is_none()
         {
             #[cfg(any(unix, windows))]
-            if request_graceful_stop(&mut child)? {
+            if request_graceful_stop(&mut child, wait)? {
                 return Ok(());
             }
             child
@@ -1270,12 +1282,12 @@ fn configure_server_command(_command: &mut Command) {}
 // throws away the flush it would otherwise do, so the signal comes first and
 // the caller only escalates when this returns false.
 #[cfg(any(unix, windows))]
-fn request_graceful_stop(child: &mut Child) -> Result<bool, String> {
+fn request_graceful_stop(child: &mut Child, wait: Duration) -> Result<bool, String> {
     if !send_stop_request(child) {
         return Ok(false);
     }
 
-    let deadline = Instant::now() + GRACEFUL_STOP_TIMEOUT;
+    let deadline = Instant::now() + wait;
     while Instant::now() < deadline {
         match child.try_wait() {
             Ok(Some(_)) => return Ok(true),
