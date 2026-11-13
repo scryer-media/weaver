@@ -10120,6 +10120,23 @@ async fn started_accepted(service: &TorrentService, job_id: JobId) {
     .await;
 }
 
+// Once no announce of the torrent's session waits for its answer and a
+// tracker has answered one. Asked after an announce was heard, it says that
+// announce's answer is taken: a tracker is sent no `stopped` while its last
+// announce waits (see `TrackerList::stop`).
+async fn announces_answered(service: &TorrentService, job_id: JobId) {
+    trackers_once(service, job_id, |announces| {
+        announces.iter().all(|announce| !announce.in_flight)
+            && announces.iter().any(|announce| {
+                announce
+                    .last
+                    .as_ref()
+                    .is_some_and(|last| last.result.is_ok())
+            })
+    })
+    .await;
+}
+
 // The next announce heard that carries an event.
 async fn next_event(announces: &mut tokio::sync::mpsc::UnboundedReceiver<Heard>) -> Heard {
     loop {
@@ -10200,20 +10217,19 @@ async fn a_torrent_moved_to_a_new_route_keeps_its_identity_and_counters() {
     old.wait_until_completed().await.unwrap();
     let before = old.totals();
     assert_eq!(before.downloaded_bytes, data.len() as u64);
+    // The old session's `completed` is answered before the move, so the new
+    // session owes none and nothing of the old one's is under way.
+    let completed = next_event(&mut announces).await;
+    assert_eq!(completed.event.as_deref(), Some("completed"));
+    announces_answered(&rig.service, job_id).await;
 
     rig.routes.route(TorrentScope::Default, 2);
     rig.service.follow_routes().await;
 
     // A move is not a start: the old session sends no `stopped`, and the
     // new one, its tracker having answered `started`, goes on with a plain
-    // announce counted on from the same start. A `completed` the old
-    // session sent says nothing here.
-    let again = loop {
-        let heard = announces.recv().await.unwrap();
-        if heard.event.as_deref() != Some("completed") {
-            break heard;
-        }
-    };
+    // announce counted on from the same start.
+    let again = announces.recv().await.unwrap();
     assert_eq!(again.event, None);
     assert_eq!(again.identity(), started.identity());
     assert_eq!(
@@ -10241,7 +10257,10 @@ async fn a_torrent_moved_to_a_new_route_keeps_its_identity_and_counters() {
     assert!(now.uploaded_protocol_bytes >= ended.uploaded_protocol_bytes);
 
     // Its one `stopped` is the shutdown's, from the new session, counted on;
-    // the stop waits for every session's, so all are heard by now.
+    // the stop waits for every session's, so all are heard by now. A
+    // tracker whose last announce still waits for its answer is sent none,
+    // so the new session's announce is answered first.
+    announces_answered(&rig.service, job_id).await;
     rig.service.stop().await;
     let mut stopped = Vec::new();
     while let Ok(heard) = announces.try_recv() {
