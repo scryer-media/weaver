@@ -13,7 +13,7 @@ import {
 } from "../src/next/data/history-deletes.ts";
 import { englishTranslate as t } from "./english-translate.ts";
 
-type Operation = { state: string; locked: boolean; action: "DELETE" | "REMOVE_FILES" };
+type Operation = { state: string; locked: boolean; action: "DELETE" | "ARCHIVE" };
 
 const row = (id: number, deleteOperation: Operation | null = null) => ({
   id,
@@ -66,13 +66,13 @@ test("a lock goes once its row is reported on or has left the page", () => {
   assert.equal(settleDeleteLocks(unchanged, [row(1)]), unchanged);
 });
 
-test("a failed files removal on a row handed to a delete reads as the delete", () => {
-  const failedRemoval: Operation = { state: "FAILED", locked: false, action: "REMOVE_FILES" };
+test("a failed archive on a row handed to a delete reads as the delete", () => {
+  const failedArchive: Operation = { state: "FAILED", locked: false, action: "ARCHIVE" };
   const locks = new Map([[1, lock]]);
-  const drawn = withDeleteLocks([row(1, failedRemoval)], locks);
+  const drawn = withDeleteLocks([row(1, failedArchive)], locks);
   assert.deepEqual(drawn[0].deleteOperation, { state: "QUEUED", locked: true, action: "DELETE" });
   // The lock holds until the server reports the delete itself.
-  assert.equal(settleDeleteLocks(locks, [row(1, failedRemoval)]), locks);
+  assert.equal(settleDeleteLocks(locks, [row(1, failedArchive)]), locks);
   assert.equal(settleDeleteLocks(locks, [row(1, { state: "QUEUED", locked: true, action: "DELETE" })]).size, 0);
 });
 

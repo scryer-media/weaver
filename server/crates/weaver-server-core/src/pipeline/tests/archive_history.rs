@@ -2,22 +2,22 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
-use crate::{HistoryFilesRemoval, HistoryFilesRemovalOutcome as Outcome};
+use crate::{ArchiveHistoryOutcome as Outcome, ArchiveHistoryResult};
 
 const NOW: i64 = 1_800_000_000;
 
-// Removing files needs no pipeline turn, as deleting history does not.
-async fn remove_files(
+// Archiving needs no pipeline turn, as deleting history does not.
+async fn archive_entries(
     pipeline: &mut Pipeline,
     job_ids: &[JobId],
     now: i64,
-) -> BTreeMap<JobId, HistoryFilesRemoval> {
+) -> BTreeMap<JobId, ArchiveHistoryResult> {
     pipeline.report_all_for_test();
     pipeline
         .shared_state
         .queue
         .clone()
-        .remove_history_files(job_ids.iter().copied().collect(), now)
+        .archive_history(job_ids.iter().copied().collect(), now)
         .await
         .unwrap()
 }
@@ -48,42 +48,42 @@ fn staging_dir(complete_dir: &Path, job_id: JobId) -> PathBuf {
     staging
 }
 
-// The record a removal kept of an entry's files: its rows, then the totals
+// The record an archive kept of an entry's files: its rows, then the totals
 // on the entry.
 type Record = (Vec<(String, u64)>, Option<u64>, Option<u64>);
 
 fn record_of(pipeline: &Pipeline, job_id: JobId) -> Record {
-    let rows = removed_rows(pipeline, job_id);
+    let rows = archived_rows(pipeline, job_id);
     let state = pipeline
         .db
         .list_job_history_file_states(&[job_id])
         .unwrap()
         .remove(&job_id)
         .expect("the history entry stays");
-    (rows, state.removed_file_count, state.removed_file_bytes)
+    (rows, state.archived_file_count, state.archived_file_bytes)
 }
 
-fn removed_rows(pipeline: &Pipeline, job_id: JobId) -> Vec<(String, u64)> {
+fn archived_rows(pipeline: &Pipeline, job_id: JobId) -> Vec<(String, u64)> {
     pipeline
         .db
-        .list_history_removed_files(job_id.0, 0, 1_000)
+        .list_archived_history_files(job_id.0, 0, 1_000)
         .unwrap()
 }
 
 const NO_RECORD: fn() -> Record = || (Vec::new(), None, None);
 
-async fn remove_files_keeping(
+async fn archive_entries_keeping(
     pipeline: &mut Pipeline,
     job_ids: &[JobId],
     now: i64,
     keep: usize,
-) -> BTreeMap<JobId, HistoryFilesRemoval> {
+) -> BTreeMap<JobId, ArchiveHistoryResult> {
     pipeline.report_all_for_test();
     pipeline
         .shared_state
         .queue
         .clone()
-        .remove_history_files_keeping(job_ids.iter().copied().collect(), now, keep)
+        .archive_history_keeping(job_ids.iter().copied().collect(), now, keep)
         .await
         .unwrap()
 }
@@ -100,7 +100,7 @@ fn stamp_of(pipeline: &Pipeline, job_id: JobId) -> Option<i64> {
         .get_job_history(job_id.0)
         .unwrap()
         .expect("the history entry stays")
-        .files_removed_at
+        .archived_at
 }
 
 // The output, working and staging directories go, the entry and its NZB
@@ -119,11 +119,11 @@ async fn owned_files_are_removed_and_the_entry_is_stamped() {
         &sample_nzb_zstd(),
     );
 
-    let outcome = remove_files(&mut pipeline, &[job_id], NOW).await;
+    let outcome = archive_entries(&mut pipeline, &[job_id], NOW).await;
 
     assert_eq!(
         outcome[&job_id],
-        HistoryFilesRemoval::new(Outcome::Removed, Some(NOW), None)
+        ArchiveHistoryResult::new(Outcome::Archived, Some(NOW), None)
     );
     assert!(!output.exists());
     assert!(!working.exists());
@@ -145,7 +145,7 @@ async fn owned_files_are_removed_and_the_entry_is_stamped() {
     retire_pipeline_database(pipeline).await;
 }
 
-// Nothing on disk is already gone, and is stamped. A second removal changes
+// Nothing on disk is already gone, and is stamped. A second archive changes
 // nothing and returns the first stamp.
 #[tokio::test]
 async fn a_missing_folder_is_already_gone_and_a_retry_keeps_the_first_stamp() {
@@ -162,17 +162,17 @@ async fn a_missing_folder_is_already_gone_and_a_retry_keeps_the_first_stamp() {
         ))
         .unwrap();
 
-    let first = remove_files(&mut pipeline, &[job_id], NOW).await;
+    let first = archive_entries(&mut pipeline, &[job_id], NOW).await;
     assert_eq!(
         first[&job_id],
-        HistoryFilesRemoval::new(Outcome::AlreadyGone, Some(NOW), None)
+        ArchiveHistoryResult::new(Outcome::AlreadyGone, Some(NOW), None)
     );
     assert_eq!(stamp_of(&pipeline, job_id), Some(NOW));
 
-    let second = remove_files(&mut pipeline, &[job_id], NOW + 60).await;
+    let second = archive_entries(&mut pipeline, &[job_id], NOW + 60).await;
     assert_eq!(
         second[&job_id],
-        HistoryFilesRemoval::new(Outcome::AlreadyGone, Some(NOW), None)
+        ArchiveHistoryResult::new(Outcome::AlreadyGone, Some(NOW), None)
     );
     assert_eq!(stamp_of(&pipeline, job_id), Some(NOW));
     retire_pipeline_database(pipeline).await;
@@ -201,11 +201,11 @@ async fn an_unmarked_output_dir_is_not_managed_and_kept() {
         ))
         .unwrap();
 
-    let outcome = remove_files(&mut pipeline, &[job_id], NOW).await;
+    let outcome = archive_entries(&mut pipeline, &[job_id], NOW).await;
 
     let removal = &outcome[&job_id];
     assert_eq!(removal.outcome, Outcome::NotManaged);
-    assert_eq!(removal.files_removed_at, None);
+    assert_eq!(removal.archived_at, None);
     assert!(
         removal
             .message
@@ -242,7 +242,7 @@ async fn a_relocated_output_dir_is_not_managed_and_kept() {
         ))
         .unwrap();
 
-    let outcome = remove_files(&mut pipeline, &[job_id], NOW).await;
+    let outcome = archive_entries(&mut pipeline, &[job_id], NOW).await;
 
     assert_eq!(outcome[&job_id].outcome, Outcome::NotManaged);
     assert!(moved.join("lantern.mkv").exists());
@@ -270,7 +270,7 @@ async fn a_symlinked_output_dir_is_not_managed_and_kept() {
         ))
         .unwrap();
 
-    let outcome = remove_files(&mut pipeline, &[job_id], NOW).await;
+    let outcome = archive_entries(&mut pipeline, &[job_id], NOW).await;
 
     assert_eq!(outcome[&job_id].outcome, Outcome::NotManaged);
     assert!(link.symlink_metadata().is_ok());
@@ -321,19 +321,19 @@ async fn a_mixed_batch_returns_each_id_s_own_outcome() {
         crate::pipeline::queue::Change::unchanged(())
     });
 
-    let outcome = remove_files(
+    let outcome = archive_entries(
         &mut pipeline,
         &[removed, held, active, unknown, unmanaged],
         NOW,
     )
     .await;
 
-    assert_eq!(outcome[&removed].outcome, Outcome::Removed);
+    assert_eq!(outcome[&removed].outcome, Outcome::Archived);
     assert_eq!(outcome[&held].outcome, Outcome::Busy);
     assert_eq!(outcome[&active].outcome, Outcome::Busy);
     assert_eq!(
         outcome[&unknown],
-        HistoryFilesRemoval::new(Outcome::NotFound, None, None)
+        ArchiveHistoryResult::new(Outcome::NotFound, None, None)
     );
     assert_eq!(outcome[&unmanaged].outcome, Outcome::NotManaged);
     assert_eq!(outcome.len(), 5);
@@ -350,11 +350,11 @@ async fn a_mixed_batch_returns_each_id_s_own_outcome() {
 }
 
 // An error part way is reported and stamps nothing. The ownership marker is
-// the last thing a removal takes, so it is still there, and a retry proves
+// the last thing an archive takes, so it is still there, and a retry proves
 // the rest Weaver's and finishes. The record kept before the first attempt
 // is of the whole folder.
 #[tokio::test]
-async fn a_failed_removal_is_unstamped_and_a_retry_finishes_it() {
+async fn a_failed_archive_is_unstamped_and_a_retry_finishes_it() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(40020);
@@ -371,11 +371,11 @@ async fn a_failed_removal_is_unstamped_and_a_retry_finishes_it() {
         .unwrap();
 
     crate::jobs::working_dir::inject_removal_failure(&output, true);
-    let failed = remove_files(&mut pipeline, &[job_id], NOW).await;
+    let failed = archive_entries(&mut pipeline, &[job_id], NOW).await;
     crate::jobs::working_dir::inject_removal_failure(&output, false);
 
     assert_eq!(failed[&job_id].outcome, Outcome::Failed);
-    assert_eq!(failed[&job_id].files_removed_at, None);
+    assert_eq!(failed[&job_id].archived_at, None);
     assert!(failed[&job_id].message.is_some());
     assert_eq!(stamp_of(&pipeline, job_id), None);
     assert!(
@@ -386,10 +386,10 @@ async fn a_failed_removal_is_unstamped_and_a_retry_finishes_it() {
     let (rows, count, bytes) = record_of(&pipeline, job_id);
     assert_eq!((rows.len(), count, bytes), (2, Some(2), Some(15)));
 
-    let retried = remove_files(&mut pipeline, &[job_id], NOW + 1).await;
+    let retried = archive_entries(&mut pipeline, &[job_id], NOW + 1).await;
     assert_eq!(
         retried[&job_id],
-        HistoryFilesRemoval::new(Outcome::Removed, Some(NOW + 1), None)
+        ArchiveHistoryResult::new(Outcome::Archived, Some(NOW + 1), None)
     );
     assert!(!output.exists());
     assert_eq!(stamp_of(&pipeline, job_id), Some(NOW + 1));
@@ -398,7 +398,7 @@ async fn a_failed_removal_is_unstamped_and_a_retry_finishes_it() {
 }
 
 // A folder that is not there while the folder that would hold it is also
-// gone, as when a mount is offline, cannot be told gone: the removal fails
+// gone, as when a mount is offline, cannot be told gone: the archive fails
 // and stamps nothing.
 #[tokio::test]
 async fn a_folder_whose_parent_is_missing_fails_and_is_not_stamped() {
@@ -416,10 +416,10 @@ async fn a_folder_whose_parent_is_missing_fails_and_is_not_stamped() {
         ))
         .unwrap();
 
-    let outcome = remove_files(&mut pipeline, &[job_id], NOW).await;
+    let outcome = archive_entries(&mut pipeline, &[job_id], NOW).await;
 
     assert_eq!(outcome[&job_id].outcome, Outcome::Failed);
-    assert_eq!(outcome[&job_id].files_removed_at, None);
+    assert_eq!(outcome[&job_id].archived_at, None);
     assert!(
         outcome[&job_id]
             .message
@@ -433,7 +433,7 @@ async fn a_folder_whose_parent_is_missing_fails_and_is_not_stamped() {
 }
 
 // Job B delivered to the folder job A once delivered to: B's marker names
-// B. Removing A's files leaves B's and answers not managed; B's own removal
+// B. Archiving A leaves B's files and answers not managed; archiving B
 // takes them. A delete with files of A leaves them too.
 #[tokio::test]
 async fn a_folder_another_job_delivered_to_is_not_managed() {
@@ -454,7 +454,7 @@ async fn a_folder_another_job_delivered_to_is_not_managed() {
             .unwrap();
     }
 
-    let outcome = remove_files(&mut pipeline, &[gone], NOW).await;
+    let outcome = archive_entries(&mut pipeline, &[gone], NOW).await;
     assert_eq!(outcome[&gone].outcome, Outcome::NotManaged);
     assert!(output.join("lantern.mkv").is_file());
     assert_eq!(stamp_of(&pipeline, gone), None);
@@ -469,8 +469,8 @@ async fn a_folder_another_job_delivered_to_is_not_managed() {
     assert_eq!(deleted.deleted.len(), 1);
     assert!(output.join("lantern.mkv").is_file());
 
-    let outcome = remove_files(&mut pipeline, &[current], NOW).await;
-    assert_eq!(outcome[&current].outcome, Outcome::Removed);
+    let outcome = archive_entries(&mut pipeline, &[current], NOW).await;
+    assert_eq!(outcome[&current].outcome, Outcome::Archived);
     assert!(!output.exists());
     retire_pipeline_database(pipeline).await;
 }
@@ -509,9 +509,9 @@ async fn a_legacy_marker_is_removable_only_when_no_other_job_records_the_folder(
             .unwrap();
     }
 
-    let outcome = remove_files(&mut pipeline, &[unique, first], NOW).await;
+    let outcome = archive_entries(&mut pipeline, &[unique, first], NOW).await;
 
-    assert_eq!(outcome[&unique].outcome, Outcome::Removed);
+    assert_eq!(outcome[&unique].outcome, Outcome::Archived);
     assert!(!unique_dir.exists());
     assert_eq!(outcome[&first].outcome, Outcome::NotManaged);
     assert!(shared_dir.join("lantern.mkv").is_file());
@@ -522,7 +522,7 @@ async fn a_legacy_marker_is_removable_only_when_no_other_job_records_the_folder(
 // The job's own working directory inside the intermediate folder goes even
 // without a marker, and the entry is stamped.
 #[tokio::test]
-async fn an_unmarked_working_dir_is_removed_by_a_files_removal() {
+async fn an_unmarked_working_dir_is_removed_by_an_archive() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(40080);
@@ -538,9 +538,9 @@ async fn an_unmarked_working_dir_is_removed_by_a_files_removal() {
         ))
         .unwrap();
 
-    let outcome = remove_files(&mut pipeline, &[job_id], NOW).await;
+    let outcome = archive_entries(&mut pipeline, &[job_id], NOW).await;
 
-    assert_eq!(outcome[&job_id].outcome, Outcome::Removed, "{outcome:?}");
+    assert_eq!(outcome[&job_id].outcome, Outcome::Archived, "{outcome:?}");
     assert!(!working.exists());
     assert_eq!(stamp_of(&pipeline, job_id), Some(NOW));
     retire_pipeline_database(pipeline).await;
@@ -577,7 +577,7 @@ async fn an_unmarked_output_dir_under_the_intermediate_dir_is_kept() {
         ))
         .unwrap();
 
-    let outcome = remove_files(&mut pipeline, &[job_id], NOW).await;
+    let outcome = archive_entries(&mut pipeline, &[job_id], NOW).await;
 
     assert_eq!(outcome[&job_id].outcome, Outcome::NotManaged, "{outcome:?}");
     assert!(delivery.join("someone-else.mkv").is_file());
@@ -585,8 +585,8 @@ async fn an_unmarked_output_dir_under_the_intermediate_dir_is_kept() {
     retire_pipeline_database(pipeline).await;
 }
 
-// A job that finishes again has its files again: the archive writes the
-// entry with no removal time and forgets the record of the removed files.
+// A job that finishes again has its files again: finishing writes the
+// entry with no archive time and forgets the record of the archived files.
 #[tokio::test]
 async fn finishing_again_clears_the_stamp() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -595,7 +595,7 @@ async fn finishing_again_clears_the_stamp() {
     let output = owned_output_dir(&complete_dir, "Again", job_id);
     let row = history_row_with_output_dir(job_id, "Again", "complete", output.clone());
     pipeline.db.insert_job_history(&row).unwrap();
-    remove_files(&mut pipeline, &[job_id], NOW).await;
+    archive_entries(&mut pipeline, &[job_id], NOW).await;
     assert_eq!(stamp_of(&pipeline, job_id), Some(NOW));
     assert_eq!(
         record_of(&pipeline, job_id),
@@ -608,7 +608,7 @@ async fn finishing_again_clears_the_stamp() {
         .archive_job(
             job_id,
             &crate::JobHistoryRow {
-                files_removed_at: Some(NOW),
+                archived_at: Some(NOW),
                 ..row
             },
         )
@@ -629,13 +629,13 @@ async fn rewriting_the_entry_without_a_stamp_clears_the_record() {
     let output = owned_output_dir(&complete_dir, "Rewritten", job_id);
     let row = history_row_with_output_dir(job_id, "Rewritten", "complete", output);
     pipeline.db.insert_job_history(&row).unwrap();
-    remove_files(&mut pipeline, &[job_id], NOW).await;
+    archive_entries(&mut pipeline, &[job_id], NOW).await;
 
     // Written again with the stamp, the record stays.
     pipeline
         .db
         .insert_job_history(&crate::JobHistoryRow {
-            files_removed_at: Some(NOW),
+            archived_at: Some(NOW),
             ..row.clone()
         })
         .unwrap();
@@ -694,11 +694,11 @@ async fn deleting_history_still_takes_only_what_it_took() {
     }
 }
 
-// The removed folder is recorded: each file by its path relative to the
+// The archived folder is recorded: each file by its path relative to the
 // folder, in the listing order, with its size, and the totals of all of it.
 // Weaver's ownership marker is not a file of the job.
 #[tokio::test]
-async fn the_removed_folder_is_recorded_in_listing_order_with_its_totals() {
+async fn the_archived_folder_is_recorded_in_listing_order_with_its_totals() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(40050);
@@ -715,9 +715,9 @@ async fn the_removed_folder_is_recorded_in_listing_order_with_its_totals() {
         ))
         .unwrap();
 
-    let outcome = remove_files(&mut pipeline, &[job_id], NOW).await;
+    let outcome = archive_entries(&mut pipeline, &[job_id], NOW).await;
 
-    assert_eq!(outcome[&job_id].outcome, Outcome::Removed);
+    assert_eq!(outcome[&job_id].outcome, Outcome::Archived);
     assert!(!output.exists());
     let sep = std::path::MAIN_SEPARATOR;
     assert_eq!(
@@ -736,12 +736,12 @@ async fn the_removed_folder_is_recorded_in_listing_order_with_its_totals() {
     assert_eq!(
         pipeline
             .db
-            .list_history_removed_files(job_id.0, 1, 1)
+            .list_archived_history_files(job_id.0, 1, 1)
             .unwrap(),
         vec![("B.nfo".to_string(), 2)]
     );
-    assert!(pipeline.db.has_history_removed_file(job_id.0, 2).unwrap());
-    assert!(!pipeline.db.has_history_removed_file(job_id.0, 3).unwrap());
+    assert!(pipeline.db.has_archived_history_file(job_id.0, 2).unwrap());
+    assert!(!pipeline.db.has_archived_history_file(job_id.0, 3).unwrap());
     retire_pipeline_database(pipeline).await;
 }
 
@@ -766,9 +766,9 @@ async fn the_record_keeps_the_first_files_up_to_the_cap_and_whole_totals() {
         ))
         .unwrap();
 
-    let outcome = remove_files_keeping(&mut pipeline, &[job_id], NOW, 2).await;
+    let outcome = archive_entries_keeping(&mut pipeline, &[job_id], NOW, 2).await;
 
-    assert_eq!(outcome[&job_id].outcome, Outcome::Removed);
+    assert_eq!(outcome[&job_id].outcome, Outcome::Archived);
     assert_eq!(
         record_of(&pipeline, job_id),
         (
@@ -804,9 +804,9 @@ async fn the_record_does_not_follow_symbolic_links() {
         ))
         .unwrap();
 
-    let outcome = remove_files(&mut pipeline, &[job_id], NOW).await;
+    let outcome = archive_entries(&mut pipeline, &[job_id], NOW).await;
 
-    assert_eq!(outcome[&job_id].outcome, Outcome::Removed);
+    assert_eq!(outcome[&job_id].outcome, Outcome::Archived);
     assert_eq!(
         record_of(&pipeline, job_id),
         (vec![("lantern.mkv".to_string(), 9)], Some(1), Some(9))
@@ -837,7 +837,7 @@ async fn an_unmanaged_or_absent_folder_keeps_no_record() {
             .unwrap();
     }
 
-    let outcome = remove_files(&mut pipeline, &[unmanaged, absent], NOW).await;
+    let outcome = archive_entries(&mut pipeline, &[unmanaged, absent], NOW).await;
 
     assert_eq!(outcome[&unmanaged].outcome, Outcome::NotManaged);
     assert_eq!(outcome[&absent].outcome, Outcome::AlreadyGone);
@@ -861,8 +861,8 @@ async fn deleting_the_entry_deletes_its_record() {
             .insert_job_history(&history_row_with_output_dir(id, name, "complete", output))
             .unwrap();
     }
-    remove_files(&mut pipeline, &[job_id, kept], NOW).await;
-    assert_eq!(removed_rows(&pipeline, job_id).len(), 1);
+    archive_entries(&mut pipeline, &[job_id, kept], NOW).await;
+    assert_eq!(archived_rows(&pipeline, job_id).len(), 1);
 
     let outcome = pipeline
         .shared_state
@@ -874,7 +874,7 @@ async fn deleting_the_entry_deletes_its_record() {
 
     assert_eq!(outcome.deleted.len(), 1);
     assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
-    assert!(removed_rows(&pipeline, job_id).is_empty());
-    assert_eq!(removed_rows(&pipeline, kept).len(), 1);
+    assert!(archived_rows(&pipeline, job_id).is_empty());
+    assert_eq!(archived_rows(&pipeline, kept).len(), 1);
     retire_pipeline_database(pipeline).await;
 }

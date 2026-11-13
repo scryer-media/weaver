@@ -144,7 +144,7 @@ async fn export_and_import_stable_state_roundtrip() {
                 .into(),
         ),
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     })
     .unwrap();
     src.insert_job_events(&[JobEvent {
@@ -294,7 +294,7 @@ fn restore_target_is_not_pristine_with_history() {
         completed_at: 1,
         metadata: None,
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     })
     .unwrap();
     assert!(!db.restore_target_is_pristine().unwrap());

@@ -17,6 +17,13 @@ use super::{JobId, JobSpec};
 
 pub const FINGERPRINT_VERSION: u16 = 1;
 
+// Version 1 of the name fingerprint hashed the shortened display name, which
+// cuts the title at its first date, quality or season token, so two dates or
+// two episodes of one show matched. Version 2 hashes the release title as
+// posted. A stored version 1 digest never matches a version 2 one: matching
+// compares kind, version and digest together.
+pub const NAME_FINGERPRINT_VERSION: u16 = 2;
+
 static DUPLICATE_ADMISSION_METRICS: LazyLock<Mutex<BTreeMap<(&'static str, &'static str), u64>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 static SEMANTIC_DUPLICATE_LIFECYCLE_METRICS: LazyLock<Mutex<BTreeMap<&'static str, u64>>> =
@@ -123,7 +130,16 @@ impl FingerprintKind {
             Self::StrictArticleLayout => "weaver.job-fingerprint/strict-article-layout/v1",
             Self::ArticleLayout => "weaver.job-fingerprint/article-layout/v1",
             Self::ArticleSet => "weaver.job-fingerprint/article-set/v1",
-            Self::NormalizedName => "weaver.job-fingerprint/normalized-name/v1",
+            Self::NormalizedName => "weaver.job-fingerprint/normalized-name/v2",
+        }
+    }
+
+    pub const fn version(self) -> u16 {
+        match self {
+            Self::NormalizedName => NAME_FINGERPRINT_VERSION,
+            Self::StrictArticleLayout | Self::ArticleLayout | Self::ArticleSet => {
+                FINGERPRINT_VERSION
+            }
         }
     }
 
@@ -156,12 +172,11 @@ pub struct JobFingerprint {
 
 impl JobFingerprint {
     pub fn from_validated_spec(spec: &JobSpec) -> Vec<Self> {
-        let normalized_name = normalize_name(&spec.name);
         vec![
             Self::strict_article_layout(spec),
             Self::article_layout(spec),
             Self::article_set(spec),
-            Self::normalized_name(&normalized_name),
+            Self::normalized_name(&duplicate_name(spec)),
         ]
     }
 
@@ -249,7 +264,7 @@ impl JobFingerprint {
     fn new(kind: FingerprintKind, hasher: blake3::Hasher) -> Self {
         Self {
             kind,
-            version: FINGERPRINT_VERSION,
+            version: kind.version(),
             digest: *hasher.finalize().as_bytes(),
         }
     }
@@ -271,6 +286,23 @@ fn write_count(hasher: &mut blake3::Hasher, count: usize) {
 fn write_string(hasher: &mut blake3::Hasher, value: &str) {
     hasher.update(&(value.len() as u64).to_be_bytes());
     hasher.update(value.as_bytes());
+}
+
+// The name duplicates compare, and the one place that decides it: the release
+// title as posted, or the user's rename of it, the way the completed folder is
+// named, folded by `normalize_name`. Never the shortened display name, which
+// drops the date or episode that tells two releases of one show apart. A job
+// with no original title, or one that folds to nothing, uses its name.
+pub fn duplicate_name(spec: &JobSpec) -> String {
+    let title = crate::ingest::original_release_title(&spec.name, &spec.metadata);
+    let title = title.trim();
+    let title = crate::ingest::strip_nzb_source_suffix(title).unwrap_or(title);
+    let normalized = normalize_name(title);
+    if normalized.is_empty() {
+        normalize_name(&spec.name)
+    } else {
+        normalized
+    }
 }
 
 pub fn normalize_name(name: &str) -> String {
@@ -744,9 +776,21 @@ impl FingerprintEvidence {
     pub fn from_validated_spec(spec: &JobSpec, raw_job_hash: [u8; 32]) -> Self {
         Self {
             raw_job_hash,
-            normalized_name: normalize_name(&spec.name),
+            normalized_name: duplicate_name(spec),
             fingerprints: JobFingerprint::from_validated_spec(spec),
         }
+    }
+
+    // Evidence made before the job's final metadata was known, as for a staged
+    // upload, takes its name from the spec as submitted. The article
+    // fingerprints depend only on the articles and stay as they are.
+    pub fn rename_from(&mut self, spec: &JobSpec) {
+        let name = duplicate_name(spec);
+        let fingerprint = JobFingerprint::normalized_name(&name);
+        self.fingerprints
+            .retain(|existing| existing.kind != FingerprintKind::NormalizedName);
+        self.fingerprints.push(fingerprint);
+        self.normalized_name = name;
     }
 }
 
@@ -838,6 +882,69 @@ mod tests {
         assert_ne!(twice[1], once[1]);
         assert_ne!(twice[2], once[2]);
         assert_eq!(twice[3], once[3]);
+    }
+
+    // A job named the way ingest names it: the shortened display name, and
+    // the title as posted kept in its metadata.
+    fn posted(title: &str) -> JobSpec {
+        let mut job = spec(vec![vec![("posted@Id", 1)]]);
+        job.name = crate::ingest::derive_release_name(Some(title), None);
+        job.metadata = crate::ingest::append_original_title_metadata(Vec::new(), Some(title), None);
+        job
+    }
+
+    fn name_fingerprint(spec: &JobSpec) -> JobFingerprint {
+        fingerprints(spec)
+            .into_iter()
+            .find(|fingerprint| fingerprint.kind == FingerprintKind::NormalizedName)
+            .unwrap()
+    }
+
+    #[test]
+    fn two_dates_of_one_show_do_not_match_by_name() {
+        let first = posted("Harbor.Lights.2026.11.12.1080p.WEB-GRP");
+        let second = posted("Harbor.Lights.2026.11.13.1080p.WEB-GRP");
+        // The display names alone would have matched.
+        assert_eq!(normalize_name(&first.name), normalize_name(&second.name));
+        assert_ne!(name_fingerprint(&first), name_fingerprint(&second));
+        assert_eq!(
+            duplicate_name(&first),
+            "harbor lights 2026 11 12 1080p web grp"
+        );
+    }
+
+    #[test]
+    fn two_episodes_of_one_show_do_not_match_by_name() {
+        let first = posted("Harbor.Lights.S01E01.1080p.WEB-GRP");
+        let second = posted("Harbor.Lights.S01E02.1080p.WEB-GRP");
+        assert_ne!(name_fingerprint(&first), name_fingerprint(&second));
+    }
+
+    #[test]
+    fn one_release_title_posted_twice_matches_by_name() {
+        let first = posted("Harbor.Lights.S01E01.1080p.WEB-GRP");
+        let second = posted("harbor lights s01e01 1080p web grp.nzb");
+        assert_eq!(name_fingerprint(&first), name_fingerprint(&second));
+        assert_eq!(name_fingerprint(&first).version, NAME_FINGERPRINT_VERSION);
+    }
+
+    #[test]
+    fn a_job_with_no_original_title_compares_its_name() {
+        let job = spec(vec![vec![("plain@Id", 1)]]);
+        assert_eq!(duplicate_name(&job), "a release name");
+        let mut renamed = posted("Harbor.Lights.S01E01.1080p.WEB-GRP");
+        crate::ingest::set_renamed_title(&mut renamed.metadata, "Harbor Lights Pilot");
+        assert_eq!(duplicate_name(&renamed), "harbor lights pilot");
+    }
+
+    #[test]
+    fn staged_evidence_takes_the_name_submitted() {
+        let staged = posted("Harbor.Lights.S01E01.1080p.WEB-GRP");
+        let mut evidence = FingerprintEvidence::from_validated_spec(&staged, [0; 32]);
+        let submitted = posted("Harbor.Lights.S01E02.1080p.WEB-GRP");
+        evidence.rename_from(&submitted);
+        assert_eq!(evidence.normalized_name, duplicate_name(&submitted));
+        assert_eq!(evidence.fingerprints, fingerprints(&submitted));
     }
 
     #[test]

@@ -173,7 +173,7 @@ async fn job_detail_snapshot_names_the_servers_that_served_an_archived_job() {
         server_attribution: Some(format!(
             r#"[{{"s":{stale_server_id},"a":2,"b":2048}},{{"s":{server_id},"a":7,"b":7168}}]"#
         )),
-        files_removed_at: None,
+        archived_at: None,
     });
 
     let resp = h
@@ -416,7 +416,7 @@ async fn job_detail_snapshot_carries_the_newest_100_events_and_the_count() {
         completed_at: 2_000,
         metadata: None,
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     };
     h.insert_history_row(&row);
     h.db.insert_job_events(&stored_events(job_id, 0..101))

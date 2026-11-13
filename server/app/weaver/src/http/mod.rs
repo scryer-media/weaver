@@ -221,7 +221,14 @@ pub async fn run_server(
     let app = routes::with_response_hardening(app);
 
     let addr = listener.local_addr()?;
-    info!(%addr, base_url = if base_url.is_empty() { "/" } else { &base_url }, "starting HTTP server");
+    // The version is on the start line so each run's span of the log, rotated
+    // files included, says which build wrote it.
+    info!(
+        %addr,
+        base_url = if base_url.is_empty() { "/" } else { &base_url },
+        version = env!("CARGO_PKG_VERSION"),
+        "starting HTTP server"
+    );
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),

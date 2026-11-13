@@ -11,9 +11,9 @@ use std::collections::BinaryHeap;
 use std::io;
 use std::path::Path;
 
-/// How many files a history entry keeps the record of when its files are
-/// removed. The totals always cover the whole folder.
-pub const REMOVED_FILES_KEPT: usize = 5_000;
+/// How many files a history entry keeps the record of when it is archived.
+/// The totals always cover the whole folder.
+pub const ARCHIVED_HISTORY_FILES_KEPT: usize = 5_000;
 
 /// One file of an output folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,7 +79,7 @@ impl Selection {
 
 /// Walks `dir` and keeps its first `keep` files in listing order, holding
 /// no more than `keep` of them at a time. A symbolic link is neither listed
-/// nor walked, so the listing is what a removal records. A folder that
+/// nor walked, so the listing is what an archive records. A folder that
 /// cannot be read is an error; an entry whose metadata cannot be read is
 /// passed over. Blocks: call it off the async runtime.
 pub fn list_output_files(dir: &Path, keep: usize) -> io::Result<OutputFileListing> {

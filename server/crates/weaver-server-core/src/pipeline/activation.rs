@@ -46,6 +46,14 @@ pub(crate) struct ReadArticles {
     staging: Option<Option<PathBuf>>,
 }
 
+#[cfg(test)]
+impl ReadArticles {
+    // Whether the job was built again from its checkpoint.
+    pub(crate) fn restored(&self) -> bool {
+        self.restored.is_some()
+    }
+}
+
 // Where a job delivers as its articles are read, so a job starting afresh
 // stages on its destination's device.
 struct StagingChoice {
@@ -54,19 +62,53 @@ struct StagingChoice {
     complete_dir: PathBuf,
     config: crate::settings::SharedConfig,
     category: Option<String>,
+    // The disk owner, which answers whether the intermediate directory and
+    // the destination share a device.
+    storage: Arc<crate::operations::StorageCapacity>,
+}
+
+// What the staging choice needs settled before its blocking part: the
+// destination, and whether it shares the intermediate directory's device.
+struct StagingDestination {
+    root: PathBuf,
+    one_device: bool,
+    // The kind of storage under the destination and under the intermediate
+    // directory, as the disk owner holds them, for the log.
+    root_kind: crate::operations::disk::StorageKind,
+    intermediate_kind: crate::operations::disk::StorageKind,
 }
 
 impl StagingChoice {
+    // The job's destination, and whether it shares the intermediate
+    // directory's device, from the disk owner: no disk call when both
+    // devices are current, else one shared look for each that is not.
+    async fn destination(&self) -> StagingDestination {
+        let root = {
+            let config = self.config.read().await;
+            crate::pipeline::queue::destination_root(
+                &self.complete_dir,
+                &config.categories,
+                self.category.as_deref(),
+            )
+        };
+        let one_device = self
+            .storage
+            .same_filesystem(&self.intermediate_dir, &root)
+            .await;
+        StagingDestination {
+            root_kind: self.storage.kind(&root),
+            intermediate_kind: self.storage.kind(&self.intermediate_dir),
+            root,
+            one_device,
+        }
+    }
+
     // The staging directory for the job's destination, made and marked the
     // job's, and the one it had gone when that is another. One that cannot
     // be made leaves the job delivering from its working directory. A staging
     // directory that already holds delivered files is kept: the final move
     // carries them to wherever the job then delivers.
-    fn choose(
-        self,
-        job_id: JobId,
-        categories: &[crate::categories::CategoryConfig],
-    ) -> Option<PathBuf> {
+    fn choose(self, job_id: JobId, destination: StagingDestination) -> Option<PathBuf> {
         // Read without following a symbolic link: a staging directory swapped
         // for a link holds nothing of the job's, and is not delivered into.
         if let Some(current) = self.current.as_ref() {
@@ -78,13 +120,11 @@ impl StagingChoice {
                 }
             }
         }
-        let root = crate::pipeline::queue::destination_root(
-            &self.complete_dir,
-            categories,
-            self.category.as_deref(),
+        let wanted = crate::pipeline::queue::staging_dir_on(
+            destination.one_device,
+            &destination.root,
+            job_id,
         );
-        let wanted =
-            crate::pipeline::queue::delivery_staging_dir(&self.intermediate_dir, &root, job_id);
         if let Some(current) = self
             .current
             .as_ref()
@@ -100,12 +140,16 @@ impl StagingChoice {
                 })
                 .is_ok()
         });
-        let output_root = staging
-            .clone()
-            .unwrap_or_else(|| self.intermediate_dir.clone());
+        // A staging directory lies on its destination's storage; without
+        // one, the job writes to the intermediate directory's.
+        let output_kind = if staging.is_some() {
+            destination.root_kind
+        } else {
+            destination.intermediate_kind
+        };
         info!(
             job_id = job_id.0,
-            storage = crate::runtime::storage_kind::storage_kind(&output_root).as_str(),
+            storage = output_kind.as_str(),
             split = staging.is_some(),
             "output storage"
         );
@@ -159,6 +203,7 @@ impl Pipeline {
             complete_dir: self.complete_dir.clone(),
             config: Arc::clone(&self.config),
             category: category.clone(),
+            storage: Arc::clone(&self.storage_capacity),
         };
         state.articles = JobArticles::Activating(summaries, activation);
         let seat = self
@@ -182,20 +227,27 @@ impl Pipeline {
         let tx = self.job_activated_tx.clone();
         tokio::spawn(async move {
             let _ = written_rx.await;
-            let categories = staging.config.read().await.categories.clone();
             let result = tokio::task::spawn_blocking(move || {
                 read_job_articles(
                     &db, job_id, category, metadata, &expected, ahead, memory, seat,
                 )
-                .map(|mut read| {
-                    if read.restored.is_none() {
-                        read.staging = Some(staging.choose(job_id, &categories));
-                    }
-                    read
-                })
             })
             .await
             .unwrap_or_else(|error| Err(format!("article read worker failed: {error}")));
+            // A job restored from its checkpoint keeps the staging it had,
+            // and asks nothing of the disk.
+            let result = match result {
+                Ok(mut read) if read.restored.is_none() => {
+                    let destination = staging.destination().await;
+                    tokio::task::spawn_blocking(move || {
+                        read.staging = Some(staging.choose(job_id, destination));
+                        read
+                    })
+                    .await
+                    .map_err(|error| format!("staging choice worker failed: {error}"))
+                }
+                other => other,
+            };
             let _ = tx
                 .send(JobActivated {
                     job_id,
