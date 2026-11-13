@@ -938,6 +938,38 @@ impl Database {
         })
     }
 
+    // The job's row names `to` if it still names `from`: whether it did. A
+    // row that has gone, or names another directory, is left as it is.
+    pub fn move_active_job_output_dir(
+        &self,
+        job_id: JobId,
+        from: &std::path::Path,
+        to: &std::path::Path,
+    ) -> Result<bool, StateError> {
+        let datastore = self.datastore();
+        let from = from.to_string_lossy().into_owned();
+        let to = to.to_string_lossy().into_owned();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "move_active_job_output_dir", |tx| {
+                let (from, to) = (from.clone(), to.clone());
+                Box::pin(async move {
+                    let changed = tx
+                        .execute(
+                            "UPDATE active_jobs SET output_dir = {} WHERE job_id = {} AND output_dir = {}",
+                            &[
+                                SqlArg::Text(to),
+                                SqlArg::I64(job_id.0 as i64),
+                                SqlArg::Text(from),
+                            ],
+                        )
+                        .await?;
+                    Ok(changed > 0)
+                })
+            })
+            .await
+        })
+    }
+
     // Persist queue positions as one write transaction through the writer
     // gate. The caller passes only the rows whose position changed; each
     // statement binds a bounded number of them, so a long queue never builds

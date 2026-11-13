@@ -33,6 +33,9 @@ pub(crate) struct JobActivated {
     // The working directory a job that never started moved to, under the
     // intermediate folder set now. It moved whatever the read found.
     pub(crate) moved_to: Option<PathBuf>,
+    // The working directory the job had when the read was sent: a move is
+    // taken only by what still names this one.
+    pub(crate) started_in: PathBuf,
     pub(crate) result: Result<ReadArticles, String>,
 }
 
@@ -164,8 +167,9 @@ impl StagingChoice {
 // folder set now, in the order that leaves its stored row naming a folder
 // that exists whatever stops in between: the new one is claimed and marked,
 // the row names it once that write commits, and only then the old one goes.
-// A row that cannot be written gives the new one up, and the job keeps what
-// it has.
+// The row takes the new one only while it still names the one the job
+// started in. A row that cannot be written, or did not take it, gives the
+// new one up, and the job keeps what it has.
 async fn follow_working_dir(
     db: &crate::Database,
     job_id: JobId,
@@ -189,9 +193,13 @@ async fn follow_working_dir(
     };
     let dir = followed.path.clone();
     let stored = dir.clone();
+    let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let moved_in_row = Arc::clone(&moved);
     let recorded =
-        match db.try_queue_job_write_committed(job_id, "update_active_job_output_dir", move |db| {
-            db.update_active_job_output_dir(job_id, &stored)
+        match db.try_queue_job_write_committed(job_id, "move_active_job_output_dir", move |db| {
+            let took = db.move_active_job_output_dir(job_id, &from, &stored)?;
+            moved_in_row.store(took, std::sync::atomic::Ordering::Release);
+            Ok(())
         }) {
             Ok(committed) => committed
                 .await
@@ -202,7 +210,9 @@ async fn follow_working_dir(
     if let Err(error) = &recorded {
         warn!(job_id = job_id.0, dir = %dir.display(), %error, "could not record the job's new working directory; it keeps the one it has");
     }
-    let recorded = recorded.is_ok();
+    // The row is the arbiter: a row that no longer names the directory the
+    // job started in, or has gone, did not move, and the claim is given up.
+    let recorded = recorded.is_ok() && moved.load(std::sync::atomic::Ordering::Acquire);
     let _ = tokio::task::spawn_blocking(move || {
         if recorded {
             followed.leave_old();
@@ -302,6 +312,7 @@ impl Pipeline {
         let tx = self.job_activated_tx.clone();
         tokio::spawn(async move {
             let _ = written_rx.await;
+            let started_in = working_dir.clone();
             let moved_to = match follow {
                 Some((root, name)) => {
                     follow_working_dir(&db, job_id, root, working_dir, name).await
@@ -339,6 +350,7 @@ impl Pipeline {
                     job_id,
                     activation,
                     moved_to,
+                    started_in,
                     result,
                 })
                 .await;
@@ -354,6 +366,7 @@ impl Pipeline {
             job_id,
             activation,
             moved_to,
+            started_in,
             result,
         } = done;
         // The activation that had the job's working directory to move is
@@ -364,23 +377,41 @@ impl Pipeline {
         }
         // A move is on disk, and on the job's stored row, whichever
         // activation it came with and whether or not the job is still
-        // installed: the job and its queue row name the new directory. A job
-        // that left meanwhile has no use for it, and it goes.
+        // installed. The installed job and its queue row take the new
+        // directory only where they still name the one the move started in:
+        // a row being retired, and a job added again under the same id, are
+        // left as they are. A directory nothing took, and nothing names, is
+        // of a job that left, and goes as that job's own cleanup would have
+        // taken it.
         if let Some(dir) = moved_to {
-            let installed = self.jobs.get_mut(&job_id).map(|state| {
-                state.working_dir = dir.clone();
-            });
-            let listed = self
-                .shared_state
-                .queue
-                .write(|inner| match inner.job_mut(job_id) {
-                    Some(row) => {
-                        row.report.job.output_dir = Some(dir.display().to_string());
-                        crate::pipeline::queue::Change::changed(true)
-                    }
-                    None => crate::pipeline::queue::Change::unchanged(false),
-                });
-            if installed.is_none() && !listed {
+            let mut named = false;
+            let mut taken = false;
+            if let Some(state) = self.jobs.get_mut(&job_id) {
+                named |= state.working_dir == dir;
+                if state.working_dir == started_in {
+                    state.working_dir = dir.clone();
+                    taken = true;
+                }
+            }
+            let (from, to) = (started_in.display().to_string(), dir.display().to_string());
+            let (row_took, row_names) =
+                self.shared_state
+                    .queue
+                    .write(|inner| match inner.job_mut(job_id) {
+                        Some(row)
+                            if !row.report.retiring
+                                && row.report.job.output_dir.as_deref() == Some(from.as_str()) =>
+                        {
+                            row.report.job.output_dir = Some(to);
+                            crate::pipeline::queue::Change::changed((true, false))
+                        }
+                        Some(row) => crate::pipeline::queue::Change::unchanged((
+                            false,
+                            row.report.job.output_dir.as_deref() == Some(to.as_str()),
+                        )),
+                        None => crate::pipeline::queue::Change::unchanged((false, false)),
+                    });
+            if !(taken || row_took || named || row_names) {
                 tokio::task::spawn_blocking(move || {
                     let Some(root) = dir.parent() else {
                         return;

@@ -323,6 +323,222 @@ async fn a_swept_job_holds_no_other_job_of_its_page_and_the_stamp_takes_only_lis
     retire_pipeline_database(pipeline).await;
 }
 
+// With the intermediate root away, as on a drive that is offline, the sweep
+// judges no job: none is stamped, whatever its record names. With the root
+// back, the job's marked folder goes and the job is stamped.
+#[tokio::test]
+async fn housekeeping_stamps_nothing_while_the_intermediate_root_is_away() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let (delivered, unrecorded) = (JobId(30090), JobId(30091));
+    let working_dir = marked_working_dir(&intermediate_dir, "Harbor", delivered).await;
+    let delivery = complete_dir.join("Harbor");
+    tokio::fs::create_dir_all(&delivery).await.unwrap();
+    pipeline
+        .db
+        .insert_job_history(&history_row_finished_at(delivered, "failed", delivery, 2))
+        .unwrap();
+    let mut bare = history_row_finished_at(unrecorded, "failed", PathBuf::new(), 2);
+    bare.output_dir = None;
+    pipeline.db.insert_job_history(&bare).unwrap();
+    pipeline.report_all_for_test();
+    let away = temp_dir.path().join("intermediate-away");
+    std::fs::rename(&intermediate_dir, &away).unwrap();
+
+    pipeline
+        .shared_state
+        .queue
+        .clone()
+        .sweep_job_files(Some(100), std::time::SystemTime::UNIX_EPOCH)
+        .await;
+    assert_eq!(swept_at(&pipeline, delivered).await, None);
+    assert_eq!(swept_at(&pipeline, unrecorded).await, None);
+    assert!(!intermediate_dir.exists());
+
+    std::fs::rename(&away, &intermediate_dir).unwrap();
+    pipeline
+        .shared_state
+        .queue
+        .clone()
+        .sweep_job_files(Some(100), std::time::SystemTime::UNIX_EPOCH)
+        .await;
+    assert!(!working_dir.exists());
+    assert!(swept_at(&pipeline, delivered).await.is_some());
+    assert!(swept_at(&pipeline, unrecorded).await.is_some());
+    retire_pipeline_database(pipeline).await;
+}
+
+// Three hundred failed jobs whose records stand in one folder that is not
+// there: the folder is judged once for them all, every one is left waiting
+// on it, and none is stamped. A job recorded under a folder that is there,
+// its own folder gone, is stamped in the same pass.
+#[tokio::test]
+async fn jobs_under_one_missing_folder_cost_one_check_and_are_not_stamped() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let gone = temp_dir.path().join("retired-drive");
+    let there = temp_dir.path().join("old-intermediate");
+    tokio::fs::create_dir_all(&there).await.unwrap();
+    let ids: Vec<JobId> = (0..300).map(|n| JobId(31000 + n)).collect();
+    let settled = JobId(31999);
+    let mut page = Vec::new();
+    for id in &ids {
+        let dir = gone.join(format!("job-{}", id.0));
+        pipeline
+            .db
+            .insert_job_history(&history_row_finished_at(*id, "failed", dir.clone(), 2))
+            .unwrap();
+        page.push((*id, Some(dir)));
+    }
+    let settled_dir = there.join("job-settled");
+    pipeline
+        .db
+        .insert_job_history(&history_row_finished_at(
+            settled,
+            "failed",
+            settled_dir.clone(),
+            2,
+        ))
+        .unwrap();
+    page.push((settled, Some(settled_dir)));
+    pipeline.report_all_for_test();
+    let queue = pipeline.shared_state.queue.clone();
+    let resources = queue.resources.get().cloned().unwrap();
+    assert_eq!(resources.intermediate_dir, intermediate_dir);
+    let mut places =
+        crate::pipeline::queue::SweepPlaces::new(Some(&crate::jobs::working_dir::RootScan {
+            marked: Vec::new(),
+            unreadable: 0,
+        }));
+
+    assert!(
+        queue
+            .sweep_failed_page(&resources, &[], &mut places, 100, page)
+            .await
+    );
+
+    // One answer per folder, however many jobs name it.
+    assert_eq!(
+        places.parents,
+        std::collections::HashMap::from([(gone.clone(), false), (there, true)])
+    );
+    assert_eq!(places.waiting, BTreeMap::from([(gone, 300)]));
+    let stamped = pipeline.db.failed_job_history_page(100, None, 500).unwrap();
+    assert_eq!(stamped.len(), 300);
+    assert!(swept_at(&pipeline, settled).await.is_some());
+    assert_eq!(swept_at(&pipeline, ids[0]).await, None);
+    assert_eq!(swept_at(&pipeline, ids[299]).await, None);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A reading of the root that could not read one of its entries stamps no
+// job: the entry it missed may be any job's. What it did find still goes.
+#[tokio::test]
+async fn a_reading_that_missed_an_entry_sweeps_what_it_found_and_stamps_no_job() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let (found, missed) = (JobId(30095), JobId(30096));
+    let found_dir = marked_working_dir(&intermediate_dir, "found", found).await;
+    for id in [found, missed] {
+        let mut row = history_row_finished_at(id, "failed", PathBuf::new(), 2);
+        row.output_dir = None;
+        pipeline.db.insert_job_history(&row).unwrap();
+    }
+    pipeline.report_all_for_test();
+    let queue = pipeline.shared_state.queue.clone();
+    let resources = queue.resources.get().cloned().unwrap();
+    let mut places =
+        crate::pipeline::queue::SweepPlaces::new(Some(&crate::jobs::working_dir::RootScan {
+            marked: vec![(found, found_dir.clone())],
+            unreadable: 1,
+        }));
+
+    assert!(
+        queue
+            .sweep_failed_page(
+                &resources,
+                &[],
+                &mut places,
+                100,
+                vec![(found, None), (missed, None)],
+            )
+            .await
+    );
+
+    assert!(!found_dir.exists());
+    assert_eq!(swept_at(&pipeline, found).await, None);
+    assert_eq!(swept_at(&pipeline, missed).await, None);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A job of a listed page that is sent for again, by a retry from history or
+// by a new add under its id, is no longer the failure the page read. When
+// it has left the queue again before the sweep reaches it, its hold is
+// refused: the folder its new run left stays, and it is not stamped.
+#[tokio::test]
+async fn a_job_sent_for_again_while_its_page_is_swept_keeps_its_new_folder() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let (retried, added) = (JobId(30097), JobId(30098));
+    let spec = |id: JobId| segmented_job_spec(&format!("Sweep {}", id.0), "payload.bin", &[100]);
+    let mut events = handle.subscribe_events();
+    for id in [retried, added] {
+        let spec = spec(id);
+        let nzb = nzb_zstd_for(&spec);
+        handle
+            .add_job(id, spec, PathBuf::from("sweep.nzb"), nzb)
+            .await
+            .unwrap();
+        pipeline.apply_queue_intents().await;
+        handle.cancel_job(id).await.unwrap();
+        pipeline.apply_queue_intents().await;
+        finish_cancel_jobs(&mut pipeline).await;
+        while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
+        {
+        }
+    }
+    let queue = pipeline.shared_state.queue.clone();
+    let resources = queue.resources.get().cloned().unwrap();
+    // The page lists both as due, as its reading of their rows does.
+    queue.write(|inner| {
+        inner.sweep_listed.extend([retried, added]);
+        crate::pipeline::queue::Change::unchanged(())
+    });
+
+    // Each is sent for again by its real command, runs, and leaves the
+    // queue with its files kept.
+    handle.redownload_job(retried).await.unwrap();
+    let again = spec(added);
+    let nzb = nzb_zstd_for(&again);
+    handle
+        .add_job(added, again, PathBuf::from("sweep.nzb"), nzb)
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
+    let mut left = Vec::new();
+    for id in [retried, added] {
+        let dir = pipeline.jobs[&id].working_dir.clone();
+        handle.cancel_job_keeping_files(id).await.unwrap();
+        pipeline.apply_queue_intents().await;
+        finish_cancel_jobs(&mut pipeline).await;
+        while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
+        {
+        }
+        assert!(dir.exists());
+        left.push((id, dir));
+    }
+
+    for (id, dir) in left {
+        let swept = queue
+            .sweep_failed_job(&resources, &[], id, Some(dir.clone()), vec![dir.clone()])
+            .await;
+        assert_eq!(swept, None);
+        assert!(dir.exists(), "the folder of the job's new run was swept");
+    }
+    retire_pipeline_database(pipeline).await;
+}
+
 // One page of the sweep works from the reading of the intermediate root it
 // is given, and reads no root of its own: a job the reading names gives up
 // its folder and is stamped, and a job whose marked folder the reading does
@@ -343,14 +559,18 @@ async fn a_sweep_page_works_from_the_one_reading_of_the_root_it_is_given() {
     pipeline.report_all_for_test();
     let queue = pipeline.shared_state.queue.clone();
     let resources = queue.resources.get().cloned().unwrap();
-    let mut marked = Some(BTreeMap::from([(read, vec![read_dir.clone()])]));
+    let mut places =
+        crate::pipeline::queue::SweepPlaces::new(Some(&crate::jobs::working_dir::RootScan {
+            marked: vec![(read, read_dir.clone())],
+            unreadable: 0,
+        }));
 
     assert!(
         queue
             .sweep_failed_page(
                 &resources,
                 &[],
-                &mut marked,
+                &mut places,
                 100,
                 vec![
                     (read, Some(read_dir.clone())),

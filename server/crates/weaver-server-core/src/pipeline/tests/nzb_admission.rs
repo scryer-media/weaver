@@ -123,6 +123,24 @@ async fn a_retired_id_with_work_in_flight_is_rechecked_without_a_walk() {
     assert!(pipeline.nzb_retired_busy.is_empty());
 }
 
+// A job that failed or completed is no longer a queue row and holds no
+// slot: the walk forgets it, its stored resume with it.
+#[tokio::test]
+async fn the_walk_forgets_the_stored_resume_of_a_job_that_left() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let (failed, completed) = (JobId(78), JobId(79));
+    for id in [failed, completed] {
+        pipeline.nzb_seen.insert(id);
+        pipeline.resumes_stored.insert(id);
+    }
+
+    pipeline.reconcile_nzb_admission(true);
+
+    assert!(pipeline.resumes_stored.is_empty());
+    assert!(pipeline.nzb_seen.is_empty());
+}
+
 #[tokio::test]
 async fn twenty_four_providers_cannot_admit_more_than_ten_of_124_nzbs() {
     let temp = tempfile::tempdir().unwrap();

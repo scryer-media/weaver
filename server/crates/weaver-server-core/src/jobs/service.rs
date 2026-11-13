@@ -13,7 +13,7 @@ use crate::jobs::assembly::{DetectedArchiveIdentity, JobAssembly};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{FileSummaries, FileSummary, JobArticles, JobSpec, JobState, JobStatus};
 use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
-use crate::jobs::working_dir::{claim_working_dir, stamp_working_dir};
+use crate::jobs::working_dir::{claim_named_working_dir, claim_working_dir, stamp_working_dir};
 use crate::pipeline::Pipeline;
 use crate::{DownloadQueue, RestoreJobRequest};
 
@@ -366,7 +366,6 @@ impl Pipeline {
             )
             .await?;
         }
-        let mut claimed_marked = false;
         let (working_dir, directory_existed) =
             match restart.as_ref().filter(|restart| restart.reprocess) {
                 Some(restart) => {
@@ -377,10 +376,18 @@ impl Pipeline {
                         &working_dir,
                     )
                     .await?;
-                    let directory_existed = tokio::fs::try_exists(&working_dir).await?;
-                    tokio::fs::create_dir_all(&working_dir)
-                        .await
-                        .map_err(crate::SchedulerError::Io)?;
+                    let root = resources.intermediate_dir.clone();
+                    let named = working_dir.clone();
+                    let directory_existed = tokio::task::spawn_blocking(move || {
+                        claim_named_working_dir(&root, &named, job_id)
+                    })
+                    .await
+                    .map_err(|error| {
+                        crate::SchedulerError::Internal(format!(
+                            "working directory claim worker panicked: {error}"
+                        ))
+                    })?
+                    .map_err(crate::SchedulerError::Io)?;
                     (working_dir, directory_existed)
                 }
                 None => {
@@ -396,17 +403,11 @@ impl Pipeline {
                         ))
                     })?
                     .map_err(crate::SchedulerError::Io)?;
-                    claimed_marked = true;
                     (claimed.path, claimed.existed)
                 }
             };
-        // A directory claimed here was marked in the step that made it, so
+        // Either way the directory was marked in the step that made it, so
         // it was never there unmarked for anything else to take.
-        if !claimed_marked && working_dir.starts_with(&resources.intermediate_dir) {
-            stamp_working_dir(&resources.intermediate_dir, &working_dir, job_id)
-                .await
-                .map_err(crate::SchedulerError::Io)?;
-        }
         crate::runtime::perf_probe::record(
             "pipeline.add_job.working_dir_ready",
             stage_start.elapsed(),

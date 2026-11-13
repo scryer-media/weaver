@@ -24,6 +24,8 @@ pub(crate) use admission::{
 pub(crate) use counters::COUNTER_SAMPLES;
 #[cfg(test)]
 pub(crate) use history::FAILED_SWEEP_PAGE;
+#[cfg(test)]
+pub(crate) use history::SweepPlaces;
 pub(crate) use history::{clear_left_working_dirs, clear_restart_artifacts, remove_job_staging};
 
 /// The control plane's shared facts. A guard never leaves a synchronous

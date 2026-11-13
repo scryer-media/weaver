@@ -179,6 +179,40 @@ impl Drop for HistoryOperation {
     }
 }
 
+// What one failed-job sweep has learned of the places its jobs' files are
+// under, each learned once and kept for every page.
+pub(crate) struct SweepPlaces {
+    // The sweep's one reading of the intermediate root, by the job each
+    // marked directory names. None when the root could not be read: no job
+    // is judged, held or stamped.
+    pub(crate) marked: Option<BTreeMap<JobId, Vec<std::path::PathBuf>>>,
+    // The reading missed no entry, so finding nothing of a job means there
+    // is nothing of it.
+    pub(crate) complete: bool,
+    // Each other folder a record stands in, and whether it was there: one
+    // check per folder per sweep.
+    pub(crate) parents: std::collections::HashMap<std::path::PathBuf, bool>,
+    // The jobs left waiting, by the place that could not be judged.
+    pub(crate) waiting: BTreeMap<std::path::PathBuf, usize>,
+}
+
+impl SweepPlaces {
+    pub(crate) fn new(scan: Option<&crate::jobs::working_dir::RootScan>) -> Self {
+        Self {
+            marked: scan.map(|scan| {
+                let mut marked = BTreeMap::<JobId, Vec<std::path::PathBuf>>::new();
+                for (owner, path) in &scan.marked {
+                    marked.entry(*owner).or_default().push(path.clone());
+                }
+                marked
+            }),
+            complete: scan.is_some_and(|scan| scan.unreadable == 0),
+            parents: std::collections::HashMap::new(),
+            waiting: BTreeMap::new(),
+        }
+    }
+}
+
 // The ids of one page of the failed-job sweep, listed as due while the page
 // is swept and unlisted when it ends, however it ends.
 struct SweepListing {
@@ -422,24 +456,13 @@ impl Queue {
 
     // Housekeeping for what jobs left on disk: the failed jobs' files when
     // `failed_finished_by` is given, then the working directories of jobs
-    // with no row.
+    // with no row. The intermediate root is read once, off the runtime, and
+    // that one reading serves both.
     pub(crate) async fn sweep_job_files(
         self: Arc<Self>,
         failed_finished_by: Option<i64>,
         marked_before: std::time::SystemTime,
     ) {
-        if let Some(finished_by) = failed_finished_by {
-            self.clone().sweep_failed_job_files(finished_by).await;
-        }
-        self.sweep_unrecorded_working_dirs(marked_before).await;
-    }
-
-    // Every failed job whose record says it finished by `finished_by`, in
-    // epoch seconds, gives up the working directories that carry its marker
-    // and its staging directory, and keeps its record. The intermediate root
-    // is read once, when the first job needs it, and that reading serves
-    // every page. A sweep that lists nothing reads no folder.
-    async fn sweep_failed_job_files(self: Arc<Self>, finished_by: i64) {
         let Some(mut resources) = self.resources.get().cloned() else {
             return;
         };
@@ -447,8 +470,56 @@ impl Queue {
             resources.intermediate_dir = paths.intermediate;
             resources.complete_dir = paths.complete;
         }
+        let root = resources.intermediate_dir.clone();
+        let scan =
+            tokio::task::spawn_blocking(move || crate::jobs::working_dir::scan_working_dirs(&root))
+                .await
+                .map_err(std::io::Error::other)
+                .and_then(|scan| scan);
+        match &scan {
+            Ok(scan) if scan.unreadable > 0 => tracing::warn!(
+                root = %resources.intermediate_dir.display(),
+                entries = scan.unreadable,
+                "entries of the intermediate directory could not be read; housekeeping goes on without them and marks no failed job as swept this time"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::debug!(
+                root = %resources.intermediate_dir.display(),
+                error = %error,
+                "the intermediate directory could not be read for housekeeping"
+            ),
+        }
+        if let Some(finished_by) = failed_finished_by {
+            let mut places = SweepPlaces::new(scan.as_ref().ok());
+            self.clone()
+                .sweep_failed_job_files(&resources, &mut places, finished_by)
+                .await;
+            for (place, jobs) in &places.waiting {
+                tracing::warn!(
+                    place = %place.display(),
+                    jobs,
+                    "a folder failed jobs' files are under cannot be read now; housekeeping leaves those jobs for a later sweep"
+                );
+            }
+        }
+        if let Ok(scan) = scan {
+            self.sweep_unrecorded_working_dirs(&resources, marked_before, scan.marked)
+                .await;
+        }
+    }
+
+    // Every failed job whose record says it finished by `finished_by`, in
+    // epoch seconds, gives up the working directories that carry its marker
+    // and its staging directory, and keeps its record. The pages are walked
+    // by a cursor, so a job left unstamped is passed, not listed again in
+    // the same sweep.
+    async fn sweep_failed_job_files(
+        self: Arc<Self>,
+        resources: &super::AdmissionResources,
+        places: &mut SweepPlaces,
+        finished_by: i64,
+    ) {
         let mut staging_roots = None;
-        let mut marked = None;
         let mut after = None;
         loop {
             let db = resources.db.clone();
@@ -472,7 +543,7 @@ impl Queue {
             };
             after = Some((completed_at, last));
             let full = page.len() == FAILED_SWEEP_PAGE;
-            if staging_roots.is_none() {
+            if staging_roots.is_none() && places.marked.is_some() {
                 staging_roots = Some(resources.staging_roots().await);
             }
             let page = page
@@ -482,9 +553,9 @@ impl Queue {
             if !self
                 .clone()
                 .sweep_failed_page(
-                    &resources,
+                    resources,
                     staging_roots.as_deref().unwrap_or_default(),
-                    &mut marked,
+                    places,
                     finished_by,
                     page,
                 )
@@ -546,22 +617,57 @@ impl Queue {
         }
     }
 
-    // One page of the failed-job sweep. Three reads serve the whole page:
-    // which of its jobs are still the failures listed, which still have a
-    // script out, and which name a folder that cannot be judged now. The
-    // rest are held, swept and released one at a time, so a retry or a
-    // delete of any other job on the page is never refused for the sweep's
-    // sake, and are stamped together at the end. `marked` is the sweep's one
-    // reading of the intermediate root, made here if no page before needed
-    // it. False when the sweep stops here.
+    // One page of the failed-job sweep. Disk calls that learn whether a
+    // place can be judged are made per place, never per job: the sweep's
+    // one reading of the intermediate root, and one existence check for
+    // each other folder a page's records stand in, kept in `places` for the
+    // whole sweep. A job under a place that cannot be judged now is counted
+    // there and passed with no disk call, unstamped. Two reads serve the
+    // page: which of its jobs are still the failures listed, and which
+    // still have a script out. The rest are held, swept and released one at
+    // a time, and stamped together at the end. False when the sweep stops
+    // here.
     pub(crate) async fn sweep_failed_page(
         self: Arc<Self>,
         resources: &super::AdmissionResources,
         staging_roots: &[std::path::PathBuf],
-        marked: &mut Option<BTreeMap<JobId, Vec<std::path::PathBuf>>>,
+        places: &mut SweepPlaces,
         finished_by: i64,
         page: Vec<(JobId, Option<std::path::PathBuf>)>,
     ) -> bool {
+        let root = resources.intermediate_dir.clone();
+        if places.marked.is_none() {
+            // The root cannot be judged: every job's answer waits on it.
+            *places.waiting.entry(root).or_default() += page.len();
+            return true;
+        }
+        // Each folder this page's records stand in that the sweep has not
+        // judged yet: one check each, off the runtime.
+        let unjudged: BTreeSet<std::path::PathBuf> = page
+            .iter()
+            .filter_map(|(_, recorded)| recorded.as_deref()?.parent())
+            .filter(|parent| *parent != root && !places.parents.contains_key(*parent))
+            .map(std::path::Path::to_path_buf)
+            .collect();
+        if !unjudged.is_empty() {
+            match tokio::task::spawn_blocking(move || {
+                unjudged
+                    .into_iter()
+                    .map(|parent| {
+                        let there = std::fs::symlink_metadata(&parent).is_ok();
+                        (parent, there)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            {
+                Ok(judged) => places.parents.extend(judged),
+                Err(error) => {
+                    tracing::warn!(error = %error, "could not judge failed jobs' folders for housekeeping");
+                    return false;
+                }
+            }
+        }
         let db = resources.db.clone();
         let ids: Vec<JobId> = page.iter().map(|(id, _)| *id).collect();
         // Listed before the read below: a job admitted from here on is
@@ -576,26 +682,15 @@ impl Queue {
             queue: self.clone(),
             ids: ids.clone(),
         };
-        let recorded: Vec<Option<std::path::PathBuf>> =
-            page.iter().map(|(_, recorded)| recorded.clone()).collect();
-        // A job retried or deleted since the listing, one whose scripts
-        // still run, and one whose folder cannot be judged now are left for
-        // a later sweep, unstamped.
+        // A job retried or deleted since the listing, and one whose scripts
+        // still run, are left for a later sweep, unstamped.
         let ready = tokio::task::spawn_blocking(move || {
             let still_failed = db.failed_jobs_finished_by(finished_by, &ids)?;
             let raw = ids.iter().map(|id| id.0).collect::<Vec<_>>();
             let scripts = db.jobs_with_live_script_events(&raw)?;
             Ok::<_, crate::StateError>(
                 ids.into_iter()
-                    .zip(recorded)
-                    .filter(|(id, recorded)| {
-                        still_failed.contains(id)
-                            && !scripts.contains(&id.0)
-                            && !recorded
-                                .as_deref()
-                                .is_some_and(crate::history::delete_files::recorded_dir_unreachable)
-                    })
-                    .map(|(id, _)| id)
+                    .filter(|id| still_failed.contains(id) && !scripts.contains(&id.0))
                     .collect::<BTreeSet<_>>(),
             )
         })
@@ -611,44 +706,34 @@ impl Queue {
                 return false;
             }
         };
-        if ready.is_empty() {
-            return true;
-        }
-        if marked.is_none() {
-            let root = resources.intermediate_dir.clone();
-            *marked = match tokio::task::spawn_blocking(move || {
-                crate::jobs::working_dir::working_dirs_by_owner(&root)
-            })
-            .await
-            {
-                Ok(Ok(marked)) => Some(marked),
-                Ok(Err(error)) => {
-                    tracing::warn!(error = %error, "could not scan the intermediate directory for housekeeping");
-                    return false;
-                }
-                Err(error) => {
-                    tracing::warn!(error = %error, "could not scan the intermediate directory for housekeeping");
-                    return false;
-                }
-            };
-        }
-        let Some(marked) = marked.as_mut() else {
-            return false;
-        };
         // A job housekeeping has done all it ever will for gets the internal
         // swept stamp, with the others of its page in one write, so no later
         // sweep lists, holds or reads for it again; nothing the entry shows
         // changes. The stamp takes only an entry that is still the failure
-        // listed: one retried after its hold went is listed afresh.
+        // listed: one retried after its hold went is listed afresh. A
+        // reading of the root that missed entries stamps no one: a folder
+        // it could not read may be any job's.
         let mut swept = Vec::new();
         for (id, recorded) in page {
             if !ready.contains(&id) {
                 continue;
             }
-            let marked = marked.remove(&id).unwrap_or_default();
+            if let Some(parent) = recorded.as_deref().and_then(std::path::Path::parent)
+                && parent != resources.intermediate_dir
+                && places.parents.get(parent) == Some(&false)
+            {
+                *places.waiting.entry(parent.to_path_buf()).or_default() += 1;
+                continue;
+            }
+            let marked = places
+                .marked
+                .as_mut()
+                .and_then(|marked| marked.remove(&id))
+                .unwrap_or_default();
             if let Some(id) = self
                 .sweep_failed_job(resources, staging_roots, id, recorded, marked)
                 .await
+                && places.complete
             {
                 swept.push(id);
             }
@@ -675,53 +760,47 @@ impl Queue {
         true
     }
 
-    // Housekeeping: a working directory whose matching marker names a job
-    // with neither an active nor a history row goes once the marker is older
-    // than `marked_before`, as at start-up. A job is stamped before its row
-    // is written, so a younger marker may be a job still being admitted. A
-    // job the queue or a history operation holds, or whose scripts still
-    // run, is left, as is a directory that cannot be removed.
-    async fn sweep_unrecorded_working_dirs(self: Arc<Self>, marked_before: std::time::SystemTime) {
-        let Some(resources) = self.resources.get().cloned() else {
+    // The working directories of jobs with no row, from the sweep's one
+    // reading of the intermediate root: each carries a marker older than
+    // `marked_before` naming a job nothing records. Two batched reads judge
+    // them all under their holds: which owners are recorded after all, and
+    // which still have a script out; those are left for a later sweep.
+    async fn sweep_unrecorded_working_dirs(
+        self: Arc<Self>,
+        resources: &super::AdmissionResources,
+        marked_before: std::time::SystemTime,
+        marked: Vec<(JobId, std::path::PathBuf)>,
+    ) {
+        if marked.is_empty() {
             return;
-        };
-        let root = self
-            .read(|inner| inner.globals.runtime_paths.clone())
-            .map_or(resources.intermediate_dir, |paths| paths.intermediate);
-        let recorded = |db: crate::Database| async move {
-            match tokio::task::spawn_blocking(move || db.recorded_job_ids()).await {
-                Ok(Ok(ids)) => Some(ids),
-                Ok(Err(error)) => {
-                    tracing::warn!(error = %error, "could not list recorded jobs for housekeeping");
-                    None
-                }
-                Err(error) => {
-                    tracing::warn!(error = %error, "could not list recorded jobs for housekeeping");
-                    None
-                }
-            }
-        };
-        let Some(known) = recorded(resources.db.clone()).await else {
-            return;
-        };
-        let scan_root = root.clone();
+        }
+        let root = resources.intermediate_dir.clone();
+        let db = resources.db.clone();
         let unclaimed = match tokio::task::spawn_blocking(move || {
-            crate::jobs::working_dir::unclaimed_working_dirs(&scan_root, |owner, path| {
-                known.contains(&owner.0)
-                    || std::fs::metadata(crate::jobs::working_dir::working_dir_marker_path(path))
-                        .and_then(|marker| marker.modified())
-                        .map_or(true, |stamped| stamped >= marked_before)
-            })
+            let known = db.recorded_job_ids()?;
+            Ok::<_, crate::StateError>(
+                marked
+                    .into_iter()
+                    .filter(|(owner, path)| {
+                        !known.contains(&owner.0)
+                            && std::fs::metadata(crate::jobs::working_dir::working_dir_marker_path(
+                                path,
+                            ))
+                            .and_then(|marker| marker.modified())
+                            .is_ok_and(|stamped| stamped < marked_before)
+                    })
+                    .collect::<Vec<_>>(),
+            )
         })
         .await
         {
             Ok(Ok(unclaimed)) => unclaimed,
             Ok(Err(error)) => {
-                tracing::warn!(error = %error, "could not scan the intermediate directory for housekeeping");
+                tracing::warn!(error = %error, "could not list recorded jobs for housekeeping");
                 return;
             }
             Err(error) => {
-                tracing::warn!(error = %error, "could not scan the intermediate directory for housekeeping");
+                tracing::warn!(error = %error, "could not list recorded jobs for housekeeping");
                 return;
             }
         };
@@ -749,26 +828,29 @@ impl Queue {
             }
         }
         // The rows are read again under the holds: a job admitted or
-        // restored since the scan has the last word.
-        let Some(known) = recorded(resources.db.clone()).await else {
-            return;
-        };
-        for (_guard, owner, path) in held {
-            if known.contains(&owner.0)
-                || crate::post_processing::events::wait_for_job_events_stopped(
-                    &resources.db,
-                    owner.0,
-                )
-                .await
-                .is_err()
-            {
-                continue;
+        // restored since the scan has the last word. The removals follow in
+        // the same step, off the runtime.
+        let db = resources.db.clone();
+        let removed = tokio::task::spawn_blocking(move || {
+            let known = db.recorded_job_ids()?;
+            let owners = held.iter().map(|(_, owner, _)| owner.0).collect::<Vec<_>>();
+            let scripts = db.jobs_with_live_script_events(&owners)?;
+            for (_guard, owner, path) in held {
+                if !known.contains(&owner.0) && !scripts.contains(&owner.0) {
+                    crate::jobs::working_dir::remove_unclaimed_working_dir(&root, &path);
+                }
             }
-            let root = root.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                crate::jobs::working_dir::remove_unclaimed_working_dir(&root, &path)
-            })
-            .await;
+            Ok::<_, crate::StateError>(())
+        })
+        .await;
+        match removed {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "could not list recorded jobs for housekeeping");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "could not remove unreferenced intermediate directories");
+            }
         }
     }
 

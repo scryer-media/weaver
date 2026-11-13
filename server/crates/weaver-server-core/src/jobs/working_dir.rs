@@ -50,6 +50,9 @@ pub struct ClaimedWorkingDir {
 // directory and writes its marker under this lock, and an adoption reads
 // the marker and writes its own under it, so no adoption ever sees a
 // directory made for a job being added before that job's marker is in it.
+// The lock is held for those two steps alone: the root is made, and an
+// adoption's directory opened, before it is taken, so a place that hangs
+// stalls its own caller and no other.
 static CLAIMS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn claims() -> std::sync::MutexGuard<'static, ()> {
@@ -68,6 +71,16 @@ pub fn claim_working_dir(
     job_id: JobId,
     name: &str,
 ) -> std::io::Result<ClaimedWorkingDir> {
+    std::fs::create_dir_all(intermediate_dir)?;
+    claim_under_root(intermediate_dir, job_id, name)
+}
+
+// The claim itself, under a root that is there: nothing here makes the root.
+fn claim_under_root(
+    intermediate_dir: &Path,
+    job_id: JobId,
+    name: &str,
+) -> std::io::Result<ClaimedWorkingDir> {
     let _claims = claims();
     let claimed = create_working_dir(intermediate_dir, job_id, name)?;
     if let Err(error) = mark_weaver_owned_working_dir(intermediate_dir, &claimed.path, job_id) {
@@ -79,12 +92,31 @@ pub fn claim_working_dir(
     Ok(claimed)
 }
 
+// A job added to work in the directory it names, as a reprocess is: the
+// directory is made, if it is not there, and marked the job's in one step
+// under the claim lock when it stands under `root`. Whether it was there.
+pub fn claim_named_working_dir(root: &Path, path: &Path, job_id: JobId) -> std::io::Result<bool> {
+    let existed = match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    if !path.starts_with(root) {
+        std::fs::create_dir_all(path)?;
+        return Ok(existed);
+    }
+    std::fs::create_dir_all(root)?;
+    let _claims = claims();
+    std::fs::create_dir_all(path)?;
+    mark_weaver_owned_working_dir(root, path, job_id)?;
+    Ok(existed)
+}
+
 fn create_working_dir(
     intermediate_dir: &Path,
     job_id: JobId,
     name: &str,
 ) -> std::io::Result<ClaimedWorkingDir> {
-    std::fs::create_dir_all(intermediate_dir)?;
     let dir_name = sanitize_dirname(name);
     let candidate = intermediate_dir.join(&dir_name);
     match std::fs::create_dir(&candidate) {
@@ -197,12 +229,59 @@ pub(crate) fn job_working_dirs(
     marked_working_dirs(root, |owner| jobs.contains(&owner))
 }
 
-// Every working directory under `root` that carries a job's ownership
-// marker, by the job: one read of the root serves every job asked about.
-pub(crate) fn working_dirs_by_owner(
-    root: &Path,
-) -> std::io::Result<std::collections::BTreeMap<JobId, Vec<PathBuf>>> {
-    marked_working_dirs(root, |_| true)
+// One reading of an intermediate root for housekeeping: every working
+// directory in it whose ownership marker matches it, with the job the
+// marker names, and how many entries could not be read. An entry that
+// cannot be read is counted, never taken for a directory that is not
+// there: whoever uses the reading knows it missed something.
+pub(crate) struct RootScan {
+    pub(crate) marked: Vec<(JobId, PathBuf)>,
+    pub(crate) unreadable: usize,
+}
+
+// A root that cannot be read, missing or not, is an error: nothing under it
+// can be judged now. An entry that cannot be read is passed and counted.
+pub(crate) fn scan_working_dirs(root: &Path) -> std::io::Result<RootScan> {
+    let mut scan = RootScan {
+        marked: Vec::new(),
+        unreadable: 0,
+    };
+    for entry in std::fs::read_dir(root)? {
+        let Ok(entry) = entry else {
+            scan.unreadable += 1;
+            continue;
+        };
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => {}
+            Ok(_) => continue,
+            Err(_) => {
+                scan.unreadable += 1;
+                continue;
+            }
+        }
+        let path = entry.path();
+        let Ok(dir) = open_working_directory(root, &path) else {
+            scan.unreadable += 1;
+            continue;
+        };
+        let stored = match read_working_marker(&dir) {
+            Ok(stored) => stored,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                scan.unreadable += 1;
+                continue;
+            }
+        };
+        let Some(owner) = marker_job_id(&stored) else {
+            continue;
+        };
+        match match_marker(&dir, &path, &stored, owner) {
+            Ok(MarkerMatch::Mismatch) => {}
+            Ok(_) => scan.marked.push((owner, path)),
+            Err(_) => scan.unreadable += 1,
+        }
+    }
+    Ok(scan)
 }
 
 fn marked_working_dirs(
@@ -821,6 +900,9 @@ pub(crate) struct FollowedDir {
     pub(crate) path: PathBuf,
     root: PathBuf,
     job_id: JobId,
+    // The claim found the directory already there, under the job's own
+    // suffixed name: giving the claim up leaves it.
+    existed: bool,
     // The directory the job had, when it was there: this job's own, holding
     // nothing but its marker.
     old: Option<(Dir, PathBuf)>,
@@ -846,9 +928,12 @@ impl FollowedDir {
         }
     }
 
-    // The new directory is not the job's after all: it goes, and whatever
-    // the job had stays as it is.
+    // The new directory is not the job's after all: what the claim made
+    // goes, and whatever the job had stays as it is.
     pub(crate) fn abandon(self) {
+        if self.existed {
+            return;
+        }
         if let Err(error) = remove_job_working_dir(&self.root, &self.path, self.job_id)
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -875,9 +960,13 @@ pub(crate) fn follow_intermediate_dir(
         return Ok(None);
     };
     // Under `root` already: one existence check, and the directory is kept
-    // unless it is gone.
-    if old_root == root
-        && !matches!(std::fs::symlink_metadata(current), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    // unless it is gone. Gone with the root itself not there, as under a
+    // mount that is not up yet, the job keeps what it has: a claim under
+    // the root the job already had never makes that root.
+    let same_root = old_root == root;
+    if same_root
+        && (!matches!(std::fs::symlink_metadata(current), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            || std::fs::symlink_metadata(root).is_err())
     {
         return Ok(None);
     }
@@ -904,11 +993,16 @@ pub(crate) fn follow_intermediate_dir(
             Some((dir, current.to_path_buf()))
         }
     };
-    let claimed = claim_working_dir(root, job_id, name)?;
+    let claimed = if same_root {
+        claim_under_root(root, job_id, name)?
+    } else {
+        claim_working_dir(root, job_id, name)?
+    };
     Ok(Some(FollowedDir {
         path: claimed.path,
         root: root.to_path_buf(),
         job_id,
+        existed: claimed.existed,
         old,
     }))
 }
@@ -929,26 +1023,31 @@ pub async fn prepare_history_working_dir(
     let root = root.to_path_buf();
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        // An adoption never runs beside a claim: a directory made for a job
-        // being added has that job's marker before it is judged here.
-        let _claims = claims();
         let dir = match open_working_directory(&root, &path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(HistoryWorkingDir::Owned);
             }
             result => result?,
         };
-        // The caller names this as the job's own working directory, so one
-        // with no marker at all is adopted as one with an empty marker is.
-        let stored = match read_working_marker(&dir) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            result => result?,
+        // An adoption never reads or writes a marker beside a claim: a
+        // directory made for a job being added has that job's marker before
+        // it is judged here, whenever it was opened.
+        let stored = {
+            let _claims = claims();
+            // The caller names this as the job's own working directory, so
+            // one with no marker at all is adopted as one with an empty
+            // marker is.
+            let stored = match read_working_marker(&dir) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                result => result?,
+            };
+            if stored.is_empty() {
+                // The durable history row supplies the legacy directory's job identity.
+                mark_open_working_dir(&dir, &path, job_id)?;
+                return Ok(HistoryWorkingDir::Owned);
+            }
+            stored
         };
-        if stored.is_empty() {
-            // The durable history row supplies the legacy directory's job identity.
-            mark_weaver_owned_working_dir(&root, &path, job_id)?;
-            return Ok(HistoryWorkingDir::Owned);
-        }
         judge_history_marker(&dir, &path, &stored, job_id)
     })
     .await
@@ -1592,5 +1691,82 @@ mod tests {
                 new
             );
         }
+    }
+
+    // A missing directory under a root that is not there, as under a mount
+    // that is not up yet, is not claimed again: nothing makes the root.
+    // With the root there, it is.
+    #[test]
+    fn a_reclaim_under_the_same_root_never_makes_the_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("mount");
+        let current = root.join("job");
+
+        assert!(
+            follow_intermediate_dir(&root, &current, JobId(3), "job")
+                .unwrap()
+                .is_none()
+        );
+        assert!(!root.exists());
+
+        std::fs::create_dir(&root).unwrap();
+        let followed = follow_intermediate_dir(&root, &current, JobId(3), "job")
+            .unwrap()
+            .unwrap();
+        assert!(is_job_working_dir(&root, &followed.path, JobId(3)).unwrap());
+    }
+
+    // A claim given up removes what it made, and spares a directory that
+    // was there before it under the job's own suffixed name.
+    #[test]
+    fn a_claim_given_up_spares_a_directory_that_was_there() {
+        let temp = tempfile::tempdir().unwrap();
+        let (old_root, root) = (temp.path().join("old"), temp.path().join("new"));
+        let made = follow_intermediate_dir(&root, &old_root.join("job"), JobId(4), "job")
+            .unwrap()
+            .unwrap();
+        let made_path = made.path.clone();
+        made.abandon();
+        assert!(!made_path.exists());
+
+        std::fs::create_dir(root.join("job")).unwrap();
+        let earlier = suffixed_working_dir(&root, "job", JobId(4));
+        std::fs::create_dir(&earlier).unwrap();
+        std::fs::write(earlier.join("kept.bin"), b"kept").unwrap();
+        let found = follow_intermediate_dir(&root, &old_root.join("job"), JobId(4), "job")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.path, earlier);
+        found.abandon();
+        assert!(earlier.join("kept.bin").exists());
+    }
+
+    // A root that is not there cannot be read, and says so; a root that is
+    // names each marked directory by its job and passes what is no
+    // directory.
+    #[test]
+    fn a_scan_of_a_missing_root_is_an_error_not_an_empty_reading() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("intermediate");
+        assert!(scan_working_dirs(&root).is_err());
+
+        let claimed = claim_working_dir(&root, JobId(5), "job").unwrap();
+        std::fs::create_dir(root.join("unmarked")).unwrap();
+        std::fs::write(root.join("a-file"), b"x").unwrap();
+        let scan = scan_working_dirs(&root).unwrap();
+        assert_eq!(scan.marked, vec![(JobId(5), claimed.path)]);
+        assert_eq!(scan.unreadable, 0);
+    }
+
+    // A job added to work in a directory it names has it made and marked in
+    // one step, and is told whether it was there.
+    #[test]
+    fn a_named_claim_makes_and_marks_the_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("intermediate");
+        let path = root.join("named");
+        assert!(!claim_named_working_dir(&root, &path, JobId(6)).unwrap());
+        assert!(is_job_working_dir(&root, &path, JobId(6)).unwrap());
+        assert!(claim_named_working_dir(&root, &path, JobId(6)).unwrap());
     }
 }

@@ -558,19 +558,6 @@ pub(crate) async fn delete_history_rows(
     )
 }
 
-// Whether a failed job's recorded folder cannot be judged now: reading it
-// fails, or neither it nor the folder that would hold it is there, as when
-// a mount is offline. Housekeeping leaves such a job for a later sweep.
-pub(crate) fn recorded_dir_unreachable(recorded: &std::path::Path) -> bool {
-    match std::fs::symlink_metadata(recorded) {
-        Ok(_) => false,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => recorded
-            .parent()
-            .is_some_and(|parent| std::fs::symlink_metadata(parent).is_err()),
-        Err(_) => true,
-    }
-}
-
 // Housekeeping for a failed job whose scripts have stopped: the working
 // directories that carry its marker, `marked`, as a scan of the intermediate
 // root found them, and its staging directory go, and its record stays. The

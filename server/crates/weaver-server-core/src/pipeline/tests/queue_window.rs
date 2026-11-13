@@ -755,32 +755,74 @@ async fn an_unstarted_job_whose_folder_is_gone_claims_a_new_one() {
     assert_eq!(stored, moved);
 }
 
-// A job that left the pipeline and the queue while its move was out leaves
-// nothing behind: the directory claimed for it goes when the reply is heard.
+// A job deleted, by the real command, while its move was out leaves nothing
+// behind: neither the directory it had nor the one claimed for it.
 #[tokio::test]
-async fn a_job_gone_before_its_move_is_heard_leaves_no_folder() {
+async fn a_job_deleted_while_its_move_is_out_leaves_no_folder() {
     let temp = tempfile::tempdir().unwrap();
     let id = JobId(1);
     let (mut pipeline, old_dir, new_root) = unstarted_job_with_a_changed_folder(&temp, id).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let mut events = handle.subscribe_events();
 
     pipeline.request_job_activation(id);
+    handle.cancel_job_and_delete_history(id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(&mut pipeline).await;
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
+    {
+    }
     let done = pipeline.job_activated_rx.recv().await.unwrap();
-    let claimed = done.moved_to.clone().unwrap();
-    assert!(claimed.exists());
-    let state = pipeline.jobs.remove(&id).unwrap();
-    pipeline.shared_state.queue.write(|inner| {
-        inner.remove_job(id);
-        crate::pipeline::queue::Change::changed(())
-    });
     pipeline.handle_job_activated(done);
+    assert!(pipeline.moving_jobs.is_empty());
 
-    // The removal runs off the actor: wait for the folder itself.
-    while claimed.exists() {
+    // The removals run off the actor: wait for the folders themselves.
+    while old_dir.exists()
+        || std::fs::read_dir(&new_root).is_ok_and(|mut entries| entries.next().is_some())
+    {
         tokio::task::yield_now().await;
     }
-    assert!(!old_dir.exists());
-    assert_eq!(std::fs::read_dir(&new_root).unwrap().count(), 0);
-    drop(state);
+    assert!(rows(&pipeline) == 0);
+}
+
+// A job cancelled while its move was out, and retried under the same id
+// before the move is heard: the retry has one folder, the one its row
+// names, and nothing is left of the first run.
+#[tokio::test]
+async fn a_job_cancelled_while_its_move_is_out_and_retried_has_one_folder() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = JobId(1);
+    let (mut pipeline, old_dir, new_root) = unstarted_job_with_a_changed_folder(&temp, id).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let mut events = handle.subscribe_events();
+
+    pipeline.request_job_activation(id);
+    handle.cancel_job(id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(&mut pipeline).await;
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
+    {
+    }
+    handle.redownload_job(id).await.unwrap();
+    let done = pipeline.job_activated_rx.recv().await.unwrap();
+    pipeline.handle_job_activated(done);
+    settle(&mut pipeline).await;
+
+    let retry = pipeline.jobs[&id].working_dir.clone();
+    assert_eq!(retry.parent(), Some(new_root.as_path()));
+    assert!(crate::jobs::working_dir::is_job_working_dir(&new_root, &retry, id).unwrap());
+    let stored = pipeline
+        .db
+        .load_active_job_row(id)
+        .unwrap()
+        .unwrap()
+        .output_dir;
+    assert_eq!(stored, retry);
+    // The removals run off the actor: wait for the folders themselves.
+    while old_dir.exists() || std::fs::read_dir(&new_root).unwrap().count() != 1 {
+        tokio::task::yield_now().await;
+    }
+    assert!(retry.exists());
 }
 
 // A reorder among jobs out of the window changes no installed job, and is
