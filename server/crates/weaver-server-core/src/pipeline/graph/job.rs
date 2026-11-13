@@ -54,6 +54,19 @@ pub(crate) enum GraphError {
 }
 
 impl GraphError {
+    // The file a write found no room for, when that is all that failed: the
+    // job waits for room rather than failing.
+    pub(crate) fn out_of_space(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Write(WriteError::Leaf(LeafError::Io { path, source }))
+                if crate::operations::is_out_of_space(source) =>
+            {
+                Some(path)
+            }
+            _ => None,
+        }
+    }
+
     // What the failure is to the job: a file's I/O error classed as the
     // extractors class theirs, and named as a full disk when it is one, a
     // refusal as the refusal, anything else terminal.

@@ -1056,6 +1056,17 @@ impl Pipeline {
             }
             match self.spill_job_parts(job_id).await {
                 Ok(()) => self.park_spilled_job(job_id),
+                // The spool had no room for a part: the job parks without
+                // it, and fetches it again once it resumes.
+                Err(error) if crate::operations::is_out_of_space(&error.source) => {
+                    warn!(
+                        job_id = job_id.0,
+                        file_id = %error.file_id,
+                        error = %error.source,
+                        "held part spool write found no room; the part is fetched again"
+                    );
+                    self.park_spilled_job(job_id);
+                }
                 Err(error) => self.fail_job_for_disk_write(error, "held part spool write failed"),
             }
         }
@@ -1154,6 +1165,18 @@ impl Pipeline {
                 {
                     warn!(path = %path.display(), %error, "could not remove a held part's spool file");
                 }
+            }
+        }
+    }
+
+    // Let a held part go as its job goes back to its checkpoint: its ledger
+    // is released, and a spooled part's file stays, for the checkpoint that
+    // may name it.
+    pub(in crate::pipeline) fn forget_parked_bytes(&mut self, bytes: ParkedBytes) {
+        match bytes {
+            ParkedBytes::Memory(data) => self.release_write_buffered(data.len_bytes(), 1),
+            ParkedBytes::Spilled { decoded_bytes, .. } => {
+                self.release_uu_spooled(decoded_bytes, 1);
             }
         }
     }
@@ -1658,6 +1681,19 @@ impl Pipeline {
     ) {
         let job_id = error.file_id.job_id;
         let out_of_space = crate::operations::is_out_of_space(&error.source);
+        // A write that found no room holds the job until the disk has room:
+        // what it did not write is fetched again.
+        if out_of_space && self.job_takes_results(job_id) {
+            warn!(
+                job_id = job_id.0,
+                file_id = %error.file_id,
+                error = %error.source,
+                context,
+                "disk write found no room; the job waits for room"
+            );
+            self.hold_job_for_full_disk(job_id, crate::operations::StorageRoot::Intermediate);
+            return;
+        }
         let message = if out_of_space {
             format!(
                 "{context} for {}: filesystem out of space or over quota ({})",

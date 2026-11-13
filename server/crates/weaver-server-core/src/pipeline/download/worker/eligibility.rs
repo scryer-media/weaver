@@ -171,8 +171,9 @@ impl Pipeline {
             .or_else(|| {
                 let state = self.jobs.get(&job_id)?;
                 self.hold_reason_of(job_id, state).or_else(|| {
-                    (!self.disk_waiting.is_empty() && self.disk_waiting.contains(&job_id))
-                        .then_some(crate::jobs::handle::DISK_SPACE_WAIT_REASON)
+                    ((!self.disk_waiting.is_empty() && self.disk_waiting.contains(&job_id))
+                        || self.held_for_full_disk(job_id))
+                    .then_some(crate::jobs::handle::DISK_SPACE_WAIT_REASON)
                 })
             })
     }

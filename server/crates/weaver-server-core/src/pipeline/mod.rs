@@ -14,6 +14,7 @@ mod decode;
 pub mod diagnostics;
 pub mod download;
 mod extraction;
+mod full_disk;
 pub mod graph;
 mod health;
 pub(crate) mod held;
@@ -1584,6 +1585,10 @@ pub struct Pipeline {
     pub(super) admission_disk_held: bool,
     // The jobs the last walk would have started but for that.
     pub(super) disk_unadmitted: std::collections::BTreeSet<JobId>,
+    // The jobs a write found the disk full for: each fetches nothing until
+    // a reading taken since shows room, and then runs on from its last
+    // checkpoint.
+    pub(super) full_disk: std::collections::BTreeMap<JobId, full_disk::FullDisk>,
     // A `RebuildNntp` has activated a new pool whose predecessor still holds
     // sockets at the provider. Fresh dials wait until the old generation has
     // drained: the provider counts both generations against one allowance,

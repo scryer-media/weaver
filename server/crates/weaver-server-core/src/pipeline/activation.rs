@@ -434,8 +434,8 @@ impl Pipeline {
         self.park_drained_jobs();
     }
 
-    // Park every paused job with nothing left out, once its held parts are
-    // spooled. Each turn asks.
+    // Park every paused job, and every job held for a full disk, with nothing
+    // left out, a paused one once its held parts are spooled. Each turn asks.
     pub(crate) fn park_drained_jobs(&mut self) {
         if self.parking_jobs.is_empty() {
             return;
@@ -446,10 +446,20 @@ impl Pipeline {
                 .jobs
                 .get(&job_id)
                 .is_some_and(|state| state.run_state == crate::jobs::model::RunState::Paused);
-            if paused && self.job_has_results_out(job_id) {
+            let full_disk = self.held_for_full_disk(job_id);
+            if (paused || full_disk) && self.job_has_results_out(job_id) {
                 continue;
             }
             self.parking_jobs.remove(&job_id);
+            // A job held for a full disk has no graph to checkpoint: it parks
+            // as it is, its cursors let go, and goes on at once if a reading
+            // since its write already shows room.
+            if full_disk {
+                self.forget_uu_cursors(job_id);
+                self.park_drained_job(job_id);
+                self.wake_full_disk();
+                continue;
+            }
             if !paused {
                 continue;
             }

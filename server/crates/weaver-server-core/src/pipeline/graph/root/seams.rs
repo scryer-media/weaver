@@ -531,8 +531,16 @@ impl Pipeline {
             return;
         }
         // A step that failed otherwise fails the job with its error: what
-        // it did not write, nothing after it can read.
+        // it did not write, nothing after it can read. A write that found no
+        // room holds the job until the disk has room instead: what the step
+        // did not write is written again from the job's last checkpoint.
         if let Err(error) = result {
+            if let Some(path) = error.out_of_space() {
+                let root = self.full_disk_root(path);
+                warn!(job_id = job_id.0, error = %error, "graph job write found no room");
+                self.hold_job_for_full_disk(job_id, root);
+                return;
+            }
             warn!(job_id = job_id.0, error = %error, "graph job step failed");
             self.fail_job_on_extraction_error(job_id, error.to_extraction());
             return;
@@ -624,7 +632,7 @@ impl Pipeline {
     // starting for it, so the loop listens for the next reading. The loop
     // reconciles the waits just before it asks.
     pub(in crate::pipeline) fn waits_for_disk_room(&self) -> bool {
-        !self.disk_waiting.is_empty() || self.admission_disk_held
+        !self.disk_waiting.is_empty() || self.admission_disk_held || !self.full_disk.is_empty()
     }
 
     // A turn busy with results, which does not wait on the next event: a
@@ -646,6 +654,7 @@ impl Pipeline {
         self.reconcile_disk_waits();
         self.wake_disk_waiters();
         self.release_admission_disk_hold();
+        self.wake_full_disk();
     }
 
     // A disk someone waits on has a new reading: each job that waits is

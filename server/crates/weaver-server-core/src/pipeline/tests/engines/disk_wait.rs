@@ -7,7 +7,9 @@
 // room and the pause lifts it completes; a shutdown is not held by it; a
 // restart restores it, and it completes. And what the reserve holds of
 // fetching: a job that never downloaded waits to start, and a job that
-// started fetches on, through a pause and a restart.
+// started fetches on, through a pause and a restart. And a write that finds
+// the disk full: the job waits for room, not failed, and completes once
+// there is room.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -16,10 +18,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::harness::{ARTICLE, JOB, Post, Scenario, admit, payload, serve_job};
 use super::lifecycle::drive;
 use super::streams::xz;
-use crate::jobs::model::{JobStatus, RunState};
+use crate::jobs::model::{JobArticles, JobStatus, RunState};
 use crate::operations::disk::DiskLedger;
 use crate::operations::{DiskSpace, StorageCapacity, StorageRoot};
 use crate::pipeline::Pipeline;
+use crate::pipeline::graph::leaf::counting::fill_after;
 use crate::pipeline::tests::job_status_for_assert;
 use crate::{JobId, SchedulerHandle};
 
@@ -761,4 +764,130 @@ async fn a_reading_with_room_is_heard_on_a_turn_busy_with_results() {
     assert!(!pipeline.admission_disk_held, "the hold ended");
     pipeline.apply_queue_intents().await;
     assert!(pipeline.nzb_admitted.contains(&OTHER), "it started");
+}
+
+// Serve the job until a write finds the disk full, and let it park, as the
+// loop's next turn does once nothing of it is out: it is held for room, not
+// failed, waits on the working disk's ledger, says it waits for disk space,
+// and fetches nothing.
+async fn until_full(pipeline: &mut Pipeline, scenario: &Scenario) {
+    drive(pipeline, scenario, JOB, |pipeline| {
+        pipeline.held_for_full_disk(JOB)
+    })
+    .await;
+    assert!(
+        pipeline.held_for_full_disk(JOB),
+        "a write found the disk full"
+    );
+    assert!(
+        !pipeline.graph_jobs.contains_key(&JOB),
+        "the graph that could not write went"
+    );
+    pipeline.park_drained_jobs();
+    assert!(
+        matches!(pipeline.jobs[&JOB].articles, JobArticles::Queued(_)),
+        "it parked"
+    );
+    assert_full_disk_held(pipeline);
+}
+
+fn assert_full_disk_held(pipeline: &Pipeline) {
+    assert!(pipeline.held_for_full_disk(JOB));
+    assert!(
+        !matches!(
+            job_status_for_assert(pipeline, JOB),
+            Some(JobStatus::Failed { .. })
+        ),
+        "the job is not failed"
+    );
+    assert!(pipeline.nzb_admitted.contains(&JOB), "it keeps its slot");
+    assert!(pipeline.waits_for_disk_room());
+    assert!(
+        working(pipeline).waited_on(),
+        "the wait hears every reading"
+    );
+    assert_eq!(
+        pipeline.dispatch_wait_reason(JOB),
+        Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON)
+    );
+    assert!(
+        !pipeline.download_scheduler_eligible_jobs().contains(&JOB),
+        "it fetches nothing"
+    );
+}
+
+// A job held for a full disk: a reading with no room keeps it held; once
+// the disk has room, a reading lets it go, it reads its articles back,
+// restored from its last checkpoint, and completes.
+async fn full_disk_freed(pipeline: &mut Pipeline, scenario: &Scenario, room: &AtomicU64) {
+    reading_of(pipeline, room, 0).await;
+    assert_full_disk_held(pipeline);
+
+    fill_after(None);
+    room_freed(pipeline, room).await;
+    assert!(!pipeline.held_for_full_disk(JOB));
+    assert!(!pipeline.waits_for_disk_room());
+    assert!(!working(pipeline).waited_on(), "no one waits on the disk");
+    assert_eq!(pipeline.dispatch_wait_reason(JOB), None);
+    assert_eq!(pipeline.download_scheduler_eligible_jobs(), vec![JOB]);
+
+    crate::pipeline::tests::activate_job(pipeline, JOB).await;
+    drive(pipeline, scenario, JOB, |_| false).await;
+    assert_eq!(
+        job_status_for_assert(pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    assert_released(pipeline, &working(pipeline));
+}
+
+// A plain file's write finds the disk full part-way through its download,
+// though the cached reading showed room: the job waits for room, and once
+// there is room it fetches again what it lost and delivers the file whole.
+#[tokio::test]
+async fn a_plain_file_whose_write_finds_the_disk_full_waits_for_room_and_completes() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let body = payload(4 * ARTICLE, 97);
+    let scenario = on_disk_posting(&room, vec![Post::plain("ember.bin", body.clone())]);
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
+    // The disk is full from here; no reading has said so yet.
+    room.store(0, Ordering::Release);
+    fill_after(Some(ARTICLE as u64 + ARTICLE as u64 / 2));
+
+    until_full(&mut pipeline, &scenario).await;
+    full_disk_freed(&mut pipeline, &scenario, &room).await;
+
+    assert_eq!(
+        file_named(&delivered(&complete_dir), "ember.bin"),
+        body.as_slice()
+    );
+}
+
+// A stored archive's member is unpacked straight from its posts; one of
+// its writes finds the disk full part-way through the download: the job
+// waits for room, and once there is room it writes again what it lost and
+// delivers the member whole.
+#[tokio::test]
+async fn an_unpacking_job_whose_write_finds_the_disk_full_waits_for_room_and_completes() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let body = payload(16 * ARTICLE + 13, 43);
+    let posts = crate::pipeline::tests::direct_store::single_member_store_set(
+        "silver.horizon.mkv",
+        &body,
+        4,
+    )
+    .into_iter()
+    .map(|(name, bytes)| Post::plain(&name, bytes))
+    .collect();
+    let scenario = on_disk_posting(&room, posts);
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
+    room.store(0, Ordering::Release);
+    fill_after(Some(6 * ARTICLE as u64));
+
+    until_full(&mut pipeline, &scenario).await;
+    full_disk_freed(&mut pipeline, &scenario, &room).await;
+
+    assert_eq!(
+        file_named(&delivered(&complete_dir), "silver.horizon.mkv"),
+        body.as_slice()
+    );
 }
