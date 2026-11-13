@@ -628,7 +628,7 @@ metric_families! {
     VOLUME_WRITE_SEEKS = ("weaver_volume_write_seeks_total", Counter, ["volume"],
         "Write calls to a volume that did not start where the previous write to the same file ended.");
     VOLUME_WRITE_RATE = ("weaver_volume_write_rate_bytes_per_second", Gauge, ["volume"],
-        "What a volume takes while a write call is inside it, over the last 30 seconds that had writes. Conditional: emitted only once the volume has been measured.");
+        "What a volume takes while a write call is inside it: its write rate over the most recent 30 seconds of samples that had writes. Conditional: emitted only once the volume has been measured.");
     VOLUME_BUFFERED_BYTES = ("weaver_volume_buffered_bytes", Gauge, ["volume"],
         "Bytes waiting in memory for a volume's writer.");
 

@@ -10,14 +10,28 @@
 use std::path::Path;
 
 // The mount path or drive root of the volume `path` lies on, read at the
-// nearest of its ancestors that exists. What cannot be read is shown by the
-// path's own root.
+// nearest of its ancestors that exists.
+//
+// A mount that cannot be read is shown by the path's own root with its
+// device beside it, as `/ (device 1a2b)`: the bare root is the label of the
+// volume really mounted there, and two volumes must never share a label, as
+// each label is one series in the metrics and one row in the interface.
 pub(crate) fn volume_label(path: &Path) -> String {
-    path.ancestors()
-        .find(|at| at.exists())
-        .and_then(mount_path)
-        .filter(|label| !label.is_empty())
-        .unwrap_or_else(|| root_of(path))
+    let mount = path.ancestors().find(|at| at.exists()).and_then(mount_path);
+    label_from(mount, path, || super::nearest_device(path))
+}
+
+// The label from what was read: the mount where there is one, and the
+// path's root marked with its device where there is not. The device is only
+// looked for when the mount could not be read.
+fn label_from(mount: Option<String>, path: &Path, device: impl FnOnce() -> Option<u64>) -> String {
+    if let Some(mount) = mount.filter(|mount| !mount.is_empty()) {
+        return mount;
+    }
+    match device() {
+        Some(device) => format!("{} (device {device:x})", root_of(path)),
+        None => format!("{} (device unknown)", root_of(path)),
+    }
 }
 
 // The root `path` starts from: `/`, or a drive or share with its separator.
@@ -137,8 +151,8 @@ mod tests {
         );
     }
 
-    // What has no mount to read is shown by its root, and a path with no
-    // root as it is.
+    // What has no mount to read starts from its root, and a path with no
+    // root is taken as it is.
     #[test]
     fn a_path_falls_back_to_its_root() {
         #[cfg(unix)]
@@ -146,5 +160,48 @@ mod tests {
         #[cfg(windows)]
         assert_eq!(root_of(Path::new(r"D:\downloads\job")), r"D:\");
         assert_eq!(root_of(Path::new("downloads/job")), "downloads/job");
+    }
+
+    // A mount that was read is the label as it stands, and no device is
+    // looked for.
+    #[test]
+    fn a_mount_that_was_read_is_the_label_unchanged() {
+        let unasked = || -> Option<u64> { panic!("a read mount needs no device") };
+        assert_eq!(
+            label_from(Some("/mnt/nas".into()), Path::new("/mnt/nas/job"), unasked),
+            "/mnt/nas"
+        );
+        assert_eq!(label_from(Some("/".into()), Path::new("/srv/job"), unasked), "/");
+    }
+
+    // Two volumes whose mounts cannot be read share a root. Neither takes
+    // the other's label, and neither takes the label of the volume really
+    // mounted at that root.
+    #[test]
+    fn volumes_with_unread_mounts_never_share_a_label() {
+        let (first, second) = (Path::new("/mnt/first/job"), Path::new("/mnt/second/job"));
+        let real_root = label_from(Some(root_of(first)), first, || Some(1));
+        let first_label = label_from(None, first, || Some(0x1a2b));
+        let second_label = label_from(None, second, || Some(0x3c4d));
+        // A mount read as empty is not a mount.
+        let empty_label = label_from(Some(String::new()), second, || Some(0x5e6f));
+        let unknown_label = label_from(None, second, || None);
+
+        let labels = [
+            real_root.as_str(),
+            first_label.as_str(),
+            second_label.as_str(),
+            empty_label.as_str(),
+            unknown_label.as_str(),
+        ];
+        let distinct: std::collections::HashSet<&str> = labels.into_iter().collect();
+        assert_eq!(distinct.len(), labels.len(), "{labels:?}");
+
+        let root = root_of(first);
+        assert_eq!(real_root, root);
+        assert_eq!(first_label, format!("{root} (device 1a2b)"));
+        assert_eq!(second_label, format!("{root} (device 3c4d)"));
+        // No device either: the label says so.
+        assert_eq!(unknown_label, format!("{root} (device unknown)"));
     }
 }
