@@ -304,6 +304,19 @@ async fn a_pin_follows_its_server_and_not_an_edited_host_or_port() {
             0,
             false,
         ),
+        (
+            "given another username",
+            vec![
+                {
+                    let mut renamed = entry("nova.example.invalid", 119, 0, 7);
+                    renamed.server.username = Some("another-account".to_string());
+                    renamed
+                },
+                other(0),
+            ],
+            0,
+            false,
+        ),
     ];
     for (case, rebuilt, position, pinned) in cases {
         let temp_dir = tempfile::tempdir().unwrap();

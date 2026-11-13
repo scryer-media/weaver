@@ -526,8 +526,13 @@ impl DownloadQueue {
     // An item keyed `key` was put in: no floor of a server that may take it
     // may stand above it. A server the item is refused to, under the
     // conditions its floor was recorded with, keeps its floor: the item is
-    // one more refusal below it. One constant-time answer per floor that
-    // exists, and nothing where no server has walked.
+    // one more refusal below it. Nothing is asked where no server has
+    // walked, or of a floor already at or above the item. Each other floor
+    // is asked once, and an item its exclusions do not already refuse is
+    // weighed by the provider policy: its quota check and a walk of the
+    // priority levels, so a step or so per server of the pool for each
+    // floor. With every one of 50 servers holding a floor that is about
+    // 2,500 steps for one item put in, and no allocation.
     fn lower_scan_floors(
         &mut self,
         key: Key,

@@ -54,6 +54,37 @@ async fn ladder_pipeline(temp_dir: &TempDir, levels: &[(u32, bool)]) -> Pipeline
 // lane's 430 takes, so the exclusion, the requeue and any booking are the
 // product's own.
 async fn answer_not_found(pipeline: &mut Pipeline, server: usize, work: DownloadWork) {
+    answer_failed(
+        pipeline,
+        server,
+        work,
+        DownloadFailureKind::ArticleNotFound,
+        "430 no such article",
+    )
+    .await;
+}
+
+// Fail the connection under `work`, handed to `server`, through the result
+// path a lane's lost connection takes: an ordinary retry, which refuses the
+// article to no server.
+async fn answer_connection_failed(pipeline: &mut Pipeline, server: usize, work: DownloadWork) {
+    answer_failed(
+        pipeline,
+        server,
+        work,
+        DownloadFailureKind::EstablishedTransport,
+        "connection closed",
+    )
+    .await;
+}
+
+async fn answer_failed(
+    pipeline: &mut Pipeline,
+    server: usize,
+    work: DownloadWork,
+    kind: DownloadFailureKind,
+    said: &str,
+) {
     let (job_id, segment_id) = (work.segment_id.file_id.job_id, work.segment_id);
     let (retry_count, exclude_servers) = (work.retry_count, work.exclude_servers);
     pipeline.hold_test_lane_works(vec![work], false);
@@ -63,10 +94,7 @@ async fn answer_not_found(pipeline: &mut Pipeline, server: usize, work: Download
             job_id,
             runtime_generation: pipeline.pool_generation,
             segment_id,
-            data: Err(DownloadError::fetch(
-                DownloadFailureKind::ArticleNotFound,
-                "430 no such article",
-            )),
+            data: Err(DownloadError::fetch(kind, said)),
             attempts: Vec::new(),
             lane_observation: None,
             source_server_idx: Some(server),
@@ -781,7 +809,15 @@ async fn a_requeued_article_sends_no_refused_server_back_over_the_queue() {
     let levels: Vec<(u32, bool)> = vec![(0, false), (0, false), (1, false), (2, true)];
     const REFUSED: [usize; 2] = [2, 3];
     let mut reread = Vec::new();
-    for articles in [400usize, 1_600] {
+    // The same holds for an ordinary retry: the connection fails under the
+    // article, which waits out its retry and goes back with no server
+    // refused to it, steered off the server it failed on.
+    for (articles, not_found) in [
+        (400usize, true),
+        (1_600, true),
+        (400, false),
+        (1_600, false),
+    ] {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut pipeline = ladder_pipeline(&temp_dir, &levels).await;
         let job_id = JobId(42030);
@@ -839,7 +875,12 @@ async fn a_requeued_article_sends_no_refused_server_back_over_the_queue() {
                 round == 0,
                 "the first article goes out first"
             );
-            answer_not_found(&mut pipeline, 0, work).await;
+            if not_found {
+                answer_not_found(&mut pipeline, 0, work).await;
+            } else {
+                answer_connection_failed(&mut pipeline, 0, work).await;
+                assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+            }
             for server in REFUSED {
                 read += refused_ask(&mut pipeline, server);
             }
@@ -850,15 +891,19 @@ async fn a_requeued_article_sends_no_refused_server_back_over_the_queue() {
         let back = ask(&mut pipeline, 1, ROUNDS);
         assert_eq!(back.len(), ROUNDS);
         assert_eq!(back[0].segment_id, held_segment(job_id, 0, 0));
-        assert_eq!(back[0].exclude_servers, weaver_nntp::ServerSet::from([0]));
+        assert_eq!(
+            back[0].exclude_servers,
+            if not_found {
+                weaver_nntp::ServerSet::from([0])
+            } else {
+                weaver_nntp::ServerSet::EMPTY
+            }
+        );
     }
     assert_eq!(
-        reread[0], reread[1],
-        "what a refused server reads does not grow with the queue"
-    );
-    assert_eq!(
-        reread[0], 0,
-        "an article put back is refused where it is put, not by a new walk"
+        reread,
+        vec![0; 4],
+        "an article put back is refused where it is put, not by a new walk, however long the queue"
     );
 }
 
@@ -1010,6 +1055,36 @@ async fn a_not_found_walk_past_a_refusing_server_is_booked_missing() {
     assert_eq!(
         pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
         1
+    );
+    // The post is missing that one article and no other. Its file cannot be
+    // whole and nothing can rebuild it, so the job ends there and the
+    // article it never asked for is abandoned, not missing.
+    assert_eq!(
+        pipeline
+            .segment_terminal_states
+            .values()
+            .filter(|state| **state == SegmentTerminalState::Missing)
+            .count(),
+        1
+    );
+    let mut ended: Vec<_> = pipeline
+        .segment_terminal_states
+        .iter()
+        .map(|(segment, state)| (segment.segment_number, *state))
+        .collect();
+    ended.sort_by_key(|(number, _)| *number);
+    assert_eq!(
+        ended,
+        vec![
+            (0, SegmentTerminalState::Missing),
+            (1, SegmentTerminalState::Abandoned)
+        ]
+    );
+    // The job ends on its health, for its missing article: the server that
+    // refuses the login was never asked, and is not what ended it.
+    assert_eq!(
+        pipeline.semantic_terminal_causes.get(&job_id),
+        Some(&crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth)
     );
 }
 
