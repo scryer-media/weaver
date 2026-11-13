@@ -26,6 +26,7 @@ pub struct SessionStatsSnapshot {
     pub connections: ConnectStatsSnapshot,
     #[serde(with = "SerializedUtpStatsSnapshot")]
     pub utp: UtpStatsSnapshot,
+    pub swarm: super::swarm::SwarmSnapshot,
 }
 
 impl From<(&SessionStats, ConnectStatsSnapshot)> for SessionStatsSnapshot {
@@ -38,6 +39,7 @@ impl From<(&SessionStats, ConnectStatsSnapshot)> for SessionStatsSnapshot {
             uptime_seconds: s.startup_time.elapsed().as_secs(),
             connections: c,
             utp: Default::default(),
+            swarm: s.swarm.snapshot(),
         }
     }
 }

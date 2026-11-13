@@ -35,6 +35,7 @@ use crate::{
     meter::Meter,
     read_buf::{Incoming, ReadQuota},
     session::CheckedIncomingConnection,
+    session_stats::swarm::{Direction, MessageKind},
     stream_connect::ConnectionKind,
 };
 use futures::TryFutureExt;
@@ -135,6 +136,9 @@ pub trait PeerConnectionHandler {
     /// handshakes and every message but a piece's block (libtorrent
     /// `stat::sent_bytes`, `received_bytes`, the protocol half).
     fn on_protocol_bytes(&self, _channel: Channel, _bytes: u64) {}
+    /// `count` messages of `kind` crossed the connection: read whole from
+    /// the peer, or framed for it.
+    fn on_wire_messages(&self, _direction: Direction, _kind: MessageKind, _count: u64) {}
     /// The connection ended while the peer was sending `block`: the bytes
     /// of it that arrived are dropped. Told once, however the connection
     /// ended.
@@ -992,6 +996,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             )
             .await?;
             self.handler.on_protocol_bytes(Channel::Upload, esz as u64);
+            self.handler
+                .on_wire_messages(Direction::Out, MessageKind::ExtendedHandshake, 1);
         }
 
         // A connection on a uTP thread reads the blocks it uploads on the
@@ -1086,6 +1092,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                         break;
                     }
                     let out = &mut buf[filled..];
+                    let kind = req.frame_kind();
                     let framed = match req {
                         WriterRequest::Message(msg) => addressed(msg.serialize(out, ext_msg_ids))?,
                         WriterRequest::UtPex(ut_pex) => addressed(
@@ -1172,6 +1179,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                         }
                     };
                     if let Some(framed) = framed {
+                        if framed.chunk.is_none()
+                            && let Some(kind) = kind
+                        {
+                            self.handler.on_wire_messages(Direction::Out, kind, 1);
+                        }
                         filled += framed.len;
                         batch.push(framed);
                     }
@@ -1274,6 +1286,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     }
                 }
                 if !sent.is_empty() {
+                    self.handler.on_wire_messages(
+                        Direction::Out,
+                        MessageKind::Piece,
+                        sent.len() as u64,
+                    );
                     self.handler.uploads_done(&sent);
                     sent.clear();
                 }
@@ -1311,6 +1328,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     Incoming::Block(block) => {
                         trace!("received: {:?}", &block);
                         let payload = block.len() as u64;
+                        self.handler
+                            .on_wire_messages(Direction::In, MessageKind::Piece, 1);
                         tokio::task::coop::consume_budget().await;
                         self.handler
                             .on_received_block(block)
@@ -1324,6 +1343,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     }
                 };
                 trace!("received: {:?}", &message);
+                self.handler
+                    .on_wire_messages(Direction::In, MessageKind::of(&message), 1);
                 let payload = match &message {
                     Message::Piece(piece) => piece.len() as u64,
                     _ => 0,

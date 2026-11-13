@@ -6,6 +6,7 @@
 
 mod mapped_endpoint_tests;
 mod mapped_filter_tests;
+mod swarm_tests;
 
 use std::{
     collections::BTreeSet,
@@ -242,6 +243,7 @@ impl Harness {
             answers: Default::default(),
             counters,
             first_message_received: AtomicBool::new(false),
+            transport: AtomicU8::new(0),
             disk: Default::default(),
             upload: Default::default(),
             cancel_token: self.live.cancellation_token.child_token(),
@@ -6492,6 +6494,7 @@ impl Harness {
             answers: Default::default(),
             counters,
             first_message_received: AtomicBool::new(true),
+            transport: AtomicU8::new(0),
             disk: Default::default(),
             upload: Default::default(),
             cancel_token: self.live.cancellation_token.child_token(),

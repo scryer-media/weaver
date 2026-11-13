@@ -18,6 +18,7 @@ use tracing::debug_span;
 use crate::{Session, torrent_state::peers::stats::AggregatePeerStatsAtomic};
 
 pub mod snapshot;
+pub mod swarm;
 
 gen_stats!(SessionCountersAtomic SessionCountersSnapshot, [
     fetched_bytes u64,
@@ -31,6 +32,7 @@ gen_stats!(SessionCountersAtomic SessionCountersSnapshot, [
 pub struct SessionStats {
     pub counters: SessionCountersAtomic,
     pub peers: Arc<AggregatePeerStatsAtomic>,
+    pub swarm: Arc<swarm::SwarmStats>,
     pub down_speed_estimator: SpeedEstimator,
     pub up_speed_estimator: SpeedEstimator,
     pub startup_time: Instant,
@@ -41,6 +43,7 @@ impl SessionStats {
         SessionStats {
             counters: Default::default(),
             peers: Default::default(),
+            swarm: Default::default(),
             down_speed_estimator: SpeedEstimator::new(5),
             up_speed_estimator: SpeedEstimator::new(5),
             startup_time: Instant::now(),
