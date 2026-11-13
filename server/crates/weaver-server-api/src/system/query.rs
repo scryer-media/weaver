@@ -319,8 +319,11 @@ impl SystemQuery {
         // Open sockets only mean "preparing" while a job is waiting to fetch
         // through them; the pool's keep-alive after a finished download, or a
         // paused queue, holds the same sockets open with nothing to prepare.
+        // Only `activity` reads it, and only to tell "preparing" from "idle",
+        // so a query that does not select `activity` does not look.
         let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
-        let work_waiting = !handle.is_globally_paused()
+        let work_waiting = ctx.look_ahead().field("activity").exists()
+            && !handle.is_globally_paused()
             && state.read_queue(|inner| {
                 inner.jobs.iter().any(|row| {
                     matches!(
