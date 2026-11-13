@@ -2939,7 +2939,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     }
 
     fn dht_port(&self) -> Option<u16> {
-        self.dht().map(|dht| dht.listen_addr().port())
+        self.told_dht_port()
     }
 
     fn answers(&self) -> Option<&AnswerBacklog> {
@@ -2975,11 +2975,23 @@ impl PeerHandler {
         (!info.is_empty() && !self.state.metadata.info.info().private).then_some(info)
     }
 
-    /// Sends our DHT port, once per connection (libtorrent
-    /// `bt_peer_connection::write_dht_port`). The writer sends the bitfield
-    /// before anything queued, so a port queued at the handshake follows it.
+    /// The DHT port this peer is told, over its family (see
+    /// `Session::dht_port_told`).
+    fn told_dht_port(&self) -> Option<u16> {
+        let dht = self.dht()?;
+        let ipv6 = self.addr.ip().to_canonical().is_ipv6();
+        let session = self.state.shared.session.upgrade()?;
+        Some(session.dht_port_told(&dht, ipv6))
+    }
+
+    /// Sends our DHT port, once per connection, with the port as it is
+    /// then: a mapping that changes later is told to new connections only
+    /// (libtorrent `bt_peer_connection::write_dht_port`, sent at the
+    /// handshake only, bt_peer_connection.cpp:329, 1418 and 3628, v2.0.15).
+    /// The writer sends the bitfield before anything queued, so a port
+    /// queued at the handshake follows it.
     fn send_dht_port(&self) {
-        let Some(port) = self.dht().map(|dht| dht.listen_addr().port()) else {
+        let Some(port) = self.told_dht_port() else {
             return;
         };
         if !self.sent_dht_port.swap(true, Ordering::Relaxed) {
