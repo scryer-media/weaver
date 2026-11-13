@@ -37,6 +37,7 @@ use crate::{
 use self::{
     availability::Availability,
     connect_order::ConnectOrder,
+    index::{Basis, ConnectKey, Indexed, PeerIndex},
     stats::{AggregatePeerStats, AggregatePeerStatsAtomic},
 };
 
@@ -51,11 +52,13 @@ use super::peer::{
 pub mod availability;
 pub(crate) mod connect_order;
 pub(crate) mod holepunch;
+pub(crate) mod index;
 pub mod stats;
 mod super_seed;
 
-// libtorrent `max_peerlist_size`: the most peers one torrent's peer list holds.
-pub(crate) const MAX_PEERLIST_SIZE: usize = 3000;
+// The most peers one torrent's peer list holds (libtorrent
+// `max_peerlist_size`). libtorrent's default is 3000; Weaver holds 5000.
+pub(crate) const MAX_PEERLIST_SIZE: usize = 5000;
 // libtorrent `peer_list::erase_peers`'s low watermark: once the list holds
 // this many, choosing whom to connect to weeds it to fewer
 // (`peer_list::find_connect_candidates`).
@@ -176,11 +179,15 @@ pub(crate) struct PeerStates {
     // (`on_clear_peers`), and crosses a pause with it in [`PeerList`]. Never
     // taken while an entry of `states` is held.
     smart_ban: Mutex<SmartBan>,
-    // The peers on the list with a connection, open or opening, web seeds
-    // aside, by host: kept as each peer is counted in and out, so a connect
-    // judgment does not walk the list for them. Taken while an entry of
-    // `states` is held, never the other way.
-    connected: Mutex<HashMap<IpAddr, Vec<SocketAddr>>>,
+    // The connect candidates in the order they are connected to and by when
+    // they are due, the peers with a connection by host, and the peers in
+    // the order the list forgets them (see [`index`]): kept as each peer is
+    // counted in and out and as anything its keys read changes
+    // ([`Self::reindex`]), so a connect judgment or an eviction reads a few
+    // entries, not the list. Taken while an entry of `states` is held, never
+    // the other way: a judgment lets it go before it takes the entry of the
+    // peer it chose.
+    index: Mutex<PeerIndex>,
     // The peers in `states` that are live, web seeds too: kept as each peer
     // is counted in and out, so the work done for every connection each
     // tick, piece or round visits the connections alone, as libtorrent's
@@ -457,6 +464,7 @@ pub(crate) enum IncomingRefused {
 // The `n` lowest of `ranked`, in no order: the first `n` a full sort would
 // put first. Each entry holds a peer's address, so no two are equal and the
 // `n` lowest are one set, whichever way ties of rank fall.
+#[cfg(test)]
 fn lowest<T: Ord>(mut ranked: Vec<T>, n: usize) -> Vec<T> {
     if n == 0 {
         ranked.clear();
@@ -489,6 +497,12 @@ impl PeerStates {
         session_stats: Arc<AggregatePeerStatsAtomic>,
         total_pieces: u32,
     ) -> Self {
+        let connect_order = ConnectOrder::default();
+        let basis = Basis {
+            ranking: connect_order.now(),
+            finished: false,
+            allow_multiple: false,
+        };
         let peers = Self {
             session_stats,
             stats: Default::default(),
@@ -505,14 +519,14 @@ impl PeerStates {
             allow_multiple_connections_per_ip: Default::default(),
             finished: AtomicBool::new(false),
             smart_ban: Mutex::new(list.smart_ban),
-            connected: Default::default(),
+            index: Mutex::new(PeerIndex::new(basis)),
             live: Default::default(),
             peer_ids: Default::default(),
             pex_version: AtomicU64::new(0),
             pex_cache: Mutex::new(None),
             untracked_owed: AtomicBool::new(list.untracked_owed),
             untracked_leaving: Mutex::default(),
-            connect_order: ConnectOrder::default(),
+            connect_order,
         };
         for mut peer in list.peers {
             peer.rejoin(&peers);
@@ -550,8 +564,15 @@ impl PeerStates {
         if self.finished.swap(finished, Ordering::Relaxed) == finished {
             return;
         }
+        // The rank of a peer a PEX message flagged a seed reads whether we
+        // are finished, so every candidate is filed again in the walk the
+        // change needs anyway. It flips when a download completes, or files
+        // or streams are chosen anew: a handful of times a run.
+        self.index.lock().basis.finished = finished;
         for mut peer in self.states.iter_mut() {
-            peer.value_mut().finished(finished, self);
+            let peer = peer.value_mut();
+            peer.finished(finished, self);
+            self.reindex(peer);
         }
         self.candidates_changed.notify_one();
     }
@@ -575,7 +596,7 @@ impl PeerStates {
     pub fn close_all(&self, closed_at: Instant) {
         for mut e in self.states.iter_mut() {
             if e.value().connected_out().is_some() {
-                e.value_mut().connection_let_go(closed_at);
+                e.value_mut().connection_let_go(closed_at, self);
             }
         }
     }
@@ -793,7 +814,7 @@ impl PeerStates {
     /// A PEX message named the peer at `addr` with `flags`; see
     /// [`Peer::pex_flags`].
     pub fn pex_flags(&self, addr: SocketAddr, flags: u8) {
-        self.with_peer_mut(addr, "pex_flags", |peer| peer.pex_flags(flags));
+        self.with_peer_mut(addr, "pex_flags", |peer| peer.pex_flags(flags, self));
     }
 
     /// Whether the connection being made to the peer at `addr` tries the
@@ -902,13 +923,14 @@ impl PeerStates {
         if let Some(r) = self.with_peer_mut(addr, "admit", known) {
             return Admitted::Known(r);
         }
-        let Some(peer) = newcomer() else {
+        let Some(mut peer) = newcomer() else {
             return Admitted::Refused;
         };
         if !self.erase_to(displace, MAX_PEERLIST_SIZE) {
             return Admitted::Refused;
         }
         self.count_in(addr, peer.get_state());
+        self.reindex(&mut peer);
         for counter in [&*self.session_stats, &*self.stats] {
             atomic_inc(&counter.seen);
         }
@@ -932,16 +954,13 @@ impl PeerStates {
             return true;
         }
         let others = self
-            .connected
+            .index
             .lock()
-            .get(&addr.ip())
-            .map(|at| {
-                at.iter()
-                    .copied()
-                    .filter(|other| *other != addr)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            .connected_at(addr.ip())
+            .iter()
+            .copied()
+            .filter(|other| *other != addr)
+            .collect::<Vec<_>>();
         let Some((other, outgoing)) = others
             .into_iter()
             .find_map(|other| Some((other, self.with_peer(other, Peer::connected_out)??)))
@@ -960,25 +979,13 @@ impl PeerStates {
         keep
     }
 
-    // The addresses a peer on the list has a connection, open or opening,
-    // at. No other peer there is connected to (libtorrent's peer list holds
-    // one entry per address, and an entry with a connection is no connect
-    // candidate).
     // The addresses of the peers on the list with a connection, open or
-    // opening, web seeds aside. None when peers at one address may each have
-    // one: no connection then stands in another's way.
-    fn connected_ips(&self) -> HashSet<IpAddr> {
-        if self
-            .allow_multiple_connections_per_ip
-            .load(Ordering::Relaxed)
-        {
-            return HashSet::new();
-        }
-        self.connected.lock().keys().copied().collect()
-    }
-
-    // `connected_ips` read off the whole list, as it was before the running
-    // count; the test that the count keeps it compares the two.
+    // opening, web seeds aside, read off the whole list; the test that the
+    // index keeps them compares the two. None when peers at one address may
+    // each have one: no connection then stands in another's way. No other
+    // peer at one of them is connected to (libtorrent's peer list holds one
+    // entry per address, and an entry with a connection is no connect
+    // candidate).
     #[cfg(test)]
     pub(crate) fn connected_ips_walked(&self) -> HashSet<IpAddr> {
         if self
@@ -996,17 +1003,118 @@ impl PeerStates {
 
     #[cfg(test)]
     pub(crate) fn connected_ips_counted(&self) -> HashSet<IpAddr> {
-        self.connected_ips()
+        if self
+            .allow_multiple_connections_per_ip
+            .load(Ordering::Relaxed)
+        {
+            return HashSet::new();
+        }
+        self.index.lock().connected_ips()
     }
 
-    /// How many peers we could connect to (libtorrent
-    /// `peer_list::num_connect_candidates`).
+    /// How many peers we could connect to, due or not, at an address no
+    /// connection holds back (libtorrent `peer_list::num_connect_candidates`).
     pub fn connect_candidates(&self) -> usize {
-        let connected = self.connected_ips();
+        self.index_blocking_now().candidates()
+    }
+
+    /// [`Self::connect_candidates`] counted off the whole list.
+    #[cfg(test)]
+    pub(crate) fn connect_candidates_walked(&self) -> usize {
+        let connected = self.connected_ips_walked();
         self.states
             .iter()
             .filter(|e| e.value().is_connect_candidate() && !connected.contains(&e.key().ip()))
             .count()
+    }
+
+    // The index, its connections holding back the candidates at their
+    // address as the setting says now. Only an operator's change to the
+    // session setting moves it, and the move visits the addresses with a
+    // connection alone.
+    fn index_blocking_now(&self) -> parking_lot::MutexGuard<'_, PeerIndex> {
+        let mut index = self.index.lock();
+        index.allow_multiple(
+            self.allow_multiple_connections_per_ip
+                .load(Ordering::Relaxed),
+        );
+        index
+    }
+
+    // Brings the index to what candidates are ranked by now: when the
+    // endpoints peers see us at moved, or whether we are finished did
+    // without [`Self::set_finished`] filing them again, every candidate is
+    // ranked anew in one walk. The endpoints move when the vote on our
+    // external address changes its winner or a port mapping changes: a
+    // handful of times a run. Not called while an entry of `states` is held.
+    fn rebase(&self) {
+        let ranking = self.connect_order.now();
+        let finished = self.is_finished();
+        {
+            let mut index = self.index_blocking_now();
+            if index.basis.ranking == ranking && index.basis.finished == finished {
+                return;
+            }
+            index.basis.ranking = ranking;
+            index.basis.finished = finished;
+        }
+        for mut e in self.states.iter_mut() {
+            self.reindex(e.value_mut());
+        }
+    }
+
+    /// Files `peer` again wherever what its keys read changed: its connect
+    /// candidacy, rank and due time, and its place in the erase order. Every
+    /// change to a peer that can move one calls it, with the peer's entry
+    /// held or the peer not yet on the list. A change that moves nothing
+    /// takes no lock unless the peer is a connect candidate.
+    pub(super) fn reindex(&self, peer: &mut Peer) {
+        let erase =
+            (!is_web_seed(peer.addr) && peer.connected_out().is_none()).then(|| erase_rank(peer));
+        let candidate = peer.is_connect_candidate();
+        let filed = peer.indexed();
+        if !candidate && !filed.candidate && erase == filed.erase {
+            return;
+        }
+        let mut index = self.index.lock();
+        if erase != filed.erase {
+            index.file_erase(peer.addr, filed.erase, erase);
+        }
+        if candidate || filed.candidate {
+            let key = candidate.then(|| ConnectKey {
+                rank: peer.connect_rank(&index.basis.ranking, index.basis.finished),
+                due: peer.reconnect_at(),
+            });
+            index.file(peer.addr, key);
+        }
+        peer.set_indexed(Indexed { candidate, erase });
+    }
+
+    // [`Self::reindex`] from nothing: the peer's connect key is filed anew
+    // even when the index holds one it thinks current.
+    fn refile(&self, peer: &mut Peer) {
+        let filed = peer.indexed();
+        if filed.candidate {
+            self.index.lock().file(peer.addr, None);
+            peer.set_indexed(Indexed {
+                candidate: false,
+                ..filed
+            });
+        }
+        self.reindex(peer);
+    }
+
+    // `peer`, at `handle`, left the table: it leaves the index.
+    fn unindex(&self, handle: PeerHandle, peer: &Peer) {
+        let filed = peer.indexed();
+        if !filed.candidate && filed.erase.is_none() {
+            return;
+        }
+        let mut index = self.index.lock();
+        index.file_erase(handle, filed.erase, None);
+        if filed.candidate {
+            index.file(handle, None);
+        }
     }
 
     /// Closes the connections of the `n` peers that rank lowest to keep
@@ -1063,20 +1171,15 @@ impl PeerStates {
     // Forgets the peers `displace` allows, lowest-ranked first, until the
     // list holds fewer than `fewer_than`; returns whether it does. Connected
     // peers and web seeds, which are on no peer list, are never forgotten.
-    // Under the admission lock.
+    // The index holds the rest in the order they go, so this reads as many
+    // as go. Under the admission lock.
     fn erase_to(&self, displace: Displace, fewer_than: usize) -> bool {
         let excess = (self.listed() + 1).saturating_sub(fewer_than);
         if excess == 0 {
             return true;
         }
-        let ranked = self
-            .states
-            .iter()
-            .filter(|e| !is_web_seed(*e.key()) && e.value().connected_out().is_none())
-            .map(|e| (erase_rank(e.value()), *e.key()))
-            .filter(|(rank, _)| displace.allows(rank))
-            .collect::<Vec<_>>();
-        for (_, addr) in lowest(ranked, excess) {
+        let victims = self.index.lock().erase_victims(displace, excess);
+        for addr in victims {
             if let Some((_, peer)) = self
                 .states
                 .remove_if(&addr, |_, peer| peer.connected_out().is_none())
@@ -1087,13 +1190,41 @@ impl PeerStates {
         self.listed() < fewer_than
     }
 
-    // `peer`, at `handle`, left the table: what was counted of it, and the
-    // records of what it sent, go with it.
+    /// The `n` peers [`Self::erase_to`] forgets first of those `displace`
+    /// allows, as the index holds them.
+    #[cfg(test)]
+    fn erase_victims(&self, displace: Displace, n: usize) -> BTreeSet<PeerHandle> {
+        self.index
+            .lock()
+            .erase_victims(displace, n)
+            .into_iter()
+            .collect()
+    }
+
+    /// [`Self::erase_victims`] read off the whole list.
+    #[cfg(test)]
+    fn erase_victims_walked(&self, displace: Displace, n: usize) -> BTreeSet<PeerHandle> {
+        let ranked = self
+            .states
+            .iter()
+            .filter(|e| !is_web_seed(*e.key()) && e.value().connected_out().is_none())
+            .map(|e| (erase_rank(e.value()), *e.key()))
+            .filter(|(rank, _)| displace.allows(rank))
+            .collect::<Vec<_>>();
+        lowest(ranked, n)
+            .into_iter()
+            .map(|(_, addr)| addr)
+            .collect()
+    }
+
+    // `peer`, at `handle`, left the table: what was counted of it, its
+    // place in the index, and the records of what it sent, go with it.
     fn erased(&self, handle: PeerHandle, peer: &Peer) {
         if is_web_seed(handle) {
             self.web_seeds.fetch_sub(1, Ordering::Relaxed);
         }
         self.count_out(handle, peer.get_state());
+        self.unindex(handle, peer);
         self.smart_ban.lock().forget(handle);
     }
 
@@ -1121,9 +1252,17 @@ impl PeerStates {
         self.smart_ban.lock().piece_passed(piece)
     }
 
-    /// When the connect loop may next connect to someone.
+    /// When the connect loop may next connect to someone: a candidate at an
+    /// address no connection holds back is due at `now`, or will be at a
+    /// time, or none is there.
     pub fn next_candidate(&self, now: Instant) -> NextCandidate {
-        let connected = self.connected_ips();
+        self.index_blocking_now().next_candidate(now)
+    }
+
+    /// [`Self::next_candidate`] read off the whole list.
+    #[cfg(test)]
+    pub(crate) fn next_candidate_walked(&self, now: Instant) -> NextCandidate {
+        let connected = self.connected_ips_walked();
         let mut next = NextCandidate::None;
         for e in self.states.iter() {
             let peer = e.value();
@@ -1172,19 +1311,52 @@ impl PeerStates {
     pub fn connect_next(&self, now: Instant) -> Option<(PeerHandle, PeerRx, PeerTx)> {
         let _admission = self.admission.lock();
         self.erase_to(Displace::EraseCandidates, PEERLIST_LOW_WATERMARK);
-        let connected = self.connected_ips();
+        loop {
+            let addr = self.connect_pick(now)?;
+            // The index is let go before the entry is taken. A peer it holds
+            // that is not due after all, or is gone, is filed again from
+            // what it is, so the next pick does not choose it again.
+            match self.with_peer_mut(addr, "connect_next", |peer| {
+                let connecting = peer.connect_if_due(now, self);
+                if connecting.is_none() {
+                    self.refile(peer);
+                }
+                connecting
+            }) {
+                Some(Some((rx, tx))) => return Some((addr, rx, tx)),
+                Some(None) => {}
+                None => self.index.lock().file(addr, None),
+            }
+        }
+    }
+
+    // The candidate [`Self::connect_next`] connects to at `now`, as the
+    // index holds it.
+    fn connect_pick(&self, now: Instant) -> Option<PeerHandle> {
+        self.rebase();
+        self.index.lock().first_due(now)
+    }
+
+    /// The candidate [`Self::connect_next`] connects to at `now`, without
+    /// connecting.
+    #[cfg(test)]
+    pub(crate) fn connect_pick_indexed(&self, now: Instant) -> Option<PeerHandle> {
+        self.connect_pick(now)
+    }
+
+    /// [`Self::connect_pick_indexed`] read off the whole list: the due
+    /// candidate at an address no connection is at that ranks first.
+    #[cfg(test)]
+    pub(crate) fn connect_pick_walked(&self, now: Instant) -> Option<PeerHandle> {
+        let connected = self.connected_ips_walked();
         let finished = self.is_finished();
         let order = self.connect_order.now();
-        let (_, addr) = self
-            .states
+        self.states
             .iter()
             .filter(|e| e.value().is_due(now) && !connected.contains(&e.key().ip()))
             .map(|e| (e.value().connect_rank(&order, finished), *e.key()))
-            .min()?;
-        let (rx, tx) = self
-            .with_peer_mut(addr, "connect_next", |peer| peer.connect_if_due(now, self))
-            .flatten()?;
-        Some((addr, rx, tx))
+            .min()
+            .map(|(_, addr)| addr)
     }
 
     /// Settles a peer whose connection closed; see [`Peer::connection_closed`].
@@ -1209,7 +1381,7 @@ impl PeerStates {
 
     /// The peer's connection completed its handshake and carried a message.
     pub fn connection_delivered(&self, addr: PeerHandle) {
-        self.with_peer_mut(addr, "connection_delivered", Peer::delivered);
+        self.with_peer_mut(addr, "connection_delivered", |peer| peer.delivered(self));
     }
 
     /// We want the peers we let go again.
@@ -1349,8 +1521,9 @@ impl PeerStates {
     }
 
     pub fn drop_peer(&self, handle: PeerHandle) -> Option<Peer> {
-        let p = self.states.remove(&handle).map(|r| r.1)?;
+        let mut p = self.states.remove(&handle).map(|r| r.1)?;
         self.erased(handle, &p);
+        p.set_indexed(Indexed::default());
         Some(p)
     }
 
@@ -1362,11 +1535,7 @@ impl PeerStates {
             counter.inc(state);
         }
         if has_connection(addr, state) {
-            self.connected
-                .lock()
-                .entry(addr.ip())
-                .or_default()
-                .push(addr);
+            self.index.lock().connection_opened(addr);
         }
         if let PeerState::Live(live) = state {
             self.live.lock().insert(addr);
@@ -1384,16 +1553,7 @@ impl PeerStates {
             counter.dec(state);
         }
         if has_connection(addr, state) {
-            let mut connected = self.connected.lock();
-            if let std::collections::hash_map::Entry::Occupied(mut at) = connected.entry(addr.ip())
-            {
-                if let Some(i) = at.get().iter().position(|held| *held == addr) {
-                    at.get_mut().swap_remove(i);
-                }
-                if at.get().is_empty() {
-                    at.remove();
-                }
-            }
+            self.index.lock().connection_closed(addr);
         }
         if let PeerState::Live(live) = state {
             self.live.lock().swap_remove(&addr);
@@ -2193,9 +2353,513 @@ mod tests {
                     }
                 });
             }
-            assert!(peers.connected.lock().is_empty());
+            assert!(peers.index.lock().connected_ips().is_empty());
             assert!(peers.live.lock().is_empty());
         }
+    }
+
+    // What the index answers is what a walk of the whole list finds: the
+    // candidate connect_next picks, when the next one is due, how many
+    // there are, and whom the list forgets first. Checked after every step
+    // of seeded runs of every change a peer goes through.
+    #[tokio::test(start_paused = true)]
+    async fn the_index_answers_as_a_walk_of_the_list_does() {
+        for seed in [
+            0x9e37_79b9_7f4a_7c15u64,
+            0x2545_f491_4f6c_dd1d,
+            0xd1b5_4a32_d192_ed03,
+            0x8cb9_2ba7_2f3d_8dd7,
+            0x0123_4567_89ab_cdef,
+        ] {
+            index_matches_walk(seed);
+        }
+    }
+
+    // The times a step's answers are read at: a little before `at`, at it,
+    // past one reconnect time and past several.
+    fn query_times(at: Instant) -> [Instant; 4] {
+        [
+            at - Duration::from_secs(45),
+            at,
+            at + Duration::from_secs(61),
+            at + Duration::from_secs(250),
+        ]
+    }
+
+    // One seeded run. Twelve hosts, local and public, IPv4 and IPv6, hold
+    // four ports each, none of them ours, so no tie between two connections
+    // with one peer is settled by chance. The session starts 50 minutes
+    // into the run, so closes come before it and soon after it: some rank
+    // as no close while a wait still holds them back.
+    fn index_matches_walk(seed: u64) {
+        use crate::peer_protocol::extended::ut_pex::{PEX_ENCRYPTION, PEX_HOLEPUNCH, PEX_SEED};
+        use connect_order::OurEndpoints;
+
+        let hosts: [IpAddr; 12] = [
+            [10, 0, 0, 1].into(),
+            [10, 0, 0, 2].into(),
+            [192, 168, 1, 7].into(),
+            [127, 0, 0, 1].into(),
+            [8, 8, 4, 4].into(),
+            [1, 2, 3, 4].into(),
+            [93, 184, 216, 34].into(),
+            [203, 0, 113, 9].into(),
+            "2001:db8::1".parse().unwrap(),
+            "2001:db8::2".parse().unwrap(),
+            "fe80::1".parse().unwrap(),
+            "fd00::5".parse().unwrap(),
+        ];
+        let addr = |i: u64| {
+            SocketAddr::new(
+                hosts[usize::try_from(i % 12).unwrap()],
+                6882 + u16::try_from(i / 12 % 4).unwrap(),
+            )
+        };
+        let web_seed = |i: u64| {
+            SocketAddr::from((
+                std::net::Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, u16::try_from(i % 3).unwrap()),
+                0,
+            ))
+        };
+        let endpoints = [
+            OurEndpoints::default(),
+            OurEndpoints {
+                addresses: [[IpAddr::from([10, 0, 0, 200]); 2]; 2],
+                port: 6881,
+            },
+            OurEndpoints {
+                addresses: [
+                    [[203, 0, 113, 1].into(), "2001:db8::99".parse().unwrap()],
+                    [[10, 0, 0, 9].into(), "fd00::9".parse().unwrap()],
+                ],
+                port: 51413,
+            },
+        ];
+        let sources = [
+            PeerSourceFlag::Tracker,
+            PeerSourceFlag::Dht,
+            PeerSourceFlag::Pex,
+            PeerSourceFlag::Lsd,
+            PeerSourceFlag::ResumeData,
+            PeerSourceFlag::Incoming,
+        ];
+        let base = Instant::now() + Duration::from_secs(10_000);
+        let start = base + Duration::from_secs(3000);
+        let ours = Arc::new(Mutex::new(endpoints[1]));
+        let order = {
+            let ours = ours.clone();
+            ConnectOrder::new(start, Arc::new(move || *ours.lock()))
+        };
+        let allowed = Arc::new(AtomicBool::new(false));
+        let build = |list: PeerList| {
+            PeerStates::founded_on(
+                list,
+                Default::default(),
+                u32::try_from(TOTAL_PIECES).unwrap(),
+            )
+            .allowing_multiple_connections_per_ip(allowed.clone())
+            .ordering_connects_by(order.clone())
+        };
+        let mut rng = seed;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let pick = |r: u64, n: usize| (n > 0).then(|| usize::try_from(r >> 24).unwrap() % n);
+
+        let mut peers = build(PeerList::default());
+        let mut conns: Vec<(PeerHandle, PeerRx, PeerTx)> = Vec::new();
+        let mut at = base;
+        let (mut picked, mut later, mut due, mut victims, mut erased) = (0, 0, 0, 0, 0);
+        let (mut dated_back_waiting, mut held_back, mut pauses) = (0, 0, 0);
+        for step in 0..3000 {
+            let r = next();
+            let a = addr(r >> 16);
+            match r % 20 {
+                0 | 1 => peers.add_peer(a, sources[usize::try_from((r >> 8) % 6).unwrap()]),
+                2 => {
+                    let kind = if r & 0x100 == 0 {
+                        ConnectionKind::Tcp
+                    } else {
+                        ConnectionKind::Utp
+                    };
+                    peers.add_refused_incoming(a, kind);
+                }
+                3 => {
+                    let flags = u8::try_from((r >> 8) & 0xff).unwrap()
+                        & (PEX_SEED | PEX_HOLEPUNCH | PEX_ENCRYPTION);
+                    peers.pex_flags(a, flags);
+                }
+                4 => {
+                    peers.with_peer_mut(a, "test", |peer| peer.holepunch(&peers));
+                }
+                5 | 6 => {
+                    let q = query_times(at)[usize::try_from((r >> 8) % 4).unwrap()];
+                    let expected = peers.connect_pick_walked(q);
+                    let got = peers.connect_next(q);
+                    assert_eq!(
+                        got.as_ref().map(|(handle, ..)| *handle),
+                        expected,
+                        "seed {seed:#x} step {step}: connect_next"
+                    );
+                    if let Some(conn) = got {
+                        picked += 1;
+                        conns.push(conn);
+                    }
+                }
+                7 => {
+                    if let Some(i) = pick(r, conns.len()) {
+                        peers.with_peer_mut(conns[i].0, "test", |peer| {
+                            peer.connecting_to_live(Id20::default(), &peers, ConnectionKind::Tcp);
+                        });
+                    }
+                }
+                8 | 9 => {
+                    if let Some(i) = pick(r, conns.len()) {
+                        let failed = r & 0x1000 == 0;
+                        peers.with_peer_mut(conns[i].0, "test", |peer| {
+                            if peer.connected_out().is_none() {
+                                return;
+                            }
+                            match (r >> 8) % 5 {
+                                0 => peers.connection_closed(peer, at, true, false),
+                                1 => peers.connection_closed(peer, at, false, false),
+                                // An encrypted handshake that did not
+                                // complete: the retry is due at once.
+                                2 => {
+                                    peer.encrypt_outgoing();
+                                    peers.connection_closed(peer, at, failed, false);
+                                }
+                                // A seed we no longer need, as we are done.
+                                3 => {
+                                    if let Some(live) = peer.get_live_mut() {
+                                        live.set_upload_only(true);
+                                    }
+                                    peers.connection_closed(peer, at, false, true);
+                                }
+                                _ => {
+                                    let needed = peer.connection_closing(
+                                        at,
+                                        failed,
+                                        peers.is_finished(),
+                                        &peers,
+                                    );
+                                    peers.settle_closed(peer, needed);
+                                }
+                            }
+                        });
+                        conns.swap_remove(i);
+                    }
+                }
+                10 => {
+                    if let Ok(rx) = connected_to_us(&peers, a) {
+                        conns.push((a, rx, unbounded_channel().0));
+                        if r & 0x100 == 0 {
+                            peers.with_peer_mut(a, "test", |peer| {
+                                peer.listens_at(SocketAddr::new(a.ip(), 7000), &peers);
+                            });
+                        }
+                    }
+                }
+                11 => match (r >> 8) % 64 {
+                    0 => peers.ban(a.ip()),
+                    1..=12 => {
+                        peers.drop_peer(a);
+                    }
+                    13..=20 => peers.refuse(|handle| handle == a),
+                    _ => {
+                        peers.with_peer_mut(a, "test", |peer| peer.set_not_needed(&peers));
+                    }
+                },
+                12 => peers.set_finished(r & 0x100 == 0),
+                13 => *ours.lock() = endpoints[usize::try_from((r >> 8) % 3).unwrap()],
+                14 => {
+                    allowed.store(r & 0x100 == 0, Ordering::Relaxed);
+                    peers.connections_per_ip_changed();
+                }
+                15 | 16 => at += Duration::from_secs((r >> 8) % 150),
+                17 => match (r >> 8) % 4 {
+                    0 => {
+                        if let Some(i) = pick(r, conns.len()) {
+                            peers.connection_delivered(conns[i].0);
+                        }
+                    }
+                    1 => {
+                        peers.with_peer_mut(a, "test", |peer| peer.piece_passed(&peers));
+                    }
+                    2 => {
+                        peers.with_peer_mut(a, "test", |peer| {
+                            peer.piece_failed(r & 0x1000 == 0, &peers)
+                        });
+                    }
+                    _ => peers.requeue_not_needed(),
+                },
+                18 => match (r >> 8) % 16 {
+                    // The run pauses and resumes on the list it left.
+                    0 => {
+                        peers.close_all(at);
+                        let list = peers.idle_list();
+                        conns.clear();
+                        peers = build(list);
+                        pauses += 1;
+                    }
+                    1..=8 => {
+                        let seed = web_seed(r >> 16);
+                        if let Some((rx, tx)) = peers.admit_web_seed(seed) {
+                            conns.push((seed, rx, tx));
+                        }
+                    }
+                    _ => {
+                        let seed = web_seed(r >> 16);
+                        peers.with_peer_mut(seed, "test", |peer| {
+                            if peer.connected_out().is_some() {
+                                peers.connection_closed(peer, at, r & 0x1000 == 0, false);
+                            }
+                        });
+                    }
+                },
+                // The list forgets one to three peers to make room.
+                _ => {
+                    let displace = if r & 0x100 == 0 {
+                        Displace::EraseCandidates
+                    } else {
+                        Displace::AnyIdle
+                    };
+                    let listed = peers.listed();
+                    let fewer_than = listed
+                        .saturating_sub(usize::try_from((r >> 9) % 3).unwrap())
+                        .max(1);
+                    let excess = (listed + 1).saturating_sub(fewer_than);
+                    let expected = peers.erase_victims_walked(displace, excess);
+                    let before: BTreeSet<PeerHandle> =
+                        peers.states.iter().map(|e| *e.key()).collect();
+                    peers.erase_to(displace, fewer_than);
+                    let after: BTreeSet<PeerHandle> =
+                        peers.states.iter().map(|e| *e.key()).collect();
+                    let gone: BTreeSet<PeerHandle> = before.difference(&after).copied().collect();
+                    assert_eq!(gone, expected, "seed {seed:#x} step {step}: erase_to");
+                    erased += gone.len();
+                }
+            }
+
+            let context = format!("seed {seed:#x} step {step}");
+            assert_eq!(
+                peers.connected_ips_counted(),
+                peers.connected_ips_walked(),
+                "{context}: connected addresses"
+            );
+            let candidates = peers.connect_candidates();
+            assert_eq!(
+                candidates,
+                peers.connect_candidates_walked(),
+                "{context}: candidates"
+            );
+            for q in query_times(at) {
+                assert_eq!(
+                    peers.next_candidate(q),
+                    peers.next_candidate_walked(q),
+                    "{context}: next candidate at {q:?}"
+                );
+            }
+            let listed = peers.listed();
+            for displace in [Displace::EraseCandidates, Displace::AnyIdle] {
+                for n in [1, 2, 5, listed + 1] {
+                    assert_eq!(
+                        peers.erase_victims(displace, n),
+                        peers.erase_victims_walked(displace, n),
+                        "{context}: erase victims, {n}"
+                    );
+                }
+            }
+            for q in query_times(at) {
+                assert_eq!(
+                    peers.connect_pick_indexed(q),
+                    peers.connect_pick_walked(q),
+                    "{context}: pick at {q:?}"
+                );
+            }
+
+            match peers.next_candidate(at) {
+                NextCandidate::At(_) => later += 1,
+                NextCandidate::Due => due += 1,
+                NextCandidate::None => {}
+            }
+            if !peers.erase_victims(Displace::EraseCandidates, 1).is_empty() {
+                victims += 1;
+            }
+            let ranking = peers.connect_order.now();
+            let finished = peers.is_finished();
+            let mut listed_candidates = 0;
+            for e in peers.states.iter() {
+                let peer = e.value();
+                if !peer.is_connect_candidate() {
+                    continue;
+                }
+                listed_candidates += 1;
+                if peer.ever_closed()
+                    && peer.connect_rank(&ranking, finished).3 == 0
+                    && peer.reconnect_at().is_some_and(|due| due > at)
+                {
+                    dated_back_waiting += 1;
+                }
+            }
+            if candidates < listed_candidates {
+                held_back += 1;
+            }
+        }
+        let context = format!("seed {seed:#x}");
+        assert!(picked > 0, "{context}: no connect_next picked a peer");
+        assert!(later > 0, "{context}: no candidate was due later");
+        assert!(due > 0, "{context}: no candidate was due");
+        assert!(victims > 0, "{context}: no erase candidate");
+        assert!(erased > 0, "{context}: no peer was forgotten");
+        assert!(
+            dated_back_waiting > 0,
+            "{context}: no candidate ranked as never closed while it waited"
+        );
+        assert!(
+            held_back > 0,
+            "{context}: no connection held a candidate back"
+        );
+        assert!(pauses > 0, "{context}: the run never paused");
+        // Every peer gone, the index is empty again.
+        let handles: Vec<PeerHandle> = peers.states.iter().map(|e| *e.key()).collect();
+        for handle in handles {
+            peers.drop_peer(handle);
+        }
+        assert!(peers.index.lock().holds_nothing(), "{context}: index left");
+    }
+
+    // Times the connect pick, a run of connect_next and the eviction pick,
+    // off the index and off a walk of the list, at list sizes up to the
+    // cap, and prints what a listed peer holds. A run by hand with
+    // WEAVER_PEER_INDEX_TIMINGS set and an optimised build prints the
+    // table; any other run returns at once.
+    #[test]
+    fn peer_index_timings() {
+        if std::env::var_os("WEAVER_PEER_INDEX_TIMINGS").is_none() {
+            return;
+        }
+        println!("size_of::<Peer>() = {} bytes", size_of::<Peer>());
+        for (entry, size) in PeerIndex::entry_sizes() {
+            println!("index {entry} entry = {size} bytes");
+        }
+        // `n` peers named by a tracker, a third of them failed once at `t0`:
+        // waiting candidates and erase candidates.
+        let list = |n: usize, t0: Instant| {
+            let peers = peer_states_started_at(t0);
+            for i in 0..n {
+                peers.add_peer(peer_addr(i), PeerSourceFlag::Tracker);
+            }
+            for i in (0..n).step_by(3) {
+                fail_at(&peers, peer_addr(i), t0);
+            }
+            peers
+        };
+        // The mean time of `reps` calls of `f`, in nanoseconds.
+        fn per_call(reps: usize, mut f: impl FnMut()) -> u128 {
+            let begun = std::time::Instant::now();
+            for _ in 0..reps {
+                f();
+            }
+            begun.elapsed().as_nanos() / u128::try_from(reps).unwrap()
+        }
+        println!(
+            "n | pick walk ns | pick index ns | connect_next walk ns | connect_next index ns | victim walk ns | victim index ns | admit full walk ns | admit full index ns | first pick rebase ns"
+        );
+        for n in [10, 300, 3000, MAX_PEERLIST_SIZE] {
+            let t0 = Instant::now();
+            let now = t0 + Duration::from_secs(1);
+            let reps = (300_000 / n).clamp(20, 20_000);
+            let peers = list(n, t0);
+            // The list orders its candidates by the session's endpoints,
+            // set after it was founded: the first pick ranks them anew in
+            // one walk, which is timed apart.
+            let rebase = per_call(1, || {
+                std::hint::black_box(peers.connect_pick_indexed(now));
+            });
+            let pick_walk = per_call(reps, || {
+                std::hint::black_box(peers.connect_pick_walked(now));
+            });
+            let pick_index = per_call(reps, || {
+                std::hint::black_box(peers.connect_pick_indexed(now));
+            });
+            let victim_walk = per_call(reps, || {
+                std::hint::black_box(peers.erase_victims_walked(Displace::EraseCandidates, 1));
+            });
+            let victim_index = per_call(reps, || {
+                std::hint::black_box(peers.erase_victims(Displace::EraseCandidates, 1));
+            });
+            // A run of connects, each as the connect loop makes it, on a
+            // list of its own each.
+            let connects = (n - n.div_ceil(3)).min(100);
+            let indexed = list(n, t0);
+            indexed.connect_pick_indexed(now);
+            let connect_index = per_call(connects, || {
+                std::hint::black_box(indexed.connect_next(now).expect("a due candidate"));
+            });
+            let walked = list(n, t0);
+            let connect_walk = per_call(connects, || {
+                std::hint::black_box(connect_next_walked(&walked, now).expect("a due candidate"));
+            });
+            // A peer named at a full list pushes out the lowest erase
+            // candidate.
+            let (admit_walk, admit_index) = if n == MAX_PEERLIST_SIZE {
+                let added = connects.min(n / 3);
+                let indexed = list(n, t0);
+                indexed.connect_pick_indexed(now);
+                let mut i = n;
+                let admit_index = per_call(added, || {
+                    indexed.add_peer(peer_addr(i), PeerSourceFlag::Tracker);
+                    i += 1;
+                });
+                let walked = list(n, t0);
+                let mut i = n;
+                let admit_walk = per_call(added, || {
+                    erase_walked(&walked, Displace::EraseCandidates, MAX_PEERLIST_SIZE);
+                    walked.add_peer(peer_addr(i), PeerSourceFlag::Tracker);
+                    i += 1;
+                });
+                assert_eq!(indexed.listed(), n);
+                assert_eq!(walked.listed(), n);
+                (admit_walk.to_string(), admit_index.to_string())
+            } else {
+                ("-".to_owned(), "-".to_owned())
+            };
+            println!(
+                "{n} | {pick_walk} | {pick_index} | {connect_walk} | {connect_index} | {victim_walk} | {victim_index} | {admit_walk} | {admit_index} | {rebase}"
+            );
+        }
+    }
+
+    // `PeerStates::erase_to` as it read the whole list for its victims.
+    fn erase_walked(peers: &PeerStates, displace: Displace, fewer_than: usize) {
+        let excess = (peers.listed() + 1).saturating_sub(fewer_than);
+        if excess == 0 {
+            return;
+        }
+        for addr in peers.erase_victims_walked(displace, excess) {
+            if let Some((_, peer)) = peers
+                .states
+                .remove_if(&addr, |_, peer| peer.connected_out().is_none())
+            {
+                peers.erased(addr, &peer);
+            }
+        }
+    }
+
+    // `PeerStates::connect_next` as it walked the whole list for its pick
+    // and its victims.
+    fn connect_next_walked(peers: &PeerStates, now: Instant) -> Option<PeerHandle> {
+        let _admission = peers.admission.lock();
+        erase_walked(peers, Displace::EraseCandidates, PEERLIST_LOW_WATERMARK);
+        let addr = peers.connect_pick_walked(now)?;
+        peers
+            .with_peer_mut(addr, "test", |peer| peer.connect_if_due(now, peers))
+            .flatten()
+            .map(|_| addr)
     }
 
     #[test]
@@ -2487,7 +3151,7 @@ mod tests {
         }
         assert!(
             !peers
-                .with_peer_mut(distrusted, "test", |peer| peer.piece_failed(false))
+                .with_peer_mut(distrusted, "test", |peer| peer.piece_failed(false, &peers))
                 .unwrap()
         );
         never_failed(&peers, kept);
@@ -2655,10 +3319,10 @@ mod tests {
             }
             peers.with_peer_mut(addr, "test", |peer| {
                 if r & 32 != 0 {
-                    peer.piece_passed();
+                    peer.piece_passed(peers);
                 }
                 if r & 64 != 0 {
-                    let _banned = peer.piece_failed(false);
+                    let _banned = peer.piece_failed(false, peers);
                 }
             });
         }
@@ -2886,10 +3550,18 @@ mod tests {
     async fn a_paused_list_keeps_the_peers_that_rank_highest() {
         let peers = make_peer_states();
         let t0 = Instant::now();
-        let most_failed = (0..1950).map(peer_addr).collect::<Vec<_>>();
-        let failed = (1950..2100).map(peer_addr).collect::<Vec<_>>();
-        let queued = (2100..2999).map(peer_addr).collect::<Vec<_>>();
-        let live = peer_addr(2999);
+        // A full list: a live peer, queued peers that leave the paused
+        // list room for 100 more, 150 failed once, and the rest failed out.
+        let queued_from = MAX_PEERLIST_SIZE - MAX_PAUSED_PEERLIST_SIZE + 100;
+        let failed_from = queued_from - 150;
+        let most_failed = (0..failed_from).map(peer_addr).collect::<Vec<_>>();
+        let failed = (failed_from..queued_from)
+            .map(peer_addr)
+            .collect::<Vec<_>>();
+        let queued = (queued_from..MAX_PEERLIST_SIZE - 1)
+            .map(peer_addr)
+            .collect::<Vec<_>>();
+        let live = peer_addr(MAX_PEERLIST_SIZE - 1);
         for &addr in &most_failed {
             peers.add_peer(addr, PeerSourceFlag::Tracker);
             fail_out(&peers, addr, t0);
@@ -3085,7 +3757,7 @@ mod tests {
         peers.add_peer(failed, PeerSourceFlag::Tracker);
         fail_at(&peers, failed, t0);
         peers
-            .with_peer_mut(failed, "test", |p| p.piece_failed(false))
+            .with_peer_mut(failed, "test", |p| p.piece_failed(false, &peers))
             .unwrap();
         let connecting = peer_addr(3);
         peers.add_peer(connecting, PeerSourceFlag::Tracker);
@@ -3829,7 +4501,7 @@ mod tests {
                     .fetch_add(fetched, Ordering::Relaxed)
             });
         }
-        peers.with_peer_mut(on_parole, "test", |peer| peer.piece_failed(false));
+        peers.with_peer_mut(on_parole, "test", |peer| peer.piece_failed(false, &peers));
 
         let order = [uninteresting, on_parole, slow, fast, seed];
         for n in 1..=order.len() {
@@ -4182,7 +4854,7 @@ mod tests {
         peers
             .with_peer_mut(higher, "test", |peer| {
                 peer.connect_if_due(t0, &peers).expect("a due candidate");
-                peer.pex_flags(PEX_SEED);
+                peer.pex_flags(PEX_SEED, &peers);
                 peers.connection_closed(peer, t0, false, true);
             })
             .unwrap();
@@ -4353,7 +5025,7 @@ mod tests {
         let distrusted = peer_addr(4);
         peers.add_peer(distrusted, PeerSourceFlag::Tracker);
         peers
-            .with_peer_mut(distrusted, "test", |p| p.piece_failed(false))
+            .with_peer_mut(distrusted, "test", |p| p.piece_failed(false, &peers))
             .unwrap();
         // Connected to us: we know no address to connect to it at.
         let (_, _incoming_rx) = add_live_peer(&peers, "10.0.0.5:50000");

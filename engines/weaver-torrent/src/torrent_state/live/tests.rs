@@ -773,7 +773,7 @@ async fn a_parole_peer_is_not_snubbed_of_its_requests() {
     let h = Harness::new("a_parole_peer_keeps_its_requests").await;
     let (peer, mut rx) = h.peer("127.0.0.1:6881");
     h.peers
-        .with_peer_mut(peer.addr, "test", |p| p.piece_failed(false))
+        .with_peer_mut(peer.addr, "test", |p| p.piece_failed(false, &h.peers))
         .unwrap();
     peer.on_i_am_unchoked();
     let piece = peer.acquire_next_piece().unwrap().piece().unwrap().get();
@@ -4811,7 +4811,7 @@ async fn a_pause_keeps_the_bans_and_the_trust_of_the_peer_list() {
     let (peer, _rx) = h.peer("203.0.113.2:6881");
     h.peers.ban(banned.ip());
     h.peers
-        .with_peer_mut(peer.addr, "test", |p| p.piece_failed(false))
+        .with_peer_mut(peer.addr, "test", |p| p.piece_failed(false, &h.peers))
         .unwrap();
     let trust = h.peers.with_peer(peer.addr, |p| p.trust()).unwrap();
     assert_ne!(trust, Default::default());
@@ -5336,7 +5336,7 @@ async fn an_incoming_connection_at_the_cap_replaces_a_connection_that_ranks_lowe
     tokio::time::pause();
     let (on_parole, mut on_parole_rx) = h.new_peer("203.0.113.1:6881");
     h.peers
-        .with_peer_mut(on_parole.addr, "test", |p| p.piece_failed(false))
+        .with_peer_mut(on_parole.addr, "test", |p| p.piece_failed(false, &h.peers))
         .unwrap();
     let (kept, mut kept_rx) = h.new_peer("203.0.113.2:6881");
     let _held = [

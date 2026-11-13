@@ -2113,7 +2113,9 @@ impl TorrentStateLive {
             let bannable = known_bad && self.received_invalid_data(peer, piece);
             let to_ban = self
                 .peers
-                .with_peer_mut(peer, "piece_failed", |p| p.piece_failed(bannable))
+                .with_peer_mut(peer, "piece_failed", |p| {
+                    p.piece_failed(bannable, &self.peers)
+                })
                 .unwrap_or(bannable);
             if to_ban {
                 self.ban_for_bad_data(peer.ip());
@@ -3099,6 +3101,7 @@ impl PeerHandler {
             tokio::time::Instant::now(),
             failed,
             self.state.is_finished_and_no_active_streams(),
+            peers,
         );
         let prev = pe.value_mut().take_state(peers);
         self.state.layer_fetch.forget(handle);
@@ -4305,7 +4308,7 @@ impl PeerHandler {
                     for peer in senders.participants() {
                         state
                             .peers
-                            .with_peer_mut(peer, "piece_passed", |p| p.piece_passed());
+                            .with_peer_mut(peer, "piece_passed", |p| p.piece_passed(&state.peers));
                     }
 
                     // Global piece counters.

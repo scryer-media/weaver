@@ -71,7 +71,7 @@ pub(crate) struct ConnectOrder {
 
 /// A [`ConnectOrder`] as it stands for one choice of candidate: the
 /// endpoints are read once for every candidate compared.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ConnectRanking {
     session_start: Instant,
     ours: OurEndpoints,
