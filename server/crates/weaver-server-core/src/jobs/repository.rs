@@ -56,6 +56,27 @@ const ACTIVE_JOB_CHILD_TABLES: [&str; 15] = [
     "graph_held_parts",
 ];
 
+// The jobs numbered below the bound, which every `{}` binds, that have rows
+// in `table` and no active row. The job ids are walked one seek each, from
+// each id to the next above it on the table's job-id key: a `DISTINCT` read
+// every row of every job, every file and article of the whole queue, to
+// find a few thousand ids.
+pub(super) fn orphan_jobs_sql(table: &str) -> String {
+    format!(
+        "WITH RECURSIVE ids(job_id) AS (
+             SELECT (SELECT MIN(job_id) FROM {table} WHERE job_id < {{}})
+             UNION ALL
+             SELECT (SELECT MIN(job_id) FROM {table}
+                      WHERE job_id > ids.job_id AND job_id < {{}})
+               FROM ids WHERE ids.job_id IS NOT NULL
+         )
+         SELECT job_id FROM ids
+          WHERE job_id IS NOT NULL AND NOT EXISTS (
+              SELECT 1 FROM active_jobs WHERE active_jobs.job_id = ids.job_id
+          )"
+    )
+}
+
 // Deletes the rows these jobs left in `table`, for each job that has no
 // active row. One statement for the whole chunk.
 async fn delete_orphan_rows(
@@ -370,14 +391,7 @@ impl Database {
         let finders = ACTIVE_TABLES
             .into_iter()
             .chain(crate::jobs::graph_checkpoint::TABLES)
-            .map(|table| {
-                format!(
-                    "SELECT DISTINCT job_id FROM {table}
-                     WHERE job_id < {{}} AND NOT EXISTS (
-                         SELECT 1 FROM active_jobs WHERE active_jobs.job_id = {table}.job_id
-                     )"
-                )
-            })
+            .map(orphan_jobs_sql)
             .chain(std::iter::once(
                 "SELECT job_id FROM job_nzbs
                   WHERE job_id < {} AND NOT EXISTS (
@@ -389,8 +403,9 @@ impl Database {
             ));
         for sql in finders {
             let datastore = self.datastore();
+            let args = vec![SqlArg::I64(below); sql.matches("{}").count()];
             let ids = self.run_sql_blocking_read(async move {
-                SqlRuntime::fetch_all(datastore.read_exec(), &sql, &[SqlArg::I64(below)])
+                SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args)
                     .await?
                     .into_iter()
                     .map(|row| row.i64("job_id"))

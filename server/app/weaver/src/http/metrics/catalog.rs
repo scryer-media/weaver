@@ -588,6 +588,8 @@ metric_families! {
         "Frames the latest checkpoint pass copied into the database file.");
     DB_WAL_BYTES = ("weaver_db_wal_bytes", Gauge, [],
         "Size of the WAL file after the latest checkpoint pass; it shrinks only when journal_size_limit trims it.");
+    DB_STATEMENT_DURATION = ("weaver_db_statement_duration_seconds", Histogram, [],
+        "Run time of each SQL statement on a pool connection, reads and writes, as SQLite times it: millisecond resolution from the wall clock, so a statement under a millisecond counts as 0 or 0.001, a clock step can misplace one, and a streamed read includes the time its rows were consumed.");
 
     // ---- process ---------------------------------------------------------------------------
     // Standard process collector names, deliberately unprefixed so the usual

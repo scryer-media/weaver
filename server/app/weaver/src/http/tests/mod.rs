@@ -1382,6 +1382,7 @@ fn sample_wal_checkpoint() -> weaver_server_core::persistence::WalCheckpointMetr
         checkpointed_frames: 19,
         copied_frames: 0,
         wal_bytes: 3_218_032,
+        statement_duration: sample_histogram(),
     }
 }
 
