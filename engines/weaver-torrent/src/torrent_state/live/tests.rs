@@ -4863,6 +4863,45 @@ async fn a_failed_connection_asks_the_peer_whose_pex_named_it_to_introduce_us() 
     assert_eq!(sent, UtHolepunch::Rendezvous(target));
 }
 
+// libtorrent `peer_connection::connect_failed` is the only place a
+// rendezvous is sent: a connection to a holepunch peer that opened and then
+// failed its handshake reached the peer, and asks no one to introduce us.
+// The target answers our key exchange with a public key of zero, which
+// fails the encrypted handshake (a failure that counts against it).
+#[tokio::test]
+async fn a_connection_that_failed_its_handshake_asks_for_no_introduction() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let h = Harness::new("holepunch_no_introducer").await;
+    let (introducer, mut rx) = h.holepunch_peer("127.0.0.2:6881", true);
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let target = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let _ = stream.write_all(&[0; 96]).await;
+                let mut sink = Vec::new();
+                let _ = stream.read_to_end(&mut sink).await;
+            });
+        }
+    });
+    let msg = pex_flagged(target, extended::ut_pex::PEX_HOLEPUNCH);
+    let msg = crate::bencode::from_bytes::<UtPex<ByteBuf>>(&msg).unwrap();
+    (&introducer)
+        .on_received_message(Message::Extended(ExtendedMessage::UtPex(msg)))
+        .await
+        .unwrap();
+    assert!(h.knows(&target.to_string()));
+
+    // The connect loop dials the target; its connection fails once open.
+    while h.peers.with_peer(target, |p| p.failcount()).unwrap() == 0 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(holepunch_sent(&mut rx), []);
+}
+
 // libtorrent `ut_pex_plugin::tick`, `send_peer`: our PEX message lists each
 // connected peer whose listening address we know, where it listens, flagged
 // a seed, connected over uTP, speaking the holepunch extension, as it is to

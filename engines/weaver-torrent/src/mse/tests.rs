@@ -549,6 +549,32 @@ fn test_select_method_keeps_the_least_significant_common_method() {
     assert_eq!(select_method(0xfc | both, prefer), Some(CRYPTO_PLAINTEXT));
 }
 
+/// libtorrent 2.0.15 `bt_peer_connection::on_receive_impl`
+/// (src/bt_peer_connection.cpp:3175-3188): the initiator masks the select
+/// with the methods it allows and runs RC4 only when RC4 alone is left.
+#[test]
+fn test_accept_select_masks_the_select_with_the_offer() {
+    let both = CRYPTO_RC4 | CRYPTO_PLAINTEXT;
+    let prefer = outgoing_offer(EncryptionPolicy::Prefer);
+    let require = outgoing_offer(EncryptionPolicy::Require);
+    assert_eq!(accept_select(both, prefer), Some(CRYPTO_PLAINTEXT));
+    assert_eq!(
+        accept_select(CRYPTO_PLAINTEXT, prefer),
+        Some(CRYPTO_PLAINTEXT)
+    );
+    assert_eq!(accept_select(CRYPTO_RC4, prefer), Some(CRYPTO_RC4));
+    assert_eq!(accept_select(0xfc | both, prefer), Some(CRYPTO_PLAINTEXT));
+    assert_eq!(accept_select(0xfc | CRYPTO_RC4, prefer), Some(CRYPTO_RC4));
+    assert_eq!(accept_select(0xfc, prefer), None);
+    assert_eq!(accept_select(0, prefer), None);
+    // Under Require a select that would mean plaintext is refused, and one
+    // of both methods runs RC4.
+    assert_eq!(accept_select(both, require), Some(CRYPTO_RC4));
+    assert_eq!(accept_select(CRYPTO_RC4, require), Some(CRYPTO_RC4));
+    assert_eq!(accept_select(CRYPTO_PLAINTEXT, require), None);
+    assert_eq!(accept_select(0xfc | CRYPTO_PLAINTEXT, require), None);
+}
+
 #[tokio::test]
 async fn test_prefer_responder_selects_plaintext_from_an_offer_of_both() {
     let tap = tapped(CRYPTO_RC4 | CRYPTO_PLAINTEXT, EncryptionPolicy::Prefer).await;

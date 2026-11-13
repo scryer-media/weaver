@@ -17,7 +17,7 @@ use crate::core::{
 use crate::peer_protocol::{DoubleBufHelper, Piece};
 use crate::sha1w::{ISha1, ISha256, Sha1, Sha256};
 use crate::torrent_state::TorrentMetadata;
-use anyhow::{Context, bail};
+use anyhow::Context;
 use tracing::{debug, trace, warn};
 
 use crate::{
@@ -155,6 +155,21 @@ fn ends_the_file(err: &anyhow::Error) -> bool {
         })
 }
 
+/// Where a paused initial check stopped: every piece before `next` was
+/// checked and the storage heard its verdict; `have` holds those found.
+#[derive(Debug)]
+pub(crate) struct CheckedSoFar {
+    pub(crate) next: usize,
+    pub(crate) have: BF,
+}
+
+/// How an initial check ended: every piece checked, or paused.
+#[derive(Debug)]
+pub(crate) enum CheckOutcome {
+    Done(BF),
+    Paused(CheckedSoFar),
+}
+
 pub(crate) struct FileOps<'a> {
     metadata: &'a TorrentMetadata,
     torrent: &'a ValidatedTorrentMetaV1Info<ByteBufOwned>,
@@ -218,22 +233,49 @@ impl<'a> FileOps<'a> {
         (v1, v2)
     }
 
-    /// The pieces whose data is already there, hashed on `threads` threads
-    /// at once. Each takes the next piece no thread has taken, reads it
-    /// once with its own buffer and hashes it as it reads (libtorrent
-    /// `torrent::start_checking` keeps a hash job per piece out to its
-    /// `hashing_threads`). The verdicts land in the bitfield in piece
-    /// order, the first error by piece ending the check; pausing stops it
-    /// at the next piece.
+    /// [`Self::initial_check_from`] from the first piece, a pause an error.
+    #[cfg(test)]
     pub fn initial_check(
         &self,
         threads: usize,
         progress: &AtomicU64,
         pause_requested: &AtomicBool,
     ) -> anyhow::Result<BF> {
+        match self.initial_check_from(threads, progress, pause_requested, None)? {
+            CheckOutcome::Done(have) => Ok(have),
+            CheckOutcome::Paused(_) => anyhow::bail!("initial check paused"),
+        }
+    }
+
+    /// The pieces whose data is already there, hashed on `threads` threads
+    /// at once. Each takes the next piece no thread has taken, reads it
+    /// once with its own buffer and hashes it as it reads (libtorrent
+    /// `torrent::start_checking` keeps a hash job per piece out to its
+    /// `hashing_threads`). The verdicts land in the bitfield in piece
+    /// order, the first error by piece ending the check; pausing stops it
+    /// at the next piece and comes back as where it stopped. When `from`
+    /// is given the check goes on from where a paused one stopped: the
+    /// pieces before it are not read again and keep their verdicts
+    /// (libtorrent `torrent::start_checking` goes on from
+    /// `m_checking_piece`, which a pause leaves, torrent.cpp:2697-2712,
+    /// v2.0.15).
+    pub fn initial_check_from(
+        &self,
+        threads: usize,
+        progress: &AtomicU64,
+        pause_requested: &AtomicBool,
+        from: Option<CheckedSoFar>,
+    ) -> anyhow::Result<CheckOutcome> {
         let lengths = self.torrent.lengths();
         let total = lengths.total_pieces() as usize;
-        let next = AtomicUsize::new(0);
+        let (start, mut have_pieces) = match from {
+            Some(CheckedSoFar { next, have }) => (next.min(total), have),
+            None => (
+                0,
+                BF::from_boxed_slice(vec![0u8; lengths.piece_bitfield_bytes()].into()),
+            ),
+        };
+        let next = AtomicUsize::new(start);
         let broken: Vec<AtomicU64> = self
             .file_infos
             .iter()
@@ -269,7 +311,7 @@ impl<'a> FileOps<'a> {
             checked
         };
         let mut checked = std::thread::scope(|s| {
-            let others: Vec<_> = (1..threads.clamp(1, total))
+            let others: Vec<_> = (1..threads.clamp(1, (total - start).max(1)))
                 .map(|_| s.spawn(worker))
                 .collect();
             let mut checked = worker();
@@ -284,9 +326,9 @@ impl<'a> FileOps<'a> {
         });
 
         checked.sort_unstable_by_key(|(piece, _)| piece.get());
-        let done = checked.len();
-        let mut have_pieces =
-            BF::from_boxed_slice(vec![0u8; lengths.piece_bitfield_bytes()].into());
+        // Every piece taken is checked before a thread stops, so the pieces
+        // checked are those from `start` up to `done`.
+        let done = start + checked.len();
         // The storage hears each verdict: a piece the check found it has, and
         // one the check did not find failed its hash as a downloaded one
         // does, so the storage lets go of whatever it held of it. What the
@@ -306,9 +348,12 @@ impl<'a> FileOps<'a> {
             have_pieces.set(piece.get() as usize, had);
         }
         if done < total {
-            bail!("initial check paused");
+            return Ok(CheckOutcome::Paused(CheckedSoFar {
+                next: done,
+                have: have_pieces,
+            }));
         }
-        Ok(have_pieces)
+        Ok(CheckOutcome::Done(have_pieces))
     }
 
     /// Whether `piece`'s data is there, read once from the files it spans.
@@ -646,6 +691,7 @@ mod tests {
     use crate::AddTorrentOptions;
     use crate::core::v2_test_torrent::{TestTorrent, metadata, payload};
     use crate::torrent_state::ManagedTorrentShared;
+    use anyhow::bail;
 
     /// Each file's bytes, read only, how many bytes were read, the pieces
     /// it was told failed, ranges of files it does not hand out though the

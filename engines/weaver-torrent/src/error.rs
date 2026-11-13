@@ -55,6 +55,10 @@ pub enum Error {
     /// it, ran out of time.
     #[error("timeout {0}")]
     ConnectTimeout(&'static str),
+    /// The TLS handshake of an SSL torrent's connection, part of the
+    /// connect, failed.
+    #[error("TLS handshake failed: {0:#}")]
+    TlsConnect(#[source] std::io::Error),
     /// A step on the open connection ran out of time.
     #[error("timeout {0}")]
     Timeout(&'static str),
@@ -144,6 +148,25 @@ impl Error {
             Error::UtpConnect(utp) => utp.is_local_refusal(),
             _ => false,
         }
+    }
+
+    /// Whether the connect itself failed: no transport reached the peer, the
+    /// TLS handshake that is part of the connect failed, or either ran out
+    /// of time. A connection that opened and then failed its BitTorrent or
+    /// encryption handshake did not. libtorrent calls
+    /// `peer_connection::connect_failed` only on a connect error or a
+    /// connect timeout (peer_connection.cpp:4948, 6325, v2.0.15; an SSL
+    /// stream's connect includes its handshake, ssl_stream.hpp:114-122,
+    /// 432-447).
+    pub fn is_dial_failure(&self) -> bool {
+        matches!(
+            self,
+            Error::TcpConnect(_)
+                | Error::UtpConnect(_)
+                | Error::Connect { .. }
+                | Error::ConnectTimeout(_)
+                | Error::TlsConnect(_)
+        ) && !self.is_local_refusal()
     }
 
     /// Whether a connection that ends in this error counts against its

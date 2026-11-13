@@ -42,6 +42,7 @@ use weaver_server_core::settings::{
     TorrentConfig, TorrentEncryption, TorrentLimit, TorrentPeerProtocol,
 };
 use weaver_server_core::tags::{TagSnapshot, split_tags};
+use weaver_server_core::torrents::metrics::{Published, SessionSeries};
 use weaver_server_core::torrents::model::{file_priority_number, file_priority_of};
 use weaver_server_core::torrents::service::fingerprint::ViewParts;
 use weaver_server_core::torrents::service::listing::{CategoryPick, FileTotals, Pick, Shown};
@@ -263,6 +264,16 @@ impl TorrentFacadeContext {
 
     // Every torrent `pick` keeps, its own fields alone: no files, trackers
     // or tags.
+    // The route sessions as the service last published them: a read of
+    // what the tick took, which waits on no session.
+    fn published_sessions(&self) -> Arc<Published> {
+        self.inner
+            .torrents
+            .as_ref()
+            .map(|torrents| torrents.metrics().published)
+            .unwrap_or_default()
+    }
+
     async fn bare(&self, pick: Pick<'_>) -> Vec<TorrentView> {
         let Some(torrents) = &self.inner.torrents else {
             return Vec::new();
@@ -1231,6 +1242,7 @@ async fn transfer_action(ctx: &TorrentFacadeContext, action: &str, params: &Para
             let views = ctx.bare(Pick::default()).await;
             axum::Json(transfer(
                 &views.iter().collect::<Vec<_>>(),
+                &ctx.published_sessions().sessions,
                 ctx.torrent_download_limit(),
                 bandwidth.upload_bps,
             ))
@@ -3506,17 +3518,40 @@ async fn edit_category(
 }
 
 // The download limit is what torrents are held to this tick: their share of
-// the global limit, not the limit itself.
-fn transfer(views: &[&TorrentView], download: Option<u64>, upload: Option<u64>) -> Value {
+// the global limit, not the limit itself. The network fields read the route
+// sessions as last published: the DHT nodes are those of every open
+// session's routing tables (libtorrent `add_dht_counters` adds each DHT
+// node's, dht_tracker.cpp:68-74, v2.0.15, which qBittorrent reports as
+// `dht_nodes`), and each external address is the first an open session's
+// vote settled on for that family, in route order, "" for none
+// (qBittorrent `SessionImpl::lastExternalIPv4Address`).
+fn transfer(
+    views: &[&TorrentView],
+    sessions: &[SessionSeries],
+    download: Option<u64>,
+    upload: Option<u64>,
+) -> Value {
+    let open = || sessions.iter().filter(|session| session.open);
+    let dht_nodes: usize = open()
+        .filter_map(|session| session.dht)
+        .map(|(v4, v6, _)| v4 + v6)
+        .sum();
+    let external = |v4: bool| {
+        open()
+            .flat_map(|session| &session.external_ips)
+            .find(|ip| ip.is_ipv4() == v4)
+            .map_or_else(String::new, ToString::to_string)
+    };
     let fields = json!({
         "dl_info_speed": views.iter().map(|view| view.download_bps).sum::<u64>(),
         "dl_info_data": views.iter().map(|view| view.downloaded_bytes).sum::<u64>(),
         "up_info_speed": views.iter().map(|view| view.upload_bps).sum::<u64>(),
         "up_info_data": views.iter().map(|view| view.uploaded_bytes).sum::<u64>(),
-        // Weaver does not learn its external address from peers.
-        "last_external_address_v4": "",
-        "last_external_address_v6": "",
-        "dht_nodes": 0,
+        "last_external_address_v4": external(true),
+        "last_external_address_v6": external(false),
+        "dht_nodes": dht_nodes,
+        // Weaver keeps no record of whether a peer reached it from outside,
+        // which qBittorrent's "firewalled" reads.
         "connection_status": "connected",
     });
     with_limits(
@@ -3590,7 +3625,7 @@ async fn maindata(
     let views: Vec<&TorrentView> = rows.iter().map(|(view, _)| view).collect();
     let (download, upload) = (ctx.torrent_download_limit(), config.bandwidth.upload_bps);
     let server_closed = u8::from(download == Some(0)) | u8::from(upload == Some(0)) << 1;
-    let mut server_state = transfer(&views, download, upload);
+    let mut server_state = transfer(&views, &ctx.published_sessions().sessions, download, upload);
     let save_path = PathBuf::from(config.complete_dir());
     let free = tokio::task::spawn_blocking(move || probe_disk_space(&save_path))
         .await

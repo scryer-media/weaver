@@ -31,7 +31,9 @@
 //! [`EncryptionPolicy::Prefer`] the handshake is always encrypted and the
 //! payload after it is RC4 only when the peer asks for nothing else; under
 //! [`EncryptionPolicy::Require`] it is always RC4. Weaver as initiator offers
-//! every method its policy allows and takes the one the responder picks.
+//! every method its policy allows and takes the one the responder picks,
+//! masked with those it offered: a pick of both methods is plaintext when
+//! plaintext was offered.
 
 mod dh;
 mod rc4;
@@ -443,12 +445,10 @@ pub(crate) async fn initiate(
     }
     wire.decrypt(pos, pad_d, &mut dec, stage).await?;
     pos += pad_d;
-    if selected.count_ones() != 1 || selected & offer == 0 {
-        return Err(MseError::BadSelect {
-            selected,
-            offered: offer,
-        });
-    }
+    let method = accept_select(selected, offer).ok_or(MseError::BadSelect {
+        selected,
+        offered: offer,
+    })?;
 
     let rest = wire.buf.split_off(pos);
     Ok(establish(
@@ -456,10 +456,27 @@ pub(crate) async fn initiate(
         writer,
         Vec::new(),
         rest,
-        selected,
+        method,
         dec,
         enc,
     ))
+}
+
+/// The method an initiator that offered `offer` runs for the responder's
+/// crypto_select `selected`. The select is masked with the methods offered,
+/// which are the ones the policy allows: RC4 runs when RC4 alone is left,
+/// plaintext when plaintext is left, alone or with RC4; `None` when nothing
+/// offered is left. So a select of both methods is plaintext under Prefer
+/// and RC4 under Require, and a plaintext select under Require is refused
+/// (libtorrent 2.0.15 `bt_peer_connection::on_receive_impl`,
+/// src/bt_peer_connection.cpp:3175-3188, `m_rc4_encrypted` false unless the
+/// masked select is `pe_rc4`, :158).
+fn accept_select(selected: u32, offer: u32) -> Option<u32> {
+    match selected & offer & (CRYPTO_PLAINTEXT | CRYPTO_RC4) {
+        0 => None,
+        CRYPTO_RC4 => Some(CRYPTO_RC4),
+        _ => Some(CRYPTO_PLAINTEXT),
+    }
 }
 
 /// Run the handshake as the side that accepted the connection. A plaintext
