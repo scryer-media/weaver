@@ -3777,6 +3777,113 @@ async fn a_start_of_every_torrent_looks_again_at_those_held_for_their_files() {
     again.stop().await;
 }
 
+// A start of every torrent lets go of those held for their files without
+// waiting on their route's session: while that route's open does not
+// return they read as opening, and the next start of every torrent still
+// looks again, and puts a torrent whose route's session runs in it. Once
+// the open returns, each joins its route's session by itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_of_every_torrent_is_not_held_by_a_route_whose_session_does_not_open() {
+    let rig = rig(set_clock());
+    rig.routes.route(TorrentScope::Category(1), 9);
+    let opening = route_key(&rig, TorrentScope::Category(1));
+    rig.service.open().await.unwrap();
+    let mut held = Vec::new();
+    for (name, seed) in [("one", 1), ("two", 2), ("three", 3)] {
+        let job_id = rig
+            .service
+            .add_opened(AddRequest {
+                category: Some("tv".into()),
+                ..request(AddSource::Metainfo(plain(name, seed)))
+            })
+            .await
+            .unwrap();
+        fetch_every_piece(&rig.service, job_id, &[seed; 3000]).await;
+        let dir = PathBuf::from(
+            rig.service
+                .torrent(job_id)
+                .await
+                .unwrap()
+                .storage_dir
+                .unwrap(),
+        );
+        held.push((job_id, dir));
+    }
+    let (late, late_dir) = with_every_piece_of(&rig, "late", 4).await;
+    let keeper = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(plain("keeper", 5))))
+        .await
+        .unwrap();
+    rig.service.stop().await;
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
+    for (_, dir) in &held {
+        std::fs::rename(dir, dir.with_extension("away")).unwrap();
+    }
+    let late_away = late_dir.with_extension("away");
+    std::fs::rename(&late_dir, &late_away).unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    let queue = queue();
+    again.publish_to(queue.clone());
+    reopen(&again).await;
+    again.opened(keeper).await;
+    // The default route's session runs, the torrents' own route's has not
+    // opened.
+    assert!(again.inner.live.lock().await[&keeper].attached.is_some());
+    for (job_id, dir) in &held {
+        held_for_its_files(&again, *job_id, dir).await;
+    }
+    held_for_its_files(&again, late, &late_dir).await;
+
+    // Their route's open does not return. It is asked for once every look
+    // of the start is done, the late torrent's among them.
+    rig.routes.unanswered.send_replace(true);
+    let mut asked = rig.routes.asked.subscribe();
+    let before = *asked.borrow_and_update();
+    for (_, dir) in &held {
+        std::fs::rename(dir.with_extension("away"), dir).unwrap();
+    }
+    queue.resume_torrents().await.unwrap();
+    asked.wait_for(|asked| *asked > before).await.unwrap();
+    held_for_its_files(&again, late, &late_dir).await;
+
+    // The next start of every torrent finds the late one's files, and puts
+    // it in the default route's session, which runs.
+    std::fs::rename(&late_away, &late_dir).unwrap();
+    let mut published = queue.state().subscribe_job_changes();
+    queue.resume_torrents().await.unwrap();
+    loop {
+        published.borrow_and_update();
+        if again.inner.live.lock().await[&late].attached.is_some() {
+            break;
+        }
+        published.changed().await.unwrap();
+    }
+    runs_with_every_piece(&again, late).await;
+    // The first start let them go to wait on their route's open.
+    for (job_id, _) in &held {
+        let view = again.torrent(*job_id).await.unwrap();
+        assert_eq!(
+            (view.route.as_deref(), view.route_reason),
+            (Some(opening.as_str()), Some(TorrentRouteReason::Opening))
+        );
+        assert!(again.attaching(*job_id).await);
+    }
+
+    rig.routes.unanswered.send_replace(false);
+    for (job_id, _) in &held {
+        again.opened(*job_id).await;
+        runs_with_every_piece(&again, *job_id).await;
+        let view = again.torrent(*job_id).await.unwrap();
+        assert_eq!(
+            (view.route.as_deref(), view.route_reason),
+            (Some(opening.as_str()), None)
+        );
+    }
+    again.stop().await;
+}
+
 // A torrent held for its files moved to where they are now takes that
 // place as its own: nothing is moved or made, and it runs with every piece
 // (qBittorrent `TorrentImpl::handleMoveStorageJobFinished`,
