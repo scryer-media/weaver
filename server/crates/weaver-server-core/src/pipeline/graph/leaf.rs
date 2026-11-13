@@ -22,7 +22,7 @@ use std::path::{Component, Path, PathBuf};
 
 use weaver_graph::{Algorithm, ByteRange, Digest, Evidenced};
 
-use crate::pipeline::graph::sparse::{PlatformMarker, create_sparse};
+use crate::pipeline::graph::sparse::{PlatformMarker, create_sized, create_sparse};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LeafError {
@@ -204,9 +204,12 @@ impl Leaf {
     }
 
     // Write `bytes` at `offset`, folding nothing: a file whose bytes no
-    // check is stated for. Writes grow the file only as far as their bytes.
-    // A declared length must not allocate unwritten space on a mount that
-    // stores ordinary files instead of sparse ones; close sets the final size.
+    // check is stated for. Writes grow the file only as far as their bytes,
+    // except on Windows, where a new file the sparse mark took is made at
+    // its declared length, all of it holes. A declared length must not
+    // allocate unwritten space on a mount that stores ordinary files instead
+    // of sparse ones, so a refused mark leaves it unsized; close sets the
+    // final size.
     pub(crate) fn write(
         &mut self,
         offset: u64,
@@ -618,11 +621,15 @@ impl Leaf {
         }
     }
 
-    fn open(&mut self, _length: Option<u64>) -> Result<&File, LeafError> {
+    // Opens the file, making it when it is not there. A file made with a
+    // declared `length` takes it where the platform presizes and the mount
+    // took the sparse mark (`sparse::create_sized`); close still sets the
+    // final length.
+    fn open(&mut self, length: Option<u64>) -> Result<&File, LeafError> {
         if self.file.is_none() {
             create_parent(&self.path)?;
-            let file =
-                create_sparse(&self.path, &PlatformMarker).map_err(LeafError::io(&self.path))?;
+            let file = create_sized(&self.path, &PlatformMarker, length)
+                .map_err(LeafError::io(&self.path))?;
             self.on_disk = true;
             self.file = Some(file);
         }
@@ -873,12 +880,21 @@ mod tests {
         assert!(!error.names_unusable(), "{error}");
     }
 
+    // Off Windows a declared length is never taken ahead of the bytes. On
+    // Windows a file the sparse mark took starts at it, all holes, and one
+    // whose mark was refused does not; either way close cuts it to its final
+    // length.
     #[test]
     fn a_write_does_not_preallocate_the_declared_unwritten_tail() {
         let dir = tempfile::tempdir().unwrap();
         let mut leaf = Leaf::at(dir.path(), "payload.bin");
         leaf.write(0, b"a", Some(1 << 30)).unwrap();
-        assert_eq!(leaf.len().unwrap(), 1);
+        let length = leaf.len().unwrap();
+        if crate::pipeline::graph::sparse::PRESIZES {
+            assert!(length == 1 || length == 1 << 30, "{length}");
+        } else {
+            assert_eq!(length, 1);
+        }
         leaf.write(1, b"b", None).unwrap();
         leaf.close(2).unwrap();
         assert_eq!(std::fs::read(leaf.path()).unwrap(), b"ab");
