@@ -1080,11 +1080,13 @@ struct RootState {
     // Which probe, by its count among those begun, took the reading now
     // published: 0 while there is none.
     published_probe: u64,
-    // Each write failure met while a probe was running, by that probe's
-    // count, and the free bytes that probe went on to publish in a good
-    // reading: a reading begun before the failure though published after
-    // it. Empty unless someone waits on a failed write.
-    straddling: Vec<(u64, Option<u64>)>,
+    // The probe whose reading was published before the one now, and the
+    // free bytes it showed: a job that waits on a failed write may hear
+    // of two readings at once, and one of them may have begun before its
+    // failure.
+    prior: Option<(u64, u64)>,
+    // How many times the root was pointed at another directory.
+    retargets: u64,
     // A probe of `path` finished, and why the latest failed while it fails.
     // A retarget clears both.
     probed: bool,
@@ -1554,11 +1556,54 @@ struct HeldPath {
     // The probes of the path begun, and which of them took `free`.
     begun: u64,
     published: u64,
-    // The free bytes its latest probe read: `None` before one, and after
-    // one that failed.
+    // The free bytes of its latest probe that read them, whether that was
+    // its latest probe, and the probe and figure before, as a root keeps.
     free: Option<u64>,
-    // As a root's: each failure met while a probe ran, and what it read.
-    straddling: Vec<(u64, Option<u64>)>,
+    good: bool,
+    prior: Option<(u64, u64)>,
+}
+
+impl HeldPath {
+    fn look(&self) -> DiskLook {
+        DiskLook {
+            begun: self.begun,
+            probe: self.published,
+            shown: self.free,
+            good: self.good,
+            prior: self.prior,
+            moved: 0,
+        }
+    }
+}
+
+// What a disk shows a job that waits on it after a write found it full:
+// how many probes it has begun, which of them took the figure it shows,
+// that figure (the last one read, even when the latest probe failed),
+// whether the latest probe read it, and the probe and figure shown before.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DiskLook {
+    pub(crate) begun: u64,
+    pub(crate) probe: u64,
+    pub(crate) shown: Option<u64>,
+    pub(crate) good: bool,
+    pub(crate) prior: Option<(u64, u64)>,
+    // How many times the root was pointed at another directory: a job that
+    // waits on a root moved since then waits on another disk.
+    pub(crate) moved: u64,
+}
+
+impl DiskLook {
+    // The figure the probe counted `probe` published, while it is the
+    // latest or the one before.
+    pub(crate) fn figure_of(&self, probe: u64) -> Option<u64> {
+        if self.probe == probe {
+            self.shown
+        } else {
+            self.prior
+                .filter(|(prior, _)| *prior == probe)
+                .map(|(_, figure)| figure)
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1590,13 +1635,11 @@ impl HeldPaths {
             let free = probe(&path).ok().map(|space| space.available_bytes);
             let mut list = self.lock();
             if let Some(held) = list.iter_mut().find(|held| held.path == path) {
+                held.prior = held.free.map(|figure| (held.published, figure));
                 held.published = held.begun;
-                held.free = free;
-                let probe = held.begun;
-                for (running, figure) in &mut held.straddling {
-                    if *running == probe {
-                        *figure = free;
-                    }
+                held.good = free.is_some();
+                if free.is_some() {
+                    held.free = free;
                 }
             }
         }
@@ -1727,7 +1770,8 @@ impl StorageCapacity {
                         begun_probes: 0,
                         completed_probes: 0,
                         published_probe: 0,
-                        straddling: Vec::new(),
+                        prior: None,
+                        retargets: 0,
                         probed: false,
                         error: None,
                         device: None,
@@ -2151,6 +2195,8 @@ impl StorageCapacity {
                 return;
             }
             state.path = path;
+            state.retargets += 1;
+            state.prior = None;
             state.probed = false;
             state.error = None;
             state.device = None;
@@ -2170,73 +2216,28 @@ impl StorageCapacity {
         self.slot(root).lock().begun_probes
     }
 
-    // A write on `root` failed now. The count of the probes begun so far,
-    // which every later probe is counted after, and the free bytes of the
-    // good reading published now: what the disk showed before the failure.
-    // A probe running now began before the failure too, and what it goes on
-    // to publish is kept for `straddled` until `failure_forgotten`.
-    pub(crate) fn failed_at(&self, root: StorageRoot) -> (u64, Option<u64>) {
-        let slot = self.slot(root);
-        let mut state = slot.lock();
-        let begun = state.begun_probes;
-        if state.published_probe < begun {
-            state.straddling.push((begun, None));
-        }
-        let shown = slot
-            .capacity
-            .read()
-            .reading()
-            .filter(|reading| !reading.stale)
-            .map(|reading| reading.available_bytes);
-        (begun, shown)
-    }
-
-    // The free bytes a probe running as a write failed, at the count
-    // `failed_at` gave, has published since in a good reading.
-    pub(crate) fn straddled(&self, root: StorageRoot, begun: u64) -> Option<u64> {
-        let state = self.slot(root).lock();
-        state
-            .straddling
-            .iter()
-            .find(|(running, _)| *running == begun)
-            .and_then(|(_, figure)| *figure)
-    }
-
-    // No one waits any longer on the failure `failed_at` counted at `begun`.
-    pub(crate) fn failure_forgotten(&self, root: StorageRoot, begun: u64) {
-        let mut state = self.slot(root).lock();
-        if let Some(at) = state
-            .straddling
-            .iter()
-            .position(|(running, _)| *running == begun)
-        {
-            state.straddling.swap_remove(at);
-        }
-    }
-
-    // `root`'s reading and the count of the probe that took it, when that
-    // probe began after `begun` probes had: a reading whose probe was
-    // already running then says nothing of what happened since.
-    pub(crate) fn reading_begun_after(
-        &self,
-        root: StorageRoot,
-        begun: u64,
-    ) -> Option<(u64, CapacityReading)> {
+    // What `root` shows now of its probes and its free space, for a job
+    // that waits on it after a write found it full.
+    pub(crate) fn look(&self, root: StorageRoot) -> DiskLook {
         let slot = self.slot(root);
         let state = slot.lock();
-        let probe = state.published_probe;
-        (probe > begun)
-            .then(|| slot.capacity.read().reading())
-            .flatten()
-            .map(|reading| (probe, reading))
+        let reading = slot.capacity.read().reading();
+        DiskLook {
+            begun: state.begun_probes,
+            probe: state.published_probe,
+            shown: reading.map(|reading| reading.available_bytes),
+            good: reading.is_some_and(|reading| !reading.stale),
+            prior: state.prior,
+            moved: state.retargets,
+        }
     }
 
     // A write on `path`, which lies on none of the roots' disks, failed now
     // for want of room, and a job waits on it: the path is read with the
-    // complete root from here, and a reading is asked for now. What
-    // `failed_at` tells of a root, for the path.
-    pub(crate) fn hold_path(&self, path: &Path) -> (u64, Option<u64>) {
-        let failed = {
+    // complete root from here, and a reading is asked for now. What the
+    // path showed as the write failed.
+    pub(crate) fn hold_path(&self, path: &Path) -> DiskLook {
+        let look = {
             let mut list = self.held.lock();
             let at = match list.iter().position(|held| held.path == path) {
                 Some(at) => at,
@@ -2247,7 +2248,8 @@ impl StorageCapacity {
                         begun: 0,
                         published: 0,
                         free: None,
-                        straddling: Vec::new(),
+                        good: false,
+                        prior: None,
                     });
                     self.held.listed.store(list.len(), Ordering::Release);
                     list.len() - 1
@@ -2255,52 +2257,28 @@ impl StorageCapacity {
             };
             let held = &mut list[at];
             held.holds += 1;
-            if held.published < held.begun {
-                held.straddling.push((held.begun, None));
-                (held.begun, None)
-            } else {
-                (held.begun, held.free)
-            }
+            held.look()
         };
         self.slot(StorageRoot::Complete).request_refresh();
-        failed
+        look
     }
 
-    // What `straddled` tells of a root, for a held path.
-    pub(crate) fn path_straddled(&self, path: &Path, begun: u64) -> Option<u64> {
-        self.held
-            .lock()
-            .iter()
-            .find(|held| held.path == path)?
-            .straddling
-            .iter()
-            .find(|(running, _)| *running == begun)
-            .and_then(|(_, figure)| *figure)
-    }
-
-    // A held path's latest probe, by its count, and the free bytes it read
-    // (`None` when it failed), when that probe began after `begun` had.
-    pub(crate) fn path_reading_after(&self, path: &Path, begun: u64) -> Option<(u64, Option<u64>)> {
+    // What a held path shows now, as `look` tells of a root.
+    pub(crate) fn path_look(&self, path: &Path) -> Option<DiskLook> {
         let list = self.held.lock();
-        let held = list.iter().find(|held| held.path == path)?;
-        (held.published > begun).then_some((held.published, held.free))
+        list.iter()
+            .find(|held| held.path == path)
+            .map(HeldPath::look)
     }
 
-    // A job no longer waits on `path` for the failure counted at `begun`:
-    // the path leaves the list with its last wait.
-    pub(crate) fn release_path(&self, path: &Path, begun: u64) {
+    // A job no longer waits on `path`: the path leaves the list with its
+    // last wait.
+    pub(crate) fn release_path(&self, path: &Path) {
         let mut list = self.held.lock();
         let Some(at) = list.iter().position(|held| held.path == path) else {
             return;
         };
         let held = &mut list[at];
-        if let Some(straddle) = held
-            .straddling
-            .iter()
-            .position(|(running, _)| *running == begun)
-        {
-            held.straddling.swap_remove(straddle);
-        }
         held.holds = held.holds.saturating_sub(1);
         if held.holds == 0 {
             list.swap_remove(at);
@@ -2487,23 +2465,14 @@ fn run_root_sampler(
         // A retarget while the probe ran makes this reading the old
         // directory's; the thread probes the new one straight away.
         if state.path == path {
+            state.prior = slot
+                .capacity
+                .read()
+                .reading()
+                .map(|reading| (state.published_probe, reading.available_bytes));
             slot.capacity.publish(capacity);
             slot.ledger.published(mark, capacity);
             state.published_probe = state.begun_probes;
-            if !state.straddling.is_empty() {
-                let probe = state.begun_probes;
-                let shown = slot
-                    .capacity
-                    .read()
-                    .reading()
-                    .filter(|reading| !reading.stale)
-                    .map(|reading| reading.available_bytes);
-                for (running, figure) in &mut state.straddling {
-                    if *running == probe {
-                        *figure = shown;
-                    }
-                }
-            }
             state.probed = true;
             state.device = Some(device);
             if kind.is_some() {

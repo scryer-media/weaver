@@ -22,7 +22,6 @@
 // a path that runs often is one test of an empty map.
 
 use std::collections::HashSet;
-use std::collections::btree_map::Entry;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
@@ -59,9 +58,17 @@ pub(crate) struct FullDisk {
     // The disk's count of the probes it had begun as the write failed: only
     // a later probe's reading can show room made since.
     since: u64,
-    // The last of the disk's probes this wait has counted: at first `since`,
-    // so a probe already running as the write failed is never counted.
-    counted: u64,
+    // What the disk showed free when the write failed: the figure of its
+    // newest reading whose probe began no later than the failure, even a
+    // stale one. A reading has to show more than this to show room made.
+    // It is this wait's alone, and ends with it. `None` while the disk has
+    // shown nothing: the first reading since the failure then sets it.
+    mark: Option<u64>,
+    // A probe was running as the write failed: it began before the failure,
+    // so the figure it publishes takes the mark's place, once.
+    running: bool,
+    // How many times the root waited on had been pointed elsewhere.
+    moved: u64,
     // Room was made, or the user asked: the job goes on once it has parked.
     go: bool,
     // What the job's graph said was left to fetch, taken before it went:
@@ -143,21 +150,19 @@ impl Pipeline {
                 .collect();
         }
         self.retire_graph_job(job_id);
-        // What the disk showed free before the write failed is what a later
-        // reading has to beat. It never lowers what an earlier wait left.
-        let (since, shown) = self.storage_capacity.failed_at(root);
-        if let Some(shown) = shown {
-            let high = self.full_disk_highs.entry(job_id).or_insert(shown);
-            *high = (*high).max(shown);
-        }
+        // What the disk showed free as the write failed is what a later
+        // reading has to beat.
+        let look = self.storage_capacity.look(root);
         self.storage_capacity.ledger(root).wait();
         self.full_disk.insert(
             job_id,
             FullDisk {
                 disk: Disk::Root(root),
                 stage: Stage::Graph,
-                since,
-                counted: since,
+                since: look.begun,
+                mark: look.shown,
+                running: look.probe < look.begun,
+                moved: look.moved,
                 go: false,
                 left,
                 named,
@@ -218,14 +223,13 @@ impl Pipeline {
     }
 
     // A reading came, a held job parked, or its old graph's last mail was
-    // heard. Each held job has a high: the most its disk has shown free, in
-    // the reading published as its write failed, in one a probe running
-    // then published after, and in every reading since. It counts its
-    // disk's reading when it is one it has not counted and its probe began
-    // after the write failed: a good one that shows more than the high, and
-    // more than the reserve, shows room was made. With no high yet, nothing
-    // was shown before to compare with, and the reading only sets it. The
-    // high never falls while the job saves nothing new. A job with room made,
+    // heard. Each wait has one mark: what its disk showed free as the write
+    // failed, or what a probe running then published after. A reading
+    // counts when it is good and its probe began after the write failed:
+    // one that shows more than the mark, with more than the reserve free to
+    // spend, shows room was made. A reading that does not changes nothing.
+    // With no mark, nothing was shown before to compare with, and the first
+    // reading that counts only sets it. A job with room made,
     // or told to try by its user, goes on once it has parked, is not paused
     // and nothing of its old graph is out: its activation is asked for here,
     // so a job with nothing left to fetch runs on with no lane asking.
@@ -238,46 +242,51 @@ impl Pipeline {
         for (job_id, hold) in &mut self.full_disk {
             // A probe running as the write failed began before it: what it
             // published can raise the high, never let the job go.
-            // What a probe running as the write failed has published, and
-            // the disk's next uncounted reading: its probe's count, and from
-            // a good one what it shows free and what is free to spend.
+            // What the disk shows now, and what is free on it to spend: for
+            // a root, less what is promised on it.
             let capacity = &self.storage_capacity;
-            let (before, reading) = match &hold.disk {
+            let (look, spendable) = match &hold.disk {
                 Disk::Root(root) => (
-                    capacity.straddled(*root, hold.since),
+                    Some(capacity.look(*root)),
                     capacity
-                        .reading_begun_after(*root, hold.counted)
-                        .map(|(probe, reading)| {
-                            let free = capacity
-                                .free(*root)
-                                .filter(|free| !free.stale && !reading.stale)
-                                .map(|free| (reading.available_bytes, free.bytes));
-                            (probe, free)
-                        }),
+                        .free(*root)
+                        .filter(|free| !free.stale)
+                        .map(|free| free.bytes),
                 ),
-                Disk::Path(path) => (
-                    capacity.path_straddled(path, hold.since),
-                    capacity
-                        .path_reading_after(path, hold.counted)
-                        .map(|(probe, free)| (probe, free.map(|free| (free, free)))),
-                ),
+                Disk::Path(path) => {
+                    let look = capacity.path_look(path);
+                    (look, look.and_then(|look| look.shown))
+                }
             };
-            if let Some(before) = before {
-                let high = self.full_disk_highs.entry(*job_id).or_insert(before);
-                *high = (*high).max(before);
-            }
-            if let Some((probe, free)) = reading {
-                hold.counted = probe;
-                if let Some((shown, spendable)) = free {
-                    match self.full_disk_highs.entry(*job_id) {
-                        Entry::Vacant(high) => {
-                            high.insert(shown);
-                        }
-                        Entry::Occupied(mut high) => {
-                            if shown > *high.get() {
-                                high.insert(shown);
-                                hold.go |= spendable > reserve;
-                            }
+            if let Some(look) = look {
+                // The root was pointed at another directory: the disk that
+                // failed is no longer the one read, so the job tries once.
+                if look.moved != hold.moved {
+                    hold.moved = look.moved;
+                    hold.go = true;
+                }
+                // A probe running as the write failed began before it:
+                // what it published is the newest figure from before the
+                // failure, and takes the mark's place.
+                if hold.running && look.probe >= hold.since {
+                    if let Some(before) = look.figure_of(hold.since) {
+                        hold.mark = Some(before);
+                    }
+                    hold.running = false;
+                }
+                // A good reading whose probe began after the failure
+                // counts. With nothing shown before, it is the mark. One
+                // that shows more than the mark, with more than the
+                // reserve free to spend, shows room was made.
+                if look.probe > hold.since
+                    && look.good
+                    && let Some(shown) = look.shown
+                {
+                    match hold.mark {
+                        None => hold.mark = Some(shown),
+                        Some(mark) => {
+                            hold.go |=
+                                shown > mark && spendable.is_some_and(|free| free > reserve);
                         }
                     }
                 }
@@ -357,25 +366,23 @@ impl Pipeline {
             }
         }
         let disk = disk.unwrap_or_else(|| Disk::Path(path.to_path_buf()));
-        let (since, shown) = match &disk {
+        let look = match &disk {
             Disk::Root(root) => {
-                let failed = self.storage_capacity.failed_at(*root);
+                let look = self.storage_capacity.look(*root);
                 self.storage_capacity.ledger(*root).wait();
-                failed
+                look
             }
             Disk::Path(path) => self.storage_capacity.hold_path(path),
         };
-        if let Some(shown) = shown {
-            let high = self.full_disk_highs.entry(job_id).or_insert(shown);
-            *high = (*high).max(shown);
-        }
         self.full_disk.insert(
             job_id,
             FullDisk {
                 disk,
                 stage: Stage::Moving(dest),
-                since,
-                counted: since,
+                since: look.begun,
+                mark: look.shown,
+                running: look.probe < look.begun,
+                moved: look.moved,
                 go: false,
                 left: None,
                 named: HashSet::new(),
@@ -430,12 +437,10 @@ impl Pipeline {
         }
     }
 
-    // The job saved something new, or left: what its disk showed free
-    // before says nothing of its next wait.
-    pub(in crate::pipeline) fn full_disk_progress(&mut self, job_id: JobId) {
-        if !self.full_disk_highs.is_empty() {
-            self.full_disk_highs.remove(&job_id);
-        }
+    // What a reading of the held job's disk has to show more than.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn full_disk_mark(&self, job_id: JobId) -> Option<u64> {
+        self.full_disk.get(&job_id).and_then(|hold| hold.mark)
     }
 
     // The job no longer waits for room after a full disk: it went on, or
@@ -446,11 +451,8 @@ impl Pipeline {
         }
         let hold = self.full_disk.remove(&job_id)?;
         match &hold.disk {
-            Disk::Root(root) => {
-                self.storage_capacity.ledger(*root).unwait();
-                self.storage_capacity.failure_forgotten(*root, hold.since);
-            }
-            Disk::Path(path) => self.storage_capacity.release_path(path, hold.since),
+            Disk::Root(root) => self.storage_capacity.ledger(*root).unwait(),
+            Disk::Path(path) => self.storage_capacity.release_path(path),
         }
         Some(hold.stage)
     }

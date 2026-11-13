@@ -1186,21 +1186,23 @@ async fn a_job_let_go_that_fails_again_waits_for_more_room_than_its_disk_has_sho
         "no reading without more room restarts it"
     );
 
-    // Its user resumes it: it tries once, and the write fails again.
+    assert_eq!(
+        pipeline.full_disk_mark(JOB),
+        Some(RESERVE + PLENTY),
+        "it waits for more than its disk showed as the write failed"
+    );
+
+    // Its user resumes it: it tries once, and the write fails again with
+    // the disk showing what it showed.
     fill_after(Some(0));
     pipeline.resume_job_runtime(JOB).unwrap();
     restarts(&mut pipeline).await;
-    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY - 1);
     until_full(&mut pipeline, &scenario).await;
-
-    // It saved nothing new, so it still waits for more than the disk showed
-    // before it was let go, not only for more than it shows now.
-    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY - 1);
     hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
     assert_full_disk_held(&pipeline);
 
-    // More room than it has ever shown lets it go, once. The write fails
-    // again with nothing new saved: the same reading does not let it go a
+    // A reading that shows more lets it go, once. The write fails again
+    // with the disk showing that: the same figure does not let it go a
     // second time.
     hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY + 1);
     restarts(&mut pipeline).await;
@@ -1208,9 +1210,9 @@ async fn a_job_let_go_that_fails_again_waits_for_more_room_than_its_disk_has_sho
     hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY + 1);
     assert_full_disk_held(&pipeline);
     assert_eq!(
-        pipeline.full_disk_highs.get(&JOB),
-        Some(&(RESERVE + PLENTY + 1)),
-        "it waits for more than the most its disk has shown"
+        pipeline.full_disk_mark(JOB),
+        Some(RESERVE + PLENTY + 1),
+        "the new wait has what the disk showed at its own failure to beat"
     );
 
     // More again: room was made, and this time the write lands.
@@ -1226,9 +1228,169 @@ async fn a_job_let_go_that_fails_again_waits_for_more_room_than_its_disk_has_sho
         file_named(&delivered(&complete_dir), "ember.bin"),
         body.as_slice()
     );
+}
+
+// A reading that shows more than the disk did as the write failed, with too
+// little of it free to spend, lets no job go and changes nothing: when what
+// is promised on the disk is given back, the same figure lets the job go.
+#[tokio::test]
+async fn room_shown_but_promised_to_others_keeps_the_job_waiting_until_it_is_free() {
+    let room = Arc::new(AtomicU64::new(0));
+    let body = payload(4 * ARTICLE, 139);
+    let scenario = on_disk_posting(&room, vec![Post::plain("ember.bin", body.clone())]);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let complete_dir = pipeline.complete_dir.clone();
+
+    fill_after(Some(ARTICLE as u64 + ARTICLE as u64 / 2));
+    until_full(&mut pipeline, &scenario).await;
+    assert_eq!(pipeline.full_disk_mark(JOB), Some(RESERVE));
+
+    // Another job has the room made promised to it.
+    working(&pipeline).promise(PLENTY);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
+    assert_full_disk_held(&pipeline);
+    assert_eq!(
+        pipeline.full_disk_mark(JOB),
+        Some(RESERVE),
+        "a reading that lets no job go raises nothing"
+    );
+
+    // That job gives it back: the disk shows the same figure.
+    working(&pipeline).release(PLENTY);
+    fill_after(None);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
+    restarts(&mut pipeline).await;
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    assert_eq!(
+        file_named(&delivered(&complete_dir), "ember.bin"),
+        body.as_slice()
+    );
+}
+
+// A job let go at a reading with much room finds the disk full again, with
+// less shown by then: it waits for more than the disk showed at that
+// failure, not for more than let it go before.
+#[tokio::test]
+async fn a_job_let_go_whose_disk_is_filled_again_goes_on_when_less_room_is_made() {
+    let room = Arc::new(AtomicU64::new(0));
+    let body = payload(4 * ARTICLE, 149);
+    let scenario = on_disk_posting(&room, vec![Post::plain("ember.bin", body.clone())]);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let complete_dir = pipeline.complete_dir.clone();
+
+    fill_after(Some(ARTICLE as u64 + ARTICLE as u64 / 2));
+    until_full(&mut pipeline, &scenario).await;
+    fill_after(Some(0));
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 2 * PLENTY);
+    restarts(&mut pipeline).await;
+
+    // Something else fills the disk before the job writes again.
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 0);
+    until_full(&mut pipeline, &scenario).await;
+    assert_eq!(pipeline.full_disk_mark(JOB), Some(RESERVE));
+
+    // Less room than let it go before, and more than the disk showed.
+    fill_after(None);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
+    restarts(&mut pipeline).await;
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    assert_eq!(
+        file_named(&delivered(&complete_dir), "ember.bin"),
+        body.as_slice()
+    );
+}
+
+// A job held on one disk, let go, and held again on another waits for more
+// than that other disk showed, whatever the first one did.
+#[tokio::test]
+async fn a_second_wait_on_another_disk_takes_that_disks_figure() {
+    let room = Arc::new(AtomicU64::new(0));
+    let body = payload(4 * ARTICLE, 151);
+    let scenario = on_disk_posting(&room, vec![Post::plain("ember.bin", body.clone())]);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+
+    // The output disk shows little, the working disk much.
+    hears(&mut pipeline, &room, StorageRoot::Complete, 0);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 2 * PLENTY);
+    fill_after(Some(ARTICLE as u64 + ARTICLE as u64 / 2));
+    until_full(&mut pipeline, &scenario).await;
+    assert_eq!(pipeline.full_disk_mark(JOB), Some(RESERVE + 2 * PLENTY));
+
+    fill_after(None);
+    pipeline.resume_job_runtime(JOB).unwrap();
+    restarts(&mut pipeline).await;
+
+    // Its next write fails on the output disk, which still shows little.
+    room.store(0, Ordering::Release);
+    pipeline.hold_job_for_full_disk(JOB, StorageRoot::Complete);
+    assert_eq!(
+        pipeline.full_disk_mark(JOB),
+        Some(RESERVE),
+        "the wait has its own disk's figure to beat"
+    );
+    pipeline.park_drained_jobs();
+    old_graph_heard(&mut pipeline).await;
+    hears(&mut pipeline, &room, StorageRoot::Complete, 0);
+    assert!(pipeline.held_for_full_disk(JOB));
+    hears(&mut pipeline, &room, StorageRoot::Complete, PLENTY);
     assert!(
-        pipeline.full_disk_highs.is_empty(),
-        "a job that ran on keeps nothing of its wait"
+        !pipeline.held_for_full_disk(JOB),
+        "more than the output disk showed lets it go"
+    );
+}
+
+// The disk could not be read as the write failed: the last figure it showed,
+// stale as it is, is what a reading has to beat. A further look that fails
+// lets nothing go, and a good reading with more room does.
+#[tokio::test]
+async fn a_stale_figure_at_the_failure_is_what_a_reading_has_to_beat() {
+    let room = Arc::new(AtomicU64::new(0));
+    let body = payload(4 * ARTICLE, 157);
+    let scenario = on_disk_posting(&room, vec![Post::plain("ember.bin", body.clone())]);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let complete_dir = pipeline.complete_dir.clone();
+
+    // A good reading, then a look that fails: the figure kept is stale.
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, UNREADABLE);
+    assert!(
+        pipeline
+            .storage_capacity
+            .current(StorageRoot::Intermediate)
+            .reading()
+            .is_some_and(|reading| reading.stale)
+    );
+    fill_after(Some(ARTICLE as u64 + ARTICLE as u64 / 2));
+    until_full(&mut pipeline, &scenario).await;
+    assert_eq!(
+        pipeline.full_disk_mark(JOB),
+        Some(RESERVE),
+        "the stale figure is what the disk showed"
+    );
+
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, UNREADABLE);
+    assert_full_disk_held(&pipeline);
+    assert_eq!(pipeline.full_disk_mark(JOB), Some(RESERVE));
+
+    // The disk reads again, with room made meanwhile: the job goes at once.
+    fill_after(None);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
+    restarts(&mut pipeline).await;
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    assert_eq!(
+        file_named(&delivered(&complete_dir), "ember.bin"),
+        body.as_slice()
     );
 }
 
@@ -1352,8 +1514,8 @@ async fn room_made_before_the_first_reading_since_the_failure_lets_the_job_go() 
     })
     .await;
     assert_eq!(
-        pipeline.full_disk_highs.get(&JOB),
-        Some(&RESERVE),
+        pipeline.full_disk_mark(JOB),
+        Some(RESERVE),
         "held, it has what its disk showed before the write failed to beat"
     );
 
@@ -1456,9 +1618,9 @@ async fn a_probe_running_as_the_write_fails_does_not_let_the_job_go() {
     pipeline.disk_reading();
     assert_full_disk_held(&pipeline);
     assert_eq!(
-        pipeline.full_disk_highs.get(&JOB),
-        Some(&(RESERVE + 2 * PLENTY)),
-        "what the probe begun before the failure showed is what has to be beaten"
+        pipeline.full_disk_mark(JOB),
+        Some(RESERVE + 2 * PLENTY),
+        "what the probe begun before the failure showed takes the mark's place"
     );
 
     fill_after(None);
