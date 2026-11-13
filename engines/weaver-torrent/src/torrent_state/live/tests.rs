@@ -4343,6 +4343,143 @@ async fn our_dht_port_goes_once_to_a_dht_peer_and_its_port_adds_its_node() {
     }));
 }
 
+// libtorrent `bt_peer_connection::write_dht_port` (bt_peer_connection.cpp:
+// 333-342, v2.0.15) names `listen_socket_t::udp_external_port`
+// (session_impl.hpp:239-247): the UDP port a mapper got for the socket the
+// DHT runs over, NAT-PMP's before UPnP's over IPv4, else the socket's own
+// port. The PORT goes once, at the handshake: a peer keeps the port it was
+// told, and a new peer is told the port as it is then.
+#[tokio::test]
+async fn the_port_message_names_the_udp_port_mapped_for_the_dhts_socket() {
+    use crate::upnp::{PortMapped, PortmapProtocol, PortmapTransport};
+    let opts = SessionOptions {
+        listen: Some(crate::ListenerOptions {
+            mode: crate::ListenerMode::TcpAndUtp,
+            listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            ..Default::default()
+        }),
+        dht: Some(crate::DhtSessionConfig {
+            bootstrap_addrs: Some(Vec::new()),
+            port: Some(0),
+            persistence: None,
+        }),
+        ipv4_only: true,
+        ..isolated_session_opts(false)
+    };
+    let h = Harness::build_on(
+        "dht_port_mapped",
+        0x00,
+        opts,
+        MemoryStorageFactory::default().clone_box(),
+    )
+    .await;
+    let listen = h._session.listen_addr().unwrap().port();
+    assert_eq!(h._session.get_dht().unwrap().listen_addr().port(), listen);
+    let mapped = |protocol, transport, external_port| PortMapped {
+        transport,
+        protocol,
+        local_port: listen,
+        external_port,
+        external_ip: None,
+        error: None,
+    };
+    let mut next = 0u8;
+    let mut told = || {
+        next += 1;
+        let (peer, mut rx) = h.peer(&format!("127.0.0.{next}:6881"));
+        (&peer)
+            .on_handshake(handshake(true), ConnectionKind::Tcp, false)
+            .unwrap();
+        let Ok(WriterRequest::Message(Message::Port(port))) = rx.try_recv() else {
+            panic!("no PORT");
+        };
+        (peer, rx, port)
+    };
+
+    // No mapping: the DHT's own port, the listener's.
+    let (_first, mut first_rx, port) = told();
+    assert_eq!(port, listen);
+    // A TCP mapping is not the DHT's.
+    h._session.port_mapped(&mapped(
+        PortmapProtocol::Tcp,
+        PortmapTransport::NatPmp,
+        Some(4000),
+    ));
+    assert_eq!(told().2, listen);
+    // UPnP maps the UDP port, then NAT-PMP, which goes first, maps it too.
+    h._session.port_mapped(&mapped(
+        PortmapProtocol::Udp,
+        PortmapTransport::Upnp,
+        Some(3001),
+    ));
+    assert_eq!(told().2, 3001);
+    h._session.port_mapped(&mapped(
+        PortmapProtocol::Udp,
+        PortmapTransport::NatPmp,
+        Some(3000),
+    ));
+    assert_eq!(told().2, 3000);
+    // The mapping changes its port, then NAT-PMP's is lost: UPnP's again.
+    h._session.port_mapped(&mapped(
+        PortmapProtocol::Udp,
+        PortmapTransport::NatPmp,
+        Some(3002),
+    ));
+    assert_eq!(told().2, 3002);
+    h._session.port_mapped(&mapped(
+        PortmapProtocol::Udp,
+        PortmapTransport::NatPmp,
+        None,
+    ));
+    assert_eq!(told().2, 3001);
+    // Both lost: the DHT's own port again.
+    h._session
+        .port_mapped(&mapped(PortmapProtocol::Udp, PortmapTransport::Upnp, None));
+    assert_eq!(told().2, listen);
+    // The first peer was told once, and is not told again.
+    assert!(first_rx.try_recv().is_err());
+}
+
+// A DHT on a socket of its own is not on the listener's mapped socket: its
+// PORT names its own port, whatever UDP port a mapper got for the listener.
+#[tokio::test]
+async fn the_port_message_ignores_a_mapping_of_a_socket_the_dht_does_not_run_over() {
+    use crate::upnp::{PortMapped, PortmapProtocol, PortmapTransport};
+    let udp = Arc::new(HeldUdp::default());
+    let opts = SessionOptions {
+        dht: Some(crate::DhtSessionConfig {
+            bootstrap_addrs: Some(Vec::new()),
+            ..Default::default()
+        }),
+        socket_factory: udp.clone(),
+        ..isolated_session_opts(false)
+    };
+    let h = Harness::build_on(
+        "dht_port_own_socket",
+        0x00,
+        opts,
+        MemoryStorageFactory::default().clone_box(),
+    )
+    .await;
+    let own = h._session.get_dht().unwrap().listen_addr().port();
+    h._session.port_mapped(&PortMapped {
+        transport: PortmapTransport::NatPmp,
+        protocol: PortmapProtocol::Udp,
+        local_port: own,
+        external_port: Some(3000),
+        external_ip: None,
+        error: None,
+    });
+    let (peer, mut rx) = h.peer("127.0.0.2:6881");
+    (&peer)
+        .on_handshake(handshake(true), ConnectionKind::Tcp, false)
+        .unwrap();
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(WriterRequest::Message(Message::Port(p))) if p == own
+    ));
+}
+
 impl Harness {
     /// A torrent of `pieces` pieces (at most 8), with `have` the bitfield
     /// of those had, added to super-seed.

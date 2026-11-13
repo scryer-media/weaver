@@ -6,6 +6,7 @@
 // Weaver authors from 2026-10-20 onward.
 
 use std::{
+    collections::HashSet,
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Instant,
@@ -18,8 +19,18 @@ use tracing::{debug, trace};
 
 use crate::dht::{INACTIVITY_TIMEOUT, SEARCH_MIN_SEEDS};
 
-// The nodes a bucket holds: BEP 5's k.
+// BEP 5's k: the nodes a near bucket holds, and the replacements any
+// bucket keeps.
 const BUCKET_SIZE: usize = 8;
+// The farthest four buckets hold 16, 8, 4 and 2 times k, the others k:
+// libtorrent's `routing_table::bucket_limit` (routing_table.cpp:277-285,
+// v2.0.15) with `dht_extended_routing_table`, on by default
+// (settings_pack.cpp:231). A bucket's index counts from the farthest, 0.
+const EXTENDED: [usize; 4] = [16, 8, 4, 2];
+
+pub(crate) fn bucket_limit(index: usize) -> usize {
+    BUCKET_SIZE * EXTENDED.get(index).copied().unwrap_or(1)
+}
 // The failures in a row after which a node leaves a bucket that has no
 // replacement to take its place: libtorrent's `dht_max_fail_count`
 // (settings_pack.cpp:391, v2.0.15), read in `routing_table::node_failed`
@@ -50,10 +61,48 @@ struct Replacement {
 
 #[derive(Clone, Debug)]
 pub struct LeafBucket {
+    // Sorted by id, so a node is found by a binary search.
     pub nodes: Vec<RoutingTableNode>,
     pub last_refreshed: Instant,
     // Not saved: a restored table hears of its nodes again.
     replacements: Vec<Replacement>,
+    // The subnet of each of `nodes`, one node per subnet: whether a bucket
+    // of up to 128 nodes holds one costs a lookup, not a scan.
+    subnets: HashSet<Subnet>,
+}
+
+impl LeafBucket {
+    fn with(mut nodes: Vec<RoutingTableNode>, replacements: Vec<Replacement>) -> Self {
+        nodes.sort_by_key(|n| n.id);
+        Self {
+            subnets: nodes.iter().map(|n| subnet(n.addr)).collect(),
+            nodes,
+            last_refreshed: Instant::now(),
+            replacements,
+        }
+    }
+
+    // Where the node `id` is among `nodes`, or would go.
+    fn position(&self, id: &Id20) -> Result<usize, usize> {
+        self.nodes.binary_search_by_key(id, |n| n.id)
+    }
+
+    fn holds_subnet_of(&self, addr: SocketAddr) -> bool {
+        self.subnets.contains(&subnet(addr))
+    }
+
+    // Adds a node not held, of a subnet not held.
+    fn insert(&mut self, node: RoutingTableNode) {
+        let (Err(pos) | Ok(pos)) = self.position(&node.id);
+        self.subnets.insert(subnet(node.addr));
+        self.nodes.insert(pos, node);
+    }
+
+    fn remove(&mut self, pos: usize) -> RoutingTableNode {
+        let node = self.nodes.remove(pos);
+        self.subnets.remove(&subnet(node.addr));
+        node
+    }
 }
 
 /// A node to ask into the table (see [`RoutingTable::next_refresh`]).
@@ -91,21 +140,13 @@ impl<'de> Deserialize<'de> for LeafBucket {
         struct Tmp {
             nodes: Vec<RoutingTableNode>,
         }
-        Tmp::deserialize(deserializer).map(|t| Self {
-            nodes: t.nodes,
-            last_refreshed: Instant::now(),
-            replacements: Vec::new(),
-        })
+        Tmp::deserialize(deserializer).map(|t| Self::with(t.nodes, Vec::new()))
     }
 }
 
 impl Default for LeafBucket {
     fn default() -> Self {
-        Self {
-            nodes: Default::default(),
-            last_refreshed: Instant::now(),
-            replacements: Vec::new(),
-        }
+        Self::with(Vec::new(), Vec::new())
     }
 }
 
@@ -123,6 +164,21 @@ struct BucketTreeNode {
     #[serde(serialize_with = "crate::dht::utils::serialize_id20")]
     end_inclusive: Id20,
     data: BucketTreeNodeData,
+}
+
+impl BucketTreeNode {
+    fn holds(&self, id: &Id20) -> bool {
+        self.start <= *id && *id <= self.end_inclusive
+    }
+
+    // The nodes this bucket holds at most. Only the bucket holding our id
+    // splits, so a bucket of `bits` that does not hold it is the one 159 -
+    // `bits` from the farthest, and the one that does is the last, 160 -
+    // `bits`: libtorrent's list of buckets, farthest first.
+    fn limit(&self, self_id: &Id20) -> usize {
+        let index = 160 - usize::from(self.bits);
+        bucket_limit(index.saturating_sub(usize::from(!self.holds(self_id))))
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -206,14 +262,29 @@ fn refresh_target(self_id: &Id20, id: &Id20) -> Id20 {
     generate_random_id(self_id, u8::try_from(160 - kept).expect("at most 160 bits"))
 }
 
-// Whether two addresses are in the same /24 (v4) or /64 (v6), libtorrent's
-// `compare_ip_cidr`.
-fn same_subnet(a: SocketAddr, b: SocketAddr) -> bool {
-    match (a.ip().to_canonical(), b.ip().to_canonical()) {
-        (IpAddr::V4(a), IpAddr::V4(b)) => a.octets()[..3] == b.octets()[..3],
-        (IpAddr::V6(a), IpAddr::V6(b)) => a.octets()[..8] == b.octets()[..8],
-        _ => false,
+// The /24 (v4) or /64 (v6) of an address: two addresses of one are close,
+// as libtorrent's `compare_ip_cidr` has it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Subnet {
+    V4([u8; 3]),
+    V6([u8; 8]),
+}
+
+fn subnet(addr: SocketAddr) -> Subnet {
+    match addr.ip().to_canonical() {
+        IpAddr::V4(a) => {
+            let [a, b, c, _] = a.octets();
+            Subnet::V4([a, b, c])
+        }
+        IpAddr::V6(a) => {
+            let o = a.octets();
+            Subnet::V6([o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7]])
+        }
     }
+}
+
+fn same_subnet(a: SocketAddr, b: SocketAddr) -> bool {
+    subnet(a) == subnet(b)
 }
 
 fn compute_split_start_end(
@@ -292,8 +363,9 @@ impl BucketTree {
     // Buckets split on id prefixes, so every node under the child that shares
     // the target's bit at a split is nearer than every node under the other:
     // walking the near child first meets the nodes in distance order, bucket
-    // by bucket, and stops once `k` are found, with no copy of the table and
-    // no sort beyond a bucket's eight.
+    // by bucket, and stops once `k` are found, with no copy of the table.
+    // Of a bucket's nodes, up to 128 in a far one, the few still wanted are
+    // selected in linear time and only they are sorted.
     fn closest(
         &self,
         target: &Id20,
@@ -309,8 +381,13 @@ impl BucketTree {
                 BucketTreeNodeData::Leaf(leaf) => {
                     let from = out.len();
                     out.extend(leaf.nodes.iter().filter(|n| keep(n)));
-                    out[from..].sort_unstable_by_key(|n| target.distance(&n.id));
+                    let wanted = k - from;
+                    let found = &mut out[from..];
+                    if found.len() > wanted {
+                        found.select_nth_unstable_by_key(wanted - 1, |n| target.distance(&n.id));
+                    }
                     out.truncate(k);
+                    out[from..].sort_unstable_by_key(|n| target.distance(&n.id));
                 }
                 BucketTreeNodeData::LeftRight(left, right) => {
                     let (near, far) = if target.get_bit(160 - node.bits) {
@@ -352,24 +429,30 @@ impl BucketTree {
         let idx = self.get_leaf(id);
         match &mut self.data[idx].data {
             BucketTreeNodeData::Leaf(leaf) => {
-                let r = leaf.nodes.iter_mut().find(|b| b.id == *id);
-                if r.is_some()
-                    && let Some(refresh) = refresh
-                {
+                let pos = leaf.position(id).ok()?;
+                if let Some(refresh) = refresh {
                     leaf.last_refreshed = refresh;
                 }
-                r
+                Some(&mut leaf.nodes[pos])
             }
             BucketTreeNodeData::LeftRight(_, _) => unreachable!(),
         }
     }
 
-    pub fn add_node(&mut self, self_id: &Id20, id: Id20, addr: SocketAddr) -> InsertResult {
+    // Adds the node `id`; a split may move nodes out of the table, which
+    // go to `moved_out` (see `split`).
+    fn add_node(
+        &mut self,
+        self_id: &Id20,
+        id: Id20,
+        addr: SocketAddr,
+        moved_out: &mut Vec<RoutingTableNode>,
+    ) -> InsertResult {
         if is_v4_mapped(addr) {
             return InsertResult::Ignored;
         }
         let idx = self.get_leaf(&id);
-        let res = self.insert_into_leaf(idx, self_id, id, addr);
+        let res = self.insert_into_leaf(idx, self_id, id, addr, moved_out);
         let idx = self.get_leaf(&id);
         let leaf = self.leaf_mut(idx);
         match res {
@@ -398,7 +481,8 @@ impl BucketTree {
         let BucketTreeNodeData::Leaf(leaf) = &self.data[self.get_leaf(id)].data else {
             unreachable!()
         };
-        leaf.nodes.iter().find(|n| n.id == *id && n.addr == addr)
+        let node = &leaf.nodes[leaf.position(id).ok()?];
+        (node.addr == addr).then_some(node)
     }
 
     // After the node `id` failed: it leaves its bucket at once when the
@@ -407,10 +491,10 @@ impl BucketTree {
     // answered take the room it leaves (libtorrent
     // `routing_table::node_failed`, routing_table.cpp:1016-1073, v2.0.15).
     // The nodes that entered in its place, if it left.
-    fn drop_failed(&mut self, id: &Id20) -> Option<Vec<Id20>> {
+    fn drop_failed(&mut self, self_id: &Id20, id: &Id20) -> Option<Vec<Id20>> {
         let idx = self.get_leaf(id);
         let leaf = self.leaf_mut(idx);
-        let pos = leaf.nodes.iter().position(|n| n.id == *id)?;
+        let pos = leaf.position(id).ok()?;
         let node = &leaf.nodes[pos];
         let leaves = !leaf.replacements.is_empty()
             || node.errors_in_a_row >= MAX_FAIL_COUNT
@@ -418,33 +502,36 @@ impl BucketTree {
         if !leaves {
             return None;
         }
-        let gone = leaf.nodes.remove(pos);
+        let gone = leaf.remove(pos);
         self.size -= 1;
         debug!(?gone, "failed node left the table");
-        Some(self.fill_from_replacements(idx))
+        Some(self.fill_from_replacements(self_id, idx))
     }
 
     // The replacements of the leaf `idx` that answered enter it while it
     // has room, each one not in the /24 or /64 of a node it holds
     // (libtorrent `routing_table::fill_from_replacements`,
     // routing_table.cpp:520-539, v2.0.15). The ones that entered.
-    fn fill_from_replacements(&mut self, idx: usize) -> Vec<Id20> {
+    fn fill_from_replacements(&mut self, self_id: &Id20, idx: usize) -> Vec<Id20> {
+        let limit = self.data[idx].limit(self_id);
         let mut entered = Vec::new();
         loop {
             if self.size >= self.max_size {
                 return entered;
             }
             let leaf = self.leaf_mut(idx);
-            if leaf.nodes.len() >= BUCKET_SIZE {
+            if leaf.nodes.len() >= limit {
                 return entered;
             }
-            let Some(pos) = leaf.replacements.iter().position(|r| {
-                r.answered.is_some() && !leaf.nodes.iter().any(|n| same_subnet(n.addr, r.addr))
-            }) else {
+            let Some(pos) = leaf
+                .replacements
+                .iter()
+                .position(|r| r.answered.is_some() && !leaf.holds_subnet_of(r.addr))
+            else {
                 return entered;
             };
             let r = leaf.replacements.remove(pos);
-            leaf.nodes.push(RoutingTableNode {
+            leaf.insert(RoutingTableNode {
                 id: r.id,
                 addr: r.addr,
                 last_request: r.answered,
@@ -453,7 +540,6 @@ impl BucketTree {
                 last_queried: r.answered,
                 errors_in_a_row: 0,
             });
-            leaf.nodes.sort_by_key(|n| n.id);
             self.size += 1;
             entered.push(r.id);
         }
@@ -477,10 +563,8 @@ impl BucketTree {
         }
         let idx = self.get_leaf(&id);
         let leaf = self.leaf_mut(idx);
-        if leaf
-            .nodes
-            .iter()
-            .any(|n| n.id == id || same_subnet(n.addr, addr))
+        if leaf.position(&id).is_ok()
+            || leaf.holds_subnet_of(addr)
             || leaf
                 .replacements
                 .iter()
@@ -546,21 +630,18 @@ impl BucketTree {
     fn next_refresh(&mut self, self_id: &Id20, now: Instant) -> Option<Refresh> {
         let room = self.size < self.max_size;
         // Nearer buckets cover fewer bits; of the two nearest, ours first.
-        let mut leaves: Vec<((u8, bool), usize)> = self
+        let mut leaves: Vec<((u8, bool), usize, usize)> = self
             .data
             .iter()
             .enumerate()
             .filter(|(_, node)| matches!(node.data, BucketTreeNodeData::Leaf(_)))
-            .map(|(idx, node)| {
-                let ours = node.start <= *self_id && *self_id <= node.end_inclusive;
-                ((node.bits, !ours), idx)
-            })
+            .map(|(idx, node)| ((node.bits, !node.holds(self_id)), idx, node.limit(self_id)))
             .collect();
         leaves.sort_unstable();
         // The node asked least recently: when, its leaf, its place there.
         let mut oldest: Option<(Instant, usize, usize)> = None;
         let mut picked = None;
-        'walk: for ((_, not_ours), idx) in leaves {
+        'walk: for ((_, not_ours), idx, limit) in leaves {
             let leaf = self.leaf_mut(idx);
             for (pos, node) in leaf.nodes.iter().enumerate() {
                 match node.last_queried {
@@ -576,7 +657,7 @@ impl BucketTree {
                 }
             }
             if room
-                && (!not_ours || leaf.nodes.len() < BUCKET_SIZE)
+                && (!not_ours || leaf.nodes.len() < limit)
                 && let Some(r) = leaf.replacements.iter().position(|r| !r.asked)
             {
                 picked = Some((idx, Err(r)));
@@ -584,12 +665,13 @@ impl BucketTree {
             }
         }
         let (idx, which) = picked.or(oldest.map(|(_, idx, pos)| (idx, Ok(pos))))?;
+        let limit = self.data[idx].limit(self_id);
         let leaf = self.leaf_mut(idx);
         // A full bucket with a full set of replacements is pinged; any
         // other is asked for nodes near a random id between us and the
         // node (`node::send_single_refresh`, node.cpp:676-716,
         // `routing_table::is_full`, routing_table.cpp:1213-1223).
-        let ping = leaf.nodes.len() >= BUCKET_SIZE && leaf.replacements.len() >= BUCKET_SIZE;
+        let ping = leaf.nodes.len() >= limit && leaf.replacements.len() >= BUCKET_SIZE;
         let (id, addr) = match which {
             Ok(pos) => {
                 let node = &mut leaf.nodes[pos];
@@ -616,33 +698,31 @@ impl BucketTree {
         self_id: &Id20,
         id: Id20,
         addr: SocketAddr,
+        moved_out: &mut Vec<RoutingTableNode>,
     ) -> InsertResult {
-        // The loop here is for this case:
-        // in case we split a node into two, and it degenerates into all the leaves
-        // being on one side, we'll need to split again "recursively" until there's space
-        // for the new node.
-        // The loop is to remove the recursion. NOTE: it might have compiled to tail recursion
-        // anyway, but whatever, did not check.
+        // Loops as the bucket splits, until the bucket the node falls in
+        // takes it or cannot split.
         let now = Instant::now();
         loop {
-            let leaf = &mut self.data[idx];
-            let nodes = match &mut leaf.data {
+            let limit = self.data[idx].limit(self_id);
+            let ours = self.data[idx].holds(self_id);
+            let nodes = match &mut self.data[idx].data {
                 BucketTreeNodeData::Leaf(nodes) => nodes,
                 BucketTreeNodeData::LeftRight(_, _) => unreachable!(),
             };
             // if already found, quit
-            if nodes.nodes.iter().any(|r| r.id == id) {
+            if nodes.position(&id).is_ok() {
                 return InsertResult::WasExisting;
             }
             // One node per /24 (v4) or /64 (v6) in a bucket: a node close to
             // one we hold, under another id, is not trusted (libtorrent
             // `routing_table::add_node_impl` with `dht_restrict_routing_ips`,
             // `compare_ip_cidr`).
-            if nodes.nodes.iter().any(|r| same_subnet(r.addr, addr)) {
+            if nodes.holds_subnet_of(addr) {
                 return InsertResult::Ignored;
             }
 
-            let mut new_node = RoutingTableNode {
+            let new_node = RoutingTableNode {
                 id,
                 addr,
                 last_request: None,
@@ -659,27 +739,27 @@ impl BucketTree {
             // (`replace_node_impl`, 165-178). The table never holds more than
             // `max_size`.
             let full = self.size >= self.max_size;
-            if !full && nodes.nodes.len() < BUCKET_SIZE {
-                nodes.nodes.push(new_node);
-                nodes.nodes.sort_by_key(|n| n.id);
+            if !full && nodes.nodes.len() < limit {
+                nodes.insert(new_node);
                 nodes.last_refreshed = now;
                 self.size += 1;
                 return InsertResult::Added;
             }
 
-            let ours = leaf.start <= *self_id && *self_id <= leaf.end_inclusive;
             if full || !ours {
-                if let Some(bad_node) = nodes
+                if let Some(bad) = nodes
                     .nodes
-                    .iter_mut()
-                    .filter(|r| matches!(r.status(now), NodeStatus::Bad))
-                    .min_by_key(|r| std::cmp::Reverse(r.errors_in_a_row))
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| matches!(r.status(now), NodeStatus::Bad))
+                    .min_by_key(|(_, r)| std::cmp::Reverse(r.errors_in_a_row))
+                    .map(|(pos, _)| pos)
                 {
-                    std::mem::swap(bad_node, &mut new_node);
-                    nodes.nodes.sort_by_key(|n| n.id);
-                    debug!("replaced bad node {:?}", new_node);
+                    let gone = nodes.remove(bad);
+                    nodes.insert(new_node);
+                    debug!("replaced bad node {:?}", gone);
                     nodes.last_refreshed = now;
-                    return InsertResult::ReplacedBad(new_node);
+                    return InsertResult::ReplacedBad(gone);
                 }
                 if full {
                     trace!(
@@ -690,58 +770,81 @@ impl BucketTree {
                 return InsertResult::Ignored;
             }
 
-            // Split
-            let ((ls, le), (rs, re)) =
-                compute_split_start_end(leaf.start, leaf.end_inclusive, leaf.bits);
-            let (mut ld, mut rd) = (Vec::new(), Vec::new());
-            for node in nodes.nodes.drain(0..) {
-                if node.id < rs {
-                    ld.push(node);
-                } else {
-                    rd.push(node)
-                }
-            }
-            let (lr, rr) = nodes.replacements.drain(0..).partition(|r| r.id < rs);
-
-            let left = BucketTreeNode {
-                bits: leaf.bits - 1,
-                start: ls,
-                end_inclusive: le,
-                data: BucketTreeNodeData::Leaf(LeafBucket {
-                    nodes: ld,
-                    replacements: lr,
-                    ..Default::default()
-                }),
-            };
-            let right = BucketTreeNode {
-                bits: leaf.bits - 1,
-                start: rs,
-                end_inclusive: re,
-                data: BucketTreeNodeData::Leaf(LeafBucket {
-                    nodes: rd,
-                    replacements: rr,
-                    ..Default::default()
-                }),
-            };
-
-            let left_idx = {
-                let l = self.data.len();
-                self.data.push(left);
-                l
-            };
-            let right_idx = {
-                let l = self.data.len();
-                self.data.push(right);
-                l
-            };
-
-            self.data[idx].data = BucketTreeNodeData::LeftRight(left_idx, right_idx);
-            if id < rs {
-                idx = left_idx
-            } else {
-                idx = right_idx
-            }
+            self.split(idx, self_id, moved_out);
+            idx = self.get_leaf(&id);
         }
+    }
+
+    // Splits the leaf `idx`, which holds our id, in two halves, as
+    // libtorrent's `routing_table::split_bucket` and the loop over it in
+    // `add_node` do (routing_table.cpp:905-966 and 575-590, v2.0.15). The
+    // far half keeps the leaf's place, so its limit is the leaf's. The near
+    // half holds our id and is one place nearer, so its limit may be
+    // smaller: while it holds more, it splits again, and the far half of
+    // that split keeps its limit's worth, the nodes that answered first,
+    // the others becoming its replacements up to a bucket's worth and the
+    // rest leaving the table into `moved_out`. With 8-node buckets no half
+    // ever holds more than its limit; with the far buckets 128, 64, 32 and
+    // 16, a near half can.
+    fn split(&mut self, mut idx: usize, self_id: &Id20, moved_out: &mut Vec<RoutingTableNode>) {
+        loop {
+            let leaf = &mut self.data[idx];
+            let (bits, start, end) = (leaf.bits, leaf.start, leaf.end_inclusive);
+            let BucketTreeNodeData::Leaf(nodes) = &mut leaf.data else {
+                unreachable!()
+            };
+            let ((ls, le), (rs, re)) = compute_split_start_end(start, end, bits);
+            let (ld, rd): (Vec<_>, Vec<_>) = nodes.nodes.drain(..).partition(|n| n.id < rs);
+            let (lr, rr) = nodes.replacements.drain(..).partition(|r| r.id < rs);
+            let half = |start, end_inclusive, nodes, replacements| BucketTreeNode {
+                bits: bits - 1,
+                start,
+                end_inclusive,
+                data: BucketTreeNodeData::Leaf(LeafBucket::with(nodes, replacements)),
+            };
+            let left_idx = self.data.len();
+            self.data.push(half(ls, le, ld, lr));
+            self.data.push(half(rs, re, rd, rr));
+            self.data[idx].data = BucketTreeNodeData::LeftRight(left_idx, left_idx + 1);
+
+            let (near, far) = if self.data[left_idx].holds(self_id) {
+                (left_idx, left_idx + 1)
+            } else {
+                (left_idx + 1, left_idx)
+            };
+            self.trim(far, self_id, moved_out);
+            if self.leaf_mut(near).nodes.len() <= self.data[near].limit(self_id) {
+                return;
+            }
+            idx = near;
+        }
+    }
+
+    // The leaf `idx`, past its limit after a split, keeps its limit's worth
+    // of nodes, the ones that answered first; of the others, those that fit
+    // join its replacements and the rest leave the table.
+    fn trim(&mut self, idx: usize, self_id: &Id20, moved_out: &mut Vec<RoutingTableNode>) {
+        let limit = self.data[idx].limit(self_id);
+        let leaf = self.leaf_mut(idx);
+        if leaf.nodes.len() <= limit {
+            return;
+        }
+        let mut order: Vec<usize> = (0..leaf.nodes.len()).collect();
+        order.sort_by_key(|&pos| leaf.nodes[pos].last_response.is_none());
+        let mut out: Vec<usize> = order.split_off(limit);
+        out.sort_unstable_by(|a, b| b.cmp(a));
+        let mut gone: Vec<RoutingTableNode> = out.into_iter().map(|pos| leaf.remove(pos)).collect();
+        gone.sort_by_key(|n| n.last_response.is_none());
+        let room = BUCKET_SIZE.saturating_sub(leaf.replacements.len());
+        leaf.replacements
+            .extend(gone.iter().take(room).map(|node| Replacement {
+                id: node.id,
+                addr: node.addr,
+                asked: node.last_request.is_some(),
+                answered: node.last_response,
+            }));
+        self.size -= gone.len();
+        moved_out.extend(gone);
     }
 }
 
@@ -894,6 +997,12 @@ pub struct RoutingTable {
 }
 
 impl RoutingTable {
+    // The most nodes a table holds. libtorrent has no such cap. With the
+    // far buckets at 128, 64, 32 and 16 and 8 after them, a table of n
+    // buckets holds at most 240 + 8 (n - 4) nodes, so it reaches 512 only
+    // with 38 buckets; a table about as deep as libtorrent's own remark
+    // puts tables in the wild, 26 or 27 (routing_table.cpp:577-580,
+    // v2.0.15), holds at most 424.
     const DEFAULT_MAX_SIZE: usize = 512;
 
     pub fn new(id: Id20, max_size: Option<usize>) -> Self {
@@ -909,15 +1018,16 @@ impl RoutingTable {
         }
     }
 
-    /// The table with only the nodes of the IPv4 family when `is_v4`, the
-    /// IPv6 one when not, never an IPv4 address written as IPv6. A table
-    /// that holds no other is returned as it is.
+    /// A restored table rebuilt with only the nodes of the IPv4 family when
+    /// `is_v4`, the IPv6 one when not, never an IPv4 address written as
+    /// IPv6. Each node enters as a new one would, so the table keeps every
+    /// bucket's limit and at most `DEFAULT_MAX_SIZE` nodes, whatever the
+    /// saved file says: a table saved with 8-node buckets loads whole, and
+    /// a larger or altered one loads within the bounds.
     pub fn of_family(self, is_v4: bool) -> Self {
         let keeps = |addr: SocketAddr| addr.is_ipv4() == is_v4 && !is_v4_mapped(addr);
-        if self.iter().all(|n| keeps(n.addr)) {
-            return self;
-        }
-        let mut table = Self::new(self.id, Some(self.buckets.max_size));
+        let max_size = self.buckets.max_size.min(Self::DEFAULT_MAX_SIZE);
+        let mut table = Self::new(self.id, Some(max_size));
         for node in self.iter().filter(|n| keeps(n.addr)) {
             table.add_node(node.id, node.addr);
         }
@@ -1035,7 +1145,16 @@ impl RoutingTable {
     }
 
     pub fn add_node(&mut self, id: Id20, addr: SocketAddr) -> InsertResult {
-        let res = self.buckets.add_node(&self.id, id, addr);
+        let mut moved_out = Vec::new();
+        let res = self.buckets.add_node(&self.id, id, addr, &mut moved_out);
+        let now = Instant::now();
+        for node in &moved_out {
+            self.size -= 1;
+            if node.is_confirmed(now) {
+                self.confirmed -= 1;
+            }
+            debug!(?node, "a split moved a node out of the table");
+        }
         let entered = match &res {
             InsertResult::WasExisting | InsertResult::Ignored => false,
             InsertResult::ReplacedBad(..) => true,
@@ -1119,7 +1238,7 @@ impl RoutingTable {
         self.mark(id, None, |n| n.mark_error());
         // Failed, it no longer counts as confirmed, so only the count of
         // nodes changes as it leaves.
-        if let Some(entered) = self.buckets.drop_failed(id) {
+        if let Some(entered) = self.buckets.drop_failed(&self.id, id) {
             self.size -= 1;
             for id in entered {
                 self.size += 1;
@@ -1350,17 +1469,245 @@ mod tests {
         use super::InsertResult;
 
         let mut table = RoutingTable::new(Id20::new([0; 20]), None);
+        // FAR far nodes fill the root bucket, and one more splits it: the
+        // far half is full and cannot split.
+        for i in 0..FAR {
+            let (id, addr) = far(i);
+            assert!(matches!(table.add_node(id, addr), InsertResult::Added));
+        }
+        let (id, addr) = other_far();
+        assert!(matches!(table.add_node(id, addr), InsertResult::Ignored));
+        assert_eq!(table.len(), usize::from(FAR));
         let mut add = |id: u8, addr: [u8; 4]| {
             table.add_node(Id20::new([id; 20]), SocketAddr::from((addr, 6881)))
         };
-        // Eight far nodes fill the root bucket, and a ninth splits it.
-        for i in 0..8 {
-            assert!(matches!(add(0x80 + i, [5, 6, i, 1]), InsertResult::Added));
-        }
-        assert!(matches!(add(0x88, [5, 6, 8, 1]), InsertResult::Ignored));
         // A near node in a far node's /24 goes to the near bucket.
         assert!(matches!(add(0x01, [5, 6, 0, 2]), InsertResult::Added));
         assert!(matches!(add(0x02, [5, 6, 0, 3]), InsertResult::Ignored));
+    }
+
+    // Our id is 0x00..: the farthest bucket, index 0, holds the ids that
+    // start with a 1 bit, and holds bucket_limit(0) of them, 128.
+    const FAR: u8 = 128;
+
+    // The far node `i`, below FAR, each in a /24 of its own.
+    fn far(i: u8) -> (Id20, SocketAddr) {
+        assert_eq!(usize::from(FAR), super::bucket_limit(0));
+        (
+            Id20::new([0x80 | i; 20]),
+            SocketAddr::from(([5, 6, i, 1], 6881)),
+        )
+    }
+
+    // A far node none of `far` is, nor shares a /24 with.
+    fn other_far() -> (Id20, SocketAddr) {
+        let mut id = [0; 20];
+        id[0] = 0x90;
+        (Id20::new(id), SocketAddr::from(([6, 6, 0, 1], 6881)))
+    }
+
+    // The node `j` of the bucket `index` from the farthest, our id being
+    // 0x00..: its id has `index` 0 bits, then a 1. Each in a /24 of its own.
+    fn at(index: u8, j: u8) -> (Id20, SocketAddr) {
+        let mut id = [0; 20];
+        id[0] = 0x80 >> index;
+        id[1] = j;
+        (
+            Id20::new(id),
+            SocketAddr::from(([10 + index, 0, j, 1], 6881)),
+        )
+    }
+
+    // How many nodes each bucket holds, farthest first, ours last.
+    fn bucket_sizes(table: &RoutingTable) -> Vec<usize> {
+        let mut sizes: Vec<_> = table
+            .iter_buckets()
+            .map(|b| {
+                let ours = *b.start <= table.id() && table.id() <= *b.end_inclusive;
+                ((std::cmp::Reverse(b.bits), ours), b.leaf.nodes.len())
+            })
+            .collect();
+        sizes.sort();
+        sizes.into_iter().map(|(_, len)| len).collect()
+    }
+
+    // libtorrent `routing_table::bucket_limit` (routing_table.cpp:277-285,
+    // v2.0.15) with `dht_extended_routing_table` on: the farthest four
+    // buckets hold 128, 64, 32 and 16 nodes, every other 8. Offered 200
+    // nodes for each of the six farthest buckets, far first or near first,
+    // the table holds that many of each, and its count is its nodes'.
+    #[test]
+    fn test_the_far_buckets_hold_more() {
+        let want = vec![128, 64, 32, 16, 8, 8, 0];
+        for near_first in [false, true] {
+            let mut table = RoutingTable::new(Id20::new([0; 20]), None);
+            let mut indexes: Vec<u8> = (0..6).collect();
+            if near_first {
+                indexes.reverse();
+            }
+            for index in indexes {
+                for j in 0..200 {
+                    let (id, addr) = at(index, j);
+                    table.add_node(id, addr);
+                }
+            }
+            assert_eq!(bucket_sizes(&table), want, "near first: {near_first}");
+            assert_eq!(table.len(), want.iter().sum::<usize>());
+            assert_eq!(table.len(), table.iter().count());
+        }
+    }
+
+    // A split whose near half holds more than its limit splits again, and
+    // a far half past its limit keeps the nodes that answered: 128 nodes of
+    // the third bucket fill the root, then the first far node splits it
+    // down to that bucket, which keeps 32, every answered one among them.
+    // Of the rest, a bucket's worth wait as its replacements, those that
+    // answered first, and the others leave; the count of confirmed nodes
+    // follows.
+    #[test]
+    fn test_a_split_past_a_limit_keeps_the_nodes_that_answered() {
+        let now = std::time::Instant::now();
+        let mut table = RoutingTable::new(Id20::new([0; 20]), None);
+        // Every other one answers: 64 confirmed nodes.
+        for j in 0..128 {
+            let (id, addr) = at(2, j);
+            table.add_node(id, addr);
+            if j % 2 == 0 {
+                table.mark_response(&id, now);
+            }
+        }
+        assert_eq!(bucket_sizes(&table), vec![128]);
+        assert!(table.is_seeded());
+        let (id, addr) = at(0, 0);
+        table.add_node(id, addr);
+        assert_eq!(bucket_sizes(&table), vec![1, 0, 32, 0]);
+        assert_eq!(table.len(), 33);
+        assert_eq!(
+            table.iter().filter(|n| n.is_confirmed(now)).count(),
+            32,
+            "the 32 that answered stay"
+        );
+        assert_eq!(table.heard_of(), 8);
+        assert!(table.is_seeded());
+        // A node of that bucket that fails makes way for a replacement that
+        // answered.
+        let (gone, addr) = at(2, 0);
+        assert!(table.mark_error(&gone, addr));
+        assert_eq!(table.len(), 33);
+        assert!(!table.iter().any(|n| n.id == gone));
+    }
+
+    // A table saved by the code that kept 8 nodes a bucket: the root split
+    // once, its far half full with eight nodes, its near half holding three.
+    // It loads whole, and its far bucket has room for more.
+    #[test]
+    fn test_a_table_saved_with_eight_node_buckets_loads() {
+        use super::InsertResult;
+
+        let hex = |id: Id20| id.as_string();
+        let node = |(id, addr): (Id20, SocketAddr)| {
+            format!(
+                r#"{{"id":"{}","addr":"{addr}","status":"Unknown","errors_in_a_row":0}}"#,
+                hex(id)
+            )
+        };
+        let leaf = |nodes: Vec<(Id20, SocketAddr)>| {
+            let nodes: Vec<_> = nodes.into_iter().map(node).collect();
+            format!(
+                r#"{{"Leaf":{{"nodes":[{}],"last_refreshed":"1.5s"}}}}"#,
+                nodes.join(",")
+            )
+        };
+        let far_nodes: Vec<_> = (0..8).map(far).collect();
+        let near_nodes: Vec<_> = (0..3).map(|j| at(3, j)).collect();
+        let zero = hex(Id20::new([0; 20]));
+        let json = format!(
+            r#"{{"id":"{zero}","size":11,"buckets":{{"data":[
+                {{"bits":160,"start":"{zero}","end_inclusive":"{ff}","data":{{"LeftRight":[1,2]}}}},
+                {{"bits":159,"start":"{zero}","end_inclusive":"{left_end}","data":{near}}},
+                {{"bits":159,"start":"{right_start}","end_inclusive":"{ff}","data":{far}}}
+            ],"size":11,"max_size":512}}}}"#,
+            ff = hex(Id20::new([0xff; 20])),
+            left_end = "7fffffffffffffffffffffffffffffffffffffff",
+            right_start = "8000000000000000000000000000000000000000",
+            near = leaf(near_nodes.clone()),
+            far = leaf(far_nodes.clone()),
+        );
+        let saved: RoutingTable = serde_json::from_str(&json).unwrap();
+        let mut table = saved.of_family(true);
+        assert_eq!(table.len(), 11);
+        for (id, _) in far_nodes.iter().chain(&near_nodes) {
+            assert!(table.iter().any(|n| n.id == *id));
+        }
+        let (id, addr) = far(8);
+        assert!(matches!(table.add_node(id, addr), InsertResult::Added));
+    }
+
+    // A table saved with the far buckets full loads whole; a saved table
+    // larger than any the code makes, or one claiming a larger bound, loads
+    // within the bucket limits and DEFAULT_MAX_SIZE.
+    #[test]
+    fn test_a_larger_saved_table_loads_within_the_bounds() {
+        let mut table = RoutingTable::new(Id20::new([0; 20]), None);
+        for index in 0..6 {
+            for j in 0..200 {
+                let (id, addr) = at(index, j);
+                table.add_node(id, addr);
+            }
+        }
+        let json = serde_json::to_string(&table).unwrap();
+        let loaded = serde_json::from_str::<RoutingTable>(&json)
+            .unwrap()
+            .of_family(true);
+        // The same buckets, but for the empty one the extra nodes offered
+        // split off near our id.
+        let held = |t: &RoutingTable| {
+            let mut sizes = bucket_sizes(t);
+            sizes.retain(|&n| n > 0);
+            sizes
+        };
+        assert_eq!(held(&loaded), held(&table));
+        let ids = |t: &RoutingTable| t.iter().map(|n| n.id).collect::<Vec<_>>();
+        assert_eq!(ids(&loaded), ids(&table));
+
+        // One bucket of 4096 nodes of every distance, and a bound of a
+        // million: rebuilt, at most DEFAULT_MAX_SIZE, each bucket within its
+        // limit.
+        let nodes: Vec<String> = (0..4096u32)
+            .map(|i| {
+                let mut id = [0u8; 20];
+                id[..4].copy_from_slice(&i.wrapping_mul(0x9e37_79b9).to_be_bytes());
+                id[4..8].copy_from_slice(&i.to_be_bytes());
+                let [_, _, a, b] = i.to_be_bytes();
+                format!(
+                    r#"{{"id":"{}","addr":"20.{a}.{b}.1:6881"}}"#,
+                    Id20::new(id).as_string()
+                )
+            })
+            .collect();
+        let json = format!(
+            r#"{{"id":"{zero}","size":4096,"buckets":{{"data":[{{"bits":160,"start":"{zero}","end_inclusive":"{ff}","data":{{"Leaf":{{"nodes":[{}]}}}}}}],"size":4096,"max_size":1000000}}}}"#,
+            nodes.join(","),
+            zero = Id20::new([0; 20]).as_string(),
+            ff = Id20::new([0xff; 20]).as_string(),
+        );
+        let saved: RoutingTable = serde_json::from_str(&json).unwrap();
+        assert_eq!(saved.iter().count(), 4096);
+        let loaded = saved.of_family(true);
+        assert!(loaded.len() <= RoutingTable::DEFAULT_MAX_SIZE);
+        assert_eq!(loaded.len(), loaded.iter().count());
+        for b in loaded.iter_buckets() {
+            let node = loaded
+                .buckets
+                .data
+                .iter()
+                .find(|n| n.start == *b.start)
+                .unwrap();
+            assert!(b.leaf.nodes.len() <= node.limit(&loaded.id()));
+        }
+        // The cap is reached only past 38 buckets (see DEFAULT_MAX_SIZE):
+        // these 4096 nodes fill far fewer.
+        assert!(loaded.len() < RoutingTable::DEFAULT_MAX_SIZE);
     }
 
     // Our id is 0x00..; the far bucket is 0x80.. once the root splits. The
@@ -1402,31 +1749,26 @@ mod tests {
         use super::InsertResult;
 
         let mut table = RoutingTable::new(Id20::new([0; 20]), None);
-        for i in 0..8 {
-            table.add_node(
-                Id20::new([0x80 + i; 20]),
-                SocketAddr::from(([5, 6, i, 1], 6881)),
-            );
+        for i in 0..FAR {
+            let (id, addr) = far(i);
+            table.add_node(id, addr);
         }
-        // A near node splits the root: the eight far ones are a bucket of
+        // A near node splits the root: the FAR far ones are a bucket of
         // their own, full, without our id.
         table.add_node(
             Id20::new([0x01; 20]),
             SocketAddr::from(([5, 7, 0, 1], 6881)),
         );
-        assert_eq!(table.len(), 9);
-        let far = Id20::new([0x90; 20]);
-        assert!(matches!(
-            table.add_node(far, SocketAddr::from(([5, 6, 9, 1], 6881))),
-            InsertResult::Ignored
-        ));
+        assert_eq!(table.len(), usize::from(FAR) + 1);
+        let (new, addr) = other_far();
+        assert!(matches!(table.add_node(new, addr), InsertResult::Ignored));
         bad(&mut table, Id20::new([0x83; 20]));
         assert!(matches!(
-            table.add_node(far, SocketAddr::from(([5, 6, 9, 1], 6881))),
+            table.add_node(new, addr),
             InsertResult::ReplacedBad(_)
         ));
-        assert_eq!(table.len(), 9);
-        assert!(table.iter().any(|n| n.id == far));
+        assert_eq!(table.len(), usize::from(FAR) + 1);
+        assert!(table.iter().any(|n| n.id == new));
     }
 
     // An IPv4 address written as IPv6 is no node: it neither enters the
@@ -1497,16 +1839,11 @@ mod tests {
 
         let now = std::time::Instant::now();
         let mut table = RoutingTable::new(Id20::new([0; 20]), None);
-        for i in 0..8 {
-            table.add_node(
-                Id20::new([0x80 + i; 20]),
-                SocketAddr::from(([5, 6, i, 1], 6881)),
-            );
+        for i in 0..FAR {
+            let (id, addr) = far(i);
+            table.add_node(id, addr);
         }
-        let far = (
-            Id20::new([0x90; 20]),
-            SocketAddr::from(([6, 6, 0, 1], 6881)),
-        );
+        let far = other_far();
         let near = Id20::new([0x02; 20]);
         table.heard_about(far.0, far.1);
         table.heard_about(near, SocketAddr::from(([6, 7, 0, 1], 6881)));
@@ -1529,7 +1866,7 @@ mod tests {
         let failed = Id20::new([0x83; 20]);
         bad(&mut table, failed);
         assert!(!table.iter().any(|n| n.id == failed));
-        assert_eq!(table.len(), 8);
+        assert_eq!(table.len(), usize::from(FAR));
         let next = table.next_refresh(now).unwrap();
         assert_eq!((next.id, next.ping), (far.0, false));
         assert!(matches!(table.add_node(far.0, far.1), InsertResult::Added));
@@ -1546,10 +1883,7 @@ mod tests {
 
         let now = std::time::Instant::now();
         let mut table = full_far_bucket(now);
-        let far = (
-            Id20::new([0x90; 20]),
-            SocketAddr::from(([6, 6, 0, 1], 6881)),
-        );
+        let far = other_far();
         // Heard of, then answering a query of ours: the full bucket has no
         // room for it, so it waits among the replacements.
         assert!(table.heard_about(far.0, far.1));
@@ -1565,20 +1899,18 @@ mod tests {
         assert!(!table.iter().any(|n| n.id == failed));
         let node = table.iter().find(|n| n.id == far.0).unwrap();
         assert!(node.is_confirmed(now));
-        assert_eq!(table.len(), 9);
+        assert_eq!(table.len(), usize::from(FAR) + 1);
         assert_eq!(table.entries(), entered + 1);
         assert_eq!(table.heard_of(), 0);
     }
 
-    // The eight far nodes 0x80.. and the near node 0x01, all answered: the
+    // The FAR far nodes 0x80.. and the near node 0x01, all answered: the
     // far bucket is full and cannot split.
     fn full_far_bucket(now: std::time::Instant) -> RoutingTable {
         let mut table = RoutingTable::new(Id20::new([0; 20]), None);
-        for i in 0..8 {
-            table.add_node(
-                Id20::new([0x80 + i; 20]),
-                SocketAddr::from(([5, 6, i, 1], 6881)),
-            );
+        for i in 0..FAR {
+            let (id, addr) = far(i);
+            table.add_node(id, addr);
         }
         table.add_node(
             Id20::new([0x01; 20]),
@@ -1588,7 +1920,7 @@ mod tests {
         for id in &ids {
             table.mark_response(id, now);
         }
-        assert_eq!(table.len(), 9);
+        assert_eq!(table.len(), usize::from(FAR) + 1);
         table
     }
 
@@ -1675,13 +2007,13 @@ mod tests {
         assert!(table.mark_error(&Id20::new([0x83; 20]), addr_of(3)));
         assert!(table.mark_error(&Id20::new([0x85; 20]), addr_of(5)));
         assert!(table.mark_error(&Id20::new([0x85; 20]), addr_of(5)));
-        let new = Id20::new([0x90; 20]);
-        match table.add_node(new, SocketAddr::from(([6, 6, 0, 1], 6881))) {
+        let (new, addr) = other_far();
+        match table.add_node(new, addr) {
             InsertResult::ReplacedBad(gone) => assert_eq!(gone.id, Id20::new([0x85; 20])),
             other => panic!("{other:?}"),
         }
         assert!(table.iter().any(|n| n.id == Id20::new([0x83; 20])));
-        assert_eq!(table.len(), 9);
+        assert_eq!(table.len(), usize::from(FAR) + 1);
     }
 
     // Each node of the table is refreshed in turn: one never asked first,

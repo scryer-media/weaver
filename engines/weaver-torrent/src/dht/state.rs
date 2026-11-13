@@ -141,8 +141,12 @@ const BOOTSTRAP_RETRY_MIN: Duration = Duration::from_secs(5);
 const EARLY_SEARCH_MIN: Duration = Duration::from_secs(30);
 // The early searches the torrents of a family may start for each time its
 // table grows: a growth wakes the torrents waiting on it, and this many
-// search; the rest wait for the next growth.
-const EARLY_SEARCHES_PER_GROWTH: usize = WALKS_AT_ONCE;
+// search; the rest wait for the next growth. This paces the searches made
+// again ahead of a torrent's turn, so a table that grows node by node does
+// not set every short torrent searching at each growth; it does not decide
+// how many searches walk at once, which the query budget does (see
+// `DhtState::admit_walk`).
+const EARLY_SEARCHES_PER_GROWTH: usize = 16;
 // The least time between two growths that nodes entering the table make:
 // the first node to enter makes one at once, and the nodes that enter in
 // the next GROWTH_SPACING make one between them as it ends. libtorrent
@@ -489,6 +493,59 @@ impl Clock for TokioClock {
 type RateLimiter =
     governor::RateLimiter<NotKeyed, InMemoryState, TokioClock, NoOpMiddleware<Nanos>>;
 
+// How the torrents' peer searches are let in to walk: by the query budget,
+// the global rate limiter, with no count of their own (see
+// `DhtState::admit_walk`).
+#[derive(Debug)]
+struct WalkAdmission {
+    // The searches waiting to walk, in line: the first holds its one permit.
+    door: tokio::sync::Semaphore,
+    // The queries waiting on the rate limiter now (see `take_budget`).
+    queries_waiting: AtomicUsize,
+    // Rung as `queries_waiting` falls to 0.
+    budget_free: tokio::sync::Notify,
+    // The searches walking now.
+    open: AtomicUsize,
+}
+
+impl WalkAdmission {
+    fn new() -> Self {
+        Self {
+            door: tokio::sync::Semaphore::new(1),
+            queries_waiting: AtomicUsize::new(0),
+            budget_free: tokio::sync::Notify::new(),
+            open: AtomicUsize::new(0),
+        }
+    }
+}
+
+// A query counted in `WalkAdmission::queries_waiting` while it waits.
+struct BudgetWait<'a>(&'a WalkAdmission);
+
+impl<'a> BudgetWait<'a> {
+    fn enter(admission: &'a WalkAdmission) -> Self {
+        admission.queries_waiting.fetch_add(1, Ordering::AcqRel);
+        Self(admission)
+    }
+}
+
+impl Drop for BudgetWait<'_> {
+    fn drop(&mut self) {
+        if self.0.queries_waiting.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.budget_free.notify_waiters();
+        }
+    }
+}
+
+// A search let in to walk, counted in `WalkAdmission::open` until dropped.
+struct OpenWalk<'a>(&'a WalkAdmission);
+
+impl Drop for OpenWalk<'_> {
+    fn drop(&mut self) {
+        self.0.open.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 // Resolves once the limiter lets one more request out.
 async fn until_ready(limiter: &RateLimiter) {
     while let Err(not_until) = limiter.check() {
@@ -722,8 +779,8 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
 
     // One search at a time, from the table (see `start`): the first as soon
     // as the torrent asks for peers, the family's first bootstrap has been
-    // sent (see `DhtState::bootstrap_sent_v4`) and one of the DHT's
-    // WALKS_AT_ONCE turns is free, then one at the torrent's own point in
+    // sent (see `DhtState::bootstrap_sent_v4`) and the query budget lets it
+    // in (see `DhtState::admit_walk`), then one at the torrent's own point in
     // the interval (see `announce_slot`) and one every
     // DHT_ANNOUNCE_INTERVAL after. Each announces us when it
     // ends (libtorrent `torrent::start_announcing` asks
@@ -769,12 +826,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
                     next_entered.as_mut().enable();
                     let mut next_router = std::pin::pin!(self.dht.routers_known.notified());
                     next_router.as_mut().enable();
-                    let turn = self
-                        .dht
-                        .walks
-                        .acquire()
-                        .await
-                        .expect("the DHT's walk turns are never closed");
+                    let turn = self.dht.admit_walk().await;
                     // Before the search starts: a growth from here on is
                     // one it did not start from.
                     let seen = growth.generation.load(Ordering::Acquire);
@@ -1430,17 +1482,11 @@ pub struct DhtState {
     // BEP 5 "v": sent with every outgoing message when set.
     client_version: Option<ByteBufOwned>,
 
-    // The torrents' peer searches walking at once; the rest wait their
-    // turn, so a session that starts ten thousand torrents does not walk
-    // for all of them in its first seconds.
-    walks: tokio::sync::Semaphore,
+    // Lets the torrents' peer searches in to walk as the query budget has
+    // room (see `admit_walk`), so a session that starts ten thousand
+    // torrents does not walk for all of them in its first seconds.
+    walk_admission: WalkAdmission,
 }
-
-// libtorrent queues the torrents that want a DHT announce now
-// (`session_impl::prioritize_dht`) and starts one per `on_dht_announce`;
-// this keeps a few walking at once instead, so a lone torrent added to an
-// idle session starts at once.
-const WALKS_AT_ONCE: usize = 16;
 
 impl DhtState {
     fn new_internal(
@@ -1479,7 +1525,7 @@ impl DhtState {
             send_guard: Arc::new(SendGuard::new()),
             cancellation_token,
             client_version,
-            walks: tokio::sync::Semaphore::new(WALKS_AT_ONCE),
+            walk_admission: WalkAdmission::new(),
         }
     }
 
@@ -1857,11 +1903,78 @@ impl DhtState {
         Ok(())
     }
 
+    // Resolves once the rate limiter lets one more query out. A query that
+    // has to wait is counted in `queries_waiting` while it does, which holds
+    // back the searches waiting to walk (see `admit_walk`); one that finds a
+    // token at once is not counted and wakes no one.
+    async fn take_budget(&self) {
+        if self.rate_limiter.check().is_ok() {
+            return;
+        }
+        let _waiting = BudgetWait::enter(&self.walk_admission);
+        until_ready(&self.rate_limiter).await;
+    }
+
+    // Lets a torrent's peer search in to walk, once the query budget has
+    // room: the global rate limiter has a token and no query is waiting on
+    // it. The searches waiting are let in one at a time in the order they
+    // came (`door` is a fair semaphore of one), and each one let in spends a
+    // token, so no more are let in than the limiter allows. So the queries of
+    // the searches already walking always come before a new search: while
+    // one of them waits on the limiter, none is let in. A search whose
+    // candidates all wait on their addresses' send windows has no query on
+    // the limiter, so it holds no one back. The search waiting first is woken
+    // as the last query waiting on the limiter is sent, or, with none
+    // waiting and the limiter spent, as the limiter's next token comes; with
+    // no search waiting, nothing runs.
+    // In flight: every query sent took a token and is answered or given up
+    // within RESPONSE_TIMEOUT, so at most the limiter's burst and
+    // RESPONSE_TIMEOUT of its rate are in flight, 250 + 250 * 15 = 4000 at
+    // the default 250 a second; each search adds at most SEARCH_BRANCHING
+    // (more only for queries sent SHORT_TIMEOUT ago) waiting to be sent.
+    // Walking: as a search is let in, every search walking has a query in
+    // flight or candidates deferred, and each of those spent a token in the
+    // last 2 * RESPONSE_TIMEOUT (a deferred candidate gives up
+    // RESPONSE_TIMEOUT after it was deferred, which is at most
+    // RESPONSE_TIMEOUT after the walk's last query was sent, or after it was
+    // let in), so at most 250 + 250 * 30 = 7750 searches walk at once.
+    // libtorrent has no such bound: it starts one torrent's announce per
+    // `dht_announce_interval / torrents`, at most 4 s apart while torrents
+    // wait to announce at once (`session_impl::update_dht_announce_interval`,
+    // session_impl.cpp:6632-6670, v2.0.15), however many are walking.
+    async fn admit_walk(&self) -> OpenWalk<'_> {
+        let admission = &self.walk_admission;
+        let _door = admission
+            .door
+            .acquire()
+            .await
+            .expect("the DHT's walk door is never closed");
+        loop {
+            let mut free = std::pin::pin!(admission.budget_free.notified());
+            free.as_mut().enable();
+            if admission.queries_waiting.load(Ordering::Acquire) == 0 {
+                match self.rate_limiter.check() {
+                    Ok(()) => break,
+                    Err(not_until) => {
+                        tokio::time::sleep(
+                            not_until.wait_time_from(self.rate_limiter.clock().now()),
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+            }
+            free.await;
+        }
+        admission.open.fetch_add(1, Ordering::AcqRel);
+        OpenWalk(admission)
+    }
+
     // A query no answer is waited for (an announce_peer), sent once its
     // address's send window and the rate limiter have room.
     async fn send_unanswered(&self, request: Request, addr: SocketAddr) {
         let slot = self.send_slot(addr.ip()).await;
-        until_ready(&self.rate_limiter).await;
+        self.take_budget().await;
         let (tid, message) = self.create_request(request, addr);
         let datagram = WorkerSendRequest {
             our_tid: Some(tid),
@@ -1898,7 +2011,7 @@ impl DhtState {
         // request never outlives the search that wanted it.
         let (tid, message) = self.create_request(request, addr);
         let (_outstanding, answer) = Outstanding::register(self, (tid, addr));
-        until_ready(&self.rate_limiter).await;
+        self.take_budget().await;
         trace!("sending {message:?}");
         self.hand_off(
             WorkerSendRequest {
@@ -4937,7 +5050,8 @@ mod tests {
     }
 
     // A table `buckets` buckets past the farthest, each a full bucket of
-    // nodes that answered, each node in its own /24.
+    // nodes that answered (128, 64, 32, 16, then 8: see
+    // `routing_table::bucket_limit`), each node in its own /24.
     fn fill_deep_table(
         dht: &DhtState,
         buckets: u8,
@@ -4945,7 +5059,8 @@ mod tests {
         let mut table = dht.routing_table_v4.write();
         let mut nodes = Vec::new();
         for bit in 0..=buckets {
-            for n in 0..8u8 {
+            let full = crate::dht::routing_table::bucket_limit(usize::from(bit));
+            for n in 0..u8::try_from(full).unwrap() {
                 let id = id_in_bucket(dht.id, bit, n);
                 let addr = SocketAddr::from(([10, bit + 1, n + 1, 1], 6881));
                 table.add_node(id, addr);
@@ -4976,7 +5091,8 @@ mod tests {
         {
             let mut table = dht.routing_table_v4.write();
             for bit in 0..=5 {
-                for n in 0..8u8 {
+                let full = crate::dht::routing_table::bucket_limit(usize::from(bit));
+                for n in 0..u8::try_from(full).unwrap() {
                     table.add_node(
                         id_in_bucket(dht.id, bit, n),
                         SocketAddr::from(([10, bit + 1, n + 1, 1], 6881)),
@@ -5459,8 +5575,18 @@ mod tests {
         // The first round of the refresh times out; the second, at 20 s,
         // grows the table.
         assert_eq!(first_growth, RESPONSE_TIMEOUT + super::BOOTSTRAP_RETRY_MIN);
+        // Each moment's searches start as the query budget lets them in,
+        // two tokens each (the search let in and its query to the router):
+        // all within 100 ms of it.
+        let moments = [Duration::ZERO, EARLY_SEARCH_MIN, second_growth];
+        let mut by_moment = BTreeMap::<Duration, usize>::new();
+        for (at, n) in &searched {
+            let moment = *moments.iter().rev().find(|m| *m <= at).unwrap();
+            assert!(*at - moment < Duration::from_millis(100), "{searched:?}");
+            *by_moment.entry(moment).or_default() += n;
+        }
         assert_eq!(
-            searched,
+            by_moment,
             BTreeMap::from([
                 (Duration::ZERO, 20),
                 (EARLY_SEARCH_MIN, EARLY_SEARCHES_PER_GROWTH),
@@ -5829,17 +5955,18 @@ mod tests {
     // the table. Inside every limit:
     // - that growth lets EARLY_SEARCHES_PER_GROWTH torrents search again, and
     //   no more come before the next growth;
-    // - no more than WALKS_AT_ONCE walks run at once (each has all its
-    //   queries outstanding until it ends: four in the first searches,
-    //   three in the second);
+    // - the searches walking at once and the queries outstanding stay inside
+    //   what the query budget allows (see `DhtState::admit_walk`): with 20 a
+    //   second, no more than 20 + 20 * 30 = 620 walking, and no more than
+    //   20 + 20 * 15 = 320 sent and in flight, with the four of the search
+    //   let in last still waiting to be sent; the second searches, at most
+    //   EARLY_SEARCHES_PER_GROWTH, have three or four each;
     // - every query waits on the global rate limiter, here 20 a second with
     //   a burst of 20, so by any time t no more than 20 + t / 50 ms went;
     // - no address is sent more than SEND_LIMIT in any WINDOW.
     #[tokio::test(start_paused = true)]
     async fn test_torrents_waiting_for_a_seeded_table_search_again_inside_every_limit() {
-        use super::{
-            EARLY_SEARCHES_PER_GROWTH, RateLimiter, SEARCH_MIN_SEEDS, TokioClock, WALKS_AT_ONCE,
-        };
+        use super::{EARLY_SEARCHES_PER_GROWTH, RateLimiter, SEARCH_MIN_SEEDS, TokioClock};
         use crate::core::hash_id::Id20;
         use crate::dht::send_windows::SEND_LIMIT;
         use std::{
@@ -5896,27 +6023,48 @@ mod tests {
         };
         let walks_ended = || {
             dht.get_stats().outstanding_requests == 0
-                && dht.walks.available_permits() == WALKS_AT_ONCE
+                && dht
+                    .walk_admission
+                    .open
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == 0
+                && dht.walk_admission.door.available_permits() == 1
         };
+        let open = || {
+            dht.walk_admission
+                .open
+                .load(std::sync::atomic::Ordering::Acquire)
+        };
+        let mut most_open = 0;
 
         // The first searches: the first ones ask the three nodes and the
         // router. The three, never answered, fail at their first short
         // timeout and leave the table, so the later ones ask the router
-        // alone.
+        // alone, until the router's send window is full: a search whose
+        // router waits on it past RESPONSE_TIMEOUT ends with nothing sent.
+        // The phase is over once every torrent's search was let in and
+        // ended: none waits at the door and none walks.
         let mut first = Vec::new();
         let mut most_in_flight = 0;
-        let mut searched = BTreeSet::new();
-        while searched.len() < usize::from(TORRENTS) {
-            let request = record(sent.recv().await.unwrap());
-            searched.insert(request.2);
-            first.push(request);
+        // Each query is taken as it is sent, so its time is when it went.
+        loop {
+            tokio::select! {
+                biased;
+                Some(request) = sent.recv() => first.push(record(request)),
+                () = tokio::time::sleep(Duration::from_millis(50)) => {
+                    if walks_ended() {
+                        break;
+                    }
+                }
+            }
             most_in_flight = most_in_flight.max(dht.get_stats().outstanding_requests);
+            most_open = most_open.max(open());
         }
-        while !walks_ended() {
-            tokio::time::advance(Duration::from_millis(50)).await;
-            assert!(sent.try_recv().is_err());
-        }
-        assert_eq!(most_in_flight, 4 * WALKS_AT_ONCE);
+        // The budget held them, not a count: far more than
+        // EARLY_SEARCHES_PER_GROWTH walked at once.
+        assert!(most_open > EARLY_SEARCHES_PER_GROWTH, "{most_open}");
+        assert!(most_open <= 20 + 20 * 30, "{most_open}");
+        assert!(most_in_flight <= 20 + 20 * 15 + 4, "{most_in_flight}");
         assert_eq!(dht.routing_table_v4.read().len(), 0);
 
         // The three nodes answer, and enter the table again: it is seeded,
@@ -5946,31 +6094,249 @@ mod tests {
         }
 
         // EARLY_SEARCHES_PER_GROWTH torrents searched again, each from the
-        // three nodes alone.
+        // three nodes: alone for the ones let in at the growth, and with the
+        // router for the ones let in after the three, silent again, failed
+        // their first queries and the table no longer counted on them.
         let mut by_torrent: HashMap<Id20, BTreeSet<SocketAddr>> = HashMap::new();
         for (_, addr, info_hash) in &again {
             assert!(by_torrent.entry(*info_hash).or_default().insert(*addr));
         }
         assert_eq!(by_torrent.len(), EARLY_SEARCHES_PER_GROWTH);
         let nodes: BTreeSet<_> = restored.iter().map(|n| SocketAddr::V4(n.1)).collect();
-        assert!(by_torrent.values().all(|asked| *asked == nodes));
-        assert!(most_in_flight <= 3 * WALKS_AT_ONCE);
+        let with_router: BTreeSet<_> = nodes.iter().copied().chain([router]).collect();
+        assert!(
+            by_torrent
+                .values()
+                .all(|asked| *asked == nodes || *asked == with_router)
+        );
+        let at_growth: BTreeSet<_> = again
+            .iter()
+            .filter(|s| s.0 == again[0].0)
+            .map(|s| s.2)
+            .collect();
+        assert!(!at_growth.is_empty());
+        assert!(at_growth.iter().all(|t| by_torrent[t] == nodes));
+        assert!(most_in_flight <= 4 * EARLY_SEARCHES_PER_GROWTH);
 
-        // The global rate limiter, over both phases.
-        // It held queries back: some went the moment its bucket allowed.
-        let all: Vec<_> = first.iter().chain(&again).collect();
+        // The global rate limiter, over both phases: every query sent and
+        // every search let in spent a token, and each torrent seen sending
+        // in a phase was let in once in it before its first query. It held
+        // them back: some went the moment its bucket allowed.
+        let all = first
+            .iter()
+            .map(|s| (0, s))
+            .chain(again.iter().map(|s| (1, s)));
+        let mut let_in = BTreeSet::new();
         let mut held = 0;
-        for (k, (at, _, _)) in all.iter().enumerate() {
+        let mut times = Vec::new();
+        for (k, (phase, (at, addr, info_hash))) in all.enumerate() {
+            let_in.insert((phase, *info_hash));
+            let spent = (k + 1 + let_in.len()) as u128;
             let tokens =
                 per_second as u128 + (*at - start).as_millis() / (1000 / per_second as u128);
-            assert!((k as u128) < tokens, "query {k} at {:?}", *at - start);
-            held += usize::from(k as u128 + 1 == tokens);
+            assert!(spent <= tokens, "query {k} at {:?}", *at - start);
+            held += usize::from(spent == tokens);
+            times.push((*at, *addr));
         }
         assert!(held > 0);
         // Each address's send window.
         for addr in nodes.iter().chain([&router]) {
-            let times: Vec<_> = all.iter().filter(|s| s.1 == *addr).map(|s| s.0).collect();
+            let times: Vec<_> = times.iter().filter(|s| s.1 == *addr).map(|s| s.0).collect();
             assert!(most_in_any_window(&times) <= SEND_LIMIT);
+        }
+    }
+
+    // A torrent's peer search, for `info_hash`, that never yields peers.
+    fn peer_search(
+        dht: &Arc<DhtState>,
+        info_hash: crate::core::hash_id::Id20,
+    ) -> tokio::task::JoinHandle<()> {
+        Arc::new(super::RecursiveRequest::get_peers(
+            dht.clone(),
+            info_hash,
+            None,
+            tokio::sync::mpsc::unbounded_channel().0,
+        ))
+        .request_peers_forever(true)
+    }
+
+    fn walking(dht: &DhtState) -> usize {
+        dht.walk_admission
+            .open
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    // A lone torrent added to an idle DHT walks at once: its first query
+    // goes out the moment it asks for peers.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_lone_torrent_walks_at_once() {
+        let (dht, mut sent) = fixture_dht();
+        let (id, addr) = node_at(1, [10, 0, 1, 1]);
+        dht.routing_table_v4
+            .write()
+            .add_node(id, SocketAddr::V4(addr));
+        let start = tokio::time::Instant::now();
+        let task = peer_search(&dht, crate::core::hash_id::Id20::new([0xf0; 20]));
+        let request = sent.recv().await.unwrap();
+        assert_eq!(request.addr, SocketAddr::V4(addr));
+        assert_eq!(tokio::time::Instant::now(), start);
+        assert_eq!(walking(&dht), 1);
+        task.abort();
+    }
+
+    // Sixteen torrents walk with the send window of every node they would
+    // ask full: each waits on the windows, with no query on the rate
+    // limiter. A seventeenth, whose nodes have room, is let in and sends at
+    // once: a walk that can only wait holds no one back.
+    #[tokio::test(start_paused = true)]
+    async fn test_walks_that_can_only_wait_hold_no_one_back() {
+        use crate::dht::send_windows::SEND_LIMIT;
+
+        let (dht, mut sent) = fixture_dht();
+        // Two groups of eight nodes, far apart: each torrent's eight closest
+        // are one group.
+        let a = |j: u8| node_at(u32::from(j), [10, 1, j, 1]);
+        let b = |j: u8| node_at(0x8000_0000 | u32::from(j), [10, 2, j, 1]);
+        {
+            let mut table = dht.routing_table_v4.write();
+            for j in 0..8 {
+                for (id, addr) in [a(j), b(j)] {
+                    table.add_node(id, SocketAddr::V4(addr));
+                }
+            }
+            assert_eq!(table.len(), 16);
+        }
+        for j in 0..8 {
+            for _ in 0..SEND_LIMIT {
+                dht.send_guard.record(std::net::IpAddr::V4(*a(j).1.ip()));
+            }
+        }
+        let start = tokio::time::Instant::now();
+        let mut tasks: Vec<_> = (0..16)
+            .map(|i| peer_search(&dht, node_at(1000 + i, [0; 4]).0))
+            .collect();
+        while walking(&dht) < 16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(sent.try_recv().is_err());
+        tasks.push(peer_search(&dht, node_at(0x8000_0000 | 1000, [0; 4]).0));
+        let request = sent.recv().await.unwrap();
+        assert_eq!(tokio::time::Instant::now(), start);
+        assert!((0..8).any(|j| request.addr == SocketAddr::V4(b(j).1)));
+        assert_eq!(walking(&dht), 17);
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    // Three torrents ask for peers in turn, with the rate limiter at 5 a
+    // second and a burst of 5, on a table of five nodes that answer every
+    // query naming nothing: each walk asks the five and ends as they
+    // answer. The first is let in and sends four at once; its fifth waits
+    // on the limiter, so the second and third wait too. Each is let in only
+    // once every query of the walks before it was sent, and in the order
+    // they asked; every search let in and every query sent spends a token.
+    #[tokio::test(start_paused = true)]
+    async fn test_walks_are_let_in_in_order_once_the_open_ones_have_sent() {
+        use super::{RateLimiter, TokioClock};
+        use std::{collections::HashMap, num::NonZeroU32};
+
+        let (mut state, mut sent) = fixture_state();
+        let start = tokio::time::Instant::now();
+        state.rate_limiter = RateLimiter::direct_with_clock(
+            governor::Quota::per_second(NonZeroU32::new(5).unwrap()),
+            TokioClock { start },
+        );
+        let dht = Arc::new(state);
+        let nodes: HashMap<SocketAddr, crate::core::hash_id::Id20> = (0..5u8)
+            .map(|j| {
+                let (id, addr) = node_at(u32::from(j), [10, 1, j, 1]);
+                (SocketAddr::V4(addr), id)
+            })
+            .collect();
+        {
+            let mut table = dht.routing_table_v4.write();
+            for (addr, id) in &nodes {
+                table.add_node(*id, *addr);
+            }
+        }
+        let hashes: Vec<_> = (0..3).map(|i| node_at(1000 + i, [0; 4]).0).collect();
+        let tasks: Vec<_> = hashes.iter().map(|h| peer_search(&dht, *h)).collect();
+        let mut sends = Vec::new();
+        while sends.len() < 15 {
+            let request = sent.recv().await.unwrap();
+            let MessageKind::GetPeersRequest(g) = &request.message.kind else {
+                panic!("not a get_peers: {:?}", request.message.kind);
+            };
+            sends.push((tokio::time::Instant::now(), g.info_hash));
+            reply(&dht, &request, nodes[&request.addr], &[], &[]);
+        }
+        let order: Vec<_> = sends.iter().map(|s| s.1).collect();
+        let expected: Vec<_> = hashes.iter().flat_map(|h| [*h; 5]).collect();
+        assert_eq!(order, expected);
+        for (k, (at, _)) in sends.iter().enumerate() {
+            let spent = (k + 1 + k / 5 + 1) as u128;
+            assert!(spent <= 5 + (*at - start).as_millis() / 200, "query {k}");
+        }
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    // 10,000 torrents ask for peers at once, with the default query budget
+    // (250 a second, 25 to start with) and one router that never answers.
+    // The router's send window fills, so most searches have nothing to
+    // send and end RESPONSE_TIMEOUT after they were let in. Every search let
+    // in spends a token, so by any time t no more than 25 + 250 t were, and
+    // at no time do more walk, or more queries wait for an answer, than the
+    // budget allows: 250 + 250 * 30 = 7750 walking, 250 + 250 * 15 = 4000 in
+    // flight. A torrent not let in yet holds no search state: its
+    // candidates are made as it is let in. Every torrent is let in, and
+    // once the last search ends none walks.
+    #[tokio::test(start_paused = true)]
+    async fn test_ten_thousand_torrents_walk_inside_the_query_budget() {
+        use crate::dht::send_windows::SEND_LIMIT;
+
+        const TORRENTS: u32 = 10_000;
+        let (dht, mut sent) = fixture_dht();
+        let router = SocketAddr::from(ROUTER);
+        dht.add_routers(&[router]);
+        let start = tokio::time::Instant::now();
+        let tasks: Vec<_> = (0..TORRENTS)
+            .map(|i| {
+                let mut hash = [0xf0; 20];
+                hash[1..4].copy_from_slice(&i.to_be_bytes()[1..]);
+                let info_hash = crate::core::hash_id::Id20::new(hash);
+                // The torrent's own turn is far past this test.
+                assert!(super::announce_slot(&info_hash) > Duration::from_secs(600));
+                peer_search(&dht, info_hash)
+            })
+            .collect();
+        let mut most_walking = 0;
+        let mut sends = Vec::new();
+        loop {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            while let Ok(request) = sent.try_recv() {
+                assert_eq!(request.addr, router);
+                sends.push(tokio::time::Instant::now());
+            }
+            let t = (tokio::time::Instant::now() - start).as_millis();
+            let now_walking = walking(&dht);
+            most_walking = most_walking.max(now_walking);
+            assert!(
+                now_walking as u128 <= 25 + 250 * t / 1000,
+                "{now_walking} at {t} ms"
+            );
+            assert!(now_walking <= 250 + 250 * 30, "{now_walking}");
+            assert!(dht.get_stats().outstanding_requests <= 250 + 250 * 15);
+            if now_walking == 0 && dht.walk_admission.door.available_permits() == 1 {
+                break;
+            }
+        }
+        assert!(most_walking > 1000, "{most_walking}");
+        assert!(most_in_any_window(&sends) <= SEND_LIMIT);
+        for task in tasks {
+            task.abort();
         }
     }
 
@@ -6109,7 +6475,7 @@ mod tests {
             table.mark_response(&id, std::time::Instant::now());
         };
 
-        // Forty-eight nodes enter at once.
+        // The six farthest buckets' nodes enter at once.
         let at = {
             let grew = growth.grew.notified();
             let mut grew = std::pin::pin!(grew);
@@ -6120,7 +6486,10 @@ mod tests {
                 () = grew => tokio::time::Instant::now() - start,
             }
         };
-        assert_eq!(dht.routing_table_v4.read().entries(), 48);
+        assert_eq!(
+            dht.routing_table_v4.read().entries(),
+            128 + 64 + 32 + 16 + 8 + 8
+        );
         assert_eq!(at, Duration::ZERO);
         assert_eq!(growth.generation.load(Ordering::Acquire), 1);
         assert_eq!(growth.turns.available_permits(), EARLY_SEARCHES_PER_GROWTH);
@@ -6133,7 +6502,10 @@ mod tests {
                 enter(bit, n);
             }
         }
-        assert_eq!(dht.routing_table_v4.read().entries(), 56);
+        assert_eq!(
+            dht.routing_table_v4.read().entries(),
+            128 + 64 + 32 + 16 + 8 + 8 + 4 + 4
+        );
         assert_eq!(growth.generation.load(Ordering::Acquire), 1);
         assert_eq!(next_growth!(), GROWTH_SPACING);
         assert_eq!(growth.generation.load(Ordering::Acquire), 2);
@@ -6326,14 +6698,15 @@ mod tests {
         table.mark_outgoing_request(&bad, std::time::Instant::now());
         let addr = table.iter().find(|n| n.id() == bad).unwrap().addr();
         table.mark_error(&bad, addr);
-        assert_eq!(table.len(), 16);
-        let new = id_in_bucket(dht.id, 0, 9);
+        let full = 128 + 64;
+        assert_eq!(table.len(), full);
+        let new = id_in_bucket(dht.id, 0, 200);
         assert!(matches!(
-            table.add_node(new, SocketAddr::from(([10, 1, 10, 1], 6881))),
+            table.add_node(new, SocketAddr::from(([10, 1, 201, 1], 6881))),
             InsertResult::ReplacedBad(_)
         ));
-        assert_eq!(table.iter().count(), 16);
-        assert_eq!(table.len(), 16);
+        assert_eq!(table.iter().count(), full);
+        assert_eq!(table.len(), full);
     }
 
     // A datagram too long for the buffer, which a socket carried through a

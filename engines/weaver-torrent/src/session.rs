@@ -310,6 +310,12 @@ struct AnnouncePort {
     set: Option<u16>,
     mapped: parking_lot::Mutex<MappedPorts>,
     port: tokio::sync::watch::Sender<ToldPorts>,
+    /// The UDP ports mapped for the listener's uTP socket, as `mapped` is
+    /// for TCP.
+    udp_mapped: parking_lot::Mutex<MappedPorts>,
+    /// Each family's port of `udp_mapped`, IPv4 then IPv6, 0 for none: read
+    /// as a PORT message is built (see [`Session::dht_port_told`]).
+    udp_external: [std::sync::atomic::AtomicU16; 2],
 }
 
 #[derive(Clone, Copy, Default)]
@@ -330,6 +336,15 @@ impl MappedPorts {
             self.natpmp.or(self.upnp)
         }
     }
+
+    /// The port `transport` reports.
+    fn of(&mut self, transport: PortmapTransport) -> &mut Option<u16> {
+        match transport {
+            PortmapTransport::NatPmp => &mut self.natpmp,
+            PortmapTransport::Upnp => &mut self.upnp,
+            PortmapTransport::PcpIpv6 => &mut self.pcp_ipv6,
+        }
+    }
 }
 
 impl AnnouncePort {
@@ -339,7 +354,16 @@ impl AnnouncePort {
             set,
             mapped: Default::default(),
             port: tokio::sync::watch::channel(ToldPorts::both(set.or(listen))).0,
+            udp_mapped: Default::default(),
+            udp_external: Default::default(),
         }
+    }
+
+    /// The UDP port mapped on the gateway for the listener's uTP socket,
+    /// over IPv6 or over IPv4.
+    fn udp_external(&self, ipv6: bool) -> Option<u16> {
+        let port = self.udp_external[usize::from(ipv6)].load(Ordering::Relaxed);
+        (port != 0).then_some(port)
     }
 
     /// The ports trackers and the DHT are told.
@@ -358,19 +382,21 @@ impl AnnouncePort {
         self.listen.map(|listen| mapped.unwrap_or(listen))
     }
 
-    /// libtorrent `session_impl::on_port_mapping`: a mapper's TCP report,
-    /// a failure included, sets that mapper's port.
+    /// libtorrent `session_impl::on_port_mapping` (session_impl.cpp:
+    /// 5751-5755, v2.0.15): a mapper's report, a failure included, sets
+    /// that mapper's TCP or UDP port.
     fn on_port_mapping(&self, event: &PortMapped) {
-        if event.protocol != PortmapProtocol::Tcp {
+        if event.protocol == PortmapProtocol::Udp {
+            let mut udp = self.udp_mapped.lock();
+            *udp.of(event.transport) = event.external_port;
+            for ipv6 in [false, true] {
+                let port = udp.port(ipv6).unwrap_or(0);
+                self.udp_external[usize::from(ipv6)].store(port, Ordering::Relaxed);
+            }
             return;
         }
         let mut mapped = self.mapped.lock();
-        let port = match event.transport {
-            PortmapTransport::NatPmp => &mut mapped.natpmp,
-            PortmapTransport::Upnp => &mut mapped.upnp,
-            PortmapTransport::PcpIpv6 => &mut mapped.pcp_ipv6,
-        };
-        *port = event.external_port;
+        *mapped.of(event.transport) = event.external_port;
         let external = |ipv6| {
             self.listen
                 .map(|listen| mapped.port(ipv6).unwrap_or(listen))
@@ -472,6 +498,9 @@ pub struct Session {
     identity: Identity,
     announce_port: Arc<AnnouncePort>,
     listen_addr: Option<SocketAddr>,
+    // Whether the DHT runs over the listener's uTP socket, whose UDP port
+    // `announce_port` keeps the mapping of.
+    dht_on_listener: bool,
     // The port SSL torrents announce: the SSL listener's, or the port a
     // mapper got for it, while the session announces a port at all.
     ssl_port: Arc<AnnouncePort>,
@@ -1781,6 +1810,7 @@ impl Session {
             let dht_share = listen_result
                 .as_mut()
                 .and_then(|listen| listen.dht_share.take());
+            let mut dht_on_listener = false;
             let dht = if let Some(dht_config) = opts.dht.take() {
                 // The DHT on the port uTP listens on, or asked for the port
                 // the listener was asked for, shares uTP's socket, as
@@ -1789,19 +1819,19 @@ impl Session {
                 // port fails to bind, or takes uTP's datagrams. Elsewhere it
                 // runs over a datagram socket the factory binds; the factory
                 // decides the real address.
-                let dht_socket = Some(
-                    match dht_share.filter(|share| {
-                        dht_config.port.is_some_and(|port| {
-                            port == share.port() || Some(port) == asked_listen_port
-                        })
-                    }) {
-                        Some(share) => share.dht_socket(),
-                        None => datagram_sockets
-                            .bind_udp(dht_listen_addr(dht_config.port, None, opts.ipv4_only))
-                            .await
-                            .context("error binding DHT socket through socket factory")?,
-                    },
-                );
+                let dht_share = dht_share.filter(|share| {
+                    dht_config
+                        .port
+                        .is_some_and(|port| port == share.port() || Some(port) == asked_listen_port)
+                });
+                dht_on_listener = dht_share.is_some();
+                let dht_socket = Some(match dht_share {
+                    Some(share) => share.dht_socket(),
+                    None => datagram_sockets
+                        .bind_udp(dht_listen_addr(dht_config.port, None, opts.ipv4_only))
+                        .await
+                        .context("error binding DHT socket through socket factory")?,
+                });
                 let dht = if let Some(persistence_config) = dht_config.persistence {
                     PersistentDht::create_from_config(
                         persistence_config,
@@ -1981,6 +2011,7 @@ impl Session {
                         .and_then(|l| l.announce_port.filter(|_| l.announce_port_set)),
                 )),
                 listen_addr: listen_result.as_ref().map(|l| l.addr),
+                dht_on_listener,
                 ssl_port: Arc::new(AnnouncePort::new(
                     listen_result
                         .as_ref()
@@ -4153,6 +4184,19 @@ impl Session {
     /// announce port is set (libtorrent `session_impl::listen_port(ssl,
     /// local_addr)`, session_impl.cpp:5859-5873, gives the
     /// `tcp_external_port` of the listen socket of the connection's family).
+    /// The port a PORT message names for `dht`, over IPv6 or over IPv4: the
+    /// UDP port mapped on the gateway for the socket the DHT runs over,
+    /// else the DHT's own port, read as the message is built (libtorrent
+    /// `bt_peer_connection::write_dht_port`, bt_peer_connection.cpp:
+    /// 333-342, and `listen_socket_t::udp_external_port`,
+    /// session_impl.hpp:239-247, v2.0.15).
+    pub(crate) fn dht_port_told(&self, dht: &Dht, ipv6: bool) -> u16 {
+        self.dht_on_listener
+            .then(|| self.announce_port.udp_external(ipv6))
+            .flatten()
+            .unwrap_or_else(|| dht.listen_addr().port())
+    }
+
     pub(crate) fn external_port_of(&self, ssl: bool, ipv6: bool) -> Option<u16> {
         if ssl {
             self.ssl_port.external(ipv6)
