@@ -2,7 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // What the API shows of each volume: its label, the kind of storage it is,
-// its live write rate and what waits in memory for its writer. Read from
+// what it takes, what is being written to it now and what waits in memory
+// for its writer. Read from
 // what the disk owner already holds; nothing here looks at a disk.
 
 use std::path::Path;
@@ -21,6 +22,9 @@ pub struct VolumeWriteRate {
     pub storage_kind: &'static str,
     // Bytes per second the volume takes; `None` until measured.
     pub write_rate: Option<u64>,
+    // Bytes per second written to it over the last window, whether or not
+    // the volume was the limit; `None` when nothing was written.
+    pub throughput: Option<u64>,
     // Bytes waiting in memory for the volume's writer.
     pub buffered_bytes: u64,
 }
@@ -63,10 +67,12 @@ fn write_rates(
         .iter()
         .map(|volume| {
             let rate = volume.write_rate.load(Ordering::Relaxed);
+            let throughput = volume.throughput.load(Ordering::Relaxed);
             VolumeWriteRate {
                 label: volume.label.clone(),
                 storage_kind: kind(volume.device).as_str(),
                 write_rate: (rate > 0).then_some(rate),
+                throughput: (throughput > 0).then_some(throughput),
                 buffered_bytes: volume.buffered_bytes.load(Ordering::Relaxed),
             }
         })
@@ -98,6 +104,8 @@ mod tests {
             volume(Some(1), "/", 0, 0),
             volume(None, "/mnt/share", 9_000_000, 0),
         ];
+        // The pool is written to at a third of what it takes.
+        volumes[0].throughput.store(60_000_000, Ordering::Relaxed);
         let kinds = HashMap::from([(1, StorageKind::Solid), (2, StorageKind::Rotational)]);
 
         let shown = write_rates(&volumes, |device| {
@@ -113,18 +121,21 @@ mod tests {
                     label: "/".into(),
                     storage_kind: "ssd",
                     write_rate: None,
+                    throughput: None,
                     buffered_bytes: 0,
                 },
                 VolumeWriteRate {
                     label: "/mnt/pool".into(),
                     storage_kind: "platter",
                     write_rate: Some(180_000_000),
+                    throughput: Some(60_000_000),
                     buffered_bytes: 4096,
                 },
                 VolumeWriteRate {
                     label: "/mnt/share".into(),
                     storage_kind: "unknown",
                     write_rate: Some(9_000_000),
+                    throughput: None,
                     buffered_bytes: 0,
                 },
             ]

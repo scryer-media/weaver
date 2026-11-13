@@ -284,6 +284,7 @@ fn the_probe_file_grows_with_the_disks_write_speed() {
                 (repeats * PROBE_CHUNK_BYTES) as f64 / bytes_per_second,
             ))
         })
+        .map(|write| write.bytes)
     };
     assert_eq!(file_at(10_000_000.0), Some(16 * MIB));
     assert_eq!(file_at(60_000_000.0), Some(80 * MIB));

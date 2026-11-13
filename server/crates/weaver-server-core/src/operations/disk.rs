@@ -18,11 +18,14 @@ mod storage_kind;
 pub(crate) mod volume;
 pub(crate) mod volume_label;
 pub(crate) mod volume_rate;
+mod volume_probe;
 mod volume_view;
 mod volumes;
 pub(crate) mod writer;
 
 pub(crate) use storage_kind::StorageKind;
+#[allow(unused_imports)]
+pub(crate) use volume_probe::{ProbeStore, probe_once};
 pub(crate) use volume_view::slowest_measured_mbps;
 pub use volume_view::VolumeWriteRate;
 

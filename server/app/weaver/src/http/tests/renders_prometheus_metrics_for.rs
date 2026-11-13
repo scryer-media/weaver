@@ -938,6 +938,15 @@ fn renders_collected_instrumentation_snapshots() {
     assert!(rendered.contains("weaver_volume_write_seeks_total{volume=\"/mnt/scratch\"} 0"));
     assert!(rendered.contains("weaver_volume_written_bytes_total{volume=\"/mnt/scratch\"} 0"));
     assert!(!rendered.contains("weaver_volume_write_rate_bytes_per_second{volume=\"/mnt/scratch\"}"));
+    // What is being written now sits beside what the volume takes, and is
+    // absent for a volume nothing is written to.
+    assert!(rendered.contains(
+        "weaver_volume_write_throughput_bytes_per_second{volume=\"/mnt/nas\"} 1100000"
+    ));
+    assert!(
+        !rendered
+            .contains("weaver_volume_write_throughput_bytes_per_second{volume=\"/mnt/scratch\"}")
+    );
 
     // HTTP.
     assert!(rendered.contains(
