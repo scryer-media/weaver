@@ -106,8 +106,9 @@ pub(super) fn repair_set(
     // set found: damage only the set's checksums can see arrived marked
     // clean.
     let mut proven = Vec::new();
-    // One limit for the repair: the slices the verification keeps take at
-    // most half of it, and par2-rs works in what they leave.
+    // The limit is par2-rs's to work in, whole: a smaller working area costs
+    // it more passes over every source slice. The slices the verification
+    // keeps sit on top of it, at most half the limit again.
     let mut kept = Kept::new(memory_limit / 2);
     let mut validity: Vec<(FileId, Vec<bool>)> = index
         .recovery_file_ids
@@ -125,8 +126,8 @@ pub(super) fn repair_set(
             )
         })
         .collect();
-    // What the kept slices leave of the limit is the copies' to read in, and
-    // par2-rs's to work in.
+    // What the kept slices leave of the limit is the copies' to read in; they
+    // are done before par2-rs starts.
     let working = memory_limit.saturating_sub(kept.bytes);
     let mut donors = BTreeMap::new();
     let copied = copy_held(state, index, &mut validity, working, access, &mut donors);
@@ -194,7 +195,7 @@ pub(super) fn repair_set(
             return short(available, access);
         }
         let verification = verification(&set, &validity, damaged);
-        match plan_repair_with_memory_limit(&set, &verification, Some(working)) {
+        match plan_repair_with_memory_limit(&set, &verification, Some(memory_limit)) {
             Ok(plan) => break plan,
             Err(Par2Error::InsufficientRecoveryData { deficit, .. }) => {
                 wanted = available + u64::from(deficit);
@@ -221,7 +222,7 @@ pub(super) fn repair_set(
         piece: RefCell::new(Vec::new()),
     };
     let options = RepairOptions {
-        memory_limit: Some(working),
+        memory_limit: Some(memory_limit),
         ..Default::default()
     };
     if let Err(error) = execute_repair_with_options(&plan, &set, &mut files, &options) {
