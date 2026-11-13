@@ -149,6 +149,28 @@ pub enum MseError {
     Timeout,
 }
 
+impl MseError {
+    /// Whether the handshake ending so counts against the peer (see
+    /// [`crate::Error::is_failure`]). A socket the peer closes or that
+    /// errs, and a peer that stays silent, close at `normal` in libtorrent
+    /// (`peer_connection::on_receive_data`, `second_tick`), as does a
+    /// plaintext handshake where encryption is required
+    /// (`bt_peer_connection::on_receive_impl`, `no_incoming_regular`).
+    /// Everything else the peer got wrong: a bad public key, no
+    /// synchronisation, a bad verification constant, padding or crypto
+    /// select (`peer_error`), or no torrent or crypto method in common
+    /// (`failure`).
+    pub fn is_failure(&self) -> bool {
+        !matches!(
+            self,
+            MseError::Closed { .. }
+                | MseError::Io { .. }
+                | MseError::Timeout
+                | MseError::PlaintextRefused
+        )
+    }
+}
+
 fn io_error(stage: &'static str, e: std::io::Error) -> MseError {
     use std::io::ErrorKind::*;
     match e.kind() {

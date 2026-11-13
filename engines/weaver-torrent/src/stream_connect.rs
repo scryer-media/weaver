@@ -334,7 +334,7 @@ impl StreamConnector {
                 Ok(dialed) => dialed?,
                 Err(_) => {
                     expired.store(true, Ordering::Relaxed);
-                    return Err(Error::Timeout("connecting"));
+                    return Err(Error::ConnectTimeout("connecting"));
                 }
             }
         };
@@ -343,13 +343,17 @@ impl StreamConnector {
         let policy = match guard {
             Guard::Mse(policy) => policy,
             Guard::Tls(ssl) => {
-                let (r, mut w) = with_timeout("TLS handshake", rw_timeout, async {
-                    ssl.connect(r, w)
-                        .await
-                        .map_err(|e| Error::Anyhow(anyhow::Error::from(e).context("TLS handshake")))
-                })
-                .await
-                .inspect_err(|e| debug!(?addr, "TLS handshake failed: {e:#}"))?;
+                // The TLS handshake is part of the connect (libtorrent
+                // `ssl_stream::async_connect`).
+                let (r, mut w) = tokio::time::timeout(rw_timeout, ssl.connect(r, w))
+                    .await
+                    .map_err(|_| Error::ConnectTimeout("TLS handshake"))
+                    .and_then(|tls| {
+                        tls.map_err(|e| {
+                            Error::Anyhow(anyhow::Error::from(e).context("TLS handshake"))
+                        })
+                    })
+                    .inspect_err(|e| debug!(?addr, "TLS handshake failed: {e:#}"))?;
                 with_timeout(
                     "writing",
                     rw_timeout,
@@ -1092,6 +1096,75 @@ mod tests {
             (1, 1, 0),
             "{stats:?}"
         );
+    }
+
+    // libtorrent `peer_connection::disconnect` counts a close against the
+    // peer only above `normal` severity. An encrypted handshake the peer
+    // closes, or leaves silent until the handshake timeout, closes at
+    // `normal` (`on_receive_data`, `second_tick`'s `timed_out_no_handshake`)
+    // and is no failure. One whose answer holds no verification constant
+    // within the padding window closes at `peer_error`
+    // (`bt_peer_connection::on_receive_impl`, `invalid_encryption_constant`)
+    // and a dial that is refused at `failure` (`connect_failed`): both are.
+    #[tokio::test(start_paused = true)]
+    async fn an_encrypted_handshake_the_peer_closes_or_leaves_silent_is_no_failure() {
+        use tokio::io::AsyncWriteExt;
+        let (connector, mut dialed) = dialing(EncryptionPolicy::Prefer).await;
+        let info_hash = Id20::new([7; 20]);
+        let handshake = |rw_timeout| {
+            connector.connect_and_send_handshake(
+                (Ipv4Addr::LOCALHOST, 6881).into(),
+                Transports::Any,
+                Guard::Mse(EncryptionPolicy::Prefer),
+                &info_hash,
+                HANDSHAKE,
+                || true,
+                Duration::MAX,
+                rw_timeout,
+            )
+        };
+
+        let close = async { drop(dialed.recv().await.unwrap()) };
+        let (closed, ()) = tokio::join!(handshake(Duration::MAX), close);
+        let closed = closed.err().unwrap();
+        assert!(
+            matches!(closed, Error::Mse(mse::MseError::Closed { .. })),
+            "{closed:?}"
+        );
+        assert!(!closed.is_failure());
+
+        // The far end is held, and says nothing, until the handshake has
+        // timed out.
+        let (silent, _held) = tokio::join!(handshake(Duration::from_secs(10)), dialed.recv());
+        let silent = silent.err().unwrap();
+        assert!(
+            matches!(silent, Error::Timeout("encryption handshake")),
+            "{silent:?}"
+        );
+        assert!(!silent.is_failure());
+
+        // A public key of 2, then more than the padding window of bytes
+        // with no verification constant in them.
+        let no_vc = async {
+            let (_, mut theirs) = dialed.recv().await.unwrap();
+            let mut key = [0u8; 96];
+            key[95] = 2;
+            theirs.write_all(&key).await.unwrap();
+            theirs.write_all(&[0xff; 600]).await.unwrap();
+            theirs
+        };
+        let (unsynced, _theirs) = tokio::join!(handshake(Duration::MAX), no_vc);
+        let unsynced = unsynced.err().unwrap();
+        assert!(
+            matches!(unsynced, Error::Mse(mse::MseError::NotSynchronised { .. })),
+            "{unsynced:?}"
+        );
+        assert!(unsynced.is_failure());
+
+        drop(dialed);
+        let refused = handshake(Duration::MAX).await.err().unwrap();
+        assert!(matches!(refused, Error::TcpConnect(_)), "{refused:?}");
+        assert!(refused.is_failure());
     }
 
     // libtorrent `bt_peer_connection::on_connected` reads `pe_support`

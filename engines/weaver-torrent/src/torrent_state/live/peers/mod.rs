@@ -3901,6 +3901,79 @@ mod tests {
         ));
     }
 
+    // libtorrent `peer_list::compare_peer` puts the fewest failures first,
+    // then the connection that closed longest ago, a peer never connected
+    // to first of all. An encrypted handshake the peer closes counts no
+    // failure (`peer_connection::disconnect` at `normal`; see
+    // `crate::Error::is_failure`) and its close is dated back
+    // (`peer_connection::fast_reconnect`), so the plaintext connection that
+    // follows comes before every candidate that failed, behind only those
+    // never connected to, and is made. One the peer answers with no
+    // verification constant counts (`peer_error`) and goes behind every
+    // candidate that did not fail.
+    #[tokio::test(start_paused = true)]
+    async fn an_encrypted_handshake_the_peer_closed_is_retried_plain_before_failed_candidates() {
+        use crate::mse::MseError;
+        let peers = make_peer_states();
+        let t0 = Instant::now() + Duration::from_secs(3600);
+        let fresh: Vec<_> = (10..13).map(peer_addr).collect();
+        let failed: Vec<_> = (20..30).map(peer_addr).collect();
+        let (closed, unsynced) = (peer_addr(1), peer_addr(2));
+        for &addr in &failed {
+            peers.add_peer(addr, PeerSourceFlag::Tracker);
+            fail_at(&peers, addr, t0 - Duration::from_secs(600));
+        }
+        for &addr in fresh.iter().chain([&closed, &unsynced]) {
+            peers.add_peer(addr, PeerSourceFlag::Tracker);
+        }
+        let ended = |addr, error: crate::Error| {
+            peers
+                .with_peer_mut(addr, "test", |peer| {
+                    peer.connect_if_due(t0, &peers).expect("a due candidate");
+                    assert!(peer.encrypt_outgoing());
+                    peers.connection_closed(peer, t0, error.is_failure(), false);
+                })
+                .unwrap()
+        };
+        ended(
+            closed,
+            MseError::Closed {
+                stage: "reading the peer's public key",
+                source: None,
+            }
+            .into(),
+        );
+        ended(
+            unsynced,
+            MseError::NotSynchronised {
+                stage: "looking for the peer's verification constant",
+            }
+            .into(),
+        );
+
+        let mut order = Vec::new();
+        while let Some((addr, _, _)) = peers.connect_next(t0) {
+            order.push(addr);
+        }
+        let expected: Vec<_> = fresh
+            .iter()
+            .chain([&closed])
+            .chain(&failed)
+            .chain([&unsynced])
+            .copied()
+            .collect();
+        assert_eq!(order, expected);
+
+        peers
+            .with_peer_mut(closed, "test", |peer| {
+                assert!(!peer.encrypt_outgoing());
+                peer.connecting_to_live(Id20::default(), &peers, ConnectionKind::Tcp);
+                peer.handshake_encryption(Encryption::None, &peers);
+            })
+            .unwrap();
+        assert_eq!(state_of(&peers, closed), Some("live"));
+    }
+
     // libtorrent `bt_peer_connection::on_receive_impl` and
     // `init_bt_handshake` set `pe_support` to the method that completed:
     // the next connection tries it again.
