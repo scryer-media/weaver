@@ -512,6 +512,12 @@ struct Framed {
     read: bool,
 }
 
+/// A handler's error as the connection ends in it: one of ours stays as it
+/// is, so a close the handler asks for at the handshake is no failure.
+fn handler_error(e: anyhow::Error) -> Error {
+    e.downcast::<Error>().unwrap_or_else(Error::Anyhow)
+}
+
 /// The frame of a message serialized, or none for one the peer cannot be
 /// sent: an extension message under an extension it names no id for, or
 /// no longer does, is dropped and the connection kept (libtorrent sends
@@ -677,7 +683,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
         self.handler
             .on_handshake(incoming.handshake, incoming.kind, speaks_v2)
-            .map_err(Error::Anyhow)?;
+            .map_err(handler_error)?;
         self.handler.on_handshake_encryption(incoming.encryption);
 
         self.manage_peer(ManagePeerArgs {
@@ -758,7 +764,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
             self.handler
                 .on_handshake(h, ckind, speaks_v2)
-                .map_err(Error::Anyhow)?;
+                .map_err(handler_error)?;
             // The peer answered, so the method this connection tried works
             // with it (libtorrent `bt_peer_connection::on_receive_impl`).
             self.handler.on_handshake_encryption(encryption);

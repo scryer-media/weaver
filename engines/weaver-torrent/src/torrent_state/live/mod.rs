@@ -129,7 +129,7 @@ use self::{
         },
     },
     peers::{
-        IncomingRefused, PeerStates,
+        IncomingRefused, PeerIdClaim, PeerStates,
         holepunch::is_local,
         stats::{AggregatePeerStats, AggregatePeerStatsAtomic},
     },
@@ -1382,14 +1382,45 @@ impl TorrentStateLive {
         TimedExistence::new(timeit(reason, || self._locked.write()), reason)
     }
 
-    fn set_peer_live(&self, handle: PeerHandle, h: Handshake, connection_kind: ConnectionKind) {
-        self.peers.with_peer_mut(handle, "set_peer_live", |p| {
+    /// The connection at `handle` completed its handshake `h`: it is live,
+    /// and holds the peer id it sent. False when another connection holds
+    /// that id and this one is to close; see [`PeerStates::claim_peer_id`].
+    /// A web seed sends no peer id.
+    fn set_peer_live(
+        &self,
+        handle: PeerHandle,
+        h: Handshake,
+        connection_kind: ConnectionKind,
+    ) -> bool {
+        let claim = self.peers.with_peer_mut(handle, "set_peer_live", |p| {
             p.connecting_to_live(h.peer_id, &self.peers, connection_kind);
             // An incoming connection is live before its handshake gets here.
             if let Some(live) = p.get_live_mut() {
                 live.fast = h.supports_fast();
             }
+            let outgoing = p.connected_out() == Some(true);
+            match p.get_live() {
+                Some(live) if !web_seed::is_web_seed(handle) => Some(self.peers.claim_peer_id(
+                    handle,
+                    live.peer_id(),
+                    outgoing,
+                    self.shared.peer_id,
+                )),
+                _ => None,
+            }
         });
+        match claim.flatten() {
+            Some(PeerIdClaim::TakenFrom(other)) => {
+                debug!(%other, "closing the connection that sent the same peer id");
+                self.peers.with_peer(other, peer::Peer::disconnect);
+                true
+            }
+            Some(PeerIdClaim::Refused) => {
+                debug!("closing: another connection sent the same peer id");
+                false
+            }
+            Some(PeerIdClaim::Held) | None => true,
+        }
     }
 
     pub fn get_uploaded_bytes(&self) -> u64 {
@@ -2554,10 +2585,16 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         speaks_v2: bool,
     ) -> anyhow::Result<()> {
         self.speaks_v2.store(speaks_v2, Ordering::Relaxed);
-        if handshake.supports_dht() {
+        // A connection closed for its peer id is closed by us, which is no
+        // failure (libtorrent disconnects with `duplicate_peer_id` at normal
+        // severity).
+        let supports_dht = handshake.supports_dht();
+        if !self.state.set_peer_live(self.addr, handshake, ckind) {
+            return Err(crate::Error::Disconnect.into());
+        }
+        if supports_dht {
             self.send_dht_port();
         }
-        self.state.set_peer_live(self.addr, handshake, ckind);
         Ok(())
     }
 
@@ -3045,10 +3082,14 @@ impl PeerHandler {
         };
         // A connection we asked to close did not fail (libtorrent
         // `peer_connection::failed`), nor did a connect our own side turned
-        // away before it reached the peer.
-        let failed = error
-            .as_ref()
-            .is_some_and(|e| !matches!(e, crate::Error::Disconnect) && !e.is_local_refusal());
+        // away before it reached the peer, nor did one to ourselves, which
+        // is banned below instead (libtorrent closes it at normal severity).
+        let failed = error.as_ref().is_some_and(|e| {
+            !matches!(
+                e,
+                crate::Error::Disconnect | crate::Error::ConnectingToOurselves
+            ) && !e.is_local_refusal()
+        });
         // A connection to a peer that speaks the holepunch extension failed,
         // and no holepunch asked for it: a peer that can introduce us is
         // asked to (libtorrent `peer_connection::connect_failed`).
@@ -3128,6 +3169,14 @@ impl PeerHandler {
         peers.settle_closed(pe.value_mut(), needed);
         trace!(state = %pe.value().get_state(), "peer settled after its connection closed");
         drop(pe);
+        // A connection to ourselves bans the address on this torrent, so it
+        // is not dialed again (libtorrent `peer_connection::disconnect`:
+        // `self_connection` bans the peer's `torrent_peer`, one per address
+        // with `allow_multiple_connections_per_ip` off).
+        if matches!(error, Some(crate::Error::ConnectingToOurselves)) {
+            debug!(addr = %handle, "the peer is ourselves");
+            peers.ban(handle.ip());
+        }
         // A peer the IP filter came to refuse while it was connected leaves
         // the list now its connection is gone.
         peers.refuse_at(handle, |addr| self.state.refuses(addr));

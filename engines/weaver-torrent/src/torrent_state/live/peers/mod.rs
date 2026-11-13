@@ -186,6 +186,13 @@ pub(crate) struct PeerStates {
     // (`torrent::second_tick`). Taken while an entry of `states` is held,
     // never the other way.
     live: Mutex<IndexSet<PeerHandle>>,
+    // The connection that holds each peer id a handshake sent, so one
+    // client reached at two addresses keeps one connection (libtorrent
+    // `allow_multiple_connections_per_pid` off): claimed at the handshake
+    // ([`Self::claim_peer_id`]) and let go as that connection leaves the
+    // live state, so a handshake looks up one id, never the list. Taken
+    // while an entry of `states` is held, never the other way.
+    peer_ids: Mutex<HashMap<Id20, PeerHandle>>,
     // Bumped by every change that can alter what [`Self::pex_listed`]
     // returns: a peer going live or leaving it, and a live peer's listen
     // address or advertised PEX flags changing. Each bump comes while the
@@ -427,6 +434,19 @@ pub(crate) enum Have {
     Completed,
 }
 
+/// What a connection's handshake leaves of it when another connection holds
+/// the peer id it sent; see [`PeerStates::claim_peer_id`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PeerIdClaim {
+    /// The connection holds the id, and no other did.
+    Held,
+    /// The connection holds the id; the one at this address held it, and
+    /// is to close.
+    TakenFrom(PeerHandle),
+    /// Another connection holds the id: this one is to close.
+    Refused,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum IncomingRefused {
     AlreadyActive,
@@ -487,6 +507,7 @@ impl PeerStates {
             smart_ban: Mutex::new(list.smart_ban),
             connected: Default::default(),
             live: Default::default(),
+            peer_ids: Default::default(),
             pex_version: AtomicU64::new(0),
             pex_cache: Mutex::new(None),
             untracked_owed: AtomicBool::new(list.untracked_owed),
@@ -1369,6 +1390,47 @@ impl PeerStates {
             self.live.lock().swap_remove(&addr);
             self.pex_changed();
             self.availability.remove(&live.bitfield);
+            let mut ids = self.peer_ids.lock();
+            if ids.get(&live.peer_id()) == Some(&addr) {
+                ids.remove(&live.peer_id());
+            }
+        }
+    }
+
+    /// The live connection at `handle`, which we made when `outgoing`, sent
+    /// `peer_id` in its handshake, and `ours` is the id we sent. One
+    /// connection holds each id. When another holds it, the end with the
+    /// greater id keeps the connection it made, so both ends close the
+    /// same one: this connection takes the id when it is outgoing and the
+    /// peer's id is below ours, or incoming and above it; else it is
+    /// refused (libtorrent `bt_peer_connection::on_receive`, "read_peer_id",
+    /// with `allow_multiple_connections_per_pid` off). Our own id is the
+    /// self connection, which ends on its own rule, and is held by none.
+    pub(crate) fn claim_peer_id(
+        &self,
+        handle: PeerHandle,
+        peer_id: Id20,
+        outgoing: bool,
+        ours: Id20,
+    ) -> PeerIdClaim {
+        if peer_id == ours {
+            return PeerIdClaim::Held;
+        }
+        match self.peer_ids.lock().entry(peer_id) {
+            std::collections::hash_map::Entry::Vacant(at) => {
+                at.insert(handle);
+                PeerIdClaim::Held
+            }
+            std::collections::hash_map::Entry::Occupied(at) if *at.get() == handle => {
+                PeerIdClaim::Held
+            }
+            std::collections::hash_map::Entry::Occupied(mut at) => {
+                if (peer_id < ours) == outgoing {
+                    PeerIdClaim::TakenFrom(at.insert(handle))
+                } else {
+                    PeerIdClaim::Refused
+                }
+            }
         }
     }
 
@@ -1888,6 +1950,81 @@ mod tests {
         }
 
         assert_eq!(haves_queued(&mut slow_rx), (0..PIECES).collect::<Vec<_>>());
+    }
+
+    // One connection holds each peer id: a second is refused or takes it
+    // as libtorrent's rule says (`bt_peer_connection::on_receive`,
+    // "read_peer_id"), the id is let go once the connection holding it
+    // closes, and our own id is held by none.
+    #[test]
+    fn a_peer_id_is_held_by_one_connection_until_it_closes() {
+        let peers = make_peer_states();
+        let ours = Id20::new([0x80; 20]);
+        let below = Id20::new([0x10; 20]);
+        let live = |addr: &str, id: Id20| {
+            let addr: SocketAddr = addr.parse().unwrap();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            peers
+                .add_incoming(addr, id, tx, ConnectionKind::Tcp, OUR_PORT)
+                .unwrap();
+            (addr, rx)
+        };
+        let (a, _rx_a) = live("192.0.2.1:6881", below);
+        let (b, _rx_b) = live("[2001:db8::1]:6881", below);
+        let (c, _rx_c) = live("192.0.2.3:6881", below);
+
+        assert_eq!(
+            peers.claim_peer_id(a, below, false, ours),
+            PeerIdClaim::Held
+        );
+        assert_eq!(
+            peers.claim_peer_id(a, below, false, ours),
+            PeerIdClaim::Held
+        );
+        // Incoming, from a client below our id: the newcomer goes.
+        assert_eq!(
+            peers.claim_peer_id(b, below, false, ours),
+            PeerIdClaim::Refused
+        );
+        // One we made, to a client below our id: the one before it goes.
+        assert_eq!(
+            peers.claim_peer_id(c, below, true, ours),
+            PeerIdClaim::TakenFrom(a)
+        );
+        // Above our id, the other way round.
+        let above = Id20::new([0xf0; 20]);
+        let (d, _rx_d) = live("192.0.2.4:6881", above);
+        let (e, _rx_e) = live("[2001:db8::4]:6881", above);
+        let (f, _rx_f) = live("192.0.2.6:6881", above);
+        assert_eq!(peers.claim_peer_id(d, above, true, ours), PeerIdClaim::Held);
+        assert_eq!(
+            peers.claim_peer_id(e, above, true, ours),
+            PeerIdClaim::Refused
+        );
+        assert_eq!(
+            peers.claim_peer_id(f, above, false, ours),
+            PeerIdClaim::TakenFrom(d)
+        );
+
+        // The connection at `a` closes, which held no id `below` by then;
+        // `c`, which held it, closes and lets it go.
+        for closed in [a, c] {
+            peers
+                .with_peer_mut(closed, "test", |peer| {
+                    peer.take_state(&peers);
+                    peers.connection_closed(peer, Instant::now(), false, false);
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            peers.claim_peer_id(b, below, false, ours),
+            PeerIdClaim::Held
+        );
+        assert_eq!(peers.peer_ids.lock().get(&above), Some(&f));
+
+        // Our own id is the self connection, never held.
+        assert_eq!(peers.claim_peer_id(b, ours, false, ours), PeerIdClaim::Held);
+        assert!(!peers.peer_ids.lock().contains_key(&ours));
     }
 
     fn peer_addr(i: usize) -> SocketAddr {
