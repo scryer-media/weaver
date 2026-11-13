@@ -7,13 +7,13 @@
 
 pub(crate) mod replay;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use weaver_graph::recovery::MemberAccess;
 use weaver_graph::{
-    Beside, ByteRange, Delivery, Emit, MemberId, Namespace, Object, ObjectId, Provenance, Segment,
-    Standing, VolumeIndex,
+    Beside, ByteRange, Delivery, Emit, MemberId, Namespace, Object, ObjectId, Placement,
+    Provenance, Segment, Standing, VolumeIndex,
 };
 
 use crate::grid::crc32;
@@ -59,6 +59,51 @@ pub(crate) fn payload(seed: u64, len: usize) -> Vec<u8> {
             (state >> 33) as u8
         })
         .collect()
+}
+
+// Ranges an owner holds, each with the placement number it was last asked
+// under and what the store answered then.
+#[derive(Default)]
+pub(crate) struct Asked(Vec<(VolumeIndex, ByteRange, Option<u64>, Vec<Placement>)>);
+
+impl Asked {
+    pub(crate) fn hold(&mut self, object: &dyn Object, volume: VolumeIndex, range: ByteRange) {
+        let mut placements = Vec::new();
+        object.locate(volume, range, &mut placements);
+        self.0.push((volume, range, object.placement(), placements));
+    }
+
+    // Every range located again, as an owner that asks after every
+    // delivery does, against the answer an owner that asks only once the
+    // number moved keeps: they must agree. How many asks the number saved.
+    pub(crate) fn compare(&mut self, object: &dyn Object) -> usize {
+        let number = object.placement();
+        let mut saved = 0;
+        for (volume, range, asked, kept) in &mut self.0 {
+            let mut placements = Vec::new();
+            object.locate(*volume, *range, &mut placements);
+            if number.is_some() && number == *asked {
+                assert_eq!(
+                    placements, *kept,
+                    "{range:?} of {volume:?} under {number:?}"
+                );
+                saved += 1;
+            } else {
+                *asked = number;
+                *kept = placements;
+            }
+        }
+        saved
+    }
+
+    // Whether no range reaches a member yet.
+    pub(crate) fn unplaced(&self) -> bool {
+        self.0.iter().all(|(_, _, _, placements)| {
+            placements
+                .iter()
+                .all(|placement| !matches!(placement, Placement::Member { .. }))
+        })
+    }
 }
 
 // What a zip64 end record and its locator say, as `zip64_end` writes them.
@@ -254,9 +299,15 @@ pub(crate) struct Store {
     // A directory lent for work on files, as a namespace that keeps them
     // lends one.
     pub(crate) scratch: Option<PathBuf>,
+    // Members the namespace has no room to rebuild.
+    pub(crate) withheld: BTreeSet<MemberId>,
 }
 
 impl MemberAccess for Store {
+    fn withheld(&self, member: MemberId) -> bool {
+        self.withheld.contains(&member)
+    }
+
     fn read(&mut self, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
         self.reads += 1;
         let Some(bytes) = self.members.get(&member) else {

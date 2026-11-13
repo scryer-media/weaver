@@ -341,7 +341,7 @@ impl GraphJob {
     }
 
     #[cfg(test)]
-    pub(crate) fn held_loans(&mut self) -> Vec<(NodeId, u64, Box<dyn weaver_graph::Object>)> {
+    pub(crate) fn held_loans(&mut self) -> Vec<works::HeldLoan> {
         self.works.take_held()
     }
 
@@ -350,14 +350,14 @@ impl GraphJob {
     #[cfg(test)]
     pub(crate) fn return_loan(
         &mut self,
-        (node, serial, mut object): (NodeId, u64, Box<dyn weaver_graph::Object>),
+        (node, serial, mut object, stop): works::HeldLoan,
         slots: &mut RepairSlots,
         limit: usize,
     ) -> Result<(), GraphError> {
         let mut said = Vec::new();
         {
             let _decoding = self.works.decoding();
-            object.work(&mut said);
+            object.work_until(&stop, &mut said);
         }
         let said = super::engine::Said {
             scope: self.works.scope(),
@@ -457,6 +457,7 @@ impl GraphJob {
     pub(in crate::pipeline) fn request_stop(&self) {
         self.runs.request_stop();
         self.loans.request_stop();
+        self.works.request_stop();
     }
 
     // The pipeline is going down. Every run stops where it stands and keeps
@@ -893,6 +894,12 @@ impl GraphJob {
     // Whether the root holds the article or has ruled it lost.
     pub(crate) fn article_settled(&self, volume: VolumeIndex, ordinal: u32) -> bool {
         self.root.map.article_settled(volume, ordinal)
+    }
+
+    // The volumes whose first article began or stopped being waited on
+    // since the last call; `None` on the first, when every one counts.
+    pub(crate) fn take_first_changes(&mut self) -> Option<std::collections::BTreeSet<VolumeIndex>> {
+        self.root.map.take_first_changes()
     }
 
     // Every article the root holds lost, with its declared encoded size.

@@ -53,6 +53,7 @@ fn no_trouble(owner: &Owner) {
             !matches!(
                 emit,
                 Emit::Damaged { .. }
+                    | Emit::Gap { .. }
                     | Emit::NeedsEngine(_)
                     | Emit::Refuse(_)
                     | Emit::Retract(_)
@@ -1730,8 +1731,9 @@ fn a_set_without_its_first_volume_says_it_damaged_whole() {
     for volume in [1, 2] {
         owner.close(volume);
     }
-    assert!(owner.said.contains(&Emit::Damaged {
-        volume: VolumeIndex(0),
+    assert!(owner.said.contains(&Emit::Gap {
+        first: VolumeIndex(0),
+        end: VolumeIndex(1),
         range: ByteRange::new(0, length),
     }));
     assert!(owner.members.is_empty());
@@ -1757,8 +1759,9 @@ fn a_missing_middle_volume_is_damaged_whole() {
     owner.frames(2, 4096);
     owner.close(0);
     owner.close(2);
-    assert!(owner.said.contains(&Emit::Damaged {
-        volume: VolumeIndex(1),
+    assert!(owner.said.contains(&Emit::Gap {
+        first: VolumeIndex(1),
+        end: VolumeIndex(2),
         range: ByteRange::new(0, length),
     }));
     // Nothing past the gap was announced: the file crossing it waits.
@@ -1806,18 +1809,14 @@ fn a_volume_numbered_last_of_all_numbers_is_placed_nowhere() {
     assert_eq!(place(&facts, &held), None);
 }
 
-// A last volume held far past every number a set may have is refused at its
-// close, not answered with a gap for every number before it.
-#[test]
-fn a_last_volume_numbered_past_every_set_is_refused_not_gapped() {
+// The store holds each volume where it is bound, under a name, every one
+// whole and closed, and says what their close says.
+fn held_at(at: &[(VolumeIndex, &Vec<u8>)]) -> (RarStore, Vec<Emit>) {
     use weaver_graph::{Delivery, Evidenced};
-    let volumes = write(&items(), &split(Version::Rar4));
-    assert_eq!(volumes.len(), 3);
-    let far = VolumeIndex(u32::MAX - 1);
     let mut object = store();
     let mut out = Vec::new();
     let mut read = |_: &Placement, _: &mut Vec<u8>| false;
-    for (volume, bytes) in [(VolumeIndex(0), &volumes[0]), (far, &volumes[2])] {
+    for &(volume, bytes) in at {
         object.bound(volume, &format!("alpha.part{}.rar", volume.0), &[], None);
         object.sized(volume, bytes.len() as u64, &mut out);
         object.deliver(
@@ -1831,27 +1830,175 @@ fn a_last_volume_numbered_past_every_set_is_refused_not_gapped() {
             &mut out,
         );
     }
-    object.volume_closed(VolumeIndex(0), &mut out);
-    object.volume_closed(far, &mut out);
-    assert!(
-        !out.iter().any(|emit| matches!(emit, Emit::Damaged { .. })),
+    for &(volume, _) in at {
+        object.volume_closed(volume, &mut out);
+    }
+    (object, out)
+}
+
+fn gaps(out: &[Emit]) -> Vec<&Emit> {
+    out.iter()
+        .filter(|emit| matches!(emit, Emit::Damaged { .. } | Emit::Gap { .. }))
+        .collect()
+}
+
+// A last volume held far past every number before it says the volumes
+// before it missing as one gap, not one report for every number, and is
+// not refused for its number.
+#[test]
+fn a_last_volume_numbered_far_out_says_one_gap() {
+    let volumes = write(&items(), &split(Version::Rar4));
+    assert_eq!(volumes.len(), 3);
+    let length = volumes[0].len() as u64;
+    let far = VolumeIndex(u32::MAX - 1);
+    let (object, out) = held_at(&[(VolumeIndex(0), &volumes[0]), (far, &volumes[2])]);
+    assert_eq!(
+        gaps(&out),
+        vec![&Emit::Gap {
+            first: VolumeIndex(1),
+            end: far,
+            range: ByteRange::new(0, length),
+        }],
         "{out:?}"
     );
-    assert_eq!(out.last(), Some(&Emit::Refuse(Why::InvalidArchive)));
+    assert!(!out.iter().any(|emit| matches!(emit, Emit::Refuse(_))));
+    assert!(!object.gone);
+    assert_eq!(object.gaps_said.runs().count(), 1);
     // The same set held where its numbers are kept says its one gap.
     let mut owner = Owner::named(store(), volumes);
     owner.frames(0, 4096);
     owner.frames(2, 4096);
     owner.close(0);
     owner.close(2);
-    assert!(owner.said.iter().any(|emit| matches!(
-        emit,
-        Emit::Damaged {
-            volume: VolumeIndex(1),
-            ..
+    assert_eq!(
+        gaps(&owner.said),
+        vec![&Emit::Gap {
+            first: VolumeIndex(1),
+            end: VolumeIndex(2),
+            range: ByteRange::new(0, length),
+        }]
+    );
+}
+
+// Two volumes posted as numbers 65,533 and 65,534, the second the set's
+// last: the 65,533 volumes before them are one gap, said once, however often
+// the closes are told again.
+#[test]
+fn two_volumes_numbered_65533_and_65534_say_one_gap() {
+    let volumes = write(&items(), &split(Version::Rar4));
+    assert_eq!(volumes.len(), 3);
+    let length = volumes[1].len() as u64;
+    let (mut object, out) = held_at(&[
+        (VolumeIndex(65_533), &volumes[1]),
+        (VolumeIndex(65_534), &volumes[2]),
+    ]);
+    assert_eq!(
+        gaps(&out),
+        vec![&Emit::Gap {
+            first: VolumeIndex(0),
+            end: VolumeIndex(65_533),
+            range: ByteRange::new(0, length),
+        }],
+        "{out:?}"
+    );
+    assert!(!out.iter().any(|emit| matches!(emit, Emit::Refuse(_))));
+    assert_eq!(object.gaps_said.runs().count(), 1);
+    let mut again = Vec::new();
+    object.volume_closed(VolumeIndex(65_533), &mut again);
+    object.volume_closed(VolumeIndex(65_534), &mut again);
+    assert!(gaps(&again).is_empty(), "{again:?}");
+    // A store restored from its facts keeps the gap said: a restore tells
+    // every close again, and nothing is said twice.
+    let mut restored = super::facts::restore(&object.facts()).expect("restores");
+    let mut told = Vec::new();
+    restored.volume_closed(VolumeIndex(65_533), &mut told);
+    restored.volume_closed(VolumeIndex(65_534), &mut told);
+    assert!(gaps(&told).is_empty(), "{told:?}");
+}
+
+// A set of 70,000 volumes, every one held and closed, the last saying it is
+// last: nothing is missing and nothing refuses it for its count. With two
+// volumes of it gone, each is one gap and nothing else is said.
+#[test]
+fn a_set_numbered_past_65536_volumes_is_whole() {
+    const COUNT: u32 = 70_000;
+    let numbered = |missing: &[u32]| {
+        let mut object = store();
+        for index in (0..COUNT).filter(|index| !missing.contains(index)) {
+            let mut volume = super::Volume::new();
+            volume.name = Some(format!("alpha.part{}.rar", index + 1));
+            volume.length = Some(100);
+            volume.closed = true;
+            object.volumes.insert(VolumeIndex(index), volume);
         }
-    )));
-    assert!(!owner.said.contains(&Emit::Refuse(Why::InvalidArchive)));
+        object.lasts.insert(VolumeIndex(COUNT - 1));
+        let mut out = Vec::new();
+        object.say_gaps(&mut out);
+        (object, out)
+    };
+    let (object, out) = numbered(&[]);
+    assert!(out.is_empty(), "{out:?}");
+    assert!(!object.gone);
+    assert_eq!(object.gaps_said.runs().count(), 0);
+    let (object, out) = numbered(&[10, 40_000]);
+    let range = ByteRange::new(0, 100);
+    assert_eq!(
+        out,
+        vec![
+            Emit::Gap {
+                first: VolumeIndex(10),
+                end: VolumeIndex(11),
+                range,
+            },
+            Emit::Gap {
+                first: VolumeIndex(40_000),
+                end: VolumeIndex(40_001),
+                range,
+            },
+        ]
+    );
+    assert!(!object.gone);
+}
+
+// A volume held with no name may place bytes, so it is said missing alone,
+// as before, and the volumes around it held nowhere are gaps.
+#[test]
+fn a_volume_held_without_a_name_is_said_alone() {
+    let mut object = store();
+    for index in [0u32, 5] {
+        let mut volume = super::Volume::new();
+        volume.name = Some(format!("alpha.part{}.rar", index + 1));
+        volume.length = Some(100);
+        volume.closed = true;
+        object.volumes.insert(VolumeIndex(index), volume);
+    }
+    object.volumes.insert(VolumeIndex(2), super::Volume::new());
+    object.lasts.insert(VolumeIndex(5));
+    let mut out = Vec::new();
+    object.say_gaps(&mut out);
+    let range = ByteRange::new(0, 100);
+    assert_eq!(
+        out,
+        vec![
+            Emit::Gap {
+                first: VolumeIndex(1),
+                end: VolumeIndex(2),
+                range,
+            },
+            Emit::Damaged {
+                volume: VolumeIndex(2),
+                range,
+            },
+            Emit::Gap {
+                first: VolumeIndex(3),
+                end: VolumeIndex(5),
+                range,
+            },
+        ]
+    );
+    let mut again = Vec::new();
+    object.say_gaps(&mut again);
+    assert!(again.is_empty(), "{again:?}");
 }
 
 // A fixture written by RAR itself streams to what unrar-rs extracts from it.
@@ -2525,4 +2672,44 @@ fn a_repair_behind_the_cursor_that_changes_only_trust_walks_again_from_the_signa
         owner.close(0);
         streamed(&owner);
     }
+}
+
+// The set of bound, open volumes agrees with a walk of every volume held,
+// through binds, closes, a give-back and a restore.
+#[test]
+fn the_open_volumes_filed_agree_with_a_walk_of_every_volume() {
+    fn walked(store: &RarStore) -> bool {
+        store
+            .volumes
+            .values()
+            .filter(|volume| volume.name.is_some())
+            .all(|volume| volume.closed)
+    }
+    let mut store = RarStore::new();
+    let mut out = Vec::new();
+    assert_eq!(store.finished(), walked(&store));
+    for index in 0..6 {
+        store.bound(
+            VolumeIndex(index),
+            &format!("set.part{:02}.rar", index + 1),
+            &[],
+            None,
+        );
+        assert!(!store.finished());
+        assert_eq!(store.finished(), walked(&store));
+    }
+    for index in [4, 1, 3] {
+        store.volume_closed(VolumeIndex(index), &mut out);
+        assert_eq!(store.finished(), walked(&store));
+    }
+    store.give_back_held(vec![VolumeIndex(0), VolumeIndex(3)], &mut out);
+    assert_eq!(store.finished(), walked(&store));
+    let restored = super::facts::restored(&store.facts()).expect("restores");
+    assert_eq!(restored.open, store.open);
+    assert_eq!(restored.finished(), walked(&restored));
+    for index in [2, 5] {
+        store.volume_closed(VolumeIndex(index), &mut out);
+        assert_eq!(store.finished(), walked(&store));
+    }
+    assert!(store.finished());
 }

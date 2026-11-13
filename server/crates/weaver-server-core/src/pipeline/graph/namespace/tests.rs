@@ -367,6 +367,12 @@ struct Seen {
     read: Option<Vec<u8>>,
     volume: Option<Vec<u8>>,
     between: Option<Box<dyn FnMut() + Send>>,
+    // What of its volume it asks to hear again once restored.
+    again: Option<ByteRange>,
+    // Whether it says it is a PAR3 set rather than a PAR2 one.
+    par3: bool,
+    // Whether the member it fixes was withheld from it when it repaired.
+    withheld: Option<bool>,
 }
 
 // The repair the pretend set makes: read the named member, write a fix.
@@ -411,7 +417,10 @@ impl Object for Par {
     fn unposted(&mut self, _: weaver_graph::VolumeIndex, _: weaver_graph::ByteRange) {}
 
     fn kind(&self) -> Kind {
-        Kind::Par2
+        match self.seen.lock().unwrap().par3 {
+            true => Kind::Par3,
+            false => Kind::Par2,
+        }
     }
 
     fn deliver(
@@ -425,6 +434,15 @@ impl Object for Par {
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
     fn wants(&self, _: &mut Vec<Seek>) {}
     fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
+
+    fn restored(&mut self, out: &mut Vec<Emit>) {
+        if let Some(range) = self.seen.lock().unwrap().again {
+            out.push(Emit::Again {
+                volume: VolumeIndex(0),
+                range,
+            });
+        }
+    }
 
     fn locate(&self, _: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         out.push(Placement::Envelope { envelope: 0, range });
@@ -536,6 +554,14 @@ impl Par {
         let (Some(fix), Some(member)) = (self.fix, self.fixing) else {
             return RepairOutcome::Clean;
         };
+        let withheld = access.withheld(member);
+        self.seen.lock().unwrap().withheld = Some(withheld);
+        if withheld {
+            return RepairOutcome::Impossible {
+                damaged: 1,
+                reachable: 1,
+            };
+        }
         let mut bytes = Vec::new();
         if access.read(member, fix.read, &mut bytes) {
             self.seen.lock().unwrap().read = Some(bytes);
@@ -2893,7 +2919,7 @@ fn give_back_retains_the_unreplayed_leaf_without_adopting_sparse_holes() {
         };
         job.writer
             .write_file(
-                &job.tree,
+                &mut job.tree,
                 NodeId::ROOT,
                 member,
                 offset,
@@ -2959,7 +2985,7 @@ fn give_back_does_not_retain_a_truncated_leaf_tail() {
     let owner = job.tree.child_of(NodeId::ROOT, member).unwrap();
     job.writer
         .write_file(
-            &job.tree,
+            &mut job.tree,
             NodeId::ROOT,
             member,
             0,
@@ -3013,7 +3039,7 @@ fn give_back_reports_a_missing_recorded_leaf_without_discarding_the_source_recor
     let owner = job.tree.child_of(NodeId::ROOT, member).unwrap();
     job.writer
         .write_file(
-            &job.tree,
+            &mut job.tree,
             NodeId::ROOT,
             member,
             0,
@@ -3241,6 +3267,49 @@ fn a_gone_stores_envelope_file_stays_until_the_checkpoint_saying_so_commits() {
     job.writer.commit_moves(&mut job.tree, 2).expect("commit");
     assert!(!envelope.exists());
     assert!(!job.writer.awaits_commit());
+}
+
+// A store gives its one volume back and goes. The volume's envelope is the
+// member's file again; what else the store kept goes with the store, and its
+// file stays until the checkpoint that records it gone has committed, not
+// until something else in the job is refused or the job ends.
+#[test]
+fn a_store_gone_with_a_volume_given_back_leaves_no_other_envelope() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("pack.bin", None);
+    job.send(member, 0, SIGNATURE, Provenance::Fresh);
+    let (child, volume) = job
+        .tree
+        .child_of(NodeId::ROOT, member)
+        .expect("bound to the store");
+    job.writer
+        .envelopes
+        .keep(child, 7, 0, b"other volume", Provenance::Fresh)
+        .expect("kept");
+    let other = job
+        .dir
+        .path()
+        .join(crate::pipeline::graph::envelope::envelope_name(child, 7));
+    assert!(other.exists());
+    assert_eq!(job.writer.envelopes.records(child).len(), 2);
+
+    let mut build = job.build();
+    job.writer
+        .said(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            child,
+            Emit::GiveBack(volume),
+            &mut job.out,
+        )
+        .expect("give back");
+    assert!(job.tree.buried(child));
+    assert!(job.writer.envelopes.records(child).is_empty());
+    assert!(other.exists(), "no checkpoint has said the store is gone");
+    job.commit();
+    assert!(!other.exists());
+    assert_eq!(job.file("pack.bin"), SIGNATURE);
 }
 
 // A root member recognised as the name a store's member was written under
@@ -4004,6 +4073,195 @@ fn a_disk_reserve_refusal_says_the_disk_is_out_of_space() {
     );
 }
 
+// A job held to a reserve of `RESERVE`, whose disk has what `free` holds
+// free each time it is read, with the pretend set, PAR3 or PAR2, and its
+// fix.
+const RESERVE: u64 = 1 << 30;
+
+fn reserved(free: &Arc<std::sync::atomic::AtomicU64>, par3: bool, fix: Fix) -> Job {
+    use crate::operations::disk::{Capacity, CapacityReading};
+
+    let mut job = Job::new(PLENTY);
+    let dir = job.dir.path().to_path_buf();
+    let free = Arc::clone(free);
+    let reader = CapacityReader::from_fn(move || {
+        Capacity::Known(CapacityReading {
+            available_bytes: free.load(std::sync::atomic::Ordering::SeqCst),
+            total_bytes: u64::MAX,
+            sampled_at: std::time::Instant::now(),
+            stale: false,
+        })
+    });
+    job.writer = job
+        .writer
+        .capped(Caps::new(
+            Arc::new(reserve_limits(RESERVE)),
+            crate::pipeline::graph::limits::known_policy(Default::default()),
+            Vec::new(),
+        ))
+        .delivering_to(dir, reader);
+    job.par.lock().unwrap().par3 = par3;
+    job.with_set(Some(fix))
+}
+
+// How many of the repair's staged outputs are left in the job's folder.
+fn staged(job: &Job) -> usize {
+    let internal = job.dir.path().join(weaver_graph::names::INTERNAL_DIR);
+    std::fs::read_dir(&internal)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".repaired"))
+        .count()
+}
+
+// A PAR3 set that describes a post none of whose bytes arrived goes out
+// without it when a declared length would leave less than the reserve
+// free: the job is not refused, the set is told the post is withheld, and
+// it reads and writes nothing of it. The same length on a disk with room
+// for it goes out to be rebuilt. A PAR2 set is not judged, and rebuilds the
+// post whatever the disk holds.
+#[test]
+fn a_rebuild_the_disk_has_no_room_for_is_withheld_from_a_par3_set() {
+    const DECLARED: u64 = 4 << 40;
+    for (par3, free, withheld) in [
+        (true, 1 << 40, true),
+        (true, DECLARED + RESERVE - 1, true),
+        (true, DECLARED + RESERVE, false),
+        (false, 1 << 40, false),
+    ] {
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(free));
+        let mut job = reserved(
+            &free,
+            par3,
+            Fix {
+                name: "video.mkv",
+                read: ByteRange::new(0, 8),
+                fix: (0, b"OK"),
+            },
+        );
+        job.member("video.mkv", Some(DECLARED));
+        assert!(job.writer.refusal().is_none());
+
+        let due = job.tree.recovery_nodes(NodeId::ROOT);
+        let mut lent = Inline::default();
+        job.writer
+            .repair(&mut job.tree, NodeId::ROOT, &due, &mut lent)
+            .unwrap();
+        assert!(job.writer.refusal().is_none(), "the job is not refused");
+        assert_eq!(lent.0.len(), 1, "the set goes out");
+        let returned = lent
+            .0
+            .pop()
+            .unwrap()
+            .run(weaver_graph::Budget::default(), &Default::default());
+        let seen = job.par.lock().unwrap();
+        assert_eq!(seen.withheld, Some(withheld), "par3 {par3}, free {free:?}");
+        if withheld {
+            assert!(seen.read.is_none(), "nothing is read");
+            assert_eq!(staged(&job), 0, "nothing is written");
+        }
+        drop(seen);
+        if withheld {
+            let mut build = job.build();
+            let result = job.writer.returned(
+                &mut job.tree,
+                &mut build,
+                &Source,
+                &weaver_objects::Objects::default(),
+                returned,
+                &mut job.out,
+            );
+            assert!(result.is_ok());
+            assert!(job.writer.refusal().is_none());
+            assert!(!job.dir.path().join("video.mkv").exists());
+            assert_eq!(staged(&job), 0);
+        }
+    }
+}
+
+// What a PAR3 set wrote into a post none of whose bytes arrived is held to
+// the reserve again as it lands, against the disk as it is then: a rebuild
+// that would now leave less than the reserve free is refused, nothing of
+// the post is written and the staged output goes; one that leaves the
+// reserve free lands. A repair of a post that arrived writes over room the
+// post holds, and lands with less than the reserve free, before and after.
+// A PAR2 set's rebuild is not held to the reserve, and lands with less than
+// it free, before and after.
+#[test]
+fn a_repair_into_the_posts_is_held_to_the_disk_reserve() {
+    use crate::pipeline::extraction::ExtractionRejectionReason;
+
+    for (par3, arrived, (before, after), lands) in [
+        (true, false, (4 * RESERVE, RESERVE + 7), false),
+        (true, false, (4 * RESERVE, RESERVE + 8), true),
+        (true, true, (RESERVE / 2, RESERVE / 2), true),
+        (false, false, (RESERVE / 2, RESERVE / 2), true),
+    ] {
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(before));
+        let fix = match arrived {
+            true => (2, &b"OK"[..]),
+            false => (0, &b"goOKgood"[..]),
+        };
+        let mut job = reserved(
+            &free,
+            par3,
+            Fix {
+                name: "video.mkv",
+                read: ByteRange::new(0, 8),
+                fix,
+            },
+        );
+        let member = job.member("video.mkv", Some(8));
+        if arrived {
+            job.send(member, 0, b"go", Provenance::Fresh);
+            job.send(member, 2, b"XX", Provenance::Damaged);
+            job.send(member, 4, b"good", Provenance::Fresh);
+        } else {
+            job.send(member, 0, &[0; 8], Provenance::Lost);
+        }
+        assert!(job.writer.refusal().is_none(), "the posts are not charged");
+
+        let mut build = job.build();
+        let due = job.tree.recovery_nodes(NodeId::ROOT);
+        let mut lent = Inline::default();
+        job.writer
+            .repair(&mut job.tree, NodeId::ROOT, &due, &mut lent)
+            .unwrap();
+        let returned = lent
+            .0
+            .pop()
+            .unwrap()
+            .run(weaver_graph::Budget::default(), &Default::default());
+        free.store(after, std::sync::atomic::Ordering::SeqCst);
+        let result = job.writer.returned(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            &weaver_objects::Objects::default(),
+            returned,
+            &mut job.out,
+        );
+        if lands {
+            assert_eq!(result.unwrap(), Some(1));
+            assert!(job.writer.refusal().is_none());
+            assert_eq!(job.file("video.mkv"), b"goOKgood");
+        } else {
+            assert!(result.is_err());
+            let refusal = job
+                .writer
+                .refusal()
+                .expect("the reserve refused the repair");
+            assert_eq!(refusal.reason(), ExtractionRejectionReason::DiskReserve);
+            assert!(
+                !job.dir.path().join("video.mkv").exists(),
+                "nothing of the post is written"
+            );
+            assert_eq!(staged(&job), 0, "the staged output goes with the refusal");
+        }
+    }
+}
+
 // The stated checksum is checked whatever shape the writes left the fold
 // in: a write over bytes already written forgets the run it overlapped, so
 // the fold no longer spans the member, and the file is read back instead.
@@ -4334,6 +4592,85 @@ fn a_lent_repair_reads_held_bytes_in_place_and_nothing_it_does_not_ask_for() {
             )
             .expect("returned");
     }
+}
+
+// A restored set asks to hear again what arrived of its volume past the
+// front, which is held for the volume on scratch. Lending its rewalk reads
+// nothing held: the rewalk reads the bytes on scratch in place, and the
+// piece stands while the hold it read is as lent. Once that hold is
+// replaced, the same piece no longer stands, and is fetched again.
+#[test]
+fn a_rewalk_reads_scratch_in_place_and_its_piece_stands_while_the_hold_does() {
+    use crate::pipeline::graph::leaf::counting;
+    let mut job = Job::new(HoldBudgets {
+        resident_limit: 0,
+        ..PLENTY
+    })
+    .with_set(None);
+    let volume = job.root().find_by_name("set.par2").expect("the set").id;
+    let tail = ByteRange::at(PAR2_SIGNATURE.len() as u64, 8);
+    job.writer
+        .keep_held(
+            NodeId::ROOT,
+            volume,
+            tail.start,
+            Bytes::from_static(b"recovery").into(),
+        )
+        .unwrap();
+    job.tree
+        .namespace_mut(NodeId::ROOT)
+        .unwrap()
+        .get_mut(volume)
+        .unwrap()
+        .coverage
+        .write(tail, Provenance::Fresh);
+    assert_eq!(job.accountant.usage().scratch, tail.len());
+    job.par.lock().unwrap().again = Some(tail);
+    let mut build = job.build();
+    let mut effects = Vec::new();
+    job.tree.restored(&mut build, &mut effects);
+    let [set] = job.tree.rewalks()[..] else {
+        panic!("one rewalk owed: {:?}", job.tree.rewalks());
+    };
+
+    let (before, _) = counting::so_far();
+    let loan = job
+        .writer
+        .lend_rewalk(&mut job.tree, set)
+        .unwrap()
+        .expect("a rewalk");
+    assert_eq!(
+        counting::so_far().0 - before,
+        0,
+        "lending reads nothing held"
+    );
+    SCRATCH_READ_MOST.set(0);
+    let mut pieces = Vec::new();
+    let whole = loan.run(&Default::default(), &mut |volume, piece, scratch| {
+        pieces.push((volume, piece, scratch));
+        true
+    });
+    assert!(whole);
+    assert_eq!(SCRATCH_READ_MOST.get(), tail.len(), "read on scratch");
+    let [(VolumeIndex(0), Ok(posted), scratch)] = &pieces[..] else {
+        panic!("one piece of the volume read back");
+    };
+    assert_eq!(posted.offset, tail.start);
+    assert_eq!(posted.bytes.as_ref(), b"recovery");
+    assert!(job.writer.scratch_stands(scratch), "the hold is as lent");
+
+    job.writer
+        .keep_held(
+            NodeId::ROOT,
+            volume,
+            tail.start,
+            Bytes::from_static(b"replaced").into(),
+        )
+        .unwrap();
+    assert!(
+        !job.writer.scratch_stands(scratch),
+        "the hold the piece read was replaced"
+    );
 }
 
 // A hold on scratch the repair read is replaced while the repair is out,
@@ -4705,4 +5042,32 @@ fn a_give_up_keeps_a_directory_held_under_another_case() {
     store_says(&mut job, lower, vec![Emit::Refuse(Why::Compressed)]);
     commit_or_error(&mut job).expect("give-up commit");
     assert!(job.dir.path().join("folder").is_dir());
+}
+
+// A member whose name the file system refuses is skipped, and its damage
+// is applied as a failed checksum's is: the owner hears it once, over the
+// whole member, and the bytes that come after it raise nothing more.
+#[test]
+fn a_refused_name_reaches_the_owner_as_damage_once() {
+    let mut job = Job::new(PLENTY);
+    // One part of 300 bytes, past the 255 a part may hold.
+    let name = format!("{}.bin", "a".repeat(296));
+    let member = job.member(&name, Some(8));
+    job.send(member, 0, b"abcd", Provenance::Fresh);
+    job.send(member, 4, b"efgh", Provenance::Fresh);
+    job.close(member);
+    assert!(job.writer.unnamable(NodeId::ROOT, member));
+    let whole = ByteRange::new(0, 8);
+    let damaged: Vec<&Effect> = job
+        .out
+        .iter()
+        .filter(|effect| matches!(effect, Effect::Damaged { member: of, .. } if *of == member))
+        .collect();
+    assert!(
+        matches!(damaged[..], [Effect::Damaged { node, range, .. }]
+            if *node == NodeId::ROOT && *range == whole),
+        "{damaged:?}"
+    );
+    assert!(job.root().get(member).unwrap().coverage.damaged(whole));
+    assert_eq!(std::fs::read_dir(job.dir.path()).unwrap().count(), 0);
 }

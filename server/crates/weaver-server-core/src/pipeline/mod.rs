@@ -584,12 +584,29 @@ impl DownloadFailureKind {
     }
 }
 
+// What a refusal for want of a selected group (412) says about the article.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum GroupRefusal {
+    // The failure is not a 412.
+    #[default]
+    None,
+    // The refusal teaches the server's requirement, and the next connection
+    // selects one of the work's groups before asking again. It costs the
+    // article nothing.
+    Learning,
+    // The work had no group to select, or the connection had one selected
+    // and the server refused anyway. Asking again is answered the same way,
+    // so the article pays a retry like for any other refusal.
+    Settled,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct DownloadFailure {
     pub(super) kind: DownloadFailureKind,
     pub(super) message: String,
     pub(super) retry_after: Option<Duration>,
     pub(super) quota_rejection: Option<weaver_nntp::transfer::QuotaRejection>,
+    pub(super) group_refusal: GroupRefusal,
 }
 
 impl DownloadFailure {
@@ -599,6 +616,21 @@ impl DownloadFailure {
             message: message.into(),
             retry_after: None,
             quota_rejection: None,
+            group_refusal: GroupRefusal::None,
+        }
+    }
+
+    // Whether the article keeps its retry count for this failure.
+    pub(super) fn preserves_article_retry_budget(&self) -> bool {
+        self.kind.preserves_article_retry_budget() && self.group_refusal != GroupRefusal::Settled
+    }
+
+    // Settle a 412 the next connection cannot answer by selecting a group:
+    // `no_group` when the work lists none, `group_selected` when the
+    // connection that was refused had one selected.
+    pub(super) fn settle_group_refusal(&mut self, no_group: bool, group_selected: bool) {
+        if self.group_refusal == GroupRefusal::Learning && (no_group || group_selected) {
+            self.group_refusal = GroupRefusal::Settled;
         }
     }
 
@@ -614,6 +646,7 @@ impl DownloadFailure {
             message: message.into(),
             retry_after,
             quota_rejection: Some(rejection),
+            group_refusal: GroupRefusal::None,
         }
     }
 
@@ -708,7 +741,11 @@ impl DownloadFailure {
                 .unwrap_or(DownloadFailureKind::ContentOrProtocol),
         };
 
-        Self::new(kind, error.to_string())
+        let mut failure = Self::new(kind, error.to_string());
+        if matches!(error, NntpError::NoGroupSelected) {
+            failure.group_refusal = GroupRefusal::Learning;
+        }
+        failure
     }
 }
 
@@ -999,6 +1036,90 @@ pub(super) struct UnanchoredPart {
     pub(super) result: DecodeResult,
     pub(super) bytes: ParkedBytes,
     pub(super) source: SegmentSource,
+}
+
+// Every article held for the ordinal before it, by file, with how many are
+// held across every file. Parts go in and come out only through these
+// methods, so the count is always the number held, in memory or spilled,
+// and is never recounted. A file that holds nothing has no entry.
+#[derive(Default)]
+pub(super) struct UnanchoredPark {
+    files: HashMap<NzbFileId, BTreeMap<u32, UnanchoredPart>>,
+    parts: usize,
+}
+
+impl UnanchoredPark {
+    pub(super) fn parts(&self) -> usize {
+        self.parts
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    pub(super) fn contains_key(&self, file_id: &NzbFileId) -> bool {
+        self.files.contains_key(file_id)
+    }
+
+    pub(super) fn get(&self, file_id: &NzbFileId) -> Option<&BTreeMap<u32, UnanchoredPart>> {
+        self.files.get(file_id)
+    }
+
+    pub(super) fn iter(
+        &self,
+    ) -> std::collections::hash_map::Iter<'_, NzbFileId, BTreeMap<u32, UnanchoredPart>> {
+        self.files.iter()
+    }
+
+    pub(super) fn keys(
+        &self,
+    ) -> std::collections::hash_map::Keys<'_, NzbFileId, BTreeMap<u32, UnanchoredPart>> {
+        self.files.keys()
+    }
+
+    // Hold a part, returning the one it replaced at the same ordinal.
+    pub(super) fn insert(
+        &mut self,
+        file_id: NzbFileId,
+        ordinal: u32,
+        part: UnanchoredPart,
+    ) -> Option<UnanchoredPart> {
+        let replaced = self.files.entry(file_id).or_default().insert(ordinal, part);
+        if replaced.is_none() {
+            self.parts += 1;
+        }
+        replaced
+    }
+
+    pub(super) fn remove(&mut self, file_id: NzbFileId, ordinal: u32) -> Option<UnanchoredPart> {
+        let parked = self.files.get_mut(&file_id)?;
+        let part = parked.remove(&ordinal)?;
+        if parked.is_empty() {
+            self.files.remove(&file_id);
+        }
+        debug_assert!(self.parts > 0, "unanchored park over-release");
+        self.parts = self.parts.saturating_sub(1);
+        Some(part)
+    }
+
+    // Every part the file holds.
+    pub(super) fn remove_file(
+        &mut self,
+        file_id: NzbFileId,
+    ) -> Option<BTreeMap<u32, UnanchoredPart>> {
+        let parked = self.files.remove(&file_id)?;
+        debug_assert!(self.parts >= parked.len(), "unanchored park over-release");
+        self.parts = self.parts.saturating_sub(parked.len());
+        Some(parked)
+    }
+}
+
+impl std::ops::Index<&NzbFileId> for UnanchoredPark {
+    type Output = BTreeMap<u32, UnanchoredPart>;
+
+    fn index(&self, file_id: &NzbFileId) -> &Self::Output {
+        &self.files[file_id]
+    }
 }
 
 // Sequential-assembly state for one uuencode file.
@@ -1797,7 +1918,12 @@ pub struct Pipeline {
     // they follow, held decoded until that ordinal is placed. Their bytes are
     // charged to the write-buffer ledger while they wait in memory, and to
     // the spool's once their paused job spills them.
-    pub(super) unanchored_parked: HashMap<NzbFileId, BTreeMap<u32, UnanchoredPart>>,
+    pub(super) unanchored_parked: UnanchoredPark,
+    // Aggregate bound on the articles held above, in memory or spilled. Bytes
+    // alone do not bound it: an article can decode to almost nothing, and
+    // each held one keeps its decode result. It is the uuencode park's
+    // aggregate entry bound, kept apart from it and from the write backlog.
+    pub(super) unanchored_park_max_parts: usize,
     // How often each article that declared no usable start has been sent back
     // for the ordinal before it because the park above had no room for it,
     // paired with how many ordinals of its file were placed when that count

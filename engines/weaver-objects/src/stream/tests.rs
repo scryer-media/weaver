@@ -682,11 +682,14 @@ fn a_zstd_frame_wider_than_the_granted_window_is_refused() {
     );
 }
 
-// A run granted a wider window than the stream was built with, as an owner
-// grants a run whose window it lets go above its ceiling, decodes a frame
-// the build's grant refused; it never holds less than the build's window.
+// A run granted a wider window than the stream was built with, as a profile
+// raised after the build grants it, holds only the window the build sized
+// and its owner reserved: a frame wider than that is refused with both
+// sizes, never held uncharged. Reserved whole at the window the frame
+// needs, as its owner reserves it on that refusal, the run decodes it; a
+// narrower grant never holds less than the build's window.
 #[test]
-fn a_run_granted_a_wider_window_than_the_build_decodes_the_wider_frame() {
+fn a_run_granted_a_wider_window_than_the_build_holds_only_the_window_reserved() {
     let built = weaver_graph::Budget {
         memory_bytes: Some(GIB),
         window_bytes: Some(MIB),
@@ -705,14 +708,21 @@ fn a_run_granted_a_wider_window_than_the_build_decodes_the_wider_frame() {
         &mut |_, _| false,
         &mut Vec::new(),
     );
-    let wider = weaver_graph::Budget {
-        memory_bytes: Some(2 * MIB),
-        window_bytes: Some(2 * MIB),
+    stream.volume_closed(VolumeIndex(0), &mut Vec::new());
+    assert_eq!(stream.reserve(), Some(MIB));
+    let raised = weaver_graph::Budget {
+        memory_bytes: Some(GIB),
+        window_bytes: Some(GIB),
         threads: 1,
         ..Default::default()
     };
+    too_large(
+        &closed_run(&mut stream, bytes.clone(), raised),
+        Some(2 * MIB),
+        Some(MIB),
+    );
     assert_eq!(
-        closed_run(&mut stream, bytes.clone(), wider),
+        closed_run(&mut stream, bytes.clone(), granted(2 * MIB, true)),
         decoded("a", b"z".to_vec())
     );
     let narrower = weaver_graph::Budget {
@@ -795,9 +805,10 @@ fn a_later_xz_block_wider_than_the_first_decodes_within_a_window_reserved_whole(
     );
 }
 
-// The same for zstd, past the decoder's own 128 MiB: a later frame of
-// 256 MiB is refused unless the run's window was reserved whole for it. Its
-// refusal cannot say what the later frame needs.
+// The same for zstd: a later frame of 256 MiB is refused unless the run's
+// window was reserved whole for it, at the window the build reserved
+// however wide the grant is. Its refusal cannot say what the later frame
+// needs.
 #[test]
 fn a_later_zstd_frame_wider_than_the_first_decodes_within_a_window_reserved_whole() {
     let mut bytes = zstd_window(20);
@@ -806,7 +817,7 @@ fn a_later_zstd_frame_wider_than_the_first_decodes_within_a_window_reserved_whol
     too_large(
         &closed_run(&mut stream, bytes.clone(), granted(512 * MIB, false)),
         None,
-        Some(128 * MIB),
+        Some(MIB),
     );
     assert_eq!(
         closed_run(&mut stream, bytes, granted(512 * MIB, true)),

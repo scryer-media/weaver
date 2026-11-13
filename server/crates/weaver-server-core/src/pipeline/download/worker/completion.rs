@@ -1347,7 +1347,7 @@ impl Pipeline {
                                 > streak.downloaded_at_start
                     });
                     let preserves_retry_budget =
-                        failure.kind.preserves_article_retry_budget() && !article_local_transport;
+                        failure.preserves_article_retry_budget() && !article_local_transport;
                     let infrastructure_retry = failure.kind.infrastructure_wait_reason().is_some();
                     let next_retry = if preserves_retry_budget || source_not_found {
                         result.retry_count

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+mod bounded;
 mod elimination;
 mod facts;
 mod indexes;
 mod readback;
+mod rebuild_absent;
 mod recovery_contracts;
 
 #[test]

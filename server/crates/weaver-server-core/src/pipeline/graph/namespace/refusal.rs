@@ -317,7 +317,7 @@ impl NamespaceWriter {
 
     fn close_if_leaf(
         &mut self,
-        tree: &Tree,
+        tree: &mut Tree,
         node: NodeId,
         member: MemberId,
     ) -> Result<(), WriteError> {

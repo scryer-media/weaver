@@ -106,6 +106,10 @@ struct Open {
     // The volumes that began or stopped being waited on since the bootstrap
     // last read them.
     reopened: BTreeSet<VolumeIndex>,
+    // The volumes whose first article began or stopped being waited on
+    // since the feed last read them. `None` until the feed first reads
+    // them, when every volume counts as changed, so nothing is filed.
+    firsts: Option<BTreeSet<VolumeIndex>>,
     // The volumes and articles the readers looked at, for the tests that
     // hold them to the ones still open.
     #[cfg(test)]
@@ -214,7 +218,7 @@ struct Volume {
     // class, a boundary, the order the volume is placed in.
     changes: u64,
     // The seeks answered since the last change, and what each was told.
-    answered: Vec<(ByteRange, Option<Class>, Pull)>,
+    answered: HashMap<(ByteRange, Option<Class>), Pull>,
 }
 
 impl Volume {
@@ -253,7 +257,7 @@ impl Volume {
             cuts: Vec::new(),
             marks: Marks::default(),
             changes: 0,
-            answered: Vec::new(),
+            answered: HashMap::new(),
         }
     }
 
@@ -278,6 +282,11 @@ impl Volume {
                 State::Waiting => self.settled_bytes - size,
                 _ => self.settled_bytes + size,
             };
+            if ordinal == self.articles[0].ordinal
+                && let Some(firsts) = open.firsts.as_mut()
+            {
+                firsts.insert(self.at);
+            }
         }
         let decoded = |state: State| match state {
             State::Arrived(Some(range)) => range.end - range.start,
@@ -766,6 +775,19 @@ impl ArticleMap {
         })
     }
 
+    // The volumes whose first article began or stopped being waited on
+    // since the last call. `None` on the first call: every volume counts as
+    // changed, and the volumes are filed from then on.
+    pub(crate) fn take_first_changes(&mut self) -> Option<BTreeSet<VolumeIndex>> {
+        match self.open.firsts.as_mut() {
+            Some(firsts) => Some(std::mem::take(firsts)),
+            None => {
+                self.open.firsts = Some(BTreeSet::new());
+                None
+            }
+        }
+    }
+
     // Every server failed the article.
     pub(crate) fn lost(&mut self, volume: VolumeIndex, ordinal: u32) {
         let Some(found) = self.volumes.get_mut(volume.0 as usize) else {
@@ -1046,10 +1068,7 @@ impl ArticleMap {
         // what it was, without mapping its range again: one that moved
         // articles changed them, so only an answer that moved none stands.
         if let Some(found) = self.volumes.get(volume.0 as usize)
-            && let Some(&(_, _, pull)) = found
-                .answered
-                .iter()
-                .find(|(asked, of, _)| *asked == range && *of == class)
+            && let Some(&pull) = found.answered.get(&(range, class))
         {
             #[cfg(test)]
             {
@@ -1069,7 +1088,7 @@ impl ArticleMap {
         if let Some(found) = self.volumes.get_mut(volume.0 as usize)
             && Some(found.changes) == changes
         {
-            found.answered.push((range, class, pull));
+            found.answered.insert((range, class), pull);
         }
         pull
     }

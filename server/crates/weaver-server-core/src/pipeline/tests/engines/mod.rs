@@ -85,6 +85,7 @@ mod depth;
 mod download_summary;
 mod embedded;
 mod encrypted_hex;
+mod first_article_sample;
 pub(in crate::pipeline) mod harness;
 mod hold_breach;
 mod lent_handed;

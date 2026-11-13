@@ -8,6 +8,7 @@
 // restart and seeding possible without ever writing the archive itself.
 
 use std::fmt;
+use std::sync::atomic::AtomicBool;
 
 use serde::{Deserialize, Serialize};
 
@@ -477,6 +478,14 @@ pub trait Object: Send + Sync {
     // Do the work I hold, away from the tree: no placement can be read.
     // What I say is applied as I come back.
     fn work(&mut self, _out: &mut Vec<Emit>) {}
+
+    // `work`, left off between one key and the next once `stop` is set:
+    // the job I was lent for has gone and nothing I say will be heard.
+    // What I did not do stays due, so I come back an object that would do
+    // it if lent again. One whose work does not stop part-way does it all.
+    fn work_until(&mut self, _stop: &AtomicBool, out: &mut Vec<Emit>) {
+        self.work(out);
+    }
 
     // Bytes of my envelope, for the inverse map's remainder.
     fn envelope(&self, envelope: u32, range: ByteRange) -> Option<bytes::Bytes>;
