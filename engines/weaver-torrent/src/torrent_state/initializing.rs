@@ -153,6 +153,11 @@ pub(crate) fn normalize_checkpoint(
 }
 
 impl TorrentStateInitializing {
+    /// Whether the check reads every piece back and trusts nothing saved.
+    pub(crate) fn is_full_check(&self) -> bool {
+        self.full_check
+    }
+
     pub(crate) fn new(
         shared: Arc<ManagedTorrentShared>,
         metadata: Arc<TorrentMetadata>,

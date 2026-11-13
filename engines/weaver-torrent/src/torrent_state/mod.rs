@@ -380,6 +380,9 @@ pub struct ManagedTorrentShared {
     pub(crate) user_agent: String,
     /// The `tracker id` each tracker gave, kept with the identity.
     pub(crate) tracker_ids: crate::TrackerIds,
+    /// Whether a tracker was told the torrent completed, kept with the
+    /// identity.
+    pub(crate) completion: crate::Completion,
     /// How the torrent's announces are written.
     pub(crate) announce_shape: &'static crate::tracker::AnnounceShape,
 
@@ -395,6 +398,14 @@ pub struct ManagedTorrentShared {
     /// What the torrent moved before its running run: the totals it was
     /// added with, and every run of it that ended since.
     pub(crate) moved: parking_lot::Mutex<TorrentTotals>,
+
+    /// What the torrent had moved when its running run, or its last, began
+    /// announcing; None before its first run. Its announces count from there
+    /// (libtorrent `torrent::start_announcing` clears `m_stat`, failed and
+    /// redundant bytes, torrent.cpp:10343-10353, v2.0.15). The first run
+    /// counts from the totals the torrent was added with taken as nothing,
+    /// so a torrent another session ran goes on from what that one reported.
+    pub(crate) announced_from: parking_lot::Mutex<Option<TorrentTotals>>,
 
     /// The torrent's web seeds, kept across its runs.
     pub(crate) web_seeds: Arc<live::web_seed::WebSeeds>,
@@ -433,6 +444,7 @@ impl ManagedTorrentShared {
             version: self.client_name_and_version.clone(),
             user_agent: self.user_agent.clone(),
             tracker_ids: self.tracker_ids.clone(),
+            completion: self.completion.clone(),
             shape: self.announce_shape,
         }
     }
@@ -945,6 +957,10 @@ impl ManagedTorrent {
                                     };
 
                                     paused.peers = checked.take_peers();
+                                    t.shared.completion.checked(
+                                        paused.chunk_tracker.bytes_left() == 0,
+                                        checked.is_full_check(),
+                                    );
                                     g.state = ManagedTorrentState::Paused(Box::new(paused));
                                     t.state_change_notify.notify_waiters();
                                     // The checked torrent goes live only if it
@@ -995,6 +1011,15 @@ impl ManagedTorrent {
                     // makes for it now, as it starts.
                     let peer_rx = peer_rx.or_else(|| session.peer_source_managed_torrent(t, true));
                     let paused = g.state.take().assert_paused();
+                    // The run's announces count from here; the first counts
+                    // from what the torrent was added with.
+                    {
+                        let mut from = t.shared.announced_from.lock();
+                        *from = Some(match *from {
+                            None => TorrentTotals::default(),
+                            Some(_) => *t.shared.moved.lock(),
+                        });
+                    }
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let live = TorrentStateLive::new(paused, tx, token.clone())?;
                     g.state = ManagedTorrentState::Live(live.clone());
