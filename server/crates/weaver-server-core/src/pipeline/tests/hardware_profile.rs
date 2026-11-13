@@ -388,11 +388,12 @@ async fn the_efficient_profile_holds_a_repair_to_its_cap() {
     let mut pipeline = pipeline_on_twelve_cores(&temp_dir).await;
     let balanced = pipeline.graph_hardware.grant();
     // Twelve cores, every one but one for repair, held to the balanced
-    // profile's six extract threads; an eighth of 8 GiB, up to 1 GiB.
+    // profile's six extract threads; an eighth of 8 GiB is 1 GiB, held to
+    // the 512 MiB ceiling.
     assert_eq!(
         balanced.repair,
         Budget {
-            memory_bytes: Some(1024 * 1024 * 1024),
+            memory_bytes: Some(512 * 1024 * 1024),
             window_bytes: None,
             window_reserved: false,
             threads: 6,
@@ -406,11 +407,11 @@ async fn the_efficient_profile_holds_a_repair_to_its_cap() {
     let grant = pipeline.graph_hardware.grant();
     let tuning = pipeline.tuner.profile_tuning();
     assert_eq!(tuning.par3_cpu_cap, Some(4));
-    // A sixteenth of 8 GiB is 512 MiB, held to the 256 MiB ceiling.
+    // A sixteenth of 8 GiB is 512 MiB, held to the 128 MiB ceiling.
     assert_eq!(
         grant.repair,
         Budget {
-            memory_bytes: Some(256 * 1024 * 1024),
+            memory_bytes: Some(128 * 1024 * 1024),
             window_bytes: None,
             window_reserved: false,
             threads: 4,
