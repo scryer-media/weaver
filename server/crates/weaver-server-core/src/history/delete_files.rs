@@ -558,66 +558,37 @@ pub(crate) async fn delete_history_rows(
     )
 }
 
-// Housekeeping for a failed job: once its scripts have stopped, its working
-// directories and its staging directory go the way a history delete takes
-// them, and its record stays. `marked` is what a marker scan found for the
-// job; the directory its record names in the intermediate root goes with
-// them, marked or not, unless another job's marker names it. Returns whether
-// nothing of the job is left on disk: no folder was left in place and the
-// folder its record names, a delivery folder included, is gone.
+// Whether a failed job's recorded folder cannot be judged now: reading it
+// fails, or neither it nor the folder that would hold it is there, as when
+// a mount is offline. Housekeeping leaves such a job for a later sweep.
+pub(crate) fn recorded_dir_unreachable(recorded: &std::path::Path) -> bool {
+    match std::fs::symlink_metadata(recorded) {
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => recorded
+            .parent()
+            .is_some_and(|parent| std::fs::symlink_metadata(parent).is_err()),
+        Err(_) => true,
+    }
+}
+
+// Housekeeping for a failed job whose scripts have stopped: the working
+// directories that carry its marker, `marked`, as a scan of the intermediate
+// root found them, and its staging directory go, and its record stays. The
+// folder its record names goes only as one of those: unmarked, another
+// job's, or a delivery folder, it is not housekeeping's to remove and stays,
+// said once. Returns whether housekeeping has done all it ever will for the
+// job; false when its recorded folder carries its marker and is still there,
+// which the next sweep's scan finds.
 pub(crate) async fn sweep_failed_job_files(
-    db: &crate::Database,
     intermediate_dir: &std::path::Path,
     staging_roots: &[PathBuf],
     job_id: JobId,
     recorded: Option<PathBuf>,
     marked: Vec<PathBuf>,
 ) -> Result<bool, crate::SchedulerError> {
-    retry_script_stop_wait(job_id, || {
-        crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0)
-    })
-    .await
-    .map_err(crate::SchedulerError::State)?;
-    // A recorded directory another job's marker names is that job's, and
-    // stays; the marked ones are taken all the same.
-    let dirs = match JobCleanupDirs::plan(
-        intermediate_dir,
-        job_id,
-        recorded.as_deref(),
-        marked.clone(),
-        staging_roots,
-    )
-    .await
-    {
-        Ok(dirs) => dirs,
-        Err((dir, error)) if !marked.contains(&dir) => {
-            // Said once for the job in each sweep. A folder another job's
-            // marker names is that job's, as it should be; anything else
-            // that refuses is not.
-            let (root, path) = (intermediate_dir.to_path_buf(), dir.clone());
-            let owner = tokio::task::spawn_blocking(move || {
-                crate::jobs::working_dir::working_dir_owner(&root, &path)
-            })
-            .await;
-            match owner {
-                Ok(Ok(Some(owner))) if owner != job_id => tracing::debug!(
-                    job_id = job_id.0,
-                    owner = owner.0,
-                    dir = %dir.display(),
-                    "a failed job's recorded folder belongs to another job; housekeeping leaves it"
-                ),
-                _ => warn!(
-                    job_id = job_id.0,
-                    dir = %dir.display(),
-                    %error,
-                    "a failed job's recorded folder refused cleanup; housekeeping leaves it"
-                ),
-            }
-            JobCleanupDirs::plan(intermediate_dir, job_id, None, marked, &[])
-                .await
-                .map_err(|(_, error)| error)?
-        }
-        Err((_, error)) => return Err(error),
+    let dirs = JobCleanupDirs {
+        owned: marked.into_iter().collect(),
+        left_in_place: Vec::new(),
     };
     let left_in_place = dirs.remove(intermediate_dir, job_id).await?.left_in_place;
     for dir in &left_in_place {
@@ -632,16 +603,40 @@ pub(crate) async fn sweep_failed_job_files(
     for staging in staged {
         info!(dir = %staging.display(), "removed a failed job's staging directory");
     }
-    if !left_in_place.is_empty() {
-        return Ok(false);
-    }
     let Some(recorded) = recorded else {
         return Ok(true);
     };
-    match tokio::fs::symlink_metadata(&recorded).await {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        _ => Ok(false),
-    }
+    let (root, destinations) = (intermediate_dir.to_path_buf(), staging_roots.to_vec());
+    tokio::task::spawn_blocking(move || {
+        match std::fs::symlink_metadata(&recorded) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+        // Still there. A delivery folder, or one outside the intermediate
+        // root, was never a working directory housekeeping takes.
+        let Some(dir) = working_dir_on_record(&root, &recorded, &destinations) else {
+            return Ok(true);
+        };
+        match crate::jobs::working_dir::working_dir_owner(&root, &dir)? {
+            Some(owner) if owner == job_id => return Ok(false),
+            Some(owner) => debug!(
+                job_id = job_id.0,
+                owner = owner.0,
+                dir = %dir.display(),
+                "a failed job's recorded folder belongs to another job; housekeeping leaves it"
+            ),
+            None => warn!(
+                job_id = job_id.0,
+                dir = %dir.display(),
+                "a failed job's recorded folder does not carry its marker; housekeeping leaves it, and removing the entry's files takes it"
+            ),
+        }
+        Ok(true)
+    })
+    .await
+    .map_err(|error| crate::SchedulerError::Io(std::io::Error::other(error)))?
+    .map_err(crate::SchedulerError::Io)
 }
 
 // Archiving history entries: their files are removed while the entries, and

@@ -202,11 +202,12 @@ async fn housekeeping_removes_an_old_failed_job_s_files_and_keeps_its_record() {
     retire_pipeline_database(pipeline).await;
 }
 
-// A failed job's recorded working directory with no marker, as one made
-// before markers were, is the job's all the same: housekeeping takes it, so
-// the next sweep finds nothing left to try.
+// A failed job's recorded working directory with no marker is not
+// housekeeping's to take, whoever made it: it stays, with what it holds. The
+// job is stamped all the same, so no later sweep lists it again; removing
+// the entry's files is still the user's to ask for.
 #[tokio::test]
-async fn housekeeping_removes_an_old_failed_job_s_unmarked_working_directory() {
+async fn housekeeping_leaves_an_unmarked_recorded_folder_and_lists_its_job_once() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30050);
@@ -225,16 +226,75 @@ async fn housekeeping_removes_an_old_failed_job_s_unmarked_working_directory() {
         ))
         .unwrap();
     pipeline.report_all_for_test();
+    let listed = |pipeline: &Pipeline| pipeline.db.failed_job_history_page(100, None, 10).unwrap();
+    assert_eq!(listed(&pipeline).len(), 1);
 
-    pipeline
-        .shared_state
-        .queue
-        .clone()
-        .sweep_job_files(Some(100), std::time::SystemTime::UNIX_EPOCH)
-        .await;
-
-    assert!(!working_dir.exists());
+    for _ in 0..2 {
+        pipeline
+            .shared_state
+            .queue
+            .clone()
+            .sweep_job_files(Some(100), std::time::SystemTime::UNIX_EPOCH)
+            .await;
+        assert!(working_dir.join("lantern.part01.rar").exists());
+        assert!(!crate::jobs::working_dir::is_weaver_owned_working_dir(
+            &working_dir
+        ));
+        assert!(swept_at(&pipeline, job_id).await.is_some());
+        assert!(listed(&pipeline).is_empty());
+    }
     assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_some());
+    retire_pipeline_database(pipeline).await;
+}
+
+// One page of the sweep works from the reading of the intermediate root it
+// is given, and reads no root of its own: a job the reading names gives up
+// its folder and is stamped, and a job whose marked folder the reading does
+// not name keeps it and is listed again.
+#[tokio::test]
+async fn a_sweep_page_works_from_the_one_reading_of_the_root_it_is_given() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let (read, unread) = (JobId(30070), JobId(30071));
+    let read_dir = marked_working_dir(&intermediate_dir, "sweep-read", read).await;
+    let unread_dir = marked_working_dir(&intermediate_dir, "sweep-unread", unread).await;
+    for (id, dir) in [(read, read_dir.clone()), (unread, unread_dir.clone())] {
+        pipeline
+            .db
+            .insert_job_history(&history_row_finished_at(id, "failed", dir, 2))
+            .unwrap();
+    }
+    pipeline.report_all_for_test();
+    let queue = pipeline.shared_state.queue.clone();
+    let resources = queue.resources.get().cloned().unwrap();
+    let mut marked = Some(BTreeMap::from([(read, vec![read_dir.clone()])]));
+
+    assert!(
+        queue
+            .sweep_failed_page(
+                &resources,
+                &[],
+                &mut marked,
+                100,
+                vec![
+                    (read, Some(read_dir.clone())),
+                    (unread, Some(unread_dir.clone())),
+                ],
+            )
+            .await
+    );
+
+    assert!(!read_dir.exists());
+    assert!(unread_dir.exists());
+    assert!(swept_at(&pipeline, read).await.is_some());
+    assert_eq!(swept_at(&pipeline, unread).await, None);
+    // Each job's hold went as its own sweep ended.
+    assert!(
+        pipeline
+            .shared_state
+            .queue
+            .read(|inner| inner.history_operations.is_empty())
+    );
     retire_pipeline_database(pipeline).await;
 }
 
@@ -357,12 +417,13 @@ fn views_of(pipeline: &Pipeline, ids: &[JobId]) -> String {
     out
 }
 
-// The sweep stamps, internally, only a failed job it left nothing of. A job
-// whose delivery folder stays is not stamped and is listed again. Nothing
-// any view shows of either entry changes, "remove files" included. A job
-// stamped and then finished again as failed is swept again.
+// The sweep stamps, internally, every failed job it has no more to do for:
+// one it left nothing of, and one whose delivery folder is not its to take.
+// Neither is listed again. Nothing any view shows of either entry changes,
+// "remove files" included. A job stamped and then finished again as failed
+// is swept again.
 #[tokio::test]
-async fn housekeeping_stamps_only_a_failed_job_it_left_nothing_of() {
+async fn housekeeping_stamps_a_failed_job_once_it_has_no_more_to_do_for_it() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
     let delivered = JobId(30060);
@@ -393,7 +454,7 @@ async fn housekeeping_stamps_only_a_failed_job_it_left_nothing_of() {
 
     assert!(delivery.join("lantern.mkv").exists());
     assert!(!working.exists());
-    assert_eq!(swept_at(&pipeline, delivered).await, None);
+    assert!(swept_at(&pipeline, delivered).await.is_some());
     assert!(swept_at(&pipeline, swept).await.is_some());
     assert_eq!(views_of(&pipeline, &[delivered, swept]), before);
     let listed = |pipeline: &Pipeline| -> Vec<JobId> {
@@ -405,7 +466,7 @@ async fn housekeeping_stamps_only_a_failed_job_it_left_nothing_of() {
             .map(|(_, id, _)| id)
             .collect()
     };
-    assert_eq!(listed(&pipeline), vec![delivered]);
+    assert_eq!(listed(&pipeline), Vec::<JobId>::new());
 
     // Restarted and failed again: the archive writes the entry afresh, the
     // stamp goes, and the next sweep takes the new working folder.
@@ -418,7 +479,7 @@ async fn housekeeping_stamps_only_a_failed_job_it_left_nothing_of() {
         )
         .unwrap();
     assert_eq!(swept_at(&pipeline, swept).await, None);
-    assert_eq!(listed(&pipeline), vec![swept, delivered]);
+    assert_eq!(listed(&pipeline), vec![swept]);
     sweep().await;
     assert!(!again.exists());
     assert!(swept_at(&pipeline, swept).await.is_some());
@@ -432,18 +493,15 @@ async fn the_failed_sweep_page_reads_the_unswept_index() {
     use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
     let temp_dir = tempfile::tempdir().unwrap();
     let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    use crate::history::queries::{FAILED_SWEEP_FIRST_PAGE_SQL, FAILED_SWEEP_NEXT_PAGE_SQL};
+    // The texts production runs, each under EXPLAIN.
     for (sql, args) in [
         (
-            "EXPLAIN QUERY PLAN SELECT job_id, completed_at, output_dir FROM job_history \
-             WHERE status = 'failed' AND files_swept_at IS NULL AND completed_at <= {} \
-             ORDER BY completed_at DESC, job_id DESC LIMIT {}",
+            format!("EXPLAIN QUERY PLAN {FAILED_SWEEP_FIRST_PAGE_SQL}"),
             vec![SqlArg::I64(100), SqlArg::I64(50)],
         ),
         (
-            "EXPLAIN QUERY PLAN SELECT job_id, completed_at, output_dir FROM job_history \
-             WHERE status = 'failed' AND files_swept_at IS NULL AND completed_at <= {} \
-             AND (completed_at < {} OR (completed_at = {} AND job_id < {})) \
-             ORDER BY completed_at DESC, job_id DESC LIMIT {}",
+            format!("EXPLAIN QUERY PLAN {FAILED_SWEEP_NEXT_PAGE_SQL}"),
             vec![
                 SqlArg::I64(100),
                 SqlArg::I64(5),
@@ -454,7 +512,7 @@ async fn the_failed_sweep_page_reads_the_unswept_index() {
         ),
     ] {
         let plan: Vec<String> =
-            SqlRuntime::fetch_all(pipeline.db.datastore().read_exec(), sql, &args)
+            SqlRuntime::fetch_all(pipeline.db.datastore().read_exec(), &sql, &args)
                 .await
                 .unwrap()
                 .into_iter()

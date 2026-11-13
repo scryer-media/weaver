@@ -32,6 +32,17 @@ const JOB_HISTORY_SELECT_ALIASED: &str =
 #[cfg(test)]
 pub(crate) const JOB_HISTORY_SELECTS: [&str; 2] = [JOB_HISTORY_SELECT, JOB_HISTORY_SELECT_ALIASED];
 
+// The failed-job sweep's page, first and following. The predicate is spelled
+// out literally so the partial unswept-failed index serves the filter and
+// the sort. The plan test reads these same texts.
+pub(crate) const FAILED_SWEEP_FIRST_PAGE_SQL: &str = "SELECT job_id, completed_at, output_dir FROM job_history \
+     WHERE status = 'failed' AND files_swept_at IS NULL AND completed_at <= {} \
+     ORDER BY completed_at DESC, job_id DESC LIMIT {}";
+pub(crate) const FAILED_SWEEP_NEXT_PAGE_SQL: &str = "SELECT job_id, completed_at, output_dir FROM job_history \
+     WHERE status = 'failed' AND files_swept_at IS NULL AND completed_at <= {} \
+     AND (completed_at < {} OR (completed_at = {} AND job_id < {})) \
+     ORDER BY completed_at DESC, job_id DESC LIMIT {}";
+
 impl Database {
     pub fn get_job_history(&self, job_id: u64) -> Result<Option<JobHistoryRow>, StateError> {
         self.get_job_history_inner(job_id)
@@ -322,16 +333,11 @@ impl Database {
             let limit = SqlArg::I64(limit as i64);
             let (sql, args) = match after {
                 None => (
-                    "SELECT job_id, completed_at, output_dir FROM job_history \
-                     WHERE status = 'failed' AND files_swept_at IS NULL AND completed_at <= {} \
-                     ORDER BY completed_at DESC, job_id DESC LIMIT {}",
+                    FAILED_SWEEP_FIRST_PAGE_SQL,
                     vec![SqlArg::I64(finished_by), limit],
                 ),
                 Some((completed_at, job_id)) => (
-                    "SELECT job_id, completed_at, output_dir FROM job_history \
-                     WHERE status = 'failed' AND files_swept_at IS NULL AND completed_at <= {} \
-                     AND (completed_at < {} OR (completed_at = {} AND job_id < {})) \
-                     ORDER BY completed_at DESC, job_id DESC LIMIT {}",
+                    FAILED_SWEEP_NEXT_PAGE_SQL,
                     vec![
                         SqlArg::I64(finished_by),
                         SqlArg::I64(completed_at),

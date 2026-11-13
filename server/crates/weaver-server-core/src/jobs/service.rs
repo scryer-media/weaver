@@ -366,6 +366,7 @@ impl Pipeline {
             )
             .await?;
         }
+        let mut claimed_marked = false;
         let (working_dir, directory_existed) =
             match restart.as_ref().filter(|restart| restart.reprocess) {
                 Some(restart) => {
@@ -395,10 +396,13 @@ impl Pipeline {
                         ))
                     })?
                     .map_err(crate::SchedulerError::Io)?;
+                    claimed_marked = true;
                     (claimed.path, claimed.existed)
                 }
             };
-        if working_dir.starts_with(&resources.intermediate_dir) {
+        // A directory claimed here was marked in the step that made it, so
+        // it was never there unmarked for anything else to take.
+        if !claimed_marked && working_dir.starts_with(&resources.intermediate_dir) {
             stamp_working_dir(&resources.intermediate_dir, &working_dir, job_id)
                 .await
                 .map_err(crate::SchedulerError::Io)?;

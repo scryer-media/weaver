@@ -46,11 +46,40 @@ pub struct ClaimedWorkingDir {
     pub existed: bool,
 }
 
+// One claim or adoption of a working directory at a time. A claim makes the
+// directory and writes its marker under this lock, and an adoption reads
+// the marker and writes its own under it, so no adoption ever sees a
+// directory made for a job being added before that job's marker is in it.
+static CLAIMS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn claims() -> std::sync::MutexGuard<'static, ()> {
+    CLAIMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 // Claims a job's working directory with the file system as the arbiter: the
 // plain name is created, not checked, so two admissions sanitizing to one
 // name cannot both take it. The one that finds the plain name taken takes
-// its job-suffixed name instead.
+// its job-suffixed name instead. The directory is marked the job's in the
+// same step, before anything else can judge it by its name.
 pub fn claim_working_dir(
+    intermediate_dir: &Path,
+    job_id: JobId,
+    name: &str,
+) -> std::io::Result<ClaimedWorkingDir> {
+    let _claims = claims();
+    let claimed = create_working_dir(intermediate_dir, job_id, name)?;
+    if let Err(error) = mark_weaver_owned_working_dir(intermediate_dir, &claimed.path, job_id) {
+        if !claimed.existed {
+            let _ = std::fs::remove_dir(&claimed.path);
+        }
+        return Err(error);
+    }
+    Ok(claimed)
+}
+
+fn create_working_dir(
     intermediate_dir: &Path,
     job_id: JobId,
     name: &str,
@@ -165,6 +194,21 @@ pub(crate) fn job_working_dirs(
     root: &Path,
     jobs: &std::collections::BTreeSet<JobId>,
 ) -> std::io::Result<std::collections::BTreeMap<JobId, Vec<PathBuf>>> {
+    marked_working_dirs(root, |owner| jobs.contains(&owner))
+}
+
+// Every working directory under `root` that carries a job's ownership
+// marker, by the job: one read of the root serves every job asked about.
+pub(crate) fn working_dirs_by_owner(
+    root: &Path,
+) -> std::io::Result<std::collections::BTreeMap<JobId, Vec<PathBuf>>> {
+    marked_working_dirs(root, |_| true)
+}
+
+fn marked_working_dirs(
+    root: &Path,
+    wanted: impl Fn(JobId) -> bool,
+) -> std::io::Result<std::collections::BTreeMap<JobId, Vec<PathBuf>>> {
     let mut found = std::collections::BTreeMap::<JobId, Vec<PathBuf>>::new();
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -173,7 +217,7 @@ pub(crate) fn job_working_dirs(
     };
     for entry in entries {
         let path = entry?.path();
-        if let Some(owner) = working_dir_owner(root, &path)?.filter(|owner| jobs.contains(owner)) {
+        if let Some(owner) = working_dir_owner(root, &path)?.filter(|owner| wanted(*owner)) {
             found.entry(owner).or_default().push(path);
         }
     }
@@ -770,46 +814,95 @@ pub(crate) fn release_failed_working_dir(
     Ok(())
 }
 
+// The working directory a job that never started was given under the
+// intermediate folder set now, and the one it had, still on disk until the
+// job's row names the new one.
+pub(crate) struct FollowedDir {
+    pub(crate) path: PathBuf,
+    root: PathBuf,
+    job_id: JobId,
+    // The directory the job had, when it was there: this job's own, holding
+    // nothing but its marker.
+    old: Option<(Dir, PathBuf)>,
+}
+
+impl FollowedDir {
+    // The job's row names the new directory: the old one goes, if it still
+    // holds nothing but the marker.
+    pub(crate) fn leave_old(self) {
+        let Some((dir, path)) = self.old else {
+            return;
+        };
+        let emptied = (|| {
+            for entry in dir.entries()? {
+                if entry?.file_name() != WORKING_DIR_MARKER {
+                    return Ok(false);
+                }
+            }
+            dir.remove_open_dir_all().map(|()| true)
+        })();
+        if let Err(error) = emptied {
+            tracing::warn!(job_id = self.job_id.0, dir = %path.display(), %error, "could not remove the working directory a job moved out of");
+        }
+    }
+
+    // The new directory is not the job's after all: it goes, and whatever
+    // the job had stays as it is.
+    pub(crate) fn abandon(self) {
+        if let Err(error) = remove_job_working_dir(&self.root, &self.path, self.job_id)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(job_id = self.job_id.0, dir = %self.path.display(), %error, "could not remove a working directory claimed for a job that did not take it");
+        }
+    }
+}
+
 // A job that never started works under the intermediate folder set now. Its
-// working directory elsewhere is claimed again under `root` and the old one
-// removed, when that one is this job's own and holds nothing but its marker.
-// One that is another's, holds anything else, or is gone is left as it is,
-// and the job keeps it: None. A directory already under `root` is kept.
+// working directory elsewhere is claimed again, marked, under `root`, when
+// the one it has is this job's own and holds nothing but its marker, or is
+// gone, folder or root: a job that never started left nothing there. One
+// that is another's or holds anything else is left as it is, and the job
+// keeps it: None. A directory already under `root` is kept. Nothing is
+// removed here: the caller records the new directory, then leaves the old.
 pub(crate) fn follow_intermediate_dir(
     root: &Path,
     current: &Path,
     job_id: JobId,
     name: &str,
-) -> std::io::Result<Option<PathBuf>> {
+) -> std::io::Result<Option<FollowedDir>> {
     let Some(old_root) = current.parent().filter(|parent| *parent != root) else {
         return Ok(None);
     };
-    let dir = match open_working_directory(old_root, current) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        result => result?,
-    };
-    let Ok(stored) = read_working_marker(&dir) else {
-        return Ok(None);
-    };
-    if marker_job_id(&stored) != Some(job_id)
-        || !matches!(
-            match_marker(&dir, current, &stored, job_id)?,
-            MarkerMatch::Current | MarkerMatch::Legacy
-        )
-    {
-        return Ok(None);
-    }
-    for entry in dir.entries()? {
-        if entry?.file_name() != WORKING_DIR_MARKER {
-            return Ok(None);
+    let old = match open_working_directory(old_root, current) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+        Ok(dir) => {
+            let Ok(stored) = read_working_marker(&dir) else {
+                return Ok(None);
+            };
+            if marker_job_id(&stored) != Some(job_id)
+                || !matches!(
+                    match_marker(&dir, current, &stored, job_id)?,
+                    MarkerMatch::Current | MarkerMatch::Legacy
+                )
+            {
+                return Ok(None);
+            }
+            for entry in dir.entries()? {
+                if entry?.file_name() != WORKING_DIR_MARKER {
+                    return Ok(None);
+                }
+            }
+            Some((dir, current.to_path_buf()))
         }
-    }
+    };
     let claimed = claim_working_dir(root, job_id, name)?;
-    mark_weaver_owned_working_dir(root, &claimed.path, job_id)?;
-    if let Err(error) = dir.remove_open_dir_all() {
-        tracing::warn!(job_id = job_id.0, dir = %current.display(), %error, "could not remove the working directory a job moved out of");
-    }
-    Ok(Some(claimed.path))
+    Ok(Some(FollowedDir {
+        path: claimed.path,
+        root: root.to_path_buf(),
+        job_id,
+        old,
+    }))
 }
 
 pub async fn stamp_working_dir(root: &Path, path: &Path, job_id: JobId) -> std::io::Result<()> {
@@ -828,6 +921,9 @@ pub async fn prepare_history_working_dir(
     let root = root.to_path_buf();
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
+        // An adoption never runs beside a claim: a directory made for a job
+        // being added has that job's marker before it is judged here.
+        let _claims = claims();
         let dir = match open_working_directory(&root, &path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(HistoryWorkingDir::Owned);

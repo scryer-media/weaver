@@ -160,6 +160,60 @@ impl StagingChoice {
     }
 }
 
+// A job that never started takes a working directory under the intermediate
+// folder set now, in the order that leaves its stored row naming a folder
+// that exists whatever stops in between: the new one is claimed and marked,
+// the row names it once that write commits, and only then the old one goes.
+// A row that cannot be written gives the new one up, and the job keeps what
+// it has.
+async fn follow_working_dir(
+    db: &crate::Database,
+    job_id: JobId,
+    root: PathBuf,
+    current: PathBuf,
+    name: String,
+) -> Option<PathBuf> {
+    let from = current.clone();
+    let followed = tokio::task::spawn_blocking(move || {
+        crate::jobs::working_dir::follow_intermediate_dir(&root, &current, job_id, &name)
+    })
+    .await
+    .map_err(std::io::Error::other)
+    .and_then(|followed| followed);
+    let followed = match followed {
+        Ok(followed) => followed?,
+        Err(error) => {
+            warn!(job_id = job_id.0, dir = %from.display(), %error, "could not move the job's working directory to the intermediate folder; it keeps the one it has");
+            return None;
+        }
+    };
+    let dir = followed.path.clone();
+    let stored = dir.clone();
+    let recorded =
+        match db.try_queue_job_write_committed(job_id, "update_active_job_output_dir", move |db| {
+            db.update_active_job_output_dir(job_id, &stored)
+        }) {
+            Ok(committed) => committed
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|written| written),
+            Err(error) => Err(error.to_string()),
+        };
+    if let Err(error) = &recorded {
+        warn!(job_id = job_id.0, dir = %dir.display(), %error, "could not record the job's new working directory; it keeps the one it has");
+    }
+    let recorded = recorded.is_ok();
+    let _ = tokio::task::spawn_blocking(move || {
+        if recorded {
+            followed.leave_old();
+        } else {
+            followed.abandon();
+        }
+    })
+    .await;
+    recorded.then_some(dir)
+}
+
 impl Pipeline {
     // Whether the job is waiting for its articles to be built: their read is
     // out, its earlier graph still has something out on a thread, or an
@@ -248,27 +302,24 @@ impl Pipeline {
         let tx = self.job_activated_tx.clone();
         tokio::spawn(async move {
             let _ = written_rx.await;
+            let moved_to = match follow {
+                Some((root, name)) => {
+                    follow_working_dir(&db, job_id, root, working_dir, name).await
+                }
+                None => None,
+            };
+            let moved = moved_to.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let moved_to = follow.and_then(|(root, name)| {
-                    crate::jobs::working_dir::follow_intermediate_dir(&root, seat.working_dir(), job_id, &name)
-                        .inspect_err(|error| {
-                            warn!(job_id = job_id.0, dir = %seat.working_dir().display(), %error, "could not move the job's working directory to the intermediate folder; it keeps the one it has");
-                        })
-                        .ok()
-                        .flatten()
-                });
-                let seat = match moved_to.clone() {
+                let seat = match moved {
                     Some(dir) => seat.moved_to(dir),
                     None => seat,
                 };
-                let result = read_job_articles(
+                read_job_articles(
                     &db, job_id, category, metadata, &expected, ahead, memory, seat,
-                );
-                (moved_to, result)
+                )
             })
             .await
-            .unwrap_or_else(|error| (None, Err(format!("article read worker failed: {error}"))));
-            let (moved_to, result) = result;
+            .unwrap_or_else(|error| Err(format!("article read worker failed: {error}")));
             // A job restored from its checkpoint keeps the staging it had,
             // and asks nothing of the disk.
             let result = match result {
@@ -311,19 +362,36 @@ impl Pipeline {
             self.moving_jobs.remove(&job_id);
             self.download_dispatch_wake = true;
         }
-        // A move is on disk whichever activation it came with: the job and
-        // its row name the new directory.
-        if let Some(dir) = moved_to
-            && let Some(state) = self.jobs.get_mut(&job_id)
-        {
-            state.working_dir = dir.clone();
-            if let Err(error) =
-                self.db
-                    .try_queue_job_write(job_id, "update_active_job_output_dir", move |db| {
-                        db.update_active_job_output_dir(job_id, &dir)
-                    })
-            {
-                warn!(job_id = job_id.0, error = %error, "could not record the job's working directory");
+        // A move is on disk, and on the job's stored row, whichever
+        // activation it came with and whether or not the job is still
+        // installed: the job and its queue row name the new directory. A job
+        // that left meanwhile has no use for it, and it goes.
+        if let Some(dir) = moved_to {
+            let installed = self.jobs.get_mut(&job_id).map(|state| {
+                state.working_dir = dir.clone();
+            });
+            let listed = self
+                .shared_state
+                .queue
+                .write(|inner| match inner.job_mut(job_id) {
+                    Some(row) => {
+                        row.report.job.output_dir = Some(dir.display().to_string());
+                        crate::pipeline::queue::Change::changed(true)
+                    }
+                    None => crate::pipeline::queue::Change::unchanged(false),
+                });
+            if installed.is_none() && !listed {
+                tokio::task::spawn_blocking(move || {
+                    let Some(root) = dir.parent() else {
+                        return;
+                    };
+                    if let Err(error) =
+                        crate::jobs::working_dir::remove_job_working_dir(root, &dir, job_id)
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        warn!(job_id = job_id.0, dir = %dir.display(), %error, "could not remove the working directory claimed for a job that left");
+                    }
+                });
             }
         }
         if !self.jobs.get(&job_id).is_some_and(|state| {

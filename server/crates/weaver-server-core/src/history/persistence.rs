@@ -430,7 +430,7 @@ impl Database {
             SqlRuntime::run_in_transaction(&datastore, "stamp_history_archived", |tx| {
                 let ids = ids.clone();
                 Box::pin(async move {
-                    for chunk in ids.chunks(max_rows_for_tx(tx, 1).saturating_sub(1).max(1)) {
+                    for chunk in ids.chunks(max_rows_for_tx(tx, 1).saturating_sub(2).max(1)) {
                         let placeholders = vec!["{}"; chunk.len()].join(", ");
                         let mut args = Vec::with_capacity(chunk.len() + 1);
                         args.push(SqlArg::I64(archived_at));
@@ -456,13 +456,15 @@ impl Database {
     }
 
     // Says that housekeeping swept each failed entry at `swept_at`, epoch
-    // seconds, and left nothing of it, in one transaction. Internal: no view
-    // of the entry reads it, so no cached entry changes. An entry already
-    // stamped keeps its first time.
+    // seconds, and has nothing more to do for it, in one transaction.
+    // Internal: no view of the entry reads it, so no cached entry changes. An
+    // entry already stamped keeps its first time, and one that is no longer
+    // the failure the sweep listed, as after a retry, is not stamped.
     pub(crate) fn stamp_history_swept(
         &self,
         job_ids: &[JobId],
         swept_at: i64,
+        finished_by: i64,
     ) -> Result<(), StateError> {
         if job_ids.is_empty() {
             return Ok(());
@@ -479,16 +481,18 @@ impl Database {
             SqlRuntime::run_in_transaction(&datastore, "stamp_history_swept", |tx| {
                 let ids = ids.clone();
                 Box::pin(async move {
-                    for chunk in ids.chunks(max_rows_for_tx(tx, 1).saturating_sub(1).max(1)) {
+                    for chunk in ids.chunks(max_rows_for_tx(tx, 1).saturating_sub(2).max(1)) {
                         let placeholders = vec!["{}"; chunk.len()].join(", ");
-                        let mut args = Vec::with_capacity(chunk.len() + 1);
+                        let mut args = Vec::with_capacity(chunk.len() + 2);
                         args.push(SqlArg::I64(swept_at));
+                        args.push(SqlArg::I64(finished_by));
                         args.extend(chunk.iter().map(|id| SqlArg::I64(*id)));
                         tx.execute(
                             &format!(
                                 "UPDATE job_history SET files_swept_at = {{}}
-                                  WHERE job_id IN ({placeholders})
-                                    AND files_swept_at IS NULL"
+                                  WHERE status = 'failed' AND files_swept_at IS NULL
+                                    AND completed_at <= {{}}
+                                    AND job_id IN ({placeholders})"
                             ),
                             &args,
                         )

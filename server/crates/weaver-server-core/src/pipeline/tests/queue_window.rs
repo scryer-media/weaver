@@ -511,6 +511,16 @@ async fn a_job_sent_for_twice_moves_its_working_directory_once() {
     let moved = pipeline.jobs[&id].working_dir.clone();
     assert_eq!(moved.parent(), Some(new_root.as_path()));
     assert!(!old_dir.exists(), "the old folder is left behind");
+    // The stored row named the new directory before the old one went.
+    let stored = |pipeline: &Pipeline| {
+        pipeline
+            .db
+            .load_active_job_row(id)
+            .unwrap()
+            .unwrap()
+            .output_dir
+    };
+    assert_eq!(stored(&pipeline), moved);
 
     // Sent for again, the job starts in the directory it moved to.
     activate_job(&mut pipeline, id).await;
@@ -525,6 +535,127 @@ async fn a_job_sent_for_twice_moves_its_working_directory_once() {
         .map(|entry| entry.unwrap().path())
         .collect::<Vec<_>>();
     assert_eq!(dirs, vec![moved]);
+}
+
+// One queued job that never started, its intermediate folder then changed.
+async fn unstarted_job_with_a_changed_folder(
+    temp: &tempfile::TempDir,
+    id: JobId,
+) -> (Pipeline, PathBuf, PathBuf) {
+    let (mut pipeline, old_root, complete) = new_direct_pipeline(temp).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    enqueue(&mut pipeline, id.0).await;
+    settle(&mut pipeline).await;
+    assert!(matches!(
+        pipeline.jobs[&id].articles,
+        crate::jobs::model::JobArticles::Queued(_)
+    ));
+    let old_dir = pipeline.jobs[&id].working_dir.clone();
+    assert_eq!(old_dir.parent(), Some(old_root.as_path()));
+    let new_root = temp.path().join("moved-intermediate");
+    handle
+        .update_runtime_paths(temp.path().join("data"), new_root.clone(), complete)
+        .await
+        .unwrap();
+    settle(&mut pipeline).await;
+    (pipeline, old_dir, new_root)
+}
+
+// A job that never started is let go while its first read moves its working
+// directory, and leaves the pipeline's installed jobs before the reply: the
+// move is not lost. The stored row and the queue row name the new
+// directory, the old one is gone, and nothing else is left under the root.
+#[tokio::test]
+async fn a_move_heard_after_the_job_was_let_go_is_kept_on_its_row() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = JobId(1);
+    let (mut pipeline, old_dir, new_root) = unstarted_job_with_a_changed_folder(&temp, id).await;
+
+    pipeline.request_job_activation(id);
+    pipeline.release_job_articles(id);
+    let done = pipeline.job_activated_rx.recv().await.unwrap();
+    // The reply finds the job no longer installed, as one paused out of the
+    // window is not.
+    let state = pipeline.jobs.remove(&id).unwrap();
+    pipeline.handle_job_activated(done);
+    assert!(pipeline.moving_jobs.is_empty());
+
+    let stored = pipeline
+        .db
+        .load_active_job_row(id)
+        .unwrap()
+        .unwrap()
+        .output_dir;
+    assert_eq!(stored.parent(), Some(new_root.as_path()));
+    assert!(crate::jobs::working_dir::is_job_working_dir(&new_root, &stored, id).unwrap());
+    assert!(!old_dir.exists(), "the old folder is left behind");
+    let listed = pipeline
+        .shared_state
+        .queue
+        .read(|inner| inner.row(id).unwrap().report.job.output_dir.clone());
+    assert_eq!(listed, Some(stored.display().to_string()));
+    let dirs = std::fs::read_dir(&new_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(dirs, vec![stored]);
+    drop(state);
+}
+
+// A job that never started whose working directory is gone, with the folder
+// it stood in, is given a new one under the intermediate folder set now as
+// it starts, and starts.
+#[tokio::test]
+async fn an_unstarted_job_whose_folder_is_gone_claims_a_new_one() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = JobId(1);
+    let (mut pipeline, old_dir, new_root) = unstarted_job_with_a_changed_folder(&temp, id).await;
+    std::fs::remove_dir_all(old_dir.parent().unwrap()).unwrap();
+
+    activate_job(&mut pipeline, id).await;
+
+    assert!(matches!(
+        pipeline.jobs[&id].articles,
+        crate::jobs::model::JobArticles::Active(_)
+    ));
+    let moved = pipeline.jobs[&id].working_dir.clone();
+    assert_eq!(moved.parent(), Some(new_root.as_path()));
+    assert!(crate::jobs::working_dir::is_job_working_dir(&new_root, &moved, id).unwrap());
+    let stored = pipeline
+        .db
+        .load_active_job_row(id)
+        .unwrap()
+        .unwrap()
+        .output_dir;
+    assert_eq!(stored, moved);
+}
+
+// A job that left the pipeline and the queue while its move was out leaves
+// nothing behind: the directory claimed for it goes when the reply is heard.
+#[tokio::test]
+async fn a_job_gone_before_its_move_is_heard_leaves_no_folder() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = JobId(1);
+    let (mut pipeline, old_dir, new_root) = unstarted_job_with_a_changed_folder(&temp, id).await;
+
+    pipeline.request_job_activation(id);
+    let done = pipeline.job_activated_rx.recv().await.unwrap();
+    let claimed = done.moved_to.clone().unwrap();
+    assert!(claimed.exists());
+    let state = pipeline.jobs.remove(&id).unwrap();
+    pipeline.shared_state.queue.write(|inner| {
+        inner.remove_job(id);
+        crate::pipeline::queue::Change::changed(())
+    });
+    pipeline.handle_job_activated(done);
+
+    // The removal runs off the actor: wait for the folder itself.
+    while claimed.exists() {
+        tokio::task::yield_now().await;
+    }
+    assert!(!old_dir.exists());
+    assert_eq!(std::fs::read_dir(&new_root).unwrap().count(), 0);
+    drop(state);
 }
 
 // A reorder among jobs out of the window changes no installed job, and is
