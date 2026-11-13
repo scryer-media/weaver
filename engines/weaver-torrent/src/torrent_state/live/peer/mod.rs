@@ -38,6 +38,7 @@ use super::PeerStates;
 use super::choker::Transfer;
 use super::peers::connect_order::{ConnectRank, ConnectRanking, source_rank};
 use super::peers::holepunch::is_local;
+use super::peers::index::Indexed;
 use stats::atomic::PeerCountersAtomic;
 
 pub(crate) type InflightRequest = ChunkInfo;
@@ -322,6 +323,8 @@ pub(crate) struct Peer {
     holepunch: bool,
     // Every source that named the peer.
     sources: PeerSources,
+    // Where the peer list's index holds the peer (`PeerStates::reindex`).
+    indexed: Indexed,
 }
 
 impl Peer {
@@ -356,6 +359,7 @@ impl Peer {
             supports_holepunch: false,
             holepunch: false,
             sources: PeerSourceFlag::Incoming.into(),
+            indexed: Indexed::default(),
         }
     }
 
@@ -379,6 +383,7 @@ impl Peer {
             supports_holepunch: false,
             holepunch: false,
             sources,
+            indexed: Indexed::default(),
         }
     }
 
@@ -445,10 +450,12 @@ impl Peer {
         closed_at: Instant,
         failed: bool,
         finished: bool,
+        peers: &PeerStates,
     ) -> bool {
         self.keep_what_it_showed();
         let needed = self.needed(finished);
         self.closed(closed_at, failed, needed);
+        peers.reindex(self);
         needed
     }
 
@@ -456,9 +463,10 @@ impl Peer {
     /// of the peer: what it showed of its peer is kept, and the close starts
     /// no wait to reconnect, so the next run may connect at once, waiting
     /// only for the failures in a row the peer had.
-    pub(crate) fn connection_let_go(&mut self, closed_at: Instant) {
+    pub(crate) fn connection_let_go(&mut self, closed_at: Instant, peers: &PeerStates) {
         self.keep_what_it_showed();
         self.closed(closed_at, false, false);
+        peers.reindex(self);
     }
 
     fn keep_what_it_showed(&mut self) {
@@ -568,12 +576,14 @@ impl Peer {
         if matches!(self.state, PeerState::Dead) {
             self.set_state(self.idle_state(counters), counters);
         }
+        counters.reindex(self);
     }
 
     /// The connection completed its handshake and carried a message, so the
     /// failures before it no longer count.
-    pub(crate) fn delivered(&mut self) {
+    pub(crate) fn delivered(&mut self, peers: &PeerStates) {
         self.failcount = 0;
+        peers.reindex(self);
     }
 
     /// Whether the connection we are making to the peer, its transport just
@@ -595,7 +605,7 @@ impl Peer {
     /// connected to it and know better (`update_peer`), and one the sender
     /// is connected to encrypted is tried encrypted next (`insert_peer`; a
     /// known peer too, as ours start at encrypted).
-    pub(crate) fn pex_flags(&mut self, flags: u8) {
+    pub(crate) fn pex_flags(&mut self, flags: u8, peers: &PeerStates) {
         if flags & PEX_SEED != 0 && self.connected_out().is_none() {
             self.maybe_upload_only = true;
         }
@@ -605,6 +615,7 @@ impl Peer {
         if flags & PEX_ENCRYPTION != 0 {
             self.encrypt = true;
         }
+        peers.reindex(self);
     }
 
     /// The peer's connection completed its handshake as `encryption` says,
@@ -630,6 +641,7 @@ impl Peer {
         if self.outgoing_address != Some(listen) {
             self.outgoing_address = Some(listen);
             peers.pex_changed();
+            peers.reindex(self);
         }
     }
 
@@ -643,7 +655,7 @@ impl Peer {
         finished: bool,
         counters: &PeerStates,
     ) {
-        let needed = self.connection_closing(closed_at, failed, finished);
+        let needed = self.connection_closing(closed_at, failed, finished, counters);
         self.settle_closed(needed, counters);
     }
 
@@ -721,15 +733,18 @@ impl Peer {
     }
 
     /// A piece the peer sent a block of passed its hash check.
-    pub(crate) fn piece_passed(&mut self) {
+    pub(crate) fn piece_passed(&mut self, peers: &PeerStates) {
         self.trust.piece_passed();
+        peers.reindex(self);
     }
 
     /// A piece the peer sent a block of failed its hash check; the peer is
     /// known to have sent the bad data and may be banned for that when
     /// `bannable` holds. Returns whether the peer is to be banned.
-    pub(crate) fn piece_failed(&mut self, bannable: bool) -> bool {
-        self.trust.piece_failed(bannable)
+    pub(crate) fn piece_failed(&mut self, bannable: bool, peers: &PeerStates) -> bool {
+        let banned = self.trust.piece_failed(bannable);
+        peers.reindex(self);
+        banned
     }
 
     /// The peer as a new run takes it from the list: where it listens, its
@@ -758,6 +773,7 @@ impl Peer {
             supports_holepunch: self.supports_holepunch,
             holepunch: false,
             sources: self.sources,
+            indexed: Indexed::default(),
         }
     }
 
@@ -872,7 +888,19 @@ impl Peer {
         }
         counters.count_out(self.addr, &self.state);
         counters.count_in(self.addr, &new);
-        std::mem::replace(&mut self.state, new)
+        let old = std::mem::replace(&mut self.state, new);
+        counters.reindex(self);
+        old
+    }
+
+    /// Where the peer list's index holds the peer.
+    pub(super) fn indexed(&self) -> Indexed {
+        self.indexed
+    }
+
+    /// The peer list's index holds the peer as `indexed` says.
+    pub(super) fn set_indexed(&mut self, indexed: Indexed) {
+        self.indexed = indexed;
     }
 
     pub fn get_live(&self) -> Option<&LivePeerState> {
