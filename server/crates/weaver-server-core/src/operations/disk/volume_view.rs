@@ -5,13 +5,12 @@
 // its live write rate and what waits in memory for its writer. Read from
 // what the disk owner already holds; nothing here looks at a disk.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::volume::Volume;
-use super::{StorageCapacity, StorageKind, lock_paths};
+use super::{StorageCapacity, StorageKind};
 
 // One volume as shown to the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,53 +26,38 @@ pub struct VolumeWriteRate {
 }
 
 impl StorageCapacity {
-    // Every volume the owner holds, by label. A volume's kind is the kind
-    // held for any root or folder on the same device, and unknown when none
-    // is held or the volume has no device.
+    // Every volume the owner holds, by label. A volume's kind is the one the
+    // metrics show for it: [`Self::kind_on_device`].
     pub fn volume_write_rates(&self) -> Vec<VolumeWriteRate> {
-        let volumes = self.volumes();
-        if volumes.is_empty() {
-            return Vec::new();
-        }
-        write_rates(&volumes, &self.kinds_by_device())
+        self.write_rates_of(&self.volumes())
     }
 
-    // The live write rate of the volume `path` is on, in MB/s (10^6 bytes);
+    fn write_rates_of(&self, volumes: &[Arc<Volume>]) -> Vec<VolumeWriteRate> {
+        write_rates(volumes, |device| self.kind_on_device(device))
+    }
+
+    // The live write rate of the volume `path` is on, in bytes per second;
     // zero until the volume has been measured.
-    pub(crate) fn write_mbps(&self, path: &Path) -> f64 {
-        mbps(&self.volume(path))
-    }
-
-    // The kind of storage held for each device: a root's first, then a
-    // folder's from its latest look. One pass over the three roots and the
-    // bounded folder cache.
-    fn kinds_by_device(&self) -> HashMap<u64, StorageKind> {
-        let mut kinds = HashMap::new();
-        for slot in &self.slots {
-            let state = slot.lock();
-            if let (Some(Some(device)), Some(kind)) = (state.device, state.kind) {
-                kinds.entry(device).or_insert(kind);
-            }
-        }
-        for entry in lock_paths(&self.paths).entries.values() {
-            if let (Some(device), Some(space)) = (
-                entry.device.as_ref().and_then(|look| look.device),
-                entry.space.as_ref(),
-            ) {
-                kinds.entry(device).or_insert(space.kind);
-            }
-        }
-        kinds
+    pub(crate) fn write_rate(&self, path: &Path) -> u64 {
+        self.volume(path).write_rate.load(Ordering::Relaxed)
     }
 }
 
-fn mbps(volume: &Volume) -> f64 {
-    volume.write_rate.load(Ordering::Relaxed) as f64 / 1_000_000.0
+// The slowest of the rates that have been measured, in MB/s (10^6 bytes).
+// A rate of zero is a volume not measured yet and is passed over; when none
+// has been measured the answer is zero, "no figure".
+pub(crate) fn slowest_measured_mbps(rates: impl IntoIterator<Item = u64>) -> f64 {
+    rates
+        .into_iter()
+        .filter(|rate| *rate > 0)
+        .min()
+        .unwrap_or(0) as f64
+        / 1_000_000.0
 }
 
 fn write_rates(
     volumes: &[Arc<Volume>],
-    kinds: &HashMap<u64, StorageKind>,
+    kind: impl Fn(Option<u64>) -> StorageKind,
 ) -> Vec<VolumeWriteRate> {
     let mut rates: Vec<VolumeWriteRate> = volumes
         .iter()
@@ -81,11 +65,7 @@ fn write_rates(
             let rate = volume.write_rate.load(Ordering::Relaxed);
             VolumeWriteRate {
                 label: volume.label.clone(),
-                storage_kind: volume
-                    .device
-                    .and_then(|device| kinds.get(&device).copied())
-                    .unwrap_or(StorageKind::Unknown)
-                    .as_str(),
+                storage_kind: kind(volume.device).as_str(),
                 write_rate: (rate > 0).then_some(rate),
                 buffered_bytes: volume.buffered_bytes.load(Ordering::Relaxed),
             }
@@ -97,6 +77,9 @@ fn write_rates(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
     use super::*;
 
     fn volume(device: Option<u64>, label: &str, rate: u64, buffered: u64) -> Arc<Volume> {
@@ -117,7 +100,11 @@ mod tests {
         ];
         let kinds = HashMap::from([(1, StorageKind::Solid), (2, StorageKind::Rotational)]);
 
-        let shown = write_rates(&volumes, &kinds);
+        let shown = write_rates(&volumes, |device| {
+            device
+                .and_then(|device| kinds.get(&device).copied())
+                .unwrap_or(StorageKind::Unknown)
+        });
 
         assert_eq!(
             shown,
@@ -144,11 +131,52 @@ mod tests {
         );
     }
 
-    // The tuner's figure is the volume's rate in MB/s, and zero, "not
-    // measured", until the volume has one.
+    // Two roots lie on one device; the first could not tell its kind and the
+    // second could. The list shows the kind that was told, as the metrics
+    // row for the same volume does.
     #[test]
-    fn a_volume_rate_reads_as_megabytes_per_second() {
-        assert_eq!(mbps(&volume(Some(1), "/", 0, 0)), 0.0);
-        assert_eq!(mbps(&volume(Some(1), "/", 60_000_000, 0)), 60.0);
+    fn a_volume_shows_the_kind_the_metrics_show_when_one_root_could_not_tell() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = StorageCapacity::with_probe(
+            [
+                dir.path().join("data"),
+                dir.path().join("intermediate"),
+                dir.path().join("complete"),
+            ],
+            Duration::from_secs(3600),
+            Arc::new(|_| {
+                Ok(super::super::DiskSpace {
+                    total_bytes: 1,
+                    available_bytes: 1,
+                })
+            }),
+        );
+        // Each root's own look is over before its reading is replaced, and
+        // the next is an hour off.
+        for (slot, kind) in [(0, StorageKind::Unknown), (1, StorageKind::Solid)] {
+            storage.wait_for_probes(super::super::StorageRoot::ALL[slot], 1);
+            let mut state = storage.slots[slot].lock();
+            state.device = Some(Some(7));
+            state.kind = Some(kind);
+        }
+        let volumes = [volume(Some(7), "/mnt/pool", 0, 0)];
+
+        let shown = storage.write_rates_of(&volumes);
+
+        assert_eq!(shown[0].storage_kind, "ssd");
+        assert_eq!(
+            shown[0].storage_kind,
+            storage.kind_on_device(Some(7)).as_str()
+        );
+    }
+
+    // Extraction admission takes the slowest volume that has a rate; a volume
+    // not measured yet says nothing, and none measured is no figure.
+    #[test]
+    fn the_slowest_measured_rate_is_the_figure() {
+        assert_eq!(slowest_measured_mbps([]), 0.0);
+        assert_eq!(slowest_measured_mbps([0, 0]), 0.0);
+        assert_eq!(slowest_measured_mbps([0, 250_000_000, 0]), 250.0);
+        assert_eq!(slowest_measured_mbps([250_000_000, 60_000_000, 0]), 60.0);
     }
 }

@@ -635,7 +635,7 @@ export const nextEn: LocaleDictionary = {
   "next.system.storageClass": "Storage class",
   "next.system.randomRead": "Random-read benchmark",
   "next.system.volumes": "Volumes",
-  "next.system.volumesNote": "live write rate",
+  "next.system.volumesNote": "write rate when this page loaded",
   "next.system.volumeNotMeasured": "not measured",
   "next.system.volumeBuffered": "{{size}} buffered",
   "next.system.noVolumes": "Nothing has been written yet.",

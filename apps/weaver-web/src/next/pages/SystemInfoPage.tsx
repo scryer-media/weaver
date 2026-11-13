@@ -31,7 +31,7 @@ interface ConfiguredStorage {
   error: string | null;
 }
 
-/** One volume as the operating system presents it, with its live write rate. */
+/** One volume as the operating system presents it, with its write rate when the page was fetched. */
 interface VolumeWriteRate {
   label: string;
   storageKind: string;
@@ -133,8 +133,8 @@ function reportText(info: SystemInfo, cacheBytes: number, cacheLimit: number): s
     `Primary storage: ${info.primaryStorage.filesystem} · ${info.primaryStorage.storageClass} · ${formatCount(info.primaryStorage.startupRandomReadIops)} IOPS`,
     // A volume's label is a path, so the report leaves it out.
     ...info.volumes.map(
-      (volume) =>
-        `Volume: ${volume.storageKind} · ${
+      (volume, index) =>
+        `Volume ${index + 1}: ${volume.storageKind} · ${
           volume.writeRateBytesPerSecond == null
             ? "write rate not measured"
             : `${formatRate(volume.writeRateBytesPerSecond)} write`
@@ -360,9 +360,9 @@ export function SystemInfoPage() {
               {info.volumes.length === 0 ? (
                 <div className="px-4 sm:px-6 py-5 text-[13px] text-wv-muted">{t("next.system.noVolumes")}</div>
               ) : (
-                info.volumes.map((volume) => (
+                info.volumes.map((volume, index) => (
                   <KeyValueRow
-                    key={volume.label}
+                    key={`${index}:${volume.label}`}
                     label={
                       <span title={volume.label} className="font-wv-mono text-[12px]">
                         {volume.label || t("next.system.storageFallback")}

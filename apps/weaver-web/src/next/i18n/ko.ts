@@ -628,7 +628,7 @@ export const nextKo: LocaleDictionary = {
   "next.system.storageClass": "스토리지 등급",
   "next.system.randomRead": "무작위 읽기 벤치마크",
   "next.system.volumes": "볼륨",
-  "next.system.volumesNote": "실시간 쓰기 속도",
+  "next.system.volumesNote": "페이지를 불러온 시점의 쓰기 속도",
   "next.system.volumeNotMeasured": "측정 전",
   "next.system.volumeBuffered": "버퍼 {{size}}",
   "next.system.noVolumes": "아직 기록된 내용이 없습니다.",

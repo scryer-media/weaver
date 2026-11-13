@@ -128,7 +128,7 @@ fn parse_startup_iops_override() {
 }
 
 // A stored measurement stands in for the probe, so this reads the host's
-// facts without writing the probe file to the test machine's disk.
+// facts without writing hundreds of megabytes to the test machine's disk.
 #[test]
 fn detect_returns_valid_profile() {
     let dir = tempfile::tempdir().unwrap();
@@ -271,9 +271,31 @@ fn the_probe_file_is_removed_when_its_guard_drops() {
     assert!(!path.exists());
 }
 
+// The file the reads are spread over grows with the disk's write speed, by
+// the same chunks and the same one-second budget as before the write speed
+// stopped being measured: 16 MiB on a very slow disk, 224 MiB on an ordinary
+// spinning one, 480 MiB on a fast one.
+#[test]
+fn the_probe_file_grows_with_the_disks_write_speed() {
+    const MIB: u64 = 1024 * 1024;
+    let file_at = |bytes_per_second: f64| {
+        probe_file_bytes(|repeats| {
+            Some(Duration::from_secs_f64(
+                (repeats * PROBE_CHUNK_BYTES) as f64 / bytes_per_second,
+            ))
+        })
+    };
+    assert_eq!(file_at(10_000_000.0), Some(16 * MIB));
+    assert_eq!(file_at(60_000_000.0), Some(80 * MIB));
+    assert_eq!(file_at(150_000_000.0), Some(224 * MIB));
+    assert_eq!(file_at(2_000_000_000.0), Some(480 * MIB));
+    // A chunk that cannot be written ends the probe.
+    assert_eq!(probe_file_bytes(|_| None), None);
+}
+
 #[test]
 fn probe_reads_stay_aligned_inside_what_was_written() {
-    let written = PROBE_FILE_BYTES as u64;
+    let written = (PROBE_CHUNK_BYTES * PROBE_WRITE_REPEATS[0]) as u64;
     let offsets = probe_read_offsets(written);
     assert_eq!(offsets.len(), PROBE_READ_COUNT);
     for offset in offsets {

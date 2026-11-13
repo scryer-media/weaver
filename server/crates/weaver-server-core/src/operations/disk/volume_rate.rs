@@ -187,7 +187,7 @@ impl StorageCapacity {
     // The kind of storage behind `device`, as the owner holds it for a root
     // or a folder found on that device. Unknown when none is held. Never
     // looks.
-    fn kind_on_device(&self, device: Option<u64>) -> StorageKind {
+    pub(super) fn kind_on_device(&self, device: Option<u64>) -> StorageKind {
         let Some(device) = device else {
             return StorageKind::Unknown;
         };

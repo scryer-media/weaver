@@ -22,6 +22,7 @@ pub(crate) mod volume_rate;
 mod volume_view;
 
 pub(crate) use storage_kind::StorageKind;
+pub(crate) use volume_view::slowest_measured_mbps;
 pub use volume_view::VolumeWriteRate;
 
 // Capacity for the filesystem backing a path.

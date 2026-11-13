@@ -719,14 +719,35 @@ impl Pipeline {
             self.applied_random_read_iops = Some(iops);
             self.tuner.set_random_read_iops(iops);
         }
-        // Extractions write what they unpack under the working directory, so
-        // its volume's live write rate is the one extraction admission reads.
-        // Zero is "not measured" and is applied as such: the directory may
-        // have moved to a volume nothing has been written to yet.
-        let write_mbps = self.storage_capacity.write_mbps(&self.intermediate_dir);
-        if self.applied_sequential_write_mbps != Some(write_mbps) {
-            self.applied_sequential_write_mbps = Some(write_mbps);
-            self.tuner.set_sequential_write_mbps(write_mbps);
+        // An extraction writes what it unpacks under the intermediate
+        // directory, or, when the job's destination is on another device, in
+        // its staging directory on the destination's device. Admission is
+        // one limit for every job, so it reads the slowest live write rate
+        // among the volumes of the intermediate directory, the complete
+        // directory and each category's folder. A volume not measured yet
+        // says nothing; none measured is "no figure", applied as such.
+        //
+        // Nothing here looks at a disk or waits: while the settings are being
+        // written the figure in force stays until the next turn.
+        if let Ok(config) = self.config.try_read() {
+            let storage = &self.storage_capacity;
+            let write_mbps = crate::operations::disk::slowest_measured_mbps(
+                [&self.intermediate_dir, &self.complete_dir]
+                    .into_iter()
+                    .map(|dir| storage.write_rate(dir))
+                    .chain(config.categories.iter().map(|category| {
+                        storage.write_rate(&crate::pipeline::queue::destination_root(
+                            &self.complete_dir,
+                            std::slice::from_ref(category),
+                            Some(&category.name),
+                        ))
+                    })),
+            );
+            drop(config);
+            if self.applied_sequential_write_mbps != Some(write_mbps) {
+                self.applied_sequential_write_mbps = Some(write_mbps);
+                self.tuner.set_sequential_write_mbps(write_mbps);
+            }
         }
         let globals = self.shared_state.queue.read(|inner| inner.globals.clone());
         if globals.paused != self.global_paused || globals.scheduled_pause != self.scheduled_pause {
