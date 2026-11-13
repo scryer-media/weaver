@@ -1634,8 +1634,12 @@ impl SchedulerHandle {
     // requests: found and not found. Read on demand, like the snapshot above.
     pub fn server_article_outcomes(
         &self,
-    ) -> Vec<crate::operations::instrumentation::ServerArticleOutcomes> {
-        self.state.metrics().server_metrics.article_outcomes()
+        stable_server_id: u32,
+    ) -> Option<crate::operations::instrumentation::ServerArticleOutcomes> {
+        self.state
+            .metrics()
+            .server_metrics
+            .article_outcomes(stable_server_id)
     }
 
     // Job lifecycle counters and duration histograms. Read on demand; see

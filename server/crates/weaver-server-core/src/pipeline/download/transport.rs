@@ -961,6 +961,10 @@ pub(crate) struct DownloadLaneRuntimeState {
     // taken — looking it up afterwards resolves against the new pool and
     // silently throws every measurement away.
     pub(in crate::pipeline) stable_ids: HashMap<usize, u32>,
+    // What each position's server was when its explorer was seeded: stable
+    // id, host, port and username, the identity a pool rebuild keeps a
+    // server by. A pipelining verdict is carried only to the same server.
+    pub(in crate::pipeline) identities: Vec<weaver_nntp::pool::ServerIdentity>,
 }
 
 #[cfg(test)]

@@ -1338,16 +1338,16 @@ impl Pipeline {
                 if article_not_found_exhausted {
                     // Every server is missing the id in use: the article moves
                     // to its next id, or with every id spent is booked missing.
-                    // Booked as an article no server may fetch is: Missing,
-                    // or Unservable when a server refusing the credentials
-                    // never answered for it, so a first article counts as
-                    // lost to the post's sample the same way on both paths.
                     if !self.spend_message_id(result.segment_id) {
-                        self.book_unservable_article(
-                            result.segment_id,
-                            retry_exclude_servers,
-                            false,
-                        );
+                        self.metrics
+                            .articles_not_found
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.send_segment_event(|| PipelineEvent::ArticleNotFound {
+                            segment_id: result.segment_id,
+                        });
+                        if self.book_failed_segment(result.segment_id) {
+                            self.note_gap_servers_support_fact(job_id, retry_exclude_servers);
+                        }
                     }
                 } else if credentials_exhausted {
                     self.book_unservable_segment(result.segment_id, retry_exclude_servers);

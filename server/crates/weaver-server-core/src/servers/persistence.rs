@@ -561,4 +561,98 @@ mod tests {
         assert_eq!(super::past_limit_fixture::ids(&written), kept());
         assert_eq!(stored_ids(&db), kept());
     }
+
+    // The trim on load deletes as a user's delete does: nothing keyed by a
+    // deleted server is left in the usage, TLS, route or schedule tables,
+    // and every kept server keeps its rows.
+    #[test]
+    fn a_trimmed_server_leaves_no_row_keyed_by_it() {
+        use super::past_limit_fixture::{GONE, kept, sixty_on_ten_levels};
+        let db = crate::Database::open_in_memory().unwrap();
+        for server in sixty_on_ten_levels() {
+            db.insert_server_past_limit(&server).unwrap();
+        }
+        let at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut schedules = Vec::new();
+        for id in 1..=60u32 {
+            db.upsert_server_download_usage(&crate::servers::ServerDownloadUsage {
+                server_id: id,
+                lifetime_bytes: 1,
+                quota_baseline_bytes: 0,
+                window_start: None,
+                window_end: None,
+                updated_at: at,
+            })
+            .unwrap();
+            db.upsert_server_tls_diagnostics(&crate::servers::ServerTlsDiagnostics {
+                server_id: id,
+                cipher_suite: "TLS_AES_128_GCM_SHA256".into(),
+                honors_client_cipher_order: None,
+                probed_at: at,
+            })
+            .unwrap();
+            db.save_proxy_routing_policy(
+                crate::proxies::Consumer::Server(id),
+                &crate::proxies::RoutingPolicy::default(),
+            )
+            .unwrap();
+            schedules.push(crate::bandwidth::ScheduleEntry {
+                id: format!("server-{id}-off"),
+                enabled: true,
+                label: String::new(),
+                days: vec![],
+                time: "08:00".into(),
+                times: vec![],
+                every_hour_at_minute: None,
+                action: crate::bandwidth::ScheduleAction::SetServerActive {
+                    server_id: id,
+                    active: false,
+                },
+            });
+        }
+        db.save_schedules(&schedules).unwrap();
+
+        db.load_config().unwrap();
+
+        let kept = kept();
+        assert_eq!(stored_ids(&db), kept);
+        assert!(GONE.iter().all(|id| !kept.contains(id)));
+        let usage: std::collections::BTreeSet<u32> = db
+            .list_server_download_usage()
+            .unwrap()
+            .into_iter()
+            .map(|usage| usage.server_id)
+            .collect();
+        assert_eq!(usage, kept);
+        let tls: std::collections::BTreeSet<u32> = db
+            .list_server_tls_diagnostics()
+            .unwrap()
+            .into_iter()
+            .map(|diagnostics| diagnostics.server_id)
+            .collect();
+        assert_eq!(tls, kept);
+        let routes: std::collections::BTreeSet<String> = db
+            .list_proxy_routes()
+            .unwrap()
+            .into_iter()
+            .map(|(consumer, _)| consumer)
+            .collect();
+        let kept_routes: std::collections::BTreeSet<String> = kept
+            .iter()
+            .map(|id| crate::proxies::Consumer::Server(*id).key())
+            .collect();
+        assert_eq!(routes, kept_routes);
+        let ruled: std::collections::BTreeSet<u32> = db
+            .list_schedules()
+            .unwrap()
+            .into_iter()
+            .filter_map(|entry| match entry.action {
+                crate::bandwidth::ScheduleAction::SetServerActive { server_id, .. } => {
+                    Some(server_id)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ruled, kept);
+    }
 }

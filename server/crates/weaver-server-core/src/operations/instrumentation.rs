@@ -753,17 +753,17 @@ impl ServerMetricsRegistry {
         counters
     }
 
-    // Every server of the active generation, in pool order, with what it
-    // answered to article requests. Each entry names its stable id, so a
-    // reader holding another generation's pool matches by identity, never
-    // by position.
-    pub fn article_outcomes(&self) -> Vec<ServerArticleOutcomes> {
+    // What the server with this stable id answered to article requests,
+    // when it is in the active generation. Found by identity, never by pool
+    // position, so a reader holding another generation's pool reads the
+    // right server or none.
+    pub fn article_outcomes(&self, stable_server_id: u32) -> Option<ServerArticleOutcomes> {
         self.active
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
+            .find(|counters| counters.stable_server_id == stable_server_id)
             .map(|counters| counters.article_outcomes())
-            .collect()
     }
 
     // Snapshot every server of the active generation. Scrape-time only.

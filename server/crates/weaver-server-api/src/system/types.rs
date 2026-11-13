@@ -1346,8 +1346,9 @@ pub struct ServerHealth {
     /// and a server pinned sequential always reads 1.
     pub body_pipeline_depth: u32,
     /// Set once the server has twice failed to answer a pipelined batch
-    /// cleanly, which holds it sequential for the rest of the process,
-    /// through any change to the server list.
+    /// cleanly, which holds it sequential until Weaver restarts. A reorder
+    /// or a priority change keeps the hold; a change of host, port or
+    /// username starts the server afresh.
     pub body_pipelining_pinned_sequential: bool,
     /// Requests the connection answered, whatever the answer: a server
     /// that says "no such article" is a working connection and counts here.
@@ -1356,12 +1357,6 @@ pub struct ServerHealth {
     /// Requests the connection failed: refused, timed out, dropped or
     /// answered out of protocol. A "no such article" answer is not one.
     pub failure_count: u64,
-    /// Article requests this server answered with the article, since the
-    /// process started.
-    pub articles_found: u64,
-    /// Article requests this server answered "no such article", since the
-    /// process started; the article may still have come from another server.
-    pub articles_not_found: u64,
     pub consecutive_failures: u32,
     /// Connections that died before reaching a healthy age, recently.
     pub premature_deaths: u32,
@@ -1371,10 +1366,39 @@ pub struct ServerHealth {
     #[graphql(skip)]
     #[serde(skip)]
     pub pool_index: usize,
+    /// The server's configured id, which its counters are kept under.
+    #[graphql(skip)]
+    #[serde(skip)]
+    pub stable_server_id: Option<u32>,
+}
+
+impl ServerHealth {
+    // What this server answered to article requests, read only when a query
+    // asks for one of the two figures, and found by the server's id.
+    fn article_outcomes(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Option<weaver_server_core::ServerArticleOutcomes> {
+        ctx.data_opt::<weaver_server_core::SchedulerHandle>()?
+            .server_article_outcomes(self.stable_server_id?)
+    }
 }
 
 #[ComplexObject]
 impl ServerHealth {
+    /// Article requests this server answered with the article, counted
+    /// since Weaver last started. The count starts again at every start.
+    async fn articles_found(&self, ctx: &Context<'_>) -> u64 {
+        self.article_outcomes(ctx)
+            .map_or(0, |outcomes| outcomes.found)
+    }
+    /// Article requests this server answered "no such article", counted
+    /// since Weaver last started; the article may still have come from
+    /// another server. The count starts again at every start.
+    async fn articles_not_found(&self, ctx: &Context<'_>) -> u64 {
+        self.article_outcomes(ctx)
+            .map_or(0, |outcomes| outcomes.not_found)
+    }
     async fn legs(&self, ctx: &Context<'_>) -> Vec<crate::networking::NetworkLegFlow> {
         let Some(handle) = ctx.data_opt::<weaver_server_core::SchedulerHandle>() else {
             return Vec::new();

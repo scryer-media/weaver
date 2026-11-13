@@ -110,6 +110,8 @@ pub struct NntpPool {
     backfill: Vec<bool>,
     // The servers that are not backfill.
     fill: crate::ServerSet,
+    // The servers by priority level, shared by every policy sampled.
+    policy_levels: crate::provider_policy::PolicyLevels,
     // Retention window in days for each server (parallel to pools/configs).
     retention_days: Vec<u32>,
     // Maximum connections per server (parallel to pools/configs).
@@ -578,6 +580,14 @@ impl NntpPool {
             health_changed,
             last_connect_failure,
             reconnect_delay: config.reconnect_delay,
+            policy_levels: crate::provider_policy::PolicyLevels::of(
+                groups.iter().zip(&backfill).map(|(priority, backfill)| {
+                    crate::provider_policy::ProviderGroup {
+                        backfill: *backfill,
+                        priority: *priority,
+                    }
+                }),
+            ),
             groups,
             fill: (0..server_count).filter(|idx| !backfill[*idx]).collect(),
             backfill,
@@ -1581,7 +1591,7 @@ impl NntpPool {
     // so a sample never waits and never fails for contention.
     pub fn provider_policy(&self) -> crate::provider_policy::ProviderPolicy {
         use crate::provider_policy::{ProviderGroup, ProviderPolicy, ProviderState};
-        ProviderPolicy::new(
+        ProviderPolicy::sampled(
             (0..self.configs.len())
                 .map(|idx| {
                     let quota_remaining =
@@ -1608,6 +1618,7 @@ impl NntpPool {
                     }
                 })
                 .collect(),
+            self.policy_levels.clone(),
         )
     }
 

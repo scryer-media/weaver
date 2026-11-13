@@ -85,7 +85,6 @@ impl Pipeline {
 
     // A wire outcome retired this segment: no server has it, or the budget
     // for asking ran out.
-    #[cfg(test)]
     pub(in crate::pipeline) fn book_failed_segment(&mut self, seg_id: SegmentId) -> bool {
         self.book_terminal_segment(seg_id, SegmentTerminalState::Missing)
     }
@@ -596,12 +595,19 @@ impl Pipeline {
         // already holds the new generation and every old position has been
         // renumbered underneath it.
         let previous_stable_ids = std::mem::take(&mut self.download_lane_runtime.stable_ids);
-        let carried: HashMap<u32, ServerPipelineExplorer> = self
+        let previous_identities = std::mem::replace(
+            &mut self.download_lane_runtime.identities,
+            self.nntp.pool().server_identities(),
+        );
+        let carried: HashMap<u32, (usize, ServerPipelineExplorer)> = self
             .download_lane_runtime
             .servers
             .drain()
             .filter_map(|(server_idx, explorer)| {
-                Some((*previous_stable_ids.get(&server_idx)?, explorer))
+                Some((
+                    *previous_stable_ids.get(&server_idx)?,
+                    (server_idx, explorer),
+                ))
             })
             .collect();
         #[expect(clippy::type_complexity, reason = "one-shot seeding tuple")]
@@ -628,7 +634,9 @@ impl Pipeline {
                     .pool()
                     .stable_server_id(weaver_nntp::pool::ServerId(server_idx))
                     .map(|stable_id| stable_id.0);
-                let prior = stable_id.and_then(|stable_id| carried.get(&stable_id));
+                let prior = stable_id
+                    .and_then(|stable_id| carried.get(&stable_id))
+                    .map(|(_, explorer)| explorer);
                 let latency = prior
                     .and_then(|explorer| explorer.latency())
                     .or_else(|| self.probe_latency(server_idx));
@@ -650,7 +658,12 @@ impl Pipeline {
         for (server_idx, stable_id, supports_pipelining, proven_depth, latency, transfer) in seeds {
             let mut explorer = ServerPipelineExplorer::seeded(proven_depth, latency, transfer);
             explorer.note_supports_pipelining(supports_pipelining);
-            if let Some(prior) = stable_id.and_then(|stable_id| carried.get(&stable_id)) {
+            // The verdict was earned by one host, port and login. A server
+            // edited to another keeps its measurements and starts unpinned.
+            if let Some((was_at, prior)) = stable_id.and_then(|stable_id| carried.get(&stable_id))
+                && previous_identities.get(*was_at)
+                    == self.download_lane_runtime.identities.get(server_idx)
+            {
                 explorer.carry_pipelining_verdict(prior);
             }
             self.download_lane_runtime

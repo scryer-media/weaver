@@ -232,8 +232,9 @@ impl Pipeline {
     // failed and health is updated so repair can take over.
     //
     // `servers` are read as the current pool numbers them: a body fetched
-    // before a rebuild names no server, so its failure is retried on every
-    // server of the new pool rather than judged against old indices.
+    // before a rebuild has its servers renumbered to the pool as it is now.
+    // Only one stamped under a layout no longer kept names no server, and
+    // its failure is retried on every server of the pool.
     pub(crate) fn handle_decode_failure(
         &mut self,
         segment_id: SegmentId,

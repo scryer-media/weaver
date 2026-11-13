@@ -331,7 +331,7 @@ impl Pipeline {
 
     // Books the article missing, every id spent, and returns the servers
     // refusing credentials that would otherwise have served it.
-    pub(in crate::pipeline) fn book_unservable_article(
+    fn book_unservable_article(
         &mut self,
         segment_id: SegmentId,
         exclude_servers: weaver_nntp::ServerSet,

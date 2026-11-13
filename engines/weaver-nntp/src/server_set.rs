@@ -128,8 +128,19 @@ impl ServerSet {
     }
 
     // A set from an index list. An index the set cannot hold is never part
-    // of a pool, so it cannot be excluded from one and is left out.
+    // of a pool: naming one is a caller's defect, caught in a debug build
+    // and left out in a release one.
     pub fn from_indices<'a>(servers: impl IntoIterator<Item = &'a usize>) -> Self {
+        Self::of_those_held(servers.into_iter().inspect(|server| {
+            debug_assert!(
+                **server < Self::CAPACITY,
+                "server index {server} is past what a pool holds"
+            );
+        }))
+    }
+
+    // The indices of a list that the set can hold.
+    fn of_those_held<'a>(servers: impl IntoIterator<Item = &'a usize>) -> Self {
         servers
             .into_iter()
             .filter(|server| **server < Self::CAPACITY)
@@ -169,7 +180,7 @@ impl<const N: usize> From<[usize; N]> for ServerSet {
 
 impl PartialEq<[usize]> for ServerSet {
     fn eq(&self, other: &[usize]) -> bool {
-        Self::from_indices(other) == *self && other.len() == self.len()
+        Self::of_those_held(other) == *self && other.len() == self.len()
     }
 }
 
@@ -361,6 +372,6 @@ mod tests {
         assert_eq!(format!("{set:?}"), "[0, 3, 63]");
         assert!(!set.contains(64));
         assert!(!set.contains(usize::MAX));
-        assert_eq!(ServerSet::from_indices(&[64, 1000]), ServerSet::EMPTY);
+        assert_ne!(set, [0, 3, 64]);
     }
 }

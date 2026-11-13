@@ -333,15 +333,10 @@ impl SystemQuery {
             });
         match live_pool.or(fallback_pool) {
             Some(pool) => {
-                let article_outcomes = handle.server_article_outcomes();
-                Ok(collect_server_health(
-                    &pool,
-                    runtime_generation,
-                    &transport,
-                    &article_outcomes,
-                    work_waiting,
+                Ok(
+                    collect_server_health(&pool, runtime_generation, &transport, work_waiting)
+                        .await,
                 )
-                .await)
             }
             None => Ok(Vec::new()),
         }
@@ -654,7 +649,6 @@ async fn collect_server_health(
     pool: &NntpPool,
     runtime_generation: u64,
     transport: &[weaver_server_core::ServerTransportHealth],
-    article_outcomes: &[weaver_server_core::ServerArticleOutcomes],
     work_waiting: bool,
 ) -> Vec<ServerHealth> {
     struct ServerLoadSnapshot {
@@ -670,14 +664,6 @@ async fn collect_server_health(
 
     let configs = pool.server_configs();
     let tiers = server_tiers(pool.server_groups(), pool.server_backfill_flags());
-    // The counters follow the active pool; a reader still holding the pool
-    // before a rebuild takes a position only when it names the same server.
-    let outcomes_for = |idx: usize| {
-        let stable_id = pool.stable_server_id(weaver_nntp::ServerId(idx))?;
-        article_outcomes
-            .get(idx)
-            .filter(|outcomes| outcomes.stable_server_id == stable_id.0)
-    };
     // Read connection load outside the health lock.
     let pre: Vec<ServerLoadSnapshot> = configs
         .iter()
@@ -781,11 +767,12 @@ async fn collect_server_health(
                     .is_some_and(|entry| entry.pinned_sequential),
                 success_count: srv.success_count,
                 failure_count: srv.failure_count,
-                articles_found: outcomes_for(idx).map_or(0, |outcomes| outcomes.found),
-                articles_not_found: outcomes_for(idx).map_or(0, |outcomes| outcomes.not_found),
                 consecutive_failures: srv.consecutive_failures,
                 premature_deaths: health.recent_premature_deaths(idx) as u32,
                 pool_index: idx,
+                stable_server_id: pool
+                    .stable_server_id(weaver_nntp::ServerId(idx))
+                    .map(|stable_id| stable_id.0),
             }
         })
         .collect()

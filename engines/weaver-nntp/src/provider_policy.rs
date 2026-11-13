@@ -59,11 +59,38 @@ struct PolicyIndex {
     // The servers whose quota an article's estimate is weighed against.
     limited: ServerSet,
     // Each group present, best first, with its servers.
-    levels: Vec<(ProviderGroup, ServerSet)>,
+    levels: PolicyLevels,
+}
+
+// A pool's priority levels: each group present, best first, with its
+// servers. A pool's groups never change while it lives, so the pool builds
+// this once and every policy sampled from it shares it.
+#[derive(Debug, Clone)]
+pub(crate) struct PolicyLevels(std::sync::Arc<[(ProviderGroup, ServerSet)]>);
+
+impl PolicyLevels {
+    pub(crate) fn of(groups: impl IntoIterator<Item = ProviderGroup>) -> Self {
+        let mut levels: Vec<(ProviderGroup, ServerSet)> = Vec::new();
+        for (idx, group) in groups.into_iter().enumerate() {
+            assert!(
+                idx < ServerSet::CAPACITY,
+                "a pool holds at most {} servers",
+                ServerSet::CAPACITY
+            );
+            match levels.binary_search_by(|(level, _)| level.cmp(&group)) {
+                Ok(at) => {
+                    levels[at].1.insert(idx);
+                }
+                Err(at) => levels.insert(at, (group, ServerSet::of(idx))),
+            }
+        }
+        Self(levels.into())
+    }
 }
 
 impl PolicyIndex {
-    fn of(servers: &[ProviderState]) -> Self {
+    // `levels` are those of `servers`' groups.
+    fn of(servers: &[ProviderState], levels: PolicyLevels) -> Self {
         assert!(
             servers.len() <= ServerSet::CAPACITY,
             "a pool holds at most {} servers",
@@ -74,7 +101,7 @@ impl PolicyIndex {
             usable: ServerSet::EMPTY,
             unlimited: ServerSet::EMPTY,
             limited: ServerSet::EMPTY,
-            levels: Vec::new(),
+            levels,
         };
         for (idx, state) in servers.iter().enumerate() {
             if !state.group.backfill {
@@ -87,15 +114,6 @@ impl PolicyIndex {
                 index.unlimited.insert(idx);
             } else {
                 index.limited.insert(idx);
-            }
-            match index
-                .levels
-                .binary_search_by(|(group, _)| group.cmp(&state.group))
-            {
-                Ok(at) => {
-                    index.levels[at].1.insert(idx);
-                }
-                Err(at) => index.levels.insert(at, (state.group, ServerSet::of(idx))),
             }
         }
         index
@@ -123,6 +141,7 @@ impl PolicyIndex {
             candidates = candidates.intersection(self.fill);
         }
         self.levels
+            .0
             .iter()
             .map(|(_, level)| level.intersection(candidates))
             .find(|level| !level.is_empty())
@@ -145,8 +164,15 @@ impl PartialEq for ProviderPolicy {
 }
 
 impl ProviderPolicy {
+    #[cfg(test)]
     pub(crate) fn new(servers: Vec<ProviderState>) -> Self {
-        let index = PolicyIndex::of(&servers);
+        let levels = PolicyLevels::of(servers.iter().map(|state| state.group));
+        Self::sampled(servers, levels)
+    }
+
+    // A sample of a pool's servers, over the levels the pool built for them.
+    pub(crate) fn sampled(servers: Vec<ProviderState>, levels: PolicyLevels) -> Self {
+        let index = PolicyIndex::of(&servers, levels);
         Self { servers, index }
     }
 
@@ -298,7 +324,8 @@ mod tests {
 
     impl Drop for Edit<'_> {
         fn drop(&mut self) {
-            self.0.index = PolicyIndex::of(&self.0.servers);
+            let levels = PolicyLevels::of(self.0.servers.iter().map(|state| state.group));
+            self.0.index = PolicyIndex::of(&self.0.servers, levels);
         }
     }
 

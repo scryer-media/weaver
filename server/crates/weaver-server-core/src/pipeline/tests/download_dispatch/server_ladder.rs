@@ -639,8 +639,14 @@ async fn the_scan_floors_hand_out_what_a_whole_walk_does() {
             for mut work in works {
                 match rng.below(4) {
                     // Not found here: back to the queue for the others.
+                    // Half the time another server has said so too, so the
+                    // article goes back refused to several floors at once.
                     0 => {
                         work.exclude_servers.insert(server);
+                        if rng.below(2) == 0 {
+                            work.exclude_servers
+                                .insert(rng.below(levels.len() as u32) as usize);
+                        }
                         pipeline.enqueue_download_work(work);
                     }
                     // A plain retry.
@@ -668,6 +674,102 @@ async fn the_scan_floors_hand_out_what_a_whole_walk_does() {
     }
     assert!(runs[0].0.iter().any(|(_, works)| !works.is_empty()));
     assert_eq!(runs[0], runs[1]);
+}
+
+// An article put back after a "not found" sends back over the queue only
+// the servers that may take it. Two top servers, a lower level not reached
+// yet and a backfill server, all asking through the dispatch path. Server 0
+// is handed an article and answers "not found" each round: the first
+// article first, which goes back at the head of the queue, then ordinary
+// ones, which go back behind their band. The lower level and the backfill
+// server are refused the whole queue once; an article that comes back is one
+// more refusal each, never a new walk, so what they read does not grow with
+// the queue.
+#[tokio::test]
+async fn a_requeued_article_sends_no_refused_server_back_over_the_queue() {
+    const ROUNDS: usize = 12;
+    let levels: Vec<(u32, bool)> = vec![(0, false), (0, false), (1, false), (2, true)];
+    const REFUSED: [usize; 2] = [2, 3];
+    let mut reread = Vec::new();
+    for articles in [400usize, 1_600] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut pipeline = ladder_pipeline(&temp_dir, &levels).await;
+        let job_id = JobId(42030);
+        insert_active_job(
+            &mut pipeline,
+            job_id,
+            segmented_job_spec("Comes Back", "payload.bin", &vec![128u32; articles]),
+        )
+        .await;
+        pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .note_first_article(held_segment(job_id, 0, 0));
+        rewrite_queue(&mut pipeline, job_id, |_| {});
+        pipeline.active_download_passes.insert(job_id);
+        // What one ask of a refused server reads of the queue to be told
+        // there is nothing for it. A debug build checks every idle answer
+        // with a whole walk past the floors, which reads the queue once
+        // more; that check is taken out of the count.
+        let refused_ask = |pipeline: &mut Pipeline, server: usize| {
+            let skipped = |pipeline: &Pipeline| {
+                pipeline
+                    .metrics
+                    .download_scheduler_scan_items_skipped_total
+                    .load(Ordering::Relaxed)
+            };
+            let before = skipped(pipeline);
+            assert!(ask(pipeline, server, 8).is_empty());
+            let queued = pipeline.jobs[&job_id]
+                .articles
+                .download_queue()
+                .map_or(0, DownloadQueue::len) as u64;
+            let checked = if cfg!(debug_assertions) { queued } else { 0 };
+            skipped(pipeline) - before - checked
+        };
+
+        // Each refused server walks the queue once.
+        let mut walked = 0;
+        for server in REFUSED {
+            walked += refused_ask(&mut pipeline, server);
+        }
+        assert_eq!(walked, (REFUSED.len() * articles) as u64);
+
+        let mut read = 0;
+        for round in 0..ROUNDS {
+            let mut works = ask(&mut pipeline, 0, 1);
+            let work = works.pop().expect("server 0 is handed an article");
+            assert_eq!(
+                work.segment_id == held_segment(job_id, 0, 0),
+                round == 0,
+                "the first article goes out first"
+            );
+            answer_not_found(&mut pipeline, 0, work).await;
+            for server in REFUSED {
+                read += refused_ask(&mut pipeline, server);
+            }
+        }
+        reread.push(read);
+
+        // Server 1 may take what came back: the first article leads.
+        let back = ask(&mut pipeline, 1, ROUNDS);
+        assert_eq!(back.len(), ROUNDS);
+        assert_eq!(back[0].segment_id, held_segment(job_id, 0, 0));
+        assert_eq!(back[0].exclude_servers, weaver_nntp::ServerSet::from([0]));
+    }
+    assert_eq!(
+        reread[0], reread[1],
+        "what a refused server reads does not grow with the queue"
+    );
+    assert_eq!(
+        reread[0], 0,
+        "an article put back is refused where it is put, not by a new walk"
+    );
 }
 
 // A "not found" puts the article straight back for the other servers. It
@@ -775,21 +877,16 @@ fn rewrite_queue(pipeline: &mut Pipeline, job_id: JobId, mut edit: impl FnMut(&m
     }
 }
 
-// A first article every server it may use said "not found", with a server
-// refusing the credentials left unasked, is booked as the sweep for work no
-// server may serve books it: Unservable, so the post's sample does not count
-// it lost on one path and spare it on the other.
+// An article every server it may use said "not found", while another server
+// refuses the credentials and is never asked, is booked missing and counts
+// to the post's missing articles.
 #[tokio::test]
-async fn a_not_found_walk_past_a_refusing_server_books_as_the_unservable_sweep_does() {
+async fn a_not_found_walk_past_a_refusing_server_is_booked_missing() {
     let levels = vec![(0, false), (1, false), (2, false)];
     let refusing = 2;
-    let booked = |pipeline: &Pipeline, segment_id| {
-        pipeline.segment_terminal_states.get(&segment_id).copied()
-    };
-
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut walked = ladder_pipeline(&temp_dir, &levels).await;
-    walked
+    let mut pipeline = ladder_pipeline(&temp_dir, &levels).await;
+    pipeline
         .nntp
         .pool()
         .health()
@@ -798,49 +895,31 @@ async fn a_not_found_walk_past_a_refusing_server_books_as_the_unservable_sweep_d
         .record_failure(refusing, true);
     let job_id = JobId(42005);
     insert_active_job(
-        &mut walked,
+        &mut pipeline,
         job_id,
         segmented_job_spec("Refused Head", "payload.bin", &[128, 128]),
     )
     .await;
-    walked.active_download_passes.insert(job_id);
+    pipeline.active_download_passes.insert(job_id);
     let head = held_segment(job_id, 0, 0);
     let mut asked = Vec::new();
     for server in [0, 1, refusing] {
-        let mut works = ask(&mut walked, server, 1);
+        let mut works = ask(&mut pipeline, server, 1);
         if let Some(work) = works.pop() {
             assert_eq!(work.segment_id, head);
             asked.push(server);
-            answer_not_found(&mut walked, server, work).await;
+            answer_not_found(&mut pipeline, server, work).await;
         }
     }
     assert_eq!(asked, vec![0, 1], "the refusing server is never handed it");
 
-    let swept_dir = tempfile::tempdir().unwrap();
-    let mut swept = ladder_pipeline(&swept_dir, &levels).await;
-    swept
-        .nntp
-        .pool()
-        .health()
-        .lock()
-        .await
-        .record_failure(refusing, true);
-    insert_active_job(
-        &mut swept,
-        job_id,
-        segmented_job_spec("Refused Head", "payload.bin", &[128, 128]),
-    )
-    .await;
-    swept.book_unservable_segment(head, [0, 1].into_iter().collect());
-
     assert_eq!(
-        booked(&walked, head),
-        Some(SegmentTerminalState::Unservable)
+        pipeline.segment_terminal_states.get(&head).copied(),
+        Some(SegmentTerminalState::Missing)
     );
-    assert_eq!(booked(&walked, head), booked(&swept, head));
     assert_eq!(
-        walked.metrics.articles_not_found.load(Ordering::Relaxed),
-        swept.metrics.articles_not_found.load(Ordering::Relaxed)
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+        1
     );
 }
 

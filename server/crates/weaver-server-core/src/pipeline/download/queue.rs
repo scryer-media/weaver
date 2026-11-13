@@ -523,12 +523,25 @@ impl DownloadQueue {
         self.scan_floors[server] = Some(ScanFloor { from, memo });
     }
 
-    // An item keyed `key` was put in: no floor may stand above it.
-    fn lower_scan_floors(&mut self, key: Key) {
-        for floor in self.scan_floors.iter_mut().flatten() {
+    // An item keyed `key` was put in: no floor of a server that may take it
+    // may stand above it. A server the item is refused to, under the
+    // conditions its floor was recorded with, keeps its floor: the item is
+    // one more refusal below it. One constant-time answer per floor that
+    // exists, and nothing where no server has walked.
+    fn lower_scan_floors(
+        &mut self,
+        key: Key,
+        exclude_servers: weaver_nntp::ServerSet,
+        byte_estimate: u32,
+    ) {
+        for (server, floor) in self.scan_floors.iter_mut().enumerate() {
+            let Some(floor) = floor else {
+                continue;
+            };
             match floor.from {
                 ScanPoint::At(from) if from <= key => {}
                 ScanPoint::Head => {}
+                _ if floor.memo.refuses(server, exclude_servers, byte_estimate) => {}
                 _ => floor.from = ScanPoint::At(key),
             }
         }
@@ -629,7 +642,7 @@ impl DownloadQueue {
             None,
             sequence,
         );
-        self.lower_scan_floors(key);
+        self.lower_scan_floors(key, weaver_nntp::ServerSet::EMPTY, byte_estimate);
         let slots = self.files.entry(segment_id.file_id).or_default();
         if slots.groups.is_none() {
             slots.groups = Some(Arc::clone(groups));
@@ -676,7 +689,7 @@ impl DownloadQueue {
         if item.completion_critical {
             self.critical_len += 1;
         }
-        self.lower_scan_floors(key);
+        self.lower_scan_floors(key, item.exclude_servers, item.byte_estimate);
         let file_id = item.segment_id.file_id;
         let job_id = *self.job_id.get_or_insert(file_id.job_id);
         let slots = self.files.entry(file_id).or_default();
@@ -1108,7 +1121,11 @@ impl DownloadQueue {
         let Some(entry) = self.order.remove(&old) else {
             return;
         };
-        self.lower_scan_floors(new);
+        let exclude_servers = entry
+            .extra()
+            .and_then(|index| self.extras.get(index))
+            .map_or(weaver_nntp::ServerSet::EMPTY, |extra| extra.exclude_servers);
+        self.lower_scan_floors(new, exclude_servers, entry.byte_estimate);
         self.order.insert(new, entry);
         let job_id = entry
             .extra()

@@ -493,14 +493,12 @@ fn article_outcomes_count_found_and_not_found_per_server() {
         found,
         not_found,
     };
-    assert_eq!(
-        registry.article_outcomes(),
-        vec![outcome(41, 0, 4), outcome(7, 2, 0)]
-    );
+    assert_eq!(registry.article_outcomes(41), Some(outcome(41, 0, 4)));
+    assert_eq!(registry.article_outcomes(7), Some(outcome(7, 2, 0)));
     // Reordered: each server keeps its own totals under its new position.
     registry.activate(&[7, 41]);
-    assert_eq!(
-        registry.article_outcomes(),
-        vec![outcome(7, 2, 0), outcome(41, 0, 4)]
-    );
+    assert_eq!(registry.article_outcomes(41), Some(outcome(41, 0, 4)));
+    assert_eq!(registry.article_outcomes(7), Some(outcome(7, 2, 0)));
+    // A server that is not in the active list reads none.
+    assert_eq!(registry.article_outcomes(9), None);
 }

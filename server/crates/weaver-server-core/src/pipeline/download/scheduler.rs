@@ -477,7 +477,7 @@ impl Pipeline {
         let mut filter = match self.servable_work_filter(
             job_id,
             server_idx,
-            bootstrap_files.as_deref(),
+            bootstrap_files.as_ref(),
             uu_cursor_ordinals.as_ref(),
         ) {
             ServableWork::Scan(filter) => filter,
@@ -696,7 +696,7 @@ impl Pipeline {
         let filter = match self.servable_work_filter(
             job_id,
             server_idx,
-            bootstrap_files.as_deref(),
+            bootstrap_files.as_ref(),
             uu_cursor_ordinals.as_ref(),
         ) {
             ServableWork::Scan(filter) => filter,

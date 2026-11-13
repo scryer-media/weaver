@@ -4548,8 +4548,9 @@ type ServerHealth {
 	bodyPipelineDepth: Int!
 	"""
 	Set once the server has twice failed to answer a pipelined batch
-	cleanly, which holds it sequential for the rest of the process,
-	through any change to the server list.
+	cleanly, which holds it sequential until Weaver restarts. A reorder
+	or a priority change keeps the hold; a change of host, port or
+	username starts the server afresh.
 	"""
 	bodyPipeliningPinnedSequential: Boolean!
 	"""
@@ -4563,21 +4564,22 @@ type ServerHealth {
 	answered out of protocol. A "no such article" answer is not one.
 	"""
 	failureCount: Int!
-	"""
-	Article requests this server answered with the article, since the
-	process started.
-	"""
-	articlesFound: Int!
-	"""
-	Article requests this server answered "no such article", since the
-	process started; the article may still have come from another server.
-	"""
-	articlesNotFound: Int!
 	consecutiveFailures: Int!
 	"""
 	Connections that died before reaching a healthy age, recently.
 	"""
 	prematureDeaths: Int!
+	"""
+	Article requests this server answered with the article, counted
+	since Weaver last started. The count starts again at every start.
+	"""
+	articlesFound: Int!
+	"""
+	Article requests this server answered "no such article", counted
+	since Weaver last started; the article may still have come from
+	another server. The count starts again at every start.
+	"""
+	articlesNotFound: Int!
 	legs: [NetworkLegFlow!]!
 	"""
 	The resolved address new connections to this server dial, once an
