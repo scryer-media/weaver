@@ -103,7 +103,7 @@ metric_families! {
     SEGMENTS_RETRIED = ("weaver_pipeline_segments_retried_total", Counter, [],
         "Total segments retried.");
     SEGMENTS_FAILED_PERMANENT = ("weaver_pipeline_segments_failed_permanent_total", Counter, [],
-        "Total segments permanently failed.");
+        "Articles that downloaded but never decoded into place and were left to repair; articles no server had are in weaver_pipeline_articles_not_found_total.");
     PARKED_INFRASTRUCTURE_WORK = ("weaver_pipeline_parked_infrastructure_work", Gauge, [],
         "Segments parked while NNTP infrastructure is unavailable.");
     GENERATION_RECOVERY_REQUEUES = ("weaver_nntp_generation_recovery_requeues_total", Counter, [],
@@ -113,9 +113,9 @@ metric_families! {
 
     // ---- failures --------------------------------------------------------
     DOWNLOAD_FAILURES = ("weaver_pipeline_download_failures_total", Counter, ["kind"],
-        "Failed article download attempts by kind.");
+        "Failed article download attempts by kind, one per server asked; an article another server then delivers still counts here.");
     ARTICLES_NOT_FOUND = ("weaver_pipeline_articles_not_found_total", Counter, [],
-        "Total articles not found.");
+        "Articles booked missing: every server and every message id was tried and none had it. Per-server refusals are download_failures_total{kind=\"article_not_found\"}.");
     DECODE_ERRORS = ("weaver_pipeline_decode_errors_total", Counter, [],
         "Total decode errors.");
     CRC_ERRORS = ("weaver_pipeline_crc_errors_total", Counter, [],
@@ -123,7 +123,7 @@ metric_families! {
 
     // ---- queues and buffers ---------------------------------------------
     DOWNLOAD_QUEUE_DEPTH = ("weaver_pipeline_download_queue_depth", Gauge, [],
-        "Download queue depth.");
+        "Articles still to fetch across every queued job, recovery articles and jobs outside the queue window included; not connections or jobs.");
     ACTIVE_DOWNLOADS = ("weaver_pipeline_active_downloads", Gauge, [],
         "Active article downloads.");
     ACTIVE_DECODES = ("weaver_pipeline_active_decodes", Gauge, [],
@@ -137,7 +137,7 @@ metric_families! {
     COMMIT_PENDING = ("weaver_pipeline_commit_pending", Gauge, [],
         "Commit pending queue depth.");
     RECOVERY_QUEUE_DEPTH = ("weaver_pipeline_recovery_queue_depth", Gauge, [],
-        "Recovery queue depth.");
+        "Recovery articles still to fetch across the jobs in the queue window; part of weaver_pipeline_download_queue_depth.");
     WRITE_BUFFERED_BYTES = ("weaver_pipeline_write_buffered_bytes", Gauge, [],
         "Buffered write bytes.");
     WRITE_BUFFERED_SEGMENTS = ("weaver_pipeline_write_buffered_segments", Gauge, [],

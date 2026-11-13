@@ -682,13 +682,19 @@ async fn collect_server_health(
     // sockets on a server that is not are only "preparing" when nothing else
     // is fetching either; behind a busy primary they are simply waiting.
     let pool_busy = pre.iter().any(|snapshot| snapshot.busy > 0);
+    // Each server's transport entry, the first listed as before, found once
+    // rather than searched for per server.
+    let mut transport_by_server = std::collections::HashMap::with_capacity(transport.len());
+    for entry in transport {
+        transport_by_server.entry(entry.server_idx).or_insert(entry);
+    }
 
     let health = pool.health().lock().await;
     pre.into_iter()
         .enumerate()
         .map(|(idx, snapshot)| {
             let srv = health.server(idx);
-            let body = transport.iter().find(|entry| entry.server_idx == idx);
+            let body = transport_by_server.get(&idx).copied();
             let state = match srv.state() {
                 weaver_nntp::ServerState::Healthy => "healthy",
                 weaver_nntp::ServerState::Degraded { .. } => "degraded",

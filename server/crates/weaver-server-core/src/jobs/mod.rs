@@ -4,6 +4,7 @@
 mod archive_password;
 pub mod assembly;
 pub mod diagnostic_names;
+pub mod diagnostic_tables;
 pub mod download_summary;
 mod download_summary_persistence;
 pub mod duplicate;
