@@ -832,6 +832,33 @@ fn higher_score_supersession_preserves_reserved_lower_candidate_for_promotion() 
     assert_eq!(claim.source.nzb_zstd, vec![81]);
 }
 
+// A name fingerprint stored before the name was the release title as posted
+// carries version 1. Even with the same digest it never matches a new one.
+#[test]
+fn a_stored_old_version_name_fingerprint_never_matches() {
+    let db = Database::open_in_memory().unwrap();
+    let old = spec(vec![vec![("old-name@example", 10)]]);
+    let mut old_request = request(&old, 111);
+    for fingerprint in &mut old_request.evidence.fingerprints {
+        if fingerprint.kind == FingerprintKind::NormalizedName {
+            fingerprint.version = 1;
+        }
+    }
+    accepted(db.admit_duplicate_submission(&old_request).unwrap());
+
+    let new = spec(vec![vec![("new-name@example", 10)]]);
+    let (_, action) = accepted(db.admit_duplicate_submission(&request(&new, 112)).unwrap());
+    assert_eq!(action, DuplicateAction::Accept);
+
+    // The same two jobs, both current, do match by name.
+    let again = spec(vec![vec![("again-name@example", 10)]]);
+    let (_, action) = accepted(
+        db.admit_duplicate_submission(&request(&again, 113))
+            .unwrap(),
+    );
+    assert_eq!(action, DuplicateAction::Warn);
+}
+
 #[test]
 fn bulk_duplicate_summaries_return_persisted_action_and_evidence_in_one_contract() {
     let db = Database::open_in_memory().unwrap();

@@ -830,6 +830,7 @@ fn renders_collected_instrumentation_snapshots() {
         "weaver_pipeline_extract_member_duration_seconds",
         "weaver_db_op_duration_seconds",
         "weaver_db_wal_checkpoint_duration_seconds",
+        "weaver_db_statement_duration_seconds",
         "weaver_http_request_duration_seconds",
     ] {
         assert!(
@@ -903,6 +904,7 @@ fn renders_collected_instrumentation_snapshots() {
     assert!(rendered.contains("weaver_db_wal_checkpointed_frames 19"));
     assert!(rendered.contains("weaver_db_wal_checkpoint_copied_frames 0"));
     assert!(rendered.contains("weaver_db_wal_bytes 3218032"));
+    assert!(rendered.contains("weaver_db_statement_duration_seconds_count 6"));
 
     // Process collector names are deliberately unprefixed.
     assert!(rendered.contains("process_cpu_seconds_total 12.5"));
@@ -955,6 +957,7 @@ fn absent_instrumentation_omits_its_families() {
         "weaver_db_runtime_info",
         "weaver_db_wal_checkpoint_passes_total",
         "weaver_db_wal_bytes",
+        "weaver_db_statement_duration_seconds",
         "process_cpu_seconds_total",
         "process_start_time_seconds",
         "weaver_disk_total_bytes",

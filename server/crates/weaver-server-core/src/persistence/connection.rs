@@ -30,6 +30,13 @@ pub use crate::rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
 const SQLITE_WRITE_QUEUE_CAPACITY: usize = 128;
 const JOB_HISTORY_CACHE_CAPACITY: usize = 1024;
 
+// The start-up credential reads of the queue. Each predicate is the one a
+// partial index of migration 90 is built on, so the reads walk only the jobs
+// that hold the credential.
+pub(crate) const ACTIVE_JOB_PASSWORDS_SQL: &str =
+    "SELECT job_id AS id, password FROM active_jobs WHERE password IS NOT NULL";
+pub(crate) const ACTIVE_JOB_PASSWORD_CANDIDATES_SQL: &str = "SELECT job_id AS id, password_candidates AS password FROM active_jobs WHERE password_candidates IS NOT NULL";
+
 type SqliteDatabaseRuntimeJob = Box<dyn FnOnce(&tokio::runtime::Runtime) + Send + 'static>;
 enum PostgresDatabaseRuntimeJob {
     Send(Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>),
@@ -1964,6 +1971,8 @@ impl Database {
     }
 
     // Return whether any persisted credential requires the encryption key.
+    // The active-job reads are served by the partial indexes of migration
+    // 90, so they walk only the jobs with a password, not the whole queue.
     // This check intentionally reads raw storage before a key is installed so
     // startup can refuse to replace a missing key over encrypted state.
     pub fn has_encrypted_credentials(&self) -> Result<bool, StateError> {
@@ -1981,8 +1990,8 @@ impl Database {
                 "SELECT password FROM servers WHERE password IS NOT NULL",
                 "SELECT password FROM rss_feeds WHERE password IS NOT NULL",
                 "SELECT password FROM proxy_profiles WHERE password IS NOT NULL",
-                "SELECT password FROM active_jobs WHERE password IS NOT NULL",
-                "SELECT password_candidates AS password FROM active_jobs WHERE password_candidates IS NOT NULL",
+                ACTIVE_JOB_PASSWORDS_SQL,
+                ACTIVE_JOB_PASSWORD_CANDIDATES_SQL,
                 "SELECT source_password AS password FROM semantic_duplicate_candidates WHERE source_password IS NOT NULL",
                 "SELECT value AS password FROM secrets",
                 "SELECT value AS password FROM settings WHERE key = 'archive_passwords'",
@@ -2052,11 +2061,11 @@ impl Database {
                 ),
                 (
                     "archive job",
-                    "SELECT job_id AS id, password FROM active_jobs WHERE password IS NOT NULL",
+                    ACTIVE_JOB_PASSWORDS_SQL,
                 ),
                 (
                     "archive job candidates",
-                    "SELECT job_id AS id, password_candidates AS password FROM active_jobs WHERE password_candidates IS NOT NULL",
+                    ACTIVE_JOB_PASSWORD_CANDIDATES_SQL,
                 ),
                 (
                     "archive candidate",
@@ -2205,11 +2214,11 @@ impl Database {
 
             for (select, update) in [
                 (
-                    "SELECT job_id, password FROM active_jobs WHERE password IS NOT NULL",
+                    ACTIVE_JOB_PASSWORDS_SQL,
                     "UPDATE active_jobs SET password = {} WHERE job_id = {} AND password = {}",
                 ),
                 (
-                    "SELECT job_id, source_password AS password FROM semantic_duplicate_candidates WHERE source_password IS NOT NULL",
+                    "SELECT job_id AS id, source_password AS password FROM semantic_duplicate_candidates WHERE source_password IS NOT NULL",
                     "UPDATE semantic_duplicate_candidates SET source_password = {} WHERE job_id = {} AND source_password = {}",
                 ),
             ] {
@@ -2226,7 +2235,7 @@ impl Database {
                         update,
                         &[
                             SqlArg::Text(encrypted),
-                            SqlArg::I64(row.i64("job_id")?),
+                            SqlArg::I64(row.i64("id")?),
                             SqlArg::Text(password),
                         ],
                     )

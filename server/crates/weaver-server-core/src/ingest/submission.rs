@@ -249,6 +249,8 @@ async fn submit_prepared_nzb(
     let (spec, evidence) = if let Some(mut preparation) = staged_preparation {
         preparation.spec.category =
             resolve_submission_category(config, category.as_deref()).await?;
+        // The metadata is the caller's at submit, not at staging.
+        preparation.evidence.rename_from(&preparation.spec);
         (preparation.spec, preparation.evidence)
     } else {
         let nzb = nzb.expect("non-staged submissions provide a parsed NZB");
@@ -726,7 +728,9 @@ pub async fn run_duplicate_fingerprint_backfill_batch(
                 skipped += 1;
                 continue;
             }
-            let spec = nzb_to_submission_spec(&nzb, None, None, None, Vec::new());
+            // The stored metadata carries the release title the name
+            // fingerprint is made from.
+            let spec = nzb_to_submission_spec(&nzb, None, None, None, source.metadata);
             let raw_job_hash = source
                 .raw_job_hash
                 .unwrap_or_else(|| persisted_nzb::hash_persisted_nzb_bytes(&nzb_zstd));

@@ -1499,6 +1499,7 @@ fn render_wal_checkpoint(out: &mut Encoder, wal: &WalCheckpointMetricsSnapshot) 
     out.sample(&f::DB_WAL_CHECKPOINTED_FRAMES, &[], wal.checkpointed_frames);
     out.sample(&f::DB_WAL_CHECKPOINT_COPIED_FRAMES, &[], wal.copied_frames);
     out.sample(&f::DB_WAL_BYTES, &[], wal.wal_bytes);
+    render_histogram(out, &f::DB_STATEMENT_DURATION, &[], &wal.statement_duration);
 }
 
 // Standard `process_*` collector series.
