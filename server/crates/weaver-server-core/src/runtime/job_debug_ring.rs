@@ -8,7 +8,7 @@
 // report fired. The binary installs a tracing layer that feeds every such
 // event carrying a `job_id` field into a small ring per job, and the code that
 // reports a stall calls [`dump`] to write that ring out beside the report, as
-// a short burst of "stall diagnostics" records.
+// one "stall diagnostics" record per episode.
 //
 // A job's ring is replayed once per stall episode. A report names the job's
 // progress, its downloaded wire bytes, and the ring remembers the progress of
@@ -26,10 +26,10 @@
 // the job's runtime is purged, so a process that never stalls pays only the
 // capture itself.
 //
-// A replayed record never repeats the captured event's own line shape. It
-// carries the event's level, target, message and fields as separate
-// `replayed_*` values, so a reader scanning the log for an event's message
-// can tell the event itself from a later replay of it.
+// A replay never repeats the captured event's own record. The episode's one
+// record carries every captured line as text in its `replayed` field, so a
+// reader scanning the log for an event's message can tell the event itself
+// from a later replay of it.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -204,11 +204,12 @@ pub fn forget(job_id: u64) {
     }
 }
 
-// Writes the job's ring out at WARN, once per stall episode, and clears it: a
-// header record giving the count, then one record per captured line, so a log
-// viewer shows one row per line. Each record carries the captured event in
-// parts, as `replayed_level`, `replayed_target`, `replayed_message` and
-// `replayed_fields`, never as the event's own rendered line.
+// Writes the job's ring out at WARN, once per stall episode, and clears it,
+// as one record: the count, the first and last capture times, and every
+// captured line in `replayed`, oldest first. A replayed
+// line is a DEBUG or TRACE event, so it is written inside the episode's one
+// record rather than as a WARN record of its own: an episode is one warning,
+// however many lines explain it.
 //
 // Callers are the throttled stall reports, each naming the job's `progress`.
 // Only the first report at a given progress writes; the rest, and any report
@@ -218,28 +219,41 @@ pub fn dump(job_id: u64, progress: u64, reason: &'static str) {
         return;
     };
     let lines = rings.replay(job_id, progress);
-    if lines.is_empty() {
+    let (Some(first), Some(last)) = (lines.first(), lines.last()) else {
         return;
-    }
+    };
     warn!(
         job_id,
         reason,
         lines = lines.len(),
-        "stall diagnostics: {} recent debug lines follow",
-        lines.len()
+        first_at = %first.timestamp(),
+        last_at = %last.timestamp(),
+        replayed = render(&lines).as_str(),
+        "stall diagnostics: the job's recent debug lines"
     );
-    for line in &lines {
-        warn!(
-            job_id,
-            reason,
-            at = %line.timestamp(),
-            replayed_level = %line.event.level,
-            replayed_target = line.event.target,
-            replayed_message = line.event.message.as_str(),
-            replayed_fields = line.event.fields.trim_start(),
-            "stall diagnostics line"
-        );
+}
+
+// The replayed lines as one line of text, oldest first, each `at=.. level=..
+// target=.. message=".."` and its fields, joined by ` | ` so a text log keeps
+// the record on one line. A replay never takes the captured event's own
+// `LEVEL target: message` shape, so a search for an event's message finds
+// the event itself apart from a replay.
+fn render(lines: &[DebugLine]) -> String {
+    let mut text = String::new();
+    for line in lines {
+        if !text.is_empty() {
+            text.push_str(" | ");
+        }
+        text.push_str("at=");
+        text.push_str(&line.timestamp());
+        text.push_str(" level=");
+        text.push_str(line.event.level.as_str());
+        text.push_str(" target=");
+        text.push_str(line.event.target);
+        text.push_str(&format!(" message={:?}", line.event.message));
+        text.push_str(&line.event.fields);
     }
+    text
 }
 
 #[cfg(test)]
@@ -338,6 +352,35 @@ mod tests {
         assert!(rings.replay(6, 10).is_empty(), "nothing new was captured");
         rings.record(6, event("next line"));
         assert_eq!(texts(rings.replay(6, 10)), vec!["next line"]);
+    }
+
+    #[test]
+    fn an_episode_renders_every_line_in_one_text_oldest_first() {
+        let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60);
+        let lines = vec![
+            DebugLine {
+                at,
+                event: CapturedEvent {
+                    fields: " job_id=5 rows=3".to_string(),
+                    ..event("checkpoint written")
+                },
+            },
+            DebugLine {
+                at,
+                event: event("lane parked"),
+            },
+        ];
+
+        let text = render(&lines);
+        let stamp = lines[0].timestamp();
+        assert_eq!(
+            text,
+            format!(
+                "at={stamp} level=DEBUG target=weaver_test message=\"checkpoint written\" \
+                 job_id=5 rows=3 | at={stamp} level=DEBUG target=weaver_test \
+                 message=\"lane parked\""
+            )
+        );
     }
 
     #[test]

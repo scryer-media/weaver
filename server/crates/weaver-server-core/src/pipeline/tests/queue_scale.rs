@@ -1538,7 +1538,9 @@ mod disk_room {
         assert_eq!(waiting_for_disk(&pipeline), 0);
         assert!(restated(&before, &reasons(&pipeline)) <= SLOTS as usize + 1);
         // The job that starts reads its articles off the pipeline's
-        // thread: that asks the disk nothing either.
+        // thread: that asks the disk nothing either, its staging device
+        // and the kind of storage it logs included, each read from the
+        // disk owner's cache.
         assert_eq!(pipeline.nzb_admitted.len(), SLOTS as usize + 1);
         activations_heard(&mut pipeline).await;
         assert_eq!(disk_looks(), looks);

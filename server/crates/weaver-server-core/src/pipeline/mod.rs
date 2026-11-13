@@ -1458,6 +1458,11 @@ pub struct Pipeline {
     // of them was still out on a thread: each is stopped, and kept only until
     // the last of its mail is heard.
     pub(super) retiring_graph_jobs: HashMap<JobId, graph::job::GraphJob>,
+    // The jobs whose working directory an activation is moving under the
+    // intermediate folder, each with that activation's number. No other
+    // activation is sent for one until that reply is heard, so one move at a
+    // time has the directory.
+    pub(super) moving_jobs: HashMap<JobId, u64>,
     // The repair slots graph jobs share, and what each job's recovery
     // objects said when it last advanced.
     pub(super) graph_status: graph::status::GraphStatus,

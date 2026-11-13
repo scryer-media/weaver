@@ -1495,7 +1495,9 @@ impl Pipeline {
             })
             .unwrap_or((None, None));
 
-        info!(
+        // DEBUG: a job is restored each time it enters the queue window, and
+        // start-up says once how many jobs it queued for restoration.
+        debug!(
             job_id = job_id.0,
             downloaded_bytes,
             restored_download_floor_bytes,

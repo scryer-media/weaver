@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use tracing::info;
 
-use crate::operations::disk::probe_nearest_disk_space;
+use crate::operations::StorageCapacity;
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -73,7 +73,7 @@ impl ExtractionLimits {
         // The completed-download directory may not exist yet at startup; its
         // nearest existing ancestor answers for the filesystem the reserve is
         // derived from.
-        let total_filesystem_bytes = probe_nearest_disk_space(complete_dir)
+        let total_filesystem_bytes = StorageCapacity::read_nearest_now(complete_dir)
             .ok()
             .map(|space| space.total_bytes);
         let default_min_free = default_disk_reserve_bytes(total_filesystem_bytes);

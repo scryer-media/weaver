@@ -644,8 +644,8 @@ pub(crate) async fn sweep_failed_job_files(
     }
 }
 
-// Removing the files of history entries while the entries, and their stored
-// NZBs, stay. What goes is what a delete with files takes, proven the same
+// Archiving history entries: their files are removed while the entries, and
+// their stored NZBs, stay. What goes is what a delete with files takes, proven the same
 // way: the job's working directories, marked or the unmarked one its record
 // names inside the intermediate root, its staging directories, and its
 // recorded output directory when its marker names the job (or is a legacy
@@ -658,21 +658,21 @@ pub(crate) async fn sweep_failed_job_files(
 //    directory and the listing of what it holds, before anything goes;
 // 4. one transaction keeping the record of every listed folder, unstamped;
 // 5. per job, the removal;
-// 6. one transaction stamping every entry whose files are gone.
+// 6. one transaction stamping every entry whose files are gone as archived.
 //
 // Every id gets its own outcome whatever fails: a record that cannot be
 // kept leaves its job untouched, and a stamp that cannot be written turns
 // the removals it would have stamped into failures a retry settles, as the
 // retry finds their folders gone and the record kept in step 4 still there.
-pub(crate) async fn remove_history_files(
+pub(crate) async fn archive_history(
     db: &crate::Database,
     intermediate_dir: &std::path::Path,
     staging_roots: &[PathBuf],
     job_ids: BTreeSet<JobId>,
     now: i64,
     keep: usize,
-) -> Result<BTreeMap<JobId, crate::HistoryFilesRemoval>, crate::SchedulerError> {
-    use crate::{HistoryFilesRemoval as Removal, HistoryFilesRemovalOutcome as Outcome};
+) -> Result<BTreeMap<JobId, crate::ArchiveHistoryResult>, crate::SchedulerError> {
+    use crate::{ArchiveHistoryOutcome as Outcome, ArchiveHistoryResult as Archive};
 
     let ids = job_ids.iter().copied().collect::<Vec<_>>();
     let lookup_db = db.clone();
@@ -688,13 +688,13 @@ pub(crate) async fn remove_history_files(
     for job_id in job_ids {
         match states.get(&job_id) {
             None => {
-                outcomes.insert(job_id, Removal::new(Outcome::NotFound, None, None));
+                outcomes.insert(job_id, Archive::new(Outcome::NotFound, None, None));
             }
-            Some(state) => match state.files_removed_at {
-                Some(removed_at) => {
+            Some(state) => match state.archived_at {
+                Some(archived_at) => {
                     outcomes.insert(
                         job_id,
-                        Removal::new(Outcome::AlreadyGone, Some(removed_at), None),
+                        Archive::new(Outcome::AlreadyGone, Some(archived_at), None),
                     );
                 }
                 None => {
@@ -726,7 +726,7 @@ pub(crate) async fn remove_history_files(
             Err((path, error)) => {
                 outcomes.insert(
                     job_id,
-                    Removal::new(
+                    Archive::new(
                         Outcome::NotManaged,
                         None,
                         Some(format!(
@@ -762,7 +762,7 @@ pub(crate) async fn remove_history_files(
         {
             outcomes.insert(
                 job_id,
-                Removal::new(Outcome::Failed, None, Some(error.to_string())),
+                Archive::new(Outcome::Failed, None, Some(error.to_string())),
             );
             continue;
         }
@@ -781,7 +781,7 @@ pub(crate) async fn remove_history_files(
             OutputDirProof::Unreachable => {
                 outcomes.insert(
                     job_id,
-                    Removal::new(
+                    Archive::new(
                         Outcome::Failed,
                         None,
                         Some(format!(
@@ -798,7 +798,7 @@ pub(crate) async fn remove_history_files(
             OutputDirProof::Failed(error) => {
                 outcomes.insert(
                     job_id,
-                    Removal::new(
+                    Archive::new(
                         Outcome::Failed,
                         None,
                         Some(format!(
@@ -828,7 +828,7 @@ pub(crate) async fn remove_history_files(
         let record_db = db.clone();
         let kept = records.clone();
         let recorded =
-            tokio::task::spawn_blocking(move || record_db.record_history_removed_files(&kept))
+            tokio::task::spawn_blocking(move || record_db.record_archived_history_files(&kept))
                 .await
                 .map_err(|error| crate::StateError::Database(error.to_string()))
                 .and_then(|result| result);
@@ -844,7 +844,7 @@ pub(crate) async fn remove_history_files(
                 }
                 outcomes.insert(
                     *job_id,
-                    Removal::new(
+                    Archive::new(
                         Outcome::Failed,
                         None,
                         Some(format!(
@@ -870,8 +870,8 @@ pub(crate) async fn remove_history_files(
         )
         .await;
         let outcome = match removal {
-            Err(error) => Removal::new(Outcome::Failed, None, Some(error.to_string())),
-            Ok(JobFilesRemoval { not_managed, .. }) if !not_managed.is_empty() => Removal::new(
+            Err(error) => Archive::new(Outcome::Failed, None, Some(error.to_string())),
+            Ok(JobFilesRemoval { not_managed, .. }) if !not_managed.is_empty() => Archive::new(
                 Outcome::NotManaged,
                 None,
                 Some(format!(
@@ -886,11 +886,11 @@ pub(crate) async fn remove_history_files(
             Ok(JobFilesRemoval { removed, .. }) => {
                 stamp.push(job_id);
                 let outcome = if removed > 0 {
-                    Outcome::Removed
+                    Outcome::Archived
                 } else {
                     Outcome::AlreadyGone
                 };
-                Removal::new(outcome, Some(now), None)
+                Archive::new(outcome, Some(now), None)
             }
         };
         outcomes.insert(job_id, outcome);
@@ -899,22 +899,21 @@ pub(crate) async fn remove_history_files(
     if !stamp.is_empty() {
         let stamp_db = db.clone();
         let stamped = stamp.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            stamp_db.stamp_history_files_removed(&stamped, now)
-        })
-        .await
-        .map_err(|error| crate::StateError::Database(error.to_string()))
-        .and_then(|result| result);
+        let result =
+            tokio::task::spawn_blocking(move || stamp_db.stamp_history_archived(&stamped, now))
+                .await
+                .map_err(|error| crate::StateError::Database(error.to_string()))
+                .and_then(|result| result);
         if let Err(error) = result {
-            warn!(%error, "could not mark history entries whose files were removed");
+            warn!(%error, "could not mark history entries archived");
             for job_id in stamp {
                 outcomes.insert(
                     job_id,
-                    Removal::new(
+                    Archive::new(
                         Outcome::Failed,
                         None,
                         Some(format!(
-                            "the files were removed but the entry could not be marked: {error}; removing again marks it"
+                            "the files were removed but the entry could not be marked archived: {error}; archiving again marks it"
                         )),
                     ),
                 );
@@ -932,7 +931,7 @@ struct JobFilesRemoval {
     not_managed: Vec<PathBuf>,
 }
 
-// One job's part of a files removal, once its directories are proven and
+// One job's part of an archive, once its directories are proven and
 // its scripts have stopped: its working directories, its recorded output
 // directory when proven the job's, and its staging directories.
 async fn remove_job_files(

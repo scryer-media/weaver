@@ -66,6 +66,10 @@ pub struct SharedPipelineState {
     segment_events: broadcast::Sender<PipelineEvent>,
     // The speed test service, held weakly: the service holds this handle.
     speed_test: Arc<std::sync::Mutex<std::sync::Weak<crate::speed_test::ServiceInner>>>,
+    // The pipeline's free-space samplers, set once it starts: requests read
+    // their cached readings and never look at the disk themselves. Held
+    // weakly, so the samplers stop with the pipeline that owns them.
+    storage_capacity: Arc<RwLock<std::sync::Weak<crate::operations::StorageCapacity>>>,
 }
 
 // Bounded like the job-level broadcast; a lagging listener drops articles,
@@ -99,6 +103,7 @@ impl SharedPipelineState {
             sevenz_decode_memory_bytes: Arc::new(AtomicU64::new(u64::MAX)),
             segment_events,
             speed_test: Arc::new(std::sync::Mutex::new(std::sync::Weak::new())),
+            storage_capacity: Arc::default(),
         }
     }
 
@@ -539,6 +544,23 @@ impl SharedPipelineState {
         self.nntp_pool.read().unwrap().clone()
     }
 
+    // The samplers of the pipeline that runs over this state.
+    pub(crate) fn set_storage_capacity(&self, storage: &Arc<crate::operations::StorageCapacity>) {
+        *self
+            .storage_capacity
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::downgrade(storage);
+    }
+
+    // The pipeline's free-space samplers, once it has started. Reading their
+    // cache looks at no disk.
+    pub fn storage_capacity(&self) -> Option<Arc<crate::operations::StorageCapacity>> {
+        self.storage_capacity
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .upgrade()
+    }
+
     pub fn set_nntp_runtime_activation(&self, activation: NntpRuntimeActivation) {
         self.queue.write(|inner| {
             inner.globals.nntp_active = Some(activation);
@@ -895,12 +917,12 @@ pub struct HistoryDeleteBatchOutcome {
     pub refused: BTreeMap<JobId, SchedulerError>,
 }
 
-// What removing one history entry's files did. The entry stays either way.
+// What archiving one history entry did. The entry stays either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HistoryFilesRemovalOutcome {
-    // Folders Weaver manages were on disk and are gone.
-    Removed,
-    // Nothing was on disk, or the entry already says its files were removed.
+pub enum ArchiveHistoryOutcome {
+    // Archived: folders Weaver manages were on disk and are gone.
+    Archived,
+    // Archived with nothing on disk, or the entry was already archived.
     AlreadyGone,
     // A folder of the job is on disk without proof that Weaver manages it,
     // so it is left as it is. Folders that are proven the job's still go.
@@ -913,11 +935,11 @@ pub enum HistoryFilesRemovalOutcome {
     Failed,
 }
 
-impl HistoryFilesRemovalOutcome {
+impl ArchiveHistoryOutcome {
     // The code an operation target keeps for the outcome.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Removed => "removed",
+            Self::Archived => "archived",
             Self::AlreadyGone => "already_gone",
             Self::NotManaged => "not_managed",
             Self::Busy => "busy",
@@ -927,10 +949,10 @@ impl HistoryFilesRemovalOutcome {
     }
 
     // The outcome a kept code names; `None` for any other code, such as a
-    // removal a delete superseded.
+    // archive a delete superseded.
     pub fn parse(code: &str) -> Option<Self> {
         Some(match code {
-            "removed" => Self::Removed,
+            "archived" => Self::Archived,
             "already_gone" => Self::AlreadyGone,
             "not_managed" => Self::NotManaged,
             "busy" => Self::Busy,
@@ -944,27 +966,27 @@ impl HistoryFilesRemovalOutcome {
     // completes. Every other outcome fails the target, which the entry then
     // shows.
     pub fn settles(self) -> bool {
-        matches!(self, Self::Removed | Self::AlreadyGone | Self::NotFound)
+        matches!(self, Self::Archived | Self::AlreadyGone | Self::NotFound)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HistoryFilesRemoval {
-    pub outcome: HistoryFilesRemovalOutcome,
-    // When the entry's files were removed, in epoch seconds, once it says so.
-    pub files_removed_at: Option<i64>,
+pub struct ArchiveHistoryResult {
+    pub outcome: ArchiveHistoryOutcome,
+    // When the entry was archived, in epoch seconds, once it says so.
+    pub archived_at: Option<i64>,
     pub message: Option<String>,
 }
 
-impl HistoryFilesRemoval {
+impl ArchiveHistoryResult {
     pub(crate) fn new(
-        outcome: HistoryFilesRemovalOutcome,
-        files_removed_at: Option<i64>,
+        outcome: ArchiveHistoryOutcome,
+        archived_at: Option<i64>,
         message: Option<String>,
     ) -> Self {
         Self {
             outcome,
-            files_removed_at,
+            archived_at,
             message,
         }
     }
@@ -1449,26 +1471,26 @@ impl SchedulerHandle {
             .await
     }
 
-    // Remove the files of a batch of history entries for the queued files
-    // removal `operation_id`, keeping the entries. `now` is the stamp, in
-    // epoch seconds, written on every entry whose files are gone. Each id's
+    // Archive a batch of history entries for the queued archive
+    // `operation_id`: remove their files and keep the entries. `now` is the
+    // stamp, in epoch seconds, written on every entry whose files are gone. Each id's
     // target is settled with its outcome before the hold on the entries is
     // released, so the queue revision that release rings finds the result
     // written. Callers holding more than `HISTORY_DELETE_BATCH_SIZE` ids send
     // them in batches of that size.
-    pub async fn remove_history_files_for_operation(
+    pub async fn archive_history_for_operation(
         &self,
         operation_id: u64,
         job_ids: BTreeSet<JobId>,
         now: i64,
-    ) -> Result<BTreeMap<JobId, HistoryFilesRemoval>, SchedulerError> {
+    ) -> Result<BTreeMap<JobId, ArchiveHistoryResult>, SchedulerError> {
         self.state
             .queue
             .clone()
-            .remove_history_files_settling(
+            .archive_history_settling(
                 job_ids,
                 now,
-                crate::history::output_files::REMOVED_FILES_KEPT,
+                crate::history::output_files::ARCHIVED_HISTORY_FILES_KEPT,
                 Some(operation_id),
             )
             .await
@@ -2064,6 +2086,15 @@ impl SchedulerHandle {
             .queue
             .read(crate::pipeline::diagnostics::QueueStateCounts::read);
         (queue, self.state.metrics().pipeline_turn.read(now))
+    }
+
+    // The pipeline's turn stamp alone, as of `now`: atomic loads, no lock,
+    // so a sampler may read it as often as it likes.
+    pub fn pipeline_turn(
+        &self,
+        now: std::time::Instant,
+    ) -> crate::operations::instrumentation::PipelineTurnReading {
+        self.state.metrics().pipeline_turn.read(now)
     }
 }
 

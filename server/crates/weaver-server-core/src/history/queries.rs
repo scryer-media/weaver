@@ -17,14 +17,14 @@ const JOB_HISTORY_SELECT: &str =
     "SELECT job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
         optional_recovery_bytes, optional_recovery_downloaded_bytes,
         failed_bytes, health, category, output_dir, nzb_path,
-        created_at, completed_at, metadata, server_attribution, files_removed_at
+        created_at, completed_at, metadata, server_attribution, archived_at
    FROM job_history";
 
 const JOB_HISTORY_SELECT_ALIASED: &str =
     "SELECT h.job_id, h.job_hash, h.name, h.status, h.error_message, h.total_bytes, h.downloaded_bytes,
         h.optional_recovery_bytes, h.optional_recovery_downloaded_bytes,
         h.failed_bytes, h.health, h.category, h.output_dir, h.nzb_path,
-        h.created_at, h.completed_at, h.metadata, h.server_attribution, h.files_removed_at
+        h.created_at, h.completed_at, h.metadata, h.server_attribution, h.archived_at
    FROM ";
 
 // The column lists every history read decodes, for a test that keeps the
@@ -165,9 +165,9 @@ impl Database {
         })
     }
 
-    // What a files removal reads of each id that has a history row: the
-    // recorded output directory, when its files were removed and the totals
-    // of the removed folder, read in bind-sized chunks. An id without a row
+    // What an archive reads of each id that has a history row: the
+    // recorded output directory, when it was archived and the totals of the
+    // folder its archive removed, read in bind-sized chunks. An id without a row
     // is absent from the map.
     pub fn list_job_history_file_states(
         &self,
@@ -186,8 +186,8 @@ impl Database {
                 let rows = SqlRuntime::fetch_all(
                     datastore.read_exec(),
                     &format!(
-                        "SELECT job_id, output_dir, files_removed_at, removed_file_count,
-                                removed_file_bytes
+                        "SELECT job_id, output_dir, archived_at, archived_file_count,
+                                archived_file_bytes
                            FROM job_history
                           WHERE job_id IN ({placeholders})"
                     ),
@@ -199,12 +199,12 @@ impl Database {
                         crate::JobId(row.i64("job_id")? as u64),
                         HistoryFileState {
                             output_dir: row.opt_text("output_dir")?,
-                            files_removed_at: row.opt_i64("files_removed_at")?,
-                            removed_file_count: row
-                                .opt_i64("removed_file_count")?
+                            archived_at: row.opt_i64("archived_at")?,
+                            archived_file_count: row
+                                .opt_i64("archived_file_count")?
                                 .map(|count| count.max(0) as u64),
-                            removed_file_bytes: row
-                                .opt_i64("removed_file_bytes")?
+                            archived_file_bytes: row
+                                .opt_i64("archived_file_bytes")?
                                 .map(|bytes| bytes.max(0) as u64),
                         },
                     );
@@ -217,7 +217,7 @@ impl Database {
     // One page of the files a history entry recorded when its files were
     // removed, from position `from` on, in listing order, as
     // `(relative path, bytes)`. A range of the primary key.
-    pub fn list_history_removed_files(
+    pub fn list_archived_history_files(
         &self,
         job_id: u64,
         from: u64,
@@ -228,7 +228,7 @@ impl Database {
         }
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
-            let (sql, args) = history_removed_files_sql(job_id, from, limit);
+            let (sql, args) = archived_history_files_sql(job_id, from, limit);
             let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
             rows.into_iter()
                 .map(|row| Ok((row.text("rel_path")?, row.i64("size_bytes")?.max(0) as u64)))
@@ -236,15 +236,15 @@ impl Database {
         })
     }
 
-    // Whether the record of a files removal holds a file at position
+    // Whether the record of an archive holds a file at position
     // `ordinal`: the record keeps fewer files than the totals count once the
     // folder was larger than the cap. One primary-key lookup.
-    pub fn has_history_removed_file(&self, job_id: u64, ordinal: u64) -> Result<bool, StateError> {
+    pub fn has_archived_history_file(&self, job_id: u64, ordinal: u64) -> Result<bool, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
-                "SELECT 1 AS present FROM job_history_removed_files
+                "SELECT 1 AS present FROM job_history_archived_files
                   WHERE job_id = {} AND ordinal = {}",
                 &[SqlArg::I64(job_id as i64), SqlArg::I64(ordinal as i64)],
             )
@@ -512,7 +512,7 @@ impl Database {
     }
 
     // The name, category and metadata of `job_id`'s history row, the columns
-    // a history edit changes, and its files removal time, or `None` when it
+    // a history edit changes, and its archive time, or `None` when it
     // has no row.
     pub fn job_history_edit_fields(
         &self,
@@ -522,7 +522,7 @@ impl Database {
         self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
-                "SELECT name, category, metadata, files_removed_at FROM job_history
+                "SELECT name, category, metadata, archived_at FROM job_history
                   WHERE job_id = {}",
                 &[SqlArg::I64(job_id as i64)],
             )
@@ -532,7 +532,7 @@ impl Database {
                     name: row.text("name")?,
                     category: row.opt_text("category")?,
                     metadata: row.opt_text("metadata")?,
-                    files_removed_at: row.opt_i64("files_removed_at")?,
+                    archived_at: row.opt_i64("archived_at")?,
                 })
             })
             .transpose()
@@ -1070,22 +1070,22 @@ fn append_history_pagination(sql: &mut String, args: &mut Vec<SqlArg>, filter: &
     }
 }
 
-// What a files removal, and the job page's file list, need of one history
+// What an archive, and the job page's file list, need of one history
 // row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryFileState {
     pub output_dir: Option<String>,
-    pub files_removed_at: Option<i64>,
-    // How many files the removed folder held, and their bytes; set by a
-    // removal that recorded the folder.
-    pub removed_file_count: Option<u64>,
-    pub removed_file_bytes: Option<u64>,
+    pub archived_at: Option<i64>,
+    // How many files the folder held when the entry was archived, and their
+    // bytes; set by an archive that recorded the folder.
+    pub archived_file_count: Option<u64>,
+    pub archived_file_bytes: Option<u64>,
 }
 
-// The removed-files page read: a range of the primary key, in its order.
-fn history_removed_files_sql(job_id: u64, from: u64, limit: usize) -> (String, Vec<SqlArg>) {
+// The archived-files page read: a range of the primary key, in its order.
+fn archived_history_files_sql(job_id: u64, from: u64, limit: usize) -> (String, Vec<SqlArg>) {
     (
-        "SELECT rel_path, size_bytes FROM job_history_removed_files
+        "SELECT rel_path, size_bytes FROM job_history_archived_files
           WHERE job_id = {} AND ordinal >= {}
           ORDER BY ordinal LIMIT {}"
             .to_string(),
@@ -1143,7 +1143,7 @@ pub(crate) fn job_history_row_from_sql(
         completed_at: row.i64("completed_at")?,
         metadata: row.opt_text("metadata")?,
         server_attribution: row.opt_text("server_attribution")?,
-        files_removed_at: row.opt_i64("files_removed_at")?,
+        archived_at: row.opt_i64("archived_at")?,
     })
 }
 
@@ -1181,13 +1181,13 @@ mod order_index_tests {
         }
     }
 
-    // The removed-files page is a range of the table's primary key, read in
+    // The archived-files page is a range of the table's primary key, read in
     // its order, so it sorts nothing.
     #[test]
-    fn the_removed_files_page_is_served_by_the_primary_key() {
+    fn the_archived_files_page_is_served_by_the_primary_key() {
         let db = Database::open_in_memory().unwrap();
         for from in [0, 4_000] {
-            let (sql, args) = history_removed_files_sql(7, from, 100);
+            let (sql, args) = archived_history_files_sql(7, from, 100);
             let sql = format!("EXPLAIN QUERY PLAN {sql}");
             let datastore = db.datastore();
             let detail = db
@@ -1199,10 +1199,10 @@ mod order_index_tests {
                 })
                 .unwrap()
                 .join("; ");
-            println!("removed files page plan, from {from}: {detail}");
+            println!("archived files page plan, from {from}: {detail}");
             assert!(
                 detail.contains(
-                    "SEARCH job_history_removed_files USING PRIMARY KEY (job_id=? AND ordinal>?)"
+                    "SEARCH job_history_archived_files USING PRIMARY KEY (job_id=? AND ordinal>?)"
                 ),
                 "{detail}"
             );
@@ -1242,7 +1242,7 @@ mod order_index_tests {
                 completed_at,
                 metadata: None,
                 server_attribution: None,
-                files_removed_at: None,
+                archived_at: None,
             })
             .unwrap();
         }
@@ -1384,7 +1384,7 @@ mod order_index_tests {
                     _ => None,
                 },
                 server_attribution: None,
-                files_removed_at: None,
+                archived_at: None,
             })
             .unwrap();
         }

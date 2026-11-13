@@ -173,7 +173,7 @@ fn finished_job(db: &Database, job_id: u64, working_directory: &Path) {
         completed_at: 2,
         metadata: None,
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     })
     .unwrap();
 }
@@ -745,7 +745,7 @@ async fn results_are_persisted_on_the_job_and_a_rerun_replaces_them() {
         completed_at: 2,
         metadata: None,
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     })
     .unwrap();
 

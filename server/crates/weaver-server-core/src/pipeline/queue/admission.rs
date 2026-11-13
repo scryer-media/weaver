@@ -76,7 +76,7 @@ impl Queue {
             let mut info = initial_info(
                 id,
                 &request.spec,
-                restore_wanted_bytes(&request),
+                request.restart.as_ref().map(|read| &read.summaries),
                 request.job_hash,
                 &request.working_dir,
                 request.status == JobStatus::Paused,
@@ -175,7 +175,7 @@ impl PreparedAdd {
         initial_info(
             id,
             &self.spec,
-            self.summaries.wanted_bytes(&self.spec),
+            Some(&self.summaries),
             self.nzb_hash,
             &self.working_dir,
             self.options.initially_paused,
@@ -184,39 +184,94 @@ impl PreparedAdd {
 }
 
 // A restore whose outline was read while it waited out of the queue window:
-// its row states the files read, as a restore read with its outline does,
-// and the ticket goes back in the row to wait its turn.
+// its row states the files read, with the figures a restore read with its
+// outline shows, and the ticket goes back in the row to wait its turn.
 pub(crate) fn outline_read(row: &mut JobRow, request: crate::jobs::handle::RestoreJobRequest) {
     let spec = &request.spec;
-    let wanted_bytes = restore_wanted_bytes(&request);
+    let figures = LeanFigures::of(spec, request.restart.as_ref().map(|read| &read.summaries));
     let info = &mut row.report.job;
     info.name = spec.name.clone();
     info.total_bytes = spec.total_bytes;
     info.total_files = spec.files.len() as u32;
-    info.remaining_bytes = wanted_bytes;
-    info.wanted_bytes = wanted_bytes;
+    info.progress = figures.progress();
+    info.remaining_bytes = figures.remaining_bytes;
+    info.wanted_bytes = figures.wanted_bytes;
+    info.optional_recovery_bytes = figures.optional_recovery_bytes;
+    info.optional_recovery_downloaded_bytes = figures.optional_recovery_downloaded_bytes;
+    info.remaining_par_files = figures.remaining_par_files;
     info.password = spec.password.clone();
     row.intents.restore = Some(request);
 }
 
-// A restart read the job from its outline, whose spec holds no articles: its
-// summaries state the bytes. Outline summaries carry nothing on disk, so the
-// row's remaining bytes start at this figure too.
-fn restore_wanted_bytes(request: &crate::jobs::handle::RestoreJobRequest) -> u64 {
-    request.restart.as_ref().map_or_else(
-        || request.spec.wanted_bytes(),
-        |read| read.summaries.wanted_bytes(&request.spec),
-    )
+// The figures a job waiting its turn shows, from its spec and the summaries
+// of the article lists it let go, so the queue answers for a job outside the
+// window without installing it or reading its lists back. A file with no
+// summary counts as it is listed in the spec. As the pipeline counts them:
+// the recovery volumes apart from what a run starts out to bring, an
+// article not in hand still to come at its share of its file's bytes, and
+// every PAR2 or PAR3 file, index included, with an article still to come.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct LeanFigures {
+    pub remaining_bytes: u64,
+    pub wanted_bytes: u64,
+    pub optional_recovery_bytes: u64,
+    pub optional_recovery_downloaded_bytes: u64,
+    pub remaining_par_files: u32,
+}
+
+impl LeanFigures {
+    pub(crate) fn of(
+        spec: &JobSpec,
+        summaries: Option<&crate::jobs::model::FileSummaries>,
+    ) -> Self {
+        use weaver_model::files::FileRole;
+        let mut figures = Self::default();
+        for (index, file) in spec.files.iter().enumerate() {
+            let summary = summaries
+                .and_then(|summaries| summaries.0.get(index).copied())
+                .unwrap_or_else(|| crate::jobs::model::FileSummary::of(file));
+            let left = if summary.articles == 0 {
+                0
+            } else {
+                (u128::from(summary.bytes) * u128::from(summary.remaining.min(summary.articles))
+                    / u128::from(summary.articles)) as u64
+            };
+            if file.role.is_recovery() {
+                figures.optional_recovery_bytes += summary.bytes;
+                figures.optional_recovery_downloaded_bytes += summary.bytes - left;
+            } else {
+                figures.remaining_bytes += left;
+                figures.wanted_bytes += summary.bytes;
+            }
+            if matches!(file.role, FileRole::Par2 { .. } | FileRole::Par3 { .. })
+                && summary.remaining > 0
+            {
+                figures.remaining_par_files += 1;
+            }
+        }
+        figures
+    }
+
+    // As the pipeline reports it: done is what is wanted less what is still
+    // to come.
+    pub(crate) fn progress(&self) -> f64 {
+        if self.wanted_bytes == 0 {
+            0.0
+        } else {
+            (self.wanted_bytes - self.remaining_bytes) as f64 / self.wanted_bytes as f64
+        }
+    }
 }
 
 pub(super) fn initial_info(
     id: JobId,
     spec: &JobSpec,
-    wanted_bytes: u64,
+    summaries: Option<&crate::jobs::model::FileSummaries>,
     hash: [u8; 32],
     working_dir: &std::path::Path,
     initially_paused: bool,
 ) -> JobInfo {
+    let figures = LeanFigures::of(spec, summaries);
     JobInfo {
         job_id: id,
         job_hash: Some(hash),
@@ -235,22 +290,22 @@ pub(super) fn initial_info(
         },
         finalizing_download: false,
         fetching_repair_data: false,
-        progress: 0.0,
+        progress: figures.progress(),
         total_bytes: spec.total_bytes,
         downloaded_bytes: 0,
-        optional_recovery_bytes: 0,
-        optional_recovery_downloaded_bytes: 0,
+        optional_recovery_bytes: figures.optional_recovery_bytes,
+        optional_recovery_downloaded_bytes: figures.optional_recovery_downloaded_bytes,
         phase_progress: Vec::new(),
         failed_bytes: 0,
         health: 1000,
         terminal_discards: Vec::new(),
         total_files: spec.files.len() as u32,
         completed_files: 0,
-        remaining_par_files: 0,
+        remaining_par_files: figures.remaining_par_files,
         file_remaining_bytes: Vec::new(),
         file_parked_bytes: Vec::new(),
-        remaining_bytes: wanted_bytes,
-        wanted_bytes,
+        remaining_bytes: figures.remaining_bytes,
+        wanted_bytes: figures.wanted_bytes,
         password: spec.password.clone(),
         category: spec.category.clone(),
         metadata: spec.metadata.clone(),
@@ -279,14 +334,31 @@ pub(crate) fn destination_root(
 // Where a job writes the files it delivers when its intermediate directory
 // and its destination lie on different devices: its staging directory on the
 // destination's device, so finalize renames them into place there instead of
-// copying every byte across. On one device nothing is staged.
+// copying every byte across. On one device nothing is staged. Whether they
+// share a device is the disk owner's answer,
+// [`crate::operations::StorageCapacity::same_filesystem`].
+pub(crate) fn staging_dir_on(
+    one_device: bool,
+    destination_root: &Path,
+    job_id: JobId,
+) -> Option<PathBuf> {
+    (!one_device).then(|| staging_dir_for(destination_root, job_id))
+}
+
+// [`staging_dir_on`] with the devices read on the spot, as the choice was
+// made before the disk owner answered it: what a test compares the owner's
+// choice with.
+#[cfg(test)]
 pub(crate) fn delivery_staging_dir(
     intermediate_dir: &Path,
     destination_root: &Path,
     job_id: JobId,
 ) -> Option<PathBuf> {
-    (!crate::runtime::fs::same_device(intermediate_dir, destination_root))
-        .then(|| staging_dir_for(destination_root, job_id))
+    staging_dir_on(
+        crate::runtime::fs::same_device(intermediate_dir, destination_root),
+        destination_root,
+        job_id,
+    )
 }
 
 pub(crate) fn staging_dir_for(destination_root: &Path, job_id: JobId) -> PathBuf {
@@ -425,5 +497,112 @@ mod staging_tests {
             )
             .expect("marker")
         );
+    }
+}
+
+#[cfg(test)]
+mod lean_figure_tests {
+    use super::*;
+    use crate::jobs::model::{FileSpec, FileSummaries, FileSummary, MessageIds, SegmentSpec};
+    use weaver_model::files::FileRole;
+
+    fn file(name: &str, sizes: &[u32]) -> FileSpec {
+        FileSpec {
+            filename: name.to_string(),
+            role: FileRole::from_filename(name),
+            groups: Vec::new(),
+            posted_at_epoch: None,
+            segments: (0u32..)
+                .zip(sizes)
+                .map(|(ordinal, &bytes)| SegmentSpec {
+                    ordinal,
+                    article_number: ordinal + 1,
+                    bytes,
+                    message_ids: MessageIds::new(vec![format!("{name}-{ordinal}")]),
+                })
+                .collect(),
+        }
+    }
+
+    fn spec() -> JobSpec {
+        JobSpec {
+            name: "post".to_string(),
+            password: None,
+            files: vec![
+                file("post.part01.rar", &[100, 100]),
+                file("post.par2", &[10]),
+                file("post.vol00+02.par2", &[50, 50]),
+                file("post.vol00+04.par3", &[40]),
+                file("post.part01.rev", &[30]),
+            ],
+            total_bytes: 430,
+            category: None,
+            metadata: Vec::new(),
+        }
+    }
+
+    // A job that never ran shows every PAR2 and PAR3 file to come, its
+    // recovery volumes apart from what it is out to bring, and the same
+    // wanted bytes the queue showed before.
+    #[test]
+    fn a_job_that_never_ran_counts_its_recovery_from_the_spec() {
+        let spec = spec();
+        let figures = LeanFigures::of(&spec, None);
+        let summaries = FileSummaries(spec.files.iter().map(FileSummary::of).collect());
+        assert_eq!(figures, LeanFigures::of(&spec, Some(&summaries)));
+        assert_eq!(figures.wanted_bytes, spec.wanted_bytes());
+        assert_eq!(figures.wanted_bytes, summaries.wanted_bytes(&spec));
+        assert_eq!(
+            figures,
+            LeanFigures {
+                remaining_bytes: 240,
+                wanted_bytes: 240,
+                optional_recovery_bytes: 140,
+                optional_recovery_downloaded_bytes: 0,
+                remaining_par_files: 3,
+            }
+        );
+    }
+
+    // A job waiting its turn after it ran shows what its summaries hold in
+    // hand, without its article lists.
+    #[test]
+    fn a_job_that_ran_counts_what_its_summaries_hold_in_hand() {
+        let mut spec = spec();
+        let in_hand = |file: &FileSpec, held: u32| FileSummary {
+            remaining: file.segments.len() as u32 - held,
+            ..FileSummary::of(file)
+        };
+        let summaries = FileSummaries(vec![
+            in_hand(&spec.files[0], 1),
+            in_hand(&spec.files[1], 1),
+            in_hand(&spec.files[2], 1),
+            in_hand(&spec.files[3], 0),
+            in_hand(&spec.files[4], 1),
+        ]);
+        spec.drop_article_lists();
+        assert_eq!(
+            LeanFigures::of(&spec, Some(&summaries)),
+            LeanFigures {
+                remaining_bytes: 100,
+                wanted_bytes: 240,
+                optional_recovery_bytes: 140,
+                optional_recovery_downloaded_bytes: 50,
+                remaining_par_files: 2,
+            }
+        );
+        let info = initial_info(
+            JobId(1),
+            &spec,
+            Some(&summaries),
+            [0; 32],
+            Path::new("/work"),
+            true,
+        );
+        assert_eq!(info.optional_recovery_bytes, 140);
+        assert_eq!(info.optional_recovery_downloaded_bytes, 50);
+        assert_eq!(info.remaining_par_files, 2);
+        assert_eq!((info.remaining_bytes, info.wanted_bytes), (100, 240));
+        assert!((info.progress - 140.0 / 240.0).abs() < 1e-9);
     }
 }

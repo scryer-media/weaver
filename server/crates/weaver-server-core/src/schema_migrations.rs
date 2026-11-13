@@ -21,7 +21,7 @@ pub(crate) mod egress_quotas_v53;
 pub(crate) mod history_release_name_v87;
 pub(crate) mod history_retention_v89;
 pub(crate) mod history_search_key_v88;
-mod history_swept_v90;
+mod history_swept_v91;
 pub(crate) mod nzb_tables_v85;
 pub(crate) mod proxy_resolver_v64;
 mod schedule_tracks_v55;
@@ -38,7 +38,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 90;
+const CURRENT_SCHEMA_VERSION: i64 = 91;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master

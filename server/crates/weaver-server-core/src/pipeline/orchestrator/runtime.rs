@@ -190,6 +190,7 @@ impl Pipeline {
             complete_dir.clone(),
             startup_disk_work,
         ));
+        shared_state.set_storage_capacity(&storage_capacity);
         let extraction_limits = Arc::new(ExtractionLimits::from_env_with_profile_ceiling(
             &complete_dir,
             profile_tuning.extraction_memory_bytes,
@@ -273,6 +274,7 @@ impl Pipeline {
             jobs: HashMap::new(),
             graph_jobs: HashMap::new(),
             retiring_graph_jobs: HashMap::new(),
+            moving_jobs: HashMap::new(),
             graph_status: Default::default(),
             graph_holds,
             graph_decode,

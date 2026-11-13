@@ -351,7 +351,7 @@ fn views_of(pipeline: &Pipeline, ids: &[JobId]) -> String {
         out.push_str(&format!("{:?}", db.get_job_history(id.0).unwrap()));
         out.push_str(&format!(
             "{:?}",
-            db.list_history_removed_files(id.0, 0, 100).unwrap()
+            db.list_archived_history_files(id.0, 0, 100).unwrap()
         ));
     }
     out

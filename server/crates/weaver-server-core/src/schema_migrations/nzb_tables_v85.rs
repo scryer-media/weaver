@@ -494,12 +494,12 @@ mod tests {
     // Every history column but the stored NZB, each job's rendered as text.
     async fn history_without_nzbs(pool: &SqlitePool) -> Vec<(i64, String)> {
         let columns: Vec<String> = sqlx::query_scalar(
-            // `release_name`, `search_key`, the files removal columns, the
-            // download summary and the swept stamp are added after 85 and
-            // filled by their own steps.
+            // `release_name`, `search_key`, the archive columns, the download
+            // summary and the swept stamp are added after 85 and filled by
+            // their own steps.
             "SELECT name FROM pragma_table_info('job_history')
-              WHERE name NOT IN ('nzb_zstd', 'release_name', 'search_key', 'files_removed_at',
-                                 'removed_file_count', 'removed_file_bytes',
+              WHERE name NOT IN ('nzb_zstd', 'release_name', 'search_key', 'archived_at',
+                                 'archived_file_count', 'archived_file_bytes',
                                  'download_summary', 'files_swept_at')
               ORDER BY cid",
         )

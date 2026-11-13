@@ -13,6 +13,7 @@ use crate::system::types::{
 use std::path::PathBuf;
 use std::sync::Arc;
 use weaver_nntp::pool::NntpPool;
+use weaver_server_core::operations::{OnDemandSpace, Reach, StorageCapacity};
 
 #[derive(Default)]
 pub(crate) struct SystemQuery;
@@ -49,14 +50,12 @@ impl SystemQuery {
             configured_storage_inputs(cfg)
         })
         .await;
-        let configured_storage = tokio::task::spawn_blocking(move || {
-            storage_inputs
-                .into_iter()
-                .map(probe_configured_storage)
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        // Each folder is answered by the disk owner: a current reading, or a
+        // look of its own, all looked at together.
+        let storage = ctx
+            .data::<weaver_server_core::SharedPipelineState>()?
+            .storage_capacity();
+        let configured_storage = configured_storage(storage.as_deref(), storage_inputs).await;
 
         let environment = weaver_server_core::runtime::environment::detect_runtime_environment();
         let profile = runtime
@@ -250,36 +249,17 @@ impl SystemQuery {
     /// A folder that does not exist yet reports the disk it would be created
     /// on. The answer is best effort: a network mount that does not answer
     /// within a few seconds reports an error instead of holding the request.
+    // The disk owner answers: its cached reading when current, else one
+    // look of its own at the folder or the nearest folder above it.
     #[graphql(guard = "AdminGuard")]
-    async fn path_storage(&self, path: String) -> ConfiguredStorage {
+    async fn path_storage(&self, ctx: &Context<'_>, path: String) -> ConfiguredStorage {
         let requested = PathBuf::from(path.trim());
         let label = requested.display().to_string();
-        let probe = tokio::task::spawn_blocking(move || {
-            probe_configured_storage(ConfiguredStorageInput {
-                labels: Vec::new(),
-                path: nearest_existing_ancestor(&requested),
-                error: None,
-            })
-        });
-        let result = match tokio::time::timeout(PATH_STORAGE_TIMEOUT, probe).await {
-            Ok(Ok(storage)) => storage,
-            Ok(Err(error)) => ConfiguredStorage {
-                labels: Vec::new(),
-                path: label.clone(),
-                capacity: None,
-                error: Some(error.to_string()),
-            },
-            Err(_) => ConfiguredStorage {
-                labels: Vec::new(),
-                path: label.clone(),
-                capacity: None,
-                error: Some("Filesystem capacity did not answer in time.".to_string()),
-            },
-        };
-        ConfiguredStorage {
-            path: label,
-            ..result
-        }
+        let storage = ctx
+            .data_opt::<weaver_server_core::SharedPipelineState>()
+            .and_then(|state| state.storage_capacity());
+        let space = StorageCapacity::path_space(storage.as_deref(), requested).await;
+        storage_row(Vec::new(), label, space)
     }
     /// Return recent log records from the in-memory ring buffer.
     #[graphql(guard = "AdminGuard")]
@@ -374,31 +354,10 @@ impl SystemQuery {
             ]
         })
         .await;
-
-        let usage = tokio::task::spawn_blocking(move || {
-            dirs.into_iter()
-                .filter_map(|(label, path)| -> Option<DiskUsage> {
-                    let space = weaver_server_core::operations::probe_disk_space(
-                        std::path::Path::new(&path),
-                    )
-                    .map_err(|error| {
-                        tracing::debug!(%label, %path, %error, "disk usage row omitted");
-                    })
-                    .ok()?;
-                    Some(DiskUsage {
-                        label,
-                        total_bytes: space.total_bytes,
-                        used_bytes: space.used_bytes(),
-                        free_bytes: space.available_bytes,
-                        path,
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
-
-        Ok(usage)
+        let storage = ctx
+            .data::<weaver_server_core::SharedPipelineState>()?
+            .storage_capacity();
+        Ok(disk_usage_rows(storage.as_deref(), dirs).await)
     }
 }
 
@@ -466,47 +425,99 @@ fn push_storage_input(
     }
 }
 
-const PATH_STORAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
-// The folder itself when it exists, otherwise the deepest parent that does.
-fn nearest_existing_ancestor(path: &std::path::Path) -> PathBuf {
-    path.ancestors()
-        .find(|candidate| !candidate.as_os_str().is_empty() && candidate.exists())
-        .unwrap_or(path)
-        .to_path_buf()
+// One row per configured folder, each answered by the disk owner at the
+// folder itself: a folder not made yet reports why, as a look at it does.
+// The folders are looked at together, so the request waits one look's
+// limit at most.
+async fn configured_storage(
+    storage: Option<&StorageCapacity>,
+    inputs: Vec<ConfiguredStorageInput>,
+) -> Vec<ConfiguredStorage> {
+    let asks: Vec<(PathBuf, Reach)> = inputs
+        .iter()
+        .filter(|input| input.error.is_none())
+        .map(|input| (input.path.clone(), Reach::Exact))
+        .collect();
+    let mut spaces = StorageCapacity::spaces(storage, &asks).await.into_iter();
+    inputs
+        .into_iter()
+        .map(|input| {
+            let path = input.path.display().to_string();
+            match input.error {
+                Some(error) => ConfiguredStorage {
+                    labels: input.labels,
+                    path,
+                    capacity: None,
+                    error: Some(error),
+                },
+                None => storage_row(
+                    input.labels,
+                    path,
+                    spaces.next().expect("one answer per ask"),
+                ),
+            }
+        })
+        .collect()
 }
 
-fn probe_configured_storage(input: ConfiguredStorageInput) -> ConfiguredStorage {
-    let path = input.path.display().to_string();
-    if let Some(error) = input.error {
-        return ConfiguredStorage {
-            labels: input.labels,
-            path,
-            capacity: None,
-            error: Some(error),
-        };
+// A row from the disk owner's answer.
+fn storage_row(labels: Vec<String>, path: String, space: OnDemandSpace) -> ConfiguredStorage {
+    let (capacity, error) = match space {
+        OnDemandSpace::Read(space) => (Some(disk_capacity(space)), None),
+        OnDemandSpace::Failed(error) => (None, Some(unavailable(&error))),
+        OnDemandSpace::Lost(error) => (None, Some(error)),
+        OnDemandSpace::TimedOut => (None, Some(DID_NOT_ANSWER.to_string())),
+    };
+    ConfiguredStorage {
+        labels,
+        path,
+        capacity,
+        error,
     }
+}
 
-    match weaver_server_core::operations::probe_disk_space(&input.path) {
-        Ok(space) => ConfiguredStorage {
-            labels: input.labels,
-            path,
-            capacity: Some(DiskCapacity {
+const DID_NOT_ANSWER: &str = "Filesystem capacity did not answer in time.";
+
+fn disk_capacity(space: weaver_server_core::operations::DiskSpace) -> DiskCapacity {
+    DiskCapacity {
+        total_bytes: space.total_bytes,
+        used_bytes: space.used_bytes(),
+        free_bytes: space.available_bytes,
+    }
+}
+
+fn unavailable(error: &str) -> String {
+    format!("Filesystem capacity is unavailable for this path: {error}")
+}
+
+// `diskUsage` rows, each answered by the disk owner at the folder itself,
+// looked at together. A folder that cannot be read is left out, as a
+// failed look always left it out.
+async fn disk_usage_rows(
+    storage: Option<&StorageCapacity>,
+    dirs: Vec<(String, String)>,
+) -> Vec<DiskUsage> {
+    let asks: Vec<(PathBuf, Reach)> = dirs
+        .iter()
+        .map(|(_, path)| (PathBuf::from(path), Reach::Exact))
+        .collect();
+    let spaces = StorageCapacity::spaces(storage, &asks).await;
+    dirs.into_iter()
+        .zip(spaces)
+        .filter_map(|((label, path), space)| {
+            let OnDemandSpace::Read(space) = space else {
+                tracing::debug!(%label, %path, "disk usage row omitted: no reading");
+                return None;
+            };
+            Some(DiskUsage {
+                label,
                 total_bytes: space.total_bytes,
                 used_bytes: space.used_bytes(),
                 free_bytes: space.available_bytes,
-            }),
-            error: None,
-        },
-        Err(error) => ConfiguredStorage {
-            labels: input.labels,
-            path,
-            capacity: None,
-            error: Some(format!(
-                "Filesystem capacity is unavailable for this path: {error}"
-            )),
-        },
-    }
+                path,
+            })
+        })
+        .collect()
 }
 
 fn deployment_environment_gql(
@@ -682,13 +693,19 @@ async fn collect_server_health(
     // sockets on a server that is not are only "preparing" when nothing else
     // is fetching either; behind a busy primary they are simply waiting.
     let pool_busy = pre.iter().any(|snapshot| snapshot.busy > 0);
+    // Each server's transport entry, the first listed as before, found once
+    // rather than searched for per server.
+    let mut transport_by_server = std::collections::HashMap::with_capacity(transport.len());
+    for entry in transport {
+        transport_by_server.entry(entry.server_idx).or_insert(entry);
+    }
 
     let health = pool.health().lock().await;
     pre.into_iter()
         .enumerate()
         .map(|(idx, snapshot)| {
             let srv = health.server(idx);
-            let body = transport.iter().find(|entry| entry.server_idx == idx);
+            let body = transport_by_server.get(&idx).copied();
             let state = match srv.state() {
                 weaver_nntp::ServerState::Healthy => "healthy",
                 weaver_nntp::ServerState::Degraded { .. } => "degraded",
