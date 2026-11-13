@@ -42,6 +42,8 @@ use crate::ssl::{SslHttpClients, SslIdentity, SslTorrent};
 use crate::torrent_state::live::{
     RateTick,
     choker::{Choker, OPTIMISTIC_UNCHOKE_INTERVAL, UNCHOKE_INTERVAL},
+    peers::connect_order::{ConnectOrder, OurEndpoints},
+    peers::holepunch::is_local,
     web_seed::WebSeeds,
 };
 use crate::tracker::{
@@ -476,6 +478,9 @@ pub struct Session {
     ssl_listen_addr: Option<SocketAddr>,
     // Our address as the internet sees it, one for each family.
     pub(crate) external_ips: Arc<ExternalIps>,
+    // When the session started, which dates the closes its peer lists
+    // order connect candidates by (libtorrent `session_impl::m_created`).
+    started: tokio::time::Instant,
     dht: Option<Dht>,
     pub(crate) connector: Arc<StreamConnector>,
     pub(crate) utp_sockets: Vec<crate::network::UtpSocket>,
@@ -1950,7 +1955,8 @@ impl Session {
                 lsd
             });
 
-            let external_ips = Arc::new(ExternalIps::new(tokio::time::Instant::now()));
+            let started = tokio::time::Instant::now();
+            let external_ips = Arc::new(ExternalIps::new(started));
             let session = Arc::new(Self {
                 persistence,
                 bitv_factory,
@@ -1987,6 +1993,7 @@ impl Session {
                     .and_then(|l| l.ssl.as_ref())
                     .map(|ssl| ssl.addr),
                 external_ips,
+                started,
                 utp_sockets,
                 utp: listen_result
                     .as_ref()
@@ -3315,6 +3322,7 @@ impl Session {
                         MetadataPeers {
                             list: peer_list,
                             stream: peers,
+                            order: self.connect_order(),
                         },
                         &unable_tx,
                         &tracker_tiers,
@@ -4062,6 +4070,43 @@ impl Session {
         self.announce_port.get()
     }
 
+    /// What a torrent's peer list orders its connect candidates by: the
+    /// session's start, and the endpoints peers see us at for BEP 40, read
+    /// as each candidate is chosen (libtorrent `torrent::get_peer_list_state`,
+    /// torrent.cpp:11400-11401). The addresses are
+    /// `session_impl::external_address` (session_impl.cpp:7016-7032): for a
+    /// peer on a local network the listen address when it is a local one,
+    /// for any other our external address of its family, else the listen
+    /// address when it is a global one; the unspecified address where none
+    /// is. The port is the first family's external port, 0 while we listen
+    /// on none (`session_impl::listen_port`, session_impl.cpp:5544-5580).
+    pub(crate) fn connect_order(&self) -> ConnectOrder {
+        let external_ips = Arc::clone(&self.external_ips);
+        let announce_port = Arc::clone(&self.announce_port);
+        let listen = self
+            .listen_addr
+            .map(|addr| addr.ip().to_canonical())
+            .filter(|ip| !ip.is_unspecified());
+        let first_family_is_ipv6 = self.first_family_is_ipv6();
+        ConnectOrder::new(
+            self.started,
+            Arc::new(move || {
+                let mut ours = OurEndpoints::default();
+                if let Some(listen) = listen {
+                    ours.addresses[usize::from(is_local(listen))][usize::from(listen.is_ipv6())] =
+                        listen;
+                }
+                for ipv6 in [false, true] {
+                    if let Some(external) = external_ips.of_family(ipv6) {
+                        ours.addresses[0][usize::from(ipv6)] = external;
+                    }
+                }
+                ours.port = announce_port.external(first_family_is_ipv6).unwrap_or(0);
+                ours
+            }),
+        )
+    }
+
     fn first_family_is_ipv6(&self) -> bool {
         self.listen_addr
             .is_some_and(|addr| addr.is_ipv6() && !addr.ip().is_unspecified())
@@ -4315,9 +4360,7 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
         let session = self.session.clone();
         // The run that ended counts from where it began, whatever run
         // begins before its connections have closed.
-        let from = torrent
-            .as_ref()
-            .map(|t| *t.shared().announced_from.lock());
+        let from = torrent.as_ref().map(|t| *t.shared().announced_from.lock());
         let ending = torrent
             .as_ref()
             .and_then(|t| t.shared().ending_run.lock().clone());

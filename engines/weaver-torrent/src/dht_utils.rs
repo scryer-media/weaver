@@ -20,7 +20,9 @@ use crate::{
     peer_info_reader::{self, MetadataFetch},
     spawn_utils::BlockingSpawner,
     stream_connect::StreamConnector,
-    torrent_state::live::peers::{NextCandidate, PeerList, PeerStates},
+    torrent_state::live::peers::{
+        NextCandidate, PeerList, PeerStates, connect_order::ConnectOrder,
+    },
     type_aliases::PeerSourceFlag,
 };
 
@@ -46,6 +48,8 @@ pub enum ReadMetainfoResult<Rx> {
 pub struct MetadataPeers<A> {
     pub list: PeerList,
     pub stream: A,
+    /// What the list orders its connect candidates by.
+    pub(crate) order: ConnectOrder,
 }
 
 /// Ask `peers` for the metadata `fetch` gathers; the peers asked fill its
@@ -91,7 +95,15 @@ pub(crate) async fn read_metainfo_from_peer_receiver<
         }
     };
 
-    match first_answer(peers.list, peers.stream, unable, read_info_guarded).await {
+    match first_answer(
+        peers.list,
+        peers.order,
+        peers.stream,
+        unable,
+        read_info_guarded,
+    )
+    .await
+    {
         (Some((info, info_bytes)), rx, seen, peers) => ReadMetainfoResult::Found {
             info,
             info_bytes,
@@ -118,6 +130,7 @@ pub(crate) async fn read_metainfo_from_peer_receiver<
 /// ended and no peer is left to ask.
 async fn first_answer<A, T, F, Fut>(
     list: PeerList,
+    order: ConnectOrder,
     mut addrs: A,
     unable: &tokio::sync::watch::Sender<HashSet<SocketAddr>>,
     ask: F,
@@ -130,9 +143,11 @@ where
     // No metadata yet, so no pieces to count availability over. Each answer
     // comes over a connection of its own, wherever its peer is.
     let peers = Arc::new(
-        PeerStates::founded_on(list, Default::default(), 0).allowing_multiple_connections_per_ip(
-            Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        ),
+        PeerStates::founded_on(list, Default::default(), 0)
+            .allowing_multiple_connections_per_ip(Arc::new(std::sync::atomic::AtomicBool::new(
+                true,
+            )))
+            .ordering_connects_by(order),
     );
     let mut seen = HashSet::<SocketAddr>::new();
     let found_unable = |addr| unable.send_if_modified(|unable| unable.insert(addr));
@@ -257,6 +272,7 @@ mod tests {
         let (asked, ask) = asker(1);
         let (found, _, _, _) = first_answer(
             listing([addr(1)]),
+            Default::default(),
             futures::stream::pending(),
             &unable(),
             ask,
@@ -280,7 +296,7 @@ mod tests {
         tx.unbounded_send((banned, PeerSourceFlag::Tracker))
             .unwrap();
         let list = PeerList::resumed([addr(1)], [banned.ip()]);
-        let (found, _, _, _) = first_answer(list, rx, &unable, ask).await;
+        let (found, _, _, _) = first_answer(list, Default::default(), rx, &unable, ask).await;
 
         assert_eq!(found, Some(addr(1)));
         assert_eq!(
@@ -295,7 +311,8 @@ mod tests {
         let (asked, ask) = asker(1);
         let (tx, rx) = futures::channel::mpsc::unbounded();
         tx.unbounded_send((addr(2), PeerSourceFlag::Dht)).unwrap();
-        let (found, _, seen, _) = first_answer(listing([addr(1)]), rx, &unable(), ask).await;
+        let (found, _, seen, _) =
+            first_answer(listing([addr(1)]), Default::default(), rx, &unable(), ask).await;
 
         assert_eq!(seen, HashSet::from([addr(2)]));
         let asked = asked.lock().unwrap();
@@ -317,6 +334,7 @@ mod tests {
         let (asked, ask) = asker(usize::MAX);
         let (found, _, _, _) = first_answer(
             listing([addr(1), addr(2)]),
+            Default::default(),
             futures::stream::empty(),
             &unable(),
             ask,
@@ -351,6 +369,7 @@ mod tests {
         };
         let (found, _, _, list) = first_answer(
             listing([answers, asking]),
+            Default::default(),
             futures::stream::pending(),
             &unable(),
             ask,
@@ -395,6 +414,7 @@ mod tests {
             MetadataPeers {
                 list: PeerList::default(),
                 stream: peer_rx,
+                order: Default::default(),
             },
             &unable(),
             None,

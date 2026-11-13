@@ -36,6 +36,7 @@ use crate::{
 
 use self::{
     availability::Availability,
+    connect_order::ConnectOrder,
     stats::{AggregatePeerStats, AggregatePeerStatsAtomic},
 };
 
@@ -48,6 +49,7 @@ use super::peer::{
 };
 
 pub mod availability;
+pub(crate) mod connect_order;
 pub(crate) mod holepunch;
 pub mod stats;
 mod super_seed;
@@ -111,7 +113,7 @@ impl SessionBans {
 type EraseRank = (bool, Reverse<u32>, bool, i8);
 
 fn erase_rank(peer: &Peer) -> EraseRank {
-    let (_, failcount, _) = peer.connect_rank();
+    let failcount = peer.failcount();
     let erase_candidate =
         peer.connected_out().is_none() && !peer.is_connect_candidate() && failcount > 0;
     (
@@ -211,6 +213,9 @@ pub(crate) struct PeerStates {
     // Held for no longer than a look or a change, never while an entry of
     // `states` is held.
     untracked_leaving: Mutex<HashSet<PeerHandle>>,
+    // What connect candidates are ordered by beyond the peers themselves;
+    // see [`Self::connect_next`].
+    connect_order: ConnectOrder,
 }
 
 // Whether a peer named by `sources` stays on a private torrent's list once
@@ -335,16 +340,11 @@ pub struct ResumePeers {
 // connection failed (`failcount`), or it sent bad data (`trust_points`
 // below zero).
 fn resume_entry(peer: &Peer) -> (IpAddr, Option<(SocketAddr, bool)>) {
-    let (_, failcount, (_, last_connected)) = peer.connect_rank();
+    let failcount = peer.failcount();
     let saved = peer
         .outgoing_address
         .filter(|_| failcount == 0 && peer.trust().points() >= 0)
-        .map(|addr| {
-            (
-                addr,
-                last_connected.is_some() || peer.connected_out().is_some(),
-            )
-        });
+        .map(|addr| (addr, peer.ever_closed() || peer.connected_out().is_some()));
     (peer.addr.ip(), saved)
 }
 
@@ -512,6 +512,7 @@ impl PeerStates {
             pex_cache: Mutex::new(None),
             untracked_owed: AtomicBool::new(list.untracked_owed),
             untracked_leaving: Mutex::default(),
+            connect_order: ConnectOrder::default(),
         };
         for mut peer in list.peers {
             peer.rejoin(&peers);
@@ -525,6 +526,12 @@ impl PeerStates {
     /// holds from the next.
     pub fn allowing_multiple_connections_per_ip(mut self, allow: Arc<AtomicBool>) -> Self {
         self.allow_multiple_connections_per_ip = allow;
+        self
+    }
+
+    /// The list, ordering its connect candidates by `order`.
+    pub(crate) fn ordering_connects_by(mut self, order: ConnectOrder) -> Self {
+        self.connect_order = order;
         self
     }
 
@@ -1156,21 +1163,23 @@ impl PeerStates {
         self.candidates_changed.notified().await
     }
 
-    /// Starts connecting to the connect candidate due at `now` that failed
-    /// least, then longest ago, at an address no connection is at. Under the
-    /// admission lock, so none comes from there meanwhile. A list grown to
-    /// its low watermark first forgets erase candidates, lowest-ranked
-    /// first, until it is under it (libtorrent
+    /// Starts connecting to the connect candidate due at `now` that ranks
+    /// first ([`Peer::connect_rank`]), at an address no connection is at.
+    /// Under the admission lock, so none comes from there meanwhile. A list
+    /// grown to its low watermark first forgets erase candidates,
+    /// lowest-ranked first, until it is under it (libtorrent
     /// `peer_list::find_connect_candidates`).
     pub fn connect_next(&self, now: Instant) -> Option<(PeerHandle, PeerRx, PeerTx)> {
         let _admission = self.admission.lock();
         self.erase_to(Displace::EraseCandidates, PEERLIST_LOW_WATERMARK);
         let connected = self.connected_ips();
+        let finished = self.is_finished();
+        let order = self.connect_order.now();
         let (_, addr) = self
             .states
             .iter()
             .filter(|e| e.value().is_due(now) && !connected.contains(&e.key().ip()))
-            .map(|e| (e.value().connect_rank(), *e.key()))
+            .map(|e| (e.value().connect_rank(&order, finished), *e.key()))
             .min()?;
         let (rx, tx) = self
             .with_peer_mut(addr, "connect_next", |peer| peer.connect_if_due(now, self))
@@ -2052,6 +2061,14 @@ mod tests {
                 peers.connection_closed(peer, at, true, false);
             })
             .unwrap();
+    }
+
+    // `addrs`, highest BEP 40 rank first, the lowest address first among
+    // equal ranks, as candidates that tie on every earlier step are handed
+    // out.
+    fn by_peer_rank(peers: &PeerStates, mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+        addrs.sort_by_key(|addr| (Reverse(peers.connect_order.now().peer_rank(*addr)), *addr));
+        addrs
     }
 
     fn reconnect_wait(failcount: u32) -> Duration {
@@ -3906,11 +3923,12 @@ mod tests {
     // to first of all. An encrypted handshake the peer closes counts no
     // failure (`peer_connection::disconnect` at `normal`; see
     // `crate::Error::is_failure`) and its close is dated back
-    // (`peer_connection::fast_reconnect`), so the plaintext connection that
-    // follows comes before every candidate that failed, behind only those
-    // never connected to, and is made. One the peer answers with no
-    // verification constant counts (`peer_error`) and goes behind every
-    // candidate that did not fail.
+    // (`peer_connection::fast_reconnect`), so in a session past its first
+    // 180 seconds the plaintext connection that follows comes before every
+    // candidate that failed, behind only those never connected to, and is
+    // made. One the peer answers with no verification constant counts
+    // (`peer_error`) and goes behind every candidate that did not fail.
+    // Peers that tie on all that, all named by a tracker, go by BEP 40 rank.
     #[tokio::test(start_paused = true)]
     async fn an_encrypted_handshake_the_peer_closed_is_retried_plain_before_failed_candidates() {
         use crate::mse::MseError;
@@ -3955,12 +3973,11 @@ mod tests {
         while let Some((addr, _, _)) = peers.connect_next(t0) {
             order.push(addr);
         }
-        let expected: Vec<_> = fresh
-            .iter()
-            .chain([&closed])
-            .chain(&failed)
-            .chain([&unsynced])
-            .copied()
+        let expected: Vec<_> = by_peer_rank(&peers, fresh)
+            .into_iter()
+            .chain([closed])
+            .chain(by_peer_rank(&peers, failed))
+            .chain([unsynced])
             .collect();
         assert_eq!(order, expected);
 
@@ -3972,6 +3989,212 @@ mod tests {
             })
             .unwrap();
         assert_eq!(state_of(&peers, closed), Some("live"));
+    }
+
+    // Every candidate due at `at`, in the order the list hands them out.
+    fn connect_order_at(peers: &PeerStates, at: Instant) -> Vec<SocketAddr> {
+        std::iter::from_fn(|| peers.connect_next(at).map(|(addr, ..)| addr)).collect()
+    }
+
+    // A list whose session started at `start`, listening at 10.0.0.200:6881,
+    // the endpoint every test peer, all on 10.0.0.0/24, sees us at: BEP 40
+    // then hashes whole addresses, so no two of them tie.
+    fn peer_states_started_at(start: Instant) -> PeerStates {
+        make_peer_states().ordering_connects_by(ConnectOrder::new(
+            start,
+            Arc::new(|| connect_order::OurEndpoints {
+                addresses: [[IpAddr::from([10, 0, 0, 200]); 2]; 2],
+                port: 6881,
+            }),
+        ))
+    }
+
+    // `addrs` as candidates that tie on failures, locality, last close and
+    // seeding are handed out: highest source rank, then highest BEP 40 rank.
+    fn by_source_then_peer_rank(
+        peers: &PeerStates,
+        mut addrs: Vec<(SocketAddr, PeerSourceFlag)>,
+    ) -> Vec<SocketAddr> {
+        addrs.sort_by_key(|(addr, source)| {
+            (
+                Reverse(connect_order::source_rank((*source).into())),
+                Reverse(peers.connect_order.now().peer_rank(*addr)),
+                *addr,
+            )
+        });
+        addrs.into_iter().map(|(addr, _)| addr).collect()
+    }
+
+    // The peers of the connect-order cases: a peer named by the DHT whose
+    // encrypted handshake we closed at `closed_at` (its plaintext retry is
+    // due at once, `peer_connection::fast_reconnect`), and never-tried
+    // peers named by a tracker, by PEX, and by the DHT. Returns the retry
+    // peer and the never-tried ones with their sources.
+    fn retry_among_never_tried(
+        peers: &PeerStates,
+        closed_at: Instant,
+    ) -> (SocketAddr, Vec<(SocketAddr, PeerSourceFlag)>) {
+        let retry = peer_addr(1);
+        peers.add_peer(retry, PeerSourceFlag::Dht);
+        assert!(attempt_at(peers, retry, closed_at, Ends::Closed));
+        let never_tried: Vec<_> = (10..12)
+            .map(|i| (peer_addr(i), PeerSourceFlag::Tracker))
+            .chain((20..22).map(|i| (peer_addr(i), PeerSourceFlag::Pex)))
+            .chain((30..38).map(|i| (peer_addr(i), PeerSourceFlag::Dht)))
+            .collect();
+        for &(addr, source) in &never_tried {
+            peers.add_peer(addr, source);
+        }
+        (retry, never_tried)
+    }
+
+    // libtorrent `peer_connection::fast_reconnect` dates the close of an
+    // encrypted handshake back 180 seconds, to 0 while the session is
+    // younger than that, which is a never-tried peer's `last_connected`:
+    // `peer_list::compare_peer` then ties the retry with every never-tried
+    // peer and goes on to source rank, then BEP 40 rank. Here the retry,
+    // named by the DHT, follows the tracker's peers, comes before PEX's,
+    // and falls among the DHT's by rank, behind some and ahead of others.
+    #[tokio::test(start_paused = true)]
+    async fn in_a_young_session_a_plain_retry_ranks_with_never_tried_peers_by_source_then_peer_rank()
+     {
+        let start = Instant::now();
+        let peers = peer_states_started_at(start);
+        let t0 = start + Duration::from_secs(179);
+        let (retry, never_tried) = retry_among_never_tried(&peers, t0);
+
+        let order = connect_order_at(&peers, t0);
+        let mut all = never_tried.clone();
+        all.push((retry, PeerSourceFlag::Dht));
+        assert_eq!(order, by_source_then_peer_rank(&peers, all));
+
+        let at = order.iter().position(|a| *a == retry).unwrap();
+        let dht: Vec<_> = order[at - 1..=at + 1]
+            .iter()
+            .map(|a| never_tried.iter().find(|(n, _)| n == a).map(|(_, s)| *s))
+            .collect();
+        assert_eq!(
+            dht,
+            [Some(PeerSourceFlag::Dht), None, Some(PeerSourceFlag::Dht)],
+            "the retry falls between two of the DHT's peers: {order:?}"
+        );
+        assert!(
+            at > 2,
+            "behind the tracker's peers and at least one DHT one"
+        );
+    }
+
+    // Once the session is 180 seconds old the date-back leaves the retry a
+    // close of its own, after every never-tried peer's 0: those all go
+    // first, whatever named them.
+    #[tokio::test(start_paused = true)]
+    async fn in_a_session_past_180_seconds_never_tried_peers_go_before_a_plain_retry() {
+        let start = Instant::now();
+        let peers = peer_states_started_at(start);
+        let t0 = start + Duration::from_secs(180);
+        let (retry, never_tried) = retry_among_never_tried(&peers, t0);
+
+        let order = connect_order_at(&peers, t0);
+        let mut expected = by_source_then_peer_rank(&peers, never_tried);
+        expected.push(retry);
+        assert_eq!(order, expected);
+    }
+
+    // `peer_list::compare_peer` puts the fewest failures first, before
+    // locality, source or rank: a tracker's peer that failed once goes
+    // behind a never-tried peer PEX named.
+    #[tokio::test(start_paused = true)]
+    async fn fewer_failures_go_first_whatever_the_source() {
+        let peers = make_peer_states();
+        let t0 = Instant::now();
+        let (failed, fresh) = (peer_addr(1), peer_addr(2));
+        peers.add_peer(failed, PeerSourceFlag::Tracker);
+        fail_at(&peers, failed, t0);
+        peers.add_peer(fresh, PeerSourceFlag::Pex);
+
+        let due = t0 + reconnect_wait(1);
+        assert_eq!(connect_order_at(&peers, due), [fresh, failed]);
+    }
+
+    // `peer_list::compare_peer`: with failures equal, a peer on a local
+    // network goes first, before source rank.
+    #[tokio::test(start_paused = true)]
+    async fn a_local_peer_goes_before_a_global_one_whatever_the_source() {
+        let peers = make_peer_states();
+        let global: SocketAddr = "203.0.113.5:6881".parse().unwrap();
+        let local = peer_addr(1);
+        peers.add_peer(global, PeerSourceFlag::Tracker);
+        peers.add_peer(local, PeerSourceFlag::Pex);
+
+        assert_eq!(connect_order_at(&peers, Instant::now()), [local, global]);
+    }
+
+    // `peer_list::compare_peer`: while we are finished, a peer PEX flagged
+    // a seed (`torrent_peer::maybe_upload_only`) goes behind one it did
+    // not, ahead of source and BEP 40 rank; while we are not, the flag
+    // counts nothing. A connection to the peer clears the flag
+    // (`peer_list::set_connection`).
+    #[tokio::test(start_paused = true)]
+    async fn while_finished_a_peer_flagged_a_seed_goes_behind_one_not_flagged() {
+        use crate::peer_protocol::extended::ut_pex::PEX_SEED;
+        let t0 = Instant::now();
+        let setup = |finished: bool| {
+            let peers = peer_states_started_at(t0);
+            let pair = by_peer_rank(&peers, vec![peer_addr(1), peer_addr(2)]);
+            let (higher, lower) = (pair[0], pair[1]);
+            for addr in [higher, lower] {
+                peers.add_peer(addr, PeerSourceFlag::Pex);
+            }
+            peers.pex_flags(higher, PEX_SEED);
+            peers.set_finished(finished);
+            (peers, higher, lower)
+        };
+
+        let (peers, higher, lower) = setup(true);
+        assert_eq!(connect_order_at(&peers, t0), [lower, higher]);
+
+        let (peers, higher, lower) = setup(false);
+        assert_eq!(connect_order_at(&peers, t0), [higher, lower]);
+
+        // Connected once, the flag is gone: the higher rank goes first
+        // again, both having closed at the same second.
+        let (peers, higher, lower) = setup(true);
+        for addr in [higher, lower] {
+            assert!(attempt_at(&peers, addr, t0, Ends::Completed));
+        }
+        let due = t0 + MIN_RECONNECT_TIME;
+        assert_eq!(connect_order_at(&peers, due), [higher, lower]);
+    }
+
+    // libtorrent `peer_list::update_peer` sets `maybe_upload_only` only
+    // while there is no connection to the peer.
+    #[tokio::test(start_paused = true)]
+    async fn a_seed_flag_for_a_connected_peer_is_ignored() {
+        use crate::peer_protocol::extended::ut_pex::PEX_SEED;
+        let t0 = Instant::now();
+        let peers = peer_states_started_at(t0);
+        let pair = by_peer_rank(&peers, vec![peer_addr(1), peer_addr(2)]);
+        let (higher, lower) = (pair[0], pair[1]);
+        for addr in [higher, lower] {
+            peers.add_peer(addr, PeerSourceFlag::Pex);
+        }
+        peers.set_finished(true);
+        peers
+            .with_peer_mut(higher, "test", |peer| {
+                peer.connect_if_due(t0, &peers).expect("a due candidate");
+                peer.pex_flags(PEX_SEED);
+                peers.connection_closed(peer, t0, false, true);
+            })
+            .unwrap();
+        peers
+            .with_peer_mut(lower, "test", |peer| {
+                peer.connect_if_due(t0, &peers).expect("a due candidate");
+                peers.connection_closed(peer, t0, false, true);
+            })
+            .unwrap();
+
+        let due = t0 + MIN_RECONNECT_TIME;
+        assert_eq!(connect_order_at(&peers, due), [higher, lower]);
     }
 
     // libtorrent `bt_peer_connection::on_receive_impl` and

@@ -36,6 +36,7 @@ use crate::type_aliases::{BF, PeerSourceFlag, PeerSources};
 
 use super::PeerStates;
 use super::choker::Transfer;
+use super::peers::connect_order::{ConnectRank, ConnectRanking, source_rank};
 use super::peers::holepunch::is_local;
 use stats::atomic::PeerCountersAtomic;
 
@@ -287,6 +288,11 @@ pub(crate) struct Peer {
     // uploads (libtorrent `torrent_peer::seed` and `upload_only`, which
     // `peer_list::set_seed` and `set_upload_only` keep past the connection).
     upload_only: bool,
+    // A PEX message flagged the peer a seed while we had no connection to it
+    // (libtorrent `torrent_peer::maybe_upload_only`, set in
+    // `peer_list::insert_peer` and `update_peer`); a connection clears it
+    // (`peer_list::set_connection`), as it soon tells us.
+    maybe_upload_only: bool,
     // When its last connection closed, failed or not (libtorrent
     // `torrent_peer::last_connected`, set in `peer_list::connection_closed`).
     last_connected: Option<Instant>,
@@ -340,6 +346,7 @@ impl Peer {
             outgoing_address: listen_address(addr, connection_kind),
             failcount: 0,
             upload_only: false,
+            maybe_upload_only: false,
             last_connected: None,
             encrypt: true,
             fast_reconnects: 0,
@@ -362,6 +369,7 @@ impl Peer {
             state: Default::default(),
             failcount: 0,
             upload_only: false,
+            maybe_upload_only: false,
             last_connected: None,
             encrypt: true,
             fast_reconnects: 0,
@@ -478,16 +486,32 @@ impl Peer {
             .map(|at| at + wait)
     }
 
-    /// Where the peer stands among connect candidates due together; the lowest
-    /// goes first: a holepunched peer, then the fewest failures in a row,
-    /// then one on a local network, then the connection that closed longest
-    /// ago (libtorrent `peer_list::compare_peer`).
-    pub(crate) fn connect_rank(&self) -> (bool, u32, (bool, Option<Instant>)) {
+    /// Where the peer stands among connect candidates due together while we
+    /// are `finished` or not; see [`ConnectRank`]. libtorrent
+    /// `peer_list::compare_peer` (peer_list.cpp:110-142) takes every step
+    /// but the first: a holepunch introduction connects at once there
+    /// (`bt_peer_connection::on_holepunch` calls `torrent::connect_to_peer`),
+    /// not through the candidates, so here it goes before them.
+    pub(crate) fn connect_rank(&self, order: &ConnectRanking, finished: bool) -> ConnectRank {
         (
             !self.holepunch,
             self.failcount,
-            (!is_local(self.addr.ip()), self.last_connected),
+            !is_local(self.addr.ip()),
+            order.session_seconds(self.last_connected),
+            finished && self.maybe_upload_only,
+            Reverse(source_rank(self.sources)),
+            Reverse(order.peer_rank(self.addr)),
         )
+    }
+
+    /// The connections that failed in a row.
+    pub(crate) fn failcount(&self) -> u32 {
+        self.failcount
+    }
+
+    /// Whether a connection to the peer has closed.
+    pub(crate) fn ever_closed(&self) -> bool {
+        self.last_connected.is_some()
     }
 
     /// Whether a holepunch introduced the peer and the connection it asked
@@ -567,10 +591,14 @@ impl Peer {
 
     /// A PEX message named the peer with `flags`: one that speaks the
     /// holepunch extension is marked so (libtorrent `peer_list::insert_peer`,
-    /// `update_peer`), and one the sender is connected to encrypted is
-    /// tried encrypted next (`insert_peer`; a known peer too, as ours start
-    /// at encrypted).
+    /// `update_peer`), one flagged a seed may only upload unless we are
+    /// connected to it and know better (`update_peer`), and one the sender
+    /// is connected to encrypted is tried encrypted next (`insert_peer`; a
+    /// known peer too, as ours start at encrypted).
     pub(crate) fn pex_flags(&mut self, flags: u8) {
+        if flags & PEX_SEED != 0 && self.connected_out().is_none() {
+            self.maybe_upload_only = true;
+        }
         if flags & PEX_HOLEPUNCH != 0 {
             self.supports_holepunch = true;
         }
@@ -639,8 +667,11 @@ impl Peer {
     /// because we want nothing of it: no wait spaces connections to a peer
     /// we do not connect to, so its close is dated back by the one
     /// reconnect time a close starts, and once we want it again it waits
-    /// only for the failures in a row it had. A close too near the clock's
-    /// origin to date back keeps its time. Holepunch mode ends with the
+    /// only for the failures in a row it had. A close dated back past the
+    /// session's start ranks as no close at all
+    /// ([`ConnectRanking::session_seconds`]). A close too near the clock's
+    /// origin to date back is no close after a failed encrypted handshake,
+    /// and keeps its time otherwise. Holepunch mode ends with the
     /// connection.
     fn closed(&mut self, closed_at: Instant, failed: bool, needed: bool) {
         self.last_connected = if std::mem::take(&mut self.fast_reconnect) {
@@ -717,6 +748,7 @@ impl Peer {
             outgoing_address: self.outgoing_address,
             failcount: self.failcount,
             upload_only: self.upload_only,
+            maybe_upload_only: self.maybe_upload_only,
             last_connected: self.last_connected,
             encrypt: self.encrypt,
             fast_reconnects: self.fast_reconnects,
@@ -833,6 +865,11 @@ impl Peer {
     }
 
     pub fn set_state(&mut self, new: PeerState, counters: &PeerStates) -> PeerState {
+        // A connection tells us soon whether the peer only uploads
+        // (libtorrent `peer_list::set_connection`).
+        if matches!(new, PeerState::Connecting(_) | PeerState::Live(_)) {
+            self.maybe_upload_only = false;
+        }
         counters.count_out(self.addr, &self.state);
         counters.count_in(self.addr, &new);
         std::mem::replace(&mut self.state, new)

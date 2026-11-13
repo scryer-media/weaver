@@ -621,6 +621,7 @@ async fn two_peers_send_the_metadata_between_them() {
         MetadataPeers {
             list: PeerList::resumed([addr(1), addr(2)], []),
             stream: futures::stream::pending(),
+            order: Default::default(),
         },
         &tokio::sync::watch::Sender::new(Default::default()),
         None,
@@ -682,6 +683,7 @@ async fn a_plaintext_only_peer_sends_the_metadata_over_the_next_connection_at_on
         MetadataPeers {
             list: PeerList::resumed([addr(1)], []),
             stream: futures::stream::pending(),
+            order: Default::default(),
         },
         &unable,
         None,

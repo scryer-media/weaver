@@ -4968,10 +4968,7 @@ async fn a_connection_we_asked_to_close_counts_no_failure() {
         let (peer, _rx) = h.peer(addr);
         let counters = peer.counters.clone();
         peer.on_peer_died(Some(error)).unwrap();
-        let failcount = h
-            .peers
-            .with_peer(sock(addr), |p| p.connect_rank().1)
-            .unwrap();
+        let failcount = h.peers.with_peer(sock(addr), |p| p.failcount()).unwrap();
         failcounts.push((failcount, counters.errors.load(Ordering::Relaxed)));
     }
     assert_eq!(failcounts, [(0, 0), (1, 1)]);
@@ -5001,10 +4998,7 @@ async fn a_connect_refused_on_our_side_counts_no_failure() {
         let (peer, _rx) = h.peer(addr);
         let counters = peer.counters.clone();
         peer.on_peer_died(Some(error)).unwrap();
-        let failcount = h
-            .peers
-            .with_peer(sock(addr), |p| p.connect_rank().1)
-            .unwrap();
+        let failcount = h.peers.with_peer(sock(addr), |p| p.failcount()).unwrap();
         failcounts.push((failcount, counters.errors.load(Ordering::Relaxed)));
     }
     assert_eq!(failcounts, [(0, 0), (0, 0), (0, 0), (1, 1)]);
