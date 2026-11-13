@@ -12,6 +12,7 @@ mod persistence;
 mod query_limiter;
 mod routing_table;
 mod send_quota;
+mod send_windows;
 mod state;
 mod utils;
 

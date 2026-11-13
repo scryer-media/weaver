@@ -27,6 +27,7 @@ use crate::dht::{
     query_limiter::QueryLimiter,
     routing_table::{InsertResult, NodeStatus, Refresh, RoutingTable, is_v4_mapped},
     send_quota::{DHT_UPLOAD_RATE_LIMIT, SendQuota},
+    send_windows::SendWindows,
 };
 use backon::{ExponentialBuilder, Retryable};
 use dashmap::DashMap;
@@ -148,6 +149,8 @@ const REPLACEMENT_SPACING: Duration = BOOTSTRAP_RETRY_MIN;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateState {
     Fresh,
+    // Not asked yet: its address's send window was full (see `SendGuard`).
+    Deferred,
     InFlight,
     Answered,
     Failed,
@@ -161,6 +164,9 @@ struct Candidate {
     state: CandidateState,
     // The write token it answered with, if any.
     token: Option<ByteBufOwned>,
+    // A deferred candidate's place in its address's line, while the search
+    // may still ask it.
+    lined_up: Option<LinedUp>,
 }
 
 // The nodes one search knows of, closest to its target first, the ones without
@@ -204,14 +210,16 @@ impl Candidates {
                 addr,
                 state: CandidateState::Fresh,
                 token: None,
+                lined_up: None,
             },
         );
         self.list.truncate(SEARCH_CANDIDATES);
     }
 
-    // The closest candidate not asked yet, unless the k closest that answered
-    // are all closer than it.
-    fn next_to_ask(&mut self) -> Option<&mut Candidate> {
+    // The closest candidate not asked yet that may be asked at `now`, unless
+    // the k closest that answered are all closer than it. A deferred one may
+    // be asked once its line says it may have room.
+    fn next_to_ask(&mut self, now: tokio::time::Instant) -> Option<&mut Candidate> {
         let mut answered = 0;
         for c in self.list.iter_mut() {
             if answered == SEARCH_K {
@@ -220,10 +228,37 @@ impl Candidates {
             match c.state {
                 CandidateState::Answered => answered += 1,
                 CandidateState::Fresh => return Some(c),
-                CandidateState::InFlight | CandidateState::Failed => {}
+                CandidateState::Deferred if c.lined_up.as_ref().is_some_and(|l| l.ready <= now) => {
+                    return Some(c);
+                }
+                CandidateState::Deferred | CandidateState::InFlight | CandidateState::Failed => {}
             }
         }
         None
+    }
+
+    // When the earliest deferred candidate the search may still ask may have
+    // room. A deferred candidate past the k closest that answered is never
+    // asked: it leaves its line.
+    fn next_wake(&mut self) -> Option<tokio::time::Instant> {
+        let mut answered = 0;
+        let mut wake: Option<tokio::time::Instant> = None;
+        for c in self.list.iter_mut() {
+            if answered == SEARCH_K {
+                c.lined_up = None;
+                continue;
+            }
+            match c.state {
+                CandidateState::Answered => answered += 1,
+                CandidateState::Deferred => {
+                    if let Some(l) = &c.lined_up {
+                        wake = Some(wake.map_or(l.ready, |w| w.min(l.ready)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        wake
     }
 
     fn settle(&mut self, addr: SocketAddr, state: CandidateState) {
@@ -373,7 +408,14 @@ trait RecursiveRequestCallbacks: Sized + Send + Sync + 'static {
         addr: SocketAddr,
         resp: &crate::dht::Result<ResponseOrError>,
     );
-    fn on_search_end(&self, _req: &RecursiveRequest<Self>, _candidates: &Candidates) {}
+    // The queries a search sends as it ends, each to its node.
+    fn on_search_end(
+        &self,
+        _req: &RecursiveRequest<Self>,
+        _candidates: &Candidates,
+    ) -> Vec<(SocketAddr, Request)> {
+        Vec::new()
+    }
 }
 
 struct RecursiveRequestCallbacksGetPeers {
@@ -429,25 +471,27 @@ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksGetPeers {
     // A search that ends announces us to the k closest nodes that gave it a
     // token (libtorrent `node::announce`, whose get_peers traversal ends in
     // `announce_fun`).
-    fn on_search_end(&self, req: &RecursiveRequest<Self>, candidates: &Candidates) {
+    fn on_search_end(
+        &self,
+        req: &RecursiveRequest<Self>,
+        candidates: &Candidates,
+    ) -> Vec<(SocketAddr, Request)> {
         let Some(port) = self.announce_port else {
-            return;
+            return Vec::new();
         };
-        for (addr, token) in candidates.token_holders() {
-            let (tid, message) = req.dht.create_request(
-                Request::Announce {
-                    info_hash: req.info_hash,
-                    token: token.clone(),
-                    port,
-                },
-                addr,
-            );
-            let _ = req.dht.worker_sender.send(WorkerSendRequest {
-                our_tid: Some(tid),
-                message,
-                addr,
-            });
-        }
+        candidates
+            .token_holders()
+            .map(|(addr, token)| {
+                (
+                    addr,
+                    Request::Announce {
+                        info_hash: req.info_hash,
+                        token: token.clone(),
+                        port,
+                    },
+                )
+            })
+            .collect()
     }
 }
 
@@ -755,26 +799,70 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
     // yet, at most SEARCH_BRANCHING at a time, and offer the nodes each answer
     // names as new candidates. A node that fails or does not answer in time is
     // marked failed and skipped. A node named at an address it cannot be
-    // reached at is not offered. The search ends when nothing is in flight and
-    // no candidate is left to ask.
+    // reached at is not offered. A node whose address's send window is full
+    // (see `SendGuard`) is deferred, holding no request in flight, and the
+    // walk asks the next candidate meanwhile; it is asked once its window
+    // has room, if the search still wants it then. The search ends when
+    // nothing is in flight and no candidate is left to ask, deferred ones
+    // past the k closest that answered included; with only deferred ones
+    // left, it waits for the first of them to have room. As it ends it sends
+    // what its callbacks ask for, each under the same limits.
     async fn walk(&self, mut candidates: Candidates) -> crate::dht::Result<SearchOutcome> {
         let mut in_flight = FuturesUnordered::new();
         let mut outcome = SearchOutcome::default();
         loop {
+            let now = tokio::time::Instant::now();
             while in_flight.len() < SEARCH_BRANCHING {
-                let Some(candidate) = candidates.next_to_ask() else {
+                let Some(candidate) = candidates.next_to_ask(now) else {
                     break;
+                };
+                let slot = match candidate.lined_up.take() {
+                    Some(lined_up) => lined_up.try_send(now),
+                    None => self.dht.send_guard.try_send(candidate.addr.ip(), now),
+                };
+                let slot = match slot {
+                    Ok(slot) => slot,
+                    Err(lined_up) => {
+                        candidate.state = CandidateState::Deferred;
+                        candidate.lined_up = Some(lined_up);
+                        continue;
+                    }
                 };
                 candidate.state = CandidateState::InFlight;
                 let (id, addr) = (candidate.id, candidate.addr);
                 in_flight.push(
-                    self.ask(id, addr)
+                    self.ask(id, addr, slot)
                         .map(move |r| ((id, addr), r))
                         .instrument(debug_span!("ask", addr = addr.to_string())),
                 );
             }
-            let Some(((id, addr), answer)) = in_flight.next().await else {
-                self.callbacks.on_search_end(self, &candidates);
+            // A deferred candidate is looked at again when its window may
+            // have room, and only while a request may be added.
+            let wake = if in_flight.len() < SEARCH_BRANCHING {
+                candidates.next_wake()
+            } else {
+                None
+            };
+            let next = if in_flight.is_empty() {
+                None
+            } else {
+                tokio::select! {
+                    next = in_flight.next() => next,
+                    () = sleep_until_some(wake) => continue,
+                }
+            };
+            let Some(((id, addr), answer)) = next else {
+                if let Some(wake) = wake {
+                    tokio::time::sleep_until(wake).await;
+                    continue;
+                }
+                let at_end = self.callbacks.on_search_end(self, &candidates);
+                drop(candidates);
+                let mut sends = at_end
+                    .into_iter()
+                    .map(|(addr, request)| self.dht.send_unanswered(request, addr))
+                    .collect::<FuturesUnordered<_>>();
+                while sends.next().await.is_some() {}
                 return Ok(outcome);
             };
             let response = match answer {
@@ -812,11 +900,12 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
         &self,
         id: Option<Id20>,
         addr: SocketAddr,
+        slot: SendSlot,
     ) -> crate::dht::Result<Response<ByteBufOwned>> {
         if let Some(id) = id {
             self.callbacks.on_request_start(self, id, addr);
         }
-        let response = self.dht.request(self.request.clone(), addr).await;
+        let response = self.dht.request_in(slot, self.request.clone(), addr).await;
         if let Some(id) = id {
             self.callbacks.on_request_end(self, id, addr, &response);
         }
@@ -904,6 +993,167 @@ impl Latch {
     }
 }
 
+// Resolves at `at`, or never with none.
+async fn sleep_until_some(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+// What the DHT sends to each address over the last 10 seconds (see
+// `send_windows`): every datagram is counted as it is handed to the socket,
+// and a query goes only with room in its address's window. libtorrent sends
+// with no such count; this is Weaver's own, so that however many searches
+// want one node at once, a router too, it is never sent the 50 datagrams in
+// 10 seconds at which a libtorrent node ignores us for 5 minutes
+// (dos_blocker.cpp:52-99, v2.0.15).
+struct SendGuard {
+    windows: parking_lot::Mutex<SendWindows>,
+    // Rings as a datagram is sent while the sweep rests.
+    sent: tokio::sync::Notify,
+}
+
+impl SendGuard {
+    fn new() -> Self {
+        Self {
+            windows: parking_lot::Mutex::new(SendWindows::new()),
+            sent: tokio::sync::Notify::new(),
+        }
+    }
+
+    // Room for a query to `ip`, or its place in that address's line.
+    fn try_send(
+        self: &Arc<Self>,
+        ip: IpAddr,
+        now: tokio::time::Instant,
+    ) -> Result<SendSlot, LinedUp> {
+        match self.windows.lock().take(ip, now) {
+            Ok(()) => Ok(SendSlot {
+                guard: self.clone(),
+                ip,
+                sent: false,
+            }),
+            Err(ready) => Err(LinedUp {
+                guard: self.clone(),
+                ip,
+                ready,
+                admitted: false,
+            }),
+        }
+    }
+
+    // A reply went to `ip`: it counts, and never waits.
+    fn record(&self, ip: IpAddr) {
+        if self.windows.lock().record(ip, tokio::time::Instant::now()) {
+            self.sent.notify_one();
+        }
+    }
+
+    // Forgets the windows that have closed, when the next one may close,
+    // and rests while nothing has been sent since the last one did. Woken
+    // by a send, never by a timer while the map is empty.
+    async fn sweep(&self) -> std::convert::Infallible {
+        loop {
+            let mut sent = std::pin::pin!(self.sent.notified());
+            sent.as_mut().enable();
+            let next = self.windows.lock().sweep(tokio::time::Instant::now());
+            match next {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => sent.await,
+            }
+        }
+    }
+}
+
+// Room in a query's address's window. It counts as sent until it is sent
+// or dropped; dropped unsent, the room is given back.
+struct SendSlot {
+    guard: Arc<SendGuard>,
+    ip: IpAddr,
+    sent: bool,
+}
+
+impl SendSlot {
+    fn sent(mut self) {
+        self.sent = true;
+        if self
+            .guard
+            .windows
+            .lock()
+            .sent(self.ip, tokio::time::Instant::now())
+        {
+            self.guard.sent.notify_one();
+        }
+    }
+}
+
+impl Drop for SendSlot {
+    fn drop(&mut self) {
+        if !self.sent {
+            self.guard.windows.lock().release(self.ip);
+        }
+    }
+}
+
+// A query lined up for room in its address's window, the queries lined up
+// before it first. Dropped before it has room, it leaves the line.
+struct LinedUp {
+    guard: Arc<SendGuard>,
+    ip: IpAddr,
+    // When it may have room.
+    ready: tokio::time::Instant,
+    admitted: bool,
+}
+
+impl std::fmt::Debug for LinedUp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinedUp")
+            .field("ip", &self.ip)
+            .field("ready", &self.ready)
+            .finish()
+    }
+}
+
+impl LinedUp {
+    fn try_send(mut self, now: tokio::time::Instant) -> Result<SendSlot, LinedUp> {
+        let taken = self.guard.windows.lock().take_lined_up(self.ip, now);
+        match taken {
+            Ok(()) => {
+                self.admitted = true;
+                Ok(SendSlot {
+                    guard: self.guard.clone(),
+                    ip: self.ip,
+                    sent: false,
+                })
+            }
+            Err(ready) => {
+                self.ready = ready;
+                Err(self)
+            }
+        }
+    }
+
+    // Waits in line for room.
+    async fn room(mut self) -> SendSlot {
+        loop {
+            tokio::time::sleep_until(self.ready).await;
+            match self.try_send(tokio::time::Instant::now()) {
+                Ok(slot) => return slot,
+                Err(lined_up) => self = lined_up,
+            }
+        }
+    }
+}
+
+impl Drop for LinedUp {
+    fn drop(&mut self) {
+        if !self.admitted {
+            self.guard.windows.lock().leave(self.ip);
+        }
+    }
+}
+
 // Runs `future`, and calls `then` once its first poll is over: for a search,
 // once the queries it starts with are sent.
 async fn after_first_poll<F: std::future::Future>(future: F, then: impl FnOnce()) -> F::Output {
@@ -973,6 +1223,9 @@ pub struct DhtState {
     // arrives while it is spent goes unanswered.
     send_quota: parking_lot::Mutex<SendQuota>,
 
+    // What each address has been sent of late; no query goes past it.
+    send_guard: Arc<SendGuard>,
+
     // BEP 5 "v": sent with every outgoing message when set.
     client_version: Option<ByteBufOwned>,
 
@@ -1022,6 +1275,7 @@ impl DhtState {
                 DHT_UPLOAD_RATE_LIMIT,
                 tokio::time::Instant::now(),
             )),
+            send_guard: Arc::new(SendGuard::new()),
             cancellation_token,
             client_version,
             walks: tokio::sync::Semaphore::new(WALKS_AT_ONCE),
@@ -1291,8 +1545,64 @@ impl DhtState {
         }
     }
 
+    // Room for a query to `ip` in its send window, waiting in line for it
+    // when the window is full (see `SendGuard`).
+    async fn send_slot(&self, ip: IpAddr) -> SendSlot {
+        match self.send_guard.try_send(ip, tokio::time::Instant::now()) {
+            Ok(slot) => slot,
+            Err(lined_up) => lined_up.room().await,
+        }
+    }
+
+    // Hands `datagram` to the socket, counted in its address's send window:
+    // in `slot` for a query, as a reply with none.
+    fn hand_off(
+        &self,
+        datagram: WorkerSendRequest,
+        slot: Option<SendSlot>,
+    ) -> crate::dht::Result<()> {
+        let ip = datagram.addr.ip();
+        self.worker_sender
+            .send(datagram)
+            .map_err(|_| Error::DhtDead)?;
+        match slot {
+            Some(slot) => slot.sent(),
+            None => self.send_guard.record(ip),
+        }
+        Ok(())
+    }
+
+    // A query no answer is waited for (an announce_peer), sent once its
+    // address's send window and the rate limiter have room.
+    async fn send_unanswered(&self, request: Request, addr: SocketAddr) {
+        let slot = self.send_slot(addr.ip()).await;
+        until_ready(&self.rate_limiter).await;
+        let (tid, message) = self.create_request(request, addr);
+        let datagram = WorkerSendRequest {
+            our_tid: Some(tid),
+            message,
+            addr,
+        };
+        if let Err(e) = self.hand_off(datagram, Some(slot)) {
+            debug!("{addr}: {e:#}");
+        }
+    }
+
+    // A query to `addr`, once its send window has room. The wait for room
+    // comes before the request's own time starts: a node is not failed for
+    // our holding the query back.
     async fn request(
         &self,
+        request: Request,
+        addr: SocketAddr,
+    ) -> crate::dht::Result<ResponseOrError> {
+        let slot = self.send_slot(addr.ip()).await;
+        self.request_in(slot, request, addr).await
+    }
+
+    async fn request_in(
+        &self,
+        slot: SendSlot,
         request: Request,
         addr: SocketAddr,
     ) -> crate::dht::Result<ResponseOrError> {
@@ -1306,13 +1616,14 @@ impl DhtState {
         let send_and_wait = async {
             until_ready(&self.rate_limiter).await;
             trace!("sending {message:?}");
-            self.worker_sender
-                .send(WorkerSendRequest {
+            self.hand_off(
+                WorkerSendRequest {
                     our_tid: Some(tid),
                     message,
                     addr,
-                })
-                .map_err(|_| Error::DhtDead)?;
+                },
+                Some(slot),
+            )?;
             answer.await.map_err(|_| Error::DhtDead)?
         };
         let response = tokio::time::timeout_at(deadline, send_and_wait)
@@ -1545,14 +1856,14 @@ impl DhtState {
                     }),
                 };
                 self.queried_by(req.id, addr);
-                self.worker_sender
-                    .send(WorkerSendRequest {
+                self.hand_off(
+                    WorkerSendRequest {
                         our_tid: None,
                         message,
                         addr,
-                    })
-                    .ok()
-                    .ok_or(Error::DhtDead)?;
+                    },
+                    None,
+                )?;
                 Ok(())
             }
             MessageKind::AnnouncePeer(ann) => {
@@ -1568,14 +1879,14 @@ impl DhtState {
                         ..Default::default()
                     }),
                 };
-                self.worker_sender
-                    .send(WorkerSendRequest {
+                self.hand_off(
+                    WorkerSendRequest {
                         our_tid: None,
                         message,
                         addr,
-                    })
-                    .ok()
-                    .ok_or(Error::DhtDead)?;
+                    },
+                    None,
+                )?;
                 Ok(())
             }
             MessageKind::GetPeersRequest(req) => {
@@ -1599,14 +1910,14 @@ impl DhtState {
                         )),
                     }),
                 };
-                self.worker_sender
-                    .send(WorkerSendRequest {
+                self.hand_off(
+                    WorkerSendRequest {
                         our_tid: None,
                         message,
                         addr,
-                    })
-                    .ok()
-                    .ok_or(Error::DhtDead)?;
+                    },
+                    None,
+                )?;
                 Ok(())
             }
             MessageKind::FindNodeRequest(req) => {
@@ -1626,14 +1937,14 @@ impl DhtState {
                         ..Default::default()
                     }),
                 };
-                self.worker_sender
-                    .send(WorkerSendRequest {
+                self.hand_off(
+                    WorkerSendRequest {
                         our_tid: None,
                         message,
                         addr,
-                    })
-                    .ok()
-                    .ok_or(Error::DhtDead)?;
+                    },
+                    None,
+                )?;
                 Ok(())
             }
             _ => unreachable!(),
@@ -2060,6 +2371,9 @@ impl DhtWorker {
             .refresh_replacements(false)
             .instrument(debug_span!("refresh_replacements_v6"));
 
+        let send_windows_sweep = self.dht.send_guard.sweep();
+
+        tokio::pin!(send_windows_sweep);
         tokio::pin!(refresh_self_v4);
         tokio::pin!(refresh_self_v6);
         tokio::pin!(refresh_replacements_v4);
@@ -2086,6 +2400,7 @@ impl DhtWorker {
                 () = &mut bootstrap, if !bootstrap_done => {
                     bootstrap_done = true;
                 },
+                never = &mut send_windows_sweep => match never {},
                 err = &mut refresh_self_v4 => {
                     return Error::task_finished(&"refresh_self_v4", err);
                 },
@@ -5306,5 +5621,349 @@ mod tests {
             "the torrent searched before the bootstrap asked both routers"
         );
         assert_eq!(found_at, Duration::ZERO);
+    }
+
+    // The most datagrams sent at `times` (in order) inside any WINDOW.
+    fn most_in_any_window(times: &[tokio::time::Instant]) -> usize {
+        use crate::dht::query_limiter::WINDOW;
+        let mut first = 0;
+        let mut most = 0;
+        for (last, &at) in times.iter().enumerate() {
+            while times[first] + WINDOW <= at {
+                first += 1;
+            }
+            most = most.max(last + 1 - first);
+        }
+        most
+    }
+
+    // `torrents` torrents added at once on a cold table of two nodes that
+    // have answered, so every search also asks the two routers: four
+    // addresses every search shares. Each answers every get_peers at once,
+    // with a token, naming no node. Returns when each address was sent a
+    // datagram, up to the time every torrent's first search has announced.
+    async fn shared_nodes_campaign(
+        torrents: u32,
+    ) -> std::collections::HashMap<std::net::IpAddr, Vec<tokio::time::Instant>> {
+        use crate::core::hash_id::Id20;
+        use std::collections::{HashMap, HashSet};
+        use std::net::IpAddr;
+
+        let (dht, mut sent) = fixture_dht();
+        dht.routers.write().extend([
+            SocketAddr::from(([192, 0, 2, 1], 6881)),
+            SocketAddr::from(([192, 0, 2, 2], 6881)),
+        ]);
+        add_table_nodes(&dht, 2, true);
+        // The id each address answers with: a table node's own.
+        let id_of = |addr: SocketAddr| match addr.ip() {
+            IpAddr::V4(a) if a.octets()[0] == 10 => Id20::new([a.octets()[2] + 1; 20]),
+            _ => Id20::new([0x77; 20]),
+        };
+        let tasks: Vec<_> = (0..torrents)
+            .map(|i| {
+                let mut hash = [0x55; 20];
+                hash[..4].copy_from_slice(&i.to_be_bytes());
+                Arc::new(super::RecursiveRequest::get_peers(
+                    dht.clone(),
+                    Id20::new(hash),
+                    Some(6881),
+                    tokio::sync::mpsc::unbounded_channel().0,
+                ))
+                .request_peers_forever(true)
+            })
+            .collect();
+        let mut sends = HashMap::<IpAddr, Vec<tokio::time::Instant>>::new();
+        let mut announced = HashSet::new();
+        while announced.len() < torrents as usize {
+            let request = sent.recv().await.unwrap();
+            let now = tokio::time::Instant::now();
+            sends.entry(request.addr.ip()).or_default().push(now);
+            match &request.message.kind {
+                MessageKind::GetPeersRequest(_) => {
+                    answer(&dht, &request, id_of(request.addr), Some(b"t"), &[]);
+                }
+                MessageKind::AnnouncePeer(a) => {
+                    announced.insert(a.info_hash);
+                }
+                kind => panic!("unexpected {kind:?}"),
+            }
+        }
+        for task in tasks {
+            task.abort();
+        }
+        sends
+    }
+
+    // However many torrents search at once from the same few nodes and
+    // routers, none of them is sent the datagrams in any 10 seconds at which
+    // a libtorrent node ignores us (dos_blocker.cpp:52-99, v2.0.15), and
+    // every torrent's first search still ends.
+    #[tokio::test(start_paused = true)]
+    async fn test_torrents_searching_from_the_same_nodes_never_flood_one() {
+        use crate::dht::{query_limiter::QUERY_LIMIT, send_windows::SEND_LIMIT};
+        for torrents in [100, 1000] {
+            let sends = shared_nodes_campaign(torrents).await;
+            assert_eq!(sends.len(), 4, "{torrents} torrents");
+            for (ip, times) in sends {
+                let most = most_in_any_window(&times);
+                assert!(
+                    most <= SEND_LIMIT && most < QUERY_LIMIT as usize,
+                    "{torrents} torrents: {ip} was sent {most} in one window"
+                );
+            }
+        }
+    }
+
+    // Searches whose nodes differ are not held back by a node whose window
+    // is full; a search that wants that node asks its others at once, and
+    // that one as its window opens.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_full_window_holds_back_only_its_own_address() {
+        use crate::core::hash_id::Id20;
+        use crate::dht::{query_limiter::WINDOW, send_windows::SEND_LIMIT};
+        use futures::{FutureExt, StreamExt};
+
+        let (dht, mut sent) = fixture_dht();
+        let full = SocketAddr::from(([10, 9, 9, 9], 6881));
+        for _ in 0..SEND_LIMIT {
+            dht.send_guard.record(full.ip());
+        }
+        let start = tokio::time::Instant::now();
+        let nodes = |search: u8, with_full: bool| {
+            (0..8u8)
+                .map(move |i| {
+                    let addr = if with_full && i == 0 {
+                        full
+                    } else {
+                        SocketAddr::from(([10, 1, search, i], 6881))
+                    };
+                    (Some(Id20::new([search * 8 + i + 1; 20])), addr)
+                })
+                .collect::<Vec<_>>()
+        };
+        let reqs = [get_peers_search(&dht), get_peers_search(&dht)];
+        let mut searches = [(0u8, false), (1, true)]
+            .into_iter()
+            .zip(&reqs)
+            .map(|((search, with_full), req)| {
+                req.search(true, nodes(search, with_full).into_iter())
+                    .map(move |outcome| (search, outcome))
+            })
+            .collect::<futures::stream::FuturesUnordered<_>>();
+        let mut asked = Vec::new();
+        let mut ended = Vec::new();
+        loop {
+            tokio::select! {
+                done = searches.next() => match done {
+                    Some((search, outcome)) => {
+                        assert_eq!(outcome.unwrap().answered, 8);
+                        ended.push((search, tokio::time::Instant::now() - start));
+                    }
+                    None => break,
+                },
+                request = sent.recv() => {
+                    let request = request.unwrap();
+                    asked.push((request.addr, tokio::time::Instant::now() - start));
+                    let id = match &request.message.kind {
+                        MessageKind::GetPeersRequest(_) if request.addr == full => Id20::new([9; 20]),
+                        MessageKind::GetPeersRequest(_) => match request.addr.ip() {
+                            std::net::IpAddr::V4(a) => Id20::new([a.octets()[2] * 8 + a.octets()[3] + 1; 20]),
+                            std::net::IpAddr::V6(_) => unreachable!(),
+                        },
+                        kind => panic!("unexpected {kind:?}"),
+                    };
+                    answer(&dht, &request, id, None, &[]);
+                }
+            }
+        }
+        // Every other node is asked at once; the full one as its window opens.
+        assert_eq!(asked.len(), 16);
+        for (addr, at) in &asked {
+            let want = if *addr == full {
+                WINDOW
+            } else {
+                Duration::ZERO
+            };
+            assert_eq!(*at, want, "{addr}");
+        }
+        assert_eq!(asked.last().unwrap().0, full);
+        ended.sort();
+        assert_eq!(ended, vec![(0, Duration::ZERO), (1, WINDOW)]);
+    }
+
+    // A node whose window is full, farther than the k closest that answer,
+    // is never asked: the search ends once they have, and the node leaves
+    // its address's line.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_search_ends_without_waiting_for_a_deferred_node_it_no_longer_needs() {
+        use crate::core::hash_id::Id20;
+        use crate::dht::send_windows::SEND_LIMIT;
+        use std::task::Poll;
+
+        let (dht, mut sent) = fixture_dht();
+        // Node i is i + 1 from the info-hash; the farthest, 8, is full.
+        let node = |i: u8| {
+            let mut id = [0x22; 20];
+            id[19] ^= i + 1;
+            (Id20::new(id), SocketAddr::from(([10, 0, i, 1], 6881)))
+        };
+        let full = node(8).1;
+        for _ in 0..SEND_LIMIT {
+            dht.send_guard.record(full.ip());
+        }
+        let req = get_peers_search(&dht);
+        let start = tokio::time::Instant::now();
+        let mut search = std::pin::pin!(req.search(
+            true,
+            (0..9).map(|i| {
+                let (id, addr) = node(i);
+                (Some(id), addr)
+            })
+        ));
+        let outcome = loop {
+            if let Poll::Ready(outcome) = futures::poll!(search.as_mut()) {
+                break outcome.unwrap();
+            }
+            let mut answered = false;
+            while let Ok(request) = sent.try_recv() {
+                assert_ne!(request.addr, full, "the deferred node was asked");
+                let i = match request.addr.ip() {
+                    std::net::IpAddr::V4(a) => a.octets()[2],
+                    std::net::IpAddr::V6(_) => unreachable!(),
+                };
+                answer(&dht, &request, node(i).0, None, &[]);
+                answered = true;
+            }
+            assert!(answered, "the search waited with nothing to answer");
+        };
+        assert_eq!(outcome.answered, 8);
+        assert_eq!(tokio::time::Instant::now(), start);
+        assert_eq!(dht.send_guard.windows.lock().lined_up(full.ip()), 0);
+    }
+
+    // Queries lined up for a full window go as it opens, one as each datagram
+    // sent leaves it, in the order they were lined up.
+    #[tokio::test(start_paused = true)]
+    async fn test_deferred_queries_go_in_order_as_their_window_opens() {
+        use crate::core::hash_id::Id20;
+        use crate::dht::{query_limiter::WINDOW, send_windows::SEND_LIMIT};
+        use std::task::Poll;
+
+        let (dht, mut sent) = fixture_dht();
+        let node = SocketAddr::from(([10, 0, 0, 1], 6881));
+        let start = tokio::time::Instant::now();
+        let step = Duration::from_millis(100);
+        for _ in 0..SEND_LIMIT {
+            dht.send_guard.record(node.ip());
+            tokio::time::advance(step).await;
+        }
+        let queries = [1u8, 2, 3]
+            .map(|i| Box::pin(dht.request(super::Request::FindNode(Id20::new([i; 20])), node)));
+        let mut queries = queries;
+        for query in &mut queries {
+            assert!(matches!(futures::poll!(query.as_mut()), Poll::Pending));
+        }
+        assert!(sent.try_recv().is_err(), "sent into a full window");
+        assert_eq!(dht.send_guard.windows.lock().lined_up(node.ip()), 3);
+        let mut all = futures::future::join_all(queries);
+        let mut went = Vec::new();
+        while went.len() < 3 {
+            tokio::select! {
+                _ = &mut all => unreachable!("the queries are not answered"),
+                request = sent.recv() => {
+                    let request = request.unwrap();
+                    let MessageKind::FindNodeRequest(f) = request.message.kind else {
+                        panic!("not a find_node");
+                    };
+                    went.push((f.target, tokio::time::Instant::now() - start));
+                }
+            }
+        }
+        assert_eq!(
+            went,
+            (0..3u8)
+                .map(|i| (Id20::new([i + 1; 20]), WINDOW + step * u32::from(i)))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // An announce_peer counts in its node's window, and one past a full
+    // window waits for it to open.
+    #[tokio::test(start_paused = true)]
+    async fn test_an_announce_is_counted_and_waits_for_room() {
+        use crate::core::hash_id::Id20;
+        use crate::dht::{query_limiter::WINDOW, send_windows::SEND_LIMIT};
+        use futures::StreamExt;
+
+        let (dht, mut sent) = fixture_dht();
+        let node = SocketAddr::from(([10, 0, 0, 1], 6881));
+        let start = tokio::time::Instant::now();
+        let mut announces = (0..=SEND_LIMIT)
+            .map(|_| {
+                dht.send_unanswered(
+                    super::Request::Announce {
+                        info_hash: Id20::new([0x22; 20]),
+                        token: ByteBufOwned::from(&b"t"[..]),
+                        port: 6881,
+                    },
+                    node,
+                )
+            })
+            .collect::<futures::stream::FuturesUnordered<_>>();
+        let mut times = Vec::new();
+        loop {
+            tokio::select! {
+                done = announces.next() => if done.is_none() { break },
+                request = sent.recv() => {
+                    let request = request.unwrap();
+                    assert!(matches!(request.message.kind, MessageKind::AnnouncePeer(_)));
+                    times.push(tokio::time::Instant::now());
+                }
+            }
+        }
+        while let Ok(request) = sent.try_recv() {
+            assert!(matches!(request.message.kind, MessageKind::AnnouncePeer(_)));
+            times.push(tokio::time::Instant::now());
+        }
+        assert_eq!(times.len(), SEND_LIMIT + 1);
+        assert_eq!(most_in_any_window(&times), SEND_LIMIT);
+        // The last waited for the first to leave the window.
+        assert_eq!(*times.last().unwrap(), times[0] + WINDOW);
+        assert!(times[0] - start < WINDOW);
+    }
+
+    // Once nothing is sent, the windows close and the map empties; the sweep
+    // then rests until the next datagram.
+    #[tokio::test(start_paused = true)]
+    async fn test_the_send_windows_empty_once_traffic_stops() {
+        use crate::dht::query_limiter::WINDOW;
+        use std::task::Poll;
+
+        let (dht, _sent) = fixture_dht();
+        let guard = dht.send_guard.clone();
+        let mut sweep = std::pin::pin!(guard.sweep());
+        assert!(matches!(futures::poll!(sweep.as_mut()), Poll::Pending));
+        for i in 1..=3u8 {
+            dht.send_guard
+                .record(SocketAddr::from(([10, 0, 0, i], 6881)).ip());
+        }
+        // Woken by the first datagram.
+        assert!(matches!(futures::poll!(sweep.as_mut()), Poll::Pending));
+        assert_eq!(dht.send_guard.windows.lock().len(), 3);
+        tokio::time::advance(WINDOW).await;
+        assert!(matches!(futures::poll!(sweep.as_mut()), Poll::Pending));
+        assert_eq!(dht.send_guard.windows.lock().len(), 0);
+        // Resting until a datagram is sent, whatever time passes.
+        tokio::time::advance(10 * WINDOW).await;
+        assert!(matches!(futures::poll!(sweep.as_mut()), Poll::Pending));
+        assert_eq!(dht.send_guard.windows.lock().len(), 0);
+        assert!(
+            dht.send_guard.windows.lock().record(
+                SocketAddr::from(([10, 0, 0, 1], 6881)).ip(),
+                tokio::time::Instant::now()
+            ),
+            "the sweep was not resting"
+        );
     }
 }
