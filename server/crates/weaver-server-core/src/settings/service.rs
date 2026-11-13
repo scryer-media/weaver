@@ -29,8 +29,20 @@ pub(crate) const RETIRED_SETTING_KEYS: &[&str] = &[
 ];
 
 impl Database {
-    // Load a full `Config` from the settings and servers tables.
+    // Load a full `Config` from the settings and servers tables, for running
+    // on: a server list past the server limit is trimmed first.
     pub fn load_config(&self) -> Result<Config, StateError> {
+        self.config_from_store(true)
+    }
+
+    // The `Config` a staged backup holds, read without bringing its server
+    // list within the limit: a backup is checked against its manifest row
+    // for row, and the trim runs when the restored database is loaded.
+    pub(crate) fn load_config_as_stored(&self) -> Result<Config, StateError> {
+        self.config_from_store(false)
+    }
+
+    fn config_from_store(&self, within_server_limit: bool) -> Result<Config, StateError> {
         let settings: std::collections::HashMap<String, String> = self
             .list_setting_records()?
             .into_iter()
@@ -44,7 +56,7 @@ impl Database {
         let mut servers = self.list_servers()?;
         // A list past the server limit (an older version's, or a restored
         // backup's) is trimmed here, before any pool is built from it.
-        if self.trim_servers_past_limit(&servers)? > 0 {
+        if within_server_limit && self.trim_servers_past_limit(&servers)? > 0 {
             servers = self.list_servers()?;
         }
         let categories = self.list_categories()?;

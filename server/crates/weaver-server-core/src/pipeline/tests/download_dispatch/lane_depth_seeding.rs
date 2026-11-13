@@ -204,7 +204,11 @@ async fn a_pinned_server_stays_sequential_across_a_pool_rebuild() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let with_id = |host: &str, id: u32| {
-        let mut config = server(host, weaver_nntp::PipeliningCapability::Known(true), Some(4));
+        let mut config = server(
+            host,
+            weaver_nntp::PipeliningCapability::Known(true),
+            Some(4),
+        );
         config.stable_id = weaver_nntp::transfer::StableServerId(id);
         config
     };
@@ -245,7 +249,11 @@ async fn a_pinned_server_stays_sequential_across_a_pool_rebuild() {
     assert_eq!(
         shown
             .iter()
-            .map(|entry| (entry.server_idx, entry.pipeline_depth, entry.pinned_sequential))
+            .map(|entry| (
+                entry.server_idx,
+                entry.pipeline_depth,
+                entry.pinned_sequential
+            ))
             .collect::<Vec<_>>(),
         vec![(0, 4, false), (1, 1, true)]
     );
