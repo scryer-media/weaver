@@ -16,6 +16,21 @@ use crate::torrent_state::{HashJob, WriteJob};
 /// check here also reads the piece back.
 const HASH_THREADS: usize = 2;
 
+/// Whether every disk thread counts against the blocking permits.
+///
+/// False: block writes, the reads of uTP uploads, and the work done in
+/// place under a permit (the reads of TCP uploads, a piece checked and
+/// written whole from memory, a torrent's check) each have a bound of their
+/// own, as many threads as there are permits, so with N permits up to 3N
+/// threads are in a disk call at once, and the piece checks beside them.
+///
+/// True: they share the one bound, so at most N threads are in a disk call
+/// at once, whatever the mix (libtorrent's `aio_threads`, one pool for
+/// reads and writes, mmap_disk_io.cpp:1685), and the piece checks of the
+/// `hash` queue run beside them on threads of their own (libtorrent's
+/// `hashing_threads`).
+pub(crate) const ONE_DISK_POOL: bool = false;
+
 /// A tool to limit the number of blocking threads used concurrently to prevent
 /// runtime starvation.
 ///
@@ -38,6 +53,20 @@ pub struct BlockingSpawner {
     reads: DiskQueue<crate::off_shard::ReadJob>,
 }
 
+// A queue of `threads` disk threads, counted against `permits` when the
+// disk work shares one bound.
+fn disk_queue<J: crate::disk::DiskJob>(
+    handle: &tokio::runtime::Handle,
+    threads: usize,
+    permits: &Arc<Semaphore>,
+) -> DiskQueue<J> {
+    if ONE_DISK_POOL {
+        DiskQueue::sharing(handle.clone(), threads, permits.clone())
+    } else {
+        DiskQueue::new(handle.clone(), threads)
+    }
+}
+
 impl std::fmt::Debug for BlockingSpawner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BlockingSpawner")
@@ -55,23 +84,26 @@ impl BlockingSpawner {
             tokio::runtime::RuntimeFlavor::MultiThread => true,
             _ => true,
         };
+        let permits = max_blocking_threads.max(1);
+        let semaphore = Arc::new(Semaphore::new(permits));
+        let write_queue = disk_queue(&handle, permits, &semaphore);
+        let read_queue = disk_queue(&handle, permits, &semaphore);
         Self {
             allow_block_in_place,
-            concurrent_block_in_place_semaphore: Arc::new(Semaphore::new(
-                max_blocking_threads.max(1),
-            )),
-            permits: max_blocking_threads.max(1),
+            permits,
             pool: BlockPool::new(MAX_QUEUED_DISK_BYTES),
             // As many disk threads as blocking permits (libtorrent's
             // `aio_threads`, a pool of its own beside the network thread).
-            disk: DiskQueue::new(handle.clone(), max_blocking_threads.max(1)),
+            disk: write_queue,
             // Checks have threads of their own, so a write never waits behind
             // one (libtorrent `settings_pack::hashing_threads`, a pool beside
             // `aio_threads`, mmap_disk_io.cpp:1685).
             hash: DiskQueue::new(handle.clone(), HASH_THREADS),
-            // Uploads are read on threads as many again (libtorrent reads
-            // on its `aio_threads` too).
-            reads: DiskQueue::new(handle.clone(), max_blocking_threads.max(1)),
+            // Uploads are read on threads as many again, or on the same
+            // bound when the disk work shares one (libtorrent reads on its
+            // `aio_threads` too).
+            reads: read_queue,
+            concurrent_block_in_place_semaphore: semaphore,
             handle,
         }
     }
