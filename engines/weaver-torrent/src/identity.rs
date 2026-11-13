@@ -18,7 +18,7 @@ use crate::core::{
 };
 use crate::crate_version;
 use crate::torrent_state::stats::TorrentTotals;
-use crate::tracker::AnnounceShape;
+use crate::tracker::{AnnounceShape, Leg};
 
 /// How a torrent names itself to its peers and trackers. A torrent keeps one
 /// for as long as it is kept: every run, session and tracker task of it goes
@@ -148,9 +148,11 @@ impl std::fmt::Debug for Completion {
 #[derive(Clone, Default)]
 pub struct Announcing(Arc<Mutex<Option<Handed>>>);
 
-/// The trackers that answered `started` under each hash, with the corrupt
-/// and redundant bytes the torrent had counted when it was sent.
-pub(crate) type Started = HashMap<(Id20, Url), (u64, u64)>;
+/// The trackers that answered `started` under each hash, over each leg,
+/// with the corrupt and redundant bytes the torrent had counted when it was
+/// sent over it. A leg that never answered one is not listed, so it is
+/// sent `started` after the move.
+pub(crate) type Started = HashMap<(Id20, Url, Leg), (u64, u64)>;
 
 /// What [`Announcing`] holds between two sessions.
 #[derive(Default)]
@@ -185,17 +187,17 @@ impl Announcing {
     }
 
     /// The trackers that answered `started` under `info_hash` before the
-    /// move, taken by the announces that go on under it.
-    pub(crate) fn take_started(&self, info_hash: Id20) -> HashMap<Url, (u64, u64)> {
+    /// move, over each leg, taken by the announces that go on under it.
+    pub(crate) fn take_started(&self, info_hash: Id20) -> HashMap<(Url, Leg), (u64, u64)> {
         let mut handed = self.0.lock();
         let Some(handed) = handed.as_mut() else {
             return HashMap::new();
         };
         let mut taken = HashMap::new();
-        handed.started.retain(|(hash, url), at| {
+        handed.started.retain(|(hash, url, leg), at| {
             let ours = *hash == info_hash;
             if ours {
-                taken.insert(url.clone(), *at);
+                taken.insert((url.clone(), *leg), *at);
             }
             !ours
         });

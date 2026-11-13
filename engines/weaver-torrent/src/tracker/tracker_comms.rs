@@ -62,9 +62,9 @@ pub struct TrackerComms {
     // The trackers under this hash and what announcing to them has done.
     list: Mutex<TrackerList>,
     // The corrupt and redundant bytes the torrent had counted when each
-    // HTTP tracker was last sent `started`: its announces report what grew
-    // since.
-    started_at: Mutex<HashMap<Url, (u64, u64)>>,
+    // HTTP tracker was last sent `started` over each leg: its announces
+    // over that leg report what grew since.
+    started_at: Mutex<HashMap<(Url, Leg), (u64, u64)>>,
     status: TrackerStatus,
     // Wakes the announce loop when the list changed under it: trackers
     // replaced or an announce forced.
@@ -351,9 +351,148 @@ fn without_url(e: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// The way one announce to a tracker leaves: held to IPv4, held to IPv6, or
+/// held to no family, as when a proxy dials the tracker. A tracker hears
+/// each as a peer of its own, so each keeps whether it answered `started`
+/// (libtorrent keeps one `announce_endpoint` per listen socket, each with
+/// its own `start_sent`, torrent.cpp:2993-3035 `refresh_endpoint_list`,
+/// 3605-3606, v2.0.15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Leg {
+    V4,
+    V6,
+    Unbound,
+}
+
+impl Leg {
+    /// The leg of an HTTP announce held to `family`, or to none.
+    fn of_route(family: Option<Family>) -> Self {
+        match family {
+            Some(Family::V4) => Self::V4,
+            Some(Family::V6) => Self::V6,
+            None => Self::Unbound,
+        }
+    }
+
+    /// The leg of a datagram to `addr`.
+    fn of_addr(addr: SocketAddr) -> Self {
+        Self::of_route(Some(Family::of(addr.ip())))
+    }
+
+    const fn bit(self) -> u8 {
+        match self {
+            Self::V4 => 1,
+            Self::V6 => 2,
+            Self::Unbound => 4,
+        }
+    }
+
+    const ALL: [Leg; 3] = [Leg::V4, Leg::V6, Leg::Unbound];
+}
+
+/// A set of [`Leg`]s.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Legs(u8);
+
+impl Legs {
+    fn has(self, leg: Leg) -> bool {
+        self.0 & leg.bit() != 0
+    }
+
+    fn add(&mut self, leg: Leg) {
+        self.0 |= leg.bit();
+    }
+
+    fn any(self) -> bool {
+        self.0 != 0
+    }
+
+    fn iter(self) -> impl Iterator<Item = Leg> {
+        Leg::ALL.into_iter().filter(move |leg| self.has(*leg))
+    }
+}
+
+impl std::ops::BitOrAssign for Legs {
+    fn bitor_assign(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+}
+
+impl FromIterator<Leg> for Legs {
+    fn from_iter<I: IntoIterator<Item = Leg>>(legs: I) -> Self {
+        let mut set = Self::default();
+        for leg in legs {
+            set.add(leg);
+        }
+        set
+    }
+}
+
+/// Trackers that answered `started`, each with the legs that answered it.
+type StartedTrackers = Vec<(SupportedTracker, Legs)>;
+
+/// The events one announce to a tracker carries, leg by leg (libtorrent
+/// picks the event of each endpoint from its own `start_sent`,
+/// torrent.cpp:3323-3331, v2.0.15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Events {
+    /// The legs that answered `started`.
+    started: Legs,
+    /// The event over a leg that answered `started`.
+    after_start: Option<TrackerRequestEvent>,
+    /// The event over any other leg; None passes that leg over, as
+    /// `stopped` passes over a leg that never answered `started`
+    /// (torrent.cpp:3279-3282, v2.0.15).
+    unstarted: Option<Option<TrackerRequestEvent>>,
+}
+
+impl Events {
+    /// `stopped`, over the legs of `started` alone.
+    fn stopped(started: Legs) -> Self {
+        Self {
+            started,
+            after_start: Some(TrackerRequestEvent::Stopped),
+            unstarted: None,
+        }
+    }
+
+    /// The event over `leg`, or None when it is passed over.
+    fn over(&self, leg: Leg) -> Option<Option<TrackerRequestEvent>> {
+        match self.started.has(leg) {
+            true => Some(self.after_start),
+            false => self.unstarted,
+        }
+    }
+
+    /// Some leg carries an event.
+    fn any(&self) -> bool {
+        self.after_start.is_some() || self.unstarted.flatten().is_some()
+    }
+}
+
+/// What a tracker accepted of one announce: the legs it answered `started`
+/// over, and whether it answered `completed` over any.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Accepted {
+    started: Legs,
+    completed: bool,
+}
+
+impl Accepted {
+    /// `leg` carried `event`, and the tracker accepted it.
+    fn take(&mut self, leg: Leg, event: Option<TrackerRequestEvent>) {
+        match event {
+            Some(TrackerRequestEvent::Started) => self.started.add(leg),
+            Some(TrackerRequestEvent::Completed) => self.completed = true,
+            Some(TrackerRequestEvent::Stopped | TrackerRequestEvent::Paused) | None => {}
+        }
+    }
+}
+
 /// One tracker as one hash of the torrent announces to it, and how that has
 /// gone (libtorrent `announce_infohash`, with the tier of its
-/// `announce_entry`).
+/// `announce_entry`). Its intervals and failures are the tracker's, shared
+/// by its legs, which announce together.
 #[derive(Clone, Debug)]
 struct Entry {
     tracker: SupportedTracker,
@@ -372,7 +511,8 @@ struct Entry {
     /// `session_impl::reopen_listen_sockets` forces every tracker's request
     /// when the listen port changes).
     port: ToldPorts,
-    start_sent: bool,
+    /// The legs over which it answered `started`.
+    start_sent: Legs,
     complete_sent: bool,
 }
 
@@ -386,7 +526,7 @@ impl Entry {
             min_announce: now,
             updating: false,
             port: ToldPorts::default(),
-            start_sent: false,
+            start_sent: Legs::default(),
             complete_sent: false,
         }
     }
@@ -466,11 +606,17 @@ impl TrackerList {
     }
 
     /// The announces go on from a session a route move took the torrent
-    /// from: each tracker of `started` answered `started` there, so it is
-    /// sent no other.
-    fn going_on(mut self, started: &HashMap<Url, (u64, u64)>) -> Self {
+    /// from: each tracker of `started` answered `started` there over the
+    /// legs named, so it is sent no other over them.
+    fn going_on(mut self, started: &HashMap<(Url, Leg), (u64, u64)>) -> Self {
+        let mut legs: HashMap<&Url, Legs> = HashMap::new();
+        for (url, leg) in started.keys() {
+            legs.entry(url).or_default().add(*leg);
+        }
         for entry in &mut self.entries {
-            entry.start_sent |= started.contains_key(&entry.tracker.url);
+            if let Some(legs) = legs.get(&entry.tracker.url) {
+                entry.start_sent |= *legs;
+            }
         }
         self
     }
@@ -480,10 +626,10 @@ impl TrackerList {
     /// tracker kept keeps what announcing to it has done, so it is not sent
     /// `started` again nor let off its back-off; libtorrent starts every
     /// entry afresh. A tracker that is gone is forgotten; those of them that
-    /// accepted `started` are returned.
+    /// accepted `started` are returned, with the legs that accepted it.
     // Each tracker is looked up once in sets built for the pass, so a pass
     // costs the trackers named and kept, not their product.
-    fn replace(&mut self, tiers: &[Vec<SupportedTracker>], now: Instant) -> Vec<SupportedTracker> {
+    fn replace(&mut self, tiers: &[Vec<SupportedTracker>], now: Instant) -> StartedTrackers {
         let old = std::mem::take(&mut self.entries);
         let at: HashMap<SupportedTracker, usize> = old
             .iter()
@@ -511,8 +657,8 @@ impl TrackerList {
         self.forced.retain(|t| named.contains(t));
         old.into_iter()
             .flatten()
-            .filter(|e| e.start_sent)
-            .map(|e| e.tracker)
+            .filter(|e| e.start_sent.any())
+            .map(|e| (e.tracker, e.start_sent))
             .collect()
     }
 
@@ -582,14 +728,14 @@ impl TrackerList {
         picked
     }
 
-    /// The regular announces due at `now`, each with its event, marked as
+    /// The regular announces due at `now`, each with its events, marked as
     /// waiting for their answers; `port` is the listen ports they carry.
     fn start_due(
         &mut self,
         now: Instant,
         port: ToldPorts,
         stats: &TrackerCommsStats,
-    ) -> Vec<(SupportedTracker, Option<TrackerRequestEvent>)> {
+    ) -> Vec<(SupportedTracker, Events)> {
         let seed = stats.completed_during_run || self.owes_completed(stats);
         // A tracker forced alone goes now if it may, else the walk and the
         // timer reach it (libtorrent `torrent::announce_tracker_now`); one
@@ -637,24 +783,32 @@ impl TrackerList {
         stats.is_completed() && !self.completion.is_sent()
     }
 
-    /// The event a regular announce to `entry` carries (libtorrent
-    /// `torrent::announce_with_tracker`, torrent.cpp:3323-3333, v2.0.15):
-    /// `started` until it accepts one, then `completed` while the torrent
-    /// owes one, and `paused` while it has every piece it wants and is not a
-    /// seed. A shape that says `paused` first says it in place of `started`
-    /// too.
-    fn event(&self, entry: &Entry, stats: &TrackerCommsStats) -> Option<TrackerRequestEvent> {
+    /// The events a regular announce to `entry` carries (libtorrent
+    /// `torrent::announce_with_tracker`, torrent.cpp:3323-3333, v2.0.15),
+    /// over each leg: `started` until that leg accepts one, then
+    /// `completed` while the torrent owes one, and `paused` while it has
+    /// every piece it wants and is not a seed. A shape that says `paused`
+    /// first says it in place of `started` too.
+    fn event(&self, entry: &Entry, stats: &TrackerCommsStats) -> Events {
         let paused = stats.finished && !stats.is_completed();
-        if paused && self.shape.paused_first {
+        let paused_first = paused && self.shape.paused_first;
+        let after_start = if paused_first {
             Some(TrackerRequestEvent::Paused)
-        } else if !entry.start_sent {
-            Some(TrackerRequestEvent::Started)
         } else if self.owes_completed(stats) && !entry.complete_sent {
             Some(TrackerRequestEvent::Completed)
         } else if paused {
             Some(TrackerRequestEvent::Paused)
         } else {
             None
+        };
+        let unstarted = match paused_first {
+            true => TrackerRequestEvent::Paused,
+            false => TrackerRequestEvent::Started,
+        };
+        Events {
+            started: entry.start_sent,
+            after_start,
+            unstarted: Some(Some(unstarted)),
         }
     }
 
@@ -684,12 +838,14 @@ impl TrackerList {
         self.entries.iter().position(|e| &e.tracker == tracker)
     }
 
-    /// `tracker` accepted an announce that carried `event` (libtorrent
-    /// `torrent::tracker_response`).
+    /// `tracker` accepted an announce, `accepted` over the legs it says
+    /// (libtorrent `torrent::tracker_response`, torrent.cpp:3605-3619,
+    /// v2.0.15: `started` marks the endpoint that sent it, `completed` the
+    /// whole torrent).
     fn on_success(
         &mut self,
         tracker: &SupportedTracker,
-        event: Option<TrackerRequestEvent>,
+        accepted: Accepted,
         now: Instant,
         delay: &ReannounceDelay,
     ) {
@@ -701,13 +857,10 @@ impl TrackerList {
         entry.fails = 0;
         entry.next_announce = now + delay.regular;
         entry.min_announce = now + delay.floor;
-        match event {
-            Some(TrackerRequestEvent::Started) => entry.start_sent = true,
-            Some(TrackerRequestEvent::Completed) => {
-                entry.complete_sent = true;
-                self.completion.sent();
-            }
-            Some(TrackerRequestEvent::Stopped | TrackerRequestEvent::Paused) | None => {}
+        entry.start_sent |= accepted.started;
+        if accepted.completed {
+            entry.complete_sent = true;
+            self.completion.sent();
         }
     }
 
@@ -747,15 +900,17 @@ impl TrackerList {
     /// `torrent::announce_with_tracker` asks it for `stopped` too,
     /// torrent.cpp:3308, v2.0.15). A working tracker passed over still
     /// stands for its tier. A run whose announces a route move handed over
-    /// owes none: the session it went to announces on.
-    fn stop(&mut self) -> Vec<SupportedTracker> {
+    /// owes none: the session it went to announces on. Each tracker owed
+    /// one comes with the legs that answered `started`, the only ones it is
+    /// sent over (torrent.cpp:3279-3282, v2.0.15).
+    fn stop(&mut self) -> StartedTrackers {
         self.announcing = false;
         if self.handed_over {
             return Vec::new();
         }
-        self.walk(|e| e.start_sent, |e| !e.updating)
+        self.walk(|e| e.start_sent.any(), |e| !e.updating)
             .into_iter()
-            .map(|i| self.entries[i].tracker.clone())
+            .map(|i| (self.entries[i].tracker.clone(), self.entries[i].start_sent))
             .collect()
     }
 }
@@ -918,6 +1073,8 @@ struct Announced {
     seen_as: Option<(IpAddr, IpAddr)>,
     /// The length of an HTTP answer's body, in bytes.
     body_len: Option<usize>,
+    /// The events of it the tracker accepted, leg by leg.
+    accepted: Accepted,
 }
 
 /// What a tracker answered to an announce it accepted (libtorrent
@@ -1273,8 +1430,8 @@ impl TrackerStatus {
 
     /// A route move takes the torrent to another session, where its
     /// announces go on: no hash that still announces sends `stopped` as it
-    /// stops. The trackers each hash's tracker answered `started` from, or
-    /// None when no hash announces any more.
+    /// stops. The trackers that answered each hash's `started`, leg by leg,
+    /// or None when no hash announces any more.
     pub(crate) fn hand_over(&self) -> Option<crate::identity::Started> {
         let mut started = crate::identity::Started::new();
         let mut announcing = false;
@@ -1286,10 +1443,16 @@ impl TrackerStatus {
             announcing = true;
             list.handed_over = true;
             let started_at = comms.started_at.lock();
-            started.extend(list.entries.iter().filter(|e| e.start_sent).map(|e| {
-                let at = started_at.get(&e.tracker.url).copied().unwrap_or_default();
-                ((comms.info_hash, e.tracker.url.clone()), at)
-            }));
+            for entry in &list.entries {
+                for leg in entry.start_sent.iter() {
+                    let url = entry.tracker.url.clone();
+                    let at = started_at
+                        .get(&(url.clone(), leg))
+                        .copied()
+                        .unwrap_or_default();
+                    started.insert((comms.info_hash, url, leg), at);
+                }
+            }
         }
         announcing.then_some(started)
     }
@@ -1303,11 +1466,11 @@ impl TrackerStatus {
     }
 
     /// [`Self::replace`], with each running hash and the trackers gone from
-    /// it that accepted `started`.
+    /// it that accepted `started`, with the legs that accepted it.
     fn replace_tiers(
         &self,
         tiers: &[Vec<SupportedTracker>],
-    ) -> Vec<(Arc<TrackerComms>, Vec<SupportedTracker>)> {
+    ) -> Vec<(Arc<TrackerComms>, StartedTrackers)> {
         let trackers = unique(tiers.iter().flatten());
         self.0.announces.send_modify(|announces| {
             *announces = trackers
@@ -1929,6 +2092,39 @@ fn saturating_u32(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
+/// One announce's answers, one per leg with the event it carried, as one:
+/// the first accepted answer with the peers of every other accepted one,
+/// and what each accepting leg accepted; the first refusal when no leg's
+/// answer was accepted.
+fn merged(
+    answers: impl IntoIterator<Item = (Leg, Option<TrackerRequestEvent>, anyhow::Result<Announced>)>,
+) -> anyhow::Result<Announced> {
+    let (mut announced, mut error) = (None::<Announced>, None);
+    let mut accepted = Accepted::default();
+    for (leg, event, answer) in answers {
+        match answer {
+            Ok(more) => {
+                accepted.take(leg, event);
+                match &mut announced {
+                    Some(announced) => announced.peers.extend(more.peers),
+                    None => announced = Some(more),
+                }
+            }
+            Err(e) => {
+                error.get_or_insert(e);
+            }
+        }
+    }
+    match (announced, error) {
+        (Some(mut announced), _) => {
+            announced.accepted = accepted;
+            Ok(announced)
+        }
+        (None, Some(error)) => Err(error),
+        (None, None) => anyhow::bail!("the tracker was not announced to"),
+    }
+}
+
 impl TrackerComms {
     /// Announce to the trackers of a multitracker torrent (BEP 12): one
     /// tracker of each tier at a time, the first in it that works, the
@@ -2117,13 +2313,13 @@ impl TrackerComms {
         self.status.0.scraper.info_hashes.lock().push(info_hash);
     }
 
-    /// Sends `stopped` to `trackers`, which accepted `started`, with the
-    /// counters as they are once the run's connections closed, each
-    /// recorded in the table as any announce is, within the stopped
-    /// announces' bound; none when that bound is zero. The wait for the
-    /// connections has its own bound, so a run slow to end still leaves the
-    /// announces theirs whole. `running` is held until they end.
-    fn send_stopped(self: &Arc<Self>, trackers: Vec<SupportedTracker>, running: RunningGuard) {
+    /// Sends `stopped` to `trackers`, over the legs of each that accepted
+    /// `started`, with the counters as they are once the run's connections
+    /// closed, each recorded in the table as any announce is, within the
+    /// stopped announces' bound; none when that bound is zero. The wait for
+    /// the connections has its own bound, so a run slow to end still leaves
+    /// the announces theirs whole. `running` is held until they end.
+    fn send_stopped(self: &Arc<Self>, trackers: StartedTrackers, running: RunningGuard) {
         let timeout = self.stopped.timeout();
         if timeout.is_zero() || trackers.is_empty() {
             return;
@@ -2148,8 +2344,8 @@ impl TrackerComms {
                         comms.stats.get()
                     }
                 };
-                let announces = trackers.into_iter().map(|tracker| {
-                    comms.announce_recorded(tracker, Some(TrackerRequestEvent::Stopped), stats)
+                let announces = trackers.into_iter().map(|(tracker, started)| {
+                    comms.announce_recorded(tracker, Events::stopped(started), stats)
                 });
                 if tokio::time::timeout(timeout, futures::future::join_all(announces))
                     .await
@@ -2173,7 +2369,7 @@ impl TrackerComms {
                 let Some(row) = announces.iter_mut().find(|a| a.url == url) else {
                     continue;
                 };
-                let asked = entry.start_sent || entry.fails > 0;
+                let asked = entry.start_sent.any() || entry.fails > 0;
                 let next = (list.announcing && asked)
                     .then(|| wall(entry.next_announce.max(entry.min_announce), now, at));
                 if (row.fails, row.next_announce) != (entry.fails, next) {
@@ -2219,10 +2415,10 @@ impl TrackerComms {
             let stats = self.stats.get();
             let current = *port.borrow_and_update();
             let due = self.list.lock().start_due(Instant::now(), current, &stats);
-            for (tracker, event) in due {
+            for (tracker, events) in due {
                 let (announce, abort) = futures::future::abortable(self.announce_recorded(
                     tracker.clone(),
-                    event,
+                    events,
                     stats,
                 ));
                 aborts.insert(tracker, abort);
@@ -2266,11 +2462,11 @@ impl TrackerComms {
     async fn announce_recorded(
         &self,
         tracker: SupportedTracker,
-        event: Option<TrackerRequestEvent>,
+        events: Events,
         stats: TrackerCommsStats,
     ) -> (SupportedTracker, Vec<SocketAddr>) {
         let in_flight = self.status.begin(&tracker);
-        let result = self.announce(&tracker, event, &stats).await;
+        let result = self.announce(&tracker, events, &stats).await;
         let (now, at) = (Instant::now(), SystemTime::now());
         let (result, peers) = match result {
             Ok(announced) => {
@@ -2281,7 +2477,8 @@ impl TrackerComms {
                 );
                 debug!(
                     ?tracker,
-                    ?event,
+                    ?events,
+                    accepted = ?announced.accepted,
                     peers = announced.peers.len(),
                     peers6 = announced.peers.iter().filter(|p| p.is_ipv6()).count(),
                     seeders = ?announced.seeders,
@@ -2293,7 +2490,9 @@ impl TrackerComms {
                     ?delay,
                     "tracker answered"
                 );
-                self.list.lock().on_success(&tracker, event, now, &delay);
+                self.list
+                    .lock()
+                    .on_success(&tracker, announced.accepted, now, &delay);
                 if let Some((ours, by)) = announced.seen_as {
                     (self.vote)(ours, by);
                 }
@@ -2323,21 +2522,21 @@ impl TrackerComms {
     async fn announce(
         &self,
         tracker: &SupportedTracker,
-        event: Option<TrackerRequestEvent>,
+        events: Events,
         stats: &TrackerCommsStats,
     ) -> anyhow::Result<Announced> {
         // An HTTP announce waits for its turn first, outside its time limit.
         let _turn = match tracker.udp {
             true => None,
-            false => Some(self.http_announces.take(event.is_some()).await),
+            false => Some(self.http_announces.take(events.any()).await),
         };
         within_completion_timeout(async {
             if tracker.udp {
-                self.announce_udp(tracker, event, stats)
+                self.announce_udp(tracker, events, stats)
                     .instrument(trace_span!("udp_tracker", ?tracker))
                     .await
             } else {
-                self.announce_http(tracker, event, stats)
+                self.announce_http(tracker, events, stats)
                     .instrument(trace_span!("http_tracker", ?tracker))
                     .await
             }
@@ -2347,20 +2546,23 @@ impl TrackerComms {
     }
 
     /// The corrupt and redundant bytes counted since `tracker` last heard
-    /// `started`; an announce that is `started` begins the count again. A
-    /// tracker that heard no `started` from this run hears none counted.
+    /// `started` over `leg`; an announce that is `started` begins the count
+    /// again. A leg that heard no `started` from this run hears none
+    /// counted.
     fn since_started(
         &self,
         tracker: &Url,
+        leg: Leg,
         event: Option<TrackerRequestEvent>,
         stats: &TrackerCommsStats,
     ) -> (u64, u64) {
         let now = (stats.corrupt_bytes, stats.redundant_bytes);
         let mut started_at = self.started_at.lock();
+        let key = (tracker.clone(), leg);
         if event == Some(TrackerRequestEvent::Started) {
-            started_at.insert(tracker.clone(), now);
+            started_at.insert(key.clone(), now);
         }
-        let (corrupt, redundant) = started_at.get(tracker).copied().unwrap_or(now);
+        let (corrupt, redundant) = started_at.get(&key).copied().unwrap_or(now);
         (
             now.0.saturating_sub(corrupt),
             now.1.saturating_sub(redundant),
@@ -2370,12 +2572,11 @@ impl TrackerComms {
     async fn announce_http(
         &self,
         tracker: &SupportedTracker,
-        event: Option<TrackerRequestEvent>,
+        events: Events,
         stats: &TrackerCommsStats,
     ) -> anyhow::Result<Announced> {
         let tracker_url = &tracker.url;
         let trackerid = self.identity.tracker_ids.get(tracker_url);
-        let (corrupt, redundant) = self.since_started(tracker_url, event, stats);
         let routes = self.http_routes(tracker_url).await;
         // libtorrent lists a private torrent's own public addresses, those
         // its announces leave from; through a proxy it knows none.
@@ -2384,7 +2585,17 @@ impl TrackerComms {
             .filter_map(|(_, from)| *from)
             .filter(|ip| stats.private && is_public(*ip))
             .collect();
-        // The port is set for each route below.
+        // Each route is a leg, with the event of its own; one the events
+        // pass over is not announced over.
+        let legs: Vec<(Option<Family>, Leg, Option<TrackerRequestEvent>)> = routes
+            .iter()
+            .filter_map(|(family, _)| {
+                let leg = Leg::of_route(*family);
+                Some((*family, leg, events.over(leg)?))
+            })
+            .collect();
+        // The port, event and counts since `started` are set for each leg
+        // below.
         let mut request = tracker_comms_http::TrackerRequest {
             info_hash: &self.info_hash,
             peer_id: &self.identity.peer_id,
@@ -2392,12 +2603,12 @@ impl TrackerComms {
             uploaded: stats.uploaded_bytes,
             downloaded: stats.downloaded_bytes,
             left: stats.announced_left(),
-            corrupt,
-            redundant,
+            corrupt: 0,
+            redundant: 0,
             compact: true,
             no_peer_id: false,
-            event,
-            numwant: numwant(event),
+            event: None,
+            numwant: 0,
             key: Some(self.identity.tracker_key),
             trackerid: trackerid.as_deref(),
             encryption: stats.encryption,
@@ -2407,17 +2618,21 @@ impl TrackerComms {
         // libtorrent's listen sockets announces its own; one held to no
         // family carries the IPv4 one, libtorrent's first listen socket's.
         let ports = *self.announce_port.borrow();
-        let mut queries = Vec::with_capacity(routes.len());
-        for (family, _) in &routes {
+        let mut queries = Vec::with_capacity(legs.len());
+        for (family, leg, event) in &legs {
             request.port =
                 announced_port(ports.of(*family == Some(Family::V6)), self.identity.shape);
+            request.event = *event;
+            request.numwant = numwant(*event);
+            (request.corrupt, request.redundant) =
+                self.since_started(tracker_url, *leg, *event, stats);
             queries.push(request.as_querystring(self.identity.shape));
         }
 
-        // One announce per route, at once; the peers of every answer are
+        // One announce per leg, at once; the peers of every answer are
         // kept, the rest of the first, as UDP's two families are.
         let answers =
-            futures::future::join_all(routes.iter().zip(&queries).map(|((family, _), query)| {
+            futures::future::join_all(legs.iter().zip(&queries).map(|((family, _, _), query)| {
                 tracker_comms_http::get(
                     &*self.http_clients,
                     self.udp_client.resolver(),
@@ -2432,23 +2647,11 @@ impl TrackerComms {
                 )
             }))
             .await;
-        let (mut announced, mut error) = (None::<Announced>, None);
-        for answer in answers {
-            match answer.and_then(|answer| self.read_http_announce(tracker_url, &answer)) {
-                Ok(more) => match &mut announced {
-                    Some(announced) => announced.peers.extend(more.peers),
-                    None => announced = Some(more),
-                },
-                Err(e) => {
-                    error.get_or_insert(e);
-                }
-            }
-        }
-        match (announced, error) {
-            (Some(announced), _) => Ok(announced),
-            (None, Some(error)) => Err(error),
-            (None, None) => anyhow::bail!("the tracker was not announced to"),
-        }
+        let answers = legs.iter().zip(answers).map(|((_, leg, event), answer)| {
+            let answer = answer.and_then(|answer| self.read_http_announce(tracker_url, &answer));
+            (*leg, *event, answer)
+        });
+        merged(answers)
     }
 
     /// The announces an HTTP tracker at `url` is sent: one per family the
@@ -2506,13 +2709,14 @@ impl TrackerComms {
                 .map(|m| String::from_utf8_lossy(m.as_ref()).into_owned()),
             seen_as: response.external_ip().zip(answer.from),
             body_len: Some(answer.body.len()),
+            accepted: Accepted::default(),
         })
     }
 
     async fn announce_udp(
         &self,
         tracker: &SupportedTracker,
-        event: Option<TrackerRequestEvent>,
+        events: Events,
         stats: &TrackerCommsStats,
     ) -> anyhow::Result<Announced> {
         let url = &tracker.url;
@@ -2530,29 +2734,29 @@ impl TrackerComms {
         .instrument(trace_span!("resolve", ?host))
         .await?;
 
-        match addrs {
-            UdpTrackerResolveResult::One(addr) => {
-                self.announce_udp_addr(addr, url, event, stats)
-                    .instrument(trace_span!("udp request", ?addr))
-                    .await
-            }
-            UdpTrackerResolveResult::Two(v4, v6) => {
-                let (r4, r6) = tokio::join!(
-                    self.announce_udp_addr(v4.into(), url, event, stats)
-                        .instrument(trace_span!("udp request", addr=?v4)),
-                    self.announce_udp_addr(v6.into(), url, event, stats)
-                        .instrument(trace_span!("udp request", addr=?v6))
-                );
-                match (r4, r6) {
-                    (Ok(mut a4), Ok(a6)) => {
-                        a4.peers.extend(a6.peers);
-                        Ok(a4)
-                    }
-                    (Ok(a), Err(_)) | (Err(_), Ok(a)) => Ok(a),
-                    (Err(e), Err(_)) => Err(e),
-                }
-            }
-        }
+        let addrs: Vec<SocketAddr> = match addrs {
+            UdpTrackerResolveResult::One(addr) => vec![addr],
+            UdpTrackerResolveResult::Two(v4, v6) => vec![v4.into(), v6.into()],
+        };
+        // Each address is a leg, with the event of its own, all at once;
+        // one the events pass over is not announced over.
+        let legs: Vec<(SocketAddr, Leg, Option<TrackerRequestEvent>)> = addrs
+            .into_iter()
+            .filter_map(|addr| {
+                let leg = Leg::of_addr(addr);
+                Some((addr, leg, events.over(leg)?))
+            })
+            .collect();
+        let answers = futures::future::join_all(legs.iter().map(|(addr, _, event)| {
+            self.announce_udp_addr(*addr, url, *event, stats)
+                .instrument(trace_span!("udp request", ?addr))
+        }))
+        .await;
+        merged(
+            legs.iter()
+                .zip(answers)
+                .map(|((_, leg, event), answer)| (*leg, *event, answer)),
+        )
     }
 
     async fn announce_udp_addr(
@@ -2597,6 +2801,7 @@ impl TrackerComms {
                     // A UDP answer (BEP 15) names no address of ours.
                     seen_as: None,
                     body_len: None,
+                    accepted: Accepted::default(),
                 })
             }
             Err(e) => {
@@ -2877,6 +3082,37 @@ mod tests {
     const STARTED: Option<TrackerRequestEvent> = Some(TrackerRequestEvent::Started);
     const COMPLETED: Option<TrackerRequestEvent> = Some(TrackerRequestEvent::Completed);
 
+    /// The leg the list's own tests announce over.
+    const LEG: super::Leg = super::Leg::V4;
+
+    /// The announces due, each with its event over [`LEG`].
+    fn due(
+        list: &mut TrackerList,
+        now: Instant,
+        port: ToldPorts,
+        stats: &TrackerCommsStats,
+    ) -> Vec<(SupportedTracker, Option<TrackerRequestEvent>)> {
+        list.start_due(now, port, stats)
+            .into_iter()
+            .map(|(tracker, events)| (tracker, events.over(LEG).flatten()))
+            .collect()
+    }
+
+    /// A tracker accepted `event` over [`LEG`].
+    fn answered(event: Option<TrackerRequestEvent>) -> super::Accepted {
+        let mut accepted = super::Accepted::default();
+        accepted.take(LEG, event);
+        accepted
+    }
+
+    /// The trackers the run's end sends `stopped`.
+    fn stopping(list: &mut TrackerList) -> Vec<SupportedTracker> {
+        list.stop()
+            .into_iter()
+            .map(|(tracker, _)| tracker)
+            .collect()
+    }
+
     // Past the limit an announce waits; a turn given back goes to the
     // announces with an event first, each kind in the order it came.
     #[tokio::test]
@@ -3019,15 +3255,20 @@ mod tests {
                 (MAX_INTERVAL, MAX_INTERVAL)
             );
             let mut list = list(&[&["a"]], t0);
-            list.start_due(t0, ToldPorts::default(), &live(0, 90, false));
+            due(&mut list, t0, ToldPorts::default(), &live(0, 90, false));
             let delay = ReannounceDelay::new(response.interval, response.min_interval, None);
-            list.on_success(&http("a"), STARTED, t0, &delay);
+            list.on_success(&http("a"), answered(STARTED), t0, &delay);
             assert_eq!(list.next_due(), Some(t0 + MAX_INTERVAL));
 
             let refusal = format!("d14:failure reason4:nope8:intervali{secs}ee").into_bytes();
             let retry = Refused::retry_interval(&read_answer(&refusal).unwrap_err());
             assert_eq!(retry, MAX_INTERVAL);
-            list.start_due(t0 + MAX_INTERVAL, ToldPorts::default(), &live(0, 90, false));
+            due(
+                &mut list,
+                t0 + MAX_INTERVAL,
+                ToldPorts::default(),
+                &live(0, 90, false),
+            );
             list.on_failure(&http("a"), t0 + MAX_INTERVAL, retry);
             assert_eq!(list.next_due(), Some(t0 + MAX_INTERVAL + MAX_INTERVAL));
         }
@@ -3059,17 +3300,17 @@ mod tests {
         // The first tracker of each tier is announced to, and nothing more
         // while they wait for their answers.
         assert_eq!(
-            list.start_due(t0, ToldPorts::default(), &stats),
+            due(&mut list, t0, ToldPorts::default(), &stats),
             [(http("a"), STARTED), (http("c"), STARTED)]
         );
-        assert_eq!(list.start_due(t0, ToldPorts::default(), &stats), []);
+        assert_eq!(due(&mut list, t0, ToldPorts::default(), &stats), []);
         assert_eq!(list.next_due(), None);
 
         // a fails: it backs off to the end of its tier, b is tried at once.
         list.on_failure(&http("a"), t0, Duration::ZERO);
         assert_eq!(order(&list), [http("b"), http("a"), http("c")]);
         assert_eq!(
-            list.start_due(t0, ToldPorts::default(), &stats),
+            due(&mut list, t0, ToldPorts::default(), &stats),
             [(http("b"), STARTED)]
         );
 
@@ -3077,34 +3318,34 @@ mod tests {
         // up; c, answering, is not asked again.
         list.on_failure(&http("b"), t0, Duration::ZERO);
         assert_eq!(order(&list), [http("a"), http("b"), http("c")]);
-        assert_eq!(list.start_due(t0, ToldPorts::default(), &stats), []);
-        list.on_success(&http("c"), STARTED, t0, &ANSWERED);
-        assert_eq!(list.start_due(t0, ToldPorts::default(), &stats), []);
+        assert_eq!(due(&mut list, t0, ToldPorts::default(), &stats), []);
+        list.on_success(&http("c"), answered(STARTED), t0, &ANSWERED);
+        assert_eq!(due(&mut list, t0, ToldPorts::default(), &stats), []);
 
         // The failing trackers come due after their back-off; c, which
         // works, is not due yet.
         assert_eq!(list.next_due(), Some(t0 + s(17)));
         let t1 = t0 + s(17);
         assert_eq!(
-            list.start_due(t1, ToldPorts::default(), &stats),
+            due(&mut list, t1, ToldPorts::default(), &stats),
             [(http("a"), STARTED), (http("b"), STARTED)]
         );
 
         // a answers and b fails again, backing off longer. a works and comes
         // first in its tier, so b is not announced to while it keeps
         // working; c, in its own tier, keeps its own interval.
-        list.on_success(&http("a"), STARTED, t1, &ANSWERED);
+        list.on_success(&http("a"), answered(STARTED), t1, &ANSWERED);
         list.on_failure(&http("b"), t1, Duration::ZERO);
         assert_eq!(list.entries[1].next_announce, t1 + s(55));
         assert_eq!(list.next_due(), Some(t0 + s(1800)));
         assert_eq!(
-            list.start_due(t0 + s(1800), ToldPorts::default(), &stats),
+            due(&mut list, t0 + s(1800), ToldPorts::default(), &stats),
             [(http("c"), None)]
         );
-        list.on_success(&http("c"), None, t0 + s(1800), &ANSWERED);
+        list.on_success(&http("c"), answered(None), t0 + s(1800), &ANSWERED);
         assert_eq!(list.next_due(), Some(t1 + s(1800)));
         assert_eq!(
-            list.start_due(t1 + s(1800), ToldPorts::default(), &stats),
+            due(&mut list, t1 + s(1800), ToldPorts::default(), &stats),
             [(http("a"), None)]
         );
     }
@@ -3117,42 +3358,42 @@ mod tests {
         let t0 = Instant::now();
         let mut list = list(&[&["a", "b"], &["c"]], t0);
         assert_eq!(
-            list.start_due(t0, ToldPorts::default(), &live(0, 90, false)),
+            due(&mut list, t0, ToldPorts::default(), &live(0, 90, false)),
             [(http("a"), STARTED), (http("c"), STARTED)]
         );
         let delay = ReannounceDelay {
             floor: s(900),
             regular: s(1800),
         };
-        list.on_success(&http("a"), STARTED, t0, &delay);
-        list.on_success(&http("c"), STARTED, t0, &delay);
+        list.on_success(&http("a"), answered(STARTED), t0, &delay);
+        list.on_success(&http("c"), answered(STARTED), t0, &delay);
 
         // The torrent becomes a seed: a and c are due at once, inside their
         // min interval, with `completed`.
         let seed = live(90, 0, true);
         let t1 = t0 + s(10);
-        assert_eq!(list.start_due(t1, ToldPorts::default(), &seed), []);
+        assert_eq!(due(&mut list, t1, ToldPorts::default(), &seed), []);
         list.completed(t1);
         assert_eq!(
-            list.start_due(t1, ToldPorts::default(), &seed),
+            due(&mut list, t1, ToldPorts::default(), &seed),
             [(http("a"), COMPLETED), (http("c"), COMPLETED)]
         );
 
         // a refuses it and backs off, and b, the next in its tier, is asked
         // at once; c accepts it.
         list.on_failure(&http("a"), t1, Duration::ZERO);
-        list.on_success(&http("c"), COMPLETED, t1, &delay);
+        list.on_success(&http("c"), answered(COMPLETED), t1, &delay);
         assert_eq!(
-            list.start_due(t1, ToldPorts::default(), &seed),
+            due(&mut list, t1, ToldPorts::default(), &seed),
             [(http("b"), STARTED)]
         );
-        list.on_success(&http("b"), STARTED, t1, &delay);
+        list.on_success(&http("b"), answered(STARTED), t1, &delay);
 
         // Once a tracker accepted it, no other is sent `completed`: b,
         // working, is the one of its tier announced to.
-        assert_eq!(list.event(&list.entries[0], &seed), None);
+        assert_eq!(list.event(&list.entries[0], &seed).over(LEG), Some(None));
         assert_eq!(
-            list.start_due(t1 + s(1800), ToldPorts::default(), &seed),
+            due(&mut list, t1 + s(1800), ToldPorts::default(), &seed),
             [(http("b"), None), (http("c"), None)]
         );
     }
@@ -3167,28 +3408,33 @@ mod tests {
         };
         // `started` still goes first.
         assert_eq!(
-            list.start_due(t0, ToldPorts::default(), &selection_done),
+            due(&mut list, t0, ToldPorts::default(), &selection_done),
             [(http("a"), STARTED)]
         );
-        list.on_success(&http("a"), STARTED, t0, &ANSWERED);
+        list.on_success(&http("a"), answered(STARTED), t0, &ANSWERED);
         let t1 = t0 + ANSWERED.regular;
         assert_eq!(
-            list.start_due(t1, ToldPorts::default(), &selection_done),
+            due(&mut list, t1, ToldPorts::default(), &selection_done),
             [(http("a"), Some(TrackerRequestEvent::Paused))]
         );
-        list.on_success(&http("a"), Some(TrackerRequestEvent::Paused), t1, &ANSWERED);
+        list.on_success(
+            &http("a"),
+            answered(Some(TrackerRequestEvent::Paused)),
+            t1,
+            &ANSWERED,
+        );
         // A seed whose trackers heard it complete announces without an
         // event, and one still fetching too.
         list.completion.sent();
         let t2 = t1 + ANSWERED.regular;
         assert_eq!(
-            list.start_due(t2, ToldPorts::default(), &live(0, 0, false)),
+            due(&mut list, t2, ToldPorts::default(), &live(0, 0, false)),
             [(http("a"), None)]
         );
-        list.on_success(&http("a"), None, t2, &ANSWERED);
+        list.on_success(&http("a"), answered(None), t2, &ANSWERED);
         let t3 = t2 + ANSWERED.regular;
         assert_eq!(
-            list.start_due(t3, ToldPorts::default(), &live(0, 30, false)),
+            due(&mut list, t3, ToldPorts::default(), &live(0, 30, false)),
             [(http("a"), None)]
         );
     }
@@ -3212,19 +3458,19 @@ mod tests {
         };
         let paused = Some(TrackerRequestEvent::Paused);
         assert_eq!(
-            list.start_due(t0, ToldPorts::default(), &selection_done),
+            due(&mut list, t0, ToldPorts::default(), &selection_done),
             [(http("a"), paused)]
         );
-        list.on_success(&http("a"), paused, t0, &ANSWERED);
+        list.on_success(&http("a"), answered(paused), t0, &ANSWERED);
         let t1 = t0 + ANSWERED.regular;
         assert_eq!(
-            list.start_due(t1, ToldPorts::default(), &selection_done),
+            due(&mut list, t1, ToldPorts::default(), &selection_done),
             [(http("a"), paused)]
         );
-        list.on_success(&http("a"), paused, t1, &ANSWERED);
+        list.on_success(&http("a"), answered(paused), t1, &ANSWERED);
         let t2 = t1 + ANSWERED.regular;
         assert_eq!(
-            list.start_due(t2, ToldPorts::default(), &live(60, 30, false)),
+            due(&mut list, t2, ToldPorts::default(), &live(60, 30, false)),
             [(http("a"), STARTED)]
         );
     }
@@ -3252,13 +3498,13 @@ mod tests {
         let seeding = live(0, 0, false);
         assert!(!may_complete(&seeding));
         assert_eq!(
-            list.start_due(t0, ToldPorts::default(), &seeding),
+            due(&mut list, t0, ToldPorts::default(), &seeding),
             [(http("a"), STARTED)]
         );
-        list.on_success(&http("a"), STARTED, t0, &ANSWERED);
+        list.on_success(&http("a"), answered(STARTED), t0, &ANSWERED);
         let t1 = t0 + ANSWERED.regular;
         assert_eq!(
-            list.start_due(t1, ToldPorts::default(), &seeding),
+            due(&mut list, t1, ToldPorts::default(), &seeding),
             [(http("a"), None)]
         );
     }
@@ -3288,27 +3534,27 @@ mod tests {
         let t0 = Instant::now();
         let mut list = list(&[&["a", "b"], &["c"]], t0);
         let stats = live(0, 90, false);
-        assert_eq!(list.stop(), []);
+        assert_eq!(stopping(&mut list), []);
 
-        list.start_due(t0, ToldPorts::default(), &stats);
+        due(&mut list, t0, ToldPorts::default(), &stats);
         // Not yet accepted: nothing is owed.
-        assert_eq!(list.stop(), []);
-        list.on_success(&http("a"), STARTED, t0, &ANSWERED);
-        assert_eq!(list.stop(), [http("a")]);
-        list.on_success(&http("c"), STARTED, t0, &ANSWERED);
-        assert_eq!(list.stop(), [http("a"), http("c")]);
+        assert_eq!(stopping(&mut list), []);
+        list.on_success(&http("a"), answered(STARTED), t0, &ANSWERED);
+        assert_eq!(stopping(&mut list), [http("a")]);
+        list.on_success(&http("c"), answered(STARTED), t0, &ANSWERED);
+        assert_eq!(stopping(&mut list), [http("a"), http("c")]);
 
         // a fails and b takes over: until b accepts `started`, a, failing,
         // is still owed `stopped`.
         list.on_failure(&http("a"), t0, Duration::ZERO);
         assert_eq!(
-            list.start_due(t0, ToldPorts::default(), &stats),
+            due(&mut list, t0, ToldPorts::default(), &stats),
             [(http("b"), STARTED)]
         );
-        assert_eq!(list.stop(), [http("a"), http("c")]);
+        assert_eq!(stopping(&mut list), [http("a"), http("c")]);
         // Then b, the tracker in use in its tier, is.
-        list.on_success(&http("b"), STARTED, t0, &ANSWERED);
-        assert_eq!(list.stop(), [http("b"), http("c")]);
+        list.on_success(&http("b"), answered(STARTED), t0, &ANSWERED);
+        assert_eq!(stopping(&mut list), [http("b"), http("c")]);
     }
 
     #[test]
@@ -3319,18 +3565,18 @@ mod tests {
         let t0 = Instant::now();
         let mut list = list(&[&["a", "b"], &["c"]], t0);
         let stats = live(0, 90, false);
-        list.start_due(t0, ToldPorts::default(), &stats);
-        list.on_success(&http("a"), STARTED, t0, &ANSWERED);
-        list.on_success(&http("c"), STARTED, t0, &ANSWERED);
+        due(&mut list, t0, ToldPorts::default(), &stats);
+        list.on_success(&http("a"), answered(STARTED), t0, &ANSWERED);
+        list.on_success(&http("c"), answered(STARTED), t0, &ANSWERED);
         list.force(t0, None, true);
         let t1 = t0 + Duration::from_secs(1);
         assert_eq!(
-            list.start_due(t1, ToldPorts::default(), &stats),
+            due(&mut list, t1, ToldPorts::default(), &stats),
             [(http("a"), None), (http("c"), None)]
         );
         // c answers, a does not: only c hears `stopped`.
-        list.on_success(&http("c"), None, t1, &ANSWERED);
-        assert_eq!(list.stop(), [http("c")]);
+        list.on_success(&http("c"), answered(None), t1, &ANSWERED);
+        assert_eq!(stopping(&mut list), [http("c")]);
     }
 
     #[test]
@@ -6062,7 +6308,7 @@ mod tests {
         list: &mut TrackerList,
         tiers: &[Vec<SupportedTracker>],
         now: Instant,
-    ) -> Vec<SupportedTracker> {
+    ) -> Vec<(SupportedTracker, super::Legs)> {
         let mut old = std::mem::take(&mut list.entries);
         for (tier, trackers) in tiers.iter().enumerate() {
             for tracker in trackers {
@@ -6084,8 +6330,8 @@ mod tests {
         list.forced
             .retain(|t| entries.iter().any(|e| &e.tracker == t));
         old.into_iter()
-            .filter(|e| e.start_sent)
-            .map(|e| e.tracker)
+            .filter(|e| e.start_sent.any())
+            .map(|e| (e.tracker, e.start_sent))
             .collect()
     }
 
@@ -6093,7 +6339,7 @@ mod tests {
         list: &mut TrackerList,
         now: Instant,
         stats: &TrackerCommsStats,
-    ) -> Vec<(SupportedTracker, Option<TrackerRequestEvent>)> {
+    ) -> Vec<(SupportedTracker, super::Events)> {
         let seed = stats.completed_during_run || list.owes_completed(stats);
         let port = ToldPorts::default();
         let forced = std::mem::take(&mut list.forced)
@@ -6192,8 +6438,8 @@ mod tests {
                         );
                     }
                     2 => {
-                        sets.on_success(&tracker, STARTED, now, &ANSWERED);
-                        walked.on_success(&tracker, STARTED, now, &ANSWERED);
+                        sets.on_success(&tracker, answered(STARTED), now, &ANSWERED);
+                        walked.on_success(&tracker, answered(STARTED), now, &ANSWERED);
                     }
                     3 => {
                         sets.on_failure(&tracker, now, Duration::from_secs(5));
@@ -6226,10 +6472,10 @@ mod tests {
         let mut list = list(&[&["a", "b"]], t0);
         let stats = live(0, 90, false);
         assert_eq!(
-            list.start_due(t0, ToldPorts::default(), &stats),
+            due(&mut list, t0, ToldPorts::default(), &stats),
             [(http("a"), STARTED)]
         );
-        list.on_success(&http("a"), STARTED, t0, &ANSWERED);
+        list.on_success(&http("a"), answered(STARTED), t0, &ANSWERED);
 
         list.replace(
             &[vec![http("c"), http("a")], vec![http("a"), http("d")]],
@@ -6243,10 +6489,10 @@ mod tests {
         // a is not sent `started` again nor brought forward; c and d, new,
         // are due, each the first of its tier.
         let a = &list.entries[1];
-        assert!(a.start_sent);
+        assert!(a.start_sent.has(LEG));
         assert_eq!(a.next_announce, t0 + ANSWERED.regular);
         assert_eq!(
-            list.start_due(t0 + s(10), ToldPorts::default(), &stats),
+            due(&mut list, t0 + s(10), ToldPorts::default(), &stats),
             [(http("c"), STARTED), (http("d"), STARTED)]
         );
     }
@@ -6257,14 +6503,14 @@ mod tests {
         let mut list = list(&[&["a", "b"], &["c"]], t0);
         let stats = live(0, 90, false);
         assert_eq!(
-            list.start_due(t0, ToldPorts::default(), &stats),
+            due(&mut list, t0, ToldPorts::default(), &stats),
             [(http("a"), STARTED), (http("c"), STARTED)]
         );
-        list.on_success(&http("a"), STARTED, t0, &ANSWERED);
+        list.on_success(&http("a"), answered(STARTED), t0, &ANSWERED);
 
         // a heard `started` and is owed `stopped`; b never heard from us.
         let gone = list.replace(&[vec![http("c")]], t0);
-        assert_eq!(gone, [http("a")]);
+        assert_eq!(gone, [(http("a"), [LEG].into_iter().collect())]);
         assert_eq!(order(&list), [http("c")]);
     }
 
@@ -6276,36 +6522,36 @@ mod tests {
         let mut list = list(&[&["a", "b"]], t0);
         let stats = live(0, 90, false);
         assert_eq!(
-            list.start_due(t0, ToldPorts::default(), &stats),
+            due(&mut list, t0, ToldPorts::default(), &stats),
             [(http("a"), STARTED)]
         );
         let delay = ReannounceDelay {
             floor: s(900),
             regular: s(1800),
         };
-        list.on_success(&http("a"), STARTED, t0, &delay);
+        list.on_success(&http("a"), answered(STARTED), t0, &delay);
 
         // Within a's min interval, a force that respects it waits for it.
         let t1 = t0 + s(60);
         assert!(list.force(t1, None, false));
-        assert_eq!(list.start_due(t1, ToldPorts::default(), &stats), []);
+        assert_eq!(due(&mut list, t1, ToldPorts::default(), &stats), []);
         assert_eq!(list.next_due(), Some(t0 + s(901)));
         // Lifting it, a is due now, and once in flight a second force sends
         // nothing more.
         assert!(list.force(t1, None, true));
         assert_eq!(
-            list.start_due(t1, ToldPorts::default(), &stats),
+            due(&mut list, t1, ToldPorts::default(), &stats),
             [(http("a"), None)]
         );
         assert!(list.force(t1, None, true));
         assert!(list.force(t1, Some(&http("a")), true));
-        assert_eq!(list.start_due(t1, ToldPorts::default(), &stats), []);
+        assert_eq!(due(&mut list, t1, ToldPorts::default(), &stats), []);
 
         // Forced alone, b goes though a works and the walk would stop there.
-        list.on_success(&http("a"), None, t1, &delay);
+        list.on_success(&http("a"), answered(None), t1, &delay);
         assert!(list.force(t1, Some(&http("b")), true));
         assert_eq!(
-            list.start_due(t1, ToldPorts::default(), &stats),
+            due(&mut list, t1, ToldPorts::default(), &stats),
             [(http("b"), STARTED)]
         );
         assert!(!list.force(t1, Some(&http("x")), true));
@@ -6322,7 +6568,7 @@ mod tests {
         let mut list = list(&[&["a"]], t0);
         let stats = live(0, 90, false);
         assert_eq!(
-            list.start_due(t0, ToldPorts::default(), &stats),
+            due(&mut list, t0, ToldPorts::default(), &stats),
             [(http("a"), STARTED)]
         );
         let delay = ReannounceDelay {
@@ -6334,12 +6580,12 @@ mod tests {
         let t1 = t0 + s(5);
         assert!(list.force(t1, None, true));
         assert!(list.force(t1, Some(&http("a")), true));
-        assert_eq!(list.start_due(t1, ToldPorts::default(), &stats), []);
+        assert_eq!(due(&mut list, t1, ToldPorts::default(), &stats), []);
         assert_eq!(list.next_due(), None);
 
         // Answered: due at the answer's interval, the force gone.
-        list.on_success(&http("a"), STARTED, t1, &delay);
-        assert_eq!(list.start_due(t1, ToldPorts::default(), &stats), []);
+        list.on_success(&http("a"), answered(STARTED), t1, &delay);
+        assert_eq!(due(&mut list, t1, ToldPorts::default(), &stats), []);
         assert_eq!(list.next_due(), Some(t1 + s(1800)));
     }
 
@@ -6584,30 +6830,30 @@ mod tests {
         let mut list = list(&[&["a"]], t0);
         let stats = live(0, 90, false);
         assert_eq!(
-            list.start_due(t0, ToldPorts::default(), &stats),
+            due(&mut list, t0, ToldPorts::default(), &stats),
             [(http("a"), STARTED)]
         );
-        list.on_success(&http("a"), STARTED, t0, &ANSWERED);
+        list.on_success(&http("a"), answered(STARTED), t0, &ANSWERED);
         assert_eq!(list.next_due(), Some(t0 + s(1800)));
 
         let t1 = t0 + s(60);
         list.replace(&[vec![http("a")], vec![http("b")]], t1);
         assert_eq!(list.next_due(), Some(t1));
         assert_eq!(
-            list.start_due(t1, ToldPorts::default(), &stats),
+            due(&mut list, t1, ToldPorts::default(), &stats),
             [(http("b"), STARTED)]
         );
-        list.on_success(&http("b"), STARTED, t1, &ANSWERED);
+        list.on_success(&http("b"), answered(STARTED), t1, &ANSWERED);
 
         assert_eq!(list.next_due(), Some(t0 + s(1800)));
         assert_eq!(
-            list.start_due(t0 + s(1800), ToldPorts::default(), &stats),
+            due(&mut list, t0 + s(1800), ToldPorts::default(), &stats),
             [(http("a"), None)]
         );
-        list.on_success(&http("a"), None, t0 + s(1800), &ANSWERED);
+        list.on_success(&http("a"), answered(None), t0 + s(1800), &ANSWERED);
         assert_eq!(list.next_due(), Some(t1 + s(1800)));
         assert_eq!(
-            list.start_due(t1 + s(1800), ToldPorts::default(), &stats),
+            due(&mut list, t1 + s(1800), ToldPorts::default(), &stats),
             [(http("b"), None)]
         );
     }
