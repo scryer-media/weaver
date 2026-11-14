@@ -113,14 +113,20 @@ pub fn claim_named_working_dir(root: &Path, path: &Path, job_id: JobId) -> std::
 }
 
 // The directory under `root` a job names for itself, as a torrent's
-// unpacking does: `name`, unless another job's marker holds it, and then
-// the job's own suffixed name, as a claim falls back to. Asked again, it
-// names the same directory: one marker read, no scan of the root.
+// unpacking does: the one already carrying its marker, the suffixed name
+// first, as a claim falls back to it; else `name`, unless another job's
+// marker holds it, and then the suffixed name. Asked again, it names the
+// same directory while that one is there, whatever became of the other: at
+// most two marker reads, no scan of the root.
 pub(crate) fn own_named_dir(root: &Path, name: &str, job_id: JobId) -> PathBuf {
     let dir_name = sanitize_dirname(name);
+    let suffixed = suffixed_working_dir(root, &dir_name, job_id);
+    if matches!(working_dir_owner(root, &suffixed), Ok(Some(owner)) if owner == job_id) {
+        return suffixed;
+    }
     let plain = root.join(&dir_name);
     match working_dir_owner(root, &plain) {
-        Ok(Some(owner)) if owner != job_id => suffixed_working_dir(root, &dir_name, job_id),
+        Ok(Some(owner)) if owner != job_id => suffixed,
         _ => plain,
     }
 }
@@ -1921,5 +1927,22 @@ mod tests {
             assert!(!torrent_dir.exists());
             assert!(nzb_dir.join("nzb.bin").exists(), "the NZB job's stays");
         }
+    }
+
+    // A torrent's unpacking that took its suffixed folder because an NZB
+    // job held the plain name keeps naming that folder once the NZB job's
+    // is gone: the name is the one its marker is in, never recomputed back.
+    #[test]
+    fn a_torrents_suffixed_unpacking_folder_keeps_its_name_once_the_plain_one_is_free() {
+        let (nzb, torrent) = (JobId(9), JobId(7));
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("intermediate");
+        let nzb_dir = claim_working_dir(&root, nzb, "torrent-7").unwrap().path;
+        let torrent_dir = own_named_dir(&root, "torrent-7", torrent);
+        assert_ne!(torrent_dir, nzb_dir);
+        claim_named_working_dir(&root, &torrent_dir, torrent).unwrap();
+        remove_job_working_dir(&root, &nzb_dir, nzb).unwrap();
+        assert!(!nzb_dir.exists());
+        assert_eq!(own_named_dir(&root, "torrent-7", torrent), torrent_dir);
     }
 }
