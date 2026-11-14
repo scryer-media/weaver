@@ -1546,6 +1546,17 @@ fn sample_incoming() -> weaver_server_core::torrents::metrics::incoming::Incomin
     incoming
 }
 
+fn sample_torrent_network() -> weaver_server_core::torrents::metrics::network::NetworkSnapshot {
+    use weaver_server_core::torrents::metrics::network::{
+        HolepunchEvent, NetworkSnapshot, PortMapResult, PortMapper,
+    };
+
+    let mut network = NetworkSnapshot::default();
+    network.port_maps[PortMapper::Upnp as usize][PortMapResult::Mapped as usize] = 93;
+    network.holepunch[HolepunchEvent::Introduced as usize] = 94;
+    network
+}
+
 fn sample_dht_counts() -> weaver_server_core::torrents::metrics::dht::DhtSnapshot {
     use weaver_server_core::torrents::metrics::dht::{
         DhtIgnored, DhtQuery, DhtQueryEnd, DhtSnapshot,
@@ -1712,6 +1723,16 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
         dht_counts: sample_dht_counts(),
         incoming: sample_incoming(),
         unchoke_slots_held: 87,
+        network: sample_torrent_network(),
+        lsd: Some(weaver_server_core::torrents::metrics::network::LsdSnapshot {
+            sent: 95,
+            received: 96,
+            peers_found: 97,
+        }),
+        limiter: weaver_server_core::torrents::metrics::network::LimiterSnapshot {
+            waits: [98, 99],
+            wait_nanos: [1_500_000_000, 0],
+        },
         web_seeds: weaver_server_core::torrents::metrics::web_seed::WebSeedSnapshot {
             requests: [88, 0, 0, 89, 0, 0],
             bytes: 90,

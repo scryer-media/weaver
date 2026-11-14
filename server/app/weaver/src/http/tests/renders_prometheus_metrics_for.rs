@@ -1284,6 +1284,16 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         format!("weaver_torrent_web_seed_received_bytes_total{{{ROUTE}}} 90"),
         format!("weaver_torrent_web_seed_retry_waits_total{{{ROUTE}}} 91"),
         format!("weaver_torrent_web_seed_connections_failed_total{{{ROUTE}}} 92"),
+        format!(
+            r#"weaver_torrent_port_mapping_reports_total{{{ROUTE},mapper="upnp",result="mapped"}} 93"#
+        ),
+        format!(r#"weaver_torrent_holepunch_events_total{{{ROUTE},event="introduced"}} 94"#),
+        format!("weaver_torrent_lsd_announces_sent_total{{{ROUTE}}} 95"),
+        format!("weaver_torrent_lsd_announces_received_total{{{ROUTE}}} 96"),
+        format!("weaver_torrent_lsd_peers_found_total{{{ROUTE}}} 97"),
+        format!(r#"weaver_torrent_rate_limit_waits_total{{{ROUTE},direction="down"}} 98"#),
+        format!(r#"weaver_torrent_rate_limit_waits_total{{{ROUTE},direction="up"}} 99"#),
+        format!(r#"weaver_torrent_rate_limit_wait_seconds_total{{{ROUTE},direction="down"}} 1.5"#),
         r#"weaver_torrent_lifecycle_events_total{event="added"} 5"#.to_owned(),
         r#"weaver_torrent_lifecycle_events_total{event="completed"} 3"#.to_owned(),
         r#"weaver_torrent_lifecycle_events_total{event="removed"} 1"#.to_owned(),

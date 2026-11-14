@@ -4752,6 +4752,12 @@ async fn a_rendezvous_tells_each_peer_to_connect_to_the_other() {
         holepunch_sent(&mut b_rx),
         [UtHolepunch::Connect(sock("203.0.113.1:6881"))]
     );
+    assert_eq!(holepunches(&h, HolepunchEvent::Introduced), 1);
+}
+
+/// How many holepunch steps of `event` the harness's session has counted.
+fn holepunches(h: &Harness, event: HolepunchEvent) -> u64 {
+    h.live.session_stats.network.snapshot().holepunch[event as usize]
 }
 
 // libtorrent `bt_peer_connection::on_holepunch`, `rendezvous`: not
@@ -4821,6 +4827,8 @@ async fn a_connect_admits_the_peer_only_over_utp_and_a_local_one_only_from_a_loc
     let (from, _rx) = with.holepunch_peer("127.0.0.1:6881", true);
     send_holepunch(&from, UtHolepunch::Connect(target)).await;
     assert!(with.knows(&target.to_string()));
+    assert_eq!(holepunches(&with, HolepunchEvent::ConnectIgnored), 1);
+    assert_eq!(holepunches(&with, HolepunchEvent::Connect), 1);
 }
 
 /// A PEX message naming `addr` with `flags`.

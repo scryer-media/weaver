@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use weaver_torrent::session_stats::dht;
 pub use weaver_torrent::session_stats::incoming;
+pub use weaver_torrent::session_stats::network;
 pub use weaver_torrent::session_stats::snapshot::UtpStatsSnapshot;
 pub use weaver_torrent::session_stats::swarm;
 pub use weaver_torrent::session_stats::tracker;
@@ -416,6 +417,13 @@ pub struct SessionSeries {
     pub unchoke_slots_held: u64,
     /// What it asked of its torrents' web seeds, counted since it opened.
     pub web_seeds: web_seed::WebSeedSnapshot,
+    /// Its port mapping reports and holepunch steps, counted since it
+    /// opened.
+    pub network: network::NetworkSnapshot,
+    /// What its local service discovery has counted, while it runs one.
+    pub lsd: Option<network::LsdSnapshot>,
+    /// What waited on a rate limit, the session's or a torrent's.
+    pub limiter: network::LimiterSnapshot,
     /// What it asked of its trackers, counted since it opened.
     pub trackers: tracker::TrackerSnapshot,
     /// Its connected peers over TCP, then over uTP, and how many of them
@@ -523,6 +531,9 @@ impl SessionSeries {
             trackers: stats.trackers,
             incoming: stats.incoming,
             web_seeds: stats.web_seeds,
+            network: stats.network,
+            lsd: stats.lsd,
+            limiter: stats.limiter,
             unchoke_slots_held: stats.unchoke_slots_held as u64,
             dht_counts: session
                 .get_dht()

@@ -114,6 +114,7 @@ use crate::{
     session::CheckedIncomingConnection,
     session_stats::{
         SessionStats,
+        network::HolepunchEvent,
         swarm::{self, Direction, MessageKind},
     },
     stream_connect::ConnectionKind,
@@ -785,11 +786,12 @@ impl TorrentStateLive {
             .fetch_add(1, Ordering::Relaxed);
         // The session's IP filter, on the address the seed's host resolved to.
         let allowed = |addr| self.may_reach(addr);
-        let session = self.shared.session.upgrade();
-        let allow_idna = session.as_ref().is_some_and(|session| session.allow_idna);
-        let counts = session
-            .map(|session| session.stats.web_seeds.clone())
-            .unwrap_or_default();
+        let allow_idna = self
+            .shared
+            .session
+            .upgrade()
+            .is_some_and(|session| session.allow_idna);
+        let counts = &self.session_stats.web_seeds;
         let connection = WebSeedConnection::new(
             clients,
             resolver,
@@ -3230,6 +3232,7 @@ impl PeerHandler {
                 ?msg,
                 "holepunch message from a peer that did not advertise it, ignoring"
             );
+            self.count_holepunch(HolepunchEvent::Unoffered);
             return;
         }
         match msg {
@@ -3237,10 +3240,14 @@ impl PeerHandler {
             // A local address is taken only from a local peer.
             UtHolepunch::Connect(addr) => {
                 if !is_local(addr.ip()) || is_local(self.addr.ip()) {
+                    self.count_holepunch(HolepunchEvent::Connect);
                     self.state.holepunch(addr);
+                } else {
+                    self.count_holepunch(HolepunchEvent::ConnectIgnored);
                 }
             }
             UtHolepunch::Error(addr, code) => {
+                self.count_holepunch(HolepunchEvent::Failed);
                 debug!(?addr, code, "the peer could not introduce us");
             }
         }
@@ -3251,6 +3258,10 @@ impl PeerHandler {
     /// connect to the other; else the peer is told why not. A local peer and
     /// one that is not are never introduced (libtorrent
     /// `bt_peer_connection::on_holepunch`, `rendezvous`).
+    fn count_holepunch(&self, event: HolepunchEvent) {
+        self.state.session_stats.network.holepunch(event);
+    }
+
     fn on_rendezvous(&self, target: SocketAddr) {
         let send = |tx: &PeerTx, msg: UtHolepunch| {
             let _ = tx.send(WriterRequest::Message(Message::Extended(
@@ -3268,14 +3279,17 @@ impl PeerHandler {
             Some(_) => None,
         };
         if let Some(code) = refused {
+            self.count_holepunch(HolepunchEvent::Refused);
             send(&self.tx, UtHolepunch::Error(target, code));
             return;
         }
         if is_local(target.ip()) != is_local(self.addr.ip()) {
+            self.count_holepunch(HolepunchEvent::Refused);
             debug!(?target, "not introducing a local peer to one that is not");
             return;
         }
         if let Some((_, target_tx)) = found {
+            self.count_holepunch(HolepunchEvent::Introduced);
             send(&self.tx, UtHolepunch::Connect(target));
             send(&target_tx, UtHolepunch::Connect(self.addr));
         }
@@ -3406,6 +3420,7 @@ impl PeerHandler {
         // once a tracker answered.
         peers.untracked_closed(handle);
         if rendezvous && let Some(introducer) = peers.introducer(handle) {
+            self.count_holepunch(HolepunchEvent::Asked);
             let _ = introducer.send(WriterRequest::Message(Message::Extended(
                 ExtendedMessage::UtHolepunch(UtHolepunch::Rendezvous(handle)),
             )));

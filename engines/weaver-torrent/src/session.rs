@@ -549,7 +549,7 @@ pub struct Session {
 
     /// Local discovery, unless disabled; it may not have joined its groups
     /// yet (see [`Session::rejoin_local_discovery`]).
-    lsd: Option<LocalServiceDiscovery>,
+    pub(crate) lsd: Option<LocalServiceDiscovery>,
 
     // Limits and throttling
     pub(crate) concurrent_initialize_semaphore: Arc<tokio::sync::Semaphore>,
@@ -2673,8 +2673,10 @@ impl Session {
         let announce_port = self.announce_port.clone();
         let ssl_port = self.ssl_port.clone();
         let external_ips = self.external_ips.clone();
+        let stats = self.stats.clone();
         self.spawn_port_mapper("port_mapping", async move {
             while let Some(event) = events.recv().await {
+                stats.network.port_mapped(&event);
                 match &event.error {
                     None => info!(?event, "port mapping"),
                     Some(error) => {
@@ -2699,8 +2701,10 @@ impl Session {
     /// announced from it and no external address counted: the mappings of
     /// an IPv6 address the session does not announce.
     fn pass_on_port_mappings(&self, mut events: PortMapReceiver, forward: Option<PortMapEvents>) {
+        let stats = self.stats.clone();
         self.spawn_port_mapper("port_mapping_unannounced", async move {
             while let Some(event) = events.recv().await {
+                stats.network.port_mapped(&event);
                 match &event.error {
                     None => info!(?event, "port mapping, not announced"),
                     Some(error) => {
@@ -5288,6 +5292,12 @@ mod tests {
             .wait_for(|announced| announced.v6 == Some(50002))
             .await
             .unwrap();
+        // The report that moved the port was counted once, as a mapping made.
+        use crate::session_stats::network::PortMapResult;
+        let reports = session.stats.network.snapshot().port_maps;
+        let mapped = |by: &[u64; PortMapResult::COUNT]| by[PortMapResult::Mapped as usize];
+        assert_eq!(reports.iter().map(mapped).sum::<u64>(), 1);
+        assert_eq!(reports.as_flattened().iter().sum::<u64>(), 1);
         assert_eq!(session.announce_ports().v4, Some(port));
         assert_eq!(session.external_port_of(false, true), Some(50002));
         assert_eq!(session.external_port_of(false, false), Some(port));

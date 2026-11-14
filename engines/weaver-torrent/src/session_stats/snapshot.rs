@@ -30,6 +30,10 @@ pub struct SessionStatsSnapshot {
     pub trackers: super::tracker::TrackerSnapshot,
     pub incoming: super::incoming::IncomingSnapshot,
     pub web_seeds: super::web_seed::WebSeedSnapshot,
+    pub network: super::network::NetworkSnapshot,
+    /// `None` while the session runs no local service discovery.
+    pub lsd: Option<super::network::LsdSnapshot>,
+    pub limiter: super::network::LimiterSnapshot,
     /// Upload slots held by unchoked peers now.
     pub unchoke_slots_held: usize,
 }
@@ -48,6 +52,9 @@ impl From<(&SessionStats, ConnectStatsSnapshot)> for SessionStatsSnapshot {
             trackers: s.trackers.snapshot(),
             incoming: s.incoming.snapshot(),
             web_seeds: s.web_seeds.snapshot(),
+            network: s.network.snapshot(),
+            lsd: None,
+            limiter: Default::default(),
             unchoke_slots_held: 0,
         }
     }

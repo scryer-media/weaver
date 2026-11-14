@@ -2,7 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // What each open torrent session asked of the services it finds peers
-// through, and what became of the connections peers opened to it.
+// through, what became of the connections peers opened to it, and what
+// held it back.
 //
 // Every figure is a count the session keeps and the torrent service read
 // when it last published: rendering reads the published copy, and does the
@@ -12,6 +13,7 @@
 use weaver_server_core::torrents::metrics::SessionSeries;
 use weaver_server_core::torrents::metrics::dht::{DhtIgnored, DhtQuery, DhtQueryEnd};
 use weaver_server_core::torrents::metrics::incoming::IncomingEnd;
+use weaver_server_core::torrents::metrics::network::{HolepunchEvent, PortMapResult, PortMapper};
 use weaver_server_core::torrents::metrics::swarm::Transport;
 use weaver_server_core::torrents::metrics::tracker::{AnnounceEvent, TrackerKind, TrackerResult};
 use weaver_server_core::torrents::metrics::web_seed::WebSeedResult;
@@ -89,6 +91,68 @@ pub(super) fn render(out: &mut Encoder, routes: &[SessionSeries]) {
     dht(out, routes);
     incoming(out, routes);
     web_seeds(out, routes);
+    network(out, routes);
+}
+
+fn network(out: &mut Encoder, routes: &[SessionSeries]) {
+    let open = || routes.iter().filter(|session| session.open);
+    for session in open() {
+        for mapper in PortMapper::ALL {
+            for result in PortMapResult::ALL {
+                out.sample(
+                    &f::TORRENT_PORT_MAPPING_REPORTS,
+                    &[
+                        ("route", session.route.as_str()),
+                        ("mapper", mapper.as_str()),
+                        ("result", result.as_str()),
+                    ],
+                    session.network.port_maps[*mapper as usize][*result as usize],
+                );
+            }
+        }
+    }
+    for session in open() {
+        for event in HolepunchEvent::ALL {
+            out.sample(
+                &f::TORRENT_HOLEPUNCH_EVENTS,
+                &[("route", session.route.as_str()), ("event", event.as_str())],
+                session.network.holepunch[*event as usize],
+            );
+        }
+    }
+    let lsd = || open().filter_map(|session| Some((session.route.as_str(), session.lsd?)));
+    for (route, lsd) in lsd() {
+        out.sample(&f::TORRENT_LSD_SENT, &[("route", route)], lsd.sent);
+    }
+    for (route, lsd) in lsd() {
+        out.sample(&f::TORRENT_LSD_RECEIVED, &[("route", route)], lsd.received);
+    }
+    for (route, lsd) in lsd() {
+        out.sample(
+            &f::TORRENT_LSD_PEERS_FOUND,
+            &[("route", route)],
+            lsd.peers_found,
+        );
+    }
+    const DIRECTIONS: [&str; 2] = ["down", "up"];
+    for session in open() {
+        for (direction, waits) in DIRECTIONS.into_iter().zip(session.limiter.waits) {
+            out.sample(
+                &f::TORRENT_RATE_LIMIT_WAITS,
+                &[("route", session.route.as_str()), ("direction", direction)],
+                waits,
+            );
+        }
+    }
+    for session in open() {
+        for (direction, nanos) in DIRECTIONS.into_iter().zip(session.limiter.wait_nanos) {
+            out.sample_f64(
+                &f::TORRENT_RATE_LIMIT_WAIT_SECONDS,
+                &[("route", session.route.as_str()), ("direction", direction)],
+                seconds(nanos),
+            );
+        }
+    }
 }
 
 fn web_seeds(out: &mut Encoder, routes: &[SessionSeries]) {

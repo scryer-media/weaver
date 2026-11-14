@@ -19,6 +19,7 @@ use crate::{Session, torrent_state::peers::stats::AggregatePeerStatsAtomic};
 
 pub mod dht;
 pub mod incoming;
+pub mod network;
 pub mod snapshot;
 pub mod swarm;
 pub mod tracker;
@@ -42,6 +43,7 @@ pub struct SessionStats {
     pub trackers: Arc<tracker::TrackerStats>,
     pub incoming: incoming::IncomingStats,
     pub web_seeds: Arc<web_seed::WebSeedStats>,
+    pub network: network::NetworkStats,
     pub down_speed_estimator: SpeedEstimator,
     pub up_speed_estimator: SpeedEstimator,
     pub startup_time: Instant,
@@ -56,6 +58,7 @@ impl SessionStats {
             trackers: Default::default(),
             incoming: Default::default(),
             web_seeds: Default::default(),
+            network: Default::default(),
             down_speed_estimator: SpeedEstimator::new(5),
             up_speed_estimator: SpeedEstimator::new(5),
             startup_time: Instant::now(),
@@ -115,6 +118,8 @@ impl Session {
             snapshot.utp += socket.0.stats().snapshot();
         }
         snapshot.unchoke_slots_held = self.choker.held();
+        snapshot.lsd = self.lsd.as_ref().map(|lsd| lsd.counted());
+        snapshot.limiter = self.ratelimits.waited();
         snapshot
     }
 }

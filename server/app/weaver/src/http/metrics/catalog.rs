@@ -744,6 +744,23 @@ metric_families! {
         ["route"], "Times a web seed was left to wait before being asked again since the session opened: its name did not resolve, it lacked a file, or it said it was unavailable.");
     TORRENT_WEB_SEED_FAILED = ("weaver_torrent_web_seed_connections_failed_total", Counter,
         ["route"], "Web seed connections that ended in failure since the session opened.");
+    TORRENT_PORT_MAPPING_REPORTS = ("weaver_torrent_port_mapping_reports_total", Counter,
+        ["route", "mapper", "result"],
+        "Reports the session's port mappers made since it opened, by mapper (natpmp, upnp, pcp_ipv6) and what each said: mapped, failed or removed. A mapping kept alive is reported again at each renewal.");
+    TORRENT_HOLEPUNCH_EVENTS = ("weaver_torrent_holepunch_events_total", Counter,
+        ["route", "event"],
+        "Holepunch steps since the session opened: asked (we asked a peer for an introduction), introduced and refused (a peer asked us for one), connect and connect_ignored (a peer told us to connect to another), failed (the peer we asked could not), unoffered (a message from a peer that did not offer the extension).");
+    TORRENT_LSD_SENT = ("weaver_torrent_lsd_announces_sent_total", Counter,
+        ["route"], "Announces the session sent to the local network since it started, one per torrent each time. Absent while the session runs no local discovery.");
+    TORRENT_LSD_RECEIVED = ("weaver_torrent_lsd_announces_received_total", Counter,
+        ["route"], "Announces of other hosts on the local network the session read since it started.");
+    TORRENT_LSD_PEERS_FOUND = ("weaver_torrent_lsd_peers_found_total", Counter,
+        ["route"], "Peers the local network's announces named for a torrent the session announces there, repeats included.");
+    TORRENT_RATE_LIMIT_WAITS = ("weaver_torrent_rate_limit_waits_total", Counter,
+        ["route", "direction"],
+        "Requests of peers for bytes to send or receive that were granted only after a wait on a rate limit, the session's or their torrent's, since the session opened. A request granted at once is not counted.");
+    TORRENT_RATE_LIMIT_WAIT_SECONDS = ("weaver_torrent_rate_limit_wait_seconds_total", Counter,
+        ["route", "direction"], "Time those requests waited in all.");
 
     // ---- speed tests -------------------------------------------------------
     SPEED_TEST_RUNS = ("weaver_speed_test_runs_total", Counter, ["kind", "status"],
