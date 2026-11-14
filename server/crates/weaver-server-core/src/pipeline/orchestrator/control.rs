@@ -875,11 +875,9 @@ impl Pipeline {
             // they stand, and reads the device of one it had not heard of
             // on a thread of its own.
             storage.set_folders(&folders);
-            let write_mbps = crate::operations::disk::slowest_measured_mbps(
-                [&self.intermediate_dir, &self.complete_dir]
-                    .into_iter()
-                    .chain(&folders)
-                    .map(|dir| storage.write_rate(dir)),
+            let write_mbps = storage.slowest_write_mbps(
+                &[self.intermediate_dir.as_path(), self.complete_dir.as_path()],
+                &folders,
             );
             if self.applied_sequential_write_mbps != Some(write_mbps) {
                 self.applied_sequential_write_mbps = Some(write_mbps);

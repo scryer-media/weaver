@@ -7,7 +7,8 @@
 
 use super::*;
 use crate::pipeline::download::{
-    DOWNLOAD_DISPATCH_STALL_KICK_AFTER, DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER,
+    DOWNLOAD_DISPATCH_STALL_KICK_AFTER, DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL,
+    DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER,
 };
 
 // A pipeline with no connections: every pass with queued work ends with
@@ -536,7 +537,11 @@ async fn with_recovery_off_a_stall_is_only_logged() {
         .insert(job_id, t0);
 
     pipeline.dispatch_downloads_at(t0);
-    assert_eq!(pipeline.last_download_dispatch_stall_log_at, Some(t0));
+    // One pass that opens nothing is not yet a stall.
+    assert_eq!(pipeline.last_download_dispatch_stall_log_at, None);
+    let logged_at = t0 + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL;
+    pipeline.dispatch_downloads_at(logged_at);
+    assert_eq!(pipeline.last_download_dispatch_stall_log_at, Some(logged_at));
     let kick_window = t0 + DOWNLOAD_DISPATCH_STALL_KICK_AFTER;
     pipeline.dispatch_downloads_at(kick_window);
     let past_release =
@@ -934,6 +939,11 @@ async fn the_liveness_stall_counts_promoted_recovery_and_not_parked() {
     let t0 = Instant::now();
     pipeline.dispatch_downloads_at(t0);
     assert_eq!(pipeline.articles_in_flight, 0);
+    // The first pass that opens nothing says nothing; the line comes once
+    // the passes have opened nothing for the log interval.
+    assert_eq!(lines.take(), Vec::<String>::new());
+    pipeline.dispatch_downloads_at(t0 + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL);
+    assert_eq!(pipeline.articles_in_flight, 0);
     let heard = lines.take();
     assert_eq!(heard.len(), 1, "{heard:?}");
     assert_eq!(field(&heard[0], "job_id"), Some("40011"), "{}", heard[0]);
@@ -967,4 +977,72 @@ async fn the_liveness_stall_counts_promoted_recovery_and_not_parked() {
     assert_eq!(field(&heard[0], "download_queue_len"), Some("4"));
     assert_eq!(field(&heard[0], "dispatchable_queue_depth"), Some("6"));
     assert_eq!(pipeline.last_download_dispatch_stall_log_at, Some(t1));
+}
+
+// The passes right after a job is added or a restart installs its jobs open
+// nothing for a moment. That says nothing; a warning comes only once the
+// passes have opened nothing for the whole log interval. The slow-disk run
+// warned 0.1 ms after its restart installed the jobs, and downloaded three
+// seconds later.
+#[tokio::test]
+async fn passes_that_open_nothing_warn_only_once_they_have_lasted_the_log_interval() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = stalled_pipeline(&temp_dir).await;
+    pipeline.download_stall_recovery = false;
+    let job_id = JobId(40020);
+    insert_stalled_job(&mut pipeline, job_id, 3).await;
+    let lines = LivenessLines::default();
+    let _capture = tracing::subscriber::set_default(lines.clone());
+    let t0 = Instant::now();
+
+    pipeline.dispatch_downloads_at(t0);
+    let almost = t0 + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL - Duration::from_millis(1);
+    pipeline.dispatch_downloads_at(almost);
+    assert_eq!(lines.take(), Vec::<String>::new());
+    assert_eq!(pipeline.download_dispatch_idle_since, Some(t0));
+
+    let lasted = t0 + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL;
+    pipeline.dispatch_downloads_at(lasted);
+    let heard = lines.take();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(field(&heard[0], "job_id"), Some("40020"), "{}", heard[0]);
+}
+
+// A job its volume holds at the hard limit waits on the disk. However long
+// that lasts, it is not warned of as a dispatch stall.
+#[tokio::test]
+async fn a_job_held_by_its_volume_is_not_warned_of_as_a_stall() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = stalled_pipeline(&temp_dir).await;
+    let job_id = JobId(40021);
+    insert_stalled_job(&mut pipeline, job_id, 3).await;
+    let volume = Arc::clone(
+        pipeline.graph_jobs[&job_id]
+            .disk()
+            .expect("the job writes through its volume's writer")
+            .working()
+            .volume(),
+    );
+    let budget = volume.buffer_limits().1;
+    volume.buffered_bytes.store(budget, Ordering::Relaxed);
+    let lines = LivenessLines::default();
+    let _capture = tracing::subscriber::set_default(lines.clone());
+    let t0 = Instant::now();
+
+    for at in [
+        t0,
+        t0 + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL,
+        t0 + DOWNLOAD_DISPATCH_STALL_KICK_AFTER,
+    ] {
+        pipeline.dispatch_downloads_at(at);
+    }
+    assert_eq!(lines.take(), Vec::<String>::new());
+
+    // Below the limit the same passes are a stall again, and warned of.
+    volume.buffered_bytes.store(budget - 1, Ordering::Relaxed);
+    let later = t0 + DOWNLOAD_DISPATCH_STALL_KICK_AFTER + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL;
+    pipeline.dispatch_downloads_at(later);
+    let heard = lines.take();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(field(&heard[0], "job_id"), Some("40021"), "{}", heard[0]);
 }

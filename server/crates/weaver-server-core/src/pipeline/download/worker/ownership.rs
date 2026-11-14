@@ -35,6 +35,7 @@ impl Pipeline {
                 server_idx: None,
                 connection,
                 outstanding: HashMap::new(),
+                outstanding_bytes: 0,
             });
         owner.mode = lease.lane_mode;
         owner
@@ -66,8 +67,10 @@ impl Pipeline {
         for work in works {
             let segment_id = work.segment_id;
             let is_recovery = work.is_recovery;
-            if owner.outstanding.insert(segment_id, work).is_none() {
-                entered.push((segment_id, is_recovery));
+            owner.outstanding_bytes += u64::from(work.byte_estimate);
+            match owner.outstanding.insert(segment_id, work) {
+                None => entered.push((segment_id, is_recovery)),
+                Some(replaced) => owner.outstanding_bytes -= u64::from(replaced.byte_estimate),
             }
         }
         for (segment_id, is_recovery) in entered {
@@ -110,6 +113,7 @@ impl Pipeline {
                 server_idx: None,
                 connection,
                 outstanding: HashMap::new(),
+                outstanding_bytes: 0,
             });
         self.hold_lane_works(0, works);
     }
@@ -295,6 +299,9 @@ impl Pipeline {
             return false;
         };
         let work = owner.outstanding.remove(&segment);
+        if let Some(work) = &work {
+            owner.outstanding_bytes -= u64::from(work.byte_estimate);
+        }
         if owner.outstanding.is_empty() && !owner.connection {
             self.download_lane_owners.remove(&lane_id);
         }
@@ -321,6 +328,10 @@ impl Pipeline {
             .extract_if(|segment, _| take(segment))
             .map(|(_, work)| work)
             .collect();
+        owner.outstanding_bytes -= works
+            .iter()
+            .map(|work| u64::from(work.byte_estimate))
+            .sum::<u64>();
         if owner.outstanding.is_empty() && !owner.connection {
             self.download_lane_owners.remove(&lane_id);
         }

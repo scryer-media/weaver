@@ -340,6 +340,9 @@ pub(super) struct DownloadLaneOwner {
     server_idx: Option<usize>,
     connection: bool,
     outstanding: HashMap<SegmentId, DownloadWork>,
+    // The estimated bytes of `outstanding`, kept with it as articles enter
+    // and leave, so sizing a lane's share never walks what it holds.
+    outstanding_bytes: u64,
 }
 
 pub(super) struct DownloadBatchLease {
@@ -1983,6 +1986,12 @@ pub struct Pipeline {
     pub(super) dispatch_hold_items_examined: std::sync::atomic::AtomicUsize,
     // Last time we logged a queued/no-active-download liveness stall.
     pub(super) last_download_dispatch_stall_log_at: Option<Instant>,
+    // The first dispatch pass of the current run of passes that found work
+    // queued and opened no download; `None` once one opens or nothing is
+    // queued. The liveness line speaks only once such a run has lasted
+    // `DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL`, so the passes right after an
+    // add or a restart, before the job's volume is sized, say nothing.
+    pub(super) download_dispatch_idle_since: Option<Instant>,
     // The dispatch stall the watchdog is timing toward a kick or a release.
     pub(super) download_dispatch_stall: Option<download::DispatchStallWatch>,
     // The available fill servers of the dispatch attempt running now, in
@@ -2091,6 +2100,9 @@ pub struct Pipeline {
     // Test-only free-space reading; `Some(None)` exercises a filesystem that
     // has never produced a reading.
     pub(super) uu_spool_available_bytes_for_test: Option<Option<u64>>,
+    #[cfg(test)]
+    // Test-only: a health probe batch waits for a seat on this server.
+    pub(super) probe_waits_on_for_test: Option<usize>,
     // Sequential-assembly state for uuencode files, created on the first
     // uuencode part of a file and dropped with that file's write buffer.
     pub(super) uu_files: scan_inputs::UuFiles,

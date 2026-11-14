@@ -17,7 +17,7 @@ use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::operations::instrumentation::{
     DbRuntimeMetricsSnapshot, DiskSpaceSnapshot, HistogramSnapshot, HttpMetricsSnapshot,
     JobLifecycleMetricsSnapshot, PipelineHistogramsSnapshot, ProcessMetricsSnapshot,
-    ServerMetricsSnapshot, VolumeSnapshot,
+    LOOP_WAIT_KINDS, ServerMetricsSnapshot, VolumeSnapshot,
 };
 use weaver_server_core::operations::metrics_store::{JOB_STATUS_KEYS, JobStatusCounts};
 use weaver_server_core::persistence::WalCheckpointMetricsSnapshot;
@@ -894,6 +894,12 @@ fn render_lanes(out: &mut Encoder, snapshot: &MetricsSnapshot) {
     ] {
         out.sample(&f::LANE_REFILLS, &[("result", result)], value);
     }
+    for (event, value) in [
+        ("held", snapshot.download_lane_room_held_total),
+        ("woken", snapshot.download_lane_room_woken_total),
+    ] {
+        out.sample(&f::LANE_ROOM_WAITS, &[("event", event)], value);
+    }
     for (kind, value) in [
         ("hot", snapshot.download_scheduler_handouts_total_hot),
         ("spill", snapshot.download_scheduler_handouts_total_spill),
@@ -1555,6 +1561,7 @@ fn render_volumes(out: &mut Encoder, volumes: &[VolumeSnapshot]) {
             out.sample(&f::VOLUME_WRITE_RATE, labels, volume.write_rate);
         }
         out.sample(&f::VOLUME_BUFFERED_BYTES, labels, volume.buffered_bytes);
+        out.sample(&f::VOLUME_ARRIVED_BYTES, labels, volume.arrived_bytes);
         // Zero is "not sized yet", which is told by the series being absent.
         if volume.buffer_limit_bytes > 0 {
             out.sample(&f::VOLUME_BUFFER_LIMIT_BYTES, labels, volume.buffer_limit_bytes);
@@ -1577,13 +1584,36 @@ fn render_volumes(out: &mut Encoder, volumes: &[VolumeSnapshot]) {
             labels,
             writer.abandoned_operations,
         );
-        out.sample(&f::VOLUME_LOOP_WAITS, labels, writer.loop_waits);
+        for (at, kind) in LOOP_WAIT_KINDS.iter().enumerate() {
+            let labels: &[(&str, &str)] = &[("volume", volume.label.as_str()), ("kind", kind)];
+            out.sample(&f::VOLUME_LOOP_WAITS, labels, writer.loop_waits_by_kind[at]);
+            out.sample_f64(
+                &f::VOLUME_LOOP_WAIT_SECONDS,
+                labels,
+                writer.loop_wait_nanos_by_kind[at] as f64 / 1e9,
+            );
+        }
+        out.sample(&f::VOLUME_LOOP_READS, labels, writer.loop_reads);
         out.sample_f64(
-            &f::VOLUME_LOOP_WAIT_SECONDS,
+            &f::VOLUME_LOOP_READ_SECONDS,
             labels,
-            writer.loop_wait_nanos as f64 / 1e9,
+            writer.loop_read_nanos as f64 / 1e9,
+        );
+        out.sample(&f::VOLUME_ASIDE_WAITS, labels, writer.aside_waits);
+        out.sample_f64(
+            &f::VOLUME_ASIDE_WAIT_SECONDS,
+            labels,
+            writer.aside_wait_nanos as f64 / 1e9,
         );
         out.sample(&f::VOLUME_WRITER_THREADS, labels, writer.threads);
+        out.sample(&f::VOLUME_WRITER_WOKEN, labels, writer.woken);
+        for (to, value) in [
+            ("returned", writer.buffers_returned),
+            ("freed", writer.buffers_freed),
+        ] {
+            let labels: &[(&str, &str)] = &[("volume", volume.label.as_str()), ("to", to)];
+            out.sample(&f::VOLUME_WRITER_BUFFERS, labels, value);
+        }
     }
 }
 

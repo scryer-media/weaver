@@ -28,14 +28,14 @@
 // owner stops.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use tracing::warn;
 
-use super::volume::Volume;
+use super::volume::{LoopWait, Volume};
 use super::{StorageCapacity, StorageKind, lock_paths};
 use crate::operations::instrumentation::VolumeSnapshot;
 
@@ -59,16 +59,16 @@ pub(crate) struct WriteReading {
 }
 
 impl WriteReading {
-    // The nanoseconds are read first, and the bytes after them. The writer
-    // adds a call's bytes first and stores its nanoseconds last, with
-    // `Release` (see [`Volume`]), so the bytes read here are at least the
-    // ones the nanoseconds were spent on: a reading may hold the bytes of a
-    // call still in flight, never the time of a call without its bytes. The
-    // idle turns are read after both: a turn the writer took once those
-    // bytes were written is then seen with them.
+    // The bytes are read first, and the nanoseconds after them. The writer
+    // adds a call's nanoseconds first and its bytes last, with `Release`
+    // (see [`Volume`]), so the nanoseconds read here are at least the ones
+    // the bytes took: a reading may hold the time of a call whose bytes
+    // are not counted yet, never bytes ahead of their time, and a rate is
+    // never read high. The idle turns are read after both: a turn the
+    // writer took once those bytes were written is then seen with them.
     fn of(volume: &Volume) -> Self {
-        let write_nanos = volume.write_nanos.load(Ordering::Acquire);
-        let written_bytes = volume.written_bytes.load(Ordering::Relaxed);
+        let written_bytes = volume.written_bytes.load(Ordering::Acquire);
+        let write_nanos = volume.write_nanos.load(Ordering::Relaxed);
         let idle_turns = volume.idle_turns.load(Ordering::Relaxed);
         let waiting = volume.buffered_bytes.load(Ordering::Relaxed) > 0;
         Self {
@@ -497,6 +497,7 @@ impl StorageCapacity {
     fn snapshots_of(&self, volumes: &[Arc<Volume>]) -> Vec<VolumeSnapshot> {
         let mut rows: Vec<VolumeSnapshot> = volumes
             .iter()
+            .filter(|volume| shown(volume))
             .map(|volume| {
                 let (soft, hard) = volume.buffer_limits();
                 let sized = |limit: u64| if limit == u64::MAX { 0 } else { limit };
@@ -515,6 +516,7 @@ impl StorageCapacity {
                 write_rate: volume.write_rate.load(Ordering::Relaxed),
                 throughput: volume.throughput.load(Ordering::Relaxed),
                 buffered_bytes: volume.buffered_bytes.load(Ordering::Relaxed),
+                arrived_bytes: volume.arrived_bytes.load(Ordering::Relaxed),
                 idle_turns: volume.idle_turns.load(Ordering::Relaxed),
                 writer: writer_counts(volume),
             })
@@ -563,17 +565,48 @@ impl StorageCapacity {
     }
 }
 
+// Whether the volume is listed: its device was read, for a root, a
+// configured folder or a job's folder, so it is a real destination even
+// before anything is written to it, or a job writes or has written to it.
+// Only the stand-in a path gets until its device is read
+// (`D:\ (device unknown)`) is left out while nothing went through it: it
+// takes no writes once the device is known, and a row of it would read zero
+// for good. Reads only what the owner holds; no disk call.
+fn shown(volume: &Volume) -> bool {
+    volume.device.is_some() || written_to(volume)
+}
+
+// Whether a job writes, or has written, to the volume: a writer thread
+// ran for it, or bytes arrived for it, wait for it or were written to it.
+fn written_to(volume: &Volume) -> bool {
+    volume.writer.threads.load(Ordering::Relaxed) > 0
+        || volume.written_bytes.load(Ordering::Relaxed) > 0
+        || volume.unwritten_bytes() > 0
+}
+
 // A volume's writer counts as they stand, each an atomic read.
 fn writer_counts(volume: &Volume) -> crate::operations::instrumentation::VolumeWriterSnapshot {
     let counts = &volume.writer;
+    let by_kind = |of: &[AtomicU64; LoopWait::COUNT]| {
+        LoopWait::ALL.map(|kind| of[kind as usize].load(Ordering::Relaxed))
+    };
     crate::operations::instrumentation::VolumeWriterSnapshot {
         batches: counts.batches.load(Ordering::Relaxed),
         operations: counts.operations.load(Ordering::Relaxed),
         loop_waits: counts.loop_waits.load(Ordering::Relaxed),
         loop_wait_nanos: counts.loop_wait_nanos.load(Ordering::Relaxed),
+        loop_waits_by_kind: by_kind(&counts.loop_waits_by_kind),
+        loop_wait_nanos_by_kind: by_kind(&counts.loop_wait_nanos_by_kind),
+        loop_reads: counts.loop_reads.load(Ordering::Relaxed),
+        loop_read_nanos: counts.loop_read_nanos.load(Ordering::Relaxed),
+        aside_waits: counts.aside_waits.load(Ordering::Relaxed),
+        aside_wait_nanos: counts.aside_wait_nanos.load(Ordering::Relaxed),
         failed_operations: counts.failed_operations.load(Ordering::Relaxed),
         abandoned_operations: counts.abandoned_operations.load(Ordering::Relaxed),
         threads: counts.threads.load(Ordering::Relaxed),
+        woken: counts.woken.load(Ordering::Relaxed),
+        buffers_returned: counts.buffers_returned.load(Ordering::Relaxed),
+        buffers_freed: counts.buffers_freed.load(Ordering::Relaxed),
     }
 }
 
@@ -1227,11 +1260,42 @@ mod tests {
         written.set_buffer_limits(700_000, 1_000_000);
         written.idle_turns.store(4, Ordering::Relaxed);
         let unseen = Volume::new(None, "/mnt/scratch".into());
+        // A volume a job writes to with no device the OS gave: a writer
+        // thread ran for it.
+        let unnumbered = Volume::new(None, "/mnt/share".into());
+        unnumbered.writer.threads.store(1, Ordering::Relaxed);
+        // A destination whose device was read, and nothing written to it
+        // yet, as on an idle server just started: listed all the same.
+        let known = Volume::new(Some(other), "/mnt/media".into());
         // The rows come by label, whatever order the volumes are held in.
-        let rows = storage.snapshots_of(&[Arc::new(unseen), Arc::new(written)]);
+        // The stand-in of a path not read yet, that nothing writes to, has
+        // none.
+        let rows = storage.snapshots_of(&[
+            Arc::new(unseen),
+            Arc::new(unnumbered),
+            Arc::new(written),
+            Arc::new(known),
+        ]);
         assert_eq!(
             rows,
             vec![
+                VolumeSnapshot {
+                    label: "/mnt/media".into(),
+                    kind: "network",
+                    device: Some(other),
+                    written_bytes: 0,
+                    write_nanos: 0,
+                    write_calls: 0,
+                    write_seeks: 0,
+                    write_rate: 0,
+                    throughput: 0,
+                    buffered_bytes: 0,
+                    arrived_bytes: 0,
+                    buffer_soft_bytes: 0,
+                    buffer_limit_bytes: 0,
+                    idle_turns: 0,
+                    writer: Default::default(),
+                },
                 VolumeSnapshot {
                     label: "/mnt/pool".into(),
                     kind: "ssd",
@@ -1243,13 +1307,14 @@ mod tests {
                     write_rate: 3_200_000,
                     throughput: 1_100_000,
                     buffered_bytes: 65_536,
+                    arrived_bytes: 0,
                     buffer_soft_bytes: 700_000,
                     buffer_limit_bytes: 1_000_000,
                     idle_turns: 4,
                     writer: Default::default(),
                 },
                 VolumeSnapshot {
-                    label: "/mnt/scratch".into(),
+                    label: "/mnt/share".into(),
                     kind: "unknown",
                     device: None,
                     written_bytes: 0,
@@ -1259,11 +1324,15 @@ mod tests {
                     write_rate: 0,
                     throughput: 0,
                     buffered_bytes: 0,
+                    arrived_bytes: 0,
                     // Not sized yet: no limit to tell.
                     buffer_soft_bytes: 0,
                     buffer_limit_bytes: 0,
                     idle_turns: 0,
-                    writer: Default::default(),
+                    writer: crate::operations::instrumentation::VolumeWriterSnapshot {
+                        threads: 1,
+                        ..Default::default()
+                    },
                 },
             ]
         );

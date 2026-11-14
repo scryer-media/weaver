@@ -15,6 +15,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use tracing::warn;
 
@@ -31,6 +32,11 @@ const REMEMBERED_PATHS: usize = 1024;
 // is asked after again, and queued then.
 const UNREAD_PATHS: usize = 256;
 
+// How long a path whose device could not be read keeps that answer before
+// an ask has it read again; also how long the slowest write rate keeps the
+// volumes of paths not read yet (`StorageCapacity::slowest_write_mbps`).
+pub(super) const UNREAD_RETRY: Duration = Duration::from_secs(5);
+
 // The name of the thread that reads the paths no reading covers.
 const READER_THREAD: &str = "weaver-volume-reader";
 
@@ -38,6 +44,9 @@ const READER_THREAD: &str = "weaver-volume-reader";
 pub(super) struct Volumes {
     known: Mutex<Known>,
     unread: Mutex<Unread>,
+    // The volumes the slowest write rate is read from, found once for each
+    // `Known::generation` (`StorageCapacity::slowest_write_mbps`).
+    pub(super) rate_volumes: Mutex<Option<super::volume_view::RateVolumes>>,
     // Rung when the reader thread ends.
     #[cfg(test)]
     read: std::sync::Condvar,
@@ -58,12 +67,19 @@ struct Known {
     by_device: HashMap<u64, Arc<Volume>>,
     // Volumes of paths the OS gave no device for, by label.
     unnumbered: HashMap<String, Arc<Volume>>,
+    // Moves whenever a path may be answered another volume than before: a
+    // path remembered anew or for another volume, or the folders told
+    // changed. What is held on a path's answer is good while it stands.
+    generation: u64,
 }
 
 struct Remembered {
     volume: Arc<Volume>,
     // The ask count at the latest ask.
     asked: u64,
+    // For a path whose device could not be read: when an ask has it read
+    // again. `None` for a path whose device is known, which no ask reads.
+    retry_at: Option<Instant>,
 }
 
 // The paths waiting for the reader thread, and whether it runs.
@@ -100,8 +116,14 @@ impl StorageCapacity {
     // The volume `path` lies on when memory alone can say: the path was
     // asked after before, or a root or a reading above it gives its device
     // and that device's volume is known. Never a disk call.
+    // A path whose device could not be read is read again, off this thread,
+    // by the first ask `UNREAD_RETRY` after the last read.
     pub(crate) fn known_volume(&self, path: &Path) -> Option<Arc<Volume>> {
-        if let Some(volume) = self.volumes.lock().recall(path) {
+        let recalled = self.volumes.lock().recall(path);
+        if let Some((volume, retry)) = recalled {
+            if retry {
+                Volumes::read_later(&self.volumes, path);
+            }
             return Some(volume);
         }
         let device = self.held_device(path)??;
@@ -161,6 +183,7 @@ impl StorageCapacity {
                 .retain(|path, _| !changed.iter().any(|folder| path.starts_with(folder)));
             known.folders = next;
             known.told = folders.to_vec();
+            known.generation += 1;
             unread
         };
         for folder in unread {
@@ -206,13 +229,23 @@ impl StorageCapacity {
 }
 
 impl Known {
-    // The volume remembered for `path`, which is asked after now.
-    fn recall(&mut self, path: &Path) -> Option<Arc<Volume>> {
+    // The volume remembered for `path`, which is asked after now, and
+    // whether its device, which could not be read, is due to be read again.
+    // A path whose device is known reads no clock.
+    fn recall(&mut self, path: &Path) -> Option<(Arc<Volume>, bool)> {
         self.asks += 1;
         let asked = self.asks;
         let remembered = self.by_path.get_mut(path)?;
         remembered.asked = asked;
-        Some(Arc::clone(&remembered.volume))
+        let due = remembered
+            .retry_at
+            .map(|at| (at, Instant::now()))
+            .filter(|(at, now)| now >= at);
+        if let Some((_, now)) = due {
+            remembered.retry_at = Some(now + UNREAD_RETRY);
+        }
+        let retry = due.is_some();
+        Some((Arc::clone(&remembered.volume), retry))
     }
 
     // Remember `path`'s volume. Past the cap the one path asked after
@@ -222,6 +255,13 @@ impl Known {
         let asked = self.asks;
         if let Some(device) = self.folders.get_mut(path) {
             *device = volume.device;
+        }
+        if self
+            .by_path
+            .get(path)
+            .is_none_or(|remembered| !Arc::ptr_eq(&remembered.volume, volume))
+        {
+            self.generation += 1;
         }
         if !self.by_path.contains_key(path)
             && self.by_path.len() >= REMEMBERED_PATHS
@@ -238,12 +278,21 @@ impl Known {
             Remembered {
                 volume: Arc::clone(volume),
                 asked,
+                retry_at: volume
+                    .device
+                    .is_none()
+                    .then(|| Instant::now() + UNREAD_RETRY),
             },
         );
     }
 }
 
 impl Volumes {
+    // See `Known::generation`.
+    pub(super) fn generation(&self) -> u64 {
+        self.lock().generation
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Known> {
         self.known.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -378,6 +427,27 @@ impl Volumes {
                 path
             };
             self.read(&path);
+        }
+    }
+
+    // Have every path whose device could not be read, and the volumes held
+    // for the slowest write rate, read again on the next ask, as
+    // `UNREAD_RETRY` after the last read would.
+    #[cfg(test)]
+    fn age_retries(&self) {
+        let now = Instant::now();
+        for remembered in self.lock().by_path.values_mut() {
+            if remembered.retry_at.is_some() {
+                remembered.retry_at = Some(now);
+            }
+        }
+        if let Some(rates) = self
+            .rate_volumes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            rates.age();
         }
     }
 
@@ -641,5 +711,123 @@ mod tests {
         assert!(Arc::ptr_eq(&storage.volume(&live), &read));
         assert_eq!(looks(), before, "nothing was read again");
         assert!(!reading(&storage));
+    }
+
+    // The slowest write rate is read from the volumes found the turn before
+    // while no path's answer changed: a rate published since is in it at
+    // once, and a folder told, or read, is found anew.
+    #[test]
+    fn the_slowest_write_rate_follows_rates_and_folders_without_a_path_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let complete = dir.path().join("complete");
+        let intermediate = dir.path().join("intermediate");
+        let shows = complete.join("shows");
+        test_devices::assign(&complete, 6);
+        test_devices::assign(&intermediate, 6);
+        test_devices::assign(&shows, 8);
+        let storage = owner(dir.path());
+        let roots = [intermediate.as_path(), complete.as_path()];
+        let root_volume = storage.volume(&complete);
+        root_volume.write_rate.store(400_000_000, Ordering::Relaxed);
+        assert_eq!(storage.slowest_write_mbps(&roots, &[]), 400.0);
+        let generation = storage.volumes.generation();
+
+        root_volume.write_rate.store(300_000_000, Ordering::Relaxed);
+        assert_eq!(storage.slowest_write_mbps(&roots, &[]), 300.0, "a new sample is read");
+        assert_eq!(storage.volumes.generation(), generation, "no path was looked up again");
+
+        let folders = [shows.clone()];
+        storage.set_folders(&folders);
+        storage.volumes.wait_read();
+        let shows_volume = storage.volume(&shows);
+        assert_eq!(shows_volume.device, Some(8));
+        shows_volume.write_rate.store(90_000_000, Ordering::Relaxed);
+        assert_eq!(storage.slowest_write_mbps(&roots, &folders), 90.0, "the folder's volume is found");
+
+        storage.set_folders(&[]);
+        assert_eq!(storage.slowest_write_mbps(&roots, &[]), 300.0, "the folder left");
+    }
+
+    // A path whose device could not be read keeps that answer for a while,
+    // read no more meanwhile; the first ask after it has the path read
+    // again, and the device read then is known from then on.
+    #[test]
+    fn a_path_whose_device_could_not_be_read_is_read_again_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = owner(dir.path());
+        // No ancestor of a relative path that does not exist is a
+        // directory: its device cannot be read.
+        let asked = PathBuf::from("weaver-volumes-test-unreadable").join("job");
+        storage.volume(&asked);
+        storage.volumes.wait_read();
+        let failed = storage.volume(&asked);
+        assert_eq!(failed.device, None);
+        let before = looks();
+        assert!(Arc::ptr_eq(&storage.volume(&asked), &failed));
+        assert!(!reading(&storage), "not read again at once");
+        assert_eq!(looks(), before);
+
+        test_devices::assign(&asked, 61);
+        let generation = storage.volumes.generation();
+        storage.volumes.age_retries();
+        assert!(Arc::ptr_eq(&storage.volume(&asked), &failed), "answered meanwhile");
+        storage.volumes.wait_read();
+
+        assert!(storage.volumes.generation() > generation, "the read that landed moved it");
+        let read = storage.volume(&asked);
+        assert_eq!(read.device, Some(61));
+        let after = looks();
+        storage.volumes.age_retries();
+        assert!(Arc::ptr_eq(&storage.volume(&asked), &read));
+        assert!(!reading(&storage), "a known device is not read again");
+        assert_eq!(looks(), after);
+    }
+
+    // A path the slowest write rate asks after whose read could not be
+    // queued is asked after again on a later turn, and its volume's rate is
+    // in the answer once the read lands. Settled, the turn holds no clock.
+    #[test]
+    fn the_slowest_write_rate_asks_again_after_a_path_it_could_not_have_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let intermediate = dir.path().join("intermediate");
+        let asked = elsewhere.path().join("downloads");
+        test_devices::assign(&intermediate, 5);
+        test_devices::assign(&asked, 62);
+        let storage = owner(dir.path());
+        storage
+            .volume(&intermediate)
+            .write_rate
+            .store(400_000_000, Ordering::Relaxed);
+        let roots = [intermediate.as_path(), asked.as_path()];
+        // The queue of paths to read is full.
+        {
+            let mut unread = storage.volumes.unread();
+            unread.running = true;
+            for index in 0..UNREAD_PATHS {
+                unread.paths.insert(dir.path().join(format!("queued-{index}")));
+            }
+        }
+        assert_eq!(storage.slowest_write_mbps(&roots, &[]), 400.0);
+        assert!(!storage.volumes.unread().paths.contains(&asked));
+        {
+            let mut unread = storage.volumes.unread();
+            unread.paths.clear();
+            unread.running = false;
+        }
+        // Before the retry is due, the turn asks after no path.
+        assert_eq!(storage.slowest_write_mbps(&roots, &[]), 400.0);
+        assert!(!reading(&storage));
+
+        storage.volumes.age_retries();
+        assert_eq!(storage.slowest_write_mbps(&roots, &[]), 400.0);
+        storage.volumes.wait_read();
+        let read = storage.volume(&asked);
+        assert_eq!(read.device, Some(62));
+        read.write_rate.store(50_000_000, Ordering::Relaxed);
+
+        assert_eq!(storage.slowest_write_mbps(&roots, &[]), 50.0, "the read volume is found");
+        let rates = storage.volumes.rate_volumes.lock().unwrap();
+        assert!(rates.as_ref().unwrap().settled());
     }
 }

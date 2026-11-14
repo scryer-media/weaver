@@ -53,6 +53,9 @@ pub(crate) struct Restored {
     pub(crate) settled: Vec<(VolumeIndex, u32)>,
     // Articles the checkpoint had that were not on disk.
     pub(crate) refetched: Vec<(VolumeIndex, u32)>,
+    // The decoded bytes of the articles in hand once those are taken out:
+    // what the job had downloaded, counted as a run counts it.
+    pub(crate) in_hand_bytes: u64,
 }
 
 impl GraphJob {
@@ -167,6 +170,9 @@ impl GraphJob {
         job.pending.restored(&job);
         Ok(Restored {
             settled: job.root.map.settled(),
+            in_hand_bytes: (0..job.root.map.volume_count())
+                .map(|volume| job.root.map.arrived_bytes(VolumeIndex(volume as u32)))
+                .sum(),
             refetched,
             job,
         })

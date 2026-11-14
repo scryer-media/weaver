@@ -1889,6 +1889,7 @@ async fn auto_pause_stalled_download_releases_blocking_runtime() {
                     avoid_server: None,
                 },
             )]),
+            outstanding_bytes: 256,
         },
     );
     pipeline.job_last_download_activity.insert(
@@ -1973,6 +1974,7 @@ async fn body_activity_keeps_only_its_current_job_alive_without_article_results(
             server_idx: Some(0),
             connection: false,
             outstanding: HashMap::new(),
+            outstanding_bytes: 0,
         },
     );
     for _ in 0..4 {

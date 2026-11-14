@@ -355,16 +355,23 @@ async fn the_startup_disk_gate_releases_every_kind_of_waiter() {
 }
 
 #[test]
-fn storage_seek_penalty_requires_device_evidence() {
+fn the_report_names_each_kind_of_storage_the_volumes_read() {
+    use crate::operations::disk::StorageKind;
+    assert_eq!(storage_class_of(StorageKind::Rotational), StorageClass::Hdd);
+    assert_eq!(storage_class_of(StorageKind::Solid), StorageClass::Ssd);
+    assert_eq!(storage_class_of(StorageKind::Network), StorageClass::Network);
+    assert_eq!(storage_class_of(StorageKind::Unknown), StorageClass::Unknown);
+}
+
+// The report and the volumes read the same kind of storage.
+#[test]
+fn the_report_reads_the_kind_the_volumes_read() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (class, _) = detect_disk_info(dir.path());
     assert_eq!(
-        storage_class_from_seek_penalty(Some(true)),
-        StorageClass::Hdd
+        class,
+        storage_class_of(crate::operations::disk::storage_kind(dir.path()))
     );
-    assert_eq!(
-        storage_class_from_seek_penalty(Some(false)),
-        StorageClass::Ssd
-    );
-    assert_eq!(storage_class_from_seek_penalty(None), StorageClass::Unknown);
 }
 
 // Memory and filesystem queries must answer on the runner. A device may
@@ -381,12 +388,11 @@ fn windows_probes_read_real_memory_and_disk() {
     assert_eq!(detect_total_memory_bytes(), Some(total));
 
     let dir = std::env::temp_dir();
-    let (storage_class, filesystem) = windows_disk_info(&dir);
+    let filesystem = windows_filesystem(&dir);
     assert!(
         !matches!(&filesystem, FilesystemType::Unknown(name) if name.is_empty()),
         "temp dir filesystem must be named, got {filesystem:?}"
     );
-    let (class_again, fs_again) = detect_disk_info(&dir);
-    assert_eq!(class_again, storage_class);
+    let (_, fs_again) = detect_disk_info(&dir);
     assert_eq!(fs_again, filesystem);
 }

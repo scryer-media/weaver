@@ -69,6 +69,152 @@ fn a_barrier_passes_once_every_write_before_it_returned() {
     assert!(reports.try_recv().is_err(), "a clean batch says nothing");
 }
 
+// A written buffer's last share goes back to the pipeline loop while the
+// way back has room, and is freed on the writer past it; a buffer someone
+// else still shares frees nothing and goes nowhere. What came back leaves
+// with the loop's free.
+#[test]
+fn written_buffers_go_back_to_the_loop_up_to_a_bound() {
+    let returns = Returns::new(8);
+    let counts = super::super::volume::WriterCounts::default();
+    returns.give(Bytes::from(vec![1u8; 5]), &counts);
+    let shared = Bytes::from(vec![2u8; 2]);
+    returns.give(shared.clone(), &counts);
+    returns.give(Bytes::from(vec![3u8; 4]), &counts);
+    assert_eq!(count(&counts.buffers_returned), 1);
+    assert_eq!(count(&counts.buffers_freed), 1, "past the bound");
+    assert_eq!(count(&returns.bytes), 5);
+    returns.free();
+    assert_eq!(count(&returns.bytes), 0);
+    assert!(returns.held.lock().unwrap().is_empty());
+    returns.give(Bytes::from(vec![3u8; 4]), &counts);
+    assert_eq!(count(&counts.buffers_returned), 2, "room again once freed");
+    drop(shared);
+
+    // Through a volume's thread: the write's count falls as it returns, and
+    // its buffer waits for the loop.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let job = writers.submitter(&volume, 7);
+    job.write(1, 0, Bytes::from(b"lantern".to_vec()), create(&path));
+    job.barrier().wait();
+    assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 0);
+    assert_eq!(count(&volume.writer.buffers_returned), 1);
+    assert_eq!(count(&writers.registry.returns.bytes), 7);
+    writers.free_returned();
+    assert_eq!(count(&writers.registry.returns.bytes), 0);
+}
+
+// While the loop waits with nothing to drive, nothing is held for it: what
+// came back is freed as it parks, and a writer frees what it writes then in
+// place. Once the loop is back, buffers go back to it again.
+#[test]
+fn nothing_is_held_for_a_loop_that_waits_with_nothing_to_drive() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let job = writers.submitter(&volume, 7);
+    job.write(1, 0, Bytes::from(b"lantern".to_vec()), create(&path));
+    job.barrier().wait();
+    assert_eq!(count(&writers.registry.returns.bytes), 7);
+
+    let parked = writers.park_returns();
+    assert_eq!(count(&writers.registry.returns.bytes), 0, "freed as the loop parks");
+    job.write(1, 7, Bytes::from(b"wick".to_vec()), None);
+    job.barrier().wait();
+    assert_eq!(count(&writers.registry.returns.bytes), 0);
+    assert_eq!(count(&volume.writer.buffers_freed), 1, "freed by the writer");
+    assert_eq!(count(&volume.writer.buffers_returned), 1);
+
+    drop(parked);
+    job.write(1, 11, Bytes::from(b"oil".to_vec()), None);
+    job.barrier().wait();
+    assert_eq!(count(&writers.registry.returns.bytes), 3, "held for the loop again");
+    assert_eq!(std::fs::read(&path).unwrap(), b"lanternwickoil");
+}
+
+// Opens a file a second after the writer's clock, as a slow open would.
+fn open_slowly(path: &Path, length: Option<u64>) -> io::Result<File> {
+    step_clock(Duration::from_secs(1));
+    open(path, length)
+}
+
+// A volume's write time is the time inside its write calls: an open between
+// two writes of one batch is not counted. Every read of the stepped clock
+// moves it a millisecond, and each open a second.
+#[test]
+fn a_batch_counts_only_the_time_inside_its_write_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    job.run(None, dir.path().to_path_buf(), || Ok(()));
+    hold.wait_held();
+    let slow = |path: &Path| {
+        Some(Create {
+            path: path.to_path_buf(),
+            length: None,
+            open: open_slowly,
+        })
+    };
+    job.write(1, 0, Bytes::from_static(b"lan"), slow(&first));
+    job.write(1, 3, Bytes::from_static(b"tern"), None);
+    job.write(2, 0, Bytes::from_static(b"wick"), slow(&second));
+    let barrier = job.barrier();
+    hold.open();
+    barrier.wait();
+    assert_eq!(std::fs::read(&first).unwrap(), b"lantern");
+    assert_eq!(std::fs::read(&second).unwrap(), b"wick");
+    assert_eq!(count(&volume.write_calls), 3);
+    assert_eq!(
+        count(&volume.write_nanos),
+        3 * Duration::from_millis(1).as_nanos() as u64,
+        "a millisecond for each call, none of either open's second"
+    );
+}
+
+// A write chained from the last one's return does not count what ran on the
+// writer between them past a few loads and stores: here a caller's code
+// that takes a second, run as the first write returns.
+#[test]
+fn a_callers_code_between_two_writes_is_not_write_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    job.run(None, dir.path().to_path_buf(), || Ok(()));
+    hold.wait_held();
+    // The open starts the stepped clock.
+    let slow = Some(Create {
+        path: path.clone(),
+        length: None,
+        open: open_slowly,
+    });
+    job.write(1, 0, Bytes::from_static(b"lan"), slow);
+    job.barrier().then(|| step_clock(Duration::from_secs(1)));
+    job.write(1, 3, Bytes::from_static(b"tern"), None);
+    let barrier = job.barrier();
+    hold.open();
+    barrier.wait();
+    // A batch is counted after its operations return.
+    hold.wait_parked();
+    assert_eq!(std::fs::read(&path).unwrap(), b"lantern");
+    assert_eq!(count(&volume.write_calls), 2);
+    assert_eq!(count(&volume.writer.batches), 2, "both writes in one batch");
+    assert_eq!(
+        count(&volume.write_nanos),
+        2 * Duration::from_millis(1).as_nanos() as u64,
+        "a millisecond for each call, none of the code's second"
+    );
+}
+
 // The order a held batch ran in, by what each write left in the file's
 // length: each write is one byte at its offset, and a probe after each
 // records how far the file reached.
@@ -145,6 +291,159 @@ fn a_close_and_a_move_follow_the_writes_before_them() {
     barrier.wait();
     assert!(!from.exists());
     assert_eq!(std::fs::read(&to).unwrap(), b"headta");
+}
+
+// A reader on a thread of its own, a repair or a check, waits for the bytes
+// and the length of what it reads, not for the writer to drop the handle a
+// close let go: that drop is slow on some systems for a large file just
+// written, and a reader opens its own handle. The key is still told its
+// operations returned only after the drop, so a settle, a checkpoint and a
+// delivery wait for it as before.
+#[test]
+fn a_reader_does_not_wait_behind_the_drop_of_a_closed_files_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    hold.hold_drops(true);
+    hold.open();
+    let job = writers.submitter(&volume, 1);
+    job.write(1, 0, Bytes::from_static(b"head"), create(&path));
+    job.close(
+        1,
+        6,
+        Create {
+            path: path.clone(),
+            length: None,
+            open,
+        },
+    );
+    // The close ran; the writer stands before dropping its handle.
+    hold.wait_dropping();
+    let barrier = job.barrier();
+    assert!(!barrier.returned() && !barrier.passed());
+    let finished = std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            barrier.wait_aside();
+            (barrier.unwritten(), std::fs::read(&path).unwrap())
+        });
+        // The reader is done, or it stands on the key behind the drop.
+        while !reader.is_finished() && barrier.key.waiters.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        let finished = reader.is_finished();
+        hold.hold_drops(false);
+        let (unwritten, bytes) = reader.join().unwrap();
+        assert!(!unwritten);
+        assert_eq!(bytes, b"head\0\0");
+        finished
+    });
+    assert!(finished, "the reader waited behind the drop of a handle");
+    barrier.wait();
+    assert!(barrier.passed());
+    assert_eq!(count(&volume.writer.aside_waits), 0);
+}
+
+// A key that closed a file waits behind its own handle's drop only: once
+// the batch runs nothing more of it, the handle is dropped and the key
+// returned, and the volume's settle has gone past it, while the rest of
+// the batch, another key's writes, is still to run.
+#[test]
+fn a_closed_handle_is_dropped_once_the_batch_runs_nothing_more_of_its_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (closed_path, other_path) = (dir.path().join("closed"), dir.path().join("other"));
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let closing = writers.submitter(&volume, 1);
+    let other = writers.submitter(&volume, 2);
+    // The thread stands in a batch of its own before what follows comes.
+    other.run(None, dir.path().to_path_buf(), || Ok(()));
+    hold.wait_held();
+    closing.write(1, 0, Bytes::from_static(b"head"), create(&closed_path));
+    closing.close(
+        1,
+        4,
+        Create {
+            path: closed_path.clone(),
+            length: None,
+            open,
+        },
+    );
+    other.write(1, 0, Bytes::from_static(b"more"), create(&other_path));
+    other.write(1, 4, Bytes::from_static(b"tail"), None);
+    let state = &writers.lane(&volume).state;
+    hold.release(1);
+    hold.wait_held();
+    assert_eq!(state.returned.load(Ordering::SeqCst), 1);
+    // The closing key's write and close run; the other key's are next.
+    hold.release(2);
+    hold.wait_held();
+    let closed = closing.barrier();
+    assert!(closed.returned() && closed.passed(), "the key waited for the batch");
+    assert!(!other.barrier().returned());
+    assert_eq!(state.returned.load(Ordering::SeqCst), 3, "the settle went past it");
+    assert!(closing.barrier().key.held().letting_go.is_empty());
+    hold.open();
+    other.barrier().wait();
+    assert_eq!(std::fs::read(&closed_path).unwrap(), b"head");
+    assert_eq!(std::fs::read(&other_path).unwrap(), b"moretail");
+}
+
+// A caller's code of a key that failed is not run, and is dropped with the
+// key's handles already dropped, as if it had run: its caller may move or
+// remove the key's files at once on a thread of its own.
+#[test]
+fn a_stopped_keys_code_is_dropped_after_the_handles_the_key_let_go() {
+    let dir = tempfile::tempdir().unwrap();
+    let (closed_path, failing_path) = (dir.path().join("closed"), dir.path().join("failing"));
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    hold.hold_drops(true);
+    let job = writers.submitter(&volume, 1);
+    let plug = writers.submitter(&volume, 2);
+    plug.run(None, dir.path().to_path_buf(), || Ok(()));
+    hold.wait_held();
+    job.write(1, 0, Bytes::from_static(b"head"), create(&closed_path));
+    job.close(
+        1,
+        4,
+        Create {
+            path: closed_path.clone(),
+            length: None,
+            open,
+        },
+    );
+    job.write(2, 0, Bytes::from_static(b"lost"), create(&failing_path));
+    let ran = Arc::new(AtomicBool::new(false));
+    let marked = Arc::clone(&ran);
+    job.run(None, dir.path().to_path_buf(), move || {
+        marked.store(true, Ordering::SeqCst);
+        Ok(())
+    });
+    hold.release(1);
+    hold.wait_held();
+    // The write and the close run; the next write fails the key.
+    hold.release(2);
+    hold.wait_held();
+    assert_eq!(job.barrier().key.held().letting_go.len(), 1);
+    hold.fail_next(io::Error::other("no room"));
+    hold.release(1);
+    hold.wait_held();
+    // The code is dropped unrun, and with it the handle the key let go:
+    // the thread goes on to the next batch without standing to drop it.
+    plug.run(None, dir.path().to_path_buf(), || Ok(()));
+    hold.release(1);
+    assert!(!hold.wait_held_or_dropping(), "a handle outlived the code");
+    let barrier = job.barrier();
+    assert!(barrier.failed() && barrier.returned());
+    assert!(!ran.load(Ordering::SeqCst));
+    assert!(barrier.key.held().letting_go.is_empty());
+    hold.hold_drops(false);
+    hold.open();
+    plug.barrier().wait();
 }
 
 #[test]
@@ -291,6 +590,33 @@ fn a_keys_barrier_and_read_pass_while_another_keys_operation_is_held() {
     assert!(!stuck.exists());
     hold.open();
     held.wait();
+    assert_eq!(std::fs::read(&stuck).unwrap(), b"stuck");
+}
+
+// The loop reads a file after that file's own writes, not after every
+// write its key queued on the volume: a repair's read of one file does not
+// stand behind a stalled write of another file of the same job. The slow
+// disk run's loop stood 66.5 s in 289 waits, most of them while repairs read
+// back with the buffer near empty.
+#[test]
+fn a_read_after_a_files_own_writes_passes_while_its_keys_write_of_another_file_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let (read, stuck) = (dir.path().join("read"), dir.path().join("stuck"));
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    let wrote = job.write(1, 0, Bytes::from_static(b"lantern"), create(&read));
+    hold.wait_held();
+    hold.release(1);
+    job.write(2, 0, Bytes::from_static(b"stuck"), create(&stuck));
+    // The thread stands before the key's write of the other file.
+    hold.wait_held();
+    assert_eq!(job.read_after(wrote, read.clone(), 3, 4).unwrap(), b"tern");
+    assert!(!stuck.exists());
+    assert_eq!(count(&volume.writer.loop_waits), 0, "the read did not wait");
+    hold.open();
+    writers.settle();
     assert_eq!(std::fs::read(&stuck).unwrap(), b"stuck");
 }
 
@@ -745,6 +1071,12 @@ fn a_wait_off_the_loop_is_not_counted_as_a_loop_wait() {
     assert!(barrier.passed());
     assert_eq!(count(&volume.writer.loop_waits), 0);
     assert_eq!(count(&volume.writer.loop_wait_nanos), 0);
+    // The thread aside stood once, and is counted apart; a wait on a
+    // barrier already passed stands for nothing and counts nothing.
+    assert_eq!(count(&volume.writer.aside_waits), 1);
+    assert!(count(&volume.writer.aside_wait_nanos) > 0);
+    barrier.wait_aside();
+    assert_eq!(count(&volume.writer.aside_waits), 1);
 }
 
 // The loop's own wait on a barrier, and its read behind queued writes, are
@@ -949,6 +1281,12 @@ fn the_loops_read_of_a_stuck_volume_ends_at_the_stops_end() {
         let error = read.join().unwrap().unwrap_err();
         assert!(error.to_string().contains("still out"), "{error}");
     });
+    // The wait is counted as a read, the kind the metrics label it.
+    let kind = |kind: LoopWait| count(&volume.writer.loop_waits_by_kind[kind as usize]);
+    assert_eq!(
+        (kind(LoopWait::Read), kind(LoopWait::Settle), kind(LoopWait::Budget)),
+        (1, 0, 0)
+    );
     assert!(job.left());
     assert!(!barrier.failed(), "nothing of the key failed");
     // Past the end the loop does not stand again.
@@ -1217,4 +1555,61 @@ fn the_volumes_own_work_is_dropped_at_a_stop() {
     drop(hold);
     writers.wait_ended(&volume);
     assert!(run.recv().is_err(), "dropped, not run");
+}
+
+// A write's bytes, call and time reach the volume's counters as the call
+// returns, while the rest of its batch is still to run: the live rate is
+// read from them, and a batch on a slow disk can take seconds.
+#[test]
+fn a_write_is_counted_as_its_call_returns_not_at_the_end_of_its_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    job.run(None, dir.path().to_path_buf(), || Ok(()));
+    hold.wait_held();
+    job.write(1, 0, Bytes::from_static(b"lan"), create(&path));
+    job.write(1, 3, Bytes::from_static(b"tern"), None);
+    // The held operation, then the first write of the batch behind it.
+    hold.release(2);
+    hold.wait_held();
+    assert_eq!(count(&volume.written_bytes), 3);
+    assert_eq!(count(&volume.write_calls), 1);
+    assert_eq!(count(&volume.writer.batches), 1, "the batch has not ended");
+    hold.open();
+    job.barrier().wait();
+    assert_eq!(count(&volume.written_bytes), 7);
+    assert_eq!(count(&volume.write_calls), 2);
+    assert_eq!(count(&volume.write_seeks), 0, "the second write follows the first");
+    drop((job, hold));
+    writers.wait_ended(&volume);
+}
+
+// A batch takes queued writes up to `BATCH_BYTES`; what is queued behind
+// them runs in the next batch.
+#[test]
+fn a_batch_stops_taking_writes_at_its_byte_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    job.run(None, dir.path().to_path_buf(), || Ok(()));
+    hold.wait_held();
+    let big = BATCH_BYTES as usize;
+    job.write(1, 0, Bytes::from(vec![7u8; big]), create(&path));
+    job.write(1, big as u64, Bytes::from_static(b"end"), None);
+    hold.open();
+    job.barrier().wait();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), big as u64 + 3);
+    // A batch is counted after its operations return: wait for the thread
+    // to stand with nothing queued.
+    hold.wait_parked();
+    // The held run alone, the write that reached the cap, the one after.
+    assert_eq!(count(&volume.writer.batches), 3);
+    drop((job, hold));
+    writers.wait_ended(&volume);
 }

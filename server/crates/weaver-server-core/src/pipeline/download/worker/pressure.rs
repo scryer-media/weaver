@@ -310,7 +310,16 @@ impl Pipeline {
             return 0;
         };
         let durable_floor = self.durable_download_floor_bytes_for_job(job_id);
-        let accepted_bytes = state.downloaded_bytes.saturating_sub(durable_floor);
+        // What is in hand is counted as the floor is: each article once, in
+        // its decoded bytes. The job's downloaded bytes count every copy
+        // decoded, a damaged one and the copy that replaced it alike, so
+        // against the floor they would hold copies no checkpoint can ever
+        // settle as not durable for good.
+        let in_hand = self
+            .graph_jobs
+            .get(&job_id)
+            .map_or(state.downloaded_bytes, |graph| graph.in_hand_bytes());
+        let accepted_bytes = in_hand.saturating_sub(durable_floor);
         let speculative_active_items = self
             .articles_in_flight_by_job
             .get(&job_id)

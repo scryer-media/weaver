@@ -183,6 +183,8 @@ metric_families! {
         "Article work items leased to download lanes.");
     LANE_REFILLS = ("weaver_pipeline_download_lane_refills_total", Counter, ["result"],
         "Lane refill scheduler decisions.");
+    LANE_ROOM_WAITS = ("weaver_pipeline_download_lane_room_waits_total", Counter, ["event"],
+        "Saturated lane refills held until their volume fell to its resume line (held), and answered once it did (woken).");
     SCHEDULER_HANDOUTS = ("weaver_pipeline_download_scheduler_handouts_total", Counter, ["kind"],
         "Article handouts cut by the per-server scheduler, by kind.");
     SCHEDULER_IDLE_WITH_SERVABLE = ("weaver_pipeline_download_scheduler_idle_with_servable_total", Counter, [],
@@ -626,10 +628,12 @@ metric_families! {
         "Bytes per second of wall time written to a volume over the last window, whether or not the volume was the limit. Conditional: emitted only while the volume is being written to.");
     VOLUME_BUFFERED_BYTES = ("weaver_volume_buffered_bytes", Gauge, ["volume"],
         "Bytes waiting in memory for a volume's writer.");
+    VOLUME_ARRIVED_BYTES = ("weaver_volume_arrived_bytes", Gauge, ["volume"],
+        "Bytes that arrived for the jobs writing to a volume and are not handed to its writer yet: being decoded. The buffer limits are read against these and `weaver_volume_buffered_bytes` together. Articles leased to a connection and not arrived are in neither.");
     VOLUME_BUFFER_LIMIT_BYTES = ("weaver_volume_buffer_limit_bytes", Gauge, ["volume"],
         "The most bytes that may have arrived for a volume and not be written: at this many, fetching stops for the jobs that write to it. Conditional: emitted only once the volume has been given its limits.");
     VOLUME_BUFFER_SOFT_LIMIT_BYTES = ("weaver_volume_buffer_soft_limit_bytes", Gauge, ["volume"],
-        "The unwritten bytes of a volume from which the jobs that write to it are fetched for one article at a time. Conditional: emitted only once the volume has been given its limits.");
+        "Seven tenths of `weaver_volume_buffer_limit_bytes`: a reported figure; fetching does not change at it. Conditional: emitted only once the volume has been given its limits.");
     VOLUME_WRITER_BATCHES = ("weaver_volume_writer_batches_total", Counter, ["volume"],
         "Batches of queued operations a volume's writer has run.");
     VOLUME_WRITER_OPERATIONS = ("weaver_volume_writer_operations_total", Counter, ["volume"],
@@ -638,12 +642,24 @@ metric_families! {
         "Operations a volume's writer ran that came back with an error.");
     VOLUME_WRITER_ABANDONED_OPERATIONS = ("weaver_volume_writer_abandoned_operations_total", Counter, ["volume"],
         "Operations queued for a volume's writer and never run: their job gave its files up, or an earlier operation of the same job failed.");
-    VOLUME_LOOP_WAITS = ("weaver_volume_loop_waits_total", Counter, ["volume"],
-        "Times the pipeline loop itself stood still until a volume's writer had caught up. Waits of other threads, and of a shutdown, are not counted.");
-    VOLUME_LOOP_WAIT_SECONDS = ("weaver_volume_loop_wait_seconds_total", Counter, ["volume"],
-        "Time the pipeline loop itself has stood still waiting for a volume's writer. Waits of other threads, and of a shutdown, are not counted.");
+    VOLUME_LOOP_WAITS = ("weaver_volume_loop_waits_total", Counter, ["volume", "kind"],
+        "Times the pipeline loop itself stood still until a volume's writer had caught up, by what it waited for: `read` (a file's bytes after its writes), `settle` (a file's operations to return, for its length or its delivery) or `budget` (the volume's limit, while the loop produced a repair's or a replay's output). Waits of other threads, and of a shutdown, are not counted.");
+    VOLUME_LOOP_WAIT_SECONDS = ("weaver_volume_loop_wait_seconds_total", Counter, ["volume", "kind"],
+        "Time the pipeline loop itself has stood still waiting for a volume's writer, by what it waited for (see `weaver_volume_loop_waits_total`). Waits of other threads, and of a shutdown, are not counted.");
+    VOLUME_LOOP_READS = ("weaver_volume_loop_reads_total", Counter, ["volume"],
+        "Reads the pipeline loop made itself of a file a volume's writer writes, once the file's writes before them had returned.");
+    VOLUME_LOOP_READ_SECONDS = ("weaver_volume_loop_read_seconds_total", Counter, ["volume"],
+        "Time the pipeline loop spent in its own reads of a volume writer's files (see `weaver_volume_loop_reads_total`), the opening of the file included; the wait before each is in `weaver_volume_loop_wait_seconds_total`.");
+    VOLUME_ASIDE_WAITS = ("weaver_volume_aside_waits_total", Counter, ["volume"],
+        "Times a thread other than the pipeline loop (a check, a repair, a replay) stood until a volume's writer had returned the operations of the file it was to read.");
+    VOLUME_ASIDE_WAIT_SECONDS = ("weaver_volume_aside_wait_seconds_total", Counter, ["volume"],
+        "Time threads other than the pipeline loop stood waiting for a volume's writer (see `weaver_volume_aside_waits_total`).");
     VOLUME_WRITER_THREADS = ("weaver_volume_writer_threads_total", Counter, ["volume"],
         "Writer threads started for a volume, one after another: a volume's thread ends when nothing writes to it and starts again at the next write.");
+    VOLUME_WRITER_WOKEN = ("weaver_volume_writer_woken_total", Counter, ["volume"],
+        "Times a volume's writer woke to new operations after it had run out of them and waited.");
+    VOLUME_WRITER_BUFFERS = ("weaver_volume_writer_buffers_total", Counter, ["volume", "to"],
+        "Written buffers a volume's writer handed back to the pipeline loop to be freed there (`returned`), and those it freed itself because the way back was full (`freed`).");
 
     // ---- PAR3 recovery -----------------------------------------------------------------------------
     // Every series here is fed from `MetricsSnapshot::par3`, which is a plain

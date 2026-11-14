@@ -1424,6 +1424,10 @@ pub struct VolumeSnapshot {
     pub throughput: u64,
     // Bytes waiting in memory for the volume's writer.
     pub buffered_bytes: u64,
+    // Bytes that arrived for the jobs writing to the volume and are not
+    // handed to its writer yet: being decoded. The limits below are read
+    // against these and the buffered bytes together.
+    pub arrived_bytes: u64,
     // The volume's buffer limits, over the bytes that arrived for it and
     // are not written: from the soft one its lanes ask for one article at
     // a time, at the hard one they stop. Zero until the volume is sized.
@@ -1435,6 +1439,10 @@ pub struct VolumeSnapshot {
     pub writer: VolumeWriterSnapshot,
 }
 
+// The label of each kind of loop wait, in the order of
+// `VolumeWriterSnapshot::loop_waits_by_kind`.
+pub const LOOP_WAIT_KINDS: [&str; 3] = ["read", "settle", "budget"];
+
 // One volume's writer counts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct VolumeWriterSnapshot {
@@ -1444,6 +1452,19 @@ pub struct VolumeWriterSnapshot {
     // Times the pipeline loop stood still for the writer, and for how long.
     pub loop_waits: u64,
     pub loop_wait_nanos: u64,
+    // The same, by what the loop waited for: a read after a file's writes,
+    // a file's operations to settle, and the volume's limit while the loop
+    // produced output itself (`LOOP_WAIT_KINDS`, in that order).
+    pub loop_waits_by_kind: [u64; 3],
+    pub loop_wait_nanos_by_kind: [u64; 3],
+    // Reads the pipeline loop made itself of the writer's files, after its
+    // wait, and how long they took, the open included.
+    pub loop_reads: u64,
+    pub loop_read_nanos: u64,
+    // Times a thread other than the loop (a check, a repair, a replay)
+    // stood for the writer, and for how long.
+    pub aside_waits: u64,
+    pub aside_wait_nanos: u64,
     // Operations that came back with an error.
     pub failed_operations: u64,
     // Operations not run: their caller gave its files up, or an earlier
@@ -1451,6 +1472,12 @@ pub struct VolumeWriterSnapshot {
     pub abandoned_operations: u64,
     // Writer threads started for the volume, one after another.
     pub threads: u64,
+    // Times the writer woke to mail after waiting for it.
+    pub woken: u64,
+    // Written buffers handed back to the loop, and those freed on the
+    // writer because the way back was full.
+    pub buffers_returned: u64,
+    pub buffers_freed: u64,
 }
 
 #[cfg(test)]

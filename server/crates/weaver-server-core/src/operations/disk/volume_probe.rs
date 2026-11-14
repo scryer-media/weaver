@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 
 use super::volume::Volume;
-use crate::runtime::system_probe::{ProbeFileGuard, ProbeWrite, synced_probe_write};
+use crate::runtime::system_probe::{ProbeFileGuard, ProbeWrite, synced_probe_write_until};
 
 // The probe's scratch file, in the directory probed. A plain name with a
 // text extension rather than a dotfile, as the start-up probe's is: security
@@ -38,6 +38,11 @@ const PROBE_RECORD: &str = "volume-probes.json";
 // A stored figure older than this is taken again, and its row is dropped
 // the next time the record is written.
 const PROBE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+// A probe that gave way to the volume's first writes is used only when it
+// wrote for at least this long: a shorter one is neither put on the volume,
+// which real writes are about to measure, nor kept, and the next start
+// probes again.
+const PROBE_KEPT_AFTER: Duration = Duration::from_millis(100);
 
 // One volume's stored figure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -55,7 +60,21 @@ struct Record {
 }
 
 type Clock = Box<dyn Fn() -> SystemTime + Send + Sync>;
-type Measure = Box<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
+// The probe of the directory, which gives way between its chunks once the
+// second argument answers true.
+type Measure = Box<dyn Fn(&Path, &dyn Fn() -> bool) -> Option<Measured> + Send + Sync>;
+
+// What a probe measured, and whether the figure is to be kept between
+// starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Measured {
+    // Bytes per second.
+    pub(crate) rate: u64,
+    // The probe wrote its whole schedule, or long enough before it gave way.
+    pub(crate) kept: bool,
+    // How long the probe wrote, the syncs included.
+    pub(crate) elapsed: Duration,
+}
 
 // The probed figures of every volume, held in memory and in one small file.
 // The file is read once, when the store is opened; asking after a volume
@@ -164,7 +183,10 @@ pub(crate) fn probe_once(
         if store.apply_stored(&volume) || volume.write_rate.load(Ordering::Relaxed) > 0 {
             return Ok(());
         }
-        let Some(write_rate) = (store.measure)(&dir) else {
+        // The probe gives way, between its chunks, to the first writes
+        // queued for the volume: they do not stand behind more of it.
+        let writes_wait = || volume.unwritten_bytes() > 0;
+        let Some(measured) = (store.measure)(&dir, &writes_wait) else {
             debug!(
                 volume = %volume.label,
                 dir = %dir.display(),
@@ -174,11 +196,17 @@ pub(crate) fn probe_once(
         };
         info!(
             volume = %volume.label,
-            mb_per_second = write_rate / 1_000_000,
+            mb_per_second = measured.rate / 1_000_000,
+            probe_ms = measured.elapsed.as_millis() as u64,
+            kept = measured.kept,
             "probed volume write rate"
         );
-        set_if_unmeasured(&volume, write_rate);
-        store.keep(&volume, write_rate);
+        // A figure from a probe cut short is one chunk's: too little to go
+        // on. The volume stays unmeasured until its own writing measures it.
+        if measured.kept {
+            set_if_unmeasured(&volume, measured.rate);
+            store.keep(&volume, measured.rate);
+        }
         Ok(())
     }
 }
@@ -186,8 +214,20 @@ pub(crate) fn probe_once(
 // What the volume under `dir` takes, in bytes per second: a scratch file
 // written there in growing chunks, each synced, for about a second of write
 // time, then removed. `None` when the file could not be written.
-fn measure_write_rate(dir: &Path) -> Option<u64> {
-    measure_with(dir, synced_probe_write)
+// It gives way to the volume's writes as `synced_probe_write_until` says.
+fn measure_write_rate(dir: &Path, give_way: &dyn Fn() -> bool) -> Option<Measured> {
+    let mut gave_way = false;
+    let mut elapsed = Duration::ZERO;
+    let rate = measure_with(dir, |path| {
+        let (write, cut) = synced_probe_write_until(path, give_way)?;
+        (gave_way, elapsed) = (cut, write.elapsed);
+        Some(write)
+    })?;
+    Some(Measured {
+        rate,
+        kept: !gave_way || elapsed >= PROBE_KEPT_AFTER,
+        elapsed,
+    })
 }
 
 // The probe with its file writer passed in. The scratch file is removed
@@ -246,7 +286,7 @@ mod tests {
     use std::sync::atomic::AtomicU64;
 
     use super::*;
-    use crate::runtime::system_probe::{PROBE_CHUNK_BYTES, probe_file_bytes};
+    use crate::runtime::system_probe::{PROBE_CHUNK_BYTES, probe_file_bytes, probe_file_bytes_until};
 
     const MIB: u64 = 1024 * 1024;
     const DAY: u64 = 24 * 60 * 60;
@@ -263,12 +303,21 @@ mod tests {
         let store = ProbeStore::open_with(
             data_dir,
             Box::new(move || UNIX_EPOCH + Duration::from_secs(now)),
-            Box::new(move |_| {
+            Box::new(move |_, _| {
                 counted.fetch_add(1, Ordering::Relaxed);
-                rate
+                rate.map(whole)
             }),
         );
         (store, probes)
+    }
+
+    // A probe that wrote its whole schedule.
+    fn whole(rate: u64) -> Measured {
+        Measured {
+            rate,
+            kept: true,
+            elapsed: Duration::from_secs(1),
+        }
     }
 
     fn rate_of(volume: &Volume) -> u64 {
@@ -313,6 +362,82 @@ mod tests {
             }),
             Some(1)
         );
+    }
+
+    // A probe gives way before its next chunk once writes wait for the
+    // volume, never before its first, and never when the budget already
+    // ended it: on a fast disk it stops after one chunk of 16 MiB, on a slow
+    // one the first chunk is the whole probe either way.
+    #[test]
+    fn the_probe_gives_way_to_writes_after_its_first_chunk() {
+        let chunks_at = |bytes_per_second: u64, give_way: bool| {
+            let written = std::cell::Cell::new(0);
+            let probed = probe_file_bytes_until(
+                |repeats| {
+                    written.set(written.get() + 1);
+                    Some(Duration::from_nanos(
+                        (repeats * PROBE_CHUNK_BYTES) as u64 * 1_000_000_000 / bytes_per_second,
+                    ))
+                },
+                &|| give_way,
+            )
+            .unwrap();
+            (probed, written.get())
+        };
+
+        let (fast, chunks) = chunks_at(1024 * MIB, true);
+        assert_eq!(chunks, 1);
+        assert!(fast.1, "it gave way");
+        assert_eq!(fast.0.bytes, 16 * MIB);
+        assert_eq!(probed_rate(fast.0), Some(1024 * MIB));
+
+        let (alone, chunks) = chunks_at(1024 * MIB, false);
+        assert_eq!(chunks, 4);
+        assert!(!alone.1);
+        assert_eq!(alone.0.bytes, 480 * MIB);
+
+        // Two seconds for the first chunk: the budget ends it, not the writes.
+        let (slow, chunks) = chunks_at(8 * MIB, true);
+        assert_eq!(chunks, 1);
+        assert!(!slow.1);
+    }
+
+    // A probe that gave way early puts no figure on the volume, so nothing
+    // goes by one chunk, and keeps nothing for the next start, which probes
+    // again; one that wrote long enough before it gave way is kept. The
+    // probe is told to give way by the bytes waiting for the volume.
+    #[test]
+    fn a_probe_that_gave_way_early_is_not_kept() {
+        let data = tempfile::tempdir().unwrap();
+        let volume = volume(Some(1), "/");
+        let asked = Arc::new(AtomicU64::new(0));
+        let told = Arc::clone(&asked);
+        let early = ProbeStore::open_with(
+            data.path(),
+            Box::new(|| UNIX_EPOCH + Duration::from_secs(1000)),
+            Box::new(move |_, writes_wait| {
+                told.store(u64::from(writes_wait()), Ordering::Relaxed);
+                Some(Measured {
+                    rate: 1_200_000_000,
+                    kept: false,
+                    elapsed: Duration::from_millis(14),
+                })
+            }),
+        );
+        volume.buffered_bytes.store(MIB, Ordering::Relaxed);
+        probe_once(Arc::clone(&volume), data.path().to_path_buf(), early)().unwrap();
+        assert_eq!(asked.load(Ordering::Relaxed), 1, "the writes waiting were seen");
+        assert_eq!(rate_of(&volume), 0, "one chunk's figure is not put on the volume");
+        assert!(!data.path().join(PROBE_RECORD).exists());
+
+        let (reopened, probes) = store(data.path(), 1000, Some(900_000_000));
+        let after_restart = self::volume(Some(1), "/");
+        assert!(!reopened.apply_stored(&after_restart));
+        probe_once(Arc::clone(&after_restart), data.path().to_path_buf(), reopened)().unwrap();
+        assert_eq!(probes.load(Ordering::Relaxed), 1, "the next start probes again");
+        assert_eq!(rate_of(&after_restart), 900_000_000);
+        let (stored, _) = store(data.path(), 1000, None);
+        assert!(stored.apply_stored(&self::volume(Some(1), "/")));
     }
 
     // The scratch file is gone whether the writer finished or gave up.
@@ -395,9 +520,9 @@ mod tests {
         let store = ProbeStore::open_with(
             data.path(),
             Box::new(|| UNIX_EPOCH + Duration::from_secs(1000)),
-            Box::new(move |_| {
+            Box::new(move |_, _| {
                 sampled.write_rate.store(90_000_000, Ordering::Relaxed);
-                Some(180_000_000)
+                Some(whole(180_000_000))
             }),
         );
 

@@ -17,7 +17,7 @@
 //
 // Nothing here syncs: an operation has returned when its system call has.
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fs::File;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-use super::volume::Volume;
+use super::volume::{LoopWait, Volume};
 use super::volume_rate::RateSignal;
 
 // How a file that is not open is opened, made when it is not there, at the
@@ -195,6 +195,9 @@ struct Registry {
     // Where the loop's own waits end once the owner is stopping. Every
     // lane holds it.
     loop_end: Arc<LoopEnd>,
+    // Written buffers on their way back to the pipeline loop. Every lane
+    // with a thread holds it.
+    returns: Arc<Returns>,
     #[cfg(test)]
     ended: Condvar,
     // Times a thread was asked for.
@@ -205,6 +208,98 @@ struct Registry {
 impl Registry {
     fn lock(&self) -> MutexGuard<'_, Lanes> {
         self.lanes.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+// What the writers may hold of written buffers for the pipeline loop to
+// free: past it a writer frees the buffer itself.
+const RETURN_BYTES: u64 = 32 << 20;
+
+// Buffers the writers have written, held for the pipeline loop to free on
+// its own turn (`VolumeWriters::free_returned`): a decoded article's buffer
+// is freed on the loop's side, as it was before writers had threads, not
+// on a writer. Bounded by `RETURN_BYTES`; a writer never waits on it.
+// While the loop waits with nothing to drive, a writer frees in place
+// (`VolumeWriters::park_returns`): nothing is held for a turn that may not
+// come for a long time.
+struct Returns {
+    held: Mutex<Vec<Bytes>>,
+    bytes: AtomicU64,
+    limit: u64,
+    // Whether the loop waits with nothing to drive.
+    idle: AtomicBool,
+}
+
+impl Default for Returns {
+    fn default() -> Self {
+        Self::new(RETURN_BYTES)
+    }
+}
+
+impl Returns {
+    fn new(limit: u64) -> Self {
+        Self {
+            held: Mutex::default(),
+            bytes: AtomicU64::new(0),
+            limit,
+            idle: AtomicBool::new(false),
+        }
+    }
+
+    // `bytes` were written. The last share of a buffer goes back to the
+    // loop while there is room for it and the loop is not idle, and is
+    // freed here otherwise; dropping any other share frees nothing.
+    fn give(&self, bytes: Bytes, counts: &super::volume::WriterCounts) {
+        if !bytes.is_unique() {
+            return;
+        }
+        let len = bytes.len() as u64;
+        // Checked, then added: writers that check at once may each add past
+        // the limit, by one buffer per writer thread at most, which is fine.
+        if self.idle.load(Ordering::SeqCst)
+            || self.bytes.load(Ordering::Relaxed).saturating_add(len) > self.limit
+        {
+            counts.buffers_freed.fetch_add(1, Ordering::Relaxed);
+            break_span();
+            return;
+        }
+        self.bytes.fetch_add(len, Ordering::Relaxed);
+        self.held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(bytes);
+        counts.buffers_returned.fetch_add(1, Ordering::Relaxed);
+        // The loop went idle after the check above, and may have freed what
+        // it held before this came: it is freed here instead.
+        if self.idle.load(Ordering::SeqCst) {
+            break_span();
+            self.take_all();
+        }
+    }
+
+    // Free what came back. One load when nothing did.
+    fn free(&self) {
+        if self.bytes.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        self.take_all();
+    }
+
+    fn take_all(&self) {
+        let held = std::mem::take(&mut *self.held.lock().unwrap_or_else(PoisonError::into_inner));
+        let len = held.iter().map(|bytes| bytes.len() as u64).sum::<u64>();
+        self.bytes.fetch_sub(len, Ordering::Relaxed);
+        drop(held);
+    }
+}
+
+// Held by the pipeline loop while it waits with nothing to drive: the
+// writers free what they write in place until it is dropped.
+pub(crate) struct ParkedReturns(Arc<Returns>);
+
+impl Drop for ParkedReturns {
+    fn drop(&mut self) {
+        self.0.idle.store(false, Ordering::SeqCst);
     }
 }
 
@@ -231,6 +326,25 @@ impl VolumeWriters {
             #[cfg(test)]
             mode: Mode::Threads,
         }
+    }
+
+    // Free the written buffers the writers handed back. Called by the
+    // pipeline loop on each of its turns; one load when none came back.
+    pub(crate) fn free_returned(&self) {
+        self.registry.returns.free();
+    }
+
+    // The pipeline loop is about to wait with nothing to drive: what came
+    // back is freed now, and the writers free in place until the returned
+    // guard is dropped as the wait ends. No wake is rung for it.
+    pub(crate) fn park_returns(&self) -> ParkedReturns {
+        let returns = &self.registry.returns;
+        returns.idle.store(true, Ordering::SeqCst);
+        // Taken under the lock, not after a load: a buffer a writer pushed
+        // before it saw the loop idle is freed here, and one pushed after
+        // is freed by that writer.
+        returns.take_all();
+        ParkedReturns(Arc::clone(returns))
     }
 
     // The same writers, ringing `rates` after every batch that wrote.
@@ -304,6 +418,7 @@ impl VolumeWriters {
             self.rates.clone(),
             Arc::clone(&self.registry.stopped),
             Arc::clone(&self.registry.loop_end),
+            (!inline).then(|| Arc::clone(&self.registry.returns)),
             Arc::downgrade(&self.registry),
             inline,
             threadless,
@@ -411,7 +526,7 @@ impl VolumeWriters {
 
     // The owner has begun to stop, and gives a volume up once `clock` reads
     // `end`: the end its settles share. From now on the pipeline loop's own
-    // waits for a volume (`Barrier::wait`, `Submitter::read_after`,
+    // waits for a volume (`Barrier::wait`, `Submitter::wait_for`,
     // `Submitter::loop_wait_below`) end there too, with what they waited
     // for still out; the key they waited on says so (`Submitter::left`).
     // Called by the loop, which stands in none of those waits then.
@@ -519,6 +634,11 @@ const VOLUME_KEY: u64 = u64::MAX;
 // No entry of a batch: the end of a key's chain through it.
 const NONE: u32 = u32::MAX;
 
+// The writes one batch takes before the rest wait for the next: about
+// half a second of the slowest disk measured (57 MB/s), so a caller's
+// operation never waits behind more than that of other writes.
+const BATCH_BYTES: u64 = 32 * 1024 * 1024;
+
 struct Key {
     id: u64,
     // An operation under the key failed: the ones after it are not run.
@@ -535,6 +655,12 @@ struct Key {
     // number through which every one of them has returned.
     submitted: AtomicU64,
     returned: AtomicU64,
+    // The number through which every operation's bytes and length are on
+    // disk: each write call, truncate, length set and caller's code has
+    // returned. Only the drop of a handle the key let go may still be out.
+    // A reader on a thread of its own opens its own handle and needs no
+    // more; delivery, checkpoints and settles still go by `returned`.
+    placed: AtomicU64,
     waiters: AtomicUsize,
     waiting: Mutex<()>,
     woke: Condvar,
@@ -551,6 +677,13 @@ struct Key {
     turn: AtomicU64,
     head: AtomicU32,
     tail: AtomicU32,
+    // The batch in which the key let a handle go that is not dropped yet,
+    // and the entry of the batch that let the first go, kept by the
+    // volume's thread alone. From that entry on the key is told its
+    // operations returned only once its handles are dropped, which is done
+    // as soon as the batch runs nothing more of the key.
+    letting: AtomicU64,
+    held_entry: AtomicU32,
 }
 
 struct Asked {
@@ -585,6 +718,10 @@ struct Held {
     open: HashMap<u64, Open>,
     // A file whose open was refused: its later writes are dropped.
     refused: HashSet<u64>,
+    // Handles a close, a release or a forget let go in the batch being
+    // run, dropped once the batch runs nothing more of the key, or before
+    // a caller's code of the key runs.
+    letting_go: Vec<Open>,
 }
 
 impl Key {
@@ -597,6 +734,7 @@ impl Key {
             unheard: AtomicU32::new(0),
             submitted: AtomicU64::new(0),
             returned: AtomicU64::new(0),
+            placed: AtomicU64::new(0),
             waiters: AtomicUsize::new(0),
             waiting: Mutex::new(()),
             woke: Condvar::new(),
@@ -606,6 +744,8 @@ impl Key {
             turn: AtomicU64::new(0),
             head: AtomicU32::new(NONE),
             tail: AtomicU32::new(NONE),
+            letting: AtomicU64::new(0),
+            held_entry: AtomicU32::new(NONE),
         }
     }
 
@@ -622,15 +762,33 @@ impl Key {
         self.abandoned.load(Ordering::Acquire) || self.failed.load(Ordering::Acquire)
     }
 
+    fn has_placed(&self, seq: u64) -> bool {
+        self.placed.load(Ordering::SeqCst) >= seq
+    }
+
     // Every operation of the key through `seq` has returned.
     fn returned(&self, seq: u64) {
+        // Placed first: nothing that has returned is still out for a reader.
+        self.placed.fetch_max(seq, Ordering::SeqCst);
         self.returned.fetch_max(seq, Ordering::SeqCst);
-        if self.waiters.load(Ordering::SeqCst) > 0 {
-            let _held = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
-            self.woke.notify_all();
-        }
+        self.wake();
         if self.asked.load(Ordering::SeqCst) <= seq {
             self.run_due();
+        }
+    }
+
+    // The bytes and lengths of the key's operations through `seq` are on
+    // disk; handles they let go may still be open (`placed`).
+    fn placed(&self, seq: u64) {
+        self.placed.fetch_max(seq, Ordering::SeqCst);
+        self.wake();
+    }
+
+    fn wake(&self) {
+        if self.waiters.load(Ordering::SeqCst) > 0 {
+            break_span();
+            let _held = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+            self.woke.notify_all();
         }
     }
 
@@ -646,6 +804,9 @@ impl Key {
             }
             let next = then.peek().map_or(u64::MAX, |asked| asked.seq);
             self.asked.store(next, Ordering::SeqCst);
+        }
+        if !due.is_empty() {
+            break_span();
         }
         for run in due {
             // One that panics does not cost the others their turn.
@@ -691,9 +852,11 @@ impl Key {
         returned
     }
 
-    fn wait(&self, seq: u64, stopped: Option<&AtomicBool>) {
+    // A reader's wait: until the key's operations through `seq` are placed,
+    // or until `stopped` is set when one is given.
+    fn wait_placed(&self, seq: u64, stopped: Option<&AtomicBool>) {
         let over = || {
-            self.has_returned(seq) || stopped.is_some_and(|stopped| stopped.load(Ordering::SeqCst))
+            self.has_placed(seq) || stopped.is_some_and(|stopped| stopped.load(Ordering::SeqCst))
         };
         if over() {
             return;
@@ -895,10 +1058,12 @@ impl Submitter {
     }
 
     // Read `len` bytes at `offset` of the file at `path`, after everything
-    // the key submitted before. The caller waits for the answer. This is
-    // the pipeline loop's read: a wait here is counted as a loop wait. A
-    // thread that is not the loop waits with `Barrier::wait_aside` and
-    // reads the file itself.
+    // the key submitted before. The caller waits for the answer. Only the
+    // tests read this way: the pipeline loop waits for the file's own
+    // writes (`wait_for`) and reads it itself, never behind every file of
+    // its key. A thread that is not the loop waits with
+    // `Barrier::wait_aside` and reads the file itself.
+    #[cfg(test)]
     pub(crate) fn read(&self, path: PathBuf, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         self.read_after(self.key.submitted.load(Ordering::Acquire), path, offset, len)
     }
@@ -907,6 +1072,7 @@ impl Submitter {
     // number the last submission for the file returned. The read is made
     // here, by the caller, as soon as those have returned: it waits for no
     // other key, queued or running.
+    #[cfg(test)]
     pub(crate) fn read_after(
         &self,
         seq: u64,
@@ -914,10 +1080,18 @@ impl Submitter {
         offset: u64,
         len: usize,
     ) -> io::Result<Vec<u8>> {
+        self.wait_for(seq)?;
+        read_at(&path, offset, len)
+    }
+
+    // The wait before such a read alone: the key's operations through `seq`
+    // have returned once this does, and the caller reads the file itself,
+    // through a handle it already holds when it has one.
+    pub(crate) fn wait_for(&self, seq: u64) -> io::Result<()> {
         if !self.key.has_returned(seq) {
             let began = Instant::now();
             let returned = self.key.wait_loop(seq, &self.lane.state.loop_end);
-            self.lane.state.waited(began);
+            self.lane.state.waited(LoopWait::Read, began);
             if !returned {
                 return Err(io::Error::other(
                     "the owner is stopping and the file's writes are still out",
@@ -927,7 +1101,13 @@ impl Submitter {
         if self.key.stopped() {
             return Err(io::Error::other("the file's writes were given up"));
         }
-        read_at(&path, offset, len)
+        Ok(())
+    }
+
+    // A read of the loop's own, made after `wait_for`, counted on the
+    // volume: how many and how long, the open of the file included.
+    pub(crate) fn loop_read(&self, began: Instant) {
+        self.lane.state.loop_read(began);
     }
 
     // Everything submitted under the key so far.
@@ -1072,33 +1252,48 @@ impl Barrier {
         }
         let began = Instant::now();
         self.key.wait_loop(self.seq, &self.lane.loop_end);
-        self.lane.waited(began);
+        self.lane.waited(LoopWait::Settle, began);
     }
 
     // What a caller asks after `wait` or `wait_aside`: the operations are
     // not all on disk, because one failed, the key was given up, or the
     // wait ended at a stop with some still out. Nothing may be read back as if they were.
+    // Asked of what is placed: a handle the writer has yet to drop does not
+    // keep bytes off disk.
     pub(crate) fn unwritten(&self) -> bool {
-        self.failed() || !self.returned()
+        self.failed() || !self.key.has_placed(self.seq)
     }
 
     // The same wait for any thread that is not the pipeline loop: a check,
-    // a repair, a replay or an extraction on a thread of its own. It is not
-    // counted, so the loop-wait counters say only what the loop stood for.
+    // a repair, a replay or an extraction on a thread of its own. It is
+    // counted apart (`aside_waits`), so the loop-wait counters say only
+    // what the loop stood for.
     // It also ends once the owner is stopping
     // (`VolumeWriters::stop_waits`), with the operations still out: the
     // caller asks `unwritten` and reads nothing back when they are.
+    // It waits until the operations are placed, not returned: a reader opens
+    // its own handle, so the writer's drop of the handles a close or a
+    // release let go is not waited for. On some systems that drop is slow
+    // for a large file just written.
     pub(crate) fn wait_aside(&self) {
-        if self.returned() {
+        if self.key.has_placed(self.seq) {
             return;
         }
+        let began = Instant::now();
         let aside = || self.lane.aside.lock().unwrap_or_else(PoisonError::into_inner);
         aside().push(Arc::clone(&self.key));
-        self.key.wait(self.seq, Some(&self.lane.stopped));
+        self.key.wait_placed(self.seq, Some(&self.lane.stopped));
         let mut aside = aside();
         if let Some(at) = aside.iter().position(|key| Arc::ptr_eq(key, &self.key)) {
             aside.swap_remove(at);
         }
+        drop(aside);
+        // Counted apart from the loop's waits: what a check, a repair or a
+        // replay stood for the writer.
+        self.lane
+            .volume
+            .writer
+            .aside_waited(began.elapsed().as_nanos() as u64);
     }
 
     // Have a wait of the loop on the barrier's key look at its clock
@@ -1175,6 +1370,9 @@ struct LaneState {
     stopped: Arc<AtomicBool>,
     // Where the loop's own waits end once the owner is stopping.
     loop_end: Arc<LoopEnd>,
+    // Where written buffers go back to the pipeline loop; `None` on a lane
+    // that runs on its callers, which free them where they are.
+    returns: Option<Arc<Returns>>,
     // The keys threads stand in `Barrier::wait_aside` for, so a stop can
     // wake them.
     aside: Mutex<Vec<Arc<Key>>>,
@@ -1187,18 +1385,23 @@ struct LaneState {
 impl LaneState {
     // The pipeline loop stood still for the writer since `began`. Called
     // only from the waits the loop itself makes.
-    fn waited(&self, began: Instant) {
-        let counts = &self.volume.writer;
-        counts.loop_waits.fetch_add(1, Ordering::Relaxed);
-        counts
-            .loop_wait_nanos
-            .fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    fn waited(&self, kind: LoopWait, began: Instant) {
+        self.volume
+            .writer
+            .loop_waited(kind, began.elapsed().as_nanos() as u64);
+    }
+
+    fn loop_read(&self, began: Instant) {
+        self.volume
+            .writer
+            .loop_read(began.elapsed().as_nanos() as u64);
     }
 
     // Have every thread in `Submitter::wait_below` look again: the bytes
     // waiting fell, or a key stopped. One load when no thread waits.
     fn look_below(&self) {
         if self.below_waiters.load(Ordering::SeqCst) > 0 {
+            break_span();
             let _held = self
                 .below_waiting
                 .lock()
@@ -1210,6 +1413,7 @@ impl LaneState {
     fn returned(&self, through: u64) {
         self.returned.fetch_max(through, Ordering::SeqCst);
         if self.waiters.load(Ordering::SeqCst) > 0 {
+            break_span();
             let _held = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
             self.woke.notify_all();
         }
@@ -1226,6 +1430,7 @@ fn unbuffer(state: &LaneState, report: &ReportFn, bytes: u64) {
     volume.buffered_bytes.fetch_sub(bytes, Ordering::SeqCst);
     state.look_below();
     if volume.take_wake() {
+        break_span();
         report(Report {
             failures: Vec::new(),
             below: true,
@@ -1243,6 +1448,7 @@ impl Lane {
         rates: Option<Arc<RateSignal>>,
         stopped: Arc<AtomicBool>,
         loop_end: Arc<LoopEnd>,
+        returns: Option<Arc<Returns>>,
         registry: Weak<Registry>,
         inline: bool,
         threadless: bool,
@@ -1262,6 +1468,7 @@ impl Lane {
             below: Condvar::new(),
             stopped,
             loop_end,
+            returns,
             aside: Mutex::default(),
             #[cfg(test)]
             gate: Mutex::default(),
@@ -1398,6 +1605,14 @@ enum Op {
 }
 
 impl Op {
+    // The bytes the operation writes: none but for a write.
+    fn write_len(&self) -> u64 {
+        match self {
+            Op::Write { bytes, .. } => bytes.len() as u64,
+            _ => 0,
+        }
+    }
+
     fn file(&self) -> Option<u64> {
         match self {
             Op::Write { file, .. }
@@ -1431,6 +1646,16 @@ struct Open {
 }
 
 impl Held {
+    // Let the handle of `file` go, to be dropped with the key's others.
+    // Whether there was one.
+    fn let_go(&mut self, file: u64) -> bool {
+        let Some(open) = self.open.remove(&file) else {
+            return false;
+        };
+        self.letting_go.push(open);
+        true
+    }
+
     // The open handle of `file`, opened through `create` when it is not
     // open. `None` for a file whose name was refused; an error for any other
     // file with no handle and no way to open one.
@@ -1476,15 +1701,70 @@ struct Ran {
     tally: Tally,
     // The bytes of the write being made, still counted as waiting.
     in_hand: u64,
+    // When the write call before this operation returned, while nothing
+    // else ran since: the next write's time is taken from it, so a run of
+    // writes reads the clock once for each call. `None` at the start of a
+    // batch and after any other operation, whose time is not a write's; a
+    // write that opens its file first reads the clock again after the open.
+    wrote_at: Option<Instant>,
+    // The operation just run let a handle go (`Held::letting_go`). Its key
+    // is told the operations from it on are placed as they run, and that
+    // they returned only once its handles are dropped: a reader does not
+    // wait behind the drop, and a settle, a checkpoint or a delivery still
+    // does.
+    let_go: bool,
+    // The operation just run was a caller's code, run with its key's
+    // handles dropped.
+    dropped: bool,
 }
 
-// What one batch adds to its volume's counters.
+// The writer's clock, for the time inside write calls. A test steps it from
+// inside an open (`step_clock`); every read of a stepped clock moves it on
+// by a millisecond.
+fn now() -> Instant {
+    #[cfg(test)]
+    if let Some(at) = STEPPED.get() {
+        let next = at + Duration::from_millis(1);
+        STEPPED.set(Some(next));
+        return next;
+    }
+    Instant::now()
+}
+
+#[cfg(test)]
+thread_local! {
+    static STEPPED: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    // Set when the writer did more between two write calls than a few
+    // loads and stores: see `break_span`.
+    static SPAN_BROKEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// Work that can take microseconds ran on this thread: a wake of waiters, a
+// caller's code, a report, or a buffer freed. A write chained from the
+// last one's return (`Ran::wrote_at`) reads the clock again instead, so
+// that work is not counted as write time. Between two calls without it
+// sit a few atomic loads and stores and one uncontended lock, tens of
+// nanoseconds against a write call of tens of microseconds or more.
+fn break_span() {
+    SPAN_BROKEN.set(true);
+}
+
+// Steps this thread's writer clock on by `by`, starting it when it is not
+// stepped yet.
+#[cfg(test)]
+fn step_clock(by: Duration) {
+    STEPPED.set(Some(STEPPED.get().unwrap_or_else(Instant::now) + by));
+}
+
+// What one batch adds to its volume's counters. Its write calls are
+// counted on the volume as each returns; `calls` only says the batch made
+// one.
 #[derive(Default)]
 struct Tally {
-    written: u64,
-    nanos: u64,
     calls: u64,
-    seeks: u64,
     operations: u64,
     abandoned: u64,
 }
@@ -1523,6 +1803,9 @@ struct Thread {
     // Each file of the batch, by its key and the key's number for it.
     files: HashMap<(usize, u64), (u32, u32, u32)>,
     ran: Ran,
+    // The batch entries at which a key first let a handle go whose handles
+    // are not dropped yet: the settle goes no further than the first.
+    held: BTreeSet<u32>,
     // Operations that reached the thread, and batches it began.
     arrived: u64,
     turn: u64,
@@ -1551,6 +1834,7 @@ impl Thread {
             order: Vec::new(),
             files: HashMap::new(),
             ran: Ran::default(),
+            held: BTreeSet::new(),
             arrived: 0,
             turn: 0,
             worked: false,
@@ -1584,7 +1868,17 @@ impl Thread {
                             #[cfg(test)]
                             self.park(false);
                             match mail {
-                                Ok(mail) => mail,
+                                Ok(mail) => {
+                                    // The thread stood with nothing queued
+                                    // and was woken: a send that found it
+                                    // parked.
+                                    self.state
+                                        .volume
+                                        .writer
+                                        .woken
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    mail
+                                }
                                 Err(_) => return,
                             }
                         }
@@ -1664,10 +1958,20 @@ impl Thread {
     // Run `first` and everything queued behind it as one batch. Whether
     // the batch was work: it held more than a caller's bookkeeping.
     fn batch(&mut self, first: Queued, queued: &mpsc::Receiver<Mail>) -> bool {
+        let mut bytes = first.op.write_len();
         self.batch.push(Entry::new(first));
-        while let Ok(more) = queued.try_recv() {
+        // A batch takes what is queued up to `BATCH_BYTES` of writes. The
+        // ordering inside a batch can run one caller's operation behind
+        // every other write of it, so an uncapped batch on a slow disk had
+        // a reader wait for hundreds of megabytes it did not need.
+        while bytes < BATCH_BYTES
+            && let Ok(more) = queued.try_recv()
+        {
             match more {
-                Mail::Op(more) => self.batch.push(Entry::new(more)),
+                Mail::Op(more) => {
+                    bytes += more.op.write_len();
+                    self.batch.push(Entry::new(more));
+                }
                 Mail::Idle(run) => self.idle.push(run),
                 Mail::Left => {}
             }
@@ -1703,13 +2007,8 @@ impl Thread {
                 .fetch_add(failures.len() as u64, Ordering::Relaxed);
         }
         if tally.calls > 0 {
-            // The bytes first and the time last, released: whoever
-            // reads the time first never sees time without its bytes.
-            volume.written_bytes.fetch_add(tally.written, Ordering::Relaxed);
-            volume.write_calls.fetch_add(tally.calls, Ordering::Relaxed);
-            volume.write_seeks.fetch_add(tally.seeks, Ordering::Relaxed);
-            volume.write_nanos.fetch_add(tally.nanos, Ordering::Release);
-            // After the counters, so a sampler this wakes finds them moved.
+            // The volume's write counters moved as each call returned
+            // (`perform`); a sampler this wakes finds them moved.
             if let Some(rates) = &self.rates {
                 rates.wake();
             }
@@ -1741,6 +2040,7 @@ impl Thread {
     fn run_batch(&mut self, base: u64) {
         self.arrange();
         let mut through = 0;
+        let mut settled = 0;
         for index in 0..self.order.len() {
             let at = self.order[index].at as usize;
             #[cfg(test)]
@@ -1758,9 +2058,24 @@ impl Thread {
             );
             self.batch[at].done = true;
             self.state.done.fetch_add(1, Ordering::Relaxed);
+            let key = &self.batch[at].key;
+            // The first handle the key lets go in the batch holds back what
+            // it returns from that operation on, and the settle from that
+            // entry on, until the key's handles are dropped.
+            if std::mem::take(&mut self.ran.let_go) && key.letting.load(Ordering::Relaxed) != self.turn
+            {
+                key.letting.store(self.turn, Ordering::Relaxed);
+                key.held_entry.store(at as u32, Ordering::Relaxed);
+                self.held.insert(at as u32);
+            }
+            // A caller's code ran with the key's handles dropped.
+            if std::mem::take(&mut self.ran.dropped) && key.letting.load(Ordering::Relaxed) == self.turn
+            {
+                key.letting.store(0, Ordering::Relaxed);
+                self.held.remove(&key.held_entry.load(Ordering::Relaxed));
+            }
             // The key hears of its own operations in the order it submitted
             // them, whatever order the batch ran them in.
-            let key = &self.batch[at].key;
             let mut head = key.head.load(Ordering::Relaxed);
             if head as usize == at {
                 let mut last = 0;
@@ -1769,18 +2084,53 @@ impl Thread {
                     head = self.batch[head as usize].next;
                 }
                 key.head.store(head, Ordering::Relaxed);
-                key.returned(last);
+                if key.letting.load(Ordering::Relaxed) != self.turn {
+                    key.returned(last);
+                } else if head == NONE {
+                    // The batch has nothing more of the key: its handles
+                    // are dropped now, after a reader was told its bytes
+                    // are placed.
+                    key.placed(last);
+                    let entry = key.held_entry.load(Ordering::Relaxed);
+                    self.let_go(entry);
+                    self.batch[at].key.returned(last);
+                } else {
+                    key.placed(last);
+                    let first = self.batch[key.held_entry.load(Ordering::Relaxed) as usize].seq;
+                    if first > 1 && !key.has_returned(last.min(first - 1)) {
+                        key.returned(last.min(first - 1));
+                    }
+                }
             }
-            let before = through;
             while through < self.batch.len() && self.batch[through].done {
                 through += 1;
             }
-            // A settle is told as the batch goes only while nothing of it
-            // failed: from a failure on it is told after the report.
-            if through > before && self.ran.failures.is_empty() {
-                self.state.returned(base + through as u64);
+            // A settle is told as the batch goes up to the first entry held
+            // back for a handle, and only while nothing of the batch failed:
+            // from a failure on it is told after the report.
+            let reach = self
+                .held
+                .first()
+                .map_or(through, |held| through.min(*held as usize));
+            if reach > settled && self.ran.failures.is_empty() {
+                settled = reach;
+                self.state.returned(base + reach as u64);
             }
         }
+        // The last of a key's operations to run is the head of its chain,
+        // so every key's handles were dropped as it ran.
+        debug_assert!(self.held.is_empty(), "a key's handles outlived its batch");
+    }
+
+    // Drop the handles the key of batch entry `entry` let go, the first of
+    // which that entry let go.
+    fn let_go(&mut self, entry: u32) {
+        #[cfg(test)]
+        self.pass_drop_gate();
+        let key = &self.batch[entry as usize].key;
+        key.held().letting_go.clear();
+        key.letting.store(0, Ordering::Relaxed);
+        self.held.remove(&entry);
     }
 
     // The batch panicked: every key with an operation in it has failed.
@@ -1789,9 +2139,13 @@ impl Thread {
     fn fail_batch(&mut self) {
         let report = &*self.report;
         unbuffer(&self.state, report, std::mem::take(&mut self.ran.in_hand));
+        self.held.clear();
         for entry in &mut self.batch {
             if let Some(Op::Write { bytes, .. }) = entry.op.take() {
                 unbuffer(&self.state, report, bytes.len() as u64);
+            }
+            if entry.key.letting.swap(0, Ordering::Relaxed) != 0 {
+                entry.key.held().letting_go.clear();
             }
             if !std::mem::replace(&mut entry.done, true) {
                 self.state.done.fetch_add(1, Ordering::Relaxed);
@@ -1925,6 +2279,26 @@ impl Thread {
         }
         gate.fail_next.take()
     }
+
+    // A test holds the thread before it drops the handles a batch let go.
+    #[cfg(test)]
+    fn pass_drop_gate(&self) {
+        let mut gate = self
+            .state
+            .gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while gate.drops_held {
+            gate.dropping = true;
+            self.state.gate_moved.notify_all();
+            gate = self
+                .state
+                .gate_moved
+                .wait(gate)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        gate.dropping = false;
+    }
 }
 
 impl Entry {
@@ -1952,7 +2326,12 @@ fn perform(
         failures,
         tally,
         in_hand,
+        wrote_at,
+        let_go,
+        dropped,
     } = ran;
+    // Only a write call's return marks the clock for the next one.
+    let since = wrote_at.take();
     *in_hand = match &op {
         Op::Write { bytes, .. } => bytes.len() as u64,
         _ => 0,
@@ -1971,16 +2350,34 @@ fn perform(
     let mut held = key.held();
     let mut result = match op {
         Op::Forget => {
-            *held = Held::default();
+            let open = std::mem::take(&mut held.open);
+            let mut letting_go = std::mem::take(&mut held.letting_go);
+            *let_go = !open.is_empty();
+            letting_go.extend(open.into_values());
+            *held = Held {
+                letting_go,
+                ..Held::default()
+            };
             Ok(())
         }
         Op::Release { file } => {
-            held.open.remove(&file);
+            *let_go = held.let_go(file);
+            Ok(())
+        }
+        // A caller's code not run is dropped as if it had run: whatever it
+        // would have moved or removed, its caller may now move or remove
+        // on a thread of its own, so the key's handles are dropped first.
+        Op::Run { file, .. } if skip => {
+            if let Some(file) = file {
+                held.open.remove(&file);
+            }
+            held.letting_go.clear();
+            *dropped = true;
             Ok(())
         }
         _ if skip => {
             if let Some(file) = file {
-                held.open.remove(&file);
+                *let_go = held.let_go(file);
             }
             Ok(())
         }
@@ -2004,22 +2401,52 @@ fn perform(
             if let Some(create) = &create {
                 failed_at.clone_from(&create.path);
             }
+            // An open made for this write is not write time: the span
+            // starts again after it.
+            let was_open = held.open.contains_key(&file);
             match held.opened(file, create.as_deref(), &mut creating) {
                 Ok(Some(open)) => {
                     tally.calls += 1;
-                    if open.end.is_some_and(|end| end != offset) {
-                        tally.seeks += 1;
-                    }
-                    let started = Instant::now();
+                    let seek = open.end.is_some_and(|end| end != offset);
+                    // A span chained from the last write's return holds
+                    // the few loads and stores between two calls; work past
+                    // that since (`break_span`) restarts it here.
+                    let broken = SPAN_BROKEN.replace(false);
+                    let started = since
+                        .filter(|_| was_open && !broken)
+                        .unwrap_or_else(now);
                     let wrote = write_all_at(&open.file, offset, &bytes);
+                    let returned = now();
                     if wrote.is_err() {
                         failed_at.clone_from(&open.path);
                     }
-                    tally.nanos += started.elapsed().as_nanos() as u64;
-                    if wrote.is_ok() {
-                        tally.written += bytes.len() as u64;
+                    // Counted as the call returns, not when the batch ends:
+                    // a batch can take seconds on a slow disk, and the rate
+                    // read from these must see each write in the span it
+                    // was made in. The time first and the bytes last,
+                    // released: whoever reads the bytes first never sees
+                    // bytes without their time.
+                    let volume = &state.volume;
+                    volume.write_nanos.fetch_add(
+                        returned.duration_since(started).as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
+                    volume.write_calls.fetch_add(1, Ordering::Relaxed);
+                    if seek {
+                        volume.write_seeks.fetch_add(1, Ordering::Relaxed);
                     }
+                    if wrote.is_ok() {
+                        volume
+                            .written_bytes
+                            .fetch_add(bytes.len() as u64, Ordering::Release);
+                    }
+                    *wrote_at = Some(returned);
                     open.end = Some(offset + bytes.len() as u64);
+                    // Its count fell as the call returned (`in_hand`); the
+                    // buffer is freed on the loop's side.
+                    if let Some(returns) = &state.returns {
+                        returns.give(bytes, &volume.writer);
+                    }
                     wrote
                 }
                 Ok(None) => Ok(()),
@@ -2044,7 +2471,7 @@ fn perform(
             let closed = held
                 .opened(file, Some(&create), &mut creating)
                 .and_then(|open| open.map_or(Ok(()), |open| open.file.set_len(length)));
-            held.open.remove(&file);
+            *let_go = held.let_go(file);
             closed
         }
         Op::Run {
@@ -2053,6 +2480,10 @@ fn perform(
             if let Some(file) = file {
                 held.open.remove(&file);
             }
+            // Its code may move or remove what a handle the key let go
+            // still holds open.
+            held.letting_go.clear();
+            *dropped = true;
             failed_at = path;
             after = Some(run);
             Ok(())
@@ -2088,6 +2519,7 @@ fn perform(
     }
 }
 
+#[cfg(test)]
 fn read_at(path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
     let file = File::open(path)?;
     let mut bytes = vec![0; len];
@@ -2146,6 +2578,10 @@ struct Gate {
     // The thread stands with nothing queued, its own work looked at.
     parked: bool,
     fail_next: Option<io::Error>,
+    // The thread may not drop the handles a batch let go, and stands
+    // before doing so.
+    drops_held: bool,
+    dropping: bool,
 }
 
 // A test's hold on a volume's thread.
@@ -2177,6 +2613,41 @@ impl Hold {
     // The next operation let through fails with `error` instead of running.
     pub(crate) fn fail_next(&self, error: io::Error) {
         self.gate().fail_next = Some(error);
+    }
+
+    // Hold the thread before it drops the handles a batch let go, or let
+    // it drop them.
+    pub(crate) fn hold_drops(&self, held: bool) {
+        self.gate().drops_held = held;
+        self.0.state.gate_moved.notify_all();
+    }
+
+    // Wait until the thread stands before dropping handles, or before an
+    // operation it may not run yet. Whether it stands before the drop.
+    pub(crate) fn wait_held_or_dropping(&self) -> bool {
+        let mut gate = self.gate();
+        while !gate.dropping && !(gate.waiting && gate.permits == 0) {
+            gate = self
+                .0
+                .state
+                .gate_moved
+                .wait(gate)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        gate.dropping
+    }
+
+    // Wait until the thread stands before dropping handles.
+    pub(crate) fn wait_dropping(&self) {
+        let mut gate = self.gate();
+        while !gate.dropping {
+            gate = self
+                .0
+                .state
+                .gate_moved
+                .wait(gate)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
     }
 
     // Wait until `count` threads stand in `Submitter::wait_below` on the
@@ -2233,6 +2704,7 @@ impl Hold {
 #[cfg(test)]
 impl Drop for Hold {
     fn drop(&mut self) {
+        self.hold_drops(false);
         self.0.leave();
     }
 }

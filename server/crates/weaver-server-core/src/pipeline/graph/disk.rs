@@ -22,10 +22,18 @@ use crate::JobId;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::job::GraphJob;
 
+// The volumes of a job's directories as a thread off the loop read them.
+pub(crate) type ReadVolumes = Vec<(PathBuf, Arc<Volume>)>;
+
 // The writers of the volumes `working_dir` and `output_dir` lie on, for the
 // job `key`. `buffers` counts the job among those writing to each volume
 // until the last copy of the job's disk is dropped, and sizes the volumes'
-// buffer limits as a volume gains its first job or loses its last.
+// buffer limits as a volume gains its first job or loses its last. A
+// directory `read` holds takes the volume read for it: memory may have
+// forgotten the path since, and would answer the stand-in of an unknown
+// device, whose limits are its own, so the job's writes would not count
+// against the limit of the volume they land on.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn job_disk(
     writers: &VolumeWriters,
     capacity: &StorageCapacity,
@@ -34,8 +42,14 @@ pub(crate) fn job_disk(
     working_dir: &Path,
     output_dir: Option<&Path>,
     buffers: &Arc<VolumeBuffers>,
+    read: &[(PathBuf, Arc<Volume>)],
 ) -> JobDisk {
-    let volume = capacity.volume(working_dir);
+    let volume_of = |dir: &Path| {
+        read.iter()
+            .find(|(at, _)| at == dir)
+            .map_or_else(|| capacity.volume(dir), |(_, volume)| Arc::clone(volume))
+    };
+    let volume = volume_of(working_dir);
     let mut writing = Writing {
         buffers: Arc::clone(buffers),
         volumes: Vec::with_capacity(2),
@@ -46,7 +60,7 @@ pub(crate) fn job_disk(
     let working = writers.submitter(&volume, key);
     probes.first_seen(writers, &volume, working_dir);
     let output = output_dir.and_then(|dir| {
-        let other = capacity.volume(dir);
+        let other = volume_of(dir);
         (!Arc::ptr_eq(&other, &volume)).then(|| {
             writing.join(&other);
             let output = writers.submitter(&other, key);
@@ -195,6 +209,21 @@ impl Pipeline {
             .get(&job_id)
             .and_then(|graph| graph.disk())
             .map_or(VolumeIntake::Open, JobDisk::intake)
+    }
+
+    // The bytes the job's volumes may still take below their hard limits,
+    // the least of them: what may arrive for them before they hold their
+    // limit. `None` when the job writes through no writer or none of its
+    // volumes is sized.
+    pub(in crate::pipeline) fn volume_room(&self, job_id: JobId) -> Option<u64> {
+        let disk = self.graph_jobs.get(&job_id)?.disk()?;
+        disk.each()
+            .filter_map(|submitter| {
+                let volume = submitter.volume();
+                let (_, hard) = volume.buffer_limits();
+                (hard != u64::MAX).then(|| hard.saturating_sub(volume.unwritten_bytes()))
+            })
+            .min()
     }
 
     // Whether a volume the job writes to holds its own hard limit or more
@@ -506,11 +535,10 @@ impl JobDisk {
             }
             let started = std::time::Instant::now();
             let below = submitter.loop_wait_below(limit.saturating_sub(1));
-            volume.writer.loop_waits.fetch_add(1, Ordering::Relaxed);
-            volume
-                .writer
-                .loop_wait_nanos
-                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            volume.writer.loop_waited(
+                crate::operations::disk::volume::LoopWait::Budget,
+                started.elapsed().as_nanos() as u64,
+            );
             if !below {
                 return false;
             }
@@ -532,9 +560,6 @@ impl JobDisk {
             .map(|submitter| intake_of(submitter.volume()))
             .fold(VolumeIntake::Open, |most, intake| match (most, intake) {
                 (VolumeIntake::Stopped, _) | (_, VolumeIntake::Stopped) => VolumeIntake::Stopped,
-                (VolumeIntake::OneAtATime, _) | (_, VolumeIntake::OneAtATime) => {
-                    VolumeIntake::OneAtATime
-                }
                 _ => VolumeIntake::Open,
             })
     }
@@ -706,6 +731,19 @@ impl JobBarrier {
     pub(crate) fn wait(&self) {
         for barrier in &self.0 {
             barrier.wait();
+        }
+    }
+
+    // Wait until every operation behind it returned, on a thread that is
+    // not the loop: not counted as a wait of any kind.
+    #[cfg(test)]
+    pub(crate) fn wait_returned(&self) {
+        for barrier in &self.0 {
+            let (returned, heard) = std::sync::mpsc::channel();
+            barrier.then(move || {
+                let _ = returned.send(());
+            });
+            heard.recv().expect("the volume's thread tells what returned");
         }
     }
 }

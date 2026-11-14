@@ -93,6 +93,9 @@ pub(crate) struct GraphRestore {
     // The parts that arrived and wait to be placed, spooled where the
     // checkpoint names them; the queue does not fetch them again either.
     pub(crate) held: Vec<HeldPart>,
+    // The decoded bytes of the articles in hand: the job's downloaded bytes
+    // a restart resumes from, in the units a run counts them in.
+    pub(crate) in_hand_bytes: u64,
 }
 
 // What a graph job's restore takes from the pipeline, gathered on the
@@ -200,6 +203,16 @@ impl RestoreSeat {
         self
     }
 
+    // The volumes of the job's directories, read on this thread when memory
+    // does not cover them: a job admitted afresh, with no checkpoint to
+    // rebuild, writes through these. For a thread that may wait on a disk.
+    pub(crate) fn read_volumes(&self) -> super::disk::ReadVolumes {
+        std::iter::once(self.working_dir.as_path())
+            .chain(self.output.as_ref().map(|(dir, _)| dir.as_path()))
+            .map(|dir| (dir.to_path_buf(), self.volumes.1.read_volume(dir)))
+            .collect()
+    }
+
     // The seat for a job whose metadata asks for no memory limit: its runs
     // are granted a window over the ceiling, as the reprocess that set it
     // granted them.
@@ -279,9 +292,12 @@ impl RestoreSeat {
         // This thread may wait on a disk: the volumes of the job's
         // directories are read here when memory does not cover them, so the
         // job's disk is never given the volume of an unknown device.
-        self.volumes.1.read_volume(&self.working_dir);
+        let mut read = vec![(
+            self.working_dir.clone(),
+            self.volumes.1.read_volume(&self.working_dir),
+        )];
         if let Some((output_dir, _)) = &self.output {
-            self.volumes.1.read_volume(output_dir);
+            read.push((output_dir.clone(), self.volumes.1.read_volume(output_dir)));
         }
         let disk = super::disk::job_disk(
             &self.volumes.0,
@@ -291,6 +307,7 @@ impl RestoreSeat {
             &self.working_dir,
             self.output.as_ref().map(|(dir, _)| dir.as_path()),
             &self.volumes.3,
+            &read,
         );
         let storage = Storage {
             disk: Some(disk),
@@ -314,6 +331,7 @@ impl RestoreSeat {
             job,
             settled,
             refetched,
+            in_hand_bytes,
         } = GraphJob::restore(&snapshot, &files, job_id.0, storage, limit)?;
         // The next checkpoint writes only what it changes of these.
         let feed_verdict = rows.feed_verdict.clone();
@@ -340,6 +358,7 @@ impl RestoreSeat {
             skip,
             held,
             feed_verdict,
+            in_hand_bytes,
         })
     }
 }

@@ -64,8 +64,9 @@ pub(crate) fn create_sparse<M: SparseMarker>(path: &Path, marker: &M) -> io::Res
 pub(crate) fn sizes_files_in(dir: &Path) -> bool {
     let probe = dir.join(".sizes-files-probe");
     let file = std::fs::File::create(&probe).expect("a probe file");
-    let sizes =
-        PlatformMarker.mark_sparse(&file).is_ok() && holes::filesystem_makes_holes(&file) == Some(true);
+    let sizes = SIZES_FILES
+        && PlatformMarker.mark_sparse(&file).is_ok()
+        && holes::filesystem_makes_holes(&file) == Some(true);
     drop(file);
     std::fs::remove_file(&probe).expect("the probe removed");
     sizes
@@ -81,10 +82,10 @@ pub(crate) fn sizes_files_in(dir: &Path) -> bool {
 // space and writes for bytes never downloaded. No space is ever reserved:
 // the length is set, never allocated.
 //
-// On Windows the sparse mark is the test, taken first and the length after
-// it: a mount that refuses the mark is not sized. On Linux and macOS it is
-// the type of filesystem the open file is on; a share over the network and a
-// filesystem not known are not sized. The type is asked once for each device
+// Only Windows sizes a file (`SIZES_FILES`). There the sparse mark is the
+// test, taken first and the length after it: a mount that refuses the mark
+// is not sized, and neither is one whose type of filesystem is not known to
+// make holes; a share over the network is not sized. The type is asked once for each device
 // and held by the disk module ([`holes`]): a file made on a device already
 // asked about costs no filesystem call.
 //
@@ -99,8 +100,19 @@ pub(crate) fn create_sized<M: SparseMarker>(
     if let Some(sized) = sizing::said() {
         return create_sized_with(path, marker, length, |_, _| sized);
     }
-    create_sized_with(path, marker, length, holes::makes_holes)
+    create_sized_with(path, marker, length, |file, metadata| {
+        SIZES_FILES && holes::makes_holes(file, metadata)
+    })
 }
+
+// Whether a new file is ever given its declared length. Only on Windows,
+// where a file that grows write by write across scattered offsets keeps
+// moving its end of file and NTFS keeps its cached pages out of the standby
+// list. On Unix a write past the end makes a hole as cheaply, and the extra
+// length call is one more `ftruncate` per file for nothing: counted on the
+// hot-path bench on macOS, the volume writer made one per file that the
+// writes on the pipeline before it did not.
+const SIZES_FILES: bool = cfg!(windows);
 
 // A test that must see one outcome whatever filesystem it runs on says
 // whether every new file is given its length, for as long as it holds the
@@ -378,7 +390,9 @@ mod tests {
     fn files_made_on_one_device_ask_the_filesystem_type_once() {
         const FILES: usize = 40;
         let temp = tempfile::tempdir().unwrap();
-        let expected = if sizes_files_in(temp.path()) { 4096 } else { 0 };
+        // The sizer here is the test's own, so whether a file is sized is
+        // the filesystem's answer, held: every file is sized as the first.
+        let mut expected = None;
         let answers = holes::HoleAnswers::new();
         let asked = std::cell::Cell::new(0);
         for index in 0..FILES {
@@ -390,7 +404,9 @@ mod tests {
                 })
             })
             .unwrap();
-            assert_eq!(file.metadata().unwrap().len(), expected, "file {index}");
+            let len = file.metadata().unwrap().len();
+            assert!(len == 0 || len == 4096, "file {index}: {len}");
+            assert_eq!(len, *expected.get_or_insert(len), "file {index}");
         }
         // Where the mark is refused no file would be sized and none asks;
         // where metadata names no device there is nothing to hold by.

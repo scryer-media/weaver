@@ -415,6 +415,8 @@ impl Pipeline {
             uu_spool_min_free_bytes: UU_SPOOL_MIN_FREE_BYTES,
             #[cfg(test)]
             uu_spool_available_bytes_for_test: None,
+            #[cfg(test)]
+            probe_waits_on_for_test: None,
             dirty_server_attribution: HashSet::new(),
             dirty_support_facts: HashSet::new(),
             reports_due: HashSet::new(),
@@ -503,6 +505,7 @@ impl Pipeline {
             #[cfg(test)]
             dispatch_hold_items_examined: Default::default(),
             last_download_dispatch_stall_log_at: None,
+            download_dispatch_idle_since: None,
             download_dispatch_stall: None,
             download_stall_recovery,
             download_pass_fill_servers: None,
@@ -1139,6 +1142,9 @@ impl Pipeline {
                 &turn_metrics.pipeline_histograms.turn_duration,
                 &turn_metrics.pipeline_turn,
             );
+            // The buffers the writers wrote since the last turn are freed
+            // here, on the loop's side.
+            self.volume_writers.free_returned();
             // A replaced pool brings its own servers; watch those, and give
             // their waiting work a pass.
             if !server_health.follows(self.nntp.pool()) {
@@ -1311,6 +1317,9 @@ impl Pipeline {
                 let disk_readings = self.storage_capacity.readings();
                 self.reconcile_disk_waits();
                 let disk_waiting = self.waits_for_disk_room();
+                // With nothing to drive the wait may be long: nothing the
+                // writers write meanwhile is held for the next turn.
+                let _parked_returns = (!drive).then(|| self.volume_writers.park_returns());
                 turn_timer.pause();
                 macro_rules! turn_select {
                     ($($biased:tt)?) => {

@@ -217,8 +217,21 @@ impl GraphJob {
 
     // The post's encoded bytes of the articles the root's facts say this
     // run does not fetch again: what the facts encoded now spare a restore.
+    #[cfg(test)]
     pub(crate) fn settled_bytes(&self) -> u64 {
         self.root.map.settled_bytes()
+    }
+
+    // The decoded bytes of the articles in hand: what a checkpoint taken now
+    // spares a restore, in the units the job's downloaded bytes count.
+    pub(crate) fn in_hand_bytes(&self) -> u64 {
+        self.root.map.in_hand_bytes()
+    }
+
+    // Count `bytes` more in hand, as articles a test does not model would.
+    #[cfg(test)]
+    pub(crate) fn add_in_hand_for_test(&mut self, bytes: u64) {
+        self.root.map.add_in_hand_for_test(bytes);
     }
 }
 

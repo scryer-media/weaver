@@ -147,6 +147,12 @@ pub(in crate::pipeline) struct SaturationWake {
     pub(in crate::pipeline) of: Option<JobId>,
     // Answer the lane again once it holds fewer than this many of them.
     pub(in crate::pipeline) below: usize,
+    // Held for the room of the job's volumes instead: the lane is answered
+    // again once each volume the job writes to has fallen to its resume
+    // line, however much it holds; `below` is not read. Each volume was
+    // asked for one wake at that line, so a lane is not asked again while
+    // its volume is still above it.
+    pub(in crate::pipeline) room: bool,
 }
 
 // The asking lane, so what it already holds of a job can be set against
@@ -173,16 +179,17 @@ enum ShareTaken {
     Saturated(SaturationWake),
     // Nothing for this server, refused by these clauses.
     Blocked(BlockedBy),
-    // The job's volume is at its soft line and the lane already holds an
-    // article of the job: the lane's room goes to the jobs after it first,
-    // and the job is asked again only when none of them had work.
+    // The job's volume has no room for another whole pipe on the lane: the
+    // lane's room goes to the jobs after it first, and the job is asked
+    // again only when none of them had work.
     Later,
 }
 
-// Whether a job at its volume's soft line may pass its turn.
+// Whether a job whose volume is short of room may pass its turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Turn {
-    // On the walk: a lane that holds one of the job passes it by.
+    // On the walk: a lane with no room left for a whole pipe of the job
+    // passes it by.
     MayPass,
     // After the walk found nothing else: the job answers.
     Last,
@@ -245,12 +252,12 @@ impl Pipeline {
             return Handout::Idle;
         };
 
-        // A job whose volume is at its soft line is held to one article
-        // on a lane at a time. That limits the job, not the lane: a lane
-        // that already holds its one passes the job by, so the rest of its
-        // room goes to the jobs after it, on volumes that are open. Such a
-        // job is come back to, in the walk's order, when no other job had
-        // work for the lane, and answers then as it always did.
+        // A job whose volume has no room for another whole pipe on the
+        // lane limits the job, not the lane: the lane passes the job by, so
+        // its room goes to the jobs after it, on volumes that have room.
+        // Such a job is come back to, in the walk's order, when no other
+        // job had work for the lane, and answers then: a whole pipe once
+        // the lane has fetched one of it down.
         let mut passed: Vec<JobId> = Vec::new();
         match self.take_lane_share(*hot_job, server_idx, want, lane, pressure, Turn::MayPass) {
             ShareTaken::Works(works) => return self.record_handout(HandoutKind::Hot, works),
@@ -389,6 +396,51 @@ impl Pipeline {
             .max(depth.max(1) + 1)
     }
 
+    // How many of a job's articles one lane may hold for the room the
+    // job's volume has: its part of the bytes the volume may still take
+    // below its hard limit, over every connection, less what the lane
+    // already holds, counted in articles of the size the lane holds. Never
+    // less than a full pipe. A lane that holds nothing is sized by the
+    // job's next article. `None` when the job writes to no sized volume:
+    // the share stands.
+    //
+    // The limit counts bytes that arrived, not leased ones. Without this,
+    // the lanes leased up to a share of the job's whole queue while the
+    // volume read empty, and all of it arrived past the limit: 262 MB out
+    // on lanes at 23:31:27 MST on the slow disk run, then 354.9 MB
+    // buffered against 268.4 MB. With it, what is out on lanes and what
+    // arrived stay within the limit, past it by at most a full pipe on
+    // each lane: a lane is handed a whole pipe only where it fits under
+    // this share, and the share is less than a full pipe never.
+    fn volume_share_of_lane(
+        &self,
+        job_id: JobId,
+        lane_id: u64,
+        holds: usize,
+        full_pipe: usize,
+    ) -> Option<usize> {
+        let room = self.volume_room(job_id)?;
+        let (held, held_bytes) = self.download_lane_held_bytes(lane_id);
+        let article = if held == 0 {
+            // A lane that holds nothing is sized by the job's next article.
+            self.jobs
+                .get(&job_id)
+                .and_then(|state| state.articles.download_queue())
+                .and_then(|queue| queue.peek_in_class(false).or_else(|| queue.peek_in_class(true)))
+                .map_or(0, |work| u64::from(work.byte_estimate))
+        } else {
+            held_bytes / held as u64
+        }
+        .max(1);
+        let connections = self.tuner.params().max_concurrent_downloads.max(1) as u64;
+        let more = (room / connections).saturating_sub(held_bytes) / article;
+        Some(
+            holds
+                .saturating_add(usize::try_from(more).unwrap_or(usize::MAX))
+                .max(full_pipe),
+        )
+    }
+
     // One job's answer to one lane: work within the lane's share, a lane
     // already at its share, or a job that is blocked on this server.
     fn take_lane_share(
@@ -403,24 +455,9 @@ impl Pipeline {
         if let Err(blocked) = self.job_articles_built(job_id) {
             return ShareTaken::Blocked(blocked);
         }
-        // From a volume's soft limit the lanes fetching for its jobs ask
-        // for one article of them at a time, as every lane does under soft
-        // pressure. At its hard limit the job's queue answers for it.
-        let want = match self.volume_intake(job_id) {
-            crate::pipeline::download::volume_pace::VolumeIntake::OneAtATime => {
-                // A lane that holds its one already has room for other
-                // jobs: this one waits for the walk to try them.
-                if turn == Turn::MayPass
-                    && lane.is_some_and(|lane| {
-                        self.download_lane_holdings_of_job(lane.lane_id, job_id) > 0
-                    })
-                {
-                    return ShareTaken::Later;
-                }
-                want.min(1)
-            }
-            _ => want,
-        };
+        // At its volume's hard limit the job's queue answers for it, as
+        // blocked. Below it the lane is handed whole pipes, held to the room
+        // the volume has below.
         let Some(lane) = lane else {
             return match self.take_servable_works(job_id, server_idx, want, pressure) {
                 Ok(works) => ShareTaken::Works(works),
@@ -433,6 +470,43 @@ impl Pipeline {
         // how this one is spread over the link.
         let holds = self.download_lane_holdings_of_job(lane.lane_id, job_id);
         let full_pipe = lane.depth.max(1) + 1;
+        // The volume's room decides only where it is short of the job's
+        // share: the lane is then held to it.
+        let (share, room_short) =
+            match self.volume_share_of_lane(job_id, lane.lane_id, holds, full_pipe) {
+                Some(volume_share) if volume_share < share => (volume_share, true),
+                _ => (share, false),
+            };
+        // A lease is a whole pipe or nothing; under a lane that asks for
+        // less, what it asks for.
+        let whole = full_pipe.min(want).max(1);
+        if room_short && holds.saturating_add(whole) > share {
+            // The volume has no room for another whole pipe on this lane.
+            // On the walk, the lane's room goes to the jobs after this one,
+            // on volumes that have room. Asked last, the lane waits until it
+            // has fetched a whole pipe of the job down, and is answered then.
+            if turn == Turn::MayPass {
+                return ShareTaken::Later;
+            }
+            // Above its resume line the volume answers for the lane: it is
+            // asked again once the volume has fallen to that line, one wake
+            // for every lane held there. Below the line, where the room is
+            // short only for the lane's part of it, the lane waits until it
+            // has fetched a whole pipe of the job down.
+            return match self.job_servable_work_for_server(job_id, server_idx, pressure, true) {
+                Ok(()) if self.ask_room_wake(job_id) => ShareTaken::Saturated(SaturationWake {
+                    of: Some(job_id),
+                    below: 0,
+                    room: true,
+                }),
+                Ok(()) => ShareTaken::Saturated(SaturationWake {
+                    of: Some(job_id),
+                    below: share + 1 - whole,
+                    room: false,
+                }),
+                Err(blocked) => ShareTaken::Blocked(blocked),
+            };
+        }
         let wake = if holds == 0 && self.download_lane_holdings(lane.lane_id) >= full_pipe {
             // A lane still full of another job does not open this one. The
             // share above is what keeps one job spread over the link; this
@@ -442,11 +516,13 @@ impl Pipeline {
             Some(SaturationWake {
                 of: None,
                 below: full_pipe,
+                room: false,
             })
         } else if holds >= share {
             Some(SaturationWake {
                 of: Some(job_id),
                 below: share,
+                room: false,
             })
         } else {
             None

@@ -1153,7 +1153,7 @@
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
           "editorMode": "code",
           "expr": "rate(weaver_volume_loop_wait_seconds_total{job=\"$job\",instance=~\"$instance\"}[$__rate_interval])",
-          "legendFormat": "{{volume}}",
+          "legendFormat": "{{volume}} {{kind}}",
           "range": true,
           "refId": "A"
         }

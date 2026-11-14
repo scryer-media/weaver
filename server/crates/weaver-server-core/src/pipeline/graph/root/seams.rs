@@ -41,7 +41,13 @@ impl Pipeline {
     // Give a job admitted, or restored with no checkpoint, its graph
     // runtime. The job's state must already be in place: what its queues
     // hold says which articles this run still has to fetch.
-    pub(crate) fn admit_graph_job(&mut self, job_id: JobId) {
+    // `volumes` are those of the job's directories as a thread off the loop
+    // read them; a directory not among them is asked after from memory.
+    pub(crate) fn admit_graph_job(
+        &mut self,
+        job_id: JobId,
+        volumes: &[(std::path::PathBuf, Arc<crate::operations::disk::volume::Volume>)],
+    ) {
         // Read before the job is borrowed, in the order they are tried, each
         // with its source for the download summary.
         let passwords = self.archive_password_candidates_for_job(job_id);
@@ -99,6 +105,7 @@ impl Pipeline {
                 &state.working_dir,
                 state.staging_dir.as_deref(),
                 &self.volume_buffers,
+                volumes,
             )),
             data_dir: Some(data_dir),
             window_ledger: self.window_ledgers.intermediate.clone(),
@@ -149,6 +156,11 @@ impl Pipeline {
                 if counts { bytes } else { 0 },
             );
         }
+        // The job's running figure is the given-up ledger's, as the one
+        // terminal edge keeps it during a run: a restored job that had lost
+        // articles reports the failed bytes and health it reported before
+        // the stop, not none.
+        state.failed_bytes = state.failed_bytes.max(given_up.bytes());
         // A job restored mid-phase takes up that phase's stage clock again.
         let reported = graph.reported_phase();
         self.released_remaining.remove(&job_id);

@@ -750,37 +750,64 @@ pub(crate) struct ProbeWrite {
 // their file down here. This blocks for about a second: never call it on
 // the pipeline loop or the async runtime.
 pub(crate) fn synced_probe_write(path: &Path) -> Option<ProbeWrite> {
+    synced_probe_write_until(path, &|| false).map(|(write, _)| write)
+}
+
+// The same write, which gives way between chunks once `give_way` answers
+// true: the first chunk is always written, and a probe that gave way says
+// so beside what it wrote.
+pub(crate) fn synced_probe_write_until(
+    path: &Path,
+    give_way: &dyn Fn() -> bool,
+) -> Option<(ProbeWrite, bool)> {
     use std::io::Write;
 
     let buffer = probe_write_buffer();
     let mut file = open_write_through(path).ok()?;
-    probe_file_bytes(|repeats| {
-        let started = Instant::now();
-        for _ in 0..repeats {
-            file.write_all(&buffer).ok()?;
-        }
-        file.sync_data().ok()?;
-        Some(started.elapsed())
-    })
+    probe_file_bytes_until(
+        |repeats| {
+            let started = Instant::now();
+            for _ in 0..repeats {
+                file.write_all(&buffer).ok()?;
+            }
+            file.sync_data().ok()?;
+            Some(started.elapsed())
+        },
+        give_way,
+    )
 }
 
 // How large the probe file grows: successive chunks of
 // [`PROBE_WRITE_REPEATS`] buffers, stopping before the next chunk once the
 // chunks written have taken [`PROBE_WRITE_BUDGET`]. `write_chunk` writes that
 // many buffers and answers how long it took, or `None` when it failed.
+#[cfg(test)]
 pub(crate) fn probe_file_bytes(
-    mut write_chunk: impl FnMut(usize) -> Option<Duration>,
+    write_chunk: impl FnMut(usize) -> Option<Duration>,
 ) -> Option<ProbeWrite> {
+    probe_file_bytes_until(write_chunk, &|| false).map(|(write, _)| write)
+}
+
+// The same schedule, stopping too before any chunk after the first once
+// `give_way` answers true. Answers whether it stopped for that, rather than
+// at the end of the schedule or of the budget.
+pub(crate) fn probe_file_bytes_until(
+    mut write_chunk: impl FnMut(usize) -> Option<Duration>,
+    give_way: &dyn Fn() -> bool,
+) -> Option<(ProbeWrite, bool)> {
     let mut bytes: u64 = 0;
     let mut elapsed = Duration::ZERO;
     for repeats in PROBE_WRITE_REPEATS {
         if elapsed >= PROBE_WRITE_BUDGET {
             break;
         }
+        if bytes > 0 && give_way() {
+            return Some((ProbeWrite { bytes, elapsed }, true));
+        }
         elapsed += write_chunk(repeats)?;
         bytes += (repeats * PROBE_CHUNK_BYTES) as u64;
     }
-    Some(ProbeWrite { bytes, elapsed })
+    Some((ProbeWrite { bytes, elapsed }, false))
 }
 
 #[cfg(unix)]
@@ -1079,44 +1106,47 @@ impl Drop for StartupDiskGateOpener {
     }
 }
 
+// The kind of storage comes from the one place that reads it for every
+// volume, the writer's included; only the filesystem's name is read here.
 fn detect_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
+    let storage_class = storage_class_of(crate::operations::disk::storage_kind(output_dir));
+
     #[cfg(target_os = "macos")]
-    {
-        macos_disk_info(output_dir)
-    }
+    let filesystem = macos_filesystem(output_dir);
 
     #[cfg(target_os = "linux")]
-    {
-        linux_disk_info(output_dir)
-    }
+    let filesystem = {
+        let target = std::fs::canonicalize(output_dir)
+            .or_else(|_| std::fs::canonicalize(output_dir.parent().unwrap_or(Path::new("/"))))
+            .unwrap_or_else(|_| Path::new("/").to_path_buf());
+        linux_filesystem_type(&target)
+    };
 
     #[cfg(windows)]
-    {
-        windows_disk_info(output_dir)
-    }
+    let filesystem = windows_filesystem(output_dir);
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-    {
-        let _ = output_dir;
-        (
-            StorageClass::Unknown,
-            FilesystemType::Unknown(String::new()),
-        )
+    let filesystem = FilesystemType::Unknown(String::new());
+
+    (storage_class, filesystem)
+}
+
+// The report's name for a kind of storage.
+fn storage_class_of(kind: crate::operations::disk::StorageKind) -> StorageClass {
+    use crate::operations::disk::StorageKind;
+    match kind {
+        StorageKind::Solid => StorageClass::Ssd,
+        StorageKind::Rotational => StorageClass::Hdd,
+        StorageKind::Network => StorageClass::Network,
+        StorageKind::Unknown => StorageClass::Unknown,
     }
 }
 
-// Windows: the volume behind the directory answers the filesystem name, the
-// drive type says whether it is a network share, and the storage device
-// behind the volume says whether it incurs a seek penalty (rotational).
+// Windows: the volume behind the directory answers the filesystem name.
 #[cfg(windows)]
-fn windows_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
+fn windows_filesystem(output_dir: &Path) -> FilesystemType {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    use windows_sys::Win32::Storage::FileSystem::{
-        GetDriveTypeW, GetVolumeInformationW, GetVolumePathNameW,
-    };
-    // `GetDriveTypeW` result for a network drive. The constant lives in a
-    // windows-sys module this crate does not otherwise pull in.
-    const DRIVE_REMOTE: u32 = 4;
+    use windows_sys::Win32::Storage::FileSystem::{GetVolumeInformationW, GetVolumePathNameW};
 
     let target = std::fs::canonicalize(output_dir)
         .or_else(|_| std::fs::canonicalize(output_dir.parent().unwrap_or(Path::new("."))))
@@ -1137,16 +1167,8 @@ fn windows_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
         )
     };
     if ok == 0 {
-        return (
-            StorageClass::Unknown,
-            FilesystemType::Unknown(String::new()),
-        );
+        return FilesystemType::Unknown(String::new());
     }
-    let root_len = volume_root
-        .iter()
-        .position(|&c| c == 0)
-        .unwrap_or(volume_root.len());
-    let root_wide = &volume_root[..root_len];
 
     let mut fs_name = [0u16; 64];
     // SAFETY: `volume_root` is NUL-terminated; the name buffer is sized as passed.
@@ -1162,130 +1184,22 @@ fn windows_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
             fs_name.len() as u32,
         )
     };
-    let filesystem = if ok == 0 {
-        FilesystemType::Unknown(String::new())
-    } else {
-        let len = fs_name
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(fs_name.len());
-        let name = std::ffi::OsString::from_wide(&fs_name[..len])
-            .to_string_lossy()
-            .into_owned();
-        parse_filesystem_type(&name)
-    };
-
-    // SAFETY: `volume_root` is NUL-terminated.
-    let drive_type = unsafe { GetDriveTypeW(volume_root.as_ptr()) };
-    if drive_type == DRIVE_REMOTE {
-        return (StorageClass::Network, filesystem);
+    if ok == 0 {
+        return FilesystemType::Unknown(String::new());
     }
-
-    let storage_class = storage_class_from_seek_penalty(windows_seek_penalty(root_wide));
-    (storage_class, filesystem)
+    let len = fs_name
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(fs_name.len());
+    let name = std::ffi::OsString::from_wide(&fs_name[..len])
+        .to_string_lossy()
+        .into_owned();
+    parse_filesystem_type(&name)
 }
 
-#[cfg(any(windows, test))]
-fn storage_class_from_seek_penalty(penalty: Option<bool>) -> StorageClass {
-    match penalty {
-        Some(true) => StorageClass::Hdd,
-        Some(false) => StorageClass::Ssd,
-        None => StorageClass::Unknown,
-    }
-}
-
-// Ask the storage device behind a volume root like `C:\` whether it incurs a
-// seek penalty. `None` when the volume has no drive letter (a mounted folder)
-// or the device does not answer the query.
-#[cfg(windows)]
-fn windows_seek_penalty(volume_root: &[u16]) -> Option<bool> {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    };
-    use windows_sys::Win32::System::IO::DeviceIoControl;
-    use windows_sys::Win32::System::Ioctl::{
-        DEVICE_SEEK_PENALTY_DESCRIPTOR, IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery,
-        STORAGE_PROPERTY_QUERY, StorageDeviceSeekPenaltyProperty,
-    };
-
-    // A root derived from a canonicalized path carries the verbatim prefix
-    // (`\\?\C:\`); the drive letter follows it.
-    let verbatim: Vec<u16> = "\\\\?\\".encode_utf16().collect();
-    let volume_root = volume_root
-        .strip_prefix(verbatim.as_slice())
-        .unwrap_or(volume_root);
-
-    // `X:\` → `\\.\X:`; anything without a drive letter is not addressable
-    // as a volume device this way.
-    let letter = match volume_root {
-        [letter, colon, ..]
-            if *colon == u16::from(b':')
-                && u8::try_from(*letter).is_ok_and(|c| c.is_ascii_alphabetic()) =>
-        {
-            *letter
-        }
-        _ => return None,
-    };
-    let device: Vec<u16> = "\\\\.\\"
-        .encode_utf16()
-        .chain([letter, u16::from(b':'), 0])
-        .collect();
-
-    // SAFETY: `device` is NUL-terminated; zero desired access is enough for
-    // a property query and needs no privilege.
-    let handle = unsafe {
-        CreateFileW(
-            device.as_ptr(),
-            0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return None;
-    }
-
-    let query = STORAGE_PROPERTY_QUERY {
-        PropertyId: StorageDeviceSeekPenaltyProperty,
-        QueryType: PropertyStandardQuery,
-        AdditionalParameters: [0],
-    };
-    let mut descriptor = DEVICE_SEEK_PENALTY_DESCRIPTOR {
-        Version: 0,
-        Size: 0,
-        IncursSeekPenalty: false,
-    };
-    let mut returned: u32 = 0;
-    // SAFETY: the in/out buffers are properly sized structs that outlive the call.
-    let ok = unsafe {
-        DeviceIoControl(
-            handle,
-            IOCTL_STORAGE_QUERY_PROPERTY,
-            (&query as *const STORAGE_PROPERTY_QUERY).cast(),
-            std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
-            (&mut descriptor as *mut DEVICE_SEEK_PENALTY_DESCRIPTOR).cast(),
-            std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
-            &mut returned,
-            std::ptr::null_mut(),
-        )
-    };
-    // SAFETY: `handle` came from a successful CreateFileW and is closed once.
-    unsafe {
-        CloseHandle(handle);
-    }
-    if ok == 0 || (returned as usize) < std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() {
-        return None;
-    }
-    Some(descriptor.IncursSeekPenalty)
-}
-
-// macOS: use `diskutil info` to detect storage class and filesystem.
+// macOS: `diskutil info` names the filesystem of the mount.
 #[cfg(target_os = "macos")]
-fn macos_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
+fn macos_filesystem(output_dir: &Path) -> FilesystemType {
     // Resolve the path to handle symlinks, then find its mount point.
     let target = std::fs::canonicalize(output_dir)
         .or_else(|_| std::fs::canonicalize(output_dir.parent().unwrap_or(Path::new("/"))))
@@ -1293,37 +1207,16 @@ fn macos_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
 
     let mount_point = find_mount_point_macos(&target);
 
-    let output = Command::new("diskutil")
+    let Ok(output) = Command::new("diskutil")
         .arg("info")
         .arg(&mount_point)
-        .output();
-
-    let text = match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
-        Err(_) => {
-            return (
-                StorageClass::Unknown,
-                FilesystemType::Unknown(String::new()),
-            );
-        }
+        .output()
+    else {
+        return FilesystemType::Unknown(String::new());
     };
+    let text = String::from_utf8_lossy(&output.stdout);
 
-    let storage_class = if text
-        .lines()
-        .any(|l| l.contains("Solid State:") && l.contains("Yes"))
-    {
-        StorageClass::Ssd
-    } else if text
-        .lines()
-        .any(|l| l.contains("Solid State:") && l.contains("No"))
-    {
-        StorageClass::Hdd
-    } else {
-        StorageClass::Unknown
-    };
-
-    let filesystem = text
-        .lines()
+    text.lines()
         .find(|l| {
             l.trim_start().starts_with("Type (Bundle):")
                 || l.trim_start().starts_with("File System Personality:")
@@ -1332,9 +1225,7 @@ fn macos_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
             let val = l.split(':').nth(1).unwrap_or("").trim();
             parse_filesystem_type(val)
         })
-        .unwrap_or(FilesystemType::Unknown(String::new()));
-
-    (storage_class, filesystem)
+        .unwrap_or(FilesystemType::Unknown(String::new()))
 }
 
 // Find the mount point for a given path on macOS using `df`.
@@ -1363,69 +1254,6 @@ fn find_mount_point_macos(path: &Path) -> String {
     }
 
     "/".to_string()
-}
-
-// Linux: check rotational flag and /proc/mounts for filesystem type.
-#[cfg(target_os = "linux")]
-fn linux_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
-    let target = std::fs::canonicalize(output_dir)
-        .or_else(|_| std::fs::canonicalize(output_dir.parent().unwrap_or(Path::new("/"))))
-        .unwrap_or_else(|_| Path::new("/").to_path_buf());
-
-    let storage_class = linux_storage_class(&target);
-    let filesystem = linux_filesystem_type(&target);
-
-    (storage_class, filesystem)
-}
-
-// Detect SSD vs HDD on Linux by reading the rotational flag.
-#[cfg(target_os = "linux")]
-fn linux_storage_class(path: &Path) -> StorageClass {
-    // Find the device for the path using df.
-    let device = match Command::new("df").arg("--output=source").arg(path).output() {
-        Ok(o) => {
-            let text = String::from_utf8_lossy(&o.stdout);
-            text.lines().nth(1).unwrap_or("").trim().to_string()
-        }
-        Err(_) => return StorageClass::Unknown,
-    };
-
-    // Extract the base block device name (e.g., /dev/sda1 -> sda, /dev/nvme0n1p1 -> nvme0n1).
-    let dev_name = device.strip_prefix("/dev/").unwrap_or(&device);
-
-    // Strip partition suffix to get the base device.
-    let base_device = strip_partition_suffix(dev_name);
-
-    let rotational_path = format!("/sys/block/{base_device}/queue/rotational");
-    match std::fs::read_to_string(&rotational_path) {
-        Ok(content) => match content.trim() {
-            "0" => StorageClass::Ssd,
-            "1" => StorageClass::Hdd,
-            _ => StorageClass::Unknown,
-        },
-        Err(_) => StorageClass::Unknown,
-    }
-}
-
-// Strip partition number suffix from a device name.
-// `sda1` -> `sda`, `nvme0n1p1` -> `nvme0n1`, `vda2` -> `vda`.
-#[cfg(target_os = "linux")]
-fn strip_partition_suffix(dev: &str) -> &str {
-    // NVMe: nvme0n1p1 -> nvme0n1
-    if let Some(idx) = dev.rfind('p')
-        && dev[..idx].ends_with(|c: char| c.is_ascii_digit())
-        && dev[idx + 1..].chars().all(|c| c.is_ascii_digit())
-        && !dev[idx + 1..].is_empty()
-    {
-        return &dev[..idx];
-    }
-
-    // Traditional: sda1 -> sda, vda2 -> vda
-    let end = dev
-        .rfind(|c: char| !c.is_ascii_digit())
-        .map(|i| i + 1)
-        .unwrap_or(dev.len());
-    &dev[..end]
 }
 
 // Detect filesystem type on Linux from /proc/mounts.

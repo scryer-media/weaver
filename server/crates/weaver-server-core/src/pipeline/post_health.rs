@@ -1043,6 +1043,10 @@ impl Pipeline {
     // and a lane on a server held back from new connections is never
     // yielded, since no batch may take its seat.
     pub(in crate::pipeline) fn probe_waits_for_seat_on(&self, server: usize) -> bool {
+        #[cfg(test)]
+        if self.probe_waits_on_for_test == Some(server) {
+            return true;
+        }
         if self.post_probes.waiting.is_empty() || self.probe_held_off(server) {
             return false;
         }

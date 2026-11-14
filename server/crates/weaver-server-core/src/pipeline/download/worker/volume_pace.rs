@@ -52,7 +52,8 @@ const VOLUME_BUFFER_POOL_FIGURES: u64 = 2;
 // the others.
 const VOLUME_BUFFER_MINIMUM_BYTES: u64 = 16 * MIB;
 
-// A volume's soft limit, as a share of its hard limit.
+// A volume's soft limit, as a share of its hard limit: a reported figure.
+// Leases do not look at it.
 const VOLUME_BUFFER_SOFT_PERCENT: u64 = 70;
 
 // The size of a typical article, for the figure's floor: that of the
@@ -236,23 +237,21 @@ pub(in crate::pipeline) fn volume_limits(
 pub(in crate::pipeline) enum VolumeIntake {
     // The volume does not hold its lanes back.
     Open,
-    // Its lanes ask for one article at a time.
-    OneAtATime,
     // Its lanes stop sending.
     Stopped,
 }
 
 // The state of a volume holding `arrived_unwritten_bytes`: the bytes that
-// have arrived and are not yet written. Below the soft limit it is open,
-// from the soft limit one article at a time, from the hard limit stopped.
+// have arrived and are not yet written. Below the hard limit it is open,
+// from the hard limit stopped. How much a lane is handed below it is the
+// room the volume has (`volume_share_of_lane`), in whole pipes; the soft
+// limit is a reported figure, not a line for leases.
 pub(in crate::pipeline) fn volume_intake(
     arrived_unwritten_bytes: u64,
     limits: VolumeLimits,
 ) -> VolumeIntake {
     if arrived_unwritten_bytes >= limits.hard_bytes {
         VolumeIntake::Stopped
-    } else if arrived_unwritten_bytes >= limits.soft_bytes {
-        VolumeIntake::OneAtATime
     } else {
         VolumeIntake::Open
     }
@@ -794,22 +793,20 @@ mod tests {
     }
 
     #[test]
-    fn volume_pace_intake_has_three_states_at_the_seventy_and_full_lines() {
+    fn volume_pace_intake_is_open_below_the_full_line_and_stopped_at_it() {
         let limits = VolumeLimits::with_hard(1000);
         assert_eq!(limits.soft_bytes, 700);
         assert_eq!(volume_intake(0, limits), VolumeIntake::Open);
-        assert_eq!(volume_intake(699, limits), VolumeIntake::Open);
-        assert_eq!(volume_intake(700, limits), VolumeIntake::OneAtATime);
-        assert_eq!(volume_intake(999, limits), VolumeIntake::OneAtATime);
+        assert_eq!(volume_intake(700, limits), VolumeIntake::Open);
+        assert_eq!(volume_intake(999, limits), VolumeIntake::Open);
         assert_eq!(volume_intake(1000, limits), VolumeIntake::Stopped);
         assert_eq!(volume_intake(u64::MAX, limits), VolumeIntake::Stopped);
 
         // The full Performance figure: 179.2 MiB and 256 MiB.
         let limits = VolumeLimits::with_hard(FIGURE);
         let soft = FIGURE * 70 / 100;
-        assert_eq!(volume_intake(soft - 1, limits), VolumeIntake::Open);
-        assert_eq!(volume_intake(soft, limits), VolumeIntake::OneAtATime);
-        assert_eq!(volume_intake(FIGURE - 1, limits), VolumeIntake::OneAtATime);
+        assert_eq!(volume_intake(soft, limits), VolumeIntake::Open);
+        assert_eq!(volume_intake(FIGURE - 1, limits), VolumeIntake::Open);
         assert_eq!(volume_intake(FIGURE, limits), VolumeIntake::Stopped);
 
         // A one-byte limit is open when empty and stopped otherwise.
@@ -974,7 +971,7 @@ mod tests {
         assert_eq!(held.buffer_limits(), (64 * MIB * 70 / 100, 64 * MIB));
         assert_eq!(intake_of(&held), VolumeIntake::Stopped);
         held.buffered_bytes.store(50 * MIB, Ordering::Relaxed);
-        assert_eq!(intake_of(&held), VolumeIntake::OneAtATime);
+        assert_eq!(intake_of(&held), VolumeIntake::Open);
         held.buffered_bytes.store(0, Ordering::Relaxed);
         assert_eq!(intake_of(&held), VolumeIntake::Open);
 

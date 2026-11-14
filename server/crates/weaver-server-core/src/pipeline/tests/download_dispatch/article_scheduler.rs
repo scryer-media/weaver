@@ -43,7 +43,7 @@ fn taken(handout: Handout) -> Vec<DownloadWork> {
 // A lane booked as holding `holds` of `job_id`'s articles, at `depth`.
 fn lane_holding(pipeline: &mut Pipeline, job_id: JobId, holds: usize, depth: usize) -> LaneShare {
     let lane_id = Pipeline::next_download_lane_id();
-    let outstanding = (0..holds)
+    let outstanding: std::collections::HashMap<SegmentId, DownloadWork> = (0..holds)
         .map(|index| {
             let segment_id = SegmentId {
                 file_id: NzbFileId {
@@ -77,6 +77,10 @@ fn lane_holding(pipeline: &mut Pipeline, job_id: JobId, holds: usize, depth: usi
             completion_critical: false,
             server_idx: Some(SERVER_A),
             connection: true,
+            outstanding_bytes: outstanding
+                .values()
+                .map(|work| u64::from(work.byte_estimate))
+                .sum(),
             outstanding,
         },
     );
@@ -954,7 +958,7 @@ async fn a_small_job_is_shared_over_every_connection() {
     assert_eq!(works.len(), 9);
     let held = lane_holding(&mut pipeline, hot, works.len(), lane.depth);
     match ask_as_lane(&mut pipeline, SERVER_A, 18, held) {
-        Handout::Saturated(wake) => assert_eq!(wake, SaturationWake { of: None, below: 9 }),
+        Handout::Saturated(wake) => assert_eq!(wake, SaturationWake { of: None, below: 9, room: false }),
         other => panic!(
             "a full lane does not open the next job, got {:?}",
             taken(other).len()
@@ -994,7 +998,8 @@ async fn a_lane_at_its_share_is_saturated_rather_than_spilled() {
             wake,
             SaturationWake {
                 of: Some(hot),
-                below: share
+                below: share,
+                room: false,
             }
         ),
         other => panic!(
@@ -1024,7 +1029,7 @@ async fn a_lane_at_its_share_is_saturated_rather_than_spilled() {
     // and is not opened to it: it waits on its own pipe, not on any share.
     let full_elsewhere = lane_holding(&mut pipeline, next, 17, 8);
     match ask_as_lane(&mut pipeline, SERVER_A, 18, full_elsewhere) {
-        Handout::Saturated(wake) => assert_eq!(wake, SaturationWake { of: None, below: 9 }),
+        Handout::Saturated(wake) => assert_eq!(wake, SaturationWake { of: None, below: 9, room: false }),
         other => panic!(
             "a full lane does not open another job, got {:?}",
             taken(other).len()
@@ -1089,7 +1094,7 @@ async fn saturation_is_only_charged_by_a_job_that_could_serve_the_lane() {
     match ask_as_lane(&mut pipeline, SERVER_A, 18, lane) {
         Handout::Saturated(wake) => assert_eq!(
             wake,
-            SaturationWake { of: None, below: 9 },
+            SaturationWake { of: None, below: 9, room: false },
             "the walk went on to the next job; only the lane's full pipe holds it"
         ),
         other => panic!(
@@ -1130,6 +1135,81 @@ async fn the_share_never_starves_a_pipe() {
         3,
         "everything the job has, well inside the floor"
     );
+}
+
+// The volume's limit counts the bytes that arrived, not those leased, so
+// a lane may lease only its part of the room the job's volume has left:
+// that room over every connection, less what the lane already holds. On the
+// slow disk run the lanes held 262 MB of a job's queue while its volume read
+// near empty, and all of it arrived at once: 354.9 MB against 268.4 MB.
+#[tokio::test]
+async fn a_lane_leases_only_its_part_of_the_room_its_jobs_volume_has_left() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.tuner.set_connection_limit(4);
+    let hot = JobId(71351);
+    add_job(&mut pipeline, hot, "Slow Disk Reel", 20_000).await;
+    assert_eq!(pipeline.lane_share_of_job(hot, 8), 5_000);
+    let volume = Arc::clone(
+        pipeline.graph_jobs[&hot]
+            .disk()
+            .expect("the job writes through its volume's writer")
+            .working()
+            .volume(),
+    );
+    // Room for 40 articles of 512 bytes on each of the 4 connections.
+    let hard = 4 * 40 * 512;
+    volume.set_buffer_limits(hard, hard);
+    assert_eq!(pipeline.volume_room(hot), Some(hard));
+
+    // A lane holding 30 is given the 10 more its part of the room takes,
+    // though its ask and its share of the queue are larger.
+    let lane = lane_holding(&mut pipeline, hot, 30, 8);
+    let works = taken(ask_as_lane(&mut pipeline, SERVER_A, 18, lane));
+    assert_eq!(works.len(), 10);
+    assert_eq!(single_job(&works), hot);
+
+    // A lane holding its part has no room for a whole pipe of 9: it is
+    // answered once it has fetched one down, below 32, never trickled.
+    let full = lane_holding(&mut pipeline, hot, 40, 8);
+    assert_eq!(
+        saturation(ask_as_lane(&mut pipeline, SERVER_A, 18, full)),
+        SaturationWake {
+            of: Some(hot),
+            below: 32,
+            room: false,
+        }
+    );
+
+    // Bytes that arrived take room from every lane, but a lane is never
+    // held below a full pipe: one holding 2 of its 9 is handed nothing,
+    // and one holding none is handed a whole pipe. Above the volume's
+    // resume line the held lane waits for the volume, not for what it
+    // holds: it is answered once the volume has fallen to that line.
+    volume
+        .arrived_bytes
+        .store(hard - 4 * 512, Ordering::SeqCst);
+    assert!(volume.unwritten_bytes() > volume.resume_line());
+    let short = lane_holding(&mut pipeline, hot, 2, 8);
+    assert_eq!(
+        saturation(ask_as_lane(&mut pipeline, SERVER_A, 18, short)),
+        SaturationWake {
+            of: Some(hot),
+            below: 0,
+            room: true,
+        }
+    );
+    assert!(pipeline.ask_room_wake(hot), "the volume holds a wake at its line");
+    let empty = lane_holding(&mut pipeline, hot, 0, 8);
+    let works = taken(ask_as_lane(&mut pipeline, SERVER_A, 18, empty));
+    assert_eq!(works.len(), 9, "a whole pipe of 9");
+}
+
+fn saturation(handout: Handout) -> SaturationWake {
+    match handout {
+        Handout::Saturated(wake) => wake,
+        other => panic!("the lane must be held, was handed {}", taken(other).len()),
+    }
 }
 
 fn scan_skips(pipeline: &Pipeline) -> u64 {

@@ -24,10 +24,9 @@ mod volume_view;
 mod volumes;
 pub(crate) mod writer;
 
-pub(crate) use storage_kind::StorageKind;
+pub(crate) use storage_kind::{StorageKind, storage_kind};
 #[allow(unused_imports)]
 pub(crate) use volume_probe::{ProbeStore, probe_once};
-pub(crate) use volume_view::slowest_measured_mbps;
 
 // Capacity for the filesystem backing a path.
 #[derive(Debug, Clone, Copy)]
@@ -1136,6 +1135,18 @@ pub enum OnDemandSpace {
 // answer. A network mount that hangs must not hold a request.
 pub const ON_DEMAND_TIMEOUT: Duration = Duration::from_secs(3);
 
+// How long an on-demand look is waited for, by an owner and without one:
+// [`ON_DEMAND_TIMEOUT`]. Code built for tests, which builds every test
+// pipeline, waits a day instead: a test's answer must not depend on how
+// loaded the machine running it is, and the test runner bounds the test.
+fn on_demand_wait() -> Duration {
+    if cfg!(any(test, feature = "test-support")) {
+        Duration::from_secs(24 * 60 * 60)
+    } else {
+        ON_DEMAND_TIMEOUT
+    }
+}
+
 // Every folder asked after that is not a root's directory with a current
 // reading: each configured category's folder, a folder typed in, a job's
 // destination. Each path has its own look, made on demand and only for
@@ -1630,6 +1641,9 @@ pub struct StorageCapacity {
     clock: Arc<Clock>,
     // What the volume write rate sampler waits on, and is stopped by.
     volume_rates: Arc<volume_rate::RateSignal>,
+    // How long an on-demand look may take (`ON_DEMAND_TIMEOUT`, unless a
+    // test pipeline set it).
+    on_demand_timeout_nanos: AtomicU64,
 }
 
 impl fmt::Debug for StorageCapacity {
@@ -1760,7 +1774,21 @@ impl StorageCapacity {
             probe,
             clock,
             volume_rates: Arc::default(),
+            on_demand_timeout_nanos: AtomicU64::new(on_demand_wait().as_nanos() as u64),
         }
+    }
+
+    // How long `spaces` waits for this owner's looks.
+    fn on_demand_timeout(&self) -> Duration {
+        Duration::from_nanos(self.on_demand_timeout_nanos.load(Ordering::Relaxed))
+    }
+
+    // Wait `timeout` for an on-demand look instead of `on_demand_wait`: for
+    // a test of the limit itself.
+    #[cfg(test)]
+    fn set_on_demand_timeout(&self, timeout: Duration) {
+        self.on_demand_timeout_nanos
+            .store(timeout.as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
     }
 
     // The free space of each asked path, in the order asked: a root's
@@ -1771,7 +1799,8 @@ impl StorageCapacity {
     // others still answer. Without an owner (no pipeline) each path gets a
     // look of its own that nothing keeps.
     pub async fn spaces(storage: Option<&Self>, asks: &[(PathBuf, Reach)]) -> Vec<OnDemandSpace> {
-        let deadline = tokio::time::Instant::now() + ON_DEMAND_TIMEOUT;
+        let deadline = tokio::time::Instant::now()
+            + storage.map_or_else(on_demand_wait, StorageCapacity::on_demand_timeout);
         let tickets: Vec<Ticket> = asks
             .iter()
             .map(|(path, reach)| match storage {
@@ -1819,7 +1848,7 @@ impl StorageCapacity {
     pub(crate) async fn same_filesystem(&self, a: &Path, b: &Path) -> bool {
         #[cfg(test)]
         SAME_FILESYSTEM_ASKS.fetch_add(1, Ordering::Relaxed);
-        let deadline = tokio::time::Instant::now() + ON_DEMAND_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + self.on_demand_timeout();
         let tickets = [a, b].map(|path| {
             self.root_device(path)
                 .map_or_else(|| self.begin(path, Want::Device), Ticket::Device)
@@ -1959,7 +1988,7 @@ impl StorageCapacity {
     // whose look does not return within [`ON_DEMAND_TIMEOUT`], or is lost,
     // answers `None`, and the others still answer.
     pub async fn classifications(&self, paths: &[PathBuf]) -> Vec<Option<Classification>> {
-        let deadline = tokio::time::Instant::now() + ON_DEMAND_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + self.on_demand_timeout();
         let tickets: Vec<Result<Arc<ClassLook>, ClassWatch>> = paths
             .iter()
             .map(|path| {
@@ -3207,6 +3236,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let (probe, mut entered, release) = holding_probe(calls.clone(), "/folders/slow");
         let storage = Arc::new(StorageCapacity::with_probe(roots(), NEVER, probe));
+        storage.set_on_demand_timeout(ON_DEMAND_TIMEOUT);
         let both = tokio::spawn({
             let storage = Arc::clone(&storage);
             async move { ask(&storage, &["/folders/slow", "/folders/fast"]).await }
@@ -3362,6 +3392,7 @@ mod tests {
             NEVER,
             counting_probe(calls),
         ));
+        storage.set_on_demand_timeout(ON_DEMAND_TIMEOUT);
         for root in StorageRoot::ALL {
             storage.wait_for_probes(root, 1);
         }

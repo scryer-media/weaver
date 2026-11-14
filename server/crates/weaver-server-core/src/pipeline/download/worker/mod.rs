@@ -925,6 +925,7 @@ impl Pipeline {
             // Nothing dispatch would serve: no stall to time, and a stall
             // timed before stays behind, not carried to the next job.
             self.download_dispatch_stall = None;
+            self.download_dispatch_idle_since = None;
             self.update_queue_metrics();
             return;
         }
@@ -971,6 +972,8 @@ impl Pipeline {
                 return;
             }
             self.log_download_dispatch_liveness_stall(now, pressure, max, eligible_count);
+        } else {
+            self.download_dispatch_idle_since = None;
         }
         self.log_download_retry_storm(now);
         self.log_download_lanes_under_cap(now, max);

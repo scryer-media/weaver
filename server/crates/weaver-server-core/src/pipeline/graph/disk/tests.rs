@@ -162,13 +162,13 @@ fn settled_bytes_are_said_once_the_disk_bears_them_out() {
     }
     let pending = Pending::default();
     assert!(!pending.put(&job, Vec::new()), "nothing may be written yet");
-    assert!(job.settled_bytes() > 0);
-    assert_eq!(pending.settled_bytes(), 0);
+    assert!(job.in_hand_bytes() > 0);
+    assert_eq!(pending.in_hand_bytes(), 0);
     let barrier = disk.barrier();
     hold.open();
     barrier.wait();
     assert!(pending.take().0.is_some());
-    assert_eq!(pending.settled_bytes(), job.settled_bytes());
+    assert_eq!(pending.in_hand_bytes(), job.in_hand_bytes());
 }
 
 // A checkpoint taken while a volume still holds the job's writes records
@@ -255,6 +255,47 @@ fn a_read_waits_for_the_writes_of_its_range() {
         hold.open();
         assert_eq!(reader.join().unwrap(), b"lanternlight");
     });
+}
+
+// The loop reads a file its writer holds open through one handle of its
+// own, as a leaf that writes its own file reads through that file. The
+// handle goes before the close and the release are submitted, a read of
+// the closed file opens it afresh, and every read is counted on the
+// volume.
+#[test]
+fn the_loop_reads_an_open_file_through_one_handle_until_it_closes() {
+    let dir = tempfile::tempdir().unwrap();
+    let through = writers();
+    let to = through.writers.submitter(&through.volume, 1);
+    let reads = || through.volume.writer.loop_reads.load(Ordering::Relaxed);
+    let mut leaf = Leaf::at(dir.path(), "a.bin").through(Some(&to));
+    leaf.write(0, b"lanternlight", None).unwrap();
+    assert!(!leaf.holds_reader(), "nothing was read yet");
+
+    let mut read = Vec::new();
+    leaf.read(0, 7, &mut read).unwrap();
+    assert!(leaf.holds_reader());
+    leaf.read(7, 5, &mut read).unwrap();
+    assert_eq!(read, b"lanternlight");
+    assert_eq!(reads(), 2);
+
+    leaf.close(12).unwrap();
+    assert!(!leaf.holds_reader(), "the handle goes before the close");
+    read.clear();
+    leaf.read(0, 12, &mut read).unwrap();
+    assert_eq!(read, b"lanternlight");
+    assert!(!leaf.holds_reader(), "a closed file is not held");
+    assert_eq!(reads(), 3);
+
+    leaf.write(12, b"!", None).unwrap();
+    read.clear();
+    leaf.read(12, 1, &mut read).unwrap();
+    assert_eq!(read, b"!");
+    assert!(leaf.holds_reader());
+    leaf.release_handle();
+    assert!(!leaf.holds_reader(), "the handle goes before the release");
+    to.barrier().wait_aside();
+    assert_eq!(std::fs::read(leaf.path()).unwrap(), b"lanternlight!");
 }
 
 // A file whose later write failed is shorter on disk than what was sent to
@@ -426,8 +467,8 @@ fn a_volume_is_at_its_limit_only_while_the_bytes_wait() {
 }
 
 // What arrived for the volume's jobs and is still being decoded counts
-// against its limits with what waits for its writer: from the soft limit
-// one article at a time, at the hard limit stopped. A limit lowered below
+// against its limits with what waits for its writer: at the hard limit
+// stopped, open below it, at the soft limit too. A limit lowered below
 // what the volume holds reads as stopped.
 #[test]
 fn a_volume_counts_what_is_being_decoded_with_what_waits_for_its_writer() {
@@ -439,7 +480,7 @@ fn a_volume_counts_what_is_being_decoded_with_what_waits_for_its_writer() {
     assert_eq!(disk.intake(), VolumeIntake::Open);
     through.volume.arrived_bytes.store(300, Ordering::Relaxed);
     assert_eq!(through.volume.unwritten_bytes(), 700);
-    assert_eq!(disk.intake(), VolumeIntake::OneAtATime);
+    assert_eq!(disk.intake(), VolumeIntake::Open);
     through.volume.arrived_bytes.store(600, Ordering::Relaxed);
     assert_eq!(disk.intake(), VolumeIntake::Stopped);
     through.volume.arrived_bytes.store(0, Ordering::Relaxed);
@@ -687,4 +728,65 @@ fn a_released_file_is_released_again_only_after_another_operation() {
     again.wait();
     assert!(again.passed());
     assert_eq!(std::fs::read(leaf.path()).unwrap(), b"lanternlight");
+}
+
+// A fold asks nothing of the disk the loop would stand still for. A check
+// that read the file whole folds what it read while a later operation of
+// the file is still held; a restore's fold, asked while one is out, folds
+// nothing and does not wait; once it returned the same fold takes. The
+// loop never waited for the volume.
+#[test]
+fn a_fold_never_waits_for_the_file_s_operations() {
+    use crate::operations::disk::volume::LoopWait;
+    use weaver_graph::Algorithm;
+
+    let dir = tempfile::tempdir().unwrap();
+    let through = writers();
+    let hold = through.hold();
+    let to = through.writers.submitter(&through.volume, 1);
+    let mut leaf = Leaf::at(dir.path(), "a.bin").through(Some(&to));
+    leaf.write(0, b"lantern", None).unwrap();
+    leaf.release_handle();
+    hold.wait_held();
+    hold.release(1);
+    let written = to.barrier();
+    leaf.write(7, b"light", None).unwrap();
+    let digest = Algorithm::Crc32.hash(b"lantern");
+
+    leaf.fold_read(7, digest);
+    assert_eq!(leaf.folded(7, Algorithm::Crc32), Some(digest.value));
+    leaf.fold_passed(7, digest);
+    assert_eq!(leaf.folded(7, Algorithm::Crc32), None, "the write is still out");
+    leaf.fold_vouched([(weaver_graph::ByteRange::new(0, 7), digest)]);
+    assert_eq!(leaf.folded(7, Algorithm::Crc32), None);
+    let waited = || {
+        through.volume.writer.loop_waits_by_kind[LoopWait::Settle as usize]
+            .load(Ordering::Relaxed)
+    };
+    assert_eq!(waited(), 0, "nothing stood still for the held operation");
+
+    hold.open();
+    written.wait_aside();
+    to.barrier().wait_aside();
+    leaf.fold_passed(7, digest);
+    assert_eq!(leaf.folded(7, Algorithm::Crc32), Some(digest.value));
+    assert_eq!(waited(), 0);
+}
+
+// The floor a checkpoint says is in the units a run counts its downloaded
+// bytes in: the decoded bytes in hand, not the post's encoded sizes, which
+// run about 3% above them.
+#[test]
+fn a_checkpoint_s_floor_counts_decoded_bytes() {
+    let encoded = PIECE + PIECE / 32;
+    let (mut job, _dir, _) = job_with(&[file("part0.mkv", &[encoded; PIECES as usize])], Vec::new());
+    for ordinal in 0..PIECES {
+        arrive(&mut job, 0, ordinal);
+    }
+    let pending = Pending::default();
+    assert!(pending.put(&job, Vec::new()));
+    assert!(pending.take().0.is_some());
+    assert_eq!(job.settled_bytes(), u64::from(PIECES * encoded));
+    assert_eq!(pending.in_hand_bytes(), u64::from(PIECES * PIECE));
+    assert_eq!(pending.in_hand_bytes(), job.in_hand_bytes());
 }

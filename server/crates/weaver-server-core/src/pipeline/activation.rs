@@ -50,6 +50,10 @@ pub(crate) struct ReadArticles {
     // where it delivers now: None when it stages nothing. A job its
     // checkpoint brings back keeps the one it has.
     staging: Option<Option<PathBuf>>,
+    // The volumes of the job's directories, read off the loop before the
+    // job is admitted: its writes go through these, whatever memory says of
+    // the paths by then.
+    volumes: crate::pipeline::graph::disk::ReadVolumes,
 }
 
 #[cfg(test)]
@@ -347,9 +351,9 @@ impl Pipeline {
                         // unknown device.
                         let storage = Arc::clone(&staging.storage);
                         let chosen = staging.choose(job_id, destination);
-                        storage.read_volume(&working_dir);
+                        read.volumes.push((working_dir.clone(), storage.read_volume(&working_dir)));
                         if let Some(dir) = &chosen {
-                            storage.read_volume(dir);
+                            read.volumes.push((dir.clone(), storage.read_volume(dir)));
                         }
                         read.staging = Some(chosen);
                         read
@@ -477,13 +481,28 @@ impl Pipeline {
                         skip,
                         held,
                         feed_verdict,
+                        in_hand_bytes,
                     }) => {
                         self.post_probes.restore_verdict(job_id, feed_verdict);
+                        // What the checkpoint has in hand is downloaded, in
+                        // the decoded units a run counts in.
+                        if let Some(state) = self.jobs.get_mut(&job_id) {
+                            state.downloaded_bytes = state.downloaded_bytes.max(in_hand_bytes);
+                            state.restored_download_floor_bytes =
+                                state.restored_download_floor_bytes.max(in_hand_bytes);
+                        }
                         (Some(job), skip, held)
                     }
                     None => (None, HashSet::new(), Vec::new()),
                 };
-                self.activate_job_articles(job_id, &skip, graph, read.repeated, held);
+                self.activate_job_articles(
+                    job_id,
+                    &skip,
+                    graph,
+                    read.repeated,
+                    held,
+                    &read.volumes,
+                );
                 self.report_job(job_id);
                 self.download_dispatch_wake = true;
             }
@@ -507,6 +526,7 @@ impl Pipeline {
         graph: Option<crate::pipeline::graph::job::GraphJob>,
         repeated: Option<Arc<RepeatedArticles>>,
         held_parts: Vec<HeldPart>,
+        volumes: &[(PathBuf, Arc<crate::operations::disk::volume::Volume>)],
     ) {
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return;
@@ -542,7 +562,7 @@ impl Pipeline {
         self.charge_job_article_memory(job_id);
         match graph {
             Some(graph) => self.install_graph_job(job_id, graph, held_parts),
-            None => self.admit_graph_job(job_id),
+            None => self.admit_graph_job(job_id, volumes),
         }
         self.abandon_dead_files(job_id);
     }
@@ -878,5 +898,6 @@ fn read_job_articles(
         repeated,
         restored,
         staging: None,
+        volumes: Vec::new(),
     })
 }

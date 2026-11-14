@@ -596,6 +596,32 @@ impl Pipeline {
         asked
     }
 
+    // Whether a volume the job writes to holds more than its resume line of
+    // bytes that arrived and are not written, with a wake asked for at that
+    // line. Each such volume is asked once; asking again for the same line
+    // costs a load. True only with a wake on its way, which wakes dispatch
+    // (`Self::volume_room_changed`): a volume that fell to its line in the
+    // meantime holds nothing.
+    pub(in crate::pipeline) fn ask_room_wake(&self, job_id: JobId) -> bool {
+        let Some(disk) = self.graph_jobs.get(&job_id).and_then(|graph| graph.disk()) else {
+            return false;
+        };
+        let mut asked = false;
+        for submitter in disk.each() {
+            let volume = submitter.volume();
+            if volume.buffer_limits().1 == u64::MAX {
+                continue;
+            }
+            let line = volume.resume_line();
+            asked |= volume.unwritten_bytes() > line && self.volume_writers.wake_below(volume, line);
+        }
+        if asked {
+            self.volume_budget_held
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        asked
+    }
+
     // The fill servers a hinted article of `job_id` could be sent to instead
     // of its hinted one. Inside a dispatch attempt this is the attempt's own
     // ranking; outside one the pool is asked, but only when the job's queue

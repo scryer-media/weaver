@@ -268,7 +268,7 @@ impl NamespaceWriter {
             .leaves
             .get_mut(&check.member)
             .expect("the current backing was checked above")
-            .fold_passed(check.length, Digest::crc32(actual));
+            .fold_read(check.length, Digest::crc32(actual));
         self.verifications.remove(&key);
         if actual != check.stated {
             let mut effects = Vec::new();

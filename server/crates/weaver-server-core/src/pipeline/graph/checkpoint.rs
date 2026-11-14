@@ -251,7 +251,8 @@ struct Gated {
     barrier: Option<super::disk::JobBarrier>,
     // The job is told when `barrier` returns.
     told: bool,
-    // The bytes the change spares a restore, said once it is released.
+    // The decoded bytes the change spares a restore, said once it is
+    // released.
     settled: u64,
     #[cfg(test)]
     named: std::collections::BTreeSet<(u32, u32)>,
@@ -304,11 +305,12 @@ struct Held {
     // `None` for rows a restore read, not ones taken from the job: the next
     // step reads every node.
     read: Option<Generations>,
-    // The post's encoded bytes of the articles the rows' root facts settle,
+    // The decoded bytes of the articles in hand the rows' root facts name,
     // as the last checkpoint taken from the job encoded them: the job's
-    // durable download floor. 0 for rows a restore read; the restore's own
+    // durable download floor, in the units its downloaded bytes count, as a
+    // restore's floor is. 0 for rows a restore read; the restore's own
     // floor stands for them until the job's first checkpoint.
-    settled_bytes: u64,
+    in_hand_bytes: u64,
 }
 
 // The rows the database holds of one node, apart as a step reads them
@@ -540,7 +542,7 @@ impl Pending {
         let encoding = job.encode_root(&mut slot.root, job.next_node());
         // What a restore is spared is said only once the disk bears the
         // change out: see `release`.
-        let settled = job.settled_bytes();
+        let settled = job.in_hand_bytes();
         let root = root_row(encoding.version, encoding.bytes);
         if held.root.as_ref() != Some(&root) {
             delta.nodes.insert(root.key(), Some(root.clone()));
@@ -619,7 +621,7 @@ impl Pending {
             if slot.gated.is_empty()
                 && let Some(held) = slot.held.as_mut()
             {
-                held.settled_bytes = settled;
+                held.in_hand_bytes = settled;
             }
             return false;
         }
@@ -674,7 +676,7 @@ impl Pending {
             slot.named.put = job.on_disk();
         }
         if let Some(held) = slot.held.as_mut() {
-            held.settled_bytes = settled;
+            held.in_hand_bytes = settled;
         }
         slot.released = slot.asked;
         match &mut slot.queued {
@@ -720,7 +722,7 @@ impl Pending {
             let gated = slot.gated.pop_front().expect("checked above");
             slot.released = gated.stamp;
             if let Some(held) = slot.held.as_mut() {
-                held.settled_bytes = gated.settled;
+                held.in_hand_bytes = gated.settled;
             }
             #[cfg(test)]
             {
@@ -990,14 +992,14 @@ impl Pending {
         slot.held = Some(held);
     }
 
-    // The bytes the rows the database holds, once what is queued is
+    // The decoded bytes the rows the database holds, once what is queued is
     // written, spare a restore fetching again; 0 while what it holds is not
     // known.
-    pub(crate) fn settled_bytes(&self) -> u64 {
+    pub(crate) fn in_hand_bytes(&self) -> u64 {
         self.slot()
             .held
             .as_ref()
-            .map_or(0, |held| held.settled_bytes)
+            .map_or(0, |held| held.in_hand_bytes)
     }
 
     #[cfg(test)]
@@ -1105,7 +1107,7 @@ impl Pipeline {
     pub(in crate::pipeline) fn graph_checkpointed_bytes(&self, job_id: JobId) -> Option<u64> {
         self.graph_jobs
             .get(&job_id)
-            .map(|graph| graph.pending().settled_bytes())
+            .map(|graph| graph.pending().in_hand_bytes())
     }
 
     // Checkpoint the job's tree as it stands now. A member's file that

@@ -258,6 +258,8 @@ fn renders_prometheus_download_observed_limiter_states() {
         download_lane_refill_parked_total: 0,
         download_lane_refill_deferred_total: 0,
         download_lane_refill_saturated_total: 0,
+        download_lane_room_held_total: 0,
+        download_lane_room_woken_total: 0,
         download_pipeline_trial_success_total: 0,
         download_pipeline_trial_failure_total: 0,
         download_pipeline_proof_pass_total: 0,
@@ -583,6 +585,12 @@ fn rendered_label_sets_cover_every_snapshot_counter() {
         "weaver_pipeline_download_lane_refills_total",
         "result",
         &["granted", "parked", "deferred", "saturated"],
+    );
+    assert_label_set(
+        &rendered,
+        "weaver_pipeline_download_lane_room_waits_total",
+        "event",
+        &["held", "woken"],
     );
     assert_label_set(
         &rendered,
@@ -935,6 +943,7 @@ fn renders_collected_instrumentation_snapshots() {
             .contains("weaver_volume_write_rate_bytes_per_second{volume=\"/mnt/nas\"} 3200000")
     );
     assert!(rendered.contains("weaver_volume_buffered_bytes{volume=\"/mnt/nas\"} 65536"));
+    assert!(rendered.contains("weaver_volume_arrived_bytes{volume=\"/mnt/nas\"} 4096"));
     // A sized volume carries its limits; one not sized yet carries neither.
     assert!(rendered.contains("weaver_volume_buffer_limit_bytes{volume=\"/mnt/nas\"} 1000000"));
     assert!(
@@ -950,14 +959,32 @@ fn renders_collected_instrumentation_snapshots() {
         ("weaver_volume_writer_operations_total", "130"),
         ("weaver_volume_writer_failed_operations_total", "2"),
         ("weaver_volume_writer_abandoned_operations_total", "5"),
-        ("weaver_volume_loop_waits_total", "3"),
-        ("weaver_volume_loop_wait_seconds_total", "1.5"),
         ("weaver_volume_writer_threads_total", "1"),
+        ("weaver_volume_writer_woken_total", "4"),
+        ("weaver_volume_loop_reads_total", "6"),
+        ("weaver_volume_loop_read_seconds_total", "0.75"),
+        ("weaver_volume_aside_waits_total", "4"),
+        ("weaver_volume_aside_wait_seconds_total", "2"),
     ] {
         let line = format!("{row}{{volume=\"/mnt/nas\"}} {value}");
         assert!(rendered.contains(&line), "{line}");
     }
-    assert!(rendered.contains("weaver_volume_loop_waits_total{volume=\"/mnt/scratch\"} 0"));
+    for (to, value) in [("returned", "30"), ("freed", "2")] {
+        let line = format!("weaver_volume_writer_buffers_total{{volume=\"/mnt/nas\",to=\"{to}\"}} {value}");
+        assert!(rendered.contains(&line), "{line}");
+    }
+    // The loop's waits on a volume, by what it waited for.
+    for (kind, waits, seconds) in [("read", "1", "0.25"), ("settle", "2", "1.25"), ("budget", "0", "0")] {
+        let line = format!("weaver_volume_loop_waits_total{{volume=\"/mnt/nas\",kind=\"{kind}\"}} {waits}");
+        assert!(rendered.contains(&line), "{line}");
+        let line = format!(
+            "weaver_volume_loop_wait_seconds_total{{volume=\"/mnt/nas\",kind=\"{kind}\"}} {seconds}"
+        );
+        assert!(rendered.contains(&line), "{line}");
+    }
+    assert!(rendered.contains(
+        "weaver_volume_loop_waits_total{volume=\"/mnt/scratch\",kind=\"settle\"} 0"
+    ));
     assert!(rendered.contains("weaver_volume_written_bytes_total{volume=\"/mnt/scratch\"} 0"));
     assert!(!rendered.contains("weaver_volume_write_rate_bytes_per_second{volume=\"/mnt/scratch\"}"));
     // What is being written now sits beside what the volume takes, and is

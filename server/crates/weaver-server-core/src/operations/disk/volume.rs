@@ -11,10 +11,10 @@ pub(crate) struct Volume {
     // The mount path or drive root shown to the user.
     pub(crate) label: String,
     // Bytes its writer has written, and the nanoseconds spent inside those
-    // write calls. After each call the writer adds the bytes first and
-    // stores the nanoseconds last, with `Release`; the rate sampler loads
-    // the nanoseconds first, with `Acquire`, and the bytes after, so it
-    // never reads a call's time without its bytes.
+    // write calls. After each call the writer adds the nanoseconds first
+    // and the bytes last, with `Release`; the rate sampler loads the bytes
+    // first, with `Acquire`, and the nanoseconds after, so it never reads a
+    // call's bytes without its time.
     pub(crate) written_bytes: AtomicU64,
     pub(crate) write_nanos: AtomicU64,
     // Write calls its writer has made, and how many of them did not start
@@ -28,8 +28,8 @@ pub(crate) struct Volume {
     // changes it.
     pub(crate) arrived_bytes: AtomicU64,
     // The volume's buffer limits, over the bytes that have arrived and are
-    // not written (`unwritten_bytes`). From the soft limit its lanes ask
-    // for one article at a time; at the hard limit they stop. One pair for
+    // not written (`unwritten_bytes`). At the hard limit its lanes stop; the
+    // soft limit is a reported figure. One pair for
     // the volume, shared by every stream writing to it. `u64::MAX` until
     // the volume is sized: no limit.
     buffer_soft_bytes: AtomicU64,
@@ -57,9 +57,20 @@ pub(crate) struct WriterCounts {
     // Batches the writer ran, and the operations in them it ran.
     pub(crate) batches: AtomicU64,
     pub(crate) operations: AtomicU64,
-    // Times the pipeline loop stood still for the writer, and for how long.
+    // Times the pipeline loop stood still for the writer, and for how long:
+    // in all, and by what it waited for (`LoopWait`).
     pub(crate) loop_waits: AtomicU64,
     pub(crate) loop_wait_nanos: AtomicU64,
+    pub(crate) loop_waits_by_kind: [AtomicU64; LoopWait::COUNT],
+    pub(crate) loop_wait_nanos_by_kind: [AtomicU64; LoopWait::COUNT],
+    // Reads the pipeline loop made itself of a file the writer writes,
+    // after its wait, and how long they took, the open included.
+    pub(crate) loop_reads: AtomicU64,
+    pub(crate) loop_read_nanos: AtomicU64,
+    // Times a thread other than the loop (a check, a repair, a replay)
+    // stood for the writer in `Barrier::wait_aside`, and for how long.
+    pub(crate) aside_waits: AtomicU64,
+    pub(crate) aside_wait_nanos: AtomicU64,
     // Operations that came back with an error.
     pub(crate) failed_operations: AtomicU64,
     // Operations not run: their caller gave its files up, or an earlier
@@ -67,6 +78,53 @@ pub(crate) struct WriterCounts {
     pub(crate) abandoned_operations: AtomicU64,
     // Writer threads started for the volume, one after another.
     pub(crate) threads: AtomicU64,
+    // Times the writer woke to mail after waiting for it: a send that found
+    // it parked.
+    pub(crate) woken: AtomicU64,
+    // Written buffers handed back to the pipeline loop to be freed there,
+    // and those the writer freed itself because the way back was full.
+    pub(crate) buffers_returned: AtomicU64,
+    pub(crate) buffers_freed: AtomicU64,
+}
+
+// What the pipeline loop stood still for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoopWait {
+    // A read of a file's bytes, after the file's writes before it.
+    Read,
+    // A file's operations to return: its length, or a delivery of it.
+    Settle,
+    // The volume's buffered bytes to fall below its limit, while the loop
+    // itself produces what is written (a repair's or a replay's output).
+    Budget,
+}
+
+impl LoopWait {
+    pub(crate) const COUNT: usize = 3;
+    // In the order of `instrumentation::LOOP_WAIT_KINDS`, which labels them.
+    pub(crate) const ALL: [LoopWait; Self::COUNT] = [Self::Read, Self::Settle, Self::Budget];
+}
+
+impl WriterCounts {
+    // The loop stood still for `nanos` waiting for `kind`. Relaxed adds.
+    pub(crate) fn loop_waited(&self, kind: LoopWait, nanos: u64) {
+        self.loop_waits.fetch_add(1, Ordering::Relaxed);
+        self.loop_wait_nanos.fetch_add(nanos, Ordering::Relaxed);
+        self.loop_waits_by_kind[kind as usize].fetch_add(1, Ordering::Relaxed);
+        self.loop_wait_nanos_by_kind[kind as usize].fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    // The loop read a writer's file itself for `nanos`. Relaxed adds.
+    pub(crate) fn loop_read(&self, nanos: u64) {
+        self.loop_reads.fetch_add(1, Ordering::Relaxed);
+        self.loop_read_nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    // A thread aside stood `nanos` for the writer. Relaxed adds.
+    pub(crate) fn aside_waited(&self, nanos: u64) {
+        self.aside_waits.fetch_add(1, Ordering::Relaxed);
+        self.aside_wait_nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
 }
 
 impl Volume {
