@@ -623,7 +623,7 @@ fn cleanup_unreferenced_intermediate_dirs(
     })?;
     Ok(unclaimed
         .iter()
-        .filter(|(_, path)| remove_unclaimed_working_dir(intermediate_dir, path))
+        .filter(|(owner, path)| remove_unclaimed_working_dir(intermediate_dir, path, *owner))
         .count())
 }
 

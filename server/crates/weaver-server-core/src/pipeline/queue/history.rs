@@ -483,14 +483,15 @@ impl Queue {
                 "entries of the intermediate directory could not be read; housekeeping goes on without them and marks no failed job as swept this time"
             ),
             Ok(_) => {}
-            Err(error) => tracing::debug!(
+            // No job can be judged: no failed job is listed, read or held.
+            Err(error) => tracing::warn!(
                 root = %resources.intermediate_dir.display(),
                 error = %error,
-                "the intermediate directory could not be read for housekeeping"
+                "the intermediate directory could not be read; housekeeping leaves failed jobs' files for a later sweep"
             ),
         }
-        if let Some(finished_by) = failed_finished_by {
-            let mut places = SweepPlaces::new(scan.as_ref().ok());
+        if let (Some(finished_by), Ok(scan)) = (failed_finished_by, &scan) {
+            let mut places = SweepPlaces::new(Some(scan));
             self.clone()
                 .sweep_failed_job_files(&resources, &mut places, finished_by)
                 .await;
@@ -519,6 +520,10 @@ impl Queue {
         places: &mut SweepPlaces,
         finished_by: i64,
     ) {
+        // With no reading of the root no job can be judged: no page is read.
+        if places.marked.is_none() {
+            return;
+        }
         let mut staging_roots = None;
         let mut after = None;
         loop {
@@ -543,7 +548,7 @@ impl Queue {
             };
             after = Some((completed_at, last));
             let full = page.len() == FAILED_SWEEP_PAGE;
-            if staging_roots.is_none() && places.marked.is_some() {
+            if staging_roots.is_none() {
                 staging_roots = Some(resources.staging_roots().await);
             }
             let page = page
@@ -621,8 +626,9 @@ impl Queue {
     // place can be judged are made per place, never per job: the sweep's
     // one reading of the intermediate root, and one existence check for
     // each other folder a page's records stand in, kept in `places` for the
-    // whole sweep. A job under a place that cannot be judged now is counted
-    // there and passed with no disk call, unstamped. Two reads serve the
+    // whole sweep. A job under a folder that is not there is counted there
+    // and left unstamped: it gives up what the reading of the root found of
+    // it, and with nothing found is passed with no disk call. Two reads serve the
     // page: which of its jobs are still the failures listed, and which
     // still have a script out. The rest are held, swept and released one at
     // a time, and stamped together at the end. False when the sweep stops
@@ -637,9 +643,8 @@ impl Queue {
     ) -> bool {
         let root = resources.intermediate_dir.clone();
         if places.marked.is_none() {
-            // The root cannot be judged: every job's answer waits on it.
-            *places.waiting.entry(root).or_default() += page.len();
-            return true;
+            // The root cannot be judged: the sweep stops, with no read.
+            return false;
         }
         // Each folder this page's records stand in that the sweep has not
         // judged yet: one check each, off the runtime.
@@ -722,7 +727,15 @@ impl Queue {
                 && parent != resources.intermediate_dir
                 && places.parents.get(parent) == Some(&false)
             {
+                // The record's folder cannot be judged, so the job is not
+                // stamped. What the reading of the root found of it still
+                // goes, with its staging; with nothing found, the job is
+                // passed with no hold and no disk call.
                 *places.waiting.entry(parent.to_path_buf()).or_default() += 1;
+                if let Some(marked) = places.marked.as_mut().and_then(|marked| marked.remove(&id)) {
+                    self.sweep_failed_job(resources, staging_roots, id, None, marked)
+                        .await;
+                }
                 continue;
             }
             let marked = places
@@ -837,7 +850,7 @@ impl Queue {
             let scripts = db.jobs_with_live_script_events(&owners)?;
             for (_guard, owner, path) in held {
                 if !known.contains(&owner.0) && !scripts.contains(&owner.0) {
-                    crate::jobs::working_dir::remove_unclaimed_working_dir(&root, &path);
+                    crate::jobs::working_dir::remove_unclaimed_working_dir(&root, &path, owner);
                 }
             }
             Ok::<_, crate::StateError>(())

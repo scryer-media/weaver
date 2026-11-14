@@ -825,6 +825,58 @@ async fn a_job_cancelled_while_its_move_is_out_and_retried_has_one_folder() {
     assert!(retry.exists());
 }
 
+// A job cancelled while its move was out, its id then being admitted again
+// or held by a history operation when the move is heard: whoever works with
+// the id may have taken the moved directory as its own, so the reply keeps
+// it. With no one working with the id, the same reply lets it go.
+#[tokio::test]
+async fn a_move_heard_while_its_id_is_worked_with_removes_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = JobId(1);
+    let (mut pipeline, _, new_root) = unstarted_job_with_a_changed_folder(&temp, id).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let mut events = handle.subscribe_events();
+
+    // The move is made and waits to be heard; the job is cancelled first.
+    pipeline.request_job_activation(id);
+    let done = pipeline.job_activated_rx.recv().await.unwrap();
+    let moved = done.moved_to.clone().expect("the read moved the job");
+    handle.cancel_job(id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(&mut pipeline).await;
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
+    {
+    }
+    assert_eq!(moved.parent(), Some(new_root.as_path()));
+    let queue = pipeline.shared_state.queue.clone();
+    assert!(queue.read(|inner| inner.row(id).is_none()));
+
+    for held_by_history in [false, true] {
+        queue.write(|inner| {
+            if held_by_history {
+                inner.history_operations.insert(id);
+            } else {
+                inner.admissions.insert(id);
+            }
+            crate::pipeline::queue::Change::unchanged(())
+        });
+        assert!(pipeline.take_moved_dir(id, &done.started_in, &moved));
+        queue.write(|inner| {
+            inner.history_operations.remove(&id);
+            inner.admissions.remove(&id);
+            crate::pipeline::queue::Change::unchanged(())
+        });
+    }
+    assert!(!pipeline.take_moved_dir(id, &done.started_in, &moved));
+
+    // Heard with no one working with the id, the directory goes, off the
+    // actor: wait for the folder itself.
+    pipeline.handle_job_activated(done);
+    while moved.exists() {
+        tokio::task::yield_now().await;
+    }
+}
+
 // A reorder among jobs out of the window changes no installed job, and is
 // stored all the same: a restart before they enter keeps it.
 #[tokio::test]

@@ -357,6 +357,41 @@ impl Pipeline {
         });
     }
 
+    // The installed job and its queue row take the directory a move made
+    // where they still name the one it started in. False when the directory
+    // is to go: nothing took it, nothing names it, and no one is working
+    // with the id. An id being admitted, or held by a history operation,
+    // may have taken the directory as its own, so it stays, and that job's
+    // own cleanup takes any directory that carries its marker.
+    pub(crate) fn take_moved_dir(&mut self, job_id: JobId, started_in: &Path, dir: &Path) -> bool {
+        let mut kept = false;
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            kept |= state.working_dir == dir;
+            if state.working_dir == started_in {
+                state.working_dir = dir.to_path_buf();
+                kept = true;
+            }
+        }
+        let (from, to) = (started_in.display().to_string(), dir.display().to_string());
+        kept | self.shared_state.queue.write(|inner| {
+            let busy =
+                inner.admissions.contains(&job_id) || inner.history_operations.contains(&job_id);
+            match inner.job_mut(job_id) {
+                Some(row)
+                    if !row.report.retiring
+                        && row.report.job.output_dir.as_deref() == Some(from.as_str()) =>
+                {
+                    row.report.job.output_dir = Some(to);
+                    crate::pipeline::queue::Change::changed(true)
+                }
+                Some(row) => crate::pipeline::queue::Change::unchanged(
+                    busy || row.report.job.output_dir.as_deref() == Some(to.as_str()),
+                ),
+                None => crate::pipeline::queue::Change::unchanged(busy),
+            }
+        })
+    }
+
     // The read came back: build the job's articles, or fail the job if they
     // could not be read. Only the reply to the job's current activation is
     // heard: a job that left the pipeline, paused, or was activated again
@@ -383,47 +418,20 @@ impl Pipeline {
         // left as they are. A directory nothing took, and nothing names, is
         // of a job that left, and goes as that job's own cleanup would have
         // taken it.
-        if let Some(dir) = moved_to {
-            let mut named = false;
-            let mut taken = false;
-            if let Some(state) = self.jobs.get_mut(&job_id) {
-                named |= state.working_dir == dir;
-                if state.working_dir == started_in {
-                    state.working_dir = dir.clone();
-                    taken = true;
+        if let Some(dir) = moved_to
+            && !self.take_moved_dir(job_id, &started_in, &dir)
+        {
+            tokio::task::spawn_blocking(move || {
+                let Some(root) = dir.parent() else {
+                    return;
+                };
+                if let Err(error) =
+                    crate::jobs::working_dir::remove_job_working_dir(root, &dir, job_id)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!(job_id = job_id.0, dir = %dir.display(), %error, "could not remove the working directory claimed for a job that left");
                 }
-            }
-            let (from, to) = (started_in.display().to_string(), dir.display().to_string());
-            let (row_took, row_names) =
-                self.shared_state
-                    .queue
-                    .write(|inner| match inner.job_mut(job_id) {
-                        Some(row)
-                            if !row.report.retiring
-                                && row.report.job.output_dir.as_deref() == Some(from.as_str()) =>
-                        {
-                            row.report.job.output_dir = Some(to);
-                            crate::pipeline::queue::Change::changed((true, false))
-                        }
-                        Some(row) => crate::pipeline::queue::Change::unchanged((
-                            false,
-                            row.report.job.output_dir.as_deref() == Some(to.as_str()),
-                        )),
-                        None => crate::pipeline::queue::Change::unchanged((false, false)),
-                    });
-            if !(taken || row_took || named || row_names) {
-                tokio::task::spawn_blocking(move || {
-                    let Some(root) = dir.parent() else {
-                        return;
-                    };
-                    if let Err(error) =
-                        crate::jobs::working_dir::remove_job_working_dir(root, &dir, job_id)
-                        && error.kind() != std::io::ErrorKind::NotFound
-                    {
-                        warn!(job_id = job_id.0, dir = %dir.display(), %error, "could not remove the working directory claimed for a job that left");
-                    }
-                });
-            }
+            });
         }
         if !self.jobs.get(&job_id).is_some_and(|state| {
             matches!(state.articles, JobArticles::Activating(_, current) if current == activation)

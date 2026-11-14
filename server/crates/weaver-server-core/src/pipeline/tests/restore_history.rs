@@ -368,6 +368,36 @@ async fn housekeeping_stamps_nothing_while_the_intermediate_root_is_away() {
     retire_pipeline_database(pipeline).await;
 }
 
+// With no reading of the root a page step stops the sweep at once: nothing
+// is read or counted for its jobs, and none is listed or held.
+#[tokio::test]
+async fn a_page_step_with_no_reading_of_the_root_stops_the_sweep() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let id = JobId(30092);
+    let mut row = history_row_finished_at(id, "failed", PathBuf::new(), 2);
+    row.output_dir = None;
+    pipeline.db.insert_job_history(&row).unwrap();
+    pipeline.report_all_for_test();
+    let queue = pipeline.shared_state.queue.clone();
+    let resources = queue.resources.get().cloned().unwrap();
+    let mut places = crate::pipeline::queue::SweepPlaces::new(None);
+
+    assert!(
+        !queue
+            .clone()
+            .sweep_failed_page(&resources, &[], &mut places, 100, vec![(id, None)])
+            .await
+    );
+    assert!(places.waiting.is_empty());
+    assert!(places.parents.is_empty());
+    assert!(
+        queue.read(|inner| inner.sweep_listed.is_empty() && inner.history_operations.is_empty())
+    );
+    assert_eq!(swept_at(&pipeline, id).await, None);
+    retire_pipeline_database(pipeline).await;
+}
+
 // Three hundred failed jobs whose records stand in one folder that is not
 // there: the folder is judged once for them all, every one is left waiting
 // on it, and none is stamped. A job recorded under a folder that is there,
@@ -428,6 +458,71 @@ async fn jobs_under_one_missing_folder_cost_one_check_and_are_not_stamped() {
     assert!(swept_at(&pipeline, settled).await.is_some());
     assert_eq!(swept_at(&pipeline, ids[0]).await, None);
     assert_eq!(swept_at(&pipeline, ids[299]).await, None);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A failed job whose record stands in a folder that is gone still gives up
+// the marked folder the reading of the root found of it, and is not
+// stamped. With nothing more found of it, the next page step passes it: no
+// hold, and nothing of it is looked for, so a staging directory made since
+// stays.
+#[tokio::test]
+async fn a_job_under_a_missing_folder_gives_up_what_the_reading_found_and_is_then_passed() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let id = JobId(30093);
+    let working_dir = marked_working_dir(&intermediate_dir, "Harbor", id).await;
+    let gone = temp_dir.path().join("tv");
+    let recorded = gone.join("Harbor");
+    pipeline
+        .db
+        .insert_job_history(&history_row_finished_at(id, "failed", recorded.clone(), 2))
+        .unwrap();
+    pipeline.report_all_for_test();
+    let queue = pipeline.shared_state.queue.clone();
+    let resources = queue.resources.get().cloned().unwrap();
+    let mut places =
+        crate::pipeline::queue::SweepPlaces::new(Some(&crate::jobs::working_dir::RootScan {
+            marked: vec![(id, working_dir.clone())],
+            unreadable: 0,
+        }));
+    let staging_roots = [complete_dir.clone()];
+
+    assert!(
+        queue
+            .clone()
+            .sweep_failed_page(
+                &resources,
+                &staging_roots,
+                &mut places,
+                100,
+                vec![(id, Some(recorded.clone()))],
+            )
+            .await
+    );
+    assert!(!working_dir.exists());
+    assert_eq!(swept_at(&pipeline, id).await, None);
+    assert_eq!(places.waiting, BTreeMap::from([(gone.clone(), 1)]));
+    assert!(queue.read(|inner| inner.history_operations.is_empty()));
+
+    // Nothing of the job is in the reading now. A staging directory made
+    // since would go if the job were swept again.
+    let staging = crate::pipeline::queue::staging_dir_for(&complete_dir, id);
+    crate::pipeline::queue::make_staging_dir(&staging, id).unwrap();
+    assert!(
+        queue
+            .sweep_failed_page(
+                &resources,
+                &staging_roots,
+                &mut places,
+                100,
+                vec![(id, Some(recorded))],
+            )
+            .await
+    );
+    assert!(staging.exists());
+    assert_eq!(swept_at(&pipeline, id).await, None);
+    assert_eq!(places.waiting, BTreeMap::from([(gone, 2)]));
     retire_pipeline_database(pipeline).await;
 }
 

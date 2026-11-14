@@ -239,8 +239,22 @@ pub(crate) struct RootScan {
     pub(crate) unreadable: usize,
 }
 
+// Whether an entry that failed this way is no working directory of ours at
+// all, so a reading that passed it missed nothing: a folder the service may
+// not open (it made every working directory itself, and could not remove
+// this one either), and a marker that is not a regular file or does not
+// read as text. Any other failure, such as an I/O error or a path that
+// stops answering, may hide a job's folder.
+fn not_ours_to_judge(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidData
+    )
+}
+
 // A root that cannot be read, missing or not, is an error: nothing under it
-// can be judged now. An entry that cannot be read is passed and counted.
+// can be judged now. An entry that is not ours to judge is passed; any other
+// that cannot be read is passed and counted.
 pub(crate) fn scan_working_dirs(root: &Path) -> std::io::Result<RootScan> {
     let mut scan = RootScan {
         marked: Vec::new(),
@@ -260,15 +274,18 @@ pub(crate) fn scan_working_dirs(root: &Path) -> std::io::Result<RootScan> {
             }
         }
         let path = entry.path();
-        let Ok(dir) = open_working_directory(root, &path) else {
-            scan.unreadable += 1;
-            continue;
+        let dir = match open_working_directory(root, &path) {
+            Ok(dir) => dir,
+            Err(error) => {
+                scan.unreadable += usize::from(!not_ours_to_judge(error.kind()));
+                continue;
+            }
         };
         let stored = match read_working_marker(&dir) {
             Ok(stored) => stored,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => {
-                scan.unreadable += 1;
+            Err(error) => {
+                scan.unreadable += usize::from(!not_ours_to_judge(error.kind()));
                 continue;
             }
         };
@@ -294,11 +311,27 @@ fn marked_working_dirs(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(found),
         Err(error) => return Err(error),
     };
+    // An entry that cannot be read is passed and counted, so one bad entry
+    // never stops the callers, who only remove what is found here.
+    let mut unreadable = 0usize;
     for entry in entries {
-        let path = entry?.path();
-        if let Some(owner) = working_dir_owner(root, &path)?.filter(|owner| wanted(*owner)) {
-            found.entry(owner).or_default().push(path);
+        let Ok(entry) = entry else {
+            unreadable += 1;
+            continue;
+        };
+        let path = entry.path();
+        match working_dir_owner(root, &path) {
+            Ok(Some(owner)) if wanted(owner) => found.entry(owner).or_default().push(path),
+            Ok(_) => {}
+            Err(_) => unreadable += 1,
         }
+    }
+    if unreadable > 0 {
+        tracing::warn!(
+            root = %root.display(),
+            entries = unreadable,
+            "entries of the intermediate directory could not be read; they are passed"
+        );
     }
     Ok(found)
 }
@@ -552,7 +585,8 @@ fn upgrade_legacy_marker(dir: &Dir, path: &Path, job_id: JobId) -> std::io::Resu
 
 fn read_working_marker(dir: &Dir) -> std::io::Result<String> {
     if !dir.symlink_metadata(WORKING_DIR_MARKER)?.is_file() {
-        return Err(std::io::Error::other(
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
             "working directory marker is not a regular file",
         ));
     }
@@ -565,7 +599,8 @@ fn read_working_marker(dir: &Dir) -> std::io::Result<String> {
     }
     let file = dir.open_with(WORKING_DIR_MARKER, &options)?;
     if !file.metadata()?.is_file() {
-        return Err(std::io::Error::other(
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
             "working directory marker is not a regular file",
         ));
     }
@@ -766,8 +801,15 @@ pub(crate) fn unclaimed_working_dirs(
         Err(error) => return Err(error),
     };
     let mut unclaimed = Vec::new();
+    // An entry that cannot be read is passed and counted: it is never
+    // removed, and never stops the rest.
+    let mut unreadable = 0usize;
     for entry in entries {
-        let path = entry?.path();
+        let Ok(entry) = entry else {
+            unreadable += 1;
+            continue;
+        };
+        let path = entry.path();
         let Some(owner) = working_dir_owner(root, &path).ok().flatten() else {
             continue;
         };
@@ -775,15 +817,24 @@ pub(crate) fn unclaimed_working_dirs(
             unclaimed.push((owner, path));
         }
     }
+    if unreadable > 0 {
+        tracing::warn!(
+            root = %root.display(),
+            entries = unreadable,
+            "entries of the intermediate directory could not be read; they are passed"
+        );
+    }
     Ok(unclaimed)
 }
 
-// Removes one directory `unclaimed_working_dirs` found, checking its marker
-// again as it goes. One that still holds what it cannot give up stays for a
+// Removes one directory found unclaimed, when its marker still names
+// `owner`, the job it was judged by: a directory that has changed hands
+// since is left. One that still holds what it cannot give up stays for a
 // later cleanup.
-pub(crate) fn remove_unclaimed_working_dir(root: &Path, path: &Path) -> bool {
-    match remove_weaver_owned_working_dir(root, path) {
-        Ok(()) => {
+pub(crate) fn remove_unclaimed_working_dir(root: &Path, path: &Path, owner: JobId) -> bool {
+    match remove_job_working_dir(root, path, owner) {
+        Ok(HistoryWorkingDir::LeftInPlace) => false,
+        Ok(HistoryWorkingDir::Owned) => {
             tracing::info!(dir = %path.display(), "removed an unreferenced intermediate directory");
             true
         }
@@ -1756,6 +1807,53 @@ mod tests {
         let scan = scan_working_dirs(&root).unwrap();
         assert_eq!(scan.marked, vec![(JobId(5), claimed.path)]);
         assert_eq!(scan.unreadable, 0);
+    }
+
+    // A folder the service may not open, and a marker that is no regular
+    // file, are no working directory of ours: a reading passes them and is
+    // still whole. Any other failure counts against the reading.
+    #[test]
+    fn an_entry_that_is_not_ours_to_judge_does_not_count_against_a_reading() {
+        use std::io::ErrorKind;
+        assert!(not_ours_to_judge(ErrorKind::PermissionDenied));
+        assert!(not_ours_to_judge(ErrorKind::InvalidData));
+        for kind in [
+            ErrorKind::Other,
+            ErrorKind::TimedOut,
+            ErrorKind::Interrupted,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::NotFound,
+        ] {
+            assert!(!not_ours_to_judge(kind), "{kind:?}");
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("intermediate");
+        let claimed = claim_working_dir(&root, JobId(6), "job").unwrap();
+        std::fs::create_dir_all(root.join("system-folder").join(WORKING_DIR_MARKER)).unwrap();
+        let scan = scan_working_dirs(&root).unwrap();
+        assert_eq!(scan.marked, vec![(JobId(6), claimed.path)]);
+        assert_eq!(scan.unreadable, 0);
+    }
+
+    // A directory found unclaimed goes only while its marker still names
+    // the job it was judged by: one replaced since by another job's stays.
+    #[test]
+    fn an_unclaimed_directory_that_changed_hands_is_left() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("intermediate");
+        let orphan = claim_working_dir(&root, JobId(7), "job").unwrap().path;
+        // Between the reading and the removal the orphan goes and another
+        // job claims the name.
+        std::fs::remove_dir_all(&orphan).unwrap();
+        let taken = claim_working_dir(&root, JobId(8), "job").unwrap().path;
+        assert_eq!(taken, orphan);
+        std::fs::write(taken.join("payload.bin"), b"kept").unwrap();
+
+        assert!(!remove_unclaimed_working_dir(&root, &orphan, JobId(7)));
+        assert!(taken.join("payload.bin").exists());
+        assert!(remove_unclaimed_working_dir(&root, &taken, JobId(8)));
+        assert!(!taken.exists());
     }
 
     // A job added to work in a directory it names has it made and marked in
