@@ -2442,7 +2442,6 @@ impl NamespaceWriter {
             .max(record.length.unwrap_or(0));
         self.admit_file(tree, node, member, end, bytes.len() as u64)?;
         let leaf = self.leaf(tree, node, member)?;
-        let started = std::time::Instant::now();
         // The leaf folds the digest the member's stated check needs, from
         // the evidence the bytes came with, hashing only bytes no level above
         // proved. A member that states no check, or not yet, as a split RAR
@@ -2457,7 +2456,6 @@ impl NamespaceWriter {
             Some(algorithm) => leaf.write_folding(offset, bytes, algorithm, record.length)?,
             None => leaf.write(offset, bytes, record.length)?,
         }
-        let took = started.elapsed();
         // Every byte to its length is in: the file takes that length, or
         // reaches as far as bytes landed past a length its articles
         // declared, as the tree closes the member. A post's `=ybegin size=`
@@ -2466,12 +2464,6 @@ impl NamespaceWriter {
             let reached = record.coverage.runs().last().map_or(0, |run| run.range.end);
             leaf.close(length.max(reached))?;
             self.caps.closed(node, member);
-        }
-        if let Some(metrics) = &self.metrics {
-            metrics.disk_write_latency_us.store(
-                u64::try_from(took.as_micros()).unwrap_or(u64::MAX),
-                std::sync::atomic::Ordering::Relaxed,
-            );
         }
         Ok(())
     }

@@ -142,7 +142,6 @@ const en: LocaleDictionary = {
   "metrics.commitPending": "Commit Pending",
   "metrics.writeBufferedBytes": "Write Buffered Bytes",
   "metrics.writeBufferedSegments": "Write Buffered Segments",
-  "metrics.diskWriteLatency": "Disk Write Latency",
   "metrics.segmentsDownloaded": "Segments Downloaded",
   "metrics.segmentsDecoded": "Segments Decoded",
   "metrics.segmentsCommitted": "Segments Committed",
@@ -182,8 +181,6 @@ const en: LocaleDictionary = {
   "metrics.activeWorkersDesc": "Live worker pressure across verify, repair, and extraction stages.",
   "metrics.writeBufferChart": "Write Buffer",
   "metrics.writeBufferDesc": "Buffered bytes and buffered segment counts waiting to hit disk.",
-  "metrics.diskWriteLatencyChart": "Disk Write Latency",
-  "metrics.diskWriteLatencyDesc": "Raw write latency from the pipeline's disk path, stored as microseconds.",
   "metrics.throughputRatesChart": "Throughput Rates",
   "metrics.throughputRatesDesc": "Current articles per second beside decode throughput for quick pacing checks.",
 

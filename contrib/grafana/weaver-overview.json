@@ -925,7 +925,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "description": "Verify, repair, and extract workers busy right now, plus disk write latency.",
+      "description": "Verify, repair, and extract workers busy right now, plus the average time of one write call on each volume.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -942,7 +942,7 @@
         },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "disk write latency" },
+            "matcher": { "id": "byRegexp", "options": "/^write call /" },
             "properties": [
               { "id": "unit", "value": "s" },
               { "id": "custom.axisPlacement", "value": "right" }
@@ -984,8 +984,8 @@
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
           "editorMode": "code",
-          "expr": "weaver_pipeline_disk_write_latency_seconds{job=\"$job\",instance=~\"$instance\"}",
-          "legendFormat": "disk write latency",
+          "expr": "rate(weaver_volume_write_seconds_total{job=\"$job\",instance=~\"$instance\"}[5m]) / rate(weaver_volume_write_calls_total{job=\"$job\",instance=~\"$instance\"}[5m])",
+          "legendFormat": "write call {{volume}}",
           "range": true,
           "refId": "D"
         }
@@ -996,6 +996,204 @@
     {
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 58 },
+      "id": 90,
+      "panels": [],
+      "title": "Volumes",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "What each volume takes: the start-up probe's figure, or its bytes over time while its writer never ran out of work. Absent until the volume has been measured.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "mappings": [],
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 59 },
+      "id": 91,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "weaver_volume_write_rate_bytes_per_second{job=\"$job\",instance=~\"$instance\"}",
+          "legendFormat": "{{volume}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Measured write rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Bytes per second written to each volume now, whether or not the volume is the limit. Absent while nothing is written to it.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "mappings": [],
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 59 },
+      "id": 92,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "weaver_volume_write_throughput_bytes_per_second{job=\"$job\",instance=~\"$instance\"}",
+          "legendFormat": "{{volume}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Live write throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Bytes waiting in memory for each volume's writer.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "mappings": [],
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 59 },
+      "id": 93,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "weaver_volume_buffered_bytes{job=\"$job\",instance=~\"$instance\"}",
+          "legendFormat": "{{volume}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Buffered for the writer",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Seconds in each second the pipeline loop itself stood still for a volume's writer. Waits of other threads are not counted.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "mappings": [],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 65 },
+      "id": 94,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "rate(weaver_volume_loop_wait_seconds_total{job=\"$job\",instance=~\"$instance\"}[$__rate_interval])",
+          "legendFormat": "{{volume}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Loop wait",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Operations each volume's writer ran that came back with an error, over each interval.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 65 },
+      "id": 95,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "increase(weaver_volume_writer_failed_operations_total{job=\"$job\",instance=~\"$instance\"}[$__rate_interval])",
+          "legendFormat": "{{volume}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Failed operations",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 71 },
       "id": 50,
       "panels": [],
       "title": "Process",
@@ -1020,7 +1218,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 59 },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 72 },
       "id": 51,
       "options": {
         "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -1078,7 +1276,7 @@
           }
         ]
       },
-      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 59 },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 72 },
       "id": 52,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -1119,7 +1317,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 65
+        "y": 78
       },
       "id": 60,
       "panels": [],
@@ -1182,7 +1380,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 66
+        "y": 79
       },
       "id": 61,
       "options": {
@@ -1317,7 +1515,7 @@
         "h": 6,
         "w": 12,
         "x": 0,
-        "y": 74
+        "y": 87
       },
       "id": 62,
       "options": {
@@ -1393,7 +1591,7 @@
         "h": 6,
         "w": 12,
         "x": 12,
-        "y": 74
+        "y": 87
       },
       "id": 63,
       "options": {
@@ -1454,7 +1652,7 @@
         "h": 6,
         "w": 8,
         "x": 0,
-        "y": 80
+        "y": 93
       },
       "id": 64,
       "options": {
@@ -1526,7 +1724,7 @@
         "h": 6,
         "w": 8,
         "x": 8,
-        "y": 80
+        "y": 93
       },
       "id": 65,
       "options": {
@@ -1598,7 +1796,7 @@
         "h": 6,
         "w": 8,
         "x": 16,
-        "y": 80
+        "y": 93
       },
       "id": 66,
       "options": {
@@ -1663,7 +1861,7 @@
         "h": 6,
         "w": 12,
         "x": 0,
-        "y": 86
+        "y": 99
       },
       "id": 67,
       "options": {
@@ -1724,7 +1922,7 @@
         "h": 6,
         "w": 12,
         "x": 12,
-        "y": 86
+        "y": 99
       },
       "id": 68,
       "options": {
@@ -1763,7 +1961,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 92
+        "y": 105
       },
       "id": 69,
       "panels": [],
@@ -1802,7 +2000,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 93
+        "y": 106
       },
       "id": 70,
       "options": {
@@ -1923,7 +2121,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 93
+        "y": 106
       },
       "id": 71,
       "options": {
@@ -1984,7 +2182,7 @@
         "h": 6,
         "w": 12,
         "x": 0,
-        "y": 101
+        "y": 114
       },
       "id": 72,
       "options": {
@@ -2045,7 +2243,7 @@
         "h": 6,
         "w": 12,
         "x": 12,
-        "y": 101
+        "y": 114
       },
       "id": 73,
       "options": {
@@ -2095,7 +2293,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 107
+        "y": 120
       },
       "id": 74,
       "panels": [],
@@ -2146,7 +2344,7 @@
         "h": 8,
         "w": 14,
         "x": 0,
-        "y": 108
+        "y": 121
       },
       "id": 75,
       "options": {
@@ -2309,7 +2507,7 @@
         "h": 8,
         "w": 10,
         "x": 14,
-        "y": 108
+        "y": 121
       },
       "id": 76,
       "options": {
@@ -2443,7 +2641,7 @@
         "h": 6,
         "w": 8,
         "x": 0,
-        "y": 116
+        "y": 129
       },
       "id": 77,
       "options": {
@@ -2515,7 +2713,7 @@
         "h": 6,
         "w": 8,
         "x": 8,
-        "y": 116
+        "y": 129
       },
       "id": 78,
       "options": {
@@ -2587,7 +2785,7 @@
         "h": 6,
         "w": 8,
         "x": 16,
-        "y": 116
+        "y": 129
       },
       "id": 79,
       "options": {
@@ -2650,7 +2848,7 @@
         "h": 6,
         "w": 8,
         "x": 0,
-        "y": 122
+        "y": 135
       },
       "id": 80,
       "options": {
@@ -2711,7 +2909,7 @@
         "h": 6,
         "w": 8,
         "x": 8,
-        "y": 122
+        "y": 135
       },
       "id": 81,
       "options": {
@@ -2794,7 +2992,7 @@
         "h": 6,
         "w": 8,
         "x": 16,
-        "y": 122
+        "y": 135
       },
       "id": 82,
       "options": {

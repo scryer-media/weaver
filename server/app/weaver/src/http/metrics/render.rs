@@ -979,16 +979,6 @@ fn render_stalls_and_workers(out: &mut Encoder, snapshot: &MetricsSnapshot) {
     out.sample(&f::VERIFY_ACTIVE, &[], snapshot.verify_active);
     out.sample(&f::REPAIR_ACTIVE, &[], snapshot.repair_active);
     out.sample(&f::EXTRACT_ACTIVE, &[], snapshot.extract_active);
-    out.sample(
-        &f::DISK_WRITE_LATENCY_US,
-        &[],
-        snapshot.disk_write_latency_us,
-    );
-    out.sample_f64(
-        &f::DISK_WRITE_LATENCY_SECONDS,
-        &[],
-        snapshot.disk_write_latency_us as f64 / 1_000_000.0,
-    );
 }
 
 fn render_rates(out: &mut Encoder, snapshot: &MetricsSnapshot) {
@@ -1463,12 +1453,6 @@ fn render_job_lifecycle(out: &mut Encoder, lifecycle: &JobLifecycleMetricsSnapsh
 
 fn render_pipeline_histograms(out: &mut Encoder, histograms: &PipelineHistogramsSnapshot) {
     render_histogram(out, &f::TURN_DURATION, &[], &histograms.turn_duration);
-    render_histogram(
-        out,
-        &f::DISK_WRITE_DURATION,
-        &[],
-        &histograms.disk_write_duration,
-    );
     // These two stay absent until their stage has actually been timed: an
     // all-zero histogram would read as "measured, nothing happened" rather than
     // "not measured".

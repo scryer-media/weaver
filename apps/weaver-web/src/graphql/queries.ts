@@ -568,7 +568,6 @@ const METRICS_FIELDS = `
     verifyActive
     repairActive
     extractActive
-    diskWriteLatencyUs
     segmentsRetried
     segmentsFailedPermanent
     downloadFailuresArticleNotFound

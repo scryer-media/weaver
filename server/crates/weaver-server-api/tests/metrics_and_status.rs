@@ -90,7 +90,6 @@ fn history_snapshot(speed: u64, bytes_downloaded: u64) -> MetricsSnapshot {
         verify_active: 0,
         repair_active: 0,
         extract_active: 0,
-        disk_write_latency_us: 250,
         segments_retried: 0,
         segments_failed_permanent: 0,
         parked_infrastructure_work: 0,

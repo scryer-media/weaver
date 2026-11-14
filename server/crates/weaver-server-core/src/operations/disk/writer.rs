@@ -287,7 +287,9 @@ impl VolumeWriters {
     }
 
     // Wait until everything submitted to every volume so far has returned,
-    // whether or not its caller still holds the volume.
+    // whether or not its caller still holds the volume. A settle is the
+    // wait of a stop, made off the pipeline loop: it is not counted as a
+    // loop wait.
     #[cfg(test)]
     pub(crate) fn settle(&self) {
         self.settle_each(None);
@@ -315,7 +317,6 @@ impl VolumeWriters {
             if state.returned.load(Ordering::SeqCst) >= sent {
                 continue;
             }
-            let started = Instant::now();
             let mut held = state.waiting.lock().unwrap_or_else(PoisonError::into_inner);
             state.waiters.fetch_add(1, Ordering::SeqCst);
             while state.returned.load(Ordering::SeqCst) < sent {
@@ -346,7 +347,6 @@ impl VolumeWriters {
             }
             state.waiters.fetch_sub(1, Ordering::SeqCst);
             drop(held);
-            state.waited(started);
         }
         left
     }
@@ -734,7 +734,10 @@ impl Submitter {
     }
 
     // Read `len` bytes at `offset` of the file at `path`, after everything
-    // the key submitted before. The caller waits for the answer.
+    // the key submitted before. The caller waits for the answer. This is
+    // the pipeline loop's read: a wait here is counted as a loop wait. A
+    // thread that is not the loop waits with `Barrier::wait_aside` and
+    // reads the file itself.
     pub(crate) fn read(&self, path: PathBuf, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         self.read_after(self.key.submitted.load(Ordering::Acquire), path, offset, len)
     }
@@ -892,8 +895,8 @@ impl Barrier {
     }
 
     // Wait until everything behind the barrier has returned, failed or not.
-    // A wait that stops here is counted against the pipeline loop: this is
-    // the wait of the loop, and of a thread the loop itself waits for.
+    // For the pipeline loop only: a wait that stops here is counted as a
+    // loop wait on the volume. Every other thread uses `wait_aside`.
     pub(crate) fn wait(&self) {
         if self.returned() {
             return;
@@ -910,10 +913,12 @@ impl Barrier {
         self.failed() || !self.returned()
     }
 
-    // The same wait for a thread the loop does not wait for, which is not
-    // counted. It also ends once the owner is stopping
+    // The same wait for any thread that is not the pipeline loop: a check,
+    // a repair, a replay or an extraction on a thread of its own. It is not
+    // counted, so the loop-wait counters say only what the loop stood for.
+    // It also ends once the owner is stopping
     // (`VolumeWriters::stop_waits`), with the operations still out: the
-    // caller asks `returned` and reads nothing back when they are.
+    // caller asks `unwritten` and reads nothing back when they are.
     pub(crate) fn wait_aside(&self) {
         if self.returned() {
             return;
@@ -1001,7 +1006,8 @@ struct LaneState {
 }
 
 impl LaneState {
-    // The pipeline loop stood still for the writer since `began`.
+    // The pipeline loop stood still for the writer since `began`. Called
+    // only from the waits the loop itself makes.
     fn waited(&self, began: Instant) {
         let counts = &self.volume.writer;
         counts.loop_waits.fetch_add(1, Ordering::Relaxed);

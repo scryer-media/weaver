@@ -214,7 +214,6 @@ pub struct Metrics {
     pub verify_active: u32,
     pub repair_active: u32,
     pub extract_active: u32,
-    pub disk_write_latency_us: u64,
     pub segments_retried: u64,
     /// Articles that downloaded but never decoded into place and were left
     /// to repair; articles no server had are in `articlesNotFound`.
@@ -235,11 +234,21 @@ pub struct Metrics {
     pub decode_rate_mbps: f64,
 }
 
-// The direct-store set counters, kept in the schema at 0 for the clients that
-// still read them: the graph engine routes no set directly.
+// Fields kept in the schema at 0 for the clients that still read them: the
+// loop's disk write time, which the volume writers left nothing to measure,
+// and the direct-store set counters, as the graph engine routes no set
+// directly.
 // TODO(0.17.0): remove
 #[ComplexObject]
 impl Metrics {
+    /// Once the time of the last disk write on the pipeline loop. The volume
+    /// writers write off the loop, so there is no such time: each volume's own
+    /// counters say what its disk took.
+    #[graphql(deprecation = "always 0 since the volume writers; removed in 0.17.0")]
+    async fn disk_write_latency_us(&self) -> u64 {
+        0
+    }
+
     /// Lifetime count of archive sets direct-store admitted. Together with
     /// the two below this is the external answer to "did direct routing carry
     /// this work, or quietly fall back?" — output bytes are identical either
@@ -367,7 +376,6 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             verify_active: m.verify_active as u32,
             repair_active: m.repair_active as u32,
             extract_active: m.extract_active as u32,
-            disk_write_latency_us: m.disk_write_latency_us,
             segments_retried: m.segments_retried,
             segments_failed_permanent: m.segments_failed_permanent,
             download_failures_article_not_found: m.download_failures_article_not_found,
