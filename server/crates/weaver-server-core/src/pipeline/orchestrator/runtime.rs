@@ -557,7 +557,7 @@ impl Pipeline {
             releasing_failed_jobs: HashSet::new(),
             pending_graph_terminals: HashMap::new(),
             deferred_moves: HashSet::new(),
-            moves_awaiting_disk: HashSet::new(),
+            moves_awaiting_disk: HashMap::new(),
             reserved_complete_destinations: HashMap::new(),
             shared_state,
             db,

@@ -286,7 +286,7 @@ impl Pipeline {
             self.wake_repair_waiters();
             self.wake_memory_waiters();
         }
-        self.retry_move_after_disk(job_id);
+        self.retry_move_after_disk(job_id, false);
     }
 
     // A stopped job after something of it was heard: it goes when nothing
@@ -348,7 +348,7 @@ impl Pipeline {
                 Ok(false) => {}
                 skipped => {
                     self.after_graph_result(job_id, skipped.map(|_| ()));
-                    self.retry_move_after_disk(job_id);
+                    self.retry_move_after_disk(job_id, true);
                     return;
                 }
             }
@@ -390,9 +390,17 @@ impl Pipeline {
         self.fail_job_on_extraction_error(job_id, disk_error(failure).to_extraction());
     }
 
-    // A delivery that waited for the job's file operations looks again.
-    fn retry_move_after_disk(&mut self, job_id: JobId) {
-        if self.moves_awaiting_disk.remove(&job_id) {
+    // A delivery that waited for the job's file operations looks again:
+    // after a failure's report, or once the barrier it waits on returned.
+    // The job's other mail of returned operations, a checkpoint's, comes
+    // while the delivery's own operations are still out and starts nothing.
+    fn retry_move_after_disk(&mut self, job_id: JobId, reported: bool) {
+        let due = self
+            .moves_awaiting_disk
+            .get(&job_id)
+            .is_some_and(|barrier| reported || barrier.returned());
+        if due {
+            self.moves_awaiting_disk.remove(&job_id);
             self.schedule_job_completion_check(job_id);
         }
     }

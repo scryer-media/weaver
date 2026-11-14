@@ -1417,7 +1417,7 @@ impl Pipeline {
             .and_then(|graph| graph.disk_barrier())
             && !barrier.passed_or_tell(job_id, &self.graph_runs.written())
         {
-            self.moves_awaiting_disk.insert(job_id);
+            self.moves_awaiting_disk.insert(job_id, barrier);
             self.shared_state.queue.write(|inner| match inner.job_mut(job_id) {
                 Some(row) => {
                     row.report.moving = false;

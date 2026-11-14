@@ -1206,7 +1206,7 @@ async fn try_run_then(
             .graph_jobs
             .get(&JOB)
             .is_some_and(|job| job.awaits_mail())
-            || pipeline.moves_awaiting_disk.contains(&JOB)
+            || pipeline.moves_awaiting_disk.contains_key(&JOB)
         {
             let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
             if let Some(heard) = &scenario.heard {

@@ -123,7 +123,7 @@ async fn a_delivery_that_waited_for_a_failed_write_fails_the_job_once() {
     let mut events = pipeline.event_tx.subscribe();
     decode_all(&mut pipeline, job_id, &posts, 0).await;
     pipeline.start_move_to_complete(job_id).await.unwrap();
-    assert!(pipeline.moves_awaiting_disk.contains(&job_id));
+    assert!(pipeline.moves_awaiting_disk.contains_key(&job_id));
     assert!(!pipeline.inflight_moves.contains(&job_id));
     // Asked while the volume stands still: a wait of the loop would not
     // have come back.
@@ -142,13 +142,47 @@ async fn a_delivery_that_waited_for_a_failed_write_fails_the_job_once() {
         "{status:?}"
     );
     settle_failed_releases(&mut pipeline).await;
-    assert!(!pipeline.moves_awaiting_disk.contains(&job_id));
+    assert!(!pipeline.moves_awaiting_disk.contains_key(&job_id));
     assert!(!pipeline.inflight_moves.contains(&job_id));
     pipeline.db.flush_write_queue().await.unwrap();
     let failed = std::iter::from_fn(|| events.try_recv().ok())
         .filter(|event| matches!(event, PipelineEvent::JobFailed { job_id: id, .. } if *id == job_id))
         .count();
     assert_eq!(failed, 1);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A delivery that stepped back for the job's writes is not started again
+// by mail of the job's other operations, a checkpoint's, while its own are
+// still out: only once the barrier it waits on returned.
+#[tokio::test]
+async fn a_waiting_delivery_looks_again_only_when_its_own_barrier_returned() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_408);
+    let posts = [Post::plain("lantern.bin", payload(3 * ARTICLE, 1))];
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let (volume, hold) = held(&pipeline, job_id);
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    pipeline.start_move_to_complete(job_id).await.unwrap();
+    let barrier = pipeline.moves_awaiting_disk[&job_id].clone();
+    assert!(!barrier.returned());
+    pipeline.remove_pending_completion_check(job_id);
+
+    // A checkpoint's mail while the volume stands still.
+    pipeline.graph_disk_returned(job_id);
+    assert!(pipeline.moves_awaiting_disk.contains_key(&job_id));
+    assert!(!pipeline.pending_completion_checks.contains(&job_id));
+    no_loop_waits(&volume);
+
+    hold.open();
+    while pipeline.moves_awaiting_disk.contains_key(&job_id) {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+    }
+    assert!(barrier.passed());
+    assert!(pipeline.pending_completion_checks.contains(&job_id));
+    assert_eq!(read(&working_dir.join("lantern.bin")), posts[0].bytes);
     retire_pipeline_database(pipeline).await;
 }
 
