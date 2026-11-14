@@ -67,9 +67,8 @@ struct Bound<'a>(&'a BTreeMap<VolumeIndex, Volume>);
 
 fn held(index: VolumeIndex, volume: &Volume) -> Option<Held<'_>> {
     volume.name.as_ref()?;
-    let facts = volume.stated();
-    (!facts.is_some_and(|facts| misplaced(index, facts))).then_some(Held {
-        facts,
+    (!volume.misplaced(index)).then_some(Held {
+        facts: volume.stated(),
         successor: volume.walk.successor(),
     })
 }
@@ -463,7 +462,7 @@ pub(crate) fn states_position(facts: &RarVolumeFacts) -> bool {
 // own headers say it is not, a name least of all.
 pub(super) fn settled(index: VolumeIndex, volume: &Volume) -> bool {
     let facts = volume.stated();
-    !facts.is_some_and(|facts| misplaced(index, facts))
+    !volume.misplaced(index)
         && (volume.walk.ended
             || facts.is_some_and(states_position)
             || volume

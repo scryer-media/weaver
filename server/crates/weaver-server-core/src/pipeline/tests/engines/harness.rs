@@ -656,9 +656,7 @@ impl Scenario {
         self
     }
 
-    // Every pipeline the scenario prepares is set this way, last. Only the
-    // rows that lend windows set it, and only where windows are mapped.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // Every pipeline the scenario prepares is set this way, last.
     pub(in crate::pipeline::tests) fn setup(
         mut self,
         setup: impl Fn(&mut Pipeline) + Send + Sync + 'static,
@@ -969,7 +967,8 @@ pub(in crate::pipeline::tests) struct GraphView {
     // look.
     pub(in crate::pipeline::tests) checkpoints: crate::pipeline::graph::checkpoint::Tally,
     // The most the live namespaces objects produced kept resident for their
-    // members at any look, summed from the tree.
+    // members, with the name ledger for the parts of its paths, at any
+    // look, summed from the tree.
     pub(in crate::pipeline::tests) resident: u64,
     // The time the looks themselves took, which a run's time is not.
     pub(in crate::pipeline::tests) observed: std::time::Duration,
@@ -1025,6 +1024,8 @@ pub(in crate::pipeline::tests) struct Outcome {
     pub(in crate::pipeline::tests) validated_password: Option<String>,
     // The metadata the job's history row keeps, as stored.
     pub(in crate::pipeline::tests) history_metadata: Option<String>,
+    // The download summary the job's history row keeps, as stored.
+    pub(in crate::pipeline::tests) download_summary: Option<String>,
     // The job's history row, as stored.
     pub(in crate::pipeline::tests) history: Option<crate::JobHistoryRow>,
     // How many times each job stage's duration was observed, by stage name.
@@ -1178,7 +1179,7 @@ async fn try_run_then(
                     JOB,
                     scenario,
                     article,
-                    &work.exclude_servers,
+                    work.exclude_servers,
                     plan.as_ref(),
                 )
                 .await;
@@ -1210,6 +1211,15 @@ async fn try_run_then(
                 heard(&said);
             }
             pipeline.graph_run_said(said);
+            observe(&pipeline, &mut graph, &mut reads);
+            continue;
+        }
+        // A job that waits for room on a disk goes on at a reading, as the
+        // orchestrator hears one, after it reconciles the waits begun.
+        pipeline.reconcile_disk_waits();
+        if pipeline.waits_for_disk_room() {
+            pipeline.storage_capacity.readings().notified().await;
+            pipeline.disk_reading();
             observe(&pipeline, &mut graph, &mut reads);
             continue;
         }
@@ -1261,6 +1271,7 @@ async fn try_run_then(
     let validated_password = pipeline.db.validated_archive_password(JOB.0).unwrap();
     let history = pipeline.db.get_job_history(JOB.0).unwrap();
     let history_metadata = history.as_ref().and_then(|row| row.metadata.clone());
+    let download_summary = pipeline.db.history_download_summary_text(JOB).unwrap();
     let stages_timed = pipeline
         .metrics
         .job_lifecycle
@@ -1288,6 +1299,7 @@ async fn try_run_then(
         metrics,
         validated_password,
         history_metadata,
+        download_summary,
         history,
         stages_timed,
     })
@@ -1513,15 +1525,7 @@ pub(in crate::pipeline::tests) async fn serve_work(
         work.segment_id.file_id.file_index,
         work.segment_id.segment_number,
     );
-    serve_from(
-        pipeline,
-        JOB,
-        scenario,
-        article,
-        &work.exclude_servers,
-        None,
-    )
-    .await;
+    serve_from(pipeline, JOB, scenario, article, work.exclude_servers, None).await;
 }
 
 // One article as the scenario's server answers it.
@@ -1540,7 +1544,15 @@ pub(in crate::pipeline::tests) async fn serve_job(
     scenario: &Scenario,
     article: (u32, u32),
 ) {
-    serve_from(pipeline, job, scenario, article, &[], None).await;
+    serve_from(
+        pipeline,
+        job,
+        scenario,
+        article,
+        weaver_nntp::ServerSet::EMPTY,
+        None,
+    )
+    .await;
 }
 
 // [`serve_job`] for an ask that excludes `exclude`: the first server it
@@ -1550,10 +1562,10 @@ async fn serve_from(
     job: JobId,
     scenario: &Scenario,
     (file, ordinal): (u32, u32),
-    exclude: &[usize],
+    exclude: weaver_nntp::ServerSet,
     leased: Option<&weaver_yenc::CheckpointPlan>,
 ) {
-    let server = (0..).find(|server| !exclude.contains(server)).unwrap();
+    let server = (0..).find(|server| !exclude.contains(*server)).unwrap();
     let segment_id = SegmentId {
         file_id: NzbFileId {
             job_id: job,
@@ -1616,8 +1628,11 @@ async fn serve_from(
                     segments: Vec::new(),
                 },
                 SegmentSource {
-                    source_server_idx: Some(server),
-                    exclude_servers: exclude.to_vec(),
+                    servers: crate::pipeline::PoolServers::stamped(
+                        pipeline.pool_generation,
+                        Some(server),
+                        exclude,
+                    ),
                 },
             )
             .await;
@@ -1673,8 +1688,11 @@ async fn serve_from(
                 segments,
             },
             SegmentSource {
-                source_server_idx: Some(server),
-                exclude_servers: exclude.to_vec(),
+                servers: crate::pipeline::PoolServers::stamped(
+                    pipeline.pool_generation,
+                    Some(server),
+                    exclude,
+                ),
             },
         )
         .await;
@@ -1803,7 +1821,8 @@ pub(in crate::pipeline::tests) fn observe(
                 .records()
                 .map(|record| namespace.resident(record.id))
         })
-        .sum();
+        .sum::<u64>()
+        + tree.names_resident();
     view.resident = view.resident.max(resident);
     let held = tree
         .live()
@@ -1942,7 +1961,7 @@ pub(in crate::pipeline::tests) async fn run_holding(scenario: &Scenario, held: u
                     work.segment_id.segment_number,
                 );
                 if article.0 == held {
-                    *pipeline.active_downloads_by_job.entry(JOB).or_insert(0) += 1;
+                    *pipeline.articles_in_flight_by_job.entry(JOB).or_insert(0) += 1;
                     out.push(work);
                     continue;
                 }
@@ -2003,7 +2022,7 @@ pub(in crate::pipeline::tests) async fn run_holding(scenario: &Scenario, held: u
         .map(|set| set.outcome)
         .collect();
 
-    pipeline.active_downloads_by_job.insert(JOB, 0);
+    pipeline.articles_in_flight_by_job.insert(JOB, 0);
     for work in std::mem::take(&mut out) {
         let article = (
             work.segment_id.file_id.file_index,

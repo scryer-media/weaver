@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { takeApiKeyLink } from "../src/lib/api-key-link.ts";
+import { mintsOnArrival, takeApiKeyLink } from "../src/lib/api-key-link.ts";
 
 test("the link Scryer writes mints a control key", () => {
   const taken = takeApiKeyLink("?createApiKey=1&name=Scryer&scope=integration");
@@ -31,6 +31,24 @@ test("a scope that means nothing here falls back to control", () => {
     name: "Scryer",
     scope: "CONTROL",
   });
+});
+
+test("read and control links mint on arrival; an admin link waits for a click", () => {
+  for (const search of [
+    "?createApiKey=1&name=Scryer&scope=integration",
+    "?createApiKey=1&name=Scryer&scope=control",
+    "?createApiKey=1&name=Scryer&scope=read",
+    "?createApiKey=1&name=Scryer",
+  ]) {
+    const { link } = takeApiKeyLink(search);
+    assert.ok(link);
+    assert.equal(mintsOnArrival(link), true, search);
+  }
+  for (const search of ["?createApiKey=1&name=Scryer&scope=admin", "?apiKeyGenerate=true&apiKeyName=Scryer&apiKeyScope=ADMIN"]) {
+    const { link } = takeApiKeyLink(search);
+    assert.ok(link);
+    assert.equal(mintsOnArrival(link), false, search);
+  }
 });
 
 test("a link is consumed, and the rest of the query string is kept", () => {

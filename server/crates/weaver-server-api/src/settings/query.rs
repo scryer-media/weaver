@@ -34,6 +34,7 @@ impl SettingsQuery {
                 complete_dir: cfg.complete_dir(),
                 cleanup_after_extract: cfg.cleanup_after_extract(),
                 delete_failed_job_files: cfg.delete_failed_job_files(),
+                history_retention_days: cfg.history_retention_days(),
                 max_download_speed: cfg.max_download_speed.unwrap_or(0),
                 propagation_delay_secs: cfg.propagation_delay_secs(),
                 max_concurrent_nzbs: cfg.max_concurrent_nzbs(),

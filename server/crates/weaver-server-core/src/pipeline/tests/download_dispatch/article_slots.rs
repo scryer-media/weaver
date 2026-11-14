@@ -55,7 +55,7 @@ fn lease_slot(pipeline: &mut Pipeline, job_id: JobId) -> Vec<(String, Vec<usize>
     leased
         .into_iter()
         .map(|item| item.dispatched(&state.spec))
-        .map(|work| (work.message_id.0.to_string(), work.exclude_servers))
+        .map(|work| (work.message_id.0.to_string(), work.exclude_servers.to_vec()))
         .collect()
 }
 
@@ -78,7 +78,7 @@ async fn finish_download(
             source_server_idx: Some(0),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;

@@ -422,6 +422,7 @@ impl Zip {
         let Some(old) = self.map.take() else {
             return;
         };
+        self.placed.moved();
         let moved = moved(&old, &new);
         for &id in moved.iter().filter(|id| **id < old.members.len()) {
             out.push(Emit::Retract(MemberId(id as u32)));

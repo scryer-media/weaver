@@ -60,6 +60,19 @@ impl Cli {
             .clone()
             .unwrap_or_else(default_implicit_config_path)
     }
+
+    pub(crate) fn implicit_download_root(&self, config_path: &std::path::Path) -> Option<PathBuf> {
+        #[cfg(target_os = "macos")]
+        if self.config.is_none() && config_path != std::path::Path::new(DEFAULT_CONFIG_FILE) {
+            return std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|home| home.is_absolute())
+                .map(|home| home.join("Downloads"));
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = config_path;
+        None
+    }
 }
 
 fn default_implicit_config_path() -> PathBuf {
@@ -73,10 +86,64 @@ fn default_implicit_config_path() -> PathBuf {
         )
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_implicit_config_path(
+            PathBuf::from(DEFAULT_CONFIG_FILE).exists(),
+            PathBuf::from("weaver.db").exists(),
+            std::env::var_os("HOME").map(PathBuf::from),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        linux_implicit_config_path(
+            PathBuf::from(DEFAULT_CONFIG_FILE).exists(),
+            PathBuf::from("weaver.db").exists(),
+            std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+            std::env::var_os("HOME").map(PathBuf::from),
+        )
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         PathBuf::from(DEFAULT_CONFIG_FILE)
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_implicit_config_path(
+    local_config_exists: bool,
+    local_db_exists: bool,
+    xdg_data_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> PathBuf {
+    if local_config_exists || local_db_exists {
+        return PathBuf::from(DEFAULT_CONFIG_FILE);
+    }
+    // XDG paths must be absolute; an empty or relative value uses the fallback.
+    xdg_data_home
+        .filter(|base| base.is_absolute())
+        .or_else(|| {
+            home.filter(|home| home.is_absolute())
+                .map(|home| home.join(".local/share"))
+        })
+        .map(|base| base.join("weaver"))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILE))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_implicit_config_path(
+    local_config_exists: bool,
+    local_db_exists: bool,
+    home: Option<PathBuf>,
+) -> PathBuf {
+    if local_config_exists || local_db_exists {
+        return PathBuf::from(DEFAULT_CONFIG_FILE);
+    }
+    home.filter(|home| home.is_absolute())
+        .map(|home| home.join("Library/Application Support/ScryerMedia/Weaver"))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILE))
 }
 
 #[cfg(windows)]
@@ -387,14 +454,142 @@ mod tests {
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     #[test]
-    fn implicit_non_windows_config_path_stays_current_directory_toml() {
+    fn implicit_other_platform_config_path_stays_current_directory_toml() {
         let cli = Cli::parse_from(["weaver"]);
 
         assert_eq!(
             cli.resolved_config_path(),
             PathBuf::from(DEFAULT_CONFIG_FILE)
+        );
+    }
+
+    #[test]
+    fn linux_fresh_profile_prefers_absolute_xdg_data_home() {
+        let root = tempfile::tempdir().unwrap();
+        let xdg = root.path().join("custom-data");
+        for home in [None, Some(root.path().join("home"))] {
+            assert_eq!(
+                super::linux_implicit_config_path(false, false, Some(xdg.clone()), home),
+                xdg.join("weaver"),
+            );
+        }
+        assert!(!xdg.exists());
+    }
+
+    #[test]
+    fn linux_unset_or_invalid_xdg_uses_home_local_share() {
+        let home = tempfile::tempdir().unwrap();
+        for xdg in [None, Some(PathBuf::new()), Some(PathBuf::from("relative"))] {
+            assert_eq!(
+                super::linux_implicit_config_path(false, false, xdg, Some(home.path().into())),
+                home.path().join(".local/share/weaver"),
+            );
+        }
+    }
+
+    #[test]
+    fn linux_local_profiles_take_precedence_over_xdg() {
+        let root = tempfile::tempdir().unwrap();
+        for (config_exists, db_exists) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                super::linux_implicit_config_path(
+                    config_exists,
+                    db_exists,
+                    Some(root.path().join("xdg")),
+                    Some(root.path().join("home")),
+                ),
+                PathBuf::from(DEFAULT_CONFIG_FILE),
+            );
+        }
+    }
+
+    #[test]
+    fn linux_without_an_absolute_data_root_keeps_legacy_fallback() {
+        for home in [None, Some(PathBuf::new()), Some(PathBuf::from("relative"))] {
+            assert_eq!(
+                super::linux_implicit_config_path(false, false, None, home),
+                PathBuf::from(DEFAULT_CONFIG_FILE),
+            );
+        }
+    }
+
+    #[test]
+    fn linux_default_profile_keeps_database_and_downloads_beneath_data_root() {
+        use weaver_server_core::persistence::setup::{
+            default_data_dir_for_config_path, resolve_database_paths,
+        };
+        let home = tempfile::tempdir().unwrap();
+        let profile =
+            super::linux_implicit_config_path(false, false, None, Some(home.path().into()));
+        let (database, toml) = resolve_database_paths(&profile);
+        assert_eq!(database, home.path().join(".local/share/weaver/weaver.db"));
+        assert_eq!(toml, None);
+        assert_eq!(default_data_dir_for_config_path(&profile), profile);
+        let db = weaver_server_core::Database::open_in_memory().unwrap();
+        let mut config = db.load_config().unwrap();
+        crate::bootstrap::default_data_dir_from_config_path(&profile, &mut config);
+        assert_eq!(
+            PathBuf::from(config.intermediate_dir()),
+            profile.join("intermediate")
+        );
+        assert_eq!(
+            PathBuf::from(config.complete_dir()),
+            profile.join("complete")
+        );
+        assert!(!profile.exists());
+    }
+
+    #[test]
+    fn macos_fresh_profile_uses_application_support() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            super::macos_implicit_config_path(false, false, Some(home.path().to_path_buf())),
+            home.path()
+                .join("Library/Application Support/ScryerMedia/Weaver"),
+        );
+    }
+
+    #[test]
+    fn macos_preserves_each_kind_of_local_profile() {
+        let home = tempfile::tempdir().unwrap();
+        for (config_exists, db_exists) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                super::macos_implicit_config_path(
+                    config_exists,
+                    db_exists,
+                    Some(home.path().to_path_buf()),
+                ),
+                PathBuf::from(DEFAULT_CONFIG_FILE),
+            );
+        }
+    }
+
+    #[test]
+    fn macos_without_absolute_home_keeps_legacy_fallback() {
+        for home in [None, Some(PathBuf::new()), Some(PathBuf::from("relative"))] {
+            assert_eq!(
+                super::macos_implicit_config_path(false, false, home),
+                PathBuf::from(DEFAULT_CONFIG_FILE),
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_profiles_never_select_platform_download_defaults() {
+        for path in ["custom-weaver.toml", "custom-profile"] {
+            let cli = Cli::parse_from(["weaver", "--config", path]);
+            assert_eq!(cli.resolved_config_path(), PathBuf::from(path));
+            assert_eq!(
+                cli.implicit_download_root(&cli.resolved_config_path()),
+                None
+            );
+        }
+        let cli = Cli::parse_from(["weaver"]);
+        assert_eq!(
+            cli.implicit_download_root(std::path::Path::new(DEFAULT_CONFIG_FILE)),
+            None
         );
     }
 

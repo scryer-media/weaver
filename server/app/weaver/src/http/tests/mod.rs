@@ -170,6 +170,7 @@ fn nzbget_history_row(
         completed_at,
         metadata,
         server_attribution: None,
+        archived_at: None,
     }
 }
 
@@ -219,6 +220,7 @@ fn test_config() -> SharedConfig {
         max_download_speed: None,
         cleanup_after_extract: None,
         delete_failed_job_files: None,
+        history_retention_days: None,
         propagation_delay_secs: None,
         max_concurrent_nzbs: None,
         watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
@@ -780,7 +782,7 @@ fn populated_metrics_snapshot() -> MetricsSnapshot {
         bytes_decoded: 8,
         bytes_committed: 7,
         download_queue_depth: 5,
-        active_downloads: 6,
+        articles_in_flight: 6,
         active_decodes: 2,
         decode_pending: 4,
         decode_pending_bytes: 4096,
@@ -1380,6 +1382,7 @@ fn sample_wal_checkpoint() -> weaver_server_core::persistence::WalCheckpointMetr
         checkpointed_frames: 19,
         copied_frames: 0,
         wal_bytes: 3_218_032,
+        statement_duration: sample_histogram(),
     }
 }
 

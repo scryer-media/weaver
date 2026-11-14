@@ -108,6 +108,10 @@ pub struct NntpPool {
     groups: Vec<u32>,
     // Backfill flag for each server (parallel to pools/configs).
     backfill: Vec<bool>,
+    // The servers that are not backfill.
+    fill: crate::ServerSet,
+    // The servers by priority level, shared by every policy sampled.
+    policy_levels: crate::provider_policy::PolicyLevels,
     // Retention window in days for each server (parallel to pools/configs).
     retention_days: Vec<u32>,
     // Maximum connections per server (parallel to pools/configs).
@@ -355,6 +359,16 @@ pub struct ServerPoolConfig {
     pub retention_days: u32,
 }
 
+// What makes a pool's server the same server in the next pool: see
+// [`NntpPool::server_identities`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ServerIdentity {
+    pub stable_id: StableServerId,
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+}
+
 #[cfg(any(test, feature = "test-support"))]
 impl Default for ServerPoolConfig {
     fn default() -> Self {
@@ -415,10 +429,41 @@ impl Drop for NntpPool {
     }
 }
 
+// A pool asked to hold more servers than Weaver takes. The stored server
+// list is trimmed to `MAX_PROVIDERS` when it is loaded, so this is only
+// reachable from a caller that skipped that, and it is answered in words,
+// never by a panic.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{servers} servers are enabled and Weaver takes at most {max}")]
+pub struct PoolTooLarge {
+    pub servers: usize,
+    pub max: usize,
+}
+
 impl NntpPool {
-    // Create a new multi-server connection pool.
+    // A pool for `config`, or the reason it cannot be built: more servers
+    // than `MAX_PROVIDERS`. Every pool built from stored or user settings
+    // is built here.
+    pub fn try_new(config: PoolConfig) -> std::result::Result<Self, PoolTooLarge> {
+        let servers = config.servers.len();
+        let max = crate::MAX_PROVIDERS;
+        if servers > max {
+            return Err(PoolTooLarge { servers, max });
+        }
+        Ok(Self::new(config))
+    }
+
+    // Create a new multi-server connection pool. Fixtures and benches build
+    // through here; settings go through [`Self::try_new`].
     pub fn new(config: PoolConfig) -> Self {
         let server_count = config.servers.len();
+        // Server sets hold one bit per pool index; a pool past them could
+        // only be answered by aliasing servers, so it is never built.
+        assert!(
+            server_count <= crate::ServerSet::CAPACITY,
+            "a pool holds at most {} servers, {server_count} configured",
+            crate::ServerSet::CAPACITY
+        );
         let mut pools = Vec::with_capacity(server_count);
         let mut configs = Vec::with_capacity(server_count);
         let mut stable_ids = Vec::with_capacity(server_count);
@@ -535,7 +580,16 @@ impl NntpPool {
             health_changed,
             last_connect_failure,
             reconnect_delay: config.reconnect_delay,
+            policy_levels: crate::provider_policy::PolicyLevels::of(
+                groups.iter().zip(&backfill).map(|(priority, backfill)| {
+                    crate::provider_policy::ProviderGroup {
+                        backfill: *backfill,
+                        priority: *priority,
+                    }
+                }),
+            ),
             groups,
+            fill: (0..server_count).filter(|idx| !backfill[*idx]).collect(),
             backfill,
             retention_days,
             max_connections,
@@ -1537,8 +1591,8 @@ impl NntpPool {
     // so a sample never waits and never fails for contention.
     pub fn provider_policy(&self) -> crate::provider_policy::ProviderPolicy {
         use crate::provider_policy::{ProviderGroup, ProviderPolicy, ProviderState};
-        ProviderPolicy {
-            servers: (0..self.configs.len())
+        ProviderPolicy::sampled(
+            (0..self.configs.len())
                 .map(|idx| {
                     let quota_remaining =
                         self.transfer_controls[idx]
@@ -1564,27 +1618,25 @@ impl NntpPool {
                     }
                 })
                 .collect(),
-        }
+            self.policy_levels.clone(),
+        )
     }
 
     // Inspect BODY eligibility without allocating or ranking server candidates.
     pub async fn body_server_availability(
         &self,
-        failure_excludes: &[usize],
-        retention_excludes: &[usize],
+        failure_excludes: crate::ServerSet,
+        retention_excludes: crate::ServerSet,
         requested_body_bytes: u64,
     ) -> BodyServerAvailability {
-        let is_excluded = |server_idx: usize| {
-            failure_excludes.contains(&server_idx) || retention_excludes.contains(&server_idx)
-        };
+        let excluded = failure_excludes.union(retention_excludes);
         let now = Instant::now();
         let mut health = self.health.lock().await;
         health.check_reenable_all();
-        let backfill_unlocked =
-            crate::provider_policy::backfill_unlocked(self.backfill.iter().copied(), is_excluded);
+        let backfill_unlocked = crate::provider_policy::backfill_unlocked(self.fill, excluded);
         let mut retry_after = None;
         for server_idx in 0..self.configs.len() {
-            if is_excluded(server_idx)
+            if excluded.contains(server_idx)
                 || !self.route_available(server_idx)
                 || (self.backfill[server_idx] && !backfill_unlocked)
                 || self.transfer_controls[server_idx]
@@ -1615,22 +1667,26 @@ impl NntpPool {
     // Whether every fill (non-backfill) server is in `exclude` — the gate
     // that makes backfill servers reachable for a request
     // ([`crate::provider_policy::backfill_unlocked`]).
-    pub fn fill_servers_exhausted(&self, exclude: &[usize]) -> bool {
-        crate::provider_policy::backfill_unlocked(self.backfill.iter().copied(), |idx| {
-            exclude.contains(&idx)
-        })
+    pub fn fill_servers_exhausted(&self, exclude: crate::ServerSet) -> bool {
+        crate::provider_policy::backfill_unlocked(self.fill, exclude)
+    }
+
+    // The servers that are not backfill.
+    pub fn fill_servers(&self) -> crate::ServerSet {
+        self.fill
     }
 
     // The same gate for an article that carries its own failure exclusions
     // and its job's retention exclusions apart.
     pub fn backfill_open_for(
         &self,
-        failure_excludes: &[usize],
-        retention_excludes: &[usize],
+        failure_excludes: crate::ServerSet,
+        retention_excludes: crate::ServerSet,
     ) -> bool {
-        crate::provider_policy::backfill_unlocked(self.backfill.iter().copied(), |idx| {
-            failure_excludes.contains(&idx) || retention_excludes.contains(&idx)
-        })
+        crate::provider_policy::backfill_unlocked(
+            self.fill,
+            failure_excludes.union(retention_excludes),
+        )
     }
 
     // Whether pool server `idx` is a backfill server.
@@ -1660,6 +1716,24 @@ impl NntpPool {
     // Server configurations (parallel to health tracker indices).
     pub fn server_configs(&self) -> &[ServerConfig] {
         &self.configs
+    }
+
+    // Each server's identity, in pool order. A server is the same one when
+    // its stable id, host, port and account all match: a reorder, a
+    // priority, connection-count or enable change keeps it, while a new
+    // host, port or account may hold different articles and counts as a new
+    // server, which nothing has asked.
+    pub fn server_identities(&self) -> Vec<ServerIdentity> {
+        self.stable_ids
+            .iter()
+            .zip(&self.configs)
+            .map(|(stable, config)| ServerIdentity {
+                stable_id: *stable,
+                host: config.host.clone(),
+                port: config.port,
+                username: config.username.clone(),
+            })
+            .collect()
     }
 
     // The pool position of the server with this stable id.
@@ -2582,8 +2656,8 @@ mod tests {
             ..PoolConfig::default()
         };
         let pool = NntpPool::new(config);
-        assert!(pool.fill_servers_exhausted(&[0]));
-        assert!(!pool.fill_servers_exhausted(&[]));
+        assert!(pool.fill_servers_exhausted(crate::ServerSet::from([0])));
+        assert!(!pool.fill_servers_exhausted(crate::ServerSet::EMPTY));
     }
 
     #[tokio::test]
@@ -3043,7 +3117,8 @@ mod tests {
             .expect("configured lane should be acquirable");
 
         assert_eq!(
-            pool.body_server_availability(&[], &[], 0).await,
+            pool.body_server_availability(crate::ServerSet::EMPTY, crate::ServerSet::EMPTY, 0)
+                .await,
             BodyServerAvailability::Eligible
         );
     }
@@ -3068,15 +3143,17 @@ mod tests {
             .record_cooldown(0, crate::health::CooldownReason::Transport);
 
         assert!(matches!(
-            pool.body_server_availability(&[], &[], 0).await,
+            pool.body_server_availability(crate::ServerSet::EMPTY, crate::ServerSet::EMPTY, 0).await,
             BodyServerAvailability::WaitingUntil(delay) if !delay.is_zero()
         ));
         assert_eq!(
-            pool.body_server_availability(&[0], &[], 0).await,
+            pool.body_server_availability(crate::ServerSet::from([0]), crate::ServerSet::EMPTY, 0)
+                .await,
             BodyServerAvailability::Eligible
         );
         assert_eq!(
-            pool.body_server_availability(&[], &[0], 0).await,
+            pool.body_server_availability(crate::ServerSet::EMPTY, crate::ServerSet::from([0]), 0)
+                .await,
             BodyServerAvailability::Eligible
         );
     }
@@ -3091,13 +3168,14 @@ mod tests {
             }
         }
         assert_eq!(
-            pool.body_server_availability(&[], &[], 0).await,
+            pool.body_server_availability(crate::ServerSet::EMPTY, crate::ServerSet::EMPTY, 0)
+                .await,
             BodyServerAvailability::Eligible
         );
 
         pool.health().lock().await.record_failure(0, true);
         assert!(matches!(
-            pool.body_server_availability(&[], &[], 0).await,
+            pool.body_server_availability(crate::ServerSet::EMPTY, crate::ServerSet::EMPTY, 0).await,
             BodyServerAvailability::WaitingUntil(delay) if !delay.is_zero()
         ));
     }
@@ -3125,14 +3203,18 @@ mod tests {
         disabled.health().lock().await.record_failure(0, true);
         assert!(
             matches!(
-                disabled.body_server_availability(&[], &[], 0).await,
+                disabled
+                    .body_server_availability(crate::ServerSet::EMPTY, crate::ServerSet::EMPTY, 0)
+                    .await,
                 BodyServerAvailability::WaitingUntil(_)
             ),
             "a fill server refusing credentials must not open backfill"
         );
-        assert!(!disabled.fill_servers_exhausted(&[]));
+        assert!(!disabled.fill_servers_exhausted(crate::ServerSet::EMPTY));
         assert_eq!(
-            disabled.body_server_availability(&[0], &[], 0).await,
+            disabled
+                .body_server_availability(crate::ServerSet::from([0]), crate::ServerSet::EMPTY, 0)
+                .await,
             BodyServerAvailability::Eligible,
             "an article the fill server does not have still reaches backfill"
         );
@@ -3145,13 +3227,13 @@ mod tests {
             .record_cooldown(0, crate::health::CooldownReason::Transport);
         assert!(
             matches!(
-                cooling.body_server_availability(&[], &[], 0).await,
+                cooling.body_server_availability(crate::ServerSet::EMPTY, crate::ServerSet::EMPTY, 0).await,
                 BodyServerAvailability::WaitingUntil(delay) if !delay.is_zero()
             ),
             "a 5-10s cooldown must wait, not spill onto backfill"
         );
         assert!(
-            !cooling.fill_servers_exhausted(&[]),
+            !cooling.fill_servers_exhausted(crate::ServerSet::EMPTY),
             "CoolingDown must not open the backfill gate"
         );
 
@@ -3174,13 +3256,13 @@ mod tests {
         }
         assert!(
             matches!(
-                outage.body_server_availability(&[], &[], 0).await,
+                outage.body_server_availability(crate::ServerSet::EMPTY, crate::ServerSet::EMPTY, 0).await,
                 BodyServerAvailability::WaitingUntil(delay) if !delay.is_zero()
             ),
             "an outage disable heals on its own and must wait, not spill onto backfill"
         );
         assert!(
-            !outage.fill_servers_exhausted(&[]),
+            !outage.fill_servers_exhausted(crate::ServerSet::EMPTY),
             "ConsecutiveFailures must not open the backfill gate"
         );
     }
@@ -3206,7 +3288,8 @@ mod tests {
         let pool = NntpPool::new(config);
 
         assert_eq!(
-            pool.body_server_availability(&[], &[], 0).await,
+            pool.body_server_availability(crate::ServerSet::EMPTY, crate::ServerSet::EMPTY, 0)
+                .await,
             BodyServerAvailability::Blocked
         );
     }

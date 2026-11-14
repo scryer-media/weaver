@@ -1,0 +1,27 @@
+{
+  "slug": "adv-rar5-many-salted-entries-wrong",
+  "title": "E2E.Adversarial.Many.Salted.Entries.Wrong.2026-TESTGRP",
+  "description": "adv-rar5-many-salted-entries' 512 encrypted members, submitted once with no password and once with a wrong one, with a configured password list that holds only wrong passwords. Every member has its own salt, so every candidate costs a key per member, derived off the pipeline turn. Each job fails with the password verdict, once.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "fixtureAssets": [
+    "adv-rar5-many-salted-entries/archive.part1.rar",
+    "adv-rar5-many-salted-entries/archive.part2.rar",
+    "adv-rar5-many-salted-entries/archive.part3.rar"
+  ],
+  "adversarial": {
+    "group": "default",
+    "outcome": "failed",
+    "failureKind": "password",
+    "submissions": [
+      {
+        "label": "absent",
+        "password": ""
+      },
+      {
+        "label": "wrong",
+        "password": "adversarial-wrong-password"
+      }
+    ]
+  }
+}

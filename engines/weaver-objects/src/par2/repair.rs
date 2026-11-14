@@ -9,26 +9,31 @@
 // through par2-rs under the repair memory limit. Nothing here touches a
 // file: every byte goes through the namespace's access.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 
+use par2_rs::packet::{HEADER_SIZE, MAGIC, PacketHeader, PacketType};
 use par2_rs::verify::FileAccess;
 use par2_rs::{
-    FileHashState, FileId, FileStatus, FileVerification, Packet, Par2Error, Par2FileSet,
-    RecoverySlice, RecoverySliceData, RepairOptions, Repairability, SliceChecksumState,
-    VerificationResult, execute_repair_with_options, parse_packet, plan_repair_with_memory_limit,
+    FileHashState, FileId, FileStatus, FileVerification, Par2Error, Par2FileSet, RecoverySlice,
+    RecoverySliceData, RepairOptions, Repairability, SliceChecksumState, VerificationResult,
+    execute_repair_with_options, plan_repair_with_memory_limit,
 };
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{ByteRange, MemberId, SliceVerdict};
 
 use super::evidence::Evidence;
-use super::sets::{Length, SetState};
+use super::sets::{Length, Location, SetState};
+use crate::elimination::by_elimination;
 use crate::grid::Grid;
 
-// The piece a sweep reads at a time when it holds nothing whole, and the
-// least a copy reads at a time.
+// The piece a sweep reads at a time when it holds nothing whole, the least
+// a copy reads at a time, and the most a recovery read asks of a volume.
 const CHUNK: u64 = 1 << 20;
+
+// Where a recovery packet's payload starts: past its header and exponent.
+const PAYLOAD: usize = HEADER_SIZE + 4;
 
 // What one set's repair came to.
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -101,7 +106,10 @@ pub(super) fn repair_set(
     // set found: damage only the set's checksums can see arrived marked
     // clean.
     let mut proven = Vec::new();
-    let mut kept = Kept::new(memory_limit);
+    // The limit is par2-rs's to work in, whole: a smaller working area costs
+    // it more passes over every source slice. The slices the verification
+    // keeps sit on top of it, at most half the limit again.
+    let mut kept = Kept::new(memory_limit / 2);
     let mut validity: Vec<(FileId, Vec<bool>)> = index
         .recovery_file_ids
         .iter()
@@ -118,15 +126,11 @@ pub(super) fn repair_set(
             )
         })
         .collect();
+    // What the kept slices leave of the limit is the copies' to read in; they
+    // are done before par2-rs starts.
+    let working = memory_limit.saturating_sub(kept.bytes);
     let mut donors = BTreeMap::new();
-    let copied = copy_held(
-        state,
-        index,
-        &mut validity,
-        memory_limit,
-        access,
-        &mut donors,
-    );
+    let copied = copy_held(state, index, &mut validity, working, access, &mut donors);
     proven.retain(|(member, range)| {
         !copied.iter().any(|(into, slice)| {
             into == member && slice.start <= range.start && range.end <= slice.end
@@ -184,74 +188,61 @@ pub(super) fn repair_set(
     // As many blocks as slices are damaged, and more while those read do
     // not solve for them: not every choice of blocks does.
     let mut wanted = damaged;
-    let mut held = Held::new(damaged, slice_size, memory_limit);
-    let plan = loop {
-        spend(
-            state,
-            slice_size,
-            wanted,
-            &mut set.recovery_slices,
-            &mut held,
-            access,
-        );
-        let available = set.recovery_slices.len() as u64;
-        if available < wanted {
-            return short(available, access);
-        }
-        let verification = verification(&set, &validity, damaged);
-        match plan_repair_with_memory_limit(&set, &verification, Some(memory_limit)) {
-            Ok(plan) => {
-                if fill(
-                    state,
-                    slice_size,
-                    &plan.recovery_exponents,
-                    &mut set.recovery_slices,
-                    &mut held,
-                    access,
-                ) {
-                    break plan;
-                }
-            }
-            Err(Par2Error::InsufficientRecoveryData { deficit, .. }) => {
-                wanted = available + u64::from(deficit);
-            }
-            Err(error) => {
-                access.repair_error(
-                    "plan repair",
-                    &format!("{:02x?}", set.recovery_set_id),
-                    &error,
-                );
-                return short(available, access);
-            }
-        }
-    };
-    let available = set.recovery_slices.len() as u64;
-    // The blocks the plan did not choose are not spent: their payloads go
-    // before the repair runs.
-    if set.recovery_slices.len() > plan.recovery_exponents.len() {
-        let chosen: BTreeSet<u32> = plan.recovery_exponents.iter().copied().collect();
-        set.recovery_slices
-            .retain(|exponent, _| chosen.contains(exponent));
-    }
     let members: BTreeMap<FileId, MemberId> = state.members().clone();
-    let mut files = Files {
-        access: RefCell::new(access),
-        members: &members,
-        set: &set,
-        donors: &donors,
-        kept: &kept,
-    };
     let options = RepairOptions {
         memory_limit: Some(memory_limit),
         ..Default::default()
     };
-    if let Err(error) = execute_repair_with_options(&plan, &set, &mut files, &options) {
-        files.access.get_mut().repair_error(
+    // A block whose payload does not read while the repair spends it is
+    // forgotten, as one that fails its check is, and the plan made again
+    // from the blocks left: each time round there is one block fewer.
+    loop {
+        let plan = loop {
+            spend(state, slice_size, wanted, &mut set.recovery_slices, access);
+            let available = set.recovery_slices.len() as u64;
+            if available < wanted {
+                return short(available, access);
+            }
+            let verification = verification(&set, &validity, damaged);
+            match plan_repair_with_memory_limit(&set, &verification, Some(memory_limit)) {
+                Ok(plan) => break plan,
+                Err(Par2Error::InsufficientRecoveryData { deficit, .. }) => {
+                    wanted = available + u64::from(deficit);
+                }
+                Err(error) => {
+                    access.repair_error(
+                        "plan repair",
+                        &format!("{:02x?}", set.recovery_set_id),
+                        &error,
+                    );
+                    return short(available, access);
+                }
+            }
+        };
+        let mut files = Files {
+            access: RefCell::new(&mut *access),
+            members: &members,
+            set: &set,
+            donors: &donors,
+            kept: &kept,
+            recovery: &state.recovery,
+            piece: RefCell::new(Vec::new()),
+            unread: Cell::new(None),
+        };
+        let Err(error) = execute_repair_with_options(&plan, &set, &mut files, &options) else {
+            break;
+        };
+        let unread = files.unread.take();
+        access.repair_error(
             "execute repair",
             &format!("{:02x?}", set.recovery_set_id),
             &error,
         );
-        return short(available, files.access.into_inner());
+        let Some(exponent) = unread else {
+            return short(set.recovery_slices.len() as u64, access);
+        };
+        state.recovery.remove(&exponent);
+        set.recovery_slices.remove(&exponent);
     }
     SetRepair {
         outcome: RepairOutcome::Repaired {
@@ -267,12 +258,13 @@ pub(super) fn repair_set(
 // an intact slice of the set shares is those bytes, copied from it, and
 // needs no recovery block. Each is marked valid, and its member range
 // returned. Equal checksums are equal bytes once padded to the slice size,
-// so a copy longer than the slice it fills ends in that padding.
+// so a copy longer than the slice it fills ends in that padding. A copy
+// reads in pieces of what the kept slices leave of the limit.
 fn copy_held(
     state: &SetState,
     index: &Par2FileSet,
     validity: &mut [(FileId, Vec<bool>)],
-    memory_limit: usize,
+    working: usize,
     access: &mut dyn MemberAccess,
     donors: &mut BTreeMap<(FileId, u64), (MemberId, ByteRange)>,
 ) -> Vec<(MemberId, ByteRange)> {
@@ -304,7 +296,7 @@ fn copy_held(
         .collect();
     let mut copied = Vec::new();
     let mut buffer = Vec::new();
-    let piece = (memory_limit as u64).max(CHUNK);
+    let piece = (working as u64).max(CHUNK);
     for (at, slice, from, from_slice) in held {
         let file = validity[at].0;
         let (Some(&into), Some(&holder), Some(target), Some(source)) = (
@@ -487,227 +479,6 @@ fn known_by_slices(
     known
 }
 
-// A file is a member's by elimination only when it is what is left: the
-// free files the members that fit it could be are no more than they are. A
-// file over is one a member still to come may be. The longest such file is
-// taken, the first of its length in the set's order, by the member that fits
-// it most tightly, the earliest of those still unnamed; each file taken
-// leaves less for the rest, so the files are tried again until none is.
-//
-// Whether a file is what is left depends only on its length. A member known
-// exactly fits its own length; one only bounded fits every length up to its
-// bound, so the members only bounded together reach every length up to the
-// longest bound. A length within that reach could be any free file within
-// it; a length past it could be only the free files of its own length. Each
-// length's margin, the members fitting it less the files it could be, is
-// kept in a tree over the lengths, and a file taken changes the margins by a
-// few ranges: the longest length with a margin of none or more is the next
-// file to take. `work` counts the steps through the tree.
-fn by_elimination(
-    free: &[(FileId, u64)],
-    mut unnamed: Vec<(MemberId, Length)>,
-    work: &mut u64,
-) -> Vec<(FileId, MemberId)> {
-    let mut known = Vec::new();
-    if free.is_empty() || unnamed.is_empty() {
-        return known;
-    }
-    let mut by_length: BTreeMap<u64, VecDeque<FileId>> = BTreeMap::new();
-    for &(file, long) in free {
-        by_length.entry(long).or_default().push_back(file);
-    }
-    let lengths: Vec<u64> = by_length.keys().copied().collect();
-    let mut files: Vec<VecDeque<FileId>> = by_length.into_values().collect();
-    let mut left: Vec<i64> = files.iter().map(|files| files.len() as i64).collect();
-    // The lengths at or under `long`, as a count of the shortest.
-    let upto = |long: u64| lengths.partition_point(|length| *length <= long);
-    let mut exact: BTreeMap<u64, BTreeSet<usize>> = BTreeMap::new();
-    let mut bounded: BTreeSet<(u64, usize)> = BTreeSet::new();
-    for (at, (_, length)) in unnamed.iter().enumerate() {
-        match *length {
-            Length::Exact(long) => {
-                exact.entry(long).or_default().insert(at);
-            }
-            Length::AtMost(bound) => {
-                bounded.insert((bound, at));
-            }
-        }
-    }
-    let mut reach = bounded.last().map(|(bound, _)| *bound);
-    let mut within = reach.map_or(0, upto);
-    let mut could_be: i64 = left[..within].iter().sum();
-    let bounds: Vec<u64> = bounded.iter().map(|(bound, _)| *bound).collect();
-    let margins: Vec<i64> = lengths
-        .iter()
-        .enumerate()
-        .map(|(at, long)| {
-            let fitting = exact.get(long).map_or(0, BTreeSet::len)
-                + (bounds.len() - bounds.partition_point(|bound| bound < long));
-            fitting as i64 - if at < within { could_be } else { left[at] }
-        })
-        .collect();
-    let mut tree = Margins::new(&margins);
-    while let Some(at) = tree.last_ready() {
-        let long = lengths[at];
-        let Some(file) = files[at].pop_front() else {
-            break;
-        };
-        let tightest = [
-            exact
-                .get(&long)
-                .and_then(|members| members.first())
-                .copied(),
-            bounded.range((long, 0)..).next().map(|(_, member)| *member),
-        ]
-        .into_iter()
-        .flatten()
-        .min_by_key(|member| (unnamed[*member].1.bound(), *member));
-        let Some(member) = tightest else {
-            break;
-        };
-        // The file taken is one fewer for its length to be.
-        left[at] -= 1;
-        if at < within {
-            could_be -= 1;
-            tree.add(0, within, 1);
-        } else {
-            tree.add(at, at + 1, 1);
-        }
-        if left[at] == 0 {
-            tree.add(at, at + 1, RETIRED);
-        }
-        // The member taken is one fewer to fit what it fitted.
-        match unnamed[member].1 {
-            Length::Exact(exactly) => {
-                if let Some(members) = exact.get_mut(&exactly) {
-                    members.remove(&member);
-                }
-                tree.add(at, at + 1, -1);
-            }
-            Length::AtMost(bound) => {
-                bounded.remove(&(bound, member));
-                tree.add(0, upto(bound), -1);
-                let narrowed = bounded.last().map(|(bound, _)| *bound);
-                if narrowed != reach {
-                    let still = narrowed.map_or(0, upto);
-                    let mut fell = 0;
-                    for (out, count) in (still..within).zip(&left[still..within]) {
-                        *work += 1;
-                        if *count > 0 {
-                            tree.add(out, out + 1, could_be - count);
-                            fell += count;
-                        }
-                    }
-                    tree.add(0, still, fell);
-                    could_be -= fell;
-                    reach = narrowed;
-                    within = still;
-                }
-            }
-        }
-        let last = unnamed.len() - 1;
-        if member != last {
-            match unnamed[last].1 {
-                Length::Exact(exactly) => {
-                    if let Some(members) = exact.get_mut(&exactly) {
-                        members.remove(&last);
-                        members.insert(member);
-                    }
-                }
-                Length::AtMost(bound) => {
-                    bounded.remove(&(bound, last));
-                    bounded.insert((bound, member));
-                }
-            }
-        }
-        known.push((file, unnamed.swap_remove(member).0));
-    }
-    *work += tree.steps;
-    known
-}
-
-// A margin no later change can lift to none: the length has no file left.
-const RETIRED: i64 = i64::MIN / 4;
-
-// Margins over the lengths, shortest first, with a range made larger or
-// smaller at once and the longest length whose margin is none or more found
-// in a walk from the root. Each node holds what was added to its whole range
-// and the largest margin under it, its own addition included.
-struct Margins {
-    width: usize,
-    largest: Vec<i64>,
-    added: Vec<i64>,
-    steps: u64,
-}
-
-impl Margins {
-    fn new(margins: &[i64]) -> Self {
-        let width = margins.len();
-        let mut tree = Self {
-            width,
-            largest: vec![0; 4 * width.max(1)],
-            added: vec![0; 4 * width.max(1)],
-            steps: 0,
-        };
-        tree.build(1, 0, width, margins);
-        tree
-    }
-
-    fn build(&mut self, node: usize, low: usize, high: usize, margins: &[i64]) {
-        self.steps += 1;
-        if high - low == 1 {
-            self.added[node] = margins[low];
-            self.largest[node] = margins[low];
-            return;
-        }
-        let middle = low + (high - low) / 2;
-        self.build(2 * node, low, middle, margins);
-        self.build(2 * node + 1, middle, high, margins);
-        self.largest[node] = self.largest[2 * node].max(self.largest[2 * node + 1]);
-    }
-
-    fn add(&mut self, from: usize, to: usize, by: i64) {
-        if from < to && by != 0 {
-            self.add_under(1, 0, self.width, from, to, by);
-        }
-    }
-
-    fn add_under(&mut self, node: usize, low: usize, high: usize, from: usize, to: usize, by: i64) {
-        self.steps += 1;
-        if to <= low || high <= from {
-            return;
-        }
-        if from <= low && high <= to {
-            self.added[node] += by;
-            self.largest[node] += by;
-            return;
-        }
-        let middle = low + (high - low) / 2;
-        self.add_under(2 * node, low, middle, from, to, by);
-        self.add_under(2 * node + 1, middle, high, from, to, by);
-        self.largest[node] =
-            self.added[node] + self.largest[2 * node].max(self.largest[2 * node + 1]);
-    }
-
-    fn last_ready(&mut self) -> Option<usize> {
-        let (mut node, mut low, mut high, mut above) = (1, 0, self.width, 0);
-        if self.largest[node] < 0 {
-            return None;
-        }
-        while high - low > 1 {
-            self.steps += 1;
-            above += self.added[node];
-            let middle = low + (high - low) / 2;
-            if self.largest[2 * node + 1] + above >= 0 {
-                (node, low) = (2 * node + 1, middle);
-            } else {
-                (node, high) = (2 * node, middle);
-            }
-        }
-        Some(low)
-    }
-}
-
 // Whether the member, as long as the described file, holds one of its
 // slices: read back in order until one checks, so `read` says one was.
 fn holds_slice_of(
@@ -805,7 +576,7 @@ struct Reading<'a> {
 // The slices the verification read back and proved good, by file and
 // index, for the repair to take as its input instead of reading them again:
 // on an encrypted store every read enciphers its bytes again. At most
-// `limit` bytes, the repair's own memory limit: past it the earliest kept go
+// `limit` bytes, half the repair's memory limit: past it the earliest kept go
 // first, and the repair reads those again. A slice proved bad is never
 // kept, and nothing is kept past one set's repair.
 struct Kept {
@@ -892,17 +663,16 @@ fn read_slice(
     Some(crc32 == expected.crc32 && md5 == expected.md5)
 }
 
-// Read recovery packets back from the volumes, in exponent order, until
-// `wanted` pass their hash, on from the last already read. The scan checked it;
-// the volume is read again here, so it is checked again. One that fails is
-// forgotten. One that passes past what `held` allows is counted, and its
-// payload let go.
+// Check recovery packets again in the volumes, in exponent order, until
+// `wanted` pass their hash, on from the last already checked. The scan
+// checked it; the volume is read again here, so it is checked again. One
+// that fails is forgotten. A packet is read a piece at a time and nothing
+// of it is held: the repair reads its payload from the volume as it needs it.
 fn spend(
     state: &mut SetState,
     slice_size: u64,
     wanted: u64,
     slices: &mut BTreeMap<u32, RecoverySlice>,
-    held: &mut Held,
     access: &mut dyn MemberAccess,
 ) {
     let mut bad = Vec::new();
@@ -914,14 +684,11 @@ fn spend(
         if slices.len() as u64 >= wanted {
             break;
         }
-        buffer.clear();
-        let read = access.read_volume(location.volume, location.range, &mut buffer);
-        match read.then(|| recovery_slice(&buffer, slice_size)).flatten() {
-            Some(data) => {
-                let data = held.hold(exponent, data);
-                slices.insert(exponent, RecoverySlice { exponent, data });
-            }
-            None => bad.push(exponent),
+        if recovery_passes(access, location, exponent, slice_size, &mut buffer) {
+            let data = RecoverySliceData::provided(slice_size as usize);
+            slices.insert(exponent, RecoverySlice { exponent, data });
+        } else {
+            bad.push(exponent);
         }
     }
     for exponent in bad {
@@ -929,90 +696,54 @@ fn spend(
     }
 }
 
-// Read back the payloads of the blocks the plan chose that were counted but
-// not held, as `spend` read them. One that no longer passes is forgotten,
-// and the plan is made again: false.
-fn fill(
-    state: &mut SetState,
-    slice_size: u64,
-    chosen: &[u32],
-    slices: &mut BTreeMap<u32, RecoverySlice>,
-    held: &mut Held,
+// Whether the packet at `location` is still recovery block `exponent` with
+// a payload of `slice_size` bytes: its header says so and its hash passes,
+// read a piece at a time.
+fn recovery_passes(
     access: &mut dyn MemberAccess,
+    location: &Location,
+    exponent: u32,
+    slice_size: u64,
+    buffer: &mut Vec<u8>,
 ) -> bool {
-    if held.unheld.is_empty() {
-        return true;
+    let range = location.range;
+    if range.len() != PAYLOAD as u64 + slice_size {
+        return false;
     }
-    let mut buffer = Vec::new();
-    let mut whole = true;
-    for &exponent in chosen {
-        if !held.unheld.remove(&exponent) {
-            continue;
+    let mut hasher = FileHashState::new();
+    let mut expected = None;
+    let mut at = range.start;
+    while at < range.end {
+        // A piece is never shorter than a header and an exponent, so the
+        // first holds both.
+        let end = (at + CHUNK).min(range.end);
+        buffer.clear();
+        if !access.read_volume(location.volume, ByteRange::new(at, end), buffer)
+            || buffer.len() as u64 != end - at
+        {
+            return false;
         }
-        let data = state.recovery.get(&exponent).and_then(|location| {
-            buffer.clear();
-            access
-                .read_volume(location.volume, location.range, &mut buffer)
-                .then(|| recovery_slice(&buffer, slice_size))
+        let mut piece = &buffer[..];
+        if expected.is_none() {
+            let Some(header) = (piece[..MAGIC.len()] == MAGIC[..])
+                .then(|| PacketHeader::parse(piece, at).ok())
                 .flatten()
-        });
-        match data {
-            Some(data) => {
-                held.bytes = held.bytes.saturating_add(data.len() as u64);
-                slices.insert(exponent, RecoverySlice { exponent, data });
+            else {
+                return false;
+            };
+            if header.length != range.len()
+                || !matches!(header.packet_type, PacketType::RecoverySlice)
+                || piece[HEADER_SIZE..PAYLOAD] != exponent.to_le_bytes()
+            {
+                return false;
             }
-            None => {
-                slices.remove(&exponent);
-                state.recovery.remove(&exponent);
-                whole = false;
-            }
+            expected = Some(header.packet_hash);
+            piece = &piece[32..];
         }
+        hasher.update(piece);
+        at = end;
     }
-    whole
-}
-
-// The recovery payloads a repair holds while it plans. The planner reads a
-// block's exponent, not its bytes, so a block read only to be counted need
-// not be held: the blocks as many as the damaged slices are held always, as
-// those the repair spends, and those read past them while the plan does not
-// solve are held as long as the payloads together are no more than those
-// blocks and as much again, or those blocks and the repair memory limit if
-// that is more. Past that, a block's payload is let go and read again only
-// when the plan chooses it.
-struct Held {
-    bytes: u64,
-    limit: u64,
-    unheld: BTreeSet<u32>,
-}
-
-impl Held {
-    fn new(damaged: u64, slice_size: u64, memory_limit: usize) -> Self {
-        let spent = damaged.saturating_mul(slice_size);
-        Self {
-            bytes: 0,
-            limit: spent.saturating_add(spent.max(memory_limit as u64)),
-            unheld: BTreeSet::new(),
-        }
-    }
-
-    fn hold(&mut self, exponent: u32, data: RecoverySliceData) -> RecoverySliceData {
-        let len = data.len() as u64;
-        if self.bytes.saturating_add(len) <= self.limit {
-            self.bytes += len;
-            return data;
-        }
-        self.unheld.insert(exponent);
-        RecoverySliceData::from(Vec::new())
-    }
-}
-
-fn recovery_slice(packet: &[u8], slice_size: u64) -> Option<par2_rs::RecoverySliceData> {
-    match parse_packet(packet, 0).ok()?.0 {
-        Packet::RecoverySlice(parsed) if parsed.data.len() as u64 == slice_size => {
-            Some(parsed.data)
-        }
-        _ => None,
-    }
+    expected == Some(hasher.finalize())
 }
 
 fn verification(
@@ -1061,6 +792,12 @@ struct Files<'a> {
     set: &'a Par2FileSet,
     donors: &'a BTreeMap<(FileId, u64), (MemberId, ByteRange)>,
     kept: &'a Kept,
+    // Where each recovery packet is, its payload read from the volume a
+    // piece at a time into `piece` as the repair asks for it.
+    recovery: &'a BTreeMap<u32, Location>,
+    piece: RefCell<Vec<u8>>,
+    // The recovery block whose payload did not read, if one did not.
+    unread: Cell<Option<u32>>,
 }
 
 impl Files<'_> {
@@ -1157,6 +894,42 @@ impl FileAccess for Files<'_> {
             self.access
                 .get_mut()
                 .write_repaired(member, offset, &data[..take]);
+        }
+        Ok(())
+    }
+
+    fn read_recovery_range_into(
+        &self,
+        exponent: u32,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> io::Result<()> {
+        let location = self
+            .recovery
+            .get(&exponent)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such recovery block"))?;
+        let start = location.range.start + PAYLOAD as u64 + offset;
+        if start + dst.len() as u64 > location.range.end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the read reaches past the recovery payload",
+            ));
+        }
+        let mut access = self.access.borrow_mut();
+        let mut piece = self.piece.borrow_mut();
+        for (step, dst) in dst.chunks_mut(CHUNK as usize).enumerate() {
+            let at = start + step as u64 * CHUNK;
+            piece.clear();
+            if !access.read_volume(
+                location.volume,
+                ByteRange::new(at, at + dst.len() as u64),
+                &mut piece,
+            ) || piece.len() != dst.len()
+            {
+                self.unread.set(Some(exponent));
+                return Err(io::Error::other("the namespace could not read the volume"));
+            }
+            dst.copy_from_slice(&piece);
         }
         Ok(())
     }
@@ -1569,6 +1342,9 @@ mod tests {
                 set,
                 donors: &donors,
                 kept: &Kept::new(0),
+                recovery: &BTreeMap::new(),
+                piece: RefCell::new(Vec::new()),
+                unread: Cell::new(None),
             }
             .read_file_range(&file, offset, end - offset)
             .unwrap();
@@ -1633,14 +1409,7 @@ mod tests {
             );
             let mut set = index;
             set.recovery_slices.clear();
-            spend(
-                state,
-                BLOCK,
-                1,
-                &mut set.recovery_slices,
-                &mut Held::new(1, BLOCK, usize::MAX),
-                &mut access,
-            );
+            spend(state, BLOCK, 1, &mut set.recovery_slices, &mut access);
             assert_eq!(set.recovery_slices.len(), 1);
             let verified = verification(&set, &validity, 1);
             let plan = plan_repair_with_memory_limit(&set, &verified, None).unwrap();
@@ -1655,6 +1424,9 @@ mod tests {
                     set: &set,
                     donors: &donors,
                     kept: &Kept::new(0),
+                    recovery: &state.recovery,
+                    piece: RefCell::new(Vec::new()),
+                    unread: Cell::new(None),
                 };
                 execute_repair_with_options(&plan, &set, &mut view, &RepairOptions::default())
             };
@@ -2370,6 +2142,344 @@ mod tests {
                 assert_eq!(largest, 2 * MIB, "{:?}", access.reads);
                 assert_eq!(kept.slices.len(), 2);
             }
+        }
+    }
+
+    // A recovery payload far past the memory limit is never held: its
+    // packet is checked, and then read again as the repair spends it, in
+    // volume reads no longer than a chunk, whatever the limit is, and the
+    // repair rebuilds the exact bytes. The limits are one under a chunk, one
+    // over it and one over the payload, so it is the chunk that sizes the
+    // reads.
+    #[test]
+    fn a_recovery_payload_past_the_memory_limit_is_read_in_bounded_pieces_and_not_held() {
+        const MIB: u64 = 1 << 20;
+        let slice = 4 * MIB;
+        let data = payload(91, (2 * slice + slice / 2) as usize);
+        let files = par2_set("set", &[("payload.bin", &data)], slice, 1, 1);
+        let mut wrong = data.clone();
+        wrong[(slice + 17) as usize] ^= 0x5A;
+        for limit in [CHUNK / 2, 2 * CHUNK, 64 * CHUNK] {
+            let (mut job, member) = fixture(&files, &wrong);
+            job.store.holes.clear();
+
+            // What the set spends is a location, not a payload.
+            let state = job.object.sets.values_mut().next().unwrap();
+            let mut slices = BTreeMap::new();
+            spend(state, slice, 1, &mut slices, &mut job.store);
+            assert_eq!(slices.len(), 1);
+            assert!(
+                slices.values().all(
+                    |block| block.data.as_bytes().is_none() && block.data.len() as u64 == slice
+                )
+            );
+            let packet = state.recovery[&0];
+            let payload = payload_of(state, 0);
+
+            let mut access = Watched::over(std::mem::take(&mut job.store));
+            let budget = weaver_graph::Budget {
+                memory_bytes: Some(limit),
+                ..weaver_graph::Budget::default()
+            };
+            let outcome = job.object.repair(&mut access, budget);
+            assert_eq!(outcome, RepairOutcome::Repaired { slices: 1 });
+            assert!(access.store.members[&member] == data);
+            let longest = access.volumes.iter().map(|(_, range)| range.len()).max();
+            assert_eq!(longest, Some(CHUNK), "limit {limit}");
+            // Checked once whole, a chunk at a time, then every byte of the
+            // payload read again as it was spent.
+            let checked: u64 = access
+                .volumes
+                .iter()
+                .filter(|(_, range)| range.start < payload.1.start)
+                .map(|(_, range)| range.len())
+                .sum();
+            let read: u64 = access.volumes.iter().map(|(_, range)| range.len()).sum();
+            assert!(
+                checked >= CHUNK && read - packet.range.len() >= slice,
+                "{read}"
+            );
+        }
+    }
+
+    // The store with every read of a member or a volume written down, and
+    // the volume reads it refuses: one that lies wholly in a refused range.
+    struct Watched {
+        store: Store,
+        members: Vec<ByteRange>,
+        volumes: Vec<(VolumeIndex, ByteRange)>,
+        refused: Vec<(VolumeIndex, ByteRange)>,
+        errors: Vec<String>,
+    }
+
+    impl Watched {
+        fn over(store: Store) -> Self {
+            Self {
+                store,
+                members: Vec::new(),
+                volumes: Vec::new(),
+                refused: Vec::new(),
+                errors: Vec::new(),
+            }
+        }
+
+        // The volume reads that lie wholly in `range` of `volume`.
+        fn within(&self, (volume, range): (VolumeIndex, ByteRange)) -> usize {
+            self.volumes
+                .iter()
+                .filter(|(of, read)| {
+                    *of == volume && range.start <= read.start && read.end <= range.end
+                })
+                .count()
+        }
+
+        // How many reads of the member touch each of its slices.
+        fn touches(&self, slice: u64, count: u64) -> Vec<usize> {
+            (0..count)
+                .map(|at| {
+                    let (start, end) = (at * slice, (at + 1) * slice);
+                    self.members
+                        .iter()
+                        .filter(|read| read.start < end && start < read.end)
+                        .count()
+                })
+                .collect()
+        }
+    }
+
+    impl MemberAccess for Watched {
+        fn repair_error(&mut self, operation: &str, _: &str, _: &dyn std::error::Error) {
+            self.errors.push(operation.to_string());
+        }
+        fn read(&mut self, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
+            self.members.push(range);
+            self.store.read(member, range, into)
+        }
+        fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
+            self.store.write_repaired(member, offset, bytes);
+        }
+        fn length(&self, member: MemberId) -> Option<u64> {
+            self.store.length(member)
+        }
+        fn arrived(&self, member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {
+            self.store.arrived(member, range, out);
+        }
+        fn read_volume(
+            &mut self,
+            volume: VolumeIndex,
+            range: ByteRange,
+            into: &mut Vec<u8>,
+        ) -> bool {
+            self.volumes.push((volume, range));
+            let refused = self.refused.iter().any(|(of, refused)| {
+                *of == volume && refused.start <= range.start && range.end <= refused.end
+            });
+            !refused && self.store.read_volume(volume, range, into)
+        }
+    }
+
+    // One file of `slices` slices of `slice` bytes with a byte wrong in its
+    // fourth, nothing of it settled by evidence, and `recovery` blocks.
+    fn one_bad_slice(slice: u64, slices: u64, recovery: u32) -> (Job<Par2>, MemberId, Vec<u8>) {
+        let data = payload(93, (slices * slice) as usize);
+        let files = par2_set("set", &[("payload.bin", &data)], slice, recovery, 1);
+        let mut wrong = data.clone();
+        wrong[(3 * slice + 17) as usize] ^= 0x5A;
+        let (mut job, member) = fixture(&files, &wrong);
+        job.store.holes.clear();
+        (job, member, data)
+    }
+
+    // Where a recovery block's payload lies: its packet past the header and
+    // the exponent. The check of a packet reads from its start, so only the
+    // repair's own reads lie wholly in this.
+    fn payload_of(state: &SetState, exponent: u32) -> (VolumeIndex, ByteRange) {
+        let at = state.recovery[&exponent];
+        let range = ByteRange::new(at.range.start + PAYLOAD as u64, at.range.end);
+        (at.volume, range)
+    }
+
+    // A block that passed its check and then does not read while the repair
+    // spends it is forgotten, and the repair is made again with the blocks
+    // left, checking another: one block lost, or two, the set still repairs,
+    // and no block that did not read is in it.
+    #[test]
+    fn a_block_that_does_not_read_as_it_is_spent_is_forgotten_and_another_spent() {
+        for lost in [1u32, 2] {
+            let (mut job, member, data) = one_bad_slice(BLOCK, 8, 3);
+            let state = job.object.sets.values_mut().next().unwrap();
+            let payloads: Vec<_> = (0..3).map(|block| payload_of(state, block)).collect();
+            let mut access = Watched::over(std::mem::take(&mut job.store));
+            access.refused = payloads[..lost as usize].to_vec();
+            let result = repair_set(state, &job.object.grid, 0, 1 << 20, &mut access);
+            assert_eq!(result.outcome, RepairOutcome::Repaired { slices: 1 });
+            assert!(access.store.members[&member] == data);
+            let left: Vec<u32> = state.recovery.keys().copied().collect();
+            assert_eq!(left, (lost..3).collect::<Vec<_>>());
+            // Each lost block was asked for once and not again; the block
+            // that rebuilt the slice is the first that read; one past it
+            // was never read.
+            for (block, payload) in payloads.iter().enumerate() {
+                let reads = access.within(*payload);
+                match (block as u32).cmp(&lost) {
+                    std::cmp::Ordering::Less => assert_eq!(reads, 1, "block {block}"),
+                    std::cmp::Ordering::Equal => assert!(reads > 0, "block {block}"),
+                    std::cmp::Ordering::Greater => assert_eq!(reads, 0, "block {block}"),
+                }
+            }
+            assert_eq!(access.errors, vec!["execute repair"; lost as usize]);
+        }
+    }
+
+    // With no block left to take the place of the one that did not read,
+    // the set is short by the loop's own rule: waiting while more is coming,
+    // impossible when none is.
+    #[test]
+    fn a_block_that_does_not_read_with_none_to_spare_leaves_the_set_short() {
+        for (coming, expected) in [
+            (
+                0,
+                RepairOutcome::Impossible {
+                    damaged: 1,
+                    reachable: 0,
+                },
+            ),
+            (1, RepairOutcome::Waiting),
+        ] {
+            let (mut job, _, _) = one_bad_slice(BLOCK, 8, 1);
+            let state = job.object.sets.values_mut().next().unwrap();
+            let mut access = Watched::over(std::mem::take(&mut job.store));
+            access.refused = vec![payload_of(state, 0)];
+            let result = repair_set(state, &job.object.grid, coming, 1 << 20, &mut access);
+            assert_eq!(result.outcome, expected);
+            assert_eq!(result.damaged, 1);
+            assert!(state.recovery.is_empty());
+            assert_eq!(access.errors, ["execute repair"]);
+        }
+    }
+
+    // The set of `one_bad_slice` with three blocks, the first spoiled by
+    // `spoil` before the repair: it is not used, and the repair completes
+    // with the second. The third is never read. Gives the volume reads that
+    // started where the first block's packet does.
+    fn repairs_without_the_first_block(spoil: impl Fn(&mut SetState, &mut Store)) -> usize {
+        let (mut job, member, data) = one_bad_slice(BLOCK, 8, 3);
+        let state = job.object.sets.values_mut().next().unwrap();
+        let payloads: Vec<_> = (0..3).map(|block| payload_of(state, block)).collect();
+        let first = state.recovery[&0];
+        spoil(state, &mut job.store);
+        let mut access = Watched::over(std::mem::take(&mut job.store));
+        let result = repair_set(state, &job.object.grid, 0, 1 << 20, &mut access);
+        assert_eq!(result.outcome, RepairOutcome::Repaired { slices: 1 });
+        assert!(access.store.members[&member] == data);
+        assert_eq!(state.recovery.keys().copied().collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(access.within(payloads[0]), 0);
+        assert!(access.within(payloads[1]) > 0);
+        assert_eq!(access.within(payloads[2]), 0);
+        assert!(access.errors.is_empty(), "{:?}", access.errors);
+        access
+            .volumes
+            .iter()
+            .filter(|(volume, read)| *volume == first.volume && read.start == first.range.start)
+            .count()
+    }
+
+    // The bytes of the first block's packet, to spoil.
+    fn first_packet<'a>(state: &SetState, store: &'a mut Store) -> &'a mut [u8] {
+        let at = state.recovery[&0];
+        let volume = store.volumes.get_mut(&at.volume).unwrap();
+        &mut volume[at.range.start as usize..at.range.end as usize]
+    }
+
+    // A packet that is not a header, an exponent and one slice long is not
+    // read at all.
+    #[test]
+    fn a_packet_of_the_wrong_length_is_not_spent() {
+        for longer in [false, true] {
+            let checked = repairs_without_the_first_block(|state, store| {
+                let at = state.recovery.get_mut(&0).unwrap();
+                let volume = at.volume;
+                at.range = if longer {
+                    ByteRange::new(at.range.start, at.range.end + 1)
+                } else {
+                    ByteRange::new(at.range.start, at.range.end - 1)
+                };
+                // The longer range is there to read.
+                store.volumes.get_mut(&volume).unwrap().push(0);
+            });
+            assert_eq!(checked, 0);
+        }
+    }
+
+    // A packet whose header no longer says a recovery packet of its length
+    // starts there: the magic, the length or the type changed. The length
+    // is still one a packet may have. The hash a packet carries covers its
+    // type, so that one is given the hash of what it now holds, and only
+    // the header check can refuse it.
+    #[test]
+    fn a_packet_with_a_bad_header_is_not_spent() {
+        for (field, change) in [(0, 0x01), (8, 0x04), (48 + 8, 0x01)] {
+            let checked = repairs_without_the_first_block(|state, store| {
+                let packet = first_packet(state, store);
+                packet[field] ^= change;
+                let mut hasher = FileHashState::new();
+                hasher.update(&packet[32..]);
+                packet[16..32].copy_from_slice(&hasher.finalize());
+            });
+            assert_eq!(checked, 1);
+        }
+    }
+
+    // A whole packet of another block where this one should be: its hash
+    // passes, and its exponent says it is not the block.
+    #[test]
+    fn a_packet_of_another_exponent_is_not_spent() {
+        let checked = repairs_without_the_first_block(|state, _| {
+            let second = state.recovery[&1];
+            state.recovery.insert(0, second);
+        });
+        // The spoiled entry points at the second block's packet.
+        assert_eq!(checked, 0);
+    }
+
+    // A packet whose payload changed since the scan no longer passes its
+    // hash.
+    #[test]
+    fn a_packet_that_fails_its_hash_is_not_spent() {
+        let checked = repairs_without_the_first_block(|state, store| {
+            let packet = first_packet(state, store);
+            packet[PAYLOAD + 5] ^= 0x01;
+        });
+        assert_eq!(checked, 1);
+    }
+
+    // The slices the verification keeps for the repair are at most half the
+    // limit: of fifteen good slices read back under a limit of eight, the
+    // repair takes four as kept and reads the rest from the member again. A
+    // slice longer than half the limit is not kept at all, and the repair
+    // reads every one again. Both rebuild the exact bytes.
+    #[test]
+    fn slices_kept_from_verification_are_at_most_half_the_limit() {
+        const SLICE: u64 = 64 * 1024;
+        const SLICES: u64 = 16;
+        for (limit, kept) in [(8 * SLICE, 4), (SLICE + SLICE / 2, 0)] {
+            let (mut job, member, data) = one_bad_slice(SLICE, SLICES, 2);
+            let state = job.object.sets.values_mut().next().unwrap();
+            let mut access = Watched::over(std::mem::take(&mut job.store));
+            let result = repair_set(state, &job.object.grid, 0, limit as usize, &mut access);
+            assert_eq!(result.outcome, RepairOutcome::Repaired { slices: 1 });
+            assert!(access.store.members[&member] == data);
+            // The verification read every slice once. One the repair did
+            // not read again is one it took as kept.
+            let touches = access.touches(SLICE, SLICES);
+            assert!(touches.iter().all(|reads| *reads > 0), "{touches:?}");
+            let once = touches
+                .iter()
+                .enumerate()
+                .filter(|(slice, reads)| *slice != 3 && **reads == 1)
+                .count();
+            assert_eq!(once, kept, "limit {limit}: {touches:?}");
+            assert!(once as u64 * SLICE <= limit / 2);
         }
     }
 

@@ -335,7 +335,7 @@ export function BetaTag({ className }: { className?: string }) {
 }
 
 
-/** An outlined mono chip: a parsed release's flags, and nothing else so far. */
+/** An outlined mono chip: a script run's marks. */
 export function Tag({ children }: { children: ReactNode }) {
   return (
     <span className="border border-wv-control px-2 py-[3px] font-wv-mono text-[10.5px] tracking-[0.06em] text-wv-tertiary uppercase">

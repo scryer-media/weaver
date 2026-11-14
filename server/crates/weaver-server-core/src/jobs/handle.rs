@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
 
@@ -21,49 +21,8 @@ use crate::pipeline::queue::{Change, Queue};
 
 pub const FINISHED_JOBS_RUNTIME_CAP: usize = 1_000;
 pub const PROPAGATION_WAIT_REASON: &str = "propagation_delay";
-
-type JobCancellationCallback = Arc<dyn Fn() + Send + Sync>;
-
-// Signals active job work without waiting for the single-threaded scheduler
-// loop. This lets a user cancellation interrupt a repair that currently owns
-// that loop before the queued cancellation command is handled.
-#[derive(Clone, Default)]
-struct JobCancellationRegistry {
-    state: Arc<Mutex<JobCancellationState>>,
-}
-
-#[derive(Default)]
-struct JobCancellationState {
-    callbacks: HashMap<JobId, Vec<JobCancellationCallback>>,
-    requested: HashSet<JobId>,
-}
-
-impl JobCancellationRegistry {
-    fn cancel(&self, job_id: JobId) -> bool {
-        let callbacks = {
-            let mut state = self
-                .state
-                .lock()
-                .expect("job cancellation registry poisoned");
-            state.requested.insert(job_id);
-            state.callbacks.get(&job_id).cloned().unwrap_or_default()
-        };
-        let cancelled = !callbacks.is_empty();
-        for callback in callbacks {
-            callback();
-        }
-        cancelled
-    }
-
-    fn clear(&self, job_id: JobId) {
-        let mut state = self
-            .state
-            .lock()
-            .expect("job cancellation registry poisoned");
-        state.callbacks.remove(&job_id);
-        state.requested.remove(&job_id);
-    }
-}
+// The job waits for room on a disk, in whatever phase it is in.
+pub const DISK_SPACE_WAIT_REASON: &str = "disk_space";
 
 #[derive(Clone)]
 pub struct SharedPipelineState {
@@ -99,7 +58,6 @@ pub struct SharedPipelineState {
     // profile put in force now reaches the next extraction. `u64::MAX` means no profile cap, and
     // the extraction ceiling alone bounds the decoder.
     sevenz_decode_memory_bytes: Arc<AtomicU64>,
-    job_cancellations: JobCancellationRegistry,
     // The per-article stream (`ArticleDownloaded`, `SegmentDecoded`, ...),
     // kept off the job-level broadcast: a download emits several of these
     // per article, and every always-on job-level subscriber (event
@@ -108,6 +66,10 @@ pub struct SharedPipelineState {
     segment_events: broadcast::Sender<PipelineEvent>,
     // The speed test service, held weakly: the service holds this handle.
     speed_test: Arc<std::sync::Mutex<std::sync::Weak<crate::speed_test::ServiceInner>>>,
+    // The pipeline's free-space samplers, set once it starts: requests read
+    // their cached readings and never look at the disk themselves. Held
+    // weakly, so the samplers stop with the pipeline that owns them.
+    storage_capacity: Arc<RwLock<std::sync::Weak<crate::operations::StorageCapacity>>>,
 }
 
 // Bounded like the job-level broadcast; a lagging listener drops articles,
@@ -139,9 +101,9 @@ impl SharedPipelineState {
             download_transport: Arc::new(RwLock::new(Vec::new())),
             server_probe_latency: Arc::new(RwLock::new(HashMap::new())),
             sevenz_decode_memory_bytes: Arc::new(AtomicU64::new(u64::MAX)),
-            job_cancellations: JobCancellationRegistry::default(),
             segment_events,
             speed_test: Arc::new(std::sync::Mutex::new(std::sync::Weak::new())),
+            storage_capacity: Arc::default(),
         }
     }
 
@@ -343,14 +305,6 @@ impl SharedPipelineState {
 
     pub fn raw_metrics_snapshot(&self) -> MetricsSnapshot {
         self.metrics.raw_snapshot()
-    }
-
-    pub(crate) fn cancel_active_job_work(&self, job_id: JobId) -> bool {
-        self.job_cancellations.cancel(job_id)
-    }
-
-    pub(crate) fn clear_job_cancellations(&self, job_id: JobId) {
-        self.job_cancellations.clear(job_id);
     }
 
     pub fn metrics(&self) -> &Arc<PipelineMetrics> {
@@ -588,6 +542,23 @@ impl SharedPipelineState {
 
     pub fn nntp_pool(&self) -> Option<Arc<weaver_nntp::pool::NntpPool>> {
         self.nntp_pool.read().unwrap().clone()
+    }
+
+    // The samplers of the pipeline that runs over this state.
+    pub(crate) fn set_storage_capacity(&self, storage: &Arc<crate::operations::StorageCapacity>) {
+        *self
+            .storage_capacity
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::downgrade(storage);
+    }
+
+    // The pipeline's free-space samplers, once it has started. Reading their
+    // cache looks at no disk.
+    pub fn storage_capacity(&self) -> Option<Arc<crate::operations::StorageCapacity>> {
+        self.storage_capacity
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .upgrade()
     }
 
     pub fn set_nntp_runtime_activation(&self, activation: NntpRuntimeActivation) {
@@ -851,6 +822,8 @@ pub struct RestartRead {
     // installs wherever it stands, so its row says what it holds; one out
     // of the window leaves it again once read.
     pub(crate) outline_pending: bool,
+    // The job has a checkpoint: some of its bytes are on disk.
+    pub(crate) on_disk: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -944,6 +917,81 @@ pub struct HistoryDeleteBatchOutcome {
     pub refused: BTreeMap<JobId, SchedulerError>,
 }
 
+// What archiving one history entry did. The entry stays either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveHistoryOutcome {
+    // Archived: folders Weaver manages were on disk and are gone.
+    Archived,
+    // Archived with nothing on disk, or the entry was already archived.
+    AlreadyGone,
+    // A folder of the job is on disk without proof that Weaver manages it,
+    // so it is left as it is. Folders that are proven the job's still go.
+    NotManaged,
+    // The job is in the queue, or another history operation holds it.
+    Busy,
+    // There is no history entry with this id.
+    NotFound,
+    // Removing stopped on an error. A retry removes what is left.
+    Failed,
+}
+
+impl ArchiveHistoryOutcome {
+    // The code an operation target keeps for the outcome.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Archived => "archived",
+            Self::AlreadyGone => "already_gone",
+            Self::NotManaged => "not_managed",
+            Self::Busy => "busy",
+            Self::NotFound => "not_found",
+            Self::Failed => "failed",
+        }
+    }
+
+    // The outcome a kept code names; `None` for any other code, such as a
+    // archive a delete superseded.
+    pub fn parse(code: &str) -> Option<Self> {
+        Some(match code {
+            "archived" => Self::Archived,
+            "already_gone" => Self::AlreadyGone,
+            "not_managed" => Self::NotManaged,
+            "busy" => Self::Busy,
+            "not_found" => Self::NotFound,
+            "failed" => Self::Failed,
+            _ => return None,
+        })
+    }
+
+    // Whether the entry ends with nothing left to remove: its target
+    // completes. Every other outcome fails the target, which the entry then
+    // shows.
+    pub fn settles(self) -> bool {
+        matches!(self, Self::Archived | Self::AlreadyGone | Self::NotFound)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveHistoryResult {
+    pub outcome: ArchiveHistoryOutcome,
+    // When the entry was archived, in epoch seconds, once it says so.
+    pub archived_at: Option<i64>,
+    pub message: Option<String>,
+}
+
+impl ArchiveHistoryResult {
+    pub(crate) fn new(
+        outcome: ArchiveHistoryOutcome,
+        archived_at: Option<i64>,
+        message: Option<String>,
+    ) -> Self {
+        Self {
+            outcome,
+            archived_at,
+            message,
+        }
+    }
+}
+
 // One `(job, bytes per second)` pair per job whose download phase currently
 // reports a rate. The rate is the value the independent ticker published for
 // that job on the metrics tick, so it is the same estimator and the same
@@ -960,8 +1008,9 @@ pub fn job_download_rates(jobs: &[JobInfo]) -> Vec<(JobId, u64)> {
         .collect()
 }
 
-// Summary info about a job (returned by queries).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// Summary info about a job (returned by queries). Its `Debug` never shows
+// the archive password.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct JobInfo {
     pub job_id: JobId,
     pub job_hash: Option<[u8; 32]>,
@@ -1048,6 +1097,101 @@ pub struct JobInfo {
     pub download_retry_at_epoch_ms: Option<f64>,
     // Wall-clock creation time (Unix epoch milliseconds).
     pub created_at_epoch_ms: f64,
+}
+
+impl std::fmt::Debug for JobInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured whole, so a new field is a compile error here rather
+        // than a field missing from the output.
+        let Self {
+            job_id,
+            job_hash,
+            name,
+            status,
+            download_state,
+            finalizing_download,
+            fetching_repair_data,
+            post_state,
+            run_state,
+            progress,
+            total_bytes,
+            downloaded_bytes,
+            optional_recovery_bytes,
+            optional_recovery_downloaded_bytes,
+            phase_progress,
+            failed_bytes,
+            health,
+            terminal_discards,
+            total_files,
+            completed_files,
+            file_remaining_bytes,
+            file_parked_bytes,
+            remaining_bytes,
+            wanted_bytes,
+            remaining_par_files,
+            password,
+            category,
+            metadata,
+            output_dir,
+            server_attribution,
+            error,
+            download_wait_reason,
+            download_retry_at_epoch_ms,
+            created_at_epoch_ms,
+        } = self;
+        f.debug_struct("JobInfo")
+            .field("job_id", job_id)
+            .field("job_hash", job_hash)
+            .field("name", name)
+            .field("status", status)
+            .field("download_state", download_state)
+            .field("finalizing_download", finalizing_download)
+            .field("fetching_repair_data", fetching_repair_data)
+            .field("post_state", post_state)
+            .field("run_state", run_state)
+            .field("progress", progress)
+            .field("total_bytes", total_bytes)
+            .field("downloaded_bytes", downloaded_bytes)
+            .field("optional_recovery_bytes", optional_recovery_bytes)
+            .field(
+                "optional_recovery_downloaded_bytes",
+                optional_recovery_downloaded_bytes,
+            )
+            .field("phase_progress", phase_progress)
+            .field("failed_bytes", failed_bytes)
+            .field("health", health)
+            .field("terminal_discards", terminal_discards)
+            .field("total_files", total_files)
+            .field("completed_files", completed_files)
+            .field("file_remaining_bytes", file_remaining_bytes)
+            .field("file_parked_bytes", file_parked_bytes)
+            .field("remaining_bytes", remaining_bytes)
+            .field("wanted_bytes", wanted_bytes)
+            .field("remaining_par_files", remaining_par_files)
+            .field("password", &password.as_ref().map(|_| "[REDACTED]"))
+            .field("category", category)
+            .field(
+                "metadata",
+                &metadata
+                    .iter()
+                    .map(|(key, value)| {
+                        let value = if crate::history::attributes::is_password_attribute_key(key) {
+                            "[REDACTED]"
+                        } else {
+                            value.as_str()
+                        };
+                        (key.as_str(), value)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .field("output_dir", output_dir)
+            .field("server_attribution", server_attribution)
+            .field("error", error)
+            .field("download_wait_reason", download_wait_reason)
+            .field("download_retry_at_epoch_ms", download_retry_at_epoch_ms)
+            .field("created_at_epoch_ms", created_at_epoch_ms)
+            .finish()
+    }
 }
 
 // Handle for sending commands to the scheduler.
@@ -1327,6 +1471,31 @@ impl SchedulerHandle {
             .await
     }
 
+    // Archive a batch of history entries for the queued archive
+    // `operation_id`: remove their files and keep the entries. `now` is the
+    // stamp, in epoch seconds, written on every entry whose files are gone. Each id's
+    // target is settled with its outcome before the hold on the entries is
+    // released, so the queue revision that release rings finds the result
+    // written. Callers holding more than `HISTORY_DELETE_BATCH_SIZE` ids send
+    // them in batches of that size.
+    pub async fn archive_history_for_operation(
+        &self,
+        operation_id: u64,
+        job_ids: BTreeSet<JobId>,
+        now: i64,
+    ) -> Result<BTreeMap<JobId, ArchiveHistoryResult>, SchedulerError> {
+        self.state
+            .queue
+            .clone()
+            .archive_history_settling(
+                job_ids,
+                now,
+                crate::history::output_files::ARCHIVED_HISTORY_FILES_KEPT,
+                Some(operation_id),
+            )
+            .await
+    }
+
     // Housekeeping for what jobs left on disk. With `failed_finished_by`, in
     // epoch seconds, the files of every failed job that finished by then go
     // and their records stay; a marked working directory of a job with no
@@ -1461,6 +1630,18 @@ impl SchedulerHandle {
         &self,
     ) -> Vec<crate::operations::instrumentation::ServerMetricsSnapshot> {
         self.state.metrics().server_metrics.snapshot()
+    }
+
+    // What each server of the active generation answered to article
+    // requests: found and not found. Read on demand, like the snapshot above.
+    pub fn server_article_outcomes(
+        &self,
+        stable_server_id: u32,
+    ) -> Option<crate::operations::instrumentation::ServerArticleOutcomes> {
+        self.state
+            .metrics()
+            .server_metrics
+            .article_outcomes(stable_server_id)
     }
 
     // Job lifecycle counters and duration histograms. Read on demand; see
@@ -1917,6 +2098,15 @@ impl SchedulerHandle {
             .queue
             .read(crate::pipeline::diagnostics::QueueStateCounts::read);
         (queue, self.state.metrics().pipeline_turn.read(now))
+    }
+
+    // The pipeline's turn stamp alone, as of `now`: atomic loads, no lock,
+    // so a sampler may read it as often as it likes.
+    pub fn pipeline_turn(
+        &self,
+        now: std::time::Instant,
+    ) -> crate::operations::instrumentation::PipelineTurnReading {
+        self.state.metrics().pipeline_turn.read(now)
     }
 }
 

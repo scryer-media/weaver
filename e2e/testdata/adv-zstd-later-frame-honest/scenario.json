@@ -1,0 +1,14 @@
+{
+  "slug": "adv-zstd-later-frame-honest",
+  "title": "E2E.Adversarial.Zstd.Later.Frame.Honest.2026-TESTGRP",
+  "description": "Two zstd frames, the second naming a 256 MiB window, within every profile's window. A multi-frame stream is honest, so the job completes with the member.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "requiredOutputs": [
+      "harbor-light.mkv"
+    ]
+  }
+}

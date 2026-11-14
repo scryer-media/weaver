@@ -22,7 +22,7 @@ use std::path::{Component, Path, PathBuf};
 
 use weaver_graph::{Algorithm, ByteRange, Digest, Evidenced};
 
-use crate::pipeline::graph::sparse::{PlatformMarker, create_sparse};
+use crate::pipeline::graph::sparse::{PlatformMarker, create_sized, create_sparse};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LeafError {
@@ -35,6 +35,15 @@ impl LeafError {
         move |source| LeafError::Io {
             path: path.to_path_buf(),
             source,
+        }
+    }
+
+    // Whether the file system refused the name itself: too long for it, or
+    // one it never takes. A full disk, a permission or a read-only volume
+    // is another error.
+    pub(crate) fn names_unusable(&self) -> bool {
+        match self {
+            LeafError::Io { source, .. } => source.kind() == io::ErrorKind::InvalidFilename,
         }
     }
 }
@@ -195,9 +204,12 @@ impl Leaf {
     }
 
     // Write `bytes` at `offset`, folding nothing: a file whose bytes no
-    // check is stated for. Writes grow the file only as far as their bytes.
-    // A declared length must not allocate unwritten space on a mount that
-    // stores ordinary files instead of sparse ones; close sets the final size.
+    // check is stated for. Writes grow the file only as far as their bytes,
+    // except on Windows, where a new file the sparse mark took is made at
+    // its declared length, all of it holes. A declared length must not
+    // allocate unwritten space on a mount that stores ordinary files instead
+    // of sparse ones, so a refused mark leaves it unsized; close sets the
+    // final size.
     pub(crate) fn write(
         &mut self,
         offset: u64,
@@ -609,11 +621,15 @@ impl Leaf {
         }
     }
 
-    fn open(&mut self, _length: Option<u64>) -> Result<&File, LeafError> {
+    // Opens the file, making it when it is not there. A file made with a
+    // declared `length` takes it where the platform presizes and the mount
+    // took the sparse mark (`sparse::create_sized`); close still sets the
+    // final length.
+    fn open(&mut self, length: Option<u64>) -> Result<&File, LeafError> {
         if self.file.is_none() {
             create_parent(&self.path)?;
-            let file =
-                create_sparse(&self.path, &PlatformMarker).map_err(LeafError::io(&self.path))?;
+            let file = create_sized(&self.path, &PlatformMarker, length)
+                .map_err(LeafError::io(&self.path))?;
             self.on_disk = true;
             self.file = Some(file);
         }
@@ -845,12 +861,40 @@ mod tests {
         assert!(leaf.truncate().is_err());
     }
 
+    // A name the file system will not take is told apart from a full disk
+    // and every other error, and nothing is made for it.
+    #[test]
+    fn a_refused_name_is_told_apart_from_other_write_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = format!("{}.mkv", "a".repeat(300));
+        let mut leaf = Leaf::at(dir.path(), &name);
+        let error = leaf.write(0, b"lantern", None).unwrap_err();
+        assert!(error.names_unusable(), "{error}");
+        assert!(!leaf.on_disk());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        let mut full = Leaf::at(dir.path(), "full.bin");
+        counting::fill_after(Some(0));
+        let error = full.write(0, b"lantern", None).unwrap_err();
+        counting::fill_after(None);
+        assert!(!error.names_unusable(), "{error}");
+    }
+
+    // Off Windows a declared length is never taken ahead of the bytes. On
+    // Windows a file the sparse mark took starts at it, all holes, and one
+    // whose mark was refused does not; either way close cuts it to its final
+    // length.
     #[test]
     fn a_write_does_not_preallocate_the_declared_unwritten_tail() {
         let dir = tempfile::tempdir().unwrap();
         let mut leaf = Leaf::at(dir.path(), "payload.bin");
         leaf.write(0, b"a", Some(1 << 30)).unwrap();
-        assert_eq!(leaf.len().unwrap(), 1);
+        let length = leaf.len().unwrap();
+        if crate::pipeline::graph::sparse::PRESIZES {
+            assert!(length == 1 || length == 1 << 30, "{length}");
+        } else {
+            assert_eq!(length, 1);
+        }
         leaf.write(1, b"b", None).unwrap();
         leaf.close(2).unwrap();
         assert_eq!(std::fs::read(leaf.path()).unwrap(), b"ab");
@@ -939,5 +983,45 @@ mod tests {
         assert_eq!(cut.folded(7000, crc), None);
         folding(&mut cut, 3000, bytes(4000, 3));
         assert_eq!(cut.folded(7000, crc), Some(file_crc(&cut, 7000)));
+    }
+
+    // Runs either side of 4 GiB, in a sparse file that writes a few
+    // KiB: a write across the line, a rewrite inside it, and a close that
+    // cuts the run just past it each keep the run's digest equal to the
+    // bytes the file holds.
+    #[test]
+    fn a_fold_across_four_gib_keeps_its_digest() {
+        const LINE: u64 = 1 << 32;
+        let dir = tempfile::tempdir().unwrap();
+        let mut leaf = Leaf::at(dir.path(), "lantern.bin");
+        let crc = Algorithm::Crc32;
+        let held = |leaf: &Leaf, from: u64, to: u64| {
+            let mut bytes = Vec::new();
+            leaf.read(from, index(to - from), &mut bytes).unwrap();
+            bytes
+        };
+        let run = |leaf: &Leaf| {
+            assert_eq!(leaf.written.len(), 1, "{:?}", leaf.written);
+            let (start, run) = leaf.written.iter().next().unwrap();
+            (*start, run.end, run.digest.map(|digest| digest.value))
+        };
+        let first = bytes(8192, 5);
+        folding(&mut leaf, LINE - 4096, first.clone());
+        assert_eq!(held(&leaf, LINE - 4096, LINE + 4096), first);
+        let (start, end, digest) = run(&leaf);
+        assert_eq!((start, end), (LINE - 4096, LINE + 4096));
+        assert_eq!(digest, Some(crc.hash(&first).value));
+
+        folding(&mut leaf, LINE - 50, bytes(100, 6));
+        let now = held(&leaf, LINE - 4096, LINE + 4096);
+        assert_eq!(&now[4046..4146], &bytes(100, 6)[..]);
+        assert_eq!(run(&leaf).2, Some(crc.hash(&now).value));
+
+        leaf.close(LINE + 10).unwrap();
+        assert_eq!(leaf.len().unwrap(), LINE + 10);
+        let kept = held(&leaf, LINE - 4096, LINE + 10);
+        let (start, end, digest) = run(&leaf);
+        assert_eq!((start, end), (LINE - 4096, LINE + 10));
+        assert_eq!(digest, Some(crc.hash(&kept).value));
     }
 }

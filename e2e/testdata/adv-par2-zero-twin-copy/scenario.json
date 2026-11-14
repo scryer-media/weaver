@@ -1,0 +1,20 @@
+{
+  "slug": "adv-par2-zero-twin-copy",
+  "title": "E2E.Adversarial.Par2.Zero.Twin.Copy.2026-TESTGRP",
+  "description": "A posted 4 KiB file of zeros and a PAR2 index with 16 MiB slices that also describes an unposted 128 MiB file of zeros. Each slice of the large file has the small file's padded checksums, so it is rebuilt by copying, a piece at a time within the memory granted. Both files are delivered with their exact bytes.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "minOutputFiles": 2,
+    "requiredOutputs": [
+      "hollow.mkv",
+      "seed.mkv"
+    ]
+  },
+  "expectedOutputBLAKE3": {
+    "hollow.mkv": "e66d34ca5a36dfa692903a66d66fd1d9c87bd553c32fbf7d3960542f4cda3257",
+    "seed.mkv": "b6fb73fc46938c981e2b0b4b1ef282adcfc89854d01bfe3972fdc4785b41b2c7"
+  }
+}

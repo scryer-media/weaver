@@ -627,3 +627,58 @@ fn job_download_rates_report_only_transferring_download_phases() {
         vec![(JobId(1), 61_000_000), (JobId(5), 1_000)]
     );
 }
+
+// The archive password, and a password kept among the job's attributes,
+// never reach a job's debug text.
+#[test]
+fn a_job_s_debug_text_never_shows_its_password() {
+    const SECRET: &str = "hunter-secret-7731";
+    let info = JobInfo {
+        job_id: JobId(9),
+        job_hash: None,
+        name: "job-9".into(),
+        status: JobStatus::Downloading,
+        download_state: crate::jobs::model::DownloadState::Downloading,
+        finalizing_download: false,
+        fetching_repair_data: false,
+        post_state: crate::jobs::model::PostState::Idle,
+        run_state: crate::jobs::model::RunState::Active,
+        progress: 0.0,
+        total_bytes: 100,
+        downloaded_bytes: 0,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        phase_progress: Vec::new(),
+        failed_bytes: 0,
+        health: 1000,
+        terminal_discards: Vec::new(),
+        total_files: 0,
+        completed_files: 0,
+        remaining_par_files: 0,
+        file_remaining_bytes: Vec::new(),
+        file_parked_bytes: Vec::new(),
+        remaining_bytes: 0,
+        wanted_bytes: 0,
+        password: Some(SECRET.into()),
+        category: None,
+        metadata: vec![
+            (
+                crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY.into(),
+                SECRET.into(),
+            ),
+            ("source".into(), "rss".into()),
+        ],
+        output_dir: None,
+        error: None,
+        download_wait_reason: None,
+        download_retry_at_epoch_ms: None,
+        server_attribution: Vec::new(),
+        created_at_epoch_ms: 0.0,
+    };
+
+    for text in [format!("{info:?}"), format!("{info:#?}")] {
+        assert!(!text.contains(SECRET), "{text}");
+        assert!(text.contains("[REDACTED]"));
+        assert!(text.contains("rss"));
+    }
+}

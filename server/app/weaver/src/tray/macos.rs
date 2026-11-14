@@ -569,7 +569,8 @@ define_class!(
 
     unsafe impl WKUIDelegate for WeaverDelegate {
         // `target="_blank"` and `window.open`. Returning nil tells WebKit no
-        // view was created; the link has already been handed to the browser.
+        // view was created; an `http`/`https` link has already been handed to
+        // the browser, and any other is dropped.
         #[unsafe(method_id(webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:))]
         fn create_web_view(
             &self,
@@ -579,7 +580,11 @@ define_class!(
             _window_features: &WKWindowFeatures,
         ) -> Option<Retained<WKWebView>> {
             // SAFETY: `request` and `URL` are the action's own properties.
-            if let Some(url) = unsafe { navigation_action.request().URL() } {
+            if let Some(url) = unsafe { navigation_action.request().URL() }
+                && url
+                    .absoluteString()
+                    .is_some_and(|text| shared::is_http_url(&text.to_string()))
+            {
                 NSWorkspace::sharedWorkspace().openURL(&url);
             }
             None

@@ -132,7 +132,7 @@ impl Pipeline {
         &mut self,
         segment_id: SegmentId,
         retry_count: u32,
-        exclude_servers: Vec<usize>,
+        exclude_servers: weaver_nntp::ServerSet,
     ) -> bool {
         // Built as a retry is: park/restore drops any rotation hint, which
         // is advisory, and the next transport failure recomputes it.
@@ -149,6 +149,20 @@ impl Pipeline {
     // the article moves to it and is queued afresh; false when every id is
     // spent and the article is lost.
     pub(in crate::pipeline) fn spend_message_id(&mut self, segment_id: SegmentId) -> bool {
+        let Some(work) = self.spend_message_id_for_work(segment_id) else {
+            return false;
+        };
+        self.enqueue_download_work(work);
+        self.update_queue_metrics();
+        true
+    }
+
+    // Spends the article's id in use and returns its work under the next
+    // id, not yet queued; `None` when every id is spent.
+    pub(in crate::pipeline) fn spend_message_id_for_work(
+        &mut self,
+        segment_id: SegmentId,
+    ) -> Option<DownloadWork> {
         let moved = self
             .jobs
             .get_mut(&segment_id.file_id.job_id)
@@ -169,18 +183,15 @@ impl Pipeline {
                     active.download_queue.pin_message_id(segment_id, pin);
                     active.recovery_queue.pin_message_id(segment_id, pin);
                 }
+                #[cfg(test)]
+                self.spent_message_ids
+                    .push(segment.message_ids.in_use().to_string());
                 Some(segment.message_ids.spend())
             })
             .unwrap_or(false);
-        let Some(work) = moved
-            .then(|| self.download_retry_work(segment_id, 0, Vec::new()))
+        moved
+            .then(|| self.download_retry_work(segment_id, 0, weaver_nntp::ServerSet::EMPTY))
             .flatten()
-        else {
-            return false;
-        };
-        self.enqueue_download_work(work);
-        self.update_queue_metrics();
-        true
     }
 
     // Whether the NZB gave `segment_id`'s part an id behind the one in use.
@@ -252,7 +263,7 @@ impl Pipeline {
         &self,
         segment_id: SegmentId,
         retry_count: u32,
-        exclude_servers: Vec<usize>,
+        exclude_servers: weaver_nntp::ServerSet,
     ) -> Option<DownloadWork> {
         let job_id = segment_id.file_id.job_id;
         let file_idx = segment_id.file_id.file_index as usize;
@@ -281,7 +292,7 @@ impl Pipeline {
         &mut self,
         segment_id: SegmentId,
         retry_count: u32,
-        exclude_servers: Vec<usize>,
+        exclude_servers: weaver_nntp::ServerSet,
         delay: Option<Duration>,
         failure_kind: DownloadFailureKind,
     ) -> bool {
@@ -307,7 +318,7 @@ impl Pipeline {
         runtime: std::sync::Arc<crate::proxies::ProxyRuntime>,
         nntp: std::sync::Arc<weaver_nntp::NntpClient>,
         rejection: weaver_nntp::transfer::QuotaRejection,
-        excludes: Vec<usize>,
+        excludes: weaver_nntp::ServerSet,
     ) {
         loop {
             // A shared capacity revision can come from an unrelated transfer.
@@ -323,7 +334,7 @@ impl Pipeline {
                 return;
             }
             let selection = nntp
-                .body_server_selection_with_estimate(&excludes, rejection.requested_body_bytes)
+                .body_server_selection_with_estimate(excludes, rejection.requested_body_bytes)
                 .await;
             if selection.eligible.iter().any(|server| {
                 nntp.pool().stable_server_id(*server).is_none_or(|stable| {
@@ -344,7 +355,7 @@ impl Pipeline {
         &mut self,
         segment_id: SegmentId,
         retry_count: u32,
-        exclude_servers: Vec<usize>,
+        exclude_servers: weaver_nntp::ServerSet,
         delay: Option<Duration>,
         wake_on_server_policy_change: bool,
         quota_rejection: Option<weaver_nntp::transfer::QuotaRejection>,
@@ -381,7 +392,7 @@ impl Pipeline {
                     rejection,
                     runtime,
                     self.nntp.clone(),
-                    self.effective_exclude_servers(job_id, &work.exclude_servers),
+                    self.effective_exclude_servers(job_id, work.exclude_servers),
                 )
             });
         let mut delay = if rejection_is_current || egress_wait.is_some() {
@@ -647,10 +658,25 @@ impl Pipeline {
         }
 
         if result.runtime_generation != self.pool_generation && result.data.is_err() {
+            // The servers the article was tried on, carried into the pool as
+            // it is now laid out; a 430 from the server that answered counts
+            // as tried too, when that server is still in the pool.
+            let generation = result.runtime_generation;
+            let mut tried = self.pool_layouts.set(generation, result.exclude_servers);
+            if matches!(
+                &result.data,
+                Err(DownloadError::Fetch(failure))
+                    if failure.kind == DownloadFailureKind::ArticleNotFound
+            ) && let Some(source) = result
+                .source_server_idx
+                .and_then(|source| self.pool_layouts.index(generation, source))
+            {
+                tried.insert(source);
+            }
             let restored = self.restore_download_result_work_without_retry(
                 result.segment_id,
                 result.retry_count,
-                Vec::new(),
+                tried,
             );
             self.metrics
                 .nntp_generation_recovery_requeues
@@ -800,8 +826,11 @@ impl Pipeline {
                 self.pending_decode.push_back(PendingDecodeWork {
                     segment_id: result.segment_id,
                     raw,
-                    source_server_idx,
-                    exclude_servers: excluded_servers,
+                    servers: PoolServers::stamped(
+                        result.runtime_generation,
+                        source_server_idx,
+                        excluded_servers,
+                    ),
                 });
                 self.pump_decode_queue();
             }
@@ -836,8 +865,11 @@ impl Pipeline {
                 self.handle_decode_success(
                     decoded,
                     SegmentSource {
-                        source_server_idx,
-                        exclude_servers: excluded_servers,
+                        servers: PoolServers::stamped(
+                            result.runtime_generation,
+                            source_server_idx,
+                            excluded_servers,
+                        ),
                     },
                 )
                 .await;
@@ -861,8 +893,11 @@ impl Pipeline {
                 self.handle_decode_failure(
                     result.segment_id,
                     &error,
-                    &excluded_servers,
-                    source_server_idx,
+                    PoolServers::stamped(
+                        result.runtime_generation,
+                        source_server_idx,
+                        excluded_servers,
+                    ),
                 );
             }
             Err(DownloadError::Local { raw_size, error }) => {
@@ -923,11 +958,11 @@ impl Pipeline {
                         && let Some(rejection) = quota_rejection.as_ref()
                     {
                         let effective_excludes =
-                            self.effective_exclude_servers(job_id, &excluded_servers);
+                            self.effective_exclude_servers(job_id, excluded_servers);
                         let mut selection = self
                             .nntp
                             .body_server_selection_with_estimate(
-                                &effective_excludes,
+                                effective_excludes,
                                 rejection.requested_body_bytes,
                             )
                             .await;
@@ -993,7 +1028,7 @@ impl Pipeline {
                         && self.schedule_download_work_without_retry_budget(
                             result.segment_id,
                             result.retry_count,
-                            excluded_servers.clone(),
+                            excluded_servers,
                             Some(Duration::ZERO),
                             false,
                             None,
@@ -1048,11 +1083,11 @@ impl Pipeline {
                     let retention_excludes = self.job_retention_excludes(job_id);
                     let unavailable_server_count = Self::unavailable_server_count_from_excludes(
                         self.nntp.pool(),
-                        &excluded_servers,
-                        &retention_excludes,
+                        excluded_servers,
+                        retention_excludes,
                     );
                     if server_count > 0 && unavailable_server_count >= server_count {
-                        self.book_unservable_segment(result.segment_id, &excluded_servers);
+                        self.book_unservable_segment(result.segment_id, excluded_servers);
                         self.maybe_finish_download_pass(job_id);
                         return;
                     }
@@ -1063,7 +1098,7 @@ impl Pipeline {
                     // auth-disable cycles otherwise stalls the queue silently.
                     let availability = self
                         .nntp
-                        .body_server_availability(&excluded_servers, &retention_excludes, 0)
+                        .body_server_availability(excluded_servers, retention_excludes, 0)
                         .await;
                     let retry_delay = match availability {
                         weaver_nntp::pool::BodyServerAvailability::Eligible => {
@@ -1226,10 +1261,10 @@ impl Pipeline {
                 // backfill tier to an article no fill server has missed.
                 let retry_exclude_servers = match failure.kind {
                     DownloadFailureKind::ArticleNotFound => Self::decode_retry_exclude_servers(
-                        &excluded_servers,
+                        excluded_servers,
                         article_not_found_server_idx,
                     ),
-                    _ => excluded_servers.clone(),
+                    _ => excluded_servers,
                 };
                 // A 430 from a server the article already excluded taught
                 // the retry nothing: the next attempt re-enters selection
@@ -1252,7 +1287,7 @@ impl Pipeline {
                             // Retention-excluded servers can never 430; they
                             // count as unavailable or exhaustion could not
                             // complete while one is configured.
-                            self.unavailable_server_count(job_id, &retry_exclude_servers)
+                            self.unavailable_server_count(job_id, retry_exclude_servers)
                                 >= server_count
                         }
                     });
@@ -1264,7 +1299,7 @@ impl Pipeline {
                 // No server left that may serve it once the refusal is
                 // counted: a verdict, booked now, not a retry to wait on.
                 let credentials_exhausted = failure.kind == DownloadFailureKind::Auth
-                    && self.no_server_can_serve(job_id, &retry_exclude_servers);
+                    && self.no_server_can_serve(job_id, retry_exclude_servers);
 
                 // Transport rotation: point the retry away from the server
                 // whose established connection just failed, when an
@@ -1292,8 +1327,8 @@ impl Pipeline {
                         backfill.iter().enumerate().any(|(other, is_backfill)| {
                             other != idx
                                 && !is_backfill
-                                && !retry_exclude_servers.contains(&other)
-                                && !retention_excludes.contains(&other)
+                                && !retry_exclude_servers.contains(other)
+                                && !retention_excludes.contains(other)
                         });
                     (idx < backfill.len() && other_fill_available).then_some(idx)
                 } else {
@@ -1311,11 +1346,11 @@ impl Pipeline {
                             segment_id: result.segment_id,
                         });
                         if self.book_failed_segment(result.segment_id) {
-                            self.note_gap_servers_support_fact(job_id, &retry_exclude_servers);
+                            self.note_gap_servers_support_fact(job_id, retry_exclude_servers);
                         }
                     }
                 } else if credentials_exhausted {
-                    self.book_unservable_segment(result.segment_id, &retry_exclude_servers);
+                    self.book_unservable_segment(result.segment_id, retry_exclude_servers);
                     // The refusal holds for the job's queued articles too:
                     // every one only refusing servers could serve is booked
                     // in this pass, not leased one batch at a time to be
@@ -1336,7 +1371,7 @@ impl Pipeline {
                                 > streak.downloaded_at_start
                     });
                     let preserves_retry_budget =
-                        failure.kind.preserves_article_retry_budget() && !article_local_transport;
+                        failure.preserves_article_retry_budget() && !article_local_transport;
                     let infrastructure_retry = failure.kind.infrastructure_wait_reason().is_some();
                     let next_retry = if preserves_retry_budget || source_not_found {
                         result.retry_count
@@ -1363,7 +1398,7 @@ impl Pipeline {
                         {
                             self.note_gap_servers_support_fact(
                                 job_id,
-                                source_server_idx.as_slice(),
+                                source_server_idx.into_iter().collect(),
                             );
                         }
                     } else if let Some(state) = self.jobs.get(&job_id) {
@@ -1386,7 +1421,7 @@ impl Pipeline {
                                 retry_count: next_retry,
                                 is_recovery: file_spec.role.is_recovery(),
                                 completion_critical,
-                                exclude_servers: retry_exclude_servers.clone(),
+                                exclude_servers: retry_exclude_servers,
                                 avoid_server,
                             };
                             self.metrics
@@ -1440,6 +1475,14 @@ impl Pipeline {
                             };
                             if infrastructure_retry {
                                 self.schedule_infrastructure_retry(Some(delay), retry);
+                            } else if delay.is_zero() {
+                                // A server without the article says nothing
+                                // about the others: the article is theirs to
+                                // ask at once. Sent round the retry channel it
+                                // would wait for a turn with no results to
+                                // handle, which a busy link never has.
+                                self.receive_retry_work(retry);
+                                self.report_job_soon(job_id);
                             } else {
                                 let retry_tx = self.retry_tx.clone();
                                 tokio::spawn(async move {

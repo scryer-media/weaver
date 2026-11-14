@@ -355,8 +355,8 @@ pub struct PipelineMetrics {
 
     // Queue depths
     pub download_queue_depth: AtomicUsize,
-    pub active_downloads: AtomicUsize,
-    // Woken when `active_downloads` is published at zero after being above it.
+    pub articles_in_flight: AtomicUsize,
+    // Woken when `articles_in_flight` is published at zero after being above it.
     pub downloads_drained: tokio::sync::Notify,
     pub active_decodes: AtomicUsize,
     // Raw article bodies waiting for decode scheduling.
@@ -447,6 +447,10 @@ pub struct PipelineMetrics {
     pub segments_downloaded: AtomicU64,
     pub segments_decoded: AtomicU64,
     pub segments_committed: AtomicU64,
+    // Articles booked missing: every server that could answer was asked and
+    // none had it. One per article, never one per server asked; a single
+    // server's "no such article" answer is `download_failures_article_not_found`
+    // and that server's `not_found` attempt count.
     pub articles_not_found: AtomicU64,
     // Articles booked missing because a 430 taught the retry nothing: the
     // exclusion set came back the same size it went out. Every increment is
@@ -550,8 +554,8 @@ impl PipelineMetrics {
     }
 
     // Publish the in-flight article count; waiters on a drain wake at zero.
-    pub fn set_active_downloads(&self, active: usize) {
-        let previous = self.active_downloads.swap(active, Ordering::AcqRel);
+    pub fn set_articles_in_flight(&self, active: usize) {
+        let previous = self.articles_in_flight.swap(active, Ordering::AcqRel);
         if active == 0 && previous != 0 {
             self.downloads_drained.notify_waiters();
         }
@@ -563,7 +567,7 @@ impl PipelineMetrics {
             let drained = self.downloads_drained.notified();
             tokio::pin!(drained);
             drained.as_mut().enable();
-            if self.active_downloads.load(Ordering::Acquire) == 0 {
+            if self.articles_in_flight.load(Ordering::Acquire) == 0 {
                 return;
             }
             drained.await;
@@ -576,7 +580,7 @@ impl PipelineMetrics {
             bytes_decoded: AtomicU64::new(0),
             bytes_committed: AtomicU64::new(0),
             download_queue_depth: AtomicUsize::new(0),
-            active_downloads: AtomicUsize::new(0),
+            articles_in_flight: AtomicUsize::new(0),
             downloads_drained: tokio::sync::Notify::new(),
             active_decodes: AtomicUsize::new(0),
             decode_pending: AtomicUsize::new(0),
@@ -749,7 +753,7 @@ impl PipelineMetrics {
             bytes_decoded,
             bytes_committed: self.bytes_committed.load(Ordering::Relaxed),
             download_queue_depth: self.download_queue_depth.load(Ordering::Relaxed),
-            active_downloads: self.active_downloads.load(Ordering::Relaxed),
+            articles_in_flight: self.articles_in_flight.load(Ordering::Relaxed),
             active_decodes: self.active_decodes.load(Ordering::Relaxed),
             decode_pending: self.decode_pending.load(Ordering::Relaxed),
             decode_pending_bytes: self.decode_pending_bytes.load(Ordering::Relaxed),
@@ -999,7 +1003,7 @@ pub struct MetricsSnapshot {
     pub bytes_decoded: u64,
     pub bytes_committed: u64,
     pub download_queue_depth: usize,
-    pub active_downloads: usize,
+    pub articles_in_flight: usize,
     pub active_decodes: usize,
     pub decode_pending: usize,
     pub decode_pending_bytes: u64,

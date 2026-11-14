@@ -98,8 +98,9 @@ pub(crate) struct Storage {
     pub(crate) free_disk: CapacityReader,
     pub(crate) slots: usize,
     pub(crate) mail: mpsc::Sender<Said>,
-    // The job's password candidates, in the order they are tried.
-    pub(crate) passwords: Vec<String>,
+    // The job's password candidates, in the order they are tried, each with
+    // where it came from.
+    pub(crate) passwords: Vec<crate::jobs::ArchivePasswordCandidate>,
     // The job's extraction budget.
     pub(crate) caps: Caps,
     // How deep the job's namespaces may nest, the root's being 0.
@@ -164,6 +165,11 @@ pub(crate) struct GraphJob {
     // Where root members were last asked whether the sets proved them;
     // `None` before the first.
     sealed_at: Option<repair::Sealed>,
+    // Counts the mutable borrows of this job: nothing of it changes without
+    // one, so what was derived from it at a count holds while the count does.
+    moved: u64,
+    // The recovery indexes still to come as of a count.
+    indexes_kept: Option<(u64, Option<Arc<[u32]>>)>,
 }
 
 // Something a step of the job did that the job's events say.
@@ -212,7 +218,7 @@ impl GraphJob {
             runs,
             storage.nesting,
         )
-        .offering(storage.passwords)
+        .offering_candidates(storage.passwords)
     }
 
     pub(crate) fn new(
@@ -267,7 +273,46 @@ impl GraphJob {
             notes: Vec::new(),
             fed: runs::Fed::default(),
             sealed_at: None,
+            moved: 0,
+            indexes_kept: None,
         }
+    }
+
+    // The job is about to be borrowed mutably: what was derived from it no
+    // longer holds unasked.
+    pub(crate) fn touched(&mut self) {
+        self.moved = self.moved.wrapping_add(1);
+    }
+
+    // [`Self::indexes_to_come`] by posted file number, as one shared list
+    // for as long as the job was not borrowed mutably. A borrow that left
+    // the answer as it was keeps the list it had, so its holders still
+    // match by pointer. The spec's declared roles do not change after the
+    // job is built, so `declared` is read only when the list is made again;
+    // a debug build makes it again on every ask and checks the kept one.
+    pub(crate) fn indexes_to_come_kept(
+        &mut self,
+        declared: impl IntoIterator<Item = (MemberId, super::metadata::RecoveryFormat)>,
+    ) -> Option<Arc<[u32]>> {
+        let numbered =
+            |held: Vec<MemberId>| -> Vec<u32> { held.into_iter().map(|member| member.0).collect() };
+        if let Some((at, kept)) = &self.indexes_kept
+            && *at == self.moved
+        {
+            debug_assert_eq!(
+                self.indexes_to_come(declared).map(numbered).as_deref(),
+                kept.as_deref(),
+                "the recovery indexes to come changed without a mutable borrow of the job"
+            );
+            return kept.clone();
+        }
+        let now = self.indexes_to_come(declared).map(numbered);
+        let kept = match (self.indexes_kept.take(), now) {
+            (Some((_, Some(kept))), Some(now)) if *kept == *now => Some(kept),
+            (_, now) => now.map(Arc::from),
+        };
+        self.indexes_kept = Some((self.moved, kept.clone()));
+        kept
     }
 
     // What the job did since this was last asked.
@@ -288,8 +333,19 @@ impl GraphJob {
     }
 
     // The candidates offered to an object that asks for a password.
+    #[cfg(test)]
     pub(crate) fn offering(mut self, candidates: Vec<String>) -> Self {
         self.passwords = Passwords::new(candidates);
+        self
+    }
+
+    // The candidates offered to an object that asks for a password, each
+    // with its source, which the download summary reads back.
+    pub(crate) fn offering_candidates(
+        mut self,
+        candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
+    ) -> Self {
+        self.passwords = Passwords::from_candidates(candidates);
         self
     }
 
@@ -329,7 +385,7 @@ impl GraphJob {
     }
 
     #[cfg(test)]
-    pub(crate) fn held_loans(&mut self) -> Vec<(NodeId, u64, Box<dyn weaver_graph::Object>)> {
+    pub(crate) fn held_loans(&mut self) -> Vec<works::HeldLoan> {
         self.works.take_held()
     }
 
@@ -338,14 +394,14 @@ impl GraphJob {
     #[cfg(test)]
     pub(crate) fn return_loan(
         &mut self,
-        (node, serial, mut object): (NodeId, u64, Box<dyn weaver_graph::Object>),
+        (node, serial, mut object, stop): works::HeldLoan,
         slots: &mut RepairSlots,
         limit: usize,
     ) -> Result<(), GraphError> {
         let mut said = Vec::new();
         {
             let _decoding = self.works.decoding();
-            object.work(&mut said);
+            object.work_until(&stop, &mut said);
         }
         let said = super::engine::Said {
             scope: self.works.scope(),
@@ -445,6 +501,7 @@ impl GraphJob {
     pub(in crate::pipeline) fn request_stop(&self) {
         self.runs.request_stop();
         self.loans.request_stop();
+        self.works.request_stop();
     }
 
     // The pipeline is going down. Every run stops where it stands and keeps
@@ -861,12 +918,8 @@ impl GraphJob {
         }
         for (volume, ordinal) in under {
             self.unarrive(volume, ordinal, limit)?;
-            if let Some(found) = self
-                .tree
-                .namespace_mut(NodeId::ROOT)
-                .and_then(|namespace| namespace.get_mut(MemberId(volume.0)))
-            {
-                found.closed = false;
+            if let Some(namespace) = self.tree.namespace_mut(NodeId::ROOT) {
+                namespace.reopen(MemberId(volume.0));
             }
             self.notes.push(Note::Unread(volume, ordinal));
         }
@@ -885,6 +938,12 @@ impl GraphJob {
     // Whether the root holds the article or has ruled it lost.
     pub(crate) fn article_settled(&self, volume: VolumeIndex, ordinal: u32) -> bool {
         self.root.map.article_settled(volume, ordinal)
+    }
+
+    // The volumes whose first article began or stopped being waited on
+    // since the last call; `None` on the first, when every one counts.
+    pub(crate) fn take_first_changes(&mut self) -> Option<std::collections::BTreeSet<VolumeIndex>> {
+        self.root.map.take_first_changes()
     }
 
     // Every article the root holds lost, with its declared encoded size.
@@ -919,6 +978,36 @@ impl GraphJob {
     // it was turned away, by this job or another.
     pub(crate) fn memory_freed(&self) -> bool {
         self.runs.wakeable()
+    }
+
+    // Whether the job waits for room on a disk, and its place among the
+    // jobs that wait.
+    pub(crate) fn disk_held(&self) -> bool {
+        self.writer.disk_held()
+    }
+
+    pub(crate) fn disk_ticket(&self) -> Option<u64> {
+        self.writer.disk_ticket()
+    }
+
+    // A reading came: whether the job has room again. If it has, what it
+    // owes is promised again, and the runs parked for room, queued again,
+    // start on the next step. A job that waits idle wakes whatever the
+    // disk reads.
+    pub(crate) fn wake_disk(&mut self) -> bool {
+        if self.disk_idle() {
+            return self.writer.wake_idle();
+        }
+        self.writer.wake_disk()
+    }
+
+    // Whether the job waits for room though nothing of it would take any:
+    // it owes nothing, has nothing to write again, and no run of it is
+    // running or waits to. Its last write crossed the reserve and closed,
+    // and it wakes on the next turn. A run still live could write again,
+    // and keeps the job waiting for a reading with room.
+    pub(crate) fn disk_idle(&self) -> bool {
+        self.writer.disk_held() && self.writer.owes_nothing() && !self.runs.live()
     }
 
     // `limit` is the slot limit the pipeline reads now, which every step

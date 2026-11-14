@@ -212,6 +212,102 @@ type ApplicationUpgradeStatus {
 	latestRun: ApplicationUpgradeRunPayload
 }
 
+"""
+What an archive request answered for one id, before any disk work.
+"""
+enum ArchiveHistoryAcceptOutcome {
+	"""
+	Queued: the entry is archived in the background.
+	"""
+	ACCEPTED
+	"""
+	There is no history entry and no job with this id.
+	"""
+	NOT_FOUND
+	"""
+	Another history operation holds the entry, or the job is in the
+	queue again.
+	"""
+	BUSY
+	"""
+	The job is in the queue and has not finished.
+	"""
+	NOT_FINISHED
+	"""
+	The entry is already archived.
+	"""
+	ALREADY_ARCHIVED
+}
+
+"""
+One id's answer to an archive request.
+"""
+type ArchiveHistoryAcceptResult {
+	id: Int!
+	outcome: ArchiveHistoryAcceptOutcome!
+}
+
+"""
+The answer to an archive request. The accepted ids are archived in the
+background; each entry then shows `archivedAt` once its files are gone,
+or a failed `deleteOperation` with `action: ARCHIVE`.
+"""
+type ArchiveHistoryAcceptance {
+	"""
+	The operation holding the accepted ids; null when none was accepted.
+	"""
+	operationId: Int
+	acceptedIds: [Int!]!
+	totalTargets: Int!
+	"""
+	One result per distinct id, in the order given.
+	"""
+	results: [ArchiveHistoryAcceptResult!]!
+}
+
+"""
+What archiving one history entry did. The entry stays either way.
+"""
+enum ArchiveHistoryOutcome {
+	"""
+	Archived: the folders Weaver manages were removed.
+	"""
+	ARCHIVED
+	"""
+	Archived with nothing on disk to remove, or already archived.
+	"""
+	ALREADY_GONE
+	"""
+	A folder of the job is not one Weaver manages and was left as it is.
+	"""
+	NOT_MANAGED
+	"""
+	The job is in the queue or another history operation holds it.
+	"""
+	BUSY
+	"""
+	There is no history entry with this id.
+	"""
+	NOT_FOUND
+	"""
+	Archiving stopped on an error. Nothing is stamped and a retry is safe.
+	"""
+	FAILED
+}
+
+"""
+Where the password that opened an archive came from. Never the password.
+"""
+enum ArchivePasswordOrigin {
+	EXPLICIT
+	INTEGRATION
+	DNZB_HEADER
+	NZB_META
+	FILENAME_CONVENTION
+	SETTINGS
+	PASSWORD_FILE
+}
+
 type ArchivePasswordSettings {
 	hasPasswords: Boolean!
 	passwordFile: String
@@ -489,6 +585,62 @@ enum DownloadBlockKindGql {
 	SERVER_QUOTA
 }
 
+enum DownloadLayout {
+	"""
+	Plain files only.
+	"""
+	PLAIN
+	"""
+	Every payload file is part of an archive.
+	"""
+	ARCHIVE
+	"""
+	Archives and plain files side by side.
+	"""
+	MIXED
+}
+
+type DownloadNode {
+	id: Int!
+	"""
+	Null for an archive inside the post itself.
+	"""
+	parentId: Int
+	"""
+	The container's kind, such as `rar_store` or `sevenz_engine`.
+	"""
+	kind: String!
+	name: String
+	volumes: Int!
+	depth: Int!
+	"""
+	Read once its volumes were on disk, rather than as they arrived.
+	"""
+	extracted: Boolean!
+	givenUp: Boolean!
+	"""
+	Why it gave up, such as `encrypted` or `compressed`.
+	"""
+	reason: String
+	encrypted: Boolean!
+	encryptedHeaders: Boolean!
+	passwordNeeded: Boolean!
+	passwordOrigin: ArchivePasswordOrigin
+}
+
+type DownloadPost {
+	files: Int!
+	articles: Int!
+	missingArticles: Int!
+	failedArticles: Int!
+	"""
+	The oldest file date in the NZB, in epoch seconds.
+	"""
+	oldestPost: Int
+	newestPost: Int
+	groups: Int!
+}
+
 enum DownloadPressureReasonGql {
 	NONE
 	DECODE
@@ -517,6 +669,53 @@ type DownloadQuotaUsage {
 	windowStartsAtEpochMs: Float
 	windowEndsAtEpochMs: Float
 	timezoneName: String!
+}
+
+type DownloadRecovery {
+	nodeId: Int!
+	"""
+	`par2`, `par3`, `sfv`, `rar_recovery` or `rar_record`.
+	"""
+	kind: String!
+	"""
+	`clean`, `repaired`, `impossible`, `waiting` or `unread`.
+	"""
+	outcome: String
+	sets: [DownloadRecoverySet!]!
+	setCount: Int!
+}
+
+type DownloadRecoverySet {
+	blocksReachable: Int!
+	damagedSlices: Int!
+	outcome: String
+	slicesRepaired: Int!
+	readBack: Boolean!
+}
+
+"""
+How a finished job's download went. Built once as the job finished.
+"""
+type DownloadSummary {
+	"""
+	Null when the archive graph did not run for the job.
+	"""
+	layout: DownloadLayout
+	"""
+	The first archive nodes, breadth first from the post: at most 200.
+	"""
+	nodes: [DownloadNode!]!
+	"""
+	Every archive node the job had, however many `nodes` holds.
+	"""
+	nodeCount: Int!
+	"""
+	The deepest an archive sat: 1 for one inside the post.
+	"""
+	maxDepth: Int!
+	recovery: [DownloadRecovery!]!
+	recoveryCount: Int!
+	post: DownloadPost!
 }
 
 enum DuplicateActionGql {
@@ -767,6 +966,11 @@ type GeneralSettings {
 	completeDir: String!
 	cleanupAfterExtract: Boolean!
 	deleteFailedJobFiles: Boolean!
+	"""
+	Days a history entry is kept after its job finished; 0 keeps history
+	forever.
+	"""
+	historyRetentionDays: Int!
 	maxDownloadSpeed: Int!
 	maxRetries: Int!
 	propagationDelaySecs: Int!
@@ -781,6 +985,10 @@ input GeneralSettingsInput {
 	completeDir: String
 	cleanupAfterExtract: Boolean
 	deleteFailedJobFiles: Boolean
+	"""
+	Days a history entry is kept, from 0 (forever) to 36500.
+	"""
+	historyRetentionDays: Int
 	maxDownloadSpeed: Int
 	maxRetries: Int
 	propagationDelaySecs: Int
@@ -928,12 +1136,23 @@ enum HistoryDeleteOperationState {
 	COMPLETED_WITH_ERRORS
 }
 
+"""
+The history operation an entry is waiting on, or the last one that
+failed for it. An archive that succeeded shows here no more; the
+entry's `archivedAt` says so instead.
+"""
 type HistoryDeleteRowState {
 	operationId: Int!
 	state: HistoryDeleteRowStateKind!
 	locked: Boolean!
+	action: HistoryOperationAction!
 	deleteFiles: Boolean!
 	errorMessage: String
+	"""
+	How a failed archive ended; null for a delete, and while the
+	archive waits or runs.
+	"""
+	archiveOutcome: ArchiveHistoryOutcome
 }
 
 enum HistoryDeleteRowStateKind {
@@ -969,6 +1188,11 @@ type HistoryItem {
 	deleteOperation: HistoryDeleteRowState
 	duplicateSummary: DuplicateSummaryInfo
 	"""
+	When the entry was archived: its files removed and the entry kept.
+	Null while it is not archived.
+	"""
+	archivedAt: DateTime
+	"""
 	The files Weaver gave a name other than their full one, each with its
 	full name. Empty when every file carries its full name.
 	"""
@@ -978,6 +1202,20 @@ type HistoryItem {
 	profile's ceiling, so `reprocessJob(noMemoryLimit: true)` may finish it.
 	"""
 	failedForMemory: Boolean!
+}
+
+"""
+What a history operation does with its entries.
+"""
+enum HistoryOperationAction {
+	"""
+	Deletes the entry, with or without its files.
+	"""
+	DELETE
+	"""
+	Archives the entry: removes its files and keeps the entry.
+	"""
+	ARCHIVE
 }
 
 type HistoryPage {
@@ -1140,6 +1378,9 @@ type JobDetailSnapshot {
 	queueItem: QueueItem
 	historyItem: HistoryItem
 	jobTimeline: JobTimeline
+	"""
+	The job's newest events, oldest first: at most 100.
+	"""
 	jobEvents: [JobEvent!]!
 	"""
 	Which servers served this job's articles, highest count first.
@@ -1150,6 +1391,16 @@ type JobDetailSnapshot {
 	that finished before the counters existed.
 	"""
 	serverAttribution: [JobServerContribution!]!
+	"""
+	How many events the job has in all, however many `jobEvents` holds.
+	"""
+	jobEventCount: Int!
+	"""
+	How the download went: its archive tree, recovery and post. Null
+	while the job is queued, and for an entry that finished before
+	Weaver kept it.
+	"""
+	downloadSummary: DownloadSummary
 }
 
 """
@@ -1170,6 +1421,10 @@ type JobEvent {
 	fileId: String
 	message: String!
 	timestamp: Float!
+	"""
+	Pass as `jobEvents(before:)` to read the events older than this one.
+	"""
+	cursor: String
 }
 
 type JobOutputFile {
@@ -1178,10 +1433,32 @@ type JobOutputFile {
 	sizeBytes: Int!
 }
 
+"""
+One page of a job's output files, and the totals of all of them.
+"""
 type JobOutputResult {
 	outputDir: String!
-	files: [JobOutputFile!]!
+	"""
+	The bytes of every file, not only of this page.
+	"""
 	totalBytes: Int!
+	"""
+	How many files there are in all.
+	"""
+	totalCount: Int!
+	"""
+	True when the entry was archived and this is the record kept of its
+	files.
+	"""
+	archived: Boolean!
+	"""
+	The `after` that asks for the next page; null on the last page.
+	"""
+	nextCursor: String
+	"""
+	This page of the files, in file name order.
+	"""
+	files: [JobOutputFile!]!
 }
 
 """
@@ -1421,8 +1698,17 @@ type Metrics {
 	bytesDownloaded: Int!
 	bytesDecoded: Int!
 	bytesCommitted: Int!
+	"""
+	Articles still to fetch across every queued job, recovery articles
+	and jobs outside the queue window included; not connections or jobs.
+	"""
 	downloadQueueDepth: Int!
-	activeDownloads: Int!
+	"""
+	Articles the download lanes hold right now: sent or about to be sent
+	to a server and not yet answered. Roughly busy connections times
+	pipeline depth. Not the number of jobs or files downloading.
+	"""
+	articlesInFlight: Int!
 	activeDecodes: Int!
 	decodePending: Int!
 	decodePendingBytes: Int!
@@ -1467,6 +1753,11 @@ type Metrics {
 	segmentsDownloaded: Int!
 	segmentsDecoded: Int!
 	segmentsCommitted: Int!
+	"""
+	Articles booked missing: every server and every message id was tried
+	and none had it. Per-server refusals are in
+	`downloadFailuresArticleNotFound`.
+	"""
 	articlesNotFound: Int!
 	decodeErrors: Int!
 	verifyActive: Int!
@@ -1474,7 +1765,15 @@ type Metrics {
 	extractActive: Int!
 	diskWriteLatencyUs: Int!
 	segmentsRetried: Int!
+	"""
+	Articles that downloaded but never decoded into place and were left
+	to repair; articles no server had are in `articlesNotFound`.
+	"""
 	segmentsFailedPermanent: Int!
+	"""
+	Article fetches a server answered as not found, one per server asked;
+	an article another server then delivers still counts here.
+	"""
 	downloadFailuresArticleNotFound: Int!
 	downloadFailuresCapacityUnavailable: Int!
 	downloadFailuresTransient: Int!
@@ -1482,6 +1781,10 @@ type Metrics {
 	downloadFailuresPermanent: Int!
 	currentDownloadSpeed: Int!
 	crcErrors: Int!
+	"""
+	Recovery articles still to fetch across the jobs in the queue window;
+	part of `downloadQueueDepth`.
+	"""
 	recoveryQueueDepth: Int!
 	articlesPerSec: Float!
 	decodeRateMbps: Float!
@@ -1733,6 +2036,15 @@ type MutationRoot {
 	Returns the remaining history jobs after deletion.
 	"""
 	deleteHistoryBatch(ids: [Int!]!, deleteFiles: Boolean! = false): [HistoryItem!]!
+	"""
+	Archive up to 100 history entries: remove their files and keep the
+	entries and their stored NZBs. Only folders Weaver manages are
+	removed. The request only queues the work and answers one result per
+	distinct id, in the order given; the files go in the background. Each
+	accepted entry then shows `archivedAt`, or a failed `deleteOperation`
+	with `action: ARCHIVE`, its `archiveOutcome` and message.
+	"""
+	archiveHistory(ids: [Int!]!): ArchiveHistoryAcceptance!
 	"""
 	Delete all completed/failed/cancelled jobs from history.
 	Integration (control) scope may also delete completed output with `deleteFiles: true`.
@@ -2512,8 +2824,16 @@ type QueryRoot {
 	"""
 	Get the event log for a specific job.
 	"""
-	jobEvents(jobId: Int!, limit: Int, offset: Int): [JobEvent!]!
-	validatedArchivePassword(id: Int!): String
+	jobEvents(		jobId: Int!,
+		"""
+		Events per page: 2000 when absent, at most 2000.
+		"""
+		limit: Int,		offset: Int,
+		"""
+		An event's `cursor`: read only events older than it, so a page holds while new events arrive.
+		"""
+		before: String
+	): [JobEvent!]!
 	"""
 	A report on a queued or finished job's NZB and how the job went, with
 	every name, path, host and password left out so it can be shared.
@@ -2566,9 +2886,20 @@ type QueryRoot {
 	"""
 	duplicateSnapshot(id: Int!): DuplicateIdentitySnapshotInfo
 	"""
-	List files in a completed job's output directory.
+	List one page of the files in a job's output directory, in file name
+	order, with the totals of all of them. Once the entry was archived,
+	the list is the record kept of its files and `archived` is true.
 	"""
-	jobOutputFiles(jobId: Int!): JobOutputResult
+	jobOutputFiles(		jobId: Int!,
+		"""
+		Files per page: 100 when absent, at most 1000.
+		"""
+		first: Int,
+		"""
+		The `nextCursor` of the page before.
+		"""
+		after: String
+	): JobOutputResult
 	postProcessingSettings: PostProcessingSettingsGql!
 	"""
 	Every saved script job, in run order.
@@ -3082,6 +3413,7 @@ enum QueueWaitReason {
 	REPAIR_CAPACITY
 	EXTRACTION_CAPACITY
 	POST_PROCESSING_CAPACITY
+	DISK_SPACE
 }
 
 enum ResolvedBy {
@@ -4133,7 +4465,8 @@ type ServerHealth {
 	"""
 	label: String!
 	"""
-	"PRIMARY" for the highest-priority server, "BACKUP" otherwise.
+	"PRIMARY" for every fill server on the top priority level, "BACKUP"
+	for every other server (lower levels and backfill servers).
 	"""
 	tier: String!
 	"""
@@ -4184,9 +4517,16 @@ type ServerHealth {
 	"""
 	runtimeGeneration: Int!
 	"""
-	EWMA request latency in milliseconds.
+	EWMA request latency in milliseconds. Reads 50.0, the figure server
+	ranking starts from, until a first request has been timed; use
+	`measuredLatencyMs` to tell a measurement from that start value.
 	"""
 	latencyMs: Float!
+	"""
+	EWMA request latency in milliseconds, absent until a first request
+	to this server has been timed.
+	"""
+	measuredLatencyMs: Float
 	"""
 	EWMA command-to-status-line wait for BODY fetches, in milliseconds.
 	Absent until the download lanes have taken an unbiased sample.
@@ -4202,21 +4542,44 @@ type ServerHealth {
 	"""
 	bodyLatencyBand: String
 	"""
-	BODY pipelining depth the lanes currently run at; 1 is sequential.
+	BODY pipelining depth the lanes currently run at; 1 is sequential,
+	and a server pinned sequential always reads 1.
 	"""
 	bodyPipelineDepth: Int!
 	"""
 	Set once the server has twice failed to answer a pipelined batch
-	cleanly, which holds it sequential for the rest of the process.
+	cleanly, which holds it sequential until Weaver restarts. A reorder
+	or a priority change keeps the hold; a change of host, port or
+	username starts the server afresh.
 	"""
 	bodyPipeliningPinnedSequential: Boolean!
+	"""
+	Requests the connection answered, whatever the answer: a server
+	that says "no such article" is a working connection and counts here.
+	What it had is in `articlesFound` and `articlesNotFound`.
+	"""
 	successCount: Int!
+	"""
+	Requests the connection failed: refused, timed out, dropped or
+	answered out of protocol. A "no such article" answer is not one.
+	"""
 	failureCount: Int!
 	consecutiveFailures: Int!
 	"""
 	Connections that died before reaching a healthy age, recently.
 	"""
 	prematureDeaths: Int!
+	"""
+	Article requests this server answered with the article, counted
+	since Weaver last started. The count starts again at every start.
+	"""
+	articlesFound: Int!
+	"""
+	Article requests this server answered "no such article", counted
+	since Weaver last started; the article may still have come from
+	another server. The count starts again at every start.
+	"""
+	articlesNotFound: Int!
 	legs: [NetworkLegFlow!]!
 	"""
 	The resolved address new connections to this server dial, once an

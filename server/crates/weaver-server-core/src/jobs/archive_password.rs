@@ -2,20 +2,34 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY;
-use crate::persistence::encryption::{decrypt_value, encrypt_value};
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+use crate::persistence::encryption::encrypt_value;
+use crate::persistence::sql_runtime::SqlRuntime;
 use crate::{Database, StateError};
+
+// The metadata of every job, queued or in history, that holds the password
+// an archive opened with. Each predicate is the one a partial index of
+// migration 90 is built on, so the read walks only those jobs, not the whole
+// queue and history.
+pub(crate) const VALIDATED_ARCHIVE_PASSWORD_METADATA_SQL: &str = "SELECT metadata FROM active_jobs WHERE metadata LIKE '%validated_archive_password%' UNION ALL SELECT metadata FROM job_history WHERE metadata LIKE '%validated_archive_password%'";
 
 impl Database {
     pub(crate) fn validated_archive_password_ciphertexts(&self) -> Result<Vec<String>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(datastore.read_exec(),
-                "SELECT metadata FROM active_jobs WHERE metadata LIKE '%validated_archive_password%' UNION ALL SELECT metadata FROM job_history WHERE metadata LIKE '%validated_archive_password%'", &[]).await?;
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                VALIDATED_ARCHIVE_PASSWORD_METADATA_SQL,
+                &[],
+            )
+            .await?;
             let mut values = Vec::new();
             for row in rows {
-                values.extend(crate::parse_history_metadata(row.opt_text("metadata")?.as_deref()).into_iter()
-                    .filter(|(key, _)| key == VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY).map(|(_, value)| value));
+                values.extend(
+                    crate::parse_history_metadata(row.opt_text("metadata")?.as_deref())
+                        .into_iter()
+                        .filter(|(key, _)| key == VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY)
+                        .map(|(_, value)| value),
+                );
             }
             Ok(values)
         })
@@ -34,7 +48,15 @@ impl Database {
             .map_err(|_| StateError::Conflict("could not encrypt archive password".into()))
     }
 
-    pub fn validated_archive_password(&self, job_id: u64) -> Result<Option<String>, StateError> {
+    // The opened password, unsealed. Only tests read it back, to prove it
+    // was sealed; no API serves a job's password.
+    #[cfg(test)]
+    pub(crate) fn validated_archive_password(
+        &self,
+        job_id: u64,
+    ) -> Result<Option<String>, StateError> {
+        use crate::persistence::encryption::decrypt_value;
+        use crate::persistence::sql_runtime::SqlArg;
         let datastore = self.datastore();
         let job_id =
             i64::try_from(job_id).map_err(|_| StateError::Conflict("invalid job id".into()))?;

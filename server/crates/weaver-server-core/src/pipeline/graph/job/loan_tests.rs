@@ -10,7 +10,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
-use weaver_graph::{NodeId, Object};
 
 use super::GraphJob;
 use crate::operations::disk::CapacityReader;
@@ -22,7 +21,7 @@ use crate::pipeline::graph::root::tests::{decoded, file};
 use crate::pipeline::graph::status::RepairSlots;
 use crate::pipeline::tests::engines::loans::{FRAME, Kind, SECRET, body, stored_zip, volumes};
 
-type Loan = (NodeId, u64, Box<dyn Object>);
+type Loan = super::works::HeldLoan;
 
 // The job runs under one slot: under none it lends nothing.
 const LIMIT: usize = 1;
@@ -311,6 +310,42 @@ fn nothing_is_lent_without_a_slot_and_the_due_work_goes_out_once_one_opens() {
     assert!(rig.lent, "the due work went out once a slot opened");
     rig.settle();
     assert!(rig.delivered(), "the member delivered whole");
+}
+
+// A job stopped while a store is out deriving a key sets the word of every
+// loan out. The store, worked under it, begins no key, says nothing, and
+// still holds the work it did not do.
+fn stopped_with_a_loan_out(kind: Kind) {
+    use std::sync::atomic::Ordering;
+    let mut rig = Rig::new(posts(kind, Shape::Flat), &[SECRET], Mode::Held);
+    for article in rig.articles(Serve::InOrder) {
+        rig.intake(article);
+    }
+    assert!(!rig.in_hand.is_empty(), "a loan is out");
+    assert!(
+        rig.in_hand
+            .iter()
+            .all(|(.., stop)| !stop.load(Ordering::Relaxed))
+    );
+    rig.job.request_stop();
+    for (_, _, mut object, stop) in std::mem::take(&mut rig.in_hand) {
+        assert!(stop.load(Ordering::Relaxed), "the loan is stopped");
+        assert!(object.work_due());
+        let mut said = Vec::new();
+        object.work_until(&stop, &mut said);
+        assert!(said.is_empty(), "{said:?}");
+        assert!(object.work_due(), "the key it did not derive stays due");
+    }
+}
+
+#[test]
+fn a_job_stopped_with_a_7z_loan_out_stops_its_key_derivation() {
+    stopped_with_a_loan_out(Kind::SevenZipAes);
+}
+
+#[test]
+fn a_job_stopped_with_a_rar5_loan_out_stops_its_key_derivation() {
+    stopped_with_a_loan_out(Kind::Rar5);
 }
 
 // Where in the served order the bad copy comes.

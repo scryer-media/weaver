@@ -48,8 +48,10 @@ use crate::jobs::model::{FileSpec, JobSpec};
 use crate::pipeline::download::queue::QueuedWork;
 use crate::pipeline::{Pipeline, SegmentTerminalState, health_milli};
 
+mod first_articles;
 mod given_up;
 
+pub(in crate::pipeline) use first_articles::FirstArticles;
 pub(in crate::pipeline) use given_up::GivenUp;
 
 // The fewest files a first-article verdict is worth taking. One article per
@@ -167,7 +169,9 @@ pub(crate) struct ProbeBatch {
     found: Vec<bool>,
     // The servers that have answered for the batch or failed to, each asked
     // once.
-    asked: Vec<usize>,
+    asked: weaver_nntp::ServerSet,
+    // The pool generation `asked` is numbered in.
+    pool_generation: u64,
     // A server could not settle the batch.
     uncertain: bool,
 }
@@ -179,9 +183,30 @@ impl ProbeBatch {
             round,
             found: vec![false; ids.len()],
             ids,
-            asked: Vec::new(),
+            asked: weaver_nntp::ServerSet::EMPTY,
+            pool_generation: 0,
             uncertain: false,
         }
+    }
+
+    // The batch, its servers numbered in pool `generation`.
+    pub(crate) fn in_pool(mut self, generation: u64) -> Self {
+        self.pool_generation = generation;
+        self
+    }
+
+    // Whether whom the batch asked was already numbered in pool
+    // `generation`. A rebuilt pool renumbers its servers, so a batch carried
+    // across the rebuild has whom it asked carried over by server identity:
+    // a server that left the pool, or is no longer the same server, drops
+    // out and is untried. What the batch found is kept.
+    pub(crate) fn rebase(&mut self, layouts: &super::PoolLayouts, generation: u64) -> bool {
+        if self.pool_generation == generation {
+            return true;
+        }
+        self.asked = layouts.set(self.pool_generation, self.asked);
+        self.pool_generation = generation;
+        false
     }
 
     // The articles no server has said it holds yet, in batch order: what the
@@ -196,8 +221,8 @@ impl ProbeBatch {
     }
 
     // The servers this batch has been put to.
-    pub(crate) fn asked(&self) -> &[usize] {
-        &self.asked
+    pub(crate) fn asked(&self) -> weaver_nntp::ServerSet {
+        self.asked
     }
 
     // Whether a server holds every article in the batch.
@@ -210,7 +235,7 @@ impl ProbeBatch {
     // could not settle the batch, or that does not cover it, leaves the batch
     // uncertain.
     pub(crate) fn fold(&mut self, server: usize, result: ProbeBatchResult) {
-        self.asked.push(server);
+        self.asked.insert(server);
         let unfound = self.found.iter().filter(|found| !**found).count();
         if result.inconclusive || result.exists.len() != unfound {
             self.uncertain = true;
@@ -469,6 +494,7 @@ pub(crate) enum Gate {
 // sample that reaches the share with articles outstanding has the verdict
 // the complete sample would have, and one that cannot reach it even were
 // every outstanding article lost has let the post through.
+#[cfg(test)]
 pub(crate) fn first_article_gate(heads: impl IntoIterator<Item = Head>) -> Gate {
     let mut total = 0;
     let mut lost = 0;
@@ -481,6 +507,12 @@ pub(crate) fn first_article_gate(heads: impl IntoIterator<Item = Head>) -> Gate 
             Head::Settled => {}
         }
     }
+    gate_of(total, lost, outstanding)
+}
+
+// The sample's verdict on `total` payload files, `lost` of whose first
+// articles every server failed and `outstanding` of which are still to come.
+pub(crate) fn gate_of(total: usize, lost: usize, outstanding: usize) -> Gate {
     let reaches = |lost: usize| lost * 100 >= total * FIRST_ARTICLE_GATE_MISSING_PCT;
     if total < FIRST_ARTICLE_GATE_MIN_FILES {
         Gate::Open
@@ -585,8 +617,18 @@ impl Pipeline {
     // The first article of each file the post names, its first segment:
     // lost when every server failed it, settled when the root holds it or
     // it ended some other way, and otherwise still to come.
+    #[cfg(test)]
     fn first_article(&self, job_id: JobId, index: u32, file: &FileSpec) -> Head {
-        let Some(first) = file.segments.iter().map(|segment| segment.ordinal).min() else {
+        let first = file.segments.iter().map(|segment| segment.ordinal).min();
+        self.first_article_head(job_id, index, first)
+    }
+
+    // Where the first article of the file at `index` stands, `first` its
+    // ordinal, `None` for a file with no articles.
+    fn first_article_head(&self, job_id: JobId, index: u32, first: Option<u32>) -> Head {
+        #[cfg(test)]
+        HEADS_READ.with(|read| read.set(read.get() + 1));
+        let Some(first) = first else {
             return Head::Settled;
         };
         let segment = SegmentId {
@@ -629,7 +671,101 @@ impl Pipeline {
     // take it there, the post has no verdict yet. Only a post the sample let
     // through is weighed by its health, at the failed bytes it lost or a
     // round projected it will, against its critical line.
-    pub(in crate::pipeline) fn post_health_verdict(&self, job_id: JobId) -> Option<String> {
+    pub(in crate::pipeline) fn post_health_verdict(&mut self, job_id: JobId) -> Option<String> {
+        if self.post_probes.dead.contains_key(&job_id) || !self.jobs.contains_key(&job_id) {
+            return None;
+        }
+        let first_articles = self.read_first_articles(job_id)?;
+        let spec = &self.jobs.get(&job_id)?.spec;
+        let verdict = match first_articles.gate() {
+            Gate::Undecided => None,
+            Gate::Dead { missing, total }
+                if first_articles.weighed().0 > first_articles.weighed().1 =>
+            {
+                Some(Some(first_article_verdict_error(missing, total)))
+            }
+            Gate::Dead { .. } | Gate::Open => {
+                Some(self.health_verdict(job_id, spec, first_articles.declared_recovery()))
+            }
+        };
+        // Kept only beside the graph it was read from: a sample read with no
+        // graph in place holds nothing in hand, and is read again whole.
+        if self.graph_jobs.contains_key(&job_id)
+            && let Some(given_up) = self.given_up.get_mut(&job_id)
+        {
+            given_up.keep_first_articles(first_articles);
+        }
+        verdict.flatten()
+    }
+
+    // The job's first-article sample brought up to date: the files whose
+    // first article was given up since it was last read, and those whose
+    // first article the root began or stopped waiting on, have their heads
+    // read again. A sample never read, read from another post or beside
+    // another graph, or with no graph to read beside, is read whole.
+    fn read_first_articles(&mut self, job_id: JobId) -> Option<FirstArticles> {
+        let changed = self
+            .graph_jobs
+            .get_mut(&job_id)
+            .map(crate::pipeline::graph::job::GraphJob::take_first_changes);
+        let kept = self
+            .given_up
+            .get_mut(&job_id)
+            .and_then(GivenUp::take_first_articles);
+        let spec = &self.jobs.get(&job_id)?.spec;
+        Some(match (kept, changed) {
+            (Some(mut kept), Some(Some(volumes))) if kept.files() == spec.files.len() => {
+                for volume in volumes {
+                    kept.stale(volume.0);
+                }
+                for index in kept.take_stale() {
+                    let head = self.first_article_head(job_id, index, kept.first(index));
+                    kept.set(index, head);
+                }
+                kept
+            }
+            _ => FirstArticles::new(spec, |index, first| {
+                self.first_article_head(job_id, index, first)
+            }),
+        })
+    }
+
+    // The post's health against its critical line, once the sample has let
+    // it through: at the failed bytes it lost or a round projected it will.
+    fn health_verdict(&self, job_id: JobId, spec: &JobSpec, recovery: u64) -> Option<String> {
+        let probe = self
+            .post_probes
+            .states
+            .get(&job_id)
+            .copied()
+            .unwrap_or_default();
+        let total = self.post_bytes(job_id, spec);
+        let lost = self.missing_bytes(job_id);
+        let failed = probe.decided(lost);
+        let health = health_milli(total, failed);
+        let critical = Self::critical_health_milli(total, recovery);
+        if !below_critical(health, critical) {
+            return None;
+        }
+        let below = format!(
+            "health {:.1}% below critical {:.1}%",
+            f64::from(health) / 10.0,
+            f64::from(critical) / 10.0
+        );
+        // The probe's projection, when it is what takes the post there, is
+        // named with what the round found.
+        Some(match probe.sampled {
+            Some((missed, asked)) if probe.projected >= lost => {
+                format!("health probe: {missed} of {asked} samples missing; {below}")
+            }
+            _ => below,
+        })
+    }
+
+    // The verdict as it is reached by walking every file of the post: what
+    // the kept sample must always agree with.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn post_health_verdict_walked(&self, job_id: JobId) -> Option<String> {
         if self.post_probes.dead.contains_key(&job_id) {
             return None;
         }
@@ -666,33 +802,27 @@ impl Pipeline {
                 }
             }
         }
-        let probe = self
-            .post_probes
-            .states
+        self.health_verdict(job_id, spec, declared_recovery_bytes(spec))
+    }
+
+    // The job's sample as the feed keeps it, and as a whole read of the post
+    // finds it now.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn first_articles_kept_and_read(
+        &self,
+        job_id: JobId,
+    ) -> (Option<FirstArticles>, Option<FirstArticles>) {
+        let kept = self
+            .given_up
             .get(&job_id)
-            .copied()
-            .unwrap_or_default();
-        let total = self.post_bytes(job_id, spec);
-        let lost = self.missing_bytes(job_id);
-        let failed = probe.decided(lost);
-        let health = health_milli(total, failed);
-        let critical = Self::critical_health_milli(total, declared_recovery_bytes(spec));
-        if !below_critical(health, critical) {
-            return None;
-        }
-        let below = format!(
-            "health {:.1}% below critical {:.1}%",
-            f64::from(health) / 10.0,
-            f64::from(critical) / 10.0
-        );
-        // The probe's projection, when it is what takes the post there, is
-        // named with what the round found.
-        Some(match probe.sampled {
-            Some((missed, asked)) if probe.projected >= lost => {
-                format!("health probe: {missed} of {asked} samples missing; {below}")
-            }
-            _ => below,
-        })
+            .and_then(GivenUp::first_articles)
+            .cloned();
+        let read = self.jobs.get(&job_id).map(|state| {
+            FirstArticles::new(&state.spec, |index, first| {
+                self.first_article_head(job_id, index, first)
+            })
+        });
+        (kept, read)
     }
 
     // Arm a round once the post's losses look like a dead release and a
@@ -724,7 +854,15 @@ impl Pipeline {
         let failing_files = self.failing_files(job_id, &state.spec);
         let decided = probe.decided(self.missing_bytes(job_id));
         let health = health_milli(total, decided);
-        let critical = Self::critical_health_milli(total, declared_recovery_bytes(&state.spec));
+        let recovery = self
+            .given_up
+            .get(&job_id)
+            .and_then(GivenUp::first_articles)
+            .map_or_else(
+                || declared_recovery_bytes(&state.spec),
+                FirstArticles::declared_recovery,
+            );
+        let critical = Self::critical_health_milli(total, recovery);
         let critical_failed = critical_failed_bytes(total, critical);
         let rearmed = decided >= probe.next_failed_bytes || failing_files > probe.failing_files;
         let needed = health < 980
@@ -759,7 +897,9 @@ impl Pipeline {
         );
         let batches: Vec<ProbeBatch> = probes
             .chunks(BATCH_SIZE)
-            .map(|batch| ProbeBatch::new(job_id, round, batch.to_vec()))
+            .map(|batch| {
+                ProbeBatch::new(job_id, round, batch.to_vec()).in_pool(self.pool_generation)
+            })
             .collect();
         self.post_probes.lane_rounds.insert(
             job_id,
@@ -784,10 +924,11 @@ impl Pipeline {
     // A lane could not take the batch's seat for a reason that says nothing
     // about the server. Nothing was asked, so the batch waits for a seat as
     // it did before, and the dispatch pass that seats it is woken now.
-    fn post_probe_unseated(&mut self, batch: ProbeBatch) {
+    fn post_probe_unseated(&mut self, mut batch: ProbeBatch) {
         if !self.post_probes.current(&batch) {
             return;
         }
+        batch.rebase(&self.pool_layouts, self.pool_generation);
         self.post_probes.waiting.push_back(batch);
         self.download_dispatch_wake = true;
     }
@@ -804,7 +945,18 @@ impl Pipeline {
         if !self.post_probes.current(&batch) {
             return;
         }
-        batch.fold(server, result);
+        // An answer from a server of a pool since rebuilt names that server
+        // as the old pool numbered it: it is folded in under the server's
+        // current number, or not at all once the server is gone or changed.
+        let asked_under = batch.pool_generation;
+        let server = if batch.rebase(&self.pool_layouts, self.pool_generation) {
+            Some(server)
+        } else {
+            self.pool_layouts.index(asked_under, server)
+        };
+        if let Some(server) = server {
+            batch.fold(server, result);
+        }
         if batch.settled() {
             self.post_probe_batch_done(batch);
             return;
@@ -830,10 +982,11 @@ impl Pipeline {
         let idle_by_server = self.idle_download_lanes_by_server();
         let waiting = std::mem::take(&mut self.post_probes.waiting);
         let mut done = Vec::new();
-        for batch in waiting {
+        for mut batch in waiting {
             if !self.post_probes.current(&batch) {
                 continue;
             }
+            batch.rebase(&self.pool_layouts, self.pool_generation);
             // The selection was contended, which says nothing about the
             // servers; the next pass asks again.
             let Some(order) = self.nntp.blocking_body_server_order(batch.asked()) else {
@@ -926,7 +1079,7 @@ impl Pipeline {
     fn post_probe_batch_done(&mut self, batch: ProbeBatch) {
         let pool = self.nntp.pool();
         let unasked_could_hold = (0..pool.server_count())
-            .any(|server| !batch.asked().contains(&server) && !pool.refuses_credentials(server));
+            .any(|server| !batch.asked().contains(server) && !pool.refuses_credentials(server));
         let job_id = batch.job_id;
         let Some(lane_round) = self
             .post_probes
@@ -1180,6 +1333,17 @@ pub(in crate::pipeline) struct AbandonWork {
 thread_local! {
     static ABANDON_WORK: std::cell::Cell<AbandonWork> =
         const { std::cell::Cell::new(AbandonWork { passes: 0, scanned: 0, lost_files: 0, checkpoints: 0 }) };
+}
+
+// The first-article heads read on this thread.
+#[cfg(test)]
+thread_local! {
+    static HEADS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(in crate::pipeline) fn heads_read() -> usize {
+    HEADS_READ.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]

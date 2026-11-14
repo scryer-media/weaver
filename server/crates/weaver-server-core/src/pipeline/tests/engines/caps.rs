@@ -27,7 +27,7 @@ pub(super) fn limits(edit: impl FnOnce(&mut ExtractionLimits)) -> ExtractionLimi
     let mut limits = ExtractionLimits {
         max_job_bytes: 2 * 1024 * GIB,
         max_member_bytes: 1024 * GIB,
-        max_entries: 100_000,
+        max_entries: 1_000_000,
         max_ratio: 100,
         ratio_floor_bytes: 1 << 30,
         max_seconds: 43_200,
@@ -184,6 +184,42 @@ async fn an_archive_past_the_entry_cap_fails_naming_entries() {
     assert_refused(&graph, "entries");
 }
 
+// One member in `lantern.tar`, named `levels` directories deep.
+fn deep_scenario(levels: usize, edit: impl FnOnce(&mut ExtractionLimits)) -> Scenario {
+    let name = format!("{}beacon.bin", "a/".repeat(levels));
+    let archive = tar(&[(name.as_str(), payload(ARTICLE + 1, 76))]);
+    Scenario::new(vec![Post::plain("lantern.tar", archive)]).limits(limits(edit))
+}
+
+// A name two thousand directories deep keeps about eight KiB of text in its
+// record, far under the limit; the part of the name ledger each directory
+// takes passes it, so the job is refused naming memory. A name eight
+// directories deep under the same limit completes.
+#[tokio::test]
+async fn a_name_whose_path_parts_pass_the_memory_limit_fails_naming_memory() {
+    const LIMIT: u64 = 128 * 1024;
+    let refused = run(&deep_scenario(2_000, |limits| {
+        limits.max_memory_bytes = LIMIT
+    }))
+    .await;
+    assert_refused(&refused, "memory");
+    let shallow = run(&deep_scenario(8, |limits| limits.max_memory_bytes = LIMIT)).await;
+    assert!(
+        shallow.completed(),
+        "{:?} {:?}",
+        shallow.status,
+        shallow.failure
+    );
+    assert!(
+        shallow
+            .files
+            .keys()
+            .any(|path| path.ends_with("a/a/a/a/a/a/a/a/beacon.bin")),
+        "{:?}",
+        shallow.files.keys()
+    );
+}
+
 // `beacon.bin` inside `levels` stored RARs, each the only member of the one
 // around it, the outermost posted as `lantern.rar`; with the bytes of
 // `beacon.bin` and of the innermost RAR, `level0.rar`.
@@ -241,6 +277,157 @@ async fn a_chain_at_the_depth_limit_delivers() {
         .collect();
     assert_eq!(delivered.len(), 1, "{:?}", graph.files.keys());
     assert!(*delivered[0].1 == body, "beacon.bin bytes");
+}
+
+// A stream inside a stream: the inner stream's bytes are output of the
+// outer one, though only the innermost member is delivered, so the job
+// counts them, but once: the inner stream and the member it holds are one
+// output at two levels, each held to the limit alone. The payload does not
+// compress, so the inner stream is the larger. A job limit of exactly the
+// inner stream delivers, though it is less than both together; a byte less
+// fails the job.
+#[tokio::test]
+async fn a_stream_inside_a_stream_counts_once_against_the_job_limit() {
+    let body = payload(40 * ARTICLE, 83);
+    let inner = xz(&body);
+    assert!(inner.len() > body.len());
+    let largest = inner.len() as u64;
+    for (limit, delivers) in [(largest, true), (largest - 1, false)] {
+        let scenario = Scenario::new(vec![Post::plain("ember.bin.xz.gz", gzip(&inner))])
+            .limits(limits(|limits| limits.max_job_bytes = limit));
+        let graph = run(&scenario).await;
+        if delivers {
+            assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+            let delivered: Vec<_> = graph
+                .files
+                .iter()
+                .filter(|(name, _)| name.ends_with("ember.bin"))
+                .collect();
+            assert_eq!(delivered.len(), 1, "{:?}", graph.files.keys());
+            assert!(*delivered[0].1 == body, "ember.bin bytes");
+        } else {
+            assert_refused(&graph, "job_bytes");
+        }
+    }
+}
+
+// `ember.bin.xz` inside `lantern.tar.gz`, with the bytes of `ember.bin`: a
+// body of text that compresses well, so each level below the post expands
+// far past it.
+fn text_nest() -> (Post, Vec<u8>, u64) {
+    let body: Vec<u8> = b"the lantern burns low over the harbour\n"
+        .iter()
+        .copied()
+        .cycle()
+        .take(64 * 1024)
+        .collect();
+    let inner = xz(&body);
+    let archive = tar(&[("ember.bin.xz", inner.clone())]);
+    let post = gzip(&archive);
+    // What the three levels below the post hold, together.
+    let levels = (archive.len() + inner.len() + body.len()) as u64;
+    (Post::plain("lantern.tar.gz", post), body, levels)
+}
+
+// The ratio that lets exactly `body` through over what `post` declared, and
+// the job limit it sets.
+fn ratio_for(declared: u64, body: u64) -> (u64, u64) {
+    let ratio = body.div_ceil(declared);
+    (ratio, ratio * declared)
+}
+
+// Three levels of honest nesting, a tar in a gzip holding an xz: the ratio
+// admits the largest level, the delivered text, though the three together
+// are far past it. The job delivers, as it did when only the delivered file
+// counted, and does across restarts too.
+#[tokio::test]
+async fn a_text_nest_three_levels_deep_under_the_ratio_delivers() {
+    let (post, body, levels) = text_nest();
+    let declared = post.bytes.len() as u64;
+    let (ratio, limit) = ratio_for(declared, body.len() as u64);
+    assert!(levels > limit, "the levels together pass the limit");
+    let scenario = Scenario::new(vec![post]).limits(limits(|limits| {
+        limits.max_ratio = ratio;
+        limits.ratio_floor_bytes = 1024;
+    }));
+    let delivered = |files: &std::collections::BTreeMap<String, Vec<u8>>| {
+        let found: Vec<_> = files
+            .iter()
+            .filter(|(name, _)| name.ends_with("ember.bin"))
+            .collect();
+        found.len() == 1 && *found[0].1 == body
+    };
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert!(delivered(&graph.files), "{:?}", graph.files.keys());
+
+    let restarted = run_restarting(&scenario, &mut |_| {}).await;
+    assert!(restarted.restarts > 0, "the run restarted");
+    assert_eq!(restarted.status, Some(JobStatus::Complete));
+    assert!(delivered(&restarted.files), "{:?}", restarted.files.keys());
+}
+
+// A tar whose few bytes of content are followed by a long run of zeros: the
+// tar is output another object reads, never delivered, and it alone expands
+// far past the ratio, so it is refused as it passes the limit, though the
+// file it holds is tiny.
+#[tokio::test]
+async fn an_inner_archive_alone_past_the_ratio_fails_the_job_naming_ratio() {
+    let mut archive = tar(&[("ember.bin", b"ember".to_vec())]);
+    archive.resize(archive.len() + 4 * 1024 * 1024, 0);
+    let scenario =
+        Scenario::new(vec![Post::plain("lantern.tar.xz", xz(&archive))]).limits(limits(|limits| {
+            limits.max_ratio = 100;
+            limits.ratio_floor_bytes = FLOOR;
+        }));
+    let graph = run(&scenario).await;
+    assert_refused(&graph, "ratio");
+}
+
+// `lantern.tar.xz`: a tar of two files of `each` bytes, and the files.
+fn two_file_tar_xz(each: usize) -> (Post, Vec<(&'static str, Vec<u8>)>) {
+    let files = vec![
+        ("ember.bin", payload(each, 84)),
+        ("cinder.bin", payload(each, 85)),
+    ];
+    let post = Post::plain("lantern.tar.xz", xz(&tar(&files)));
+    (post, files)
+}
+
+// The tar out of a tar.xz is read by the tar, never delivered, so the
+// member limit is not its to meet: past the limit, with each file it holds
+// under it, the job delivers both.
+#[tokio::test]
+async fn an_inner_archive_past_the_member_limit_with_files_under_it_delivers() {
+    let each = 30 * ARTICLE;
+    let (post, files) = two_file_tar_xz(each);
+    let limit = (each + ARTICLE) as u64;
+    assert!(tar(&files).len() as u64 > limit);
+    let scenario =
+        Scenario::new(vec![post]).limits(limits(|limits| limits.max_member_bytes = limit));
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    for (name, bytes) in &files {
+        let delivered: Vec<_> = graph
+            .files
+            .iter()
+            .filter(|(path, _)| path.rsplit('/').next() == Some(*name))
+            .collect();
+        assert_eq!(delivered.len(), 1, "{name}: {:?}", graph.files.keys());
+        assert!(delivered[0].1 == bytes, "{name} bytes");
+    }
+}
+
+// A file the tar out of a tar.xz delivers past the member limit fails the
+// job naming the member limit, as a file anywhere does.
+#[tokio::test]
+async fn a_file_inside_an_inner_archive_past_the_member_limit_fails_naming_member_bytes() {
+    let each = 30 * ARTICLE;
+    let (post, _) = two_file_tar_xz(each);
+    let scenario = Scenario::new(vec![post])
+        .limits(limits(|limits| limits.max_member_bytes = each as u64 - 1));
+    let graph = run(&scenario).await;
+    assert_refused(&graph, "member_bytes");
 }
 
 #[tokio::test]
@@ -598,4 +785,76 @@ async fn a_breadth_post_restarted_counts_its_entries_and_resident_bytes_as_befor
         );
         assert!(restarted.files.is_empty(), "{:?}", restarted.files.keys());
     }
+}
+
+// A TAR holding one stored 7z `copies` times, each under a name of its own,
+// posted as `lantern.tar`. Every copy after the first is another posting of
+// the first, folded into it; its record is still an entry the TAR holds.
+fn copies_scenario(copies: usize, edit: impl FnOnce(&mut ExtractionLimits)) -> Scenario {
+    let archive = super::sevenz::container(
+        sevenz_turbo::EncoderConfiguration::new(sevenz_turbo::EncoderMethod::COPY),
+        None,
+    );
+    let names: Vec<String> = (0..copies)
+        .map(|index| format!("ember{index}.7z"))
+        .collect();
+    let members: Vec<(&str, Vec<u8>)> = names
+        .iter()
+        .map(|name| (name.as_str(), archive.clone()))
+        .collect();
+    Scenario::new(vec![Post::plain("lantern.tar", tar(&members))]).limits(limits(edit))
+}
+
+// The 7z's members, once each, every byte as written.
+fn assert_sevenz_members(graph: &super::harness::Outcome) {
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    let expected = super::sevenz::members();
+    assert_eq!(
+        graph.files.len(),
+        expected.len(),
+        "{:?}",
+        graph.files.keys()
+    );
+    for (name, bytes) in expected {
+        assert!(
+            graph.files.get(&super::sevenz::delivered(name)) == Some(&bytes),
+            "{name}: {:?}",
+            graph.files.keys()
+        );
+    }
+}
+
+// Six copies are six entries of the TAR, beside the 7z's two members: eight
+// entries, as six distinct files and two members would be. One entry under
+// that the job is refused; at it the copies fold and the members come out.
+#[tokio::test]
+async fn copies_of_one_archive_count_as_the_entries_they_are() {
+    let entries = 6 + super::sevenz::members().len() as u64;
+    let refused = run(&copies_scenario(6, |limits| {
+        limits.max_entries = entries - 1
+    }))
+    .await;
+    assert_refused(&refused, "entries");
+    assert!(
+        refused
+            .failure
+            .as_deref()
+            .is_some_and(|failure| failure.ends_with(&format!(
+                "archive contains {entries} entries, limit is {}",
+                entries - 1
+            ))),
+        "{:?}",
+        refused.failure
+    );
+    let at = run(&copies_scenario(6, |limits| limits.max_entries = entries)).await;
+    assert_sevenz_members(&at);
+}
+
+// Fifty copies of one archive in a TAR, under the default limits: they fold
+// into the first and its members come out once.
+#[tokio::test]
+async fn fifty_copies_of_one_archive_complete_under_the_default_limits() {
+    let graph = run(&copies_scenario(50, |_| {})).await;
+    assert_sevenz_members(&graph);
+    assert_fetched_once(&graph);
 }

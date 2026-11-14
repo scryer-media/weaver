@@ -26,6 +26,10 @@ ENV WEAVER_DEPLOYMENT_ENV=docker
 # Overridable like any other variable, for host-network or proxy-only setups.
 ENV WEAVER_HTTP_BIND_ADDRESS=0.0.0.0
 
+# An image cannot set how long the runtime waits after this signal before it
+# kills the server: that is 10 seconds unless the run sets it. `--stop-timeout
+# 60`, or `stop_grace_period: 60s` in a compose file, gives the server the
+# minute the desktop tray gives it.
 STOPSIGNAL SIGTERM
 
 ENTRYPOINT ["/entrypoint.sh"]

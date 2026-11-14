@@ -325,3 +325,52 @@ async fn successful_archives_clear_only_their_cancelled_checkpoint_failures() {
         assert!(db.get_job_history(job.0).unwrap().is_some());
     }
 }
+
+// The two checkpoint reads are pure reads: with the writer gate held, a
+// write parked on it, and the serial writer thread busy with that write,
+// both still answer, and with the rows they answer with the gate open.
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_reads_answer_while_a_write_waits_at_the_gate() {
+    let db = tokio::task::spawn_blocking(Database::open_in_memory)
+        .await
+        .unwrap()
+        .unwrap();
+    let job = JobId(4290);
+    let read = |db: Database| {
+        tokio::task::spawn_blocking(move || {
+            (
+                db.has_graph_checkpoint(job).unwrap(),
+                db.load_graph_checkpoint(job).unwrap(),
+            )
+        })
+    };
+    {
+        let db = db.clone();
+        tokio::task::spawn_blocking(move || {
+            db.create_active_job(&postgres_sample_job(job)).unwrap();
+            db.save_graph_checkpoint(job, Arc::new(checkpoint()))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+    let open = read(db.clone()).await.unwrap();
+    assert!(open.0);
+    assert!(open.1.is_some());
+
+    let StoreDatastore::Sqlite { writer_gate, .. } = db.datastore() else {
+        unreachable!("open_in_memory is SQLite");
+    };
+    let held = writer_gate.lock().await;
+    let parked = {
+        let db = db.clone();
+        tokio::task::spawn_blocking(move || db.save_active_job_root_phase(job, "downloading"))
+    };
+    writer_gate.until_waiting(1).await;
+
+    let closed = read(db.clone()).await.unwrap();
+    assert_eq!(closed, open);
+
+    drop(held);
+    parked.await.unwrap().unwrap();
+}

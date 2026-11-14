@@ -1,0 +1,20 @@
+{
+  "slug": "adv-rar4-volumes-rotated",
+  "title": "Crimson.Vector.S01E03.Rotated.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "direct-store-rar4's three RAR4 volumes, each posted under another volume's name: the first as part3, the second as part1, the end as part2. A RAR4 volume numbers itself only in its end record, so a name places it until its headers say otherwise; a volume its headers rule out is given back once, never claimed and returned in a cycle. Every volume is present, so the member is delivered with its exact bytes.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "fixtureAssets": [
+    "direct-store-rar4/archive.part1.rar::archive.part3.rar",
+    "direct-store-rar4/archive.part2.rar::archive.part1.rar",
+    "direct-store-rar4/archive.part3.rar::archive.part2.rar"
+  ],
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "minOutputFiles": 1
+  },
+  "expectedOutputBLAKE3": {
+    "work/crimson.vector.s01e03.mkv": "ac5df2b08baa912e94924eed671a13e910b60bdda5e6210b2d2da15d67fa3fc1"
+  }
+}

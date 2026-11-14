@@ -1136,3 +1136,69 @@ scope = "all"
 kind = "rust"
 hook_id = "fill_history_search_keys_v88"
 scope = "all"
+
+[[migration]]
+version = 89
+description = "a history entry keeps when it was archived; existing history upgrades with age retention off"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0089_history_archived/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0089_history_archived/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "seed_history_retention_v89"
+scope = "all"
+
+[[migration]]
+version = 90
+description = "index the rows that hold credentials, for the start-up credential checks"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0090_credential_scan_indexes/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0090_credential_scan_indexes/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 91
+description = "a history entry keeps when housekeeping swept a failed job's files, with an index for the sweep's page"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0091_history_swept/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0091_history_swept/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 92
+description = "a server list stored past the server limit is trimmed to it"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "trim_servers_to_limit_v92"
+scope = "all"

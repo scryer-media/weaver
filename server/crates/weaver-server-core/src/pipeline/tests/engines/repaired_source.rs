@@ -132,8 +132,11 @@ async fn periodic_copy7z_repair_preserves_archive_before_extraction() {
                 .handle_decode_done(DecodeDone::Success {
                     result,
                     source: SegmentSource {
-                        source_server_idx: Some(0),
-                        exclude_servers: Vec::new(),
+                        servers: crate::pipeline::PoolServers::stamped(
+                            pipeline.pool_generation,
+                            Some(0),
+                            weaver_nntp::ServerSet::EMPTY,
+                        ),
                     },
                 })
                 .await;

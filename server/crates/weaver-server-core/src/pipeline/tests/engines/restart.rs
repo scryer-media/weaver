@@ -129,7 +129,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
                 from_disk.insert(article);
             }
             let server = (0..)
-                .find(|server| !work.exclude_servers.contains(server))
+                .find(|server| !work.exclude_servers.contains(*server))
                 .unwrap();
             if scenario.spoils(server, article) {
                 spoiled.insert(article);
@@ -326,7 +326,7 @@ async fn shut_down(pipeline: &mut Pipeline) {
 
 // The pipeline goes down with what it held in memory, and a new one restores
 // the job from what reached the database.
-async fn restart(
+pub(in crate::pipeline::tests) async fn restart(
     temp_dir: &tempfile::TempDir,
     pipeline: Pipeline,
     scenario: &Scenario,
@@ -1491,6 +1491,51 @@ async fn plain_files_under_par3_restarted_after_every_article_are_repaired_with_
     restart_row(Scenario::new(posts).damaged(0, 2)).await;
 }
 
+// Every file is given its declared length when it is made, on whatever
+// platform the test runs: a file's length then says nothing of how far its
+// bytes reach. Articles a restored member holds in memory, undecided under
+// its set, are in no file, and each restart fetches them again from what the
+// checkpoint says alone. One that took the file's length for them would
+// leave holes of zeros where they lay, more than the set's blocks mend.
+#[tokio::test]
+async fn articles_held_in_memory_over_a_sized_file_are_fetched_again_after_every_restart() {
+    let _sized = crate::pipeline::graph::sparse::sizing::always();
+    let files = [
+        ("lantern.bin", payload(6 * ARTICLE, 83)),
+        ("beacon.bin", payload(3 * ARTICLE + 9, 84)),
+    ];
+    let posts = with_par3(&files, &["lantern.bin", "beacon.bin"], "lantern");
+    restart_row(Scenario::new(posts).damaged(0, 2)).await;
+}
+
+// No file is given a length before its bytes, so each is as long as its
+// last byte written. The second file is small enough to be decided at its
+// first article: its first and last articles come first and go to its
+// file, which then reaches its end. Every article between them comes after
+// a restart, while the member is undecided under its set, and is held in
+// memory below the file's length. Each restart fetches those again: the
+// file's length covers them, and the checkpoint does not.
+#[tokio::test]
+async fn articles_held_in_memory_below_a_files_length_are_fetched_again_after_every_restart() {
+    let _grown = crate::pipeline::graph::sparse::sizing::never();
+    let files = [
+        ("lantern.bin", payload(6 * ARTICLE, 83)),
+        ("beacon.bin", payload(3 * ARTICLE + 9, 84)),
+    ];
+    let posts = with_par3(&files, &["lantern.bin", "beacon.bin"], "lantern");
+    // Sixteen bytes an article: the second file is thirteen of them.
+    let scenario = Scenario::new(posts).framed(16).first(&[(1, 0), (1, 12)]);
+    let whole = run(&scenario).await;
+    assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
+    let restarted = run_restarting(&scenario, &mut |_| {}).await;
+    assert_restarted(&restarted, &whole);
+    assert!(
+        (1..12).any(|ordinal| restarted.in_memory.contains(&(1, ordinal))),
+        "some article between the file's ends was held in memory at a restart: {:?}",
+        restarted.in_memory
+    );
+}
+
 // The members are bound by their bytes, so the restored set must still
 // know what it identified: a lost match would read them back again, and a
 // lost rename would deliver them under their hex names.
@@ -2122,7 +2167,7 @@ impl Reopened {
         // A blocked job holds no articles until its restore goes through.
         assert!(pipeline.jobs[&JOB].articles.active().is_none());
         pipeline.dispatch_downloads();
-        assert_eq!(pipeline.active_downloads, 0);
+        assert_eq!(pipeline.articles_in_flight, 0);
         // The pause goes on the job's writer lane.
         pipeline.db.flush_write_queue().await.unwrap();
         let row = pipeline
@@ -2177,7 +2222,7 @@ impl Reopened {
         );
         assert!(pipeline.jobs[&JOB].articles.active().is_none());
         pipeline.dispatch_downloads();
-        assert_eq!(pipeline.active_downloads, 0);
+        assert_eq!(pipeline.articles_in_flight, 0);
         pipeline.db.flush_write_queue().await.unwrap();
         let row = pipeline
             .db
@@ -2770,6 +2815,49 @@ async fn a_paused_job_counts_only_the_articles_its_checkpoint_does_not_hold_as_q
         crate::jobs::model::JobArticles::Queued(_)
     ));
     assert_eq!(articles.queued_download_len(), 100);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A job built again from its checkpoint keeps the staging it has, so its
+// activation asks the disk owner nothing.
+#[tokio::test]
+async fn a_job_restored_from_its_checkpoint_asks_nothing_of_the_disk() {
+    let body = payload(40 * ARTICLE + 5, 74);
+    let scenario = Scenario::new(vec![Post::plain("beacon.bin.xz", xz(&body))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
+    scenario.prepare(&mut pipeline);
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    while !pipeline.graph_jobs[&JOB].awaits_mail() {
+        let work =
+            next_work(&mut pipeline, &scenario).expect("the run starts before the post ends");
+        serve_work(&mut pipeline, &scenario, &work).await;
+    }
+    pipeline.pause_job_runtime(JOB).unwrap();
+    pipeline.resume_job_runtime(JOB).unwrap();
+    while pipeline.retiring_graph_jobs.contains_key(&JOB) {
+        let said = pipeline
+            .graph_runs
+            .recv()
+            .await
+            .expect("the stopped run ends");
+        pipeline.graph_run_said(said);
+    }
+    let asks = crate::operations::disk::same_filesystem_asks();
+    pipeline.request_job_activation(JOB);
+    let read = pipeline
+        .job_activated_rx
+        .recv()
+        .await
+        .expect("the read replies");
+    assert!(
+        read.result.as_ref().is_ok_and(|read| read.restored()),
+        "built from its checkpoint"
+    );
+    assert_eq!(crate::operations::disk::same_filesystem_asks(), asks);
+    pipeline.hear_graph_runs();
+    pipeline.handle_job_activated(read);
     retire_pipeline_database(pipeline).await;
 }
 

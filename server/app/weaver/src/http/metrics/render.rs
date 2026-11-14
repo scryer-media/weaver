@@ -297,7 +297,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         render_schedules(&mut out, metrics);
     }
     if let Some(metrics) = network {
-        render_network(&mut out, metrics);
+        render_network(&mut out, metrics, server_health);
     }
     if let Some(metrics) = tunnel {
         render_tunnel(&mut out, metrics);
@@ -424,7 +424,11 @@ fn render_queues(out: &mut Encoder, snapshot: &MetricsSnapshot) {
         &[],
         snapshot.download_queue_depth as u64,
     );
-    out.sample(&f::ACTIVE_DOWNLOADS, &[], snapshot.active_downloads as u64);
+    out.sample(
+        &f::ARTICLES_IN_FLIGHT,
+        &[],
+        snapshot.articles_in_flight as u64,
+    );
     out.sample(&f::ACTIVE_DECODES, &[], snapshot.active_decodes as u64);
     out.sample(&f::DECODE_PENDING, &[], snapshot.decode_pending as u64);
     out.sample(&f::DECODE_PENDING_BYTES, &[], snapshot.decode_pending_bytes);
@@ -1254,10 +1258,12 @@ fn render_server_transfers(
 
     for transfer in server_transfers {
         let server_id = transfer.stable_server_id.0.to_string();
-        let label = labels_by_id
-            .get(server_id.as_str())
-            .copied()
-            .unwrap_or_default();
+        // A server the pool does not run has no `server` label to give and
+        // nothing moving to report: its series are left out, not sent with
+        // an empty label.
+        let Some(&label) = labels_by_id.get(server_id.as_str()) else {
+            continue;
+        };
         let id: &[(&str, &str)] = &[("server_id", server_id.as_str()), ("server", label)];
 
         out.sample(
@@ -1375,10 +1381,10 @@ fn render_server_articles(
 
     for server in server_metrics {
         let server_id = server.stable_server_id.to_string();
-        let label = labels_by_id
-            .get(server_id.as_str())
-            .copied()
-            .unwrap_or_default();
+        // As for transfers: only the servers the pool runs.
+        let Some(&label) = labels_by_id.get(server_id.as_str()) else {
+            continue;
+        };
         let id: &[(&str, &str)] = &[("server_id", server_id.as_str()), ("server", label)];
 
         for attempt in &server.attempts {
@@ -1499,6 +1505,7 @@ fn render_wal_checkpoint(out: &mut Encoder, wal: &WalCheckpointMetricsSnapshot) 
     out.sample(&f::DB_WAL_CHECKPOINTED_FRAMES, &[], wal.checkpointed_frames);
     out.sample(&f::DB_WAL_CHECKPOINT_COPIED_FRAMES, &[], wal.copied_frames);
     out.sample(&f::DB_WAL_BYTES, &[], wal.wal_bytes);
+    render_histogram(out, &f::DB_STATEMENT_DURATION, &[], &wal.statement_duration);
 }
 
 // Standard `process_*` collector series.
@@ -1607,7 +1614,7 @@ fn observed_download_limiter(
     // `idle` — "nothing to do" — when the truth is "nowhere to fetch from",
     // which is the exact state the next check exists to name.
     if required_queue_depth == 0
-        && snapshot.active_downloads == 0
+        && snapshot.articles_in_flight == 0
         && snapshot.parked_infrastructure_work == 0
     {
         return "idle";
@@ -1619,7 +1626,7 @@ fn observed_download_limiter(
     // `dispatch_limited` here would point the operator at the decode/write
     // path or at Weaver's own scheduler, when the problem is upstream of both.
     // It cannot mask an ordinary busy pipeline, which has active downloads.
-    if snapshot.parked_infrastructure_work > 0 && snapshot.active_downloads == 0 {
+    if snapshot.parked_infrastructure_work > 0 && snapshot.articles_in_flight == 0 {
         return "infrastructure_unavailable";
     }
     if snapshot.download_pressure_state != DownloadPressureState::Clear {
@@ -1649,13 +1656,13 @@ fn observed_download_limiter(
         .map(|server| server.connections_available)
         .sum::<usize>();
     if required_queue_depth > 0
-        && snapshot.active_downloads > 0
+        && snapshot.articles_in_flight > 0
         && total_connections > 0
         && available_connections == 0
     {
         return "network_limited";
     }
-    if snapshot.active_downloads > 0 {
+    if snapshot.articles_in_flight > 0 {
         return "active";
     }
     "dispatch_limited"
@@ -1904,10 +1911,25 @@ pub(crate) fn render_schedules(out: &mut Encoder, metrics: &ScheduleMetricsSnaps
 // One per-leg gauge's value, or `None` to leave the leg's series out.
 type LegValue = fn(&LegMetrics) -> Option<f64>;
 
-pub(crate) fn render_network(out: &mut Encoder, metrics: &NetworkMetricsSnapshot) {
+// A leg of a server the pool does not run is left out: no connection is made
+// on it, so its state (`up` until something says otherwise) says nothing.
+pub(crate) fn render_network(
+    out: &mut Encoder,
+    metrics: &NetworkMetricsSnapshot,
+    server_health: &[ServerHealthInfo],
+) {
+    let running: std::collections::HashSet<&str> = server_health
+        .iter()
+        .map(|srv| srv.server_id.as_str())
+        .collect();
     let legs: Vec<(String, String, &LegMetrics)> = metrics
         .legs
         .iter()
+        .filter(|leg| {
+            leg.consumer
+                .strip_prefix("server:")
+                .is_none_or(|id| running.contains(id))
+        })
         .map(|leg| (leg.position.to_string(), leg.egress_id.to_string(), leg))
         .collect();
     for (position, egress, leg) in &legs {

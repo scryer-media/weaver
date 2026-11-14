@@ -82,6 +82,7 @@ impl GraphJob {
         .metered(storage.metrics);
         writer.restore_verifications(&snapshot.root.pending_verifications);
         writer.restore_members(&tree);
+        writer.note_recorded_holds(&tree, &snapshot.holds);
         for ((node, member), state) in &snapshot.files {
             if tree
                 .namespace(*node)
@@ -117,7 +118,7 @@ impl GraphJob {
             works: super::works::Works::new(runs.scope(), runs.mail(), runs.hardware())
                 .timed(runs.clock()),
             runs,
-            passwords: Passwords::new(storage.passwords),
+            passwords: Passwords::from_candidates(storage.passwords),
             reported: snapshot.root.reported,
             pending: Pending::default(),
             mail_owed: None,
@@ -125,6 +126,8 @@ impl GraphJob {
             notes: Vec::new(),
             fed: super::runs::Fed::default(),
             sealed_at: None,
+            moved: 0,
+            indexes_kept: None,
         };
         for (node, index) in &snapshot.passwords {
             job.offer_again(*node, *index)?;
@@ -252,15 +255,12 @@ impl GraphJob {
         // Nothing is lent inside a restore: the job lends once installed.
         for (volume, ordinal) in missing {
             self.unarrive(volume, ordinal, 0)?;
-            if let Some(found) = self
-                .tree
-                .namespace_mut(NodeId::ROOT)
-                .and_then(|namespace| namespace.get_mut(MemberId(volume.0)))
-            {
-                found.closed = false;
+            if let Some(namespace) = self.tree.namespace_mut(NodeId::ROOT) {
+                namespace.reopen(MemberId(volume.0));
             }
             refetched.push((volume, ordinal));
         }
+        self.writer.forget_recorded_holds();
         Ok(refetched)
     }
 

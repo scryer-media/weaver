@@ -105,6 +105,7 @@ use zeroize::Zeroizing;
 use crate::engine::{Format, SetName};
 use crate::grid::{Grid, crc32};
 use crate::kept::Kept;
+use crate::placed::Placed;
 use crate::zip_engine::ZipFormat;
 use crate::zip_engine::naming::{LAST, VolumeName};
 use geometry::Geometry;
@@ -165,6 +166,14 @@ pub struct Zip {
     // Ciphertext waiting for its keys to run over it away from the loop.
     #[serde(default)]
     held: Vec<held::Held>,
+    // Moved at every look at what changed and wherever a directory read
+    // again takes over. Whatever moves the geometry, the last disk or the
+    // ranges kept asks for that look, and while one is due no number is
+    // reported. Only a store with no map reports one: once a map stands,
+    // what `place` reads moves with what its members say, so the store is
+    // asked every time.
+    #[serde(skip)]
+    placed: Placed,
 }
 
 impl Durable for Zip {
@@ -426,6 +435,7 @@ impl Zip {
         if self.gone || !std::mem::take(&mut self.stale) {
             return;
         }
+        self.placed.moved();
         self.find_recovery(out);
         // A map not yet held against its directory reads it: a walk's
         // gathers it as it comes and is checked once the walk reaches it;
@@ -746,6 +756,10 @@ impl Object for Zip {
 
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         self.place(volume, range, out);
+    }
+
+    fn placement(&self) -> Option<u64> {
+        (self.map.is_none() && self.next.is_none() && !self.stale).then(|| self.placed.number())
     }
 
     fn posted(

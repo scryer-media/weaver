@@ -74,7 +74,13 @@ fn bench_body_server_availability(c: &mut Criterion) {
             BenchmarkId::from_parameter(server_count),
             &server_count,
             |b, _| {
-                b.iter(|| black_box(runtime.block_on(pool.body_server_availability(&[], &[], 0))));
+                b.iter(|| {
+                    black_box(runtime.block_on(pool.body_server_availability(
+                        weaver_nntp::ServerSet::EMPTY,
+                        weaver_nntp::ServerSet::EMPTY,
+                        0,
+                    )))
+                });
             },
         );
     }

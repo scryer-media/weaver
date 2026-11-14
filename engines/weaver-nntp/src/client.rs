@@ -13,6 +13,8 @@ use tokio::time::Instant as TokioInstant;
 use tracing::{debug, trace, warn};
 use weaver_yenc::{CheckpointPlan, YencError};
 
+use crate::ServerSet;
+
 use crate::connection::ServerConfig;
 use crate::error::{NntpError, Result};
 use crate::fused_yenc::{FusedArticleBody, FusedYencArticleStats, FusedYencError};
@@ -1010,7 +1012,25 @@ impl NntpClient {
             max_idle_age: config.max_idle_age,
             ..PoolConfig::default()
         });
+        Self::around(pool, max_retries_per_server, soft_timeout)
+    }
 
+    // A client for settings: refuses, in words, a server list past
+    // `MAX_PROVIDERS` instead of building a pool it cannot index.
+    pub fn try_new(
+        config: NntpClientConfig,
+    ) -> std::result::Result<Self, crate::pool::PoolTooLarge> {
+        let max_retries_per_server = config.max_retries_per_server;
+        let soft_timeout = config.soft_timeout;
+        let pool = NntpPool::try_new(PoolConfig {
+            servers: config.servers,
+            max_idle_age: config.max_idle_age,
+            ..PoolConfig::default()
+        })?;
+        Ok(Self::around(pool, max_retries_per_server, soft_timeout))
+    }
+
+    fn around(pool: NntpPool, max_retries_per_server: u32, soft_timeout: Duration) -> Self {
         let pool = Arc::new(pool);
         pool.start_route_probes();
         NntpClient {
@@ -1044,14 +1064,14 @@ impl NntpClient {
         client
     }
 
-    pub async fn body_server_order(&self, exclude: &[usize]) -> Vec<ServerId> {
+    pub async fn body_server_order(&self, exclude: ServerSet) -> Vec<ServerId> {
         self.body_server_selection(exclude).await.eligible
     }
 
     pub async fn body_server_availability(
         &self,
-        failure_excludes: &[usize],
-        retention_excludes: &[usize],
+        failure_excludes: ServerSet,
+        retention_excludes: ServerSet,
         requested_body_bytes: u64,
     ) -> BodyServerAvailability {
         self.pool
@@ -1059,13 +1079,13 @@ impl NntpClient {
             .await
     }
 
-    pub async fn body_server_selection(&self, exclude: &[usize]) -> BodyServerSelection {
+    pub async fn body_server_selection(&self, exclude: ServerSet) -> BodyServerSelection {
         self.body_server_selection_with_estimate(exclude, 0).await
     }
 
     pub async fn body_server_selection_with_estimate(
         &self,
-        exclude: &[usize],
+        exclude: ServerSet,
         requested_body_bytes: u64,
     ) -> BodyServerSelection {
         let mut eligible = Vec::new();
@@ -1223,7 +1243,9 @@ impl NntpClient {
             return Ok(Vec::new());
         }
 
-        let order = self.article_server_order(&[], &[]).await;
+        let order = self
+            .article_server_order(ServerSet::EMPTY, ServerSet::EMPTY)
+            .await;
         if order.is_empty() {
             return Err(NntpError::ServiceUnavailable);
         }
@@ -1241,7 +1263,7 @@ impl NntpClient {
         let mut had_success = false;
         let mut last_error: Option<NntpError> = None;
         let mut had_retryable_uncertainty = false;
-        let mut missing = vec![Vec::new(); message_ids.len()];
+        let mut missing = vec![ServerSet::EMPTY; message_ids.len()];
 
         for idx in order {
             if remaining.is_empty() {
@@ -1254,7 +1276,7 @@ impl NntpClient {
                 .copied()
                 .filter(|&i| {
                     matches!(
-                        policy.eligibility(idx, &missing[i], &[], 1),
+                        policy.eligibility(idx, missing[i], ServerSet::EMPTY, 1),
                         crate::provider_policy::ArticleEligibility::Eligible(_)
                     )
                 })
@@ -1274,7 +1296,7 @@ impl NntpClient {
                         if exists {
                             found[original_idx] = true;
                         } else {
-                            missing[original_idx].push(idx);
+                            missing[original_idx].insert(idx);
                         }
                     }
                     remaining.retain(|&i| !found[i]);
@@ -1294,7 +1316,7 @@ impl NntpClient {
 
         had_retryable_uncertainty |= remaining.iter().any(|&i| {
             (0..self.pool.server_count()).any(|server| {
-                !missing[i].contains(&server) && !self.pool.refuses_credentials(server)
+                !missing[i].contains(server) && !self.pool.refuses_credentials(server)
             })
         });
         if remaining.is_empty() {
@@ -1318,7 +1340,7 @@ impl NntpClient {
     // confirmation mark the entire batch inconclusive so callers can unwind
     // without applying projected health damage.
     pub async fn confirm_exists_for_probe(&self, message_ids: &[&str]) -> ProbeBatchResult {
-        self.confirm_exists_for_probe_excluding(message_ids, &[])
+        self.confirm_exists_for_probe_excluding(message_ids, ServerSet::EMPTY)
             .await
             .unwrap_or_else(|| ProbeBatchResult {
                 exists: vec![false; message_ids.len()],
@@ -1338,7 +1360,7 @@ impl NntpClient {
     pub async fn confirm_exists_for_probe_excluding(
         &self,
         message_ids: &[&str],
-        exclude: &[usize],
+        exclude: ServerSet,
     ) -> Option<ProbeBatchResult> {
         self.confirm_exists_for_probe_using(message_ids, exclude, |_, _, _| async { None })
             .await
@@ -1349,26 +1371,26 @@ impl NntpClient {
     pub async fn confirm_exists_for_probe_using<F, Fut>(
         &self,
         message_ids: &[&str],
-        exclude: &[usize],
+        exclude: ServerSet,
         mut cached: F,
     ) -> Option<ProbeBatchResult>
     where
         F: FnMut(usize, Vec<String>, ProbeWorkGuard) -> Fut,
         Fut: Future<Output = Option<ProbeBatchResult>>,
     {
-        let order = self.article_server_order(exclude, &[]).await;
+        let order = self.article_server_order(exclude, ServerSet::EMPTY).await;
         if order.is_empty() && !message_ids.is_empty() {
             return None;
         }
         let mut exists = vec![false; message_ids.len()];
-        let mut missing = vec![Vec::new(); message_ids.len()];
+        let mut missing = vec![ServerSet::EMPTY; message_ids.len()];
         for server in order {
             let policy = self.pool.provider_policy();
             let selected: Vec<_> = (0..message_ids.len())
                 .filter(|&i| {
                     !exists[i]
                         && matches!(
-                            policy.eligibility(server, &missing[i], exclude, 1),
+                            policy.eligibility(server, missing[i], exclude, 1),
                             crate::provider_policy::ArticleEligibility::Eligible(_)
                         )
                 })
@@ -1381,8 +1403,8 @@ impl NntpClient {
                 .map(|&i| message_ids[i].to_string())
                 .collect();
             let pool = Arc::clone(&self.pool);
-            let excluded = exclude.to_vec();
-            let attempted: Vec<_> = selected.iter().map(|&i| missing[i].clone()).collect();
+            let excluded = exclude;
+            let attempted: Vec<_> = selected.iter().map(|&i| missing[i]).collect();
             let caller_guard = self.work_guard.clone();
             let guard: ProbeWorkGuard = Arc::new(move || {
                 caller_guard
@@ -1392,7 +1414,7 @@ impl NntpClient {
                         let policy = pool.provider_policy();
                         attempted.iter().all(|missing| {
                             matches!(
-                                policy.eligibility(server, missing, &excluded, 1),
+                                policy.eligibility(server, *missing, excluded, 1),
                                 crate::provider_policy::ArticleEligibility::Eligible(_)
                             )
                         })
@@ -1410,7 +1432,7 @@ impl NntpClient {
                 if result.exists.get(slot) == Some(&true) {
                     exists[original] = true;
                 } else if !result.inconclusive {
-                    missing[original].push(server);
+                    missing[original].insert(server);
                 }
             }
         }
@@ -1419,8 +1441,8 @@ impl NntpClient {
         let inconclusive = (0..message_ids.len()).any(|i| {
             !exists[i]
                 && (0..self.pool.server_count()).any(|server| {
-                    !exclude.contains(&server)
-                        && !missing[i].contains(&server)
+                    !exclude.contains(server)
+                        && !missing[i].contains(server)
                         && !self.pool.refuses_credentials(server)
                 })
         });
@@ -1498,7 +1520,7 @@ impl NntpClient {
         &self,
         message_id: &str,
         groups: &[String],
-        exclude: &[usize],
+        exclude: ServerSet,
     ) -> Result<Bytes> {
         self.fetch_body_with_groups_excluding_traced(message_id, groups, exclude)
             .await
@@ -1510,7 +1532,7 @@ impl NntpClient {
         message_id: &str,
         groups: &[String],
     ) -> FetchBodyTrace {
-        self.fetch_body_with_groups_excluding_traced(message_id, groups, &[])
+        self.fetch_body_with_groups_excluding_traced(message_id, groups, ServerSet::EMPTY)
             .await
     }
 
@@ -1518,9 +1540,9 @@ impl NntpClient {
         &self,
         message_id: &str,
         groups: &[String],
-        exclude: &[usize],
+        exclude: ServerSet,
     ) -> FetchBodyTrace {
-        self.fetch_body_with_groups_ordered_traced(message_id, groups, exclude, &[])
+        self.fetch_body_with_groups_ordered_traced(message_id, groups, exclude, ServerSet::EMPTY)
             .await
     }
 
@@ -1528,8 +1550,8 @@ impl NntpClient {
         &self,
         message_id: &str,
         groups: &[String],
-        exclude: &[usize],
-        avoid: &[usize],
+        exclude: ServerSet,
+        avoid: ServerSet,
     ) -> FetchBodyTrace {
         if groups.is_empty() {
             return FetchBodyTrace {
@@ -1692,9 +1714,9 @@ impl NntpClient {
         &self,
         message_id: &str,
         groups: &[String],
-        exclude: &[usize],
+        exclude: ServerSet,
     ) -> FetchBodyTrace {
-        self.fetch_body_with_groups_ordered_traced(message_id, groups, &[], exclude)
+        self.fetch_body_with_groups_ordered_traced(message_id, groups, ServerSet::EMPTY, exclude)
             .await
     }
 
@@ -1704,7 +1726,7 @@ impl NntpClient {
         message_id: &str,
         groups: &[String],
     ) -> std::result::Result<DecodedBody, DecodedBodyError> {
-        self.fetch_body_decoded_with_groups_excluding(message_id, groups, &[])
+        self.fetch_body_decoded_with_groups_excluding(message_id, groups, ServerSet::EMPTY)
             .await
     }
 
@@ -1713,7 +1735,7 @@ impl NntpClient {
         message_id: &str,
         groups: &[String],
     ) -> DecodedBodyTrace {
-        self.fetch_body_decoded_with_groups_excluding_traced(message_id, groups, &[])
+        self.fetch_body_decoded_with_groups_excluding_traced(message_id, groups, ServerSet::EMPTY)
             .await
     }
 
@@ -1721,17 +1743,22 @@ impl NntpClient {
         &self,
         message_id: &str,
         groups: &[String],
-        exclude: &[usize],
+        exclude: ServerSet,
     ) -> DecodedBodyTrace {
-        self.fetch_body_decoded_with_groups_ordered_traced(message_id, groups, &[], exclude)
-            .await
+        self.fetch_body_decoded_with_groups_ordered_traced(
+            message_id,
+            groups,
+            ServerSet::EMPTY,
+            exclude,
+        )
+        .await
     }
 
     pub async fn fetch_bodies_decoded_with_groups_prefer_excluding_traced(
         &self,
         message_ids: &[&str],
         groups: &[String],
-        exclude: &[usize],
+        exclude: ServerSet,
     ) -> Vec<DecodedBodyTrace> {
         let mut traces: Vec<Option<DecodedBodyTrace>> =
             (0..message_ids.len()).map(|_| None).collect();
@@ -1762,7 +1789,7 @@ impl NntpClient {
         &self,
         message_ids: &[&str],
         groups: &[String],
-        exclude: &[usize],
+        exclude: ServerSet,
         mut on_trace: F,
     ) where
         F: FnMut(usize, DecodedBodyTrace) -> Fut,
@@ -1784,7 +1811,7 @@ impl NntpClient {
             return;
         }
 
-        let order = self.article_server_order(&[], exclude).await;
+        let order = self.article_server_order(ServerSet::EMPTY, exclude).await;
 
         if order.is_empty() {
             for message_idx in 0..message_ids.len() {
@@ -1820,7 +1847,11 @@ impl NntpClient {
             let mut eligible = Vec::with_capacity(pending_now.len());
             for message_idx in pending_now {
                 if self
-                    .article_attempt_eligible(idx, &[], &attempts_by_index[message_idx])
+                    .article_attempt_eligible(
+                        idx,
+                        ServerSet::EMPTY,
+                        &attempts_by_index[message_idx],
+                    )
                     .await
                 {
                     eligible.push(message_idx);
@@ -2211,7 +2242,7 @@ impl NntpClient {
         &self,
         message_id: &str,
         groups: &[String],
-        exclude: &[usize],
+        exclude: ServerSet,
     ) -> std::result::Result<DecodedBody, DecodedBodyError> {
         self.fetch_body_decoded_with_groups_excluding_traced(message_id, groups, exclude)
             .await
@@ -2362,18 +2393,23 @@ impl NntpClient {
         &self,
         message_id: &str,
         groups: &[String],
-        exclude: &[usize],
+        exclude: ServerSet,
     ) -> DecodedBodyTrace {
-        self.fetch_body_decoded_with_groups_ordered_traced(message_id, groups, exclude, &[])
-            .await
+        self.fetch_body_decoded_with_groups_ordered_traced(
+            message_id,
+            groups,
+            exclude,
+            ServerSet::EMPTY,
+        )
+        .await
     }
 
     async fn fetch_body_decoded_with_groups_ordered_traced(
         &self,
         message_id: &str,
         groups: &[String],
-        exclude: &[usize],
-        avoid: &[usize],
+        exclude: ServerSet,
+        avoid: ServerSet,
     ) -> DecodedBodyTrace {
         let order = self.article_server_order(exclude, avoid).await;
 
@@ -2603,7 +2639,7 @@ impl NntpClient {
     pub fn try_acquire_blocking_body_lane(
         &self,
         groups: &[String],
-        exclude: &[usize],
+        exclude: ServerSet,
     ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
         self.try_acquire_blocking_body_lane_with_estimate(groups, exclude, 0)
     }
@@ -2617,7 +2653,7 @@ impl NntpClient {
     // momentary lock collision.
     pub fn try_blocking_body_server_selection_with_estimate(
         &self,
-        exclude: &[usize],
+        exclude: ServerSet,
         requested_body_bytes: u64,
     ) -> Option<BodyServerSelection> {
         self.try_blocking_body_server_selection(exclude, requested_body_bytes, QuotaCheck::Dispatch)
@@ -2626,7 +2662,7 @@ impl NntpClient {
     pub fn try_acquire_blocking_body_lane_with_estimate(
         &self,
         groups: &[String],
-        exclude: &[usize],
+        exclude: ServerSet,
         requested_body_bytes: u64,
     ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
         self.acquire_blocking_lane(groups, exclude, requested_body_bytes, None)
@@ -2641,7 +2677,7 @@ impl NntpClient {
     pub fn try_warm_blocking_body_lane(
         &self,
         groups: &[String],
-        exclude: &[usize],
+        exclude: ServerSet,
         requested_body_bytes: u64,
         seat: ServerId,
     ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
@@ -2651,7 +2687,7 @@ impl NntpClient {
     fn acquire_blocking_lane(
         &self,
         groups: &[String],
-        exclude: &[usize],
+        exclude: ServerSet,
         requested_body_bytes: u64,
         warm_seat: Option<ServerId>,
     ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
@@ -2686,7 +2722,7 @@ impl NntpClient {
             }
             let policy = self.pool.provider_policy();
             if !matches!(
-                policy.eligibility(server.0, exclude, &[], requested_body_bytes),
+                policy.eligibility(server.0, exclude, ServerSet::EMPTY, requested_body_bytes),
                 crate::provider_policy::ArticleEligibility::Eligible(_)
             ) {
                 // An occupied permit in a higher group cannot turn this
@@ -2824,12 +2860,12 @@ impl NntpClient {
     // server out of the ranking, so without this its refusal would read as
     // "no eligible server", which waits: the work it alone may serve would
     // sit in the queue for as long as the credentials stay wrong.
-    fn credentials_refusal(&self, exclude: &[usize]) -> Option<BlockingBodyLaneAcquireError> {
+    fn credentials_refusal(&self, exclude: ServerSet) -> Option<BlockingBodyLaneAcquireError> {
         let backfill_flags = self.pool.server_backfill_flags();
         let backfill_unlocked = self.pool.fill_servers_exhausted(exclude);
         (0..self.pool.server_count())
             .find(|idx| {
-                !exclude.contains(idx)
+                !exclude.contains(*idx)
                     && self.pool.route_available(*idx)
                     && (!backfill_flags[*idx] || backfill_unlocked)
                     && self.pool.refuses_credentials(*idx)
@@ -2852,12 +2888,12 @@ impl NntpClient {
     // The servers a new owned lane would try, in the order the pool ranks
     // them right now. A question, not a dispatch: it reserves nothing and
     // clears no quota latch. `None` while the health state is contended.
-    pub fn blocking_body_server_order(&self, exclude: &[usize]) -> Option<Vec<ServerId>> {
+    pub fn blocking_body_server_order(&self, exclude: ServerSet) -> Option<Vec<ServerId>> {
         self.try_blocking_body_server_selection(exclude, 0, QuotaCheck::ReadOnly)
             .map(|selection| selection.eligible)
     }
 
-    pub fn blocking_body_lane_candidacy(&self, exclude: &[usize]) -> BlockingBodyLaneCandidacy {
+    pub fn blocking_body_lane_candidacy(&self, exclude: ServerSet) -> BlockingBodyLaneCandidacy {
         // A question, not a dispatch: it asks for no bytes, so every server
         // with any headroom "fits", and letting that fit clear a server's
         // blocked latch erased the refusal the last real dispatch recorded —
@@ -2888,7 +2924,7 @@ impl NntpClient {
         }
     }
 
-    pub fn has_blocking_body_lane_candidate(&self, exclude: &[usize]) -> bool {
+    pub fn has_blocking_body_lane_candidate(&self, exclude: ServerSet) -> bool {
         matches!(
             self.blocking_body_lane_candidacy(exclude),
             BlockingBodyLaneCandidacy::Candidate
@@ -2958,7 +2994,7 @@ impl NntpClient {
     // tiering verdict and silently pushed the work off the owned fast path.
     fn try_blocking_body_server_selection(
         &self,
-        exclude: &[usize],
+        exclude: ServerSet,
         requested_body_bytes: u64,
         quota_check: QuotaCheck,
     ) -> Option<BodyServerSelection> {
@@ -2985,9 +3021,7 @@ impl NntpClient {
         let mut candidates = Vec::with_capacity(server_count);
         let mut quota_blocked = None;
         for (idx, group) in server_groups.iter().copied().enumerate().take(server_count) {
-            if exclude.contains(&idx)
-                || !health.is_available(idx)
-                || !self.pool.route_available(idx)
+            if exclude.contains(idx) || !health.is_available(idx) || !self.pool.route_available(idx)
             {
                 continue;
             }
@@ -3271,10 +3305,10 @@ impl NntpClient {
 
     // Rank candidates without granting permission to use them. Eligibility
     // is evaluated for each article immediately before its next attempt.
-    async fn article_server_order(&self, exclude: &[usize], avoid: &[usize]) -> Vec<usize> {
+    async fn article_server_order(&self, exclude: ServerSet, avoid: ServerSet) -> Vec<usize> {
         let mut groups = std::collections::BTreeMap::new();
         for idx in 0..self.pool.server_count() {
-            if !exclude.contains(&idx) {
+            if !exclude.contains(idx) {
                 groups
                     .entry((
                         self.pool.server_backfill_flags()[idx],
@@ -3287,7 +3321,7 @@ impl NntpClient {
         let mut order = Vec::new();
         for group in groups.into_values() {
             let mut ranked = self.rank_servers_in_group(&group).await;
-            ranked.sort_by_key(|idx| avoid.contains(idx));
+            ranked.sort_by_key(|idx| avoid.contains(*idx));
             order.extend(ranked);
         }
         order
@@ -3296,10 +3330,10 @@ impl NntpClient {
     async fn article_attempt_eligible(
         &self,
         server: usize,
-        exclude: &[usize],
+        exclude: ServerSet,
         attempts: &[FetchAttemptTrace],
     ) -> bool {
-        let missing: Vec<_> = attempts
+        let missing: ServerSet = attempts
             .iter()
             .filter(|attempt| matches!(attempt.outcome, FetchAttemptOutcome::NotFound))
             .map(|attempt| attempt.server_idx)
@@ -3307,7 +3341,7 @@ impl NntpClient {
         matches!(
             self.pool
                 .provider_policy()
-                .eligibility(server, &missing, exclude, 1),
+                .eligibility(server, missing, exclude, 1),
             crate::provider_policy::ArticleEligibility::Eligible(_)
         )
     }
@@ -3331,7 +3365,7 @@ impl NntpClient {
     // ([`crate::provider_policy::backfill_unlocked`]). Within a priority group, immediately acquirable
     // servers are preferred over fully saturated peers.
     #[allow(clippy::needless_range_loop)]
-    async fn build_server_order(&self, exclude: &[usize]) -> Vec<usize> {
+    async fn build_server_order(&self, exclude: ServerSet) -> Vec<usize> {
         let server_count = self.pool.server_count();
         let server_groups = self.pool.server_groups();
         let backfill_flags = self.pool.server_backfill_flags();
@@ -3354,9 +3388,7 @@ impl NntpClient {
         let mut backfill_groups: std::collections::BTreeMap<u32, GroupCandidates> =
             std::collections::BTreeMap::new();
         for idx in 0..server_count {
-            if exclude.contains(&idx)
-                || !health.is_available(idx)
-                || !self.pool.route_available(idx)
+            if exclude.contains(idx) || !health.is_available(idx) || !self.pool.route_available(idx)
             {
                 continue;
             }
@@ -3481,7 +3513,7 @@ impl NntpClient {
 
     // Internal: fetch with multi-server failover logic.
     async fn fetch_with_failover(&self, message_id: &str, kind: FetchKind) -> Result<Bytes> {
-        self.fetch_with_failover_excluding(message_id, kind, &[])
+        self.fetch_with_failover_excluding(message_id, kind, ServerSet::EMPTY)
             .await
     }
 
@@ -3489,18 +3521,18 @@ impl NntpClient {
         &self,
         message_id: &str,
         kind: FetchKind,
-        exclude: &[usize],
+        exclude: ServerSet,
     ) -> Result<Bytes> {
-        let order = self.article_server_order(exclude, &[]).await;
+        let order = self.article_server_order(exclude, ServerSet::EMPTY).await;
         let mut last_error: Option<NntpError> = None;
         let mut last_retryable_error: Option<NntpError> = None;
 
-        let mut missing = Vec::new();
+        let mut missing = ServerSet::EMPTY;
         for idx in order {
             if !matches!(
                 self.pool
                     .provider_policy()
-                    .eligibility(idx, &missing, exclude, 1),
+                    .eligibility(idx, missing, exclude, 1),
                 crate::provider_policy::ArticleEligibility::Eligible(_)
             ) {
                 continue;
@@ -3517,7 +3549,7 @@ impl NntpClient {
                 Err(NntpError::ArticleNotFound)
                 | Err(NntpError::NoSuchArticle { .. })
                 | Err(NntpError::NoArticleWithNumber) => {
-                    missing.push(idx);
+                    missing.insert(idx);
                     debug!(
                         server = idx,
                         message_id, "article not found, trying next server"

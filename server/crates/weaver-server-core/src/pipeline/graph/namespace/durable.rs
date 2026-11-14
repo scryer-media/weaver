@@ -101,6 +101,24 @@ impl NamespaceWriter {
             .collect()
     }
 
+    // What the member's coverage counts that a checkpoint taken now gives no
+    // home on disk, as merged spans in offset order. Before a stop that is
+    // every hold, as no row records one; after it, the holds still in RAM.
+    // A checkpoint leaves these out of the member's coverage, so a restart
+    // finds them not arrived and fetches them again, whatever length the
+    // member's file has.
+    pub(crate) fn unrecorded(&self, node: NodeId, member: MemberId) -> Vec<ByteRange> {
+        let Some(files) = self.files.get(&node) else {
+            return Vec::new();
+        };
+        let volume = super::held_volume(member);
+        if self.stopped {
+            files.holds.resident_spans(volume).collect()
+        } else {
+            files.holds.held_spans(volume).collect()
+        }
+    }
+
     // A graceful stop: every namespace pages what it holds in RAM to
     // scratch, under the same budgets as any page-out, and what scratch
     // cannot take goes to its member's spill file as far as the disk
@@ -126,7 +144,18 @@ impl NamespaceWriter {
             .collect();
         let mut free_disk = self.free_disk_bytes();
         for node in nodes {
-            let (page_outs, spills) = self.files_mut(node).holds.page_out_all(free_disk);
+            // The stop changes which of each member's held bytes a
+            // checkpoint says: every member that holds any is told again.
+            let files = self.files_mut(node);
+            let holding: Vec<MemberId> = files
+                .holds
+                .held_volumes()
+                .map(super::held_member)
+                .collect();
+            for member in holding {
+                files.leaves.mark(member);
+            }
+            let (page_outs, spills) = files.holds.page_out_all(free_disk);
             for page_out in &page_outs {
                 free_disk = free_disk.saturating_sub(page_out.range.len());
                 self.scratch(node)?
@@ -155,6 +184,40 @@ impl NamespaceWriter {
     // has, or one past the end of its file, is not adopted, so its article
     // reads as missing and is fetched again: a restore never fails for a
     // hold. Bytes the rows do not describe are never read.
+    // What the checkpoint's hold rows name of each member, noted before the
+    // members' files are put back: those bytes were on scratch or in a spill
+    // file, so no file is taken to hold them, and none folds them.
+    pub(crate) fn note_recorded_holds(&mut self, tree: &Tree, records: &[HoldRecord]) {
+        for record in records {
+            let member = super::held_member(record.held.volume);
+            if tree
+                .namespace(record.node)
+                .and_then(|found| found.get(member))
+                .is_none()
+            {
+                continue;
+            }
+            self.files_mut(record.node)
+                .recorded
+                .entry(member)
+                .or_default()
+                .add(record.held.range);
+        }
+    }
+
+    // The restore has judged every article: the rows' ranges are forgotten.
+    pub(crate) fn forget_recorded_holds(&mut self) {
+        let noted: Vec<NodeId> = self
+            .files
+            .iter()
+            .filter(|(_, files)| !files.recorded.is_empty())
+            .map(|(node, _)| *node)
+            .collect();
+        for node in noted {
+            self.files_mut(node).recorded.clear();
+        }
+    }
+
     pub(crate) fn restore_holds(
         &mut self,
         tree: &Tree,
@@ -347,11 +410,20 @@ impl NamespaceWriter {
             )?;
             if let Some(stated) = record.crc32 {
                 let pending = self.verifications.contains(&(node, member));
+                // Bytes a hold row names are not in this file: it folds
+                // none of them, and did not pass whole with any away.
+                let recorded = self
+                    .files
+                    .get(&node)
+                    .and_then(|files| files.recorded.get(&member))
+                    .cloned()
+                    .unwrap_or_default();
                 match (pending, record.length) {
                     // The worker reads it back, off the pipeline thread.
                     (true, _) => {}
                     (false, Some(length))
                         if record.closed
+                            && recorded.is_empty()
                             && record.coverage.covered(ByteRange::new(0, length))
                             && !record.coverage.damaged(ByteRange::new(0, length)) =>
                     {
@@ -360,12 +432,13 @@ impl NamespaceWriter {
                     (false, _) => {
                         let mut runs = vouched(segments, node, member, &record.coverage);
                         runs.extend(produced(tree, node, member, &record.coverage));
+                        runs.retain(|(range, _)| !recorded.overlaps(*range));
                         leaf.fold_vouched(runs)
                     }
                 }
             }
             self.files_mut(node).leaves.insert(member, leaf);
-            self.caps.restore(tree, node, member);
+            self.caps.restore(tree, node, member, self.kept_device());
         }
         if let Some(why) = state.refused {
             self.files_mut(node).refuse(member, why);
@@ -429,7 +502,7 @@ impl NamespaceWriter {
     // The restored tree's members, counted and charged against the job's
     // budget as the tree holds them.
     pub(crate) fn restore_members(&mut self, tree: &Tree) {
-        self.caps.restore_members(tree);
+        self.caps.restore_members(tree, self.kept_device());
     }
 
     // A member whose front a restore read again keeps it in memory: the

@@ -312,6 +312,9 @@ pub(crate) struct Runs {
     // refused node's run is forgotten, so this outlives it; a node that
     // runs again leaves it.
     held_back: BTreeSet<NodeId>,
+    // How many of `runs` have ended, so whether one is live is a count,
+    // not a walk of them.
+    ended: usize,
 }
 
 impl Runs {
@@ -332,6 +335,7 @@ impl Runs {
             clock: DecodeClock::default(),
             windows: None,
             held_back: BTreeSet::new(),
+            ended: 0,
         }
     }
 
@@ -373,9 +377,14 @@ impl Runs {
     // A run is waiting for a slot, waiting for memory, running, or stopped
     // before it finished.
     pub(crate) fn live(&self) -> bool {
-        self.runs
-            .values()
-            .any(|run| !matches!(run.life, Life::Ended { .. }))
+        debug_assert_eq!(
+            self.ended,
+            self.runs
+                .values()
+                .filter(|run| matches!(run.life, Life::Ended { .. }))
+                .count(),
+        );
+        self.runs.len() > self.ended
     }
 
     pub(crate) fn in_flight(&self) -> bool {
@@ -573,10 +582,14 @@ impl Runs {
             }
             Err(room) => room,
         };
-        run.life = Life::Starved {
-            freed: room.freed,
-            limit: room.limit,
-        };
+        turn(
+            &mut self.ended,
+            &mut run.life,
+            Life::Starved {
+                freed: room.freed,
+                limit: room.limit,
+            },
+        );
         self.marks.mark(node);
         let admissions = run
             .ticket
@@ -598,7 +611,7 @@ impl Runs {
             return;
         };
         let generation = shelf.begin();
-        run.life = Life::Running { generation };
+        turn(&mut self.ended, &mut run.life, Life::Running { generation });
         self.marks.mark(node);
         let volumes = Arc::new(RunVolumes::new(shelf, generation));
         run.volumes = Some(Arc::clone(&volumes));
@@ -661,6 +674,7 @@ impl Runs {
             if volumes.lost() {
                 sink(Emit::Refuse(Why::Unrepairable));
             }
+            volumes.decoded(decoding.spent());
             drop(decoding);
             extracting_hook(&volumes);
         });
@@ -671,12 +685,41 @@ impl Runs {
     pub(crate) fn ended(&mut self, node: NodeId, generation: u64, limit: usize) -> Vec<NodeId> {
         let mut admitted = self.follow(limit);
         if let Some(run) = self.runs.get_mut(&node)
+            && run.volumes.as_ref().is_some_and(|volumes| volumes.parked())
+        {
+            // Stopped for the job to wait for room: it gives back what it
+            // reserved and its slot, and waits for a slot again, to run
+            // again from the start of its volumes. While the job waits its
+            // limit is none, so the slot goes to no one of the job's. Its
+            // part of the job's decoding clock is given back: it decodes
+            // all of it again.
+            if let Some(volumes) = &run.volumes {
+                self.clock.discard(volumes.decode_time());
+            }
+            turn(&mut self.ended, &mut run.life, Life::Queued);
+            run.volumes = None;
+            run.placed = Placed::Grant;
+            run.rerun = false;
+            give_back(&self.pool, run);
+            self.pool.stop_waiting(&mut run.whole);
+            let admissions = run
+                .ticket
+                .take()
+                .map(|ticket| self.slots.release(ticket))
+                .unwrap_or_default();
+            self.marks.mark(node);
+            admitted.extend(self.admit(admissions));
+            admitted.extend(self.queue(node));
+            admitted.extend(self.wake());
+            return admitted;
+        }
+        if let Some(run) = self.runs.get_mut(&node)
             && std::mem::take(&mut run.rerun)
         {
             // Widened: it gives back what it reserved at the narrower
             // window and starts again under the slot it holds, reserving
             // the wider one.
-            run.life = Life::Queued;
+            turn(&mut self.ended, &mut run.life, Life::Queued);
             run.volumes = None;
             run.placed = Placed::Grant;
             give_back(&self.pool, run);
@@ -688,7 +731,7 @@ impl Runs {
             return admitted;
         }
         if let Some(run) = self.runs.get_mut(&node) {
-            run.life = Life::Ended { generation };
+            turn(&mut self.ended, &mut run.life, Life::Ended { generation });
             self.marks.mark(node);
             admitted.extend(self.free(node));
         }
@@ -805,6 +848,30 @@ impl Runs {
         self.runs.get(&node).is_some_and(|run| run.rerun)
     }
 
+    // The node's run wrote while its job waited for room on a disk: it
+    // stops where it stands, and once it ended it gives back its memory and
+    // its slot, and runs again from the start once the job has room. What
+    // it said already landed; nothing it says from here is heard.
+    // A run widened, stopped already to start again, is parked as well: it
+    // starts again at the wider window once the job has room.
+    pub(crate) fn park(&mut self, node: NodeId) {
+        if let Some(run) = self.runs.get(&node)
+            && let Some(volumes) = run.volumes.as_ref()
+            && (volumes.current() || run.rerun)
+        {
+            volumes.park();
+        }
+    }
+
+    // Whether the run stopped for its job to wait for room on a disk, and is
+    // ending to run again from the start.
+    pub(crate) fn parked(&self, node: NodeId) -> bool {
+        self.runs.get(&node).is_some_and(|run| {
+            matches!(run.life, Life::Running { .. })
+                && run.volumes.as_ref().is_some_and(|volumes| volumes.parked())
+        })
+    }
+
     // Stop every run where it stands: the job is going down. What a run read
     // is on its shelf, for the restored job to read again. Its slot and its
     // memory are given back, but the run stays, stopped under its generation:
@@ -823,13 +890,14 @@ impl Runs {
             self.free(node);
             if let Some(run) = self.runs.get_mut(&node) {
                 self.marks.mark(node);
-                run.life = match run.life {
+                let life = match run.life {
                     Life::Queued | Life::Starved { .. } => Life::Stopped { generation: None },
                     Life::Running { generation } => Life::Stopped {
                         generation: Some(generation),
                     },
                     life @ (Life::Ended { .. } | Life::Stopped { .. }) => life,
                 };
+                turn(&mut self.ended, &mut run.life, life);
             }
         }
     }
@@ -843,8 +911,10 @@ impl Runs {
     }
 
     // Forget the runs of `gone`, nodes no longer engines: refused,
-    // retracted or unbound. Their threads may still be out: what they say
-    // is under a generation no run holds, and is not heard. Their slots and
+    // retracted, unbound or taken away. Each is stopped where it stands, as
+    // a stopped job's runs are, so a reader waiting on a shelf nothing feeds
+    // again wakes and its thread returns. What a thread says from here is
+    // under a generation no run holds, and is not heard. Their slots and
     // their memory go to whoever waits; returns the nodes that may start
     // now, as a raised limit or released memory admits them even when
     // nothing is gone.
@@ -857,7 +927,13 @@ impl Runs {
         }
         for node in gone {
             admitted.extend(self.free(node));
-            if self.runs.remove(&node).is_some() {
+            if let Some(run) = self.runs.remove(&node) {
+                if matches!(run.life, Life::Ended { .. }) {
+                    self.ended -= 1;
+                }
+                if let Some(volumes) = &run.volumes {
+                    volumes.stop();
+                }
                 self.marks.mark(node);
             }
         }
@@ -900,7 +976,7 @@ impl Runs {
     // The node waits for a slot, or takes a free one.
     fn queue(&mut self, node: NodeId) -> Option<NodeId> {
         let run = self.runs.get_mut(&node)?;
-        run.life = Life::Queued;
+        turn(&mut self.ended, &mut run.life, Life::Queued);
         self.marks.mark(node);
         match self.slots.ask(asker(node)) {
             Asked::Admitted(ticket) => {
@@ -962,6 +1038,18 @@ fn give_back(pool: &DecodePool, run: &mut Run) {
         pool.release_above(len);
     } else {
         pool.release(len);
+    }
+}
+
+// A run moves on in its life, and the count of runs ended follows it.
+fn turn(ended: &mut usize, life: &mut Life, to: Life) {
+    let was = matches!(*life, Life::Ended { .. });
+    let is = matches!(to, Life::Ended { .. });
+    *life = to;
+    match (was, is) {
+        (false, true) => *ended += 1,
+        (true, false) => *ended -= 1,
+        _ => {}
     }
 }
 

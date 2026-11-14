@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use weaver_tunnel::{TunnelProvider, pipe::Purpose};
 
 fn proxy() -> ProxyProfile {
     ProxyProfile {
@@ -312,6 +313,196 @@ async fn a_feed_leg_holds_its_health_until_its_last_rung_and_fallback_have_faile
         "{:?}",
         health()
     );
+    runtime.shutdown().await;
+}
+
+// A pool member whose session is refused for good, as on a changed host key.
+struct FatalMember;
+#[async_trait::async_trait]
+impl Dialer for FatalMember {
+    async fn prepare(&self) -> Result<(), DialError> {
+        Err(DialError::Fatal(weaver_tunnel::TunnelError::Engine(
+            "host key changed".into(),
+        )))
+    }
+    async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
+        panic!("a blocked member is never dialed")
+    }
+    fn budget(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+    fn describe(&self) -> String {
+        "fatal member".into()
+    }
+}
+
+// A pool member that cannot be reached right now.
+struct UnreachableMember;
+#[async_trait::async_trait]
+impl Dialer for UnreachableMember {
+    async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
+        Err(DialError::Egress(std::io::Error::other("no route to host")))
+    }
+    fn budget(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+    fn describe(&self) -> String {
+        "unreachable member".into()
+    }
+}
+
+// A feed route of one leg, "pool 7, then direct", whose pool members are
+// `members` in place of real proxy sessions.
+fn feed_pool_runtime(members: Vec<Arc<dyn Dialer>>) -> (Arc<NetworkRuntime>, Arc<ConsumerRoute>) {
+    let db = Database::open_in_memory().unwrap();
+    let runtime = NetworkRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let mut config = runtime.configuration.read().unwrap().clone();
+    config.consumers.insert(Consumer::Rss(1).key());
+    let ids: Vec<u32> = (1..=members.len() as u32).collect();
+    let bottom = NetworkRuntime::bottom(&config, 0, Duration::from_secs(1)).unwrap();
+    for (id, member) in ids.iter().zip(members) {
+        let mut profile = proxy();
+        profile.id = *id;
+        profile.name = format!("fixture-{id}");
+        profile.kind = ProxyKind::Ssh;
+        profile.revision = u64::from(*id);
+        let revisions = vec![(*id, Some(profile.revision))];
+        config.profiles.insert(*id, profile);
+        runtime.sessions.lock().unwrap().insert(
+            format!("{}:{:?}:{revisions:?}", bottom.id(), bottom.binding()),
+            member,
+        );
+    }
+    config.pools.insert(
+        7,
+        ProxyPool {
+            id: 7,
+            name: "fixture".into(),
+            kind: ProxyKind::Ssh,
+            member_ids: ids,
+            enabled: true,
+        },
+    );
+    config.policies.insert(
+        Consumer::Rss(1).key(),
+        RoutingPolicy {
+            legs: vec![RouteLeg {
+                egress_id: 0,
+                weight: 100,
+                path: LegPath::Ladder {
+                    rungs: vec![Rung::Pool { id: 7 }],
+                    direct_fallback: true,
+                },
+            }],
+            ..Default::default()
+        },
+    );
+    runtime.apply_configuration(config).unwrap();
+    let legacy = ProxyRuntime::new(db, tokio::runtime::Handle::current())
+        .unwrap()
+        .draft_route(RoutingPolicy::default(), Duration::from_secs(1))
+        .unwrap();
+    (runtime, legacy)
+}
+
+// Dials every member of pool 7 once, so each records what its dial found.
+// A fetch builds the pool first.
+async fn dial_every_member(runtime: &NetworkRuntime, legacy: &Arc<ConsumerRoute>) {
+    runtime
+        .fetch_attempts(Consumer::Rss(1), legacy.clone())
+        .unwrap();
+    let pool = runtime.pools.lock().unwrap()[&(7, 0)].clone();
+    let target = Target {
+        host: "feed.invalid".into(),
+        port: 443,
+        purpose: Purpose::Outbound,
+        addresses: Vec::new(),
+    };
+    for (_, lease) in pool.lease_members() {
+        assert!(lease.dial(&target).await.is_err());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_feed_pool_with_every_member_blocked_fails_its_leg_instead_of_going_direct() {
+    let (runtime, legacy) = feed_pool_runtime(vec![Arc::new(FatalMember), Arc::new(FatalMember)]);
+    let route = runtime
+        .route(Consumer::Rss(1), 1, Duration::from_secs(1))
+        .unwrap();
+    let health = || route.weighted.allocations()[0].health.clone();
+
+    // Before any member is blocked: both members, then the direct fallback.
+    let first = runtime
+        .fetch_attempts(Consumer::Rss(1), legacy.clone())
+        .unwrap();
+    assert_eq!(first.len(), 3, "two members and the direct fallback");
+    dial_every_member(&runtime, &legacy).await;
+
+    // The first fetch's last member reports the fatal error, which cools the
+    // pool rung; the leg itself waits for its fallback.
+    first[1].report(Some(&DialError::Fatal(weaver_tunnel::TunnelError::Engine(
+        "all pool members are blocked".into(),
+    ))));
+    assert_eq!(health(), LegHealthState::Up);
+
+    // Every member blocked, the rung cooling or not: one attempt, which fails
+    // with the pool's fatal error, and no direct fallback after it.
+    let attempts = runtime
+        .fetch_attempts(Consumer::Rss(1), legacy.clone())
+        .unwrap();
+    assert_eq!(attempts.len(), 1, "the blocked pool and nothing after it");
+    let error = FetchPath::resolve(attempts[0].as_ref(), "feed.invalid")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, DialError::Fatal(_)), "{error:?}");
+    assert!(
+        error.to_string().ends_with("all pool members are blocked"),
+        "{error}"
+    );
+    assert!(
+        attempts[0].dial("192.0.2.1", 443).await.is_err(),
+        "an address in the URL is not dialed directly either"
+    );
+
+    // Reported, it blocks the leg as the same error does on the dial path.
+    attempts[0].report(Some(&error));
+    assert!(
+        matches!(health(), LegHealthState::Blocked(_)),
+        "{:?}",
+        health()
+    );
+    assert!(
+        runtime
+            .fetch_attempts(Consumer::Rss(1), legacy)
+            .unwrap()
+            .is_empty()
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_feed_pool_with_an_unblocked_member_keeps_its_direct_fallback() {
+    // One member blocked, the other only unreachable: the pool still has a
+    // member to try, so the route behaves as it always has.
+    let (runtime, legacy) =
+        feed_pool_runtime(vec![Arc::new(FatalMember), Arc::new(UnreachableMember)]);
+    dial_every_member(&runtime, &legacy).await;
+    let attempts = runtime
+        .fetch_attempts(Consumer::Rss(1), legacy.clone())
+        .unwrap();
+    assert_eq!(attempts.len(), 2, "the unreachable member and direct");
+    assert_eq!(attempts[0].describe(), "pool 7 member 2");
+    assert_ne!(attempts[1].describe(), attempts[0].describe());
+    runtime.shutdown().await;
+
+    // Every member only unreachable: unchanged too.
+    let (runtime, legacy) = feed_pool_runtime(vec![
+        Arc::new(UnreachableMember),
+        Arc::new(UnreachableMember),
+    ]);
+    dial_every_member(&runtime, &legacy).await;
+    let attempts = runtime.fetch_attempts(Consumer::Rss(1), legacy).unwrap();
+    assert_eq!(attempts.len(), 3, "two members and the direct fallback");
     runtime.shutdown().await;
 }
 

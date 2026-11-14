@@ -184,7 +184,7 @@ fn each_profile_sizes_extraction_par3_and_holds_limits() {
             efficient.par3_memory,
             MemoryShare {
                 divisor: 16,
-                cap_bytes: 256 * MIB
+                cap_bytes: 128 * MIB
             }
         );
         assert_eq!(efficient.par3_cpu_cap, Some(efficient.extract_threads));
@@ -199,7 +199,7 @@ fn each_profile_sizes_extraction_par3_and_holds_limits() {
             balanced.par3_memory,
             MemoryShare {
                 divisor: 8,
-                cap_bytes: GIB
+                cap_bytes: 512 * MIB
             }
         );
         assert_eq!(balanced.par3_cpu_cap, Some(balanced.extract_threads));
@@ -211,7 +211,7 @@ fn each_profile_sizes_extraction_par3_and_holds_limits() {
             performance.par3_memory,
             MemoryShare {
                 divisor: 8,
-                cap_bytes: 2 * GIB
+                cap_bytes: GIB
             }
         );
         assert_eq!(performance.par3_cpu_cap, None);
@@ -219,9 +219,27 @@ fn each_profile_sizes_extraction_par3_and_holds_limits() {
     }
 
     let share = HardwareProfile::Balanced.tuning(&machine(4, 8)).par3_memory;
-    assert_eq!(share.of(8 * GIB), GIB);
-    assert_eq!(share.of(64 * GIB), GIB);
+    assert_eq!(share.of(4 * GIB), 512 * MIB);
+    assert_eq!(share.of(8 * GIB), 512 * MIB);
+    assert_eq!(share.of(64 * GIB), 512 * MIB);
     assert_eq!(share.of(GIB), 128 * MIB);
+
+    // The smallest profile's repair grant stops at 128 MiB.
+    let share = HardwareProfile::Efficient
+        .tuning(&machine(4, 8))
+        .par3_memory;
+    assert_eq!(share.of(GIB), 64 * MIB);
+    assert_eq!(share.of(2 * GIB), 128 * MIB);
+    assert_eq!(share.of(64 * GIB), 128 * MIB);
+
+    // The widest profile's repair grant stops at 1 GiB however much memory
+    // the machine has.
+    let share = HardwareProfile::Performance
+        .tuning(&machine(16, 64))
+        .par3_memory;
+    assert_eq!(share.of(16 * GIB), GIB);
+    assert_eq!(share.of(64 * GIB), GIB);
+    assert_eq!(share.of(4 * GIB), 512 * MIB);
 }
 
 #[test]

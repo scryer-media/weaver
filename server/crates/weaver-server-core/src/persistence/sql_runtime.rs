@@ -576,9 +576,72 @@ impl SqlRuntime {
             }
         }
     }
+
+    // Pure reads that must see one snapshot: one connection, one deferred
+    // transaction, rolled back at the end. It never takes the writer gate, so
+    // a write parked there, or a checkpoint pass a write waits on, does not
+    // hold it up. `op` must not write: on SQLite a write here would meet the
+    // gated writer in the busy handler, and on Postgres the transaction is
+    // read-only and refuses it.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: a read-only snapshot transaction, outside the gate by design"
+    )]
+    pub(crate) async fn run_read_transaction<T, F>(
+        datastore: &StoreDatastore,
+        op_name: &'static str,
+        op: F,
+    ) -> SqlResult<T>
+    where
+        T: Send,
+        F: for<'tx, 'db> Fn(&'tx mut SqlTx<'db>) -> TxFuture<'tx, T> + Send + Sync,
+    {
+        let engine = datastore.engine().as_str();
+        let started = Instant::now();
+        let result = match datastore {
+            StoreDatastore::Sqlite { pool, .. } => {
+                run_with_sqlite_busy_retries(op_name, || {
+                    let pool = pool.clone();
+                    let op = &op;
+                    async move {
+                        let mut tx = SqlTx::Sqlite(pool.begin().await.map_err(db_err)?);
+                        let result = op(&mut tx).await?;
+                        tx.rollback().await?;
+                        Ok(result)
+                    }
+                })
+                .await
+            }
+            StoreDatastore::Postgres { pool } => {
+                run_postgres_transaction_with_retries(op_name, || async {
+                    let before = |e| PostgresTxError::new(TxPhase::BeforeCommit, e);
+                    let mut tx =
+                        SqlTx::Postgres(pool.begin().await.map_err(|e| before(pg_db_err(e)))?);
+                    tx.execute("SET TRANSACTION READ ONLY", &[])
+                        .await
+                        .map_err(before)?;
+                    let result = op(&mut tx).await.map_err(before)?;
+                    tx.rollback().await.map_err(before)?;
+                    Ok(result)
+                })
+                .await
+            }
+        };
+        crate::runtime::perf_probe::record_sql_op(engine, op_name, started.elapsed());
+        result
+    }
 }
 
 impl<'db> SqlTx<'db> {
+    // This transaction's connection, for code that also runs inside a
+    // transaction it does not own.
+    pub(crate) fn conn(&mut self) -> SqlConn<'_> {
+        match self {
+            SqlTx::Sqlite(tx) => SqlConn::Sqlite(tx),
+            SqlTx::Postgres(tx) => SqlConn::Postgres(tx),
+        }
+    }
+
     #[expect(
         clippy::disallowed_methods,
         reason = "writer gate: runs on a transaction run_in_transaction opened under the gate; Postgres has no writer gate"
@@ -710,6 +773,13 @@ impl<'db> SqlTx<'db> {
         match self {
             SqlTx::Sqlite(tx) => tx.commit().await.map_err(db_err),
             SqlTx::Postgres(tx) => tx.commit().await.map_err(pg_db_err),
+        }
+    }
+
+    pub(crate) async fn rollback(self) -> SqlResult<()> {
+        match self {
+            SqlTx::Sqlite(tx) => tx.rollback().await.map_err(db_err),
+            SqlTx::Postgres(tx) => tx.rollback().await.map_err(pg_db_err),
         }
     }
 }

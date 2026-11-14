@@ -26,6 +26,7 @@ mod progress;
 pub mod queue;
 mod queue_window;
 pub(crate) use queue_window::waits_its_turn;
+mod scan_inputs;
 mod server_attribution;
 mod support_facts;
 #[cfg(any(test, feature = "test-support"))]
@@ -357,12 +358,12 @@ pub(super) struct DownloadBatchLease {
     // rewriting queued work, and the same for every article on the lane:
     // each result unions it with its own work's failure ledger rather than
     // reporting this set alone.
-    pub(super) effective_exclude_servers: Vec<usize>,
+    pub(super) effective_exclude_servers: weaver_nntp::ServerSet,
     // The servers the lane's adopt or dial must not use. A batch is cut for
     // one server, so this is every other server: the connection goes where
     // the scheduler's answer was for. Kept apart from the excludes above,
     // which reach the failure ledger — a pin is not a failure.
-    pub(super) dial_exclude_servers: Vec<usize>,
+    pub(super) dial_exclude_servers: weaver_nntp::ServerSet,
     // Immutable common-refinement geometry captured when this batch was
     // leased. Each response carries this same snapshot through durable commit
     // so grids admitted later cannot reinterpret old decoder output.
@@ -472,7 +473,7 @@ pub(super) struct DownloadResult {
     // How many times this segment has been retried so far.
     pub(super) retry_count: u32,
     // Servers intentionally excluded for this fetch attempt.
-    pub(super) exclude_servers: Vec<usize>,
+    pub(super) exclude_servers: weaver_nntp::ServerSet,
     // Whether this result releases one NNTP connection dispatch slot.
     pub(super) release_connection_slot: bool,
 }
@@ -584,12 +585,29 @@ impl DownloadFailureKind {
     }
 }
 
+// What a refusal for want of a selected group (412) says about the article.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum GroupRefusal {
+    // The failure is not a 412.
+    #[default]
+    None,
+    // The refusal teaches the server's requirement, and the next connection
+    // selects one of the work's groups before asking again. It costs the
+    // article nothing.
+    Learning,
+    // The work had no group to select, or the connection had one selected
+    // and the server refused anyway. Asking again is answered the same way,
+    // so the article pays a retry like for any other refusal.
+    Settled,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct DownloadFailure {
     pub(super) kind: DownloadFailureKind,
     pub(super) message: String,
     pub(super) retry_after: Option<Duration>,
     pub(super) quota_rejection: Option<weaver_nntp::transfer::QuotaRejection>,
+    pub(super) group_refusal: GroupRefusal,
 }
 
 impl DownloadFailure {
@@ -599,6 +617,21 @@ impl DownloadFailure {
             message: message.into(),
             retry_after: None,
             quota_rejection: None,
+            group_refusal: GroupRefusal::None,
+        }
+    }
+
+    // Whether the article keeps its retry count for this failure.
+    pub(super) fn preserves_article_retry_budget(&self) -> bool {
+        self.kind.preserves_article_retry_budget() && self.group_refusal != GroupRefusal::Settled
+    }
+
+    // Settle a 412 the next connection cannot answer by selecting a group:
+    // `no_group` when the work lists none, `group_selected` when the
+    // connection that was refused had one selected.
+    pub(super) fn settle_group_refusal(&mut self, no_group: bool, group_selected: bool) {
+        if self.group_refusal == GroupRefusal::Learning && (no_group || group_selected) {
+            self.group_refusal = GroupRefusal::Settled;
         }
     }
 
@@ -614,6 +647,7 @@ impl DownloadFailure {
             message: message.into(),
             retry_after,
             quota_rejection: Some(rejection),
+            group_refusal: GroupRefusal::None,
         }
     }
 
@@ -708,7 +742,11 @@ impl DownloadFailure {
                 .unwrap_or(DownloadFailureKind::ContentOrProtocol),
         };
 
-        Self::new(kind, error.to_string())
+        let mut failure = Self::new(kind, error.to_string());
+        if matches!(error, NntpError::NoGroupSelected) {
+            failure.group_refusal = GroupRefusal::Learning;
+        }
+        failure
     }
 }
 
@@ -787,8 +825,7 @@ pub(super) fn download_outcome_keeps_connection(
 pub(super) struct PendingDecodeWork {
     pub(super) segment_id: SegmentId,
     pub(super) raw: Bytes,
-    pub(super) source_server_idx: Option<usize>,
-    pub(super) exclude_servers: Vec<usize>,
+    pub(in crate::pipeline) servers: PoolServers,
 }
 
 // Native outcomes share the existing repair completion queue. Dispatch occurs
@@ -1001,6 +1038,90 @@ pub(super) struct UnanchoredPart {
     pub(super) source: SegmentSource,
 }
 
+// Every article held for the ordinal before it, by file, with how many are
+// held across every file. Parts go in and come out only through these
+// methods, so the count is always the number held, in memory or spilled,
+// and is never recounted. A file that holds nothing has no entry.
+#[derive(Default)]
+pub(super) struct UnanchoredPark {
+    files: HashMap<NzbFileId, BTreeMap<u32, UnanchoredPart>>,
+    parts: usize,
+}
+
+impl UnanchoredPark {
+    pub(super) fn parts(&self) -> usize {
+        self.parts
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    pub(super) fn contains_key(&self, file_id: &NzbFileId) -> bool {
+        self.files.contains_key(file_id)
+    }
+
+    pub(super) fn get(&self, file_id: &NzbFileId) -> Option<&BTreeMap<u32, UnanchoredPart>> {
+        self.files.get(file_id)
+    }
+
+    pub(super) fn iter(
+        &self,
+    ) -> std::collections::hash_map::Iter<'_, NzbFileId, BTreeMap<u32, UnanchoredPart>> {
+        self.files.iter()
+    }
+
+    pub(super) fn keys(
+        &self,
+    ) -> std::collections::hash_map::Keys<'_, NzbFileId, BTreeMap<u32, UnanchoredPart>> {
+        self.files.keys()
+    }
+
+    // Hold a part, returning the one it replaced at the same ordinal.
+    pub(super) fn insert(
+        &mut self,
+        file_id: NzbFileId,
+        ordinal: u32,
+        part: UnanchoredPart,
+    ) -> Option<UnanchoredPart> {
+        let replaced = self.files.entry(file_id).or_default().insert(ordinal, part);
+        if replaced.is_none() {
+            self.parts += 1;
+        }
+        replaced
+    }
+
+    pub(super) fn remove(&mut self, file_id: NzbFileId, ordinal: u32) -> Option<UnanchoredPart> {
+        let parked = self.files.get_mut(&file_id)?;
+        let part = parked.remove(&ordinal)?;
+        if parked.is_empty() {
+            self.files.remove(&file_id);
+        }
+        debug_assert!(self.parts > 0, "unanchored park over-release");
+        self.parts = self.parts.saturating_sub(1);
+        Some(part)
+    }
+
+    // Every part the file holds.
+    pub(super) fn remove_file(
+        &mut self,
+        file_id: NzbFileId,
+    ) -> Option<BTreeMap<u32, UnanchoredPart>> {
+        let parked = self.files.remove(&file_id)?;
+        debug_assert!(self.parts >= parked.len(), "unanchored park over-release");
+        self.parts = self.parts.saturating_sub(parked.len());
+        Some(parked)
+    }
+}
+
+impl std::ops::Index<&NzbFileId> for UnanchoredPark {
+    type Output = BTreeMap<u32, UnanchoredPart>;
+
+    fn index(&self, file_id: &NzbFileId) -> &Self::Output {
+        &self.files[file_id]
+    }
+}
+
 // Sequential-assembly state for one uuencode file.
 //
 // A uuencode part's position is the cumulative *decoded* length of every part
@@ -1012,7 +1133,7 @@ pub(super) struct UnanchoredPart {
 #[derive(Default)]
 pub(super) struct UuFileAssembly {
     // The next segment ordinal the cursor will place.
-    pub(super) next_index: u32,
+    pub(super) next_index: scan_inputs::UuCursor,
     // The decoded byte offset that ordinal will be placed at.
     pub(super) next_offset: u64,
     // Parts that arrived ahead of the cursor, keyed by ordinal.
@@ -1043,11 +1164,11 @@ impl Pipeline {
     // cursor starts where they end.
     pub(in crate::pipeline) fn uu_file(&mut self, file_id: NzbFileId) -> &mut UuFileAssembly {
         let graph_jobs = &self.graph_jobs;
-        self.uu_files.entry(file_id).or_insert_with(|| {
+        self.uu_files.get_or_insert_with(file_id, || {
             let (next_index, next_offset, damaged) =
                 Self::graph_ordered_front(graph_jobs, file_id).unwrap_or_default();
             UuFileAssembly {
-                next_index,
+                next_index: scan_inputs::UuCursor::at(next_index),
                 next_offset,
                 damaged,
                 ..UuFileAssembly::default()
@@ -1060,7 +1181,7 @@ impl Pipeline {
     // early and the file is damaged from there. The repair, or the file's
     // verdict, rules on what that leaves.
     pub(in crate::pipeline) fn pass_given_up_uu(&mut self, file_id: NzbFileId) {
-        let Some(mut next) = self.uu_files.get(&file_id).map(|uu| uu.next_index) else {
+        let Some(mut next) = self.uu_files.get(&file_id).map(|uu| uu.next_index.get()) else {
             return;
         };
         let from = next;
@@ -1074,7 +1195,7 @@ impl Pipeline {
             && let Some(uu) = self.uu_files.get_mut(&file_id)
         {
             uu.damaged = true;
-            uu.next_index = next;
+            uu.next_index.set(next);
         }
     }
 }
@@ -1116,10 +1237,140 @@ pub(super) struct YencLayoutAssertions {
     pub(super) end: Option<u64>,
 }
 
+// The server a body came from and the servers its article had excluded, as
+// numbered by the pool generation that fetched it. A rebuild may give the
+// same index to another server, so the set is read under another generation
+// only through the map from its own: a body fetched before a rebuild and
+// decoded after it cannot pass old indices off as current ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PoolServers {
+    generation: u64,
+    source: Option<usize>,
+    excluded: weaver_nntp::ServerSet,
+}
+
+impl PoolServers {
+    pub(in crate::pipeline) fn stamped(
+        generation: u64,
+        source: Option<usize>,
+        excluded: weaver_nntp::ServerSet,
+    ) -> Self {
+        Self {
+            generation,
+            source,
+            excluded,
+        }
+    }
+
+    // No server, under every generation.
+    pub(in crate::pipeline) fn none() -> Self {
+        Self::stamped(0, None, weaver_nntp::ServerSet::EMPTY)
+    }
+
+    // The source and excluded servers as the current pool numbers them:
+    // carried across each rebuild since they were taken, a server that is
+    // gone or is no longer the same server dropping out.
+    pub(in crate::pipeline) fn under(
+        self,
+        layouts: &PoolLayouts,
+        generation: u64,
+    ) -> (Option<usize>, weaver_nntp::ServerSet) {
+        if self.generation == generation {
+            (self.source, self.excluded)
+        } else {
+            (
+                self.source
+                    .and_then(|source| layouts.index(self.generation, source)),
+                layouts.set(self.generation, self.excluded),
+            )
+        }
+    }
+}
+
+// How many past pool layouts a set taken under one of them can still be
+// carried from. Work outlives a rebuild by a retry's delay or a decode at
+// most, so a set older than this many rebuilds reads as no server at all.
+const POOL_LAYOUTS_KEPT: usize = 16;
+
+// The server layouts of recent pool generations, each with the map from it
+// to the current pool. The maps are built once per rebuild, by each server's
+// identity rather than by chaining one rebuild's map after another, so a
+// server that left the pool for one generation and came back is still the
+// same server to work taken before it left.
+#[derive(Default)]
+pub(crate) struct PoolLayouts {
+    held: std::collections::VecDeque<(
+        u64,
+        Vec<weaver_nntp::ServerIdentity>,
+        weaver_nntp::ServerRemap,
+    )>,
+}
+
+impl PoolLayouts {
+    // The pool is now `generation`, laid out as `identities`; `previous`
+    // is the generation it replaced and how that one was laid out, used
+    // when no layout is held yet. Returns the map from the previous
+    // generation to this one.
+    pub(in crate::pipeline) fn activate(
+        &mut self,
+        previous: (u64, Vec<weaver_nntp::ServerIdentity>),
+        generation: u64,
+        identities: Vec<weaver_nntp::ServerIdentity>,
+    ) -> weaver_nntp::ServerRemap {
+        if self
+            .held
+            .back()
+            .is_none_or(|(held, _, _)| *held != previous.0)
+        {
+            self.held
+                .push_back((previous.0, previous.1, weaver_nntp::ServerRemap::NONE));
+        }
+        for (_, layout, remap) in &mut self.held {
+            *remap = weaver_nntp::ServerRemap::between(layout, &identities);
+        }
+        let from_previous = self
+            .held
+            .back()
+            .map_or(weaver_nntp::ServerRemap::NONE, |(_, _, remap)| *remap);
+        let count = identities.len();
+        self.held.push_back((
+            generation,
+            identities,
+            weaver_nntp::ServerRemap::identity(count),
+        ));
+        while self.held.len() > POOL_LAYOUTS_KEPT {
+            self.held.pop_front();
+        }
+        from_previous
+    }
+
+    fn remap(&self, generation: u64) -> Option<&weaver_nntp::ServerRemap> {
+        self.held
+            .iter()
+            .rev()
+            .find(|(held, _, _)| *held == generation)
+            .map(|(_, _, remap)| remap)
+    }
+
+    // `set`, taken under `generation`, as the current pool numbers it.
+    pub(in crate::pipeline) fn set(
+        &self,
+        generation: u64,
+        set: weaver_nntp::ServerSet,
+    ) -> weaver_nntp::ServerSet {
+        self.remap(generation)
+            .map_or(weaver_nntp::ServerSet::EMPTY, |remap| remap.set(set))
+    }
+
+    // The server `index` of `generation` as the current pool numbers it.
+    pub(in crate::pipeline) fn index(&self, generation: u64, index: usize) -> Option<usize> {
+        self.remap(generation).and_then(|remap| remap.index(index))
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct SegmentSource {
-    pub(super) source_server_idx: Option<usize>,
-    pub(super) exclude_servers: Vec<usize>,
+    pub(in crate::pipeline) servers: PoolServers,
 }
 
 // Completion of a decode task, including explicit failures so backlog
@@ -1135,8 +1386,7 @@ pub(super) enum DecodeDone {
         segment_id: SegmentId,
         raw_size: u64,
         error: String,
-        source_server_idx: Option<usize>,
-        exclude_servers: Vec<usize>,
+        servers: PoolServers,
     },
 }
 
@@ -1332,11 +1582,16 @@ pub struct Pipeline {
     pub(super) jobs: HashMap<JobId, JobState>,
     // The graph runtime of each job holding its articles, given when they
     // are built.
-    pub(super) graph_jobs: HashMap<JobId, graph::job::GraphJob>,
+    pub(super) graph_jobs: scan_inputs::GraphJobs,
     // The graph runtimes of jobs that dropped their articles while something
     // of them was still out on a thread: each is stopped, and kept only until
     // the last of its mail is heard.
     pub(super) retiring_graph_jobs: HashMap<JobId, graph::job::GraphJob>,
+    // The jobs whose working directory an activation is moving under the
+    // intermediate folder, each with that activation's number. No other
+    // activation is sent for one until that reply is heard, so one move at a
+    // time has the directory.
+    pub(super) moving_jobs: HashMap<JobId, u64>,
     // The repair slots graph jobs share, and what each job's recovery
     // objects said when it last advanced.
     pub(super) graph_status: graph::status::GraphStatus,
@@ -1367,6 +1622,9 @@ pub struct Pipeline {
     // work drains.
     pub(crate) nzb_retired_busy: HashSet<JobId>,
     pub(crate) nzb_pause_releases: HashSet<JobId>,
+    // The paused jobs whose resume waits for a download slot and is stored
+    // already: each is written once, when the resume is asked for.
+    pub(crate) resumes_stored: HashSet<JobId>,
     pub(crate) nzb_reprocess_pending: HashSet<JobId>,
     // The slots whose take or release is out on the writer, not yet
     // committed. Both count as held.
@@ -1419,12 +1677,12 @@ pub struct Pipeline {
     // was last stored: a reorder among parked jobs is stored too.
     pub(super) stored_queue_order: Vec<JobId>,
     // Number of in-flight article downloads (primary + recovery).
-    pub(super) active_downloads: usize,
+    pub(super) articles_in_flight: usize,
     // Number of NNTP connection tasks currently fetching articles.
     pub(super) active_download_connections: usize,
     // Active connection lanes carrying completion-critical PAR2 work.
     pub(super) active_completion_critical_connections: usize,
-    // Number of in-flight recovery downloads (subset of active_downloads).
+    // Number of in-flight recovery downloads (subset of articles_in_flight).
     pub(super) active_recovery: usize,
     // Runtime-only per-server BODY depth explorers. Seeded from the persisted
     // depth on first observation; the measurements themselves never persist.
@@ -1442,6 +1700,27 @@ pub struct Pipeline {
     // freed connection was handed back out. Setting this makes the park
     // itself the wake, with no timer to poll.
     pub(super) download_dispatch_wake: bool,
+    // The graph jobs that wait for room on a disk, which a reading of a disk
+    // anyone waits on wakes in the order they began to wait.
+    pub(super) disk_waiting: std::collections::BTreeSet<JobId>,
+    // How many times a writer had begun to wait on the output and working
+    // ledgers when the loop last looked: a count that moved means a job may
+    // have begun to wait since.
+    pub(super) disk_tickets_seen: [u64; 2],
+    // How many times a disk anyone waits on had rung when the loop last
+    // heard it: a count that moved means a reading came, or room was given
+    // back, since.
+    pub(super) disk_rings_seen: u64,
+    // The jobs among `disk_waiting` a step left owing nothing with no run
+    // live: they wake on the next turn whatever the disk reads. A turn
+    // with none of them looks at no job.
+    pub(super) disk_idle: std::collections::BTreeSet<JobId>,
+    // The working disk had no room over its reserve when a job that never
+    // downloaded was to start: no such job starts until a good reading shows
+    // room. A job that started fetches on.
+    pub(super) admission_disk_held: bool,
+    // The jobs the last walk would have started but for that.
+    pub(super) disk_unadmitted: std::collections::BTreeSet<JobId>,
     // A `RebuildNntp` has activated a new pool whose predecessor still holds
     // sockets at the provider. Fresh dials wait until the old generation has
     // drained: the provider counts both generations against one allowance,
@@ -1457,14 +1736,14 @@ pub struct Pipeline {
     // Estimated decoded/raw bytes held by released results that are not committed yet.
     pub(super) pending_released_download_result_bytes_by_job: HashMap<JobId, u64>,
     // In-flight article download count per job.
-    pub(super) active_downloads_by_job: HashMap<JobId, usize>,
+    pub(super) articles_in_flight_by_job: HashMap<JobId, usize>,
     // In-flight NNTP connection task count per job.
     pub(super) active_download_connections_by_job: HashMap<JobId, usize>,
     // Completion-critical connection lanes per job. Kept separately from
     // article counts because pipelined lanes can carry several articles.
     pub(super) active_completion_critical_connections_by_job: HashMap<JobId, usize>,
     // In-flight article download count per file.
-    pub(super) active_downloads_by_file: HashMap<NzbFileId, usize>,
+    pub(super) articles_in_flight_by_file: HashMap<NzbFileId, usize>,
     // In-flight decode task count per job.
     pub(super) active_decodes_by_job: decode::ActiveDecodes,
     // In-flight decode task count per file.
@@ -1562,6 +1841,9 @@ pub struct Pipeline {
     // generation they were scheduled under so stale indices can be dropped
     // when they re-enter after a rebuild.
     pub(super) pool_generation: u64,
+    // The layouts of recent pool generations, to carry a set of servers
+    // taken under one of them to the current pool.
+    pub(in crate::pipeline) pool_layouts: PoolLayouts,
     // Per-server article attempt counters for the active NNTP generation,
     // indexed by runtime `server_idx`.
     //
@@ -1687,6 +1969,16 @@ pub struct Pipeline {
     pub(super) propagation_delay: Duration,
     #[cfg(test)]
     pub(super) propagation_delay_forced: Option<Duration>,
+    // How deep the unservable-article booking is nested in itself now, and
+    // the deepest it has been.
+    #[cfg(test)]
+    pub(super) unservable_booking_depth: (usize, usize),
+    // Every message-id an article spent, in the order spent.
+    #[cfg(test)]
+    pub(super) spent_message_ids: Vec<String>,
+    // Queued articles the dispatch-hold reason has read.
+    #[cfg(test)]
+    pub(super) dispatch_hold_items_examined: std::sync::atomic::AtomicUsize,
     // Last time we logged a queued/no-active-download liveness stall.
     pub(super) last_download_dispatch_stall_log_at: Option<Instant>,
     // The dispatch stall the watchdog is timing toward a kick or a release.
@@ -1694,7 +1986,7 @@ pub struct Pipeline {
     // The available fill servers of the dispatch attempt running now, in
     // its order; `None` outside one. Read by the rotation hint, which keeps
     // an article off its hinted server only while one of these could take it.
-    pub(super) download_pass_fill_servers: Option<Vec<usize>>,
+    pub(super) download_pass_fill_servers: Option<weaver_nntp::ServerSet>,
     // The provider policy sampled once at the top of the dispatch pass running
     // now, read by every candidate of the pass; `None` outside one.
     pub(super) download_pass_provider_policy:
@@ -1707,6 +1999,10 @@ pub struct Pipeline {
     // article is as stalled as one with no active downloads, but it looks
     // busy from every gauge the stall log reads, so it gets its own window.
     pub(super) download_retry_storm_window: Option<(Instant, u64, u64)>,
+    // The storm under way, if one is: when the window that found it closed,
+    // and the retry and download counts at that moment. The storm is warned
+    // about once as it starts and noted once as it ends, never per window.
+    pub(super) download_retry_storm: Option<(Instant, u64, u64)>,
     // Rate limiter, per job, for the owned blocking lane acquire warning.
     pub(super) owned_lane_acquire_failure_log_throttle: download::JobLogThrottle,
     // Rate limiter, per job, for the "a pass found this job ineligible"
@@ -1721,11 +2017,12 @@ pub struct Pipeline {
     // their cap are only a fault when a lane actually failed to open.
     pub(super) last_owned_lane_acquire_failure_at: Option<Instant>,
     // When the servers were first seen below their configured connection cap
-    // while work was queued, and the last time that was reported. Cleared as
-    // soon as a pass finds the lanes filled, so only a *sustained* underfill
-    // is ever logged.
+    // while work was queued, and whether that underfill has been reported.
+    // Cleared as soon as a pass finds the lanes filled or the queue empty, so
+    // only a *sustained* underfill is logged, once as it starts and once as
+    // it ends.
     pub(super) download_lanes_under_cap_since: Option<Instant>,
-    pub(super) last_download_lanes_under_cap_log_at: Option<Instant>,
+    pub(super) download_lanes_under_cap_reported: bool,
     // Current in-memory decoded backlog retained for sequential write ordering.
     pub(super) write_buffered_bytes: usize,
     // Current in-memory decoded segment count retained for sequential write ordering.
@@ -1774,7 +2071,7 @@ pub struct Pipeline {
     pub(super) uu_spool_available_bytes_for_test: Option<Option<u64>>,
     // Sequential-assembly state for uuencode files, created on the first
     // uuencode part of a file and dropped with that file's write buffer.
-    pub(super) uu_files: HashMap<NzbFileId, UuFileAssembly>,
+    pub(super) uu_files: scan_inputs::UuFiles,
     // How often each uuencode segment has been displaced by park pressure and
     // requeued while its file's cursor stood still, paired with the cursor
     // position that count was taken at. Purely a livelock bound — deliberately
@@ -1787,7 +2084,12 @@ pub struct Pipeline {
     // they follow, held decoded until that ordinal is placed. Their bytes are
     // charged to the write-buffer ledger while they wait in memory, and to
     // the spool's once their paused job spills them.
-    pub(super) unanchored_parked: HashMap<NzbFileId, BTreeMap<u32, UnanchoredPart>>,
+    pub(super) unanchored_parked: UnanchoredPark,
+    // Aggregate bound on the articles held above, in memory or spilled. Bytes
+    // alone do not bound it: an article can decode to almost nothing, and
+    // each held one keeps its decode result. It is the uuencode park's
+    // aggregate entry bound, kept apart from it and from the write backlog.
+    pub(super) unanchored_park_max_parts: usize,
     // How often each article that declared no usable start has been sent back
     // for the ordinal before it because the park above had no room for it,
     // paired with how many ordinals of its file were placed when that count
@@ -1809,7 +2111,7 @@ pub struct Pipeline {
     // Cached per-job retention exclusions (pool server indices whose
     // retention window is older than the job). TTL'd; cleared on NNTP
     // client rebuilds and job removal.
-    pub(super) job_retention_exclude_cache: HashMap<JobId, (Instant, Arc<Vec<usize>>)>,
+    pub(super) job_retention_exclude_cache: HashMap<JobId, (Instant, weaver_nntp::ServerSet)>,
     // Rate limiter, per job, for the "no eligible news server" warning.
     pub(super) no_eligible_server_warn_throttle: download::JobLogThrottle,
     // Rate limiter, per job, for BODY work waiting on local lane capacity.

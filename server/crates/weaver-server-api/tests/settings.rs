@@ -44,6 +44,53 @@ async fn nzb_limit_defaults_to_ten_and_accepts_only_positive_integers() {
 }
 
 #[tokio::test]
+async fn history_retention_defaults_to_ninety_days_and_takes_zero_to_36500() {
+    let h = TestHarness::new().await;
+    let response = h.execute("{ settings { historyRetentionDays } }").await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["settings"]["historyRetentionDays"],
+        90
+    );
+    for value in ["-1", "36501", "1.5"] {
+        let response = h
+            .execute(&format!(
+                "mutation {{ updateSettings(input: {{ historyRetentionDays: {value} }}) {{ historyRetentionDays }} }}"
+            ))
+            .await;
+        assert!(!response.errors.is_empty(), "{value} must be rejected");
+        assert_eq!(h.db.load_config().unwrap().history_retention_days(), 90);
+    }
+    for days in [0, 36500, 30] {
+        let response = h
+            .execute(&format!(
+                "mutation {{ updateSettings(input: {{ historyRetentionDays: {days} }}) {{ historyRetentionDays }} }}"
+            ))
+            .await;
+        assert_no_errors(&response);
+        assert_eq!(
+            response_data(&response)["updateSettings"]["historyRetentionDays"],
+            days
+        );
+        assert_eq!(h.db.load_config().unwrap().history_retention_days(), days);
+    }
+    // A save that leaves it out keeps it.
+    let response = h
+        .execute("mutation { updateSettings(input: { maxRetries: 4 }) { historyRetentionDays } }")
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["updateSettings"]["historyRetentionDays"],
+        30
+    );
+    let response = h.execute("{ settings { historyRetentionDays } }").await;
+    assert_eq!(
+        response_data(&response)["settings"]["historyRetentionDays"],
+        30
+    );
+}
+
+#[tokio::test]
 async fn create_schedule_refuses_a_client_supplied_id_and_generates_one() {
     let h = TestHarness::new().await;
     let data_dir = std::path::PathBuf::from(&h.config.read().await.data_dir);
@@ -131,13 +178,12 @@ async fn archive_password_settings_never_return_passwords_and_support_replace_cl
 }
 
 #[tokio::test]
-async fn archive_password_settings_and_reveal_require_admin() {
+async fn archive_password_settings_require_admin() {
     let h = TestHarness::new().await;
     for scope in [CallerScope::Read, CallerScope::Control] {
         for query in [
             "{ archivePasswordSettings { hasPasswords passwordFile } }",
             "mutation { updateArchivePasswordSettings(passwords: [\"synthetic\"]) { hasPasswords } }",
-            "{ validatedArchivePassword(id: 1) }",
         ] {
             assert!(!h.execute_as(query, scope).await.errors.is_empty());
         }
