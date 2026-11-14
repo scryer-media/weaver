@@ -5345,9 +5345,20 @@ impl DiskJob for HashJob {
                 disk.push(DiskWrite::Piece(PieceWrite(self)));
             }
             Ok(verdict) => self.settle(verdict),
+            // A check that gave no verdict, its piece unread: the torrent
+            // ends in error, as a write's error does (libtorrent
+            // `torrent::on_piece_verified` hands a hash job's error to
+            // `handle_disk_error`, which sets the error and pauses). Its
+            // connection ends for the error, and the piece goes back to the
+            // queue as the job is dropped (`PieceCheck`).
             Err(e) => {
-                self.check.done();
-                chunk_failed(&self.tx, self.addr, &self.chunk, e);
+                error!(
+                    id = state.shared.id,
+                    info_hash = ?state.shared.info_hash,
+                    "FATAL: error checking a piece written: {e:#}"
+                );
+                chunk_failed(&self.tx, self.addr, &self.chunk, anyhow::anyhow!("{e:#}"));
+                let _ = state.on_fatal_error(e);
             }
         }
         stats.hash_thread_worked(since);

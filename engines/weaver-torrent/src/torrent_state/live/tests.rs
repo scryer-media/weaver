@@ -8494,16 +8494,19 @@ async fn a_connection_stops_reading_at_the_pools_high_mark_and_reads_again_once_
 }
 
 /// A memory storage, writing as a file storage does, whose one armed read
-/// (the check of a piece reading it back) is held until released.
+/// (the check of a piece reading it back) is held until released, and whose
+/// next read errors when told to.
 #[derive(Clone, Default)]
 struct ReadGatedStorageFactory {
     inner: MemoryStorageFactory,
     gate: Arc<Gate>,
+    fail_read: Arc<AtomicBool>,
 }
 
 struct ReadGatedStorage {
     inner: Box<dyn TorrentStorage>,
     gate: Arc<Gate>,
+    fail_read: Arc<AtomicBool>,
 }
 
 impl StorageFactory for ReadGatedStorageFactory {
@@ -8517,6 +8520,7 @@ impl StorageFactory for ReadGatedStorageFactory {
         Ok(ReadGatedStorage {
             inner: Box::new(self.inner.create(shared, metadata)?),
             gate: self.gate.clone(),
+            fail_read: self.fail_read.clone(),
         })
     }
 
@@ -8541,6 +8545,10 @@ impl TorrentStorage for ReadGatedStorage {
             entered.send(()).unwrap();
             release.recv().unwrap();
         }
+        anyhow::ensure!(
+            !self.fail_read.swap(false, Ordering::SeqCst),
+            "the read failed"
+        );
         self.inner.pread_exact(file_id, offset, buf)
     }
 
@@ -8564,12 +8572,65 @@ impl TorrentStorage for ReadGatedStorage {
         Ok(Box::new(ReadGatedStorage {
             inner: self.inner.take()?,
             gate: self.gate.clone(),
+            fail_read: self.fail_read.clone(),
         }))
     }
 
     fn on_piece_completed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
         self.inner.on_piece_completed(piece)
     }
+}
+
+// Every block of piece 0 is written to its files on its connection's turn,
+// and the read of its check errors: the check gives no verdict. The
+// connection, which waited for the check's end, is ended for the error, and
+// the torrent ends in error, as libtorrent's does for a hash job's error
+// (`torrent::on_piece_verified`, `handle_disk_error`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_check_that_errors_ends_its_connection_and_the_torrent_in_error() {
+    let storage = ReadGatedStorageFactory::default();
+    let h = Harness::build_on(
+        "check_errors",
+        0x00,
+        isolated_session_opts(false),
+        storage.clone_box(),
+    )
+    .await;
+    let (owner, mut owner_rx) = h.peer("127.0.0.1:6881");
+    h.take(&owner, 0);
+    let last = CHUNKS_PER_PIECE - 1;
+    for chunk in 0..last {
+        h.send(&owner, (0, chunk), false).await.unwrap();
+    }
+    storage.fail_read.store(true, Ordering::SeqCst);
+    // The connection is told of the error as its own end, not by the wait.
+    h.send(&owner, (0, last), false).await.unwrap();
+    assert!(!storage.fail_read.load(Ordering::SeqCst), "the check read");
+    let ended = loop {
+        match owner_rx
+            .recv()
+            .await
+            .expect("the peer's writer queue closed")
+        {
+            WriterRequest::Disconnect(ended) => break ended,
+            _ => continue,
+        }
+    };
+    assert!(ended.is_err());
+    assert!(!h.have(0));
+    let handle = h.handle();
+    let error = loop {
+        let changed = handle.next_state_change();
+        let error = handle.with_state(|s| match s {
+            crate::ManagedTorrentState::Error(e) => Some(format!("{e:#}")),
+            _ => None,
+        });
+        if let Some(error) = error {
+            break error;
+        }
+        changed.await;
+    };
+    assert!(error.contains("the read failed"), "{error}");
 }
 
 // Every block of both pieces is written; the last write of each takes the
