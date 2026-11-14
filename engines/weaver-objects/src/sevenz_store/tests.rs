@@ -7,6 +7,7 @@ mod owner;
 
 use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use sevenz_turbo::encoder_options::{AesEncoderOptions, Lzma2Options};
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password};
@@ -155,6 +156,43 @@ fn bytes_ahead_of_the_tail_are_held_until_it_arrives() {
     // Nothing moves: the tail arrives in the normal order, last.
     owner.pull = Pull::Moved(0);
     owner.frames(0, 4096);
+    owner.close(0);
+    no_trouble(&owner);
+    streamed(&owner);
+}
+
+// Bytes ahead of the tail are held a piece per delivery, and the placement
+// number stands over them until the end header moves it: an owner that asks
+// only once it moves places every held piece as one that asks after every
+// delivery, and asks nothing while the body comes.
+#[test]
+fn held_pieces_place_the_same_asked_only_once_the_placement_number_moves() {
+    let bytes = archive(copy(), false);
+    let tail = end_header(&bytes);
+    let mut owner = Owner::single(store(), bytes);
+    owner.pull = Pull::Moved(0);
+    let mut asked = crate::testing::Asked::default();
+    let (mut pieces, mut saved) = (0, 0);
+    let mut standing = None;
+    for start in (0..tail.start).step_by(64) {
+        let range = ByteRange::new(start, (start + 64).min(tail.start));
+        owner.deliver(0, range);
+        asked.hold(&owner.object, VolumeIndex(0), range);
+        saved += asked.compare(&owner.object);
+        pieces += 1;
+        let number = owner.object.placement();
+        assert!(number.is_some(), "at {start}");
+        assert_eq!(*standing.get_or_insert(number), number, "at {start}");
+    }
+    assert!(asked.unplaced());
+    assert_eq!(owner.held(), pieces);
+    assert_eq!(saved, pieces * (pieces + 1) / 2);
+    assert!(owner.skipped > 0);
+
+    owner.deliver(0, tail);
+    assert_ne!(owner.object.placement(), standing.flatten());
+    assert_eq!(asked.compare(&owner.object), 0, "the end header moved it");
+    assert!(!asked.unplaced());
     owner.close(0);
     no_trouble(&owner);
     streamed(&owner);
@@ -382,6 +420,36 @@ fn an_encrypted_header_no_candidate_opens_is_refused_at_quiet() {
     owner.quiet();
     assert!(has(&owner, &Emit::Refuse(Why::EncryptedHeader)));
     assert!(owner.members.is_empty());
+}
+
+// Worked under a stop already set, a store begins no folder key, says
+// nothing, and keeps its keys due. Worked again unstopped, it derives the
+// same keys and says the same as a twin that was never stopped.
+#[test]
+fn a_stopped_derivation_keeps_its_keys_due_and_then_derives_as_an_unstopped_one() {
+    let bytes = archive(aes(), false);
+    let mut stopped = Owner::single(store(), bytes.clone());
+    let mut plain = Owner::single(store(), bytes);
+    for owner in [&mut stopped, &mut plain] {
+        owner.frames(0, 4096);
+        owner.object.offer_password(PASSWORD, &mut Vec::new());
+        assert!(owner.object.work_due(), "a folder key is due");
+    }
+    let mut said = Vec::new();
+    stopped.object.work_until(&AtomicBool::new(true), &mut said);
+    assert!(said.is_empty(), "{said:?}");
+    assert!(stopped.object.work_due(), "the keys stay due");
+    assert!(stopped.object.derived.is_empty(), "no key was begun");
+    stopped
+        .object
+        .work_until(&AtomicBool::new(false), &mut said);
+    let mut unstopped = Vec::new();
+    plain.object.work(&mut unstopped);
+    assert!(!said.is_empty());
+    assert!(said == unstopped, "{said:?} {unstopped:?}");
+    assert!(!stopped.object.work_due());
+    assert!(!stopped.object.derived.is_empty());
+    assert!(stopped.object.derived == plain.object.derived);
 }
 
 // An encrypted header read on bytes that came whole but are not the posted

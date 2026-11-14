@@ -110,6 +110,7 @@ pub(super) fn par3(facts: &Facts) -> Result<Par3, RestoreError> {
                 .as_deref()
                 .and_then(|name| crate::recovery_volume::named_blocks(name, ".par3")),
             name: volume.name,
+            changes: 0,
         })
         .collect();
     par3.set_bound(kept.bound);

@@ -565,8 +565,38 @@ fn administrator() -> serde_json::Value {
 #[tokio::test]
 async fn a_loopback_install_sets_up_without_a_code() {
     let (db, app) = authenticated_setup_router(setup_code::SetupChallenge::open());
+    let outcome = post_setup_with_headers(
+        app,
+        administrator(),
+        &[
+            ("host", "127.0.0.1:9090"),
+            ("origin", "http://127.0.0.1:9090"),
+        ],
+    )
+    .await;
+
+    assert_eq!(outcome.status, StatusCode::OK, "{}", outcome.payload);
+    assert!(db.get_auth_credentials().unwrap().is_some());
+}
+
+#[tokio::test]
+async fn codeless_setup_refuses_a_request_without_a_host() {
+    let (db, app) = authenticated_setup_router(setup_code::SetupChallenge::open());
     let outcome =
         post_setup_with_headers(app, administrator(), &[("origin", "http://127.0.0.1:9090")]).await;
+
+    assert_eq!(outcome.status, StatusCode::FORBIDDEN, "{}", outcome.payload);
+    assert_eq!(outcome.payload["code"], "SETUP_LOCAL_ONLY");
+    assert!(db.get_auth_credentials().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn setup_with_a_code_still_proceeds_without_a_host() {
+    let (challenge, code) = setup_code::SetupChallenge::generate();
+    let (db, app) = authenticated_setup_router(challenge);
+    let mut body = administrator();
+    body["setupCode"] = serde_json::Value::String(code);
+    let outcome = post_setup_with_headers(app, body, &[("origin", "http://127.0.0.1:9090")]).await;
 
     assert_eq!(outcome.status, StatusCode::OK, "{}", outcome.payload);
     assert!(db.get_auth_credentials().unwrap().is_some());

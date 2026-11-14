@@ -155,7 +155,7 @@ async fn recovered_batch_tries_unsent_articles_before_leaving_the_provider() {
         .fetch_bodies_decoded_with_groups_prefer_excluding_traced(
             &["<first@test>", "<second@test>", "<third@test>"],
             &[],
-            &[],
+            crate::ServerSet::EMPTY,
         )
         .await;
     assert!(!pool.requires_recovery(0));
@@ -274,7 +274,7 @@ async fn a_credentials_quarantine_refuses_where_a_transport_quarantine_waits() {
             .try_acquire_blocking_permit_for_work(ServerId(0), true),
         Err(NntpError::AuthenticationRejected)
     ));
-    let Err(error) = refused.try_acquire_blocking_body_lane(&[], &[]) else {
+    let Err(error) = refused.try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY) else {
         panic!("a server refusing credentials opened a lane");
     };
     assert!(
@@ -297,7 +297,7 @@ async fn a_credentials_quarantine_refuses_where_a_transport_quarantine_waits() {
     );
     // Excluded for the article, the server is no answer at all.
     assert!(matches!(
-        refused.try_acquire_blocking_body_lane(&[], &[0]),
+        refused.try_acquire_blocking_body_lane(&[], crate::ServerSet::from([0])),
         Err(BlockingBodyLaneAcquireError::NoEligibleServer)
     ));
     // Once the disable runs out the one probe is due, and the refusal is a
@@ -328,7 +328,7 @@ async fn a_credentials_quarantine_refuses_where_a_transport_quarantine_waits() {
             .try_acquire_blocking_permit_for_work(ServerId(0), true),
         Err(NntpError::ServerRecovering)
     ));
-    let Err(error) = outage.try_acquire_blocking_body_lane(&[], &[]) else {
+    let Err(error) = outage.try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY) else {
         panic!("an outage-quarantined server opened a lane");
     };
     assert!(

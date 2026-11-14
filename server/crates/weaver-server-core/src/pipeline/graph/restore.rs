@@ -200,6 +200,12 @@ impl RestoreSeat {
         &self.working_dir
     }
 
+    // The seat for a job whose working directory moved before it started.
+    pub(crate) fn moved_to(mut self, working_dir: PathBuf) -> Self {
+        self.working_dir = working_dir;
+        self
+    }
+
     // Read the job's checkpoint back and rebuild the job from it. A
     // checkpoint this build does not restore is none: the job starts afresh
     // and fetches every article, and its first checkpoint replaces the old
@@ -440,15 +446,14 @@ fn restore_passwords(
     db: &crate::Database,
     job_id: JobId,
     spec_password: Option<&str>,
-) -> Result<Vec<String>, LoadError> {
+) -> Result<Vec<crate::jobs::ArchivePasswordCandidate>, LoadError> {
     let (carried, _) = read_job_password_candidates(db, job_id)?;
     let global = db.global_archive_password_candidates()?;
-    Ok(
-        assemble_archive_password_candidates(spec_password, &carried, &global)
-            .iter()
-            .map(|candidate| candidate.value().to_owned())
-            .collect(),
-    )
+    Ok(assemble_archive_password_candidates(
+        spec_password,
+        &carried,
+        &global,
+    ))
 }
 
 #[cfg(test)]

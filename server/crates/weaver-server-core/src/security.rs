@@ -887,11 +887,16 @@ impl RuntimeSecurityConfig {
             if self.authenticated_access_mode() {
                 return None;
             }
-            // No `X-Forwarded-For` at all: honor the single-address headers
-            // some proxies send instead. There is no chain to verify, but this
-            // is only ever reached from a box the operator named, so believing
-            // it is the same trust decision they already made.
-            return Some(single_forwarded_ip(headers).unwrap_or(peer_ip));
+            // No `X-Forwarded-For` at all: honor what some proxies send
+            // instead. `X-Real-IP` is one address with no chain to verify, but
+            // this is only ever reached from a box the operator named, so
+            // believing it is the same trust decision they already made.
+            // `Forwarded` is a chain, peeled from the right like
+            // `X-Forwarded-For`.
+            if let Some(ip) = real_ip(headers) {
+                return Some(ip);
+            }
+            return Some(forwarded_client(headers, peer_ip, is_proxy).unwrap_or(peer_ip));
         }
         chain.push(peer_ip);
         while chain.last().is_some_and(|hop| is_proxy(*hop)) {
@@ -953,30 +958,50 @@ fn forwarded_for_chain(headers: &HeaderMap) -> Result<Vec<IpAddr>, ()> {
     Ok(hops)
 }
 
-// The client address from the single-hop forwarding headers, for proxies that
-// send one of those and no `X-Forwarded-For`.
-fn single_forwarded_ip(headers: &HeaderMap) -> Option<IpAddr> {
-    if let Some(ip) = headers
+// The client address from `X-Real-IP`, for proxies that send it and no
+// `X-Forwarded-For`.
+fn real_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    headers
         .get(REAL_IP_HEADER)
         .and_then(|value| value.to_str().ok())
         .and_then(parse_forwarded_token)
-    {
-        return Some(ip);
+}
+
+// The client an RFC 7239 `Forwarded` chain names, for proxies that send it
+// and no `X-Forwarded-For`.
+//
+// Every element of every `Forwarded` header is one hop, left to right, and
+// trusted hops are peeled off the right, the end a proxy appends to. The
+// rightmost untrusted hop decides. When that hop names no usable address (no
+// `for=`, `unknown`, an obfuscated identifier), or the chain is malformed or
+// too long, the answer is `None` and the caller keeps the socket peer: an
+// entry further left was written by someone no trusted proxy vouched for.
+fn forwarded_client(
+    headers: &HeaderMap,
+    peer_ip: IpAddr,
+    is_proxy: impl Fn(IpAddr) -> bool,
+) -> Option<IpAddr> {
+    let mut hops: Vec<Option<IpAddr>> = Vec::new();
+    for value in headers.get_all(http::header::FORWARDED) {
+        let value = value.to_str().ok()?;
+        for element in value.split(',') {
+            if hops.len() == MAX_FORWARDED_HOPS {
+                return None;
+            }
+            hops.push(element.split(';').find_map(|pair| {
+                let (name, raw) = pair.split_once('=')?;
+                name.trim()
+                    .eq_ignore_ascii_case("for")
+                    .then(|| parse_forwarded_token(raw))
+                    .flatten()
+            }));
+        }
     }
-    headers
-        .get(http::header::FORWARDED)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| {
-            value.split(',').find_map(|entry| {
-                entry.split(';').find_map(|part| {
-                    let (name, raw) = part.split_once('=')?;
-                    if !name.trim().eq_ignore_ascii_case("for") {
-                        return None;
-                    }
-                    parse_forwarded_token(raw)
-                })
-            })
-        })
+    hops.push(Some(peer_ip));
+    while hops.last().is_some_and(|hop| hop.is_some_and(&is_proxy)) {
+        hops.pop();
+    }
+    hops.last().copied().flatten()
 }
 
 // A browser `Origin`, reduced to the authority it was served from.
@@ -2063,6 +2088,72 @@ mod tests {
                 ])
             ),
             Some("192.168.1.50".parse().unwrap())
+        );
+    }
+
+    // `Forwarded` is peeled from the right like `X-Forwarded-For`, so a
+    // client that writes its own element is judged on the one the proxy
+    // appended.
+    #[test]
+    fn forwarded_is_peeled_from_the_right() {
+        let config = proxied(&["192.168.1.0/24"], &["172.20.0.0/16"]);
+        let proxy = peer("172.20.0.5:41000");
+        let resolve =
+            |pairs: &[(&str, &str)]| config.resolve_client_ip(proxy, &headers_with(pairs));
+        let ip = |value: &str| Some(value.parse::<IpAddr>().unwrap());
+
+        // One honest proxy writing one element: the same answer as before.
+        assert_eq!(
+            resolve(&[("forwarded", "for=192.168.1.50")]),
+            ip("192.168.1.50")
+        );
+        // A forged first element sits left of the proxy's own.
+        assert_eq!(
+            resolve(&[("forwarded", "for=192.168.1.10, for=203.0.113.9;proto=https")]),
+            ip("203.0.113.9")
+        );
+        assert!(!config.is_trusted_client(
+            proxy,
+            &headers_with(&[("forwarded", "for=192.168.1.10, for=203.0.113.9")])
+        ));
+        // Trusted hops peel across repeated headers.
+        assert_eq!(
+            resolve(&[
+                ("forwarded", "for=203.0.113.7"),
+                (
+                    "forwarded",
+                    "for=192.168.1.50;by=172.20.0.9, for=172.20.0.9"
+                ),
+            ]),
+            ip("192.168.1.50")
+        );
+        // A proxy element without a usable `for=` leaves the socket peer,
+        // not an address further left.
+        assert_eq!(
+            resolve(&[("forwarded", "for=192.168.1.10, proto=https")]),
+            ip("172.20.0.5")
+        );
+        assert_eq!(
+            resolve(&[("forwarded", "for=192.168.1.10, for=unknown")]),
+            ip("172.20.0.5")
+        );
+        // All trusted, or too long, falls back to the socket peer.
+        assert_eq!(
+            resolve(&[("forwarded", "for=172.20.0.9")]),
+            ip("172.20.0.5")
+        );
+        let long_chain = (0..MAX_FORWARDED_HOPS + 1)
+            .map(|_| "for=192.168.1.50")
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(resolve(&[("forwarded", &long_chain)]), ip("172.20.0.5"));
+        // `X-Forwarded-For` stays authoritative over `Forwarded`.
+        assert_eq!(
+            resolve(&[
+                ("x-forwarded-for", "192.168.1.50"),
+                ("forwarded", "for=203.0.113.9"),
+            ]),
+            ip("192.168.1.50")
         );
     }
 

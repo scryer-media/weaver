@@ -27,6 +27,8 @@ fn stored(payload: &[u8]) -> Vec<u8> {
 struct HeaderLast {
     // Bytes held once the whole body had arrived.
     held: u64,
+    // Ranges located by the passes the body's deliveries ran.
+    located_while_held: usize,
     // Ranges located by the passes the end header ran.
     located_at_release: usize,
     // The most passes over the holds that ran at once.
@@ -88,14 +90,17 @@ fn header_last(pieces: usize, piece: usize) -> HeaderLast {
     };
     send(&mut writer, &mut tree, 0, &archive[..data_at]);
     RELEASE_DEPTH.set((0, 0));
+    RELEASE_LOCATED.set(0);
     for (index, bytes) in payload.chunks(piece).enumerate() {
         send(&mut writer, &mut tree, data_at + index * piece, bytes);
     }
     let held = writer.held_bytes(NodeId::ROOT);
+    let located_while_held = RELEASE_LOCATED.get();
     RELEASE_LOCATED.set(0);
     send(&mut writer, &mut tree, footer, &archive[footer..]);
     HeaderLast {
         held,
+        located_while_held,
         located_at_release: RELEASE_LOCATED.get(),
         deepest: RELEASE_DEPTH.get().1,
         held_after: writer.held_bytes(NodeId::ROOT),
@@ -107,12 +112,15 @@ fn header_last(pieces: usize, piece: usize) -> HeaderLast {
 // An archive whose end header comes last has its whole body held, a piece
 // per article, until the header places it. The header's delivery releases
 // every piece from one pass over the holds, never one inside another, and
-// each piece is located once there; the member is written whole.
+// each piece is located once there; the member is written whole. While the
+// body comes the store's placement number stands, so only the first hold
+// is ever located before the header.
 #[test]
 fn a_body_held_in_thousands_of_pieces_releases_from_one_pass() {
     for pieces in [256, 2048] {
         let run = header_last(pieces, 16);
         assert_eq!(run.held, run.payload.len() as u64, "{pieces}: all held");
+        assert_eq!(run.located_while_held, 1, "{pieces}: the first hold only");
         assert_eq!(run.deepest, 1, "{pieces}: no pass inside another");
         assert_eq!(run.located_at_release, pieces, "{pieces}: each piece once");
         assert_eq!(run.held_after, 0, "{pieces}: nothing left held");

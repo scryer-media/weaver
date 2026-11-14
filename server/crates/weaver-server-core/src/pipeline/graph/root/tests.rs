@@ -732,7 +732,7 @@ async fn moves_by_segment_leave_the_queues_as_walks_of_them_do() {
                         continue;
                     };
                     if *steered {
-                        work.exclude_servers = vec![1];
+                        work.exclude_servers = weaver_nntp::ServerSet::from([1]);
                         active.download_queue.push(work);
                     }
                 }
@@ -910,7 +910,11 @@ async fn retried_articles_of_a_file_share_the_one_group_list_the_queue_holds() {
     let retries: Vec<_> = (0..segments)
         .map(|ordinal| {
             pipeline
-                .download_retry_work(segment_id(job_id, 1, ordinal), 1, Vec::new())
+                .download_retry_work(
+                    segment_id(job_id, 1, ordinal),
+                    1,
+                    weaver_nntp::ServerSet::EMPTY,
+                )
                 .unwrap()
         })
         .collect();
@@ -977,7 +981,7 @@ async fn a_requeued_graph_article_comes_back_at_the_roots_priority_not_its_roles
     // retry rebuilt from the post says so; the root holds it ordinary.
     let first_volume = segment_id(job_id, 3, 1);
     let retry = pipeline
-        .download_retry_work(first_volume, 1, Vec::new())
+        .download_retry_work(first_volume, 1, weaver_nntp::ServerSet::EMPTY)
         .unwrap();
     assert_eq!(
         retry.priority,
@@ -1267,8 +1271,11 @@ async fn a_damaged_yenc_article_is_delivered_as_damaged() {
                 segments: Vec::new(),
             },
             SegmentSource {
-                source_server_idx: Some(0),
-                exclude_servers: Vec::new(),
+                servers: crate::pipeline::PoolServers::stamped(
+                    pipeline.pool_generation,
+                    Some(0),
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
             },
         )
         .await;
@@ -2629,4 +2636,38 @@ fn an_unchanged_seek_is_answered_without_mapping_its_range_again() {
     root.map.seek(VolumeIndex(0), whole, critical);
     root.map.seek(VolumeIndex(0), whole, critical);
     assert_eq!(SEEK_MAPPED.with(std::cell::Cell::get), 1);
+}
+
+// A round of seeks over many gaps, asked again with nothing changed, is told
+// the same answers in the same order and maps none of them again. Each memo
+// answer is also checked against a fresh mapping inside `seek`.
+#[test]
+fn a_repeated_round_over_many_gaps_is_answered_from_the_memo() {
+    let mut root = ArticleRoot::new(&[file("volume.vol", &[100; 64])]);
+    for ordinal in (1..64).step_by(2) {
+        root.map.lost(VolumeIndex(0), ordinal);
+    }
+    let asks: Vec<(ByteRange, Option<Class>)> = (1..64u64)
+        .step_by(2)
+        .flat_map(|ordinal| {
+            let gap = ByteRange::new(ordinal * 100, ordinal * 100 + 100);
+            [(gap, None), (gap, Some(Class::Critical))]
+        })
+        .collect();
+    let round = |root: &mut ArticleRoot| -> Vec<Pull> {
+        asks.iter()
+            .map(|(range, class)| root.map.seek(VolumeIndex(0), *range, *class))
+            .collect()
+    };
+    // The first round raises what can still come; the second settles.
+    round(&mut root);
+    let settled = round(&mut root);
+    SEEK_MAPPED.with(|calls| calls.set(0));
+    for _ in 0..3 {
+        assert_eq!(round(&mut root), settled);
+    }
+    assert_eq!(SEEK_MAPPED.with(std::cell::Cell::get), 0);
+    root.map.lost(VolumeIndex(0), 0);
+    round(&mut root);
+    assert!(SEEK_MAPPED.with(std::cell::Cell::get) > 0);
 }

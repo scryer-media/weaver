@@ -38,7 +38,7 @@ use weaver_graph::{
 use super::checkpoint::why_name;
 use super::envelope::{Envelopes, Shelf, Shelved};
 use super::leaf::{Leaf, LeafError};
-use super::limits::Caps;
+use super::limits::{Caps, Device, Output};
 use crate::operations::disk::CapacityReader;
 use crate::pipeline::extraction::ExtractionFailure;
 
@@ -280,6 +280,11 @@ pub(crate) struct NamespaceWriter {
     given_up: BTreeSet<(NodeId, bool)>,
     // The budgets each member has spilled past, said once each.
     spills_said: BTreeSet<(NodeId, MemberId, Budget)>,
+    // The members whose file the file system refused to create for its
+    // name (`skip_unnamable`).
+    unnamable: BTreeSet<(NodeId, MemberId)>,
+    // Their damage, to apply once the refused write has returned.
+    unnamed_damage: Vec<Effect>,
     #[cfg(test)]
     diagnostics: Vec<weaver_graph::recovery::RepairDiagnostic>,
     placements: Vec<Placement>,
@@ -295,10 +300,42 @@ pub(crate) struct NamespaceWriter {
     // (`Object::again_waits`), in the order raised.
     replaying: BTreeSet<NodeId>,
     again_held: Vec<Effect>,
+    // What the job, waiting for room, last found its due recovery sets would
+    // rebuild: asked again only once something it rests on changed.
+    held_want: Option<HeldWant>,
+    // The files each recovery set was last said to withhold, so the same
+    // ones are said once.
+    withheld_said: BTreeMap<NodeId, BTreeSet<MemberId>>,
+    // What the deliveries that bound members gave their new objects, while
+    // those members are handed over, innermost last: it is in each member's
+    // record and with its object, but in no file or hold, so the hand-over
+    // reads none of it from the member's file. Each names the object and
+    // the volume of it the bytes went to.
+    reached_now: Vec<(NodeId, MemberId, (NodeId, VolumeIndex), ByteRange)>,
     // How many requests are being answered at once, and the most there
     // ever were.
     #[cfg(test)]
     answering: (u32, u32),
+}
+
+// A file of the posts with a length, none of whose bytes arrived: what a
+// recovery set over it would rebuild whole.
+pub(super) fn absent_from_posts(record: &weaver_graph::Member) -> bool {
+    record.length.is_some_and(|length| length > 0)
+        && !record.coverage.runs().any(|run| run.provenance.arrived())
+}
+
+// What a job waiting for room found its due recovery sets would rebuild,
+// and what that rests on: the sets, the wait it was found in, the sizes of
+// the disks, the posts as marked then, and the files none of whose bytes
+// had arrived that a set covers.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct HeldWant {
+    pub(super) due: Vec<NodeId>,
+    pub(super) tickets: [Option<u64>; 2],
+    pub(super) sizes: (Option<u64>, Option<u64>),
+    pub(super) at: u64,
+    pub(super) absent: BTreeSet<MemberId>,
 }
 
 // A cipher's tail read back before the ranges that fed its keys are
@@ -354,6 +391,8 @@ impl NamespaceWriter {
             given_back: Vec::new(),
             given_up: BTreeSet::new(),
             spills_said: BTreeSet::new(),
+            unnamable: BTreeSet::new(),
+            unnamed_damage: Vec::new(),
             #[cfg(test)]
             diagnostics: Vec::new(),
             placements: Vec::new(),
@@ -361,6 +400,9 @@ impl NamespaceWriter {
             metrics: None,
             replaying: BTreeSet::new(),
             again_held: Vec::new(),
+            held_want: None,
+            withheld_said: BTreeMap::new(),
+            reached_now: Vec::new(),
             #[cfg(test)]
             answering: (0, 0),
         }
@@ -433,6 +475,46 @@ impl NamespaceWriter {
 
     pub(crate) fn decode_clock(&self) -> super::decoding::DecodeClock {
         self.caps.decode_clock()
+    }
+
+    // Whether the job waits for room on a disk, and its place among those
+    // that wait.
+    pub(crate) fn disk_held(&self) -> bool {
+        self.caps.disk_held()
+    }
+
+    pub(crate) fn disk_ticket(&self) -> Option<u64> {
+        self.caps.disk_ticket()
+    }
+
+    // A reading came: whether the job has room again on every disk it
+    // waits on. If it has, all it owes is promised again and its runs may
+    // decode.
+    pub(crate) fn wake_disk(&mut self) -> bool {
+        self.caps.wake_disk(&self.output_free_disk, &self.free_disk)
+    }
+
+    // Whether the job owes nothing and has nothing to write again.
+    pub(crate) fn owes_nothing(&self) -> bool {
+        self.caps.owes_nothing()
+    }
+
+    // The job waits though nothing of it is left that would write: see
+    // `Caps::wake_idle`. Whether it woke.
+    pub(crate) fn wake_idle(&mut self) -> bool {
+        self.caps.wake_idle()
+    }
+
+    // A run stopped for room takes back what it built while this is set:
+    // see `Caps::rewriting`.
+    pub(crate) fn rewriting(&mut self, rewriting: bool) {
+        self.caps.rewriting(rewriting);
+    }
+
+    // What the job waits for on its repairs' behalf, on both disks.
+    #[cfg(test)]
+    pub(crate) fn wanted(&self) -> u64 {
+        self.caps.wanted()
     }
 
     #[cfg(test)]
@@ -516,6 +598,12 @@ impl NamespaceWriter {
     // to own it.
     pub(crate) fn refused(&self, node: NodeId, member: MemberId) -> Option<Why> {
         self.files.get(&node)?.refused.get(&member).copied()
+    }
+
+    // Whether the file system refused the member's name, so no file of it
+    // was made.
+    pub(crate) fn unnamable(&self, node: NodeId, member: MemberId) -> bool {
+        self.unnamable.contains(&(node, member))
     }
 
     // A repair's return is down. Each member refused while it was applied,
@@ -610,7 +698,11 @@ impl NamespaceWriter {
         self.caps.admit_member(tree, node, member)?;
         if Leaf::is_directory(&output_name) {
             self.settle(tree, builder, segments, node, member, out)?;
-            self.leaf(tree, node, member)?.create_directory()?;
+            let made = self
+                .leaf(tree, node, member)?
+                .create_directory()
+                .map_err(WriteError::from);
+            self.skip_unnamable(tree, (node, member), made)?;
         } else if length == Some(0) {
             return self.shut(tree, builder, segments, node, member, out);
         }
@@ -734,12 +826,53 @@ impl NamespaceWriter {
                 _ => None,
             })
             .collect();
+        // An object that gave a volume back may have gone with it. Once
+        // every volume given back in the batch has taken its envelope, what
+        // the gone object still kept is pruned, once for the batch.
+        let given_back = effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::GivenBack { .. }));
+        // What the delivery that bound a member gave its new object went to
+        // the object, not to the member's file or holds: the hand-over
+        // reads the file around it.
+        let reached: Vec<(NodeId, MemberId, (NodeId, VolumeIndex), ByteRange)> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Reached {
+                    node,
+                    member,
+                    child,
+                    volume,
+                    offset,
+                    bytes,
+                    ..
+                } if bound.contains(&(*node, *member, *child)) => Some((
+                    *node,
+                    *member,
+                    (*child, *volume),
+                    ByteRange::at(*offset, bytes.len() as u64),
+                )),
+                _ => None,
+            })
+            .collect();
         for effect in effects.drain(..) {
             self.apply(tree, builder, segments, effect, write, out)?;
+            self.apply_unnamed(tree, builder, segments, out)?;
         }
+        if given_back {
+            self.prune(tree)?;
+        }
+        let depth = self.reached_now.len();
+        self.reached_now.extend(reached);
+        let mut handed = Ok(());
         for (node, member, child) in bound {
-            self.hand_over(tree, builder, segments, (node, member), child, out)?;
+            handed = self.hand_over(tree, builder, segments, (node, member), child, out);
+            if handed.is_err() {
+                break;
+            }
         }
+        self.reached_now.truncate(depth);
+        handed?;
         for (node, copy, held) in folded {
             self.fold_over(tree, builder, segments, (node, copy), &held, out)?;
         }
@@ -1129,6 +1262,35 @@ impl NamespaceWriter {
         | Effect::Renamed { node, member, .. } = &effect
         {
             self.caps.admit_member(tree, *node, *member)?;
+        }
+        // Bytes an object produced that no member's file takes now are
+        // charged here, before they are kept: a member another object reads,
+        // but for a recovery volume, which is written to its own file, and a
+        // member whose owner its front has not yet decided. The posts are
+        // never charged.
+        match &effect {
+            Effect::Reached {
+                node,
+                member,
+                child,
+                offset,
+                bytes,
+                ..
+            } if *node != NodeId::ROOT && !tree.recovers(*child) => {
+                let end = offset.saturating_add(bytes.len() as u64);
+                self.admit_kept(tree, *node, *member, end)?;
+            }
+            Effect::WriteLeaf {
+                node,
+                member,
+                offset,
+                bytes,
+                ..
+            } if *node != NodeId::ROOT && tree.is_undecided(*node, *member) => {
+                let end = offset.saturating_add(bytes.len() as u64);
+                self.admit_kept(tree, *node, *member, end)?;
+            }
+            _ => {}
         }
         if let Effect::Again { node, .. } = &effect {
             if self.replaying.contains(node) && tree.again_waits(*node) {
@@ -1945,6 +2107,29 @@ impl NamespaceWriter {
         Ok(())
     }
 
+    // What of the member is out of its file and not for the file to give:
+    // its holds, and what the delivery that bound it gave its object, while
+    // that object still has the member as the volume they went to. An
+    // object that gave the member up gave those bytes up with it, and
+    // whoever takes the member next reads them from the file like the rest,
+    // the same object taking it again as another volume included.
+    fn not_in_file(&self, tree: &Tree, node: NodeId, member: MemberId) -> Vec<ByteRange> {
+        let owner = tree.child_of(node, member);
+        let mut ranges = self
+            .files
+            .get(&node)
+            .map(|files| files.holds.held_ranges(held_volume(member)))
+            .unwrap_or_default();
+        ranges.extend(
+            self.reached_now
+                .iter()
+                .filter(|(at, of, child, _)| *at == node && *of == member && owner == Some(*child))
+                .map(|(_, _, _, range)| *range),
+        );
+        ranges.sort_by_key(|range| range.start);
+        ranges
+    }
+
     // Held bytes go down again once the object their member is a volume of
     // places them, at whatever depth: an object's map grows only as it
     // hears its volumes or announces a member, and either may come from an
@@ -1961,8 +2146,27 @@ impl NamespaceWriter {
         segments: &dyn Segments,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        self.apply_unnamed(tree, builder, segments, out)?;
         while self.release_placed(tree, builder, segments, out)? {}
         Ok(())
+    }
+
+    // The damage `skip_unnamable` marked on a member whose name was
+    // refused, applied as any checksum failure's is, once the write that
+    // met the refusal has returned: the objects and sets that read the
+    // member, and the owner, hear it. Empty but for that error path.
+    fn apply_unnamed(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        if self.unnamed_damage.is_empty() {
+            return Ok(());
+        }
+        let effects = std::mem::take(&mut self.unnamed_damage);
+        self.apply_each(tree, builder, segments, effects, Write::Again, out)
     }
 
     // One pass over every hold, each held volume once in volume order and
@@ -2139,6 +2343,18 @@ impl NamespaceWriter {
 
     fn write_file(
         &mut self,
+        tree: &mut Tree,
+        node: NodeId,
+        member: MemberId,
+        offset: u64,
+        bytes: &Evidenced,
+    ) -> Result<(), WriteError> {
+        let written = self.write_into(tree, node, member, offset, bytes);
+        self.skip_unnamable(tree, (node, member), written)
+    }
+
+    fn write_into(
+        &mut self,
         tree: &Tree,
         node: NodeId,
         member: MemberId,
@@ -2154,7 +2370,7 @@ impl NamespaceWriter {
         let end = offset
             .saturating_add(bytes.len() as u64)
             .max(record.length.unwrap_or(0));
-        self.admit_file(tree, node, member, end)?;
+        self.admit_file(tree, node, member, end, bytes.len() as u64)?;
         let leaf = self.leaf(tree, node, member)?;
         let started = std::time::Instant::now();
         // The leaf folds the digest the member's stated check needs, from
@@ -2179,6 +2395,7 @@ impl NamespaceWriter {
         if let Some(length) = record.length.filter(|_| record.is_complete()) {
             let reached = record.coverage.runs().last().map_or(0, |run| run.range.end);
             leaf.close(length.max(reached))?;
+            self.caps.closed(node, member);
         }
         if let Some(metrics) = &self.metrics {
             metrics.disk_write_latency_us.store(
@@ -2197,6 +2414,16 @@ impl NamespaceWriter {
     // writes it.
     fn close_leaf(
         &mut self,
+        tree: &mut Tree,
+        node: NodeId,
+        member: MemberId,
+    ) -> Result<(), WriteError> {
+        let closed = self.close_file(tree, node, member);
+        self.skip_unnamable(tree, (node, member), closed)
+    }
+
+    fn close_file(
+        &mut self,
         tree: &Tree,
         node: NodeId,
         member: MemberId,
@@ -2213,8 +2440,73 @@ impl NamespaceWriter {
         if length > 0 && !written {
             return Ok(());
         }
-        self.admit_file(tree, node, member, length)?;
+        self.admit_file(tree, node, member, length, 0)?;
         self.leaf(tree, node, member)?.close(length)?;
+        self.caps.closed(node, member);
+        Ok(())
+    }
+
+    // A leaf whose file the file system will not create for its name, too
+    // long or one it never takes, is skipped and the job goes on with the
+    // rest: no file is made, and the member is damaged over its whole
+    // length, which its record keeps through a restart, so the delivery
+    // counts it short. That damage is applied as a failed checksum's is.
+    // Every later byte for it meets the same refusal and is dropped the
+    // same way. Any other error stands: a full disk, a permission, a
+    // read-only volume, a file already on disk, and a member an object
+    // reads, such as a recovery volume, still fail the job.
+    fn skip_unnamable(
+        &mut self,
+        tree: &mut Tree,
+        (node, member): (NodeId, MemberId),
+        result: Result<(), WriteError>,
+    ) -> Result<(), WriteError> {
+        let Err(WriteError::Leaf(error)) = &result else {
+            return result;
+        };
+        let creating = self
+            .files
+            .get(&node)
+            .and_then(|files| files.leaves.get(&member))
+            .is_some_and(|leaf| !leaf.on_disk());
+        if !error.names_unusable() || !creating || tree.child_of(node, member).is_some() {
+            return result;
+        }
+        if let Some(leaf) = self.files_mut(node).leaves.remove(&member) {
+            drop(leaf);
+        }
+        self.caps.forget(tree, node, member);
+        if !self.unnamable.insert((node, member)) {
+            return Ok(());
+        }
+        let name_bytes = tree
+            .namespace(node)
+            .and_then(|namespace| namespace.get(member))
+            .map_or(0, |record| record.output_name.len());
+        tracing::info!(
+            job_id = self.scope,
+            node = node.0,
+            member = member.0,
+            name_bytes,
+            "member skipped: the file system refused its name"
+        );
+        // A leaf member (no child, checked above) raises one effect here:
+        // `Damaged` over its whole length, none for a member of unknown
+        // length. The write path that met the refusal has no builder to
+        // apply it with, so it waits in `unnamed_damage` for the
+        // `apply_drain` or `release_held` that called it. Any later write
+        // it causes to this member meets the refusal again and returns at
+        // the insert above, so nothing loops.
+        let from = self.unnamed_damage.len();
+        tree.checksum_failed(node, member, &mut self.unnamed_damage);
+        debug_assert!(
+            self.unnamed_damage[from..].iter().all(|effect| matches!(
+                effect,
+                Effect::Damaged { node: at, member: of, .. } if (*at, *of) == (node, member)
+            )),
+            "a refused leaf raised more than its own damage: {:?}",
+            &self.unnamed_damage[from..]
+        );
         Ok(())
     }
 
@@ -2285,23 +2577,209 @@ impl NamespaceWriter {
         }
     }
 
-    // The member's file reaches `end`, by a write or by taking its length.
-    // Only what an object produces counts against the disk, and that is
-    // delivered, so it is judged against the output directory's device.
+    // The member's file reaches `end`, by a write of `landing` bytes or by
+    // taking its length. Only what an object produces counts against the
+    // disk, and that is delivered, so it is judged against the output
+    // directory's device.
     fn admit_file(
         &mut self,
         tree: &Tree,
         node: NodeId,
         member: MemberId,
         end: u64,
+        landing: u64,
     ) -> Result<(), WriteError> {
         self.caps.admit_write(
             tree,
             (node, member),
             end,
-            (&self.output_dir, self.output_free_disk.current()),
+            (Output::File, landing),
+            (&self.output_free_disk, Device::Output),
         )?;
         Ok(())
+    }
+
+    // Bytes up to `end` of a member an object produced that wait in the
+    // working directory: in the envelope of the object that reads the
+    // member, or held until the member's place or owner is known. They are
+    // the producing object's output as much as a file is, so they count as
+    // one would, against the working directory's device, at the level of
+    // their depth: what the reading object makes of them counts again at
+    // its own level, never added to theirs.
+    fn admit_kept(
+        &mut self,
+        tree: &Tree,
+        node: NodeId,
+        member: MemberId,
+        end: u64,
+    ) -> Result<(), WriteError> {
+        let device = self.kept_device();
+        let reader = match device {
+            Device::Output => &self.output_free_disk,
+            Device::Working => &self.free_disk,
+        };
+        self.caps.admit_write(
+            tree,
+            (node, member),
+            end,
+            (Output::Kept, 0),
+            (reader, device),
+        )?;
+        Ok(())
+    }
+
+    // The device a member that waits lies on: the working directory's,
+    // unless that is the output directory.
+    pub(super) fn kept_device(&self) -> Device {
+        if self.output_dir == self.working_dir {
+            Device::Output
+        } else {
+            Device::Working
+        }
+    }
+
+    // What a repair wrote into the posts, before any of it lands, each run
+    // as its member, and how many bytes: no limit of the job's holds the
+    // posts, but a post none of whose bytes arrived takes room on the disk
+    // it lies on, as any output does. A repair of a post that did arrive
+    // writes over room the post already holds, and is not counted. A post
+    // no object reads lies under the output directory, and one another
+    // object reads under the working directory.
+    pub(super) fn admit_repaired(
+        &mut self,
+        tree: &Tree,
+        runs: impl Iterator<Item = (MemberId, u64)>,
+    ) -> Result<(), WriteError> {
+        let posts = tree.namespace(NodeId::ROOT);
+        let arrived = |member| {
+            posts
+                .and_then(|namespace| namespace.get(member))
+                .is_some_and(|record| record.coverage.runs().any(|run| run.provenance.arrived()))
+        };
+        let (mut output, mut working) = (0u64, 0u64);
+        for (member, bytes) in runs.filter(|&(member, _)| !arrived(member)) {
+            match self.root_for(tree, NodeId::ROOT, member) == self.output_dir.as_path() {
+                true => output = output.saturating_add(bytes),
+                false => working = working.saturating_add(bytes),
+            }
+        }
+        if self.output_dir == self.working_dir {
+            output = output.saturating_add(working);
+            working = 0;
+        }
+        self.caps
+            .admit_repaired(output, (&self.output_free_disk, Device::Output))?;
+        self.caps
+            .admit_repaired(working, (&self.free_disk, Device::Working))?;
+        Ok(())
+    }
+
+    // Before a PAR3 set over the posts goes out: the files it describes
+    // none of whose bytes arrived, at the lengths they declare, are what its
+    // rebuild would add to the disk, as the file under the post's directory
+    // and as the repair's staged output under the working directory. Taken
+    // smallest first, a file that with those taken before it would leave
+    // less than the reserve free on a disk of its size even empty can never
+    // be rebuilt here with them: it is withheld, and the set writes nothing
+    // into it. The rest are rebuilt however the set describes them,
+    // once the disks have room for them all above the reserve: until then
+    // the set does not go out, and the job waits for room, as it does for a
+    // write. `None` while it waits. Only a PAR3 set can name one block in
+    // many places of a file; any other set writes no more than the recovery
+    // it received, and is not judged here.
+    // `noted`, when given, gains each file found absent.
+    pub(super) fn withheld(
+        &mut self,
+        tree: &Tree,
+        set: NodeId,
+        noted: Option<&mut BTreeSet<MemberId>>,
+    ) -> Option<BTreeSet<MemberId>> {
+        let mut withheld = BTreeSet::new();
+        if tree.kind(set) != Some(Kind::Par3) {
+            return Some(withheld);
+        }
+        let (Some(recovery), Some(posts)) = (tree.recovery(set), tree.namespace(NodeId::ROOT))
+        else {
+            return Some(withheld);
+        };
+        let mut absent: Vec<(u64, MemberId)> = posts
+            .members()
+            .filter(|record| absent_from_posts(record) && recovery.covers(record.id))
+            .filter_map(|record| Some((record.length?, record.id)))
+            .collect();
+        if let Some(noted) = noted {
+            noted.extend(absent.iter().map(|&(_, member)| member));
+        }
+        if absent.is_empty() {
+            return Some(withheld);
+        }
+        // Smallest first: as many files as fit the disk together are
+        // rebuilt, and the rest are withheld.
+        absent.sort_unstable();
+        let shared = self.output_dir == self.working_dir;
+        let reserve = self.caps.reserve();
+        let (output_size, working_size) = self.disk_sizes();
+        let (mut output, mut working) = (0u64, 0u64);
+        let mut held = 0u64;
+        for (length, member) in absent {
+            // The bytes it adds to the output device and to the working one.
+            let (onto_output, onto_working) = match shared {
+                true => (length, 0),
+                false if self.root_for(tree, NodeId::ROOT, member) == self.output_dir.as_path() => {
+                    (length, length)
+                }
+                false => (0, length),
+            };
+            // The files taken so far and this one could never fit the disk
+            // together, however much is freed on it.
+            let never = |used: u64, more: u64, size: Option<u64>| {
+                reserve > 0
+                    && more > 0
+                    && size.is_some_and(|size| {
+                        used.saturating_add(more).saturating_add(reserve) > size
+                    })
+            };
+            if never(output, onto_output, output_size) || never(working, onto_working, working_size)
+            {
+                withheld.insert(member);
+                held = held.saturating_add(length);
+            } else {
+                output = output.saturating_add(onto_output);
+                working = working.saturating_add(onto_working);
+            }
+        }
+        // Said once for each change of what the set withholds.
+        if !withheld.is_empty() && self.withheld_said.get(&set) != Some(&withheld) {
+            self.withheld_said.insert(set, withheld.clone());
+            tracing::info!(
+                set = set.0,
+                withheld = withheld.len(),
+                withheld_bytes = held,
+                rebuilt_bytes = output.max(working),
+                output_size = ?output_size,
+                working_size = ?working_size,
+                "files a recovery set would rebuild are withheld: the disk is too small for them"
+            );
+        }
+        self.caps
+            .want_both((output, &self.output_free_disk), (working, &self.free_disk))
+            .then_some(withheld)
+    }
+
+    // The size of the output disk, and of the working one when it is
+    // another directory, as last read.
+    pub(super) fn disk_sizes(&self) -> (Option<u64>, Option<u64>) {
+        let size = |reader: &CapacityReader| {
+            reader
+                .current()
+                .reading()
+                .map(|reading| reading.total_bytes)
+        };
+        let working = match self.output_dir == self.working_dir {
+            true => None,
+            false => size(&self.free_disk),
+        };
+        (size(&self.output_free_disk), working)
     }
 
     fn retract(&mut self, tree: &Tree, node: NodeId, member: MemberId) -> Result<(), WriteError> {

@@ -12,20 +12,27 @@
 // what, is decided here, by the same rules at every depth.
 
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
 use std::collections::binary_heap::{BinaryHeap, PeekMut};
+use std::collections::{BTreeSet, HashSet};
 
 use bytes::Bytes;
 use weaver_graph::recovery::{Recovery, RepairOutcome, SetRuling};
 use weaver_graph::{
-    Algorithm, Builder, ByteRange, Effect, Handed, Kind, MemberId, NodeId, Provenance,
+    Algorithm, Builder, ByteRange, Effect, Handed, Kind, MemberId, Namespace, NodeId, Provenance,
     RecoveryKind, Restore, Segment, Tree, VolumeIndex,
 };
 
 use super::{
-    Acknowledging, Arrival, Loan, NamespaceWriter, READ_BACK, Returned, Segments, Write,
-    WriteError, in_own_file, index,
+    Acknowledging, Arrival, HeldWant, Loan, NamespaceWriter, READ_BACK, Returned, Segments, Write,
+    WriteError, absent_from_posts, in_own_file, index,
 };
+
+// How many times a job waiting for room asked again what its due sets
+// would rebuild.
+#[cfg(test)]
+thread_local! {
+    pub(super) static HELD_RECHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 // Who a due set's repair is lent to, to run off the loop. One goes out at a
 // time, under a repair slot; its return comes back to `returned`.
@@ -582,7 +589,10 @@ impl NamespaceWriter {
         }
         // A name some posting already has is its member's, bound or not.
         if let Some(namespace) = tree.namespace(node) {
-            absent.retain(|(name, _)| namespace.records().all(|member| member.name != *name));
+            unposted(
+                &mut absent,
+                namespace.records().map(|member| member.name.as_str()),
+            );
         }
         for (name, length) in absent {
             let mut effects = Vec::new();
@@ -601,23 +611,103 @@ impl NamespaceWriter {
     // it is due rules on members still arriving and volumes it has not read,
     // and its verdict stands. Each goes out of the tree with what its reads
     // reach, so it repairs off the loop while the tree goes on; a due check
-    // meanwhile finds it out and does not take it again.
+    // meanwhile finds it out and does not take it again. A PAR3 set over
+    // the posts goes without the files that never arrived a disk of its
+    // size could never hold, and waits, with the job, until the disks have
+    // room for the rest. While the job waits for room no repair goes out,
+    // and what the job waits for on the sets' behalf follows what they
+    // would write now: a file that arrived since is no longer theirs to
+    // rebuild, and a set no longer due wants nothing. That is asked again
+    // only once something it rests on changed, not on every walk.
     pub(super) fn repair(
-        &self,
+        &mut self,
         tree: &mut Tree,
         node: NodeId,
         due: &[NodeId],
         lender: &mut dyn Lender,
     ) -> Result<(), WriteError> {
+        if node == NodeId::ROOT {
+            if !self.caps.disk_held() {
+                self.held_want = None;
+            } else {
+                if !self.held_want_stands(tree, due) {
+                    #[cfg(test)]
+                    HELD_RECHECKS.with(|rechecks| rechecks.set(rechecks.get() + 1));
+                    self.caps.rewant();
+                    let mut absent = BTreeSet::new();
+                    for &set in due {
+                        let _ = self.withheld(tree, set, Some(&mut absent));
+                    }
+                    self.held_want = Some(HeldWant {
+                        due: due.to_vec(),
+                        tickets: self.caps.disk_tickets(),
+                        sizes: self.disk_sizes(),
+                        at: tree
+                            .namespace(NodeId::ROOT)
+                            .map_or(0, Namespace::generation),
+                        absent,
+                    });
+                }
+                return Ok(());
+            }
+        }
         for &set in due {
-            if !lender.admit() {
+            // A repair writes what it rebuilds: none goes out while the job
+            // waits for room.
+            if self.caps.disk_held() || !lender.admit() {
                 break;
             }
-            if let Some(loan) = self.lend(tree, node, set)? {
+            let withheld = match node == NodeId::ROOT {
+                true => self.withheld(tree, set, None),
+                false => Some(BTreeSet::new()),
+            };
+            let Some(withheld) = withheld else {
+                continue;
+            };
+            if let Some(mut loan) = self.lend(tree, node, set)? {
+                loan.withhold(withheld);
                 lender.lend(loan);
             }
         }
         Ok(())
+    }
+
+    // Whether what the job waiting for room last found its due sets would
+    // rebuild still holds: the same sets, the same wait, the same disks,
+    // and no file of the posts marked since has come to arrive, been lost,
+    // or come to be wanted. Only the files marked since are looked at.
+    fn held_want_stands(&mut self, tree: &Tree, due: &[NodeId]) -> bool {
+        let tickets = self.caps.disk_tickets();
+        let sizes = self.disk_sizes();
+        let Some(held) = self.held_want.as_mut() else {
+            return false;
+        };
+        if held.due != due || held.tickets != tickets || held.sizes != sizes {
+            return false;
+        }
+        let Some(posts) = tree.namespace(NodeId::ROOT) else {
+            return false;
+        };
+        let at = posts.generation();
+        if at == held.at {
+            return true;
+        }
+        let stands = posts.changed_since(held.at).all(|member| {
+            let absent = posts.get(member).is_some_and(|record| {
+                absent_from_posts(record)
+                    && due.iter().any(|&set| {
+                        tree.kind(set) == Some(Kind::Par3)
+                            && tree
+                                .recovery(set)
+                                .is_some_and(|recovery| recovery.covers(member))
+                    })
+            });
+            absent == held.absent.contains(&member)
+        });
+        if stands {
+            held.at = at;
+        }
+        stands
     }
 
     // A lent repair came back. The object takes its node again and hears
@@ -721,6 +811,17 @@ impl NamespaceWriter {
             self.diagnostics.push(diagnostic);
         }
         self.read_backs += reads;
+        // What a PAR3 set wrote into a post none of whose bytes arrived is
+        // held to the disk reserve before any of it lands; what a repair
+        // wrote into an object's output is held to the job's limits as it
+        // lands, as that output always is.
+        if node == NodeId::ROOT
+            && tree.kind(set) == Some(Kind::Par3)
+            && let Err(error) = self.admit_repaired(tree, repaired.sizes())
+        {
+            let _ = repaired.remove();
+            return Err(error);
+        }
         // The set binds what it ruled before its bytes land: a member it
         // rebuilds takes the length it describes, so the slices that reach
         // that length close the file there. A repair reads members back, so
@@ -1268,7 +1369,7 @@ impl NamespaceWriter {
                 .get(&node)
                 .is_some_and(|files| files.leaves.contains_key(member));
             if let Some(length) = length.filter(|_| has_file) {
-                self.admit_file(tree, node, *member, length)?;
+                self.admit_file(tree, node, *member, length, 0)?;
                 if let Some(leaf) = self
                     .files
                     .get_mut(&node)
@@ -1479,13 +1580,16 @@ fn follow_founded(tree: &mut Tree, node: NodeId, sets: Vec<NodeId>) -> Vec<NodeI
         }
         let mut named = Vec::new();
         recovery.absent(&mut named);
+        if named.is_empty() {
+            continue;
+        }
+        let named = folded(&named);
+        let mut name = String::new();
         let founded = tree.namespaces_below(node).into_iter().find(|below| {
             tree.namespace(*below).is_some_and(|namespace| {
-                namespace.members().any(|member| {
-                    named
-                        .iter()
-                        .any(|(name, _)| name.eq_ignore_ascii_case(&member.name))
-                })
+                namespace
+                    .members()
+                    .any(|member| names(&named, &member.name, &mut name))
             })
         });
         if let Some(into) = founded {
@@ -1494,6 +1598,33 @@ fn follow_founded(tree: &mut Tree, node: NodeId, sets: Vec<NodeId>) -> Vec<NodeI
         }
     }
     moved
+}
+
+// Leave out of `absent` every name some posting has.
+fn unposted<'a>(absent: &mut Vec<(String, u64)>, posted: impl Iterator<Item = &'a str>) {
+    if absent.is_empty() {
+        return;
+    }
+    let posted: HashSet<&str> = posted.collect();
+    absent.retain(|(name, _)| !posted.contains(name.as_str()));
+}
+
+// The names, each in ASCII lower case, so a name is looked up regardless
+// of ASCII case.
+fn folded(named: &[(String, u64)]) -> HashSet<String> {
+    named
+        .iter()
+        .map(|(name, _)| name.to_ascii_lowercase())
+        .collect()
+}
+
+// Whether `name` is one of the folded names regardless of ASCII case,
+// folded into `buffer`.
+fn names(folded: &HashSet<String>, name: &str, buffer: &mut String) -> bool {
+    buffer.clear();
+    buffer.push_str(name);
+    buffer.make_ascii_lowercase();
+    folded.contains(buffer.as_str())
 }
 
 // Where, inside `range`, a block of any of `sizes` begins: the cuts a
@@ -1547,4 +1678,56 @@ pub(super) fn block_cuts(range: ByteRange, sizes: &mut [u64]) -> Vec<u64> {
         }
     }
     cuts
+}
+
+#[cfg(test)]
+mod name_sets {
+    use super::{folded, names, unposted};
+
+    // Names drawn from a small alphabet that mixes ASCII case and a letter
+    // outside ASCII, so many collide only by case and some not at all.
+    fn names_of(seed: &mut u64, count: usize) -> Vec<String> {
+        const LETTERS: [&str; 7] = ["a", "A", "b", "B", ".", "é", "É"];
+        (0..count)
+            .map(|_| {
+                let mut name = String::new();
+                for _ in 0..3 {
+                    *seed = seed
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    name.push_str(LETTERS[(*seed >> 33) as usize % LETTERS.len()]);
+                }
+                name
+            })
+            .collect()
+    }
+
+    // The set lookups answer what comparing every pair of the two lists
+    // answered.
+    #[test]
+    fn a_name_set_answers_as_every_pair_compared() {
+        let mut seed = 7;
+        for round in 0..64 {
+            let absent: Vec<(String, u64)> = names_of(&mut seed, round % 9)
+                .into_iter()
+                .zip(0..)
+                .collect();
+            let posted = names_of(&mut seed, round % 13);
+
+            let mut kept = absent.clone();
+            kept.retain(|(name, _)| posted.iter().all(|member| member != name));
+            let mut found = absent.clone();
+            unposted(&mut found, posted.iter().map(String::as_str));
+            assert_eq!(found, kept);
+
+            let set = folded(&absent);
+            let mut buffer = String::new();
+            for member in &posted {
+                let before = absent
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(member));
+                assert_eq!(names(&set, member, &mut buffer), before, "{member}");
+            }
+        }
+    }
 }

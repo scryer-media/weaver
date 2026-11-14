@@ -103,6 +103,12 @@ pub trait MemberAccess {
     // so the member's coverage says what the object found.
     fn found_damaged(&mut self, _member: MemberId, _range: ByteRange) {}
     fn length(&self, member: MemberId) -> Option<u64>;
+    // Whether the namespace has no room for this member to be rebuilt: the
+    // object writes nothing into it, and a repair that would have rebuilt
+    // it does not say it repaired what it covers.
+    fn withheld(&self, _member: MemberId) -> bool {
+        false
+    }
     // The runs of `range` of the member that arrived, in offset order, each
     // of which reads; the bytes between them never came.
     fn arrived(&self, _member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {

@@ -815,8 +815,11 @@ async fn explicit_article_body(
         panic!("valid transport decode")
     };
     let source = SegmentSource {
-        source_server_idx: Some(0),
-        exclude_servers: Vec::new(),
+        servers: crate::pipeline::PoolServers::stamped(
+            pipeline.pool_generation,
+            Some(0),
+            weaver_nntp::ServerSet::EMPTY,
+        ),
     };
     pipeline.note_decode_started(id, raw.len() as u64);
     pipeline

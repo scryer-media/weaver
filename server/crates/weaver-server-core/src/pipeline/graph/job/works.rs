@@ -12,6 +12,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::mpsc;
 use weaver_graph::{Emit, NodeId, Object};
@@ -26,8 +28,9 @@ pub(crate) struct Works {
     mail: mpsc::Sender<Said>,
     // The number the last loan went out under.
     serial: u64,
-    // The loans out, by node, under their numbers.
-    out: BTreeMap<NodeId, u64>,
+    // The loans out, by node, under their numbers, each with the word that
+    // stops its work once the job has gone.
+    out: BTreeMap<NodeId, (u64, Arc<AtomicBool>)>,
     // The rewalks reading, by node: each one's number and the word that lets its reader go on to the next piece once the last
     // one was heard. Its object stays home, so a checkpoint records it as
     // it stands.
@@ -47,9 +50,10 @@ pub(crate) struct Works {
     lent: u64,
 }
 
-// A loan a test keeps in hand: its node, its number, and the object.
+// A loan a test keeps in hand: its node, its number, the object, and the
+// word that stops its work.
 #[cfg(test)]
-pub(crate) type HeldLoan = (NodeId, u64, Box<dyn Object>);
+pub(crate) type HeldLoan = (NodeId, u64, Box<dyn Object>, Arc<AtomicBool>);
 
 struct Rewalking {
     serial: u64,
@@ -161,11 +165,20 @@ impl Works {
     // The loan numbered `serial` came back to `node`: it is no longer out.
     // `false` for anything else, which is not heard.
     pub(crate) fn returned(&mut self, node: NodeId, serial: u64) -> bool {
-        if self.out.get(&node) == Some(&serial) {
+        if self.out.get(&node).is_some_and(|(out, _)| *out == serial) {
             self.out.remove(&node);
             return true;
         }
         false
+    }
+
+    // The job is going and will hear none of its loans: each stops its work
+    // between one key and the next and comes back with the rest undone. A
+    // loan lent after this is not stopped.
+    pub(crate) fn request_stop(&self) {
+        for (_, stop) in self.out.values() {
+            stop.store(true, Ordering::Relaxed);
+        }
     }
 
     // Whether the rewalk numbered `serial` still reads for `node`.
@@ -201,35 +214,40 @@ impl Works {
         let shutdown = self.hardware.shutdown().clone();
         tokio::task::spawn_blocking(move || {
             let _job = crate::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
-            let tell = |piece, whole| {
+            let tell = |piece, whole, scratch| {
                 mail.blocking_send(Said {
                     scope,
                     node,
                     generation: serial,
-                    heard: Heard::Rewalked(Box::new(Rewalked { piece, whole })),
+                    heard: Heard::Rewalked(Box::new(Rewalked {
+                        piece,
+                        whole,
+                        scratch,
+                    })),
                 })
                 .is_ok()
             };
             // A closed channel means the pipeline is gone, or the loop let
             // the rewalk go, and no one is left to tell.
-            let whole = loan.run(&shutdown, &mut |volume, posted| {
-                tell(Some((volume, posted)), true) && hearing.recv().is_ok()
+            let whole = loan.run(&shutdown, &mut |volume, posted, scratch| {
+                tell(Some((volume, posted)), true, scratch) && hearing.recv().is_ok()
             });
-            tell(None, whole);
+            tell(None, whole, Default::default());
         });
     }
 
     pub(crate) fn lend(&mut self, node: NodeId, mut object: Box<dyn Object>) {
         self.serial += 1;
         let (scope, serial) = (self.scope, self.serial);
-        self.out.insert(node, serial);
+        let stop = Arc::new(AtomicBool::new(false));
+        self.out.insert(node, (serial, Arc::clone(&stop)));
         #[cfg(test)]
         {
             self.lent += 1;
         }
         #[cfg(test)]
         if let Some(held) = &mut self.held {
-            held.push((node, serial, object));
+            held.push((node, serial, object, stop));
             return;
         }
         let mail = self.mail.clone();
@@ -241,7 +259,7 @@ impl Works {
             // Executing once a thread of the pool takes it, until it is done.
             grant.install(|| {
                 let _decoding = clock.decoding();
-                object.work(&mut said);
+                object.work_until(&stop, &mut said);
             });
             // A closed channel means the pipeline is gone, and no one is
             // left to tell.

@@ -703,3 +703,350 @@ async fn a_zip_with_a_drive_letter_member_delivers_every_member() {
 async fn a_tar_with_a_drive_letter_member_delivers_every_member() {
     a_drive_letter_member_beside_a_plain_one_delivers_both("lantern.tar", tar).await;
 }
+
+// The rows above again with members too large to be held: a member's tail
+// that arrives before its front goes to the member's own file, and the
+// object its front binds is handed that file. LARGE is past what a
+// namespace holds for one member, and FRAME keeps a row to a few thousand
+// articles.
+const LARGE: usize = 1_500_000;
+const FRAME: usize = 16 * 1024;
+
+type Compress = (&'static str, &'static str, fn(&[u8]) -> Vec<u8>);
+
+const STREAMS: [Compress; 6] = [
+    ("xz.bin.xz", "xz.bin", xz),
+    ("gz.bin.gz", "gz.bin", gzip),
+    ("bz.bin.bz2", "bz.bin", bzip2),
+    ("zst.bin.zst", "zst.bin", zstd),
+    ("br.bin.br", "br.bin", brotli),
+    ("raw.bin.deflate", "raw.bin", deflate),
+];
+
+fn store_of(kind: Kind, entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    match kind {
+        Kind::Rar => rar(entries),
+        Kind::SevenZ => sevenz_of(entries),
+        Kind::Tar => tar(entries),
+        Kind::Zip => zip(entries),
+        _ => unreachable!("a store"),
+    }
+}
+
+// The post delivered `held` under `name` and nothing else, with no object
+// refused on the way, served in order and last article first.
+async fn large_row(posted: &str, store: Vec<u8>, name: &str, held: &[u8]) {
+    for backwards in [false, true] {
+        let scenario = Scenario::new(vec![Post::plain(posted, store.clone())]).framed(FRAME);
+        let scenario = if backwards {
+            scenario.backwards()
+        } else {
+            scenario
+        };
+        let (lines, guard) = Lines::capture();
+        let graph = run(&scenario).await;
+        drop(guard);
+        assert!(
+            lines.of("object refused").is_empty(),
+            "backwards={backwards}: {:?}",
+            lines.of("object refused")
+        );
+        assert_eq!(
+            summary(&graph),
+            format!("Some(Complete) [{name}]"),
+            "backwards={backwards}"
+        );
+        assert!(
+            graph.files[&delivered(name)] == held,
+            "backwards={backwards}: the bytes"
+        );
+    }
+}
+
+// One large stream of each kind as the one member of a store of `kind`.
+async fn large_stream_under(kind: Kind, posted: &str, stream: usize) {
+    let (member, name, compress) = STREAMS[stream];
+    let held = noise(LARGE + stream, 60 + stream as u64);
+    let store = store_of(kind, &[(member, compress(&held))]);
+    large_row(posted, store, name, &held).await;
+}
+
+macro_rules! large_streams {
+    ($($name:ident => $kind:expr, $posted:expr, $stream:expr;)*) => {
+        $(
+            #[tokio::test]
+            async fn $name() {
+                large_stream_under($kind, $posted, $stream).await;
+            }
+        )*
+    };
+}
+
+large_streams! {
+    a_large_xz_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", 0;
+    a_large_gzip_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", 1;
+    a_large_bzip2_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", 2;
+    a_large_zstd_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", 3;
+    a_large_brotli_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", 4;
+    a_large_deflate_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", 5;
+    a_large_xz_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", 0;
+    a_large_gzip_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", 1;
+    a_large_bzip2_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", 2;
+    a_large_zstd_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", 3;
+    a_large_brotli_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", 4;
+    a_large_deflate_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", 5;
+    a_large_xz_under_a_tar_delivers => Kind::Tar, "lantern.tar", 0;
+    a_large_gzip_under_a_tar_delivers => Kind::Tar, "lantern.tar", 1;
+    a_large_bzip2_under_a_tar_delivers => Kind::Tar, "lantern.tar", 2;
+    a_large_zstd_under_a_tar_delivers => Kind::Tar, "lantern.tar", 3;
+    a_large_brotli_under_a_tar_delivers => Kind::Tar, "lantern.tar", 4;
+    a_large_deflate_under_a_tar_delivers => Kind::Tar, "lantern.tar", 5;
+    a_large_xz_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", 0;
+    a_large_gzip_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", 1;
+    a_large_bzip2_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", 2;
+    a_large_zstd_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", 3;
+    a_large_brotli_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", 4;
+    a_large_deflate_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", 5;
+}
+
+// One large container of kind `inner`, holding one file, as the one member
+// of a store of kind `outer`.
+async fn large_container_under(outer: Kind, posted: &str, inner: Kind, member: &str) {
+    let held = noise(LARGE, 90);
+    let store = store_of(outer, &[(member, inner.wrap(FILE, held.clone()))]);
+    large_row(posted, store, FILE, &held).await;
+}
+
+macro_rules! large_containers {
+    ($($name:ident => $outer:expr, $posted:expr, $inner:expr, $member:expr;)*) => {
+        $(
+            #[tokio::test]
+            async fn $name() {
+                large_container_under($outer, $posted, $inner, $member).await;
+            }
+        )*
+    };
+}
+
+large_containers! {
+    a_large_rar_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", Kind::Rar, "inner.rar";
+    a_large_7z_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", Kind::SevenZ, "inner.7z";
+    a_large_tar_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", Kind::Tar, "inner.tar";
+    a_large_tar_gz_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", Kind::TarGz, "inner.tar.gz";
+    a_large_zip_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", Kind::Zip, "inner.zip";
+    a_large_rar_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", Kind::Rar, "inner.rar";
+    a_large_7z_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", Kind::SevenZ, "inner.7z";
+    a_large_tar_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", Kind::Tar, "inner.tar";
+    a_large_tar_gz_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", Kind::TarGz, "inner.tar.gz";
+    a_large_zip_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", Kind::Zip, "inner.zip";
+    a_large_rar_under_a_tar_delivers => Kind::Tar, "lantern.tar", Kind::Rar, "inner.rar";
+    a_large_7z_under_a_tar_delivers => Kind::Tar, "lantern.tar", Kind::SevenZ, "inner.7z";
+    a_large_tar_under_a_tar_delivers => Kind::Tar, "lantern.tar", Kind::Tar, "inner.tar";
+    a_large_tar_gz_under_a_tar_delivers => Kind::Tar, "lantern.tar", Kind::TarGz, "inner.tar.gz";
+    a_large_zip_under_a_tar_delivers => Kind::Tar, "lantern.tar", Kind::Zip, "inner.zip";
+    a_large_rar_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", Kind::Rar, "inner.rar";
+    a_large_7z_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", Kind::SevenZ, "inner.7z";
+    a_large_tar_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", Kind::Tar, "inner.tar";
+    a_large_tar_gz_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", Kind::TarGz, "inner.tar.gz";
+    a_large_zip_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", Kind::Zip, "inner.zip";
+}
+
+// An object that binds a member gives it back, or is asked
+// to read back what it was given at its binding, at sizes where the member
+// has a file of its own. No recovery stands beside the binding-and-give-back
+// rows, so a hole in a file cannot be patched without notice: the job must
+// end Complete, with the bytes and no repair.
+
+// Delivered `expected` under `name`, Complete, no repair outcome.
+async fn checked_row(scenario: Scenario, name: &str, expected: &[u8], case: &str) -> Outcome {
+    let (lines, guard) = Lines::capture();
+    let graph = run(&scenario).await;
+    drop(guard);
+    let refused = lines.of("object refused");
+    assert!(
+        graph.completed(),
+        "{case}: {} refused {refused:?}",
+        summary(&graph)
+    );
+    let path = delivered(name);
+    assert!(
+        graph.files.contains_key(&path),
+        "{case}: {} refused {refused:?}",
+        summary(&graph)
+    );
+    let got = &graph.files[&path];
+    let wrong = got.iter().zip(expected).position(|(a, b)| a != b);
+    assert!(
+        got.len() == expected.len() && wrong.is_none(),
+        "{case}: len {} of {}, first wrong byte {wrong:?}, refused {refused:?}",
+        got.len(),
+        expected.len()
+    );
+    assert!(
+        graph.graph().outcomes.iter().all(Option::is_none),
+        "{case}: {:?}",
+        graph.graph().outcomes
+    );
+    graph
+}
+
+fn both_orders(make: impl Fn() -> Scenario) -> [(Scenario, &'static str); 2] {
+    [(make(), "in order"), (make().backwards(), "backwards")]
+}
+
+// Q1a. A four-volume stored RAR5 set of one large member, its second and
+// third volumes posted under each other's names, two deep, no PAR2.
+fn swapped_set() -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
+    use crate::pipeline::tests::direct_store::single_member_store_set;
+    let held = noise(4 * LARGE + 13, 201);
+    let set = single_member_store_set("beacon.bin", &held, 4);
+    let mut swapped = set.clone();
+    swapped.swap(1, 2);
+    let posted = set
+        .into_iter()
+        .zip(swapped)
+        .map(|((name, _), (_, bytes))| (name, bytes))
+        .collect();
+    (held, posted)
+}
+
+#[tokio::test]
+async fn swapped_rar_volumes_at_the_root_large_no_par2() {
+    let (held, posted) = swapped_set();
+    for (scenario, case) in
+        both_orders(|| Scenario::new(super::rar::posts(posted.clone())).framed(FRAME))
+    {
+        checked_row(scenario, "beacon.bin", &held, case).await;
+    }
+}
+
+#[tokio::test]
+async fn swapped_rar_volumes_two_deep_large_no_par2() {
+    let (held, posted) = swapped_set();
+    let entries: Vec<(&str, Vec<u8>)> = posted
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.clone()))
+        .collect();
+    let post = Post::plain("lantern.7z", super::deep::two_deep(&entries));
+    for (scenario, case) in both_orders(|| {
+        Scenario::new(vec![Post::plain(&post.name, post.bytes.clone())]).framed(FRAME)
+    }) {
+        checked_row(scenario, "beacon.bin", &held, case).await;
+    }
+}
+
+// Q1b. A member named as one container that is another by its bytes.
+async fn misnamed(outer: Kind, posted: &str, member: &str, inner: Kind) {
+    let held = noise(LARGE, 202);
+    let store = store_of(outer, &[(member, inner.wrap(FILE, held.clone()))]);
+    let post = Post::plain(posted, store);
+    for (scenario, case) in both_orders(|| {
+        Scenario::new(vec![Post::plain(&post.name, post.bytes.clone())]).framed(FRAME)
+    }) {
+        checked_row(scenario, FILE, &held, case).await;
+    }
+}
+
+#[tokio::test]
+async fn a_rar_named_zip_in_a_stored_7z() {
+    misnamed(Kind::SevenZ, "lantern.7z", "inner.zip", Kind::Rar).await;
+}
+
+#[tokio::test]
+async fn a_zip_named_rar_in_a_stored_7z() {
+    misnamed(Kind::SevenZ, "lantern.7z", "inner.rar", Kind::Zip).await;
+}
+
+#[tokio::test]
+async fn a_7z_named_rar_in_a_stored_zip() {
+    misnamed(Kind::Zip, "lantern.zip", "inner.rar", Kind::SevenZ).await;
+}
+
+// Q1c. A stream member: named xz with plain bytes, so a stream bound by
+// its name gives it back; and an xz named gz.
+#[tokio::test]
+async fn plain_bytes_named_xz_in_a_stored_zip() {
+    let held = noise(LARGE, 203);
+    let post = Post::plain("lantern.zip", zip(&[("ember.bin.xz", held.clone())]));
+    for (scenario, case) in both_orders(|| {
+        Scenario::new(vec![Post::plain(&post.name, post.bytes.clone())]).framed(FRAME)
+    }) {
+        checked_row(scenario, "ember.bin.xz", &held, case).await;
+    }
+}
+
+#[tokio::test]
+async fn an_xz_named_gz_in_a_stored_zip() {
+    let held = noise(LARGE, 204);
+    let post = Post::plain("lantern.zip", zip(&[("ember.bin.gz", xz(&held))]));
+    for (scenario, case) in both_orders(|| {
+        Scenario::new(vec![Post::plain(&post.name, post.bytes.clone())]).framed(FRAME)
+    }) {
+        let graph = run(&scenario).await;
+        assert!(graph.completed(), "{case}: {}", summary(&graph));
+        let whole = graph.files.values().any(|bytes| *bytes == held);
+        assert!(whole, "{case}: {} holds no decoded file", summary(&graph));
+        assert!(graph.graph().outcomes.iter().all(Option::is_none), "{case}");
+    }
+}
+
+// A stored RAR of an xz under PAR2 sliced at 24 KiB over 16 KiB
+// articles. Article 1 is the delivery that binds the xz (its front needs
+// 16 KiB past the RAR header). Losing article 2 repairs slice 1, which cuts
+// article 1's run, so the store reads [16 KiB, 24 KiB) of the volume back
+// from the xz member: bytes the binding delivery gave the stream.
+async fn rar_xz_read_back(shape: fn(Scenario) -> Scenario, lose: u32, case: &str) {
+    use crate::pipeline::tests::direct_store::single_member_store_set;
+    let held = noise(2 * LARGE + 7, 205);
+    let volumes = single_member_store_set("ember.bin.xz", &xz(&held), 1);
+    let (name, bytes) = volumes[0].clone();
+    let mut posts = super::rar::posts(volumes);
+    posts.extend(super::harness::par2_volumes_sliced(
+        "lantern",
+        &[(name.as_str(), &bytes)],
+        24 * 1024,
+        4,
+        1,
+    ));
+    let scenario = shape(Scenario::new(posts).framed(FRAME).lost(0, lose));
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{case}: {}", summary(&graph));
+    let got = &graph.files[&delivered("ember.bin")];
+    let wrong = got.iter().zip(&held).position(|(a, b)| a != b);
+    assert!(
+        got.len() == held.len() && wrong.is_none(),
+        "{case}: len {} of {}, first wrong byte {wrong:?}",
+        got.len(),
+        held.len()
+    );
+    assert!(
+        graph.graph().outcomes.iter().any(|outcome| matches!(
+            outcome,
+            Some(weaver_graph::recovery::RepairOutcome::Repaired { .. })
+        )),
+        "{case}: {:?}",
+        graph.graph().outcomes
+    );
+}
+
+#[tokio::test]
+async fn rar_xz_read_back_of_binding_bytes_in_order() {
+    rar_xz_read_back(|scenario| scenario, 2, "in order").await;
+}
+
+#[tokio::test]
+async fn rar_xz_read_back_of_binding_bytes_backwards() {
+    rar_xz_read_back(Scenario::backwards, 2, "backwards").await;
+}
+
+#[tokio::test]
+async fn rar_xz_read_back_of_binding_bytes_tail_first() {
+    rar_xz_read_back(|scenario| scenario.reversed(&[0]), 2, "tail first").await;
+}
+
+// Article 1 lost: slices 0 and 1 are repaired, which overwrites article
+// 0's run, the one that holds the RAR header and the front of the xz.
+#[tokio::test]
+async fn rar_xz_read_back_when_the_binding_article_is_lost() {
+    rar_xz_read_back(|scenario| scenario, 1, "binding article lost").await;
+}

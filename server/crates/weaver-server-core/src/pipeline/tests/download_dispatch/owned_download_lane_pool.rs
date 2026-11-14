@@ -66,7 +66,7 @@ async fn a_recovery_lease_takes_an_owned_lane() {
         retry_count: 0,
         is_recovery: true,
         completion_critical: true,
-        exclude_servers: Vec::new(),
+        exclude_servers: weaver_nntp::ServerSet::EMPTY,
         avoid_server: None,
     };
     let lease = DownloadBatchLease {
@@ -77,8 +77,8 @@ async fn a_recovery_lease_takes_an_owned_lane() {
         lane_mode: DownloadLaneMode::Sequential,
         server_modes: Vec::new(),
         completion_critical: work.completion_critical,
-        effective_exclude_servers: Vec::new(),
-        dial_exclude_servers: Vec::new(),
+        effective_exclude_servers: weaver_nntp::ServerSet::EMPTY,
+        dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
         works: vec![work],
@@ -87,7 +87,7 @@ async fn a_recovery_lease_takes_an_owned_lane() {
     assert!(
         pipeline
             .nntp
-            .has_blocking_body_lane_candidate(&lease.dial_exclude_servers),
+            .has_blocking_body_lane_candidate(lease.dial_exclude_servers),
         "a recovery lease must be eligible for a cached owned lane"
     );
 }
@@ -117,7 +117,7 @@ async fn a_recovery_lease_keeps_the_owned_lane_fleet_intact() {
         retry_count: 0,
         is_recovery: true,
         completion_critical: false,
-        exclude_servers: Vec::new(),
+        exclude_servers: weaver_nntp::ServerSet::EMPTY,
         avoid_server: None,
     };
     let lease = DownloadBatchLease {
@@ -128,8 +128,8 @@ async fn a_recovery_lease_keeps_the_owned_lane_fleet_intact() {
         lane_mode: DownloadLaneMode::Sequential,
         server_modes: Vec::new(),
         completion_critical: work.completion_critical,
-        effective_exclude_servers: Vec::new(),
-        dial_exclude_servers: Vec::new(),
+        effective_exclude_servers: weaver_nntp::ServerSet::EMPTY,
+        dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
         works: vec![work],
@@ -243,7 +243,7 @@ async fn shutdown_drain_consumes_inflight_download_results() {
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await
@@ -251,15 +251,15 @@ async fn shutdown_drain_consumes_inflight_download_results() {
 
     pipeline.drain().await;
 
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     assert!(
         !pipeline
-            .active_downloads_by_job
+            .articles_in_flight_by_job
             .contains_key(&segment_id.file_id.job_id)
     );
     assert!(
         !pipeline
-            .active_downloads_by_file
+            .articles_in_flight_by_file
             .contains_key(&segment_id.file_id)
     );
 }
@@ -302,7 +302,7 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -438,7 +438,7 @@ async fn transport_failure_retry_rotates_off_the_failed_server() {
             source_server_idx: Some(0),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -503,7 +503,7 @@ async fn transport_failure_retry_keeps_single_server_eligible() {
             source_server_idx: Some(0),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -592,7 +592,7 @@ async fn transport_failure_retry_does_not_rotate_toward_backfill() {
             source_server_idx: Some(0),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -674,7 +674,7 @@ async fn fail_segment_with(
             source_server_idx: Some(0),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -1018,7 +1018,7 @@ async fn group_discovery_at_retry_limit_preserves_the_article_for_a_grouped_retr
             source_server_idx: Some(0),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: MAX_SEGMENT_RETRIES,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -1055,6 +1055,83 @@ async fn group_discovery_at_retry_limit_preserves_the_article_for_a_grouped_retr
     let setup =
         DownloadFailure::from_lane_acquire_failure(Some(&weaver_nntp::NntpError::NoGroupSelected));
     assert!(setup.kind.preserves_article_retry_budget());
+}
+
+// A 412 the next connection cannot answer by selecting a group (no group to
+// select, or one already selected) pays a retry: below the limit the article
+// comes back with one more retry spent, at the limit it fails, so a job
+// whose articles the server will never serve ends instead of retrying them
+// every second.
+#[tokio::test]
+async fn a_settled_group_refusal_spends_the_article_retry_budget() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20025);
+    let segment_ids: Vec<SegmentId> = (0..2)
+        .map(|segment_number| SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            segment_number,
+        })
+        .collect();
+    let spec = segmented_job_spec("Group refused", "group.bin", &[128, 128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
+    hold_on_test_lane(&mut pipeline, &segment_ids);
+    pipeline.active_download_passes.insert(job_id);
+
+    let settled = || {
+        let mut failure = DownloadFailure::from_nntp(weaver_nntp::NntpError::NoGroupSelected);
+        failure.settle_group_refusal(true, false);
+        DownloadError::Fetch(failure)
+    };
+    let refused = |segment_id, retry_count| DownloadResult {
+        runtime_generation: 0,
+        lane_id: 0,
+        job_id,
+        segment_id,
+        data: Err(settled()),
+        attempts: Vec::new(),
+        lane_observation: None,
+        source_server_idx: Some(0),
+        origin: DownloadResultOrigin::NormalPrimary,
+        retry_count,
+        exclude_servers: weaver_nntp::ServerSet::EMPTY,
+        release_connection_slot: true,
+    };
+
+    pipeline
+        .handle_download_done(refused(segment_ids[0], 0))
+        .await;
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    let retry = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
+    assert_eq!(retry.segment_id, segment_ids[0]);
+    assert_eq!(retry.retry_count, 1, "the refusal spent one retry");
+
+    pipeline
+        .handle_download_done(refused(segment_ids[1], MAX_SEGMENT_RETRIES))
+        .await;
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        1,
+        "the article at the retry limit fails"
+    );
 }
 
 #[test]
@@ -1140,7 +1217,7 @@ async fn generation_wake_requeues_ten_thousand_segments_in_one_batch() {
                     retry_count: MAX_SEGMENT_RETRIES,
                     is_recovery: false,
                     completion_critical: false,
-                    exclude_servers: vec![0],
+                    exclude_servers: weaver_nntp::ServerSet::from([0]),
                     avoid_server: None,
                 },
             },
@@ -1238,7 +1315,7 @@ async fn stale_generation_transport_failure_is_requeued_without_poisoning_health
             source_server_idx: Some(0),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: MAX_SEGMENT_RETRIES + 10,
-            exclude_servers: vec![0],
+            exclude_servers: weaver_nntp::ServerSet::from([0]),
             release_connection_slot: true,
         })
         .await;
@@ -1311,7 +1388,7 @@ async fn stale_generation_success_does_not_update_new_lane_health() {
         source_server_idx: Some(0),
         origin: DownloadResultOrigin::NormalPrimary,
         retry_count: 0,
-        exclude_servers: Vec::new(),
+        exclude_servers: weaver_nntp::ServerSet::EMPTY,
         release_connection_slot: true,
     });
 
@@ -1592,7 +1669,7 @@ async fn server_quota_lane_failure_parks_until_retry_at_without_lane_spin() {
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: MAX_SEGMENT_RETRIES + 1,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: false,
         })
         .await;
@@ -1706,7 +1783,7 @@ async fn quota_acquire_failure_requeues_smaller_tail_for_independent_selection()
     let large_estimate = Pipeline::bandwidth_reservation_estimate(large_bytes);
     let blocked = pipeline
         .nntp
-        .body_server_selection_with_estimate(&[], large_estimate)
+        .body_server_selection_with_estimate(weaver_nntp::ServerSet::EMPTY, large_estimate)
         .await;
     assert!(blocked.eligible.is_empty());
     let failure =
@@ -1732,7 +1809,7 @@ async fn quota_acquire_failure_requeues_smaller_tail_for_independent_selection()
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 4,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: false,
         })
         .await;
@@ -1748,7 +1825,7 @@ async fn quota_acquire_failure_requeues_smaller_tail_for_independent_selection()
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 7,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: false,
         })
         .await;
@@ -1775,7 +1852,7 @@ async fn quota_acquire_failure_requeues_smaller_tail_for_independent_selection()
     let tail_selection = pipeline
         .nntp
         .body_server_selection_with_estimate(
-            &tail_work.exclude_servers,
+            tail_work.exclude_servers,
             Pipeline::bandwidth_reservation_estimate(tail_work.byte_estimate),
         )
         .await;
@@ -1858,7 +1935,7 @@ async fn server_quota_reservation_refund_wakes_parked_work() {
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: false,
         })
         .await;
@@ -1959,7 +2036,7 @@ async fn server_quota_source_failure_keeps_backfill_locked_and_fails_over_to_fil
             source_server_idx: Some(0),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: MAX_SEGMENT_RETRIES + 1,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: false,
         })
         .await;
@@ -1991,12 +2068,12 @@ async fn server_quota_source_failure_keeps_backfill_locked_and_fails_over_to_fil
         soft_timeout: Duration::from_secs(1),
     });
     let quota_retry = fill_and_backfill
-        .body_server_selection_with_estimate(&retry.work.exclude_servers, 1)
+        .body_server_selection_with_estimate(retry.work.exclude_servers, 1)
         .await;
     assert!(quota_retry.eligible.is_empty());
     assert!(quota_retry.quota_blocked.is_some());
     let missing_or_retention_retry = fill_and_backfill
-        .body_server_selection_with_estimate(&[0], 1)
+        .body_server_selection_with_estimate(weaver_nntp::ServerSet::from([0]), 1)
         .await;
     assert_eq!(
         missing_or_retention_retry.eligible,
@@ -2014,7 +2091,7 @@ async fn server_quota_source_failure_keeps_backfill_locked_and_fails_over_to_fil
         soft_timeout: Duration::from_secs(1),
     });
     let fill_failover = two_fills
-        .body_server_selection_with_estimate(&retry.work.exclude_servers, 1)
+        .body_server_selection_with_estimate(retry.work.exclude_servers, 1)
         .await;
     assert_eq!(fill_failover.eligible, vec![weaver_nntp::ServerId(1)]);
 
@@ -2102,7 +2179,7 @@ async fn server_quota_source_failure_parks_while_only_backfill_remains() {
             source_server_idx: Some(0),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: MAX_SEGMENT_RETRIES + 1,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: false,
         })
         .await;
@@ -2211,7 +2288,7 @@ async fn other_fill_refund_wakes_manual_quota_park_without_unlocking_backfill() 
 
     let blocked = pipeline
         .nntp
-        .body_server_selection_with_estimate(&[], 1)
+        .body_server_selection_with_estimate(weaver_nntp::ServerSet::EMPTY, 1)
         .await;
     assert!(blocked.eligible.is_empty());
     let rejection = blocked
@@ -2250,7 +2327,7 @@ async fn other_fill_refund_wakes_manual_quota_park_without_unlocking_backfill() 
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: MAX_SEGMENT_RETRIES + 1,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: false,
         })
         .await;
@@ -2283,7 +2360,7 @@ async fn other_fill_refund_wakes_manual_quota_park_without_unlocking_backfill() 
     );
     let resumed = pipeline
         .nntp
-        .body_server_selection_with_estimate(&retry.work.exclude_servers, 1)
+        .body_server_selection_with_estimate(retry.work.exclude_servers, 1)
         .await;
     assert_eq!(resumed.eligible, vec![other_server]);
     assert!(
@@ -2333,9 +2410,15 @@ async fn retention_excludes_derive_from_job_age_and_server_windows() {
     // effective set merges with per-article failure excludes without dupes.
     age_job_days(&mut pipeline, job_id, 10);
     pipeline.clear_job_retention_excludes(job_id);
-    assert_eq!(pipeline.job_retention_excludes(job_id).as_slice(), &[0]);
-    assert_eq!(pipeline.effective_exclude_servers(job_id, &[1]), vec![1, 0]);
-    assert_eq!(pipeline.effective_exclude_servers(job_id, &[0]), vec![0]);
+    assert_eq!(pipeline.job_retention_excludes(job_id), [0]);
+    assert_eq!(
+        pipeline.effective_exclude_servers(job_id, weaver_nntp::ServerSet::from([1])),
+        vec![1, 0]
+    );
+    assert_eq!(
+        pipeline.effective_exclude_servers(job_id, weaver_nntp::ServerSet::from([0])),
+        vec![0]
+    );
 
     // Younger than every window: nothing excluded.
     age_job_days(&mut pipeline, job_id, 1);
@@ -2385,7 +2468,7 @@ async fn article_not_found_exhaustion_counts_retention_excluded_servers() {
             source_server_idx: Some(1),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -2445,7 +2528,7 @@ async fn enqueued_work_no_server_may_fetch_is_booked_missing() {
         retry_count: 0,
         is_recovery: false,
         completion_critical: false,
-        exclude_servers: vec![0],
+        exclude_servers: weaver_nntp::ServerSet::from([0]),
         avoid_server: None,
     });
 
@@ -2558,7 +2641,7 @@ async fn fully_retention_excluded_job_books_missing_instead_of_requeueing() {
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -2627,28 +2710,26 @@ async fn traced_article_not_found_retries_other_servers_without_retry_budget() {
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
 
-    assert_eq!(
-        pipeline.pending_retries_by_job.get(&job_id).copied(),
-        Some(1)
-    );
+    // The article is back on the queue at once, for the next server: no
+    // retry waits on the channel for a quiet turn.
+    assert_eq!(pipeline.pending_retries_by_job.get(&job_id).copied(), None);
+    assert!(pipeline.retry_rx.try_recv().is_err());
     assert_eq!(
         pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
         Some(0)
     );
     assert!(pipeline.pending_completion_checks.is_empty());
 
-    let work = pipeline
-        .retry_rx
-        .recv()
-        .await
-        .expect("retry channel must stay open")
-        .work;
-    assert_eq!(work.exclude_servers, vec![0]);
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    let queue = &state.articles.active().unwrap().download_queue;
+    assert_eq!(queue.len(), 1);
+    let work = queue.peek_first_matching(|_| true).unwrap();
+    assert_eq!(work.exclude_servers, &[0]);
     assert_eq!(work.retry_count, 0);
 }
 
@@ -2690,7 +2771,7 @@ async fn recovery_article_not_found_does_not_mark_health_failure() {
             source_server_idx: None,
             origin: DownloadResultOrigin::Recovery,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -2754,7 +2835,7 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -2783,7 +2864,7 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: MAX_SEGMENT_RETRIES,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -2841,13 +2922,13 @@ async fn download_pass_finishes_when_only_optional_recovery_queue_remains() {
                 retry_count: 0,
                 is_recovery: true,
                 completion_critical: false,
-                exclude_servers: Vec::new(),
+                exclude_servers: weaver_nntp::ServerSet::EMPTY,
                 avoid_server: None,
             });
     }
 
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 0);
+    pipeline.articles_in_flight_by_job.insert(job_id, 0);
 
     assert!(!pipeline.pending_completion_checks.contains(&job_id));
     assert!(!pipeline.job_has_pending_download_pipeline_work(job_id));
@@ -2917,7 +2998,7 @@ async fn released_result_books_its_own_job_after_its_lane_owner_is_gone() {
                     retry_count: 0,
                     is_recovery: false,
                     completion_critical: false,
-                    exclude_servers: Vec::new(),
+                    exclude_servers: weaver_nntp::ServerSet::EMPTY,
                     avoid_server: None,
                 },
             )]),
@@ -2940,7 +3021,7 @@ async fn released_result_books_its_own_job_after_its_lane_owner_is_gone() {
         source_server_idx: Some(0),
         origin: DownloadResultOrigin::NormalPrimary,
         retry_count: 0,
-        exclude_servers: Vec::new(),
+        exclude_servers: weaver_nntp::ServerSet::EMPTY,
         release_connection_slot: true,
     }));
 
@@ -2949,7 +3030,7 @@ async fn released_result_books_its_own_job_after_its_lane_owner_is_gone() {
         "the result that closes a lane retires its owner before the job is booked"
     );
     assert!(
-        !pipeline.active_downloads_by_job.contains_key(&job_id),
+        !pipeline.articles_in_flight_by_job.contains_key(&job_id),
         "the result's own job is what the in-flight count is charged back to"
     );
     assert!(
@@ -3011,7 +3092,7 @@ async fn article_not_found_exhausts_when_the_work_already_failed_elsewhere() {
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
             // What the article carries after its first 430 on server 0.
-            exclude_servers: vec![0],
+            exclude_servers: weaver_nntp::ServerSet::from([0]),
             release_connection_slot: true,
         })
         .await;
@@ -3076,7 +3157,7 @@ async fn article_not_found_that_learns_no_new_server_books_instead_of_retrying()
             source_server_idx: Some(1),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: vec![1],
+            exclude_servers: weaver_nntp::ServerSet::from([1]),
             release_connection_slot: true,
         })
         .await;
@@ -3200,7 +3281,7 @@ async fn egress_quota_refusal_parks_when_no_server_has_a_leg_in_quota() {
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: false,
         })
         .await;
@@ -3225,7 +3306,7 @@ async fn egress_quota_refusal_parks_when_no_server_has_a_leg_in_quota() {
         runtime.clone(),
         pipeline.nntp.clone(),
         egress.quota_rejection_for_dispatch(128).unwrap(),
-        Vec::new(),
+        weaver_nntp::ServerSet::EMPTY,
     ));
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());
     assert!(std::future::Future::poll(capacity_wait.as_mut(), &mut context).is_pending());
@@ -3272,59 +3353,7 @@ async fn recovery_metadata_bootstrap_holds_graph_payload_until_indexes_settle() 
         let (mut pipeline, _, _) =
             new_direct_pipeline_with_backlog(&temp_dir, 16 * 1024 * 1024, 4).await;
         let job_id = JobId(40146);
-        let payload = (0..(7 * 128))
-            .map(|index| (index % 251) as u8)
-            .collect::<Vec<_>>();
-        let index = build_test_par2_index("payload.mkv", &payload, 64);
-        let payload_segments = (0..7)
-            .map(|number| {
-                segment_spec! {
-                    number: number,
-                    bytes: 128,
-                    message_id: format!("graph-payload-{number}@example.com"),
-                }
-            })
-            .collect::<Vec<_>>();
-        let spec = JobSpec {
-            name: "Graph PAR2 Bootstrap".to_string(),
-            password: None,
-            total_bytes: (index.len() + payload.len()) as u64,
-            category: None,
-            metadata: vec![],
-            files: vec![
-                FileSpec {
-                    filename: if par3 {
-                        "00-index.par3"
-                    } else {
-                        "00-index.par2"
-                    }
-                    .to_string(),
-                    role: if par3 {
-                        FileRole::Par3 { is_index: true }
-                    } else {
-                        FileRole::Par2 {
-                            is_index: true,
-                            recovery_block_count: 0,
-                        }
-                    },
-                    groups: vec!["alt.binaries.test".to_string()],
-                    posted_at_epoch: None,
-                    segments: vec![segment_spec! {
-                        number: 0,
-                        bytes: index.len() as u32,
-                        message_id: "graph-index@example.com".to_string(),
-                    }],
-                },
-                FileSpec {
-                    filename: "payload.mkv".to_string(),
-                    role: FileRole::Standalone,
-                    groups: vec!["alt.binaries.test".to_string()],
-                    posted_at_epoch: None,
-                    segments: payload_segments,
-                },
-            ],
-        };
-        insert_active_job(&mut pipeline, job_id, spec).await;
+        insert_active_job(&mut pipeline, job_id, index_and_payload_spec(par3)).await;
         let queued = pipeline
             .jobs
             .get(&job_id)
@@ -3371,19 +3400,124 @@ async fn recovery_metadata_bootstrap_holds_graph_payload_until_indexes_settle() 
                 0,
             )
             .unwrap();
-        let declared = [(
-            weaver_graph::MemberId(0),
-            if par3 {
-                crate::pipeline::graph::metadata::RecoveryFormat::Par3
-            } else {
-                crate::pipeline::graph::metadata::RecoveryFormat::Par2
-            },
-        )];
         assert_eq!(
-            graph.indexes_to_come(declared),
+            graph.indexes_to_come(declared_index(par3)),
             None,
             "a missing index must release payload"
         );
+    }
+}
+
+// A graph the pipeline changed while it was out of the map of graphs, as a
+// retiring one is, is asked again when it is put back: the list it held
+// from before does not come back with it.
+#[tokio::test]
+async fn a_graph_changed_out_of_the_map_holds_no_list_when_put_back() {
+    for par3 in [false, true] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) =
+            new_direct_pipeline_with_backlog(&temp_dir, 16 * 1024 * 1024, 4).await;
+        let job_id = JobId(40147);
+        insert_active_job(&mut pipeline, job_id, index_and_payload_spec(par3)).await;
+        assert_eq!(
+            pipeline
+                .graph_jobs
+                .indexes_to_come(&job_id, declared_index(par3))
+                .as_deref(),
+            Some(&[0u32][..])
+        );
+
+        let mut graph = pipeline.graph_jobs.remove(&job_id).unwrap();
+        graph
+            .lost(
+                weaver_graph::VolumeIndex(0),
+                0,
+                &mut crate::pipeline::graph::status::RepairSlots::default(),
+                0,
+            )
+            .unwrap();
+        pipeline.graph_jobs.insert(job_id, graph);
+
+        assert_eq!(
+            pipeline
+                .graph_jobs
+                .indexes_to_come(&job_id, declared_index(par3)),
+            None
+        );
+    }
+}
+
+fn declared_index(
+    par3: bool,
+) -> [(
+    weaver_graph::MemberId,
+    crate::pipeline::graph::metadata::RecoveryFormat,
+); 1] {
+    [(
+        weaver_graph::MemberId(0),
+        if par3 {
+            crate::pipeline::graph::metadata::RecoveryFormat::Par3
+        } else {
+            crate::pipeline::graph::metadata::RecoveryFormat::Par2
+        },
+    )]
+}
+
+// A recovery index of one article and a payload file of seven.
+fn index_and_payload_spec(par3: bool) -> JobSpec {
+    {
+        let payload = (0..(7 * 128))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let index = build_test_par2_index("payload.mkv", &payload, 64);
+        let payload_segments = (0..7)
+            .map(|number| {
+                segment_spec! {
+                    number: number,
+                    bytes: 128,
+                    message_id: format!("graph-payload-{number}@example.com"),
+                }
+            })
+            .collect::<Vec<_>>();
+        JobSpec {
+            name: "Graph PAR2 Bootstrap".to_string(),
+            password: None,
+            total_bytes: (index.len() + payload.len()) as u64,
+            category: None,
+            metadata: vec![],
+            files: vec![
+                FileSpec {
+                    filename: if par3 {
+                        "00-index.par3"
+                    } else {
+                        "00-index.par2"
+                    }
+                    .to_string(),
+                    role: if par3 {
+                        FileRole::Par3 { is_index: true }
+                    } else {
+                        FileRole::Par2 {
+                            is_index: true,
+                            recovery_block_count: 0,
+                        }
+                    },
+                    groups: vec!["alt.binaries.test".to_string()],
+                    posted_at_epoch: None,
+                    segments: vec![segment_spec! {
+                        number: 0,
+                        bytes: index.len() as u32,
+                        message_id: "graph-index@example.com".to_string(),
+                    }],
+                },
+                FileSpec {
+                    filename: "payload.mkv".to_string(),
+                    role: FileRole::Standalone,
+                    groups: vec!["alt.binaries.test".to_string()],
+                    posted_at_epoch: None,
+                    segments: payload_segments,
+                },
+            ],
+        }
     }
 }
 
@@ -3418,7 +3552,7 @@ fn unclean_batch_result(job_id: JobId, segment_number: u32) -> DownloadResult {
         source_server_idx: Some(0),
         origin: DownloadResultOrigin::NormalPrimary,
         retry_count: 0,
-        exclude_servers: Vec::new(),
+        exclude_servers: weaver_nntp::ServerSet::EMPTY,
         release_connection_slot: false,
     }
 }
@@ -3630,7 +3764,7 @@ async fn pool_capacity_failure_at_retry_limit_does_not_poison_health() {
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: MAX_SEGMENT_RETRIES,
-            exclude_servers: vec![0],
+            exclude_servers: weaver_nntp::ServerSet::from([0]),
             release_connection_slot: true,
         })
         .await;
@@ -3734,7 +3868,7 @@ async fn body_lane_unavailable_at_retry_limit_requeues_without_article_failure()
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: MAX_SEGMENT_RETRIES + 1,
-            exclude_servers: vec![0, 1],
+            exclude_servers: weaver_nntp::ServerSet::from([0, 1]),
             release_connection_slot: false,
         })
         .await;

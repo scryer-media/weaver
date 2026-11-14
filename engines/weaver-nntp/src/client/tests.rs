@@ -503,12 +503,12 @@ fn blocking_body_lane_candidate_honors_exclusions_and_capacity() {
         soft_timeout: Duration::from_secs(15),
     });
 
-    assert!(client.has_blocking_body_lane_candidate(&[]));
+    assert!(client.has_blocking_body_lane_candidate(crate::ServerSet::EMPTY));
     assert!(
-        client.has_blocking_body_lane_candidate(&[0]),
+        client.has_blocking_body_lane_candidate(crate::ServerSet::from([0])),
         "a plaintext server is as good an owned-lane host as a TLS one"
     );
-    assert!(!client.has_blocking_body_lane_candidate(&[0, 1]));
+    assert!(!client.has_blocking_body_lane_candidate(crate::ServerSet::from([0, 1])));
 
     let saturated = NntpClient::new(NntpClientConfig {
         servers: vec![scripted_blocking_s2n_server(1, 0)],
@@ -516,7 +516,7 @@ fn blocking_body_lane_candidate_honors_exclusions_and_capacity() {
         max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
     });
-    assert!(!saturated.has_blocking_body_lane_candidate(&[]));
+    assert!(!saturated.has_blocking_body_lane_candidate(crate::ServerSet::EMPTY));
 }
 
 #[test]
@@ -538,7 +538,7 @@ fn blocking_body_lane_candidate_survives_temporary_permit_saturation() {
 
     assert_eq!(client.pool().server_load(0), (0, 2));
     assert!(
-        client.has_blocking_body_lane_candidate(&[]),
+        client.has_blocking_body_lane_candidate(crate::ServerSet::EMPTY),
         "leased permits can belong to reusable owned-lane caches"
     );
 
@@ -558,7 +558,7 @@ fn blocking_body_lane_candidate_survives_the_over_limit_holdoff() {
 
     assert!(client.pool().is_over_limit(ServerId(0)));
     assert!(
-        client.has_blocking_body_lane_candidate(&[]),
+        client.has_blocking_body_lane_candidate(crate::ServerSet::EMPTY),
         "a held-off server must keep feeding the owned lanes it already opened"
     );
 }
@@ -585,14 +585,14 @@ fn blocking_body_lane_candidate_keeps_backfill_locked_until_fill_excluded() {
     });
 
     assert!(
-        !client.has_blocking_body_lane_candidate(&[]),
+        !client.has_blocking_body_lane_candidate(crate::ServerSet::EMPTY),
         "locked backfill must not serve ordinary work"
     );
     assert!(
-        client.has_blocking_body_lane_candidate(&[0]),
+        client.has_blocking_body_lane_candidate(crate::ServerSet::from([0])),
         "excluding the fill tier unlocks backfill"
     );
-    assert!(!client.has_blocking_body_lane_candidate(&[0, 1]));
+    assert!(!client.has_blocking_body_lane_candidate(crate::ServerSet::from([0, 1])));
 }
 
 #[tokio::test]
@@ -1012,7 +1012,8 @@ async fn declined_dial_holds_blocking_lanes_on_the_holdoff() {
     ));
     let client = tokio::task::spawn_blocking(move || {
         for _ in 0..4 {
-            let Err(error) = client.try_acquire_blocking_body_lane(&[], &[]) else {
+            let Err(error) = client.try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            else {
                 panic!("a held-off server must not open a lane");
             };
             assert!(
@@ -1253,7 +1254,7 @@ fn multi_server_client(server_count: usize) -> NntpClient {
 async fn build_server_order_respects_priority_groups() {
     let client = multi_server_client(4);
 
-    let order = client.build_server_order(&[]).await;
+    let order = client.build_server_order(crate::ServerSet::EMPTY).await;
     // All 4 servers should be present.
     assert_eq!(order.len(), 4);
     // Group 0 servers (0, 1) should come before group 1 servers (2, 3).
@@ -1282,7 +1283,9 @@ async fn build_server_order_respects_priority_groups() {
 async fn build_server_order_excludes_servers() {
     let client = multi_server_client(4);
 
-    let order = client.build_server_order(&[1, 3]).await;
+    let order = client
+        .build_server_order(crate::ServerSet::from([1, 3]))
+        .await;
     assert_eq!(order.len(), 2);
     assert!(!order.contains(&1));
     assert!(!order.contains(&3));
@@ -1410,7 +1413,9 @@ async fn estimate_selection_fails_over_large_request_but_keeps_smaller_work_movi
         soft_timeout: UNREACHED_TIMEOUT,
     });
 
-    let large = client.body_server_selection_with_estimate(&[], 41).await;
+    let large = client
+        .body_server_selection_with_estimate(crate::ServerSet::EMPTY, 41)
+        .await;
     assert_eq!(large.eligible, vec![ServerId(1)]);
     let rejection = large.quota_blocked.unwrap();
     assert_eq!(rejection.stable_server_id, limited_id);
@@ -1426,7 +1431,7 @@ async fn estimate_selection_fails_over_large_request_but_keeps_smaller_work_movi
     assert!(client.server_quota_rejection(ServerId(0), 40).is_none());
     assert!(client.server_quota_rejection(ServerId(1), 41).is_none());
     let blocking_large = client
-        .try_blocking_body_server_selection_with_estimate(&[], 41)
+        .try_blocking_body_server_selection_with_estimate(crate::ServerSet::EMPTY, 41)
         .expect("the health state is uncontended in this test");
     assert_eq!(blocking_large.eligible, vec![ServerId(1)]);
     assert_eq!(
@@ -1434,7 +1439,9 @@ async fn estimate_selection_fails_over_large_request_but_keeps_smaller_work_movi
         limited_id
     );
 
-    let small = client.body_server_selection_with_estimate(&[], 40).await;
+    let small = client
+        .body_server_selection_with_estimate(crate::ServerSet::EMPTY, 40)
+        .await;
     assert_eq!(small.eligible, vec![ServerId(0), ServerId(1)]);
     assert!(small.quota_blocked.is_none());
     assert!(!client.all_normal_fill_servers_quota_blocked());
@@ -1680,17 +1687,22 @@ async fn body_selection_reports_earliest_quota_when_all_fills_are_blocked() {
     let earlier = Instant::now() + Duration::from_secs(60);
     let client = quota_selection_client(&[false, false], &[(0, Some(later)), (1, Some(earlier))]);
 
-    let selection = client.body_server_selection(&[]).await;
+    let selection = client.body_server_selection(crate::ServerSet::EMPTY).await;
     assert!(selection.eligible.is_empty());
     let rejection = selection
         .quota_blocked
         .expect("quota block must survive filtering");
     assert_eq!(rejection.stable_server_id, StableServerId(1_001));
     assert_eq!(rejection.retry_at, Some(earlier));
-    assert!(client.body_server_order(&[]).await.is_empty());
+    assert!(
+        client
+            .body_server_order(crate::ServerSet::EMPTY)
+            .await
+            .is_empty()
+    );
 
     let blocking = client
-        .try_acquire_blocking_body_lane(&[], &[])
+        .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
         .err()
         .expect("blocking selection must surface the same quota block");
     assert!(matches!(
@@ -1712,7 +1724,7 @@ async fn body_selection_keeps_quota_reason_when_other_fill_is_health_unavailable
         .await
         .record_cooldown(1, CooldownReason::Transport);
 
-    let selection = client.body_server_selection(&[]).await;
+    let selection = client.body_server_selection(crate::ServerSet::EMPTY).await;
     assert!(selection.eligible.is_empty());
     assert_eq!(
         selection.quota_blocked.unwrap().stable_server_id,
@@ -1726,14 +1738,18 @@ async fn body_selection_never_reports_quota_from_excluded_servers() {
     let second = Instant::now() + Duration::from_secs(60);
     let client = quota_selection_client(&[false, false], &[(0, Some(first)), (1, Some(second))]);
 
-    let selection = client.body_server_selection(&[0]).await;
+    let selection = client
+        .body_server_selection(crate::ServerSet::from([0]))
+        .await;
     assert!(selection.eligible.is_empty());
     assert_eq!(
         selection.quota_blocked.unwrap().stable_server_id,
         StableServerId(1_001)
     );
 
-    let selection = client.body_server_selection(&[0, 1]).await;
+    let selection = client
+        .body_server_selection(crate::ServerSet::from([0, 1]))
+        .await;
     assert!(selection.eligible.is_empty());
     assert!(selection.quota_blocked.is_none());
 }
@@ -1743,14 +1759,16 @@ async fn quota_blocked_fill_does_not_unlock_or_report_locked_backfill() {
     let retry_at = Instant::now() + Duration::from_secs(60);
     let client = quota_selection_client(&[false, true], &[(0, Some(retry_at))]);
 
-    let selection = client.body_server_selection(&[]).await;
+    let selection = client.body_server_selection(crate::ServerSet::EMPTY).await;
     assert!(selection.eligible.is_empty());
     assert_eq!(
         selection.quota_blocked.unwrap().stable_server_id,
         StableServerId(1_000)
     );
 
-    let selection = client.body_server_selection(&[0]).await;
+    let selection = client
+        .body_server_selection(crate::ServerSet::from([0]))
+        .await;
     assert_eq!(selection.eligible, vec![ServerId(1)]);
     assert!(selection.quota_blocked.is_none());
 }
@@ -1791,7 +1809,7 @@ async fn all_fill_quota_blocked_reads_published_state_without_locking() {
 async fn backfill_server_absent_from_ordinary_order() {
     let client = tiered_client(&[false, false, true]);
 
-    let order = client.build_server_order(&[]).await;
+    let order = client.build_server_order(crate::ServerSet::EMPTY).await;
     assert_eq!(order.len(), 2);
     assert!(order.contains(&0));
     assert!(order.contains(&1));
@@ -1805,14 +1823,16 @@ async fn backfill_server_absent_from_ordinary_order() {
 async fn backfill_unlocks_only_when_all_active_fill_servers_excluded() {
     let client = tiered_client(&[false, false, true]);
 
-    let order = client.build_server_order(&[0]).await;
+    let order = client.build_server_order(crate::ServerSet::from([0])).await;
     assert_eq!(
         order,
         vec![1],
         "one fill server left: backfill stays locked"
     );
 
-    let order = client.build_server_order(&[0, 1]).await;
+    let order = client
+        .build_server_order(crate::ServerSet::from([0, 1]))
+        .await;
     assert_eq!(
         order,
         vec![2],
@@ -1831,7 +1851,7 @@ async fn cooling_fill_server_keeps_backfill_locked_and_order_empty() {
         .await
         .record_cooldown(0, CooldownReason::Transport);
 
-    let order = client.build_server_order(&[]).await;
+    let order = client.build_server_order(crate::ServerSet::EMPTY).await;
     assert!(
         order.is_empty(),
         "cooling fill tier must wait, not spill onto backfill: {order:?}"
@@ -1848,7 +1868,7 @@ async fn credentials_refusing_fill_server_keeps_backfill_locked() {
     client.pool.health().lock().await.record_failure(0, true);
 
     // Server 1: missed the article, so it is on the exclusion ladder.
-    let order = client.build_server_order(&[1]).await;
+    let order = client.build_server_order(crate::ServerSet::from([1])).await;
     assert!(
         order.is_empty(),
         "a fill server refusing credentials must not unlock backfill: {order:?}"
@@ -1874,13 +1894,13 @@ async fn outage_disabled_fill_server_keeps_backfill_locked_with_peers_excluded()
         ));
     }
 
-    let order = client.build_server_order(&[1]).await;
+    let order = client.build_server_order(crate::ServerSet::from([1])).await;
     assert!(
         order.is_empty(),
         "a consecutive-failure disable is an outage, not a config error: {order:?}"
     );
     let selection = client
-        .try_blocking_body_server_selection(&[1], 0, QuotaCheck::Dispatch)
+        .try_blocking_body_server_selection(crate::ServerSet::from([1]), 0, QuotaCheck::Dispatch)
         .expect("the health state is uncontended in this test");
     assert!(
         selection.eligible.is_empty(),
@@ -1900,7 +1920,7 @@ async fn cooling_fill_server_keeps_backfill_locked_with_peers_excluded() {
         .await
         .record_cooldown(0, CooldownReason::Transport);
 
-    let order = client.build_server_order(&[1]).await;
+    let order = client.build_server_order(crate::ServerSet::from([1])).await;
     assert!(
         !order.contains(&2),
         "a 5-10s cooldown is a blip, not an outage: {order:?}"
@@ -1920,7 +1940,7 @@ async fn blocking_selection_keeps_backfill_locked_for_an_unavailable_fill_server
     client.pool.health().lock().await.record_failure(0, true);
 
     let selection = client
-        .try_blocking_body_server_selection(&[1], 0, QuotaCheck::Dispatch)
+        .try_blocking_body_server_selection(crate::ServerSet::from([1]), 0, QuotaCheck::Dispatch)
         .expect("the health state is uncontended in this test");
     assert!(
         selection.eligible.is_empty(),
@@ -1936,7 +1956,7 @@ async fn blocking_selection_keeps_backfill_locked_for_an_unavailable_fill_server
         .await
         .record_cooldown(0, CooldownReason::Transport);
     let selection = cooling
-        .try_blocking_body_server_selection(&[1], 0, QuotaCheck::Dispatch)
+        .try_blocking_body_server_selection(crate::ServerSet::from([1]), 0, QuotaCheck::Dispatch)
         .expect("the health state is uncontended in this test");
     assert!(
         selection.eligible.is_empty(),
@@ -1978,11 +1998,11 @@ async fn candidacy_separates_contention_from_having_no_candidate() {
         soft_timeout: Duration::from_secs(15),
     });
     assert_eq!(
-        client.blocking_body_lane_candidacy(&[]),
+        client.blocking_body_lane_candidacy(crate::ServerSet::EMPTY),
         BlockingBodyLaneCandidacy::Candidate
     );
     assert_eq!(
-        client.blocking_body_lane_candidacy(&[0]),
+        client.blocking_body_lane_candidacy(crate::ServerSet::from([0])),
         BlockingBodyLaneCandidacy::None,
         "the only server is excluded, so there is genuinely no candidate"
     );
@@ -1990,13 +2010,13 @@ async fn candidacy_separates_contention_from_having_no_candidate() {
     let health = client.pool.health().clone();
     let guard = health.lock().await;
     assert_eq!(
-        client.blocking_body_lane_candidacy(&[]),
+        client.blocking_body_lane_candidacy(crate::ServerSet::EMPTY),
         BlockingBodyLaneCandidacy::Contended,
         "a held health mutex is 'ask again', not 'no candidate'"
     );
     drop(guard);
     assert_eq!(
-        client.blocking_body_lane_candidacy(&[]),
+        client.blocking_body_lane_candidacy(crate::ServerSet::EMPTY),
         BlockingBodyLaneCandidacy::Candidate
     );
 }
@@ -2009,7 +2029,9 @@ async fn contended_health_mutex_reports_contention_not_an_empty_tier() {
     let health = client.pool.health().clone();
     let guard = health.lock().await;
 
-    let Err(error) = client.try_acquire_blocking_body_lane_with_estimate(&[], &[], 0) else {
+    let Err(error) =
+        client.try_acquire_blocking_body_lane_with_estimate(&[], crate::ServerSet::EMPTY, 0)
+    else {
         panic!("selection cannot rank candidates while health is held");
     };
     assert!(
@@ -2021,7 +2043,9 @@ async fn contended_health_mutex_reports_contention_not_an_empty_tier() {
     drop(guard);
     // With the lock free the same call reaches an ordinary tiering verdict
     // again rather than contention.
-    let Err(error) = client.try_acquire_blocking_body_lane_with_estimate(&[], &[0], 0) else {
+    let Err(error) =
+        client.try_acquire_blocking_body_lane_with_estimate(&[], crate::ServerSet::from([0]), 0)
+    else {
         panic!("the only server is excluded, so no lane can be acquired");
     };
     assert!(
@@ -2034,7 +2058,7 @@ async fn contended_health_mutex_reports_contention_not_an_empty_tier() {
 async fn all_backfill_config_degrades_to_fill_with_warning() {
     let client = tiered_client(&[true, true]);
 
-    let order = client.build_server_order(&[]).await;
+    let order = client.build_server_order(crate::ServerSet::EMPTY).await;
     assert_eq!(order.len(), 2, "all-backfill config is normalized to fill");
 }
 
@@ -2043,10 +2067,12 @@ async fn backfill_server_that_misses_joins_exclusion_ladder() {
     let client = tiered_client(&[false, true]);
 
     // Fill server missed the article, backfill unlocked…
-    let order = client.build_server_order(&[0]).await;
+    let order = client.build_server_order(crate::ServerSet::from([0])).await;
     assert_eq!(order, vec![1]);
     // …and a backfill miss exhausts the order entirely.
-    let order = client.build_server_order(&[0, 1]).await;
+    let order = client
+        .build_server_order(crate::ServerSet::from([0, 1]))
+        .await;
     assert!(order.is_empty());
 }
 
@@ -2679,7 +2705,7 @@ async fn fetch_body_prefer_excluding_falls_back_when_only_server_excluded() {
         .fetch_body_with_groups_prefer_excluding_traced(
             "<exists@example.com>",
             &[String::from("alt.binaries.test")],
-            &[0],
+            crate::ServerSet::from([0]),
         )
         .await;
 
@@ -2722,7 +2748,7 @@ async fn fetch_body_prefer_excluding_uses_alternate_server_first() {
         .fetch_body_with_groups_prefer_excluding_traced(
             "<exists@example.com>",
             &[String::from("alt.binaries.test")],
-            &[0],
+            crate::ServerSet::from([0]),
         )
         .await;
 
@@ -2786,7 +2812,7 @@ async fn build_server_order_prefers_healthy_over_degraded() {
         }
     }
 
-    let order = client.build_server_order(&[]).await;
+    let order = client.build_server_order(crate::ServerSet::EMPTY).await;
     assert_eq!(order, vec![0, 1]);
 }
 
@@ -2824,7 +2850,7 @@ async fn build_server_order_keeps_backfill_after_primary_group() {
         soft_timeout: Duration::from_secs(15),
     };
 
-    let order = client.build_server_order(&[]).await;
+    let order = client.build_server_order(crate::ServerSet::EMPTY).await;
     assert_eq!(order, vec![0, 1]);
 }
 
@@ -2862,7 +2888,7 @@ async fn build_server_order_prefers_ready_servers_within_same_group() {
         soft_timeout: Duration::from_secs(15),
     };
 
-    let order = client.build_server_order(&[]).await;
+    let order = client.build_server_order(crate::ServerSet::EMPTY).await;
     assert_eq!(order, vec![1, 0]);
 }
 
@@ -3214,7 +3240,10 @@ async fn a_probe_with_every_server_excluded_has_nobody_to_ask() {
     });
 
     let outcome = client
-        .confirm_exists_for_probe_excluding(&["<probe@silver.horizon>"], &[0])
+        .confirm_exists_for_probe_excluding(
+            &["<probe@silver.horizon>"],
+            crate::ServerSet::from([0]),
+        )
         .await;
     assert!(
         outcome.is_none(),
@@ -3309,14 +3338,14 @@ fn candidacy_probe_leaves_the_quota_blocked_signal_alone() {
     // A dispatch that skips the limited server for headroom is the server
     // turning work away, and the signal latches.
     let selection = client
-        .try_blocking_body_server_selection_with_estimate(&[], 41)
+        .try_blocking_body_server_selection_with_estimate(crate::ServerSet::EMPTY, 41)
         .expect("the health state is uncontended in this test");
     assert_eq!(selection.eligible, vec![ServerId(1)]);
     assert!(limited.snapshot().quota_blocked);
 
     // The probe still sees the limited server as a candidate (zero bytes fit)
     // and the latch stands.
-    let candidacy = client.blocking_body_lane_candidacy(&[]);
+    let candidacy = client.blocking_body_lane_candidacy(crate::ServerSet::EMPTY);
     assert!(
         !matches!(candidacy, BlockingBodyLaneCandidacy::Contended),
         "the health state is uncontended in this test"

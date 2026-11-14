@@ -66,7 +66,7 @@ async fn queued_tail_and_granted_refill_are_returned_when_the_job_becomes_inelig
                     initial_lease: test_lease(
                         JobId(42),
                         0,
-                        vec![],
+                        weaver_nntp::ServerSet::EMPTY,
                         (0..3).map(|i| tail_work(i, 0)).collect(),
                     ),
                 },
@@ -76,7 +76,12 @@ async fn queued_tail_and_granted_refill_are_returned_when_the_job_becomes_inelig
             .recv()
             .await
             .expect("issued BODY requests its next lease");
-        let mut next = test_lease(JobId(42), 0, vec![], vec![tail_work(3, 0)]);
+        let mut next = test_lease(
+            JobId(42),
+            0,
+            weaver_nntp::ServerSet::EMPTY,
+            vec![tail_work(3, 0)],
+        );
         next.completion_critical = true;
         assert!(
             request
@@ -189,7 +194,12 @@ async fn transport_fault_after_prefetch_releases_the_granted_connection_class() 
                 event_tx,
                 refill_tx,
                 parked_tx,
-                initial_lease: test_lease(JobId(42), 0, vec![], vec![tail_work(0, 0)]),
+                initial_lease: test_lease(
+                    JobId(42),
+                    0,
+                    weaver_nntp::ServerSet::EMPTY,
+                    vec![tail_work(0, 0)],
+                ),
             },
         );
     });
@@ -206,7 +216,7 @@ async fn transport_fault_after_prefetch_releases_the_granted_connection_class() 
         let mut work = tail_work(1, 0);
         work.is_recovery = true;
         work.completion_critical = true;
-        let mut next = test_lease(JobId(42), 0, vec![], vec![work]);
+        let mut next = test_lease(JobId(42), 0, weaver_nntp::ServerSet::EMPTY, vec![work]);
         next.completion_critical = true;
         assert!(request.response_tx.send(DownloadLaneRefillResponse { lease: Some(next), park_reason: LaneParkReason::NoWork }).is_ok());
         let mut returned = 0;
@@ -301,7 +311,7 @@ async fn a_parking_lane_returns_its_tail_before_waiting_on_its_refill() {
                 event_tx,
                 refill_tx,
                 parked_tx,
-                initial_lease: test_lease(JobId(42), 0, vec![], works),
+                initial_lease: test_lease(JobId(42), 0, weaver_nntp::ServerSet::EMPTY, works),
             },
         );
     });
@@ -432,7 +442,12 @@ async fn a_parking_lane_releases_its_idle_thread_memory_once() {
                 event_tx,
                 refill_tx,
                 parked_tx,
-                initial_lease: test_lease(JobId(42), 0, vec![], vec![tail_work(0, 0)]),
+                initial_lease: test_lease(
+                    JobId(42),
+                    0,
+                    weaver_nntp::ServerSet::EMPTY,
+                    vec![tail_work(0, 0)],
+                ),
             },
         );
     });
@@ -583,14 +598,19 @@ async fn an_expired_session_keeps_its_lane_after_an_in_place_reauth() {
                 initial_lease: test_lease(
                     JobId(42),
                     0,
-                    vec![],
+                    weaver_nntp::ServerSet::EMPTY,
                     (0..4).map(|segment| tail_work(segment, 0)).collect(),
                 ),
             },
         );
     });
     let mut results = Vec::new();
-    let mut successor = Some(test_lease(JobId(42), 0, vec![], vec![tail_work(4, 0)]));
+    let mut successor = Some(test_lease(
+        JobId(42),
+        0,
+        weaver_nntp::ServerSet::EMPTY,
+        vec![tail_work(4, 0)],
+    ));
     // The first refill is held until the in-place login has been answered;
     // every later one is told there is nothing more.
     let mut held_refill = None;

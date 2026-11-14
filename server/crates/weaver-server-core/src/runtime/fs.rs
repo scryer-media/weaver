@@ -432,7 +432,48 @@ pub(crate) mod test_devices {
         DEVICES.lock().unwrap().push((dir.to_path_buf(), device));
     }
 
-    pub(super) fn of(path: &Path) -> Option<u64> {
+    // Directories whose device reads are held: each read announces itself
+    // on the sender and waits until the hold is dropped.
+    type Hold = (
+        PathBuf,
+        tokio::sync::mpsc::UnboundedSender<PathBuf>,
+        std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>,
+    );
+    static HELD: Mutex<Vec<Hold>> = Mutex::new(Vec::new());
+
+    // Releases the device reads of its directory when dropped.
+    pub(crate) struct HeldDevice(std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+    impl Drop for HeldDevice {
+        fn drop(&mut self) {
+            *self.0.0.lock().unwrap() = true;
+            self.0.1.notify_all();
+        }
+    }
+
+    // Hold every device read of `dir` until the returned hold is dropped;
+    // each read is announced on the receiver as it begins.
+    pub(crate) fn hold(dir: &Path) -> (HeldDevice, tokio::sync::mpsc::UnboundedReceiver<PathBuf>) {
+        let (entered, announced) = tokio::sync::mpsc::unbounded_channel();
+        let gate = std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        HELD.lock()
+            .unwrap()
+            .push((dir.to_path_buf(), entered, std::sync::Arc::clone(&gate)));
+        (HeldDevice(gate), announced)
+    }
+
+    pub(crate) fn of(path: &Path) -> Option<u64> {
+        let held = HELD
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(dir, _, _)| path == dir)
+            .map(|(_, entered, gate)| (entered.clone(), std::sync::Arc::clone(gate)));
+        if let Some((entered, gate)) = held {
+            let _ = entered.send(path.to_path_buf());
+            let (released, wake) = &*gate;
+            drop(wake.wait_while(released.lock().unwrap(), |released| !*released));
+        }
         DEVICES
             .lock()
             .unwrap()
@@ -443,40 +484,11 @@ pub(crate) mod test_devices {
     }
 }
 
-// Whether two directories lie on one device, each read at the nearest of
-// its ancestors that exists, as one not yet made will be made there. A
-// device that cannot be read, or a platform with no device to read, counts
-// as one device: nothing changes for it.
-pub(crate) fn same_device(a: &Path, b: &Path) -> bool {
-    match (nearest_device(a), nearest_device(b)) {
-        (Some(a), Some(b)) => a == b,
-        _ => true,
-    }
-}
-
-fn nearest_device(path: &Path) -> Option<u64> {
-    #[cfg(test)]
-    if let Some(device) = test_devices::of(path) {
-        return Some(device);
-    }
-    let existing = path
-        .ancestors()
-        .find(|at| std::fs::metadata(at).is_ok_and(|meta| meta.is_dir()))?;
-    let fingerprint = directory_fingerprint_from_path(existing).ok()?;
-    #[cfg(unix)]
-    {
-        Some(fingerprint.dev)
-    }
-    #[cfg(windows)]
-    {
-        Some(u64::from(fingerprint.volume_serial_number))
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = fingerprint;
-        None
-    }
-}
+// Whether two directories lie on one device, read on the spot: for tests
+// only. Everything else asks the disk owner,
+// [`crate::operations::StorageCapacity`].
+#[cfg(test)]
+pub(crate) use crate::operations::disk::same_device_now as same_device;
 
 fn directory_fingerprint_from_path(path: &Path) -> io::Result<DirectoryFingerprint> {
     let metadata = std::fs::metadata(path)?;

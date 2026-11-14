@@ -276,8 +276,11 @@ async fn article(pipeline: &mut Pipeline, fixture: &Fixture, file: u32, ordinal:
         .handle_decode_done(DecodeDone::Success {
             result,
             source: SegmentSource {
-                source_server_idx: Some(0),
-                exclude_servers: Vec::new(),
+                servers: crate::pipeline::PoolServers::stamped(
+                    pipeline.pool_generation,
+                    Some(0),
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
             },
         })
         .await;

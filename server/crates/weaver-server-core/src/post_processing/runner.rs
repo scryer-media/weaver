@@ -92,7 +92,8 @@ impl NzbgetScriptStatus {
     }
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+// Its `Debug` never shows the archive password.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CompatibilityFacts {
     pub parameters: Vec<(String, String)>,
     pub marked_bad: bool,
@@ -112,8 +113,48 @@ pub struct CompatibilityFacts {
     pub previous_script_status: NzbgetScriptStatus,
 }
 
+impl std::fmt::Debug for CompatibilityFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured whole, so a new field is a compile error here.
+        let Self {
+            parameters,
+            marked_bad,
+            final_directory_override,
+            total_bytes,
+            downloaded_bytes,
+            health_milli,
+            critical_health_milli,
+            password,
+            failure_message,
+            data_dir,
+            intermediate_dir,
+            complete_dir,
+            temp_dir,
+            app_dir,
+            previous_script_status,
+        } = self;
+        f.debug_struct("CompatibilityFacts")
+            .field("parameters", parameters)
+            .field("marked_bad", marked_bad)
+            .field("final_directory_override", final_directory_override)
+            .field("total_bytes", total_bytes)
+            .field("downloaded_bytes", downloaded_bytes)
+            .field("health_milli", health_milli)
+            .field("critical_health_milli", critical_health_milli)
+            .field("password", &password.as_ref().map(|_| "[REDACTED]"))
+            .field("failure_message", failure_message)
+            .field("data_dir", data_dir)
+            .field("intermediate_dir", intermediate_dir)
+            .field("complete_dir", complete_dir)
+            .field("temp_dir", temp_dir)
+            .field("app_dir", app_dir)
+            .field("previous_script_status", previous_script_status)
+            .finish()
+    }
+}
+
 // Which run this is, as the script itself is told.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct RunIdentity {
     pub run_id: String,
     pub instance_id: String,
@@ -125,6 +166,22 @@ pub struct RunIdentity {
     pub token: Option<String>,
     // Where lines the script sends through the API join what it printed.
     pub output: OutputInjector,
+}
+
+// The token lets a script call Weaver back, so a debug print shows only
+// whether there is one.
+impl std::fmt::Debug for RunIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunIdentity")
+            .field("run_id", &self.run_id)
+            .field("instance_id", &self.instance_id)
+            .field("instance_name", &self.instance_name)
+            .field("trigger", &self.trigger)
+            .field("api_url", &self.api_url)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("output", &self.output)
+            .finish()
+    }
 }
 
 impl RunIdentity {
@@ -2567,6 +2624,16 @@ mod capture_tests {
 mod go_run_tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[test]
+    fn a_run_identity_debug_print_hides_the_token() {
+        let identity = RunIdentity {
+            token: Some("secret-run-token".into()),
+            ..RunIdentity::default()
+        };
+        let printed = format!("{identity:?}");
+        assert!(!printed.contains("secret-run-token") && printed.contains("<redacted>"));
+    }
 
     fn text_env(env: BTreeMap<OsStringWire, OsStringWire>) -> BTreeMap<String, String> {
         env.into_iter()

@@ -379,8 +379,11 @@ impl<E: Replicate> ResolutionCache<E> {
     }
 }
 
+// A name with a trailing dot is absolute; one without may be completed from
+// the host's search domains, so the two can resolve differently and are held
+// apart.
 fn key(name: &str) -> String {
-    name.trim_end_matches('.').to_ascii_lowercase()
+    name.to_ascii_lowercase()
 }
 
 // A lookup the cache is waiting on. Dropped before it lands, as when the

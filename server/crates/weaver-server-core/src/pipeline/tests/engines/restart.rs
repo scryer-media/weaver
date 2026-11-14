@@ -129,7 +129,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
                 from_disk.insert(article);
             }
             let server = (0..)
-                .find(|server| !work.exclude_servers.contains(server))
+                .find(|server| !work.exclude_servers.contains(*server))
                 .unwrap();
             if scenario.spoils(server, article) {
                 spoiled.insert(article);
@@ -326,7 +326,7 @@ async fn shut_down(pipeline: &mut Pipeline) {
 
 // The pipeline goes down with what it held in memory, and a new one restores
 // the job from what reached the database.
-async fn restart(
+pub(in crate::pipeline::tests) async fn restart(
     temp_dir: &tempfile::TempDir,
     pipeline: Pipeline,
     scenario: &Scenario,
@@ -2122,7 +2122,7 @@ impl Reopened {
         // A blocked job holds no articles until its restore goes through.
         assert!(pipeline.jobs[&JOB].articles.active().is_none());
         pipeline.dispatch_downloads();
-        assert_eq!(pipeline.active_downloads, 0);
+        assert_eq!(pipeline.articles_in_flight, 0);
         // The pause goes on the job's writer lane.
         pipeline.db.flush_write_queue().await.unwrap();
         let row = pipeline
@@ -2177,7 +2177,7 @@ impl Reopened {
         );
         assert!(pipeline.jobs[&JOB].articles.active().is_none());
         pipeline.dispatch_downloads();
-        assert_eq!(pipeline.active_downloads, 0);
+        assert_eq!(pipeline.articles_in_flight, 0);
         pipeline.db.flush_write_queue().await.unwrap();
         let row = pipeline
             .db
@@ -2770,6 +2770,49 @@ async fn a_paused_job_counts_only_the_articles_its_checkpoint_does_not_hold_as_q
         crate::jobs::model::JobArticles::Queued(_)
     ));
     assert_eq!(articles.queued_download_len(), 100);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A job built again from its checkpoint keeps the staging it has, so its
+// activation asks the disk owner nothing.
+#[tokio::test]
+async fn a_job_restored_from_its_checkpoint_asks_nothing_of_the_disk() {
+    let body = payload(40 * ARTICLE + 5, 74);
+    let scenario = Scenario::new(vec![Post::plain("beacon.bin.xz", xz(&body))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
+    scenario.prepare(&mut pipeline);
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    while !pipeline.graph_jobs[&JOB].awaits_mail() {
+        let work =
+            next_work(&mut pipeline, &scenario).expect("the run starts before the post ends");
+        serve_work(&mut pipeline, &scenario, &work).await;
+    }
+    pipeline.pause_job_runtime(JOB).unwrap();
+    pipeline.resume_job_runtime(JOB).unwrap();
+    while pipeline.retiring_graph_jobs.contains_key(&JOB) {
+        let said = pipeline
+            .graph_runs
+            .recv()
+            .await
+            .expect("the stopped run ends");
+        pipeline.graph_run_said(said);
+    }
+    let asks = crate::operations::disk::same_filesystem_asks();
+    pipeline.request_job_activation(JOB);
+    let read = pipeline
+        .job_activated_rx
+        .recv()
+        .await
+        .expect("the read replies");
+    assert!(
+        read.result.as_ref().is_ok_and(|read| read.restored()),
+        "built from its checkpoint"
+    );
+    assert_eq!(crate::operations::disk::same_filesystem_asks(), asks);
+    pipeline.hear_graph_runs();
+    pipeline.handle_job_activated(read);
     retire_pipeline_database(pipeline).await;
 }
 

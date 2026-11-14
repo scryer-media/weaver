@@ -327,16 +327,23 @@ impl PoolState {
         // same way: only connects and setups count against them.
         dialed
     }
-    fn pool_error(&self, error: DialError) -> DialError {
+    // The fatal error of a pool that has members and every one of them is
+    // blocked; `None` while any member is not blocked, or there are none.
+    fn blocked(&self) -> Option<DialError> {
         let members = self.members.read().expect("pool members");
         let all_blocked = !members.is_empty()
             && members
                 .values()
                 .all(|member| member.status.lock().expect("pool member").blocked.is_some());
-        if all_blocked {
+        all_blocked.then(|| {
             DialError::Fatal(weaver_tunnel::TunnelError::Engine(
                 "all pool members are blocked".into(),
             ))
+        })
+    }
+    fn pool_error(&self, error: DialError) -> DialError {
+        if let Some(blocked) = self.blocked() {
+            blocked
         } else if matches!(error, DialError::Fatal(_)) {
             DialError::Egress(std::io::Error::other(error))
         } else {
@@ -706,6 +713,11 @@ impl PoolStage {
     }
     pub fn revision(&self) -> u64 {
         self.state.revision.load(Ordering::Acquire)
+    }
+    // The error a dial through the pool fails with when every member is
+    // blocked, so a fetch fails the same way instead of skipping the pool.
+    pub(crate) fn blocked(&self) -> Option<DialError> {
+        self.state.blocked()
     }
     // Each lease keeps the same member for DNS validation and its HTTP fetch.
     pub fn lease_members(&self) -> Vec<(u32, Arc<dyn Dialer>)> {

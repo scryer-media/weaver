@@ -9,9 +9,10 @@
 // fingerprint, not a CRC32, so the segment checksums fold into nothing it
 // can compare; it reads members back to verify them instead. It keeps the
 // front of each volume to learn early which members it describes, and reads
-// every arrived run of each volume back when it repairs. Only packets that
-// lie wholly in a volume's readable ranges count: one a hole cuts is
-// dropped, and the scan carries on past it.
+// every arrived run of each volume back when it repairs, a piece at a time,
+// leaving its data and recovery blocks where they lie until the rebuild
+// spends them. Only packets that lie wholly in a volume's readable ranges
+// count: one a hole cuts is dropped, and the scan carries on past it.
 //
 // A member binds to a described file by its path or bare name, or, when no
 // described name answers to it, by its bytes: the repair reads it back and
@@ -21,11 +22,13 @@
 pub(crate) mod facts;
 mod identity;
 mod rebuild;
+mod volumes;
 
 #[cfg(test)]
 mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use par3_rs::layout::{BlockLayout, FileLayout};
@@ -101,9 +104,23 @@ struct Volume {
     named_blocks: Option<u64>,
     // The name it was bound under, which a later volume of the set continues.
     name: Option<String>,
+    // How many times what its front reads as has changed.
+    changes: u64,
 }
 
 impl Volume {
+    // The packets the readable spans of the kept front hold, in order.
+    fn front_packets(&self) -> Vec<Packet> {
+        let mut packets = Vec::new();
+        for span in readable(&self.arrived) {
+            let end = span.end.min(self.front.len() as u64);
+            if let Some(bytes) = self.front.get(span.start as usize..end as usize) {
+                scan(bytes, &mut packets);
+            }
+        }
+        packets
+    }
+
     // Whether the volume shows it carries recovery blocks: its packets,
     // header by header from its start through what arrived of its front,
     // reach a recovery packet, or its name says it carries some and its
@@ -421,6 +438,19 @@ pub struct Par3 {
     // either changes.
     shown: Shown,
     refused_blocks: u64,
+    // What the kept fronts were last read as.
+    fronts: Mutex<Fronts>,
+}
+
+// The packets each volume's kept front held when it was last scanned, and
+// the sets they all described, each with the changes of the fronts it was
+// read at.
+#[derive(Default)]
+struct Fronts {
+    packets: Vec<Option<(u64, Vec<Packet>)>>,
+    sets: Option<(Vec<u64>, Arc<Vec<Par3Set>>)>,
+    // How many fronts were scanned.
+    scans: u64,
 }
 
 impl Par3 {
@@ -441,6 +471,7 @@ impl Par3 {
             memory_limit: REPAIR_MEMORY_LIMIT,
             shown: Shown::default(),
             refused_blocks: 0,
+            fronts: Mutex::new(Fronts::default()),
         }
     }
 
@@ -460,17 +491,31 @@ impl Par3 {
     }
 
     // The sets as far as the readable spans of the kept fronts describe them.
-    fn front_sets(&self) -> Vec<Par3Set> {
-        let mut packets = Vec::new();
-        for volume in &self.volumes {
-            for span in readable(&volume.arrived) {
-                let end = span.end.min(volume.front.len() as u64);
-                if let Some(bytes) = volume.front.get(span.start as usize..end as usize) {
-                    scan(bytes, &mut packets);
-                }
-            }
+    // Only a front that changed since it was last read is scanned again.
+    fn front_sets(&self) -> Arc<Vec<Par3Set>> {
+        let mut fronts = self.fronts.lock().unwrap_or_else(PoisonError::into_inner);
+        let changes: Vec<u64> = self.volumes.iter().map(|volume| volume.changes).collect();
+        if let Some((at, sets)) = &fronts.sets
+            && *at == changes
+        {
+            return Arc::clone(sets);
         }
-        sets(packets)
+        let Fronts { packets, scans, .. } = &mut *fronts;
+        packets.resize_with(self.volumes.len(), || None);
+        let mut all = Vec::new();
+        for (volume, kept) in self.volumes.iter().zip(packets.iter_mut()) {
+            let found = match kept {
+                Some((at, found)) if *at == volume.changes => found,
+                _ => {
+                    *scans += 1;
+                    &kept.insert((volume.changes, volume.front_packets())).1
+                }
+            };
+            all.extend(found.iter().cloned());
+        }
+        let sets = Arc::new(sets(all));
+        fronts.sets = Some((changes, Arc::clone(&sets)));
+        sets
     }
 
     fn coming(&self) -> bool {
@@ -551,6 +596,60 @@ impl Par3 {
         }
         let reachable = self.reach()?;
         (damaged > reachable).then_some(RepairOutcome::Impossible { damaged, reachable })
+    }
+
+    // Whether the refusals show the object will be short before any repair
+    // has said so: whole blocks of bound files will never come, no repair
+    // has ruled since what it binds last changed, none has settled a set,
+    // and the blocks its volumes can bring are known and may cover them.
+    // Its first repair then finds the blocks in hand rather than waiting on
+    // them; a repair's ruling takes over from there.
+    fn refused_wanting(&self) -> bool {
+        self.refused_blocks > 0
+            && self.last.is_none()
+            && self.settled.is_empty()
+            && self
+                .reach()
+                .is_some_and(|reach| self.refused_blocks <= reach)
+    }
+
+    // The volumes wanted whole now, by index. While the last repair waits
+    // on damaged blocks, every open one. While only the refusals show the
+    // object will be short, the fewest that bring the refused blocks past
+    // those the closed volumes hold, fewest blocks first: the order a
+    // shortfall reads them in, so none is fetched that the repair would not
+    // have asked for. Otherwise none.
+    fn raised(&self) -> Vec<bool> {
+        if self.needed > 0 {
+            return vec![true; self.volumes.len()];
+        }
+        let mut raised = vec![false; self.volumes.len()];
+        if !self.refused_wanting() {
+            return raised;
+        }
+        let held: u64 = self
+            .volumes
+            .iter()
+            .filter(|volume| volume.closed)
+            .filter_map(|volume| volume.named_blocks)
+            .sum();
+        let mut shortfall = self.refused_blocks.saturating_sub(held);
+        let mut order: Vec<usize> = (0..self.volumes.len())
+            .filter(|index| !self.volumes[*index].closed)
+            .collect();
+        order.sort_by_key(|index| (self.volumes[*index].named_blocks, *index));
+        for index in order {
+            if shortfall == 0 {
+                break;
+            }
+            let blocks = self.volumes[index].named_blocks.unwrap_or(0);
+            if blocks == 0 {
+                continue;
+            }
+            shortfall = shortfall.saturating_sub(blocks);
+            raised[index] = true;
+        }
+        raised
     }
 
     // Whether the namespace shows damage the sets not yet read may cover: a
@@ -773,6 +872,7 @@ impl Object for Par3 {
         if offset >= FRONT_CAP {
             return;
         }
+        volume.changes += 1;
         let end = offset.saturating_add(delivery.bytes.len()).min(FRONT_CAP);
         if end > volume.front.len() {
             volume.front.resize(end, 0);
@@ -823,6 +923,7 @@ impl Object for Par3 {
         if let Some(found) = self.volumes.get_mut(volume.0 as usize) {
             found.arrived.erase(range);
             found.closed = false;
+            found.changes += 1;
         }
     }
 
@@ -1029,11 +1130,14 @@ impl Recovery for Par3 {
     // volume that may describe them is, all of it, then the next once that
     // one is read through without one. Otherwise every volume whose head
     // shows it carries recovery is deferred: the rest waits until a repair
-    // is short. Nothing of the deferral is kept: the same fronts say it
-    // again on every round.
+    // is short, or until a refusal shows it will be, and then only the
+    // volumes that cover the refused blocks are (`raised`). Nothing of the
+    // deferral is kept: the same fronts say it again on every round.
     fn wants(&self, out: &mut Vec<Seek>) {
         let describing = self.describing();
+        let raised = self.raised();
         for (index, volume) in self.volumes.iter().enumerate() {
+            let short = raised[index];
             if volume.closed {
                 continue;
             }
@@ -1047,7 +1151,7 @@ impl Recovery for Par3 {
                 });
                 continue;
             }
-            if self.needed == 0 {
+            if !short {
                 if volume.shows_recovery() {
                     recovery_volume::gaps(&volume.arrived, |range| {
                         out.push(Seek::deferred(VolumeIndex(index as u32), range))
@@ -1078,21 +1182,24 @@ impl Recovery for Par3 {
         if let Some(short) = self.refused_short() {
             return short;
         }
-        // Every readable span of every volume, read back and scanned one at
-        // a time; a span that does not read back whole is left out.
-        let mut packets = Vec::new();
-        let mut bytes = Vec::new();
-        for (index, volume) in self.volumes.iter().enumerate() {
-            for span in readable(&volume.arrived) {
-                bytes.clear();
-                if access.read_volume(VolumeIndex(index as u32), span, &mut bytes)
-                    && bytes.len() as u64 == span.len()
-                {
-                    scan(&bytes, &mut packets);
-                }
-            }
-        }
-        let sets = sets(packets);
+        // Every readable span of every volume, scanned one at a time a piece
+        // at a time; a span that does not read back whole is left out. The
+        // data and recovery blocks stay in the volumes until spent.
+        let spans = self
+            .volumes
+            .iter()
+            .enumerate()
+            .flat_map(|(index, volume)| {
+                readable(&volume.arrived)
+                    .into_iter()
+                    .map(move |span| (VolumeIndex(index as u32), span))
+            })
+            .collect();
+        let volumes::Read {
+            sets,
+            payloads,
+            volumes,
+        } = volumes::read(spans, ScanLimits::default(), MAX_SETS, access);
         // With no set described by anything read, the object waits on a
         // volume that may carry a description while damage shows; with no
         // damage, or none left open, it checked nothing.
@@ -1115,7 +1222,7 @@ impl Recovery for Par3 {
         let mut waiting = 0;
         self.ruled.clear();
         let arriving = self.arriving();
-        for set in sets {
+        for (set, payloads) in sets.into_iter().zip(payloads) {
             // The digest of the set's root packet, which its recovery packets
             // name it by.
             let id: String = set
@@ -1140,7 +1247,7 @@ impl Recovery for Par3 {
                 }
             } else {
                 rebuild::repair_set(
-                    &set,
+                    (&set, &payloads, &volumes),
                     &self.bound,
                     coming,
                     weaver_graph::Budget {
@@ -1160,7 +1267,7 @@ impl Recovery for Par3 {
             let settled = Settled {
                 members,
                 slice_size: set.block_size(),
-                blocks_reachable: rebuild::usable_recovery(&set).len() as u64,
+                blocks_reachable: rebuild::usable_recovery(&set, &payloads).len() as u64,
                 damaged_slices: result.lost,
                 outcome: result.outcome,
             };

@@ -117,7 +117,7 @@ impl GraphJob {
             works: super::works::Works::new(runs.scope(), runs.mail(), runs.hardware())
                 .timed(runs.clock()),
             runs,
-            passwords: Passwords::new(storage.passwords),
+            passwords: Passwords::from_candidates(storage.passwords),
             reported: snapshot.root.reported,
             pending: Pending::default(),
             mail_owed: None,
@@ -125,6 +125,8 @@ impl GraphJob {
             notes: Vec::new(),
             fed: super::runs::Fed::default(),
             sealed_at: None,
+            moved: 0,
+            indexes_kept: None,
         };
         for (node, index) in &snapshot.passwords {
             job.offer_again(*node, *index)?;

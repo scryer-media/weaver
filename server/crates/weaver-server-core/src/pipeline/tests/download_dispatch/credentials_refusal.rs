@@ -55,7 +55,7 @@ async fn a_credentials_refusal_retries_on_a_server_that_may_still_serve() {
             source_server_idx: Some(0),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -85,16 +85,16 @@ async fn a_credentials_refusal_retries_on_a_server_that_may_still_serve() {
     assert!(!Pipeline::server_may_serve(
         pipeline.nntp.pool(),
         0,
-        &ready[0].work.exclude_servers,
-        &retention,
+        ready[0].work.exclude_servers,
+        retention,
     ));
     assert!(Pipeline::server_may_serve(
         pipeline.nntp.pool(),
         1,
-        &ready[0].work.exclude_servers,
-        &retention,
+        ready[0].work.exclude_servers,
+        retention,
     ));
-    assert!(!pipeline.no_server_can_serve(job_id, &ready[0].work.exclude_servers));
+    assert!(!pipeline.no_server_can_serve(job_id, ready[0].work.exclude_servers));
 }
 
 // Every article of a file refused by one server waits to retry on the other,
@@ -153,7 +153,7 @@ async fn refused_articles_of_a_file_retry_holding_its_one_group_list() {
                 source_server_idx: Some(0),
                 origin: DownloadResultOrigin::NormalPrimary,
                 retry_count: 0,
-                exclude_servers: Vec::new(),
+                exclude_servers: weaver_nntp::ServerSet::EMPTY,
                 release_connection_slot: true,
             })
             .await;
@@ -220,7 +220,7 @@ async fn a_fill_server_refusing_credentials_books_the_article_and_leaves_backfil
     assert!(pipeline.nntp.pool().refuses_credentials(0));
     // Before any refusal reaches the article, nothing may serve it: the
     // fill server refuses and the backfill tier stays closed.
-    assert!(pipeline.no_server_can_serve(job_id, &[]));
+    assert!(pipeline.no_server_can_serve(job_id, weaver_nntp::ServerSet::EMPTY));
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
@@ -250,7 +250,7 @@ async fn a_fill_server_refusing_credentials_books_the_article_and_leaves_backfil
             source_server_idx: Some(0),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -268,7 +268,7 @@ async fn a_fill_server_refusing_credentials_books_the_article_and_leaves_backfil
     assert!(!Pipeline::server_may_serve(
         pipeline.nntp.pool(),
         1,
-        &[],
-        &retention,
+        weaver_nntp::ServerSet::EMPTY,
+        retention,
     ));
 }

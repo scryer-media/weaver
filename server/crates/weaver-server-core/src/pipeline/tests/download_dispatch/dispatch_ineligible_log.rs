@@ -251,7 +251,7 @@ async fn a_verifying_job_holding_its_slot_with_recovery_parked_is_not_a_stall() 
     let now = std::time::Instant::now();
     pipeline.dispatch_downloads_at(now);
 
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     assert_eq!(
         pipeline.dispatch_slot_wait_log_throttle.last_emitted_at(()),
         None,

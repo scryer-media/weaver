@@ -189,8 +189,11 @@ async fn deliver(pipeline: &mut Pipeline, turns: &mut Turns, post: &Post, file: 
         decoder.set_checkpoint_plan(checkpoint_plan(pipeline, job));
         let mut input = bytes::BytesMut::from(raw.as_slice());
         let source = || SegmentSource {
-            source_server_idx: Some(0),
-            exclude_servers: Vec::new(),
+            servers: PoolServers::stamped(
+                pipeline.pool_generation,
+                Some(0),
+                weaver_nntp::ServerSet::EMPTY,
+            ),
         };
         // A body that does not decode reaches the decode stage as a failed
         // decode, as a lane hands it over.
@@ -198,8 +201,11 @@ async fn deliver(pipeline: &mut Pipeline, turns: &mut Turns, post: &Post, file: 
             segment_id: segment,
             raw_size: raw.len() as u64,
             error,
-            source_server_idx: Some(0),
-            exclude_servers: Vec::new(),
+            servers: PoolServers::stamped(
+                pipeline.pool_generation,
+                Some(0),
+                weaver_nntp::ServerSet::EMPTY,
+            ),
         };
         let done = match decoder.decode_available(&mut input) {
             Ok(Some(decoded)) => {

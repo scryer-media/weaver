@@ -77,9 +77,13 @@ struct Input {
 }
 
 // The held revisions of a member within `range`, as `Holds::revisions`
-// answers them.
+// answers them. `held` is in offset order, the holds never overlapping, as
+// `Holds::revisions` gives them, so only those `range` reaches are visited.
 fn clipped(held: &[(ByteRange, u64)], range: ByteRange) -> Vec<(ByteRange, u64)> {
-    held.iter()
+    let from = held.partition_point(|(held, _)| held.end <= range.start);
+    held[from..]
+        .iter()
+        .take_while(|(held, _)| held.start < range.end)
         .filter_map(|(held, age)| Some((held.intersect(range)?, *age)))
         .collect()
 }
@@ -126,6 +130,12 @@ impl Returned {
 }
 
 impl Loan {
+    // The members the repair is to write nothing into: the disk has no room
+    // for them.
+    pub(super) fn withhold(&mut self, members: BTreeSet<MemberId>) {
+        self.access.withheld = members;
+    }
+
     // Run the repair, where it is not in anyone's way, within `budget`. A
     // repair given after `shutdown` started, or after the job's working
     // directory went, reads nothing, and one going when either happens
@@ -243,13 +253,14 @@ struct Lent {
     // Replay validates every node's revisions on return, so it notes
     // nothing of what it reads.
     defer_holds: bool,
-    // Whether bytes held on scratch are read in place, through the loan's
-    // own handle on the namespace's scratch file, as the work asks for
-    // them. A loan whose return checks the holds it read does: a span is
-    // written again only once every hold on scratch has left, which that
-    // check sees. A rewalk, whose pieces are heard as read, copies them
-    // when lent.
-    scratch_in_place: bool,
+    // Bytes held on scratch are read in place, through the loan's own
+    // handle on the namespace's scratch file, as the work asks for them. A
+    // span is written again only once every hold on scratch has left, which
+    // the hold revisions show. A repair's return checks the revisions of
+    // what it read. A rewalk's pieces are heard as read, so it notes here
+    // the held ranges each piece found on scratch, and the loop checks
+    // their revisions as it hears the piece (`scratch_stands`).
+    scratch_read: Option<RefCell<Vec<(NodeId, MemberId, ByteRange)>>>,
     // Each namespace's scratch file, opened when lent for a member that
     // holds bytes there.
     held_scratch: BTreeMap<NodeId, File>,
@@ -275,6 +286,8 @@ struct Lent {
     scratch: Option<PathBuf>,
     // The pipeline's shutdown: once it starts, no read is answered.
     shutdown: Shutdown,
+    // The members the disk has no room for the repair to rebuild.
+    withheld: BTreeSet<MemberId>,
 }
 
 // What a repair rewrote: runs of members in the order written, each one's
@@ -371,6 +384,11 @@ impl Repaired {
         self.failed.take()
     }
 
+    // Each run's member and how many bytes it holds, in the order written.
+    pub(crate) fn sizes(&self) -> impl Iterator<Item = (MemberId, u64)> + '_ {
+        self.runs.iter().map(|(member, _, at)| (*member, at.len()))
+    }
+
     pub(crate) fn members(&self) -> impl Iterator<Item = MemberId> + '_ {
         self.runs.iter().map(|(member, _, _)| *member)
     }
@@ -423,7 +441,7 @@ impl NamespaceWriter {
             set,
             recovery: Some(set),
             defer_holds: false,
-            scratch_in_place: true,
+            scratch_read: None,
             held_scratch: BTreeMap::new(),
             internal: self.working_dir.join(weaver_graph::names::INTERNAL_DIR),
             members: BTreeMap::new(),
@@ -439,6 +457,7 @@ impl NamespaceWriter {
             diagnostics: Vec::new(),
             scratch: None,
             shutdown: Shutdown::default(),
+            withheld: BTreeSet::new(),
         };
         let mut seen = BTreeSet::new();
         self.take_namespace(tree, namespace, &mut access, &mut seen);
@@ -570,7 +589,7 @@ impl NamespaceWriter {
         };
         let files = self.files.get(&node);
         let held = match files {
-            Some(files) if access.scratch_in_place => {
+            Some(files) => {
                 let held: Vec<(ByteRange, Location)> = files
                     .holds
                     .peek(held_volume(member), ALL)
@@ -591,7 +610,6 @@ impl NamespaceWriter {
                 }
                 held
             }
-            Some(files) => self.held_pieces(files, member),
             None => Vec::new(),
         };
         let bound = tree
@@ -641,32 +659,43 @@ impl NamespaceWriter {
         self.take_namespace(tree, child, access, seen);
     }
 
-    // What is held for the member, for a loan that reads no scratch in
-    // place: bytes paged to scratch are copied out, since the scratch span
-    // is reused once its hold leaves. Bytes on file stay there, read
-    // through the loan's own handle on the spill file as it asks for them:
-    // nothing bounds how much spilled, so none of it is copied here.
-    fn held_pieces(&self, files: &super::Files, member: MemberId) -> Vec<(ByteRange, Location)> {
-        files
-            .holds
-            .peek(held_volume(member), ALL)
-            .into_iter()
-            .filter_map(|piece| {
-                let location = match piece.location {
-                    Location::Scratch { offset, len } => {
-                        let mut bytes = Vec::new();
-                        files
-                            .scratch
-                            .as_ref()?
-                            .read(offset, index(len), &mut bytes)
-                            .ok()?;
-                        Location::Ram(Bytes::from(bytes))
-                    }
-                    kept @ (Location::Ram(_) | Location::Spilled) => kept,
-                };
-                Some((piece.range, location))
-            })
-            .collect()
+    // Whether every held range a rewalk's piece read on scratch is held
+    // as it was when lent: the same holds, at the same revisions, so the
+    // span the piece read was not written again under it.
+    pub(crate) fn scratch_stands(&self, read: &ScratchRead) -> bool {
+        read.0.iter().all(|(node, member, range, basis)| {
+            self.files
+                .get(node)
+                .is_some_and(|files| files.holds.revisions(held_volume(*member), *range) == *basis)
+        })
+    }
+}
+
+// The held ranges one piece of a rewalk read on scratch, each with the
+// revisions its holds stood at when lent.
+#[derive(Default)]
+pub(crate) struct ScratchRead(Vec<(NodeId, MemberId, ByteRange, Revisions)>);
+
+// Held ranges with the revision each stood at, as `Holds::revisions` gives
+// them.
+type Revisions = Vec<(ByteRange, u64)>;
+
+impl Lent {
+    // What the reads since the last call found on scratch, with the
+    // revisions lent for it.
+    fn scratch_read(&self) -> ScratchRead {
+        let Some(read) = &self.scratch_read else {
+            return ScratchRead::default();
+        };
+        ScratchRead(
+            read.borrow_mut()
+                .drain(..)
+                .filter_map(|(node, member, range)| {
+                    let taken = self.members.get(&(node, member))?;
+                    Some((node, member, range, clipped(&taken.held_basis, range)))
+                })
+                .collect(),
+        )
     }
 }
 
@@ -776,10 +805,15 @@ impl Source for Lent {
                     Location::Ram(bytes) => {
                         Location::Ram(bytes.slice(index(from)..index(from + inside.len())))
                     }
-                    Location::Scratch { offset, .. } => Location::Scratch {
-                        offset: offset + from,
-                        len: inside.len(),
-                    },
+                    Location::Scratch { offset, .. } => {
+                        if let Some(read) = &self.scratch_read {
+                            read.borrow_mut().push((node, member, inside));
+                        }
+                        Location::Scratch {
+                            offset: offset + from,
+                            len: inside.len(),
+                        }
+                    }
                     Location::Spilled => Location::Spilled,
                 };
                 Some((inside, location))
@@ -870,6 +904,10 @@ impl MemberAccess for Lent {
     fn length(&self, member: MemberId) -> Option<u64> {
         self.note((self.namespace, member), None);
         self.members.get(&(self.namespace, member))?.length
+    }
+
+    fn withheld(&self, member: MemberId) -> bool {
+        self.withheld.contains(&member)
     }
 
     fn arrived(&self, member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {

@@ -3,6 +3,17 @@
 
 use super::*;
 
+// A job's run state as its queue row states it, installed or not: a job
+// paused before it started waits as its row.
+fn row_run_state(pipeline: &Pipeline, id: JobId) -> crate::RunState {
+    pipeline.shared_state.queue.read(|inner| {
+        inner
+            .job(id)
+            .map(|row| row.info(&inner.globals).run_state)
+            .unwrap()
+    })
+}
+
 async fn enqueue(pipeline: &mut Pipeline, id: u64) {
     let spec = segmented_job_spec(&format!("Queued NZB {id}"), "payload.bin", &[512; 8]);
     let nzb_zstd = nzb_zstd_for(&spec);
@@ -112,6 +123,24 @@ async fn a_retired_id_with_work_in_flight_is_rechecked_without_a_walk() {
     assert!(pipeline.nzb_retired_busy.is_empty());
 }
 
+// A job that failed or completed is no longer a queue row and holds no
+// slot: the walk forgets it, its stored resume with it.
+#[tokio::test]
+async fn the_walk_forgets_the_stored_resume_of_a_job_that_left() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let (failed, completed) = (JobId(78), JobId(79));
+    for id in [failed, completed] {
+        pipeline.nzb_seen.insert(id);
+        pipeline.resumes_stored.insert(id);
+    }
+
+    pipeline.reconcile_nzb_admission(true);
+
+    assert!(pipeline.resumes_stored.is_empty());
+    assert!(pipeline.nzb_seen.is_empty());
+}
+
 #[tokio::test]
 async fn twenty_four_providers_cannot_admit_more_than_ten_of_124_nzbs() {
     let temp = tempfile::tempdir().unwrap();
@@ -216,7 +245,7 @@ async fn twenty_four_providers_cannot_admit_more_than_ten_of_124_nzbs() {
                 source_server_idx: None,
                 origin: DownloadResultOrigin::NormalPrimary,
                 retry_count: 0,
-                exclude_servers: Vec::new(),
+                exclude_servers: weaver_nntp::ServerSet::EMPTY,
                 release_connection_slot: true,
             })
             .await;
@@ -502,10 +531,46 @@ async fn restart_between_pause_intent_and_drain_restores_without_a_slot() {
     pipeline.apply_queue_intents().await;
     assert!(pipeline.nzb_admitted.is_empty());
     assert!(pipeline.db.load_nzb_admissions().unwrap().is_empty());
-    assert_eq!(pipeline.jobs[&JobId(1)].run_state, crate::RunState::Paused);
-    assert_eq!(pipeline.jobs[&JobId(2)].run_state, crate::RunState::Paused);
+    assert_eq!(row_run_state(&pipeline, JobId(1)), crate::RunState::Paused);
+    assert_eq!(row_run_state(&pipeline, JobId(2)), crate::RunState::Paused);
     assert!(!pipeline.blocked_restores.contains_key(&JobId(1)));
     assert!(!pipeline.blocked_restores.contains_key(&JobId(2)));
+}
+
+// A resume that waits for its slot is stored once, as it is asked for: the
+// turns that find it still waiting write nothing, and a restart before the
+// slot comes restores the job resumed, waiting for its slot.
+#[tokio::test]
+async fn a_resume_waiting_for_its_slot_survives_a_restart() {
+    use crate::pipeline::completion::finalize::RUNTIME_WRITES;
+    use std::sync::atomic::Ordering;
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let handle = handle(&pipeline);
+    handle
+        .set_max_concurrent_nzbs(std::num::NonZeroU32::new(1).unwrap())
+        .await
+        .unwrap();
+    enqueue_saved(&mut pipeline, 1).await;
+    enqueue_saved(&mut pipeline, 2).await;
+    // Job 1 has bytes in hand, so pausing it keeps it installed.
+    pipeline.jobs.get_mut(&JobId(1)).unwrap().downloaded_bytes = 512;
+    handle.pause_job(JobId(1)).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    pipeline.apply_queue_intents().await;
+    assert_eq!(pipeline.nzb_admitted, HashSet::from([JobId(2)]));
+    let writes = RUNTIME_WRITES.load(Ordering::Relaxed);
+    handle.resume_job(JobId(1)).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    pipeline.apply_queue_intents().await;
+    assert_eq!(pipeline.jobs[&JobId(1)].run_state, crate::RunState::Paused);
+    assert_eq!(RUNTIME_WRITES.load(Ordering::Relaxed) - writes, 1);
+    pipeline.db.flush_write_queue().await.unwrap();
+
+    let mut pipeline = restart_and_restore(&temp, pipeline).await;
+    pipeline.apply_queue_intents().await;
+    assert_eq!(row_run_state(&pipeline, JobId(1)), crate::RunState::Active);
+    assert_eq!(pipeline.nzb_admitted, HashSet::from([JobId(2)]));
 }
 
 #[tokio::test]

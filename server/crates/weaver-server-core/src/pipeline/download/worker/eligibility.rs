@@ -69,7 +69,7 @@ impl Pipeline {
                                     .uu_files
                                     .get(&work.segment_id.file_id)
                                     .is_none_or(|uu| {
-                                        uu.next_index == work.segment_id.segment_number
+                                        uu.next_index.get() == work.segment_id.segment_number
                                     }))
                     })
                     .is_some();
@@ -91,7 +91,7 @@ impl Pipeline {
                     .peek_next_matching(|work| {
                         self.uu_files
                             .get(&work.segment_id.file_id)
-                            .is_none_or(|uu| uu.next_index == work.segment_id.segment_number)
+                            .is_none_or(|uu| uu.next_index.get() == work.segment_id.segment_number)
                     })
                     .is_some()
         })
@@ -109,11 +109,17 @@ impl Pipeline {
     // server, byte pressure, a direct-store hold or the restart checkpoint.
     // None while a lane holds the job or none of its queued work is gated, so
     // a job only waiting its turn behind another reads as plain queued.
+    #[cfg(any(test, feature = "test-support"))]
     pub(in crate::pipeline) fn job_dispatch_hold_reason(
         &self,
         job_id: JobId,
     ) -> Option<&'static str> {
-        let state = self.jobs.get(&job_id)?;
+        self.jobs
+            .get(&job_id)
+            .and_then(|state| self.hold_reason_of(job_id, state))
+    }
+
+    fn hold_reason_of(&self, job_id: JobId, state: &JobState) -> Option<&'static str> {
         if !Self::has_dispatchable_work(state) || self.job_has_current_download_activity(job_id) {
             return None;
         }
@@ -152,12 +158,23 @@ impl Pipeline {
     }
 
     // The dispatcher's word on a job: the wait it recorded, else the gate
-    // holding it.
+    // holding it, else a wait for room on a disk, which holds the job's
+    // extraction and repair while its fetches go on. A job the dispatcher
+    // holds is waiting for that first; the disk is the reason only when
+    // nothing else explains the wait. Only an installed job can wait for
+    // room, and the jobs the loop found waiting are a set of its own: a job
+    // out of the queue window is answered by the one lookup it always was.
     pub(in crate::pipeline) fn dispatch_wait_reason(&self, job_id: JobId) -> Option<&'static str> {
         self.download_wait_by_job
             .get(&job_id)
             .map(|wait| wait.reason)
-            .or_else(|| self.job_dispatch_hold_reason(job_id))
+            .or_else(|| {
+                let state = self.jobs.get(&job_id)?;
+                self.hold_reason_of(job_id, state).or_else(|| {
+                    (!self.disk_waiting.is_empty() && self.disk_waiting.contains(&job_id))
+                        .then_some(crate::jobs::handle::DISK_SPACE_WAIT_REASON)
+                })
+            })
     }
 
     // A hold lands or lifts, and a job gains or loses its lanes, with no job
@@ -173,7 +190,7 @@ impl Pipeline {
             .iter()
             .chain(self.download_wait_by_job.keys())
             .chain(self.active_download_connections_by_job.keys())
-            .chain(self.active_downloads_by_job.keys())
+            .chain(self.articles_in_flight_by_job.keys())
             .chain(self.active_decodes_by_job.jobs())
             .chain(self.pending_released_download_results_by_job.keys())
             .copied()

@@ -11,6 +11,7 @@
 // is the backstop.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use unrar_rs::{
     MemberKeying, PasswordCheck, RarVolumeHeaderEncryption, check_member_password,
@@ -261,9 +262,17 @@ impl RarStore {
     }
 
     // Derive every key a file is waiting on, away from the loop, into the
-    // cache: the files open from it once the store is back.
-    pub(super) fn derive_due(&mut self) {
-        for (candidate, index) in std::mem::take(&mut self.derive_due) {
+    // cache: the files open from it once the store is back. Once `stop` is
+    // set no further key is begun, and every file with a key still to
+    // derive stays due; `false` then.
+    pub(super) fn derive_due(&mut self, stop: &AtomicBool) -> bool {
+        let mut due = std::mem::take(&mut self.derive_due).into_iter();
+        while let Some((candidate, index)) = due.next() {
+            if stop.load(Ordering::Relaxed) {
+                self.derive_due.insert((candidate, index));
+                self.derive_due.extend(due);
+                return false;
+            }
             let (Some(found), Some(store)) = (
                 self.candidates.get(candidate),
                 self.entries
@@ -276,6 +285,7 @@ impl RarStore {
             self.derived.insert((candidate, index), derived);
         }
         self.stale = true;
+        true
     }
 
     pub(super) fn open_files(&mut self, out: &mut Vec<Emit>) {

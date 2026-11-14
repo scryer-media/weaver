@@ -85,7 +85,7 @@ impl Pipeline {
     }
 
     pub(crate) fn publish_active_stage_metrics(&self) {
-        self.metrics.set_active_downloads(self.active_downloads);
+        self.metrics.set_articles_in_flight(self.articles_in_flight);
         self.metrics
             .active_decodes
             .store(self.active_decodes_by_job.total(), Ordering::Relaxed);
@@ -120,7 +120,7 @@ impl Pipeline {
                 .retain(|segment_id| segment_id.file_id != file_id);
             for part in self
                 .unanchored_parked
-                .remove(&file_id)
+                .remove_file(file_id)
                 .into_iter()
                 .flat_map(BTreeMap::into_values)
             {

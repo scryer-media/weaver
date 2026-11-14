@@ -483,13 +483,22 @@ impl HoldLedger {
 
     // Source-local identities at a worker transition. Cuts and page-outs
     // retain their ages; replacement bytes always get a new age.
+    // Only the holds the range reaches are visited, as `peek` visits them.
     pub fn revisions(&self, volume: VolumeIndex, range: ByteRange) -> Vec<(ByteRange, u64)> {
+        if range.is_empty() {
+            return Vec::new();
+        }
         self.volumes
             .get(&volume)
             .map(|holds| {
+                let start = holds
+                    .range(..=range.start)
+                    .next_back()
+                    .filter(|(_, hold)| hold.range.end > range.start)
+                    .map_or(range.start, |(&start, _)| start);
                 holds
-                    .values()
-                    .filter_map(|hold| Some((hold.range.intersect(range)?, hold.age)))
+                    .range(start..range.end)
+                    .filter_map(|(_, hold)| Some((hold.range.intersect(range)?, hold.age)))
                     .collect()
             })
             .unwrap_or_default()
@@ -1203,6 +1212,48 @@ mod tests {
         assert!(
             ledger
                 .held_in(VolumeIndex(1), ByteRange::new(0, 100))
+                .is_empty()
+        );
+    }
+
+    // The revisions of a range, visiting only the holds it reaches, are
+    // what a walk over every hold of the volume gives, for every range over
+    // holds that were cut, replaced and left gaps.
+    #[test]
+    fn revisions_of_a_range_match_a_walk_over_every_hold() {
+        let accountant = Arc::new(HoldsAccountant::new(budgets(100)));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        for (offset, fill) in [(10, 1), (30, 2), (50, 3), (70, 4), (75, 5)] {
+            ledger.hold(VolumeIndex(0), offset, bytes(fill, 10), PLENTY);
+        }
+        ledger.hold(VolumeIndex(1), 0, bytes(6, 10), PLENTY);
+        let _ = ledger.take(VolumeIndex(0), ByteRange::new(33, 36));
+        let every = |range: ByteRange| -> Vec<(ByteRange, u64)> {
+            ledger.volumes[&VolumeIndex(0)]
+                .values()
+                .filter_map(|hold| Some((hold.range.intersect(range)?, hold.age)))
+                .collect()
+        };
+        let mut compared = 0;
+        for start in 0..100 {
+            for end in start..100 {
+                let range = ByteRange::new(start, end);
+                assert_eq!(
+                    ledger.revisions(VolumeIndex(0), range),
+                    every(range),
+                    "{range:?}"
+                );
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, 5050);
+        assert_eq!(
+            ledger.revisions(VolumeIndex(0), ByteRange::new(0, u64::MAX)),
+            every(ByteRange::new(0, u64::MAX))
+        );
+        assert!(
+            ledger
+                .revisions(VolumeIndex(2), ByteRange::new(0, 10))
                 .is_empty()
         );
     }

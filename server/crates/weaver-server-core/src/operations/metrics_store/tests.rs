@@ -70,7 +70,7 @@ fn sample_snapshot(
         bytes_decoded,
         bytes_committed,
         download_queue_depth: queue_depth,
-        active_downloads: 0,
+        articles_in_flight: 0,
         active_decodes: 0,
         decode_pending: queue_depth / 2,
         decode_pending_bytes: 0,
@@ -195,7 +195,7 @@ fn uu_spool_gauges_append_after_legacy_history_slots() {
         [
             "weaver_pipeline_current_download_speed_bytes_per_second",
             "weaver_pipeline_download_queue_depth",
-            "weaver_pipeline_active_downloads",
+            "weaver_pipeline_articles_in_flight",
             "weaver_pipeline_active_decodes",
             "weaver_pipeline_decode_pending",
             "weaver_pipeline_decode_pending_bytes",

@@ -15,7 +15,7 @@ use weaver_graph::{ByteRange, NodeId, Placement, Posted, Rewalk, Tree, VolumeInd
 use super::super::super::hardware::Shutdown;
 use super::super::super::leaf::LeafError;
 use super::super::{NamespaceWriter, read_placed};
-use super::{Lent, Repaired};
+use super::{Lent, Repaired, ScratchRead};
 
 pub(crate) struct RewalkLoan {
     rewalk: Rewalk,
@@ -25,10 +25,12 @@ pub(crate) struct RewalkLoan {
 // One piece read again, or the range of one that did not read back
 // (`Err`), or the end of them (`None`): `whole` when every piece was
 // taken, not when a shutdown or the working directory going cut the
-// reading short.
+// reading short. `scratch` is what the piece read of holds on scratch,
+// which the loop checks before it hears the piece.
 pub(crate) struct Rewalked {
     pub(crate) piece: Option<(VolumeIndex, Result<Posted, ByteRange>)>,
     pub(crate) whole: bool,
+    pub(crate) scratch: ScratchRead,
 }
 
 impl std::fmt::Debug for Rewalked {
@@ -58,7 +60,7 @@ impl RewalkLoan {
     pub(crate) fn run(
         mut self,
         shutdown: &Shutdown,
-        said: &mut dyn FnMut(VolumeIndex, Result<Posted, ByteRange>) -> bool,
+        said: &mut dyn FnMut(VolumeIndex, Result<Posted, ByteRange>, ScratchRead) -> bool,
     ) -> bool {
         self.access.shutdown = shutdown.clone();
         let access = &self.access;
@@ -76,7 +78,7 @@ impl RewalkLoan {
                 break;
             }
             if let Some((volume, piece)) = self.rewalk.read(index, &mut placed)
-                && !said(volume, piece)
+                && !said(volume, piece, access.scratch_read())
             {
                 whole = false;
                 break;
@@ -118,7 +120,7 @@ impl NamespaceWriter {
             set: node,
             recovery: Some(node),
             defer_holds: false,
-            scratch_in_place: false,
+            scratch_read: Some(RefCell::default()),
             held_scratch: BTreeMap::new(),
             internal: self.working_dir.join(weaver_graph::names::INTERNAL_DIR),
             members: BTreeMap::new(),
@@ -134,6 +136,7 @@ impl NamespaceWriter {
             diagnostics: Vec::new(),
             scratch: None,
             shutdown: Shutdown::default(),
+            withheld: BTreeSet::new(),
         };
         let mut seen = BTreeSet::new();
         for (volume, member) in volumes {

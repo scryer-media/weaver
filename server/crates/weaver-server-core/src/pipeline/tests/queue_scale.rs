@@ -102,7 +102,7 @@ async fn a_turn_with_no_new_intent_walks_no_queue_row() {
     handle.pause_job(in_window).await.unwrap();
     pipeline.apply_queue_intents().await;
     assert!(row_walks() > settled);
-    assert_eq!(pipeline.jobs[&in_window].run_state, crate::RunState::Paused);
+    assert_eq!(row_run_state(&pipeline, in_window), crate::RunState::Paused);
     let acted = row_walks();
     pipeline.apply_queue_intents().await;
     assert_eq!(row_walks(), acted);
@@ -600,8 +600,11 @@ async fn a_decode_done_during_a_restart_is_heard_between_batches() {
             },
             raw_size: 0,
             error: "synthetic decode failure".to_string(),
-            source_server_idx: None,
-            exclude_servers: Vec::new(),
+            servers: PoolServers::stamped(
+                pipeline.pool_generation,
+                None,
+                weaver_nntp::ServerSet::EMPTY,
+            ),
         })
         .await
         .unwrap();
@@ -1043,7 +1046,7 @@ async fn a_result_turn_and_a_refill_turn_walk_no_row_and_ask_no_database_on_a_lo
                 source_server_idx: None,
                 origin: DownloadResultOrigin::NormalPrimary,
                 retry_count: 0,
-                exclude_servers: Vec::new(),
+                exclude_servers: weaver_nntp::ServerSet::EMPTY,
                 release_connection_slot: true,
             })
             .await;
@@ -1138,25 +1141,35 @@ async fn the_jobs_next_up_hold_their_lists_read_ahead() {
 }
 
 // A job stored before outlines were restores with no NZB read before the
-// server answers. Each such job installs, wherever it stands, reading its NZB
-// once and storing the outline it reads; the jobs out of the window leave it
-// again. Each job then holds the summaries it held before the restart, and
-// the next restart reads no NZB.
+// server answers. Each such job reads its NZB once, wherever it stands, and
+// stores the outline it reads: a job in the window installs, and one out of
+// it reads its outline alone and waits as its row, which states its files.
+// Each job then holds the summaries it held before the restart, and the next
+// restart reads no NZB.
 #[tokio::test]
 async fn a_restart_fills_the_outlines_of_jobs_stored_without_one() {
+    use crate::jobs::service::OUTLINE_ONLY_READS;
     let temp = tempfile::tempdir().unwrap();
     let Restarted {
         mut pipeline,
-        handle: _handle,
+        handle,
         order,
         summaries: expected,
         recovery_parses,
     } = restarted_long_queue_with(&temp, true).await;
     assert_eq!(recovery_parses, 0);
     let parses = nzb_parses();
+    let outline_only = OUTLINE_ONLY_READS.load(Ordering::Relaxed);
     settle_window(&mut pipeline).await;
     assert_eq!(nzb_parses() - parses, QUEUED);
     assert_eq!(pipeline.jobs.len(), QUEUE_WINDOW + 1);
+    // Only the window and the late slot holder were installed.
+    assert_eq!(
+        OUTLINE_ONLY_READS.load(Ordering::Relaxed) - outline_only,
+        QUEUED - (QUEUE_WINDOW as u64 + 1)
+    );
+    let parked = order[QUEUE_WINDOW];
+    assert!(pipeline.window_parked(parked));
     assert!(
         order[..QUEUE_WINDOW]
             .iter()
@@ -1173,6 +1186,33 @@ async fn a_restart_fills_the_outlines_of_jobs_stored_without_one() {
     pipeline.db.flush_write_queue().await.unwrap();
     let outlines = pipeline.db.load_job_outlines(None).unwrap();
     assert_eq!(outlines.len(), QUEUED as usize);
+    // A job that waits as its row states the files its outline read.
+    let row = handle.get_job(parked).unwrap();
+    assert_eq!(row.total_files as usize, outlines[&parked].files.len());
+    assert_eq!(
+        row.total_bytes,
+        outlines[&parked]
+            .files
+            .iter()
+            .map(|file| file.bytes)
+            .sum::<u64>()
+    );
+    assert!(row.total_bytes > 0);
+    // Its wanted and remaining bytes are what the job states once it
+    // installs.
+    let parked_figures = (row.wanted_bytes, row.remaining_bytes);
+    assert!(parked_figures.0 > 0);
+    handle
+        .reorder_jobs(vec![(parked, QueueMoveTarget::Top)])
+        .await
+        .unwrap();
+    settle_window(&mut pipeline).await;
+    assert!(pipeline.jobs.contains_key(&parked));
+    let installed = handle.get_job(parked).unwrap();
+    assert_eq!(
+        (installed.wanted_bytes, installed.remaining_bytes),
+        parked_figures
+    );
     // Every job installed before the restart holds the same files.
     for (id, summaries) in &expected {
         let files: Vec<(u32, u64)> = outlines[id]
@@ -1284,4 +1324,233 @@ async fn a_restart_fails_the_jobs_stored_without_an_outline_whose_nzb_cannot_be_
     assert!(!state.spec.files.is_empty());
     assert!(state.failure_error.is_none());
     assert!(!pipeline.blocked_restores.contains_key(&readable));
+}
+
+// A long queue on a working disk whose free space the test sets, held to a
+// reserve. What each pass does is counted, never timed, so the counts hold
+// at any length: the same test at ten thousand jobs passes too.
+mod disk_room {
+    use super::*;
+    use crate::operations::{DiskSpace, StorageCapacity, StorageRoot};
+    use std::sync::atomic::AtomicU64;
+
+    const LONG: u64 = 2_500;
+    const SLOTS: u32 = 4;
+    const RESERVE: u64 = 1 << 30;
+    const NEVER: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+    // Counted on every thread but a sampler's.
+    fn disk_looks() -> u64 {
+        crate::operations::disk::DISK_LOOKS.load(Ordering::Relaxed)
+    }
+
+    fn refresh_asks() -> u64 {
+        crate::operations::disk::REFRESH_ASKS.load(Ordering::Relaxed)
+    }
+
+    fn visits() -> u64 {
+        crate::pipeline::nzb_admission::ADMISSION_VISITS.with(std::cell::Cell::get)
+    }
+
+    // The disk under every root, read by its sampler alone: `room` over the
+    // reserve, and the probes made on the thread the pipeline runs on.
+    struct Disk {
+        room: Arc<AtomicU64>,
+        on_actor: Arc<AtomicU64>,
+    }
+
+    impl Disk {
+        fn under(pipeline: &mut Pipeline) -> Self {
+            let room = Arc::new(AtomicU64::new(RESERVE));
+            let on_actor = Arc::new(AtomicU64::new(0));
+            let actor = std::thread::current().id();
+            let probe = {
+                let (room, on_actor) = (Arc::clone(&room), Arc::clone(&on_actor));
+                Arc::new(move |_: &std::path::Path| {
+                    if std::thread::current().id() == actor {
+                        on_actor.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(DiskSpace {
+                        total_bytes: RESERVE * 64,
+                        available_bytes: RESERVE + room.load(Ordering::Acquire),
+                    })
+                })
+            };
+            let roots = [
+                pipeline.script_data_dir.clone(),
+                pipeline.intermediate_dir.clone(),
+                pipeline.complete_dir.clone(),
+            ];
+            let capacity = StorageCapacity::with_probe(roots, NEVER, probe);
+            for root in StorageRoot::ALL {
+                capacity.wait_for_probes(root, 1);
+            }
+            pipeline.storage_capacity = Arc::new(capacity);
+            let mut limits = (*pipeline.extraction_limits).clone();
+            limits.min_free_bytes = RESERVE;
+            pipeline.extraction_limits = Arc::new(limits);
+            Self { room, on_actor }
+        }
+
+        // The working disk reads `room` over the reserve: the test waits
+        // for the reading that says so, whatever other probes ran first.
+        // `room` differs from the room the disk read last.
+        fn reads(&self, pipeline: &Pipeline, room: u64) {
+            self.room.store(room, Ordering::Release);
+            let capacity = &pipeline.storage_capacity;
+            capacity.request_refresh(StorageRoot::Intermediate);
+            capacity.wait_for_reading(StorageRoot::Intermediate, |reading| {
+                reading.available_bytes == RESERVE + room
+            });
+        }
+    }
+
+    // Hears each admitted job's article read come back, so what the read
+    // does is done before the test counts.
+    async fn activations_heard(pipeline: &mut Pipeline) {
+        while pipeline.jobs.values().any(|state| {
+            matches!(
+                state.articles,
+                crate::jobs::model::JobArticles::Activating(..)
+            )
+        }) {
+            let done = pipeline.job_activated_rx.recv().await.unwrap();
+            pipeline.handle_job_activated(done);
+        }
+    }
+
+    fn reasons(pipeline: &Pipeline) -> Vec<Option<String>> {
+        pipeline.shared_state.queue.read(|inner| {
+            inner
+                .jobs
+                .iter()
+                .map(|row| row.report.job.download_wait_reason.clone())
+                .collect()
+        })
+    }
+
+    fn restated(before: &[Option<String>], after: &[Option<String>]) -> usize {
+        before.iter().zip(after).filter(|(a, b)| a != b).count()
+    }
+
+    fn waiting_for_disk(pipeline: &Pipeline) -> usize {
+        reasons(pipeline)
+            .iter()
+            .filter(|reason| reason.as_deref() == Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON))
+            .count()
+    }
+
+    // A burst of adds at the end of the queue and moves among the jobs out
+    // of the window, as a client sends them.
+    async fn burst(pipeline: &mut Pipeline, handle: &SchedulerHandle, first: u64) {
+        for id in first..first + 500 {
+            enqueue(pipeline, id).await;
+        }
+        let moves: Vec<_> = (0..100)
+            .map(|step| (JobId(LONG - step), QueueMoveTarget::Offset(-3)))
+            .collect();
+        handle.reorder_jobs(moves).await.unwrap();
+        pipeline.apply_queue_intents().await;
+    }
+
+    // With the disk not short and then short, adds and moves of a long
+    // queue ask the disk nothing on the pipeline's thread and
+    // ring its sampler at most once, the walk looks at no more candidates
+    // than the slots call for, and a hold that begins or ends restates no
+    // more rows than there are slots.
+    #[tokio::test]
+    async fn a_long_queue_reads_the_disk_from_the_cache_short_or_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+        let disk = Disk::under(&mut pipeline);
+        let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+        handle
+            .set_max_concurrent_nzbs(std::num::NonZeroU32::new(SLOTS).unwrap())
+            .await
+            .unwrap();
+        for id in 1..=LONG {
+            enqueue(&mut pipeline, id).await;
+        }
+        settle_window(&mut pipeline).await;
+        activations_heard(&mut pipeline).await;
+        assert_eq!(pipeline.nzb_admitted.len(), SLOTS as usize);
+
+        // Not short.
+        let (looks, asks, walks, visited) = (disk_looks(), refresh_asks(), row_walks(), visits());
+        burst(&mut pipeline, &handle, LONG + 1).await;
+        assert_eq!(disk_looks(), looks, "nothing asked of the disk itself");
+        assert_eq!(refresh_asks(), asks, "nor of its sampler");
+        let walked = row_walks() - walks;
+        assert!(walked > 0);
+        assert!(
+            visits() - visited <= walked,
+            "each walk looked at one candidate, the slots being full"
+        );
+        assert!(!pipeline.admission_disk_held);
+        assert_eq!(waiting_for_disk(&pipeline), 0);
+
+        // The disk goes short, and a slot comes free: the walk judges the
+        // disk once, shows the next job waiting for it, and starts none.
+        disk.reads(&pipeline, 0);
+        let before = reasons(&pipeline);
+        let (looks, asks, walks, visited) = (disk_looks(), refresh_asks(), row_walks(), visits());
+        handle
+            .set_max_concurrent_nzbs(std::num::NonZeroU32::new(SLOTS + 1).unwrap())
+            .await
+            .unwrap();
+        pipeline.apply_queue_intents().await;
+        assert!(pipeline.admission_disk_held, "the hold began");
+        assert_eq!(
+            pipeline.nzb_admitted.len(),
+            SLOTS as usize,
+            "no job started"
+        );
+        assert_eq!(
+            pipeline.disk_unadmitted.len(),
+            1,
+            "one free slot, one shown"
+        );
+        assert_eq!(waiting_for_disk(&pipeline), 1);
+        assert!(restated(&before, &reasons(&pipeline)) <= 1);
+        assert_eq!(disk_looks(), looks);
+        assert_eq!(refresh_asks() - asks, 1, "the hold asked one early reading");
+        let walked = row_walks() - walks;
+        assert!(visits() - visited <= walked * u64::from(SLOTS + 1));
+
+        // Short: a burst asks the disk nothing, rings no sampler again, and
+        // each walk looks at no more candidates than there are slots.
+        let (looks, asks, walks, visited) = (disk_looks(), refresh_asks(), row_walks(), visits());
+        burst(&mut pipeline, &handle, LONG + 501).await;
+        assert_eq!(disk_looks(), looks);
+        assert_eq!(refresh_asks(), asks, "the hold is rung once, not per job");
+        let walked = row_walks() - walks;
+        assert!(walked > 0);
+        assert!(visits() - visited <= walked * u64::from(SLOTS + 1));
+        assert!(pipeline.disk_unadmitted.len() <= SLOTS as usize + 1);
+        assert_eq!(pipeline.nzb_admitted.len(), SLOTS as usize);
+
+        // A reading with room ends the hold: the job shown waiting starts,
+        // and no more rows are restated than there are slots.
+        disk.reads(&pipeline, 64 * RESERVE);
+        let before = reasons(&pipeline);
+        let looks = disk_looks();
+        pipeline.disk_reading();
+        assert_eq!(disk_looks(), looks, "the hold ends on the cached reading");
+        pipeline.apply_queue_intents().await;
+        assert!(!pipeline.admission_disk_held);
+        assert_eq!(waiting_for_disk(&pipeline), 0);
+        assert!(restated(&before, &reasons(&pipeline)) <= SLOTS as usize + 1);
+        // The job that starts reads its articles off the pipeline's
+        // thread: that asks the disk nothing either, its staging device
+        // and the kind of storage it logs included, each read from the
+        // disk owner's cache.
+        assert_eq!(pipeline.nzb_admitted.len(), SLOTS as usize + 1);
+        activations_heard(&mut pipeline).await;
+        assert_eq!(disk_looks(), looks);
+        assert_eq!(
+            disk.on_actor.load(Ordering::Relaxed),
+            0,
+            "only the sampler's own thread probed"
+        );
+    }
 }

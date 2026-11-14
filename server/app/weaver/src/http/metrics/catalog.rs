@@ -103,7 +103,7 @@ metric_families! {
     SEGMENTS_RETRIED = ("weaver_pipeline_segments_retried_total", Counter, [],
         "Total segments retried.");
     SEGMENTS_FAILED_PERMANENT = ("weaver_pipeline_segments_failed_permanent_total", Counter, [],
-        "Total segments permanently failed.");
+        "Articles that downloaded but never decoded into place and were left to repair; articles no server had are in weaver_pipeline_articles_not_found_total.");
     PARKED_INFRASTRUCTURE_WORK = ("weaver_pipeline_parked_infrastructure_work", Gauge, [],
         "Segments parked while NNTP infrastructure is unavailable.");
     GENERATION_RECOVERY_REQUEUES = ("weaver_nntp_generation_recovery_requeues_total", Counter, [],
@@ -113,9 +113,9 @@ metric_families! {
 
     // ---- failures --------------------------------------------------------
     DOWNLOAD_FAILURES = ("weaver_pipeline_download_failures_total", Counter, ["kind"],
-        "Failed article download attempts by kind.");
+        "Failed article download attempts by kind, one per server asked; an article another server then delivers still counts here.");
     ARTICLES_NOT_FOUND = ("weaver_pipeline_articles_not_found_total", Counter, [],
-        "Total articles not found.");
+        "Articles booked missing: every server and every message id was tried and none had it. Per-server refusals are download_failures_total{kind=\"article_not_found\"}.");
     DECODE_ERRORS = ("weaver_pipeline_decode_errors_total", Counter, [],
         "Total decode errors.");
     CRC_ERRORS = ("weaver_pipeline_crc_errors_total", Counter, [],
@@ -123,9 +123,9 @@ metric_families! {
 
     // ---- queues and buffers ---------------------------------------------
     DOWNLOAD_QUEUE_DEPTH = ("weaver_pipeline_download_queue_depth", Gauge, [],
-        "Download queue depth.");
-    ACTIVE_DOWNLOADS = ("weaver_pipeline_active_downloads", Gauge, [],
-        "Active article downloads.");
+        "Articles still to fetch across every queued job, recovery articles and jobs outside the queue window included; not connections or jobs.");
+    ARTICLES_IN_FLIGHT = ("weaver_pipeline_articles_in_flight", Gauge, [],
+        "Articles the download lanes hold right now: sent or about to be sent to a server and not yet answered. Roughly busy connections times pipeline depth. Not the number of jobs or files downloading.");
     ACTIVE_DECODES = ("weaver_pipeline_active_decodes", Gauge, [],
         "Active decode tasks.");
     DECODE_PENDING = ("weaver_pipeline_decode_pending", Gauge, [],
@@ -137,7 +137,7 @@ metric_families! {
     COMMIT_PENDING = ("weaver_pipeline_commit_pending", Gauge, [],
         "Commit pending queue depth.");
     RECOVERY_QUEUE_DEPTH = ("weaver_pipeline_recovery_queue_depth", Gauge, [],
-        "Recovery queue depth.");
+        "Recovery articles still to fetch across the jobs in the queue window; part of weaver_pipeline_download_queue_depth.");
     WRITE_BUFFERED_BYTES = ("weaver_pipeline_write_buffered_bytes", Gauge, [],
         "Buffered write bytes.");
     WRITE_BUFFERED_SEGMENTS = ("weaver_pipeline_write_buffered_segments", Gauge, [],
@@ -524,7 +524,7 @@ metric_families! {
         ["server_id", "server", "outcome", "recovery"],
         "Article fetch attempts per server by outcome, split by whether the attempt came from the recovery (PAR2 top-up) queue. Every combination is emitted, so the series pre-exist at zero.");
     SERVER_ARTICLE_LATENCY = ("weaver_server_article_latency_seconds", Histogram,
-        ["server_id", "server"], "Per-server article fetch latency.");
+        ["server_id", "server"], "How long each article request took on its connection, per server, timed by the download lane itself: for a lone request from sending the command to the end of the answer, for a pipelined one from the lane turning to that answer to its end. A not-found answer is timed the same way. Time the pipeline spent before handing the article out is not in it.");
 
     // ---- job lifecycle --------------------------------------------------------------
     JOBS_SUBMITTED = ("weaver_jobs_submitted_total", Counter, ["origin", "category"],
@@ -588,6 +588,8 @@ metric_families! {
         "Frames the latest checkpoint pass copied into the database file.");
     DB_WAL_BYTES = ("weaver_db_wal_bytes", Gauge, [],
         "Size of the WAL file after the latest checkpoint pass; it shrinks only when journal_size_limit trims it.");
+    DB_STATEMENT_DURATION = ("weaver_db_statement_duration_seconds", Histogram, [],
+        "Run time of each SQL statement on a pool connection, reads and writes, as SQLite times it: millisecond resolution from the wall clock, so a statement under a millisecond counts as 0 or 0.001, a clock step can misplace one, and a streamed read includes the time its rows were consumed.");
 
     // ---- process ---------------------------------------------------------------------------
     // Standard process collector names, deliberately unprefixed so the usual

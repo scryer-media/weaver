@@ -14,11 +14,21 @@ impl Pipeline {
         let old_client = std::mem::replace(&mut self.nntp, new_client);
         self.shared_state
             .set_nntp_pool(Arc::clone(self.nntp.pool()));
-        // Server indices and retention windows may have changed:
-        // recompute retention and drop queued failure exclusions,
-        // whose indices refer to the old pool layout. Bumping the
-        // generation also invalidates the failure indices carried by
-        // in-flight delayed retries when they re-enter the queue.
+        // Server indices and retention windows may have changed. The
+        // servers each article was tried on are carried into the new
+        // layout by server identity (stable id, host, port and account),
+        // through one map built here: a server that left, or whose
+        // identity changed, drops out and is untried; a reordered or
+        // re-prioritised one keeps its tried bit under its new index.
+        // Queued work and the articles lanes hold are carried now, before
+        // any lease is restored; anything stamped with the old generation
+        // (delayed retries, stale results, decodes, probe batches) is
+        // carried through the same layouts when it comes back.
+        let remap = self.pool_layouts.activate(
+            (self.pool_generation, old_client.pool().server_identities()),
+            generation,
+            self.nntp.pool().server_identities(),
+        );
         self.pool_generation = generation;
         // Re-point the per-server metric counters at the new pool
         // layout. This is the only place the counter vector is
@@ -31,18 +41,19 @@ impl Pipeline {
         // the rebuild keeps what it had measured, matched by
         // stable id rather than by position.
         self.seed_download_lane_explorers();
-        let recovery_requeues = self.wake_all_infrastructure_retries();
-        self.reset_owned_download_lanes();
-        self.drop_held_download_refills();
-        self.clear_retention_exclude_cache();
         for active in self
             .jobs
             .values_mut()
             .filter_map(|state| state.articles.active_mut())
         {
-            active.download_queue.clear_exclude_servers();
-            active.recovery_queue.clear_exclude_servers();
+            active.download_queue.remap_servers(&remap);
+            active.recovery_queue.remap_servers(&remap);
         }
+        self.remap_lane_holdings(&remap);
+        let recovery_requeues = self.wake_all_infrastructure_retries();
+        self.reset_owned_download_lanes();
+        self.drop_held_download_refills();
+        self.clear_retention_exclude_cache();
         self.metrics
             .nntp_generation_recovery_requeues
             .fetch_add(recovery_requeues as u64, Ordering::Relaxed);
@@ -93,7 +104,7 @@ impl Pipeline {
             return true;
         }
         if self
-            .active_downloads_by_job
+            .articles_in_flight_by_job
             .get(&job_id)
             .is_some_and(|n| *n > 0)
             || self
@@ -478,6 +489,7 @@ impl Pipeline {
         }
         // Ahead of the archive, which copies them from the active row: a job
         // write that the batch's archive, queued after it, waits out.
+        self.persist_download_summary_before_archive(job_id);
         self.persist_support_facts_before_archive(job_id);
         let state = self
             .jobs
@@ -520,6 +532,7 @@ impl Pipeline {
             // before the cancel: the servers did the work, and the
             // row is the only place left to say so.
             server_attribution: state.server_attribution.to_storage_json(),
+            archived_at: None,
         };
         Ok((
             row,
@@ -581,6 +594,7 @@ impl Pipeline {
                 serde_json::to_string(&info.metadata).ok()
             },
             server_attribution: None,
+            archived_at: None,
         };
         Ok((
             row,

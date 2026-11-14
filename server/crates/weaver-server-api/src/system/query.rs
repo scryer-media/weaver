@@ -13,6 +13,7 @@ use crate::system::types::{
 use std::path::PathBuf;
 use std::sync::Arc;
 use weaver_nntp::pool::NntpPool;
+use weaver_server_core::operations::{OnDemandSpace, Reach, StorageCapacity};
 
 #[derive(Default)]
 pub(crate) struct SystemQuery;
@@ -49,14 +50,12 @@ impl SystemQuery {
             configured_storage_inputs(cfg)
         })
         .await;
-        let configured_storage = tokio::task::spawn_blocking(move || {
-            storage_inputs
-                .into_iter()
-                .map(probe_configured_storage)
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        // Each folder is answered by the disk owner: a current reading, or a
+        // look of its own, all looked at together.
+        let storage = ctx
+            .data::<weaver_server_core::SharedPipelineState>()?
+            .storage_capacity();
+        let configured_storage = configured_storage(storage.as_deref(), storage_inputs).await;
 
         let environment = weaver_server_core::runtime::environment::detect_runtime_environment();
         let profile = runtime
@@ -250,36 +249,17 @@ impl SystemQuery {
     /// A folder that does not exist yet reports the disk it would be created
     /// on. The answer is best effort: a network mount that does not answer
     /// within a few seconds reports an error instead of holding the request.
+    // The disk owner answers: its cached reading when current, else one
+    // look of its own at the folder or the nearest folder above it.
     #[graphql(guard = "AdminGuard")]
-    async fn path_storage(&self, path: String) -> ConfiguredStorage {
+    async fn path_storage(&self, ctx: &Context<'_>, path: String) -> ConfiguredStorage {
         let requested = PathBuf::from(path.trim());
         let label = requested.display().to_string();
-        let probe = tokio::task::spawn_blocking(move || {
-            probe_configured_storage(ConfiguredStorageInput {
-                labels: Vec::new(),
-                path: nearest_existing_ancestor(&requested),
-                error: None,
-            })
-        });
-        let result = match tokio::time::timeout(PATH_STORAGE_TIMEOUT, probe).await {
-            Ok(Ok(storage)) => storage,
-            Ok(Err(error)) => ConfiguredStorage {
-                labels: Vec::new(),
-                path: label.clone(),
-                capacity: None,
-                error: Some(error.to_string()),
-            },
-            Err(_) => ConfiguredStorage {
-                labels: Vec::new(),
-                path: label.clone(),
-                capacity: None,
-                error: Some("Filesystem capacity did not answer in time.".to_string()),
-            },
-        };
-        ConfiguredStorage {
-            path: label,
-            ..result
-        }
+        let storage = ctx
+            .data_opt::<weaver_server_core::SharedPipelineState>()
+            .and_then(|state| state.storage_capacity());
+        let space = StorageCapacity::path_space(storage.as_deref(), requested).await;
+        storage_row(Vec::new(), label, space)
     }
     /// Return recent log records from the in-memory ring buffer.
     #[graphql(guard = "AdminGuard")]
@@ -339,8 +319,11 @@ impl SystemQuery {
         // Open sockets only mean "preparing" while a job is waiting to fetch
         // through them; the pool's keep-alive after a finished download, or a
         // paused queue, holds the same sockets open with nothing to prepare.
+        // Only `activity` reads it, and only to tell "preparing" from "idle",
+        // so a query that does not select `activity` does not look.
         let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
-        let work_waiting = !handle.is_globally_paused()
+        let work_waiting = ctx.look_ahead().field("activity").exists()
+            && !handle.is_globally_paused()
             && state.read_queue(|inner| {
                 inner.jobs.iter().any(|row| {
                     matches!(
@@ -374,31 +357,10 @@ impl SystemQuery {
             ]
         })
         .await;
-
-        let usage = tokio::task::spawn_blocking(move || {
-            dirs.into_iter()
-                .filter_map(|(label, path)| -> Option<DiskUsage> {
-                    let space = weaver_server_core::operations::probe_disk_space(
-                        std::path::Path::new(&path),
-                    )
-                    .map_err(|error| {
-                        tracing::debug!(%label, %path, %error, "disk usage row omitted");
-                    })
-                    .ok()?;
-                    Some(DiskUsage {
-                        label,
-                        total_bytes: space.total_bytes,
-                        used_bytes: space.used_bytes(),
-                        free_bytes: space.available_bytes,
-                        path,
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
-
-        Ok(usage)
+        let storage = ctx
+            .data::<weaver_server_core::SharedPipelineState>()?
+            .storage_capacity();
+        Ok(disk_usage_rows(storage.as_deref(), dirs).await)
     }
 }
 
@@ -466,47 +428,99 @@ fn push_storage_input(
     }
 }
 
-const PATH_STORAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
-// The folder itself when it exists, otherwise the deepest parent that does.
-fn nearest_existing_ancestor(path: &std::path::Path) -> PathBuf {
-    path.ancestors()
-        .find(|candidate| !candidate.as_os_str().is_empty() && candidate.exists())
-        .unwrap_or(path)
-        .to_path_buf()
+// One row per configured folder, each answered by the disk owner at the
+// folder itself: a folder not made yet reports why, as a look at it does.
+// The folders are looked at together, so the request waits one look's
+// limit at most.
+async fn configured_storage(
+    storage: Option<&StorageCapacity>,
+    inputs: Vec<ConfiguredStorageInput>,
+) -> Vec<ConfiguredStorage> {
+    let asks: Vec<(PathBuf, Reach)> = inputs
+        .iter()
+        .filter(|input| input.error.is_none())
+        .map(|input| (input.path.clone(), Reach::Exact))
+        .collect();
+    let mut spaces = StorageCapacity::spaces(storage, &asks).await.into_iter();
+    inputs
+        .into_iter()
+        .map(|input| {
+            let path = input.path.display().to_string();
+            match input.error {
+                Some(error) => ConfiguredStorage {
+                    labels: input.labels,
+                    path,
+                    capacity: None,
+                    error: Some(error),
+                },
+                None => storage_row(
+                    input.labels,
+                    path,
+                    spaces.next().expect("one answer per ask"),
+                ),
+            }
+        })
+        .collect()
 }
 
-fn probe_configured_storage(input: ConfiguredStorageInput) -> ConfiguredStorage {
-    let path = input.path.display().to_string();
-    if let Some(error) = input.error {
-        return ConfiguredStorage {
-            labels: input.labels,
-            path,
-            capacity: None,
-            error: Some(error),
-        };
+// A row from the disk owner's answer.
+fn storage_row(labels: Vec<String>, path: String, space: OnDemandSpace) -> ConfiguredStorage {
+    let (capacity, error) = match space {
+        OnDemandSpace::Read(space) => (Some(disk_capacity(space)), None),
+        OnDemandSpace::Failed(error) => (None, Some(unavailable(&error))),
+        OnDemandSpace::Lost(error) => (None, Some(error)),
+        OnDemandSpace::TimedOut => (None, Some(DID_NOT_ANSWER.to_string())),
+    };
+    ConfiguredStorage {
+        labels,
+        path,
+        capacity,
+        error,
     }
+}
 
-    match weaver_server_core::operations::probe_disk_space(&input.path) {
-        Ok(space) => ConfiguredStorage {
-            labels: input.labels,
-            path,
-            capacity: Some(DiskCapacity {
+const DID_NOT_ANSWER: &str = "Filesystem capacity did not answer in time.";
+
+fn disk_capacity(space: weaver_server_core::operations::DiskSpace) -> DiskCapacity {
+    DiskCapacity {
+        total_bytes: space.total_bytes,
+        used_bytes: space.used_bytes(),
+        free_bytes: space.available_bytes,
+    }
+}
+
+fn unavailable(error: &str) -> String {
+    format!("Filesystem capacity is unavailable for this path: {error}")
+}
+
+// `diskUsage` rows, each answered by the disk owner at the folder itself,
+// looked at together. A folder that cannot be read is left out, as a
+// failed look always left it out.
+async fn disk_usage_rows(
+    storage: Option<&StorageCapacity>,
+    dirs: Vec<(String, String)>,
+) -> Vec<DiskUsage> {
+    let asks: Vec<(PathBuf, Reach)> = dirs
+        .iter()
+        .map(|(_, path)| (PathBuf::from(path), Reach::Exact))
+        .collect();
+    let spaces = StorageCapacity::spaces(storage, &asks).await;
+    dirs.into_iter()
+        .zip(spaces)
+        .filter_map(|((label, path), space)| {
+            let OnDemandSpace::Read(space) = space else {
+                tracing::debug!(%label, %path, "disk usage row omitted: no reading");
+                return None;
+            };
+            Some(DiskUsage {
+                label,
                 total_bytes: space.total_bytes,
                 used_bytes: space.used_bytes(),
                 free_bytes: space.available_bytes,
-            }),
-            error: None,
-        },
-        Err(error) => ConfiguredStorage {
-            labels: input.labels,
-            path,
-            capacity: None,
-            error: Some(format!(
-                "Filesystem capacity is unavailable for this path: {error}"
-            )),
-        },
-    }
+                path,
+            })
+        })
+        .collect()
 }
 
 fn deployment_environment_gql(
@@ -632,8 +646,8 @@ pub(crate) fn server_socket_counts(pool: &NntpPool, idx: usize) -> (u32, u32) {
 
 // Snapshot per-server health from the live NNTP pool. Mirrors the per-server fields
 // emitted by the Prometheus exporter (`collect_server_health` in the app binary), shaped
-// for the GraphQL monitoring API. The connection pool orders servers by priority, so the
-// first entry is the primary and the rest are backups.
+// for the GraphQL monitoring API. Every fill server on the top priority level is a
+// primary, however many there are; every other server is a backup.
 async fn collect_server_health(
     pool: &NntpPool,
     runtime_generation: u64,
@@ -652,6 +666,7 @@ async fn collect_server_health(
     }
 
     let configs = pool.server_configs();
+    let tiers = server_tiers(pool.server_groups(), pool.server_backfill_flags());
     // Read connection load outside the health lock.
     let pre: Vec<ServerLoadSnapshot> = configs
         .iter()
@@ -664,7 +679,7 @@ async fn collect_server_health(
                 .unwrap_or(max_connections);
             let penalty_until = pool.over_limit_until_epoch_ms(weaver_nntp::ServerId(idx));
             let (open, busy) = server_socket_counts(pool, idx);
-            let tier = if idx == 0 { "PRIMARY" } else { "BACKUP" };
+            let tier = tiers[idx];
             ServerLoadSnapshot {
                 host: cfg.host.clone(),
                 port: cfg.port,
@@ -682,13 +697,19 @@ async fn collect_server_health(
     // sockets on a server that is not are only "preparing" when nothing else
     // is fetching either; behind a busy primary they are simply waiting.
     let pool_busy = pre.iter().any(|snapshot| snapshot.busy > 0);
+    // Each server's transport entry, the first listed as before, found once
+    // rather than searched for per server.
+    let mut transport_by_server = std::collections::HashMap::with_capacity(transport.len());
+    for entry in transport {
+        transport_by_server.entry(entry.server_idx).or_insert(entry);
+    }
 
     let health = pool.health().lock().await;
     pre.into_iter()
         .enumerate()
         .map(|(idx, snapshot)| {
             let srv = health.server(idx);
-            let body = transport.iter().find(|entry| entry.server_idx == idx);
+            let body = transport_by_server.get(&idx).copied();
             let state = match srv.state() {
                 weaver_nntp::ServerState::Healthy => "healthy",
                 weaver_nntp::ServerState::Degraded { .. } => "degraded",
@@ -738,6 +759,7 @@ async fn collect_server_health(
                 capacity_penalty_until_epoch_ms: snapshot.penalty_until,
                 runtime_generation,
                 latency_ms: health.latency_ms(idx),
+                measured_latency_ms: health.measured_latency_ms(idx),
                 body_latency_ms: body.and_then(|entry| entry.latency_ms),
                 body_transfer_ms: body.and_then(|entry| entry.transfer_ms),
                 body_latency_band: body.and_then(|entry| entry.latency_band.clone()),
@@ -751,6 +773,33 @@ async fn collect_server_health(
                 consecutive_failures: srv.consecutive_failures,
                 premature_deaths: health.recent_premature_deaths(idx) as u32,
                 pool_index: idx,
+                stable_server_id: pool
+                    .stable_server_id(weaver_nntp::ServerId(idx))
+                    .map(|stable_id| stable_id.0),
+            }
+        })
+        .collect()
+}
+
+// "PRIMARY" for every fill server on the top priority level (the lowest
+// priority number any fill server has), "BACKUP" for every other server:
+// lower levels and backfill servers. One pass for the level, one for the
+// labels, whatever the number of servers and levels.
+fn server_tiers(groups: &[u32], backfill: &[bool]) -> Vec<&'static str> {
+    let top = groups
+        .iter()
+        .zip(backfill)
+        .filter(|(_, backfill)| !**backfill)
+        .map(|(group, _)| *group)
+        .min();
+    groups
+        .iter()
+        .zip(backfill)
+        .map(|(group, backfill)| {
+            if !backfill && Some(*group) == top {
+                "PRIMARY"
+            } else {
+                "BACKUP"
             }
         })
         .collect()
@@ -762,5 +811,36 @@ fn absolutize_default_browse_path(path: String) -> std::io::Result<std::path::Pa
         Ok(path)
     } else {
         std::env::current_dir().map(|cwd| cwd.join(path))
+    }
+}
+
+#[cfg(test)]
+mod server_tier_tests {
+    use super::server_tiers;
+
+    // Thirteen servers over five levels, three of them on the top level and
+    // one a backfill server placed on it: all three fill servers are
+    // primaries, and nothing else is.
+    #[test]
+    fn every_fill_server_on_the_top_level_is_a_primary() {
+        let groups = [0, 0, 0, 0, 1, 1, 2, 2, 2, 3, 3, 4, 4];
+        let mut backfill = [false; 13];
+        backfill[3] = true;
+        backfill[12] = true;
+        let tiers = server_tiers(&groups, &backfill);
+        assert_eq!(tiers[..3], ["PRIMARY"; 3]);
+        assert!(tiers[3..].iter().all(|tier| *tier == "BACKUP"), "{tiers:?}");
+    }
+
+    // The top level is the lowest priority number in use, not zero, and a
+    // pool of backfill servers alone has no primary.
+    #[test]
+    fn the_top_level_is_the_lowest_number_a_fill_server_has() {
+        assert_eq!(
+            server_tiers(&[0, 5, 5, 9], &[true, false, false, false]),
+            ["BACKUP", "PRIMARY", "PRIMARY", "BACKUP"]
+        );
+        assert_eq!(server_tiers(&[0, 1], &[true, true]), ["BACKUP", "BACKUP"]);
+        assert!(server_tiers(&[], &[]).is_empty());
     }
 }
