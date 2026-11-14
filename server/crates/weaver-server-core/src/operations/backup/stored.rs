@@ -5,7 +5,7 @@ use super::manifest::{BACKUP_FORMAT_VERSION, io_err};
 use super::{BackupArtifact, BackupService, BackupServiceError};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -170,6 +170,7 @@ pub(super) fn list_backups(
         return Ok(Vec::new());
     }
     let mut backups = Vec::new();
+    let mut unreadable = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(io_err)? {
         let entry = match entry {
             Ok(entry) => entry,
@@ -191,7 +192,7 @@ pub(super) fn list_backups(
         let bytes = match std::fs::read(entry.path()) {
             Ok(bytes) => bytes,
             Err(error) => {
-                tracing::warn!(%error, %filename, "could not read backup metadata");
+                unreadable.push((entry.path(), error));
                 continue;
             }
         };
@@ -221,12 +222,45 @@ pub(super) fn list_backups(
         }
         backups.push(info);
     }
+    static WARNED: std::sync::Mutex<BTreeSet<PathBuf>> = std::sync::Mutex::new(BTreeSet::new());
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (path, error) in note_unreadable(&mut warned, dir, unreadable) {
+        // The backup's name, as this line has always carried it: a checked
+        // name with no folder in it.
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".metadata.json"))
+            .unwrap_or_default();
+        tracing::warn!(%error, %filename, "could not read backup metadata");
+    }
+    drop(warned);
     backups.sort_by(|a, b| {
         b.created_at
             .cmp(&a.created_at)
             .then_with(|| b.filename.cmp(&a.filename))
     });
     Ok(backups)
+}
+
+// The metadata files of `dir` a listing could not read, less those already
+// reported: an unreadable file is warned about once, not on every listing.
+// `warned` keeps, for `dir`, only the files this listing found unreadable, so
+// a file that reads again or is gone leaves it, and it never holds more than
+// the unreadable files of the directories listed.
+fn note_unreadable(
+    warned: &mut BTreeSet<PathBuf>,
+    dir: &Path,
+    unreadable: Vec<(PathBuf, std::io::Error)>,
+) -> Vec<(PathBuf, std::io::Error)> {
+    let failing: BTreeSet<&Path> = unreadable.iter().map(|(path, _)| path.as_path()).collect();
+    warned.retain(|path| path.parent() != Some(dir) || failing.contains(path.as_path()));
+    unreadable
+        .into_iter()
+        .filter(|(path, _)| warned.insert(path.clone()))
+        .collect()
 }
 
 pub(super) fn delete_artifact(dir: &Path, info: &BackupInfo) -> Result<(), BackupServiceError> {
@@ -789,6 +823,69 @@ mod tests {
         .unwrap();
         assert_eq!(saved.status, BackupArtifactStatus::Failed);
         assert!(saved.error.is_some());
+    }
+
+    #[test]
+    fn an_unreadable_backup_file_is_reported_once_and_forgotten_once_it_reads() {
+        let dir = Path::new("/backups");
+        let other = Path::new("/elsewhere");
+        let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let first = dir.join("weaver_backup_a.enc.metadata.json");
+        let second = dir.join("weaver_backup_b.enc.metadata.json");
+        let elsewhere = other.join("weaver_backup_c.enc.metadata.json");
+        let paths = |reported: Vec<(PathBuf, std::io::Error)>| {
+            reported
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect::<Vec<_>>()
+        };
+        let mut warned = BTreeSet::new();
+
+        assert_eq!(
+            paths(note_unreadable(
+                &mut warned,
+                other,
+                vec![(elsewhere.clone(), denied())]
+            )),
+            vec![elsewhere.clone()]
+        );
+        assert_eq!(
+            paths(note_unreadable(
+                &mut warned,
+                dir,
+                vec![(first.clone(), denied())]
+            )),
+            vec![first.clone()]
+        );
+        for _ in 0..5 {
+            assert!(
+                note_unreadable(&mut warned, dir, vec![(first.clone(), denied())]).is_empty(),
+                "a file already reported stays quiet"
+            );
+        }
+        assert_eq!(
+            paths(note_unreadable(
+                &mut warned,
+                dir,
+                vec![(first.clone(), denied()), (second.clone(), denied())]
+            )),
+            vec![second.clone()],
+            "only the newly unreadable file is reported"
+        );
+
+        // Both read again: the directory's entries leave the set, the other
+        // directory's stay.
+        assert!(note_unreadable(&mut warned, dir, Vec::new()).is_empty());
+        assert_eq!(warned, BTreeSet::from([elsewhere]));
+        assert_eq!(
+            paths(note_unreadable(
+                &mut warned,
+                dir,
+                vec![(first.clone(), denied())]
+            )),
+            vec![first],
+            "a file that read in between is reported again when it fails again"
+        );
     }
 
     #[test]
