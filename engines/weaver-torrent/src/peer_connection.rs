@@ -1062,6 +1062,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         };
         let stats = self.spawner.stats().clone();
         let stats = &*stats;
+        // The handshake, and the extended handshake after it, went out
+        // before the transport was known here: one buffer each.
+        stats.sent(transport);
+        if supports_extended {
+            stats.sent(transport);
+        }
         let read_key = crate::off_shard::reader_key();
 
         let writer = async move {
@@ -1080,6 +1086,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     rwtimeout,
                 )
                 .await?;
+                stats.sent(transport);
                 self.handler.on_protocol_bytes(Channel::Upload, len as u64);
                 trace!("sent bitfield");
             }
@@ -1793,6 +1800,8 @@ mod tests {
     async fn every_byte_that_crosses_is_paid_for_once() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let ledger = Ledger::default();
+        let spawner = BlockingSpawner::new(1);
+        let stats = spawner.stats().clone();
         let (connection, _dialed) = connection(EncryptionPolicy::Disabled).await;
         let connection = PeerConnection::new(
             connection.addr,
@@ -1800,7 +1809,7 @@ mod tests {
             connection.peer_id,
             &ledger,
             Some(connection.options),
-            BlockingSpawner::new(1),
+            spawner,
             connection.connector,
         );
         let (ours, mut theirs) = tokio::io::duplex(1 << 16);
@@ -1858,6 +1867,17 @@ mod tests {
         assert!(meter.sent() > 68 + 9);
         assert_eq!(load(&ledger.paid[1]), meter.sent());
         assert_eq!(load(&ledger.protocol[1]), meter.sent());
+        // Each buffer written whole is one send: the handshake, the
+        // extended handshake and the have.
+        let sockets = stats.snapshot().sockets;
+        assert_eq!(
+            sockets[crate::session_stats::disk::Transport::Tcp.index()].send_calls,
+            3
+        );
+        assert_eq!(
+            sockets[crate::session_stats::disk::Transport::Utp.index()].send_calls,
+            0
+        );
     }
 
     /// Advertises every extension of ours but ut_pex, and keeps the
