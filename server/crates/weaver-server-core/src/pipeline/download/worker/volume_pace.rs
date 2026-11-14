@@ -1321,7 +1321,7 @@ mod tests {
                     // Each gauge swings x to 4x, and the base moves for good
                     // every 300 ticks.
                     let base = [NVME, SATA, HDD, SATA, HDD][i] >> ((tick / 300 + i as u32) % 3);
-                    let live = if (tick + i as u32) % 2 == 0 {
+                    let live = if (tick + i as u32).is_multiple_of(2) {
                         base
                     } else {
                         4 * base
