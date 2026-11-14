@@ -457,3 +457,49 @@ async fn test_seed_mode_checks_at_once_are_bounded_by_the_blocking_permits() -> 
     assert!(seed.seed_mode(), "two pieces are not yet checked");
     Ok(())
 }
+
+// A check of a seed-mode piece that no peer's request runs, as the one a
+// server makes of a torrent it placed, holds a blocking permit too: with
+// the session's permits all held, the piece is claimed and not read until
+// one is free.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_seed_mode_check_off_the_runtime_waits_for_a_blocking_permit() -> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new(
+        "test_seed_mode_permit",
+        PIECES * PIECE_LENGTH as usize,
+        PIECE_LENGTH,
+    )
+    .await?;
+    let dir = TempDir::with_prefix("test_seed_mode_permit_out")?;
+    let (_session, seed, gate, mut reaches) = seeding_gated(&t, &dir, 1).await?;
+    let live = seed.live().context("the seed is not live")?;
+    let piece = piece_of(5)?;
+    let held = live.shared.spawner.semaphore().acquire_owned().await?;
+
+    let checked = tokio::task::spawn_blocking({
+        let seed = seed.clone();
+        move || seed.check_seeded(piece.get())
+    });
+    while !seed.shared().options.seed.claimed(piece) {
+        tokio::task::yield_now().await;
+    }
+    // A peer asking for the piece now waits on that check, which has no
+    // permit to read with.
+    let asked = tokio::spawn({
+        let live = live.clone();
+        async move { live.serve_seeded(piece).await }
+    });
+    while seed.shared().options.seed.waiting(piece) < 1 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(gate.counts(), (0, 0, 0), "nothing is read without a permit");
+
+    drop(held);
+    reaches.recv().await.context("no read came")?;
+    gate.open();
+    assert!(checked.await?.context("the torrent is not running")??);
+    assert!(asked.await??);
+    assert_eq!(gate.counts(), (1, 0, 1));
+    Ok(())
+}

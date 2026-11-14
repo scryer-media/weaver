@@ -1302,7 +1302,13 @@ impl ManagedTorrent {
                 &*paused.files,
                 self.shared.options.disable_v1_hashes,
             );
-            if matches!(ops.check_piece(piece), Ok(crate::file_ops::Verdict::Passed)) {
+            // One of the session's blocking permits for the read, as a
+            // running torrent's check of the piece holds.
+            let _permit = seed_mode::blocking_permit(&self.shared.spawner);
+            if matches!(
+                ops.check_piece_whole(piece),
+                Ok(crate::file_ops::Verdict::Passed)
+            ) {
                 let checked = paused.files.on_piece_checked(piece);
                 seed.checked(piece);
                 return Some(checked.map(|()| true));

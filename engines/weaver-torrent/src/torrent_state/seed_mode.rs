@@ -77,6 +77,17 @@ impl Drop for Checking {
     }
 }
 
+// One of the session's blocking permits, waited for on the calling thread:
+// for a check of a seed-mode piece that no peer's request runs, which is
+// called off the async runtime. The checks of seed-mode pieces that read
+// at once, whoever asked for them, are as many as the session has permits.
+// None once the session's permits are closed.
+pub(crate) fn blocking_permit(
+    spawner: &crate::spawn_utils::BlockingSpawner,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    futures::executor::block_on(spawner.semaphore().acquire_owned()).ok()
+}
+
 impl SeedMode {
     // Seed mode over `pieces` pieces, those `verified` sets already checked
     // (libtorrent's `verified_pieces` in resume data, restored on a seed-mode
@@ -141,6 +152,12 @@ impl SeedMode {
                 })
             }
         }
+    }
+
+    // Whether a check of `piece` is claimed.
+    #[cfg(test)]
+    pub(crate) fn claimed(&self, piece: ValidPieceIndex) -> bool {
+        self.checking.lock().contains_key(&piece.get())
     }
 
     // How many wait on the check of `piece` that runs.

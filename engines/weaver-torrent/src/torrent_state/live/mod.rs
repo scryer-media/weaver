@@ -1424,7 +1424,8 @@ impl TorrentStateLive {
     // A piece is checked once however many ask for it meanwhile: the first
     // to ask checks it and the rest wait for what that check finds
     // (libtorrent skips a request whose piece is `verifying_piece`,
-    // peer_connection.cpp:5316, v2.0.15). The wait here blocks its thread.
+    // peer_connection.cpp:5316, v2.0.15). The wait here blocks its thread,
+    // for a permit as for another's check: called off the async runtime.
     pub(crate) fn check_seeded(&self, piece: ValidPieceIndex) -> anyhow::Result<bool> {
         use crate::torrent_state::seed_mode::Claim;
         let seed = &self.shared.options.seed;
@@ -1433,7 +1434,13 @@ impl TorrentStateLive {
                 return Ok(true);
             }
             match seed.claim(piece) {
-                Claim::Check(checking) => return self.check_claimed(piece, checking),
+                Claim::Check(checking) => {
+                    // The check holds one of the session's blocking
+                    // permits, as a peer's does, and only while it runs.
+                    let _permit =
+                        crate::torrent_state::seed_mode::blocking_permit(&self.shared.spawner);
+                    return self.check_claimed(piece, checking);
+                }
                 Claim::Wait(mut found) => {
                     crate::session_stats::check::CHECK_STATS.seed_checks_joined(1);
                     // A check that ended in an error told nothing: the

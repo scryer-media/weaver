@@ -328,7 +328,7 @@ impl TorrentStateInitializing {
                     })
                     .enumerate()
                 {
-                    if fo.check_piece(piece_id).is_err() {
+                    if fo.check_piece_whole(piece_id).is_err() {
                         return true;
                     }
 
@@ -388,7 +388,7 @@ impl TorrentStateInitializing {
                 );
                 finished
                     .iter()
-                    .map(|piece| (*piece, fo.check_piece(*piece)))
+                    .map(|piece| (*piece, fo.check_piece_whole(*piece)))
                     .collect::<Vec<_>>()
             })
             .await;

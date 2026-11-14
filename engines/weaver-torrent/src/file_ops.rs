@@ -2279,4 +2279,38 @@ mod tests {
         assert!(ops.check_piece(piece).is_err());
         assert!(ops.check_piece_whole(piece).is_err());
     }
+
+    /// A piece of a v2 or a hybrid torrent read whole gets the verdict it
+    /// gets read a part at a time, whole or damaged, with and without its
+    /// v1 hashes: the checks of a resumed torrent's pieces read them whole.
+    #[test]
+    fn a_v2_or_hybrid_piece_checked_whole_gets_the_verdict_it_got_in_parts() {
+        for torrent in [checking_torrent(), two_files()] {
+            let metadata = metadata(&torrent.torrent_bytes());
+            let whole = torrent.v1_payload();
+            let mut damaged = whole.clone();
+            let middle = damaged.len() / 2;
+            damaged[middle] ^= 1;
+            // A read that fails is an error either way; its callers do
+            // not tell one error from another.
+            let verdict = |v: anyhow::Result<Verdict>| v.ok();
+            for payload in [&whole, &damaged] {
+                for disable_v1_hashes in [true, false] {
+                    let mut files = Files::new(&metadata, payload);
+                    let longest = files.0.iter_mut().max_by_key(|f| f.len()).unwrap();
+                    longest.truncate(longest.len() - 1);
+                    let ops = FileOps::new(&metadata, &files, disable_v1_hashes);
+                    let mut verdicts = Vec::new();
+                    for piece in metadata.lengths().iter_piece_infos() {
+                        let piece = piece.piece_index;
+                        let parts = verdict(ops.check_piece(piece));
+                        assert_eq!(verdict(ops.check_piece_whole(piece)), parts, "{piece}");
+                        verdicts.push(parts);
+                    }
+                    assert!(verdicts.contains(&None), "no piece failed to read");
+                    assert!(verdicts.contains(&Some(Verdict::Passed)));
+                }
+            }
+        }
+    }
 }
