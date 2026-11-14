@@ -375,24 +375,27 @@ impl ReadAhead {
     }
 
     // A buffer of `len` bytes to read into: one the check is done with,
-    // or a new one. A buffer for a hasher is waited for while the check
-    // holds all it may; the one the reader hashes from is not.
+    // or a new one. A spare buffer too short for `len` is let go, not
+    // grown, so a new buffer is always asked room for. A buffer for a
+    // hasher is waited for while the check holds all it may; the one the
+    // reader hashes from is not.
     fn buffer(&self, len: usize, for_hasher: bool) -> Vec<u8> {
         let mut line = self.line.lock();
         let mut bytes = loop {
             if let Some(bytes) = line.spare.pop() {
-                break bytes;
+                if bytes.capacity() >= len {
+                    break bytes;
+                }
+                line.held -= bytes.capacity();
+                continue;
             }
             if !for_hasher || self.has_room(&line, len) {
-                break Vec::new();
+                let bytes = Vec::with_capacity(len);
+                line.hold(bytes.capacity());
+                break bytes;
             }
             self.room.wait(&mut line);
         };
-        let had = bytes.capacity();
-        if had < len {
-            bytes.reserve_exact(len - bytes.len());
-            line.hold(bytes.capacity() - had);
-        }
         drop(line);
         bytes.resize(len, 0);
         bytes
@@ -3321,6 +3324,300 @@ mod tests {
                         .collect();
                     assert_eq!(had, want, "at {at_byte} threads {threads}");
                 }
+            }
+        }
+
+        /// Adversary proofs, review 2 of the check reader (commits
+        /// 0b5dd1957 and 67a459e30).
+        mod review2 {
+            use super::*;
+
+            fn sliced(
+                metadata: &TorrentMetadata,
+                payload: &[u8],
+                damage: &dyn Fn(&mut Files),
+                memory: CheckMemory,
+                threads: usize,
+                wants: bool,
+            ) -> (Left, usize) {
+                let mut files = Files::new(metadata, payload);
+                damage(&mut files);
+                let mut storage = Recording::new(files);
+                storage.wants = wants;
+                let progress = AtomicU64::new(0);
+                let (outcome, most) = FileOps::new(metadata, &storage, true).check_within(
+                    memory,
+                    threads,
+                    &progress,
+                    &AtomicBool::new(false),
+                    None,
+                );
+                let CheckOutcome::Done(have) = outcome.unwrap() else {
+                    panic!("paused");
+                };
+                (left(metadata, &storage.files, have, &progress), most)
+            }
+
+            /// Pieces a little longer than a slice: each read is a full
+            /// slice and a short one. A spare buffer of a short slice is
+            /// grown to a full one without asking for room.
+            #[test]
+            fn adversary2_pieces_just_past_a_slice_stay_within_the_stated_memory() {
+                const PIECE: usize = 1024;
+                let (metadata, payload) = v1_torrent(&[("a", 300 * PIECE)], PIECE);
+                let mut seen = Vec::new();
+                for slice in [600, 768, 1000] {
+                    let memory = CheckMemory {
+                        slice,
+                        ahead: 3 * PIECE,
+                    };
+                    for threads in [2, 3, 4, 9] {
+                        let (l, most) =
+                            sliced(&metadata, &payload, &|_| {}, memory, threads, false);
+                        assert!(l.0.iter().all(|h| *h));
+                        seen.push((slice, threads, most, memory.ahead + slice));
+                    }
+                }
+                println!("ADV2 most held (slice, threads, most, stated bound): {seen:?}");
+                assert!(
+                    seen.iter().all(|(_, _, most, bound)| most <= bound),
+                    "{seen:?}"
+                );
+            }
+
+            /// Wanted pieces larger than the whole read-ahead, mixed with
+            /// unwanted ones of the same size: no hang, the verdicts of the
+            /// old check, and the bytes held.
+            #[test]
+            fn adversary2_wanted_pieces_larger_than_the_memory_mixed_with_others() {
+                const PIECE: usize = 16384;
+                let (metadata, payload) = v1_torrent(&[("a", 20 * PIECE)], PIECE);
+                let memory = CheckMemory {
+                    slice: 1024,
+                    ahead: 4096,
+                };
+                let mut damaged = payload.clone();
+                damaged[4 * PIECE + 3] ^= 1;
+                damaged[10 * PIECE + 3] ^= 1;
+                let mut seen = Vec::new();
+                for payload in [&payload, &damaged] {
+                    let want = reference(&metadata, payload, &|_: &mut Files| {}, 1);
+                    for threads in [1, 2, 4, 9] {
+                        let mut storage = Recording::new(Files::new(&metadata, payload));
+                        storage.wants_in = Some((3..6, u32::try_from(PIECE).unwrap()));
+                        let progress = AtomicU64::new(0);
+                        let (outcome, most) = FileOps::new(&metadata, &storage, true).check_within(
+                            memory,
+                            threads,
+                            &progress,
+                            &AtomicBool::new(false),
+                            None,
+                        );
+                        let CheckOutcome::Done(have) = outcome.unwrap() else {
+                            panic!("paused");
+                        };
+                        assert_eq!(
+                            left(&metadata, &storage.files, have, &progress),
+                            want,
+                            "threads {threads}"
+                        );
+                        seen.push((threads, most));
+                        assert!(most <= PIECE + memory.ahead + memory.slice, "{most}");
+                    }
+                }
+                println!("ADV2 wanted 16 KiB pieces, 4 KiB ahead: (threads, most) {seen:?}");
+            }
+
+            /// Every damage of every file, slices and read-aheads smaller
+            /// than, equal to and larger than a piece, read-ahead below one
+            /// slice, the storage wanting none or all: the old check's
+            /// verdicts, and no hang.
+            #[test]
+            fn adversary2_every_damage_over_odd_memories_gets_the_old_verdicts() {
+                let (metadata, payload) =
+                    v1_torrent(&[("a", 100), ("b", 9 * 16384 + 5), ("c", 30_000)], 16384);
+                let whole: Damage = ("whole".into(), Box::new(|_: &mut Files| {}));
+                let damages = every_file_damage(&metadata, |_| true);
+                let memories = [
+                    CheckMemory {
+                        slice: 1000,
+                        ahead: 500,
+                    },
+                    CheckMemory {
+                        slice: 1000,
+                        ahead: 1000,
+                    },
+                    CheckMemory {
+                        slice: 5000,
+                        ahead: 15_000,
+                    },
+                    CheckMemory {
+                        slice: 4096,
+                        ahead: 16384,
+                    },
+                    CheckMemory {
+                        slice: 32768,
+                        ahead: 16384,
+                    },
+                    CHECK_MEMORY,
+                ];
+                let mut runs = 0;
+                for (name, damage) in std::iter::once(&whole).chain(&damages) {
+                    let want = reference(&metadata, &payload, damage, 1);
+                    for memory in memories {
+                        for threads in [1, 2, 3, 5, 9] {
+                            for wants in [false, true] {
+                                let (got, most) =
+                                    sliced(&metadata, &payload, damage, memory, threads, wants);
+                                assert_eq!(
+                                    got, want,
+                                    "{name} slice {} ahead {} threads {threads} wants {wants}",
+                                    memory.slice, memory.ahead
+                                );
+                                if !wants {
+                                    assert!(
+                                        most <= memory.ahead.max(memory.slice) + memory.slice,
+                                        "{name} {most} slice {} ahead {}",
+                                        memory.slice,
+                                        memory.ahead
+                                    );
+                                }
+                                runs += 1;
+                            }
+                        }
+                    }
+                }
+                println!("ADV2 odd memories: {runs} checks");
+            }
+
+            /// A pause raised while the second slice of a piece is read
+            /// stops the check after that piece, on any number of threads,
+            /// and the check goes on from there to the end an unpaused one
+            /// reaches, with a damaged piece before and after the pause.
+            #[test]
+            fn adversary2_a_pause_mid_slice_resumes_to_the_same_end() {
+                const PIECE: usize = 16384;
+                let (metadata, mut payload) = v1_torrent(&[("a", 20 * PIECE)], PIECE);
+                payload[2 * PIECE + 1] ^= 1;
+                payload[15 * PIECE + 1] ^= 1;
+                let memory = CheckMemory {
+                    slice: 5000,
+                    ahead: 15_000,
+                };
+                let want = reference(&metadata, &payload, &|_: &mut Files| {}, 1).0;
+                for threads in [1, 2, 4] {
+                    let pause = std::sync::Arc::new(AtomicBool::new(false));
+                    let mut storage = Recording::new(Files::new(&metadata, &payload));
+                    storage.pause_at = Some((0, (7 * PIECE + 6000) as u64, pause.clone()));
+                    let ops = FileOps::new(&metadata, &storage, true);
+                    let progress = AtomicU64::new(0);
+                    let (outcome, _) = ops.check_within(memory, threads, &progress, &pause, None);
+                    let CheckOutcome::Paused(at) = outcome.unwrap() else {
+                        panic!("not paused on {threads}");
+                    };
+                    assert_eq!(at.next, 8, "threads {threads}");
+                    let (outcome, _) = ops.check_within(
+                        memory,
+                        threads,
+                        &progress,
+                        &AtomicBool::new(false),
+                        Some(at),
+                    );
+                    let CheckOutcome::Done(have) = outcome.unwrap() else {
+                        panic!("paused again");
+                    };
+                    let had: Vec<bool> = have.iter().by_vals().take(20).collect();
+                    assert_eq!(had, want, "threads {threads}");
+                }
+            }
+
+            /// A pure v2 piece whose file's piece layer is not held reads
+            /// whole and good, and the single-piece check calls it Unknown:
+            /// validate_fastresume (initializing.rs) now takes only Passed,
+            /// so resume data naming it sends the torrent to a full check,
+            /// which then marks the piece needed (`had` maps Unknown to
+            /// false). Before 67a459e30 the same resume data was kept.
+            #[test]
+            fn adversary2_a_good_v2_piece_without_its_layer_is_not_passed_by_the_spot_check() {
+                let mut t = two_files();
+                t.layers = false;
+                let metadata = metadata(&t.torrent_bytes());
+                let payload = t.v1_payload();
+                let files = Files::new(&metadata, &payload);
+                let ops = FileOps::new(&metadata, &files, false);
+                let piece = metadata.lengths().validate_piece_index(1).unwrap();
+                let verdict = ops.check_piece_whole(piece).unwrap();
+                assert_eq!(verdict, Verdict::Unknown);
+                assert!(
+                    ops.check_piece_whole(piece).is_ok(),
+                    "the old test passed it"
+                );
+                assert!(!matches!(ops.check_piece_whole(piece), Ok(Verdict::Passed)));
+            }
+
+            /// The same growth, step by step and with no thread: two spare
+            /// buffers of a short slice are grown to full slices while the
+            /// check already holds all it may.
+            #[test]
+            fn adversary2_a_short_spare_is_grown_past_the_memory() {
+                let ahead = ReadAhead {
+                    line: Mutex::default(),
+                    read: Condvar::new(),
+                    room: Condvar::new(),
+                    idle: AtomicUsize::new(0),
+                    most: 2,
+                    memory: CheckMemory {
+                        slice: 1000,
+                        ahead: 3000,
+                    },
+                    failed: AtomicBool::new(false),
+                };
+                let short_a = ahead.buffer(24, true);
+                let short_b = ahead.buffer(24, true);
+                let _full_a = ahead.buffer(1000, true);
+                let _full_b = ahead.buffer(1000, true);
+                let _rest = ahead.buffer(952, true);
+                assert_eq!(ahead.line.lock().held, 3000);
+                ahead.done_with(short_a);
+                ahead.done_with(short_b);
+                // The short spares are let go, not grown: the reader's
+                // own buffer is the one slice past `ahead`. A buffer for
+                // a hasher would wait here for room.
+                let _own = ahead.buffer(1000, false);
+                let line = ahead.line.lock();
+                assert!(line.spare.is_empty());
+                assert_eq!(line.held, 2952 + 1000);
+            }
+
+            /// The default memory scaled down 256 times (a slice of 1 KiB,
+            /// 64 slices ahead), over pieces of one and a half slices, as a
+            /// v1 torrent of 384 KiB pieces reads at the default: how far
+            /// past `ahead` plus one slice the check goes.
+            #[test]
+            fn adversary2_pieces_of_a_slice_and_a_half_at_the_default_ratio() {
+                const PIECE: usize = 1536;
+                let (metadata, payload) = v1_torrent(&[("a", 2000 * PIECE)], PIECE);
+                let memory = CheckMemory {
+                    slice: 1024,
+                    ahead: 64 * 1024,
+                };
+                let mut seen = Vec::new();
+                for threads in [4, 9, 16] {
+                    for _ in 0..3 {
+                        let (l, most) =
+                            sliced(&metadata, &payload, &|_| {}, memory, threads, false);
+                        assert!(l.0.iter().all(|h| *h));
+                        seen.push((threads, most));
+                    }
+                }
+                println!(
+                    "ADV2 slice and a half (threads, most), stated bound {}: {seen:?}",
+                    memory.ahead + memory.slice
+                );
+                assert!(
+                    seen.iter()
+                        .all(|(_, most)| *most <= memory.ahead + memory.slice)
+                );
             }
         }
     }
