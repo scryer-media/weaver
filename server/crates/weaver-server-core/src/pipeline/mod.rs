@@ -856,6 +856,8 @@ pub(super) enum MoveToCompleteFailure {
         message: String,
         needs: u64,
         again: Vec<PathBuf>,
+        // An entry was refused by a quota, not by the disk.
+        quota: bool,
     },
 }
 

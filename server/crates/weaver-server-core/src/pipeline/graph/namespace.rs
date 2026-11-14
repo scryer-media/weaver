@@ -281,6 +281,9 @@ pub(crate) struct NamespaceWriter {
     // What a repair or a staging that failed gave back to the disk as it
     // failed, until the job asks: the room it needs to run again.
     gave_back: Option<u64>,
+    // What was left to write of the member whose write found no room, by
+    // its declared length, until the job asks.
+    left_to_write: Option<u64>,
     // The budgets each member has spilled past, said once each.
     spills_said: BTreeSet<(NodeId, MemberId, Budget)>,
     // The members whose file the file system refused to create for its
@@ -394,6 +397,7 @@ impl NamespaceWriter {
             given_back: Vec::new(),
             given_up: BTreeSet::new(),
             gave_back: None,
+            left_to_write: None,
             spills_said: BTreeSet::new(),
             unnamable: BTreeSet::new(),
             unnamed_damage: Vec::new(),
@@ -509,6 +513,11 @@ impl NamespaceWriter {
     // repair's or a staging's, which remove their output as they fail.
     pub(crate) fn take_gave_back(&mut self) -> Option<u64> {
         self.gave_back.take()
+    }
+
+    // What was left to write of the member whose write just found no room.
+    pub(crate) fn take_left_to_write(&mut self) -> Option<u64> {
+        self.left_to_write.take()
     }
 
     // A decode window of `needs` bytes, the free space its disk keeps
@@ -2434,9 +2443,24 @@ impl NamespaceWriter {
             let algorithm = bytes.evidence().first()?.digest.algorithm;
             bytes.proven(algorithm).then_some(algorithm)
         };
-        match record.check().or_else(proven) {
-            Some(algorithm) => leaf.write_folding(offset, bytes, algorithm, record.length)?,
-            None => leaf.write(offset, bytes, record.length)?,
+        let wrote = match record.check().or_else(proven) {
+            Some(algorithm) => leaf.write_folding(offset, bytes, algorithm, record.length),
+            None => leaf.write(offset, bytes, record.length),
+        };
+        if let Err(error) = wrote {
+            // A write the disk had no room for: the job waits for the room
+            // of what the member still has to take, by its declared length
+            // and what the leaf holds of it, and never for less than the
+            // write that was refused.
+            if let (LeafError::Io { source, .. }, Some(length)) = (&error, record.length)
+                && crate::operations::is_out_of_space(source)
+            {
+                let left = length
+                    .saturating_sub(leaf.written_bytes())
+                    .max(bytes.len() as u64);
+                self.left_to_write = Some(left);
+            }
+            return Err(error.into());
         }
         let took = started.elapsed();
         // Every byte to its length is in: the file takes that length, or

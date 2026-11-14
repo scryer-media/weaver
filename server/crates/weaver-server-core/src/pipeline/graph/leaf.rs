@@ -223,6 +223,14 @@ impl Leaf {
         Ok(())
     }
 
+    // The bytes the leaf holds written, summed over its runs: asked only
+    // when a write failed, never per write.
+    pub(crate) fn written_bytes(&self) -> u64 {
+        self.written.iter().fold(0u64, |sum, (start, run)| {
+            sum.saturating_add(run.end - start)
+        })
+    }
+
     // Write `bytes` at `offset`, folding nothing: a file whose bytes no
     // check is stated for. Writes grow the file only as far as their bytes,
     // except on Windows, where a new file the sparse mark took is made at
@@ -725,7 +733,7 @@ fn create_parent(path: &Path, device: Device) -> Result<(), LeafError> {
 fn write_all_at(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
     #[cfg(test)]
     if counting::full(bytes.len()) {
-        return Err(io::Error::from(io::ErrorKind::StorageFull));
+        return Err(io::Error::from(counting::refusal()));
     }
     #[cfg(test)]
     counting::wrote(bytes.len());
@@ -800,6 +808,23 @@ pub(crate) mod counting {
         static WRITTEN: Cell<u64> = const { Cell::new(0) };
         // The bytes this thread may still write before the disk is full.
         static ROOM: Cell<Option<u64>> = const { Cell::new(None) };
+        // Whether a write refused for room is refused by a quota.
+        static QUOTA: Cell<bool> = const { Cell::new(false) };
+    }
+
+    // A write this thread refuses for room is refused by a quota, or by the
+    // disk again.
+    pub(crate) fn refuse_by_quota(quota: bool) {
+        QUOTA.with(|cell| cell.set(quota));
+    }
+
+    // What a write refused for room fails with.
+    pub(super) fn refusal() -> std::io::ErrorKind {
+        if QUOTA.with(Cell::get) {
+            std::io::ErrorKind::QuotaExceeded
+        } else {
+            std::io::ErrorKind::StorageFull
+        }
     }
 
     // The disk fills once this thread has written `room` more bytes, or

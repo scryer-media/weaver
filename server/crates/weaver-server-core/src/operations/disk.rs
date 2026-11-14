@@ -342,6 +342,30 @@ fn one_device(a: Option<u64>, b: Option<u64>) -> bool {
     }
 }
 
+// True when an out-of-space error is the caller's quota refusing the write,
+// not the filesystem: its free figure may show room the caller cannot use.
+pub fn is_quota_exceeded(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::QuotaExceeded {
+        return true;
+    }
+    let Some(code) = error.raw_os_error() else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        code == libc::EDQUOT
+    }
+    #[cfg(windows)]
+    {
+        code as u32 == windows_sys::Win32::Foundation::ERROR_DISK_QUOTA_EXCEEDED
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = code;
+        false
+    }
+}
+
 // True when an I/O error means the filesystem (or the caller's quota on it)
 // ran out of room, as opposed to a corrupt path, permission problem, or
 // hardware fault.

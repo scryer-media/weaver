@@ -544,11 +544,21 @@ impl Pipeline {
                 // A repair or a staging removes what it wrote as it fails:
                 // the job then waits for the room that takes, not for more
                 // than the disk showed.
-                let needs = self
+                // A file's own write names what was left of the file. A
+                // write a quota refused says so: the disk shows room the
+                // job cannot use.
+                let (needs, left) = self
                     .graph_jobs
                     .get_mut(&job_id)
-                    .and_then(|graph| graph.take_gave_back());
-                self.hold_job_for_full_disk(job_id, root, needs);
+                    .map_or((None, None), |graph| {
+                        (graph.take_gave_back(), graph.take_left_to_write())
+                    });
+                let wants = crate::pipeline::full_disk::Wants {
+                    needs,
+                    left,
+                    quota: error.quota(),
+                };
+                self.hold_job_for_full_disk(job_id, root, wants);
                 return;
             }
             warn!(job_id = job_id.0, error = %error, "graph job step failed");

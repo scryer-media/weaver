@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use super::deobfuscate::{self, DeliveryNamingPlan, SrrdbInputs};
 use crate::jobs::working_dir::{WORKING_DIR_MARKER, mark_weaver_owned_output_dir};
-use crate::pipeline::full_disk::Stage;
+use crate::pipeline::full_disk::{Stage, Wants};
 use crate::post_processing::model::PostProcessingSettings;
 use crate::runtime::{file_cache, fs as runtime_fs};
 
@@ -488,6 +488,12 @@ fn entry_found_no_room(rename_err: &std::io::Error, copy_err: &std::io::Error) -
     crate::operations::is_out_of_space(rename_err) || crate::operations::is_out_of_space(copy_err)
 }
 
+// Whether the entry's move was refused by a quota, not by the disk.
+fn entry_found_quota(rename_err: &std::io::Error, copy_err: &std::io::Error) -> bool {
+    crate::operations::is_quota_exceeded(rename_err)
+        || crate::operations::is_quota_exceeded(copy_err)
+}
+
 // What an entry whose copy found no room still has to deliver: the bytes
 // left under it, since a copy takes each file out of the source as it
 // lands. An entry whose rename was refused for room copied nothing and took
@@ -671,7 +677,12 @@ pub(crate) static CLAIM_FULL: std::sync::atomic::AtomicBool =
 pub(in crate::pipeline) enum ClaimFailure {
     // The disk had no room for the folder: the job waits for room on the
     // disk `path` lies on, the nearest folder above it that exists.
-    Full { path: PathBuf, message: String },
+    // `quota` says a quota refused it, not the disk.
+    Full {
+        path: PathBuf,
+        message: String,
+        quota: bool,
+    },
     Other(String),
 }
 
@@ -864,6 +875,7 @@ async fn run_move_to_claimed_destination(
     // Whether an entry failed for want of room at the destination, and what
     // those entries hold: what the move needs free to go on.
     let mut full = false;
+    let mut quota = false;
     let mut needs = 0u64;
     // The names in the destination whose copy found no room this time.
     let mut cut_short: Vec<PathBuf> = Vec::new();
@@ -907,6 +919,7 @@ async fn run_move_to_claimed_destination(
                 Ok(Err((rename_err, copy_err))) => {
                     if entry_found_no_room(&rename_err, &copy_err) {
                         full = true;
+                        quota |= entry_found_quota(&rename_err, &copy_err);
                         needs = needs.saturating_add(left_to_copy(&src, &copy_err).await);
                         if crate::operations::is_out_of_space(&copy_err) {
                             cut_short.push(dst.clone());
@@ -974,6 +987,8 @@ async fn run_move_to_claimed_destination(
                     Ok(Err((rename_err, copy_err))) => {
                         if entry_found_no_room(&rename_err, &copy_err) {
                             full = true;
+                            quota |= entry_found_quota(&rename_err, &copy_err);
+                            quota |= entry_found_quota(&rename_err, &copy_err);
                             needs = needs.saturating_add(left_to_copy(&src, &copy_err).await);
                         }
                         failures.push(format!(
@@ -1006,6 +1021,7 @@ async fn run_move_to_claimed_destination(
                 Ok(Err((rename_err, copy_err))) => {
                     if entry_found_no_room(&rename_err, &copy_err) {
                         full = true;
+                        quota |= entry_found_quota(&rename_err, &copy_err);
                         needs = needs.saturating_add(left_to_copy(&src, &copy_err).await);
                         if crate::operations::is_out_of_space(&copy_err) {
                             cut_short.push(dst.clone());
@@ -1050,6 +1066,7 @@ async fn run_move_to_claimed_destination(
                 message,
                 needs,
                 again: cut_short,
+                quota,
             }
         } else {
             MoveToCompleteFailure::Operational(message)
@@ -1427,6 +1444,7 @@ impl Pipeline {
         Err(ClaimFailure::Full {
             path: path.to_path_buf(),
             message,
+            quota: crate::operations::is_quota_exceeded(&error),
         })
     }
 
@@ -1642,13 +1660,20 @@ impl Pipeline {
             {
                 Ok(dest) => (dest, None),
                 Err(ClaimFailure::Other(error)) => return Err(error),
-                Err(ClaimFailure::Full { path, message }) => {
+                Err(ClaimFailure::Full {
+                    path,
+                    message,
+                    quota,
+                }) => {
                     self.hold_move_for_full_disk(
                         job_id,
                         Stage::Claim(left_behind),
                         &path,
                         &message,
-                        None,
+                        Wants {
+                            quota,
+                            ..Wants::default()
+                        },
                     );
                     return Ok(());
                 }
@@ -1778,8 +1803,21 @@ impl Pipeline {
                 }
                 // No room for the destination's folder: the job waits for
                 // room there, and comes back here once let go.
-                Err(ClaimFailure::Full { path, message }) => {
-                    self.hold_move_for_full_disk(job_id, Stage::Restored, &path, &message, None);
+                Err(ClaimFailure::Full {
+                    path,
+                    message,
+                    quota,
+                }) => {
+                    self.hold_move_for_full_disk(
+                        job_id,
+                        Stage::Restored,
+                        &path,
+                        &message,
+                        Wants {
+                            quota,
+                            ..Wants::default()
+                        },
+                    );
                     return;
                 }
             }
@@ -1859,7 +1897,7 @@ impl Pipeline {
                     Stage::Moving(dest, again),
                     &path,
                     &message,
-                    None,
+                    Wants::of(&error, None),
                 );
             } else {
                 self.fail_job(job_id, message);
@@ -2096,6 +2134,7 @@ impl Pipeline {
                 message,
                 needs,
                 again,
+                quota,
             }) => {
                 // What the entries that found no room still hold in the
                 // working directory is what the move needs free; an entry
@@ -2105,7 +2144,11 @@ impl Pipeline {
                     Stage::Moving(dest, again.into_iter().collect()),
                     &path,
                     &message,
-                    (needs > 0).then_some(needs),
+                    Wants {
+                        needs: (needs > 0).then_some(needs),
+                        left: None,
+                        quota,
+                    },
                 );
             }
         }
