@@ -111,11 +111,16 @@ pub(crate) struct VolumeWriters {
 
 // Every volume with a writer, by the address of its record. A volume stays
 // here until its thread has ended, whether or not a caller still holds it.
+// One whose thread could not be started stays until its last caller has let
+// go: see `VolumeWriters::lane`.
 #[derive(Default)]
 struct Registry {
     lanes: Mutex<Lanes>,
     #[cfg(test)]
     ended: Condvar,
+    // Times a thread was asked for.
+    #[cfg(test)]
+    starts: AtomicU64,
 }
 
 impl Registry {
@@ -212,7 +217,9 @@ impl VolumeWriters {
         let (inline, threadless) = (self.mode == Mode::Inline, self.mode == Mode::NoThread);
         #[cfg(not(test))]
         let (inline, threadless) = (false, false);
-        let (lane, live) = Lane::start(
+        #[cfg(test)]
+        self.registry.starts.fetch_add(1, Ordering::Relaxed);
+        let lane = Lane::start(
             Arc::clone(volume),
             Arc::clone(&self.report),
             self.rates.clone(),
@@ -221,10 +228,12 @@ impl VolumeWriters {
             threadless,
         );
         lane.state.users.fetch_add(1, Ordering::SeqCst);
-        // A lane with no thread is not kept: the next caller tries again.
-        if live {
-            lanes.push((at, Arc::clone(&lane)));
-        }
+        // A lane whose thread could not be started is kept as well, so the
+        // callers that come while it is held share it and fail at once: no
+        // thread is asked for again on their behalf. It leaves when the last
+        // of them lets go, and only the caller after that asks for a thread
+        // again: one ask each time the volume has been let go by everyone.
+        lanes.push((at, Arc::clone(&lane)));
         lane
     }
 
@@ -705,6 +714,9 @@ impl Submitter {
                 unbuffer(state, &*self.lane.report, bytes.len() as u64);
             }
             state.done.fetch_add(1, Ordering::Relaxed);
+            // Nothing sent to the volume will run, so all of it has
+            // returned: a settle does not wait for it.
+            state.returned(state.sent.load(Ordering::SeqCst));
             let counts = &state.volume.writer;
             counts.failed_operations.fetch_add(1, Ordering::Relaxed);
             let first = !self.key.failed.swap(true, Ordering::AcqRel);
@@ -821,6 +833,9 @@ struct Lane {
     // A lane with no thread: what a thread would hold, run by whoever
     // submits.
     inline: Option<Mutex<(Thread, mpsc::Receiver<Mail>)>>,
+    // Set on a lane whose thread could not be started: where it is kept
+    // until its last caller lets go.
+    threadless: Option<Weak<Registry>>,
 }
 
 struct LaneState {
@@ -888,7 +903,9 @@ fn unbuffer(state: &LaneState, report: &ReportFn, bytes: u64) {
 }
 
 impl Lane {
-    // The lane, and whether anything will run what is sent to it.
+    // The lane, with its thread started. When no thread could be started
+    // nothing will run what is sent to the lane: every submission fails its
+    // key at once.
     fn start(
         volume: Arc<Volume>,
         report: Arc<ReportFn>,
@@ -896,7 +913,7 @@ impl Lane {
         registry: Weak<Registry>,
         inline: bool,
         threadless: bool,
-    ) -> (Arc<Self>, bool) {
+    ) -> Arc<Self> {
         let (send, queued) = mpsc::channel();
         let state = Arc::new(LaneState {
             volume,
@@ -912,23 +929,22 @@ impl Lane {
             #[cfg(test)]
             gate_moved: Condvar::new(),
         });
-        let thread = Thread::new(Arc::clone(&state), Arc::clone(&report), rates, registry);
+        let thread = Thread::new(
+            Arc::clone(&state),
+            Arc::clone(&report),
+            rates,
+            registry.clone(),
+        );
         if inline {
-            let lane = Arc::new(Self {
+            return Arc::new(Self {
                 state,
                 report,
                 send,
                 inline: Some(Mutex::new((thread, queued))),
+                threadless: None,
             });
-            return (lane, true);
         }
         let name = format!("volume-writer {}", state.volume.label);
-        let lane = Arc::new(Self {
-            state,
-            report,
-            send,
-            inline: None,
-        });
         let run = move || thread.run(queued);
         let spawned = if threadless {
             drop(run);
@@ -939,17 +955,38 @@ impl Lane {
         if let Err(error) = &spawned {
             // With no thread the receiver is gone, and every submission
             // fails its key at once instead of waiting forever.
-            tracing::error!(%error, "could not start a volume's writer thread");
+            tracing::error!(
+                %error,
+                volume = %state.volume.label,
+                "could not start a volume's writer thread; what is written to the volume fails until it is let go and asked for again"
+            );
         }
-        (lane, spawned.is_ok())
+        Arc::new(Self {
+            state,
+            report,
+            send,
+            inline: None,
+            threadless: spawned.is_err().then_some(registry),
+        })
     }
 
     // A caller lets the volume go. The thread is woken to see whether it
-    // was the last.
+    // was the last. A lane with no thread leaves the registry with its last
+    // caller, decided under the registry's lock as a thread's end is, so
+    // none takes the lane as it goes.
     fn leave(&self) {
         self.state.users.fetch_sub(1, Ordering::SeqCst);
         let _ = self.send.send(Mail::Left);
         self.run_inline();
+        let Some(registry) = self.threadless.as_ref().and_then(Weak::upgrade) else {
+            return;
+        };
+        let mut lanes = registry.lock();
+        if self.state.users.load(Ordering::SeqCst) == 0 {
+            lanes.retain(|(_, lane)| !Arc::ptr_eq(&lane.state, &self.state));
+            #[cfg(test)]
+            registry.ended.notify_all();
+        }
     }
 
     // On a lane with no thread, run what was sent.

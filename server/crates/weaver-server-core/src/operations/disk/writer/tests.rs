@@ -593,3 +593,74 @@ fn the_counters_hold_what_a_scripted_run_did() {
     assert_eq!(report.failures[0].key, 0);
     assert!(reports.try_recv().is_err(), "one report, for the one failure");
 }
+
+// A volume no thread can be started for is asked for one once, however many
+// callers come while it is held. Each of them fails at once and hears of it
+// once, nothing waits for what they sent, and a thread is asked for again
+// only by the caller that comes after all of them have let go.
+#[test]
+fn a_volume_with_no_thread_is_asked_for_one_again_only_once_it_was_let_go() {
+    let dir = tempfile::tempdir().unwrap();
+    let (first_path, second_path) = (dir.path().join("first"), dir.path().join("second"));
+    let (send, reports) = mpsc::channel();
+    let send = Mutex::new(send);
+    let writers = VolumeWriters::threadless(move |report| {
+        let _ = send.lock().unwrap().send(report);
+    });
+    let volume = volume("one");
+    let starts = || count(&writers.registry.starts);
+
+    let first = writers.submitter(&volume, 1);
+    let second = writers.submitter(&volume, 2);
+    let own = writers.volume_submitter(&volume);
+    assert_eq!(starts(), 1, "one ask for the three of them");
+
+    first.write(1, 0, Bytes::from_static(b"lost"), create(&first_path));
+    first.write(1, 4, Bytes::from_static(b"too"), None);
+    second.write(1, 0, Bytes::from_static(b"lost"), create(&second_path));
+    own.run(None, dir.path().to_path_buf(), || Ok(()));
+    for job in [&first, &second, &own] {
+        let barrier = job.barrier();
+        assert!(barrier.returned() && !barrier.passed());
+    }
+    assert!(first.failed() && second.failed());
+    // Each key heard once, of the first thing it sent.
+    let mut failures: Vec<(u64, PathBuf)> = reports
+        .try_iter()
+        .flat_map(|report| report.failures)
+        .map(|failure| (failure.key, failure.path))
+        .collect();
+    failures.sort();
+    assert_eq!(
+        failures,
+        [
+            (1, first_path.clone()),
+            (2, second_path.clone()),
+            (VOLUME_KEY, dir.path().to_path_buf()),
+        ]
+    );
+    assert_eq!(count(&volume.buffered_bytes), 0);
+    assert!(!first_path.exists() && !second_path.exists());
+    // Nothing is waited for, with or without a span.
+    writers.settle();
+    assert!(
+        writers
+            .settle_within(Duration::from_secs(30), &HandClock::default())
+            .is_empty()
+    );
+    assert_eq!(starts(), 1);
+    assert_eq!(count(&volume.writer.threads), 0);
+
+    // One caller lets go and another comes: the volume is still held.
+    drop(first);
+    let third = writers.submitter(&volume, 3);
+    assert_eq!(starts(), 1);
+
+    // All let go: the next caller asks again, once.
+    drop((second, own, third));
+    writers.wait_ended(&volume);
+    let fourth = writers.submitter(&volume, 4);
+    let fifth = writers.submitter(&volume, 5);
+    assert_eq!(starts(), 2);
+    drop((fourth, fifth));
+}
