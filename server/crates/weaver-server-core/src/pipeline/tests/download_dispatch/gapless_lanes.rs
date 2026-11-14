@@ -694,3 +694,71 @@ async fn a_saturated_refill_waits_for_the_lane_to_drain_below_its_share() {
     assert_eq!(lease.works.len(), 1);
     assert!(pipeline.held_download_refills.is_empty());
 }
+
+// A lane whose ask found every job stopped by a volume at its hard limit
+// waits for the volume, not for the next pass: a pass with the volume still
+// full puts its ask to no job again, and the pass after the volume has room
+// answers it.
+#[tokio::test]
+async fn a_lane_held_for_a_full_volume_is_asked_again_only_once_it_has_room() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(41401);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        segmented_job_spec("Full Volume", "payload.bin", &vec![512u32; 600]),
+    )
+    .await;
+    let lane_id = book_connected_lane(&mut pipeline, job_id, false);
+    pipeline.volume_buffers.set_figure(1024, u64::MAX);
+    let volume = std::sync::Arc::clone(
+        pipeline.graph_jobs[&job_id]
+            .disk()
+            .unwrap()
+            .working()
+            .volume(),
+    );
+    assert_eq!(volume.buffer_limits().1, 1024);
+    let refused = |pipeline: &Pipeline| {
+        pipeline.metrics.download_scheduler_hot_blocked_total
+            [crate::SchedulerBlockClause::WriteBuffer.index()]
+            .load(Ordering::Relaxed)
+    };
+
+    // Two results wait for the loop: the volume holds its limit, and the
+    // lane's ask is refused and held.
+    for _ in 0..2 {
+        pipeline.note_released_download_result_pending(job_id, 512);
+    }
+    assert!(pipeline.volume_holds_budget(job_id));
+    let (response_tx, mut response_rx) = oneshot::channel();
+    pipeline.handle_download_lane_refill_request(refill_request_on(lane_id, 0, response_tx));
+    assert!(response_rx.try_recv().is_err(), "the ask is held");
+    assert_eq!(pipeline.held_download_refills.len(), 1);
+    let refused_once = refused(&pipeline);
+    assert!(refused_once > 0, "the volume refused the job");
+
+    // Passes while the volume is still full leave the hold as it is.
+    for _ in 0..3 {
+        pipeline.service_held_download_refills();
+    }
+    assert!(response_rx.try_recv().is_err());
+    assert_eq!(pipeline.held_download_refills.len(), 1);
+    assert_eq!(refused(&pipeline), refused_once, "the job was not asked again");
+
+    // The loop hands both results on: the volume has room, dispatch is
+    // woken, and the next pass answers the lane.
+    pipeline.download_dispatch_wake = false;
+    pipeline.finish_released_download_result_processing(job_id, 512);
+    pipeline.finish_released_download_result_processing(job_id, 512);
+    assert!(pipeline.download_dispatch_wake);
+    pipeline.service_held_download_refills();
+    let lease = response_rx
+        .await
+        .unwrap()
+        .lease
+        .expect("a lane held for a volume is served once it has room");
+    assert_eq!(lease.job_id, job_id);
+    assert!(pipeline.held_download_refills.is_empty());
+}

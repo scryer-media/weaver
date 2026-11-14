@@ -126,6 +126,13 @@ impl Pipeline {
             return;
         }
         let now = Instant::now();
+        // Whether every idle hold would hear the same answer again. Asked
+        // once for the pass, and only when a hold is idle.
+        let volumes_refuse = self
+            .held_download_refills
+            .iter()
+            .any(|held| held.wake.is_none())
+            && self.volumes_refuse_every_job();
         let held = std::mem::take(&mut self.held_download_refills);
         for HeldDownloadRefill {
             request,
@@ -134,6 +141,14 @@ impl Pipeline {
         } in held
         {
             let Some(SaturationWake { of, below }) = wake else {
+                if volumes_refuse && self.idle_hold_stands(&request, since, now) {
+                    self.held_download_refills.push(HeldDownloadRefill {
+                        request,
+                        since,
+                        wake,
+                    });
+                    continue;
+                }
                 self.answer_download_lane_refill(request, now, Some(since));
                 continue;
             };
@@ -158,6 +173,43 @@ impl Pipeline {
             // idle hold that starts here starts its own window.
             self.answer_download_lane_refill(request, now, None);
         }
+    }
+
+    // Whether no job can be handed an article until a volume has room:
+    // the link is open, and each job dispatch could draw from writes to a
+    // volume that holds its hard limit of unwritten bytes. Every lane's ask
+    // is refused then, whichever job it is put to, and the wake each such
+    // volume was asked for here wakes dispatch when the answer can change.
+    // Until then a pass asks the volumes once, not every job for every held
+    // lane.
+    fn volumes_refuse_every_job(&mut self) -> bool {
+        let pressure = self.refresh_download_pressure();
+        if self.download_scheduler_link_gate(pressure).is_some() {
+            return false;
+        }
+        let eligible = self.download_scheduler_eligible_jobs();
+        // Every job is asked, so every stopped volume has its wake.
+        !eligible.is_empty()
+            && eligible
+                .iter()
+                .fold(true, |all, job_id| self.volume_refuses_job(*job_id) && all)
+    }
+
+    // Whether an idle hold is left as it is while the volumes refuse every
+    // job: its ask would be put to the scheduler, be refused there and be
+    // held again. A hold whose lane is gone, whose window ran out, or whose
+    // lane a probe batch waits for is answered as on any pass.
+    fn idle_hold_stands(
+        &self,
+        request: &DownloadLaneRefillRequest,
+        since: Instant,
+        now: Instant,
+    ) -> bool {
+        !request.response_tx.is_closed()
+            && request.runtime_generation == self.pool_generation
+            && self.download_lane_is_live(request.lane_id)
+            && now.saturating_duration_since(since) < DOWNLOAD_REFILL_IDLE_HOLD
+            && !self.probe_waits_for_seat_on(request.server_idx)
     }
 
     // Articles `lane_id` has been handed and not yet produced a result for.

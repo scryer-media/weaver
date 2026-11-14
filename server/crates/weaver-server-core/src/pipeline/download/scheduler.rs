@@ -265,7 +265,10 @@ impl Pipeline {
     }
 
     // The gates that are about the link rather than about any job's queue.
-    fn download_scheduler_link_gate(&mut self, pressure: DownloadPressure) -> Option<YieldReason> {
+    pub(in crate::pipeline) fn download_scheduler_link_gate(
+        &mut self,
+        pressure: DownloadPressure,
+    ) -> Option<YieldReason> {
         if self.shared_state.is_paused() || self.shared_state.schedule_replay_paused() {
             return Some(YieldReason::Paused);
         }

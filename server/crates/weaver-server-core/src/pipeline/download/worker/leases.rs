@@ -546,23 +546,8 @@ impl Pipeline {
         if checkpoint.holds_every_payload_article() && queue.recovery_work_count() == 0 {
             return Err(BlockedBy::only(SchedulerBlockClause::Checkpoint));
         }
-        // A volume the job writes to holds its own hard limit of bytes that
-        // arrived and are not written: nothing more is fetched for the job
-        // until it is below. Each such volume is asked for one wake, an
-        // eighth of its limit lower so the loop is not woken per write; a
-        // volume that fell there in the meantime holds nothing.
-        if self.volume_holds_budget(job_id) {
-            let mut asked = false;
-            if let Some(disk) = self.graph_jobs.get(&job_id).and_then(|graph| graph.disk()) {
-                for submitter in disk.each() {
-                    let volume = submitter.volume();
-                    asked |= volume.unwritten_bytes() >= volume.buffer_limits().1
-                        && self.volume_writers.wake_below(volume, volume.resume_line());
-                }
-            }
-            if asked {
-                return Err(BlockedBy::only(SchedulerBlockClause::WriteBuffer));
-            }
+        if self.volume_refuses_job(job_id) {
+            return Err(BlockedBy::only(SchedulerBlockClause::WriteBuffer));
         }
         let Some(bootstrap_files) = bootstrap_files else {
             return Ok(());
@@ -588,6 +573,27 @@ impl Pipeline {
             "the bootstrap answer changed without a change to a file's queued count"
         );
         answer
+    }
+
+    // Whether a volume the job writes to holds its own hard limit of bytes
+    // that arrived and are not written: nothing more is fetched for the job
+    // until it is below. Each such volume is asked for one wake, an eighth
+    // of its limit lower so the loop is not woken per write; a volume that
+    // fell there in the meantime holds nothing. True only with a wake on
+    // its way, which wakes dispatch (`Self::volume_room_changed`).
+    pub(in crate::pipeline) fn volume_refuses_job(&self, job_id: JobId) -> bool {
+        if !self.volume_holds_budget(job_id) {
+            return false;
+        }
+        let mut asked = false;
+        if let Some(disk) = self.graph_jobs.get(&job_id).and_then(|graph| graph.disk()) {
+            for submitter in disk.each() {
+                let volume = submitter.volume();
+                asked |= volume.unwritten_bytes() >= volume.buffer_limits().1
+                    && self.volume_writers.wake_below(volume, volume.resume_line());
+            }
+        }
+        asked
     }
 
     // The fill servers a hinted article of `job_id` could be sent to instead
