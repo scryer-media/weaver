@@ -555,7 +555,11 @@ async fn a_torrent_unpack_held_for_room_is_woken_when_room_returns() {
         tee.take(super::Word::Said(said, 1), (false, false));
     }
     assert!(outside.waits_for_disk(), "the job waits for room");
-    assert_eq!(outside.disk_waits_began(), vec![1], "heard once, as it began");
+    assert_eq!(
+        outside.disk_waits_began(),
+        vec![1],
+        "heard once, as it began"
+    );
     assert!(outside.disk_waits_began().is_empty());
     let waiters = outside.disk_waiters();
     assert_eq!(waiters.len(), 1);

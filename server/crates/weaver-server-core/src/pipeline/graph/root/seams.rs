@@ -627,7 +627,10 @@ impl Pipeline {
         for scope in self.graph_outside.disk_waits_began() {
             #[cfg(test)]
             DISK_WAIT_LOOKS.with(|looks| looks.set(looks.get() + 1));
-            tracing::debug!(job_id = scope, "a job outside the pipeline waits for disk room");
+            tracing::debug!(
+                job_id = scope,
+                "a job outside the pipeline waits for disk room"
+            );
         }
         if self.disk_idle.is_empty() {
             return;
@@ -706,7 +709,9 @@ impl Pipeline {
     // unpacking, takes its place among them by its ticket from the same
     // ledger, and goes on through its own task.
     pub(in crate::pipeline) fn wake_disk_waiters(&mut self) {
-        let mut waiting: Vec<(u64, JobId, Option<Arc<dyn Hears>>)> = self
+        // Each waiter's ticket and job, and how to wake it when it is outside.
+        type Waiter = (u64, JobId, Option<Arc<dyn Hears>>);
+        let mut waiting: Vec<Waiter> = self
             .disk_waiting
             .iter()
             .map(|job_id| {

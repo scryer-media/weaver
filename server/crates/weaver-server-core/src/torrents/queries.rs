@@ -207,7 +207,8 @@ impl Database {
         let ids = job_ids.iter().map(|id| id.0 as i64).collect::<Vec<_>>();
         self.run_sql_blocking_read(async move {
             let mut torrents = std::collections::BTreeSet::new();
-            let rows_per = crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 1);
+            let rows_per =
+                crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 1);
             for chunk in ids.chunks(rows_per) {
                 let placeholders = vec!["{}"; chunk.len()].join(", ");
                 let args = chunk.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
