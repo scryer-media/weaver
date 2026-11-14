@@ -401,9 +401,14 @@ impl SharedPipelineState {
     // The owner publishes through its handle, which carries the events.
     fn publish_torrent_jobs(&self, torrents: Vec<JobInfo>) -> Vec<PipelineEvent> {
         self.queue.write(|inner| {
+            // The same jobs as they stand: nothing changed, and nothing is
+            // said, so an idle publish wakes no reader.
+            if inner.torrents == torrents {
+                return Change::unchanged(Vec::new());
+            }
             let events = owned_job_events(&inner.torrents, &torrents);
-            inner.torrent_ids = torrents.iter().map(|job| job.job_id).collect();
             inner.torrents = torrents;
+            inner.reindex_torrents();
             Change::changed(events)
         })
     }
@@ -414,11 +419,10 @@ impl SharedPipelineState {
         self.queue.write(|inner| {
             let job_id = job.job_id;
             // Only a job already published is looked for among the others.
-            let at = inner
-                .torrent_ids
-                .contains(&job_id)
-                .then(|| inner.torrents.iter().position(|was| was.job_id == job_id))
-                .flatten();
+            let at = inner.torrent_position(job_id);
+            if at.is_some_and(|at| inner.torrents[at] == job) {
+                return Change::unchanged(Vec::new());
+            }
             let before = at.map_or(&[][..], |at| std::slice::from_ref(&inner.torrents[at]));
             let events = owned_job_events(before, std::slice::from_ref(&job));
             match at {
@@ -428,8 +432,8 @@ impl SharedPipelineState {
                     let at = inner
                         .torrents
                         .partition_point(|was| (was.created_at_epoch_ms, was.job_id) <= key);
-                    inner.torrent_ids.insert(job_id);
                     inner.torrents.insert(at, job);
+                    inner.reindex_torrents();
                 }
             }
             Change::changed(events)
@@ -443,7 +447,9 @@ impl SharedPipelineState {
 
     // The owner that answers for `job_id`; `None` is the pipeline.
     fn owner_of(&self, job_id: JobId) -> Option<Arc<dyn QueueOwner>> {
-        let owned = self.queue.read(|inner| inner.torrent_ids.contains(&job_id));
+        let owned = self
+            .queue
+            .read(|inner| inner.torrent_position(job_id).is_some());
         owned.then(|| self.owner.read().unwrap().clone()).flatten()
     }
 
@@ -1864,8 +1870,10 @@ impl SchedulerHandle {
         queue.write(|inner| {
             let ended = info.ended_event();
             let job_id = info.job_id;
-            inner.torrents.retain(|job| job.job_id != job_id);
-            inner.torrent_ids.remove(&job_id);
+            if let Some(at) = inner.torrent_position(job_id) {
+                inner.torrents.remove(at);
+                inner.reindex_torrents();
+            }
             let mut history: Vec<_> = queue
                 .history()
                 .iter()

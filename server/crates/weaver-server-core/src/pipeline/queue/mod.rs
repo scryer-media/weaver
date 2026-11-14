@@ -87,8 +87,9 @@ pub struct QueueInner {
     pub jobs: Vec<JobRow>,
     // The jobs another owner publishes beside the pipeline's, in its order.
     pub torrents: Vec<JobInfo>,
-    // The ids of `torrents`, so asking whose a job is costs no walk of them.
-    pub(crate) torrent_ids: std::collections::HashSet<JobId>,
+    // Each of `torrents`' position, so asking whose a job is, or reading
+    // one, costs no walk of them. Kept in step by `reindex_torrents`.
+    torrent_positions: HashMap<JobId, usize>,
     // Each row's position in `jobs`, so a lookup by id is one probe.
     job_positions: HashMap<JobId, usize>,
     // The rows in a phase, the only ones the metrics tick samples.
@@ -537,6 +538,27 @@ impl QueueInner {
     }
 
     // Rebuilds the position index after `jobs` was replaced or reordered.
+    /// Rebuilds the position of each of `torrents`, once they were
+    /// replaced, or one was added or removed.
+    pub(crate) fn reindex_torrents(&mut self) {
+        self.torrent_positions = self
+            .torrents
+            .iter()
+            .enumerate()
+            .map(|(position, job)| (job.job_id, position))
+            .collect();
+    }
+
+    /// Where `job_id` sits among the other owner's `torrents`, if it is one.
+    pub(crate) fn torrent_position(&self, job_id: JobId) -> Option<usize> {
+        self.torrent_positions.get(&job_id).copied()
+    }
+
+    /// The other owner's job `job_id`, if it is one: one probe.
+    pub fn torrent(&self, job_id: JobId) -> Option<&JobInfo> {
+        self.torrent_position(job_id).map(|at| &self.torrents[at])
+    }
+
     pub(crate) fn reindex_jobs(&mut self) {
         self.job_positions = self
             .jobs

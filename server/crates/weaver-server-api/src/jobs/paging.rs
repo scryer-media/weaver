@@ -1044,7 +1044,7 @@ pub(crate) fn read_row(state: &SharedPipelineState, id: JobId) -> Option<JobInfo
         inner
             .row(id)
             .map(|row| row.info(&inner.globals))
-            .or_else(|| inner.torrents.iter().find(|job| job.job_id == id).cloned())
+            .or_else(|| inner.torrent(id).cloned())
     })
 }
 

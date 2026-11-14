@@ -935,3 +935,39 @@ fn a_job_s_debug_text_never_shows_its_password() {
         assert!(text.contains("rss"));
     }
 }
+
+// Publishing the other owner's jobs as they already stand changes nothing:
+// no reader is woken and no event goes out. A change to one wakes them once.
+#[tokio::test]
+async fn publishing_the_owned_jobs_as_they_stand_wakes_no_reader() {
+    let (handle, _task) = test_scheduler().await;
+    let mut events = handle.subscribe_events();
+    let mut changes = handle.subscribe_job_changes();
+    handle.publish_owned_jobs(vec![owned_job(JobId(2), 0.0), owned_job(JobId(3), 1.0)]);
+    assert!(changes.has_changed().unwrap());
+    changes.borrow_and_update();
+    while events.try_recv().is_ok() {}
+
+    handle.publish_owned_jobs(vec![owned_job(JobId(2), 0.0), owned_job(JobId(3), 1.0)]);
+    handle.publish_owned_job(owned_job(JobId(3), 1.0));
+    assert!(
+        !changes.has_changed().unwrap(),
+        "an idle publish woke a reader"
+    );
+    assert!(events.try_recv().is_err(), "an idle publish sent an event");
+
+    let mut paused = owned_job(JobId(3), 1.0);
+    paused.status = JobStatus::Paused;
+    handle.publish_owned_job(paused);
+    assert!(changes.has_changed().unwrap());
+    assert!(matches!(
+        events.try_recv(),
+        Ok(PipelineEvent::JobPaused { job_id: JobId(3) })
+    ));
+    assert_eq!(
+        handle
+            .state()
+            .read_queue(|inner| inner.torrent(JobId(3)).map(|job| job.status.clone())),
+        Some(JobStatus::Paused)
+    );
+}
