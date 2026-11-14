@@ -8,14 +8,47 @@
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-use crate::disk::{BlockPool, DiskQueue, MAX_QUEUED_DISK_BYTES};
+use crate::disk::{
+    BlockPool, DiskQueue, MAX_QUEUED_CHECK_BYTES, MAX_QUEUED_DISK_BYTES, WeakDiskQueue,
+};
 use crate::session_stats::disk::{DiskStats, DiskStatsSnapshot};
-use crate::torrent_state::{HashJob, WriteJob};
+use crate::torrent_state::{DiskWrite, HashJob};
 
-/// Threads that check pieces. libtorrent's default is one
-/// (settings_pack.cpp:353); a second starts only while a backlog waits, as a
-/// check here also reads the piece back.
-const HASH_THREADS: usize = 2;
+/// Threads that check pieces: one, libtorrent's default
+/// (`settings_pack::hashing_threads`, settings_pack.cpp:353). One thread
+/// hashes a piece as fast as its core does, and the checks of a torrent end
+/// in the order they were queued, so the pieces a storage holds in memory
+/// reach the write queue, and the files, in that order.
+const HASH_THREADS: usize = 1;
+
+// The hashing queue of the process, there while a session holds it. Every
+// session shares it, so the pieces of every torrent, from peers over TCP
+// and over uTP alike, are checked by the one thread, whatever the number of
+// sessions open (libtorrent's `hashing_threads` are its one session's).
+static HASH: parking_lot::Mutex<WeakDiskQueue<HashJob>> =
+    parking_lot::Mutex::new(WeakDiskQueue::new());
+
+// The process's hashing queue: the one open sessions hold, or a new one on
+// `handle`'s runtime when none does.
+fn hash_queue(handle: &tokio::runtime::Handle) -> DiskQueue<HashJob> {
+    let mut shared = HASH.lock();
+    if let Some(queue) = shared.upgrade() {
+        return queue;
+    }
+    let queue = DiskQueue::new(handle.clone(), HASH_THREADS);
+    *shared = queue.downgrade();
+    queue
+}
+
+/// A piece check counted as waiting for the hashing thread, among its
+/// session's, until the thread takes it or it is dropped.
+pub(crate) struct QueuedCheck(Arc<DiskStats>);
+
+impl Drop for QueuedCheck {
+    fn drop(&mut self) {
+        self.0.check_taken();
+    }
+}
 
 /// Whether every disk thread counts against the blocking permits.
 ///
@@ -47,8 +80,12 @@ pub struct BlockingSpawner {
     handle: tokio::runtime::Handle,
     // The blocks received from peers, and the threads that write them.
     pool: BlockPool,
-    disk: DiskQueue<WriteJob>,
-    // The threads that check a piece whose last block was written.
+    // The whole pieces storages hold in memory that wait for their check
+    // and their write, counted by the marks the blocks are.
+    checks: BlockPool,
+    disk: DiskQueue<DiskWrite>,
+    // The thread that checks a piece whose last block landed: one for the
+    // process, shared by its sessions.
     hash: DiskQueue<HashJob>,
     // The threads that read the blocks peers on uTP threads upload.
     reads: DiskQueue<crate::off_shard::ReadJob>,
@@ -95,13 +132,14 @@ impl BlockingSpawner {
             allow_block_in_place,
             permits,
             pool: BlockPool::new(MAX_QUEUED_DISK_BYTES),
+            checks: BlockPool::new(MAX_QUEUED_CHECK_BYTES),
             // As many disk threads as blocking permits (libtorrent's
             // `aio_threads`, a pool of its own beside the network thread).
             disk: write_queue,
-            // Checks have threads of their own, so a write never waits behind
+            // Checks have a thread of their own, so a write never waits behind
             // one (libtorrent `settings_pack::hashing_threads`, a pool beside
             // `aio_threads`, mmap_disk_io.cpp:1685).
-            hash: DiskQueue::new(handle.clone(), HASH_THREADS),
+            hash: hash_queue(&handle),
             // Uploads are read on threads as many again, or on the same
             // bound when the disk work shares one (libtorrent reads on its
             // `aio_threads` too).
@@ -125,9 +163,10 @@ impl BlockingSpawner {
         snapshot.permits = self.permits as u64;
         snapshot.permits_in_use = self.permits.saturating_sub(free) as u64;
         snapshot.write_jobs_queued = self.disk.waiting();
-        snapshot.hash_jobs_queued = self.hash.waiting();
         snapshot.read_jobs_queued = self.reads.waiting();
         snapshot.queued_write_bytes = self.pool.queued_bytes();
+        snapshot.check_pieces_waiting = self.checks.spans();
+        snapshot.check_bytes_waiting = self.checks.queued_bytes();
         snapshot
     }
 
@@ -149,14 +188,25 @@ impl BlockingSpawner {
         &self.pool
     }
 
-    /// The threads that write received blocks.
-    pub(crate) fn disk(&self) -> &DiskQueue<WriteJob> {
+    /// What counts the whole pieces that wait for their check and write.
+    pub(crate) fn checks(&self) -> &BlockPool {
+        &self.checks
+    }
+
+    /// The threads that write received blocks and checked pieces.
+    pub(crate) fn disk(&self) -> &DiskQueue<DiskWrite> {
         &self.disk
     }
 
-    /// The threads that check pieces.
+    /// The thread that checks pieces, the process's one.
     pub(crate) fn hash(&self) -> &DiskQueue<HashJob> {
         &self.hash
+    }
+
+    /// Counts a check about to be queued for the hashing thread.
+    pub(crate) fn check_queued(&self) -> QueuedCheck {
+        self.stats.check_queued();
+        QueuedCheck(self.stats.clone())
     }
 
     /// Only call this if you can't call the async function block_in_place_with_semaphore
@@ -251,16 +301,6 @@ impl BlockingSpawner {
             .await?)
     }
 
-    /// Runs `fut` on the session's runtime, from any thread: a task that
-    /// blocks in place must not land on a uTP thread's runtime.
-    pub(crate) fn spawn<F>(&self, fut: F) -> tokio::task::JoinHandle<F::Output>
-    where
-        F: std::future::Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        self.handle.spawn(fut)
-    }
-
     /// Runs `f` on a disk thread for a reader on a uTP thread, its reads in
     /// order under `key`, and hands the result back with the others that
     /// finish meanwhile, in one wake of the uTP thread. None when the
@@ -339,8 +379,7 @@ mod tests {
     }
 
     // Work handed off another runtime's thread, as a uTP thread's, runs on
-    // the session's runtime: a task there may block in place, and a
-    // blocking call runs on the session's pool.
+    // the session's runtime: a blocking call runs on the session's pool.
     #[test]
     fn work_handed_from_another_runtime_runs_on_the_sessions() {
         let session = tokio::runtime::Builder::new_multi_thread()
@@ -351,18 +390,12 @@ mod tests {
         let other = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        let (in_place, flavor) = other.block_on(async {
-            let in_place = spawner
-                .spawn(async { tokio::task::block_in_place(|| 7) })
-                .await
-                .unwrap();
-            let flavor = spawner
+        let flavor = other.block_on(async {
+            spawner
                 .spawn_blocking_with_permit(|| tokio::runtime::Handle::current().runtime_flavor())
                 .await
-                .unwrap();
-            (in_place, flavor)
+                .unwrap()
         });
-        assert_eq!(in_place, 7);
         assert_eq!(flavor, tokio::runtime::RuntimeFlavor::MultiThread);
     }
 

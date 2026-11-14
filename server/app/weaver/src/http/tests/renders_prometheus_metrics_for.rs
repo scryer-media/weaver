@@ -1173,6 +1173,10 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         format!("weaver_torrent_disk_read_jobs_queued{{{ROUTE}}} 2"),
         format!("weaver_torrent_disk_piece_check_waits_total{{{ROUTE}}} 40"),
         format!("weaver_torrent_disk_piece_check_wait_seconds_total{{{ROUTE}}} 2"),
+        format!("weaver_torrent_disk_hash_jobs_queued{{{ROUTE}}} 1"),
+        format!("weaver_torrent_disk_hash_busy_seconds_total{{{ROUTE}}} 3.5"),
+        format!("weaver_torrent_disk_pieces_waiting{{{ROUTE}}} 5"),
+        format!("weaver_torrent_disk_piece_bytes_waiting{{{ROUTE}}} 5242880"),
         format!(
             r#"weaver_torrent_peer_socket_calls_total{{{ROUTE},transport="tcp",direction="in"}} 100"#
         ),

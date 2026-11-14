@@ -2633,7 +2633,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
 
     async fn disk_room(&self) {
         if self.disk.blocked() {
-            self.disk.room(self.state.shared.spawner.pool()).await;
+            self.disk.room(self.waits_pool()).await;
             self.state.shared.spawner.stats().peer_resumed();
         }
     }
@@ -4401,21 +4401,39 @@ impl PeerHandler {
         if self.disk.queued(pool.charge(block.buf_mut())) {
             self.state.shared.spawner.stats().peer_stopped();
         }
-        self.state.shared.spawner.disk().push(WriteJob {
-            state: self.state.clone(),
-            tx: self.tx.clone(),
-            addr: self.addr,
-            counters: self.counters.clone(),
-            chunk: chunk_info,
-            block,
-            written: Written(Some(self.disk.clone())),
-            _run: self.state.tasks.token(),
-        });
+        self.state
+            .shared
+            .spawner
+            .disk()
+            .push(DiskWrite::Block(WriteJob {
+                state: self.state.clone(),
+                tx: self.tx.clone(),
+                addr: self.addr,
+                counters: self.counters.clone(),
+                chunk: chunk_info,
+                block,
+                written: Written(Some(self.disk.clone())),
+                _run: self.state.tasks.token(),
+            }));
         Ok(())
     }
 
-    /// Writes the block on this connection's turn, and checks its piece
-    /// when it was the last.
+    /// The pool that counts what this connection has waiting for the disk:
+    /// whole pieces where the storage holds them in memory, blocks where it
+    /// writes them as they come.
+    fn waits_pool(&self) -> &crate::disk::BlockPool {
+        let spawner = &self.state.shared.spawner;
+        if self.state.files.writes_to_memory() {
+            spawner.checks()
+        } else {
+            spawner.pool()
+        }
+    }
+
+    /// Writes the block on this connection's turn. When it was its piece's
+    /// last, the piece is checked on the hashing thread, never here: with
+    /// this connection back at its socket where the storage holds the piece
+    /// in memory, and with it waiting for the check otherwise.
     async fn land_here(
         &self,
         piece: &Piece<ByteBuf<'_>>,
@@ -4426,46 +4444,76 @@ impl PeerHandler {
         let land = || land_block(state, self.addr, piece, &chunk_info);
         // A block the storage copies into memory is copied here, on this
         // thread: only a write that reaches a file, and the check of a
-        // piece, which hashes it and writes it out, take a blocking thread.
-        let landed = if state.files.writes_to_memory() {
+        // piece, take a blocking thread.
+        let from_memory = state.files.writes_to_memory();
+        let landed = if from_memory {
             land()
         } else {
             spawner.block_in_place_with_semaphore(land).await
         }
         .with_context(|| format!("error processing received chunk {chunk_info:?}"))?;
+        let Some((time, senders, piece_check)) = landed else {
+            return Ok(());
+        };
         // The piece is out of flight and out of the queue from here until its
         // verdict, so its check belongs to the torrent, not to this
-        // connection: it runs on a task of its own, which this connection
-        // waits for, and which goes on when the connection ends while it
-        // waits for a blocking permit (libtorrent `torrent::verify_piece`
-        // posts the hash job bound to the torrent, `shared_from_this()`, and
-        // `torrent::on_piece_verified` takes its verdict whatever became of
-        // the sender).
-        if let Some((time, senders, piece_check)) = landed {
-            let state = self.state.clone();
-            let addr = self.addr;
-            let counters = self.counters.clone();
-            let check = async move {
-                let spawner = state.shared.spawner.clone();
-                spawner
-                    .block_in_place_with_semaphore(|| {
-                        let checked =
-                            check_landed_piece(&state, addr, &counters, &chunk_info, time, senders);
-                        piece_check.done();
-                        checked
-                    })
-                    .await
-            };
-            // On the session's runtime, which may block in place: from a uTP
-            // thread, `tokio::task::spawn` would run it on that thread.
-            let since = std::time::Instant::now();
-            let checked = spawner.spawn(check.in_current_span()).await;
-            spawner.stats().check_waited(since);
-            checked
-                .context("the piece check ended")?
-                .with_context(|| format!("error processing received chunk {chunk_info:?}"))?;
+        // connection, and goes on when the connection ends (libtorrent
+        // `torrent::verify_piece` posts the hash job bound to the torrent,
+        // `shared_from_this()`, and `torrent::on_piece_verified` takes its
+        // verdict whatever became of the sender).
+        if from_memory {
+            // The whole piece waits in the storage's memory for the hashing
+            // thread and then for its write: it is counted until both are
+            // done, and a connection that has one waiting already stops
+            // reading while the count is past its high mark (libtorrent
+            // `peer_connection::incoming_piece`, `m_outstanding_writing_bytes`
+            // against `max_queued_disk_bytes`).
+            let piece_len = u64::from(state.lengths.piece_length(chunk_info.piece_index));
+            let (charge, waiting) = spawner.checks().charge_bytes(piece_len);
+            if self.disk.queued(charge) {
+                spawner.stats().peer_stopped();
+            }
+            spawner.hash().push(HashJob {
+                check: piece_check,
+                state: self.state.clone(),
+                tx: self.tx.clone(),
+                addr: self.addr,
+                counters: self.counters.clone(),
+                chunk: chunk_info,
+                time,
+                senders,
+                waiting: Some(waiting),
+                written: Written(Some(self.disk.clone())),
+                queued: Some(spawner.check_queued()),
+                ended: None,
+                _run: self.state.tasks.token(),
+            });
+            return Ok(());
         }
-
+        // The piece is in its files: it is read back and checked on the
+        // hashing thread like any other, and this connection waits for the
+        // check's end, which a check that fails tells it of as an error of
+        // its own.
+        let (ended, end) = tokio::sync::oneshot::channel();
+        let since = std::time::Instant::now();
+        spawner.hash().push(HashJob {
+            check: piece_check,
+            state: self.state.clone(),
+            tx: self.tx.clone(),
+            addr: self.addr,
+            counters: self.counters.clone(),
+            chunk: chunk_info,
+            time,
+            senders,
+            waiting: None,
+            written: Written(None),
+            queued: Some(spawner.check_queued()),
+            ended: Some(ended),
+            _run: self.state.tasks.token(),
+        });
+        // Dropped unsent when the check is over, however it ended.
+        let _ = end.await;
+        spawner.stats().check_waited(since);
         Ok(())
     }
 
@@ -4797,16 +4845,36 @@ fn write_failed(state: &TorrentStateLive, chunk_info: &ChunkInfo, e: anyhow::Err
     state.on_fatal_error(e).map(|()| None)
 }
 
-// Checks a piece whose last block landed, and hands it to the
-// storage if it passed. The time is known when the piece was in
-// flight: one whose last block came after it was given back has none.
-fn check_landed_piece(
+// Hashes the piece whose last block was written: where the storage holds it
+// in memory, or read back from its files.
+fn hash_landed_piece(
+    state: &TorrentStateLive,
+    piece_index: ValidPieceIndex,
+) -> anyhow::Result<Verdict> {
+    let stats = state.shared.spawner.stats();
+    let call = stats.call(if state.files.writes_to_memory() {
+        DiskOp::HashMemory
+    } else {
+        DiskOp::HashFiles
+    });
+    call.bytes(u64::from(state.lengths.piece_length(piece_index)));
+    state
+        .file_ops()
+        .check_piece(piece_index)
+        .with_context(|| format!("error checking piece={}", piece_index.get()))
+}
+
+// What follows a piece's verdict: one that passed is handed to the storage,
+// which writes it whole when it held it in memory, and is had once the
+// storage took it; one that failed is fetched again.
+fn settle_landed_piece(
     state: &TorrentStateLive,
     addr: PeerHandle,
     counters: &AtomicPeerCounters,
     chunk_info: &ChunkInfo,
     full_piece_download_time: Option<Duration>,
     senders: crate::piece_tracker::Senders,
+    verdict: Verdict,
 ) -> anyhow::Result<()> {
     let index = chunk_info.piece_index.get();
     let piece_index = chunk_info.piece_index;
@@ -4817,16 +4885,7 @@ fn check_landed_piece(
     let stats = state.shared.spawner.stats();
     let piece_len = u64::from(state.lengths.piece_length(piece_index));
     let from_memory = state.files.writes_to_memory();
-    let verdict = {
-        let call = stats.call(if from_memory {
-            DiskOp::HashMemory
-        } else {
-            DiskOp::HashFiles
-        });
-        call.bytes(piece_len);
-        state.file_ops().check_piece(chunk_info.piece_index)
-    };
-    match verdict.with_context(|| format!("error checking piece={index}"))? {
+    match verdict {
         Verdict::Inconsistent => {
             return state.on_fatal_error(inconsistent_hashes(chunk_info.piece_index));
         }
@@ -5021,11 +5080,28 @@ impl Drop for Written {
     }
 }
 
-impl DiskJob for WriteJob {
-    // One torrent's writes run on one thread at a time: writes racing on
-    // the same files cost each other more than they gain.
+/// A write for the disk threads: a received block, or a whole piece its
+/// storage held in memory, checked and now to be written.
+pub(crate) enum DiskWrite {
+    Block(WriteJob),
+    Piece(PieceWrite),
+}
+
+/// A piece that passed its check on the hashing thread, and what its check
+/// carried: the storage writes it whole, and it is had once it did.
+pub(crate) struct PieceWrite(HashJob);
+
+impl DiskJob for DiskWrite {
+    // One torrent's writes run on one thread at a time, in the order
+    // queued: writes racing on the same files cost each other more than
+    // they gain, and whole pieces reach the files in the order their
+    // checks ended.
     fn key(&self) -> usize {
-        Arc::as_ptr(&self.state) as usize
+        let state = match self {
+            DiskWrite::Block(job) => &job.state,
+            DiskWrite::Piece(PieceWrite(job)) => &job.state,
+        };
+        Arc::as_ptr(state) as usize
     }
 
     fn run(self) {
@@ -5033,6 +5109,28 @@ impl DiskJob for WriteJob {
         Self::run_batch(&mut one);
     }
 
+    // Each run of blocks is landed as one batch; a piece is written on its
+    // turn among them.
+    fn run_batch(batch: &mut std::collections::VecDeque<Self>) {
+        let mut blocks = std::collections::VecDeque::new();
+        while let Some(job) = batch.pop_front() {
+            match job {
+                DiskWrite::Block(job) => {
+                    blocks.push_back(job);
+                    while let Some(DiskWrite::Block(_)) = batch.front() {
+                        if let Some(DiskWrite::Block(job)) = batch.pop_front() {
+                            blocks.push_back(job);
+                        }
+                    }
+                    WriteJob::run_batch(&mut blocks);
+                }
+                DiskWrite::Piece(PieceWrite(job)) => job.settle(Verdict::Passed),
+            }
+        }
+    }
+}
+
+impl WriteJob {
     // The batch is landed a torrent at a time: each run of jobs of one
     // torrent takes the torrent's lock twice, not twice per block.
     fn run_batch(batch: &mut std::collections::VecDeque<Self>) {
@@ -5092,8 +5190,8 @@ impl WriteJob {
         match landed {
             Ok(None) => {}
             Ok(Some((time, senders, check))) => {
-                let hash = state.shared.spawner.hash().clone();
-                hash.push(HashJob {
+                let spawner = state.shared.spawner.clone();
+                spawner.hash().push(HashJob {
                     check,
                     state,
                     tx,
@@ -5102,6 +5200,10 @@ impl WriteJob {
                     chunk,
                     time,
                     senders,
+                    waiting: None,
+                    written: Written(None),
+                    queued: Some(spawner.check_queued()),
+                    ended: None,
                     _run,
                 });
             }
@@ -5131,6 +5233,16 @@ pub(crate) struct HashJob {
     time: Option<Duration>,
     senders: crate::piece_tracker::Senders,
     check: PieceCheck,
+    // The piece counted while it waits whole in its storage's memory, and
+    // the connection told when it waits no more: both until the piece is
+    // written, or its check failed, or the job is dropped.
+    waiting: Option<crate::disk::Span>,
+    written: Written,
+    // Counted among its session's checks that wait for the hashing thread,
+    // until the thread takes it.
+    queued: Option<crate::spawn_utils::QueuedCheck>,
+    // Dropped when the check is over, for a connection that waits for it.
+    ended: Option<tokio::sync::oneshot::Sender<()>>,
     _run: tokio_util::task::task_tracker::TaskTrackerToken,
 }
 
@@ -5161,18 +5273,43 @@ impl Drop for PieceCheck {
 
 impl DiskJob for HashJob {
     // The checks of one torrent share nothing but its lock, taken for the
-    // verdict, so they run side by side: one thread reads back and hashes
-    // no faster than its core does, and a torrent that receives faster
-    // than that is held to it. The torrent is the key, so torrents are
-    // served in turn, and one whose checks wait takes every hashing thread
-    // only while no other torrent's check waits.
+    // verdict. The torrent is the key, so the torrents of every session are
+    // served in turn: the hashing thread takes one check of a torrent, and
+    // a torrent with more waiting goes behind the others that wait, so none
+    // holds the thread from another however many pieces it has queued.
     const SIDE_BY_SIDE: bool = true;
 
     fn key(&self) -> usize {
         Arc::as_ptr(&self.state) as usize
     }
 
-    fn run(self) {
+    fn run(mut self) {
+        let since = std::time::Instant::now();
+        self.queued = None;
+        let stats = self.state.shared.spawner.stats().clone();
+        match hash_landed_piece(&self.state, self.chunk.piece_index) {
+            // A piece its storage holds in memory is written whole now: on
+            // the torrent's turn of the write threads, in the order the
+            // checks ended, with the hashing thread on to the next check
+            // (libtorrent hashes on `hashing_threads` and writes on
+            // `aio_threads`, mmap_disk_io.cpp:369-374).
+            Ok(Verdict::Passed) if self.state.files.writes_to_memory() => {
+                let disk = self.state.shared.spawner.disk().clone();
+                disk.push(DiskWrite::Piece(PieceWrite(self)));
+            }
+            Ok(verdict) => self.settle(verdict),
+            Err(e) => {
+                self.check.done();
+                chunk_failed(&self.tx, self.addr, &self.chunk, e);
+            }
+        }
+        stats.hash_thread_worked(since);
+    }
+}
+
+impl HashJob {
+    // The piece's verdict is acted on, and its check is over.
+    fn settle(self, verdict: Verdict) {
         let HashJob {
             state,
             tx,
@@ -5182,13 +5319,21 @@ impl DiskJob for HashJob {
             time,
             senders,
             check,
+            waiting,
+            written,
+            queued: _,
+            ended,
             _run,
         } = self;
-        let checked = check_landed_piece(&state, addr, &counters, &chunk, time, senders);
+        let settled = settle_landed_piece(&state, addr, &counters, &chunk, time, senders, verdict);
         check.done();
-        if let Err(e) = checked {
+        // The piece waits no more before its connection is told so.
+        drop(waiting);
+        drop(written);
+        if let Err(e) = settled {
             chunk_failed(&tx, addr, &chunk, e);
         }
+        drop(ended);
     }
 }
 

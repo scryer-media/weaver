@@ -39,6 +39,15 @@ pub(crate) const BLOCK_LEN: usize = CHUNK_SIZE as usize;
 /// default, settings_pack.cpp:277).
 pub(crate) const MAX_QUEUED_DISK_BYTES: usize = 1024 * 1024;
 
+/// The bytes of whole pieces a storage holds in memory that may wait for
+/// their check and their write before the connections that completed them
+/// stop reading: by the pool's marks, reads stop at three quarters of it,
+/// 48 MiB, and go on at half, 32 MiB. The bound is soft by a piece for each
+/// connection, as the block bound is by a block. A piece is the unit that
+/// waits here, so the bound is one that holds some pieces, where the block
+/// bound holds some blocks.
+pub(crate) const MAX_QUEUED_CHECK_BYTES: usize = 64 * 1024 * 1024;
+
 /// The session's block buffers, counted while they hold a block queued for
 /// the disk.
 #[derive(Clone)]
@@ -60,6 +69,9 @@ struct PoolInner {
     // Blocks queued for the disk now, as `PoolState::in_use` counts them:
     // kept apart so a scrape reads it without the pool's lock.
     queued: AtomicUsize,
+    // Spans of bytes counted without a buffer of the pool's now
+    // (`BlockPool::charge_bytes`).
+    spans: AtomicUsize,
 }
 
 struct PoolState {
@@ -97,6 +109,7 @@ impl BlockPool {
             below: Notify::new(),
             allocated: AtomicUsize::new(0),
             queued: AtomicUsize::new(0),
+            spans: AtomicUsize::new(0),
         }))
     }
 
@@ -140,10 +153,28 @@ impl BlockPool {
     pub(crate) fn charge(&self, block: &mut BlockBuf) -> Charge {
         debug_assert!(!block.charged);
         block.charged = true;
+        self.add(1)
+    }
+
+    /// `bytes` held elsewhere wait for the disk, as a whole piece its
+    /// storage keeps in memory does until it is checked and written: they
+    /// count against the bound as so many blocks do, by the same marks,
+    /// until the span is dropped.
+    pub(crate) fn charge_bytes(&self, bytes: u64) -> (Charge, Span) {
+        let blocks = usize::try_from(bytes.div_ceil(BLOCK_LEN as u64)).unwrap_or(usize::MAX);
+        self.0.spans.fetch_add(1, Ordering::Relaxed);
+        let span = Span {
+            pool: self.clone(),
+            blocks,
+        };
+        (self.add(blocks), span)
+    }
+
+    fn add(&self, blocks: usize) -> Charge {
         let inner = &*self.0;
-        inner.queued.fetch_add(1, Ordering::Relaxed);
+        inner.queued.fetch_add(blocks, Ordering::Relaxed);
         let mut state = inner.state.lock();
-        state.in_use += 1;
+        state.in_use += blocks;
         if state.in_use >= inner.low_watermark + (inner.max_use - inner.low_watermark) / 2 {
             state.exceeded = true;
         }
@@ -151,6 +182,21 @@ impl BlockPool {
             exceeded: state.exceeded,
             generation: state.generation,
         }
+    }
+
+    // `blocks` no longer wait, with the pool's lock held; whether the pool
+    // fell to its low mark for it, which the caller rings once the lock is
+    // let go.
+    fn sub(&self, state: &mut PoolState, blocks: usize) -> bool {
+        let inner = &*self.0;
+        inner.queued.fetch_sub(blocks, Ordering::Relaxed);
+        state.in_use -= blocks;
+        if state.exceeded && state.in_use <= inner.low_watermark {
+            state.exceeded = false;
+            state.generation += 1;
+            return true;
+        }
+        false
     }
 
     /// Whether the pool fell to its low mark since `generation`.
@@ -167,16 +213,7 @@ impl BlockPool {
     fn give_back(&self, buf: Box<[u8]>, charged: bool) {
         let inner = &*self.0;
         let mut state = inner.state.lock();
-        let mut fell = false;
-        if charged {
-            inner.queued.fetch_sub(1, Ordering::Relaxed);
-            state.in_use -= 1;
-            if state.exceeded && state.in_use <= inner.low_watermark {
-                state.exceeded = false;
-                state.generation += 1;
-                fell = true;
-            }
-        }
+        let fell = charged && self.sub(&mut state, 1);
         if state.free.len() < inner.kept && !buf.is_empty() {
             state.free.push(buf);
         }
@@ -189,6 +226,11 @@ impl BlockPool {
     /// Bytes of blocks queued for the disk now, read without a lock.
     pub(crate) fn queued_bytes(&self) -> u64 {
         (self.0.queued.load(Ordering::Relaxed) * BLOCK_LEN) as u64
+    }
+
+    /// Spans counted now ([`Self::charge_bytes`]), read without a lock.
+    pub(crate) fn spans(&self) -> u64 {
+        self.0.spans.load(Ordering::Relaxed) as u64
     }
 
     /// Blocks queued for the disk now.
@@ -206,6 +248,24 @@ impl BlockPool {
     #[cfg(test)]
     pub(crate) fn max_use(&self) -> usize {
         self.0.max_use
+    }
+}
+
+/// Bytes counted against a pool's bound without a buffer of its own
+/// ([`BlockPool::charge_bytes`]), until this is dropped.
+pub(crate) struct Span {
+    pool: BlockPool,
+    blocks: usize,
+}
+
+impl Drop for Span {
+    fn drop(&mut self) {
+        let inner = &*self.pool.0;
+        inner.spans.fetch_sub(1, Ordering::Relaxed);
+        let fell = self.pool.sub(&mut inner.state.lock(), self.blocks);
+        if fell {
+            inner.below.notify_waiters();
+        }
     }
 }
 
@@ -418,6 +478,20 @@ impl<J: DiskJob> Clone for DiskQueue<J> {
     }
 }
 
+/// A queue as those who would share it find it: there while anyone holds
+/// it or a job of its is queued or run, and gone after.
+pub(crate) struct WeakDiskQueue<J: DiskJob>(std::sync::Weak<QueueInner<J>>);
+
+impl<J: DiskJob> WeakDiskQueue<J> {
+    pub(crate) const fn new() -> Self {
+        Self(std::sync::Weak::new())
+    }
+
+    pub(crate) fn upgrade(&self) -> Option<DiskQueue<J>> {
+        self.0.upgrade().map(|inner| DiskQueue { inner })
+    }
+}
+
 struct QueueInner<J> {
     handle: Handle,
     jobs: Mutex<Jobs<J>>,
@@ -573,6 +647,16 @@ impl<J: DiskJob> DiskQueue<J> {
         if start {
             spawn_drain(&self.inner);
         }
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakDiskQueue<J> {
+        WeakDiskQueue(Arc::downgrade(&self.inner))
+    }
+
+    /// Whether `other` is this queue.
+    #[cfg(test)]
+    pub(crate) fn is(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     /// Jobs waiting for a thread now, read without a lock.
@@ -904,6 +988,45 @@ mod tests {
         others.clear();
         room.await;
         assert_eq!(peer.outstanding(), 2);
+    }
+
+    // Whole pieces are counted by the same marks, each as its blocks: a
+    // peer with one waiting stops at the high mark, 48 of 64 blocks, and
+    // reads again once the count falls to the low one, 32, its own pieces
+    // still waiting. The pieces waiting are counted too.
+    #[tokio::test(start_paused = true)]
+    async fn pieces_waiting_stop_a_peer_at_the_high_mark_until_the_low_one() {
+        let pool = BlockPool::new(64 * BLOCK_LEN);
+        let piece = 8 * BLOCK_LEN as u64;
+        let peer = PeerDisk::default();
+        let mut mine = Vec::new();
+        for waiting in 1..=6 {
+            let (charge, span) = pool.charge_bytes(piece);
+            assert_eq!(charge.exceeded, waiting == 6, "{waiting}");
+            assert_eq!(peer.queued(charge), waiting == 6);
+            mine.push(span);
+        }
+        assert_eq!(pool.spans(), 6);
+        assert_eq!(pool.queued_bytes(), 6 * piece);
+        // A piece that is not whole blocks counts the block it ends in.
+        let (_, odd) = pool.charge_bytes(BLOCK_LEN as u64 + 1);
+        assert_eq!(pool.in_use(), 50);
+        drop(odd);
+
+        let room = peer.room(&pool);
+        tokio::pin!(room);
+        assert!(futures::poll!(room.as_mut()).is_pending());
+        mine.pop();
+        peer.written();
+        assert_eq!(pool.in_use(), 40);
+        assert!(futures::poll!(room.as_mut()).is_pending());
+        mine.pop();
+        peer.written();
+        assert_eq!(pool.in_use(), 32);
+        room.await;
+        assert!(!peer.blocked());
+        assert_eq!(peer.outstanding(), 4);
+        assert_eq!(pool.spans(), 4);
     }
 
     struct Count(Arc<AtomicUsize>);

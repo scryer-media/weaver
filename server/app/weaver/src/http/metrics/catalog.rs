@@ -672,9 +672,17 @@ metric_families! {
     TORRENT_DISK_READ_JOBS_QUEUED = ("weaver_torrent_disk_read_jobs_queued", Gauge, ["route"],
         "Upload reads waiting for a disk thread of the session now.");
     TORRENT_DISK_PIECE_CHECK_WAITS = ("weaver_torrent_disk_piece_check_waits_total", Counter, ["route"],
-        "Times a peer connection waited for the check and write of a piece it completed, since the session opened.");
+        "Times a peer connection waited for the hashing thread to check a piece it completed, since the session opened. A piece held in memory until it is checked is not waited for: it is handed to the hashing thread and counted among the pieces waiting.");
     TORRENT_DISK_PIECE_CHECK_WAIT_SECONDS = ("weaver_torrent_disk_piece_check_wait_seconds_total", Counter, ["route"],
-        "Time peer connections waited for the check and write of a piece they completed, since the session opened, summed.");
+        "Time peer connections waited for the hashing thread to check a piece they completed, since the session opened, summed.");
+    TORRENT_DISK_HASH_JOBS_QUEUED = ("weaver_torrent_disk_hash_jobs_queued", Gauge, ["route"],
+        "Piece checks of the session waiting for the hashing thread now. The process has one hashing thread, which every session shares.");
+    TORRENT_DISK_HASH_BUSY_SECONDS = ("weaver_torrent_disk_hash_busy_seconds_total", Counter, ["route"],
+        "Time the hashing thread spent on the session's piece checks since the session opened. The process has one hashing thread, which every session shares: the rates of all sessions summed are the share of the thread in use, and at 1 the thread is the bound on what they download.");
+    TORRENT_DISK_PIECES_WAITING = ("weaver_torrent_disk_pieces_waiting", Gauge, ["route"],
+        "Whole pieces held in memory that wait for their check or their write now.");
+    TORRENT_DISK_PIECE_BYTES_WAITING = ("weaver_torrent_disk_piece_bytes_waiting", Gauge, ["route"],
+        "Bytes of the whole pieces held in memory that wait for their check or their write now, in whole blocks. A connection with a piece waiting stops reading its socket once this passes 48 MiB, and reads again at 32 MiB.");
     TORRENT_PEER_SOCKET_CALLS = ("weaver_torrent_peer_socket_calls_total", Counter, ["route", "transport", "direction"],
         "Reads of peer sockets that returned bytes (in) and buffers written to them whole (out), since the session opened, by transport. A connection is counted once it is open: the handshakes that open it, the encryption's and BitTorrent's, either way, and the reads behind the last message it took, are not counted.");
     TORRENT_PEER_REQUEST_WRITES = ("weaver_torrent_peer_request_writes_total", Counter, ["route", "transport"],

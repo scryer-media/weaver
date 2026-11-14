@@ -146,6 +146,8 @@ pub struct DiskStats {
     peers_resumed: AtomicU64,
     check_waits: AtomicU64,
     check_wait_nanos: AtomicU64,
+    hash_busy_nanos: AtomicU64,
+    hash_jobs_queued: AtomicU64,
     read_buffer_growths: AtomicU64,
     // Writers holding a batch buffer.
     batch_buffers: AtomicU64,
@@ -171,12 +173,20 @@ pub struct DiskStatsSnapshot {
     /// Blocking permits held now, and how many there are.
     pub permits_in_use: u64,
     pub permits: u64,
-    /// Jobs waiting for a thread of each disk queue now.
+    /// Jobs waiting for a thread of each disk queue now; of the hashing
+    /// thread, which every session of the process shares, the session's
+    /// own.
     pub write_jobs_queued: u64,
     pub hash_jobs_queued: u64,
     pub read_jobs_queued: u64,
     /// Bytes of received blocks queued for the disk now.
     pub queued_write_bytes: u64,
+    /// Whole pieces their storage holds in memory that wait for their
+    /// check or their write now, and their bytes, in whole blocks.
+    pub check_pieces_waiting: u64,
+    pub check_bytes_waiting: u64,
+    /// Time the hashing thread spent on the session's checks, summed.
+    pub hash_busy_nanos: u64,
     /// Times a connection stopped reading for the disk, and read again.
     pub peers_stopped: u64,
     pub peers_resumed: u64,
@@ -291,6 +301,21 @@ impl DiskStats {
         self.check_wait_nanos.fetch_add(nanos_since(since), Relaxed);
     }
 
+    /// The hashing thread worked on a check of the session since `since`.
+    pub fn hash_thread_worked(&self, since: Instant) {
+        self.hash_busy_nanos.fetch_add(nanos_since(since), Relaxed);
+    }
+
+    /// A check of the session waits for the hashing thread.
+    pub fn check_queued(&self) {
+        self.hash_jobs_queued.fetch_add(1, Relaxed);
+    }
+
+    /// A check of the session waits no more: it was taken, or dropped.
+    pub fn check_taken(&self) {
+        self.hash_jobs_queued.fetch_sub(1, Relaxed);
+    }
+
     pub fn read_buffers_grew(&self, times: u64) {
         self.read_buffer_growths.fetch_add(times, Relaxed);
     }
@@ -349,6 +374,8 @@ impl DiskStats {
             peers_resumed: self.peers_resumed.load(Relaxed),
             check_waits: self.check_waits.load(Relaxed),
             check_wait_nanos: self.check_wait_nanos.load(Relaxed),
+            hash_busy_nanos: self.hash_busy_nanos.load(Relaxed),
+            hash_jobs_queued: self.hash_jobs_queued.load(Relaxed),
             read_buffer_growths: self.read_buffer_growths.load(Relaxed),
             batch_buffers: self.batch_buffers.load(Relaxed),
             read_seeks: self.read_seeks.load(Relaxed),

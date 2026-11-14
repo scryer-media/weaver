@@ -2802,6 +2802,33 @@ fn render_torrent_disk(out: &mut Encoder, routes: &[SessionSeries]) {
         );
     }
     for session in sessions() {
+        out.sample(
+            &f::TORRENT_DISK_HASH_JOBS_QUEUED,
+            &[("route", session.route.as_str())],
+            session.disk.hash_jobs_queued,
+        );
+    }
+    for session in sessions() {
+        out.sample_f64(
+            &f::TORRENT_DISK_HASH_BUSY_SECONDS,
+            &[("route", session.route.as_str())],
+            seconds(session.disk.hash_busy_nanos),
+        );
+    }
+    for (family, value) in [
+        (
+            &f::TORRENT_DISK_PIECES_WAITING,
+            (|s: &SessionSeries| s.disk.check_pieces_waiting) as fn(&SessionSeries) -> u64,
+        ),
+        (&f::TORRENT_DISK_PIECE_BYTES_WAITING, |s: &SessionSeries| {
+            s.disk.check_bytes_waiting
+        }),
+    ] {
+        for session in sessions() {
+            out.sample(family, &[("route", session.route.as_str())], value(session));
+        }
+    }
+    for session in sessions() {
         for transport in Transport::ALL {
             let socket = &session.disk.sockets[transport.index()];
             for (direction, calls) in [("in", socket.receive_calls), ("out", socket.send_calls)] {
