@@ -600,7 +600,7 @@ pub(crate) static BEFORE_FIRST_MOVE: std::sync::Mutex<Option<MoveHook>> =
 pub(crate) static DESTINATION_ROOM: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
-pub(crate) type SpentHook =Box<dyn FnOnce(&[PathBuf]) + Send>;
+pub(crate) type SpentHook = Box<dyn FnOnce(&[PathBuf]) + Send>;
 
 // Runs with the consumed inputs once their handles are released and before
 // they are removed.

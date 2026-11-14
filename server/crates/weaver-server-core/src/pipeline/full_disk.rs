@@ -321,8 +321,7 @@ impl Pipeline {
                     match hold.mark {
                         None => hold.mark = Some(shown),
                         Some(mark) => {
-                            hold.go |=
-                                shown > mark && spendable.is_some_and(|free| free > reserve);
+                            hold.go |= shown > mark && spendable.is_some_and(|free| free > reserve);
                         }
                     }
                 }

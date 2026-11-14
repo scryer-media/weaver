@@ -122,6 +122,10 @@ pub trait MemberAccess {
     fn scratch(&mut self) -> Option<std::path::PathBuf> {
         None
     }
+    // A write the object made in that directory failed. The namespace hears
+    // why, so a disk with no room is not taken for a set that cannot be
+    // repaired.
+    fn scratch_failed(&mut self, _error: std::io::Error) {}
 
     // Bytes of the recovery object's own volume, which the namespace kept
     // where the object's inverse map placed them. This is where the

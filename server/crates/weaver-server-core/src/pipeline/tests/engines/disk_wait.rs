@@ -1613,7 +1613,11 @@ async fn a_root_pointed_elsewhere_leaves_the_held_job_waiting_on_the_disk_that_f
         !working(&pipeline).waited_on(),
         "the root pointed elsewhere is no longer waited on"
     );
-    assert_eq!(pipeline.full_disk_mark(JOB), Some(RESERVE), "its mark stands");
+    assert_eq!(
+        pipeline.full_disk_mark(JOB),
+        Some(RESERVE),
+        "its mark stands"
+    );
 
     // The disk that failed reads no more room, then room made.
     hears(&mut pipeline, &room, StorageRoot::Complete, 0);

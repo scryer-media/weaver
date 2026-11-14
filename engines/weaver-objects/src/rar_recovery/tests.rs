@@ -725,6 +725,32 @@ fn a_restore_that_writes_nothing_leaves_a_volume_that_is_not_whole_unsound() {
     assert_eq!(verdict(&job, lost), vec![SliceVerdict::Damaged]);
 }
 
+// A scratch directory that refuses the staged files is told to the namespace,
+// each refusal with its cause, so a disk with no room is not lost in a set
+// ruled beyond repair.
+#[test]
+fn a_scratch_directory_that_refuses_the_staged_files_is_told_to_the_namespace() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let mut job = job();
+    let (bytes, lost) = rar4_restore(&mut job, &dir);
+    job.store.scratch = Some(dir.path().join("gone"));
+    job.store.members.insert(lost, vec![0; bytes.len()]);
+    job.store
+        .holes
+        .insert(lost, vec![ByteRange::new(0, bytes.len() as u64)]);
+    bind(&mut job);
+    job.object
+        .repair(&mut job.store, weaver_graph::Budget::default());
+    assert_eq!(job.store.writes, 0);
+    assert!(!job.store.scratch_failures.is_empty());
+    assert!(
+        job.store
+            .scratch_failures
+            .iter()
+            .all(|kind| *kind == std::io::ErrorKind::NotFound)
+    );
+}
+
 #[test]
 fn acknowledged_rev_growth_retains_repaired_proof_but_later_loss_revokes_it() {
     let mut job = job();

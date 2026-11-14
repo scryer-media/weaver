@@ -380,6 +380,22 @@ impl Repaired {
         }
     }
 
+    // The repair's scratch directory, which lies beside the output on the
+    // working disk, refused a write for want of room. The repair failed with
+    // it as it does when the output refuses one: nothing staged is applied.
+    pub(crate) fn refuse(&mut self, path: &std::path::Path, source: std::io::Error) {
+        if self.failed.is_some() {
+            return;
+        }
+        self.output.release_handle();
+        let _ = std::fs::remove_file(self.output.path());
+        self.failed = Some(LeafError::Io {
+            device: crate::pipeline::graph::limits::Device::Working,
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+
     // The write the output refused, if one did: the repair failed with it.
     pub(crate) fn failed(&mut self) -> Option<LeafError> {
         self.failed.take()
@@ -933,9 +949,24 @@ impl MemberAccess for Lent {
             self.namespace.0, self.set.0
         ));
         super::remove_scratch(&dir);
-        std::fs::create_dir(&dir).ok()?;
+        if let Err(error) = std::fs::create_dir(&dir) {
+            self.scratch_failed(error);
+            return None;
+        }
         self.scratch = Some(dir.clone());
         Some(dir)
+    }
+
+    // Only a disk with no room is the namespace's to wait on. Any other
+    // failure stays the object's, which rules the set as it did before.
+    fn scratch_failed(&mut self, error: std::io::Error) {
+        if crate::operations::is_out_of_space(&error) {
+            let dir = self
+                .scratch
+                .clone()
+                .unwrap_or_else(|| self.internal.clone());
+            self.repaired.refuse(&dir, error);
+        }
     }
 
     // The set's volume is a member of the namespace it was posted in, or a
@@ -960,5 +991,59 @@ impl MemberAccess for Lent {
             into.truncate(start);
         }
         read
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::graph::job::GraphError;
+    use crate::pipeline::graph::limits::Device;
+    use crate::pipeline::graph::namespace::WriteError;
+
+    // A repair whose output finds the disk full part-way comes back as a
+    // write the working disk had no room for, which holds the job, whatever
+    // kind of recovery wrote it: every kind writes what it rebuilt here.
+    #[test]
+    fn a_repair_whose_output_finds_the_disk_full_comes_back_out_of_space() {
+        use crate::pipeline::graph::leaf::counting::fill_after;
+        let dir = tempfile::tempdir().expect("a working directory");
+        let mut repaired = Repaired::again(dir.path(), NodeId(4)).expect("an output");
+        fill_after(Some(10));
+        repaired.write(MemberId(0), 0, b"rebuilt");
+        repaired.write(MemberId(0), 7, b"rebuilt");
+        fill_after(None);
+        assert!(!repaired.output.path().exists());
+
+        let error = repaired.failed().expect("the repair failed");
+        let error = GraphError::from(WriteError::from(error));
+        assert_eq!(error.out_of_space(), Some(Device::Working));
+    }
+
+    // A repair whose scratch directory found the disk full comes back as a
+    // write the working disk had no room for, which holds the job: nothing
+    // it staged is applied, and its output is gone.
+    #[test]
+    fn a_repair_whose_scratch_found_the_disk_full_comes_back_out_of_space() {
+        let dir = tempfile::tempdir().expect("a working directory");
+        let mut repaired = Repaired::again(dir.path(), NodeId(3)).expect("an output");
+        repaired.write(MemberId(0), 0, b"rebuilt");
+        let output = repaired.output.path().to_path_buf();
+        assert!(output.exists());
+
+        let scratch = dir.path().join("scratch");
+        repaired.refuse(
+            &scratch,
+            std::io::Error::from(std::io::ErrorKind::StorageFull),
+        );
+        // A later write is not made, and a second refusal does not replace
+        // the first.
+        repaired.write(MemberId(0), 7, b"more");
+        repaired.refuse(&scratch, std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(!output.exists());
+
+        let error = repaired.failed().expect("the repair failed");
+        let error = GraphError::from(WriteError::from(error));
+        assert_eq!(error.out_of_space(), Some(Device::Working));
     }
 }
