@@ -18,7 +18,7 @@ async fn a_missing_recorded_engine_envelope_waits_for_refetch_and_keeps_survivin
     assert!(expected.completed(), "{:?}", expected.failure);
     let temp = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) =
-        new_direct_pipeline_with_buffers(&temp, buffers(), 1).await;
+        new_direct_pipeline_with_backlog(&temp, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     let working_dir = insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
     for article in [(0, 0), (1, 0)] {

@@ -183,8 +183,13 @@ impl<'a> Volume<'a> {
                 Some(high) if packed && flags & LARGE != 0 => u64::from(le_u32(high)),
                 _ => 0,
             };
-            match at.checked_add(size + (high << 32 | low)) {
-                Some(next) if next <= self.length => at = next,
+            // The sizes are the volume's own word, so a sum past 64 bits, or
+            // a next header that is not past this one, ends the walk.
+            match size
+                .checked_add(high << 32 | low)
+                .and_then(|span| at.checked_add(span))
+            {
+                Some(next) if at < next && next <= self.length => at = next,
                 _ => break false,
             }
         })

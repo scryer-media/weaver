@@ -517,7 +517,7 @@ async fn held_off_server_stops_reconnecting_inside_the_holdoff_window() {
     let client = tokio::task::spawn_blocking(move || {
         for _ in 0..CONNECTIONS {
             assert!(matches!(
-                client.try_acquire_blocking_body_lane(&[], &[]),
+                client.try_acquire_blocking_body_lane(&[], weaver_nntp::ServerSet::EMPTY),
                 Err(
                     weaver_nntp::client::BlockingBodyLaneAcquireError::ProviderCapacity(
                         weaver_nntp::NntpError::ServerOverLimit { .. }
@@ -626,6 +626,94 @@ async fn rename_preserves_an_existing_working_directory_collision() {
     assert!(crate::jobs::working_dir::is_weaver_owned_working_dir(
         &old_dir
     ));
+}
+
+// Each failure in a row doubles the wait before the next try, up to a cap.
+#[test]
+fn a_rename_backoff_doubles_up_to_its_cap() {
+    let now = tokio::time::Instant::now();
+    let mut retry = crate::pipeline::RenameRetry::default();
+    let mut waits = Vec::new();
+    for _ in 0..12 {
+        retry.failed(now);
+        waits.push((retry.retry_at.unwrap() - now).as_secs());
+    }
+    assert_eq!(waits, [1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300, 300]);
+}
+
+// A rename that fails is not tried again until its backoff runs out, and a
+// job busy with a move is renamed by the first turn after the move ends.
+// Neither leaves a walk over the queue due.
+#[tokio::test]
+async fn a_failed_rename_waits_out_its_backoff_and_a_busy_one_needs_no_walk() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(10068);
+    let old_dir = intermediate_dir.join("original");
+    std::fs::create_dir(&old_dir).unwrap();
+    crate::jobs::working_dir::mark_weaver_owned_working_dir(&intermediate_dir, &old_dir, job_id)
+        .unwrap();
+    let mut state = minimal_job_state(job_id, "renamed", old_dir.clone());
+    state.download_state = crate::jobs::model::DownloadState::Queued;
+    pipeline.jobs.insert(job_id, state);
+    pipeline.shared_state.queue.write(|inner| {
+        let mut row = crate::pipeline::queue::JobRow::new(finished_job_info(job_id));
+        row.intents.rename_to = Some("renamed".to_string());
+        inner.push_job(row);
+        crate::pipeline::queue::Change::changed(())
+    });
+    std::fs::create_dir(intermediate_dir.join("renamed")).unwrap();
+    let collision = intermediate_dir.join("renamed.#10068");
+    std::fs::create_dir(&collision).unwrap();
+
+    let before = tokio::time::Instant::now();
+    pipeline.pending_renames.entry(job_id).or_default();
+    pipeline.retry_pending_renames().await;
+    let retry = &pipeline.pending_renames[&job_id];
+    assert_eq!(retry.failures, 1);
+    let retry_at = retry.retry_at.expect("a backoff after the failure");
+    assert!(retry_at >= before + std::time::Duration::from_secs(1));
+    assert_eq!(pipeline.next_rename_retry_at(), Some(retry_at));
+    assert!(!pipeline.queue_walk_due);
+
+    // Inside the backoff nothing is tried.
+    let far = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+    pipeline.pending_renames.get_mut(&job_id).unwrap().retry_at = Some(far);
+    pipeline.retry_pending_renames().await;
+    assert_eq!(pipeline.pending_renames[&job_id].failures, 1);
+    assert_eq!(pipeline.pending_renames[&job_id].retry_at, Some(far));
+
+    // Once it runs out the rename is tried, and fails again.
+    pipeline.pending_renames.get_mut(&job_id).unwrap().retry_at = Some(tokio::time::Instant::now());
+    pipeline.retry_pending_renames().await;
+    assert_eq!(pipeline.pending_renames[&job_id].failures, 2);
+
+    // A move holds the folder: the turn passes without a try or a walk.
+    std::fs::remove_dir(intermediate_dir.join("renamed")).unwrap();
+    std::fs::remove_dir(&collision).unwrap();
+    pipeline.pending_renames.get_mut(&job_id).unwrap().retry_at = Some(tokio::time::Instant::now());
+    pipeline.inflight_moves.insert(job_id);
+    pipeline.retry_pending_renames().await;
+    assert_eq!(pipeline.pending_renames[&job_id].failures, 2);
+    assert_eq!(pipeline.pending_renames[&job_id].retry_at, None);
+    assert_eq!(pipeline.next_rename_retry_at(), None);
+    assert!(!pipeline.queue_walk_due);
+    assert_eq!(pipeline.jobs[&job_id].working_dir, old_dir);
+
+    pipeline.inflight_moves.remove(&job_id);
+    pipeline.retry_pending_renames().await;
+    assert!(pipeline.pending_renames.is_empty());
+    assert_eq!(
+        pipeline.jobs[&job_id].working_dir,
+        intermediate_dir.join("renamed")
+    );
+    let asked = pipeline.shared_state.queue.read(|inner| {
+        inner
+            .job(job_id)
+            .map(|row| row.intents.rename_to.clone())
+            .expect("the job's row")
+    });
+    assert_eq!(asked, None);
 }
 
 #[tokio::test]
@@ -867,9 +955,10 @@ async fn hard_write_pressure_latches_until_soft_watermark() {
 }
 
 #[tokio::test]
-async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
+async fn delayed_retry_carries_exclusions_across_a_pool_rebuild() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(hosts_client(&[0, 1]));
     let job_id = JobId(40041);
     let file_id = NzbFileId {
         job_id,
@@ -913,14 +1002,14 @@ async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
         retry_count: 1,
         is_recovery: false,
         completion_critical: false,
-        exclude_servers: vec![0],
+        exclude_servers: weaver_nntp::ServerSet::from([0]),
         avoid_server: None,
     };
 
-    // A rebuild bumped the generation after this retry was scheduled under gen 0:
-    // its exclude index no longer refers to the server it was computed against,
-    // so the guard must drop it (the retry re-tries every server cleanly).
-    pipeline.pool_generation = 1;
+    // A rebuild swapped the two servers after this retry was scheduled under
+    // gen 0: server 0 of that pool is server 1 of the new one, and the retry
+    // keeps it tried under that number.
+    pipeline.activate_nntp(hosts_client(&[1, 0]), 4, 1);
     pipeline.note_retry_scheduled(segment_id);
     pipeline.receive_retry_work(super::RetryWork {
         scheduled_pool_generation: 0,
@@ -938,10 +1027,31 @@ async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
         .pop()
         .expect("stale retry should still requeue");
     assert_eq!(queued.segment_id, segment_id);
-    assert!(
-        queued.exclude_servers.is_empty(),
-        "stale server exclusions must be dropped after a pool rebuild"
+    assert_eq!(
+        queued.exclude_servers,
+        [1],
+        "server exclusions are carried by server identity across a pool rebuild"
     );
+
+    // Scheduled under a generation no layout is held for: nothing can be
+    // read from its numbers, so the retry tries every server.
+    pipeline.note_retry_scheduled(segment_id);
+    pipeline.receive_retry_work(super::RetryWork {
+        scheduled_pool_generation: 77,
+        infrastructure_retry: false,
+        work: make_work(),
+    });
+    let queued = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .pop()
+        .expect("an unknown-generation retry should still requeue");
+    assert!(queued.exclude_servers.is_empty());
 
     // No rebuild since scheduling: exclusions are still valid and preserved.
     pipeline.note_retry_scheduled(segment_id);
@@ -995,7 +1105,14 @@ async fn restored_post_processing_is_interrupted_without_rerunning_scripts() {
     );
     pipeline.schedule_job_completion_check(job_id);
 
-    assert!(pipeline.recover_restored_terminal_post_processing(job_id));
+    assert!(pipeline.recover_restored_terminal_post_processing(
+        job_id,
+        Some(crate::pipeline::RestoredPostProcessing::read(
+            &pipeline.db,
+            job_id,
+            None
+        ))
+    ));
     settle_failed_releases(&mut pipeline).await;
 
     assert!(!pipeline.pending_completion_checks.contains(&job_id));
@@ -1040,7 +1157,14 @@ async fn restored_post_processing_that_already_finished_archives_as_complete() {
     );
     pipeline.schedule_job_completion_check(job_id);
 
-    assert!(pipeline.recover_restored_terminal_post_processing(job_id));
+    assert!(pipeline.recover_restored_terminal_post_processing(
+        job_id,
+        Some(crate::pipeline::RestoredPostProcessing::read(
+            &pipeline.db,
+            job_id,
+            None
+        ))
+    ));
 
     assert!(!pipeline.pending_completion_checks.contains(&job_id));
     assert!(!pipeline.jobs.contains_key(&job_id));
@@ -1420,7 +1544,7 @@ async fn sparse_article_numbers_commit_cleanly_with_dense_ordinals() {
             total_size,
         );
 
-        pipeline.active_downloads += 1;
+        pipeline.articles_in_flight += 1;
         pipeline
             .handle_download_done(DownloadResult {
                 lane_id: 0,
@@ -1433,7 +1557,7 @@ async fn sparse_article_numbers_commit_cleanly_with_dense_ordinals() {
                 source_server_idx: None,
                 origin: DownloadResultOrigin::NormalPrimary,
                 retry_count: 0,
-                exclude_servers: Vec::new(),
+                exclude_servers: weaver_nntp::ServerSet::EMPTY,
                 release_connection_slot: true,
             })
             .await;

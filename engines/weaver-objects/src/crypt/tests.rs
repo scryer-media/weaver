@@ -413,6 +413,50 @@ fn sealing_re_enciphers_from_any_kept_seed() {
     }
 }
 
+// A seal whose seed lies a stride behind its range, and a seal of the whole
+// stream, read the plaintext no more than a piece at a time, and give back
+// the posted cipher byte for byte.
+#[test]
+fn sealing_reads_a_bounded_piece_at_a_time_however_far_the_seed() {
+    let (plain, cipher) = two_strides();
+    let mut stream = cbc(&plain, &cipher);
+    let mut out = Out::default();
+    for range in chunks(cipher.len()) {
+        out.deliver(
+            &mut stream,
+            range.start,
+            &cipher[range.start as usize..range.end as usize],
+            Provenance::Fresh,
+        );
+    }
+    assert_eq!(stream.kept(), 3);
+    let cipher_len = cipher.len() as u64;
+    for range in [
+        ByteRange::new(STRIDE - 40, STRIDE - 3),
+        ByteRange::new(2 * STRIDE - 40, 2 * STRIDE - 3),
+        ByteRange::new(0, cipher_len),
+    ] {
+        let (mut most, mut read) = (0, 0);
+        let mut reader = |wanted: ByteRange, into: &mut Vec<u8>| {
+            most = most.max(wanted.len());
+            read += wanted.len();
+            into.extend_from_slice(&plain[wanted.start as usize..wanted.end as usize]);
+            true
+        };
+        let mut into = Vec::new();
+        assert!(
+            stream.seal(&out.coverage, &out.padding, range, &mut reader, &mut into),
+            "{range}"
+        );
+        assert!(most <= SEAL_PIECE, "{range}: one read of {most}");
+        assert!(read > SEAL_PIECE, "{range}: the seed lies past a piece");
+        assert!(
+            into == cipher[range.start as usize..range.end as usize],
+            "{range}: byte-identical"
+        );
+    }
+}
+
 // Blocks staged behind a gap post as they came: no seed is needed for
 // them, so the gap never comes into it. Across the gap nothing seals.
 #[test]

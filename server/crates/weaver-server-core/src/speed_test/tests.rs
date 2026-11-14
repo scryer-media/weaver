@@ -45,7 +45,6 @@ async fn rig_on(routes: Arc<dyn crate::torrents::sessions::Routes>) -> Rig {
         hardware_profile: None,
         intermediate_dir: None,
         complete_dir: None,
-        buffer_pool: None,
         servers: vec![],
         categories: vec![],
         retry: None,
@@ -54,6 +53,7 @@ async fn rig_on(routes: Arc<dyn crate::torrents::sessions::Routes>) -> Rig {
         max_concurrent_nzbs: None,
         cleanup_after_extract: None,
         delete_failed_job_files: None,
+        history_retention_days: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: None,
@@ -300,7 +300,7 @@ async fn a_cancel_while_draining_ends_without_a_result_and_resumes_the_queue() {
     .await;
     let http = HttpFixture::start(nzb(&[("only@fixture", 9_000)]), 0, None).await;
     let server = add_server(&rig, &nntp, None).await;
-    rig.metrics.set_active_downloads(1);
+    rig.metrics.set_articles_in_flight(1);
 
     let started = rig
         .service
@@ -338,7 +338,7 @@ async fn an_aborted_drive_lifts_the_hold_and_ends_the_run() {
     let nntp = NntpFixture::start(vec![], None, None).await;
     let http = HttpFixture::start(nzb(&[("only@fixture", 9_000)]), 0, None).await;
     let server = add_server(&rig, &nntp, None).await;
-    rig.metrics.set_active_downloads(1);
+    rig.metrics.set_articles_in_flight(1);
     let mut holds = rig.handle.state().subscribe_holds();
 
     let started = rig
@@ -386,7 +386,7 @@ async fn a_later_operator_pause_survives_speed_test_cancellation() {
     let nntp = NntpFixture::start(vec![], None, None).await;
     let http = HttpFixture::start(nzb(&[("only@fixture", 9_000)]), 0, None).await;
     let server = add_server(&rig, &nntp, None).await;
-    rig.metrics.set_active_downloads(1);
+    rig.metrics.set_articles_in_flight(1);
     let started = rig
         .service
         .start(usenet_request(
@@ -431,7 +431,7 @@ async fn an_operator_resume_leaves_a_running_test_held() {
     let nntp = NntpFixture::start(vec![], None, None).await;
     let http = HttpFixture::start(nzb(&[("only@fixture", 9_000)]), 0, None).await;
     let server = add_server(&rig, &nntp, None).await;
-    rig.metrics.set_active_downloads(1);
+    rig.metrics.set_articles_in_flight(1);
     let started = rig
         .service
         .start(usenet_request(
@@ -513,7 +513,7 @@ async fn a_server_removed_while_draining_cannot_bypass_its_pool_loan() {
     let nntp = NntpFixture::start(vec![], None, None).await;
     let http = HttpFixture::start(nzb(&[("only@fixture", 9_000)]), 0, None).await;
     let server = add_server(&rig, &nntp, None).await;
-    rig.metrics.set_active_downloads(1);
+    rig.metrics.set_articles_in_flight(1);
     let started = rig
         .service
         .start(usenet_request(
@@ -537,7 +537,7 @@ async fn a_server_removed_while_draining_cannot_bypass_its_pool_loan() {
         .set_nntp_pool(Arc::new(weaver_nntp::pool::NntpPool::new(
             Default::default(),
         )));
-    rig.metrics.set_active_downloads(0);
+    rig.metrics.set_articles_in_flight(0);
     let run = finished(&rig, started.id).await;
     assert_eq!(run.status, SpeedTestStatus::Failed);
     assert_eq!(
@@ -554,7 +554,7 @@ async fn a_server_whose_connections_drop_while_draining_is_refused_its_loan() {
     let nntp = NntpFixture::start(vec![], None, None).await;
     let http = HttpFixture::start(nzb(&[("only@fixture", 9_000)]), 0, None).await;
     let server = add_server(&rig, &nntp, None).await;
-    rig.metrics.set_active_downloads(1);
+    rig.metrics.set_articles_in_flight(1);
     let started = rig
         .service
         .start(usenet_request(
@@ -585,7 +585,7 @@ async fn a_server_whose_connections_drop_while_draining_is_refused_its_loan() {
                 ..Default::default()
             },
         )));
-    rig.metrics.set_active_downloads(0);
+    rig.metrics.set_articles_in_flight(0);
     let run = finished(&rig, started.id).await;
     assert_eq!(run.status, SpeedTestStatus::Failed);
     assert!(
@@ -639,7 +639,7 @@ async fn a_second_run_is_refused_while_one_runs() {
     .await;
     let http = HttpFixture::start(nzb(&[("only@fixture", 9_000)]), 0, None).await;
     let server = add_server(&rig, &nntp, None).await;
-    rig.metrics.set_active_downloads(1);
+    rig.metrics.set_articles_in_flight(1);
     let url = format!("http://{}/test.nzb", http.addr);
     let first = rig
         .service
@@ -658,7 +658,7 @@ async fn a_second_run_is_refused_while_one_runs() {
             run: first.id
         })
     );
-    rig.metrics.set_active_downloads(0);
+    rig.metrics.set_articles_in_flight(0);
     assert_eq!(
         finished(&rig, first.id).await.status,
         SpeedTestStatus::Completed
@@ -1571,6 +1571,14 @@ async fn a_torrent_run_pulls_from_the_swarm_and_serves_what_it_held() {
         ..Answer::default()
     });
     let rig = torrent_rig(&fixture).await;
+    // Both peers listen on 127.0.0.1. With one connection per address, a
+    // pull that dials the leecher first holds the seeder back until that
+    // connection closes, which the idle leecher leaves to the peer timeout.
+    rig.config
+        .write()
+        .await
+        .torrent
+        .allow_multiple_connections_per_ip = true;
     rig.service
         .peer_upload_budget_for_tests(u64::from(PIECE_LEN));
     let started = rig

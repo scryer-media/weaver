@@ -5,7 +5,7 @@ use super::*;
 
 impl DownloadPipelineBacklog {
     pub(in crate::pipeline::download::worker) fn has_durable_catch_up_work(self) -> bool {
-        self.active_downloads != 0
+        self.articles_in_flight != 0
             || self.active_decodes != 0
             || self.released_results != 0
             || self.pending_decodes != 0
@@ -79,6 +79,12 @@ impl CheckpointLease {
 }
 
 impl CheckpointAdmission {
+    // Whether the checkpoint refuses no article at all.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn admits_every_article(self) -> bool {
+        !self.enforced || self.limit == 0
+    }
+
     // Whether the checkpoint refuses every payload article of the job, of
     // any size, until its durable floor moves: an article sent to close the
     // gap is still out, or the lead is already past the limit while the
@@ -93,7 +99,7 @@ impl CheckpointAdmission {
 
     pub(in crate::pipeline) fn decision(
         self,
-        work: &DownloadWork,
+        work: &QueuedWork<'_>,
         leased: &[DownloadWork],
     ) -> CheckpointDecision {
         self.decision_with_lease(work, CheckpointLease::of(leased))
@@ -102,7 +108,7 @@ impl CheckpointAdmission {
     // [`Self::decision`] against a lease already summed.
     pub(in crate::pipeline) fn decision_with_lease(
         self,
-        work: &DownloadWork,
+        work: &QueuedWork<'_>,
         leased: CheckpointLease,
     ) -> CheckpointDecision {
         if !self.enforced || self.limit == 0 {
@@ -240,18 +246,9 @@ impl Pipeline {
         self.uu_spool_debits.apply(self.uu_spool_capacity.current())
     }
 
-    pub(in crate::pipeline::download::worker) fn uu_spool_cursor_ordinals(
-        &self,
-    ) -> HashMap<NzbFileId, u32> {
-        self.uu_files
-            .iter()
-            .map(|(file_id, uu)| (*file_id, uu.next_index))
-            .collect()
-    }
-
     pub(in crate::pipeline::download::worker) fn uu_work_closes_cursor(
         cursors: &HashMap<NzbFileId, u32>,
-        work: &DownloadWork,
+        work: &QueuedWork<'_>,
     ) -> bool {
         // Only identified UU files have a sequential cursor. yEnc and files
         // whose encoding is not yet known retain ordinary dispatch; if an
@@ -315,7 +312,7 @@ impl Pipeline {
         let durable_floor = self.durable_download_floor_bytes_for_job(job_id);
         let accepted_bytes = state.downloaded_bytes.saturating_sub(durable_floor);
         let speculative_active_items = self
-            .active_downloads_by_job
+            .articles_in_flight_by_job
             .get(&job_id)
             .copied()
             .unwrap_or(0)
@@ -339,14 +336,18 @@ impl Pipeline {
         &self,
         job_id: JobId,
     ) -> DownloadPipelineBacklog {
+        // Only tests queue undecoded bodies.
+        #[cfg(test)]
         let pending_decodes = self
             .pending_decode
             .iter()
             .filter(|work| work.segment_id.file_id.job_id == job_id)
             .count();
+        #[cfg(not(test))]
+        let pending_decodes = 0;
         DownloadPipelineBacklog {
-            active_downloads: self
-                .active_downloads_by_job
+            articles_in_flight: self
+                .articles_in_flight_by_job
                 .get(&job_id)
                 .copied()
                 .unwrap_or(0),
@@ -413,7 +414,9 @@ impl Pipeline {
         lease: &DownloadBatchLease,
     ) -> Option<SegmentId> {
         let first = lease.works.first()?;
-        (self.checkpoint_admission(lease.job_id).decision(first, &[])
+        (self
+            .checkpoint_admission(lease.job_id)
+            .decision(&first.view(), &[])
             == CheckpointDecision::ProgressArticle)
             .then_some(first.segment_id)
     }
@@ -540,7 +543,7 @@ impl Pipeline {
         work: &DownloadWork,
     ) -> bool {
         self.checkpoint_admission(job_id)
-            .decision(work, &[])
+            .decision(&work.view(), &[])
             .allows()
     }
 

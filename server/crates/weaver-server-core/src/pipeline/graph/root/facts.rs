@@ -213,6 +213,24 @@ impl Durable for Encoded {
 }
 
 impl Encoded {
+    // The ordinals of `volume`'s articles these facts, as last encoded, say
+    // are not fetched again; none when they were never read from a job.
+    pub(crate) fn settled(&self, volume: usize) -> std::collections::HashSet<u32> {
+        self.volumes
+            .get(volume)
+            .filter(|volume| volume.read.is_some())
+            .map(|volume| {
+                volume
+                    .articles
+                    .chunks()
+                    .flat_map(|(_, entries)| entries.iter())
+                    .filter(|(_, facts)| *facts != ArticleFacts::Waiting)
+                    .map(|(ordinal, _)| *ordinal)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn facts(&self) -> RootFacts {
         RootFacts {
             next_node: self.next_node,

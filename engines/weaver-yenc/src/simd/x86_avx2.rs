@@ -3,6 +3,26 @@
 
 use super::*;
 
+// The asm loop's escape select for this CPU, chosen once per process. Intel
+// (family 6) takes the and-add form: `vpblendvb ymm` is two uops there from
+// Haswell on and three on Golden Cove, against two for `vpand` + `vpaddb`;
+// measured 1.5-5% faster on Sapphire Rapids. AMD keeps rapidyenc's
+// `vpblendvb`, one uop on Zen 2 to Zen 4; the and-add form measured 1-2%
+// slower on Zen 4.
+fn avx2_and_add_select() -> bool {
+    #[cfg(any(fuzzing, test))]
+    if let Some(on) = super::fuzzing::and_add_select_override() {
+        return on;
+    }
+    static PICK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PICK.get_or_init(|| x86_cpu_family_model().0 == 6)
+}
+
+// The window loop prefetches this far ahead of the cursor, on spans of at
+// least PREFETCH_MIN_SPAN bytes.
+const PREFETCH_AHEAD: usize = 2048;
+const PREFETCH_MIN_SPAN: usize = 16 * PREFETCH_AHEAD;
+
 // Maintenance contract: this Rust kernel and the intrinsic path selected by
 // `WEAVER_YENC_RAW_ASM=0` are the tunable source of truth behind the frozen
 // `asm!` kernel. For future tuning or bug fixes, change this implementation,
@@ -37,8 +57,12 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
     // single-cursor loop transliterated from rapidyenc's own emission on the
     // measurement host — see avx2_raw_kernel_oracle); the body below is the
     // `WEAVER_YENC_RAW_ASM=0` build's kernel.
-    if cfg!(weaver_yenc_raw_asm) {
-        return avx2_raw_kernel_oracle::<SEARCH_END>(input, output, state, mode, input.len());
+    if avx2_raw_asm() {
+        return if avx2_and_add_select() {
+            avx2_raw_kernel_oracle::<SEARCH_END, true>(input, output, state, mode, input.len())
+        } else {
+            avx2_raw_kernel_oracle::<SEARCH_END, false>(input, output, state, mode, input.len())
+        };
     }
 
     let mut src = 0usize;
@@ -48,11 +72,12 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
     // the SIMD span, for the scalar epilogue.
     let out_base = output.as_mut_ptr();
     let mut out = out_base;
-    // Oracle `lenBuffer` for `isRaw && searchEnd` is `width-1 + 3 + 1`
-    // (decoder_common.h:44-46) == this 67; the widest lookahead is the lane-B
-    // `+4` view, ending at `src + WIDTH + 3`, and the loop bound
-    // (`src + WIDTH <= len - tail`) leaves a further WIDTH bytes of slack.
-    let tail = WIDTH - 1 + 4;
+    // The widest lookahead with the end search is the lane-B `+4` view,
+    // ending at `src + WIDTH + 3`; without the end search the
+    // deepest is the `+2` view, ending at `src + WIDTH + 1`. The loop bound
+    // (`src + WIDTH <= len - tail`) keeps exactly that, as rapidyenc's
+    // rounded-up `dLen` does (decoder_common.h:130-131).
+    let tail = if SEARCH_END { 4 } else { 2 };
     let simd_limit = input.len().saturating_sub(tail);
 
     let sub42 = _mm256_set1_epi8(42i8.wrapping_neg());
@@ -427,7 +452,7 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
 
     // `out` advanced by the SIMD span (or not at all); hand the scalar epilogue
     // the equivalent byte offset.
-    let mut dst = out.offset_from(out_base) as usize;
+    let dst = out.offset_from(out_base) as usize;
 
     // Only re-derive the carried state when the SIMD loop actually consumed at
     // least one window. With no window consumed (len in {129,130} => simd_limit
@@ -437,35 +462,346 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
     // A SEARCH_END break already set the state from the no-backtrack rule over
     // the unconsumed window, so the (backtracking) lookback must not run.
     if !broke && src > 0 {
-        let out_next_mask: u16 = if src >= 2 && src + 1 < input.len() {
-            if input[src - 2] == b'\r' && input[src - 1] == b'\n' && input[src] == b'.' {
-                1
-            } else if input[src - 1] == b'\r' && input[src] == b'\n' && input[src + 1] == b'.' {
-                2
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-
-        state.state = if esc_first != 0 {
-            DecoderState::Eq
-        } else if out_next_mask == 1 {
-            DecoderState::CrLf
-        } else if out_next_mask == 2 {
-            DecoderState::Cr
-        } else {
-            DecoderState::None
-        };
+        // The scalar machine's state after the span (at least one window
+        // consumed, so `src >= 64`): `Cr`/`CrLf` before any byte, and a
+        // line-start `=` carries `CrLfEq`, as `avx2_exit_state` reads them.
+        state.state = avx2_exit_state(input, src, esc_first != 0);
     }
 
-    while src < input.len() {
-        if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+    // The tail (decoder_common.h:145-147).
+    avx2_tail(input, output, state, mode, src, dst, input.len())
+}
+
+// One step of the scalar machine for the heads and tails, with the common
+// bytes inline: a plain byte, CR or LF in the `None` state, `=` with its
+// escaped byte in reach, the LF of a CR LF, and a plain byte at a line
+// start. These are the cases rapidyenc's scalar loop takes inline
+// (decoder.cc:52-70); each is exactly what `decode_scalar_step` does with
+// that byte and state, and none of them but `=` reads past its byte, so they
+// run up to the last input byte. Every other case, and a full output, goes
+// to `decode_scalar_step`.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn avx2_tail_step(
+    input: &[u8],
+    src: &mut usize,
+    output: &mut [u8],
+    dst: &mut usize,
+    state: &mut KernelState,
+    mode: DecodeStepMode,
+) -> Result<bool, YencError> {
+    let s = *src;
+    let d = *dst;
+    if s < input.len() && d < output.len() {
+        let byte = input[s];
+        match state.state {
+            DecoderState::None => match byte {
+                b'\r' => {
+                    *src = s + 1;
+                    state.state = DecoderState::Cr;
+                    return Ok(true);
+                }
+                b'\n' => {
+                    *src = s + 1;
+                    return Ok(true);
+                }
+                b'=' if s + 1 < input.len() => {
+                    let escaped = input[s + 1];
+                    output[d] = escaped.wrapping_sub(106);
+                    *src = s + 2;
+                    *dst = d + 1;
+                    if mode.dot_unstuffing && escaped == b'\r' {
+                        state.state = DecoderState::Cr;
+                    }
+                    return Ok(true);
+                }
+                b'=' => {}
+                _ => {
+                    output[d] = byte.wrapping_sub(42);
+                    *src = s + 1;
+                    *dst = d + 1;
+                    return Ok(true);
+                }
+            },
+            DecoderState::Cr if byte == b'\n' => {
+                *src = s + 1;
+                state.state = DecoderState::CrLf;
+                return Ok(true);
+            }
+            DecoderState::CrLf
+                if !matches!(byte, b'=' | b'\r' | b'\n')
+                    && !(mode.dot_unstuffing && byte == b'.') =>
+            {
+                output[d] = byte.wrapping_sub(42);
+                *src = s + 1;
+                *dst = d + 1;
+                state.state = DecoderState::None;
+                return Ok(true);
+            }
+            _ => {}
+        }
+    }
+    decode_scalar_step(input, src, output, dst, state, mode)
+}
+
+// The scalar machine's state at `at` (the cursor after a window), raw
+// dot-unstuffing, read off the bytes before it: `CrLfEq` or `Eq` when the
+// window's last `=` escapes the byte at `at` (a line-start `=` is `CrLfEq`),
+// `Cr` after a CR (an escaped CR also arms it), `CrLf` after CR LF, else
+// `None`. Whatever byte follows: a later call may stop at a line-start `=y`.
+// Needs `2 <= at`.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn avx2_exit_state(input: &[u8], at: usize, esc_out: bool) -> DecoderState {
+    if esc_out {
+        if at >= 3 && input[at - 3] == b'\r' && input[at - 2] == b'\n' {
+            DecoderState::CrLfEq
+        } else {
+            DecoderState::Eq
+        }
+    } else if input[at - 1] == b'\r' {
+        DecoderState::Cr
+    } else if input[at - 2] == b'\r' && input[at - 1] == b'\n' {
+        DecoderState::CrLf
+    } else {
+        DecoderState::None
+    }
+}
+
+// One window over the bytes `input[w + o..w + e]` (`o < e <= 64`), entered in
+// `entry` (`None`, `Eq`, `Cr` or `CrLf`): the span's head and tail, which
+// rapidyenc decodes byte by byte (decoder_common.h:40-47, 145-147), decoded
+// from one unaligned 64-byte load at `w` with the bytes outside the range
+// dropped. Writes the decoded bytes at `output[dst..]` and returns their
+// count and whether the range ends on an unescaped `=` (the next byte is
+// escaped); the caller takes the exit state from `avx2_exit_state`.
+//
+// Each byte decodes as the scalar machine decodes it, read off the bytes
+// alone (raw dot-unstuffing):
+// - escapes: an `=` escapes the next byte unless it is escaped itself
+//   (`fix_eq_mask`); `Eq` escapes the first byte. An escaped byte is
+//   `byte - 106` and always kept.
+// - an unescaped `=`, CR or LF is dropped.
+// - a `.` is dropped exactly when the two bytes before it are CR LF (an
+//   escaped CR counts, since `Eq` then CR leaves `Cr`; the LF cannot be
+//   escaped, as the byte before it is the CR). Before the range those two
+//   bytes are `entry`'s: `CrLf` stands for CR LF, `Cr` for CR.
+// - everything else is `byte - 42`.
+// With the end search, a line start followed by `=` or `.` with its CR in
+// the range or one byte after it (`\r\n=y`, `\r\n.=y`, `\r\n.\r\n` and the
+// shapes `x86_search_end_head` resolves), or an entry at a line start, is
+// left to the scalar machine: the function returns `None` and writes
+// nothing. Needs `w + 66 <= input.len()` and `dst <= w + o`.
+#[cfg(target_arch = "x86_64")]
+// Inlined into its AVX2 callers (no `target_feature` of its own, so it may
+// be `inline(always)`); called only from AVX2 code.
+#[inline(always)]
+#[allow(unsafe_op_in_unsafe_fn, clippy::too_many_arguments)]
+unsafe fn avx2_edge_window(
+    input: &[u8],
+    w: usize,
+    o: u32,
+    e: u32,
+    entry: DecoderState,
+    search_end: bool,
+    output: &mut [u8],
+    dst: usize,
+) -> Option<(usize, bool)> {
+    use std::arch::x86_64::*;
+    debug_assert!(o < e && e <= 64 && w + 66 <= input.len() && dst <= w + o as usize);
+    debug_assert!(matches!(
+        entry,
+        DecoderState::None | DecoderState::Eq | DecoderState::Cr | DecoderState::CrLf
+    ));
+    let p = input.as_ptr().add(w);
+    let a = _mm256_loadu_si256(p as *const __m256i);
+    let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let range = (u64::MAX << o) & (u64::MAX >> (64 - e));
+    let cr_w = avx2_mask64(a, b, b'\r');
+    let lf_w = avx2_mask64(a, b, b'\n');
+    let eq_w = avx2_mask64(a, b, b'=');
+    let dot_w = avx2_mask64(a, b, b'.');
+    if search_end {
+        if matches!(entry, DecoderState::Cr | DecoderState::CrLf) {
+            return None;
+        }
+        let at64 = *input.get_unchecked(w + 64);
+        let at65 = *input.get_unchecked(w + 65);
+        let lf_x = lf_w as u128 | ((at64 == b'\n') as u128) << 64;
+        let ed_x = (eq_w | dot_w) as u128
+            | (matches!(at64, b'=' | b'.') as u128) << 64
+            | (matches!(at65, b'=' | b'.') as u128) << 65;
+        if (cr_w & range) as u128 & (lf_x >> 1) & (ed_x >> 2) != 0 {
+            return None;
+        }
+    }
+    let esc_in = (entry == DecoderState::Eq) as u64;
+    let eq = eq_w & range & !(esc_in << o);
+    let unescaped = fix_eq_mask(eq, eq << 1);
+    let escaped = ((unescaped << 1) | (esc_in << o)) & range;
+    let cr = cr_w & range;
+    let lf = lf_w & range;
+    let crlf_in = (entry == DecoderState::CrLf) as u64;
+    let cr_in = (entry == DecoderState::Cr) as u64;
+    let lf_before = (lf << 1) | (crlf_in << o);
+    let cr_two_before = (cr << 2) | (crlf_in << o) | ((cr_in << o) << 1);
+    let dropped = unescaped | ((cr | lf) & !escaped) | (dot_w & range & lf_before & cr_two_before);
+    let skip = !range | dropped;
+    let (decoded_a, decoded_b) = avx2_decode_with_escape_mask(a, b, escaped);
+    let n = 64 - skip.count_ones() as usize;
+    let table = compact_table_16().as_ptr() as *const u8;
+    // The store is 64 bytes wide; it stays below `input.len()`, as every
+    // span store does, or goes through a stack copy.
+    if dst + 64 <= input.len().min(output.len()) {
+        avx2_compact_store64(
+            decoded_a,
+            decoded_b,
+            skip,
+            table,
+            output.as_mut_ptr().add(dst),
+        );
+    } else {
+        let mut buf = std::mem::MaybeUninit::<[u8; 64]>::uninit();
+        let buf = buf.as_mut_ptr() as *mut u8;
+        avx2_compact_store64(decoded_a, decoded_b, skip, table, buf);
+        debug_assert!(dst + n <= output.len());
+        std::ptr::copy_nonoverlapping(buf, output.as_mut_ptr().add(dst), n);
+    }
+    Some((n, (unescaped >> (e - 1)) & 1 != 0))
+}
+
+// The head up to the first 64-byte boundary `to` as one edge window, when
+// the state and the range allow it. Returns whether it ran.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
+#[inline]
+#[allow(unsafe_op_in_unsafe_fn, clippy::manual_range_contains)]
+unsafe fn avx2_head_window(
+    input: &[u8],
+    output: &mut [u8],
+    state: &mut KernelState,
+    search_end: bool,
+    src: &mut usize,
+    dst: &mut usize,
+    to: usize,
+) -> bool {
+    if to < *src + 2
+        || to < 3
+        || to > 64
+        || input.len() < 66
+        || !matches!(
+            state.state,
+            DecoderState::None | DecoderState::Eq | DecoderState::Cr | DecoderState::CrLf
+        )
+    {
+        return false;
+    }
+    match avx2_edge_window(
+        input,
+        0,
+        *src as u32,
+        to as u32,
+        state.state,
+        search_end,
+        output,
+        *dst,
+    ) {
+        Some((n, esc_out)) => {
+            *src = to;
+            *dst += n;
+            state.state = avx2_exit_state(input, to, esc_out);
+            true
+        }
+        None => false,
+    }
+}
+
+// The tail after the span (decoder_common.h:145-147). Up to `limit` =
+// `input.len()`: the bytes to the span's reserve as one edge window, then
+// the rest through the scalar kernel's main loop; a bounded call (`limit`
+// short of the end) keeps the stepwise tail, which stops at `limit`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
+#[inline]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn avx2_tail(
+    input: &[u8],
+    output: &mut [u8],
+    state: &mut KernelState,
+    mode: DecodeStepMode,
+    mut src: usize,
+    mut dst: usize,
+    limit: usize,
+) -> Result<KernelOutcome, YencError> {
+    if limit == input.len() {
+        let reserve = if mode.search_end { 4 } else { 2 };
+        let c = input.len().saturating_sub(reserve);
+        // Without the end search: the bytes to the reserve as one edge
+        // window, then the last two one step each. With it the tail holds
+        // the trailer, and the scalar kernel takes it whole, as rapidyenc's
+        // own scalar tail does (an edge window there costs more than it
+        // saves).
+        if !mode.search_end
+            && c >= src + 2
+            && c - src <= 64
+            && c >= 64
+            && matches!(
+                state.state,
+                DecoderState::None | DecoderState::Eq | DecoderState::Cr | DecoderState::CrLf
+            )
+        {
+            let w = c - 64;
+            if let Some((n, esc_out)) = avx2_edge_window(
+                input,
+                w,
+                (src - w) as u32,
+                64,
+                state.state,
+                false,
+                output,
+                dst,
+            ) {
+                src = c;
+                dst += n;
+                state.state = avx2_exit_state(input, c, esc_out);
+                while src < limit {
+                    if !avx2_tail_step(input, &mut src, output, &mut dst, state, mode)? {
+                        break;
+                    }
+                }
+                return Ok(KernelOutcome {
+                    consumed: src,
+                    written: dst,
+                    end: state.end.into(),
+                });
+            }
+        }
+        if input.len() - src > reserve {
+            return x86_fold_head(
+                decode_kernel_scalar(
+                    &input[src..],
+                    &mut output[dst..],
+                    state,
+                    mode.dot_unstuffing,
+                    mode.preserve_pending,
+                    mode.search_end,
+                ),
+                src,
+                dst,
+            );
+        }
+    }
+    while src < limit {
+        if state.state == DecoderState::None {
+            decode_plain_run(&input[..limit], &mut src, output, &mut dst);
+            if src >= limit {
+                break;
+            }
+        }
+        if !avx2_tail_step(input, &mut src, output, &mut dst, state, mode)? {
             break;
         }
     }
-
     Ok(KernelOutcome {
         consumed: src,
         written: dst,
@@ -519,9 +855,24 @@ pub(super) unsafe fn decode_kernel_avx2(
                     end: state.end.into(),
                 });
             }
-            if (input.as_ptr() as usize + head_src).is_multiple_of(WIDTH)
-                || !decode_scalar_step(input, &mut head_src, output, &mut head_dst, state, mode)?
-            {
+            if (input.as_ptr() as usize + head_src).is_multiple_of(WIDTH) {
+                break;
+            }
+            // Plain bytes up to the boundary in one run, as rapidyenc's
+            // scalar head does; a special byte goes through the machine.
+            let to = (head_src + (input.as_ptr() as usize + head_src).wrapping_neg() % WIDTH)
+                .min(input.len());
+            if avx2_head_window(input, output, state, true, &mut head_src, &mut head_dst, to) {
+                continue;
+            }
+            if state.state == DecoderState::None {
+                let before = head_src;
+                decode_plain_run(&input[..to], &mut head_src, output, &mut head_dst);
+                if head_src != before {
+                    continue;
+                }
+            }
+            if !avx2_tail_step(input, &mut head_src, output, &mut head_dst, state, mode)? {
                 break;
             }
         }
@@ -546,11 +897,21 @@ pub(super) unsafe fn decode_kernel_avx2(
     {
         // `head_src`/`head_dst` are 0 unless the head loop ran, so the
         // `::<false>` instantiation always sees the untouched full buffers.
-        let outcome = if search_end {
-            decode_kernel_avx2_raw::<true>(&input[head_src..], &mut output[head_dst..], state, mode)
-        } else {
-            decode_kernel_avx2_raw::<false>(input, output, state, mode)
-        };
+        // Without the end search, or when the head loop consumed nothing,
+        // the raw kernel's outcome is already absolute: return it as it is,
+        // not rebuilt through the fold.
+        if !search_end {
+            return decode_kernel_avx2_raw::<false>(input, output, state, mode);
+        }
+        if head_src == 0 && head_dst == 0 {
+            return decode_kernel_avx2_raw::<true>(input, output, state, mode);
+        }
+        let outcome = decode_kernel_avx2_raw::<true>(
+            &input[head_src..],
+            &mut output[head_dst..],
+            state,
+            mode,
+        );
         return x86_fold_head(outcome, head_src, head_dst);
     }
 
@@ -788,7 +1149,7 @@ pub(super) unsafe fn decode_kernel_avx2(
     }
 
     while (!search_end || state.end == DecodeEnd::None) && src < input.len() {
-        if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+        if !avx2_tail_step(input, &mut src, output, &mut dst, state, mode)? {
             break;
         }
     }
@@ -820,7 +1181,7 @@ pub(super) unsafe fn decode_raw_bounded_avx2(
     state: &mut KernelState,
     limit: usize,
 ) -> Option<Result<KernelOutcome, YencError>> {
-    if !cfg!(weaver_yenc_raw_asm) {
+    if !avx2_raw_asm() {
         return None;
     }
     let mode = DecodeStepMode {
@@ -854,13 +1215,23 @@ pub(super) unsafe fn decode_raw_bounded_avx2(
             end: state.end.into(),
         }),
         Ok(false) => x86_fold_head(
-            avx2_raw_kernel_oracle::<true>(
-                &input[src..],
-                &mut output[dst..],
-                state,
-                mode,
-                limit - src,
-            ),
+            if avx2_and_add_select() {
+                avx2_raw_kernel_oracle::<true, true>(
+                    &input[src..],
+                    &mut output[dst..],
+                    state,
+                    mode,
+                    limit - src,
+                )
+            } else {
+                avx2_raw_kernel_oracle::<true, false>(
+                    &input[src..],
+                    &mut output[dst..],
+                    state,
+                    mode,
+                    limit - src,
+                )
+            },
             src,
             dst,
         ),
@@ -890,9 +1261,10 @@ pub(super) unsafe fn decode_raw_bounded_avx2(
 //
 // `out` must have 64 writable bytes; the returned pointer is
 // `out + 64 - popcount(skip)`.
+// Inlined into its AVX2 callers (no `target_feature` of its own, so it may
+// be `inline(always)`); called only from AVX2 code.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
-#[inline]
+#[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 pub(super) unsafe fn avx2_compact_store64(
     decoded_a: std::arch::x86_64::__m256i,
@@ -1022,14 +1394,15 @@ static YW_EQY: u16 = 0x793d;
 //
 // Safety: the caller guarantees the raw-path contract (`dot_unstuffing`,
 // entry state in {None,Eq,Cr,CrLf}); the scalar prelude/epilogue share the
-// kernel's usual bounds; the span keeps the 67-byte tail reserve, and the
-// deepest lookahead reads `c + 4 + 31 < span end + reserve`. Flags are
+// kernel's usual bounds; the span leaves 2 bytes (4 with the end search)
+// after its last window, and no window's deepest lookahead (`+2`, or `+4`
+// with the end search) reads past them. Flags are
 // clobbered; the block reads input + LUT and writes output; no stack use.
 #[cfg(target_arch = "x86_64")]
 #[cfg_attr(not(weaver_yenc_raw_asm), allow(dead_code))]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn avx2_raw_kernel_oracle<const SEARCH_END: bool>(
+unsafe fn avx2_raw_kernel_oracle<const SEARCH_END: bool, const AND_ADD: bool>(
     input: &[u8],
     output: &mut [u8],
     state: &mut KernelState,
@@ -1057,7 +1430,20 @@ unsafe fn avx2_raw_kernel_oracle<const SEARCH_END: bool>(
         if src >= limit || (input.as_ptr() as usize + src) & (WIDTH - 1) == 0 {
             break;
         }
-        if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+        // Plain bytes up to the boundary in one run, as rapidyenc's scalar
+        // head does; a special byte goes through the machine.
+        let to = (src + (input.as_ptr() as usize + src).wrapping_neg() % WIDTH).min(limit);
+        if avx2_head_window(input, output, state, SEARCH_END, &mut src, &mut dst, to) {
+            continue;
+        }
+        if state.state == DecoderState::None {
+            let before = src;
+            decode_plain_run(&input[..to], &mut src, output, &mut dst);
+            if src != before {
+                continue;
+            }
+        }
+        if !avx2_tail_step(input, &mut src, output, &mut dst, state, mode)? {
             return Ok(KernelOutcome {
                 consumed: src,
                 written: dst,
@@ -1066,17 +1452,33 @@ unsafe fn avx2_raw_kernel_oracle<const SEARCH_END: bool>(
         }
     }
 
-    let tail = WIDTH - 1 + 4;
-    // The span keeps its lookahead reserve inside `input` even when `limit`
-    // stops it early, so a bounded call probes the bytes past `limit` exactly
-    // as an unbounded one does.
-    let simd_limit = input.len().saturating_sub(tail).min(limit);
+    // A window's deepest read ends `reserve` bytes past it: the `+2` view in
+    // the raw loop, the `+4` view with the end search. That is rapidyenc's
+    // `lenBuffer` (decoder_common.h:49-51) less the 63 its round-up of `dLen`
+    // (decoder_common.h:130-131) takes back, so the span covers the same
+    // windows rapidyenc's does. The reserve stays inside `input` even when
+    // `limit` stops the span early, so a bounded call probes the bytes past
+    // `limit` exactly as an unbounded one does.
+    let reserve = if SEARCH_END { 4 } else { 2 };
+    let simd_limit = input.len().saturating_sub(reserve).min(limit);
     let span = (simd_limit.saturating_sub(src) / WIDTH) * WIDTH;
+    // Software prefetch distance for the window loop: 2 KiB ahead on a span
+    // long enough for it to land inside the input, otherwise the window just
+    // loaded (a no-op prefetch). Chosen once per call.
+    let prefetch_ahead: usize = if span >= PREFETCH_MIN_SPAN {
+        PREFETCH_AHEAD
+    } else {
+        0
+    };
 
     if span > 0 {
         // entry state -> escFirst / minMask (oracle _do_decode_simd switch),
         // computed AFTER the alignment steps from the live state.
-        let mut esc_first: u64 = (state.state == DecoderState::Eq) as u64;
+        // A head window may leave `CrLfEq` (a line-start `=` before the
+        // boundary); without an end search, or past the head's `=y` check,
+        // it escapes the next byte exactly as `Eq` does.
+        let mut esc_first: u64 =
+            matches!(state.state, DecoderState::Eq | DecoderState::CrLfEq) as u64;
         let entry_next_mask: u16 = match state.state {
             DecoderState::CrLf if input[src] == b'.' => 1,
             DecoderState::Cr
@@ -1090,7 +1492,10 @@ unsafe fn avx2_raw_kernel_oracle<const SEARCH_END: bool>(
         let sub42 = _mm256_set1_epi8(42i8.wrapping_neg());
         let dot = _mm256_set1_epi8(b'.' as i8);
         let eq_needle = _mm256_set1_epi8(b'=' as i8);
-        let esc_off = _mm256_set1_epi8(-106);
+        let cr_needle = _mm256_set1_epi8(b'\r' as i8);
+        // The escaped-byte offset: the whole -106 for `vpblendvb`, the -64 the
+        // and-add form adds on top of the -42 offset.
+        let esc_off = _mm256_set1_epi8(if AND_ADD { -64 } else { -106 });
         let special_lut = _mm256_set_epi8(
             -1,
             b'=' as i8,
@@ -1189,7 +1594,7 @@ unsafe fn avx2_raw_kernel_oracle<const SEARCH_END: bool>(
         // their rare out-of-line block (`outline`), plus the operands those
         // use.
         macro_rules! oracle_span {
-            ([$($nondot:literal),*], [$($dotarm:literal),*], [$($outline:literal),*], $($extra:tt)*) => {
+            ([$($pf:literal),*], [$($cr23:literal),*], [$($cr25:literal),*], [$($sel_join:literal),*], [$($sel_coll:literal),*], [$($nondot:literal),*], [$($dotarm:literal),*], [$($outline:literal),*], $($extra:tt)*) => {
                 core::arch::asm!(
                 "jmp 20f",
                 // ---- specials (backward target of the head): `=` masks -------
@@ -1208,29 +1613,18 @@ unsafe fn avx2_raw_kernel_oracle<const SEARCH_END: bool>(
                 "lea {t1}, [{ef} + {meq}*2]",
                 "test {mask}, {t1}",
                 "jnz 26f",
-                // weaver's measured edge the oracle lacks (+11.7% on CRLF-heavy
-                // content, r2 trade pricing): when the window itself carries no
-                // `=` (meq == 0), skip the whole escape select — `yov` already
-                // holds the carried-escape byte-0 offset, so the plain adds are
-                // exact even when an escape straddled in. (The eq_shift1==0 form
-                // of this gate failed the differential net; the meq==0 form
-                // passes it and fires on strictly more windows.)
-                "test {meq}, {meq}",
-                "jz 28f",
                 "vinserti128 {s0}, {eqn}, {s2:x}, 1",
                 "mov {ef}, {meq}",
                 "vpalignr {s2}, {s2}, {s0}, 15",
                 "vpcmpeqb {s0}, {eqn}, ymmword ptr [{c} - 1]",
                 "shr {ef}, 63",
-                "vpblendvb {s2}, {yov}, {eof}, {s2}",
-                "vpaddb {s2}, {lo}, {s2}",
-                "vpblendvb {s0}, {s42}, {eof}, {s0}",
-                "vpaddb {s0}, {hi}, {s0}",
+                $($sel_join,)*
                 // ---- store (falls into the head; oracle 6c1f3) ---------------
                 "24:",
                 "mov {meq:e}, {mask:e}",
                 "vmovd {yov:x}, {ef:e}",
                 "add {c}, 64",
+                $($pf,)*
                 "and {meq:e}, 0x7fff",
                 "vpsllw {yov:x}, {yov:x}, 6",
                 "shl {meq:e}, 4",
@@ -1287,58 +1681,26 @@ unsafe fn avx2_raw_kernel_oracle<const SEARCH_END: bool>(
                 "shl {meq}, 32",
                 "or {mask}, {meq}",
                 "jnz 21b",
-                // clean window: the head's fallthrough. First iteration decodes
-                // with the carried `yov` (straddled-escape byte 0) and resets the
-                // carry, then falls into the pipelined clean streak.
+                // clean window, rapidyenc's (decoder_avx2_base.h:602-612):
+                // byte 0 takes the carried offset, the carry resets, both
+                // halves store whole, and the loop goes on.
                 "vpaddb {s1}, {yov}, {lo}",
                 "vpaddb {s0}, {hi}, {s42}",
                 "vmovdqa {yov}, {s42}",
                 "xor {ef:e}, {ef:e}",
-                "jmp 42f",
-                // ---- pipelined clean streak: decode N, then load N+1 BEFORE
-                // storing N (the July 2-window result: breaking the serial
-                // load->store->load chain is worth ~+15% on pure-clean content;
-                // here it costs the heavy path nothing — specials exit to 21).
-                // In-streak invariants: ef == 0, yov == sub42, mmv == dot (a
-                // pending dot forces the specials path, so a clean window can
-                // never carry one).
-                ".p2align 4",
-                "41:",
-                "vpaddb {s1}, {lo}, {s42}",
-                "vpaddb {s0}, {hi}, {s42}",
-                "42:",
-                // speculative next-window loads: the span keeps a 67-byte tail
-                // reserve, so reading one window past the last is in bounds.
-                "vmovdqa {hi}, ymmword ptr [{c} + 64]",
-                "vmovdqa {lo}, ymmword ptr [{c} + 32]",
+                "add {c}, 64",
                 "vmovdqu ymmword ptr [{out}], {s1}",
                 "vmovdqu ymmword ptr [{out} + 32], {s0}",
-                "add {c}, 64",
                 "add {out}, 64",
                 "mov {mask}, {ne}",
                 "add {mask}, {c}",
-                "jz 30f",
-                "vpminub {s1}, {hi}, {dot}",
-                "vpminub {s0}, {mmv}, {lo}",
-                "vpshufb {s1}, {lut}, {s1}",
-                "vpshufb {s0}, {lut}, {s0}",
-                "vpcmpeqb {s1}, {s1}, {hi}",
-                "vpcmpeqb {s0}, {s0}, {lo}",
-                "vpmovmskb {meq:e}, {s1}",
-                "vpmovmskb {mask:e}, {s0}",
-                "shl {meq}, 32",
-                "or {mask}, {meq}",
-                "jz 41b",
-                "jmp 21b",
+                "jnz 20b",
+                "jmp 30f",
                 // ---- CR/LF present: remat CR, `.`-at-+2 probe (oracle 6c358) -
                 ".p2align 4",
                 "23:",
-                "mov {t1:e}, 0x0d0d0d0d",
-                "vmovd {s0:x}, {t1:e}",
-                "vpbroadcastd {s0}, {s0:x}",
+                $($cr23,)*
                 "vpcmpeqb {s1}, {dot}, ymmword ptr [{c} - 30]",
-                "vpcmpeqb {mmv}, {lo}, {s0}",
-                "vpcmpeqb {s3}, {hi}, {s0}",
                 "vpand {s1}, {s1}, {mmv}",
                 "vpcmpeqb {mmv}, {dot}, ymmword ptr [{c} + 2]",
                 "vpand {mmv}, {s3}, {mmv}",
@@ -1356,8 +1718,7 @@ unsafe fn avx2_raw_kernel_oracle<const SEARCH_END: bool>(
                 "vmovdqa {s5}, ymmword ptr [{c}]",
                 "vmovd {s3:x}, {t1:e}",
                 "vpbroadcastd {s3}, {s3:x}",
-                "vpcmpeqb {s5}, {s5}, {s0}",
-                "vpcmpeqb {s4}, {s4}, {s0}",
+                $($cr25,)*
                 "vpcmpeqb {s0}, {s3}, ymmword ptr [{c} + 1]",
                 "vpand {s5}, {s5}, {s0}",
                 "vpcmpeqb {s3}, {s3}, ymmword ptr [{c} - 31]",
@@ -1375,12 +1736,6 @@ unsafe fn avx2_raw_kernel_oracle<const SEARCH_END: bool>(
                 "vpsrldq {s0:x}, {s0:x}, 14",
                 "vpsubusb {mmv}, {dot}, {s0}",
                 "jmp 22b",
-                // ---- escaped == 0: plain adds (weaver's shortcut) ------------
-                "28:",
-                "vpaddb {s2}, {lo}, {yov}",
-                "vpaddb {s0}, {hi}, {s42}",
-                "xor {ef:e}, {ef:e}",
-                "jmp 24b",
                 // ---- consecutive-`=` collision (oracle 6c498) ----------------
                 "26:",
                 "not {t1}",
@@ -1405,11 +1760,7 @@ unsafe fn avx2_raw_kernel_oracle<const SEARCH_END: bool>(
                 "vpand {s2}, {s2}, {s3}",
                 "vpand {s0}, {s0}, {s3}",
                 "vpcmpeqb {s2}, {s2}, {s3}",
-                "vpblendvb {s2}, {yov}, {eof}, {s2}",
-                "vpaddb {s2}, {lo}, {s2}",
-                "vpcmpeqb {s0}, {s0}, {s3}",
-                "vpblendvb {s0}, {s42}, {eof}, {s0}",
-                "vpaddb {s0}, {hi}, {s0}",
+                $($sel_coll,)*
                 "jmp 24b",
                 $($outline,)*
                 "30:",
@@ -1418,6 +1769,7 @@ unsafe fn avx2_raw_kernel_oracle<const SEARCH_END: bool>(
                 out = inout(reg) out_v,
                 ef = inout(reg) ef_v,
                 tab = in(reg) table,
+                pd = in(reg) prefetch_ahead,
                 mask = out(reg) mask_out,
                 meq = out(reg) _,
                 t1 = out(reg) _,
@@ -1445,8 +1797,28 @@ unsafe fn avx2_raw_kernel_oracle<const SEARCH_END: bool>(
                 )
             };
         }
+        // The escape select, as the CPU family wants it (`avx2_and_add_select`):
+        // `{s2}`/`{s0}` hold the escaped-byte masks of the low and high
+        // halves; each half becomes `data + (escaped ? -106 : offset)`, the
+        // offset being `{yov}` (byte 0 carries a straddled escape) for the
+        // low half and -42 for the high half.
+        macro_rules! with_select {
+            ($sel_join:tt, $sel_coll:tt, $pf:tt) => {
         if SEARCH_END {
             oracle_span!(
+                $pf,
+                // The end search uses all 16 ymm registers: CR is
+                // rematerialised in {s0}, which its arms read.
+                [
+                    "mov {t1:e}, 0x0d0d0d0d",
+                    "vmovd {s0:x}, {t1:e}",
+                    "vpbroadcastd {s0}, {s0:x}",
+                    "vpcmpeqb {mmv}, {lo}, {s0}",
+                    "vpcmpeqb {s3}, {hi}, {s0}"
+                ],
+                ["vpcmpeqb {s5}, {s5}, {s0}", "vpcmpeqb {s4}, {s4}, {s0}"],
+                $sel_join,
+                $sel_coll,
                 [
                     // `\r\n=y` is the only end reachable without a stuffed
                     // dot (rapidyenc decoder_avx2_base.h, the `partialEndFound`
@@ -1536,7 +1908,75 @@ unsafe fn avx2_raw_kernel_oracle<const SEARCH_END: bool>(
                 eqy_w = sym YW_EQY,
             );
         } else {
-            oracle_span!([], [], [],);
+            // Without it the CR needle has a register of its own
+            // (rapidyenc's loop keeps it in one too).
+            oracle_span!(
+                $pf,
+                ["vpcmpeqb {mmv}, {lo}, {crn}", "vpcmpeqb {s3}, {hi}, {crn}"],
+                ["vpcmpeqb {s5}, {s5}, {crn}", "vpcmpeqb {s4}, {s4}, {crn}"],
+                $sel_join,
+                $sel_coll,
+                [],
+                [],
+                [],
+                crn = in(ymm_reg) cr_needle,
+            );
+        }
+            };
+        }
+        // The prefetch is in the loop only on a span long enough for it
+        // (`prefetch_ahead` nonzero); a short span runs the loop without it.
+        macro_rules! with_pf {
+            ($sel_join:tt, $sel_coll:tt) => {
+                if prefetch_ahead != 0 {
+                    with_select!($sel_join, $sel_coll, ["prefetcht0 byte ptr [{c} + {pd}]"]);
+                } else {
+                    with_select!($sel_join, $sel_coll, ["/* {pd} */"]);
+                }
+            };
+        }
+        if AND_ADD {
+            // `vpand` keeps -64 where escaped, then two adds: the escaped
+            // byte gets -64 + offset = -106 (the alignr fill and the
+            // collision masks are clear at byte 0, so a carried escape there
+            // is `{yov}`'s alone).
+            with_pf!(
+                [
+                    "vpand {s2}, {s2}, {eof}",
+                    "vpaddb {s2}, {lo}, {s2}",
+                    "vpaddb {s2}, {s2}, {yov}",
+                    "vpand {s0}, {s0}, {eof}",
+                    "vpaddb {s0}, {hi}, {s0}",
+                    "vpaddb {s0}, {s0}, {s42}"
+                ],
+                [
+                    "vpand {s2}, {s2}, {eof}",
+                    "vpaddb {s2}, {lo}, {s2}",
+                    "vpaddb {s2}, {s2}, {yov}",
+                    "vpcmpeqb {s0}, {s0}, {s3}",
+                    "vpand {s0}, {s0}, {eof}",
+                    "vpaddb {s0}, {hi}, {s0}",
+                    "vpaddb {s0}, {s0}, {s42}"
+                ]
+            );
+        } else {
+            // rapidyenc's select (decoder_avx2_base.h:491-533): `vpblendvb`
+            // between the offset and -106.
+            with_pf!(
+                [
+                    "vpblendvb {s2}, {yov}, {eof}, {s2}",
+                    "vpaddb {s2}, {lo}, {s2}",
+                    "vpblendvb {s0}, {s42}, {eof}, {s0}",
+                    "vpaddb {s0}, {hi}, {s0}"
+                ],
+                [
+                    "vpblendvb {s2}, {yov}, {eof}, {s2}",
+                    "vpaddb {s2}, {lo}, {s2}",
+                    "vpcmpeqb {s0}, {s0}, {s3}",
+                    "vpblendvb {s0}, {s42}, {eof}, {s0}",
+                    "vpaddb {s0}, {hi}, {s0}"
+                ]
+            );
         }
 
         esc_first = ef_v;
@@ -1549,54 +1989,29 @@ unsafe fn avx2_raw_kernel_oracle<const SEARCH_END: bool>(
         if SEARCH_END && stopped != src + span {
             src = stopped;
             state.state = x86_break_state(input, src, mask_out, esc_first);
-            while src < input.len() {
-                if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
-                    break;
-                }
-            }
-            return Ok(KernelOutcome {
-                consumed: src,
-                written: dst,
-                end: state.end.into(),
-            });
+            return x86_fold_head(
+                decode_kernel_scalar(
+                    &input[src..],
+                    &mut output[dst..],
+                    state,
+                    mode.dot_unstuffing,
+                    mode.preserve_pending,
+                    mode.search_end,
+                ),
+                src,
+                dst,
+            );
         }
         src += span;
 
-        // Exit state from the trailing bytes — identical to the generic
-        // kernel's lookback; runs only when the SIMD span consumed windows.
-        let out_next_mask: u16 = if src >= 2 && src + 1 < input.len() {
-            if input[src - 2] == b'\r' && input[src - 1] == b'\n' && input[src] == b'.' {
-                1
-            } else if input[src - 1] == b'\r' && input[src] == b'\n' && input[src + 1] == b'.' {
-                2
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-        state.state = if esc_first != 0 {
-            DecoderState::Eq
-        } else if out_next_mask == 1 {
-            DecoderState::CrLf
-        } else if out_next_mask == 2 {
-            DecoderState::Cr
-        } else {
-            DecoderState::None
-        };
+        // The scalar machine's state after the span (at least one window
+        // consumed, so `src >= 64`): `Cr`/`CrLf` before any byte, and a
+        // line-start `=` carries `CrLfEq`, as `avx2_exit_state` reads them.
+        state.state = avx2_exit_state(input, src, esc_first != 0);
     }
 
-    while src < limit {
-        if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
-            break;
-        }
-    }
-
-    Ok(KernelOutcome {
-        consumed: src,
-        written: dst,
-        end: state.end.into(),
-    })
+    // The tail, as above, up to `limit`.
+    avx2_tail(input, output, state, mode, src, dst, limit)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1770,4 +2185,385 @@ pub(super) unsafe fn decode_normal_run_avx2(
 
     let (extra_src, extra_dst) = unsafe { decode_normal_run_sse2(input, src, output, dst) };
     (src - start + extra_src, dst - dst_start + extra_dst)
+}
+
+#[cfg(test)]
+mod span_end_tests {
+    use super::*;
+
+    // A byte mix dense in the bytes the window loop and its probes treat
+    // specially (`=`, CR, LF, `.`, `y`), so every window boundary, the last
+    // window of the span and the scalar tail after it all see escapes,
+    // stuffed dots, line breaks and terminators.
+    fn article(seed: u64, len: usize) -> Vec<u8> {
+        const MIX: &[u8] = b"==\r\n\r\n..yy=y\r\n.=\rAbc*~\x00\xff\x3c\x3e\x2a\x80";
+        let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                if x.is_multiple_of(3) {
+                    MIX[(x >> 8) as usize % MIX.len()]
+                } else {
+                    (x >> 16) as u8
+                }
+            })
+            .collect()
+    }
+
+    // Every input length across the span end (the last window, the reserve
+    // and the scalar tail), at every 64-byte phase of the input start, in
+    // every raw dot-unstuffing mode the AVX2 kernel serves, against the
+    // scalar kernel: same bytes, cursors, end and carried state.
+    #[test]
+    fn avx2_span_end_matches_scalar() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("no avx2; skipping");
+            return;
+        }
+        let mut checked = 0usize;
+        for len in 129..=420usize {
+            for seed in 0..4u64 {
+                let body = article(seed * 1000 + len as u64, len);
+                // 64-aligned backing store, so `phase` sets the input's
+                // offset from a window boundary.
+                let mut backing = vec![0u8; len + 128];
+                let base = backing.as_ptr().align_offset(64);
+                let phase = (seed as usize * 17 + len) % 64;
+                let at = base + phase;
+                backing[at..at + len].copy_from_slice(&body);
+                let input = &backing[at..at + len];
+                for search_end in [false, true] {
+                    for initial in [
+                        DecoderState::CrLf,
+                        DecoderState::None,
+                        DecoderState::Eq,
+                        DecoderState::Cr,
+                    ] {
+                        let start = KernelState {
+                            state: initial,
+                            ..KernelState::body()
+                        };
+                        let mut want = vec![0u8; len + 64];
+                        let mut want_state = start;
+                        let want_outcome = scalar::decode_kernel_scalar(
+                            input,
+                            &mut want,
+                            &mut want_state,
+                            true,
+                            true,
+                            search_end,
+                        );
+                        let ctx = format!(
+                            "len {len} seed {seed} phase {phase} end {search_end} {initial:?}"
+                        );
+                        let check = |name: &str, got: &[u8], got_state: KernelState, got_outcome: Result<KernelOutcome, YencError>| {
+                            match (&want_outcome, got_outcome) {
+                                (Ok(w), Ok(g)) => {
+                                    assert_eq!(g, *w, "{name} outcome: {ctx}");
+                                    assert_eq!(got[..g.written], want[..w.written], "{name} bytes: {ctx}");
+                                    assert_eq!(got_state, want_state, "{name} state: {ctx}");
+                                }
+                                (Err(_), Err(_)) => {}
+                                (w, g) => panic!("{name} result differs: {ctx}: scalar {w:?}, avx2 {g:?}"),
+                            }
+                        };
+                        let mut got = vec![0u8; len + 64];
+                        let mut got_state = start;
+                        let got_outcome = unsafe {
+                            decode_kernel_avx2(
+                                input,
+                                &mut got,
+                                &mut got_state,
+                                true,
+                                true,
+                                search_end,
+                            )
+                        };
+                        check("kernel", &got, got_state, got_outcome);
+                        // Both escape selects, whichever this CPU picks.
+                        #[cfg(weaver_yenc_raw_asm)]
+                        for and_add in [false, true] {
+                            let mode = DecodeStepMode {
+                                dot_unstuffing: true,
+                                preserve_pending: true,
+                                search_end,
+                            };
+                            let mut got = vec![0u8; len + 64];
+                            let mut got_state = start;
+                            let got_outcome = unsafe {
+                                match (search_end, and_add) {
+                                    (false, false) => avx2_raw_kernel_oracle::<false, false>(
+                                        input,
+                                        &mut got,
+                                        &mut got_state,
+                                        mode,
+                                        len,
+                                    ),
+                                    (false, true) => avx2_raw_kernel_oracle::<false, true>(
+                                        input,
+                                        &mut got,
+                                        &mut got_state,
+                                        mode,
+                                        len,
+                                    ),
+                                    (true, false) => avx2_raw_kernel_oracle::<true, false>(
+                                        input,
+                                        &mut got,
+                                        &mut got_state,
+                                        mode,
+                                        len,
+                                    ),
+                                    (true, true) => avx2_raw_kernel_oracle::<true, true>(
+                                        input,
+                                        &mut got,
+                                        &mut got_state,
+                                        mode,
+                                        len,
+                                    ),
+                                }
+                            };
+                            check(
+                                if and_add { "and-add" } else { "blendv" },
+                                &got,
+                                got_state,
+                                got_outcome,
+                            );
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, (420 - 129 + 1) * 4 * 2 * 4);
+    }
+
+    const ALL_STATES: [DecoderState; 7] = [
+        DecoderState::CrLf,
+        DecoderState::Eq,
+        DecoderState::Cr,
+        DecoderState::None,
+        DecoderState::CrLfDot,
+        DecoderState::CrLfDotCr,
+        DecoderState::CrLfEq,
+    ];
+
+    // `input` decoded by `decode_kernel_avx2` (the asm or the Rust raw
+    // kernel, as built) and, with the asm built and a raw-path entry, by
+    // both oracle instantiations, against the scalar kernel: same result,
+    // bytes, consumed, written, end and carried state.
+    fn check_against_scalar(input: &[u8], entry: DecoderState, mode: DecodeStepMode, ctx: &str) {
+        let start = KernelState {
+            state: entry,
+            ..KernelState::body()
+        };
+        let len = input.len();
+        let mut want = vec![0u8; len + 64];
+        let mut want_state = start;
+        let want_outcome = scalar::decode_kernel_scalar(
+            input,
+            &mut want,
+            &mut want_state,
+            mode.dot_unstuffing,
+            mode.preserve_pending,
+            mode.search_end,
+        );
+        let check = |name: &str,
+                     got: &[u8],
+                     got_state: KernelState,
+                     got_outcome: Result<KernelOutcome, YencError>| {
+            match (&want_outcome, got_outcome) {
+                (Ok(w), Ok(g)) => {
+                    assert_eq!(g, *w, "{name} outcome: {ctx}");
+                    assert_eq!(got[..g.written], want[..w.written], "{name} bytes: {ctx}");
+                    assert_eq!(got_state, want_state, "{name} state: {ctx}");
+                }
+                (Err(w), Err(g)) => {
+                    assert_eq!(format!("{w:?}"), format!("{g:?}"), "{name} error: {ctx}")
+                }
+                (w, g) => panic!("{name} result differs: {ctx}: scalar {w:?}, avx2 {g:?}"),
+            }
+        };
+        let mut got = vec![0u8; len + 64];
+        let mut got_state = start;
+        let got_outcome = unsafe {
+            decode_kernel_avx2(
+                input,
+                &mut got,
+                &mut got_state,
+                mode.dot_unstuffing,
+                mode.preserve_pending,
+                mode.search_end,
+            )
+        };
+        check("kernel", &got, got_state, got_outcome);
+        #[cfg(weaver_yenc_raw_asm)]
+        if mode.dot_unstuffing
+            && matches!(
+                entry,
+                DecoderState::None | DecoderState::Eq | DecoderState::Cr | DecoderState::CrLf
+            )
+        {
+            for and_add in [false, true] {
+                let mut got = vec![0u8; len + 64];
+                let mut got_state = start;
+                let got_outcome = unsafe {
+                    match (mode.search_end, and_add) {
+                        (false, false) => avx2_raw_kernel_oracle::<false, false>(
+                            input,
+                            &mut got,
+                            &mut got_state,
+                            mode,
+                            len,
+                        ),
+                        (false, true) => avx2_raw_kernel_oracle::<false, true>(
+                            input,
+                            &mut got,
+                            &mut got_state,
+                            mode,
+                            len,
+                        ),
+                        (true, false) => avx2_raw_kernel_oracle::<true, false>(
+                            input,
+                            &mut got,
+                            &mut got_state,
+                            mode,
+                            len,
+                        ),
+                        (true, true) => avx2_raw_kernel_oracle::<true, true>(
+                            input,
+                            &mut got,
+                            &mut got_state,
+                            mode,
+                            len,
+                        ),
+                    }
+                };
+                check(
+                    if and_add { "and-add" } else { "blendv" },
+                    &got,
+                    got_state,
+                    got_outcome,
+                );
+            }
+        }
+    }
+
+    // `body` copied to `head` bytes past a 64-byte boundary.
+    fn at_head(backing: &mut Vec<u8>, head: usize, body: &[u8]) -> (usize, usize) {
+        backing.clear();
+        backing.resize(body.len() + 128, 0);
+        let at = backing.as_ptr().align_offset(64) + head;
+        backing[at..at + body.len()].copy_from_slice(body);
+        (at, at + body.len())
+    }
+
+    // A window ending in `=\r\n` before a stuffed line-start `.`, raw mode:
+    // the escaped CR still ends the line (`Eq` then CR leaves `Cr`), so the
+    // window carries `CrLf` and the `.` is dropped. The general kernel's
+    // `span_end_state` required an unescaped CR and decoded the dot as data
+    // (entry `CrLfDot` reaches that kernel): 135 bytes written, not 134.
+    #[test]
+    fn span_end_state_arms_crlf_after_an_escaped_cr() {
+        let mut win = [b'a'; 64];
+        win[61..64].copy_from_slice(b"=\r\n");
+        let fixed_eq = 1u64 << 61;
+        assert_eq!(
+            super::super::x86_common::span_end_state(&win, fixed_eq, true),
+            DecoderState::CrLf
+        );
+        assert_eq!(
+            super::super::x86_common::span_end_state(&win, fixed_eq, false),
+            DecoderState::None
+        );
+    }
+
+    #[test]
+    fn avx2_escaped_cr_before_a_stuffed_dot_matches_scalar() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("no avx2; skipping");
+            return;
+        }
+        let mut backing = Vec::new();
+        let mut body = vec![b'a'; 62];
+        body.extend_from_slice(b"=\r\n.b");
+        body.extend_from_slice(&[b'a'; 70]);
+        let mut written = None;
+        for head in 0..64 {
+            for pp in [false, true] {
+                let mode = DecodeStepMode {
+                    dot_unstuffing: true,
+                    preserve_pending: pp,
+                    search_end: false,
+                };
+                let (a, b) = at_head(&mut backing, head, &body);
+                for entry in ALL_STATES {
+                    check_against_scalar(
+                        &backing[a..b],
+                        entry,
+                        mode,
+                        &format!("head {head} pp {pp} {entry:?}"),
+                    );
+                }
+                // The repro's own shape: entry `CrLfDot` at head 0.
+                if head == 0 && !pp {
+                    let mut out = vec![0u8; body.len() + 64];
+                    let mut st = KernelState {
+                        state: DecoderState::CrLfDot,
+                        ..KernelState::body()
+                    };
+                    let o = unsafe {
+                        decode_kernel_avx2(&backing[a..b], &mut out, &mut st, true, false, false)
+                    };
+                    written = o.ok().map(|o| o.written);
+                }
+            }
+        }
+        assert_eq!(written, Some(134));
+    }
+
+    // Each line-state-sensitive trailing sequence at every window offset
+    // (and in the span, the last window, the reserve and the tail), every
+    // entry state, every mode, against the scalar kernel. Covers the carried
+    // state at the raw kernels' exits: `Cr`/`CrLf` before any byte, and
+    // `CrLfEq` for a line-start `=` left pending.
+    #[test]
+    fn avx2_trailing_line_states_match_scalar() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("no avx2; skipping");
+            return;
+        }
+        const TRAILS: [&[u8]; 6] = [b"\r", b"\r\n", b"\r\n=", b"=\r\n", b"=\r\n.", b"\r\n.\r\n="];
+        let mut backing = Vec::new();
+        let mut checked = 0usize;
+        for trail in TRAILS {
+            for k in 0..=200usize {
+                let mut body = vec![b'K'; k];
+                body.extend_from_slice(trail);
+                for head in [0usize, 1, 31, 63] {
+                    let (a, b) = at_head(&mut backing, head, &body);
+                    for dot_unstuffing in [true, false] {
+                        for preserve_pending in [true, false] {
+                            for search_end in [false, true] {
+                                let mode = DecodeStepMode {
+                                    dot_unstuffing,
+                                    preserve_pending,
+                                    search_end,
+                                };
+                                for entry in ALL_STATES {
+                                    let ctx = format!(
+                                        "trail {trail:?} k {k} head {head} {mode:?} {entry:?}"
+                                    );
+                                    check_against_scalar(&backing[a..b], entry, mode, &ctx);
+                                    checked += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 6 * 201 * 4 * 8 * 7);
+    }
 }

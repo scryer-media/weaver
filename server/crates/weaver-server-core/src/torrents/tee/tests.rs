@@ -340,7 +340,10 @@ async fn no_checkpoint_is_taken_while_an_object_is_out_for_its_work() {
     let layout =
         Arc::new(PieceLayout::new(1024, vec![file("lantern.zip", archive.len() as u64)]).unwrap());
     let mut storage = storage(dir.path(), &mail, CapacityReader::unknown());
-    storage.passwords = vec![SECRET.to_owned()];
+    storage.passwords = vec![crate::jobs::ArchivePasswordCandidate::new(
+        crate::jobs::ArchivePasswordSource::Tracker,
+        SECRET.to_owned(),
+    )];
     let tee = Tee::fresh(parts(&layout, dir.path(), &mail, Arc::default()), storage);
     tee.with(|job| job.hold_loans());
     // Every piece but the first leaves its step unread: only the job's
@@ -395,7 +398,10 @@ const LZ: &[u8] = include_bytes!(concat!(
 
 // A tee over a compressed archive whose free disk reads panic once
 // `armed`, as a failing probe of the disk would, with the trap that
-// records this thread's panics.
+// records this thread's panics. The disk is all but full: a KiB above a
+// one-byte reserve. What the job may write is then promised a little at a
+// time, so a write its runs make once their pieces are in reads the disk
+// again, as one that fits what was promised before would not.
 fn armed_tee(
     dir: &Path,
     mail: &RunMail,
@@ -407,6 +413,7 @@ fn armed_tee(
 ) {
     let layout = Arc::new(PieceLayout::new(64, vec![file("set.rar", LZ.len() as u64)]).unwrap());
     let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let read_at = std::time::Instant::now();
     let reader = {
         let armed = Arc::clone(&armed);
         CapacityReader::from_fn(move || {
@@ -414,15 +421,30 @@ fn armed_tee(
                 !armed.load(std::sync::atomic::Ordering::Acquire),
                 "the disk could not be read"
             );
-            crate::operations::disk::Capacity::Unknown
+            crate::operations::disk::Capacity::Known(crate::operations::disk::CapacityReading {
+                available_bytes: 1 + 1024,
+                total_bytes: 1 << 40,
+                sampled_at: read_at,
+                stale: false,
+            })
         })
     };
     let work = dir.join("work");
     std::fs::create_dir_all(&work).unwrap();
-    let tee = Tee::fresh(
-        parts(&layout, &work, mail, Arc::default()),
-        storage(&work, mail, reader),
+    let mut storage = storage(&work, mail, reader);
+    let mut limits = crate::pipeline::ExtractionLimits::unbounded();
+    limits.min_free_bytes = 1;
+    storage.caps = Caps::new(
+        Arc::new(limits),
+        crate::pipeline::graph::limits::known_policy(
+            crate::post_processing::model::PostProcessingSettings {
+                unacceptable_extensions: Vec::new(),
+                ..Default::default()
+            },
+        ),
+        Vec::new(),
     );
+    let tee = Tee::fresh(parts(&layout, &work, mail, Arc::default()), storage);
     let trap = Arc::new(crate::runtime::panic_trap::Trap::new(
         &dir.join("marks"),
         "test",

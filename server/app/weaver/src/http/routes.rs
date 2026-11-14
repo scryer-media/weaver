@@ -178,6 +178,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         torrents,
         rss.clone(),
         super::torrent_facade::Api::LATEST,
+        Some(Arc::clone(&disk_space)),
     );
     let nzbget_context = super::nzbget::NzbgetFacadeContext::new(
         db.clone(),

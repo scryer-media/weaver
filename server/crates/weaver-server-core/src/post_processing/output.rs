@@ -1170,6 +1170,7 @@ mod tests {
             completed_at: 2,
             metadata: None,
             server_attribution: None,
+            archived_at: None,
         })
         .unwrap();
     }

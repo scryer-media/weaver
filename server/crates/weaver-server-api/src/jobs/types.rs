@@ -173,6 +173,8 @@ pub enum QueueWaitReason {
     RepairCapacity,
     ExtractionCapacity,
     PostProcessingCapacity,
+    // The job waits for room on a disk, in whatever phase it is in.
+    DiskSpace,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
@@ -1118,11 +1120,36 @@ pub struct JobOutputFile {
     pub size_bytes: u64,
 }
 
+/// One page of a job's output files, and the totals of all of them.
 #[derive(Debug, Clone, SimpleObject)]
+#[graphql(complex)]
 pub struct JobOutputResult {
     pub output_dir: String,
-    pub files: Vec<JobOutputFile>,
+    /// The bytes of every file, not only of this page.
     pub total_bytes: u64,
+    /// How many files there are in all.
+    pub total_count: u64,
+    /// True when the entry was archived and this is the record kept of its
+    /// files.
+    pub archived: bool,
+    /// The `after` that asks for the next page; null on the last page.
+    pub next_cursor: Option<String>,
+    #[graphql(skip)]
+    pub(crate) source: JobOutputSource,
+}
+
+/// Where a job's output files are read from: loaded only when `files` is
+/// selected.
+#[derive(Debug, Clone)]
+pub(crate) enum JobOutputSource {
+    /// Read from disk with the totals; this page is already in hand.
+    Disk(Vec<JobOutputFile>),
+    /// The record an archive kept, read from `offset` on.
+    Archived {
+        job_id: u64,
+        offset: u64,
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Clone, SimpleObject)]
@@ -1462,7 +1489,7 @@ fn queue_item_from_display(
         state,
         download_state: QueueDownloadState::from(info.download_state),
         post_state: QueuePostState::from(info.post_state),
-        wait_reason: wait_reason_for_post_state(info.post_state),
+        wait_reason: wait_reason_for(info),
         download_wait_reason: info.download_wait_reason.clone(),
         download_retry_at_epoch_ms: info.download_retry_at_epoch_ms,
         error: info.error.clone(),
@@ -1729,6 +1756,56 @@ pub fn metrics_from_snapshot(snapshot: &MetricsSnapshot) -> Metrics {
     Metrics::from(snapshot)
 }
 
+// Whether a queue row's view passes `filter`, judged on the same facts its
+// queue item would be: the row is not copied, and its attributes are read only
+// when the filter names one.
+pub(crate) fn matches_view_filter_prepared(
+    view: &weaver_server_core::pipeline::queue::paging::JobView<'_>,
+    filter: Option<&PreparedQueueFilter>,
+) -> bool {
+    let Some(prepared) = filter else {
+        return true;
+    };
+    let job = view.job();
+    let attributes = if prepared.has_attribute_key.is_some() || prepared.attribute_equals.is_some()
+    {
+        split_attributes(&job.metadata).1
+    } else {
+        Vec::new()
+    };
+    matches_item_filter_prepared(
+        job.job_id.0,
+        queue_item_state(QueueStateFacts::of_view(view)),
+        job.category.as_ref(),
+        &attributes,
+        filter,
+    )
+}
+
+// Whether a queued row copied out as `info`, a torrent's, passes `filter`,
+// as its queue item would.
+pub(crate) fn matches_info_filter_prepared(
+    info: &weaver_server_core::JobInfo,
+    filter: Option<&PreparedQueueFilter>,
+) -> bool {
+    let Some(prepared) = filter else {
+        return true;
+    };
+    let attributes = if prepared.has_attribute_key.is_some() || prepared.attribute_equals.is_some()
+    {
+        split_attributes(&info.metadata).1
+    } else {
+        Vec::new()
+    };
+    matches_item_filter_prepared(
+        info.job_id.0,
+        queue_item_state(QueueStateFacts::of_job(info)),
+        info.category.as_ref(),
+        &attributes,
+        filter,
+    )
+}
+
 fn matches_item_filter_prepared(
     id: u64,
     state: QueueItemState,
@@ -1800,10 +1877,15 @@ fn ms_to_datetime(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
 }
 
-fn wait_reason_for_post_state(
-    post_state: weaver_server_core::PostState,
-) -> Option<QueueWaitReason> {
-    match post_state {
+// What the job waits for: room on a disk, which holds it in any phase,
+// else the capacity its post-processing state queues it for.
+fn wait_reason_for(info: &weaver_server_core::JobInfo) -> Option<QueueWaitReason> {
+    if info.download_wait_reason.as_deref()
+        == Some(weaver_server_core::jobs::handle::DISK_SPACE_WAIT_REASON)
+    {
+        return Some(QueueWaitReason::DiskSpace);
+    }
+    match info.post_state {
         weaver_server_core::PostState::QueuedRepair => Some(QueueWaitReason::RepairCapacity),
         weaver_server_core::PostState::QueuedExtract => Some(QueueWaitReason::ExtractionCapacity),
         weaver_server_core::PostState::QueuedPostProcessing => {

@@ -7,7 +7,7 @@ cd "$SRC/weaver"
 cargo +nightly fuzz build -O --debug-assertions
 
 readonly target_dir="fuzz/target/x86_64-unknown-linux-gnu/release"
-for target in nzb_parser yenc_article; do
+for target in nzb_parser yenc_article yenc_decode_tiers yenc_encode_tiers yenc_roundtrip; do
     cp "$target_dir/$target" "$OUT/$target"
     cp "fuzz/dictionaries/$target.dict" "$OUT/$target.dict"
     cp "fuzz/options/$target.options" "$OUT/$target.options"

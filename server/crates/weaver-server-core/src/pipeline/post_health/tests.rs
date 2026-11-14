@@ -140,3 +140,41 @@ fn the_sample_decides_before_health_while_its_outstanding_first_articles_could_r
         Gate::Open
     );
 }
+
+// A batch carried across a pool rebuild carries whom it asked by server
+// identity, since the new pool may number its servers differently: a server
+// still in the pool stays asked under its new number, one that left drops
+// out. What the batch found is kept.
+#[test]
+fn a_batch_across_a_pool_rebuild_carries_whom_it_asked() {
+    let identity = |n: u32| weaver_nntp::ServerIdentity {
+        stable_id: weaver_nntp::transfer::StableServerId(n),
+        host: format!("news-{n}.example.com"),
+        port: 563,
+        username: None,
+    };
+    let mut layouts = crate::pipeline::PoolLayouts::default();
+    layouts.activate(
+        (2, vec![identity(1), identity(2), identity(3)]),
+        3,
+        vec![identity(1), identity(2), identity(3)],
+    );
+    let mut batch = ProbeBatch::new(JobId(30050), 0, vec!["a@x".into(), "b@x".into()]).in_pool(3);
+    assert!(batch.rebase(&layouts, 3));
+    for server in [0, 2] {
+        batch.fold(
+            server,
+            ProbeBatchResult {
+                exists: vec![server == 0, false],
+                inconclusive: false,
+            },
+        );
+    }
+    assert_eq!(batch.asked(), [0, 2]);
+    // Server 3 moves to the front, server 1 leaves.
+    layouts.activate((3, Vec::new()), 4, vec![identity(3), identity(2)]);
+    assert!(!batch.rebase(&layouts, 4));
+    assert_eq!(batch.asked(), [0]);
+    assert_eq!(batch.unfound(), vec!["b@x".to_string()]);
+    assert!(batch.rebase(&layouts, 4));
+}

@@ -381,6 +381,13 @@ unsafe fn main_loop(
                 "test {fl}, {fl}",
                 "jnz 7f",
                 "jmp 3f",
+                // The loop sits at a fixed place in its 64-byte line, so the
+                // code around it cannot move its branches: measured on
+                // Sapphire Rapids, its escape branches mispredict a third
+                // more at some offsets, whatever the kernel's code. The
+                // padding follows a jump and never runs.
+                ".p2align 6",
+                ".skip 51, 0x90",
                 // A block without escapes: advance, or leave at a line end
                 // or the end.
                 "2:",

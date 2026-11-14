@@ -32,19 +32,15 @@ use crate::pipeline::tests::direct_store::{
     protected_store_set, single_member_store_set,
 };
 use crate::pipeline::tests::{
-    insert_active_job, job_status_for_assert, new_direct_pipeline_with_buffers,
+    insert_active_job, job_status_for_assert, new_direct_pipeline_with_backlog,
     pump_pipeline_runtime_queues, retire_pipeline_database,
 };
 use crate::pipeline::{Pipeline, PipelineEvent};
 
 const SECRET: &str = "lantern-restart-secret";
 
-fn buffers() -> crate::runtime::buffers::BufferPoolConfig {
-    crate::runtime::buffers::BufferPoolConfig {
-        small_count: 8,
-        medium_count: 4,
-        large_count: 2,
-    }
+fn backlog_base_bytes() -> usize {
+    16 * 1024 * 1024
 }
 
 // What a restarted run came to.
@@ -101,7 +97,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
 ) -> Restarted {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) =
-        new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
 
@@ -133,7 +129,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
                 from_disk.insert(article);
             }
             let server = (0..)
-                .find(|server| !work.exclude_servers.contains(server))
+                .find(|server| !work.exclude_servers.contains(*server))
                 .unwrap();
             if scenario.spoils(server, article) {
                 spoiled.insert(article);
@@ -271,19 +267,14 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
 // whose turn comes first, a turn of each named post at a time; the rest stay
 // queued.
 fn next_work(pipeline: &mut Pipeline, scenario: &Scenario) -> Option<DownloadWork> {
-    let queue = &mut pipeline
-        .jobs
-        .get_mut(&JOB)?
-        .articles
-        .active_mut()
-        .unwrap()
-        .download_queue;
+    let crate::jobs::model::JobState { articles, spec, .. } = pipeline.jobs.get_mut(&JOB)?;
+    let queue = &mut articles.active_mut().unwrap().download_queue;
     if scenario.together.is_empty() && scenario.first.is_empty() {
-        return queue.pop();
+        return queue.pop().map(|item| item.dispatched(spec));
     }
     let mut queued = Vec::new();
     while let Some(work) = queue.pop() {
-        queued.push(work);
+        queued.push(work.dispatched(spec));
     }
     let article = |work: &DownloadWork| {
         (
@@ -335,7 +326,7 @@ async fn shut_down(pipeline: &mut Pipeline) {
 
 // The pipeline goes down with what it held in memory, and a new one restores
 // the job from what reached the database.
-async fn restart(
+pub(in crate::pipeline::tests) async fn restart(
     temp_dir: &tempfile::TempDir,
     pipeline: Pipeline,
     scenario: &Scenario,
@@ -361,12 +352,27 @@ async fn restart_heard(
     // the coverage a crash loses before the writer's barrier is due.
     pipeline.flush_graph_checkpoint(JOB);
     in_memory.extend(pipeline.graph_jobs[&JOB].in_memory());
+    // Boxed: the restore's future is large, and a caller's frame holds it
+    // once already.
+    Box::pin(restart_as_it_stands(temp_dir, pipeline, scenario, inspect)).await
+}
+
+// The pipeline dropped as it stands and the next made over the same
+// folders, the job restored from the database's rows: a restart of a job
+// whose graph is not live, as one held for a full disk.
+pub(in crate::pipeline::tests) async fn restart_as_it_stands(
+    temp_dir: &tempfile::TempDir,
+    pipeline: Pipeline,
+    scenario: &Scenario,
+    inspect: Inspect<'_>,
+) -> (Pipeline, tokio::sync::broadcast::Receiver<PipelineEvent>) {
     let working_dir = pipeline.jobs[&JOB].working_dir.clone();
     let db = pipeline.db.clone();
     retire_pipeline_database(pipeline).await;
     drop(db);
 
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(temp_dir, buffers(), 1).await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(temp_dir, backlog_base_bytes(), 1).await;
     let heard = pipeline.event_tx.subscribe();
     scenario.prepare(&mut pipeline);
     let rows = pipeline
@@ -572,7 +578,7 @@ pub(in crate::pipeline::tests) struct RestartedDone {
 async fn run_restarted_once_done(scenario: &Scenario) -> RestartedDone {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) =
-        new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
     let mut sent = pipeline.event_tx.subscribe();
@@ -680,7 +686,7 @@ pub(in crate::pipeline::tests) async fn run_restarted_while_repairing(
 ) -> (RestartedDone, bool) {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) =
-        new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
     let mut sent = pipeline.event_tx.subscribe();
@@ -966,12 +972,14 @@ async fn a_job_with_no_checkpoint_is_admitted_afresh_at_restore() {
     let scenario = Scenario::new(vec![Post::plain("ember.bin", payload(3 * ARTICLE, 76))]);
     let temp_dir = tempfile::tempdir().unwrap();
     let working_dir = {
-        let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+        let (mut pipeline, _, _) =
+            new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
         let working_dir = insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
         retire_pipeline_database(pipeline).await;
         working_dir
     };
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     let _ = pipeline
         .restore_job(crate::RestoreJobRequest {
             job_id: JOB,
@@ -1014,7 +1022,8 @@ async fn a_job_with_no_checkpoint_is_admitted_afresh_at_restore() {
 async fn a_restored_graph_job_advances_its_durable_floor_with_its_checkpoints() {
     let scenario = Scenario::new(vec![Post::plain("ember.bin", payload(12 * ARTICLE, 73))]);
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
     for _ in 0..4 {
@@ -1060,10 +1069,13 @@ async fn a_restored_graph_job_advances_its_durable_floor_with_its_checkpoints() 
     let limit = Pipeline::restart_durable_lead_limit_bytes();
     pipeline.jobs.get_mut(&JOB).unwrap().downloaded_bytes = floor + limit - 2 * estimate;
     let admission = pipeline.checkpoint_admission(JOB);
-    assert_eq!(admission.decision(&work, &[]).as_str(), "within_limit");
+    assert_eq!(
+        admission.decision(&work.view(), &[]).as_str(),
+        "within_limit"
+    );
     assert_eq!(
         admission
-            .decision(&work, std::slice::from_ref(&work))
+            .decision(&work.view(), std::slice::from_ref(&work))
             .as_str(),
         "within_limit",
         "a restored graph job must not drop to one article at a time"
@@ -1493,6 +1505,51 @@ async fn plain_files_under_par3_restarted_after_every_article_are_repaired_with_
     restart_row(Scenario::new(posts).damaged(0, 2)).await;
 }
 
+// Every file is given its declared length when it is made, on whatever
+// platform the test runs: a file's length then says nothing of how far its
+// bytes reach. Articles a restored member holds in memory, undecided under
+// its set, are in no file, and each restart fetches them again from what the
+// checkpoint says alone. One that took the file's length for them would
+// leave holes of zeros where they lay, more than the set's blocks mend.
+#[tokio::test]
+async fn articles_held_in_memory_over_a_sized_file_are_fetched_again_after_every_restart() {
+    let _sized = crate::pipeline::graph::sparse::sizing::always();
+    let files = [
+        ("lantern.bin", payload(6 * ARTICLE, 83)),
+        ("beacon.bin", payload(3 * ARTICLE + 9, 84)),
+    ];
+    let posts = with_par3(&files, &["lantern.bin", "beacon.bin"], "lantern");
+    restart_row(Scenario::new(posts).damaged(0, 2)).await;
+}
+
+// No file is given a length before its bytes, so each is as long as its
+// last byte written. The second file is small enough to be decided at its
+// first article: its first and last articles come first and go to its
+// file, which then reaches its end. Every article between them comes after
+// a restart, while the member is undecided under its set, and is held in
+// memory below the file's length. Each restart fetches those again: the
+// file's length covers them, and the checkpoint does not.
+#[tokio::test]
+async fn articles_held_in_memory_below_a_files_length_are_fetched_again_after_every_restart() {
+    let _grown = crate::pipeline::graph::sparse::sizing::never();
+    let files = [
+        ("lantern.bin", payload(6 * ARTICLE, 83)),
+        ("beacon.bin", payload(3 * ARTICLE + 9, 84)),
+    ];
+    let posts = with_par3(&files, &["lantern.bin", "beacon.bin"], "lantern");
+    // Sixteen bytes an article: the second file is thirteen of them.
+    let scenario = Scenario::new(posts).framed(16).first(&[(1, 0), (1, 12)]);
+    let whole = run(&scenario).await;
+    assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
+    let restarted = run_restarting(&scenario, &mut |_| {}).await;
+    assert_restarted(&restarted, &whole);
+    assert!(
+        (1..12).any(|ordinal| restarted.in_memory.contains(&(1, ordinal))),
+        "some article between the file's ends was held in memory at a restart: {:?}",
+        restarted.in_memory
+    );
+}
+
 // The members are bound by their bytes, so the restored set must still
 // know what it identified: a lost match would read them back again, and a
 // lost rename would deliver them under their hex names.
@@ -1875,7 +1932,8 @@ async fn served_four(
     temp_dir: &tempfile::TempDir,
     scenario: &Scenario,
 ) -> (Pipeline, std::path::PathBuf) {
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(temp_dir, buffers(), 1).await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(temp_dir, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     let working_dir = insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
     for _ in 0..4 {
@@ -2017,7 +2075,7 @@ async fn reopened() -> Reopened {
     let (pipeline, working_dir) = served_four(&temp_dir, &scenario).await;
     retire_pipeline_database(pipeline).await;
     let (mut pipeline, _, complete_dir) =
-        new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     Reopened {
         pipeline,
@@ -2123,7 +2181,7 @@ impl Reopened {
         // A blocked job holds no articles until its restore goes through.
         assert!(pipeline.jobs[&JOB].articles.active().is_none());
         pipeline.dispatch_downloads();
-        assert_eq!(pipeline.active_downloads, 0);
+        assert_eq!(pipeline.articles_in_flight, 0);
         // The pause goes on the job's writer lane.
         pipeline.db.flush_write_queue().await.unwrap();
         let row = pipeline
@@ -2178,7 +2236,7 @@ impl Reopened {
         );
         assert!(pipeline.jobs[&JOB].articles.active().is_none());
         pipeline.dispatch_downloads();
-        assert_eq!(pipeline.active_downloads, 0);
+        assert_eq!(pipeline.articles_in_flight, 0);
         pipeline.db.flush_write_queue().await.unwrap();
         let row = pipeline
             .db
@@ -2206,7 +2264,7 @@ impl Reopened {
         } = self;
         retire_pipeline_database(pipeline).await;
         let (mut pipeline, _, complete_dir) =
-            new_direct_pipeline_with_buffers(&_temp_dir, buffers(), 1).await;
+            new_direct_pipeline_with_backlog(&_temp_dir, backlog_base_bytes(), 1).await;
         scenario.prepare(&mut pipeline);
         Reopened {
             pipeline,
@@ -2319,7 +2377,8 @@ async fn a_fresh_jobs_first_checkpoint_replaces_every_stale_row() {
     let temp_dir = tempfile::tempdir().unwrap();
     let working_dir = changed_checkpoint(&temp_dir, &scenario, ROOT_VERSION_AHEAD).await;
 
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     // The old checkpoint covers four articles across both files.
     let stale = covered(&pipeline);
@@ -2479,7 +2538,8 @@ async fn a_restart_restores_a_running_job_with_its_articles_and_a_queued_job_wit
     let scenario = Scenario::new(vec![Post::plain("ember.bin", payload(12 * ARTICLE, 80))]);
     let temp_dir = tempfile::tempdir().unwrap();
     let working_dir = {
-        let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+        let (mut pipeline, _, _) =
+            new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
         scenario.prepare(&mut pipeline);
         let working_dir = insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
         for _ in 0..4 {
@@ -2496,7 +2556,8 @@ async fn a_restart_restores_a_running_job_with_its_articles_and_a_queued_job_wit
         working_dir
     };
 
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     pipeline.process_memory_budget =
         std::sync::Arc::new(crate::pipeline::ProcessMemoryBudget::new(0));
@@ -2528,7 +2589,8 @@ async fn a_restart_restores_a_running_job_with_its_articles_and_a_queued_job_wit
     retire_pipeline_database(pipeline).await;
 
     let queued_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&queued_dir, buffers(), 1).await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&queued_dir, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     let working_dir = queued_dir.path().join("queued");
     std::fs::create_dir_all(&working_dir).unwrap();
@@ -2556,7 +2618,8 @@ async fn a_restart_restores_a_running_job_with_its_articles_and_a_queued_job_wit
 async fn a_paused_job_drops_its_articles_and_resumes_from_its_checkpoint() {
     let scenario = Scenario::new(vec![Post::plain("ember.bin", payload(12 * ARTICLE, 81))]);
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
     let mut served = Vec::new();
@@ -2611,7 +2674,7 @@ async fn held_part_survives_pause_restart_resume(scenario: Scenario) {
     assert!(whole.completed(), "{:?}", whole.failure);
     let temp = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) =
-        new_direct_pipeline_with_buffers(&temp, buffers(), 1).await;
+        new_direct_pipeline_with_backlog(&temp, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     let working_dir = insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
     let work = next_work(&mut pipeline, &scenario).unwrap();
@@ -2640,7 +2703,8 @@ async fn held_part_survives_pause_restart_resume(scenario: Scenario) {
     );
     retire_pipeline_database(pipeline).await;
 
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp, buffers(), 1).await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     pipeline
         .restore_job(request_for(&scenario, working_dir, JobStatus::Paused))
@@ -2729,7 +2793,8 @@ async fn a_numbered_stream_held_part_survives_pause_restart_resume() {
 async fn a_paused_job_counts_only_the_articles_its_checkpoint_does_not_hold_as_queued() {
     let scenario = Scenario::new(vec![Post::plain("ember.bin", payload(1000 * ARTICLE, 82))]);
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     let working_dir = insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
     for _ in 0..900 {
@@ -2751,7 +2816,8 @@ async fn a_paused_job_counts_only_the_articles_its_checkpoint_does_not_hold_as_q
     pipeline.db.flush_write_queue().await.unwrap();
     retire_pipeline_database(pipeline).await;
 
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     pipeline
         .restore_job(request_for(&scenario, working_dir, JobStatus::Paused))
@@ -2763,6 +2829,49 @@ async fn a_paused_job_counts_only_the_articles_its_checkpoint_does_not_hold_as_q
         crate::jobs::model::JobArticles::Queued(_)
     ));
     assert_eq!(articles.queued_download_len(), 100);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A job built again from its checkpoint keeps the staging it has, so its
+// activation asks the disk owner nothing.
+#[tokio::test]
+async fn a_job_restored_from_its_checkpoint_asks_nothing_of_the_disk() {
+    let body = payload(40 * ARTICLE + 5, 74);
+    let scenario = Scenario::new(vec![Post::plain("beacon.bin.xz", xz(&body))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
+    scenario.prepare(&mut pipeline);
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    while !pipeline.graph_jobs[&JOB].awaits_mail() {
+        let work =
+            next_work(&mut pipeline, &scenario).expect("the run starts before the post ends");
+        serve_work(&mut pipeline, &scenario, &work).await;
+    }
+    pipeline.pause_job_runtime(JOB).unwrap();
+    pipeline.resume_job_runtime(JOB).unwrap();
+    while pipeline.retiring_graph_jobs.contains_key(&JOB) {
+        let said = pipeline
+            .graph_runs
+            .recv()
+            .await
+            .expect("the stopped run ends");
+        pipeline.graph_run_said(said);
+    }
+    let asks = crate::operations::disk::same_filesystem_asks();
+    pipeline.request_job_activation(JOB);
+    let read = pipeline
+        .job_activated_rx
+        .recv()
+        .await
+        .expect("the read replies");
+    assert!(
+        read.result.as_ref().is_ok_and(|read| read.restored()),
+        "built from its checkpoint"
+    );
+    assert_eq!(crate::operations::disk::same_filesystem_asks(), asks);
+    pipeline.hear_graph_runs();
+    pipeline.handle_job_activated(read);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -2778,7 +2887,7 @@ async fn a_job_paused_while_its_stream_runs_resumes_and_its_restored_run_is_hear
     let scenario = Scenario::new(vec![Post::plain("beacon.bin.xz", xz(&body))]);
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) =
-        new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
     while !pipeline.graph_jobs[&JOB].awaits_mail() {
@@ -2876,7 +2985,8 @@ async fn cancelling_a_job_blocked_on_its_checkpoint_clears_the_block() {
     let scenario = Scenario::new(vec![Post::plain("ember.bin", payload(12 * ARTICLE, 78))]);
     let temp_dir = tempfile::tempdir().unwrap();
     let working_dir = changed_checkpoint(&temp_dir, &scenario, COLUMN_AWAY).await;
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     let mut request = request_for(&scenario, working_dir, JobStatus::Paused);
     request.paused_resume_status = Some(JobStatus::Extracting);
     pipeline.restore_job(request).await.unwrap();
@@ -2923,7 +3033,8 @@ async fn a_job_blocked_on_its_checkpoint_resumes_into_the_status_its_lanes_name(
         let scenario = Scenario::new(vec![Post::plain("ember.bin", payload(12 * ARTICLE, 79))]);
         let temp_dir = tempfile::tempdir().unwrap();
         let working_dir = changed_checkpoint(&temp_dir, &scenario, COLUMN_AWAY).await;
-        let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+        let (mut pipeline, _, _) =
+            new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
         let mut request = request_for(&scenario, working_dir, status.clone());
         request.download_state = Some(download_state);
         request.post_state = Some(post_state);
@@ -2980,7 +3091,8 @@ async fn a_job_restored_under_paused_post_processing_starts_no_run_until_resume(
     let body = payload(3 * ARTICLE + 7, 92);
     let scenario = Scenario::new(vec![Post::plain("ember.bin.xz", xz(&body))]);
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
     set_post_processing_paused(&mut pipeline, true).await;
@@ -2998,7 +3110,7 @@ async fn a_job_restored_under_paused_post_processing_starts_no_run_until_resume(
     drop(db);
 
     let (mut pipeline, _, complete_dir) =
-        new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     set_post_processing_paused(&mut pipeline, true).await;
     pipeline

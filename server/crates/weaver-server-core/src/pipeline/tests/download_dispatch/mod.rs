@@ -12,13 +12,14 @@ async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf)
     (pipeline, intermediate_dir, complete_dir)
 }
 
-async fn new_direct_pipeline_with_buffers(
+async fn new_direct_pipeline_with_backlog(
     temp_dir: &TempDir,
-    buffer_config: BufferPoolConfig,
+    backlog_base_bytes: usize,
     total_connections: usize,
 ) -> (Pipeline, PathBuf, PathBuf) {
     let (mut pipeline, intermediate_dir, complete_dir) =
-        super::new_direct_pipeline_with_buffers(temp_dir, buffer_config, total_connections).await;
+        super::new_direct_pipeline_with_backlog(temp_dir, backlog_base_bytes, total_connections)
+            .await;
     pipeline.audit_lane_holdings = true;
     (pipeline, intermediate_dir, complete_dir)
 }
@@ -46,7 +47,7 @@ fn held_works(segments: &[SegmentId]) -> Vec<DownloadWork> {
             retry_count: 0,
             is_recovery: false,
             completion_critical: false,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             avoid_server: None,
         })
         .collect()
@@ -77,6 +78,7 @@ fn posted_job_spec(name: &str, posted_at: Option<u64>) -> JobSpec {
     spec
 }
 
+mod alternate_message_ids;
 mod article_scheduler;
 mod article_slots;
 mod checkpoint_progress;
@@ -91,5 +93,6 @@ mod lane_failure_visibility;
 mod lane_holdings;
 mod owned_download_lane_pool;
 mod propagation_delay;
+mod server_ladder;
 mod stall_recovery;
 mod stall_retry;

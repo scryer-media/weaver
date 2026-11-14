@@ -17,9 +17,10 @@ use crate::StateError;
 use crate::persistence::Database;
 #[cfg(test)]
 use crate::persistence::database_target::DatabaseTarget;
-use crate::persistence::sql_runtime::{SqlRuntime, StoreDatastore};
+use crate::persistence::sql_runtime::{SqlConn, SqlRuntime, StoreDatastore};
 #[cfg(test)]
 use crate::rss::RssService;
+use crate::schema_migrations::history_search_key_v88::fill_history_search_columns;
 #[cfg(test)]
 use crate::{HistoryFilter, SchedulerHandle};
 
@@ -427,13 +428,23 @@ async fn import_stable_state_to_postgres(pool: PgPool, src: PathBuf) -> Result<(
             .await
             .map_err(db_err)?;
     }
+    sqlx::raw_sql(CLEAR_HISTORY_NZBS_SQL)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
 
     for table in LEGACY_V1_STABLE_TABLES {
         if *table == "schema_version" {
             continue;
         }
 
-        let columns = postgres_columns(&mut tx, table).await?;
+        let mut columns = postgres_columns(&mut tx, table).await?;
+        // A legacy bundle may predate the stored release name and search
+        // key; they are filled from each row's name and metadata once the
+        // rows are in.
+        if *table == "job_history" {
+            columns.retain(|column| !matches!(column.name.as_str(), "release_name" | "search_key"));
+        }
         if columns.is_empty() {
             return Err(StateError::Database(format!(
                 "restore target is missing table {table}"
@@ -541,6 +552,8 @@ async fn import_stable_state_to_postgres(pool: PgPool, src: PathBuf) -> Result<(
             builder.build().execute(&mut *tx).await.map_err(db_err)?;
         }
     }
+    copy_legacy_history_nzbs_to_postgres(&mut source, &mut tx).await?;
+    fill_history_search_columns(&mut SqlConn::Postgres(&mut tx)).await?;
 
     for (table, column) in [
         ("api_keys", "id"),
@@ -561,6 +574,48 @@ async fn import_stable_state_to_postgres(pool: PgPool, src: PathBuf) -> Result<(
 
     tx.commit().await.map_err(db_err)?;
     Ok(())
+}
+
+// The stored NZBs of finished jobs, which the history clear above leaves
+// behind in their own table.
+const CLEAR_HISTORY_NZBS_SQL: &str =
+    "DELETE FROM job_nzbs WHERE job_id NOT IN (SELECT job_id FROM active_jobs)";
+
+// A legacy bundle keeps a finished job's stored NZB on its history row; it is
+// restored to `job_nzbs`, a few jobs at a time so no read holds them all.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: Postgres, no writer gate"
+)]
+async fn copy_legacy_history_nzbs_to_postgres(
+    source: &mut SqliteConnection,
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+) -> Result<(), StateError> {
+    const BATCH: i64 = 32;
+    if !table_has_column(source, "main", "job_history", "nzb_zstd").await? {
+        return Ok(());
+    }
+    let mut after = i64::MIN;
+    loop {
+        let rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT job_id, nzb_zstd FROM job_history
+              WHERE job_id > ? AND nzb_zstd IS NOT NULL ORDER BY job_id LIMIT ?",
+        )
+        .bind(after)
+        .bind(BATCH)
+        .fetch_all(&mut *source)
+        .await
+        .map_err(db_err)?;
+        let Some(last) = rows.last().map(|(job_id, _)| *job_id) else {
+            return Ok(());
+        };
+        let mut builder = QueryBuilder::<Postgres>::new("INSERT INTO job_nzbs (job_id, nzb_zstd) ");
+        builder.push_values(rows, |mut values, (job_id, nzb)| {
+            values.push_bind(job_id).push_bind(nzb);
+        });
+        builder.build().execute(&mut **tx).await.map_err(db_err)?;
+        after = last;
+    }
 }
 
 #[expect(
@@ -1006,6 +1061,10 @@ impl Database {
                                     .await
                                     .map_err(db_err)?;
                             }
+                            sqlx::raw_sql(CLEAR_HISTORY_NZBS_SQL)
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(db_err)?;
 
                             let import_sql = format!(
                                 "INSERT INTO settings (key, value)
@@ -1080,6 +1139,7 @@ impl Database {
                             .await
                             .map_err(db_err)?;
                             rebuild_job_history_attributes_tx(&mut tx).await?;
+                            fill_history_search_columns(&mut SqlConn::Sqlite(&mut tx)).await?;
 
                             // Archives created before proxy routing omit these tables.
                             // Restore both together so a restricted consumer cannot lose its policy.

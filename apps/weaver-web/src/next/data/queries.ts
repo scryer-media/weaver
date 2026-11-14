@@ -30,12 +30,13 @@ export const NEXT_HISTORY_PAGE_QUERY = gql`
         tags
         createdAt
         completedAt
+        archivedAt
         deleteOperation {
-          operationId
           state
           locked
-          deleteFiles
+          action
           errorMessage
+          archiveOutcome
         }
       }
       totalCount
@@ -47,6 +48,21 @@ export const NEXT_HISTORY_PAGE_QUERY = gql`
       categoryCounts {
         category
         count
+      }
+    }
+  }
+`;
+
+/** The newest rows the History strip's numbers are taken from, and nothing else. */
+export const NEXT_HISTORY_SAMPLE_QUERY = gql`
+  query NextHistorySample($input: HistoryPageInput!) {
+    historyPage(input: $input) {
+      items {
+        id
+        totalBytes
+        downloadedBytes
+        createdAt
+        completedAt
       }
     }
   }

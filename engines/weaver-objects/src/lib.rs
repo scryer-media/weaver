@@ -7,6 +7,7 @@
 // asks for an object by kind through `build`.
 
 pub mod crypt;
+mod elimination;
 pub mod engine;
 mod grid;
 mod kept;
@@ -15,6 +16,7 @@ mod lent;
 mod lost;
 pub mod par2;
 pub mod par3;
+mod placed;
 mod quiet;
 pub mod rar_engine;
 pub mod rar_record;
@@ -86,9 +88,7 @@ pub fn restore(facts: &Facts, budget: Budget) -> Result<Box<dyn Object>, Restore
         facts: &Facts,
         budget: Budget,
     ) -> Result<Box<dyn Object>, RestoreError> {
-        Ok(Box::new(
-            facts.read::<stream::Stream<D>>(facts.kind)?.within(budget),
-        ))
+        Ok(Box::new(stream::restore::<D>(facts)?.within(budget)))
     }
     match facts.kind {
         Kind::Par2 => par2::facts::restore(facts),

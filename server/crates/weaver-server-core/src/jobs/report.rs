@@ -119,6 +119,7 @@ impl JobReport {
                 .then(|| serde_json::to_string(&self.metadata).expect("pairs of strings")),
             server_attribution: None,
             protocol: self.protocol,
+            archived_at: None,
         }
     }
 }

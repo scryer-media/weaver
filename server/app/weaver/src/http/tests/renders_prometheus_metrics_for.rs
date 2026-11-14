@@ -47,7 +47,7 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
 
     assert!(rendered.contains("weaver_pipeline_paused 1"));
     assert!(rendered.contains("weaver_pipeline_current_download_speed_bytes_per_second 19"));
-    assert!(rendered.contains("weaver_pipeline_active_downloads 6"));
+    assert!(rendered.contains("weaver_pipeline_articles_in_flight 6"));
     assert!(rendered.contains("weaver_pipeline_decode_pending_bytes 4096"));
     assert!(rendered.contains("weaver_pipeline_download_pressure_state{state=\"soft\"} 1"));
     assert!(rendered.contains("weaver_pipeline_download_pressure_reason{reason=\"decode\"} 1"));
@@ -61,8 +61,8 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
         rendered.contains("weaver_pipeline_download_lane_states_active{state=\"awaiting_work\"} 0")
     );
     assert!(rendered.contains("weaver_pipeline_download_lanes_active_total 3"));
-    // The memory-footprint series: the lanes' share of the resident set, the
-    // dispatch ranking behind it, and the pool the article buffers come from.
+    // The memory-footprint series: the lanes' share of the resident set and
+    // the dispatch ranking behind it.
     assert!(rendered.contains("weaver_pipeline_download_lane_inflight_bytes 6291456"));
     assert!(rendered.contains("weaver_pipeline_download_jobs_eligible 4"));
     assert!(rendered.contains("weaver_pipeline_download_jobs_hot 1"));
@@ -217,7 +217,7 @@ fn renders_prometheus_download_observed_limiter_states() {
         bytes_decoded: 0,
         bytes_committed: 0,
         download_queue_depth: 10,
-        active_downloads: 20,
+        articles_in_flight: 20,
         active_decodes: 0,
         decode_pending: 0,
         decode_pending_bytes: 0,
@@ -403,7 +403,7 @@ fn renders_prometheus_download_observed_limiter_states() {
     snapshot.decode_rate_mbps = 0.0;
     snapshot.download_queue_depth = 10;
     snapshot.recovery_queue_depth = 0;
-    snapshot.active_downloads = 0;
+    snapshot.articles_in_flight = 0;
     snapshot.parked_infrastructure_work = 10;
     snapshot.download_pressure_state = weaver_server_core::DownloadPressureState::Soft;
     snapshot.download_pressure_reason = weaver_server_core::DownloadPressureReason::Write;
@@ -437,7 +437,7 @@ fn renders_prometheus_download_observed_limiter_states() {
     // Parked work alongside live downloads is an ordinary busy pipeline, not an
     // outage: the new value must not mask it.
     snapshot.download_queue_depth = 10;
-    snapshot.active_downloads = 4;
+    snapshot.articles_in_flight = 4;
     snapshot.download_pressure_state = weaver_server_core::DownloadPressureState::Clear;
     snapshot.download_pressure_reason = weaver_server_core::DownloadPressureReason::None;
     let rendered = metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &[], 0);
@@ -457,7 +457,7 @@ fn renders_prometheus_download_observed_limiter_states() {
     snapshot.download_pressure_state = weaver_server_core::DownloadPressureState::Clear;
     snapshot.download_pressure_reason = weaver_server_core::DownloadPressureReason::None;
     snapshot.download_queue_depth = 0;
-    snapshot.active_downloads = 0;
+    snapshot.articles_in_flight = 0;
     let rendered = metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &[], 0);
     assert!(rendered.contains("weaver_pipeline_download_observed_limiter{limiter=\"idle\"} 1"));
 
@@ -846,6 +846,8 @@ fn renders_collected_instrumentation_snapshots() {
         "weaver_pipeline_decode_task_duration_seconds",
         "weaver_pipeline_extract_member_duration_seconds",
         "weaver_db_op_duration_seconds",
+        "weaver_db_wal_checkpoint_duration_seconds",
+        "weaver_db_statement_duration_seconds",
         "weaver_http_request_duration_seconds",
     ] {
         assert!(
@@ -910,6 +912,16 @@ fn renders_collected_instrumentation_snapshots() {
     assert!(rendered.contains("weaver_db_runtime_in_flight 2"));
     assert!(rendered.contains("weaver_db_runtime_blocked_submissions_total 9"));
     assert!(rendered.contains("weaver_db_op_duration_seconds_count{engine=\"sqlite\"} 6"));
+    assert!(rendered.contains("weaver_db_wal_checkpoint_passes_total 31"));
+    assert!(rendered.contains("weaver_db_wal_checkpoint_passes_incomplete_total 12"));
+    assert!(rendered.contains("weaver_db_wal_checkpoint_busy_total 3"));
+    assert!(rendered.contains("weaver_db_wal_restarts_total 17"));
+    assert!(rendered.contains("weaver_db_wal_checkpoint_duration_seconds_count 6"));
+    assert!(rendered.contains("weaver_db_wal_log_frames 785"));
+    assert!(rendered.contains("weaver_db_wal_checkpointed_frames 19"));
+    assert!(rendered.contains("weaver_db_wal_checkpoint_copied_frames 0"));
+    assert!(rendered.contains("weaver_db_wal_bytes 3218032"));
+    assert!(rendered.contains("weaver_db_statement_duration_seconds_count 6"));
 
     // Process collector names are deliberately unprefixed.
     assert!(rendered.contains("process_cpu_seconds_total 12.5"));
@@ -960,6 +972,9 @@ fn absent_instrumentation_omits_its_families() {
         "weaver_job_duration_seconds",
         "weaver_pipeline_disk_write_duration_seconds",
         "weaver_db_runtime_info",
+        "weaver_db_wal_checkpoint_passes_total",
+        "weaver_db_wal_bytes",
+        "weaver_db_statement_duration_seconds",
         "process_cpu_seconds_total",
         "process_start_time_seconds",
         "weaver_disk_total_bytes",
@@ -1825,25 +1840,11 @@ async fn response_compression_supports_deflate() {
     );
 }
 
-// The pool the article buffers are carved from, and the process total they
-// are part of.
-//
-// Reported in bytes rather than in buffers: the three tiers hold different
-// buffer sizes, so only bytes add up to a share of the resident set.
+// The process's resident set, the total the pipeline's memory series are
+// part of.
 #[test]
-fn renders_the_buffer_pool_and_the_process_resident_set() {
-    use weaver_server_core::runtime::buffers::BufferPoolMetrics;
-
+fn renders_the_process_resident_set() {
     let snapshot = populated_metrics_snapshot();
-    let pool = BufferPoolMetrics {
-        small_in_use: 2,
-        small_total: 8,
-        medium_in_use: 1,
-        medium_total: 4,
-        large_in_use: 0,
-        large_total: 2,
-        wait_count: 9,
-    };
     let process = weaver_server_core::operations::instrumentation::ProcessMetricsSnapshot {
         resident_memory_bytes: Some(542 * 1024 * 1024),
         ..Default::default()
@@ -1852,27 +1853,14 @@ fn renders_the_buffer_pool_and_the_process_resident_set() {
     let block = manual_pause_block();
     let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
     input.build = Default::default();
-    input.buffer_pool = Some(&pool);
     input.process = Some(&process);
     let rendered = metrics::render_prometheus_metrics_input(&input);
 
     assert_valid_prometheus_exposition(&rendered);
-    for expected in [
-        // 2 × 512 KiB, 8 × 512 KiB.
-        "weaver_runtime_buffer_pool_in_use_bytes{tier=\"small\"} 1048576",
-        "weaver_runtime_buffer_pool_total_bytes{tier=\"small\"} 4194304",
-        "weaver_runtime_buffer_pool_in_use_bytes{tier=\"medium\"} 1048576",
-        "weaver_runtime_buffer_pool_total_bytes{tier=\"medium\"} 4194304",
-        "weaver_runtime_buffer_pool_in_use_bytes{tier=\"large\"} 0",
-        "weaver_runtime_buffer_pool_total_bytes{tier=\"large\"} 8388608",
-        "weaver_runtime_buffer_pool_waits_total 9",
-        "process_resident_memory_bytes 568328192",
-    ] {
-        assert!(
-            rendered.contains(expected),
-            "exposition is missing {expected:?}:\n{rendered}"
-        );
-    }
+    assert!(
+        rendered.contains("process_resident_memory_bytes 568328192"),
+        "exposition is missing the resident set:\n{rendered}"
+    );
 }
 
 // Renders one area's snapshot, with the exposition checks every render must
@@ -2013,9 +2001,11 @@ fn networking_renders_leg_egress_pool_and_tunnel_families() {
     let network = sample_network();
     let tunnel = sample_tunnel();
     let (snapshot, block) = (populated_metrics_snapshot(), DownloadBlockState::default());
+    let server_health = vec![sample_server_health()];
     let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
     input.network = Some(&network);
     input.tunnel = Some(&tunnel);
+    input.server_health = &server_health;
     let rendered = render_area(&input);
 
     assert_label_set(
@@ -2085,6 +2075,128 @@ fn networking_renders_leg_egress_pool_and_tunnel_families() {
     assert!(rendered.contains("weaver_network_proxies{kind=\"wireguard\",enabled=\"true\"} 1"));
     assert!(rendered.contains("weaver_network_leg_revocations_total 3"));
     assert!(rendered.contains("weaver_egress_upload_bytes_total{egress_id=\"2\"} 4096"));
+}
+
+// Samples written one server at a time come out exactly as if they had been
+// written one family at a time: the same lines, each family one group, the
+// families in first-seen order.
+#[test]
+fn the_encoder_groups_each_familys_lines_whatever_the_write_order() {
+    use metrics::encode::{Encoder, MetricFamily, MetricKind};
+    static FIRST: MetricFamily = MetricFamily {
+        name: "weaver_example_first",
+        kind: MetricKind::Gauge,
+        labels: &["server_id"],
+        help: "First.",
+        deprecated_by: None,
+    };
+    static SECOND: MetricFamily = MetricFamily {
+        name: "weaver_example_second",
+        kind: MetricKind::Counter,
+        labels: &["server_id"],
+        help: "Second.",
+        deprecated_by: None,
+    };
+    let servers = ["1", "2", "3"];
+
+    let mut by_server = Encoder::new();
+    for server in servers {
+        by_server.sample(&FIRST, &[("server_id", server)], 1);
+        by_server.sample(&SECOND, &[("server_id", server)], 2);
+    }
+    let mut by_family = Encoder::new();
+    for server in servers {
+        by_family.sample(&FIRST, &[("server_id", server)], 1);
+    }
+    for server in servers {
+        by_family.sample(&SECOND, &[("server_id", server)], 2);
+    }
+
+    let rendered = by_server.finish();
+    assert_eq!(rendered, by_family.finish());
+    assert_eq!(interleaved_family(&rendered), None, "{rendered}");
+    assert_eq!(rendered.matches("# HELP weaver_example_first ").count(), 1);
+}
+
+// Every per-server family stays one group when the pool runs more than one
+// server: health, address plan, transfers, article outcomes and network legs.
+#[test]
+fn per_server_families_stay_whole_across_servers() {
+    let mut network = sample_network();
+    let mut second_leg = network.legs[0].clone();
+    second_leg.consumer = "server:8".into();
+    network.legs.push(second_leg);
+    let mut second_health = sample_server_health();
+    second_health.server_id = "8".into();
+    second_health.label = "news2.example:563".into();
+    let server_health = vec![sample_server_health(), second_health];
+    let mut second_transfer = sample_transfer_snapshot();
+    second_transfer.stable_server_id = weaver_nntp::transfer::StableServerId(8);
+    let transfers = vec![sample_transfer_snapshot(), second_transfer];
+    let mut second_articles = sample_server_metrics();
+    second_articles.stable_server_id = 8;
+    let articles = vec![sample_server_metrics(), second_articles];
+    let jobs = vec![
+        sample_job(42, "Silver Horizon", JobStatus::Downloading),
+        sample_job(43, "Copper Valley", JobStatus::Queued),
+    ];
+    let (snapshot, block) = (populated_metrics_snapshot(), DownloadBlockState::default());
+    let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
+    input.network = Some(&network);
+    input.server_health = &server_health;
+    input.server_transfers = &transfers;
+    input.egress_transfers = &transfers;
+    input.server_metrics = &articles;
+    input.jobs = &jobs;
+    input.per_job_series = weaver_server_core::settings::PerJobSeries::All;
+    let rendered = render_area(&input);
+
+    for server in ["7", "8"] {
+        for family in [
+            "weaver_server_info",
+            "weaver_server_address_info",
+            "weaver_server_address_connect_seconds",
+            "weaver_server_download_bytes_total",
+            "weaver_server_article_attempts_total",
+        ] {
+            assert!(
+                rendered.contains(&format!("{family}{{server_id=\"{server}\"")),
+                "{family} for {server}"
+            );
+        }
+        assert!(rendered.contains(&format!("consumer=\"server:{server}\"")));
+    }
+}
+
+// A server the pool does not run (in the transfer registry, the article
+// counters or a network leg, but not in the health list) sends no series: no
+// empty `server` label, no leg reported up for a server nothing connects to.
+#[test]
+fn a_server_the_pool_does_not_run_sends_no_series() {
+    let mut network = sample_network();
+    let mut idle_leg = network.legs[0].clone();
+    idle_leg.consumer = "server:9".into();
+    network.legs.push(idle_leg);
+    let mut idle_transfer = sample_transfer_snapshot();
+    idle_transfer.stable_server_id = weaver_nntp::transfer::StableServerId(9);
+    let transfers = vec![sample_transfer_snapshot(), idle_transfer];
+    let mut idle_articles = sample_server_metrics();
+    idle_articles.stable_server_id = 9;
+    let articles = vec![sample_server_metrics(), idle_articles];
+    let (snapshot, block) = (populated_metrics_snapshot(), DownloadBlockState::default());
+    let server_health = vec![sample_server_health()];
+    let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
+    input.network = Some(&network);
+    input.server_health = &server_health;
+    input.server_transfers = &transfers;
+    input.server_metrics = &articles;
+    let rendered = render_area(&input);
+
+    assert!(!rendered.contains("server=\"\""), "{rendered}");
+    assert!(!rendered.contains("server_id=\"9\""));
+    assert!(!rendered.contains("consumer=\"server:9\""));
+    assert!(rendered.contains("server_id=\"7\",server=\"news.example:563\""));
+    assert!(rendered.contains("consumer=\"server:7\""));
 }
 
 #[test]

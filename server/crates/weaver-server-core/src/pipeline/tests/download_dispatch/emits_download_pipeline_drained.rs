@@ -50,16 +50,8 @@ async fn skips_download_pipeline_drained_when_no_post_download_work_remains() {
 #[tokio::test]
 async fn dispatch_downloads_respects_hard_decode_byte_pressure() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        4,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 6 * 1024 * 1024, 4).await;
     let job_id = JobId(20002);
     let files = vec![("queued.bin".to_string(), 512u32)];
     let spec = standalone_job_spec("Decode Byte Pressure", &files);
@@ -72,7 +64,7 @@ async fn dispatch_downloads_respects_hard_decode_byte_pressure() {
         .store(1024, Ordering::Relaxed);
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     assert_eq!(
         pipeline
             .metrics
@@ -141,16 +133,8 @@ async fn dispatch_downloads_respects_hard_decode_byte_pressure() {
 #[tokio::test]
 async fn hot_download_batch_lease_stays_large_for_fresh_job_when_restart_lead_would_cap_it() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        2,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 16 * 1024 * 1024, 2).await;
     let job_id = JobId(20029);
     let durable_lead_limit = Pipeline::restart_durable_lead_limit_bytes();
     let segment_bytes = (durable_lead_limit / 4).max(1).min(u64::from(u32::MAX)) as u32;
@@ -185,9 +169,9 @@ async fn hot_download_batch_lease_stays_large_for_fresh_job_when_restart_lead_wo
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, segment_count as usize);
+    assert_eq!(pipeline.articles_in_flight, segment_count as usize);
     assert_eq!(
-        pipeline.active_downloads_by_job.get(&job_id),
+        pipeline.articles_in_flight_by_job.get(&job_id),
         Some(&(segment_count as usize))
     );
     assert_eq!(
@@ -214,16 +198,8 @@ async fn hot_download_batch_lease_caps_restored_job_for_restart_durable_lead() {
     // wider fixture here would have a second lane slip past it — that
     // imprecision is real but belongs to the durable-lead accounting itself,
     // not to this test's job.
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        1,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 16 * 1024 * 1024, 1).await;
     let job_id = JobId(20030);
     let durable_lead_limit = Pipeline::restart_durable_lead_limit_bytes();
     let segment_bytes = (durable_lead_limit / 4).max(1).min(u64::from(u32::MAX)) as u32;
@@ -263,8 +239,8 @@ async fn hot_download_batch_lease_caps_restored_job_for_restart_durable_lead() {
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 4);
-    assert_eq!(pipeline.active_downloads_by_job.get(&job_id), Some(&4));
+    assert_eq!(pipeline.articles_in_flight, 4);
+    assert_eq!(pipeline.articles_in_flight_by_job.get(&job_id), Some(&4));
     assert_eq!(
         pipeline
             .jobs
@@ -282,16 +258,8 @@ async fn hot_download_batch_lease_caps_restored_job_for_restart_durable_lead() {
 #[tokio::test]
 async fn dispatch_downloads_counts_completed_files_for_restart_durable_lead() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        2,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 16 * 1024 * 1024, 2).await;
     let job_id = JobId(20004);
     let complete_files = 17u32;
     let file_bytes = 64 * 1024 * 1024u32;
@@ -359,7 +327,7 @@ async fn dispatch_downloads_counts_completed_files_for_restart_durable_lead() {
         retry_count: 0,
         is_recovery: false,
         completion_critical: false,
-        exclude_servers: vec![],
+        exclude_servers: weaver_nntp::ServerSet::from([]),
         avoid_server: None,
     };
     assert!(pipeline.primary_download_within_restart_durable_lead(job_id, &next_work));
@@ -375,7 +343,7 @@ async fn dispatch_downloads_counts_completed_files_for_restart_durable_lead() {
 
     pipeline.dispatch_downloads();
 
-    assert!(pipeline.active_downloads > 0);
+    assert!(pipeline.articles_in_flight > 0);
     assert_eq!(
         pipeline
             .metrics
@@ -388,16 +356,7 @@ async fn dispatch_downloads_counts_completed_files_for_restart_durable_lead() {
 #[tokio::test]
 async fn capped_uu_spool_dispatches_only_the_missing_cursor_prefix() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 1,
-            medium_count: 1,
-            large_count: 1,
-        },
-        2,
-    )
-    .await;
+    let (mut pipeline, _, _) = new_direct_pipeline_with_backlog(&temp_dir, 5632 * 1024, 2).await;
     let job_id = JobId(20015);
     insert_active_job(
         &mut pipeline,
@@ -425,7 +384,7 @@ async fn capped_uu_spool_dispatches_only_the_missing_cursor_prefix() {
         retry_count: 0,
         is_recovery: false,
         completion_critical: false,
-        exclude_servers: Vec::new(),
+        exclude_servers: weaver_nntp::ServerSet::EMPTY,
         avoid_server: None,
     };
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
@@ -444,13 +403,7 @@ async fn capped_uu_spool_dispatches_only_the_missing_cursor_prefix() {
         .unwrap()
         .download_queue
         .push(work(0, "uu-prefix@example.invalid"));
-    pipeline.uu_files.insert(
-        file_id,
-        UuFileAssembly {
-            next_index: 0,
-            ..UuFileAssembly::default()
-        },
-    );
+    pipeline.uu_files.insert(file_id, UuFileAssembly::default());
     pipeline.uu_spool_max_segments = 0;
     pipeline.uu_spool_available_bytes_for_test = Some(Some(u64::MAX));
 
@@ -484,16 +437,7 @@ async fn capped_uu_spool_dispatches_only_the_missing_cursor_prefix() {
 #[tokio::test]
 async fn capped_uu_spool_keeps_unrelated_yenc_ordinals_eligible() {
     let temp = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp,
-        BufferPoolConfig {
-            small_count: 1,
-            medium_count: 1,
-            large_count: 1,
-        },
-        2,
-    )
-    .await;
+    let (mut pipeline, _, _) = new_direct_pipeline_with_backlog(&temp, 5632 * 1024, 2).await;
     let uu_job = JobId(20150);
     let yenc_job = JobId(20151);
     let mut spec = standalone_job_spec("Spool isolation", &[("small.bin".to_string(), 16)]);
@@ -518,6 +462,7 @@ async fn capped_uu_spool_keeps_unrelated_yenc_ordinals_eligible() {
             .download_queue
             .pop()
             .unwrap();
+        let first = pipeline.dispatched(first);
         assert_eq!(first.segment_id.segment_number, 0);
     }
     pipeline.uu_files.insert(
@@ -702,16 +647,8 @@ async fn refresh_download_pressure_saturates_released_result_byte_aggregation() 
 #[tokio::test]
 async fn released_result_bytes_block_dispatch_until_processing_clears_hysteresis() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        1,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 6 * 1024 * 1024, 1).await;
     let queued_job_id = JobId(20031);
     insert_active_job(
         &mut pipeline,
@@ -736,7 +673,7 @@ async fn released_result_bytes_block_dispatch_until_processing_clears_hysteresis
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     assert_eq!(
         pipeline
             .metrics
@@ -757,7 +694,7 @@ async fn released_result_bytes_block_dispatch_until_processing_clears_hysteresis
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: vec![],
+            exclude_servers: weaver_nntp::ServerSet::from([]),
             release_connection_slot: false,
         })
         .await;
@@ -777,22 +714,14 @@ async fn released_result_bytes_block_dispatch_until_processing_clears_hysteresis
     );
 
     pipeline.dispatch_downloads();
-    assert!(pipeline.active_downloads > 0);
+    assert!(pipeline.articles_in_flight > 0);
 }
 
 #[tokio::test]
 async fn dispatch_downloads_allows_postprocessing_status_with_remaining_download_work() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        2,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 6 * 1024 * 1024, 2).await;
     let cases = [
         (JobId(20006), JobStatus::Extracting),
         (JobId(20007), JobStatus::QueuedExtract),
@@ -822,7 +751,7 @@ async fn dispatch_downloads_allows_postprocessing_status_with_remaining_download
 
     // Both jobs dispatch: the second connection is not left idle once the
     // first job's single article has been handed out.
-    assert_eq!(pipeline.active_downloads, 2);
+    assert_eq!(pipeline.articles_in_flight, 2);
     for (job_id, status) in &cases {
         let state = pipeline.jobs.get(job_id).unwrap();
         assert_eq!(&state.status, status);
@@ -834,16 +763,8 @@ async fn dispatch_downloads_allows_postprocessing_status_with_remaining_download
 #[tokio::test]
 async fn dispatch_downloads_prefers_new_higher_priority_job_after_inflight_segments() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        2,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 6 * 1024 * 1024, 2).await;
 
     let low_job_id = JobId(20015);
     let high_job_id = JobId(20016);
@@ -882,6 +803,7 @@ async fn dispatch_downloads_prefers_new_higher_priority_job_after_inflight_segme
             .download_queue
             .pop()
             .expect("low-priority job should have an in-flight segment to drain");
+        let in_flight = pipeline.dispatched(in_flight);
         pipeline.hold_test_lane_works(vec![in_flight], true);
     }
     pipeline.active_download_connections = 1;
@@ -892,7 +814,7 @@ async fn dispatch_downloads_prefers_new_higher_priority_job_after_inflight_segme
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 2);
+    assert_eq!(pipeline.articles_in_flight, 2);
     assert_eq!(pipeline.active_download_connections, 2);
     assert_eq!(
         pipeline
@@ -918,23 +840,21 @@ async fn dispatch_downloads_prefers_new_higher_priority_job_after_inflight_segme
             .len(),
         0
     );
-    assert_eq!(pipeline.active_downloads_by_job.get(&low_job_id), Some(&1));
-    assert_eq!(pipeline.active_downloads_by_job.get(&high_job_id), Some(&1));
+    assert_eq!(
+        pipeline.articles_in_flight_by_job.get(&low_job_id),
+        Some(&1)
+    );
+    assert_eq!(
+        pipeline.articles_in_flight_by_job.get(&high_job_id),
+        Some(&1)
+    );
 }
 
 #[tokio::test]
 async fn dispatch_downloads_yields_retained_hot_job_to_high_priority_while_critical_lane_runs() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        2,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 6 * 1024 * 1024, 2).await;
     let normal_job_id = JobId(20029);
     let promoted_job_id = JobId(20030);
 
@@ -1032,16 +952,8 @@ async fn dispatch_downloads_yields_retained_hot_job_to_high_priority_while_criti
 #[tokio::test]
 async fn dispatch_downloads_prefers_earliest_job_within_priority_band() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        1,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 6 * 1024 * 1024, 1).await;
 
     let earlier_job_id = JobId(20017);
     let later_job_id = JobId(20018);
@@ -1096,7 +1008,7 @@ async fn dispatch_downloads_prefers_earliest_job_within_priority_band() {
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 1);
+    assert_eq!(pipeline.articles_in_flight, 1);
     assert_eq!(
         pipeline
             .jobs
@@ -1129,16 +1041,8 @@ async fn dispatch_downloads_prefers_earliest_job_within_priority_band() {
 // hot job has nothing the asking server may fetch.
 async fn dispatch_downloads_hot_job_takes_full_capacity_over_same_priority_peers() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        8,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 16 * 1024 * 1024, 8).await;
 
     let job_ids = [JobId(21400), JobId(21401), JobId(21402), JobId(21403)];
     for (idx, job_id) in job_ids.into_iter().enumerate() {
@@ -1182,16 +1086,8 @@ async fn dispatch_downloads_hot_job_takes_full_capacity_over_same_priority_peers
 #[tokio::test]
 async fn a_lower_priority_critical_recovery_waits_behind_the_hot_jobs_regular_bytes() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        8,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 16 * 1024 * 1024, 8).await;
 
     let hot_job_id = JobId(21420);
     let critical_job_id = JobId(21421);
@@ -1271,16 +1167,8 @@ async fn a_lower_priority_critical_recovery_waits_behind_the_hot_jobs_regular_by
 #[tokio::test]
 async fn the_hot_job_takes_the_only_connection_ahead_of_a_critical_recovery() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        1,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 6 * 1024 * 1024, 1).await;
 
     let hot_job_id = JobId(21422);
     let critical_job_id = JobId(21423);
@@ -1345,16 +1233,8 @@ async fn the_hot_job_takes_the_only_connection_ahead_of_a_critical_recovery() {
 #[tokio::test]
 async fn dispatch_downloads_single_job_keeps_hot_runway() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        8,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 16 * 1024 * 1024, 8).await;
 
     let job_id = JobId(21410);
     let files = many_standalone_files("single-hot-runway", 600);
@@ -1379,7 +1259,7 @@ async fn dispatch_downloads_single_job_keeps_hot_runway() {
     let want =
         pipeline.download_refill_want(pipeline.download_lane_mode_for_server(0, pressure, true));
     assert_eq!(
-        pipeline.active_downloads_by_job.get(&job_id),
+        pipeline.articles_in_flight_by_job.get(&job_id),
         Some(&(8 * want))
     );
 }
@@ -1387,16 +1267,8 @@ async fn dispatch_downloads_single_job_keeps_hot_runway() {
 #[tokio::test]
 async fn dispatch_downloads_does_not_share_with_lower_priority() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        8,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 16 * 1024 * 1024, 8).await;
 
     let hot_job_id = JobId(21420);
     let low_job_id = JobId(21421);
@@ -1431,16 +1303,8 @@ async fn dispatch_downloads_does_not_share_with_lower_priority() {
 #[tokio::test]
 async fn dispatch_downloads_under_soft_pressure_opens_one_lane_for_the_hot_job() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        8,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 16 * 1024 * 1024, 8).await;
 
     let hot_job_id = JobId(21430);
     let peer_job_id = JobId(21431);
@@ -1486,16 +1350,8 @@ async fn dispatch_downloads_under_soft_pressure_opens_one_lane_for_the_hot_job()
 #[tokio::test]
 async fn critical_work_of_later_jobs_waits_behind_the_hot_jobs_regular_bytes() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        4,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 16 * 1024 * 1024, 4).await;
 
     let hot_job_id = JobId(21500);
     let critical_a = JobId(21501);
@@ -1591,16 +1447,8 @@ async fn critical_work_of_later_jobs_waits_behind_the_hot_jobs_regular_bytes() {
 #[tokio::test]
 async fn first_dispatch_pass_reaches_full_capacity_with_no_ramp() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        8,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 16 * 1024 * 1024, 8).await;
 
     let job_id = JobId(21540);
     insert_active_job(
@@ -1624,16 +1472,8 @@ async fn first_dispatch_pass_reaches_full_capacity_with_no_ramp() {
 #[tokio::test]
 async fn hot_clear_pressure_lane_leases_sequential_runway() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        1,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 6 * 1024 * 1024, 1).await;
 
     let job_id = JobId(20024);
     let files = (0..100)
@@ -1654,7 +1494,7 @@ async fn hot_clear_pressure_lane_leases_sequential_runway() {
     let pressure = pipeline.refresh_download_pressure();
     let want =
         pipeline.download_refill_want(pipeline.download_lane_mode_for_server(0, pressure, true));
-    assert_eq!(pipeline.active_downloads, want);
+    assert_eq!(pipeline.articles_in_flight, want);
     assert_eq!(
         pipeline
             .jobs
@@ -1683,16 +1523,8 @@ async fn hot_clear_pressure_lane_leases_sequential_runway() {
 // own queue.
 async fn a_lane_refill_is_answered_from_the_hot_job_while_a_same_priority_peer_waits() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        8,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 16 * 1024 * 1024, 8).await;
 
     let hot_job_id = JobId(21440);
     let peer_job_id = JobId(21441);
@@ -1810,7 +1642,7 @@ async fn released_download_result_fences_completion_until_processed() {
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: vec![],
+            exclude_servers: weaver_nntp::ServerSet::from([]),
             release_connection_slot: false,
         })
         .await;
@@ -1878,7 +1710,7 @@ async fn failed_job_retains_released_result_ledgers_until_terminal_processing() 
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: vec![],
+            exclude_servers: weaver_nntp::ServerSet::from([]),
             release_connection_slot: false,
         })
         .await;
@@ -1947,7 +1779,7 @@ async fn owned_download_lane_batch_event_releases_and_acks_results() {
                 source_server_idx: None,
                 origin: DownloadResultOrigin::NormalPrimary,
                 retry_count: 0,
-                exclude_servers: vec![],
+                exclude_servers: weaver_nntp::ServerSet::from([]),
                 release_connection_slot: false,
             }],
             unrequested_works: vec![],
@@ -1957,10 +1789,10 @@ async fn owned_download_lane_batch_event_releases_and_acks_results() {
         &mut pending,
     );
 
-    assert_eq!(pipeline.active_downloads, 0);
-    assert_eq!(pipeline.active_downloads_by_job.get(&job_id), None);
+    assert_eq!(pipeline.articles_in_flight, 0);
+    assert_eq!(pipeline.articles_in_flight_by_job.get(&job_id), None);
     assert_eq!(
-        pipeline.active_downloads_by_file.get(&segment_id.file_id),
+        pipeline.articles_in_flight_by_file.get(&segment_id.file_id),
         None
     );
     assert_eq!(pending.len(), 1);
@@ -2019,6 +1851,7 @@ async fn owned_download_lane_requeues_unrequested_tail_without_retry_result() {
         .download_queue
         .pop()
         .unwrap();
+    let tail_work = pipeline.dispatched(tail_work);
     pipeline.hold_test_lane_works(vec![tail_work.clone()], false);
 
     let (ack, ack_rx) = std::sync::mpsc::sync_channel(1);
@@ -2034,10 +1867,10 @@ async fn owned_download_lane_requeues_unrequested_tail_without_retry_result() {
         &mut pending,
     );
 
-    assert_eq!(pipeline.active_downloads, 0);
-    assert_eq!(pipeline.active_downloads_by_job.get(&job_id), None);
+    assert_eq!(pipeline.articles_in_flight, 0);
+    assert_eq!(pipeline.articles_in_flight_by_job.get(&job_id), None);
     assert_eq!(
-        pipeline.active_downloads_by_file.get(&segment_id.file_id),
+        pipeline.articles_in_flight_by_file.get(&segment_id.file_id),
         None
     );
     assert!(pending.is_empty());
@@ -2087,8 +1920,11 @@ async fn emits_download_pipeline_drained_once_before_later_completion_events() {
             segment_number: 0,
         },
         raw: Bytes::from_static(b"pending"),
-        source_server_idx: None,
-        exclude_servers: Vec::new(),
+        servers: PoolServers::stamped(
+            pipeline.pool_generation,
+            None,
+            weaver_nntp::ServerSet::EMPTY,
+        ),
     });
 
     pipeline.emit_download_finished_if_active(job_id);

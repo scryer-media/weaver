@@ -201,6 +201,10 @@ struct Slot {
     // `None` until a checkpoint is written or read: what the database holds
     // of the job is not known, so the next change is the whole job.
     held: Option<Held>,
+    // What the stored checkpoint a restore read says is in hand, the
+    // ordinals of each volume: left by the restore, and gone once the root
+    // is encoded, which then says it.
+    restored: Option<Vec<Vec<u32>>>,
     feed_verdict: Option<crate::jobs::feed_verdict::FeedVerdict>,
     // The change waiting for its barrier or for a queued write to take it.
     queued: Option<Delta>,
@@ -511,6 +515,8 @@ impl Pending {
         }
         let held = slot.held.get_or_insert_with(Held::default);
         let encoding = job.encode_root(&mut slot.root, job.next_node());
+        // The root as encoded now says what is in hand.
+        slot.restored = None;
         held.settled_bytes = job.settled_bytes();
         let root = root_row(encoding.version, encoding.bytes);
         if held.root.as_ref() != Some(&root) {
@@ -842,6 +848,70 @@ impl Pending {
             .map_or(0, |held| held.settled_bytes)
     }
 
+    // What the stored checkpoint a restore read says is not fetched again,
+    // by volume: taken by the restore, off the pipeline's thread, from the
+    // root facts it had already decoded, and kept until this run's first
+    // checkpoint says it instead. The articles in `refetched` are ones the
+    // restore found not on disk and fetches again: they are not in hand.
+    pub(crate) fn stored_settled(&self, root: &RootFacts, refetched: &[(VolumeIndex, u32)]) {
+        let again: std::collections::HashSet<(u32, u32)> = refetched
+            .iter()
+            .map(|(volume, ordinal)| (volume.0, *ordinal))
+            .collect();
+        let settled = root
+            .volumes
+            .iter()
+            .zip(0u32..)
+            .map(|(facts, volume)| {
+                facts
+                    .articles
+                    .iter()
+                    .filter(|(ordinal, article)| {
+                        *article != facts::ArticleFacts::Waiting
+                            && !again.contains(&(volume, *ordinal))
+                    })
+                    .map(|(ordinal, _)| *ordinal)
+                    .collect()
+            })
+            .collect();
+        self.slot().restored = Some(settled);
+    }
+
+    // The ordinals of `volume`'s articles the last checkpoint taken from
+    // the job says are not fetched again: what a restore has in hand. For a
+    // job restored and not yet checkpointed in this run, what its restore
+    // took from the stored checkpoint. None while no checkpoint was taken
+    // from the job.
+    pub(in crate::pipeline) fn checkpoint_settled(
+        &self,
+        volume: usize,
+    ) -> std::collections::HashSet<u32> {
+        let slot = self.slot();
+        if slot.held.is_none() {
+            return std::collections::HashSet::new();
+        }
+        // The rows are a restore's, and no checkpoint was taken since: what
+        // the restore took from them stands.
+        if let Some(restored) = &slot.restored {
+            return restored
+                .get(volume)
+                .map(|settled| settled.iter().copied().collect())
+                .unwrap_or_default();
+        }
+        slot.root.settled(volume)
+    }
+
+    // The spool files of the held parts the last checkpoint taken names,
+    // each as its row names it, under the job's working directory.
+    pub(in crate::pipeline) fn held_spools(&self) -> Vec<String> {
+        self.slot().held.as_ref().map_or_else(Vec::new, |held| {
+            held.held_parts
+                .iter()
+                .map(|row| row.spool_path.clone())
+                .collect()
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn tally(&self) -> Tally {
         self.slot().tally
@@ -862,6 +932,12 @@ impl Pipeline {
     // Called only after the ordered archive command answered: every old
     // checkpoint and its completion callback has relinquished this job.
     pub(in crate::pipeline) fn recover_cancelled_graph_checkpoint(&mut self, job_id: JobId) {
+        // A job held for a full disk has only a graph that says more than
+        // its files hold, still to hear its mail: no checkpoint is taken of
+        // it. The job goes on from the checkpoint it was held at.
+        if self.held_for_full_disk(job_id) {
+            return;
+        }
         let held = self.held_part_rows(job_id);
         let Some(graph) = self
             .graph_jobs
@@ -875,6 +951,9 @@ impl Pipeline {
         // a new full snapshot rather than revive that obsolete replay payload.
         pending.forget();
         pending.control().resume();
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state.checkpointed_download_bytes = state.downloaded_bytes;
+        }
         pending.put_with_feed(graph, held, self.post_probes.verdicts.get(&job_id));
         let stamp = pending.stamp();
         graph.recorded(stamp);
@@ -961,6 +1040,13 @@ impl Pipeline {
             };
             if graph.pending().control().cancelled() {
                 return;
+            }
+            // What the job counted downloaded is what this checkpoint holds.
+            // None is taken while an object is out for its work.
+            if !graph.working()
+                && let Some(state) = self.jobs.get_mut(&job_id)
+            {
+                state.checkpointed_download_bytes = state.downloaded_bytes;
             }
             let feed_verdict = self.post_probes.verdicts.get(&job_id);
             match checkpoint_job(graph, job_id, &self.db, &mail, held, feed_verdict, false) {

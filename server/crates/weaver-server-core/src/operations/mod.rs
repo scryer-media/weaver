@@ -14,9 +14,10 @@ pub mod recovery;
 pub mod usage_history;
 
 pub use async_ops::{
+    ArchiveHistoryAcceptOutcome, ArchiveHistoryAcceptance, ArchiveHistorySettlement,
     AsyncOperationState, AsyncOperationTargetState, HistoryDeleteOperationInsertError,
     HistoryDeleteOperationPayload, HistoryDeleteOperationRow, HistoryDeleteOperationSummary,
-    HistoryDeleteRowState, HistoryDeleteTargetWork,
+    HistoryDeleteRowState, HistoryDeleteTargetWork, HistoryOperationAction,
 };
 pub use backup::{
     BackupArtifact, BackupInspectResult, BackupManifest, BackupService, BackupServiceError,
@@ -24,9 +25,8 @@ pub use backup::{
     RestoreOptions, RestoreReport, StableStateExport, apply_pending_restore,
 };
 pub use disk::{
-    Capacity, CapacityDebits, CapacityReader, CapacityReading, CapacitySampler, DiskProbeError,
-    DiskSpace, StorageCapacity, StorageRoot, disk_space, is_out_of_space, probe_disk_space,
-    probe_nearest_disk_space,
+    Capacity, CapacityDebits, CapacityReader, CapacityReading, DiskProbeError, DiskSpace,
+    OnDemandSpace, Reach, StorageCapacity, StorageRoot, is_out_of_space, is_quota_exceeded,
 };
 pub use health::{
     BrowseDirectoryError, CreateDirectoryError, DirectoryBrowseEntry, DirectoryBrowseListing,
@@ -39,8 +39,9 @@ pub use instrumentation::{
     HistogramSnapshot, HttpMetricsSnapshot, HttpRequestCount, JOB_DURATION_BOUNDS, JobFinishCount,
     JobLifecycleMetrics, JobLifecycleMetricsSnapshot, JobResultKind, JobStageKind,
     JobSubmissionCount, PipelineHistograms, PipelineHistogramsSnapshot, ProcessMetricsSnapshot,
-    STAGE_DURATION_BOUNDS, ServerAttemptCount, ServerAttemptOutcomeKind, ServerCounters,
-    ServerMetricsRegistry, ServerMetricsSnapshot, StageOutcomeKind, VerificationOutcomeKind,
+    STAGE_DURATION_BOUNDS, ServerArticleOutcomes, ServerAttemptCount, ServerAttemptOutcomeKind,
+    ServerCounters, ServerMetricsRegistry, ServerMetricsSnapshot, StageOutcomeKind,
+    VerificationOutcomeKind,
 };
 pub use logs::snapshot_service_logs;
 pub use maintenance::spawn_maintenance_worker;
@@ -53,7 +54,7 @@ pub use metrics_store::{
     RawMetricsHistoryPoint, RollupMetricsHistoryPoint,
 };
 pub use recovery::{RecoveredServerState, RestoreCandidate, recover_server_state};
-pub(crate) use recovery::{read_stored_files, restore_request};
+pub(crate) use recovery::{apply_password_override, read_stored_files, restore_request};
 pub use usage_history::{
     FinishedJobCounts, JOBS_FINISHED, JOBS_REPAIRED, REMOVED_SERVER_ID_PREFIX, RecoveryBytes,
     RemovedServerUsage, ServerStateReading, ServerUsageReading, StageReading, TorrentUsageReading,

@@ -306,7 +306,12 @@ pub(super) async fn prepare_upgrade_backup_for_target(
     // Startup waits for this export before migrations can touch the source.
     // Its duration scales with the database, so the interactive backup
     // deadline must not prevent a large installation from upgrading.
-    let result = run.await;
+    // Nothing else answers meanwhile, so the wait is published for the
+    // holding page.
+    let result = {
+        let _published = crate::schema_upgrade::UpgradeBackup::start();
+        run.await
+    };
     let info = complete_backup(&dir, info, result)?;
     // Clear pending first: a crash before advancing the last version safely retries.
     write_marker(target, PENDING_VERSION, "").await?;

@@ -6,7 +6,7 @@ use std::path::Path;
 
 use weaver_nzb::{Nzb, NzbError};
 
-const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+pub(super) const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 #[derive(Debug)]
 pub enum PersistedNzbError {

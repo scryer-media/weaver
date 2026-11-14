@@ -257,6 +257,37 @@ async fn a_lost_article_beside_par2_is_rebuilt() {
     );
 }
 
+// A four-volume set beside PAR2, with two plain files no set holds.
+fn set_beside_plain_files() -> Vec<Post> {
+    let mut posts = with_par2(single_member_store_set(MEMBER, &body(), 4));
+    posts.push(Post::plain("notes.txt", payload(3 * ARTICLE, 7)));
+    posts.push(Post::plain("cover.jpg", payload(2 * ARTICLE + 5, 9)));
+    posts
+}
+
+// The bootstrap files each set's waiting volumes again only as their waiting
+// or member changes, and every round holds its bids to a walk of every
+// waiting volume. The set is fetched in several orders, with parked recovery
+// volumes and plain files beside it, and with losses that bring the recovery
+// volumes in.
+#[tokio::test]
+async fn the_bootstrap_bids_what_a_walk_of_every_waiting_volume_bids() {
+    let shapes = [
+        Scenario::new(set_beside_plain_files()),
+        Scenario::new(set_beside_plain_files()).backwards(),
+        Scenario::new(set_beside_plain_files()).together(&[0, 1, 2, 3, 6]),
+        Scenario::new(set_beside_plain_files()).reversed(&[1, 3, 7]),
+        Scenario::new(set_beside_plain_files()).lost(1, 0),
+        Scenario::new(set_beside_plain_files())
+            .lost(2, 1)
+            .backwards(),
+    ];
+    for scenario in shapes {
+        let graph = run(&scenario).await;
+        assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    }
+}
+
 // Every article of the scenario's recovery volumes.
 fn recovery_articles(scenario: &Scenario) -> Vec<(u32, u32)> {
     scenario

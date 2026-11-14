@@ -32,7 +32,19 @@ pub(super) struct Evidence {
     vouched: bool,
     // The member's length is exactly the described one.
     pub(super) exact: bool,
+    // Per slice, empty until the first refusal: `UNMARKED`, or refused and
+    // counted, with whether the grid holds all of its bytes (`HELD`) or not
+    // (`ABSENT`). A refused slice an alike slice held when it was refused is
+    // left unmarked: the repair copies it and spends no block on it.
+    marks: Vec<u8>,
+    // The marked slices still absent: each will never come and needs a
+    // block, counted as the refusals and the folds change.
+    lost: u64,
 }
+
+const UNMARKED: u8 = 0;
+const ABSENT: u8 = 1;
+const HELD: u8 = 2;
 
 impl Evidence {
     pub(super) fn of(
@@ -50,6 +62,8 @@ impl Evidence {
                 whole: SliceVerdict::Unknown,
                 vouched: false,
                 exact: false,
+                marks: Vec::new(),
+                lost: 0,
             };
         };
         let described = description.length;
@@ -60,6 +74,8 @@ impl Evidence {
             whole: SliceVerdict::Unknown,
             vouched: false,
             exact: length == Some(described),
+            marks: Vec::new(),
+            lost: 0,
         };
         evidence.refold(
             grid,
@@ -97,18 +113,21 @@ impl Evidence {
             for slice in first..(last + 1).min(self.slices.len()) {
                 let start = slice as u64 * block;
                 let end = (start + block).min(described);
-                let verdict = match checksums.get(slice) {
+                // A short final slice is compared on its zero padding, which
+                // says something only when the member ends where described.
+                let expected = checksums
+                    .get(slice)
+                    .filter(|_| end - start == block || exact);
+                let marked = self.marks.get(slice).is_some_and(|mark| *mark != UNMARKED);
+                let folded = (expected.is_some() || marked)
+                    .then(|| grid.fold(member, block, slice as u64, ByteRange::new(start, end)))
+                    .flatten();
+                if marked {
+                    self.mark(slice, folded.is_some());
+                }
+                let verdict = match expected {
                     None => SliceVerdict::Unknown,
-                    // A short final slice is compared on its zero padding,
-                    // which says something only when the member ends where
-                    // described.
-                    Some(_) if end - start < block && !exact => SliceVerdict::Unknown,
-                    Some(expected) => grid::verdict(
-                        grid.fold(member, block, slice as u64, ByteRange::new(start, end)),
-                        end - start,
-                        block,
-                        expected.crc32,
-                    ),
+                    Some(expected) => grid::verdict(folded, end - start, block, expected.crc32),
                 };
                 let was = std::mem::replace(&mut self.slices[slice], verdict);
                 self.damaged += u64::from(verdict == SliceVerdict::Damaged);
@@ -133,6 +152,43 @@ impl Evidence {
     // too.
     pub(super) fn damaged(&self) -> u64 {
         self.damaged
+    }
+
+    // How many refused slices are still absent. None of them is damaged:
+    // a damaged slice was folded, so its bytes are held.
+    pub(super) fn lost(&self) -> u64 {
+        self.lost
+    }
+
+    // Whether the slice checksums say the slice is damaged.
+    pub(super) fn damaged_at(&self, slice: u64) -> bool {
+        usize::try_from(slice)
+            .ok()
+            .and_then(|at| self.slices.get(at))
+            .is_some_and(|verdict| *verdict == SliceVerdict::Damaged)
+    }
+
+    // Whether a refusal already marked the slice.
+    pub(super) fn marked(&self, slice: usize) -> bool {
+        self.marks.get(slice).is_some_and(|mark| *mark != UNMARKED)
+    }
+
+    // A refused slice counts toward what the set needs while its bytes are
+    // not all held; `held` says whether the grid holds them now.
+    pub(super) fn refuse(&mut self, slice: usize, held: bool) {
+        if slice >= self.slices.len() {
+            return;
+        }
+        if self.marks.is_empty() {
+            self.marks = vec![UNMARKED; self.slices.len()];
+        }
+        self.mark(slice, held);
+    }
+
+    fn mark(&mut self, slice: usize, held: bool) {
+        let was = std::mem::replace(&mut self.marks[slice], if held { HELD } else { ABSENT });
+        self.lost += u64::from(!held);
+        self.lost -= u64::from(was == ABSENT);
     }
 
     // Proven intact without a read: every slice intact with independent

@@ -114,7 +114,7 @@ pub(super) async fn serve_queued(
     (file, ordinal): (u32, u32),
 ) {
     if let Some(state) = pipeline.jobs.get_mut(&JOB) {
-        let this = |work: &crate::pipeline::download::queue::DownloadWork| {
+        let this = |work: &crate::pipeline::download::queue::QueuedWork<'_>| {
             work.segment_id.file_id.file_index == file && work.segment_id.segment_number == ordinal
         };
         state

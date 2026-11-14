@@ -352,6 +352,67 @@ async fn an_aes_7z_inside_a_header_encrypted_rar5_delivers() {
     assert_eq!(kinds(&graph), ["rar_store", "sevenz_store"]);
 }
 
+fn nested_encrypted() -> Scenario {
+    let iron = payload(4 * ARTICLE + 11, 77);
+    let inner = sevenz(
+        &[Entry::File("iron.bin", &iron)],
+        copy(),
+        Some(SECRET),
+        false,
+    );
+    let volumes =
+        header_encrypted_store_set("inner.7z", &inner, 1, SECRET, HeaderCheck::For(SECRET));
+    Scenario::new(posts(&volumes)).password(SECRET)
+}
+
+// The same two levels, as the history row's summary keeps them: the inner
+// 7z under the RAR, both opened by the password the job came with, and the
+// password itself nowhere in the stored text.
+#[tokio::test]
+async fn a_nested_encrypted_download_keeps_its_tree_and_never_the_password() {
+    let outcome = run(&nested_encrypted()).await;
+    let text = outcome.download_summary.clone().expect("a stored summary");
+    assert!(!text.contains(SECRET), "{text}");
+    let summary = super::download_summary::summary(&outcome);
+    assert_eq!(
+        (summary.node_count, summary.max_depth),
+        (2, 2),
+        "{summary:?}"
+    );
+    let [outer, inner] = &summary.nodes[..] else {
+        panic!("{summary:?}");
+    };
+    assert_eq!(
+        (outer.kind.as_str(), outer.parent, outer.depth),
+        ("rar_store", None, 1)
+    );
+    assert_eq!(
+        (inner.kind.as_str(), inner.parent, inner.depth),
+        ("sevenz_store", Some(outer.id), 2)
+    );
+    for node in [outer, inner] {
+        assert!(node.encrypted && node.password_needed, "{node:?}");
+        assert_eq!(
+            node.password_source.as_deref(),
+            Some("explicit"),
+            "{node:?}"
+        );
+        assert!(!node.given_up, "{node:?}");
+    }
+}
+
+// The node cap, lowered to one: the first node breadth first is kept, and
+// the true count and depth stay.
+#[tokio::test]
+async fn a_capped_summary_keeps_the_first_nodes_and_the_true_count() {
+    crate::pipeline::graph::summary::NODES_KEPT_HERE.with(|kept| kept.set(1));
+    let outcome = run(&nested_encrypted()).await;
+    let summary = super::download_summary::summary(&outcome);
+    assert_eq!(summary.nodes.len(), 1, "{summary:?}");
+    assert_eq!(summary.nodes[0].kind, "rar_store");
+    assert_eq!((summary.node_count, summary.max_depth), (2, 2));
+}
+
 // A stored 7z one deep holding a directory with a member, an empty file and
 // an empty directory: every one is delivered at depth two, the empty file
 // empty and the directories as directories, which are no files of the

@@ -13,7 +13,7 @@ use crate::persistence::database_target::DatabaseTarget;
 use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime, StoreDatastore};
 use crate::rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
 use crate::servers::ServerConfig;
-use crate::settings::{BufferPoolOverrides, Config, RetryOverrides};
+use crate::settings::{Config, RetryOverrides};
 
 fn fetch_i64(db: &Database, sql: &'static str, args: Vec<SqlArg>) -> i64 {
     let datastore = db.datastore();
@@ -102,6 +102,7 @@ fn postgres_sample_history(job_id: crate::jobs::ids::JobId) -> JobHistoryRow {
         completed_at: 1_700_000_100,
         metadata: Some("[[\"engine\",\"postgres\"]]".to_string()),
         server_attribution: None,
+        archived_at: None,
     }
 }
 
@@ -2203,6 +2204,119 @@ async fn postgres_job_lane_writes_keep_order_and_archive_last_when_configured() 
     admin_pool.close().await;
 }
 
+// Five archives the database had no room for are kept, in the order they
+// came, with nothing written, and the listener is told of each job once. A
+// pass tries the test cap of two, in order: the first is refused again and
+// stays first, with nothing said of it; the second is written and let go;
+// and the listener is told where the next pass starts, as more remain and
+// the pass wrote one. In the next pass one fails for another reason and is
+// let go as not written, its sender dropped. A pass that writes none says
+// nothing. The last pass writes the two still kept, in the order they came.
+#[tokio::test]
+async fn kept_archives_are_tried_again_in_order_a_capped_pass_at_a_time() {
+    use super::ArchiveNews::{Kept, LetGo, More};
+    use std::sync::atomic::Ordering;
+    let no_room = || crate::StateError::OutOfSpace("database or disk is full".into());
+    let refuse = |error| super::ARCHIVE_REFUSED.lock().unwrap().push_back(error);
+    let written = || super::ARCHIVES_WRITTEN.load(Ordering::Relaxed);
+    let db = Database::open_in_memory().unwrap();
+    let news = Arc::new(Mutex::new(Vec::new()));
+    db.hear_archive_news({
+        let news = Arc::clone(&news);
+        move |said| news.lock().unwrap().push(said)
+    });
+    let told = || std::mem::take(&mut *news.lock().unwrap());
+    let jobs = [801_u64, 802, 803, 804, 805].map(crate::jobs::ids::JobId);
+    let mut committed = std::collections::VecDeque::new();
+    for job_id in jobs {
+        db.create_active_job(&postgres_sample_job(job_id)).unwrap();
+        refuse(no_room());
+        committed.push_back(
+            db.try_queue_archive_job_with_terminal_cause(
+                job_id,
+                postgres_sample_history(job_id),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+    }
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(db.kept_archive_jobs(), jobs);
+    assert_eq!(told(), jobs.map(Kept));
+    assert_eq!(written(), 0);
+    for committed in &mut committed {
+        assert!(committed.try_recv().is_err(), "nothing committed");
+    }
+    let mut done = |at: usize| committed.remove(at).unwrap();
+
+    // 801 is refused again, 802 is written; 803 on are past the cap.
+    refuse(no_room());
+    db.retry_kept_archives(0);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(db.kept_archive_jobs(), [jobs[0], jobs[2], jobs[3], jobs[4]]);
+    let let_go = |job_id, written| LetGo { job_id, written };
+    assert_eq!(told(), [let_go(jobs[1], true), More { from: 1 }]);
+    assert_eq!(written(), 1);
+    done(1).await.unwrap();
+
+    // 803 fails for another reason and is lost; 804 is written.
+    refuse(crate::StateError::Database("the row is malformed".into()));
+    db.retry_kept_archives(1);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(db.kept_archive_jobs(), [jobs[0], jobs[4]]);
+    assert_eq!(
+        told(),
+        [
+            let_go(jobs[2], false),
+            let_go(jobs[3], true),
+            More { from: 1 }
+        ]
+    );
+    assert!(done(1).await.is_err(), "its sender is dropped");
+    done(1).await.unwrap();
+    assert!(db.get_job_history(jobs[2].0).unwrap().is_none());
+
+    // 805 is refused again: the pass wrote none and says nothing.
+    refuse(no_room());
+    db.retry_kept_archives(1);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(db.kept_archive_jobs(), [jobs[0], jobs[4]]);
+    assert_eq!(told(), []);
+    assert_eq!(written(), 2);
+
+    // The next ring starts at the front and writes both.
+    db.retry_kept_archives(0);
+    db.flush_write_queue().await.unwrap();
+    assert!(db.kept_archive_jobs().is_empty());
+    assert_eq!(told(), [let_go(jobs[0], true), let_go(jobs[4], true)]);
+    assert_eq!(written(), 4);
+    done(0).await.unwrap();
+    done(0).await.unwrap();
+    for job_id in [jobs[0], jobs[1], jobs[3], jobs[4]] {
+        assert!(db.get_job_history(job_id.0).unwrap().is_some());
+    }
+    // A pass over an empty list writes nothing and says nothing.
+    db.retry_kept_archives(0);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!((told(), written()), (Vec::new(), 4));
+}
+
+// Only want of room on a SQLite database keeps an archive. A Postgres
+// server's disk cannot be read from here: an archive it refuses with its
+// disk-full state is not kept, and neither is any other failure anywhere.
+#[test]
+fn an_archive_postgres_has_no_room_for_is_not_kept() {
+    let no_room = crate::StateError::OutOfSpace("sqlstate=53100; could not extend file".into());
+    let other = crate::StateError::Database("the row is malformed".into());
+    let postgres = DatabaseTarget::PostgresUrl("postgres://localhost/weaver".into());
+    let sqlite = DatabaseTarget::SqlitePath(PathBuf::from("/config/weaver.db"));
+    assert!(super::keeps_archive(&sqlite, &no_room));
+    assert!(!super::keeps_archive(&postgres, &no_room));
+    assert!(!super::keeps_archive(&sqlite, &other));
+    assert!(!super::keeps_archive(&postgres, &other));
+}
+
 #[tokio::test]
 async fn schema_parity_when_postgres_configured() {
     let Some((admin_pool, schema, target_url)) = create_postgres_test_schema("schema_parity").await
@@ -2381,11 +2495,6 @@ async fn postgres_runtime_smoke_when_configured() {
         hardware_profile: None,
         intermediate_dir: Some("/tmp/weaver-pg/intermediate".to_string()),
         complete_dir: Some("/tmp/weaver-pg/complete".to_string()),
-        buffer_pool: Some(BufferPoolOverrides {
-            small_count: Some(4),
-            medium_count: Some(3),
-            large_count: Some(2),
-        }),
         servers: vec![ServerConfig {
             id: 7,
             host: "news.example.com".to_string(),
@@ -2434,6 +2543,7 @@ async fn postgres_runtime_smoke_when_configured() {
         },
         cleanup_after_extract: Some(false),
         delete_failed_job_files: None,
+        history_retention_days: None,
         propagation_delay_secs: Some(0),
         max_concurrent_nzbs: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
@@ -2648,6 +2758,7 @@ async fn postgres_runtime_smoke_when_configured() {
             completed_at: 1_700_000_100,
             metadata: Some("[[\"engine\",\"postgres\"]]".to_string()),
             server_attribution: None,
+            archived_at: None,
         },
     )
     .unwrap();
@@ -2890,6 +3001,7 @@ async fn postgres_post_processing_roundtrip_when_configured() {
         completed_at: 2,
         metadata: None,
         server_attribution: None,
+        archived_at: None,
     })
     .unwrap();
     let results = vec![crate::post_processing::model::ScriptResult {
@@ -2983,4 +3095,35 @@ fn a_sync_write_returns_its_connection_without_another_job() {
     while pool.num_idle() < pool.size() as usize {
         std::thread::yield_now();
     }
+}
+
+// A scratch database's storage facts are read without a write: its files
+// measured where they are, its page layout and journal mode as SQLite
+// reports them.
+#[test]
+fn sqlite_storage_facts_read_a_scratch_database() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("storage-facts.db");
+    let db = Database::open(&path).unwrap();
+
+    let sizes = db.sqlite_file_sizes().expect("a SQLite database has files");
+    let main_len = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(sizes.database_file, SqliteFileSize::Present(main_len));
+    assert!(main_len > 0);
+    for (name, file) in [("wal", &sizes.wal_file), ("shm", &sizes.shm_file)] {
+        assert!(
+            !matches!(file, SqliteFileSize::Unreadable(_)),
+            "{name}: {file:?}"
+        );
+    }
+    let facts = db.sqlite_page_facts().expect("a SQLite database has pages");
+    let page_size = facts.page_size.clone().unwrap();
+    assert!(
+        page_size.is_power_of_two() && page_size >= 512,
+        "{page_size}"
+    );
+    assert!(facts.page_count.clone().unwrap() > 0);
+    assert!(facts.freelist_count.clone().unwrap() <= facts.page_count.clone().unwrap());
+    assert_eq!(facts.journal_mode.as_deref(), Ok("wal"));
+    db.close().unwrap();
 }

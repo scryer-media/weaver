@@ -1,0 +1,23 @@
+{
+  "slug": "adv-nzb-tar-size-lie",
+  "title": "E2E.Adversarial.NZB.Tar.Size.Lie.2026-TESTGRP",
+  "description": "A ustar archive holding one 2 MiB member, posted in 256 KiB articles whose every =ybegin states size=536870912000, the most the yEnc layout trusts. The archive's end blocks arrive where its bytes end, so the member comes out byte-equal and nothing is allocated for the stated length alone.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "segment_size": 262144,
+  "yencHeaderLies": [
+    {
+      "size": 536870912000
+    }
+  ],
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "requiredObjectKinds": [
+      "tar"
+    ]
+  },
+  "expectedOutputBLAKE3": {
+    "inner.s01e04.mkv": "82869c6cc972e4d279e760bb66163c15c6ea01c6040cfa889110f097e177757f"
+  }
+}

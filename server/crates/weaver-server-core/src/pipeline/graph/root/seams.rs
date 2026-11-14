@@ -19,7 +19,7 @@ use super::intake::Decoded;
 use super::source::{Class, Move};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{JobState, JobStatus};
-use crate::pipeline::download::queue::DownloadWork;
+use crate::pipeline::download::queue::{DownloadWork, QueueItem};
 use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::graph::job::{GraphError, GraphJob, RootFile, Storage};
 use crate::pipeline::graph::limits;
@@ -30,17 +30,21 @@ use crate::pipeline::{DecodedChunk, Pipeline};
 // neutral priority.
 const WINDOW_PRIORITY: u32 = 3;
 
+// How many jobs the loop looked at for a wait for room, on this thread, so
+// a test can pin that a turn with nothing changed looks at none.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static DISK_WAIT_LOOKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl Pipeline {
     // Give a job admitted, or restored with no checkpoint, its graph
     // runtime. The job's state must already be in place: what its queues
     // hold says which articles this run still has to fetch.
     pub(crate) fn admit_graph_job(&mut self, job_id: JobId) {
-        // Read before the job is borrowed, in the order they are tried.
-        let passwords: Vec<String> = self
-            .archive_password_candidates_for_job(job_id)
-            .iter()
-            .map(|candidate| candidate.value().to_owned())
-            .collect();
+        // Read before the job is borrowed, in the order they are tried, each
+        // with its source for the download summary.
+        let passwords = self.archive_password_candidates_for_job(job_id);
         let slots = self.graph_slot_limit();
         let Some(state) = self.jobs.get(&job_id) else {
             return;
@@ -382,6 +386,9 @@ impl Pipeline {
                 if let Some(ticket) = graph.as_mut().and_then(GraphJob::forget_slot) {
                     self.graph_status.repairs.release(ticket);
                 }
+                // A job held for a full disk may go on now its old graph has
+                // nothing out.
+                self.wake_full_disk();
                 match self.pending_graph_terminals.remove(&job_id) {
                     Some(crate::pipeline::health::PendingGraphTerminal::Failed(failure)) => {
                         let cancelling = self.shared_state.queue.read(|inner| {
@@ -480,7 +487,9 @@ impl Pipeline {
 
     // How many runs and repairs the job may hold now: the pipeline's limit,
     // and none while the job is not admitted or is paused, so each of those
-    // holds its extraction and repair and nothing else.
+    // holds its extraction and repair and nothing else. A job that waits
+    // for room on a disk holds its slots, and the job itself holds back the
+    // work that writes: what writes nothing goes on.
     pub(in crate::pipeline) fn graph_job_slot_limit(&self, job_id: JobId) -> usize {
         if self.nzb_admitted.contains(&job_id)
             && self
@@ -508,6 +517,18 @@ impl Pipeline {
         job_id: JobId,
         result: Result<(), GraphError>,
     ) {
+        // Every step of a job ends here: one that left a job waiting for
+        // room owing nothing, with no run live, has it woken on the next
+        // turn. With no job waiting this is one test of an empty set.
+        if !self.disk_waiting.is_empty()
+            && self.disk_waiting.contains(&job_id)
+            && self
+                .graph_jobs
+                .get(&job_id)
+                .is_some_and(GraphJob::disk_idle)
+        {
+            self.disk_idle.insert(job_id);
+        }
         if self.job_failure_started(job_id) {
             return;
         }
@@ -521,8 +542,33 @@ impl Pipeline {
             return;
         }
         // A step that failed otherwise fails the job with its error: what
-        // it did not write, nothing after it can read.
+        // it did not write, nothing after it can read. A write that found no
+        // room holds the job until the disk has room instead: what the step
+        // did not write is written again from the job's last checkpoint.
         if let Err(error) = result {
+            if let Some(device) = error.out_of_space() {
+                let root = self.full_disk_root(job_id, device);
+                warn!(job_id = job_id.0, error = %error, "graph job write found no room");
+                // A repair or a staging removes what it wrote as it fails:
+                // the job then waits for the room that takes, not for more
+                // than the disk showed.
+                // A file's own write names what was left of the file. A
+                // write a quota refused says so: the disk shows room the
+                // job cannot use.
+                let (needs, left) = self
+                    .graph_jobs
+                    .get_mut(&job_id)
+                    .map_or((None, None), |graph| {
+                        (graph.take_gave_back(), graph.take_left_to_write())
+                    });
+                let wants = crate::pipeline::full_disk::Wants {
+                    needs,
+                    left,
+                    quota: error.quota(),
+                };
+                self.hold_job_for_full_disk(job_id, root, wants);
+                return;
+            }
             warn!(job_id = job_id.0, error = %error, "graph job step failed");
             self.fail_job_on_extraction_error(job_id, error.to_extraction());
             return;
@@ -532,6 +578,156 @@ impl Pipeline {
         // The step's bytes are written: the checkpoint can say so.
         self.step_graph_checkpoint(job_id);
         self.wake_memory_waiters();
+    }
+
+    // Whether the job's graph waits for room on a disk, read from the job
+    // itself.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn graph_disk_held(&self, job_id: JobId) -> bool {
+        self.graph_jobs
+            .get(&job_id)
+            .is_some_and(GraphJob::disk_held)
+    }
+
+    // Every job that began to wait for room is listed among those a reading
+    // wakes, and shown waiting. A job begins to wait only by taking a ticket
+    // from the ledger of the disk it waits on, so the jobs are looked over
+    // only when a count moved since the last look: once per wait begun, not
+    // per turn. A job that waits and owes nothing, its last write landed
+    // and closed, wakes here whatever the disk reads. It is found idle as
+    // it begins to wait, or by the step that left it so: a turn with no
+    // wait begun and no step leaving a job idle looks at no job.
+    pub(in crate::pipeline) fn reconcile_disk_waits(&mut self) {
+        let tickets = self.disk_tickets();
+        if tickets != self.disk_tickets_seen {
+            self.disk_tickets_seen = tickets;
+            let began: Vec<JobId> = self
+                .graph_jobs
+                .iter()
+                .filter(|(job_id, graph)| graph.disk_held() && !self.disk_waiting.contains(job_id))
+                .map(|(job_id, _)| *job_id)
+                .collect();
+            for job_id in began {
+                #[cfg(test)]
+                DISK_WAIT_LOOKS.with(|looks| looks.set(looks.get() + 1));
+                self.disk_waiting.insert(job_id);
+                if self
+                    .graph_jobs
+                    .get(&job_id)
+                    .is_some_and(GraphJob::disk_idle)
+                {
+                    self.disk_idle.insert(job_id);
+                }
+                self.report_job(job_id);
+            }
+        }
+        if self.disk_idle.is_empty() {
+            return;
+        }
+        let idle: Vec<JobId> = std::mem::take(&mut self.disk_idle)
+            .into_iter()
+            .filter(|job_id| {
+                #[cfg(test)]
+                DISK_WAIT_LOOKS.with(|looks| looks.set(looks.get() + 1));
+                self.disk_waiting.contains(job_id)
+                    && self
+                        .graph_jobs
+                        .get(job_id)
+                        .is_none_or(|graph| !graph.disk_held() || graph.disk_idle())
+            })
+            .collect();
+        for job_id in idle {
+            if self
+                .graph_jobs
+                .get_mut(&job_id)
+                .is_none_or(GraphJob::wake_disk)
+            {
+                self.disk_woke(job_id);
+            }
+        }
+    }
+
+    // The tickets the output and working ledgers have given out.
+    fn disk_tickets(&self) -> [u64; 2] {
+        [
+            crate::operations::StorageRoot::Complete,
+            crate::operations::StorageRoot::Intermediate,
+        ]
+        .map(|root| self.storage_capacity.ledger(root).tickets())
+    }
+
+    // Whether a job waits for room on a disk, or a job is kept from
+    // starting for it, so the loop listens for the next reading. The loop
+    // reconciles the waits just before it asks.
+    pub(in crate::pipeline) fn waits_for_disk_room(&self) -> bool {
+        !self.disk_waiting.is_empty()
+            || self.admission_disk_held
+            || !self.full_disk.is_empty()
+            || self.archive_wait.is_some()
+    }
+
+    // A turn busy with results, which does not wait on the next event: a
+    // disk that rang since the last turn heard it is heard now, as the
+    // wait would hear it, and a waiter a step left idle wakes. With no job
+    // waiting and no ring, it is one look at a count and one at a set.
+    pub(in crate::pipeline) fn hear_disk_on_busy_turn(&mut self) {
+        if self.storage_capacity.rings() != self.disk_rings_seen {
+            self.disk_reading();
+        } else if !self.disk_idle.is_empty() {
+            self.reconcile_disk_waits();
+        }
+    }
+
+    // A disk has a new reading, or gave back room, while jobs wait for room
+    // or are kept from starting.
+    pub(in crate::pipeline) fn disk_reading(&mut self) {
+        self.disk_rings_seen = self.storage_capacity.rings();
+        self.reconcile_disk_waits();
+        self.wake_disk_waiters();
+        self.release_admission_disk_hold();
+        self.wake_full_disk();
+        self.wake_kept_archives();
+    }
+
+    // A disk someone waits on has a new reading: each job that waits is
+    // woken, in the order they began to wait, if the disk has room for all
+    // it owes beside what those woken before it promised. A job woken goes
+    // on; the rest wait for the next reading. A job no longer here is no
+    // longer waited on.
+    pub(in crate::pipeline) fn wake_disk_waiters(&mut self) {
+        let mut waiting: Vec<(u64, JobId)> = self
+            .disk_waiting
+            .iter()
+            .map(|job_id| {
+                let ticket = self
+                    .graph_jobs
+                    .get(job_id)
+                    .and_then(GraphJob::disk_ticket)
+                    .unwrap_or(0);
+                (ticket, *job_id)
+            })
+            .collect();
+        waiting.sort_unstable();
+        for (_, job_id) in waiting {
+            let woke = self
+                .graph_jobs
+                .get_mut(&job_id)
+                .is_none_or(GraphJob::wake_disk);
+            if woke {
+                self.disk_woke(job_id);
+            }
+        }
+    }
+
+    // The job has room again, or owes nothing: it no longer waits, says so,
+    // and its runs and repairs go on.
+    fn disk_woke(&mut self, job_id: JobId) {
+        self.disk_waiting.remove(&job_id);
+        self.disk_idle.remove(&job_id);
+        self.download_dispatch_wake = true;
+        self.report_job(job_id);
+        self.resume_graph_work(job_id);
+        self.lend_graph_repairs(job_id);
     }
 
     // Decode memory a step, a retired job or a new profile freed goes to the
@@ -607,7 +803,10 @@ impl Pipeline {
             )
         };
         match round {
-            Ok(moves) => apply_moves(state, &moves),
+            Ok(moves) => {
+                apply_moves(state, &moves);
+                rank_volumes(state, &graph.take_volume_ranks());
+            }
             Err(error) => warn!(job_id = job_id.0, error = %error, "graph seek round failed"),
         }
         self.wake_repair_waiters();
@@ -641,8 +840,100 @@ pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
         .iter()
         .map(|found| ((found.volume.0, found.ordinal), found.class))
         .collect();
-    let class_of = |work: &DownloadWork| {
-        let id = work.segment_id;
+    let class_of = |id: SegmentId| {
+        (id.file_id.job_id == job_id)
+            .then(|| classes.get(&(id.file_id.file_index, id.segment_number)))
+            .flatten()
+            .copied()
+    };
+    // The moved segments whose class `pick` takes, each found by its file
+    // and number in the queue rather than by a walk of it.
+    let picked = |pick: fn(Class) -> bool| {
+        classes
+            .iter()
+            .filter(move |(_, class)| pick(**class))
+            .map(move |(&(volume, ordinal), _)| segment(job_id, VolumeIndex(volume), ordinal))
+    };
+    for (&(volume, ordinal), class) in &classes {
+        if *class == Class::FirstArticle {
+            state
+                .download_queue
+                .note_first_article(segment(job_id, VolumeIndex(volume), ordinal));
+        }
+    }
+    for work in state
+        .download_queue
+        .extract_segments(picked(|class| class == Class::Parked))
+    {
+        state.recovery_queue.push(work);
+    }
+    let mut taken = state
+        .recovery_queue
+        .extract_segments(picked(|class| class != Class::Parked));
+    // An ordinary move only brings parked work back: queued work keeps its
+    // place. A window move re-keys in place below.
+    taken.extend(state.download_queue.extract_segments(picked(|class| {
+        class < Class::Ordinary && !matches!(class, Class::Window(_))
+    })));
+    taken.sort_by_key(|work| class_of(work.segment_id));
+    for mut work in taken {
+        if let Some(class) = class_of(work.segment_id) {
+            classify_item(&mut work, class);
+        }
+        state.download_queue.push(work);
+    }
+    state
+        .download_queue
+        .reprioritize_segments(classes.iter().filter_map(
+            |(&(volume, ordinal), class)| match class {
+                Class::Window(rank) => Some((
+                    segment(job_id, VolumeIndex(volume), ordinal),
+                    WINDOW_PRIORITY,
+                    Some(*rank),
+                )),
+                _ => None,
+            },
+        ));
+}
+
+// Rank the ordinary articles of each volume whose place in its set is now
+// known, so the volumes past the window are fetched by place. Only the
+// articles at the neutral priority move: a window volume, a first article
+// and anything raised or parked keep their place. Each volume's own
+// articles are found by its file, not by a walk of the queue.
+pub(super) fn rank_volumes(state: &mut JobState, ranks: &[(VolumeIndex, u32)]) {
+    if ranks.is_empty() {
+        return;
+    }
+    let job_id = state.job_id;
+    let Some(state) = state.articles.active_mut() else {
+        return;
+    };
+    for &(volume, rank) in ranks {
+        state.download_queue.rank_ordinary_file(
+            file(job_id, volume),
+            crate::pipeline::graph::NEUTRAL_PRIORITY,
+            rank,
+        );
+    }
+}
+
+// The moves applied by walks of the whole queue, which `apply_moves` must
+// match on every state.
+#[cfg(test)]
+pub(super) fn apply_moves_by_walk(state: &mut JobState, moves: &[Move]) {
+    if moves.is_empty() {
+        return;
+    }
+    let job_id = state.job_id;
+    let Some(state) = state.articles.active_mut() else {
+        return;
+    };
+    let classes: BTreeMap<(u32, u32), Class> = moves
+        .iter()
+        .map(|found| ((found.volume.0, found.ordinal), found.class))
+        .collect();
+    let class_of = |id: SegmentId| {
         (id.file_id.job_id == job_id)
             .then(|| classes.get(&(id.file_id.file_index, id.segment_number)))
             .flatten()
@@ -656,36 +947,36 @@ pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
                 .note_first_article(segment(job_id, VolumeIndex(volume), ordinal));
         }
     }
-    let parked = |work: &DownloadWork| class_of(work) == Some(Class::Parked);
+    let parked = |work: &crate::pipeline::download::QueuedWork<'_>| {
+        class_of(work.segment_id) == Some(Class::Parked)
+    };
     if any(|class| class == Class::Parked) {
         for work in state.download_queue.extract_matching(parked) {
             state.recovery_queue.push(work);
         }
     }
-    let mut taken = state
-        .recovery_queue
-        .extract_matching(|work| class_of(work).is_some_and(|class| class != Class::Parked));
-    // An ordinary move only brings parked work back: queued work keeps its
-    // place. A window move re-keys in place below.
+    let mut taken = state.recovery_queue.extract_matching(|work| {
+        class_of(work.segment_id).is_some_and(|class| class != Class::Parked)
+    });
     let raised = |class: Class| class < Class::Ordinary && !matches!(class, Class::Window(_));
     if any(raised) {
         taken.extend(
             state
                 .download_queue
-                .extract_matching(|work| class_of(work).is_some_and(raised)),
+                .extract_matching(|work| class_of(work.segment_id).is_some_and(raised)),
         );
     }
-    taken.sort_by_key(|work| class_of(work));
+    taken.sort_by_key(|work| class_of(work.segment_id));
     for mut work in taken {
-        if let Some(class) = class_of(&work) {
-            classify(&mut work, class);
+        if let Some(class) = class_of(work.segment_id) {
+            classify_item(&mut work, class);
         }
         state.download_queue.push(work);
     }
     if any(|class| matches!(class, Class::Window(_))) {
         state
             .download_queue
-            .reprioritize_matching_with_rank(|work| match class_of(work) {
+            .reprioritize_matching_with_rank(|work| match class_of(work.segment_id) {
                 Some(Class::Window(rank)) => Some((WINDOW_PRIORITY, Some(rank))),
                 _ => None,
             });
@@ -695,9 +986,33 @@ pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
 // The queue flags a class is fetched under, and its priority: a window
 // volume's, or the one neutral priority every other article holds.
 fn classify(work: &mut DownloadWork, class: Class) {
-    work.completion_critical |= class.waited_on();
-    work.is_recovery |= class == Class::Recovery;
-    work.priority = match class {
+    classify_flags(
+        &mut work.completion_critical,
+        &mut work.is_recovery,
+        &mut work.priority,
+        class,
+    );
+}
+
+// [`classify`] for an item taken off a queue.
+fn classify_item(work: &mut QueueItem, class: Class) {
+    classify_flags(
+        &mut work.completion_critical,
+        &mut work.is_recovery,
+        &mut work.priority,
+        class,
+    );
+}
+
+fn classify_flags(
+    completion_critical: &mut bool,
+    is_recovery: &mut bool,
+    priority: &mut u32,
+    class: Class,
+) {
+    *completion_critical |= class.waited_on();
+    *is_recovery |= class == Class::Recovery;
+    *priority = match class {
         Class::Window(_) => WINDOW_PRIORITY,
         _ => crate::pipeline::graph::NEUTRAL_PRIORITY,
     };

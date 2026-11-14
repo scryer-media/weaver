@@ -443,6 +443,128 @@ async fn a_member_a_par2_and_a_par3_set_describe_is_repaired_once() {
     );
 }
 
+// `ember.bin` as a PAR2 set describes it, and the same name and length
+// with its second slice different, as a PAR3 set describes it.
+fn disagreeing() -> (Vec<u8>, Vec<u8>) {
+    let par2 = payload(3 * ARTICLE, 69);
+    let mut par3 = par2.clone();
+    par3[ARTICLE..2 * ARTICLE].copy_from_slice(&payload(ARTICLE, 70));
+    (par2, par3)
+}
+
+// `posted` as `ember.bin`, then a PAR2 set over `par2` and a PAR3 set over
+// `par3`, each of `blocks` recovery blocks, the PAR3 set first when
+// `par3_first` says so.
+fn both_sets(
+    posted: &[u8],
+    (par2, par2_blocks): (&[u8], u32),
+    (par3, par3_blocks): (&[u8], u64),
+    par3_first: bool,
+) -> Vec<Post> {
+    let mut sets = vec![
+        par2_set("lantern", &[("ember.bin", par2)], par2_blocks),
+        par3_set("beacon", &[("ember.bin", par3)], par3_blocks),
+    ];
+    if par3_first {
+        sets.reverse();
+    }
+    let mut posts = vec![Post::plain("ember.bin", posted.to_vec())];
+    posts.extend(sets.into_iter().flatten());
+    posts
+}
+
+fn assert_completes(graph: &Outcome) {
+    assert!(
+        graph.completed(),
+        "{:?} {:?} {:?}",
+        graph.status,
+        graph.graph().outcomes,
+        repair_and_terminal_events(graph)
+    );
+}
+
+// Posted as the PAR2 set describes it. The PAR3 set rewrites the slice it
+// disagrees on, the PAR2 set rewrites it back once, and the PAR3 set's
+// next repair loses to it: the member ends as the PAR2 set describes it,
+// whichever set is posted first.
+#[tokio::test]
+async fn a_par3_set_disagreeing_with_a_posted_file_par2_holds_whole_loses_to_it() {
+    let (par2, par3) = disagreeing();
+    for par3_first in [false, true] {
+        let posts = both_sets(&par2, (&par2, 2), (&par3, 2), par3_first);
+        let graph = run(&Scenario::new(posts)).await;
+        assert_fetched_once(&graph);
+        assert_completes(&graph);
+        assert_eq!(
+            repair_and_terminal_events(&graph),
+            ["RepairComplete 1", "RepairComplete 1", "JobCompleted"],
+            "PAR3 first: {par3_first}"
+        );
+        assert_delivers(&graph, &[("ember.bin", &par2)]);
+    }
+}
+
+// Posted as the PAR3 set describes it, the PAR2 set able to rebuild its own
+// version: the PAR2 set rewrites the slice once and stands.
+#[tokio::test]
+async fn a_posted_file_par3_holds_whole_ends_as_the_par2_set_describes_it() {
+    let (par2, par3) = disagreeing();
+    for par3_first in [false, true] {
+        let posts = both_sets(&par3, (&par2, 2), (&par3, 2), par3_first);
+        let graph = run(&Scenario::new(posts)).await;
+        assert_fetched_once(&graph);
+        assert_completes(&graph);
+        assert_eq!(
+            repair_and_terminal_events(&graph),
+            ["RepairComplete 1", "JobCompleted"],
+            "PAR3 first: {par3_first}"
+        );
+        assert_delivers(&graph, &[("ember.bin", &par2)]);
+    }
+}
+
+// The slice the sets disagree on arrives damaged, and each set can rebuild
+// it its own way: the member ends as the PAR2 set describes it.
+#[tokio::test]
+async fn a_damaged_slice_two_sets_rebuild_differently_ends_as_the_par2_set_describes_it() {
+    let (par2, par3) = disagreeing();
+    for par3_first in [false, true] {
+        let posts = both_sets(&par2, (&par2, 2), (&par3, 2), par3_first);
+        let graph = run(&Scenario::new(posts).damaged(0, 1)).await;
+        assert_fetched_once(&graph);
+        assert_completes(&graph);
+        assert_eq!(
+            repair_and_terminal_events(&graph),
+            ["RepairComplete 1", "JobCompleted"],
+            "PAR3 first: {par3_first}"
+        );
+        assert_delivers(&graph, &[("ember.bin", &par2)]);
+    }
+}
+
+// The PAR2 set disagrees on two slices and holds one recovery block, so it
+// cannot make its version; the PAR3 set repairs the damaged first slice they
+// agree on. The member ends as the PAR3 set describes it and the job
+// completes.
+#[tokio::test]
+async fn a_par2_set_short_of_its_version_leaves_the_par3_repair_standing() {
+    let par3 = payload(3 * ARTICLE, 69);
+    let mut par2 = par3.clone();
+    par2[ARTICLE..].copy_from_slice(&payload(2 * ARTICLE, 70));
+    for par3_first in [false, true] {
+        let posts = both_sets(&par3, (&par2, 1), (&par3, 2), par3_first);
+        let graph = run(&Scenario::new(posts).damaged(0, 0)).await;
+        assert_fetched_once(&graph);
+        assert_completes(&graph);
+        assert_eq!(
+            repair_and_terminal_events(&graph),
+            ["RepairComplete 1", "JobCompleted"],
+            "PAR3 first: {par3_first}"
+        );
+        assert_delivers(&graph, &[("ember.bin", &par3)]);
+    }
+}
+
 // `beacon.bin` takes two damaged slices against one recovery block;
 // `lantern.bin` beside it arrives whole. The partial-delivery invariant
 // (2026-10-18) keeps the whole member delivered and ends the job Partial,
@@ -599,6 +721,104 @@ async fn a_file_a_par3_set_describes_and_the_post_withholds_is_rebuilt() {
         &[("lantern.bin", &lantern), ("beacon.bin", &beacon)],
     );
     assert_repaired_and_announced(&graph, &[RepairOutcome::Repaired { slices: 2 }], 2);
+}
+
+// Every disk the job reads at `RESERVE` and `room` bytes over it on its
+// first reading, and `then` bytes over it on every reading after, the job
+// held to keep `RESERVE` free. A reading after the first is one a job
+// waiting for room asked for; `readings` counts them all.
+fn disk_with_room(
+    posts: Vec<Post>,
+    room: u64,
+    then: u64,
+    readings: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> Scenario {
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use crate::operations::{DiskSpace, StorageCapacity, StorageRoot};
+
+    const RESERVE: u64 = 1 << 30;
+    const NEVER: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 60 * 60);
+    Scenario::new(posts)
+        .limits(super::caps::limits(|limits| {
+            limits.min_free_bytes = RESERVE
+        }))
+        .setup(move |pipeline| {
+            let roots = [
+                pipeline.script_data_dir.clone(),
+                pipeline.intermediate_dir.clone(),
+                pipeline.complete_dir.clone(),
+            ];
+            let first = roots.len();
+            let readings = Arc::clone(&readings);
+            let probe = Arc::new(move |_: &Path| {
+                let over = if readings.fetch_add(1, Ordering::AcqRel) < first {
+                    room
+                } else {
+                    then
+                };
+                Ok(DiskSpace {
+                    total_bytes: RESERVE * 8,
+                    available_bytes: RESERVE + over,
+                })
+            });
+            let capacity = StorageCapacity::with_probe(roots, NEVER, probe);
+            for root in StorageRoot::ALL {
+                capacity.wait_for_probes(root, 1);
+            }
+            pipeline.storage_capacity = Arc::new(capacity);
+        })
+}
+
+// `beacon.mkv` is described by the set and never posted, and `lantern.mkv`
+// arrives with an article damaged; the set holds blocks enough for both.
+// With room on the disk for `beacon.mkv` the set rebuilds it and repairs
+// `lantern.mkv`, and the job completes. On a disk with no room over its
+// reserve the job fails nothing: it waits and asks for a reading, and once
+// one shows room it goes on, rebuilds `beacon.mkv`, repairs `lantern.mkv`
+// and completes the same.
+#[tokio::test]
+async fn a_job_on_a_disk_with_no_room_waits_and_completes_once_a_reading_shows_room() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const PLENTY: u64 = 1 << 30;
+    let lantern = payload(3 * ARTICLE, 85);
+    let beacon = payload(2 * ARTICLE, 86);
+    let posts = || {
+        let mut posts = vec![Post::plain("lantern.mkv", lantern.clone())];
+        posts.extend(par3_set(
+            "lantern",
+            &[("lantern.mkv", &lantern), ("beacon.mkv", &beacon)],
+            4,
+        ));
+        posts
+    };
+
+    let readings = Arc::new(AtomicUsize::new(0));
+    let room = disk_with_room(posts(), PLENTY, PLENTY, Arc::clone(&readings)).damaged(0, 1);
+    let graph = run(&room).await;
+    assert_delivers(
+        &graph,
+        &[("lantern.mkv", &lantern), ("beacon.mkv", &beacon)],
+    );
+    assert_repaired_and_announced(&graph, &[RepairOutcome::Repaired { slices: 3 }], 3);
+    assert_eq!(readings.load(Ordering::Acquire), 3, "no job waited");
+
+    let readings = Arc::new(AtomicUsize::new(0));
+    let short = disk_with_room(posts(), 0, PLENTY, Arc::clone(&readings)).damaged(0, 1);
+    let graph = run(&short).await;
+    assert!(
+        readings.load(Ordering::Acquire) > 3,
+        "the job waited and asked for a reading"
+    );
+    assert_delivers(
+        &graph,
+        &[("lantern.mkv", &lantern), ("beacon.mkv", &beacon)],
+    );
+    assert_repaired_and_announced(&graph, &[RepairOutcome::Repaired { slices: 3 }], 3);
 }
 
 // A set written under FFT Reed-Solomon, one cohort, two adjacent articles

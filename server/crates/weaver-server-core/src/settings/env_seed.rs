@@ -1148,7 +1148,6 @@ mod tests {
             hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
-            buffer_pool: None,
             servers: vec![existing_server()],
             categories: vec![CategoryConfig {
                 upload_cap: Default::default(),
@@ -1164,6 +1163,7 @@ mod tests {
             bandwidth: Default::default(),
             cleanup_after_extract: None,
             delete_failed_job_files: None,
+            history_retention_days: None,
             propagation_delay_secs: None,
             max_concurrent_nzbs: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),

@@ -6,12 +6,10 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { formatJobReleaseName, type JobData } from "@/lib/job-types";
 import type { TorrentSummaryData } from "@/lib/torrents";
 import { isActiveStatus, statusToken } from "@/lib/status-tokens";
-import { cn } from "@/lib/utils";
 import { Square } from "@/next/components/chrome";
 import { CheckBox } from "@/next/components/controls";
-import { Icon, type IconName } from "@/next/components/icons";
 import { PhaseBars, useJobProgress } from "@/next/components/PhaseBars";
-import { ListRow, ValueCell } from "@/next/components/rows";
+import { ListRow, RowIconButton, ValueCell } from "@/next/components/rows";
 import { TagChips } from "@/next/components/Tags";
 import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
 
@@ -209,37 +207,6 @@ const RowActions = memo(function RowActions({
     </div>
   );
 });
-
-/** A 28px icon action inside a row; its click never reaches the row. */
-function RowIconButton({
-  icon,
-  label,
-  danger = false,
-  onClick,
-}: {
-  icon: IconName;
-  label: string;
-  danger?: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      title={label}
-      aria-label={label}
-      onClick={(event) => {
-        event.stopPropagation();
-        onClick();
-      }}
-      className={cn(
-        "flex size-7 flex-none cursor-pointer items-center justify-center border border-transparent text-wv-muted hover:border-wv-control hover:bg-wv-button",
-        danger ? "hover:text-wv-error" : "hover:text-wv-fg",
-      )}
-    >
-      <Icon name={icon} size={15} />
-    </button>
-  );
-}
 
 /**
  * The rate an active row shows. A rate-limited job waits between articles,

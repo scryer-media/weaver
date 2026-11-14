@@ -16,7 +16,7 @@
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use weaver_graph::{ByteRange, Coverage, Lost, VolumeIndex, Volumes};
@@ -56,6 +56,11 @@ pub(crate) struct RunVolumes {
     // The lost spans reads failed on that the run has not read on past.
     lost: Mutex<BTreeSet<(u32, u64, u64)>>,
     stopped: AtomicBool,
+    // Stopped for the job to wait for room on a disk.
+    parked: AtomicBool,
+    // The time the run's decoder spent executing, in nanoseconds, set as
+    // it returns.
+    decoded: AtomicU64,
     // The run's decoder while it executes: a read waiting on the shelf is
     // the decoder waiting, not decoding.
     decoding: Mutex<Weak<Decoding>>,
@@ -79,6 +84,8 @@ impl RunVolumes {
             generation,
             lost: Mutex::default(),
             stopped: AtomicBool::new(false),
+            parked: AtomicBool::new(false),
+            decoded: AtomicU64::new(0),
             decoding: Mutex::default(),
         }
     }
@@ -108,6 +115,35 @@ impl RunVolumes {
 
     fn stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
+    }
+
+    // The run stops where it stands because its job waits for room on a
+    // disk: it ends, and once it has, it is queued to run again from the
+    // start of its volumes.
+    pub(crate) fn park(&self) {
+        self.parked.store(true, Ordering::Release);
+        self.stop();
+    }
+
+    // Whether the run stopped for its job to wait for room.
+    pub(crate) fn parked(&self) -> bool {
+        self.parked.load(Ordering::Acquire)
+    }
+
+    // The run's decoder returned, having taken `spent` of the job's
+    // decoding clock. Set before the run says it ended, which its owner
+    // hears after this.
+    pub(crate) fn decoded(&self, spent: std::time::Duration) {
+        self.decoded.store(
+            u64::try_from(spent.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
+    }
+
+    // The part of the job's decoding clock the run's decoder took, once it
+    // returned.
+    pub(crate) fn decode_time(&self) -> std::time::Duration {
+        std::time::Duration::from_nanos(self.decoded.load(Ordering::Acquire))
     }
 
     #[cfg(test)]

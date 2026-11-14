@@ -23,11 +23,12 @@ import { Pagination } from "../components/Pagination";
 import { CheckBox, SecondaryButton, TextField } from "../components/controls";
 import { Icon } from "../components/icons";
 import { Menu, MenuItem } from "../components/Menu";
-import { GridHeader, GridRow } from "../components/rows";
+import { GridHeader, GridRow, RowIconButton } from "../components/rows";
 import { StorageMounts, storageMounts, type StorageVolume } from "../components/storage";
 import { Tabs } from "../components/Tabs";
 import { useStartOfToday } from "../data/clock";
-import { NEXT_HISTORY_PAGE_QUERY } from "../data/queries";
+import { NEXT_HISTORY_PAGE_QUERY, NEXT_HISTORY_SAMPLE_QUERY } from "../data/queries";
+import { useDebouncedValue } from "../data/timers";
 import {
   EM_DASH,
   formatClock,
@@ -41,7 +42,7 @@ import {
 import { WV } from "../data/palette";
 import { countLabel } from "../i18n/labels";
 import { useStatusLabel } from "../data/status";
-import { testIds } from "@/next/testids";
+import { jobIds, testIds } from "@/next/testids";
 import { NextShell, RailBlock } from "../shell/NextShell";
 import { CategoryListBlock, TagFilterBlock } from "../shell/rail-blocks";
 import { TagChips } from "../components/Tags";
@@ -55,6 +56,15 @@ import {
 import { useNextData } from "../data/next-data";
 import { describeDeleteProgress } from "../data/history-deletes";
 import { useHistoryDeletes } from "../data/use-history-deletes";
+import {
+  describeFailedArchive,
+  describeArchiveHistory,
+  rowDeletes,
+  rowOperationKind,
+  rowArchives,
+  type HistoryRowOperation,
+} from "../data/history-archive";
+import { useArchiveHistory } from "../data/use-archive-history";
 import { useHistoryLiveRefresh } from "../data/use-history-live-refresh";
 
 /**
@@ -74,17 +84,20 @@ import { useHistoryLiveRefresh } from "../data/use-history-live-refresh";
 /** The row tracks, shared by the column header and every row. */
 // Release and outcome are what this screen is for, so they are the two that
 // never drop; size joins them once there is room, and the finished-at stack
-// last, at the width the handoff was drawn for.
+// last, at the width the handoff was drawn for. The row's own two actions
+// sit before the open mark at every width.
 const COLUMNS = {
-  base: "26px minmax(0, 1fr) 76px 14px",
-  sm: "26px minmax(0, 2fr) minmax(96px, 1fr) 64px 14px",
-  lg: "26px minmax(0, 2.4fr) minmax(112px, 1.1fr) 64px 84px 14px",
+  base: "26px minmax(0, 1fr) 76px 58px 14px",
+  sm: "26px minmax(0, 2fr) minmax(96px, 1fr) 64px 58px 14px",
+  lg: "26px minmax(0, 2.4fr) minmax(112px, 1.1fr) 64px 84px 58px 14px",
 };
 const PAGE_SIZES = [25, 50, 100] as const;
 /** Deep enough to cover a busy day, cheap enough to ask for on every visit. */
 const SAMPLE_SIZE = 200;
 // A tag change answers with JobTag rows; refetch the page when one lands.
 const TAG_CONTEXT = { additionalTypenames: ["JobTag"] };
+/** Typing is one search once the keys stop, not one per key. */
+const SEARCH_SETTLE_MS = 300;
 const NO_COUNTS = { all: 0, success: 0, failure: 0 };
 const NO_VOLUMES: StorageVolume[] = [];
 
@@ -125,7 +138,15 @@ interface HistoryRow {
   tags?: string[];
   createdAt: string | number | null;
   completedAt: string | number | null;
-  deleteOperation: { state: string; locked: boolean } | null;
+  /** When the entry was archived, or null while it is not. */
+  archivedAt: string | number | null;
+  deleteOperation: HistoryRowOperation | null;
+}
+
+/** What a confirm dialog acts on, and the note it shows for them. */
+interface ConfirmTargets {
+  ids: number[];
+  note: string;
 }
 
 interface HistoryPageResponse {
@@ -135,6 +156,15 @@ interface HistoryPageResponse {
     counts: { all: number; success: number; failure: number };
     categoryCounts: { category: string; count: number }[];
   };
+}
+
+type HistorySampleRow = Pick<
+  HistoryRow,
+  "id" | "totalBytes" | "downloadedBytes" | "createdAt" | "completedAt"
+>;
+
+interface HistorySampleResponse {
+  historyPage: { items: HistorySampleRow[] };
 }
 
 interface DayGroup {
@@ -149,7 +179,7 @@ function millis(value: string | number | null): number | null {
 }
 
 /** How long the job took, start to finish, or null when either end is missing. */
-function elapsedMs(row: HistoryRow): number | null {
+function elapsedMs(row: Pick<HistoryRow, "createdAt" | "completedAt">): number | null {
   const started = millis(row.createdAt);
   const finished = millis(row.completedAt);
   if (started === null || finished === null || finished < started) {
@@ -199,7 +229,10 @@ export function HistoryPage() {
   const [picked, setPicked] = useState<ReadonlySet<number>>(() => new Set());
   const [facets, setFacets] = useState<ReadonlySet<string>>(NO_FACETS);
   const [tag, setTag] = useState<string | null>(null);
-  const [confirmDelete, setConfirmDelete] = useState(false);
+  // The entries a confirm dialog acts on: the picked ones, or one row's own.
+  const [confirmDelete, setConfirmDelete] = useState<ConfirmTargets | null>(null);
+  const [confirmArchive, setConfirmArchive] = useState<ConfirmTargets | null>(null);
+  const [archiveError, setArchiveError] = useState<string | null>(null);
   const [retryAction, setRetryAction] = useState<"redownload" | "reprocess" | null>(null);
   const [report, setReport] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -218,6 +251,13 @@ export function HistoryPage() {
       return next;
     });
   }, [setSearchParams]);
+  const search = useDebouncedValue(query.trim(), SEARCH_SETTLE_MS);
+  // A new search starts from its first page, once it is the search in force.
+  const [searchedFor, setSearchedFor] = useState(search);
+  if (searchedFor !== search) {
+    setSearchedFor(search);
+    setPageIndex(0);
+  }
 
   const sortOption = SORT_OPTIONS.find((option) => option.value === sort)!;
   const categories = useMemo(() => facetsToCategories(facets), [facets]);
@@ -225,7 +265,7 @@ export function HistoryPage() {
     () => ({
       pageIndex,
       pageSize,
-      search: query.trim() === "" ? undefined : query.trim(),
+      search: search === "" ? undefined : search,
       status: TAB_STATUS[tab],
       categories,
       sortField: sortOption.field,
@@ -233,7 +273,7 @@ export function HistoryPage() {
       completedSinceEpochSec: since ?? undefined,
       tag: tag ?? undefined,
     }),
-    [categories, pageIndex, pageSize, query, since, sortOption.direction, sortOption.field, tab, tag],
+    [categories, pageIndex, pageSize, search, since, sortOption.direction, sortOption.field, tab, tag],
   );
 
   const [{ data, fetching }, reexecute] = useQuery<HistoryPageResponse>({
@@ -244,8 +284,8 @@ export function HistoryPage() {
   // The strip's own numbers — today's jobs and what they averaged — need rows
   // the current page may not hold, so they come from a shallow newest-first
   // window rather than from whatever happens to be on screen.
-  const [{ data: sampleData }, reexecuteSample] = useQuery<HistoryPageResponse>({
-    query: NEXT_HISTORY_PAGE_QUERY,
+  const [{ data: sampleData }, reexecuteSample] = useQuery<HistorySampleResponse>({
+    query: NEXT_HISTORY_SAMPLE_QUERY,
     variables: {
       input: {
         pageIndex: 0,
@@ -266,6 +306,7 @@ export function HistoryPage() {
   const [, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
   const [, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
   const [, rerunPostProcessing] = useMutation(RERUN_POST_PROCESSING_MUTATION);
+  const requestArchiveHistory = useArchiveHistory();
 
   const page = data?.historyPage;
   const pageRows = useMemo(() => page?.items ?? [], [page?.items]);
@@ -406,17 +447,44 @@ export function HistoryPage() {
     refresh();
   };
 
-  const deletePicked = async (deleteFiles: boolean) => {
-    const ids = [...picked];
+  // The bulk delete and a row's own run this, with the picked ids or the row's.
+  const deleteEntries = async (ids: readonly number[], deleteFiles: boolean) => {
     setDeleteError(null);
-    const error = await deletes.accept(ids, deleteFiles);
+    const error = await deletes.accept([...ids], deleteFiles);
     if (error !== null) {
       setDeleteError(error);
       return;
     }
-    setConfirmDelete(false);
+    setConfirmDelete(null);
     setReport(null);
     setPicked((current) => new Set([...current].filter((id) => !ids.includes(id))));
+  };
+
+  // An entry already archived is not offered for archiving again.
+  const archivedIds = useMemo(
+    () => new Set(rows.filter((row) => row.archivedAt !== null).map((row) => row.id)),
+    [rows],
+  );
+  const archivableIds = [...picked].filter((id) => !archivedIds.has(id));
+
+  // The bulk archive and a row's own run this, with the picked ids or the row's.
+  const archiveEntries = async (ids: readonly number[]) => {
+    setArchiveError(null);
+    setBusy(true);
+    const { results, refused } = await requestArchiveHistory(ids);
+    setBusy(false);
+    if (refused !== null && results.length === 0) {
+      setArchiveError(refused);
+      return;
+    }
+    setConfirmArchive(null);
+    // Answered entries leave the selection; entries no call answered for
+    // stay picked, so they can be sent again.
+    const answered = new Set(results.map((result) => result.id));
+    setPicked((current) => new Set([...current].filter((id) => !answered.has(id))));
+    const summary = describeArchiveHistory(t, results, ids.length);
+    setReport(refused === null ? summary : `${summary} · ${refused}`);
+    refresh();
   };
 
   const actionsBusy = busy || deletes.accepting;
@@ -448,10 +516,25 @@ export function HistoryPage() {
       <BulkButton
         icon="remove"
         tone="danger"
+        testId={jobIds.historyArchive}
+        disabled={actionsBusy || archivableIds.length === 0}
+        onClick={() => {
+          setArchiveError(null);
+          setConfirmArchive({
+            ids: archivableIds,
+            note: t("bulk.selected", { count: archivableIds.length }),
+          });
+        }}
+      >
+        {t("next.historyArchive.action")}
+      </BulkButton>
+      <BulkButton
+        icon="remove"
+        tone="danger"
         disabled={actionsBusy}
         onClick={() => {
           setDeleteError(null);
-          setConfirmDelete(true);
+          setConfirmDelete({ ids: [...picked], note: t("bulk.selected", { count: picked.size }) });
         }}
       >
         {t("action.delete")}
@@ -507,7 +590,7 @@ export function HistoryPage() {
             placeholder={t("next.completed.filterPlaceholder")}
             mono={false}
             value={query}
-            onChange={(next) => reset(() => setQuery(next))}
+            onChange={setQuery}
             className="w-[118px] min-w-[80px] sm:w-[172px] sm:min-w-[96px]"
           />
           <SecondaryButton icon="downloadFile" onClick={exportList} disabled={rows.length === 0}>
@@ -527,7 +610,7 @@ export function HistoryPage() {
         </>
       }
       railFooter={
-        <RailBlock eyebrow={t("next.completed.archive")}>
+        <RailBlock eyebrow={t("next.completed.storage")}>
           <StorageMounts volumes={volumes} layout="stack" />
         </RailBlock>
       }
@@ -663,6 +746,7 @@ export function HistoryPage() {
                 {t("next.completed.done")}
               </span>,
               "",
+              "",
             ]}
             cellClassNames={[undefined, undefined, undefined, "hidden sm:block", "hidden lg:block"]}
           />
@@ -703,12 +787,17 @@ export function HistoryPage() {
               <SectionHeader
                 label={day.label}
                 count={countLabel(t, "next.completed.items", day.rows.length)}
-                note={t("next.completed.archived", { size: formatSize(day.bytes) })}
+                note={t("next.completed.dayTotal", { size: formatSize(day.bytes) })}
               />
               {day.rows.map((row) => {
                 const token = statusToken(row.status);
                 const failed = token === "failed";
-                const removing = row.deleteOperation !== null;
+                const operation = rowOperationKind(row.deleteOperation);
+                const pending = operation === "deleting" || operation === "archiving";
+                const archiveFailed =
+                  operation === "archiveFailed" && row.deleteOperation
+                    ? describeFailedArchive(t, row.deleteOperation)
+                    : null;
                 const locked = lockedIds.has(row.id);
                 const finished = millis(row.completedAt);
                 const elapsed = elapsedMs(row);
@@ -719,11 +808,9 @@ export function HistoryPage() {
                     columns={COLUMNS}
                     selected={picked.has(row.id)}
                     onClick={() => navigate(`/jobs/${row.id}`)}
-                    title={
-                      row.error
-                        ? `${formatJobReleaseName(row)}\n${row.error}`
-                        : formatJobReleaseName(row)
-                    }
+                    title={[formatJobReleaseName(row), row.error, archiveFailed]
+                      .filter(Boolean)
+                      .join("\n")}
                     className={cn(
                       "border-b border-wv-hairline px-4 sm:px-[22px] py-[11px]",
                       locked && "opacity-60",
@@ -742,17 +829,31 @@ export function HistoryPage() {
                         {row.hasPassword ? (
                           <Icon name="lock" size={11} className="ml-[6px] inline-block align-[-1px] text-wv-muted" />
                         ) : null}
+                        {row.archivedAt !== null ? (
+                          <span
+                            data-testid={jobIds.historyArchived(row.id)}
+                            className="ml-[8px] font-wv-mono text-[10.5px] tracking-[0.06em] text-wv-faint uppercase"
+                          >
+                            {t("next.historyArchive.mark")}
+                          </span>
+                        ) : archiveFailed !== null ? (
+                          <span className="ml-[8px] font-wv-mono text-[10.5px] tracking-[0.06em] text-wv-error-text uppercase">
+                            {archiveFailed}
+                          </span>
+                        ) : null}
                       </div>
                       <TagChips tags={row.tags} className="flex-none flex-nowrap" />
                     </div>
                     <div className="flex min-w-0 items-center gap-[7px]">
                       <Square
-                        color={removing ? WV.idle : failed ? WV.error : WV.accent}
+                        color={pending ? WV.idle : failed ? WV.error : WV.accent}
                       />
                       <span className="truncate text-[12.5px] text-wv-secondary">
-                        {removing
+                        {operation === "deleting"
                           ? t("next.completed.deleting")
-                          : token === "completed"
+                          : operation === "archiving"
+                            ? t("next.historyArchive.pending")
+                            : token === "completed"
                             ? t("next.completed.complete")
                             : failed
                               ? t("status.failed")
@@ -769,6 +870,34 @@ export function HistoryPage() {
                       <span className="font-wv-mono text-[10.5px] whitespace-nowrap text-wv-faint">
                         {elapsed === null ? EM_DASH : t("next.completed.took", { span: formatElapsed(elapsed) })}
                       </span>
+                    </div>
+                    <div className="flex items-center justify-end gap-0.5">
+                      {rowArchives(row) ? (
+                        <RowIconButton
+                          icon="archive"
+                          label={t("next.historyArchive.action")}
+                          danger
+                          disabled={actionsBusy}
+                          testId={jobIds.historyRowArchive(row.id)}
+                          onClick={() => {
+                            setArchiveError(null);
+                            setConfirmArchive({ ids: [row.id], note: formatJobReleaseName(row) });
+                          }}
+                        />
+                      ) : null}
+                      {rowDeletes(row) ? (
+                        <RowIconButton
+                          icon="remove"
+                          label={t("action.delete")}
+                          danger
+                          disabled={actionsBusy}
+                          testId={jobIds.historyRowDelete(row.id)}
+                          onClick={() => {
+                            setDeleteError(null);
+                            setConfirmDelete({ ids: [row.id], note: formatJobReleaseName(row) });
+                          }}
+                        />
+                      ) : null}
                     </div>
                     <div className="flex justify-end text-wv-dim">
                       <Icon name="open" size={14} />
@@ -789,9 +918,9 @@ export function HistoryPage() {
           void runOnPicked("requeued", (id) => retryAction === "redownload" ? redownloadJob({ id, password }) : reprocessJob({ id, password }));
         }} /> : null}
       <ConfirmDialog
-        open={confirmDelete}
+        open={confirmDelete !== null}
         title={t("action.delete")}
-        note={t("bulk.selected", { count: picked.size })}
+        note={confirmDelete?.note}
         busy={actionsBusy}
         body={
           <>
@@ -801,10 +930,31 @@ export function HistoryPage() {
             )}
           </>
         }
-        alternative={{ label: t("next.job.deleteSaveFiles"), onConfirm: () => void deletePicked(false) }}
+        alternative={{
+          label: t("next.job.deleteSaveFiles"),
+          onConfirm: () => void deleteEntries(confirmDelete?.ids ?? [], false),
+        }}
         confirmLabel={t("action.delete")}
-        onConfirm={() => void deletePicked(true)}
-        onDismiss={() => setConfirmDelete(false)}
+        onConfirm={() => void deleteEntries(confirmDelete?.ids ?? [], true)}
+        onDismiss={() => setConfirmDelete(null)}
+      />
+      <ConfirmDialog
+        open={confirmArchive !== null}
+        testId={testIds.dialog("archiveHistory")}
+        title={t("next.historyArchive.title")}
+        note={confirmArchive?.note}
+        busy={actionsBusy}
+        body={
+          <>
+            {confirmArchive?.ids.length === 1 ? t("next.historyArchive.jobBody") : t("next.historyArchive.body")}
+            {archiveError === null ? null : (
+              <span className="mt-3 block text-wv-error-text">{archiveError}</span>
+            )}
+          </>
+        }
+        confirmLabel={t("next.historyArchive.action")}
+        onConfirm={() => void archiveEntries(confirmArchive?.ids ?? [])}
+        onDismiss={() => setConfirmArchive(null)}
       />
     </NextShell>
   );

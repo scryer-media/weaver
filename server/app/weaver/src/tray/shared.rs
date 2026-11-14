@@ -37,14 +37,12 @@ pub(crate) const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 // How long a stop waits after asking the server to exit — `SIGTERM` on Unix,
 // a console Ctrl+C on Windows — before it kills the process. The server's own
 // graceful teardown is what needs the time here; a process that ignores the
-// request must not be able to strand the wrapper.
-#[cfg(unix)]
-const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(10);
-// Shorter on Windows, where the stop also runs inside the installer's
-// shutdown command and while the session ends, and both of those are bounded
-// by someone else.
-#[cfg(windows)]
-const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+// request must not be able to strand the wrapper. One minute on every
+// platform for a stop the user asked for, so the server's drain and database
+// flush finish before a kill. A stop someone else bounds, as when the
+// Windows session ends, passes its own shorter wait to `stop_within`.
+#[cfg(any(unix, windows))]
+pub(crate) const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(60);
 
 // The names the wrapper and the server are installed under. Both binaries
 // ship in the same directory, which is what lets the wrapper find the server
@@ -128,6 +126,13 @@ pub(crate) fn opens_in_external_browser(app_origin: &str, url: &str) -> bool {
         Some(origin) => !origin.eq_ignore_ascii_case(app_origin),
         None => false,
     }
+}
+
+// Whether a URL a page asked to open is an absolute `http`/`https` URL with a
+// host part. Any other scheme names a program the shell would launch, so a
+// page's request for one is dropped.
+pub(crate) fn is_http_url(url: &str) -> bool {
+    http_origin(url).is_some_and(|origin| !origin.ends_with("://"))
 }
 
 // The `scheme://authority` prefix of an absolute `http`/`https` URL.
@@ -989,6 +994,16 @@ impl ServerSupervisor {
     // Stop the server this wrapper started. A server it did not start is left
     // alone: it belongs to whoever ran it.
     pub(crate) fn stop(&mut self) -> Result<(), String> {
+        #[cfg(any(unix, windows))]
+        return self.stop_within(GRACEFUL_STOP_TIMEOUT);
+        #[cfg(not(any(unix, windows)))]
+        self.stop_within(Duration::ZERO)
+    }
+
+    // `stop`, giving the server `wait` to exit on its own before it is
+    // killed: for a stop someone else puts a shorter limit on.
+    #[cfg_attr(not(any(unix, windows)), allow(unused_variables))]
+    pub(crate) fn stop_within(&mut self, wait: Duration) -> Result<(), String> {
         let Some(mut child) = self.server.take() else {
             return Ok(());
         };
@@ -999,7 +1014,7 @@ impl ServerSupervisor {
             .is_none()
         {
             #[cfg(any(unix, windows))]
-            if request_graceful_stop(&mut child)? {
+            if request_graceful_stop(&mut child, wait)? {
                 return Ok(());
             }
             child
@@ -1267,12 +1282,12 @@ fn configure_server_command(_command: &mut Command) {}
 // throws away the flush it would otherwise do, so the signal comes first and
 // the caller only escalates when this returns false.
 #[cfg(any(unix, windows))]
-fn request_graceful_stop(child: &mut Child) -> Result<bool, String> {
+fn request_graceful_stop(child: &mut Child, wait: Duration) -> Result<bool, String> {
     if !send_stop_request(child) {
         return Ok(false);
     }
 
-    let deadline = Instant::now() + GRACEFUL_STOP_TIMEOUT;
+    let deadline = Instant::now() + wait;
     while Instant::now() < deadline {
         match child.try_wait() {
             Ok(Some(_)) => return Ok(true),
@@ -1366,13 +1381,33 @@ mod tests {
     use super::{
         HttpResponse, PopoverContent, QueueRow, SMOKE_BODY, SMOKE_RESPONSE, app_origin, app_url,
         build_server_command, decode_chunked, desktop_profile_dir_from, format_bytes, format_speed,
-        http_origin, is_weaver_document, last_logged_error, logged_error_message,
+        http_origin, is_http_url, is_weaver_document, last_logged_error, logged_error_message,
         note_version_change, opens_in_external_browser, parse_http_response, parse_setup_code_line,
         popover_content_from_graphql, remove_desktop_profile, row_detail, set_cookie_value,
         tcp_table_port,
     };
     #[cfg(unix)]
     use super::{RELAUNCH_PENDING_MESSAGE, ServerSupervisor, SupervisedServer};
+
+    // The Windows installer cannot read the constant, so its own wait for the
+    // old processes is held to it here.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn the_installer_waits_as_long_as_the_tray_before_it_kills() {
+        let installer = include_str!("../../../../../packaging/windows/weaver.wxs");
+        let wait = format!(
+            "Wait-Process -Timeout {} ",
+            super::GRACEFUL_STOP_TIMEOUT.as_secs()
+        );
+        assert_eq!(super::GRACEFUL_STOP_TIMEOUT.as_secs(), 60);
+        assert_eq!(installer.matches("Wait-Process -Timeout ").count(), 1);
+        assert_eq!(installer.matches(wait.as_str()).count(), 1);
+        let waits_at = installer.find(wait.as_str()).expect("the installer waits");
+        let kills_at = installer
+            .find("Stop-Process -Force")
+            .expect("the installer kills");
+        assert!(waits_at < kills_at, "the wait comes before the kill");
+    }
 
     #[test]
     fn a_tcp_table_port_is_read_out_of_network_byte_order() {
@@ -1685,6 +1720,38 @@ mod tests {
                 "{internal} should be left to the webview"
             );
             assert_eq!(http_origin(internal), None);
+        }
+    }
+
+    #[test]
+    fn only_http_links_are_opened_for_a_page() {
+        for opened in [
+            "http://example.invalid/item",
+            "https://example.invalid/item?id=1#top",
+            "HTTPS://Example.Invalid/",
+            "hTtP://127.0.0.1:9090",
+        ] {
+            assert!(is_http_url(opened), "{opened} should open");
+        }
+        for dropped in [
+            "file:///etc/passwd",
+            "file://server/share/run.exe",
+            "ms-settings:privacy",
+            "steam://run/1",
+            "x-custom://payload",
+            "javascript:alert(1)",
+            "mailto:someone@example.invalid",
+            "data:text/html,<p>hi</p>",
+            "",
+            "http",
+            "http:",
+            "http:/example.invalid",
+            "http://",
+            "https:///path",
+            "httpx://example.invalid/",
+            " https://example.invalid/",
+        ] {
+            assert!(!is_http_url(dropped), "{dropped:?} should be dropped");
         }
     }
 

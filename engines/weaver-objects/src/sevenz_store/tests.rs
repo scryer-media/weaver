@@ -7,6 +7,7 @@ mod owner;
 
 use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use sevenz_turbo::encoder_options::{AesEncoderOptions, Lzma2Options};
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password};
@@ -155,6 +156,43 @@ fn bytes_ahead_of_the_tail_are_held_until_it_arrives() {
     // Nothing moves: the tail arrives in the normal order, last.
     owner.pull = Pull::Moved(0);
     owner.frames(0, 4096);
+    owner.close(0);
+    no_trouble(&owner);
+    streamed(&owner);
+}
+
+// Bytes ahead of the tail are held a piece per delivery, and the placement
+// number stands over them until the end header moves it: an owner that asks
+// only once it moves places every held piece as one that asks after every
+// delivery, and asks nothing while the body comes.
+#[test]
+fn held_pieces_place_the_same_asked_only_once_the_placement_number_moves() {
+    let bytes = archive(copy(), false);
+    let tail = end_header(&bytes);
+    let mut owner = Owner::single(store(), bytes);
+    owner.pull = Pull::Moved(0);
+    let mut asked = crate::testing::Asked::default();
+    let (mut pieces, mut saved) = (0, 0);
+    let mut standing = None;
+    for start in (0..tail.start).step_by(64) {
+        let range = ByteRange::new(start, (start + 64).min(tail.start));
+        owner.deliver(0, range);
+        asked.hold(&owner.object, VolumeIndex(0), range);
+        saved += asked.compare(&owner.object);
+        pieces += 1;
+        let number = owner.object.placement();
+        assert!(number.is_some(), "at {start}");
+        assert_eq!(*standing.get_or_insert(number), number, "at {start}");
+    }
+    assert!(asked.unplaced());
+    assert_eq!(owner.held(), pieces);
+    assert_eq!(saved, pieces * (pieces + 1) / 2);
+    assert!(owner.skipped > 0);
+
+    owner.deliver(0, tail);
+    assert_ne!(owner.object.placement(), standing.flatten());
+    assert_eq!(asked.compare(&owner.object), 0, "the end header moved it");
+    assert!(!asked.unplaced());
     owner.close(0);
     no_trouble(&owner);
     streamed(&owner);
@@ -384,6 +422,36 @@ fn an_encrypted_header_no_candidate_opens_is_refused_at_quiet() {
     assert!(owner.members.is_empty());
 }
 
+// Worked under a stop already set, a store begins no folder key, says
+// nothing, and keeps its keys due. Worked again unstopped, it derives the
+// same keys and says the same as a twin that was never stopped.
+#[test]
+fn a_stopped_derivation_keeps_its_keys_due_and_then_derives_as_an_unstopped_one() {
+    let bytes = archive(aes(), false);
+    let mut stopped = Owner::single(store(), bytes.clone());
+    let mut plain = Owner::single(store(), bytes);
+    for owner in [&mut stopped, &mut plain] {
+        owner.frames(0, 4096);
+        owner.object.offer_password(PASSWORD, &mut Vec::new());
+        assert!(owner.object.work_due(), "a folder key is due");
+    }
+    let mut said = Vec::new();
+    stopped.object.work_until(&AtomicBool::new(true), &mut said);
+    assert!(said.is_empty(), "{said:?}");
+    assert!(stopped.object.work_due(), "the keys stay due");
+    assert!(stopped.object.derived.is_empty(), "no key was begun");
+    stopped
+        .object
+        .work_until(&AtomicBool::new(false), &mut said);
+    let mut unstopped = Vec::new();
+    plain.object.work(&mut unstopped);
+    assert!(!said.is_empty());
+    assert!(said == unstopped, "{said:?} {unstopped:?}");
+    assert!(!stopped.object.work_due());
+    assert!(!stopped.object.derived.is_empty());
+    assert!(stopped.object.derived == plain.object.derived);
+}
+
 // An encrypted header read on bytes that came whole but are not the posted
 // ones, its end header untouched, does not open under the right password.
 // That rules the password wrong for those bytes only: another store sharing
@@ -461,6 +529,173 @@ fn an_end_header_declared_past_any_byte_holds_nothing_until_bytes_arrive() {
         "{:?}",
         owner.said
     );
+}
+
+// A container whose signature header states its end header at `offset`
+// and `length`, with the signature's own checksum written again over them.
+fn restated(bytes: &[u8], offset: u64, length: u64) -> Vec<u8> {
+    let mut bytes = bytes.to_vec();
+    bytes[12..20].copy_from_slice(&offset.to_le_bytes());
+    bytes[20..28].copy_from_slice(&length.to_le_bytes());
+    let crc = crate::grid::crc32(&bytes[12..32]);
+    bytes[8..12].copy_from_slice(&crc.to_le_bytes());
+    bytes
+}
+
+// A container whose bytes run out before the end header its signature
+// states: what the store held of it, what it last asked for, and what it
+// said once nothing more came.
+fn short_of_its_end_header(bytes: Vec<u8>) -> (usize, usize, Vec<weaver_graph::Seek>, Owner) {
+    let mut owner = Owner::single(store(), bytes);
+    owner.whole(4096);
+    owner.quiet();
+    let (held, allocated) = owner.object.kept.held();
+    let seeks = owner.seeks.clone();
+    (held, allocated, seeks, owner)
+}
+
+// The end of a container cut one byte short of its end header, as a
+// truncated post ends: no member, nothing refused or handed on.
+fn ends_as_truncated(owner: &Owner, truncated: &Owner) {
+    assert!(owner.members.is_empty(), "{:?}", owner.members);
+    assert_eq!(owner.said, truncated.said);
+    assert!(
+        !owner.said.iter().any(|emit| matches!(
+            emit,
+            Emit::NeedsEngine(_) | Emit::Refuse(_) | Emit::Damaged { .. }
+        )),
+        "{:?}",
+        owner.said
+    );
+}
+
+// An end header stated at 2^63 bytes holds only the bytes posted: the store
+// keeps what arrives in the stated range and asks for nothing past the
+// file, and the container ends as one cut short of its end header does.
+#[test]
+fn an_end_header_stated_at_two_to_the_sixty_third_holds_only_the_bytes_posted() {
+    let posted = archive(copy(), false);
+    let length = posted.len();
+    let (_, _, _, truncated) = short_of_its_end_header(posted[..length - 1].to_vec());
+    let forged = restated(&posted, 0, 1 << 63);
+    assert!(matches!(
+        super::header::signature(&forged),
+        super::header::Signature::Start(_)
+    ));
+    let (held, allocated, seeks, owner) = short_of_its_end_header(forged);
+    assert!(held <= length, "{held} of {length}");
+    assert!(allocated <= 2 * held, "{allocated} for {held}");
+    assert!(!seeks.is_empty());
+    assert!(
+        seeks.iter().all(|seek| seek.range.end <= length as u64),
+        "{seeks:?}"
+    );
+    ends_as_truncated(&owner, &truncated);
+}
+
+// An end header stated one byte past the end of the file never completes:
+// the store holds no more than the bytes posted, asks for nothing past
+// them, and ends as the container cut one byte short does.
+#[test]
+fn an_end_header_stated_one_byte_past_the_file_ends_as_a_truncated_container() {
+    let posted = archive(copy(), false);
+    let length = posted.len();
+    let end = end_header(&posted);
+    let (_, _, _, truncated) = short_of_its_end_header(posted[..length - 1].to_vec());
+    let forged = restated(&posted, end.start - 32, end.len() + 1);
+    let (held, allocated, seeks, owner) = short_of_its_end_header(forged);
+    assert!(
+        held <= 32 + length - end.start as usize,
+        "{held} of {length}"
+    );
+    assert!(allocated <= 2 * held, "{allocated} for {held}");
+    assert!(
+        seeks.iter().all(|seek| seek.range.end <= length as u64),
+        "{seeks:?}"
+    );
+    ends_as_truncated(&owner, &truncated);
+}
+
+// Before the file's length is known nothing is asked for, and a stated end
+// header of 2^63 bytes holds only the bytes that arrived in it.
+#[test]
+fn an_end_header_stated_at_two_to_the_sixty_third_before_any_length_holds_what_arrived() {
+    let posted = archive(copy(), false);
+    let forged = restated(&posted, 0, 1 << 63);
+    let mut lone = store();
+    let mut out = Vec::new();
+    let mut delivered = 0;
+    for start in (0..forged.len()).step_by(4096) {
+        let end = (start + 4096).min(forged.len());
+        lone.deliver(
+            weaver_graph::Delivery {
+                volume: VolumeIndex(0),
+                offset: start as u64,
+                bytes: &weaver_graph::Evidenced::from(forged[start..end].to_vec()),
+                provenance: Provenance::Fresh,
+            },
+            &mut |_, _| false,
+            &mut out,
+        );
+        delivered += end - start;
+        let (held, allocated) = lone.kept.held();
+        assert!(held <= delivered, "{held} of {delivered}");
+        assert!(allocated <= 2 * held, "{allocated} for {held}");
+        let mut seeks = Vec::new();
+        lone.wants(&mut seeks);
+        assert!(seeks.is_empty(), "{seeks:?}");
+    }
+    assert!(
+        !out.iter()
+            .any(|emit| matches!(emit, Emit::Member { .. } | Emit::NeedsEngine(_))),
+        "{out:?}"
+    );
+}
+
+// An honest container with thousands of members opens to the entries its
+// end header lists, and the store keeps no more than the header's bytes.
+#[test]
+fn a_container_with_thousands_of_members_opens_to_every_entry() {
+    let payloads: Vec<(String, Vec<u8>)> = (0..6_000u32)
+        .map(|index| {
+            (
+                format!("season-{:02}/episode-{index:05}.bin", index % 40),
+                payload(u64::from(index), 16 + index as usize % 48),
+            )
+        })
+        .collect();
+    let entries: Vec<_> = payloads
+        .iter()
+        .map(|(name, bytes)| (None, Entry::File(name, bytes)))
+        .collect();
+    let bytes = write(copy(), false, &entries);
+    let listed: Vec<String> =
+        sevenz_turbo::Archive::read(&mut Cursor::new(&bytes), &Password::empty())
+            .unwrap()
+            .files
+            .iter()
+            .map(|entry| entry.name().to_owned())
+            .collect();
+    assert_eq!(listed.len(), payloads.len());
+    let end = end_header(&bytes);
+    // The writer packs a header this size, as 7z writers do: the end header
+    // only says where the packed one lies.
+    assert_eq!(bytes[end.start as usize], 0x17);
+    let mut owner = Owner::single(store(), bytes.clone());
+    owner.whole(4096);
+    no_trouble(&owner);
+    let names: Vec<String> = owner.members.values().map(|got| got.name.clone()).collect();
+    assert_eq!(names, listed);
+    for (name, payload) in &payloads {
+        let got = owner.member(name);
+        assert!(got.closed, "{name}");
+        assert_eq!(&got.bytes, payload, "{name}");
+    }
+    let content: usize = payloads.iter().map(|(_, bytes)| bytes.len()).sum();
+    let (held, allocated) = owner.object.kept.held();
+    assert!(held <= bytes.len() - content, "{held} of {}", bytes.len());
+    assert!(held as u64 >= end.len());
+    assert!(allocated <= 2 * held, "{allocated} for {held}");
 }
 
 // A 7z of a major version this store cannot read is refused for that, not
@@ -831,6 +1066,68 @@ fn every_unproven_candidate_wrong_needs_a_password() {
     assert!(has(&owner, &Emit::NeedsPassword));
     owner.quiet();
     assert!(has(&owner, &Emit::Refuse(Why::EncryptedHeader)));
+}
+
+// A wrong candidate condemned over a folder two cipher strides long: the
+// folder, asked for again whole, is read back as the tree reads it, a piece
+// at a time, and no piece reads more than a piece of plaintext at once,
+// gives back more than a piece, or enciphers more than the stride behind it
+// and itself, however long the folder. The right candidate then opens the
+// same bytes.
+#[test]
+fn a_condemned_folder_is_read_back_a_bounded_piece_at_a_time() {
+    use crate::crypt::{BLOCK, STRIDE};
+    use weaver_graph::AGAIN_PIECE;
+
+    let file = payload(52, 2 * STRIDE as usize + 12_345);
+    let bytes = write(aes(), false, &[(None, Entry::File("large.bin", &file))]);
+    let mut owner = Owner::single(store(), bytes.clone());
+    owner.offer("not-the-passphrase");
+    owner.offer(PASSWORD);
+    owner.frames(0, 256 << 10);
+    owner.close(0);
+    no_trouble(&owner);
+    let again: Vec<ByteRange> = owner
+        .said
+        .iter()
+        .filter_map(|emit| match emit {
+            Emit::Again { range, .. } => Some(*range),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(again.len(), 1, "one folder, once");
+    assert!(again[0].len() > file.len() as u64, "the whole folder");
+    assert!(
+        owner.again_pieces as u64 > 2 * STRIDE / AGAIN_PIECE,
+        "{} pieces",
+        owner.again_pieces
+    );
+    assert!(owner.again_read_most > 0, "read back");
+    assert!(
+        owner.again_read_most <= AGAIN_PIECE,
+        "one read of {}",
+        owner.again_read_most
+    );
+    assert!(
+        owner.again_piece_most <= AGAIN_PIECE,
+        "one piece of {}",
+        owner.again_piece_most
+    );
+    assert!(
+        owner.again_sealed_most > AGAIN_PIECE,
+        "a seed lies behind a piece"
+    );
+    assert!(
+        owner.again_sealed_most <= STRIDE + AGAIN_PIECE + 2 * BLOCK,
+        "one piece enciphered {}",
+        owner.again_sealed_most
+    );
+    let got = owner.member("large.bin");
+    assert!(got.closed);
+    assert!(got.bytes == file, "byte-identical");
+    assert!(got.coverage.verified(ByteRange::new(0, file.len() as u64)));
+    assert_eq!(owner.held(), 0);
+    assert!(owner.posted(0).as_deref() == Some(bytes.as_slice()));
 }
 
 fn member_id(owner: &Owner, name: &str) -> MemberId {

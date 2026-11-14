@@ -652,6 +652,7 @@ fn assert_finished_counts(db: &Database) {
             completed_at: at,
             metadata: None,
             server_attribution: None,
+            archived_at: None,
         })
         .unwrap();
     }
@@ -1029,6 +1030,7 @@ fn assert_recovery_and_failure_causes(db: &Database) {
             completed_at: at,
             metadata: None,
             server_attribution: None,
+            archived_at: None,
         })
         .unwrap();
         if cause.is_some() {

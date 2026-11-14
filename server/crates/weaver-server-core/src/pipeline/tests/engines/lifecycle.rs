@@ -15,7 +15,7 @@ use super::super::{
     settle_inflight_moves, two_server_retention_client,
 };
 use super::harness::{
-    ARTICLE, JOB, Post, Scenario, admit, admit_with, collect, payload, serve_job,
+    ARTICLE, JOB, Post, Scenario, admit, admit_with, collect, par2_set, payload, serve_job,
 };
 use super::streams::xz;
 use crate::jobs::ids::JobId;
@@ -40,7 +40,7 @@ fn ended(pipeline: &Pipeline, job: JobId) -> bool {
 // Plays the server for `job` and runs its completion gate, a run's mail and
 // the moves it starts, as the orchestrator does, until `until` holds or the
 // job has ended. A round that changes nothing twice over is a stall.
-async fn drive(
+pub(super) async fn drive(
     pipeline: &mut Pipeline,
     scenario: &Scenario,
     job: JobId,
@@ -118,6 +118,11 @@ async fn history(pipeline: &mut Pipeline, job: JobId) -> crate::JobHistoryRow {
         .expect("the job is archived")
 }
 
+// Why the job's history row says it failed, `None` for a job that did not.
+fn failure_kind(pipeline: &Pipeline, job: JobId) -> Option<crate::history::HistoryFailureKind> {
+    pipeline.db.nzbget_history_states(&[job.0]).unwrap()[&job.0].failure_kind
+}
+
 // Admit the job the way a submission is admitted, so its durable candidate
 // row records the terminal cause the archive writes.
 fn admitted_job_id(pipeline: &Pipeline, spec: &crate::jobs::model::JobSpec) -> JobId {
@@ -144,31 +149,71 @@ fn admitted_job_id(pipeline: &Pipeline, spec: &crate::jobs::model::JobSpec) -> J
     job_id
 }
 
+// A second copy of the post `spec` names, posted again under other article
+// ids and admitted after it with a lower score: it waits, parked, for the
+// first to fail.
+fn parked_duplicate(pipeline: &Pipeline, spec: &crate::jobs::model::JobSpec) -> JobId {
+    let mut copy = spec.clone();
+    for (index, file) in copy.files.iter_mut().enumerate() {
+        for segment in &mut file.segments {
+            segment.message_ids = crate::jobs::MessageIds::new(vec![format!(
+                "copy-{index}-{}@example.com",
+                segment.ordinal
+            )]);
+        }
+    }
+    let request = crate::DuplicateAdmissionRequest {
+        evidence: crate::FingerprintEvidence::from_validated_spec(&copy, [61; 32]),
+        mode: crate::DuplicateMode::Score,
+        semantic: crate::SemanticDuplicate::from_source(&spec.name, 5),
+        semantic_source: Some(crate::SemanticCandidateSource {
+            nzb_zstd: sample_nzb_zstd(),
+            filename: Some(format!("{}.copy.nzb", spec.name)),
+            password: None,
+            category: None,
+            metadata: vec![],
+        }),
+        origin: crate::SubmissionOrigin::Api,
+        idempotency: None,
+        policy: crate::DuplicatePolicy::default(),
+    };
+    match pipeline.db.admit_duplicate_submission(&request).unwrap() {
+        crate::DuplicateAdmission::Parked { job_id, .. } => job_id,
+        outcome => panic!("the second copy must be parked, got {outcome:?}"),
+    }
+}
+
 // The last server that may serve the job refuses the pool's credentials: the
 // articles only it could serve are booked missing, not retried, and the job
-// fails for the server rather than for articles missing from Usenet.
-#[tokio::test]
-async fn the_last_server_refusing_credentials_fails_the_job() {
+// fails for want of them. Its cause is the missing articles, so its parked
+// duplicate is the one promoted next, and its reason names the server.
+// `servers` holds each server's retention in days; the last one refuses, and
+// with two the job is aged past the first one's retention.
+async fn the_last_server_refusing_credentials_fails_the_job(servers: &[u32], named: &str) {
     let scenario = Scenario::new(vec![Post::plain("payload.bin", payload(4 * ARTICLE, 1))]);
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    // Index 0 keeps five days of retention, index 1 everything; a job ten
-    // days old is index 1's alone, and index 1 refuses the credentials.
-    pipeline.nntp = std::sync::Arc::new(two_server_retention_client());
+    pipeline.nntp = std::sync::Arc::new(super::super::retention_client(servers));
+    let refusing = servers.len() - 1;
     let spec = scenario.spec();
     let job = admitted_job_id(&pipeline, &spec);
+    let duplicate = parked_duplicate(&pipeline, &spec);
     insert_active_job(&mut pipeline, job, spec).await;
-    age_job_days(&mut pipeline, job, 10);
-    pipeline.clear_job_retention_excludes(job);
-    assert_eq!(pipeline.job_retention_excludes(job).as_slice(), &[0]);
+    if refusing > 0 {
+        // Index 0 keeps five days of retention, index 1 everything; a job
+        // ten days old is index 1's alone.
+        age_job_days(&mut pipeline, job, 10);
+        pipeline.clear_job_retention_excludes(job);
+        assert_eq!(pipeline.job_retention_excludes(job), [0]);
+    }
     pipeline
         .nntp
         .pool()
         .health()
         .lock()
         .await
-        .record_failure(1, true);
-    assert!(pipeline.nntp.pool().refuses_credentials(1));
+        .record_failure(refusing, true);
+    assert!(pipeline.nntp.pool().refuses_credentials(refusing));
 
     // The first queued article is leased and answered with what the pool
     // says for it, the way a lane task answers it.
@@ -182,11 +227,12 @@ async fn the_last_server_refusing_credentials_fails_the_job() {
         .download_queue
         .pop()
         .unwrap();
+    let work = pipeline.dispatched(work);
     pipeline.hold_test_lane_works(vec![work.clone()], false);
-    let effective_exclude_servers = pipeline.effective_exclude_servers(job, &work.exclude_servers);
+    let effective_exclude_servers = pipeline.effective_exclude_servers(job, work.exclude_servers);
     let Err(error) = pipeline
         .nntp
-        .try_acquire_blocking_body_lane(&[], &effective_exclude_servers)
+        .try_acquire_blocking_body_lane(&[], effective_exclude_servers)
     else {
         panic!("a lane opened with no server that may serve the article");
     };
@@ -199,7 +245,7 @@ async fn the_last_server_refusing_credentials_fails_the_job() {
         server_modes: Vec::new(),
         completion_critical: false,
         effective_exclude_servers,
-        dial_exclude_servers: Vec::new(),
+        dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
         works: vec![work],
@@ -214,14 +260,25 @@ async fn the_last_server_refusing_credentials_fails_the_job() {
         &mut pending,
     );
     assert_eq!(pending.len(), 1, "the refused article takes the answer");
-    assert_eq!(pending[0].source_server_idx, Some(1));
+    assert_eq!(pending[0].source_server_idx, Some(refusing));
     for result in pending {
         pipeline.process_released_download_done(result).await;
     }
+    // The refused article is booked; it takes the post below its health, so
+    // the feed gives the post up and leaves the rest unasked, none retried.
     assert_eq!(
         pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
-        4,
-        "every article is booked, none retried"
+        1
+    );
+    assert_eq!(
+        pipeline
+            .segment_terminal_states
+            .values()
+            .filter(|state| **state == crate::pipeline::SegmentTerminalState::Unservable)
+            .count(),
+        1,
+        "the post has no recovery: its first loss gives it up, and the file's other articles \
+         are abandoned, not booked unservable"
     );
     assert_eq!(pipeline.pending_retries_by_job.get(&job).copied(), None);
     assert_eq!(pipeline.infrastructure_retries.len(), 0);
@@ -236,15 +293,573 @@ async fn the_last_server_refusing_credentials_fails_the_job() {
         "{:?}",
         job_status_for_assert(&pipeline, job)
     );
-    assert_eq!(history(&mut pipeline, job).await.status, "failed");
+    // The post's health counts the articles no server can bring, so the
+    // feed gives the post up: the job fails at its download, for health.
     assert_eq!(
-        pipeline
-            .db
-            .semantic_candidate_snapshot(job)
-            .unwrap()
-            .and_then(|candidate| candidate.terminal_cause),
-        Some(crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage)
+        pipeline.pipeline_failure_stages.get(&job).copied(),
+        Some(crate::post_processing::model::PipelineFailureStage::Download)
     );
+    let row = history(&mut pipeline, job).await;
+    assert_eq!(row.status, "failed");
+    let error = row.error_message.unwrap_or_default();
+    assert_eq!(
+        failure_kind(&pipeline, job),
+        Some(crate::history::HistoryFailureKind::Health),
+        "{error}"
+    );
+    assert!(!error.starts_with("no file was delivered whole"), "{error}");
+    assert!(
+        error.ends_with(&format!(
+            "; server {named} refuses the login and was never asked for the articles no \
+             other server had"
+        )),
+        "{error}"
+    );
+    let candidate = pipeline
+        .db
+        .semantic_candidate_snapshot(job)
+        .unwrap()
+        .expect("the job was admitted");
+    assert_eq!(
+        candidate.terminal_cause,
+        Some(crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth)
+    );
+    assert_eq!(
+        candidate.promotion_state,
+        crate::jobs::duplicate_persistence::SemanticPromotionState::Pending
+    );
+    // The refusing servers are let go with the job.
+    assert!(!pipeline.login_refusals.contains_key(&job));
+    // The pass that hands promoted copies to the queue takes the parked one.
+    let claims = pipeline.db.reconcile_semantic_promotion_claims(8).unwrap();
+    assert_eq!(
+        claims
+            .iter()
+            .map(|claim| (claim.trigger_job_id, claim.job_id))
+            .collect::<Vec<_>>(),
+        [(job, duplicate)]
+    );
+}
+
+#[tokio::test]
+async fn a_lone_server_refusing_credentials_fails_the_job_and_promotes_its_duplicate() {
+    the_last_server_refusing_credentials_fails_the_job(&[0], "retention-0.example.com:563").await;
+}
+
+#[tokio::test]
+async fn the_last_of_two_servers_refusing_credentials_fails_the_job_and_promotes_its_duplicate() {
+    the_last_server_refusing_credentials_fails_the_job(&[5, 0], "retention-1.example.com:563")
+        .await;
+}
+
+// A job whose recovery covers a lost article, with the payload's second
+// article answered "not found" by server 0. Server 1 refuses the login when
+// `refusing`, and is never asked; otherwise it answers "not found" too.
+async fn with_an_article_lost(
+    refusing: bool,
+) -> (
+    tempfile::TempDir,
+    Pipeline,
+    Scenario,
+    JobId,
+    crate::pipeline::SegmentId,
+) {
+    with_an_article_lost_by(refusing, false).await
+}
+
+// As [`with_an_article_lost`]; `at_once` books the article the moment no
+// server may serve it, server 0 having already said "not found" and server 1
+// refusing the login, as the queued work no server may fetch is booked.
+async fn with_an_article_lost_by(
+    refusing: bool,
+    at_once: bool,
+) -> (
+    tempfile::TempDir,
+    Pipeline,
+    Scenario,
+    JobId,
+    crate::pipeline::SegmentId,
+) {
+    let data = payload(4 * ARTICLE, 7);
+    let mut posts = vec![Post::plain("payload.bin", data.clone())];
+    posts.extend(par2_set("lantern", &[("payload.bin", &data)], 2));
+    let scenario = Scenario::new(posts);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    // Neither server's retention rules out a job posted now.
+    pipeline.nntp = std::sync::Arc::new(two_server_retention_client());
+    let spec = scenario.spec();
+    let job = admitted_job_id(&pipeline, &spec);
+    insert_active_job(&mut pipeline, job, spec).await;
+    pipeline.active_download_passes.insert(job);
+    if refusing {
+        pipeline
+            .nntp
+            .pool()
+            .health()
+            .lock()
+            .await
+            .record_failure(1, true);
+    }
+
+    // The payload's second article is taken off the queue and answered "not
+    // found" by server 0, the way a lane answers it.
+    let lost = crate::pipeline::SegmentId {
+        file_id: crate::jobs::ids::NzbFileId {
+            job_id: job,
+            file_index: 0,
+        },
+        segment_number: 1,
+    };
+    let queued = pipeline
+        .jobs
+        .get_mut(&job)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .drain_all();
+    let mut work = None;
+    for queued in pipeline.dispatched_all(queued) {
+        if queued.segment_id == lost {
+            work = Some(queued);
+        } else {
+            pipeline
+                .jobs
+                .get_mut(&job)
+                .unwrap()
+                .articles
+                .active_mut()
+                .unwrap()
+                .download_queue
+                .push(queued);
+        }
+    }
+    let mut work = work.expect("the payload's second article is queued");
+    if at_once {
+        assert!(refusing);
+        work.exclude_servers.insert(0);
+        pipeline.book_unservable_work(&work);
+        return (temp_dir, pipeline, scenario, job, lost);
+    }
+    let (retry_count, mut exclude_servers) = (work.retry_count, work.exclude_servers);
+    pipeline.hold_test_lane_works(vec![work], false);
+    // With no server refusing, server 1 has already said "not found".
+    if !refusing {
+        exclude_servers.insert(1);
+    }
+    pipeline
+        .handle_download_done(DownloadResult {
+            lane_id: 0,
+            job_id: job,
+            runtime_generation: pipeline.pool_generation,
+            segment_id: lost,
+            data: Err(crate::pipeline::DownloadError::fetch(
+                crate::pipeline::DownloadFailureKind::ArticleNotFound,
+                "430 no such article",
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(0),
+            origin: crate::pipeline::DownloadResultOrigin::NormalPrimary,
+            retry_count,
+            exclude_servers,
+            release_connection_slot: true,
+        })
+        .await;
+    (temp_dir, pipeline, scenario, job, lost)
+}
+
+// An article fails once on its server, with a refused login or a broken
+// connection, is retried and served. The job later fails on its password:
+// the failure the article was retried past is not the job's cause, the
+// password is, and the next duplicate is promoted.
+#[tokio::test]
+async fn a_password_failure_after_an_article_served_past_a_server_failure_promotes_the_duplicate() {
+    for kind in [
+        crate::pipeline::DownloadFailureKind::Auth,
+        crate::pipeline::DownloadFailureKind::EstablishedTransport,
+    ] {
+        let scenario = Scenario::new(vec![Post::plain("payload.bin", payload(4 * ARTICLE, 3))]);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        pipeline.nntp = std::sync::Arc::new(two_server_retention_client());
+        let spec = scenario.spec();
+        let job = admitted_job_id(&pipeline, &spec);
+        let duplicate = parked_duplicate(&pipeline, &spec);
+        insert_active_job(&mut pipeline, job, spec).await;
+        pipeline.active_download_passes.insert(job);
+        let work = pipeline
+            .jobs
+            .get_mut(&job)
+            .unwrap()
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .pop()
+            .unwrap();
+        let work = pipeline.dispatched(work);
+        let (segment_id, retry_count, exclude_servers) =
+            (work.segment_id, work.retry_count, work.exclude_servers);
+        pipeline.hold_test_lane_works(vec![work], false);
+        pipeline
+            .handle_download_done(DownloadResult {
+                lane_id: 0,
+                job_id: job,
+                runtime_generation: pipeline.pool_generation,
+                segment_id,
+                data: Err(crate::pipeline::DownloadError::fetch(
+                    kind,
+                    "the server failed",
+                )),
+                attempts: Vec::new(),
+                lane_observation: None,
+                source_server_idx: Some(0),
+                origin: crate::pipeline::DownloadResultOrigin::NormalPrimary,
+                retry_count,
+                exclude_servers,
+                release_connection_slot: true,
+            })
+            .await;
+        assert!(
+            !pipeline.segment_terminal_states.contains_key(&segment_id),
+            "{kind:?}: the article is retried, not booked"
+        );
+        // The retry is served.
+        serve_job(
+            &mut pipeline,
+            job,
+            &scenario,
+            (segment_id.file_id.file_index, segment_id.segment_number),
+        )
+        .await;
+
+        let reason = format!(
+            "{}the password is wrong",
+            crate::pipeline::extraction::error::PASSWORD_REQUIRED_MARKER
+        );
+        pipeline.jobs.get_mut(&job).unwrap().status = JobStatus::Extracting;
+        pipeline.fail_job(job, reason.clone());
+        let (error, cause, promotion) = failed_record(&mut pipeline, job).await;
+        assert_eq!(error.as_deref(), Some(reason.as_str()), "{kind:?}");
+        assert_eq!(
+            cause,
+            Some(crate::jobs::SemanticTerminalCause::PasswordFailure),
+            "{kind:?}"
+        );
+        assert_eq!(
+            promotion,
+            crate::jobs::duplicate_persistence::SemanticPromotionState::Pending,
+            "{kind:?}"
+        );
+        let claims = pipeline.db.reconcile_semantic_promotion_claims(8).unwrap();
+        assert_eq!(
+            claims
+                .iter()
+                .map(|claim| (claim.trigger_job_id, claim.job_id))
+                .collect::<Vec<_>>(),
+            [(job, duplicate)],
+            "{kind:?}"
+        );
+    }
+}
+
+// An article server 0 does not hold under its first id, whose other server
+// refuses the login, moves to its second id, and server 0 serves it. The job
+// later fails on its password: the refusal ended no article, so the password
+// is the job's cause and the next duplicate is promoted.
+#[tokio::test]
+async fn a_password_failure_after_an_article_moved_past_a_refusing_server_promotes_the_duplicate() {
+    let scenario = Scenario::new(vec![Post::plain("payload.bin", payload(4 * ARTICLE, 4))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(two_server_retention_client());
+    let mut spec = scenario.spec();
+    for segment in &mut spec.files[0].segments {
+        let first = segment.message_ids.in_use().to_string();
+        segment.message_ids =
+            crate::jobs::MessageIds::new(vec![first.clone(), format!("again-{first}")]);
+    }
+    let job = admitted_job_id(&pipeline, &spec);
+    let duplicate = parked_duplicate(&pipeline, &spec);
+    insert_active_job(&mut pipeline, job, spec).await;
+    pipeline.active_download_passes.insert(job);
+    pipeline
+        .nntp
+        .pool()
+        .health()
+        .lock()
+        .await
+        .record_failure(1, true);
+    let work = pipeline
+        .jobs
+        .get_mut(&job)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
+    let work = pipeline.dispatched(work);
+    let (segment_id, retry_count) = (work.segment_id, work.retry_count);
+    // Server 0 has said "not found" under the first id.
+    let mut exclude_servers = work.exclude_servers;
+    exclude_servers.insert(0);
+    pipeline.hold_test_lane_works(vec![work], false);
+    pipeline
+        .handle_download_done(DownloadResult {
+            lane_id: 0,
+            job_id: job,
+            runtime_generation: pipeline.pool_generation,
+            segment_id,
+            data: Err(crate::pipeline::DownloadError::fetch(
+                crate::pipeline::DownloadFailureKind::Auth,
+                "481 authentication failed",
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(1),
+            origin: crate::pipeline::DownloadResultOrigin::NormalPrimary,
+            retry_count,
+            exclude_servers,
+            release_connection_slot: true,
+        })
+        .await;
+    assert!(
+        !pipeline.segment_terminal_states.contains_key(&segment_id),
+        "the article moves to its next id, not booked"
+    );
+    assert!(!pipeline.message_id_left(segment_id));
+    serve_job(
+        &mut pipeline,
+        job,
+        &scenario,
+        (segment_id.file_id.file_index, segment_id.segment_number),
+    )
+    .await;
+
+    let reason = format!(
+        "{}the password is wrong",
+        crate::pipeline::extraction::error::PASSWORD_REQUIRED_MARKER
+    );
+    pipeline.jobs.get_mut(&job).unwrap().status = JobStatus::Extracting;
+    pipeline.fail_job(job, reason.clone());
+    let (error, cause, promotion) = failed_record(&mut pipeline, job).await;
+    assert_eq!(error.as_deref(), Some(reason.as_str()));
+    assert_eq!(
+        cause,
+        Some(crate::jobs::SemanticTerminalCause::PasswordFailure)
+    );
+    assert_eq!(
+        promotion,
+        crate::jobs::duplicate_persistence::SemanticPromotionState::Pending
+    );
+    let claims = pipeline.db.reconcile_semantic_promotion_claims(8).unwrap();
+    assert_eq!(
+        claims
+            .iter()
+            .map(|claim| (claim.trigger_job_id, claim.job_id))
+            .collect::<Vec<_>>(),
+        [(job, duplicate)]
+    );
+}
+
+// What a failed job's record holds: its reason, its cause and whether a
+// duplicate of it is promoted.
+async fn failed_record(
+    pipeline: &mut Pipeline,
+    job: JobId,
+) -> (
+    Option<String>,
+    Option<crate::jobs::SemanticTerminalCause>,
+    crate::jobs::duplicate_persistence::SemanticPromotionState,
+) {
+    let row = history(pipeline, job).await;
+    assert_eq!(row.status, "failed");
+    let candidate = pipeline
+        .db
+        .semantic_candidate_snapshot(job)
+        .unwrap()
+        .expect("the job was admitted");
+    (
+        row.error_message,
+        candidate.terminal_cause,
+        candidate.promotion_state,
+    )
+}
+
+// A job with an article a refusing server was never asked for, failed in
+// `stage` for `reason`, against the same job with no server refusing. With
+// `at_once` the refused article is booked the moment no server may serve it.
+async fn failed_past_a_refusal_and_without(
+    stage: JobStatus,
+    reason: &str,
+    at_once: bool,
+) -> [(
+    Option<String>,
+    Option<crate::jobs::SemanticTerminalCause>,
+    crate::jobs::duplicate_persistence::SemanticPromotionState,
+); 2] {
+    let mut records = Vec::new();
+    for refusing in [true, false] {
+        let (_temp_dir, mut pipeline, _, job, _) =
+            with_an_article_lost_by(refusing, at_once && refusing).await;
+        assert_eq!(pipeline.login_refusal_words(job).is_some(), refusing);
+        pipeline.jobs.get_mut(&job).unwrap().status = stage.clone();
+        pipeline.fail_job(job, reason.to_string());
+        records.push(failed_record(&mut pipeline, job).await);
+    }
+    records.try_into().unwrap()
+}
+
+// A failure in `stage` for `reason` past a refusing server, the article
+// booked either way, ends as it does with no server refusing: the same
+// reason with nothing added, the same cause, and a duplicate promoted. The
+// typed cause is the last one an article's failure recorded, the missing
+// article, as it is on a job no server refuses; the history row reads a
+// password failure from the reason.
+async fn a_failure_past_a_refusing_server_keeps_its_own_cause_and_promotion(
+    stage: JobStatus,
+    reason: &str,
+) {
+    for at_once in [false, true] {
+        let [refused, plain] =
+            failed_past_a_refusal_and_without(stage.clone(), reason, at_once).await;
+        assert_eq!(refused, plain, "at once: {at_once}");
+        assert_eq!(refused.0.as_deref(), Some(reason));
+        assert_eq!(
+            refused.1,
+            Some(crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth)
+        );
+        assert_eq!(
+            refused.2,
+            crate::jobs::duplicate_persistence::SemanticPromotionState::Pending
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_wrong_password_past_a_refusing_server_keeps_its_own_cause_and_promotion() {
+    let reason = format!(
+        "{}the password is wrong",
+        crate::pipeline::extraction::error::PASSWORD_REQUIRED_MARKER
+    );
+    a_failure_past_a_refusing_server_keeps_its_own_cause_and_promotion(
+        JobStatus::Extracting,
+        &reason,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_failed_repair_past_a_refusing_server_keeps_its_own_cause_and_promotion() {
+    a_failure_past_a_refusing_server_keeps_its_own_cause_and_promotion(
+        JobStatus::Repairing,
+        "repair failed: not enough recovery blocks",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_failed_unpack_past_a_refusing_server_keeps_its_own_cause_and_promotion() {
+    a_failure_past_a_refusing_server_keeps_its_own_cause_and_promotion(
+        JobStatus::Extracting,
+        "extraction failed: the archive is damaged",
+    )
+    .await;
+}
+
+// The job failing for want of articles names the refusing server. Its cause
+// is still the missing articles, the servers asked having said so, and a
+// duplicate is promoted, as with no server refusing.
+#[tokio::test]
+async fn a_failure_for_want_of_articles_past_a_refusing_server_names_it() {
+    let mut records = Vec::new();
+    for refusing in [true, false] {
+        let (_temp_dir, mut pipeline, _, job, _) = with_an_article_lost(refusing).await;
+        pipeline.fail_job_on_health(job, "the post cannot complete".to_string());
+        records.push(failed_record(&mut pipeline, job).await);
+    }
+    assert_eq!(
+        records[0],
+        (
+            Some(
+                "the post cannot complete; server retention-1.example.com:563 refuses the login and \
+                 was never asked for the articles no other server had"
+                    .to_string()
+            ),
+            Some(crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth),
+            crate::jobs::duplicate_persistence::SemanticPromotionState::Pending
+        )
+    );
+    assert_eq!(
+        records[1],
+        (
+            Some("the post cannot complete".to_string()),
+            Some(crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth),
+            crate::jobs::duplicate_persistence::SemanticPromotionState::Pending
+        )
+    );
+}
+
+// A job its recovery covers. One payload article is not on the server asked,
+// and the other server refuses the login and is never asked: the article is
+// booked unservable, the set rebuilds it, and the job completes whole, with
+// no failure and no refusal in its record. Booked the moment no server may
+// serve it, it is booked unservable alone and the job completes the same.
+#[tokio::test]
+async fn a_job_its_recovery_covers_completes_past_an_article_a_refusing_server_never_served() {
+    for (at_once, booked) in [
+        (
+            false,
+            crate::pipeline::SegmentTerminalState::UnservableNotFound,
+        ),
+        (true, crate::pipeline::SegmentTerminalState::Unservable),
+    ] {
+        let (_temp_dir, mut pipeline, scenario, job, lost) =
+            with_an_article_lost_by(true, at_once).await;
+        assert_eq!(
+            pipeline.segment_terminal_states.get(&lost).copied(),
+            Some(booked)
+        );
+        assert!(pipeline.login_refusal_words(job).is_some());
+
+        drive(&mut pipeline, &scenario, job, |_| false).await;
+
+        let row = history(&mut pipeline, job).await;
+        assert_eq!(row.status, "complete");
+        assert_eq!(row.error_message, None);
+        assert_eq!(failure_kind(&pipeline, job), None);
+        assert!(!pipeline.login_refusals.contains_key(&job));
+        assert_eq!(
+            pipeline
+                .db
+                .semantic_candidate_snapshot(job)
+                .unwrap()
+                .and_then(|candidate| candidate.terminal_cause),
+            Some(crate::jobs::SemanticTerminalCause::Success)
+        );
+        // The cause the booked article recorded goes with the job: run again
+        // under the same id and failed on its password, the job's cause is
+        // its own.
+        assert!(!pipeline.semantic_terminal_causes.contains_key(&job));
+        insert_active_job(&mut pipeline, job, scenario.spec()).await;
+        let reason = format!(
+            "{}the password is wrong",
+            crate::pipeline::extraction::error::PASSWORD_REQUIRED_MARKER
+        );
+        pipeline.jobs.get_mut(&job).unwrap().status = JobStatus::Extracting;
+        pipeline.fail_job(job, reason.clone());
+        let (error, cause, _) = failed_record(&mut pipeline, job).await;
+        assert_eq!(error.as_deref(), Some(reason.as_str()));
+        assert_eq!(
+            cause,
+            Some(crate::jobs::SemanticTerminalCause::PasswordFailure)
+        );
+    }
 }
 
 // A queue script subscribed to NZB_DOWNLOADED: the job's last decode brings

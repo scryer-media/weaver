@@ -116,6 +116,16 @@ impl Kept {
         self.generation
     }
 
+    // How many bytes the pieces hold, and how many they have allocated.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> (usize, usize) {
+        self.pieces
+            .values()
+            .fold((0, 0), |(held, allocated), piece| {
+                (held + piece.bytes.len(), allocated + piece.bytes.capacity())
+            })
+    }
+
     pub(crate) fn want(&mut self, range: ByteRange) {
         if range.is_empty() {
             return;

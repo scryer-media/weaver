@@ -179,7 +179,7 @@ impl Volumes for Gate {
 }
 
 // What a run said, with each member's bytes joined in order.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Said {
     Member(u32, String, Option<u64>),
     Bytes(u32, Vec<u8>),
@@ -290,7 +290,7 @@ fn a_zip_extracts_its_files_in_directory_order_and_skips_the_rest() {
 }
 
 #[test]
-fn a_directory_larger_than_the_run_memory_budget_is_refused() {
+fn a_directory_opens_whatever_memory_the_run_is_granted() {
     let mut emits = Vec::new();
     let mut sink = |emit| {
         emits.push(emit);
@@ -304,27 +304,184 @@ fn a_directory_larger_than_the_run_memory_budget_is_refused() {
             ..Default::default()
         },
     );
-    assert!(matches!(emits.as_slice(), [Emit::Refuse(Why::Unsupported)]));
+    assert_eq!(said(&emits), plain_said());
 }
 
 #[test]
-fn a_lying_directory_size_cannot_bypass_the_memory_limit() {
+fn a_directory_size_of_one_byte_is_refused() {
     let mut archive = plain();
     let end = records::find_end(&archive).unwrap().at as usize;
     archive[end + 12..end + 16].copy_from_slice(&1u32.to_le_bytes());
-    let mut emits = Vec::new();
-    ZipEngine::new().start().run(
-        Gate::whole(vec![archive]),
-        &mut |emit| {
-            emits.push(emit);
-            true
-        },
-        weaver_graph::Budget {
-            memory_bytes: Some(8),
-            ..Default::default()
-        },
+    assert_eq!(
+        run(&mut ZipEngine::new(), vec![archive]),
+        vec![Said::Refuse(Why::Unsupported)]
     );
-    assert!(matches!(emits.as_slice(), [Emit::Refuse(_)]));
+}
+
+// The archive with its end record's fields at `at` set to `value`, each
+// `width` bytes, wherever the end record is.
+fn ended(mut archive: Vec<u8>, fields: &[(usize, u64, usize)]) -> Vec<u8> {
+    let end = records::find_end(&archive).unwrap().at as usize;
+    for &(at, value, width) in fields {
+        archive[end + at..end + at + width].copy_from_slice(&value.to_le_bytes()[..width]);
+    }
+    archive
+}
+
+// What a run said of an archive, and the most it held reading a directory.
+fn run_held(archive: Vec<u8>) -> (Vec<Said>, usize) {
+    super::image::peak::take();
+    let said = run(&mut ZipEngine::new(), vec![archive]);
+    (said, super::image::peak::take())
+}
+
+#[test]
+fn a_stated_directory_size_holds_no_more_than_the_bytes_read() {
+    let refused = vec![Said::Refuse(Why::Unsupported)];
+    // Past the bytes before the end record: nothing is read or held.
+    let huge = ended(plain(), &[(12, u64::from(u32::MAX - 1), 4)]);
+    assert_eq!(run_held(huge), (refused.clone(), 0));
+    // Over three MiB of stored member stated as the directory: the read
+    // ends at the first entry that is none, a piece in.
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    writer.start_file("big.bin", stored).unwrap();
+    writer.write_all(&payload(4, 3 << 20)).unwrap();
+    let archive = writer.finish().unwrap().into_inner();
+    let end = records::find_end(&archive).unwrap();
+    let whole = ended(archive, &[(12, end.at, 4), (16, 0, 4)]);
+    let (said, held) = run_held(whole.clone());
+    assert_eq!(said, refused);
+    assert!(held > 0);
+    assert!(
+        held <= (1 << 20) + records::CENTRAL_LEN + 3 * u16::MAX as usize,
+        "held {held} of a {} byte archive",
+        whole.len()
+    );
+}
+
+#[test]
+fn a_stated_entry_count_holds_no_more_than_the_entries_read() {
+    let refused = vec![Said::Refuse(Why::Unsupported)];
+    let directory = records::find_end(&plain()).unwrap().size as usize;
+    let narrow = ended(plain(), &[(8, 0xfffe, 2), (10, 0xfffe, 2)]);
+    let (said, held) = run_held(narrow);
+    assert_eq!(said, refused);
+    assert!(held <= 3 * directory, "held {held} of {directory}");
+    // A zip64 record counting every entry there can be.
+    let mut wide = plain();
+    let mut record = 0;
+    zip64_end(&mut wide, 1, |said| record = said.record as usize);
+    for at in [24, 32] {
+        wide[record + at..record + at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+    }
+    let (said, held) = run_held(wide);
+    assert_eq!(said, refused);
+    assert!(held <= 3 * directory, "held {held} of {directory}");
+}
+
+// What the zip library names an archive's entries, in directory order.
+fn library_names(archive: &[u8]) -> Vec<String> {
+    let mut archive = ZipArchive::new(Cursor::new(archive)).unwrap();
+    (0..archive.len())
+        .map(|index| {
+            archive
+                .by_index_raw(index)
+                .unwrap()
+                .name()
+                .unwrap()
+                .into_owned()
+        })
+        .collect()
+}
+
+fn said_names(said: &[Said]) -> Vec<String> {
+    said.iter()
+        .filter_map(|said| match said {
+            Said::Member(_, name, _) => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_directory_of_more_than_eight_mib_extracts_every_entry() {
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    for index in 0..129 {
+        writer.start_file(format!("f{index:03}"), stored).unwrap();
+        writer.write_all(&payload(index, 10)).unwrap();
+    }
+    let original = writer.finish().unwrap().into_inner();
+    // Each entry carries the longest comment it can, as the directory's.
+    let end = records::find_end(&original).unwrap();
+    let offset = end.offset as usize;
+    let directory = &original[offset..offset + end.size as usize];
+    let comment = vec![b'x'; u16::MAX as usize];
+    let mut archive = original[..offset].to_vec();
+    for central in records::directory(directory, end.entries).unwrap() {
+        let mut record = directory[central.span].to_vec();
+        record[32..34].copy_from_slice(&u16::MAX.to_le_bytes());
+        archive.extend(record);
+        archive.extend(&comment);
+    }
+    let size = archive.len() - offset;
+    assert!(size > 8 << 20);
+    let mut ending = original[offset + end.size as usize..].to_vec();
+    ending[12..16].copy_from_slice(&u32::try_from(size).unwrap().to_le_bytes());
+    archive.extend(ending);
+    let said = run(&mut ZipEngine::new(), vec![archive.clone()]);
+    assert_eq!(said_names(&said), library_names(&archive));
+    for index in 0..129u32 {
+        assert!(said.contains(&Said::Bytes(index, payload(u64::from(index), 10))));
+        assert!(said.contains(&Said::Closed(index)));
+    }
+    assert!(!said.iter().any(|said| matches!(said, Said::Refuse(_))));
+}
+
+#[test]
+fn a_directory_of_more_than_a_narrow_count_of_entries_extracts_every_entry() {
+    const ENTRIES: u32 = 70_000;
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    for index in 0..ENTRIES {
+        writer.start_file(format!("{index:05x}"), stored).unwrap();
+    }
+    let archive = writer.finish().unwrap().into_inner();
+    let end = records::find_end(&archive).unwrap();
+    assert!(end.wide, "the count needs zip64 records");
+    let said = run(&mut ZipEngine::new(), vec![archive.clone()]);
+    let names = said_names(&said);
+    assert_eq!(names.len(), ENTRIES as usize);
+    assert_eq!(names, library_names(&archive));
+    assert_eq!(said.last(), Some(&Said::Closed(ENTRIES - 1)));
+    assert!(!said.iter().any(|said| matches!(said, Said::Refuse(_))));
+}
+
+#[test]
+fn a_directory_read_a_piece_at_a_time_is_the_one_read_whole() {
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    // Names long enough that entries straddle the pieces.
+    for index in 0..40_000u32 {
+        let name = format!("{index:05}-{}", "n".repeat((index % 300) as usize));
+        writer.start_file(name, stored).unwrap();
+    }
+    let archive = writer.finish().unwrap().into_inner();
+    let end = records::find_end(&archive).unwrap();
+    assert!(end.size > 3 << 20);
+    let directory = &archive[end.offset as usize..(end.offset + end.size) as usize];
+    let whole = super::image::rewrite(directory, &end, end.offset, &|disk| {
+        (disk == 0).then_some(0)
+    })
+    .unwrap();
+    let length = archive.len() as u64;
+    let joined = crate::engine::Joined::new(Gate::whole(vec![archive]));
+    let disks = super::image::Disks::new(&joined, vec![(VolumeIndex(0), length)]);
+    let pieces =
+        super::image::read_rewritten(&disks, end.offset, &end, &|disk| (disk == 0).then_some(0))
+            .unwrap();
+    assert_eq!(pieces, Some(whole));
 }
 
 #[test]
@@ -779,10 +936,7 @@ fn run_far(set: Sparse) -> Vec<Said> {
 // The rewritten directory, as the store's own reader reads it, for a set
 // whose image opens.
 fn rewritten(set: Sparse) -> Vec<records::Central> {
-    let image = match super::image::Image::open(
-        crate::engine::Joined::new(Arc::new(set)),
-        &weaver_graph::Budget::default(),
-    ) {
+    let image = match super::image::Image::open(crate::engine::Joined::new(Arc::new(set))) {
         Ok(image) => image,
         Err(_) => panic!("the set opens as an image"),
     };

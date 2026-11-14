@@ -21,7 +21,7 @@ fn history_snapshot(speed: u64, bytes_downloaded: u64) -> MetricsSnapshot {
         bytes_decoded: bytes_downloaded / 2,
         bytes_committed: bytes_downloaded / 3,
         download_queue_depth: 1,
-        active_downloads: 0,
+        articles_in_flight: 0,
         active_decodes: 0,
         decode_pending: 0,
         decode_pending_bytes: 0,

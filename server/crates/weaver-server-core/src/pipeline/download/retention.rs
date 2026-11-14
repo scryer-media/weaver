@@ -123,30 +123,36 @@ impl Pipeline {
     // post age. These servers are skipped for the job's articles without a
     // network attempt, carry no health penalty, and count toward
     // per-article exhaustion.
-    pub(in crate::pipeline) fn job_retention_excludes(&mut self, job_id: JobId) -> Arc<Vec<usize>> {
+    pub(in crate::pipeline) fn job_retention_excludes(
+        &mut self,
+        job_id: JobId,
+    ) -> weaver_nntp::ServerSet {
         let now = Instant::now();
         if let Some((computed_at, excludes)) = self.job_retention_exclude_cache.get(&job_id)
             && now.duration_since(*computed_at) < JOB_RETENTION_EXCLUDES_TTL
         {
-            return Arc::clone(excludes);
+            return *excludes;
         }
-        let excludes = Arc::new(self.compute_job_retention_excludes(job_id));
+        let excludes = self.compute_job_retention_excludes(job_id);
         self.job_retention_exclude_cache
-            .insert(job_id, (now, Arc::clone(&excludes)));
+            .insert(job_id, (now, excludes));
         excludes
     }
 
-    pub(in crate::pipeline) fn compute_job_retention_excludes(&self, job_id: JobId) -> Vec<usize> {
+    pub(in crate::pipeline) fn compute_job_retention_excludes(
+        &self,
+        job_id: JobId,
+    ) -> weaver_nntp::ServerSet {
         let retention_days = self.nntp.pool().server_retention_days();
         if retention_days.iter().all(|days| *days == 0) {
-            return Vec::new();
+            return weaver_nntp::ServerSet::EMPTY;
         }
         let Some(posted_at) = self
             .jobs
             .get(&job_id)
             .and_then(|state| Self::job_posted_at_epoch(&state.spec))
         else {
-            return Vec::new();
+            return weaver_nntp::ServerSet::EMPTY;
         };
         let now_epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -161,28 +167,6 @@ impl Pipeline {
             .collect()
     }
 
-    // Set union of two exclusion lists, order-preserving and duplicate-free.
-    // Small sets (one entry per configured server at most), so the linear
-    // membership scan is cheaper than any set type.
-    pub(in crate::pipeline) fn union_exclude_servers(
-        first: &[usize],
-        second: &[usize],
-    ) -> Vec<usize> {
-        let mut merged = first.to_vec();
-        Self::extend_exclude_servers(&mut merged, second);
-        merged
-    }
-
-    // [`Self::union_exclude_servers`] into a list the caller already owns,
-    // so a result that owns its work's ledger reuses that ledger's buffer.
-    pub(in crate::pipeline) fn extend_exclude_servers(merged: &mut Vec<usize>, more: &[usize]) {
-        for idx in more {
-            if !merged.contains(idx) {
-                merged.push(*idx);
-            }
-        }
-    }
-
     // Union of a work item's failure exclusions and the job's retention
     // exclusions — the effective exclude set for server ordering. Failure
     // excludes stay per-article on the work item; retention excludes stay
@@ -191,19 +175,9 @@ impl Pipeline {
     pub(in crate::pipeline) fn effective_exclude_servers(
         &mut self,
         job_id: JobId,
-        failure_excludes: &[usize],
-    ) -> Vec<usize> {
-        let retention = self.job_retention_excludes(job_id);
-        if retention.is_empty() {
-            return failure_excludes.to_vec();
-        }
-        let mut merged = failure_excludes.to_vec();
-        for idx in retention.iter() {
-            if !merged.contains(idx) {
-                merged.push(*idx);
-            }
-        }
-        merged
+        failure_excludes: weaver_nntp::ServerSet,
+    ) -> weaver_nntp::ServerSet {
+        failure_excludes.union(self.job_retention_excludes(job_id))
     }
 
     // Number of distinct, currently-valid pool indices unavailable to this
@@ -214,16 +188,16 @@ impl Pipeline {
     pub(in crate::pipeline) fn unavailable_server_count(
         &mut self,
         job_id: JobId,
-        failure_excludes: &[usize],
+        failure_excludes: weaver_nntp::ServerSet,
     ) -> usize {
         let retention = self.job_retention_excludes(job_id);
-        Self::unavailable_server_count_from_excludes(self.nntp.pool(), failure_excludes, &retention)
+        Self::unavailable_server_count_from_excludes(self.nntp.pool(), failure_excludes, retention)
     }
 
     pub(in crate::pipeline) fn unavailable_server_count_from_excludes(
         pool: &weaver_nntp::NntpPool,
-        failure_excludes: &[usize],
-        retention_excludes: &[usize],
+        failure_excludes: weaver_nntp::ServerSet,
+        retention_excludes: weaver_nntp::ServerSet,
     ) -> usize {
         (0..pool.server_count())
             .filter(|idx| !Self::server_may_serve(pool, *idx, failure_excludes, retention_excludes))
@@ -244,11 +218,11 @@ impl Pipeline {
     pub(in crate::pipeline) fn server_may_serve(
         pool: &weaver_nntp::NntpPool,
         idx: usize,
-        failure_excludes: &[usize],
-        retention_excludes: &[usize],
+        failure_excludes: weaver_nntp::ServerSet,
+        retention_excludes: weaver_nntp::ServerSet,
     ) -> bool {
-        !failure_excludes.contains(&idx)
-            && !retention_excludes.contains(&idx)
+        !failure_excludes.contains(idx)
+            && !retention_excludes.contains(idx)
             && !pool.refuses_credentials(idx)
             && (!pool.is_backfill(idx)
                 || pool.backfill_open_for(failure_excludes, retention_excludes))
@@ -261,7 +235,7 @@ impl Pipeline {
     pub(in crate::pipeline) fn no_server_can_serve(
         &mut self,
         job_id: JobId,
-        failure_excludes: &[usize],
+        failure_excludes: weaver_nntp::ServerSet,
     ) -> bool {
         let server_count = self.nntp.pool().server_count();
         server_count > 0 && self.unavailable_server_count(job_id, failure_excludes) >= server_count
@@ -273,16 +247,16 @@ impl Pipeline {
     // downloading forever with nothing in flight.
     //
     // When a server refusing this pool's credentials is among those that
-    // would otherwise serve it, the refusal is why: the job's terminal cause
-    // says so, not that the article is missing from Usenet.
+    // would otherwise serve it, the refusal is why: the job keeps which
+    // server refused, and its failure for want of articles says so.
     pub(in crate::pipeline) fn book_unservable_work(&mut self, work: &DownloadWork) {
-        self.book_unservable_segment(work.segment_id, &work.exclude_servers);
+        self.book_unservable_segment(work.segment_id, work.exclude_servers);
     }
 
     pub(in crate::pipeline) fn book_unservable_segment(
         &mut self,
         segment_id: SegmentId,
-        exclude_servers: &[usize],
+        exclude_servers: weaver_nntp::ServerSet,
     ) {
         self.book_unservable_segment_logged(segment_id, exclude_servers, true);
     }
@@ -293,24 +267,78 @@ impl Pipeline {
     fn book_unservable_segment_logged(
         &mut self,
         segment_id: SegmentId,
-        exclude_servers: &[usize],
+        exclude_servers: weaver_nntp::ServerSet,
         warn_per_article: bool,
-    ) -> Vec<usize> {
-        // The id in use failed on every server it may use. When the NZB gave
-        // the part another id, the article moves to it instead of being booked.
-        if self.spend_message_id(segment_id) {
-            return Vec::new();
+    ) -> weaver_nntp::ServerSet {
+        #[cfg(test)]
+        {
+            let (depth, deepest) = &mut self.unservable_booking_depth;
+            *depth += 1;
+            *deepest = (*deepest).max(*depth);
         }
+        let refused_by =
+            self.book_unservable_segment_inner(segment_id, exclude_servers, warn_per_article);
+        #[cfg(test)]
+        {
+            self.unservable_booking_depth.0 -= 1;
+        }
+        refused_by
+    }
+
+    fn book_unservable_segment_inner(
+        &mut self,
+        segment_id: SegmentId,
+        exclude_servers: weaver_nntp::ServerSet,
+        warn_per_article: bool,
+    ) -> weaver_nntp::ServerSet {
+        // The id in use failed on every server it may use. When the NZB gave
+        // the part another id, the article moves to it instead of being
+        // booked. An id no server may serve either is spent the same way, one
+        // turn of this loop per id, until an id is queued or none is left.
         let job_id = segment_id.file_id.job_id;
-        let retention = self.job_retention_excludes(job_id);
-        let pool = self.nntp.pool();
-        let refused_by = (0..pool.server_count())
-            .filter(|idx| {
-                !exclude_servers.contains(idx)
-                    && !retention.contains(idx)
-                    && pool.refuses_credentials(*idx)
-            })
-            .collect::<Vec<_>>();
+        let mut unservable: Option<DownloadWork> = None;
+        while let Some(work) = self.spend_message_id_for_work(segment_id) {
+            match self.enqueue_servable_download_work(work) {
+                Some(work) => unservable = Some(work),
+                None => {
+                    self.update_queue_metrics();
+                    if unservable.is_some() {
+                        self.finish_spent_message_ids(job_id);
+                    }
+                    return weaver_nntp::ServerSet::EMPTY;
+                }
+            }
+        }
+        let Some(work) = unservable else {
+            return self.book_unservable_article(segment_id, exclude_servers, warn_per_article);
+        };
+        // The last id is booked as the article's own requeue is: with the
+        // exclusions that work carried, warned per article.
+        self.book_unservable_article(segment_id, work.exclude_servers, true);
+        self.finish_spent_message_ids(job_id);
+        weaver_nntp::ServerSet::EMPTY
+    }
+
+    // What follows an article that spent ids no server could serve, once it
+    // is queued or booked: the queue metrics and the download pass are
+    // brought up to date. Both answer the same however often they are asked
+    // in a row, so once covers every id spent.
+    fn finish_spent_message_ids(&mut self, job_id: JobId) {
+        self.update_queue_metrics();
+        self.maybe_finish_download_pass(job_id);
+        self.update_queue_metrics();
+    }
+
+    // Books the article missing, every id spent, and returns the servers
+    // refusing credentials that would otherwise have served it.
+    fn book_unservable_article(
+        &mut self,
+        segment_id: SegmentId,
+        exclude_servers: weaver_nntp::ServerSet,
+        warn_per_article: bool,
+    ) -> weaver_nntp::ServerSet {
+        let job_id = segment_id.file_id.job_id;
+        let refused_by = self.login_refused_unasked(job_id, exclude_servers);
         if warn_per_article {
             warn!(
                 segment = %segment_id,
@@ -326,18 +354,25 @@ impl Pipeline {
                 "no server may fetch this article; booking it as missing so repair can proceed"
             );
         }
+        // The job lacks the article whether or not a server refused: its
+        // cause is the missing articles, as when every server asked said
+        // the article is not there, so its next duplicate is tried. The job
+        // keeps which server refused, and a failure for want of articles
+        // names it.
         if !refused_by.is_empty() {
             self.semantic_terminal_causes.insert(
                 job_id,
-                crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage,
+                crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth,
             );
+            self.note_login_refusals(job_id, refused_by);
         }
         self.metrics
             .articles_not_found
             .fetch_add(1, Ordering::Relaxed);
         self.send_segment_event(|| PipelineEvent::ArticleNotFound { segment_id });
         // A server that refuses the credentials never said the article is
-        // gone, so the post's health does not count it.
+        // gone, and the state says so; the post's health counts it missing
+        // all the same, since no server can bring it.
         let state = if refused_by.is_empty() {
             SegmentTerminalState::Missing
         } else {
@@ -349,6 +384,92 @@ impl Pipeline {
         refused_by
     }
 
+    // The servers refusing the login that an article of `job_id` carrying
+    // `exclude_servers` was never asked of: neither excluded for the article
+    // nor out of the post's retention. One pass over the server list, from
+    // what the pool and the job already hold.
+    pub(in crate::pipeline) fn login_refused_unasked(
+        &mut self,
+        job_id: JobId,
+        exclude_servers: weaver_nntp::ServerSet,
+    ) -> weaver_nntp::ServerSet {
+        let retention = self.job_retention_excludes(job_id);
+        let pool = self.nntp.pool();
+        (0..pool.server_count())
+            .filter(|idx| {
+                !exclude_servers.contains(*idx)
+                    && !retention.contains(*idx)
+                    && pool.refuses_credentials(*idx)
+            })
+            .collect()
+    }
+
+    // An article was booked past `refused_by`, every other server having
+    // answered not-found for it or being out of the post's retention: the
+    // job keeps which servers refused, by identity (stable
+    // id, host, port and account) so the set outlives a change of the server
+    // list as the tried servers of an article do. Nothing else changes
+    // here: the job's cause is whatever its failures record.
+    pub(in crate::pipeline) fn note_login_refusals(
+        &mut self,
+        job_id: JobId,
+        refused_by: weaver_nntp::ServerSet,
+    ) {
+        if refused_by.is_empty() {
+            return;
+        }
+        let pool = self.nntp.pool();
+        let configs = pool.server_configs();
+        let held = self.login_refusals.entry(job_id).or_default();
+        for server in refused_by.iter() {
+            let (Some(stable), Some(config)) = (
+                pool.stable_server_id(weaver_nntp::pool::ServerId(server)),
+                configs.get(server),
+            ) else {
+                continue;
+            };
+            // Compared in place: a server already held costs no allocation.
+            if !held.iter().any(|known| {
+                known.stable_id == stable
+                    && known.host == config.host
+                    && known.port == config.port
+                    && known.username == config.username
+            }) {
+                held.push(weaver_nntp::pool::ServerIdentity {
+                    stable_id: stable,
+                    host: config.host.clone(),
+                    port: config.port,
+                    username: config.username.clone(),
+                });
+            }
+        }
+    }
+
+    // The words a job failing for want of articles gains when a server
+    // refusing the login left articles of it unasked for, naming each such
+    // server still in the server list, in the list's order. A server since
+    // removed is not named, and with none left there are no words.
+    pub(in crate::pipeline) fn login_refusal_words(&self, job_id: JobId) -> Option<String> {
+        let refused_by = self.login_refusals.get(&job_id)?;
+        let names = self
+            .nntp
+            .pool()
+            .server_identities()
+            .into_iter()
+            .filter(|server| refused_by.contains(server))
+            .map(|server| format!("{}:{}", server.host, server.port))
+            .collect::<Vec<_>>();
+        let rest = "never asked for the articles no other server had";
+        match names.as_slice() {
+            [] => None,
+            [name] => Some(format!("server {name} refuses the login and was {rest}")),
+            names => Some(format!(
+                "servers {} refuse the login and were {rest}",
+                names.join(", ")
+            )),
+        }
+    }
+
     // Book as missing every queued article of `job_id` that no server may
     // fetch. Returns how many were retired.
     pub(in crate::pipeline) fn retire_unservable_queued_work(&mut self, job_id: JobId) -> usize {
@@ -358,8 +479,8 @@ impl Pipeline {
             return 0;
         }
         let retention = self.job_retention_excludes(job_id);
-        let unservable = |work: &DownloadWork| {
-            Self::unavailable_server_count_from_excludes(&pool, &work.exclude_servers, &retention)
+        let unservable = |work: &QueuedWork<'_>| {
+            Self::unavailable_server_count_from_excludes(&pool, work.exclude_servers, retention)
                 >= server_count
         };
         let Some(active) = self
@@ -375,12 +496,12 @@ impl Pipeline {
             return 0;
         }
         let mut exclude_sets = std::collections::BTreeSet::new();
-        let mut refusing = std::collections::BTreeSet::new();
+        let mut refusing = weaver_nntp::ServerSet::EMPTY;
         for work in &retired {
-            exclude_sets.insert(work.exclude_servers.clone());
-            refusing.extend(self.book_unservable_segment_logged(
+            exclude_sets.insert(work.exclude_servers);
+            refusing = refusing.union(self.book_unservable_segment_logged(
                 work.segment_id,
-                &work.exclude_servers,
+                work.exclude_servers,
                 false,
             ));
         }

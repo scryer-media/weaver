@@ -246,6 +246,14 @@ impl Why {
         }
     }
 
+    // Whether a store that hands its volumes to an engine for this reason
+    // hands them over again after a repair of them: the archive's headers
+    // declare it, coders, a cipher, an entry that is no file body, and no
+    // password or repair changes what they declare.
+    pub fn outlasts_repair(self) -> bool {
+        matches!(self, Why::Compressed | Why::Encrypted | Why::NotAFile)
+    }
+
     // Whether an object that refused a member for this reason disclaims it:
     // not its to open, so the member is the posted file and is whole when
     // its bytes are. For any other reason the object's set failed with the
@@ -331,6 +339,16 @@ pub enum Emit {
     // "My volume is bad at this range": a header checksum failed.
     Damaged {
         volume: VolumeIndex,
+        range: ByteRange,
+    },
+    // "My volumes from `first` up to `end` never came, and I hold nothing
+    // of any of them": each is bad at `range`, as a `Damaged` for each
+    // would say, in one report however many volumes the run spans. A
+    // volume of the run its object holds anything of is said by `Damaged`
+    // instead, since only a volume held places anywhere.
+    Gap {
+        first: VolumeIndex,
+        end: VolumeIndex,
         range: ByteRange,
     },
     // "I cannot read further without a password."

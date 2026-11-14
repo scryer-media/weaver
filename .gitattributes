@@ -8,3 +8,6 @@ server/crates/weaver-server-core/tests/fixtures/**/*.rar filter=lfs diff=lfs mer
 # checksums recorded in every database are derived from these files, so they
 # must read byte-identically on every platform.
 *.sql text eol=lf
+
+# Captured NNTP article bodies: their CRLF line ends are the data under test.
+engines/weaver-yenc/fixtures/real-articles/** -text

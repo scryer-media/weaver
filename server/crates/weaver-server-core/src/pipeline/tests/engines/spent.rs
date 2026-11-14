@@ -127,13 +127,16 @@ async fn a_left_input_s_working_directory_goes_with_the_history_delete() {
 
 // While the root fetches recovery volumes for a lost article the job shows
 // it is fetching repair data, not repairing; once the repair run is out it
-// shows repairing, and is no longer fetching.
+// shows repairing, and is no longer fetching. The payload's last article is
+// the one lost, so the loss is told once the rest of the payload is in and
+// the recovery comes after it: a loss told earlier raises the recovery
+// beside the payload, and the repair may find it in hand.
 #[tokio::test]
 async fn a_graph_job_fetches_repair_data_before_it_repairs() {
     let data = payload(4 * ARTICLE, 43);
     let mut posts = vec![Post::plain("lantern.bin", data.clone())];
     posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 2));
-    let graph = run(&Scenario::new(posts).lost(0, 1)).await;
+    let graph = run(&Scenario::new(posts).lost(0, 3)).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     assert!(graph.files["lantern beacon/lantern.bin"] == data);
     let shown = &graph.graph().shown;

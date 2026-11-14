@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::{RwLock, broadcast};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{heartbeat, http, restart, shutdown, usage, wiring};
 use weaver_server_core::events::model::PipelineEvent;
@@ -129,13 +129,9 @@ pub(crate) async fn run(
         base_url
     };
 
-    let wiring::RuntimeContext {
-        profile,
-        buffers,
-        write_buf_max,
-    } = wiring::build_runtime_context(weaver_server_core::runtime::detect_startup_profile(
-        &data_dir,
-    ));
+    let wiring::RuntimeContext { profile, backlog } = wiring::build_runtime_context(
+        weaver_server_core::runtime::detect_startup_profile(&data_dir),
+    );
     let system_profile = Arc::new(std::sync::RwLock::new(profile.clone()));
 
     // Build the NNTP client from capability values validated when servers were saved.
@@ -287,13 +283,13 @@ pub(crate) async fn run(
     let mut pipeline = Pipeline::new(
         event_tx,
         nntp,
-        Arc::clone(&buffers),
+        backlog.base_bytes,
         profile,
         data_dir,
         intermediate_dir,
         complete_dir,
         total_connections,
-        write_buf_max,
+        backlog.pending_writes_per_file,
         initial_history,
         initial_holds,
         shared_state,
@@ -508,7 +504,6 @@ pub(crate) async fn run(
         nntp_pool,
         Arc::clone(&server_transfer_policy),
         shared_config.clone(),
-        buffers,
     )
     .with_schedules(shared_schedules)
     .with_torrents(torrents.clone());
@@ -799,17 +794,28 @@ async fn stop_torrents(torrents: Option<&weaver_server_core::torrents::service::
     }
 }
 
+// Start-up says once how many jobs it queued for restoration; each job's own
+// line is DEBUG. A job that could not be queued is an error of its own.
 async fn enqueue_restore_tickets(
     handle: &SchedulerHandle,
     candidates: Vec<weaver_server_core::operations::RestoreCandidate>,
 ) {
+    let total = candidates.len();
+    let mut failed = 0usize;
     for candidate in candidates {
         match handle.restore_job(candidate.request).await {
-            Ok(()) => info!(job_id = candidate.job_id.0, "job queued for restoration"),
+            Ok(()) => debug!(job_id = candidate.job_id.0, "job queued for restoration"),
             Err(e) => {
+                failed += 1;
                 error!(job_id = candidate.job_id.0, error = %e, "failed to queue job restoration")
             }
         }
+    }
+    if total > 0 {
+        info!(
+            queued = total - failed,
+            failed, "jobs queued for restoration"
+        );
     }
 }
 

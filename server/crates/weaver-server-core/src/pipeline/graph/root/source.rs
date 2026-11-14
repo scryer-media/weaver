@@ -103,6 +103,13 @@ struct Open {
     lost: BTreeMap<VolumeIndex, BTreeSet<usize>>,
     // The volumes holding a lost article or a short tail not yet told.
     untold: BTreeSet<VolumeIndex>,
+    // The volumes that began or stopped being waited on since the bootstrap
+    // last read them.
+    reopened: BTreeSet<VolumeIndex>,
+    // The volumes whose first article began or stopped being waited on
+    // since the feed last read them. `None` until the feed first reads
+    // them, when every volume counts as changed, so nothing is filed.
+    firsts: Option<BTreeSet<VolumeIndex>>,
     // The volumes and articles the readers looked at, for the tests that
     // hold them to the ones still open.
     #[cfg(test)]
@@ -111,7 +118,9 @@ struct Open {
 
 impl Open {
     fn file(&mut self, volume: VolumeIndex, index: usize, state: State) {
-        file_in(&mut self.waiting, volume, index, state == State::Waiting);
+        if file_in(&mut self.waiting, volume, index, state == State::Waiting) {
+            self.reopened.insert(volume);
+        }
         file_in(
             &mut self.lost,
             volume,
@@ -133,26 +142,32 @@ impl Open {
     }
 }
 
+// File the article in or out of its volume's entry. True when the volume
+// gained or lost its entry.
 fn file_in(
     sets: &mut BTreeMap<VolumeIndex, BTreeSet<usize>>,
     volume: VolumeIndex,
     index: usize,
     held: bool,
-) {
+) -> bool {
     match (sets.entry(volume), held) {
         (Entry::Vacant(entry), true) => {
             entry.insert(BTreeSet::from([index]));
+            true
         }
         (Entry::Occupied(mut entry), true) => {
             entry.get_mut().insert(index);
+            false
         }
         (Entry::Occupied(mut entry), false) => {
             entry.get_mut().remove(&index);
             if entry.get().is_empty() {
                 entry.remove();
+                return true;
             }
+            false
         }
-        (Entry::Vacant(_), false) => {}
+        (Entry::Vacant(_), false) => false,
     }
 }
 
@@ -203,7 +218,7 @@ struct Volume {
     // class, a boundary, the order the volume is placed in.
     changes: u64,
     // The seeks answered since the last change, and what each was told.
-    answered: Vec<(ByteRange, Option<Class>, Pull)>,
+    answered: HashMap<(ByteRange, Option<Class>), Pull>,
 }
 
 impl Volume {
@@ -242,7 +257,7 @@ impl Volume {
             cuts: Vec::new(),
             marks: Marks::default(),
             changes: 0,
-            answered: Vec::new(),
+            answered: HashMap::new(),
         }
     }
 
@@ -267,6 +282,11 @@ impl Volume {
                 State::Waiting => self.settled_bytes - size,
                 _ => self.settled_bytes + size,
             };
+            if ordinal == self.articles[0].ordinal
+                && let Some(firsts) = open.firsts.as_mut()
+            {
+                firsts.insert(self.at);
+            }
         }
         let decoded = |state: State| match state {
             State::Arrived(Some(range)) => range.end - range.start,
@@ -755,6 +775,19 @@ impl ArticleMap {
         })
     }
 
+    // The volumes whose first article began or stopped being waited on
+    // since the last call. `None` on the first call: every volume counts as
+    // changed, and the volumes are filed from then on.
+    pub(crate) fn take_first_changes(&mut self) -> Option<BTreeSet<VolumeIndex>> {
+        match self.open.firsts.as_mut() {
+            Some(firsts) => Some(std::mem::take(firsts)),
+            None => {
+                self.open.firsts = Some(BTreeSet::new());
+                None
+            }
+        }
+    }
+
     // Every server failed the article.
     pub(crate) fn lost(&mut self, volume: VolumeIndex, ordinal: u32) {
         let Some(found) = self.volumes.get_mut(volume.0 as usize) else {
@@ -965,6 +998,18 @@ impl ArticleMap {
             .copied()
     }
 
+    // The volumes that began or stopped being waited on since the last call.
+    pub(crate) fn take_reopened(&mut self) -> BTreeSet<VolumeIndex> {
+        std::mem::take(&mut self.open.reopened)
+    }
+
+    // The volumes still waited on, read without counting a visit, for the
+    // tests that check a reader against a walk of them all.
+    #[cfg(test)]
+    pub(crate) fn waiting_volumes_unseen(&self) -> Vec<VolumeIndex> {
+        self.open.waiting.keys().copied().collect()
+    }
+
     // Parked articles are waiting ones, so the volume has one to come
     // unasked when it waits on more than it parked.
     fn to_come(&self, volume: VolumeIndex, waiting: &BTreeSet<usize>) -> bool {
@@ -1023,10 +1068,7 @@ impl ArticleMap {
         // what it was, without mapping its range again: one that moved
         // articles changed them, so only an answer that moved none stands.
         if let Some(found) = self.volumes.get(volume.0 as usize)
-            && let Some(&(_, _, pull)) = found
-                .answered
-                .iter()
-                .find(|(asked, of, _)| *asked == range && *of == class)
+            && let Some(&pull) = found.answered.get(&(range, class))
         {
             #[cfg(test)]
             {
@@ -1046,7 +1088,7 @@ impl ArticleMap {
         if let Some(found) = self.volumes.get_mut(volume.0 as usize)
             && Some(found.changes) == changes
         {
-            found.answered.push((range, class, pull));
+            found.answered.insert((range, class), pull);
         }
         pull
     }

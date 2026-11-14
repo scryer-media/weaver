@@ -52,7 +52,8 @@ impl WireGuardTunnelProvider {
         let identity = WireGuardIdentity::of(&spec);
         Self(
             proxy_tunnels::WireGuardTunnelProvider::new(spec, Arc::new(Observer(observer, None)))
-                .with_download_tuning(),
+                .with_download_tuning()
+                .with_endpoint_resolver(Arc::new(crate::resolution::HostEndpoints)),
             identity,
         )
     }

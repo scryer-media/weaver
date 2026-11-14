@@ -252,11 +252,12 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
     // no-backtrack rule instead of the trailing-bytes lookback.
     let mut broke = false;
 
-    // Carry-forward end-candidate state (SEARCH_END only). A `\r\n=y` control
-    // sequence whose `\r` sits in the last three bytes of a window cannot be
-    // decided from that window's own 64 bytes. Rather than peek into the next
-    // window (the load this rewrite exists to delete), classify the tail here
-    // and re-test it against the next window's first bytes at the top of the
+    // Carry-forward end-candidate state (SEARCH_END only), set only by the
+    // Neoverse-N1 assembly span below; the Rust loop decides a straddling
+    // `\r\n=y` in the window that holds its `\r` (see its no-dot arm), so on
+    // every other core this stays 0. A `\r\n=y` control sequence whose `\r`
+    // sits in the last three bytes of a window is classified by that span and
+    // re-tested against the next window's first bytes at the top of the
     // following iteration, before that window is emitted:
     //   window ended `\r\n=` → needs `y`    → resumes in CrLfEq
     //   window ended `\r\n`  → needs `=y`   → resumes in CrLf
@@ -297,12 +298,14 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
     // three microarchitectures it tracks 7 instructions divided by the core's
     // decode width.
     //
-    // `span` is the exact byte count covered by whole windows, so the last
-    // window still has the full 67-byte tail reserve behind it. DO NOT round
-    // `span` up: one window over happens to be benign because the reserve is
-    // exactly one window of slack, two windows over decodes wrong.
+    // `span` is the bytes covered by whole windows: `simd_limit` rounded UP to
+    // a window, as rapidyenc rounds `dLen` (decoder_common.h:129-131), so the
+    // scalar drain sees 4..=67 bytes instead of 67..=130. The deepest read of
+    // a window is its byte 67 (the `win + 52` view); the last window starts
+    // at most at `len - 68`, so that read is at most byte `len - 1`. Never
+    // round further: a second extra window reads past the input.
     let span = if input.len() > WIDTH * 2 {
-        (simd_limit / WIDTH) * WIDTH
+        simd_limit.div_ceil(WIDTH) * WIDTH
     } else {
         0
     };
@@ -383,19 +386,21 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
             // leaves a consistent (src, dst, state) triple for the scalar
             // drain, exactly like the in-window no-backtrack break.
             if SEARCH_END && pending_tail != 0 {
-                // Bit-test dispatch (`tbnz`), not equality against the three
-                // tags: equality lets LLVM hoist the compares above the
-                // zero test and pay them on every window.
-                let resumed = if pending_tail & PEND_CR != 0 {
-                    (*sp.offset(i) == b'\n'
-                        && *sp.offset(i + 1) == b'='
-                        && *sp.offset(i + 2) == b'y')
-                        .then_some(DecoderState::Cr)
-                } else if pending_tail & PEND_CRLF != 0 {
-                    (*sp.offset(i) == b'=' && *sp.offset(i + 1) == b'y')
-                        .then_some(DecoderState::CrLf)
+                // A tag bit is a candidate, not a verdict (see the no-dot arm):
+                // test the four bytes from its `\r` against `\r\n=y`. The
+                // three shapes end in a different byte 63 of the previous
+                // window, so at most one can hold.
+                let end = u32::from_le_bytes(*b"\r\n=y");
+                let at =
+                    |k: isize| u32::from_le_bytes((sp.offset(i - 3 + k) as *const [u8; 4]).read());
+                let resumed = if pending_tail & PEND_EQ != 0 && at(0) == end {
+                    Some(DecoderState::CrLfEq)
+                } else if pending_tail & PEND_CRLF != 0 && at(1) == end {
+                    Some(DecoderState::CrLf)
+                } else if pending_tail & PEND_CR != 0 && at(2) == end {
+                    Some(DecoderState::Cr)
                 } else {
-                    (*sp.offset(i) == b'y').then_some(DecoderState::CrLfEq)
+                    None
                 };
                 if let Some(resumed) = resumed {
                     state.state = resumed;
@@ -500,12 +505,31 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
                     let cr_b = vceqq_u8(b, constants.cr);
                     let cr_c = vceqq_u8(c, constants.cr);
                     let cr_d = vceqq_u8(d, constants.cr);
-                    let m2cr_a = vandq_u8(cr_a, vceqq_u8(vextq_u8::<2>(a, b), constants.dot));
-                    let m2cr_b = vandq_u8(cr_b, vceqq_u8(vextq_u8::<2>(b, c), constants.dot));
-                    let m2cr_c = vandq_u8(cr_c, vceqq_u8(vextq_u8::<2>(c, d), constants.dot));
-                    let m2cr_d = vandq_u8(cr_d, vceqq_u8(tmp2, constants.dot));
-                    let m2cr_any = vorrq_u8(vorrq_u8(m2cr_a, m2cr_b), vorrq_u8(m2cr_c, m2cr_d));
-                    if neon64_any(m2cr_any) {
+                    // Whether a stuffed dot can be here, decided in mask space.
+                    // The vector test below (`\r` at i, `.` at i+2: 19 vector
+                    // instructions) ran on every window with a line break, and
+                    // this loop is bound by the vector pipes, not the integer
+                    // ones. A `\r\n.` at byte i sets bit i of
+                    //     mask & (mask >> 1) & !(mask >> 2)
+                    // (`.` is not in `mask`); bytes 64/65 are not in `mask`,
+                    // so the top bits count as possible. One candidate is
+                    // settled by its byte i+2 (at most `win + 65`, inside the
+                    // +67 the loop bound allows); none or one that is not a
+                    // `.` means no `\r\n.` here. Otherwise the vector test
+                    // runs, and its arm is exact. Entering that arm without a
+                    // `\r\n.` was always possible (it keys on `\r` and `.`
+                    // only) and decodes the same as the arm below.
+                    let dot_cand = mask & ((mask >> 1) | 1 << 63) & (!(mask >> 2) | 3 << 62);
+                    let dot_j = (dot_cand | 1 << 63).trailing_zeros() as usize;
+                    let dot_maybe = ((dot_cand != 0) & (*win.add(dot_j + 2) == b'.'))
+                        | ((dot_cand & dot_cand.wrapping_sub(1)) != 0);
+                    if dot_maybe
+                        && let m2cr_a = vandq_u8(cr_a, vceqq_u8(vextq_u8::<2>(a, b), constants.dot))
+                        && let m2cr_b = vandq_u8(cr_b, vceqq_u8(vextq_u8::<2>(b, c), constants.dot))
+                        && let m2cr_c = vandq_u8(cr_c, vceqq_u8(vextq_u8::<2>(c, d), constants.dot))
+                        && let m2cr_d = vandq_u8(cr_d, vceqq_u8(tmp2, constants.dot))
+                        && neon64_any(vorrq_u8(vorrq_u8(m2cr_a, m2cr_b), vorrq_u8(m2cr_c, m2cr_d)))
+                    {
                         let lf_a = vceqq_u8(vextq_u8::<1>(a, b), constants.lf);
                         let lf_b = vceqq_u8(vextq_u8::<1>(b, c), constants.lf);
                         let lf_c = vceqq_u8(vextq_u8::<1>(c, d), constants.lf);
@@ -651,9 +675,9 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
                         // The two shifted terms are OR'd with their vacated top
                         // bits so the same expression also flags the shapes that
                         // run off the end of the window — bit 62 = two adjacent
-                        // specials at 62/63, bit 63 = a special at 63 — which is
-                        // where the tail carry is classified. One test, one
-                        // branch, covering both.
+                        // specials at 62/63, bit 63 = a special at 63 — a sequence
+                        // whose `=` and `y` lie past it. One test, one branch,
+                        // covering both.
                         //
                         // Being a superset is the point: it also fires on
                         // `\n\r=`, `\r\r=`, `\n\n=` and on a plain line-start
@@ -665,70 +689,64 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
                         } else {
                             0
                         };
-                        if cand != 0 {
-                            // Bits 0..=61: an end sequence may start inside this
-                            // window. `cand << 2` drops the two straddle bits.
-                            if cand << 2 != 0 {
-                                let y = vdupq_n_u8(b'y');
-                                let m2eq_a = vextq_u8::<2>(eq_a, eq_b);
-                                let m2eq_b = vextq_u8::<2>(eq_b, eq_c);
-                                let m2eq_c = vextq_u8::<2>(eq_c, eq_d);
-                                let m2eq_d = vceqq_u8(tmp2, constants.eq);
-                                let m3eqy_a = vandq_u8(m2eq_a, vceqq_u8(vextq_u8::<3>(a, b), y));
-                                let m3eqy_b = vandq_u8(m2eq_b, vceqq_u8(vextq_u8::<3>(b, c), y));
-                                let m3eqy_c = vandq_u8(m2eq_c, vceqq_u8(vextq_u8::<3>(c, d), y));
-                                let m3eqy_d = vandq_u8(m2eq_d, vceqq_u8(vld1q_u8(win.add(51)), y));
-                                let any_eqy = vorrq_u8(
-                                    vorrq_u8(m3eqy_a, m3eqy_b),
-                                    vorrq_u8(m3eqy_c, m3eqy_d),
+                        // On bodies with many line-start escapes `cand` fires
+                        // on about every other line, so a branch on it is a
+                        // coin toss, and with input not in cache each miss
+                        // costs the loads behind it.
+                        // Settle the usual case, one candidate, without a
+                        // branch instead: the four bytes from its `\r` spell
+                        // `\r\n=y` or they do not. That covers a sequence that
+                        // starts at byte 61..=63 too (the read ends at +66,
+                        // inside the +67 the loop bound allows), so no tail
+                        // tag is carried to the next window. With no candidate
+                        // `j` is 63, and bytes 63..=66 cannot spell `\r\n=y`
+                        // then: a `\r` at 63 would have set bit 63. Only a hit
+                        // or a second candidate runs the oracle's vector test
+                        // (lines 254-284), which is exact and reads the `=`
+                        // and `y` of a straddling sequence from the +50 and
+                        // +51 views, deciding it in the window that holds its
+                        // `\r`, as rapidyenc decides it.
+                        let j = (cand | 1 << 63).trailing_zeros() as usize;
+                        let at_j = u32::from_le_bytes((win.add(j) as *const [u8; 4]).read());
+                        let hit = at_j == u32::from_le_bytes(*b"\r\n=y");
+                        let second = (cand & cand.wrapping_sub(1)) != 0;
+                        if SEARCH_END && (hit | second) {
+                            let y = vdupq_n_u8(b'y');
+                            let m2eq_a = vextq_u8::<2>(eq_a, eq_b);
+                            let m2eq_b = vextq_u8::<2>(eq_b, eq_c);
+                            let m2eq_c = vextq_u8::<2>(eq_c, eq_d);
+                            let m2eq_d = vceqq_u8(tmp2, constants.eq);
+                            let m3eqy_a = vandq_u8(m2eq_a, vceqq_u8(vextq_u8::<3>(a, b), y));
+                            let m3eqy_b = vandq_u8(m2eq_b, vceqq_u8(vextq_u8::<3>(b, c), y));
+                            let m3eqy_c = vandq_u8(m2eq_c, vceqq_u8(vextq_u8::<3>(c, d), y));
+                            let m3eqy_d = vandq_u8(m2eq_d, vceqq_u8(vld1q_u8(win.add(51)), y));
+                            let any_eqy =
+                                vorrq_u8(vorrq_u8(m3eqy_a, m3eqy_b), vorrq_u8(m3eqy_c, m3eqy_d));
+                            if neon64_any(any_eqy) {
+                                let lf_a = vceqq_u8(vextq_u8::<1>(a, b), constants.lf);
+                                let lf_b = vceqq_u8(vextq_u8::<1>(b, c), constants.lf);
+                                let lf_c = vceqq_u8(vextq_u8::<1>(c, d), constants.lf);
+                                let lf_d = vceqq_u8(vld1q_u8(win.add(49)), constants.lf);
+                                let match_end = vorrq_u8(
+                                    vorrq_u8(
+                                        vandq_u8(m3eqy_a, vandq_u8(lf_a, cr_a)),
+                                        vandq_u8(m3eqy_b, vandq_u8(lf_b, cr_b)),
+                                    ),
+                                    vorrq_u8(
+                                        vandq_u8(m3eqy_c, vandq_u8(lf_c, cr_c)),
+                                        vandq_u8(m3eqy_d, vandq_u8(lf_d, cr_d)),
+                                    ),
                                 );
-                                if neon64_any(any_eqy) {
-                                    let lf_a = vceqq_u8(vextq_u8::<1>(a, b), constants.lf);
-                                    let lf_b = vceqq_u8(vextq_u8::<1>(b, c), constants.lf);
-                                    let lf_c = vceqq_u8(vextq_u8::<1>(c, d), constants.lf);
-                                    let lf_d = vceqq_u8(vld1q_u8(win.add(49)), constants.lf);
-                                    let match_end = vorrq_u8(
-                                        vorrq_u8(
-                                            vandq_u8(m3eqy_a, vandq_u8(lf_a, cr_a)),
-                                            vandq_u8(m3eqy_b, vandq_u8(lf_b, cr_b)),
-                                        ),
-                                        vorrq_u8(
-                                            vandq_u8(m3eqy_c, vandq_u8(lf_c, cr_c)),
-                                            vandq_u8(m3eqy_d, vandq_u8(lf_d, cr_d)),
-                                        ),
+                                if neon64_any(match_end) {
+                                    state.state = neon64_break_state(
+                                        input,
+                                        (span as isize + i) as usize,
+                                        mask,
+                                        esc_first,
                                     );
-                                    if neon64_any(match_end) {
-                                        state.state = neon64_break_state(
-                                            input,
-                                            (span as isize + i) as usize,
-                                            mask,
-                                            esc_first,
-                                        );
-                                        broke = true;
-                                        break;
-                                    }
+                                    broke = true;
+                                    break;
                                 }
-                            }
-
-                            // Byte-exact tail classification for the carry. The
-                            // three shapes need `\r` at 61 / 62 / 63, each of
-                            // which sets the corresponding bit of `cand`, so
-                            // this only runs when one is possible. The tag is
-                            // the `escaped` bit that would falsify it; the veto
-                            // itself happens once `escaped` is resolved, below.
-                            if cand >> 61 != 0 {
-                                let b61 = *win.add(61);
-                                let b62 = *win.add(62);
-                                let b63 = *win.add(63);
-                                pending_tail = if b61 == b'\r' && b62 == b'\n' && b63 == b'=' {
-                                    PEND_EQ
-                                } else if b62 == b'\r' && b63 == b'\n' {
-                                    PEND_CRLF
-                                } else if b63 == b'\r' {
-                                    PEND_CR
-                                } else {
-                                    0
-                                };
                             }
                         }
                         // `\r\n` present but no stuffed dot: reset the carry.
@@ -752,19 +770,7 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
                 let escaped = (fixed_eq << 1) | esc_first_in;
                 esc_first = fixed_eq >> 63;
 
-                let decoded = if escaped == 0 {
-                    // No escaped bytes in this window: plain offset subtract.
-                    // `escaped == 0` implies `esc_first_in == 0` (bit 0 of
-                    // `escaped` IS `esc_first_in`), so lane A takes the plain
-                    // constant too — no derived vector on this arm, which is
-                    // every CRLF-only specials window.
-                    [
-                        vsubq_u8(a, normal_offset),
-                        vsubq_u8(b, normal_offset),
-                        vsubq_u8(c, normal_offset),
-                        vsubq_u8(d, normal_offset),
-                    ]
-                } else if collision {
+                let decoded = if collision {
                     // Consecutive `=` run: expand the chain-resolved `escaped`
                     // mask (which already carries esc_first at bit 0) to a
                     // per-lane select (oracle lines 315-354).
@@ -795,13 +801,7 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
 
                 let skip = mask & !escaped;
 
-                if skip == 0 {
-                    vst1q_u8_x4(
-                        out,
-                        uint8x16x4_t(decoded[0], decoded[1], decoded[2], decoded[3]),
-                    );
-                    out = out.add(WIDTH);
-                } else {
+                {
                     // Four independent LUT-compaction stores; the entry gate +
                     // tail guarantee ≥64 spare output bytes so each 16-byte
                     // store can overwrite ahead.
@@ -874,18 +874,20 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
     // this a `\r\n=y` split across the last window boundary would reach the
     // scalar drain as `None` + `=y` and decode as a plain escape.
     if SEARCH_END && !broke && pending_tail != 0 {
-        let at = |k: usize, want: u8| input.get(src + k) == Some(&want);
-        let hit = match pending_tail {
-            PEND_EQ => at(0, b'y'),
-            PEND_CRLF => at(0, b'=') && at(1, b'y'),
-            _ => at(0, b'\n') && at(1, b'=') && at(2, b'y'),
+        // As at the loop top: each tag bit is tested against the bytes, from
+        // its `\r` (at `src - 3 + k`) on; at most one can match.
+        let at = |k: usize| input.get(src - 3 + k..src + 1 + k) == Some(&b"\r\n=y"[..]);
+        let resumed = if pending_tail & PEND_EQ != 0 && at(0) {
+            Some(DecoderState::CrLfEq)
+        } else if pending_tail & PEND_CRLF != 0 && at(1) {
+            Some(DecoderState::CrLf)
+        } else if pending_tail & PEND_CR != 0 && at(2) {
+            Some(DecoderState::Cr)
+        } else {
+            None
         };
-        if hit {
-            state.state = match pending_tail {
-                PEND_EQ => DecoderState::CrLfEq,
-                PEND_CRLF => DecoderState::CrLf,
-                _ => DecoderState::Cr,
-            };
+        if let Some(resumed) = resumed {
+            state.state = resumed;
             broke = true;
         }
     }
@@ -922,7 +924,15 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
         };
     }
 
+    // The scalar drain, rapidyenc's scalar tail (decoder.cc:13-146): plain
+    // bytes in a tight run, everything else one state-machine step at a time.
     while src < input.len() {
+        if state.state == DecoderState::None {
+            decode_plain_run(input, &mut src, output, &mut dst);
+            if src >= input.len() {
+                break;
+            }
+        }
         if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
             break;
         }
@@ -2608,5 +2618,145 @@ pub(super) mod n1_span_se {
         *pending_tail = pend;
         *mask_out = mout;
         *kind = kind_v;
+    }
+}
+
+// The window kernel against the scalar machine, at the boundaries this file
+// sets: the span rounded up to whole windows (so every length from the first
+// one the kernel takes reaches the drain with 4..=67 bytes), the one-candidate
+// end probe with an end sequence at every byte of a window, and windows that
+// hold two candidates.
+#[cfg(all(test, target_arch = "aarch64"))]
+mod window_boundary_tests {
+    use super::*;
+
+    fn run(
+        input: &[u8],
+        start: DecoderState,
+        search_end: bool,
+        neon: bool,
+    ) -> (Result<KernelOutcome, YencError>, Vec<u8>, KernelState) {
+        let mut output = vec![0u8; input.len() + 64];
+        let mut state = KernelState {
+            state: start,
+            ..KernelState::body()
+        };
+        let out = if neon {
+            unsafe { decode_kernel_neon(input, &mut output, &mut state, true, true, search_end) }
+        } else {
+            decode_kernel_scalar(input, &mut output, &mut state, true, true, search_end)
+        };
+        if let Ok(o) = &out {
+            output.truncate(o.written);
+        }
+        (out, output, state)
+    }
+
+    fn assert_same(input: &[u8], what: &str) {
+        for start in [DecoderState::CrLf, DecoderState::None] {
+            for search_end in [false, true] {
+                let (no, nb, ns) = run(input, start, search_end, true);
+                let (so, sb, ss) = run(input, start, search_end, false);
+                assert_eq!(
+                    format!("{no:?}"),
+                    format!("{so:?}"),
+                    "{what} {start:?} end={search_end}"
+                );
+                assert_eq!(nb, sb, "{what} {start:?} end={search_end}");
+                assert_eq!(ns, ss, "{what} {start:?} end={search_end}");
+            }
+        }
+    }
+
+    // A body that cycles plain bytes, escapes and line breaks, so lengths
+    // and offsets land on every byte class.
+    fn body(len: usize, seed: u8) -> Vec<u8> {
+        const PIECES: [&[u8]; 6] = [b"abc", b"=}", b"\r\n", b"=J", b"xyz0", b"\r\n=@"];
+        let mut out = Vec::with_capacity(len + 8);
+        let mut k = seed as usize;
+        while out.len() < len {
+            out.extend_from_slice(PIECES[k % PIECES.len()]);
+            k = k.wrapping_mul(7).wrapping_add(3);
+        }
+        out.truncate(len);
+        out
+    }
+
+    #[test]
+    fn every_length_around_the_first_windows_matches_scalar() {
+        for len in 120..=340 {
+            for seed in 0..6 {
+                assert_same(&body(len, seed), &format!("len {len} seed {seed}"));
+            }
+        }
+    }
+
+    #[test]
+    fn end_sequence_at_every_offset_matches_scalar() {
+        for trailer in [&b"\r\n=yend\r\n"[..], b"\r\n.\r\n", b"\r\n.=yend"] {
+            for at in 0..200 {
+                let mut input = vec![b'q'; at];
+                input.extend_from_slice(trailer);
+                input.extend_from_slice(&[b'z'; 140]);
+                assert_same(&input, &format!("{trailer:?} at {at}"));
+            }
+        }
+    }
+
+    // Near-misses of `\r\n=y` across a window boundary: each sets a tail
+    // tag that the next window (or the exit) must reject, and a real end
+    // right after one must still be found.
+    #[test]
+    fn tail_near_misses_across_a_boundary_match_scalar() {
+        let shapes: [&[u8]; 9] = [
+            b"\r\n=A",
+            b"\r\nA",
+            b"\rA",
+            b"\n\n=y",
+            b"\r\r=y",
+            b"\n\r=y",
+            b"==\r\n=y",
+            b"=\r\n=y",
+            b"\r\n\r\n=y",
+        ];
+        for shape in shapes {
+            for at in 110..200 {
+                for tail in [&b""[..], b"\r\n=yend"] {
+                    let mut input = vec![b'q'; at];
+                    input.extend_from_slice(shape);
+                    input.extend_from_slice(tail);
+                    input.extend_from_slice(&[b'z'; 3]);
+                    assert_same(&input, &format!("{shape:?} at {at} tail {tail:?}"));
+                    input.extend_from_slice(&[b'z'; 140]);
+                    assert_same(&input, &format!("{shape:?} at {at} tail {tail:?} long"));
+                }
+            }
+        }
+    }
+
+    // Line-start escapes (`\r\n=`) are candidates that are not ends; put
+    // one or two of them in the same window as a real end, before and after
+    // it, so the probe sees a miss, a hit, and a second candidate.
+    #[test]
+    fn two_candidates_in_one_window_match_scalar() {
+        for first in 0..60 {
+            for gap in [4usize, 5, 9, 17, 33] {
+                for real_second in [false, true] {
+                    let mut input = vec![b'q'; 64 + first];
+                    input.extend_from_slice(b"\r\n=A");
+                    input.extend_from_slice(&vec![b'k'; gap]);
+                    input.extend_from_slice(if real_second {
+                        b"\r\n=yend"
+                    } else {
+                        b"\r\n=B__"
+                    });
+                    input.extend_from_slice(&[b'z'; 150]);
+                    assert_same(
+                        &input,
+                        &format!("first {first} gap {gap} real {real_second}"),
+                    );
+                }
+            }
+        }
     }
 }

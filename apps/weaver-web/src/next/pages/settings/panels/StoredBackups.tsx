@@ -14,6 +14,7 @@ import { formatDate } from "../../../data/format";
 import { SettingsBlocks, type SettingsBlock } from "../framework";
 import { settingsIds, testIds } from "@/next/testids";
 import { useBackupAdminAction } from "./useBackupAdminAction";
+import { useVisibleInterval } from "../../../data/timers";
 
 interface BackupInfo {
   filename: string; sizeBytes: number; createdAt: string; sourceWeaverVersion: string;
@@ -39,11 +40,10 @@ export function StoredBackups({ generation }: { generation: number }) {
   const creating = data?.backups.some((backup) => backup.status === "CREATING") ?? false;
   const automaticEnabled = data?.autoBackupSettings.enabled ?? false;
   useEffect(() => { refresh({ requestPolicy: "network-only" }); }, [generation, refresh]);
-  useEffect(() => {
-    if (!creating && !automaticEnabled) return;
-    const timer = window.setInterval(() => refresh({ requestPolicy: "network-only" }), creating ? 2000 : 30_000);
-    return () => window.clearInterval(timer);
-  }, [creating, automaticEnabled, refresh]);
+  useVisibleInterval(
+    () => refresh({ requestPolicy: "network-only" }),
+    creating ? 2000 : automaticEnabled ? 30_000 : null,
+  );
   useEffect(() => {
     const onFocus = () => refresh({ requestPolicy: "network-only" });
     window.addEventListener("focus", onFocus);

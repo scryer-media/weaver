@@ -1,0 +1,18 @@
+# Standalone yEnc decode bench: each weaver decoder tier against the matching
+# rapidyenc kernel, in one process. Its own workspace; it links weaver-yenc
+# by path, built with `--cfg weaver_yenc_bench` (.cargo/config.toml) for the
+# per-tier entry points, and rapidyenc through weaver-yenc's build script.
+#
+#   WEAVER_RAPIDYENC_SRC=/path/to/rapidyenc cargo run --locked --release -- [--quick]
+
+[package]
+name = "weaver-yenc-decode-bench"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace]
+
+[dependencies]
+weaver-yenc = { path = ".." }

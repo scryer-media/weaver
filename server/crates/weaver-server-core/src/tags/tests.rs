@@ -54,6 +54,7 @@ fn history_row(job_id: u64) -> JobHistoryRow {
         completed_at: 1_767_000_090,
         metadata: None,
         server_attribution: None,
+        archived_at: None,
     }
 }
 

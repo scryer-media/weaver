@@ -20,6 +20,7 @@ fn lease_to_new_lane(pipeline: &mut Pipeline, job_id: JobId, take: usize) -> Dow
                 .download_queue
                 .pop()
                 .expect("the job has queued work")
+                .dispatched(&state.spec)
         })
         .collect();
     lease_works_to_new_lane(pipeline, job_id, works)
@@ -38,8 +39,8 @@ fn lease_works_to_new_lane(
         lane_mode: DownloadLaneMode::Sequential,
         server_modes: vec![(0, DownloadLaneMode::Sequential)],
         completion_critical: false,
-        effective_exclude_servers: Vec::new(),
-        dial_exclude_servers: Vec::new(),
+        effective_exclude_servers: weaver_nntp::ServerSet::EMPTY,
+        dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
         works,
@@ -65,7 +66,7 @@ fn transport_failure(lane_id: u64, segment_id: SegmentId) -> DownloadResult {
         source_server_idx: Some(0),
         origin: DownloadResultOrigin::NormalPrimary,
         retry_count: 0,
-        exclude_servers: Vec::new(),
+        exclude_servers: weaver_nntp::ServerSet::EMPTY,
         release_connection_slot: false,
     }
 }
@@ -108,7 +109,7 @@ fn decoded_whole_file(
         source_server_idx: Some(0),
         origin: DownloadResultOrigin::NormalPrimary,
         retry_count: 0,
-        exclude_servers: Vec::new(),
+        exclude_servers: weaver_nntp::ServerSet::EMPTY,
         release_connection_slot: true,
     }
 }
@@ -133,7 +134,7 @@ fn batch_complete(
 
 fn in_flight(pipeline: &Pipeline, job_id: JobId) -> usize {
     pipeline
-        .active_downloads_by_job
+        .articles_in_flight_by_job
         .get(&job_id)
         .copied()
         .unwrap_or(0)
@@ -218,6 +219,7 @@ async fn an_article_the_lane_does_not_hold_is_refused_without_moving_a_gauge() {
         .download_queue
         .pop()
         .unwrap();
+    let stray = pipeline.dispatched(stray);
     let queued_before = queued(&pipeline, job_id);
 
     let mut pending = VecDeque::new();
@@ -259,10 +261,11 @@ async fn a_lease_that_names_an_article_twice_owes_one_result() {
         .download_queue
         .pop()
         .unwrap();
+    let work = pipeline.dispatched(work);
     let segment_id = work.segment_id;
     let lease = lease_works_to_new_lane(&mut pipeline, job_id, vec![work.clone(), work]);
     assert_eq!(in_flight(&pipeline, job_id), 1);
-    assert_eq!(pipeline.active_downloads, 1);
+    assert_eq!(pipeline.articles_in_flight, 1);
 
     pipeline
         .handle_download_done(transport_failure(lease.lane_id, segment_id))
@@ -271,7 +274,7 @@ async fn a_lease_that_names_an_article_twice_owes_one_result() {
         .handle_download_done(transport_failure(lease.lane_id, segment_id))
         .await;
     assert_eq!(in_flight(&pipeline, job_id), 0);
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     assert_gauges_match_lanes(&pipeline);
 }
 
@@ -305,7 +308,7 @@ async fn a_result_for_a_cancelled_job_is_refused_and_nothing_is_owed() {
     pipeline
         .handle_download_done(transport_failure(lease.lane_id, held))
         .await;
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     assert_gauges_match_lanes(&pipeline);
 }
 
@@ -334,7 +337,7 @@ async fn a_stall_release_takes_back_the_tail_a_lane_carries_for_its_previous_job
     .await;
     let lease = lease_to_new_lane(&mut pipeline, tail_job, 1);
     let tail = lease.works[0].segment_id;
-    let refill: Vec<DownloadWork> = (0..2)
+    let refill = (0..2)
         .map(|_| {
             pipeline
                 .jobs
@@ -347,7 +350,8 @@ async fn a_stall_release_takes_back_the_tail_a_lane_carries_for_its_previous_job
                 .pop()
                 .unwrap()
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let refill: Vec<DownloadWork> = pipeline.dispatched_all(refill);
     pipeline.rebook_download_lane_owner(
         lease.lane_id,
         next_job,
@@ -401,7 +405,7 @@ async fn a_stopped_lease_hands_back_everything_it_held() {
     pipeline.restore_stopped_owned_lane_lease(lease);
 
     assert_eq!(in_flight(&pipeline, job_id), 0);
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     assert_eq!(pipeline.active_download_connections, 0);
     assert_eq!(queued(&pipeline, job_id), 3);
     assert!(!pipeline.download_lane_owners.contains_key(&lane_id));
@@ -593,8 +597,11 @@ async fn the_lane_holdings_audit_fails_on_an_article_no_lane_holds() {
     )
     .await;
     assert_gauges_match_lanes(&pipeline);
-    pipeline.active_downloads += 1;
-    *pipeline.active_downloads_by_job.entry(job_id).or_default() += 1;
+    pipeline.articles_in_flight += 1;
+    *pipeline
+        .articles_in_flight_by_job
+        .entry(job_id)
+        .or_default() += 1;
     assert_eq!(pipeline.lane_holdings_discrepancies().len(), 2);
 
     pipeline.dispatch_downloads();

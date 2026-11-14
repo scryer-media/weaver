@@ -278,12 +278,30 @@ impl ServerTransferPolicyRegistry {
         [&self.servers, &self.egresses]
     }
 
-    fn load_usage(&self, scope: TransferScope, id: u32) -> Result<ServerDownloadUsage, StateError> {
-        let usage = match scope {
-            TransferScope::Server => self.db.server_download_usage(id)?,
-            TransferScope::Egress => self.db.egress_download_usage(id)?,
+    // Every holder's stored usage in one read, in `holders` order; a holder
+    // with no row starts empty. The table holds a row per server or egress,
+    // so reading all of it is bounded by them, not by a reconfigure's size
+    // times a read each. Only the holders' rows are decoded, so a bad row
+    // fails the reconfigure only when it is a holder's.
+    fn load_usages(
+        &self,
+        scope: TransferScope,
+        holders: &[QuotaHolder],
+    ) -> Result<Vec<ServerDownloadUsage>, StateError> {
+        let ids = holders.iter().map(|holder| holder.id).collect();
+        let stored = match scope {
+            TransferScope::Server => self.db.server_download_usages(&ids)?,
+            TransferScope::Egress => self.db.egress_download_usages(&ids)?,
         };
-        Ok(usage.unwrap_or_else(|| ServerDownloadUsage::empty(id)))
+        Ok(holders
+            .iter()
+            .map(|holder| {
+                stored
+                    .get(&holder.id)
+                    .cloned()
+                    .unwrap_or_else(|| ServerDownloadUsage::empty(holder.id))
+            })
+            .collect())
     }
 
     fn load_upload(&self, scope: TransferScope, id: u32) -> Result<UploadCount, StateError> {
@@ -454,14 +472,11 @@ impl ServerTransferPolicyRegistry {
             .iter()
             .map(|holder| holder.id)
             .collect::<HashSet<_>>();
-        let usages = holders
-            .iter()
-            .map(|holder| {
-                Ok((
-                    self.load_usage(scope, holder.id)?,
-                    self.load_upload(scope, holder.id)?,
-                ))
-            })
+        let usages = self
+            .load_usages(scope, holders)?
+            .into_iter()
+            .zip(holders)
+            .map(|(usage, holder)| Ok((usage, self.load_upload(scope, holder.id)?)))
             .collect::<Result<Vec<_>, StateError>>()?;
         let mut usage_updates = Vec::new();
         let mut policies = book.policies();
@@ -1162,6 +1177,142 @@ mod tests {
             download_quota: quota(ServerDownloadQuotaPeriod::OneTime),
             tls_ca_cert: None,
         }
+    }
+
+    // Twenty-five servers over ten priority levels, every other one with
+    // stored usage. One read loads them all, and each holder gets what a
+    // read of its own row gives it, an empty count where it has none.
+    #[test]
+    fn a_reconfigure_reads_every_servers_usage_at_once() {
+        let db = Database::open_in_memory().unwrap();
+        let servers = (1..=25)
+            .map(|id| ServerConfig {
+                priority: id % 10,
+                ..quota_server(id)
+            })
+            .collect::<Vec<_>>();
+        for server in &servers {
+            db.insert_server(server).unwrap();
+        }
+        let stored = servers
+            .iter()
+            .filter(|server| server.id % 2 == 1)
+            .map(|server| ServerDownloadUsage {
+                lifetime_bytes: u64::from(server.id) * 1_000,
+                quota_baseline_bytes: u64::from(server.id),
+                ..ServerDownloadUsage::empty(server.id)
+            })
+            .collect::<Vec<_>>();
+        db.store_download_usage(&stored, &[]).unwrap();
+        let registry = ServerTransferPolicyRegistry::new(db.clone(), &[]).unwrap();
+        let holders = servers
+            .iter()
+            .map(|server| QuotaHolder {
+                id: server.id,
+                rate: (server.max_download_speed != 0).then_some(server.max_download_speed),
+                quota: (&server.download_quota).into(),
+                upload_caps: UploadCaps::default(),
+            })
+            .collect::<Vec<_>>();
+        let statements = || {
+            db.wal_checkpoint_metrics_snapshot()
+                .expect("a file database")
+                .statement_duration
+                .count
+        };
+
+        let before = statements();
+        let loaded = registry
+            .load_usages(TransferScope::Server, &holders)
+            .unwrap();
+        assert_eq!(statements() - before, 1, "one read for every server");
+
+        let one_by_one = servers
+            .iter()
+            .map(|server| {
+                db.server_download_usage(server.id)
+                    .unwrap()
+                    .unwrap_or_else(|| ServerDownloadUsage::empty(server.id))
+            })
+            .collect::<Vec<_>>();
+        // An empty count is stamped with the time it was made.
+        let without_stamp = |usages: Vec<ServerDownloadUsage>| {
+            usages
+                .into_iter()
+                .map(|usage| ServerDownloadUsage {
+                    updated_at: chrono::DateTime::<Utc>::UNIX_EPOCH,
+                    ..usage
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(without_stamp(loaded.clone()), without_stamp(one_by_one));
+        assert_eq!(
+            loaded
+                .iter()
+                .filter(|usage| usage.lifetime_bytes > 0)
+                .count(),
+            13
+        );
+    }
+
+    // A bad usage row of a server the reconfigure does not hold fails
+    // nothing, as when each holder's row was read by its id; a bad row of a
+    // holder still fails the read.
+    #[test]
+    fn a_bad_usage_row_fails_only_its_own_holder() {
+        let db = Database::open_in_memory().unwrap();
+        let servers = (1..=3).map(quota_server).collect::<Vec<_>>();
+        for server in &servers {
+            db.insert_server(server).unwrap();
+        }
+        db.insert_server(&quota_server(4)).unwrap();
+        let corrupt = |id: i64| {
+            let datastore = db.datastore();
+            db.run_sql_blocking(async move {
+                crate::persistence::sql_runtime::SqlRuntime::execute(
+                    datastore.write_exec(),
+                    "INSERT INTO server_download_usage
+                        (server_id, lifetime_bytes, quota_baseline_bytes,
+                         window_start_epoch_seconds, window_end_epoch_seconds,
+                         updated_at_epoch_seconds)
+                     VALUES ({}, -1, 0, NULL, NULL, 0)",
+                    &[crate::persistence::sql_runtime::SqlArg::I64(id)],
+                )
+                .await
+                .map(|_| ())
+            })
+            .unwrap();
+        };
+        // Server 4 is stored but not among the holders.
+        corrupt(4);
+        let registry = ServerTransferPolicyRegistry::new(db.clone(), &[]).unwrap();
+        let holders = servers
+            .iter()
+            .map(|server| QuotaHolder {
+                id: server.id,
+                rate: (server.max_download_speed != 0).then_some(server.max_download_speed),
+                quota: (&server.download_quota).into(),
+                upload_caps: UploadCaps::default(),
+            })
+            .collect::<Vec<_>>();
+        let loaded = registry
+            .load_usages(TransferScope::Server, &holders)
+            .unwrap();
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|usage| usage.server_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        corrupt(2);
+        assert!(
+            registry
+                .load_usages(TransferScope::Server, &holders)
+                .is_err()
+        );
+        assert!(db.server_download_usage(2).is_err());
     }
 
     #[test]

@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::operations::instrumentation::PipelinePhase;
 
 const UU_SPOOL_MIN_BYTES: usize = 64 * 1024 * 1024;
 const UU_SPOOL_MAX_BYTES: usize = 4 * 1024 * 1024 * 1024;
@@ -53,6 +54,8 @@ impl Pipeline {
     // Bound on how long `drain` waits to join detached fire-and-forget writes.
     const FIRE_AND_FORGET_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const DOWNLOAD_COMPLETION_DRAIN_LIMIT: usize = 128;
+    // Delayed retries re-entered per busy turn: the retry channel's capacity.
+    const RETRY_DRAIN_LIMIT: usize = 256;
     // Released results processed per orchestrator turn before the turn's
     // dispatch pass, barrier poll and chase reap run again. One result per
     // turn made every lane batch of 64 articles cost 64 full dispatch passes
@@ -67,7 +70,7 @@ impl Pipeline {
     pub async fn new(
         event_tx: broadcast::Sender<PipelineEvent>,
         nntp: NntpClient,
-        buffers: Arc<BufferPool>,
+        backlog_base_bytes: usize,
         profile: SystemProfile,
         data_dir: PathBuf,
         intermediate_dir: PathBuf,
@@ -83,9 +86,13 @@ impl Pipeline {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let metrics = Arc::clone(shared_state.metrics());
         initial_history.truncate(crate::jobs::FINISHED_JOBS_RUNTIME_CAP);
-        let write_backlog_budget_bytes = compute_write_backlog_budget_bytes(&profile, &buffers);
-        let decode_backlog_budget_bytes =
-            compute_decode_backlog_budget_bytes(&profile, &buffers, write_backlog_budget_bytes);
+        let write_backlog_budget_bytes =
+            compute_write_backlog_budget_bytes(&profile, backlog_base_bytes);
+        let decode_backlog_budget_bytes = compute_decode_backlog_budget_bytes(
+            &profile,
+            backlog_base_bytes,
+            write_backlog_budget_bytes,
+        );
         let (hardware_profile, hold_settings, propagation_delay) = {
             let cfg = config.read().await;
             // An install that never chose one — every upgraded install — runs
@@ -186,6 +193,7 @@ impl Pipeline {
             complete_dir.clone(),
             startup_disk_work,
         ));
+        shared_state.set_storage_capacity(&storage_capacity);
         let extraction_limits = Arc::new(ExtractionLimits::from_env_with_profile_ceiling(
             &complete_dir,
             profile_tuning.extraction_memory_bytes,
@@ -204,6 +212,14 @@ impl Pipeline {
         let (failed_release_tx, failed_release_rx) = mpsc::channel(32);
         let (job_activated_tx, job_activated_rx) = mpsc::channel(32);
         let (db_reply_tx, db_reply_rx) = mpsc::unbounded_channel();
+        // The one listener for the history archives the writer keeps for
+        // want of room: each is told to the loop as a database reply.
+        db.hear_archive_news({
+            let replies = db_reply_tx.clone();
+            move |news| {
+                let _ = replies.send(crate::pipeline::db_reply::DbReply::Archive(news));
+            }
+        });
         let (terminal_post_processing_done_tx, terminal_post_processing_done_rx) =
             mpsc::channel(32);
         let script_effects_rx = db.subscribe_script_effects();
@@ -262,23 +278,28 @@ impl Pipeline {
             _control_runtime: crate::pipeline::queue::RuntimeGuard(shared_state.queue.clone()),
             event_tx,
             nntp,
-            buffers,
             tuner,
             configured_hardware_profile: hardware_profile,
             scheduled_hardware_profile: None,
             metrics,
             jobs: HashMap::new(),
-            graph_jobs: HashMap::new(),
+            graph_jobs: Default::default(),
             retiring_graph_jobs: HashMap::new(),
+            moving_jobs: HashMap::new(),
             graph_status: Default::default(),
             graph_holds,
             graph_decode,
             graph_runs: Default::default(),
             graph_outside: Default::default(),
+            #[cfg(test)]
+            graph_mail_stamps: None,
             post_probes: Default::default(),
             nzb_admitted,
             nzb_seen: HashSet::new(),
+            nzb_retired_busy: HashSet::new(),
+            pending_renames: HashMap::new(),
             nzb_pause_releases,
+            resumes_stored: HashSet::new(),
             nzb_reprocess_pending: HashSet::new(),
             nzb_admitting: HashSet::new(),
             nzb_releasing: HashSet::new(),
@@ -296,25 +317,38 @@ impl Pipeline {
             queue_positions: Some(queue_positions),
             queue_positions_lost: Arc::default(),
             semantic_terminal_causes: HashMap::new(),
+            login_refusals: HashMap::new(),
             pipeline_failure_stages: HashMap::new(),
             job_order: Vec::new(),
             stored_queue_order: Vec::new(),
-            active_downloads: 0,
+            articles_in_flight: 0,
             active_download_connections: 0,
             active_completion_critical_connections: 0,
             active_recovery: 0,
             download_lane_runtime: DownloadLaneRuntimeState::default(),
             held_download_refills: Vec::new(),
             download_dispatch_wake: false,
+            disk_waiting: std::collections::BTreeSet::new(),
+            disk_tickets_seen: [0; 2],
+            disk_rings_seen: 0,
+            disk_idle: std::collections::BTreeSet::new(),
+            admission_disk_held: false,
+            disk_unadmitted: std::collections::BTreeSet::new(),
+            full_disk: std::collections::BTreeMap::new(),
+            full_disk_moves: Vec::new(),
+            full_disk_promised: std::collections::BTreeMap::new(),
+            archive_wait: None,
+            #[cfg(test)]
+            full_disk_sweeps: Vec::new(),
             nntp_handoff_draining: false,
             active_download_passes: HashSet::new(),
             jobs_finalizing_download: HashSet::new(),
             pending_released_download_results_by_job: HashMap::new(),
             pending_released_download_result_bytes_by_job: HashMap::new(),
-            active_downloads_by_job: HashMap::new(),
+            articles_in_flight_by_job: HashMap::new(),
             active_download_connections_by_job: HashMap::new(),
             active_completion_critical_connections_by_job: HashMap::new(),
-            active_downloads_by_file: HashMap::new(),
+            articles_in_flight_by_file: HashMap::new(),
             active_decodes_by_job: Default::default(),
             active_decodes_by_file: HashMap::new(),
             active_decode_bytes: HashMap::new(),
@@ -339,14 +373,17 @@ impl Pipeline {
             uu_spool_max_bytes: compute_uu_spool_max_bytes(write_backlog_budget_bytes),
             uu_spool_max_segments: compute_uu_spool_max_segments(write_buf_max_pending),
             uu_park_max_segments: compute_uu_spool_max_segments(write_buf_max_pending),
+            unanchored_park_max_parts: compute_uu_spool_max_segments(write_buf_max_pending),
             uu_spool_min_free_bytes: UU_SPOOL_MIN_FREE_BYTES,
             #[cfg(test)]
             uu_spool_available_bytes_for_test: None,
             dirty_server_attribution: HashSet::new(),
             dirty_support_facts: HashSet::new(),
+            reports_due: HashSet::new(),
             server_attribution_checkpoint_at: Instant::now(),
             #[cfg(test)]
             par2_ignore_extensions_override: None,
+            #[cfg(test)]
             pending_decode: VecDeque::new(),
             pending_completion_checks: VecDeque::new(),
             blocked_restores: HashMap::new(),
@@ -367,6 +404,7 @@ impl Pipeline {
             retry_rx,
             infrastructure_retries: infrastructure_retry::InfrastructureRetryQueue::default(),
             pool_generation: 0,
+            pool_layouts: Default::default(),
             server_counters,
             job_stage_started_at: HashMap::new(),
             nntp_handoff_drained_tx,
@@ -423,26 +461,33 @@ impl Pipeline {
             propagation_delay,
             #[cfg(test)]
             propagation_delay_forced: None,
+            #[cfg(test)]
+            unservable_booking_depth: (0, 0),
+            #[cfg(test)]
+            spent_message_ids: Vec::new(),
+            #[cfg(test)]
+            dispatch_hold_items_examined: Default::default(),
             last_download_dispatch_stall_log_at: None,
             download_dispatch_stall: None,
             download_stall_recovery,
             download_pass_fill_servers: None,
             download_pass_provider_policy: None,
             download_retry_storm_window: None,
+            download_retry_storm: None,
             owned_lane_acquire_failure_log_throttle: Default::default(),
             dispatch_ineligible_log_throttle: Default::default(),
             dispatch_slot_wait_log_throttle: Default::default(),
             last_owned_lane_acquire_failure_at: None,
             download_lanes_under_cap_since: None,
-            last_download_lanes_under_cap_log_at: None,
+            download_lanes_under_cap_reported: false,
             write_buffered_bytes: 0,
             write_buffered_segments: 0,
             uu_spooled_bytes: 0,
             uu_spooled_segments: 0,
             uu_parked_segments: 0,
-            uu_files: HashMap::new(),
+            uu_files: Default::default(),
             uu_park_requeues: HashMap::new(),
-            unanchored_parked: HashMap::new(),
+            unanchored_parked: UnanchoredPark::default(),
             unanchored_requeues: HashMap::new(),
             pending_unanchored_release: Vec::new(),
             storage_capacity,
@@ -451,6 +496,7 @@ impl Pipeline {
             process_memory_budget,
             job_article_memory: HashMap::new(),
             next_activation: 0,
+            next_up: Default::default(),
             parking_jobs: HashSet::new(),
             spilling_jobs: HashSet::new(),
             repeated_articles: HashMap::new(),
@@ -707,12 +753,14 @@ impl Pipeline {
     pub(crate) fn clear_job_progress_floor_runtime(&mut self, job_id: JobId) {
         self.dirty_server_attribution.remove(&job_id);
         self.dirty_support_facts.remove(&job_id);
+        self.reports_due.remove(&job_id);
         self.blocked_restores.remove(&job_id);
         self.download_restart_durable_lead_retry_after
             .remove(&job_id);
         self.checkpoint_progress_articles.remove(&job_id);
         self.released_remaining.remove(&job_id);
         self.propagation_ready_at.remove(&job_id);
+        self.drop_full_disk_hold(job_id);
     }
 
     pub(crate) fn note_download_activity(&mut self, job_id: JobId) {
@@ -721,6 +769,11 @@ impl Pipeline {
     }
 
     pub(crate) fn emit_download_finished_if_active(&mut self, job_id: JobId) {
+        // A job held for a full disk fetches again what it lost: its
+        // download is not finished while it waits.
+        if self.held_for_full_disk(job_id) {
+            return;
+        }
         if self.active_download_passes.remove(&job_id) {
             self.phase_end(job_id, JobPhase::Downloading);
             let finalization_pending = self.job_has_pending_download_pipeline_work(job_id);
@@ -737,6 +790,9 @@ impl Pipeline {
     }
 
     pub(crate) fn emit_download_pipeline_drained_if_pending(&mut self, job_id: JobId) {
+        if self.held_for_full_disk(job_id) {
+            return;
+        }
         if self.jobs_finalizing_download.remove(&job_id) {
             self.emit_job_event(PipelineEvent::DownloadPipelineDrained { job_id });
         }
@@ -830,7 +886,7 @@ impl Pipeline {
                 }
 
                 let in_flight = self
-                    .active_downloads_by_job
+                    .articles_in_flight_by_job
                     .get(job_id)
                     .copied()
                     .unwrap_or(0);
@@ -884,9 +940,13 @@ impl Pipeline {
     // that have not yet settled to zero. Every term is a length or a flag,
     // so asking costs the same however many jobs and history rows exist.
     pub(crate) fn pipeline_is_live(&self) -> bool {
-        self.active_downloads > 0
+        // Only tests queue undecoded bodies.
+        #[cfg(test)]
+        if !self.pending_decode.is_empty() {
+            return true;
+        }
+        self.articles_in_flight > 0
             || !self.active_download_connections_by_job.is_empty()
-            || !self.pending_decode.is_empty()
             || !self.active_decodes_by_job.is_empty()
             || !self.held_download_refills.is_empty()
             || !self.rate_limit_reservations.is_empty()
@@ -918,6 +978,42 @@ impl Pipeline {
                     crate::jobs::HoldOwner::All,
                 ) || (!self.nzb_admitted.is_empty() && !inner.globals.holds_downloads())
             })
+    }
+
+    // Whether the pipeline has settled with nothing it can do, so the memory
+    // its work left behind can go back: no work to drive, or jobs holding
+    // slots that no server is set up to serve; and no read ahead or install
+    // still out, so a start-up's window and ring have filled. This does not
+    // change what drives the ticks: jobs holding slots still do.
+    pub(in crate::pipeline) fn memory_settled(&self, driving: bool) -> bool {
+        let stranded = || {
+            self.nntp.pool().server_count() == 0
+                && !self.pipeline_is_live()
+                && !self.queue_walk_due
+                && !self.shared_state.queue.read(|inner| {
+                    inner.globals.holds.held_by(
+                        crate::jobs::HoldOrigin::SpeedTest,
+                        crate::jobs::HoldOwner::All,
+                    )
+                })
+        };
+        (!driving || stranded())
+            && !self.next_up.reading()
+            && !self.restores_waiting
+            && self.installing.is_empty()
+    }
+
+    // Whether to give memory back this turn: once, as the pipeline settles.
+    // Not again while it stays settled, whatever wakes it, and never while
+    // work moves.
+    pub(in crate::pipeline) fn memory_release_due(was_settled: bool, settled: bool) -> bool {
+        settled && !was_settled
+    }
+
+    // Give back the memory a pipeline with no work is holding for work that
+    // has stopped: every page the allocator is keeping freed.
+    pub(in crate::pipeline) fn release_idle_memory(&self) {
+        crate::runtime::thread_release::release_idle_process_memory();
     }
 
     // Leave the gauges the parked drivers would publish saying what the
@@ -977,6 +1073,9 @@ impl Pipeline {
         let mut metrics_snapshot_interval = Self::metrics_snapshot_timer(metrics_live);
         // Whether the periodic drivers ran through the previous turn.
         let mut driving = true;
+        // Whether the last turn left the pipeline settled: see
+        // `memory_settled`.
+        let mut memory_settled = false;
         // Whether the previous turn did anything that dispatch must follow.
         let mut dispatch_due = true;
         let mut tune_interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -1003,6 +1102,7 @@ impl Pipeline {
         loop {
             let mut turn_timer = crate::operations::instrumentation::TurnTimer::new(
                 &turn_metrics.pipeline_histograms.turn_duration,
+                &turn_metrics.pipeline_turn,
             );
             // A replaced pool brings its own servers; watch those, and give
             // their waiting work a pass.
@@ -1011,6 +1111,7 @@ impl Pipeline {
                 self.download_dispatch_wake = true;
             }
             if queue.read(|inner| inner.globals.shutting_down) {
+                turn_timer.phase(PipelinePhase::Shutdown);
                 // Readmission can wait for cancellation cleanup, whose terminal
                 // completion event releases the last script cancellation sender.
                 // Keep servicing those events while accepted admissions settle.
@@ -1053,6 +1154,8 @@ impl Pipeline {
                 break;
             }
             self.run_queue_intents().await;
+            self.resume_full_disk_moves().await;
+            turn_timer.phase(PipelinePhase::ReadyResults);
             // Whether this turn was woken by, or found, anything other than a
             // periodic tick. Only such a turn can have changed what the job
             // snapshot shows or what dispatch would hand out.
@@ -1060,6 +1163,7 @@ impl Pipeline {
             self.drain_ready_download_results(&mut pending_download_results);
             self.drain_ready_lane_control_messages();
             turn_active |= self.hear_graph_runs();
+            #[cfg(test)]
             self.pump_decode_queue();
 
             // An ordinal can be retired from outside the result handlers — a
@@ -1070,9 +1174,11 @@ impl Pipeline {
             if !self.pending_unanchored_release.is_empty() {
                 turn_active = true;
                 self.release_settled_unanchored_runs().await;
+                #[cfg(test)]
                 self.pump_decode_queue();
             }
 
+            turn_timer.phase(PipelinePhase::CompletionChecks);
             let pending_completion_checks = self.pending_completion_checks.len();
             turn_active |= pending_completion_checks > 0;
             for _ in 0..pending_completion_checks {
@@ -1080,12 +1186,15 @@ impl Pipeline {
                     break;
                 };
                 self.check_job_completion(job_id).await;
+                #[cfg(test)]
                 self.pump_decode_queue();
             }
 
+            turn_timer.phase(PipelinePhase::ParkAndSpill);
             self.consume_due_checkpoint_rechecks();
             self.park_drained_jobs();
             self.spill_parked_parts().await;
+            turn_timer.phase(PipelinePhase::Dispatch);
             // A pass over the eligible jobs follows only something that could
             // change its answer: activity, a wake, live transfers, or a gate
             // that lifts with time. An idle turn would find what the last one
@@ -1116,6 +1225,12 @@ impl Pipeline {
                 tokio::time::sleep_until(infrastructure_retry_deadline.unwrap_or_else(|| {
                     tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
                 }));
+            // A failed folder rename is tried again at this instant.
+            let rename_retry_at = self.next_rename_retry_at();
+            let rename_retry_sleep =
+                tokio::time::sleep_until(rename_retry_at.unwrap_or_else(|| {
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
+                }));
             // A held server admits work again on its own at this instant.
             let connection_hold_deadline = self.nntp.pool().next_connection_hold_deadline();
             let connection_hold_sleep =
@@ -1129,6 +1244,7 @@ impl Pipeline {
                 self.dispatch_downloads();
             }
 
+            turn_timer.phase(PipelinePhase::DownloadResults);
             let processed_results = self
                 .process_download_result_turn(
                     &mut pending_download_results,
@@ -1136,7 +1252,14 @@ impl Pipeline {
                 )
                 .await;
             turn_active |= processed_results > 0;
-            if processed_results == 0 {
+            if processed_results > 0 {
+                // A busy turn skips the wait below: it hears a reading, room
+                // given back or a waiter left idle as the wait would.
+                self.hear_disk_on_busy_turn();
+                // It skips the retries heard there too, and a link that keeps
+                // answering would keep them waiting for as long as it does.
+                self.drain_ready_retries();
+            } else {
                 // Set by the periodic arms that found nothing to do; every
                 // other arm is an event.
                 let mut idle_tick = false;
@@ -1148,14 +1271,21 @@ impl Pipeline {
                 // A batch out is waited on as any answer is.
                 let restoring = self.restores_waiting;
                 let next_batch = restoring && self.installing.is_empty();
+                // A job that waits for room on a disk wakes on a reading of
+                // a disk someone waits on, never on a timer of its own.
+                let disk_readings = self.storage_capacity.readings();
+                self.reconcile_disk_waits();
+                let disk_waiting = self.waits_for_disk_room();
                 turn_timer.pause();
                 macro_rules! turn_select {
                     ($($biased:tt)?) => {
                         tokio::select! {
                             $($biased;)?
-                            _ = queue.intent_changed() => { turn_timer.resume(); }
+                            _ = queue.intent_changed() => {
+                                turn_timer.resume(PipelinePhase::IntentChanged);
+                            }
                             Some(result) = self.download_done_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::DownloadDone);
                                 if !self.release_download_result(&result) { continue; }
                                 self.note_released_download_result_pending(
                                     result.job_id,
@@ -1164,30 +1294,41 @@ impl Pipeline {
                                 pending_download_results.push_back(result);
                             }
                             Some(request) = self.download_refill_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::LaneRefill);
                                 self.drain_ready_download_results(&mut pending_download_results);
                                 self.handle_download_lane_refill_request(request);
                             }
                             Some(parked) = self.download_lane_parked_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::LaneParked);
                                 self.handle_download_lane_parked(parked);
                             }
                             Some(event) = self.owned_download_lane_event_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::LaneEvent);
                                 self.handle_owned_download_lane_event(
                                     event,
                                     &mut pending_download_results,
                                 );
                             }
                             Some(said) = self.graph_runs.recv() => {
+                                turn_timer.resume(PipelinePhase::GraphRun);
                                 self.graph_run_said(said);
+                                #[cfg(test)]
+                                if let Some(stamps) = &self.graph_mail_stamps {
+                                    let _ = stamps.send(
+                                        turn_metrics.pipeline_turn.read(std::time::Instant::now()),
+                                    );
+                                }
                             }
                             Some(mail) = self.post_probes.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::PostProbe);
                                 self.post_probe_mail(mail);
                             }
+                            _ = disk_readings.notified(), if disk_waiting => {
+                                turn_timer.resume(PipelinePhase::GraphRun);
+                                self.disk_reading();
+                            }
                             Some(result) = self.decode_done_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::DecodeDone);
                                 #[cfg(test)]
                                 if restoring {
                                     DECODES_HEARD_RESTORING.fetch_add(1, Ordering::Relaxed);
@@ -1199,29 +1340,29 @@ impl Pipeline {
                                 self.handle_decode_done(result).await;
                             }
                             Some(generation) = self.nntp_handoff_drained_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::NntpHandoffDrained);
                                 self.handle_nntp_handoff_drained(generation);
                             }
                             Some(done) = self.job_activated_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::JobActivated);
                                 self.handle_job_activated(done);
                             }
                             Some(reply) = self.db_reply_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::DbReply);
                                 self.handle_db_reply(reply).await;
                             }
                             Some(done) = self.move_done_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::MoveDone);
                                 let reported_job = done.job_id;
                                 self.handle_move_to_complete_done(done).await;
                                 self.report_job(reported_job);
                             }
                             Some(released) = self.failed_release_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::FailedRelease);
                                 self.handle_failed_job_released(released);
                             }
                             Ok(()) = self.script_effects_rx.changed() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::ScriptEffects);
                                 for job_id in self.db.take_script_effects() {
                                     let job_id = JobId(job_id);
                                     // A job out of the queue window is called
@@ -1236,17 +1377,17 @@ impl Pipeline {
                                 }
                             }
                             Some(event) = self.terminal_post_processing_done_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::TerminalPostProcessing);
                                 self.handle_terminal_post_processing_event(event).await;
                             }
                             Some(retry) = self.retry_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::Retry);
                                 let reported_job = retry.work.segment_id.file_id.job_id;
                                 self.receive_retry_work(retry);
-                                self.report_job(reported_job);
+                                self.report_job_soon(reported_job);
                             }
                             _ = metrics_snapshot_interval.tick(), if drive => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::MetricsTick);
                                 idle_tick = true;
                                 count_periodic_tick();
                                 self.refresh_periodic_snapshot();
@@ -1255,26 +1396,34 @@ impl Pipeline {
                                 // wake comes.
                                 self.service_held_download_refills();
                             }
-                            _ = rate_sleep, if !rate_delay.is_zero() => { turn_timer.resume(); }
+                            _ = rate_sleep, if !rate_delay.is_zero() => {
+                                turn_timer.resume(PipelinePhase::RateLimit);
+                            }
                             _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::DurableLeadRetry);
                                 self.consume_due_checkpoint_rechecks();
                             }
-                            _ = propagation_sleep, if propagation_delay.is_some() => { turn_timer.resume(); }
+                            _ = propagation_sleep, if propagation_delay.is_some() => {
+                                turn_timer.resume(PipelinePhase::Propagation);
+                            }
                             _ = infrastructure_retry_sleep, if infrastructure_retry_deadline.is_some() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::InfrastructureRetry);
                                 self.requeue_due_infrastructure_retries();
                             }
                             () = server_health.changed() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::ServerHealth);
                                 self.download_dispatch_wake = true;
                             }
                             _ = connection_hold_sleep, if connection_hold_deadline.is_some() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::ConnectionHold);
                                 self.download_dispatch_wake = true;
                             }
+                            // The next turn's queue pass retries the rename.
+                            _ = rename_retry_sleep, if rename_retry_at.is_some() => {
+                                turn_timer.resume(PipelinePhase::RenameRetry);
+                            }
                             _ = tune_interval.tick(), if drive => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::TuneTick);
                                 idle_tick = true;
                                 count_periodic_tick();
                                 self.refresh_download_pressure();
@@ -1283,7 +1432,7 @@ impl Pipeline {
                                 if tracing::enabled!(tracing::Level::DEBUG) {
                                 let live = self.pipeline_is_live();
                                 let snapshot = self.metrics.raw_snapshot();
-                                let not_found = snapshot.articles_not_found;
+                                let articles_not_found = snapshot.articles_not_found;
                                 // Folded over every job, so only while something
                                 // is moving; an idle pipeline's health is unchanged.
                                 let min_health: Option<u32> = live.then(|| self.jobs.values()
@@ -1292,7 +1441,7 @@ impl Pipeline {
                                     .map(|s| (s.spec.total_bytes.saturating_sub(s.failed_bytes) * 1000 / s.spec.total_bytes) as u32)
                                     .min()).flatten();
                                 debug!(
-                                    active = self.active_downloads,
+                                    active = self.articles_in_flight,
                                     queue = snapshot.download_queue_depth,
                                     speed_mbps = format!("{:.1}", snapshot.current_download_speed as f64 / (1024.0 * 1024.0)),
                                     downloaded_mb = snapshot.bytes_downloaded / (1024 * 1024),
@@ -1305,30 +1454,31 @@ impl Pipeline {
                                     pressure_state = snapshot.download_pressure_state.as_str(),
                                     pressure_reason = snapshot.download_pressure_reason.as_str(),
                                     direct_write_evictions = snapshot.direct_write_evictions,
-                                    not_found,
+                                    articles_not_found,
+                                    not_found_answers = snapshot.download_failures_article_not_found,
                                     health = min_health.map(|h| format!("{:.1}%", h as f64 / 10.0)).unwrap_or_default(),
                                     "pipeline tick"
                                 );
                                 }
                             }
                             _ = stalled_download_interval.tick(), if drive => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::StallCheck);
                                 count_periodic_tick();
                                 // A stall needs a transfer in flight; with none the
                                 // walk over every job would find nothing.
-                                idle_tick = self.active_downloads_by_job.is_empty();
+                                idle_tick = self.articles_in_flight_by_job.is_empty();
                                 if !idle_tick {
                                     self.auto_pause_stalled_downloads();
                                 }
                             }
                             _ = state_reconcile_interval.tick(), if drive => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::StateReconcile);
                                 idle_tick = true;
                                 count_periodic_tick();
                                 self.reconcile_candidate_jobs().await;
                             }
                             () = std::future::ready(()), if next_batch => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::RestoreBatch);
                                 idle_tick = true;
                             }
                         }
@@ -1342,7 +1492,9 @@ impl Pipeline {
                 turn_active |= !idle_tick;
             }
 
+            #[cfg(test)]
             self.pump_decode_queue();
+            turn_timer.end_of_turn(self.jobs.len());
             let live = self.pipeline_is_live();
             if turn_active {
                 self.reconcile_clean = false;
@@ -1356,10 +1508,15 @@ impl Pipeline {
                     // stops, rather than on a tick nobody will take.
                     self.reconcile_candidate_jobs().await;
                 }
-                if driving || turn_active {
+                if driving || turn_active || !self.reports_due.is_empty() {
                     self.settle_parked_gauges();
                 }
             }
+            let settled = self.memory_settled(now_driving);
+            if Self::memory_release_due(memory_settled, settled) {
+                self.release_idle_memory();
+            }
+            memory_settled = settled;
             driving = now_driving;
             if live != metrics_live {
                 metrics_live = live;
@@ -1377,7 +1534,8 @@ impl Pipeline {
         metrics_interval: &mut tokio::time::Interval,
     ) -> usize {
         let mut processed = 0;
-        // One report per job per turn, however many of its results landed.
+        // Each job a result landed for is reported once the turn is done: at
+        // once if its stage moved, else on the snapshot tick.
         let mut reported = BTreeSet::new();
         while processed < Self::DOWNLOAD_RESULTS_PER_TURN {
             let Some(result) = pending.pop_front() else {
@@ -1394,7 +1552,7 @@ impl Pipeline {
             }
         }
         for job_id in reported {
-            self.report_job(job_id);
+            self.report_job_soon(job_id);
         }
         if processed != 0 {
             // A backlog can keep every actor operation immediately ready.
@@ -1415,6 +1573,7 @@ impl Pipeline {
 
     pub(in crate::pipeline) fn refresh_periodic_snapshot(&mut self) {
         self.checkpoint_server_attribution_if_due();
+        self.report_due_jobs();
         // Queue edits can change eligibility while the data plane is idle.
         // The existing active/idle tick cadence bounds these small walks.
         self.publish_download_footprint_metrics();
@@ -1525,7 +1684,7 @@ impl Pipeline {
             self.receive_retry_work(retry);
         }
         for job_id in jobs {
-            self.report_job(job_id);
+            self.report_job_soon(job_id);
         }
         count
     }
@@ -1549,6 +1708,22 @@ impl Pipeline {
             );
             pending.push_back(result);
             self.drain_ready_lane_control_messages();
+        }
+    }
+
+    // Re-enters the delayed retries whose wait is over, at most one channel's
+    // worth a turn so a burst never holds the turn up.
+    fn drain_ready_retries(&mut self) {
+        let mut jobs = HashSet::new();
+        for _ in 0..Self::RETRY_DRAIN_LIMIT {
+            let Ok(retry) = self.retry_rx.try_recv() else {
+                break;
+            };
+            jobs.insert(retry.work.segment_id.file_id.job_id);
+            self.receive_retry_work(retry);
+        }
+        for job_id in jobs {
+            self.report_job_soon(job_id);
         }
     }
 
@@ -1594,14 +1769,20 @@ impl Pipeline {
         if scheduled_pool_generation != self.pool_generation
             && (!work.exclude_servers.is_empty() || work.avoid_server.is_some())
         {
+            // Scheduled under an older pool: carry the tried servers and the
+            // hint over by server identity, never read them unmapped.
+            work.exclude_servers = self
+                .pool_layouts
+                .set(scheduled_pool_generation, work.exclude_servers);
+            work.avoid_server = work
+                .avoid_server
+                .and_then(|server| self.pool_layouts.index(scheduled_pool_generation, server));
             debug!(
                 segment = %work.segment_id,
                 scheduled_generation = scheduled_pool_generation,
                 current_generation = self.pool_generation,
-                "dropping stale server exclusions on retry after NNTP pool rebuild"
+                "carried server exclusions on retry across an NNTP pool rebuild"
             );
-            work.exclude_servers.clear();
-            work.avoid_server = None;
         }
         if infrastructure_retry {
             self.note_infrastructure_retry_requeued(work.segment_id.file_id.job_id);
@@ -1623,6 +1804,25 @@ impl Pipeline {
     // for fresh work would cancel some other segment's real pending retry and
     // let the download pass end before that retry fires.
     pub(crate) fn enqueue_download_work(&mut self, work: DownloadWork) {
+        // Work every server is excluded from can never be seated by a lane:
+        // the queue would hold it, and the job with it, indefinitely. Every
+        // producer of a re-queue passes through here, so this is where the
+        // article is retired instead.
+        if let Some(work) = self.enqueue_servable_download_work(work) {
+            let job_id = work.segment_id.file_id.job_id;
+            self.book_unservable_work(&work);
+            self.update_queue_metrics();
+            self.maybe_finish_download_pass(job_id);
+        }
+    }
+
+    // [`Self::enqueue_download_work`], except that work no server may serve
+    // is handed back instead of booked.
+    #[inline]
+    pub(crate) fn enqueue_servable_download_work(
+        &mut self,
+        work: DownloadWork,
+    ) -> Option<DownloadWork> {
         let job_id = work.segment_id.file_id.job_id;
         let segment_id = work.segment_id;
         if self
@@ -1635,7 +1835,7 @@ impl Pipeline {
                 segment = %segment_id,
                 "dropping download work for a job that is gone or terminal"
             );
-            return;
+            return None;
         }
         // A lane or delayed retry may return work after the feed's verdict.
         // It must not put an abandoned file back into dispatch.
@@ -1652,17 +1852,10 @@ impl Pipeline {
             self.book_terminal_segment(segment_id, SegmentTerminalState::Abandoned);
             self.update_queue_metrics();
             self.maybe_finish_download_pass(job_id);
-            return;
+            return None;
         }
-        // Work every server is excluded from can never be seated by a lane:
-        // the queue would hold it, and the job with it, indefinitely. Every
-        // producer of a re-queue passes through here, so this is where the
-        // article is retired instead.
-        if self.no_server_can_serve(job_id, &work.exclude_servers) {
-            self.book_unservable_work(&work);
-            self.update_queue_metrics();
-            self.maybe_finish_download_pass(job_id);
-            return;
+        if self.no_server_can_serve(job_id, work.exclude_servers) {
+            return Some(work);
         }
         // The job's root classes the work.
         let mut work = work;
@@ -1679,6 +1872,7 @@ impl Pipeline {
                 active.download_queue.push(work);
             }
         }
+        None
     }
 
     pub(crate) async fn drain(&mut self) {
@@ -1707,29 +1901,25 @@ impl Pipeline {
         }
         self.checkpoint_graph_holds();
 
-        if self.active_downloads > 0
-            || !self.active_decodes_by_job.is_empty()
-            || !self.pending_decode.is_empty()
-        {
+        if self.articles_in_flight > 0 || self.has_queued_or_active_decode() {
             warn!(
-                active_downloads = self.active_downloads,
+                articles_in_flight = self.articles_in_flight,
                 active_decodes = self.active_decodes_by_job.total(),
-                pending_decode = self.pending_decode.len(),
                 "shutdown drain ended with in-flight pipeline work"
             );
         } else {
             info!("shutdown drain completed active download/decode work");
         }
 
-        if self.active_downloads > 0 {
+        if self.articles_in_flight > 0 {
             info!(
-                active = self.active_downloads,
+                active = self.articles_in_flight,
                 "draining in-flight downloads"
             );
         }
         self.flush_server_attribution();
         self.flush_support_facts();
-        if let Err(error) = self.shared_state.queue.sample_bandwidth(true) {
+        if let Err(error) = self.shared_state.queue.clone().flush_bandwidth().await {
             warn!(error = %error, "failed to flush pending bandwidth usage during drain");
         }
 
@@ -1737,6 +1927,7 @@ impl Pipeline {
         // writes such as a proven pipelining depth) so shutdown does not drop
         // them. Bounded so a stuck write cannot hang shutdown forever.
         self.join_fire_and_forget_tasks().await;
+        self.retry_kept_archives_at_drain();
         match tokio::time::timeout(
             Self::FIRE_AND_FORGET_DRAIN_TIMEOUT,
             self.db.flush_write_queue(),
@@ -1747,30 +1938,42 @@ impl Pipeline {
             Ok(Err(error)) => warn!(%error, "failed to flush ordered database writes during drain"),
             Err(_) => warn!("timed out flushing ordered database writes during drain"),
         }
+        self.warn_of_kept_archives();
     }
 
-    fn has_download_or_decode_drain_work(&self) -> bool {
-        self.active_downloads > 0
-            || !self.active_decodes_by_job.is_empty()
-            || !self.pending_decode.is_empty()
+    // A decode running, or an undecoded body queued for one. Only tests
+    // queue undecoded bodies.
+    fn has_queued_or_active_decode(&self) -> bool {
+        #[cfg(test)]
+        if !self.pending_decode.is_empty() {
+            return true;
+        }
+        !self.active_decodes_by_job.is_empty()
+    }
+
+    fn has_decode_drain_work(&self) -> bool {
+        self.has_queued_or_active_decode()
             || self.metrics.decode_pending.load(Ordering::Relaxed) > 0
     }
 
+    fn has_download_or_decode_drain_work(&self) -> bool {
+        self.articles_in_flight > 0 || self.has_decode_drain_work()
+    }
+
     async fn drain_inflight_download_and_decode_work(&mut self) {
+        #[cfg(test)]
         self.pump_decode_queue();
 
         while self.has_download_or_decode_drain_work() {
             let event = tokio::time::timeout(Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT, async {
                 tokio::select! {
-                    result = self.download_done_rx.recv(), if self.active_downloads > 0 => {
+                    result = self.download_done_rx.recv(), if self.articles_in_flight > 0 => {
                         result.map(ShutdownDrainEvent::Download)
                     }
-                    result = self.owned_download_lane_event_rx.recv(), if self.active_downloads > 0 => {
+                    result = self.owned_download_lane_event_rx.recv(), if self.articles_in_flight > 0 => {
                         result.map(ShutdownDrainEvent::OwnedDownload)
                     }
-                    result = self.decode_done_rx.recv(), if !self.active_decodes_by_job.is_empty()
-                        || !self.pending_decode.is_empty()
-                        || self.metrics.decode_pending.load(Ordering::Relaxed) > 0 => {
+                    result = self.decode_done_rx.recv(), if self.has_decode_drain_work() => {
                         result.map(ShutdownDrainEvent::Decode)
                     }
                 }
@@ -1780,6 +1983,7 @@ impl Pipeline {
             match event {
                 Ok(Some(ShutdownDrainEvent::Download(result))) => {
                     self.handle_download_done(result).await;
+                    #[cfg(test)]
                     self.pump_decode_queue();
                 }
                 Ok(Some(ShutdownDrainEvent::OwnedDownload(event))) => {
@@ -1790,10 +1994,12 @@ impl Pipeline {
                         self.process_released_download_done(result).await;
                         self.report_job(reported_job);
                     }
+                    #[cfg(test)]
                     self.pump_decode_queue();
                 }
                 Ok(Some(ShutdownDrainEvent::Decode(result))) => {
                     self.handle_decode_done(result).await;
+                    #[cfg(test)]
                     self.pump_decode_queue();
                 }
                 Ok(None) => {
@@ -1802,9 +2008,8 @@ impl Pipeline {
                 }
                 Err(_) => {
                     warn!(
-                        active_downloads = self.active_downloads,
+                        articles_in_flight = self.articles_in_flight,
                         active_decodes = self.active_decodes_by_job.total(),
-                        pending_decode = self.pending_decode.len(),
                         decode_pending = self.metrics.decode_pending.load(Ordering::Relaxed),
                         idle_timeout_secs = Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT.as_secs(),
                         "timed out waiting for in-flight download/decode work during shutdown"
@@ -1876,19 +2081,20 @@ enum ShutdownDrainEvent {
     Decode(DecodeDone),
 }
 
+// The decoded bytes that may wait for the writer, sized from the memory
+// tier's base size (`BacklogSizing::base_bytes`) and the machine's memory.
 pub(crate) fn compute_write_backlog_budget_bytes(
     profile: &SystemProfile,
-    buffers: &Arc<BufferPool>,
+    backlog_base_bytes: usize,
 ) -> usize {
     use crate::runtime::system_profile::StorageClass;
 
-    // The write backlog stays scratch-anchored: growing it with memory only
-    // defers flushing into a larger end-of-job drain tail (measured as added
-    // wall variance), while decode-side scaling is what prevents pressure
-    // latch cycles during download waves.
-    let scratch_bytes = buffer_pool_total_bytes(buffers);
+    // The write backlog stays anchored to the tier's base size: growing it
+    // with memory only defers flushing into a larger end-of-job drain tail
+    // (measured as added wall variance), while decode-side scaling is what
+    // prevents pressure latch cycles during download waves.
     let available_bytes = backlog_memory_ceiling_bytes(profile);
-    let base = scratch_bytes
+    let base = backlog_base_bytes
         .max(64 * 1024 * 1024)
         .min((available_bytes / 8).max(64 * 1024 * 1024));
 
@@ -1901,27 +2107,28 @@ pub(crate) fn compute_write_backlog_budget_bytes(
     }
 }
 
+// The bytes that may wait to be decoded, sized from the memory tier's base
+// size, the machine's memory and the write backlog limit.
 pub(crate) fn compute_decode_backlog_budget_bytes(
     profile: &SystemProfile,
-    buffers: &Arc<BufferPool>,
+    backlog_base_bytes: usize,
     write_backlog_budget_bytes: usize,
 ) -> usize {
-    const DECODE_BACKLOG_POOL_MULTIPLIER: usize = 3;
+    const DECODE_BACKLOG_BASE_MULTIPLIER: usize = 3;
     const DECODE_BACKLOG_MEMORY_FRACTION: usize = 8;
     const DECODE_BACKLOG_MAX_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
-    let scratch_bytes = buffer_pool_total_bytes(buffers);
     let available_bytes = backlog_memory_ceiling_bytes(profile);
     // A full download wave (every lane's leased runway decoding at once) must
     // fit under the soft limit on machines with memory to spare, or the
     // pressure latch cycles on every wave; scale the budget with available
-    // memory instead of pinning it to buffer-pool scratch alone.
+    // memory instead of pinning it to the tier's base size alone.
     let scaled = available_bytes / 12;
     let memory_cap = (available_bytes / DECODE_BACKLOG_MEMORY_FRACTION)
         .max(write_backlog_budget_bytes)
         .min(DECODE_BACKLOG_MAX_BYTES);
-    let target = scratch_bytes
-        .saturating_mul(DECODE_BACKLOG_POOL_MULTIPLIER)
+    let target = backlog_base_bytes
+        .saturating_mul(DECODE_BACKLOG_BASE_MULTIPLIER)
         .max(scaled)
         .max(write_backlog_budget_bytes);
 
@@ -1936,15 +2143,6 @@ fn backlog_memory_ceiling_bytes(profile: &SystemProfile) -> usize {
         Some(cgroup_limit) => available_bytes.min(cgroup_limit) as usize,
         None => available_bytes as usize,
     }
-}
-
-fn buffer_pool_total_bytes(buffers: &Arc<BufferPool>) -> usize {
-    use crate::runtime::buffers::BufferTier;
-
-    let metrics = buffers.metrics();
-    metrics.small_total * BufferTier::Small.size_bytes()
-        + metrics.medium_total * BufferTier::Medium.size_bytes()
-        + metrics.large_total * BufferTier::Large.size_bytes()
 }
 
 pub(crate) fn timestamp_secs() -> u64 {

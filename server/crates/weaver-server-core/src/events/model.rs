@@ -80,6 +80,8 @@ pub enum PipelineEvent {
         server_id: ServerId,
         attempt: u32,
         retry_count: u32,
+        // The request's time on its connection as the download lane timed
+        // it, a not-found answer included; never time spent in the pipeline.
         latency_ms: u64,
         outcome: ServerAttemptOutcome,
         error: Option<String>,
@@ -121,7 +123,7 @@ pub enum PipelineEvent {
     },
 
     // ---- Decode stage ----
-    // yEnc decode completed. Data is in a pooled buffer.
+    // yEnc decode completed.
     SegmentDecoded {
         segment_id: SegmentId,
         decoded_size: u32,

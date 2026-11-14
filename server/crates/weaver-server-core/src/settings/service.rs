@@ -7,9 +7,9 @@ use crate::persistence::Database;
 use crate::runtime::hardware_profile::HardwareProfile;
 use crate::settings::record::SettingRecord;
 use crate::settings::{
-    BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides, Leaf,
-    MetricsConfig, PerJobSeries, RetryOverrides, SeedTimeCounting, SeedingAction, SeedingGoalMode,
-    SeedingPolicy, TorrentConfig, TorrentEncryption, TorrentPeerProtocol,
+    Config, DeliveryNamingOverrides, DirectStoreOverrides, Leaf, MetricsConfig, PerJobSeries,
+    RetryOverrides, SeedTimeCounting, SeedingAction, SeedingGoalMode, SeedingPolicy, TorrentConfig,
+    TorrentEncryption, TorrentPeerProtocol,
 };
 use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
 
@@ -24,6 +24,9 @@ pub(crate) const RETIRED_SETTING_KEYS: &[&str] = &[
     "ip_replacement_trial_extra_connections",
     "direct_store.enabled",
     "direct_unpack.enabled",
+    "buffer_pool.small_count",
+    "buffer_pool.medium_count",
+    "buffer_pool.large_count",
 ];
 
 // The torrent listen port. Absent until the first load draws one.
@@ -86,6 +89,9 @@ impl Database {
         let delete_failed_job_files = settings
             .get("delete_failed_job_files")
             .and_then(|v| v.parse().ok());
+        let history_retention_days = settings
+            .get("history_retention_days")
+            .and_then(|v| v.parse().ok());
         let watch_folder = WatchFolderConfig {
             mode: settings
                 .get("watch_folder.mode")
@@ -108,26 +114,6 @@ impl Database {
                 .get("watch_folder.scanning_paused")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(false),
-        };
-        let buffer_pool = {
-            let small = settings
-                .get("buffer_pool.small_count")
-                .and_then(|v| v.parse().ok());
-            let medium = settings
-                .get("buffer_pool.medium_count")
-                .and_then(|v| v.parse().ok());
-            let large = settings
-                .get("buffer_pool.large_count")
-                .and_then(|v| v.parse().ok());
-            if small.is_some() || medium.is_some() || large.is_some() {
-                Some(BufferPoolOverrides {
-                    small_count: small,
-                    medium_count: medium,
-                    large_count: large,
-                })
-            } else {
-                None
-            }
         };
 
         let retry = {
@@ -250,13 +236,13 @@ impl Database {
             data_dir,
             intermediate_dir,
             complete_dir,
-            buffer_pool,
             servers,
             categories,
             retry,
             bandwidth,
             cleanup_after_extract,
             delete_failed_job_files,
+            history_retention_days,
             propagation_delay_secs,
             max_concurrent_nzbs: settings
                 .get("max_concurrent_nzbs")
@@ -420,6 +406,9 @@ impl Database {
         if let Some(delete) = config.delete_failed_job_files {
             self.set_setting("delete_failed_job_files", &delete.to_string())?;
         }
+        if let Some(days) = config.history_retention_days {
+            self.set_setting("history_retention_days", &days.to_string())?;
+        }
         self.set_setting("watch_folder.mode", config.watch_folder.mode.as_str())?;
         match config.watch_folder.normalized_path() {
             Some(path) => self.set_setting("watch_folder.path", &path)?,
@@ -471,18 +460,6 @@ impl Database {
             "duplicate_policy.normalized_name",
             config.duplicate_policy.normalized_name.as_str(),
         )?;
-        if let Some(ref bp) = config.buffer_pool {
-            if let Some(v) = bp.small_count {
-                self.set_setting("buffer_pool.small_count", &v.to_string())?;
-            }
-            if let Some(v) = bp.medium_count {
-                self.set_setting("buffer_pool.medium_count", &v.to_string())?;
-            }
-            if let Some(v) = bp.large_count {
-                self.set_setting("buffer_pool.large_count", &v.to_string())?;
-            }
-        }
-
         if let Some(ref direct_store) = config.direct_store {
             for (key, bytes) in [
                 (

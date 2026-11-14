@@ -11,7 +11,6 @@ use crate::Database;
 use crate::ingest::submit_nzb_bytes;
 use crate::jobs::ids::MessageId;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
-use crate::runtime::buffers::{BufferPool, BufferPoolConfig};
 use crate::runtime::system_profile::{
     CpuProfile, DiskProfile, FilesystemType, MemoryProfile, SimdSupport, StorageClass,
     SystemProfile,
@@ -44,6 +43,7 @@ macro_rules! segment_spec {
     };
 }
 
+mod archive_history;
 mod archive_output_contract;
 mod archive_passwords;
 mod archive_topology;
@@ -54,11 +54,14 @@ mod core;
 mod decode_stage;
 pub(in crate::pipeline) mod delivered_restore;
 pub(in crate::pipeline) mod direct_store;
+mod dispatch_order;
 mod download_dispatch;
 pub(in crate::pipeline) mod engines;
 mod full_file_names;
 mod hardware_profile;
 mod idle;
+mod memory_release;
+mod next_up_ring;
 mod nzb_admission;
 mod par2;
 mod par2_completion;
@@ -156,7 +159,6 @@ impl TestHarness {
             hardware_profile: None,
             intermediate_dir: Some(intermediate_dir.display().to_string()),
             complete_dir: Some(complete_dir.display().to_string()),
-            buffer_pool: None,
             servers: vec![],
             categories: vec![],
             retry: None,
@@ -165,6 +167,7 @@ impl TestHarness {
             max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
             delete_failed_job_files: None,
+            history_retention_days: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: Some(crate::settings::DirectStoreOverrides {
@@ -209,16 +212,10 @@ impl TestHarness {
                 same_filesystem: true,
             },
         };
-        let buffers = BufferPool::new(BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        });
-
         let mut pipeline = Pipeline::new(
             event_tx,
             nntp,
-            buffers,
+            16 * 1024 * 1024,
             profile,
             data_dir.clone(),
             intermediate_dir,
@@ -373,8 +370,10 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         failure_error: None,
         delivered: None,
         delivery_left_behind: Vec::new(),
+        delivery_source: None,
         working_dir,
         downloaded_bytes: 0,
+        checkpointed_download_bytes: 0,
         restored_download_floor_bytes: 0,
         downloaded_wire_bytes: 0,
         server_attribution: Default::default(),
@@ -456,6 +455,7 @@ fn history_row_with_output_dir(
         completed_at: 2,
         metadata: None,
         server_attribution: None,
+        archived_at: None,
     }
 }
 
@@ -467,8 +467,9 @@ fn insert_history_row_with_nzb_zstd(db: &Database, row: &crate::JobHistoryRow, n
     db.run_sql_blocking(async move {
         SqlRuntime::execute(
             datastore.write_exec(),
-            "UPDATE job_history SET nzb_zstd = {} WHERE job_id = {}",
-            &[SqlArg::Bytes(nzb_zstd), SqlArg::I64(job_id)],
+            "INSERT INTO job_nzbs (job_id, nzb_zstd) VALUES ({}, {})
+             ON CONFLICT(job_id) DO UPDATE SET nzb_zstd = excluded.nzb_zstd",
+            &[SqlArg::I64(job_id), SqlArg::Bytes(nzb_zstd)],
         )
         .await?;
         Ok(())
@@ -537,15 +538,15 @@ async fn settle_lane_dials(pipeline: &mut Pipeline) {
     }
 }
 
-pub(crate) async fn new_direct_pipeline_with_buffers(
+pub(crate) async fn new_direct_pipeline_with_backlog(
     temp_dir: &TempDir,
-    buffer_config: BufferPoolConfig,
+    backlog_base_bytes: usize,
     total_connections: usize,
 ) -> (Pipeline, PathBuf, PathBuf) {
-    new_direct_pipeline_with(temp_dir, buffer_config, total_connections, None).await
+    new_direct_pipeline_with(temp_dir, backlog_base_bytes, total_connections, None).await
 }
 
-// [`new_direct_pipeline_with_buffers`], plus the `[direct_store]` config table.
+// [`new_direct_pipeline_with_backlog`], plus the `[direct_store]` config table.
 //
 // Everything else in this module reaches for `set_gate`, which bypasses
 // configuration entirely. The tests that exist to prove the *config* is the
@@ -553,7 +554,7 @@ pub(crate) async fn new_direct_pipeline_with_buffers(
 // here instead.
 async fn new_direct_pipeline_with(
     temp_dir: &TempDir,
-    buffer_config: BufferPoolConfig,
+    backlog_base_bytes: usize,
     total_connections: usize,
     direct_store: Option<crate::settings::DirectStoreOverrides>,
 ) -> (Pipeline, PathBuf, PathBuf) {
@@ -562,7 +563,7 @@ async fn new_direct_pipeline_with(
         temp_dir.path().join("intermediate"),
         temp_dir.path().join("complete"),
         temp_dir.path().join("weaver.db"),
-        buffer_config,
+        backlog_base_bytes,
         total_connections,
         direct_store,
     )
@@ -582,7 +583,7 @@ async fn new_direct_pipeline_at_roots(
     intermediate_dir: PathBuf,
     complete_dir: PathBuf,
     db_path: PathBuf,
-    buffer_config: BufferPoolConfig,
+    backlog_base_bytes: usize,
     total_connections: usize,
     direct_store: Option<crate::settings::DirectStoreOverrides>,
 ) -> (Pipeline, PathBuf, PathBuf) {
@@ -591,7 +592,7 @@ async fn new_direct_pipeline_at_roots(
         intermediate_dir,
         complete_dir,
         db_path,
-        buffer_config,
+        backlog_base_bytes,
         total_connections,
         direct_store,
         SystemProfile {
@@ -627,7 +628,7 @@ async fn new_direct_pipeline_on_machine(
     intermediate_dir: PathBuf,
     complete_dir: PathBuf,
     db_path: PathBuf,
-    buffer_config: BufferPoolConfig,
+    backlog_base_bytes: usize,
     total_connections: usize,
     direct_store: Option<crate::settings::DirectStoreOverrides>,
     profile: SystemProfile,
@@ -648,7 +649,6 @@ async fn new_direct_pipeline_on_machine(
         hardware_profile: None,
         intermediate_dir: Some(intermediate_dir.display().to_string()),
         complete_dir: Some(complete_dir.display().to_string()),
-        buffer_pool: None,
         servers: vec![],
         categories: vec![],
         retry: None,
@@ -657,6 +657,7 @@ async fn new_direct_pipeline_on_machine(
         max_concurrent_nzbs: None,
         cleanup_after_extract: Some(true),
         delete_failed_job_files: None,
+        history_retention_days: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: Some(direct_store),
@@ -696,12 +697,10 @@ async fn new_direct_pipeline_on_machine(
         max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
     });
-    let buffers = BufferPool::new(buffer_config);
-
     let mut pipeline = Pipeline::new(
         event_tx,
         nntp,
-        buffers,
+        backlog_base_bytes,
         profile,
         data_dir,
         intermediate_dir.clone(),
@@ -741,16 +740,7 @@ async fn new_scheduler_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathB
 }
 
 pub(crate) async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf) {
-    new_direct_pipeline_with_buffers(
-        temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        0,
-    )
-    .await
+    new_direct_pipeline_with_backlog(temp_dir, 16 * 1024 * 1024, 0).await
 }
 
 // End a pipeline incarnation before the next one opens its database.
@@ -1589,7 +1579,11 @@ pub(super) fn build_test_par2_index_for_files(files: &[(&str, &[u8])], slice_siz
     stream
 }
 
-fn segmented_job_spec(name: &str, filename: &str, segment_sizes: &[u32]) -> JobSpec {
+pub(in crate::pipeline) fn segmented_job_spec(
+    name: &str,
+    filename: &str,
+    segment_sizes: &[u32],
+) -> JobSpec {
     JobSpec {
         name: name.to_string(),
         password: None,
@@ -1766,8 +1760,10 @@ async fn insert_active_job_with_persisted_nzb_named(
             failure_error: None,
             delivered: None,
             delivery_left_behind: Vec::new(),
+            delivery_source: None,
             working_dir: working_dir.clone(),
             downloaded_bytes: 0,
+            checkpointed_download_bytes: 0,
             restored_download_floor_bytes: 0,
             downloaded_wire_bytes: 0,
             server_attribution: Default::default(),
@@ -1812,6 +1808,7 @@ pub(in crate::pipeline) async fn insert_delivered_job(
         .download_queue
         .pop()
         .unwrap();
+    let work = pipeline.dispatched(work);
     let segment_id = work.segment_id;
     let raw = encode_article_part(filename, payload, 1, 1, 1, payload.len() as u64);
     // Lane 0 holds the article, as a dispatched lease would book it.
@@ -1828,7 +1825,7 @@ pub(in crate::pipeline) async fn insert_delivered_job(
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -2048,8 +2045,11 @@ async fn submit_decoded_segment_declaring(
                 segments,
             },
             SegmentSource {
-                source_server_idx: None,
-                exclude_servers: Vec::new(),
+                servers: PoolServers::stamped(
+                    pipeline.pool_generation,
+                    None,
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
             },
         )
         .await;
@@ -2165,6 +2165,27 @@ fn retention_client(retention_days: &[u32]) -> weaver_nntp::client::NntpClient {
         max_idle_age: Duration::from_secs(300),
         max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(1),
+    })
+}
+
+// A client of the `retention_client` servers named by `hosts`, in that
+// order: host `n` is the same server in every client built here.
+fn hosts_client(hosts: &[usize]) -> weaver_nntp::client::NntpClient {
+    weaver_nntp::client::NntpClient::new(weaver_nntp::client::NntpClientConfig {
+        servers: hosts
+            .iter()
+            .map(|host| weaver_nntp::pool::ServerPoolConfig {
+                server: weaver_nntp::ServerConfig {
+                    host: format!("retention-{host}.example.com"),
+                    ..Default::default()
+                },
+                max_connections: 2,
+                ..weaver_nntp::pool::ServerPoolConfig::default()
+            })
+            .collect(),
+        max_idle_age: std::time::Duration::from_secs(300),
+        max_retries_per_server: 1,
+        soft_timeout: std::time::Duration::from_secs(1),
     })
 }
 

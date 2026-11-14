@@ -166,3 +166,42 @@ fn get_job_events_latest_returns_all_when_under_cap() {
     // Empty job yields an empty tail.
     assert!(db.get_job_events_latest(99, 2000).unwrap().is_empty());
 }
+
+#[test]
+fn events_of_kinds_are_every_matching_event_oldest_first() {
+    let db = Database::open_in_memory().unwrap();
+    let kinds = ["JobCreated", "ScriptOutput", "JobCompleted", "ScriptOutput"];
+    let mut events: Vec<JobEvent> = (0..3000)
+        .map(|index| JobEvent {
+            job_id: 7,
+            timestamp: 1000 + index as i64,
+            kind: kinds[index % kinds.len()].to_string(),
+            message: format!("event {index}"),
+            file_id: None,
+        })
+        .collect();
+    events.push(JobEvent {
+        job_id: 8,
+        timestamp: 9000,
+        kind: "JobCreated".to_string(),
+        message: "other job".to_string(),
+        file_id: None,
+    });
+    db.insert_job_events(&events).unwrap();
+
+    let read = db
+        .get_job_events_of_kinds(7, &["JobCreated", "JobCompleted"])
+        .unwrap();
+    let expected: Vec<String> = events
+        .iter()
+        .filter(|event| event.job_id == 7 && event.kind != "ScriptOutput")
+        .map(|event| event.message.clone())
+        .collect();
+    assert_eq!(
+        read.iter()
+            .map(|event| event.message.clone())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(db.get_job_events_of_kinds(7, &[]).unwrap().is_empty());
+}

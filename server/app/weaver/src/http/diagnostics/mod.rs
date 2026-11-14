@@ -28,14 +28,22 @@
 //    they identify nobody. The manifest records how many stand-ins the
 //    package allocated, so a reader knows the names are not real, and how
 //    many finished jobs the history holds: names are read for the 2,000 most
-//    recent. A table source that cannot be read leaves every component out.
-//    There is no way to turn this off.
+//    recent. A table source that cannot be read leaves every component out
+//    but the few that name nothing by construction, `database.json` and the
+//    pipeline-internals fallback, which then ship with fixed sentences in
+//    place of any error text. There is no way to turn this off. The one file that skips the pass is
+//    `nzb-reports.json`: the support reports in it are built from fixed
+//    names and generated tokens only, and join the package as written.
 // 3. **A failed component never fails the package.** Each piece records
 //    either its bytes or its error, and the error is written into the manifest.
 //    A report that is missing one section is still a report; a 500 is not.
 
 mod archive;
+mod bounded;
+mod database_facts;
 mod graphql;
+mod nzb_reports;
+mod pipeline_internals;
 mod redact;
 mod sanitize;
 
@@ -51,7 +59,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
 use weaver_server_api::WeaverSchema;
-use weaver_server_core::operations::disk::StorageCapacity;
+use weaver_server_core::operations::disk::{OnDemandSpace, Reach, StorageCapacity};
 use weaver_server_core::settings::model::SharedConfig;
 use weaver_server_core::{Database, SchedulerHandle};
 
@@ -70,6 +78,19 @@ const MAX_LOG_BYTES: u64 = 32 * 1024 * 1024;
 // Ceiling on a single copied configuration file. A config this large is not a
 // config, and reading it into memory to redact it should stay bounded.
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+
+// How long the stand-in table may take to read. It reads every table source,
+// the NZB of every job named in the package among them, so a healthy but
+// large instance takes far longer than a single read; the bound is the one
+// the support reports already give their NZB reads.
+const STORED_NAMES_WAIT: Duration = nzb_reports::REPORT_BUDGET;
+
+// How long the GraphQL root fields may take together. They run at once, so
+// this is spent once. A busy instance with thousands of jobs answers the
+// queue snapshot in many seconds while nothing is stalled, and the package
+// is worth little without it, so the wait is the long one, not the short
+// wait a single pragma gets.
+const GRAPHQL_WAIT: Duration = nzb_reports::REPORT_BUDGET;
 
 // Arguments for the two bounded root fields. The ring buffer holds far fewer
 // lines than the service-log limit, so that one asks for all of them; the job
@@ -206,45 +227,94 @@ async fn collect_components(
         exporter.render(disk_space, http_metrics).await,
     ));
 
-    components.extend(collect_graphql_components(schema, &caller).await);
-    components.push(collect_pipeline_internals(handle).await);
+    // The pipeline's turns are sampled from its stamp for as long as the rest
+    // is collected, up to the second Prometheus sample.
+    let gather = async {
+        // These wait on the pipeline or the database only until their own short
+        // deadlines, and together: a stall costs the package that wait once.
+        let (graphql, pipeline, database) = tokio::join!(
+            collect_graphql_components(schema, &caller),
+            pipeline_internals::collect_pipeline_internals(handle),
+            database_facts::collect_database_facts(db),
+        );
+        components.extend(graphql);
+        components.extend(pipeline);
+        components.extend(database);
+        // The support reports name nothing to begin with, so they join the
+        // package as their report code wrote them, after the stand-in pass.
+        let nzb_reports = nzb_reports::collect_nzb_reports(db, handle).await;
 
-    let (data_dir, intermediate_dir, complete_dir, watch_dir) = {
-        let config = config.read().await;
+        let (data_dir, intermediate_dir, complete_dir, watch_dir) = {
+            let config = config.read().await;
+            (
+                PathBuf::from(&config.data_dir),
+                PathBuf::from(config.intermediate_dir()),
+                PathBuf::from(config.complete_dir()),
+                config
+                    .watch_folder
+                    .path
+                    .as_deref()
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from),
+            )
+        };
+
+        let host_dirs = (
+            data_dir.clone(),
+            intermediate_dir.clone(),
+            complete_dir.clone(),
+        );
+        // Each directory's space and storage class come from the disk owner,
+        // looked at together, each within the owner's time limit.
+        let host_paths = [
+            data_dir.clone(),
+            intermediate_dir.clone(),
+            complete_dir.clone(),
+        ];
+        let host_asks = [
+            (data_dir.clone(), Reach::Exact),
+            (intermediate_dir.clone(), Reach::Exact),
+            (complete_dir.clone(), Reach::Exact),
+        ];
+        let (host_spaces, host_classes) = tokio::join!(
+            StorageCapacity::spaces(Some(disk_space.as_ref()), &host_asks),
+            disk_space.classifications(&host_paths),
+        );
+        let host = tokio::task::spawn_blocking(move || {
+            collect_host_facts(host_dirs, host_spaces, host_classes)
+        })
+        .await;
+        components.push(match host {
+            Ok(facts) => Component::json("host.json", &facts),
+            Err(error) => Component::failed("host.json", error),
+        });
+
+        components.extend(collect_log_files().await);
+        components.extend(collect_config_files(&data_dir).await);
+
+        // The second Prometheus sample is the last thing collected, so the gap
+        // between the two is at least the configured one no matter how long the
+        // rest of the collection took.
+        let elapsed = started.elapsed();
+        if let Some(remaining) = METRICS_SAMPLE_GAP.checked_sub(elapsed) {
+            tokio::time::sleep(remaining).await;
+        }
         (
-            PathBuf::from(&config.data_dir),
-            PathBuf::from(config.intermediate_dir()),
-            PathBuf::from(config.complete_dir()),
-            config
-                .watch_folder
-                .path
-                .as_deref()
-                .filter(|path| !path.is_empty())
-                .map(PathBuf::from),
+            nzb_reports,
+            data_dir,
+            intermediate_dir,
+            complete_dir,
+            watch_dir,
         )
     };
-
-    let host_dirs = (
-        data_dir.clone(),
-        intermediate_dir.clone(),
-        complete_dir.clone(),
-    );
-    let host = tokio::task::spawn_blocking(move || collect_host_facts(host_dirs)).await;
-    components.push(match host {
-        Ok(facts) => Component::json("host.json", &facts),
-        Err(error) => Component::failed("host.json", error),
-    });
-
-    components.extend(collect_log_files().await);
-    components.extend(collect_config_files(&data_dir).await);
-
-    // The second Prometheus sample is the last thing collected, so the gap
-    // between the two is at least the configured one no matter how long the
-    // rest of the collection took.
-    let elapsed = started.elapsed();
-    if let Some(remaining) = METRICS_SAMPLE_GAP.checked_sub(elapsed) {
-        tokio::time::sleep(remaining).await;
-    }
+    let ((nzb_reports, data_dir, intermediate_dir, complete_dir, watch_dir), phases) =
+        pipeline_internals::sample_turn_phases_while(
+            |now| handle.pipeline_turn(now),
+            pipeline_internals::PHASE_SAMPLE_EVERY,
+            gather,
+        )
+        .await;
+    components.push(phases.component());
     components.push(Component::text(
         "metrics-2.txt",
         exporter.render(disk_space, http_metrics).await,
@@ -255,32 +325,32 @@ async fn collect_components(
     let local = sanitize::LocalNames::current(data_dir, intermediate_dir, complete_dir, watch_dir);
     // The table is read once everything is collected, so a name added
     // during the collection is in it.
+    // A table that cannot be read in time is a table that cannot be read:
+    // every component is left out, as for any other failure to read it.
     let stored = {
         let db = db.clone();
-        tokio::task::spawn_blocking(move || sanitize::read_stored_names(&db))
-            .await
-            .unwrap_or_else(|error| {
-                Err(format!(
-                    "the stand-in table could not read the database: {error}"
-                ))
-            })
+        bounded::within(
+            tokio::time::Instant::now() + STORED_NAMES_WAIT,
+            bounded::blocking(move || sanitize::read_stored_names(&db)),
+        )
+        .await
     };
-    sanitize_components(components, stored, local).await
+    let (mut components, sanitized) = sanitize_components(components, stored, local).await;
+    components.push(nzb_reports);
+    (components, sanitized)
 }
 
 // The one sanitizing pass over a collected package. A table source that
 // cannot be read, or a table that cannot be built, leaves every component
-// out: a table missing a source would let that source's names leave. The
+// out but those that name nothing by construction: a table missing a source
+// would let that source's names leave. The
 // pass scans every byte, so it runs off the async runtime.
 async fn sanitize_components(
     components: Vec<Component>,
-    stored: Result<sanitize::StoredNames, String>,
+    stored: Result<sanitize::StoredNames, bounded::ReadRefused>,
     local: sanitize::LocalNames,
 ) -> (Vec<Component>, archive::ManifestSanitized) {
-    let names: Vec<String> = components
-        .iter()
-        .map(|component| component.name.clone())
-        .collect();
+    let shells: Vec<Component> = components.iter().map(sanitize::shell_of).collect();
     let history_jobs_total = stored.as_ref().ok().map(|stored| stored.history_total);
     let schema_keys = SchemaShape::current()
         .map(SchemaShape::field_names)
@@ -288,21 +358,26 @@ async fn sanitize_components(
     let fallback = local.clone();
     let pass = tokio::task::spawn_blocking(move || {
         let mut components = components;
-        let result = stored.and_then(|stored| {
-            sanitize::sanitize_package(&mut components, &local, &stored, schema_keys)
-        });
+        let result = match stored {
+            Ok(stored) => sanitize::sanitize_package(&mut components, &local, &stored, schema_keys)
+                .map_err(|error| (error, None)),
+            Err(refused) => Err((
+                format!(
+                    "the stand-in table could not read the database: {}",
+                    refused.message
+                ),
+                Some(refused.reason),
+            )),
+        };
         match result {
             Ok(stand_ins) => (components, stand_ins),
-            Err(error) => {
-                let names = components.into_iter().map(|component| component.name);
-                (sanitize::left_out(&local, names, &error), 0)
-            }
+            Err((error, code)) => (sanitize::left_out(&local, components, &error, code), 0),
         }
     })
     .await;
     let (components, stand_ins) = pass.unwrap_or_else(|error| {
         let reason = format!("the stand-in table could not be built: {error}");
-        (sanitize::left_out(&fallback, names.into_iter(), &reason), 0)
+        (sanitize::left_out(&fallback, shells, &reason, None), 0)
     });
     let sanitized = archive::ManifestSanitized {
         stand_ins: stand_ins as u64,
@@ -318,6 +393,10 @@ async fn sanitize_components(
 // simpler, but the schema caps query complexity, and the whole point of a
 // generated selection is that it grows: a shared budget would mean a new field
 // on `Metrics` silently costing `queueSnapshot` its place in the package.
+//
+// Some fields read the database (the queue's duplicate summaries, the
+// servers' TLS diagnostics, the schedules), so the fields run together and
+// each waits only until one shared deadline.
 async fn collect_graphql_components(
     schema: &WeaverSchema,
     caller: &super::auth::ResolvedCaller,
@@ -331,27 +410,55 @@ async fn collect_graphql_components(
                 .collect();
         }
     };
-
-    let mut components = Vec::new();
-    for group in GRAPHQL_COMPONENTS {
-        let mut data = serde_json::Map::new();
-        let mut errors = Vec::new();
-        for (field, arguments) in group.fields {
-            match graphql::run_root_field(
+    collect_graphql_within(
+        GRAPHQL_COMPONENTS,
+        tokio::time::Instant::now() + GRAPHQL_WAIT,
+        |field, arguments| {
+            graphql::run_root_field(
                 schema,
                 shape,
                 caller.scope,
                 caller.identity.clone(),
                 field,
-                *arguments,
+                arguments,
             )
-            .await
-            {
+        },
+    )
+    .await
+}
+
+async fn collect_graphql_within<Run, Fut>(
+    groups: &[GraphqlComponent],
+    deadline: tokio::time::Instant,
+    run: Run,
+) -> Vec<Component>
+where
+    Run: Fn(&'static str, Option<&'static str>) -> Fut,
+    Fut: std::future::Future<Output = Result<(serde_json::Value, Vec<String>), String>>,
+{
+    let fields: Vec<_> = groups
+        .iter()
+        .flat_map(|group| group.fields.iter())
+        .map(|&(field, arguments)| bounded::within(deadline, run(field, arguments)))
+        .collect();
+    let mut answers = bounded::join_all(fields).await.into_iter();
+
+    let mut components = Vec::new();
+    for group in groups {
+        let mut data = serde_json::Map::new();
+        let mut errors = Vec::new();
+        let mut timed_out = Vec::new();
+        for (field, _) in group.fields {
+            match answers.next().expect("one answer per field") {
                 Ok((value, field_errors)) => {
                     data.insert((*field).to_string(), value);
                     errors.extend(field_errors);
                 }
-                Err(error) => errors.push(error),
+                Err(refused) if refused.reason == bounded::REASON_TIMED_OUT => {
+                    errors.push(format!("`{field}`: {}", refused.message));
+                    timed_out.push(*field);
+                }
+                Err(refused) => errors.push(refused.message),
             }
         }
 
@@ -360,9 +467,32 @@ async fn collect_graphql_components(
             redact_json(&mut data, is_sensitive_json_key);
         }
 
+        let empty = data.as_object().is_some_and(serde_json::Map::is_empty);
+        if !timed_out.is_empty() && (empty || group.file == SERVICE_LOG_FILE) {
+            components.push(Component::failed_because(
+                group.file,
+                bounded::REASON_TIMED_OUT,
+                errors.join("; "),
+            ));
+            continue;
+        }
+        if !timed_out.is_empty() {
+            // Partial because a field did not answer in time: the file names
+            // those fields, and the manifest records the file as timed out.
+            components.push(Component::failed_because(
+                group.file,
+                bounded::REASON_TIMED_OUT,
+                format!("{} did not answer in time", timed_out.join(", ")),
+            ));
+            components.push(Component::json(
+                group.file,
+                &serde_json::json!({ "data": data, "errors": errors, "timed_out": timed_out }),
+            ));
+            continue;
+        }
         components.push(if group.file == SERVICE_LOG_FILE {
             Component::text(group.file, service_log_text(&data))
-        } else if data.as_object().is_some_and(serde_json::Map::is_empty) {
+        } else if empty {
             Component::failed(group.file, errors.join("; "))
         } else if errors.is_empty() {
             Component::json(group.file, &data)
@@ -449,31 +579,25 @@ fn service_log_text(data: &serde_json::Value) -> String {
     text
 }
 
-// The read-only pipeline snapshot, which exists nowhere else.
-async fn collect_pipeline_internals(handle: &SchedulerHandle) -> Component {
-    const FILE: &str = "pipeline-internals.json";
-    // A wedged pipeline is exactly the case this endpoint is for, so the
-    // request must not inherit the wedge: if the pipeline cannot answer
-    // promptly, that fact is the diagnostic.
-    match tokio::time::timeout(Duration::from_secs(3), handle.pipeline_diagnostics()).await {
-        Ok(Ok(diagnostics)) => Component::json(FILE, &diagnostics),
-        Ok(Err(error)) => Component::failed(FILE, error),
-        Err(_) => Component::failed(
-            FILE,
-            "the pipeline did not answer the diagnostics request within 3s",
-        ),
-    }
-}
-
 // Host facts, including a storage classification per configured directory.
-fn collect_host_facts(dirs: (PathBuf, PathBuf, PathBuf)) -> HostFacts {
+// Each directory's space and classification are the disk owner's answers,
+// in `spaces` and `classes`, given in the order data, intermediate,
+// complete. A classification that did not answer in time is left out.
+fn collect_host_facts(
+    dirs: (PathBuf, PathBuf, PathBuf),
+    spaces: Vec<OnDemandSpace>,
+    classes: Vec<
+        Option<(
+            weaver_server_core::runtime::system_profile::StorageClass,
+            weaver_server_core::runtime::system_profile::FilesystemType,
+        )>,
+    >,
+) -> HostFacts {
     use weaver_server_core::runtime::{environment, system_probe};
 
     let (data_dir, intermediate_dir, complete_dir) = dirs;
-    // The startup profile is the cheap half of the probe: it classifies the
-    // filesystem behind the path it is given and reads CPU and memory, with no
-    // benchmark attached.
-    let profile = system_probe::detect_startup_profile(&data_dir);
+    // CPU and memory only: storage comes from the disk owner.
+    let (cpu, memory) = system_probe::detect_cpu_and_memory();
     let deployment = environment::detect_runtime_environment();
 
     let storage = [
@@ -482,25 +606,33 @@ fn collect_host_facts(dirs: (PathBuf, PathBuf, PathBuf)) -> HostFacts {
         ("complete", complete_dir),
     ]
     .into_iter()
-    .map(|(role, path)| {
-        let (storage_class, filesystem) = system_probe::classify_storage(&path);
+    .zip(spaces)
+    .zip(classes)
+    .map(|(((role, path), space), class)| {
         let mut entry = HostStorage {
             role,
             path: path.display().to_string(),
-            storage_class: Some(format!("{storage_class:?}")),
-            filesystem: Some(format!("{filesystem:?}")),
+            storage_class: class
+                .as_ref()
+                .map(|(storage_class, _)| format!("{storage_class:?}")),
+            filesystem: class
+                .as_ref()
+                .map(|(_, filesystem)| format!("{filesystem:?}")),
             total_bytes: None,
             used_bytes: None,
             free_bytes: None,
             error: None,
         };
-        match weaver_server_core::operations::probe_disk_space(&path) {
-            Ok(space) => {
+        match space {
+            OnDemandSpace::Read(space) => {
                 entry.total_bytes = Some(space.total_bytes);
                 entry.used_bytes = Some(space.used_bytes());
                 entry.free_bytes = Some(space.available_bytes);
             }
-            Err(error) => entry.error = Some(error.to_string()),
+            OnDemandSpace::Failed(error) | OnDemandSpace::Lost(error) => entry.error = Some(error),
+            OnDemandSpace::TimedOut => {
+                entry.error = Some("filesystem capacity did not answer in time".to_string());
+            }
         }
         entry
     })
@@ -510,12 +642,12 @@ fn collect_host_facts(dirs: (PathBuf, PathBuf, PathBuf)) -> HostFacts {
         operating_system: std::env::consts::OS,
         architecture: std::env::consts::ARCH,
         deployment: format!("{:?}", deployment.deployment),
-        physical_cores: profile.cpu.physical_cores,
-        logical_cores: profile.cpu.logical_cores,
-        cpu_cgroup_limit: profile.cpu.cgroup_limit,
-        memory_total_bytes: profile.memory.total_bytes,
-        memory_available_bytes: profile.memory.available_bytes,
-        memory_cgroup_limit_bytes: profile.memory.cgroup_limit,
+        physical_cores: cpu.physical_cores,
+        logical_cores: cpu.logical_cores,
+        cpu_cgroup_limit: cpu.cgroup_limit,
+        memory_total_bytes: memory.total_bytes,
+        memory_available_bytes: memory.available_bytes,
+        memory_cgroup_limit_bytes: memory.cgroup_limit,
         storage,
     }
 }

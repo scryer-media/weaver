@@ -58,19 +58,35 @@ impl Window {
     }
 
     // Let go of the volumes with nothing left queued, then draw the round's
-    // bids into the free places, lightest first. Returns every bid that
-    // landed in the window, with its volume's rank.
-    pub(crate) fn draw(&mut self, mut queued: impl FnMut(VolumeIndex) -> bool) -> Vec<(Bid, u32)> {
+    // bids into the free places, lightest first. Bids of one weight from one
+    // bidder are drawn by the volume's place in its set where `placed` knows
+    // it, ahead of the volumes it does not, which go in posted order. A bid
+    // `ready` turns down takes no place yet. Returns every bid that landed in
+    // the window, with its volume's rank.
+    pub(crate) fn draw(
+        &mut self,
+        mut queued: impl FnMut(VolumeIndex) -> bool,
+        placed: impl Fn(VolumeIndex) -> Option<u32>,
+        ready: impl Fn(&Bid) -> bool,
+    ) -> Vec<(Bid, u32)> {
         self.held.retain(|held| queued(held.volume));
         let mut bids = std::mem::take(&mut self.bids);
-        bids.sort_by_key(|bid| (bid.weight, bid.bidder, bid.volume, bid.range.start));
+        bids.sort_by_cached_key(|bid| {
+            (
+                bid.weight,
+                bid.bidder,
+                placed(bid.volume).unwrap_or(u32::MAX),
+                bid.volume,
+                bid.range.start,
+            )
+        });
         let mut drawn = Vec::new();
         for bid in bids {
             if let Some(rank) = self.rank(bid.volume) {
                 drawn.push((bid, rank));
                 continue;
             }
-            if !queued(bid.volume) || !self.has_room(bid.in_order) {
+            if !ready(&bid) || !queued(bid.volume) || !self.has_room(bid.in_order) {
                 continue;
             }
             let rank = self.next_rank;

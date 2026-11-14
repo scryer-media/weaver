@@ -83,13 +83,52 @@ fn an_xz_stream_restored_at_every_point_sizes_and_decodes_as_the_live_one() {
     assert_eq!(early.reserve(), None);
     assert_eq!(
         late.reserve(),
-        Some(Xz::window(&bytes, &weaver_graph::Budget::default()))
+        Some(Xz::window(&bytes, None, &weaver_graph::Budget::default()))
     );
 }
 
 fn header_facts(steps: &[Step<'_>], cut: usize) -> XzStream {
     let (facts, _, _) = restores_alike(Box::new(XzStream::new()), steps, cut, &[]);
     facts.read(Kind::Xz).expect("decodes")
+}
+
+// A stream as version 4 wrote it: its name, front and whether its volume
+// closed, and no length.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct VersionFour {
+    name: String,
+    first: Vec<u8>,
+    closed: bool,
+}
+
+impl Durable for VersionFour {
+    const VERSION: u16 = 4;
+}
+
+// A version 4 stream restores with its length unknown, reserves what it
+// did, decodes its member, and is kept as version 5 from then on.
+#[test]
+fn a_version_four_stream_restores_with_no_length() {
+    let plain = first_payload();
+    let bytes = xz_at(&plain, 1 << 18);
+    let old = VersionFour {
+        name: "alpha.bin.xz".to_owned(),
+        first: bytes[..FIRST].to_vec(),
+        closed: true,
+    };
+    let facts = Facts::of(Kind::Xz, &old);
+    assert_eq!(facts.version, 4);
+    let restored = crate::restore(&facts, weaver_graph::Budget::default()).expect("restores");
+    let kept = restored.facts();
+    assert_eq!(kept.version, 5);
+    let mut stream: XzStream = kept.read(Kind::Xz).expect("decodes");
+    assert_eq!(stream.length, None);
+    assert!(stream.closed);
+    assert_eq!(
+        stream.reserve(),
+        Some(Xz::window(&bytes, None, &weaver_graph::Budget::default()))
+    );
+    assert_eq!(whole(&mut stream, bytes), decoded("alpha.bin", plain));
 }
 
 #[test]

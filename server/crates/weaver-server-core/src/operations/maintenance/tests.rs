@@ -211,6 +211,7 @@ fn staging_cleanup_keeps_a_history_job_s_staging_until_its_record_goes() {
         metadata: None,
         server_attribution: None,
         protocol: crate::jobs::Protocol::Nzb,
+        archived_at: None,
     })
     .unwrap();
     let past_the_ttl = SystemTime::now() + STALE_STAGING_TTL * 2;

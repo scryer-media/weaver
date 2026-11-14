@@ -1,0 +1,18 @@
+{
+  "slug": "adv-rev-distinct-stems",
+  "title": "E2E.Adversarial.Rev.Distinct.Stems.2026-TESTGRP",
+  "description": "rar5-single's archive beside sixty-four RAR recovery volumes of noise, each under its own stem. The sets the post names are founded one after another, not each from inside the last, and none takes the archive. The archive's member is delivered and the job completes.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "fixtureAssets": [
+    "rar5-single/archive.rar"
+  ],
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "minOutputFiles": 1,
+    "requiredOutputSuffixes": [
+      ".mkv"
+    ]
+  }
+}

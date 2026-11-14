@@ -37,9 +37,17 @@ pub fn detect(output_dir: &Path) -> SystemProfile {
 // wants the class and filesystem of a *second* configured root (the
 // intermediate or complete directory, say) has no way to ask for it. This is
 // the same classification the startup profile uses, with no benchmark attached:
-// it runs the platform's filesystem lookup and nothing else.
-pub fn classify_storage(path: &Path) -> (StorageClass, FilesystemType) {
+// it runs the platform's filesystem lookup and nothing else. Only the disk
+// owner, [`crate::operations::StorageCapacity`], calls it, off the async
+// runtime and within its time limit; everything else asks the owner.
+pub(crate) fn classify_storage(path: &Path) -> (StorageClass, FilesystemType) {
     detect_disk_info(path)
+}
+
+// The CPU and memory facts of the start-up profile, without its look at a
+// directory's storage: for a caller that takes storage from the disk owner.
+pub fn detect_cpu_and_memory() -> (CpuProfile, MemoryProfile) {
+    (detect_cpu(), detect_memory())
 }
 
 // Collect the fast system facts needed to start the runtime.
@@ -49,8 +57,7 @@ pub fn classify_storage(path: &Path) -> (StorageClass, FilesystemType) {
 // the tuner admits only one extraction until the measured values are
 // applied. Zero write throughput reads as "not measured".
 pub fn detect_startup_profile(output_dir: &Path) -> SystemProfile {
-    let cpu = detect_cpu();
-    let memory = detect_memory();
+    let (cpu, memory) = detect_cpu_and_memory();
     let (storage_class, filesystem) = detect_disk_info(output_dir);
     let disk = DiskProfile {
         storage_class,

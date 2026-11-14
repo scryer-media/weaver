@@ -41,7 +41,8 @@ pub struct FullFileName {
 }
 
 // A file renamed on disk, and the full name the rename gave it before Weaver
-// shortened, cleaned or numbered it into `to`.
+// shortened, cleaned or numbered it into `to`. An empty full name records no
+// entry for the file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRename {
     pub from: String,
@@ -73,13 +74,37 @@ pub fn record_file_renames(metadata: &mut Vec<(String, String)>, renames: &[File
         return false;
     }
     let before = full_file_names_record(metadata).map(str::to_string);
-    let mut entries = full_file_names(metadata);
-    for rename in renames {
-        entries.retain(|entry| entry.name != rename.from && entry.name != rename.to);
-        entries.extend(full_file_name(&rename.to, &rename.full_name));
+    // Each rename drops the entries that name its source or its destination,
+    // then adds its own. An entry survives when no rename after it names it:
+    // the renames are walked from the last, gathering the names they touch.
+    let mut touched = std::collections::HashSet::<&str>::with_capacity(renames.len() * 2);
+    let mut added = Vec::new();
+    for rename in renames.iter().rev() {
+        #[cfg(test)]
+        tests::ENTRIES_EXAMINED.with(|n| n.set(n.get() + 1));
+        if !touched.contains(rename.to.as_str())
+            && let Some(entry) = full_file_name(&rename.to, &rename.full_name)
+        {
+            added.push(entry);
+        }
+        touched.insert(&rename.from);
+        touched.insert(&rename.to);
     }
+    let mut entries = full_file_names(metadata);
+    entries.retain(|entry| {
+        #[cfg(test)]
+        tests::ENTRIES_EXAMINED.with(|n| n.set(n.get() + 1));
+        !touched.contains(entry.name.as_str())
+    });
+    entries.extend(added.into_iter().rev());
     store_full_file_names(metadata, entries);
     full_file_names_record(metadata) != before.as_deref()
+}
+
+// Whether no entry carrying `full_name` could ever be stored: the name alone
+// is longer than the record may grow, and the stored form is never shorter.
+pub(crate) fn full_file_name_never_kept(full_name: &str) -> bool {
+    full_name.len() > FULL_FILE_NAMES_MAX_BYTES
 }
 
 pub fn full_file_names_record(metadata: &[(String, String)]) -> Option<&str> {
