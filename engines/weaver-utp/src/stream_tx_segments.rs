@@ -746,9 +746,10 @@ impl Segments {
         // after a resend say the resend was lost too.
         let mut latest = [None::<Instant>; SACK_DUP_THRESH as usize + 1];
 
-        let take = high_data
-            .signed_offset_from(self.snd_una)
-            .map_or(0, |offset| offset.max(0) as usize);
+        // Every segment sent, the newest at `high_data` with them: the
+        // flight size counts the same segments (RFC 6675 section 4,
+        // SetPipe, runs from HighACK to HighData).
+        let take = self.flight_take(high_data);
 
         // After this we don't consider the packet being in the network.
         // rtt/2 might be a bit too aggressive.
@@ -1450,5 +1451,91 @@ mod tests {
         );
         // More removed from the front than lie before the wrap.
         assert!(acked > usize::from(u16::MAX - 65_000), "acked={acked}");
+    }
+}
+
+#[cfg(test)]
+mod pipe_tests {
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
+    use super::{Segments, SeqNr};
+    use crate::raw::{UtpHeader, selective_ack::SelectiveAck};
+    use crate::stats::UtpStats;
+
+    const SIZE: usize = 1000;
+    const SRTT: Duration = Duration::from_millis(100);
+    const MS: Duration = Duration::from_millis(1);
+
+    fn sack(ack_nr: u16, seqs: impl IntoIterator<Item = u16>) -> UtpHeader {
+        UtpHeader {
+            ack_nr: ack_nr.into(),
+            extensions: crate::raw::Extensions {
+                selective_ack: SelectiveAck::new_test(
+                    seqs.into_iter().map(|s| usize::from(s - ack_nr - 2)),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn queue(first: u16, last: u16) -> Segments {
+        let mut segs = Segments::new(first.into());
+        for _ in first..=last {
+            assert!(segs.enqueue(SIZE, false));
+        }
+        segs
+    }
+
+    fn send(segs: &mut Segments, seqs: std::ops::RangeInclusive<u16>, at: Instant) {
+        let stats = UtpStats::default();
+        for mut item in segs.iter_mut_for_sending(None) {
+            if seqs.contains(&item.seq_nr().0) {
+                item.on_sent(at, &stats);
+            }
+        }
+    }
+
+    // As the recovery send path does: send again, then clear the loss mark.
+    fn resend_as_lost(segs: &mut Segments, seq: u16, at: Instant) {
+        let stats = UtpStats::default();
+        let mut item = segs
+            .iter_mut_for_sending(None)
+            .find(|s| s.seq_nr() == SeqNr(seq))
+            .unwrap();
+        item.on_sent(at, &stats);
+        item.on_resent_as_lost();
+    }
+
+    // Three packets sent and none acknowledged: all three are in the pipe,
+    // the newest with them, as all three are in the flight.
+    #[test]
+    fn the_pipe_counts_the_newest_packet_sent() {
+        let t0 = Instant::now();
+        let mut segs = queue(10, 12);
+        send(&mut segs, 10..=12, t0);
+        assert_eq!(segs.walk_flight_size_to(12.into()), 3 * SIZE);
+        let pipe = segs.calc_pipe(9.into(), 12.into(), SRTT, t0);
+        assert_eq!(pipe.pipe, 3 * SIZE);
+    }
+
+    // Packet 10 is resent at t1. The only packet sent after the resend is
+    // the newest, 20, and it arrives. The resend was outrun, so it is due a
+    // round trip and a quarter after it left.
+    #[test]
+    fn a_resend_outrun_by_the_newest_packet_is_due() {
+        let t0 = Instant::now();
+        let t1 = t0 + SRTT;
+        let mut segs = queue(10, 20);
+        send(&mut segs, 10..=19, t0);
+        segs.remove_up_to_ack(t1, &sack(9, 11..=15));
+        segs.calc_pipe(9.into(), 19.into(), SRTT, t1);
+        resend_as_lost(&mut segs, 10, t1);
+        send(&mut segs, 20..=20, t1 + 10 * MS);
+        segs.remove_up_to_ack(t1 + 110 * MS, &sack(9, 11..=20));
+        let pipe = segs.calc_pipe(10.into(), 20.into(), SRTT, t1 + 110 * MS);
+        assert_eq!(pipe.reorder_at, Some(t1 + 125 * MS));
     }
 }

@@ -213,8 +213,9 @@ async fn test_duplicate_ack_counted_only_on_st_state() {
 }
 
 // A packet the retransmission timer resent is not fast-resent after it, as
-// in libtorrent: a SACK that then marks it lost resends the packets after it
-// instead, and only the timer sends the head again.
+// in libtorrent: a SACK that then marks it lost does not send it again, and
+// only the timer does. The window after the expiry is one packet and the
+// resent head fills it, so the packet after it waits for the head's ACK.
 #[tokio::test]
 async fn a_packet_the_timer_resent_is_not_fast_resent() {
     setup_test_logging();
@@ -273,8 +274,7 @@ async fn a_packet_the_timer_resent_is_not_fast_resent() {
     );
     t.poll_once_assert_pending().await;
     let resent: Vec<u16> = t.take_sent().iter().map(|p| p.header.seq_nr.0).collect();
-    assert!(resent.contains(&102), "{resent:?}");
-    assert!(!resent.contains(&101), "{resent:?}");
+    assert_eq!(resent, Vec::<u16>::new());
     let head = t
         .vsock
         .user_tx_segments
@@ -283,6 +283,26 @@ async fn a_packet_the_timer_resent_is_not_fast_resent() {
         .unwrap()
         .send_count();
     assert_eq!(head, 2);
+
+    // The head's resend arrives: 102 is the hole now, with four packets
+    // past it, and goes at once.
+    t.send_msg(
+        UtpHeader {
+            htype: State,
+            seq_nr: 0.into(),
+            ack_nr: 101.into(),
+            wnd_size: 1024,
+            extensions: crate::raw::Extensions {
+                selective_ack: SelectiveAck::new_test([0, 1, 2, 3]),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        "",
+    );
+    t.poll_once_assert_pending().await;
+    let resent: Vec<u16> = t.take_sent().iter().map(|p| p.header.seq_nr.0).collect();
+    assert_eq!(resent, vec![102]);
 }
 
 // A packet the timer's go-back resent is not fast-resent by the next SACK,
