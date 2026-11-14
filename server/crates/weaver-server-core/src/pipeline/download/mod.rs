@@ -10,6 +10,7 @@ mod retention;
 pub(in crate::pipeline) mod scheduler;
 pub(crate) mod transport;
 mod worker;
+pub(in crate::pipeline) use worker::volume_pace;
 
 #[cfg(test)]
 pub(in crate::pipeline) use worker::lane_acquire_failure_for_work;

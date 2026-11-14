@@ -261,17 +261,19 @@ impl VolumeWriters {
         lane
     }
 
-    // Wake whoever hears the reports, once, when the bytes waiting for
-    // `volume` are `bytes` or fewer. False when they already are: nothing
-    // was asked and no wake comes. One line is kept per volume; asking again
-    // replaces it.
+    // Wake whoever hears the reports, once, when the bytes that arrived for
+    // `volume` and are not written (`Volume::unwritten_bytes`) are `bytes`
+    // or fewer. False when they already are: nothing was asked and no wake
+    // comes. One line is kept per volume; asking again replaces it. The
+    // writer takes the wake as it writes; the loop takes it itself, with
+    // `Volume::take_wake`, as it hands on what was being decoded.
     pub(crate) fn wake_below(&self, volume: &Arc<Volume>, bytes: u64) -> bool {
         let ask = bytes.saturating_add(1);
         if volume.wake_line.load(Ordering::Relaxed) == ask {
             return true;
         }
         volume.wake_line.store(ask, Ordering::SeqCst);
-        if volume.buffered_bytes.load(Ordering::SeqCst) > bytes {
+        if volume.unwritten_bytes() > bytes {
             return true;
         }
         // Already there. When the writer took the ask first, its wake is on
@@ -945,19 +947,9 @@ fn unbuffer(state: &LaneState, report: &ReportFn, bytes: u64) {
         return;
     }
     let volume = &state.volume;
-    let left = volume
-        .buffered_bytes
-        .fetch_sub(bytes, Ordering::SeqCst)
-        .saturating_sub(bytes);
+    volume.buffered_bytes.fetch_sub(bytes, Ordering::SeqCst);
     state.look_below();
-    let ask = volume.wake_line.load(Ordering::SeqCst);
-    if ask != 0
-        && left < ask
-        && volume
-            .wake_line
-            .compare_exchange(ask, 0, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-    {
+    if volume.take_wake() {
         report(Report {
             failures: Vec::new(),
             below: true,

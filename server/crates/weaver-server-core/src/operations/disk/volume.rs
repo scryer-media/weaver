@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // One volume as the OS presents it: every path with the same device id.
 pub(crate) struct Volume {
@@ -23,8 +23,19 @@ pub(crate) struct Volume {
     pub(crate) write_seeks: AtomicU64,
     // Bytes waiting in memory for its writer.
     pub(crate) buffered_bytes: AtomicU64,
-    // One more than the count of waiting bytes someone asked to be woken
-    // at; zero when no one asked. The writer clears it as it wakes them.
+    // Bytes that arrived for the jobs writing here and have not been handed
+    // to its writer yet: what is being decoded. Only the pipeline loop
+    // changes it.
+    pub(crate) arrived_bytes: AtomicU64,
+    // The volume's buffer limits, over the bytes that have arrived and are
+    // not written (`unwritten_bytes`). From the soft limit its lanes ask
+    // for one article at a time; at the hard limit they stop. One pair for
+    // the volume, shared by every stream writing to it. `u64::MAX` until
+    // the volume is sized: no limit.
+    buffer_soft_bytes: AtomicU64,
+    buffer_hard_bytes: AtomicU64,
+    // One more than the count of unwritten bytes someone asked to be woken
+    // at; zero when no one asked. Whoever wakes them clears it.
     pub(crate) wake_line: AtomicU64,
     // Times its writer ran out of work. A sample across which this did not
     // move is one in which the writer never did.
@@ -68,11 +79,59 @@ impl Volume {
             write_calls: AtomicU64::new(0),
             write_seeks: AtomicU64::new(0),
             buffered_bytes: AtomicU64::new(0),
+            arrived_bytes: AtomicU64::new(0),
+            buffer_soft_bytes: AtomicU64::new(u64::MAX),
+            buffer_hard_bytes: AtomicU64::new(u64::MAX),
             wake_line: AtomicU64::new(0),
             idle_turns: AtomicU64::new(0),
             write_rate: AtomicU64::new(0),
             throughput: AtomicU64::new(0),
             writer: WriterCounts::default(),
         }
+    }
+
+    // The bytes that have arrived for the volume and are not written: what
+    // is being decoded for its jobs and what waits for its writer. Articles
+    // leased to a connection that have not arrived are not in it.
+    pub(crate) fn unwritten_bytes(&self) -> u64 {
+        self.arrived_bytes
+            .load(Ordering::SeqCst)
+            .saturating_add(self.buffered_bytes.load(Ordering::SeqCst))
+    }
+
+    // Give the volume its soft and hard buffer limits. A limit lowered
+    // below what the volume holds stops its lanes until it has drained.
+    pub(crate) fn set_buffer_limits(&self, soft_bytes: u64, hard_bytes: u64) {
+        self.buffer_soft_bytes.store(soft_bytes, Ordering::Relaxed);
+        self.buffer_hard_bytes.store(hard_bytes, Ordering::Relaxed);
+    }
+
+    // The volume's soft and hard buffer limits, in that order.
+    pub(crate) fn buffer_limits(&self) -> (u64, u64) {
+        (
+            self.buffer_soft_bytes.load(Ordering::Relaxed),
+            self.buffer_hard_bytes.load(Ordering::Relaxed),
+        )
+    }
+
+    // The unwritten bytes at which whoever was stopped at the hard limit is
+    // woken: an eighth below it, so the loop is not woken per write.
+    pub(crate) fn resume_line(&self) -> u64 {
+        let (_, hard) = self.buffer_limits();
+        hard.saturating_sub((hard / 8).max(1))
+    }
+
+    // Take the wake someone asked for, when the unwritten bytes have fallen
+    // to their line: true once for each ask, to whoever lowered the bytes
+    // there, the volume's writer or the pipeline loop. The caller lowers
+    // its count first and asks after.
+    pub(crate) fn take_wake(&self) -> bool {
+        let ask = self.wake_line.load(Ordering::SeqCst);
+        ask != 0
+            && self.unwritten_bytes() < ask
+            && self
+                .wake_line
+                .compare_exchange(ask, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
     }
 }

@@ -1428,6 +1428,8 @@ fn sample_volumes() -> Vec<instr::VolumeSnapshot> {
             write_rate: 3_200_000,
             throughput: 1_100_000,
             buffered_bytes: 65_536,
+            buffer_soft_bytes: 0,
+            buffer_limit_bytes: 0,
             idle_turns: 12,
             writer: instr::VolumeWriterSnapshot {
                 batches: 40,
@@ -1451,6 +1453,8 @@ fn sample_volumes() -> Vec<instr::VolumeSnapshot> {
             write_rate: 0,
             throughput: 0,
             buffered_bytes: 0,
+            buffer_soft_bytes: 0,
+            buffer_limit_bytes: 0,
             idle_turns: 0,
             writer: Default::default(),
         },

@@ -96,6 +96,11 @@ impl RuntimeTuner {
         profile_download_limit(self.total_connections, &self.tuning)
     }
 
+    // The sum of all configured server connections.
+    pub fn connection_limit(&self) -> usize {
+        self.total_connections
+    }
+
     // Update the connection limit (e.g. after adding/removing a server) and
     // recalculate `max_concurrent_downloads` so downloads can use the new capacity.
     pub fn set_connection_limit(&mut self, total_connections: usize) {

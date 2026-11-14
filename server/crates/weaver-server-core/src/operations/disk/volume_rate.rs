@@ -497,7 +497,14 @@ impl StorageCapacity {
     fn snapshots_of(&self, volumes: &[Arc<Volume>]) -> Vec<VolumeSnapshot> {
         let mut rows: Vec<VolumeSnapshot> = volumes
             .iter()
-            .map(|volume| VolumeSnapshot {
+            .map(|volume| {
+                let (soft, hard) = volume.buffer_limits();
+                let sized = |limit: u64| if limit == u64::MAX { 0 } else { limit };
+                (volume, sized(soft), sized(hard))
+            })
+            .map(|(volume, buffer_soft_bytes, buffer_limit_bytes)| VolumeSnapshot {
+                buffer_soft_bytes,
+                buffer_limit_bytes,
                 label: volume.label.clone(),
                 kind: self.kind_on_device(volume.device).as_str(),
                 device: volume.device,
@@ -1217,6 +1224,7 @@ mod tests {
         written.write_rate.store(3_200_000, Ordering::Relaxed);
         written.throughput.store(1_100_000, Ordering::Relaxed);
         written.buffered_bytes.store(65_536, Ordering::Relaxed);
+        written.set_buffer_limits(700_000, 1_000_000);
         written.idle_turns.store(4, Ordering::Relaxed);
         let unseen = Volume::new(None, "/mnt/scratch".into());
         // The rows come by label, whatever order the volumes are held in.
@@ -1235,6 +1243,8 @@ mod tests {
                     write_rate: 3_200_000,
                     throughput: 1_100_000,
                     buffered_bytes: 65_536,
+                    buffer_soft_bytes: 700_000,
+                    buffer_limit_bytes: 1_000_000,
                     idle_turns: 4,
                     writer: Default::default(),
                 },
@@ -1249,6 +1259,9 @@ mod tests {
                     write_rate: 0,
                     throughput: 0,
                     buffered_bytes: 0,
+                    // Not sized yet: no limit to tell.
+                    buffer_soft_bytes: 0,
+                    buffer_limit_bytes: 0,
                     idle_turns: 0,
                     writer: Default::default(),
                 },

@@ -578,6 +578,49 @@ impl Pipeline {
                 .entry(job_id)
                 .or_insert(0);
             *pending_bytes = pending_bytes.saturating_add(bytes);
+            self.note_volume_arrived(job_id, bytes);
+        }
+    }
+
+    // Count `bytes` that arrived for the job on the volume its articles
+    // are written to, until the loop has handed them on. One map entry per
+    // job with results waiting; nothing is walked.
+    fn note_volume_arrived(&mut self, job_id: JobId, bytes: u64) {
+        let (volume, held) = match self.volume_arrived_by_job.entry(job_id) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let Some(volume) = self
+                    .graph_jobs
+                    .get(&job_id)
+                    .and_then(|graph| graph.disk())
+                    .map(|disk| Arc::clone(disk.working().volume()))
+                else {
+                    return;
+                };
+                entry.insert((volume, 0))
+            }
+        };
+        *held = held.saturating_add(bytes);
+        volume.arrived_bytes.fetch_add(bytes, Ordering::SeqCst);
+    }
+
+    // The loop handed on `bytes` of the job that had arrived, or, with
+    // `last`, everything of it that had. They leave the volume's count, and
+    // dispatch that asked to be woken at the line the volume has now
+    // reached looks again.
+    fn note_volume_handed_on(&mut self, job_id: JobId, bytes: u64, last: bool) {
+        let Some((volume, held)) = self.volume_arrived_by_job.get_mut(&job_id) else {
+            return;
+        };
+        let gone = if last { *held } else { bytes.min(*held) };
+        *held -= gone;
+        volume.arrived_bytes.fetch_sub(gone, Ordering::SeqCst);
+        let woken = gone != 0 && volume.take_wake();
+        if last {
+            self.volume_arrived_by_job.remove(&job_id);
+        }
+        if woken {
+            self.volume_room_changed();
         }
     }
 
@@ -595,6 +638,7 @@ impl Pipeline {
             self.pending_released_download_results_by_job
                 .remove(&job_id);
         }
+        self.note_volume_handed_on(job_id, bytes, remove);
         if bytes != 0 {
             let remove_bytes = if let Some(pending_bytes) = self
                 .pending_released_download_result_bytes_by_job

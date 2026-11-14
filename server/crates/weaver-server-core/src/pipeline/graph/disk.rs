@@ -14,6 +14,7 @@ use crate::operations::StorageCapacity;
 use crate::operations::disk::volume::Volume;
 use crate::operations::disk::writer::{Barrier, Failure, Report, Submitter, VolumeWriters};
 use crate::pipeline::Pipeline;
+use crate::pipeline::download::volume_pace::{VolumeBuffers, VolumeIntake, intake_of};
 use crate::pipeline::graph::job::GraphError;
 use crate::pipeline::graph::leaf::LeafError;
 use crate::pipeline::graph::namespace::WriteError;
@@ -22,7 +23,8 @@ use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::job::GraphJob;
 
 // The writers of the volumes `working_dir` and `output_dir` lie on, for the
-// job `key`.
+// job `key`. A volume first seen here is given its buffer limits by
+// `buffers`.
 pub(crate) fn job_disk(
     writers: &VolumeWriters,
     capacity: &StorageCapacity,
@@ -30,19 +32,21 @@ pub(crate) fn job_disk(
     key: u64,
     working_dir: &Path,
     output_dir: Option<&Path>,
-    budget: u64,
+    buffers: &VolumeBuffers,
 ) -> JobDisk {
     let volume = capacity.volume(working_dir);
+    buffers.seen(&volume);
     probes.first_seen(writers, &volume, working_dir);
     let working = writers.submitter(&volume, key);
     let output = output_dir.and_then(|dir| {
         let other = capacity.volume(dir);
         (!Arc::ptr_eq(&other, &volume)).then(|| {
+            buffers.seen(&other);
             probes.first_seen(writers, &other, dir);
             (dir.to_path_buf(), writers.submitter(&other, key))
         })
     });
-    JobDisk::new(working, output).holding(budget)
+    JobDisk::new(working, output)
 }
 
 type Probe = Box<dyn FnOnce() -> std::io::Result<()> + Send>;
@@ -142,20 +146,38 @@ pub(crate) mod threads {
 }
 
 impl Pipeline {
-    // Whether a volume the job writes to holds the write budget or more for
-    // its writer. Dispatch for the job stops while one does, and the batch
-    // that brings it below wakes dispatch.
-    pub(in crate::pipeline) fn volume_holds_budget(&self, job_id: JobId) -> bool {
-        let held = self
-            .graph_jobs
+    // What the volumes the job writes to ask of the lanes fetching for it:
+    // the most held back of them. Each volume is read against its own
+    // limits.
+    pub(in crate::pipeline) fn volume_intake(&self, job_id: JobId) -> VolumeIntake {
+        self.graph_jobs
             .get(&job_id)
             .and_then(|graph| graph.disk())
-            .is_some_and(|disk| disk.over(self.write_backlog_budget_bytes as u64));
+            .map_or(VolumeIntake::Open, JobDisk::intake)
+    }
+
+    // Whether a volume the job writes to holds its own hard limit or more
+    // of bytes that arrived and are not written. Dispatch for the job
+    // stops while one does, and whatever brings it below wakes dispatch.
+    pub(in crate::pipeline) fn volume_holds_budget(&self, job_id: JobId) -> bool {
+        let held = self.volume_intake(job_id) == VolumeIntake::Stopped;
         if held {
             self.volume_budget_held
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         held
+    }
+
+    // The limits of every volume were sized on other numbers, or a
+    // volume's unwritten bytes fell to the line dispatch asked to be woken
+    // at: dispatch that stopped for a volume looks again.
+    pub(in crate::pipeline) fn volume_room_changed(&mut self) {
+        if self
+            .volume_budget_held
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.download_dispatch_wake = true;
+        }
     }
 
     // A stopped job has nothing left out, on a thread or with a volume's
@@ -326,12 +348,7 @@ impl Pipeline {
         for failure in report.failures {
             self.graph_disk_failed(failure);
         }
-        if self
-            .volume_budget_held
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
-            self.download_dispatch_wake = true;
-        }
+        self.volume_room_changed();
     }
 }
 
@@ -348,35 +365,27 @@ pub(crate) struct JobDisk {
     working: Arc<Submitter>,
     // Where the delivered files lie and their volume, when it is another.
     output: Option<(PathBuf, Arc<Submitter>)>,
-    // How many bytes a volume may hold in memory for its writer before a
-    // thread that produces the job's output waits for it.
-    budget: u64,
+}
+
+// The bytes a volume may hold in memory for its writer before a thread
+// that produces a job's output waits for it: the volume's own hard limit.
+fn output_limit(submitter: &Submitter) -> u64 {
+    submitter.volume().buffer_limits().1
 }
 
 impl JobDisk {
     pub(crate) fn new(working: Arc<Submitter>, output: Option<(PathBuf, Arc<Submitter>)>) -> Self {
-        Self {
-            working,
-            output,
-            budget: u64::MAX,
-        }
-    }
-
-    // The job's disk, its producing threads held to `budget` bytes waiting
-    // on a volume.
-    pub(crate) fn holding(mut self, budget: u64) -> Self {
-        self.budget = budget;
-        self
+        Self { working, output }
     }
 
     // Stand still until no volume the job writes to holds more than its
-    // budget for its writer: the wait of a thread that produces what the
-    // job writes, an extraction's run, before it hands the loop more.
+    // hard limit for its writer: the wait of a thread that produces what
+    // the job writes, an extraction's run, before it hands the loop more.
     // Never for the loop. Returns at once for a job whose writes failed
     // or were given up.
     pub(crate) fn wait_below(&self) {
         for submitter in self.each() {
-            submitter.wait_below(self.budget);
+            submitter.wait_below(output_limit(submitter));
         }
     }
 
@@ -401,22 +410,24 @@ impl JobDisk {
         JobBarrier(self.each().map(|submitter| submitter.barrier()).collect())
     }
 
-    // The loop's own wait on the budget, for the one kind of work in which
-    // the loop itself produces what is written: a repair's or a replay's
-    // output read back from its staging file and said again, slice after
-    // slice, in one step. Before the next slice is queued the loop stands
-    // still while a volume holds its budget, so no more than the budget
-    // and a slice is ever queued. Counted as a loop wait on the volume.
-    // For those applications only: nothing else on the loop may call it.
+    // The loop's own wait on a volume's hard limit, for the one kind of
+    // work in which the loop itself produces what is written: a repair's or
+    // a replay's output read back from its staging file and said again,
+    // slice after slice, in one step. Before the next slice is queued the
+    // loop stands still while a volume holds its limit for its writer, so
+    // no more than the limit and a slice is ever queued. Counted as a loop
+    // wait on the volume. For those applications only: nothing else on the
+    // loop may call it.
     pub(crate) fn loop_wait_below(&self) {
         use std::sync::atomic::Ordering;
         for submitter in self.each() {
             let volume = submitter.volume();
-            if volume.buffered_bytes.load(Ordering::Relaxed) < self.budget {
+            let limit = output_limit(submitter);
+            if volume.buffered_bytes.load(Ordering::Relaxed) < limit {
                 continue;
             }
             let started = std::time::Instant::now();
-            submitter.wait_below(self.budget.saturating_sub(1));
+            submitter.wait_below(limit.saturating_sub(1));
             volume.writer.loop_waits.fetch_add(1, Ordering::Relaxed);
             volume
                 .writer
@@ -425,16 +436,18 @@ impl JobDisk {
         }
     }
 
-    // Whether a volume the job writes to holds `budget` bytes or more for
-    // its writer.
-    pub(crate) fn over(&self, budget: u64) -> bool {
-        self.each().any(|submitter| {
-            submitter
-                .volume()
-                .buffered_bytes
-                .load(std::sync::atomic::Ordering::Relaxed)
-                >= budget
-        })
+    // What the volumes the job writes to ask of its lanes: the most held
+    // back of them, each read against its own limits.
+    pub(in crate::pipeline) fn intake(&self) -> VolumeIntake {
+        self.each()
+            .map(|submitter| intake_of(submitter.volume()))
+            .fold(VolumeIntake::Open, |most, intake| match (most, intake) {
+                (VolumeIntake::Stopped, _) | (_, VolumeIntake::Stopped) => VolumeIntake::Stopped,
+                (VolumeIntake::OneAtATime, _) | (_, VolumeIntake::OneAtATime) => {
+                    VolumeIntake::OneAtATime
+                }
+                _ => VolumeIntake::Open,
+            })
     }
 
     // Whether everything the job submitted has returned, failed or not.

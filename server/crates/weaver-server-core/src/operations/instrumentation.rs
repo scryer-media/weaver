@@ -1433,6 +1433,11 @@ pub struct VolumeSnapshot {
     pub throughput: u64,
     // Bytes waiting in memory for the volume's writer.
     pub buffered_bytes: u64,
+    // The volume's buffer limits, over the bytes that arrived for it and
+    // are not written: from the soft one its lanes ask for one article at
+    // a time, at the hard one they stop. Zero until the volume is sized.
+    pub buffer_soft_bytes: u64,
+    pub buffer_limit_bytes: u64,
     // Times the volume's writer found nothing more to do after working.
     pub idle_turns: u64,
     // What the volume's writer did and what waiting on it cost.

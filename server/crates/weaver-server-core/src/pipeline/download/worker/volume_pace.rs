@@ -10,13 +10,15 @@
 // is what is being decoded plus what waits for the writer. Articles leased to
 // a connection that have not arrived are not counted.
 //
-// Every function here is pure: numbers in, numbers out, no clock and no
-// pipeline state. Each limit is a cap on what may wait, not memory taken up
-// front.
+// The sizing functions here are pure: numbers in, numbers out, no clock and
+// no pipeline state. `VolumeBuffers` keeps what they are given and puts
+// their answers on the volumes. Each limit is a cap on what may wait, not
+// memory taken up front.
 
-// Nothing calls this module yet.
-#![allow(dead_code)]
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::operations::disk::volume::Volume;
 use crate::runtime::HardwareProfile;
 
 const MIB: u64 = 1024 * 1024;
@@ -52,6 +54,14 @@ const VOLUME_BUFFER_MINIMUM_BYTES: u64 = 16 * MIB;
 
 // A volume's soft limit, as a share of its hard limit.
 const VOLUME_BUFFER_SOFT_PERCENT: u64 = 70;
+
+// The size of a typical article, for the figure's floor: that of the
+// reference load.
+pub(in crate::pipeline) const TYPICAL_ARTICLE_BYTES: u64 = 800_000;
+
+// A volume's measured write rate has changed materially when it moved by
+// this share of the rate its limit was sized on, or more.
+const VOLUME_RATE_CHANGE_PERCENT: u64 = 25;
 
 // The figure: the bytes that may wait for one volume's writer when the
 // volume has a full share (see `volume_limits`).
@@ -246,6 +256,127 @@ pub(in crate::pipeline) fn volume_intake(
     } else {
         VolumeIntake::Open
     }
+}
+
+// The state of a volume as it stands: what has arrived for it and is not
+// written, against its own limits.
+pub(in crate::pipeline) fn intake_of(volume: &Volume) -> VolumeIntake {
+    let (soft_bytes, hard_bytes) = volume.buffer_limits();
+    volume_intake(
+        volume.unwritten_bytes(),
+        VolumeLimits {
+            soft_bytes,
+            hard_bytes,
+        },
+    )
+}
+
+// The keeper of every volume's limits: the one place they are sized and
+// put on the volumes. It knows the volumes jobs were given a writer of,
+// with the write rate each was last sized on.
+//
+// Sizing is asked for when a volume is first seen, when the figure changes
+// (the profile in force, the connection count) and when a volume's measured
+// rate has moved. Nothing here runs per article.
+pub(crate) struct VolumeBuffers {
+    sizing: Mutex<Sizing>,
+}
+
+struct Sizing {
+    figure_bytes: u64,
+    memory_ceiling_bytes: u64,
+    // Each known volume and the write rate its limit was sized on.
+    volumes: Vec<(Arc<Volume>, u64)>,
+}
+
+impl VolumeBuffers {
+    pub(in crate::pipeline) fn new(figure_bytes: u64, memory_ceiling_bytes: u64) -> Self {
+        Self {
+            sizing: Mutex::new(Sizing {
+                figure_bytes,
+                memory_ceiling_bytes,
+                volumes: Vec::new(),
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Sizing> {
+        self.sizing.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // A job was given `volume`'s writer. The first time, the volume joins
+    // the known ones and every limit is sized again.
+    pub(crate) fn seen(&self, volume: &Arc<Volume>) {
+        let mut sizing = self.lock();
+        if sizing
+            .volumes
+            .iter()
+            .any(|(known, _)| Arc::ptr_eq(known, volume))
+        {
+            return;
+        }
+        sizing.volumes.push((Arc::clone(volume), 0));
+        sizing.size();
+    }
+
+    // Size every limit on another figure. Whether a limit changed.
+    pub(in crate::pipeline) fn set_figure(
+        &self,
+        figure_bytes: u64,
+        memory_ceiling_bytes: u64,
+    ) -> bool {
+        let mut sizing = self.lock();
+        if (sizing.figure_bytes, sizing.memory_ceiling_bytes)
+            == (figure_bytes, memory_ceiling_bytes)
+        {
+            return false;
+        }
+        sizing.figure_bytes = figure_bytes;
+        sizing.memory_ceiling_bytes = memory_ceiling_bytes;
+        sizing.size()
+    }
+
+    // Size every limit again when a volume's measured rate has moved
+    // materially from the one its limit was sized on. Whether a limit
+    // changed. With no rate moved this reads each volume's rate and writes
+    // nothing.
+    pub(in crate::pipeline) fn follow_rates(&self) -> bool {
+        let mut sizing = self.lock();
+        let moved = sizing.volumes.iter().any(|(volume, sized_on)| {
+            rate_moved(*sized_on, volume.write_rate.load(Ordering::Relaxed))
+        });
+        moved && sizing.size()
+    }
+}
+
+impl Sizing {
+    // Put each known volume's limits on it. Whether any changed.
+    fn size(&mut self) -> bool {
+        for (volume, sized_on) in &mut self.volumes {
+            *sized_on = volume.write_rate.load(Ordering::Relaxed);
+        }
+        let rates: Vec<u64> = self.volumes.iter().map(|(_, rate)| *rate).collect();
+        let limits = volume_limits(self.figure_bytes, self.memory_ceiling_bytes, &rates);
+        let mut changed = false;
+        for ((volume, _), limits) in self.volumes.iter().zip(limits) {
+            let now = (limits.soft_bytes, limits.hard_bytes);
+            if volume.buffer_limits() != now {
+                volume.set_buffer_limits(now.0, now.1);
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
+// Whether `now` differs materially from `sized_on`. A rate measured for the
+// first time, or no longer measured, always does.
+fn rate_moved(sized_on: u64, now: u64) -> bool {
+    if sized_on == 0 || now == 0 {
+        return sized_on != now;
+    }
+    u128::from(sized_on.abs_diff(now)) * 100
+        >= u128::from(sized_on) * u128::from(VOLUME_RATE_CHANGE_PERCENT)
 }
 
 #[cfg(test)]
@@ -633,5 +764,126 @@ mod tests {
         let limits = VolumeLimits::with_hard(1);
         assert_eq!(volume_intake(0, limits), VolumeIntake::Open);
         assert_eq!(volume_intake(1, limits), VolumeIntake::Stopped);
+    }
+
+    fn volume(rate: u64) -> Arc<Volume> {
+        let volume = Arc::new(Volume::new(None, "test".to_owned()));
+        volume.write_rate.store(rate, Ordering::Relaxed);
+        volume
+    }
+
+    fn hard(volume: &Volume) -> u64 {
+        volume.buffer_limits().1
+    }
+
+    // A volume has no limit until it is seen, and the full figure from then
+    // on while there are no more than two. Seen again, nothing changes.
+    #[test]
+    fn volume_buffers_size_a_volume_when_it_is_first_seen() {
+        let buffers = VolumeBuffers::new(FIGURE, ROOMY);
+        let (first, second) = (volume(HDD), volume(0));
+        assert_eq!(first.buffer_limits(), (u64::MAX, u64::MAX));
+        assert_eq!(intake_of(&first), VolumeIntake::Open);
+
+        buffers.seen(&first);
+        assert_eq!(first.buffer_limits(), (FIGURE * 70 / 100, FIGURE));
+        buffers.seen(&second);
+        buffers.seen(&first);
+        assert_eq!(hard(&first), FIGURE);
+        assert_eq!(hard(&second), FIGURE);
+        assert_eq!(buffers.lock().volumes.len(), 2);
+    }
+
+    // Three volumes share two figures by the inverse of their speeds: the
+    // hard disk is held to the figure, and the rest goes 1 : 10 to the NVMe
+    // and the SATA drive.
+    #[test]
+    fn volume_buffers_give_three_volumes_inverse_speed_shares() {
+        let buffers = VolumeBuffers::new(FIGURE, ROOMY);
+        let (nvme, sata, hdd) = (volume(NVME), volume(SATA), volume(HDD));
+        for seen in [&nvme, &sata, &hdd] {
+            buffers.seen(seen);
+        }
+        assert_eq!(hard(&hdd), FIGURE);
+        assert!(hard(&nvme).abs_diff(FIGURE / 11) <= ROUNDING, "{}", hard(&nvme));
+        assert!(
+            hard(&sata).abs_diff(FIGURE * 10 / 11) <= ROUNDING,
+            "{}",
+            hard(&sata)
+        );
+        assert!(hard(&nvme) < hard(&sata) && hard(&sata) < hard(&hdd));
+        for sized in [&nvme, &sata, &hdd] {
+            let (soft, limit) = sized.buffer_limits();
+            assert_eq!(soft, limit * 70 / 100);
+        }
+    }
+
+    // A rate that moved by less than a quarter leaves every limit alone. One
+    // that moved by a quarter or more, or was measured for the first time,
+    // sizes them all again.
+    #[test]
+    fn volume_buffers_follow_a_rate_that_moved_materially() {
+        let buffers = VolumeBuffers::new(FIGURE, ROOMY);
+        let (nvme, sata, unmeasured) = (volume(NVME), volume(SATA), volume(0));
+        for seen in [&nvme, &sata, &unmeasured] {
+            buffers.seen(seen);
+        }
+        let sized = |volumes: [&Arc<Volume>; 3]| volumes.map(|volume| hard(volume));
+        let before = sized([&nvme, &sata, &unmeasured]);
+        assert!(!buffers.follow_rates(), "nothing moved");
+
+        sata.write_rate.store(SATA * 110 / 100, Ordering::Relaxed);
+        assert!(!buffers.follow_rates(), "a tenth is not material");
+        assert_eq!(sized([&nvme, &sata, &unmeasured]), before);
+
+        sata.write_rate.store(SATA * 3 / 4, Ordering::Relaxed);
+        assert!(buffers.follow_rates());
+        let slower = sized([&nvme, &sata, &unmeasured]);
+        assert_ne!(slower, before, "the shares follow the new rate");
+        assert!(!buffers.follow_rates(), "sized on the rate it has now");
+
+        // The third volume's probe returns: it is the slowest of the three.
+        unmeasured.write_rate.store(HDD, Ordering::Relaxed);
+        assert!(buffers.follow_rates());
+        assert_eq!(hard(&unmeasured), FIGURE);
+        assert!(hard(&sata) < slower[1]);
+    }
+
+    #[test]
+    fn volume_buffers_tell_a_material_change_of_rate() {
+        assert!(!rate_moved(0, 0));
+        assert!(rate_moved(0, 1));
+        assert!(rate_moved(1, 0));
+        assert!(!rate_moved(1000, 1000));
+        assert!(!rate_moved(1000, 1249));
+        assert!(!rate_moved(1000, 751));
+        assert!(rate_moved(1000, 1250));
+        assert!(rate_moved(1000, 750));
+        assert!(rate_moved(u64::MAX, u64::MAX / 2));
+    }
+
+    // Another figure sizes every limit again; the same one changes nothing.
+    // A limit lowered below what a volume holds stops it until it drains.
+    #[test]
+    fn volume_buffers_size_every_volume_on_another_figure() {
+        let buffers = VolumeBuffers::new(FIGURE, ROOMY);
+        let held = volume(SATA);
+        buffers.seen(&held);
+        held.buffered_bytes.store(100 * MIB, Ordering::Relaxed);
+        assert_eq!(intake_of(&held), VolumeIntake::Open);
+
+        assert!(!buffers.set_figure(FIGURE, ROOMY));
+        assert!(buffers.set_figure(64 * MIB, ROOMY));
+        assert_eq!(held.buffer_limits(), (64 * MIB * 70 / 100, 64 * MIB));
+        assert_eq!(intake_of(&held), VolumeIntake::Stopped);
+        held.buffered_bytes.store(50 * MIB, Ordering::Relaxed);
+        assert_eq!(intake_of(&held), VolumeIntake::OneAtATime);
+        held.buffered_bytes.store(0, Ordering::Relaxed);
+        assert_eq!(intake_of(&held), VolumeIntake::Open);
+
+        // A volume seen later is sized on the figure in force.
+        let later = volume(0);
+        buffers.seen(&later);
+        assert_eq!(hard(&later), 64 * MIB);
     }
 }
