@@ -8263,7 +8263,6 @@ impl Harness {
     /// The peer is asked for chunk `chunk` of piece `index`, and it arrives
     /// in a pool buffer, as a connection receives it, to be queued for the
     /// disk.
-
     async fn send_block(&self, peer: &PeerHandler, (index, chunk): (u32, u32)) {
         let info = self.chunk(index, chunk);
         self.peers
@@ -8546,14 +8545,8 @@ async fn a_pause_waits_for_the_check_under_way_and_drops_the_one_queued() {
     assert!(!pausing.is_finished(), "the pause waits for the check");
     release.send(()).unwrap();
     let paused = pausing.await.unwrap();
-    h.live
-        .shared
-        .ending_run
-        .lock()
-        .clone()
-        .unwrap()
-        .wait()
-        .await;
+    let run = h.live.shared.ending_run.lock().clone().unwrap();
+    run.wait().await;
 
     let chunks = &paused.chunk_tracker;
     assert!(chunks.is_piece_have(h.piece(0)), "the check under way");
@@ -8616,14 +8609,8 @@ async fn a_run_that_ends_leaves_the_rooms_of_its_waiting_pieces_to_the_next() {
         assert!(paused.files.reserve_piece(piece, &room));
     }
     // Every job of the run that ended is over.
-    h.live
-        .shared
-        .ending_run
-        .lock()
-        .clone()
-        .unwrap()
-        .wait()
-        .await;
+    let run = h.live.shared.ending_run.lock().clone().unwrap();
+    run.wait().await;
     h.settled().await;
     assert_eq!(storage.checked_on.lock().len(), 1, "the queued check ran");
     assert_eq!(*storage.held.lock(), held, "a job of the run that ended");
