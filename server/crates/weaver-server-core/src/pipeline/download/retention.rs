@@ -338,15 +338,7 @@ impl Pipeline {
         warn_per_article: bool,
     ) -> weaver_nntp::ServerSet {
         let job_id = segment_id.file_id.job_id;
-        let retention = self.job_retention_excludes(job_id);
-        let pool = self.nntp.pool();
-        let refused_by: weaver_nntp::ServerSet = (0..pool.server_count())
-            .filter(|idx| {
-                !exclude_servers.contains(*idx)
-                    && !retention.contains(*idx)
-                    && pool.refuses_credentials(*idx)
-            })
-            .collect();
+        let refused_by = self.login_refused_unasked(job_id, exclude_servers);
         if warn_per_article {
             warn!(
                 segment = %segment_id,
@@ -362,12 +354,7 @@ impl Pipeline {
                 "no server may fetch this article; booking it as missing so repair can proceed"
             );
         }
-        if !refused_by.is_empty() {
-            self.semantic_terminal_causes.insert(
-                job_id,
-                crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage,
-            );
-        }
+        self.note_login_refusals(job_id, refused_by);
         self.metrics
             .articles_not_found
             .fetch_add(1, Ordering::Relaxed);
@@ -383,6 +370,61 @@ impl Pipeline {
             self.note_gap_servers_support_fact(job_id, exclude_servers);
         }
         refused_by
+    }
+
+    // The servers refusing the login that an article of `job_id` carrying
+    // `exclude_servers` was never asked of: neither excluded for the article
+    // nor out of the post's retention. One pass over the server list, from
+    // what the pool and the job already hold.
+    pub(in crate::pipeline) fn login_refused_unasked(
+        &mut self,
+        job_id: JobId,
+        exclude_servers: weaver_nntp::ServerSet,
+    ) -> weaver_nntp::ServerSet {
+        let retention = self.job_retention_excludes(job_id);
+        let pool = self.nntp.pool();
+        (0..pool.server_count())
+            .filter(|idx| {
+                !exclude_servers.contains(*idx)
+                    && !retention.contains(*idx)
+                    && pool.refuses_credentials(*idx)
+            })
+            .collect()
+    }
+
+    // An article of `job_id` was booked unservable past `refused_by`: the
+    // job's cause is the refusal, and the job keeps which servers refused.
+    pub(in crate::pipeline) fn note_login_refusals(
+        &mut self,
+        job_id: JobId,
+        refused_by: weaver_nntp::ServerSet,
+    ) {
+        if refused_by.is_empty() {
+            return;
+        }
+        self.semantic_terminal_causes.insert(
+            job_id,
+            crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage,
+        );
+        let held = self.login_refusals.entry(job_id).or_default();
+        if refused_by.iter().any(|server| !held.contains(server)) {
+            *held = held.iter().chain(refused_by.iter()).collect();
+        }
+    }
+
+    // The words a failed job's reason gains when a server refusing the login
+    // left articles of it unasked for, naming each such server.
+    pub(in crate::pipeline) fn login_refusal_words(&self, job_id: JobId) -> Option<String> {
+        let refused_by = self.login_refusals.get(&job_id)?;
+        let pool = self.nntp.pool();
+        let names = refused_by
+            .iter()
+            .map(|server| pool.server_address(weaver_nntp::pool::ServerId(server)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!(
+            "server {names} refuses the login and was never asked for the articles no other server had"
+        ))
     }
 
     // Book as missing every queued article of `job_id` that no server may

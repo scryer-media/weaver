@@ -18,6 +18,7 @@ impl Pipeline {
         self.download_wait_by_job.remove(&job_id);
         self.clear_terminal_segment_failures(job_id);
         self.terminal_reconciliations.remove(&job_id);
+        self.login_refusals.remove(&job_id);
         self.inflight_moves.remove(&job_id);
         self.deferred_moves.remove(&job_id);
         self.reserved_complete_destinations.remove(&job_id);
@@ -228,6 +229,11 @@ impl Pipeline {
         let whole = completed && shortfall.is_none();
         let typed_terminal_cause = if whole {
             Some(crate::jobs::SemanticTerminalCause::Success)
+        } else if self.login_refusals.contains_key(&job_id) {
+            // Articles a server refusing the login was never asked for: the
+            // refusal is the cause, whatever a later failure recorded.
+            self.semantic_terminal_causes.remove(&job_id);
+            Some(crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage)
         } else {
             self.semantic_terminal_causes.remove(&job_id)
         };

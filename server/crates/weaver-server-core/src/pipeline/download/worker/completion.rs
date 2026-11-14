@@ -1211,7 +1211,11 @@ impl Pipeline {
                         crate::jobs::SemanticTerminalCause::DecodeOrCorruptData
                     }
                 };
-                self.semantic_terminal_causes.insert(job_id, terminal_cause);
+                // A job with articles a refusing server was never asked for
+                // keeps the refusal as its cause.
+                if !self.login_refusals.contains_key(&job_id) {
+                    self.semantic_terminal_causes.insert(job_id, terminal_cause);
+                }
                 match &failure.kind {
                     DownloadFailureKind::ArticleNotFound => self
                         .metrics
@@ -1345,9 +1349,22 @@ impl Pipeline {
                         self.send_segment_event(|| PipelineEvent::ArticleNotFound {
                             segment_id: result.segment_id,
                         });
-                        if self.book_failed_segment(result.segment_id) {
+                        // A server that refuses the login was never asked:
+                        // the article is unservable, not known to be gone,
+                        // and the refusal is the job's cause.
+                        let refused_by = self.login_refused_unasked(job_id, retry_exclude_servers);
+                        let booked = if refused_by.is_empty() {
+                            self.book_failed_segment(result.segment_id)
+                        } else {
+                            self.book_terminal_segment(
+                                result.segment_id,
+                                SegmentTerminalState::UnservableNotFound,
+                            )
+                        };
+                        if booked {
                             self.note_gap_servers_support_fact(job_id, retry_exclude_servers);
                         }
+                        self.note_login_refusals(job_id, refused_by);
                     }
                 } else if credentials_exhausted {
                     self.book_unservable_segment(result.segment_id, retry_exclude_servers);

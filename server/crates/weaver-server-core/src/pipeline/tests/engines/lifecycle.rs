@@ -15,7 +15,7 @@ use super::super::{
     settle_inflight_moves, two_server_retention_client,
 };
 use super::harness::{
-    ARTICLE, JOB, Post, Scenario, admit, admit_with, collect, payload, serve_job,
+    ARTICLE, JOB, Post, Scenario, admit, admit_with, collect, par2_set, payload, serve_job,
 };
 use super::streams::xz;
 use crate::jobs::ids::JobId;
@@ -245,6 +245,108 @@ async fn the_last_server_refusing_credentials_fails_the_job() {
             .unwrap()
             .and_then(|candidate| candidate.terminal_cause),
         Some(crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage)
+    );
+}
+
+// A job its recovery covers. One payload article is not on the server asked,
+// and the other server refuses the login and is never asked: the article is
+// booked unservable, the set rebuilds it, and the job completes whole, with
+// no failure and no refusal in its record.
+#[tokio::test]
+async fn a_job_its_recovery_covers_completes_past_an_article_a_refusing_server_never_served() {
+    let data = payload(4 * ARTICLE, 7);
+    let mut posts = vec![Post::plain("payload.bin", data.clone())];
+    posts.extend(par2_set("lantern", &[("payload.bin", &data)], 2));
+    let scenario = Scenario::new(posts);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    // Neither server's retention rules out a job posted now.
+    pipeline.nntp = std::sync::Arc::new(two_server_retention_client());
+    let spec = scenario.spec();
+    let job = admitted_job_id(&pipeline, &spec);
+    insert_active_job(&mut pipeline, job, spec).await;
+    pipeline.active_download_passes.insert(job);
+    pipeline
+        .nntp
+        .pool()
+        .health()
+        .lock()
+        .await
+        .record_failure(1, true);
+
+    // The payload's second article is taken off the queue and answered "not
+    // found" by server 0, the way a lane answers it.
+    let lost = crate::pipeline::SegmentId {
+        file_id: crate::jobs::ids::NzbFileId {
+            job_id: job,
+            file_index: 0,
+        },
+        segment_number: 1,
+    };
+    let queued = pipeline
+        .jobs
+        .get_mut(&job)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .drain_all();
+    let mut work = None;
+    for queued in pipeline.dispatched_all(queued) {
+        if queued.segment_id == lost {
+            work = Some(queued);
+        } else {
+            pipeline
+                .jobs
+                .get_mut(&job)
+                .unwrap()
+                .articles
+                .active_mut()
+                .unwrap()
+                .download_queue
+                .push(queued);
+        }
+    }
+    let work = work.expect("the payload's second article is queued");
+    let (retry_count, exclude_servers) = (work.retry_count, work.exclude_servers);
+    pipeline.hold_test_lane_works(vec![work], false);
+    pipeline
+        .handle_download_done(DownloadResult {
+            lane_id: 0,
+            job_id: job,
+            runtime_generation: pipeline.pool_generation,
+            segment_id: lost,
+            data: Err(crate::pipeline::DownloadError::fetch(
+                crate::pipeline::DownloadFailureKind::ArticleNotFound,
+                "430 no such article",
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(0),
+            origin: crate::pipeline::DownloadResultOrigin::NormalPrimary,
+            retry_count,
+            exclude_servers,
+            release_connection_slot: true,
+        })
+        .await;
+    assert_eq!(
+        pipeline.segment_terminal_states.get(&lost).copied(),
+        Some(crate::pipeline::SegmentTerminalState::UnservableNotFound)
+    );
+    assert!(pipeline.login_refusal_words(job).is_some());
+
+    drive(&mut pipeline, &scenario, job, |_| false).await;
+
+    assert_eq!(history(&mut pipeline, job).await.status, "complete");
+    assert_eq!(history(&mut pipeline, job).await.error_message, None);
+    assert_eq!(
+        pipeline
+            .db
+            .semantic_candidate_snapshot(job)
+            .unwrap()
+            .and_then(|candidate| candidate.terminal_cause),
+        Some(crate::jobs::SemanticTerminalCause::Success)
     );
 }
 

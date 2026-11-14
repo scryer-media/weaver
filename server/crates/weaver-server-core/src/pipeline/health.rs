@@ -85,6 +85,18 @@ impl Pipeline {
         if self.job_failure_started(job_id) {
             return;
         }
+        // A job with articles left unasked for by a server refusing the
+        // login says so, and its cause is the refusal whatever stage failed.
+        let error = match self.login_refusal_words(job_id) {
+            Some(words) => {
+                self.semantic_terminal_causes.insert(
+                    job_id,
+                    crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage,
+                );
+                format!("{error}; {words}")
+            }
+            None => error,
+        };
         tracing::error!(job_id = job_id.0, reason = %error, "job failed");
         let failure_stage = self
             .jobs

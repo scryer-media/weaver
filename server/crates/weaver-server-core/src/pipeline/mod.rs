@@ -1517,6 +1517,11 @@ pub(in crate::pipeline) enum SegmentTerminalState {
     // No server may fetch the article: one that would refuses the
     // credentials. The servers never said the article is gone.
     Unservable,
+    // Unservable too, after every server asked said the article is not
+    // there: a server that would have been asked next refuses the
+    // credentials. The post's health and its first-article sample count it
+    // as they count a missing article, so the job gives up when it did.
+    UnservableNotFound,
     // The feed stopped asking for the article once it gave the post up.
     Abandoned,
 }
@@ -1667,6 +1672,10 @@ pub struct Pipeline {
     // Typed terminal provenance retained until the ordered history archive has
     // durably updated duplicate-promotion eligibility.
     pub(super) semantic_terminal_causes: HashMap<JobId, crate::jobs::SemanticTerminalCause>,
+    // Per job, the servers refusing the login that an article booked
+    // unservable was never asked of. Written when such an article is booked,
+    // read when the job's failure is worded, dropped with the job.
+    pub(super) login_refusals: HashMap<JobId, weaver_nntp::ServerSet>,
     // The stage a failed job was in when it failed, kept until its history
     // row records the failure kind.
     pub(super) pipeline_failure_stages:
