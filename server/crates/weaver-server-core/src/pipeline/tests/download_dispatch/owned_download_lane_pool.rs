@@ -1592,7 +1592,7 @@ async fn the_feed_reads_a_posts_losses_without_walking_its_articles() {
         segment_number,
     };
     pipeline.book_terminal_segment(segment(0), SegmentTerminalState::Missing);
-    pipeline.book_terminal_segment(segment(2), SegmentTerminalState::Unservable);
+    pipeline.book_terminal_segment(segment(2), SegmentTerminalState::RetriesExhausted);
     let read = |pipeline: &Pipeline| {
         (
             pipeline.missing_bytes(job_id),

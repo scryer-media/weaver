@@ -1538,12 +1538,14 @@ pub(in crate::pipeline) enum SegmentTerminalState {
     // Bodies arrived but no attempt decoded into the declared placement.
     DecodeExhausted,
     // No server may fetch the article: one that would refuses the
-    // credentials. The servers never said the article is gone.
+    // credentials. The servers never said the article is gone, but none
+    // can bring it, so the post's health and its first-article sample count
+    // it as they count a missing article.
     Unservable,
     // Unservable too, after every server asked said the article is not
     // there: a server that would have been asked next refuses the
-    // credentials. The post's health and its first-article sample count it
-    // as they count a missing article, so the job gives up when it did.
+    // credentials. Counted the same; only the support facts tell the two
+    // apart, by what the servers said.
     UnservableNotFound,
     // The feed stopped asking for the article once it gave the post up.
     Abandoned,

@@ -1211,7 +1211,11 @@ impl Pipeline {
                         crate::jobs::SemanticTerminalCause::DecodeOrCorruptData
                     }
                 };
-                self.semantic_terminal_causes.insert(job_id, terminal_cause);
+                // The failure becomes the job's cause only where it ends the
+                // article, below. A failure the article is retried past says
+                // nothing of the job once the article is served, and left
+                // standing a login or transport failure would keep a later
+                // failure of the job from trying its next duplicate.
                 match &failure.kind {
                     DownloadFailureKind::ArticleNotFound => self
                         .metrics
@@ -1339,6 +1343,7 @@ impl Pipeline {
                     // Every server is missing the id in use: the article moves
                     // to its next id, or with every id spent is booked missing.
                     if !self.spend_message_id(result.segment_id) {
+                        self.semantic_terminal_causes.insert(job_id, terminal_cause);
                         self.metrics
                             .articles_not_found
                             .fetch_add(1, Ordering::Relaxed);
@@ -1363,6 +1368,9 @@ impl Pipeline {
                         self.note_login_refusals(job_id, refused_by);
                     }
                 } else if credentials_exhausted {
+                    // The refusal is not the job's cause: the article may move
+                    // to its next id and be served, and booked past a refusing
+                    // server it records the missing articles itself.
                     self.book_unservable_segment(result.segment_id, retry_exclude_servers);
                     // The refusal holds for the job's queued articles too:
                     // every one only refusing servers could serve is booked
@@ -1406,6 +1414,7 @@ impl Pipeline {
                         // article: without this, health stays optimistic and
                         // recovery promotion waits for post-download verify.
                         self.transport_failure_streaks.remove(&seg_id);
+                        self.semantic_terminal_causes.insert(job_id, terminal_cause);
                         if self
                             .book_terminal_segment(seg_id, SegmentTerminalState::RetriesExhausted)
                         {
