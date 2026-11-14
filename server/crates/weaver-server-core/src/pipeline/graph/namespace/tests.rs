@@ -1862,6 +1862,55 @@ fn two_members_that_want_one_name_are_both_written() {
     assert!(job.root().get(second).unwrap().is_complete());
 }
 
+// Every member wants one name and takes the next suffix; then a member that
+// outranks them all takes the name, and each moves on one suffix, the last
+// first. Each move waits for the commit that frees the name the one after it
+// left, so the chain takes a checkpoint per member, and each pass of the
+// moves reads the files once however many moves wait: the files read grow
+// with the members times the checkpoints, never times the moves weighed too.
+#[test]
+fn a_chain_of_moves_reads_the_files_once_per_pass() {
+    const N: usize = 300;
+    let mut job = Job::new(PLENTY);
+    let top = job.member("other.txt", Some(1));
+    job.send(top, 0, b"t", Provenance::Fresh);
+    let members: Vec<MemberId> = (0..N)
+        .map(|k| {
+            let member = job.member("beacon.txt", Some(1));
+            job.send(member, 0, &[k as u8], Provenance::Fresh);
+            member
+        })
+        .collect();
+    let mut build = job.build();
+    job.writer
+        .rename(&mut job.tree, &mut build, NodeId::ROOT, top, "beacon.txt")
+        .unwrap();
+    let before = super::moves::TALLY.with(std::cell::Cell::get);
+    let mut checkpoints = 0;
+    while job.writer.moves_waiting() {
+        let stamp = job.writer.committed + 1;
+        job.writer.recorded(stamp);
+        job.writer
+            .commit_moves(&mut job.tree, stamp)
+            .expect("moves");
+        checkpoints += 1;
+    }
+    let after = super::moves::TALLY.with(std::cell::Cell::get);
+    assert_eq!(after.moves - before.moves, N as u64 + 1);
+    assert_eq!(checkpoints, N + 2);
+    let weighed = after.weighed - before.weighed;
+    assert!(
+        weighed <= ((checkpoints + 1) * (N + 1)) as u64,
+        "{weighed} files read over {checkpoints} checkpoints"
+    );
+    assert_eq!(job.file("beacon.txt"), b"t");
+    for (k, member) in members.iter().enumerate() {
+        let name = format!("beacon ({}).txt", k + 1);
+        assert_eq!(job.root().get(*member).unwrap().output_name, name);
+        assert_eq!(job.file(&name), [k as u8]);
+    }
+}
+
 #[test]
 fn a_member_closes_exactly_when_covered_at_its_length() {
     let mut job = Job::new(PLENTY);
