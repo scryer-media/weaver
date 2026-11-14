@@ -3737,26 +3737,92 @@ async fn a_block_write_that_finds_no_room_is_fetched_again_after_upload_mode() {
 // maps to).
 #[test]
 fn a_piece_is_counted_into_every_file_past_an_empty_one() {
-    let file = |name: &str, piece_range: std::ops::Range<u32>| FileInfo {
-        relative_filename: name.into(),
-        offset_in_torrent: 0,
-        piece_range,
-        attrs: Default::default(),
-        len: 0,
+    let lengths = Lengths::new(64, 16).unwrap();
+    let files = files_laid_out(&lengths, &[16, 0, 8, 0, 30, 10]);
+    let ranges: Vec<_> = files.iter().map(|f| f.piece_range.clone()).collect();
+    assert_eq!(ranges, [0..1, 1..1, 1..2, 1..1, 1..4, 3..4]);
+    let names = |piece| -> Vec<usize> {
+        let piece = lengths.validate_piece_index(piece).unwrap();
+        files_in_piece(&files, &lengths, piece)
+            .map(|(i, _)| i)
+            .collect()
     };
-    let files = [
-        file("a", 0..1),
-        file("empty at the start of piece 1", 1..1),
-        file("b", 1..2),
-        file("empty inside piece 1", 1..1),
-        file("c", 1..3),
-        file("d", 3..4),
-    ];
-    let names = |piece| -> Vec<usize> { files_in_piece(&files, piece).map(|(i, _)| i).collect() };
     assert_eq!(names(0), vec![0]);
     assert_eq!(names(1), vec![2, 3, 4]);
     assert_eq!(names(2), vec![4]);
-    assert_eq!(names(3), vec![5]);
+    assert_eq!(names(3), vec![4, 5]);
+}
+
+/// Files of the lengths given, one after the other from the torrent's first
+/// byte.
+fn files_laid_out(lengths: &Lengths, lens: &[u64]) -> Vec<FileInfo> {
+    let mut offset = 0;
+    lens.iter()
+        .enumerate()
+        .map(|(i, &len)| {
+            let file = FileInfo {
+                relative_filename: format!("f{i}").into(),
+                offset_in_torrent: offset,
+                piece_range: lengths.iter_pieces_within_offset(offset, len),
+                attrs: Default::default(),
+                len,
+            };
+            offset += len;
+            file
+        })
+        .collect()
+}
+
+// The files of a piece are found by halving. Over layouts of many files,
+// empty ones, ones smaller than a piece and ones of many pieces among them,
+// every piece has the files a walk from the first file finds.
+#[test]
+fn the_files_of_a_piece_found_by_halving_are_those_a_walk_finds() {
+    fn walked(file_infos: &[FileInfo], piece: u32) -> Vec<usize> {
+        file_infos
+            .iter()
+            .enumerate()
+            .skip_while(|(_, fi)| fi.piece_range.end <= piece)
+            .take_while(|(_, fi)| fi.piece_range.start <= piece)
+            .map(|(i, _)| i)
+            .collect()
+    }
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move || {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        seed >> 33
+    };
+    for layout in 0..200 {
+        let piece_length = [16, 64, 1024][layout % 3];
+        let lens: Vec<u64> = (0..1 + next() % 60)
+            .map(|_| match next() % 5 {
+                0 => 0,
+                1 => 1 + next() % u64::from(piece_length),
+                2 => u64::from(piece_length),
+                3 => u64::from(piece_length) * (1 + next() % 4),
+                _ => next() % (u64::from(piece_length) * 6),
+            })
+            .collect();
+        let total: u64 = lens.iter().sum();
+        if total == 0 {
+            continue;
+        }
+        let lengths = Lengths::new(total, piece_length).unwrap();
+        let files = files_laid_out(&lengths, &lens);
+        for piece in lengths.iter_piece_infos() {
+            let piece = piece.piece_index;
+            let halved: Vec<usize> = files_in_piece(&files, &lengths, piece)
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                halved,
+                walked(&files, piece.get()),
+                "piece {piece} of {lens:?} in pieces of {piece_length}"
+            );
+        }
+    }
 }
 
 /// A PEX message adding `added` and dropping `dropped`.

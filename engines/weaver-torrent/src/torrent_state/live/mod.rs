@@ -2302,7 +2302,7 @@ impl TorrentStateLive {
         self.stats
             .have_bytes
             .fetch_add(piece_len, Ordering::Relaxed);
-        for (idx, file_info) in files_in_piece(&self.metadata.file_infos, id.get()) {
+        for (idx, file_info) in files_in_piece(&self.metadata.file_infos, &self.lengths, id) {
             if pieces.update_file_have_on_piece_completed(id, idx, file_info)
                 && !file_info.attrs.padding
             {
@@ -2578,13 +2578,23 @@ impl Drop for PeerLifetime {
 }
 
 /// The files with bytes in piece `piece`, by index. Files are in torrent
-/// order, so they are the run from the first that ends past the piece to
-/// the last that starts in it. An empty file inside that run holds no piece
-/// and adds nothing, but does not end it.
-fn files_in_piece(file_infos: &[FileInfo], piece: u32) -> impl Iterator<Item = (usize, &FileInfo)> {
+/// order, so they are the run from the first that ends past the piece's
+/// first byte, found by halving as a torrent may have many thousands of
+/// files and this runs under the torrent's lock for every piece had, to
+/// the last that starts in the piece. An empty file inside that run holds
+/// no piece and adds nothing, but does not end it.
+fn files_in_piece<'a>(
+    file_infos: &'a [FileInfo],
+    lengths: &Lengths,
+    piece: ValidPieceIndex,
+) -> impl Iterator<Item = (usize, &'a FileInfo)> {
+    let piece_start = lengths.piece_offset(piece);
+    let piece = piece.get();
+    let first = file_infos.partition_point(|fi| fi.offset_in_torrent + fi.len <= piece_start);
     file_infos
         .iter()
         .enumerate()
+        .skip(first)
         .skip_while(move |(_, fi)| fi.piece_range.end <= piece)
         .take_while(move |(_, fi)| fi.piece_range.start <= piece)
 }
