@@ -257,6 +257,31 @@ fn a_read_waits_for_the_writes_of_its_range() {
     });
 }
 
+// A file whose later write failed is shorter on disk than what was sent to
+// it. Asked for its length, the leaf says the write failed: it does not
+// answer the short length as its own.
+#[test]
+fn the_length_of_a_file_whose_write_failed_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let through = writers();
+    let hold = through.hold();
+    let to = through.writers.submitter(&through.volume, 1);
+    let mut leaf = Leaf::at(dir.path(), "a.bin").through(Some(&to));
+    leaf.write(0, b"lantern", None).unwrap();
+    leaf.write(7, b"light", None).unwrap();
+    hold.wait_held();
+    // The first write goes down; the second fails.
+    hold.release(1);
+    hold.wait_held();
+    hold.fail_next(std::io::Error::other("no room"));
+    hold.open();
+
+    let error = leaf.len().unwrap_err();
+
+    assert!(error.to_string().contains("failed"), "{error}");
+    assert_eq!(std::fs::metadata(leaf.path()).unwrap().len(), 7);
+}
+
 // A file's move to the name it wants follows its last write.
 #[test]
 fn a_move_follows_the_last_write_of_its_file() {

@@ -249,12 +249,6 @@ impl Leaf {
             .map(|queued| queued.to.barrier_at(queued.last))
     }
 
-    fn settle(&self) {
-        if let Some(settled) = self.settled() {
-            settled.wait();
-        }
-    }
-
     fn create(&self, length: Option<u64>) -> Create {
         Create {
             path: self.path.clone(),
@@ -648,7 +642,19 @@ impl Leaf {
 
     // How far the file reaches: every byte written to it lies below.
     pub(crate) fn len(&self) -> Result<u64, LeafError> {
-        self.settle();
+        if let Some(settled) = self.settled() {
+            settled.wait();
+            // A write that failed left the file short of what was sent to
+            // it: its length is not the length of what the leaf holds.
+            if settled.failed() {
+                return Err(LeafError::Io {
+                    path: self.path.clone(),
+                    source: io::Error::other(
+                        "a write of the file failed, so its length on disk is not its own",
+                    ),
+                });
+            }
+        }
         match &self.file {
             Some(file) => file.metadata(),
             None => std::fs::metadata(&self.path),

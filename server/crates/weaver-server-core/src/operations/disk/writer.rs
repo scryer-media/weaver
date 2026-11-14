@@ -816,11 +816,9 @@ impl Submitter {
                 unbuffer(state, &*self.lane.report, bytes.len() as u64);
             }
             state.done.fetch_add(1, Ordering::Relaxed);
-            // Nothing sent to the volume will run, so all of it has
-            // returned: a settle does not wait for it.
-            state.returned(state.sent.load(Ordering::SeqCst));
             // The caller makes this one itself: nothing failed.
             if matches!(unsent.op, Op::Run { own: true, .. }) {
+                state.returned(state.sent.load(Ordering::SeqCst));
                 self.key.returned(seq);
                 return seq;
             }
@@ -844,6 +842,10 @@ impl Submitter {
                     below: false,
                 });
             }
+            // Nothing sent to the volume will run, so all of it has
+            // returned: a settle does not wait for it. Said after the
+            // failure is reported, so a settle never ends ahead of it.
+            state.returned(state.sent.load(Ordering::SeqCst));
         }
         self.lane.run_inline();
         seq
@@ -1437,7 +1439,7 @@ impl Thread {
         // A panic in one operation must not leave the volume's callers
         // waiting for a thread that is gone.
         if catch_unwind(AssertUnwindSafe(|| self.run_batch(base))).is_err() {
-            self.fail_batch(base);
+            self.fail_batch();
         }
         self.batch.clear();
         let Ran {
@@ -1475,6 +1477,9 @@ impl Thread {
                 below: false,
             });
         }
+        // After the report: a settle that waited for this batch finds its
+        // failures already with the caller.
+        self.state.returned(self.arrived);
     }
 
     fn run_batch(&mut self, base: u64) {
@@ -1514,7 +1519,9 @@ impl Thread {
             while through < self.batch.len() && self.batch[through].done {
                 through += 1;
             }
-            if through > before {
+            // A settle is told as the batch goes only while nothing of it
+            // failed: from a failure on it is told after the report.
+            if through > before && self.ran.failures.is_empty() {
                 self.state.returned(base + through as u64);
             }
         }
@@ -1523,7 +1530,7 @@ impl Thread {
     // The batch panicked: every key with an operation in it has failed.
     // What was not run is not run, all of it counts as returned, and its
     // bytes stop waiting.
-    fn fail_batch(&mut self, base: u64) {
+    fn fail_batch(&mut self) {
         let report = &*self.report;
         unbuffer(&self.state, report, std::mem::take(&mut self.ran.in_hand));
         for entry in &mut self.batch {
@@ -1546,7 +1553,6 @@ impl Thread {
             key.returned(entry.seq);
         }
         self.state.look_below();
-        self.state.returned(base + self.batch.len() as u64);
     }
 
     // Order the batch: see `Place`. Overlapping writes of one file between

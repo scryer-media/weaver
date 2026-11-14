@@ -901,3 +901,69 @@ fn a_write_to_a_file_that_is_not_open_fails_its_key() {
     assert!(!after.exists(), "nothing of a failed key is written after");
     assert_eq!(count(&volume.buffered_bytes), 0);
 }
+
+// What a settle of `job`'s volume would still wait for, each time a failure
+// is reported under key 1: taken inside the report.
+type Outstanding = Arc<Mutex<Vec<u64>>>;
+
+fn reporting_what_is_outstanding(
+    make: fn(Box<dyn Fn(Report) + Send + Sync>) -> VolumeWriters,
+) -> (VolumeWriters, Arc<Mutex<Option<Arc<Lane>>>>, Outstanding) {
+    let lane: Arc<Mutex<Option<Arc<Lane>>>> = Arc::default();
+    let seen = Outstanding::default();
+    let (at, into) = (Arc::clone(&lane), Arc::clone(&seen));
+    let writers = make(Box::new(move |report: Report| {
+        if report.failures.is_empty() {
+            return;
+        }
+        let lane = at.lock().unwrap();
+        let state = &lane.as_ref().expect("the volume is known").state;
+        into.lock().unwrap().push(
+            state.sent.load(Ordering::SeqCst) - state.returned.load(Ordering::SeqCst),
+        );
+    }));
+    (writers, lane, seen)
+}
+
+// A settle does not end ahead of the report of a failure in what it waited
+// for: when the failure of a batch's last operation is reported, the volume
+// has not yet said that operation returned.
+#[test]
+fn a_batchs_failures_are_reported_before_a_settle_of_it_can_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (writers, lane, seen) = reporting_what_is_outstanding(|report| VolumeWriters::new(report));
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    *lane.lock().unwrap() = Some(Arc::clone(&job.lane));
+    job.write(1, 0, Bytes::from_static(b"kept"), create(&dir.path().join("a")));
+    job.write(1, 4, Bytes::from_static(b"lost"), None);
+    hold.wait_held();
+    hold.release(1);
+    hold.wait_held();
+    hold.fail_next(io::Error::other("no room"));
+    hold.open();
+
+    writers.settle();
+
+    // The report was made, and found the failed write still outstanding.
+    assert_eq!(*seen.lock().unwrap(), [1]);
+    assert!(job.failed());
+}
+
+// The same on a volume with no thread, where the submit itself reports.
+#[test]
+fn a_failure_on_a_volume_with_no_thread_is_reported_before_a_settle_can_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (writers, lane, seen) =
+        reporting_what_is_outstanding(|report| VolumeWriters::threadless(report));
+    let volume = volume("one");
+    let job = writers.submitter(&volume, 1);
+    *lane.lock().unwrap() = Some(Arc::clone(&job.lane));
+
+    job.write(1, 0, Bytes::from_static(b"lost"), create(&dir.path().join("a")));
+
+    writers.settle();
+    assert_eq!(*seen.lock().unwrap(), [1]);
+    assert!(job.failed());
+}
