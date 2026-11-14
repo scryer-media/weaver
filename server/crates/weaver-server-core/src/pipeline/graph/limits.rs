@@ -361,6 +361,17 @@ struct Extent {
     device: Device,
 }
 
+// A job's wait for room on one disk: what it owes there that must fit above
+// the reserve before it wakes, what the cached reading shows free, and the
+// reserve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiskWait {
+    pub(crate) device: Device,
+    pub(crate) owes: u64,
+    pub(crate) free: Option<u64>,
+    pub(crate) reserve: u64,
+}
+
 // How much is promised from a device beyond what a write needs when the
 // ledger is asked, so that most writes touch nothing shared, and how much
 // that was promised may land before the ledger hears of it.
@@ -1051,6 +1062,42 @@ impl Caps {
         [self.spend[0].waiting, self.spend[1].waiting]
     }
 
+    // What the job waits for on the first device it waits on, `output` read
+    // through `output` and the working one through `working`: the room
+    // `wake_disk` asks of it above the reserve, both devices' together on
+    // one filesystem, and what the cached reading shows free there. None
+    // when the job does not wait. Read from the cached readings only.
+    pub(crate) fn disk_wait(
+        &self,
+        (output, working): (&CapacityReader, &CapacityReader),
+    ) -> Option<DiskWait> {
+        let readers = [output, working];
+        let ledger = |index: usize| {
+            self.spend[index]
+                .ledger
+                .as_ref()
+                .unwrap_or_else(|| readers[index].ledger())
+        };
+        let index = self
+            .spend
+            .iter()
+            .position(|spend| spend.waiting.is_some())?;
+        let owes = match ledger(0).same_disk(ledger(1)) {
+            true => self.spend[0]
+                .needed()
+                .saturating_add(self.spend[1].needed()),
+            false => self.spend[index].needed(),
+        };
+        Some(DiskWait {
+            device: [Device::Output, Device::Working][index],
+            owes,
+            free: ledger(index)
+                .free_with(|| readers[index].current())
+                .map(|free| free.bytes),
+            reserve: self.limits.min_free_bytes,
+        })
+    }
+
     // A reading came: whether every device the job waits on, `output` read
     // through `output` and the working one through `working`, has room above
     // the reserve for all the job owes it. If so, all of it is promised
@@ -1577,5 +1624,124 @@ mod tests {
             "the repair takes what was put in hand on the first"
         );
         assert_eq!(short.ledger().promised(), 100 * MIB, "and on the second");
+    }
+
+    const GIB: u64 = 1024 * MIB;
+
+    // A disk of `total` bytes showing what `available` holds free.
+    fn disk(available: &Arc<AtomicU64>, total: u64) -> CapacityReader {
+        let available = Arc::clone(available);
+        CapacityReader::from_fn(move || {
+            Capacity::Known(CapacityReading {
+                available_bytes: available.load(Ordering::SeqCst),
+                total_bytes: total,
+                sampled_at: Instant::now(),
+                stale: false,
+            })
+        })
+    }
+
+    fn reserved(reserve: u64) -> Caps {
+        let mut caps = Caps::unbounded();
+        Arc::make_mut(&mut caps.limits).min_free_bytes = reserve;
+        caps
+    }
+
+    // A member's first write takes its whole length, as `admit_write` does
+    // for a file: owed to the device until it lands.
+    fn takes(caps: &mut Caps, key: (NodeId, MemberId), end: u64, at: (&CapacityReader, Device)) {
+        let (reader, device) = at;
+        member(caps, key, end, device);
+        caps.extents.get_mut(&key).unwrap().owed = end;
+        caps.book(device, end, reader);
+    }
+
+    // On a disk of 100 GiB that keeps 5 GiB free, a job that owes 120 GiB,
+    // more than the whole disk, is never refused for it: it waits, as any
+    // job short of room does, and the wait reads what it owes, what is free
+    // and the reserve.
+    #[test]
+    fn a_job_larger_than_the_whole_disk_waits_and_is_never_refused() {
+        let available = Arc::new(AtomicU64::new(20 * GIB));
+        let output = disk(&available, 100 * GIB);
+        let working = free(10 * 1024 * GIB);
+        let mut caps = reserved(5 * GIB);
+        takes(
+            &mut caps,
+            (NodeId(1), MemberId(0)),
+            120 * GIB,
+            (&output, Device::Output),
+        );
+        assert!(caps.disk_held(), "no room for it: the job waits");
+        assert_eq!(
+            caps.disk_wait((&output, &working)),
+            Some(DiskWait {
+                device: Device::Output,
+                owes: 120 * GIB,
+                free: Some(20 * GIB),
+                reserve: 5 * GIB,
+            })
+        );
+        assert!(caps.check().is_ok(), "nothing refuses it");
+        assert!(caps.refusal().is_none());
+        assert!(!caps.wake_disk(&output, &working));
+        assert!(caps.disk_held(), "it goes on waiting");
+    }
+
+    // A job that owes 60 GiB with 20 GiB free waits for what it owes, and
+    // wakes once a reading shows that much above the reserve: what the wait
+    // reads is what its wake asks for.
+    #[test]
+    fn a_wait_reads_what_its_wake_asks_for() {
+        let available = Arc::new(AtomicU64::new(20 * GIB));
+        let output = disk(&available, 100 * GIB);
+        let working = free(10 * 1024 * GIB);
+        let mut caps = reserved(5 * GIB);
+        takes(
+            &mut caps,
+            (NodeId(1), MemberId(0)),
+            60 * GIB,
+            (&output, Device::Output),
+        );
+        let wait = caps.disk_wait((&output, &working)).expect("the job waits");
+        assert_eq!((wait.owes, wait.free), (60 * GIB, Some(20 * GIB)));
+
+        available.store(wait.reserve + wait.owes - 1, Ordering::SeqCst);
+        assert!(!caps.wake_disk(&output, &working), "a byte short");
+        available.store(wait.reserve + wait.owes, Ordering::SeqCst);
+        assert!(caps.wake_disk(&output, &working));
+        assert_eq!(
+            caps.disk_wait((&output, &working)),
+            None,
+            "it no longer waits"
+        );
+    }
+
+    // Two folders on one disk wait together: the wait reads what both owe,
+    // as their wake asks room for both at once.
+    #[test]
+    fn two_folders_on_one_disk_wait_for_both() {
+        let available = Arc::new(AtomicU64::new(20 * GIB));
+        let one = disk(&available, 100 * GIB);
+        let mut caps = reserved(5 * GIB);
+        takes(
+            &mut caps,
+            (NodeId(1), MemberId(0)),
+            30 * GIB,
+            (&one, Device::Output),
+        );
+        takes(
+            &mut caps,
+            (NodeId(1), MemberId(1)),
+            30 * GIB,
+            (&one, Device::Working),
+        );
+        let wait = caps.disk_wait((&one, &one)).expect("the job waits");
+        assert_eq!(wait.owes, 60 * GIB);
+
+        available.store(5 * GIB + 60 * GIB - 1, Ordering::SeqCst);
+        assert!(!caps.wake_disk(&one, &one));
+        available.store(5 * GIB + 60 * GIB, Ordering::SeqCst);
+        assert!(caps.wake_disk(&one, &one));
     }
 }

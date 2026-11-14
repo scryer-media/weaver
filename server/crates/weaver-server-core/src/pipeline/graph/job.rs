@@ -1054,6 +1054,11 @@ impl GraphJob {
         self.writer.disk_held() && self.writer.owes_nothing() && !self.runs.live()
     }
 
+    // What the job waits for room for, and the folder it waits on.
+    pub(crate) fn disk_wait(&self) -> Option<(super::limits::DiskWait, std::path::PathBuf)> {
+        self.writer.disk_wait()
+    }
+
     // `limit` is the slot limit the pipeline reads now, which every step
     // that asks or frees a run follows, and a repair the step lends asks
     // `slots` under it. The runs step before the lend, so a run the step
