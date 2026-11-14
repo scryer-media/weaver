@@ -19,7 +19,6 @@ use weaver_server_core::operations::instrumentation::{
     JobLifecycleMetricsSnapshot, PipelineHistogramsSnapshot, ProcessMetricsSnapshot,
     ServerMetricsSnapshot, VolumeSnapshot,
 };
-use weaver_server_core::operations::VolumeWriteRate;
 use weaver_server_core::operations::metrics_store::{JOB_STATUS_KEYS, JobStatusCounts};
 use weaver_server_core::persistence::WalCheckpointMetricsSnapshot;
 use weaver_server_core::post_processing::executor::PostProcessingMetricsSnapshot;
@@ -99,9 +98,6 @@ pub(crate) struct PrometheusRenderInput<'a> {
     pub(crate) disk_space: &'a [DiskSpaceSnapshot],
     // One row per volume the download side writes to.
     pub(crate) volumes: &'a [VolumeSnapshot],
-    // The same volumes as the system page lists them; the throughput row
-    // is read from here.
-    pub(crate) volume_rates: &'a [VolumeWriteRate],
     pub(crate) http_metrics: Option<&'a HttpMetricsSnapshot>,
 }
 
@@ -150,7 +146,6 @@ impl<'a> PrometheusRenderInput<'a> {
             process: None,
             disk_space: &[],
             volumes: &[],
-            volume_rates: &[],
             http_metrics: None,
         }
     }
@@ -209,7 +204,6 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         process,
         disk_space,
         volumes,
-        volume_rates,
         http_metrics,
     } = *input;
 
@@ -291,7 +285,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     }
     render_disk_space(&mut out, disk_space);
     render_volumes(&mut out, volumes);
-    render_volume_throughput(&mut out, volume_rates);
+    render_volume_throughput(&mut out, volumes);
     if let Some(http) = http_metrics {
         render_http(&mut out, http);
     }
@@ -1598,11 +1592,11 @@ fn render_volumes(out: &mut Encoder, volumes: &[VolumeSnapshot]) {
 
 // What is being written to each volume now. A volume nothing is written to
 // has no figure, which is told by the series being absent.
-fn render_volume_throughput(out: &mut Encoder, volumes: &[VolumeWriteRate]) {
+fn render_volume_throughput(out: &mut Encoder, volumes: &[VolumeSnapshot]) {
     for volume in volumes {
-        if let Some(throughput) = volume.throughput {
+        if volume.throughput > 0 {
             let labels: &[(&str, &str)] = &[("volume", volume.label.as_str())];
-            out.sample(&f::VOLUME_WRITE_THROUGHPUT, labels, throughput);
+            out.sample(&f::VOLUME_WRITE_THROUGHPUT, labels, volume.throughput);
         }
     }
 }

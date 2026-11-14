@@ -28,7 +28,6 @@ pub(crate) use storage_kind::StorageKind;
 #[allow(unused_imports)]
 pub(crate) use volume_probe::{ProbeStore, probe_once};
 pub(crate) use volume_view::slowest_measured_mbps;
-pub use volume_view::VolumeWriteRate;
 
 // Capacity for the filesystem backing a path.
 #[derive(Debug, Clone, Copy)]
@@ -306,30 +305,50 @@ fn directory_device(path: &Path) -> Option<u64> {
     metadata.is_dir().then(|| metadata.dev())
 }
 
+// The volume a directory lies on is told by the volume's GUID path, the name
+// the OS keeps for it wherever and however often it is mounted: two drive
+// letters or folders that mount one volume give one id, and two volumes
+// never share one, which a volume's serial number does not promise. A
+// network share has no GUID path, and is told by its share root instead.
 #[cfg(windows)]
 fn directory_device(path: &Path) -> Option<u64> {
-    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle,
-    };
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW;
+
     if !std::fs::metadata(path).ok()?.is_dir() {
         return None;
     }
-    let directory = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
-        .ok()?;
-    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
-    // SAFETY: the handle is open for the call and `info` is a valid slot.
-    let result =
-        unsafe { GetFileInformationByHandle(directory.as_raw_handle(), info.as_mut_ptr()) };
-    if result == 0 {
-        return None;
-    }
-    // SAFETY: the call succeeded, so it filled `info`.
-    let info = unsafe { info.assume_init() };
-    Some(u64::from(info.dwVolumeSerialNumber))
+    let root = storage_kind::volume_root(path)?;
+    // A GUID path is 49 units and its NUL.
+    let mut name = [0u16; 50];
+    // SAFETY: `root` holds the NUL-terminated volume path just written, and
+    // `name` is as long as the length passed; the return code is checked
+    // before `name` is read.
+    let found = unsafe {
+        GetVolumeNameForVolumeMountPointW(root.as_ptr(), name.as_mut_ptr(), name.len() as u32)
+    };
+    Some(if found != 0 {
+        volume_identity(&name)
+    } else {
+        volume_identity(&root)
+    })
+}
+
+// The device id of a volume from its name: the units before the first NUL,
+// letters of either case alike, as one stable number. The same name gives
+// the same id in every run.
+#[cfg(any(windows, test))]
+fn volume_identity(name: &[u16]) -> u64 {
+    // FNV-1a over each unit's two bytes.
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    name.iter()
+        .take_while(|unit| **unit != 0)
+        .map(|unit| match *unit {
+            upper @ 0x41..=0x5a => upper + 0x20,
+            unit => unit,
+        })
+        .flat_map(u16::to_le_bytes)
+        .fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1349,13 +1368,15 @@ fn lock_paths(cache: &Mutex<PathCache>) -> std::sync::MutexGuard<'_, PathCache> 
 // path. Its device is read first and handed out at once, so an asker of the
 // device never waits on the free space; then the free space. Each part is
 // stored in `cache`, when there is one, as it returns, and handed to every
-// waiter. A look that panics closes the channel, and its waiters are told
-// it was lost.
+// waiter. The device's volume is made known in `volumes`, when given. A
+// look that panics closes the channel, and its waiters are told it was
+// lost.
 fn spawn_look(
     probe: SharedProbeFn,
     clock: Arc<Clock>,
     path: PathBuf,
     cache: Option<Arc<Mutex<PathCache>>>,
+    volumes: Option<Arc<volumes::Volumes>>,
 ) -> LookWatch {
     let (sender, receiver) = tokio::sync::watch::channel(LookProgress::default());
     drop(tokio::task::spawn_blocking(move || {
@@ -1363,6 +1384,11 @@ fn spawn_look(
             device: nearest_device(&path),
             at: clock.now(),
         };
+        // The device's volume is known before the device is: whoever is
+        // answered the device from memory finds its volume there too.
+        if let Some(volumes) = &volumes {
+            volumes.seen(device.device, &path);
+        }
         if let Some(cache) = &cache
             && let Some(entry) = lock_paths(cache).entries.get_mut(&path)
         {
@@ -1593,8 +1619,9 @@ pub struct StorageCapacity {
     readings: Arc<tokio::sync::Notify>,
     // Every other path asked after, looked at on demand.
     paths: Arc<Mutex<PathCache>>,
-    // The volumes asked after, one per device.
-    volumes: volumes::Volumes,
+    // The volumes asked after, one per device. Shared with the threads
+    // that read a device, which make its volume known as they do.
+    volumes: Arc<volumes::Volumes>,
     interval: Duration,
     probe: SharedProbeFn,
     clock: Arc<Clock>,
@@ -1655,6 +1682,7 @@ impl StorageCapacity {
         let readings = Arc::new(tokio::sync::Notify::new());
         // The roots' ledgers count together where they share a filesystem.
         let counts = Arc::new(Counts::default());
+        let volumes = Arc::new(volumes::Volumes::default());
         let slots = StorageRoot::ALL.map(|root| {
             Arc::new_cyclic(|slot: &std::sync::Weak<RootSlot>| {
                 let slot = slot.clone();
@@ -1700,10 +1728,17 @@ impl StorageCapacity {
             let thread_slot = Arc::clone(slot);
             let thread_probe: SharedProbeFn = Arc::clone(&probe);
             let thread_gate = startup_disk_work.clone();
+            let thread_volumes = Arc::clone(&volumes);
             let spawned = std::thread::Builder::new()
                 .name(format!("{SAMPLER_THREAD}{}", slot.root.label()))
                 .spawn(move || {
-                    run_root_sampler(&thread_slot, interval, thread_probe, &thread_gate)
+                    run_root_sampler(
+                        &thread_slot,
+                        interval,
+                        thread_probe,
+                        &thread_gate,
+                        &thread_volumes,
+                    )
                 });
             if let Err(error) = spawned {
                 warn!(
@@ -1717,7 +1752,7 @@ impl StorageCapacity {
             slots,
             readings,
             paths: Arc::default(),
-            volumes: volumes::Volumes::default(),
+            volumes,
             interval,
             probe,
             clock,
@@ -1744,6 +1779,7 @@ impl StorageCapacity {
                     Arc::new(probe_disk_space),
                     Arc::new(Clock::new()),
                     path.clone(),
+                    None,
                     None,
                 )),
             })
@@ -1897,6 +1933,9 @@ impl StorageCapacity {
             Arc::clone(&self.clock),
             path.to_path_buf(),
             Some(Arc::clone(&self.paths)),
+            // A device is asked after for a directory a job will write to;
+            // free space is asked of any folder a user names.
+            matches!(want, Want::Device).then(|| Arc::clone(&self.volumes)),
         );
         entry.flight = Some(flight.clone());
         Ticket::Wait(flight)
@@ -2200,6 +2239,7 @@ fn run_root_sampler(
     interval: Duration,
     probe: SharedProbeFn,
     startup_disk_work: &StartupDiskGate,
+    volumes: &volumes::Volumes,
 ) {
     // Hold the first probe until the startup disk work is done. Stopping the
     // storage meanwhile ends the wait as well.
@@ -2240,6 +2280,11 @@ fn run_root_sampler(
         // The filesystem is found again before each probe, so a root moved
         // to another one counts with its new peers from its next reading.
         let device = nearest_device(&path);
+        // The volume of a root jobs write under is known before the root
+        // holds the device, so a job's directory finds both in memory.
+        if slot.root != StorageRoot::Data {
+            volumes.seen(device, &path);
+        }
         slot.ledger.on_device(device);
         // The kind of storage is read once for each directory the root is
         // pointed at, here, so no one else has to look for it.
@@ -2279,6 +2324,37 @@ fn run_root_sampler(
 
 #[cfg(test)]
 mod tests {
+    // A volume's id comes from its name alone: the same name gives the same
+    // id whatever follows its NUL and whatever the case of its letters, and
+    // another volume's name gives another.
+    #[test]
+    fn a_volume_name_gives_one_id_and_another_name_another() {
+        fn wide(name: &str) -> Vec<u16> {
+            name.encode_utf16().collect()
+        }
+        let guid = r"\\?\Volume{4c1b02c1-d990-11dc-99ae-806e6f6e6963}\";
+        let mut buffered = wide(guid);
+        buffered.extend([0, 0x58, 0x59]);
+        let id = volume_identity(&wide(guid));
+        assert_eq!(id, volume_identity(&buffered));
+        assert_eq!(id, volume_identity(&wide(&guid.to_uppercase())));
+        assert_ne!(
+            id,
+            volume_identity(&wide(r"\\?\Volume{4c1b02c1-d990-11dc-99ae-806e6f6e6964}\"))
+        );
+        // A share is told by its root.
+        assert_eq!(
+            volume_identity(&wide(r"\\NAS\Media\")),
+            volume_identity(&wide(r"\\nas\media\"))
+        );
+        assert_ne!(
+            volume_identity(&wide(r"\\nas\media\")),
+            volume_identity(&wide(r"\\nas\backup\"))
+        );
+        // The id is the same in every run: it is kept beside readings.
+        assert_eq!(volume_identity(&wide("a")), 0x089b_e207_b544_f1e4);
+    }
+
     // Two roots found on one filesystem count together, and go on doing so
     // across a failed look: only a filesystem found otherwise, or a new
     // directory, parts them.

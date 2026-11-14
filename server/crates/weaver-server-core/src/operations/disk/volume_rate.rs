@@ -487,14 +487,15 @@ impl StorageCapacity {
             .collect()
     }
 
-    // One row per volume, from what is held: the counters are read where
-    // they stand and no disk is looked at.
+    // One row per volume, by label, from what is held: the counters are
+    // read where they stand and no disk is looked at. The one view of a
+    // volume: the API, the metrics page and the diagnostics all read it.
     pub fn volume_snapshots(&self) -> Vec<VolumeSnapshot> {
         self.snapshots_of(&self.volumes())
     }
 
     fn snapshots_of(&self, volumes: &[Arc<Volume>]) -> Vec<VolumeSnapshot> {
-        volumes
+        let mut rows: Vec<VolumeSnapshot> = volumes
             .iter()
             .map(|volume| VolumeSnapshot {
                 label: volume.label.clone(),
@@ -505,10 +506,14 @@ impl StorageCapacity {
                 write_calls: volume.write_calls.load(Ordering::Relaxed),
                 write_seeks: volume.write_seeks.load(Ordering::Relaxed),
                 write_rate: volume.write_rate.load(Ordering::Relaxed),
+                throughput: volume.throughput.load(Ordering::Relaxed),
                 buffered_bytes: volume.buffered_bytes.load(Ordering::Relaxed),
+                idle_turns: volume.idle_turns.load(Ordering::Relaxed),
                 writer: writer_counts(volume),
             })
-            .collect()
+            .collect();
+        rows.sort_by(|a, b| a.label.cmp(&b.label));
+        rows
     }
 
     // The kind of storage behind `device`. Found once for each device and
@@ -1210,9 +1215,12 @@ mod tests {
         written.write_calls.store(120, Ordering::Relaxed);
         written.write_seeks.store(9, Ordering::Relaxed);
         written.write_rate.store(3_200_000, Ordering::Relaxed);
+        written.throughput.store(1_100_000, Ordering::Relaxed);
         written.buffered_bytes.store(65_536, Ordering::Relaxed);
+        written.idle_turns.store(4, Ordering::Relaxed);
         let unseen = Volume::new(None, "/mnt/scratch".into());
-        let rows = storage.snapshots_of(&[Arc::new(written), Arc::new(unseen)]);
+        // The rows come by label, whatever order the volumes are held in.
+        let rows = storage.snapshots_of(&[Arc::new(unseen), Arc::new(written)]);
         assert_eq!(
             rows,
             vec![
@@ -1225,7 +1233,9 @@ mod tests {
                     write_calls: 120,
                     write_seeks: 9,
                     write_rate: 3_200_000,
+                    throughput: 1_100_000,
                     buffered_bytes: 65_536,
+                    idle_turns: 4,
                     writer: Default::default(),
                 },
                 VolumeSnapshot {
@@ -1237,7 +1247,9 @@ mod tests {
                     write_calls: 0,
                     write_seeks: 0,
                     write_rate: 0,
+                    throughput: 0,
                     buffered_bytes: 0,
+                    idle_turns: 0,
                     writer: Default::default(),
                 },
             ]

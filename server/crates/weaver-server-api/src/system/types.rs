@@ -1284,14 +1284,15 @@ impl SystemInfo {
             .data::<weaver_server_core::SharedPipelineState>()?
             .storage_capacity();
         Ok(storage
-            .map(|storage| storage.volume_write_rates())
+            .map(|storage| storage.volume_snapshots())
             .unwrap_or_default()
             .into_iter()
             .map(|volume| StorageVolumeWriteRate {
                 label: volume.label,
-                storage_kind: volume.storage_kind.to_string(),
-                write_rate_bytes_per_second: volume.write_rate,
-                throughput_bytes_per_second: volume.throughput,
+                storage_kind: volume.kind.to_string(),
+                // Zero is "not measured" and "nothing written".
+                write_rate_bytes_per_second: (volume.write_rate > 0).then_some(volume.write_rate),
+                throughput_bytes_per_second: (volume.throughput > 0).then_some(volume.throughput),
                 buffered_bytes: volume.buffered_bytes,
             })
             .collect())
