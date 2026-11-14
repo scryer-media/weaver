@@ -1186,17 +1186,18 @@ impl<'a> FileOps<'a> {
         h: &mut PieceDigest,
     ) -> anyhow::Result<()> {
         let piece_length = self.torrent.lengths().piece_length(piece_index);
-        let mut absolute_offset = self.torrent.lengths().piece_offset(piece_index);
+        // The piece's first file found by halving, not by a walk from the
+        // torrent's first file, as the reads and writes of blocks find it:
+        // a file before it, or one that ends where the piece starts, gives
+        // the piece no bytes.
+        let (first, mut absolute_offset) =
+            self.file_at(self.torrent.lengths().piece_offset(piece_index));
         let mut buf = vec![0u8; std::cmp::min(65536, piece_length as usize)];
 
         let mut piece_remaining_bytes = piece_length as usize;
 
-        for (file_idx, fi) in self.file_infos.iter().enumerate() {
+        for (file_idx, fi) in self.file_infos.iter().enumerate().skip(first) {
             let file_len = fi.len;
-            if absolute_offset > file_len {
-                absolute_offset -= file_len;
-                continue;
-            }
             let file_remaining_len = file_len - absolute_offset;
 
             let to_read_in_file: usize =
@@ -1678,6 +1679,97 @@ mod tests {
             .iter_piece_infos()
             .flat_map(|piece| lengths.iter_chunk_infos(piece.piece_index))
             .collect()
+    }
+
+    // A downloaded piece read back from its files hashes the same bytes in
+    // the same order as a walk from the torrent's first file did: over
+    // empty files at the start, in the middle, at a piece's start and at
+    // the end, a piece across three files and more, and padding, in a v1
+    // torrent and a hybrid.
+    #[test]
+    fn a_piece_hashed_from_its_files_hashes_what_a_walk_of_the_files_did() {
+        // The walk hash_from_files made before it found the first file by
+        // halving.
+        fn walked(ops: &FileOps<'_>, piece: ValidPieceIndex) -> PieceDigest {
+            let mut h = ops.digest(piece);
+            let piece_length = ops.torrent.lengths().piece_length(piece);
+            let mut absolute_offset = ops.torrent.lengths().piece_offset(piece);
+            let mut buf = vec![0u8; std::cmp::min(65536, piece_length as usize)];
+            let mut remaining = piece_length as usize;
+            for (file_idx, fi) in ops.file_infos.iter().enumerate() {
+                if absolute_offset > fi.len {
+                    absolute_offset -= fi.len;
+                    continue;
+                }
+                let to_read: usize = std::cmp::min(fi.len - absolute_offset, remaining as u64)
+                    .try_into()
+                    .unwrap();
+                update_hash_from_file(
+                    file_idx,
+                    fi,
+                    absolute_offset,
+                    ops.files,
+                    &mut h,
+                    &mut buf,
+                    to_read,
+                )
+                .unwrap();
+                remaining -= to_read;
+                if remaining == 0 {
+                    break;
+                }
+                absolute_offset = 0;
+            }
+            h
+        }
+
+        let v1 = v1_torrent(
+            &[
+                ("a", 0),
+                ("b", 3),
+                ("c", 0),
+                ("d", 16380),
+                ("e", 0),
+                ("f", 0),
+                ("g", 5),
+                ("h", 20000),
+                ("i", 0),
+                ("j", 1),
+                ("k", 1),
+                ("l", 12000),
+                ("m", 0),
+                ("n", 30000),
+                ("o", 0),
+            ],
+            16384,
+        );
+        let hybrid = checking_torrent();
+        let torrents = [v1, (metadata(&hybrid.torrent_bytes()), hybrid.v1_payload())];
+        let mut across_three = false;
+        for (metadata, payload) in torrents {
+            let files = Files::new(&metadata, &payload);
+            let ops = FileOps::new(&metadata, &files, false);
+            let lengths = metadata.lengths();
+            for info in lengths.iter_piece_infos() {
+                let piece = info.piece_index;
+                let start = lengths.piece_offset(piece);
+                let end = start + u64::from(lengths.piece_length(piece));
+                let holding = metadata
+                    .file_infos
+                    .iter()
+                    .filter(|fi| {
+                        fi.offset_in_torrent < end && fi.offset_in_torrent + fi.len > start
+                    })
+                    .count();
+                across_three |= holding >= 3;
+                let mut found = ops.digest(piece);
+                ops.hash_from_files(piece, &mut found).unwrap();
+                let (found, expected) = (found.finish(), walked(&ops, piece).finish());
+                assert_eq!(found, expected, "piece {piece}");
+                assert!(found.0.is_some() || found.1.is_some(), "piece {piece}");
+            }
+        }
+        assert!(across_three, "no piece spans three files");
     }
 
     // Over many files, empty ones and padding among them, the file found
