@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::pipeline::download::LoginRefusalView;
 use crate::pipeline::queue::Change;
 
 pub(crate) const NZB_SLOT_WAIT_REASON: &str = "nzb_slot";
@@ -384,6 +385,7 @@ impl Pipeline {
                 }
             }
         }
+        let login_refusals = self.login_refusal_view();
         self.shared_state.queue.write(|inner| {
             let mut changed = false;
             for row in &mut inner.jobs {
@@ -395,7 +397,7 @@ impl Pipeline {
                         .map(|(_, epoch)| *epoch as f64);
                     changed = true;
                 }
-                changed |= self.restate_slot(row);
+                changed |= self.restate_slot(row, login_refusals);
             }
             if changed {
                 Change::changed(())
@@ -480,19 +482,23 @@ impl Pipeline {
     // The wait reason a queue row stores, the one answer every writer of the
     // row gives: a slot while the job would download but holds none (not
     // while its post is still propagating, which the row states by its
-    // deadline), else the dispatcher's wait or hold.
-    pub(crate) fn stored_wait_reason(
+    // deadline), else the dispatcher's wait or hold. `login_refusals` is the
+    // pass's one read of the pool's login refusals, taken before the queue
+    // lock ([`Self::login_refusal_view`]).
+    pub(in crate::pipeline) fn stored_wait_reason(
         &self,
         row: &crate::pipeline::queue::JobRow,
-    ) -> Option<&'static str> {
+        login_refusals: LoginRefusalView,
+    ) -> Option<std::borrow::Cow<'static, str>> {
+        use std::borrow::Cow;
         if self.waits_for_nzb_slot(row) {
             if !self.disk_unadmitted.is_empty() && self.disk_unadmitted.contains(&row.id) {
-                return Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON);
+                return Some(Cow::Borrowed(crate::jobs::handle::DISK_SPACE_WAIT_REASON));
             }
             return (!self.propagation_ready_at.contains_key(&row.id))
-                .then_some(NZB_SLOT_WAIT_REASON);
+                .then_some(Cow::Borrowed(NZB_SLOT_WAIT_REASON));
         }
-        self.dispatch_wait_reason(row.id)
+        self.dispatch_wait_reason(row.id, login_refusals)
     }
 
     // Whether the row's job would download now but holds no slot: an intake,
@@ -580,10 +586,11 @@ impl Pipeline {
         // A slot that moved is walked to: the holder is installed wherever
         // it stands, and a slot let go is free for the next candidate.
         self.queue_walk_due = true;
+        let login_refusals = self.login_refusal_view();
         self.shared_state.queue.write(|inner| {
             if inner
                 .job_mut(id)
-                .is_some_and(|mut row| self.restate_slot(&mut row))
+                .is_some_and(|mut row| self.restate_slot(&mut row, login_refusals))
             {
                 Change::changed(())
             } else {
@@ -594,17 +601,22 @@ impl Pipeline {
 
     // States on the row whether its job holds a slot, and the wait that
     // follows from it. Returns whether the row changed.
-    fn restate_slot(&self, row: &mut crate::pipeline::queue::JobRow) -> bool {
+    fn restate_slot(
+        &self,
+        row: &mut crate::pipeline::queue::JobRow,
+        login_refusals: LoginRefusalView,
+    ) -> bool {
         let mut changed = false;
         let admitted = self.nzb_admitted.contains(&row.id);
         if row.report.nzb_admitted != admitted {
             row.report.nzb_admitted = admitted;
             changed = true;
         }
-        let reason = self.stored_wait_reason(row);
-        if row.report.job.download_wait_reason.as_deref() != reason {
-            row.report.job.download_wait_reason = reason.map(str::to_owned);
-            if reason == Some(NZB_SLOT_WAIT_REASON)
+        let reason = self.stored_wait_reason(row, login_refusals);
+        if row.report.job.download_wait_reason.as_deref() != reason.as_deref() {
+            let slot_wait = reason.as_deref() == Some(NZB_SLOT_WAIT_REASON);
+            row.report.job.download_wait_reason = reason.map(std::borrow::Cow::into_owned);
+            if slot_wait
                 || (!self.disk_unadmitted.is_empty() && self.disk_unadmitted.contains(&row.id))
             {
                 row.report.job.download_state = crate::DownloadState::Queued;

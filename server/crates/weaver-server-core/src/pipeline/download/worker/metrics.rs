@@ -65,8 +65,12 @@ impl Pipeline {
     // holds the scheduler keeps on it — a propagation deferral, a restart
     // durable-lead retry, a timed infrastructure retry of one of its
     // articles — or the soft byte-pressure delay every job shares. A job
-    // whose articles are being built waits until now, so the stall counts
-    // from now while that lasts. A stalled job with none of these is waiting
+    // whose articles are being built, or all of whose queued download work
+    // waits on a fill server refusing the login
+    // ([`Self::job_login_refusal_wait`]), waits until now, so the stall
+    // counts from now while that lasts; a job with other queued work that
+    // does not wait on the login is not explained by it. A
+    // stalled job with none of these is waiting
     // on nothing anyone scheduled, and the stall is unexplained: `None`.
     // Otherwise the earliest wait across the stalled jobs, which is when the
     // stall starts counting.
@@ -100,12 +104,22 @@ impl Pipeline {
                 .and_modify(|earliest| *earliest = (*earliest).min(deadline))
                 .or_insert(deadline);
         }
+        // A fill server refusing the login is waited for until its run of
+        // refusals reaches the verdict, as through an outage. The wait has
+        // no deadline the watchdog can hold to: like a wait for articles,
+        // the clock restarts while it lasts and the ordinary windows run
+        // from when it ends.
+        let login_refusals = self.login_refusal_view();
         let mut waits = HashMap::new();
         for job_id in self.download_scheduler_eligible_jobs() {
             // A job whose articles are being built waits on that, which has
             // no deadline: the clock restarts while it lasts, as under a
             // quota, and a slow read never kicks the other jobs.
-            if self.awaits_job_articles(job_id) {
+            if self.awaits_job_articles(job_id)
+                || self
+                    .job_login_refusal_wait(job_id, login_refusals, None)
+                    .is_some_and(|wait| wait.every)
+            {
                 waits.insert(job_id, now);
                 continue;
             }
@@ -198,7 +212,9 @@ impl Pipeline {
         // contended ranking says nothing about the servers and holds the
         // clock too. Accepted narrower case: while any server is available,
         // a stalled job whose articles only a cooled-down server holds still
-        // escalates after the windows.
+        // escalates after the windows. A fill server refusing the login is
+        // the exception: while the job's work waits on it alone, the clock
+        // restarts (see `explained_dispatch_waits`).
         if self.dispatchable_server_count() == 0 {
             if let Some(watch) = self.download_dispatch_stall.as_mut() {
                 watch.since = now;
@@ -338,7 +354,10 @@ impl Pipeline {
 
     // Books every queued article of each job the kick did not move as work
     // no server can serve, so the job leaves its download phase with them
-    // missing and its completion check decides what it becomes.
+    // missing and its completion check decides what it becomes. The articles
+    // that wait on a fill server refusing the login
+    // ([`Self::login_refusal_waited_by`]) are left queued: they wait for
+    // that server's verdict, whatever wedged the rest of the job.
     fn release_download_dispatch_stall(
         &mut self,
         now: Instant,
@@ -383,21 +402,49 @@ impl Pipeline {
             max_connections,
             eligible_count,
         );
+        let login_refusals = self.login_refusal_view();
         for job_id in released {
-            let Some(active) = self
-                .jobs
-                .get_mut(&job_id)
-                .and_then(|state| state.articles.active_mut())
-            else {
-                continue;
-            };
-            let queued = active.download_queue.extract_matching(|_| true);
+            let queued = self.take_stall_released_work(job_id, login_refusals);
             for work in &queued {
                 self.book_unservable_segment(work.segment_id, work.exclude_servers);
             }
             self.update_queue_metrics();
             self.maybe_finish_download_pass(job_id);
         }
+    }
+
+    // The queued download work of `job_id` a stall release books, taken out
+    // of its queue: everything but the articles waiting on a fill server
+    // refusing the login, which stay queued for that server's verdict.
+    pub(in crate::pipeline) fn take_stall_released_work(
+        &mut self,
+        job_id: JobId,
+        login_refusals: crate::pipeline::download::LoginRefusalView,
+    ) -> Vec<crate::pipeline::download::queue::QueueItem> {
+        let waits_on_login = !login_refusals.waiting.is_empty();
+        let retention = if waits_on_login {
+            self.job_retention_excludes(job_id)
+        } else {
+            weaver_nntp::ServerSet::EMPTY
+        };
+        let pool = Arc::clone(self.nntp.pool());
+        let Some(active) = self
+            .jobs
+            .get_mut(&job_id)
+            .and_then(|state| state.articles.active_mut())
+        else {
+            return Vec::new();
+        };
+        active.download_queue.extract_matching(|work| {
+            !waits_on_login
+                || Self::login_refusal_waited_by_in(
+                    &pool,
+                    login_refusals,
+                    work.exclude_servers,
+                    retention,
+                )
+                .is_none()
+        })
     }
 
     #[allow(clippy::too_many_arguments)]

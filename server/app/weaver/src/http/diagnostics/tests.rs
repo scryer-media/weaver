@@ -355,6 +355,7 @@ async fn a_package_takes_its_names_from_one_read() {
             "queue.json",
             &serde_json::json!({
                 "category": CATEGORY,
+                "downloadWaitReason": format!("login_refused:{PROVIDER}:563"),
                 "metadata": [
                     { "key": "tvdb_id", "value": "81189" },
                     { "key": "request", "value": HISTORY_ATTRIBUTE },
@@ -422,6 +423,9 @@ async fn a_package_takes_its_names_from_one_read() {
     for stand_in in ["category-5", "job-17/meta-1", "job-23/meta-1"] {
         assert!(queue.contains(&format!("\"{stand_in}\"")), "{queue}");
     }
+    // A job waiting on a server refusing the login names the server by its
+    // stand-in.
+    assert!(queue.contains("\"login_refused:provider-3\""), "{queue}");
 
     // The manifest counts the whole history.
     let manifest: archive::Manifest =

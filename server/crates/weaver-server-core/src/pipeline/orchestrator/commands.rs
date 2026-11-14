@@ -14,6 +14,10 @@ impl Pipeline {
         let old_client = std::mem::replace(&mut self.nntp, new_client);
         self.shared_state
             .set_nntp_pool(Arc::clone(self.nntp.pool()));
+        // Only now is the new pool the one in use: a server whose login
+        // identity or configured role it changes is asked again at once,
+        // by this pool and not by the one it replaces.
+        self.nntp.pool().activated();
         // Server indices and retention windows may have changed. The
         // servers each article was tried on are carried into the new
         // layout by server identity (stable id, host, port and account),

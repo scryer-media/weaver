@@ -462,6 +462,8 @@ impl Pipeline {
             spent_message_ids: Vec::new(),
             #[cfg(test)]
             dispatch_hold_items_examined: Default::default(),
+            #[cfg(test)]
+            login_refusal_sets_examined: Default::default(),
             last_download_dispatch_stall_log_at: None,
             download_dispatch_stall: None,
             download_stall_recovery,
@@ -497,7 +499,7 @@ impl Pipeline {
             repeated_articles: HashMap::new(),
             decode_retries: HashMap::new(),
             phase_progress: HashMap::new(),
-            job_retention_exclude_cache: HashMap::new(),
+            job_retention_exclude_cache: std::sync::Mutex::default(),
             no_eligible_server_warn_throttle: Default::default(),
             body_lane_capacity_log_throttle: Default::default(),
             body_fetch_failure_log_throttle: Default::default(),
@@ -1229,6 +1231,20 @@ impl Pipeline {
                     || tokio::time::Instant::now() + std::time::Duration::from_secs(3600),
                     tokio::time::Instant::from_std,
                 ));
+            // A fill server's run of login refusals becomes the verdict at
+            // this instant, with no connection outcome to announce it. One
+            // already due, the hour having come up in a busy turn or a
+            // login having been refused past it, is told here, so no turn
+            // that skips the wait below skips it.
+            let mut login_verdict_at = self.nntp.pool().next_login_refusal_verdict();
+            if login_verdict_at.is_some_and(|at| at <= std::time::Instant::now()) {
+                self.tell_login_refusal_verdicts();
+                login_verdict_at = self.nntp.pool().next_login_refusal_verdict();
+            }
+            let login_verdict_sleep = tokio::time::sleep_until(login_verdict_at.map_or_else(
+                || tokio::time::Instant::now() + std::time::Duration::from_secs(3600),
+                tokio::time::Instant::from_std,
+            ));
 
             self.drain_ready_lane_control_messages();
             if self.take_download_dispatch_wake() {
@@ -1408,6 +1424,12 @@ impl Pipeline {
                             _ = connection_hold_sleep, if connection_hold_deadline.is_some() => {
                                 turn_timer.resume(PipelinePhase::ConnectionHold);
                                 self.download_dispatch_wake = true;
+                            }
+                            // The hour of a refused login is up: the work
+                            // that waited for the server is weighed again.
+                            _ = login_verdict_sleep, if login_verdict_at.is_some() => {
+                                turn_timer.resume(PipelinePhase::ConnectionHold);
+                                self.tell_login_refusal_verdicts();
                             }
                             // The next turn's queue pass retries the rename.
                             _ = rename_retry_sleep, if rename_retry_at.is_some() => {

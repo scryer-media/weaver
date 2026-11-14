@@ -11,8 +11,9 @@ use std::sync::atomic::Ordering;
 use super::super::restore_history::{hold_database_writer, wait_for_job_event};
 use super::super::script_events::enable_queue_script;
 use super::super::{
-    age_job_days, insert_active_job, job_status_for_assert, new_direct_pipeline, sample_nzb_zstd,
-    settle_inflight_moves, two_server_retention_client,
+    age_job_days, insert_active_job, job_status_for_assert, new_direct_pipeline, refuse_login,
+    refuse_login_past_give_up, retention_client, sample_nzb_zstd, settle_inflight_moves,
+    two_server_retention_client,
 };
 use super::harness::{
     ARTICLE, JOB, Post, Scenario, admit, admit_with, collect, par2_set, payload, serve_job,
@@ -183,8 +184,9 @@ fn parked_duplicate(pipeline: &Pipeline, spec: &crate::jobs::model::JobSpec) -> 
     }
 }
 
-// The last server that may serve the job refuses the pool's credentials: the
-// articles only it could serve are booked missing, not retried, and the job
+// The last server that may serve the job has refused the pool's credentials
+// for its whole give-up time: the articles only it could serve are booked
+// missing, not retried, and the job
 // fails for want of them. Its cause is the missing articles, so its parked
 // duplicate is the one promoted next, and its reason names the server.
 // `servers` holds each server's retention in days; the last one refuses, and
@@ -206,14 +208,7 @@ async fn the_last_server_refusing_credentials_fails_the_job(servers: &[u32], nam
         pipeline.clear_job_retention_excludes(job);
         assert_eq!(pipeline.job_retention_excludes(job), [0]);
     }
-    pipeline
-        .nntp
-        .pool()
-        .health()
-        .lock()
-        .await
-        .record_failure(refusing, true);
-    assert!(pipeline.nntp.pool().refuses_credentials(refusing));
+    refuse_login_past_give_up(&pipeline, refusing).await;
 
     // The first queued article is leased and answered with what the pool
     // says for it, the way a lane task answers it.
@@ -352,6 +347,635 @@ async fn the_last_of_two_servers_refusing_credentials_fails_the_job_and_promotes
         .await;
 }
 
+// How many articles of `job` are queued for download.
+fn queued_len(pipeline: &Pipeline, job: JobId) -> usize {
+    pipeline.jobs[&job]
+        .articles
+        .active()
+        .unwrap()
+        .download_queue
+        .len()
+}
+
+// The first queued article of `job` is leased and its lane's dial meets
+// server `server` refusing the login, the way a refused probe answers it.
+async fn refused_probe_for_first_article(
+    pipeline: &mut Pipeline,
+    job: JobId,
+    server: usize,
+) -> crate::pipeline::SegmentId {
+    let work = pipeline
+        .jobs
+        .get_mut(&job)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
+    let work = pipeline.dispatched(work);
+    let segment_id = work.segment_id;
+    pipeline.hold_test_lane_works(vec![work.clone()], false);
+    let effective_exclude_servers = pipeline.effective_exclude_servers(job, work.exclude_servers);
+    let lease = DownloadBatchLease {
+        body_activity: std::sync::Arc::default(),
+        lane_id: 0,
+        job_id: job,
+        runtime_generation: pipeline.pool_generation,
+        lane_mode: DownloadLaneMode::Sequential,
+        server_modes: Vec::new(),
+        completion_critical: false,
+        effective_exclude_servers,
+        dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
+        checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+        pressure_clear: true,
+        works: vec![work],
+    };
+    pipeline.active_download_connections = 1;
+    pipeline.active_download_passes.insert(job);
+    pipeline.active_download_connections_by_job.insert(job, 1);
+    pipeline.note_download_lane_started(DownloadLaneMode::Sequential);
+    let error = weaver_nntp::client::BlockingBodyLaneAcquireError::CredentialsRefused {
+        server: weaver_nntp::ServerId(server),
+        error: weaver_nntp::NntpError::AuthenticationFailed,
+    };
+    let mut pending: VecDeque<DownloadResult> = VecDeque::new();
+    pipeline.handle_owned_download_lane_event(
+        OwnedDownloadLaneEvent::AcquireFailed { lease, error },
+        &mut pending,
+    );
+    for result in pending {
+        pipeline.process_released_download_done(result).await;
+    }
+    segment_id
+}
+
+// The wait reason a job shows while it waits on pool server `server`
+// refusing the login: the code and the server as `host:port`.
+fn login_refused_reason(pipeline: &Pipeline, server: usize) -> String {
+    let identity = &pipeline.nntp.pool().server_identities()[server];
+    format!(
+        "{}:{}:{}",
+        crate::jobs::handle::LOGIN_REFUSED_WAIT_REASON,
+        identity.host,
+        identity.port
+    )
+}
+
+// The job's only server refuses the login and has not yet refused it for
+// its give-up time: the article its probe was refused for waits, as through
+// an outage, the job shows why for the whole wait, and nothing is booked or
+// failed. The login
+// is then taken at a probe and the job completes.
+#[tokio::test]
+async fn a_lone_server_refusing_the_login_holds_the_job_waiting_until_it_takes_the_login() {
+    let scenario = Scenario::new(vec![Post::plain("payload.bin", payload(4 * ARTICLE, 5))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[0]));
+    let spec = scenario.spec();
+    let job = admitted_job_id(&pipeline, &spec);
+    insert_active_job(&mut pipeline, job, spec).await;
+    pipeline.active_download_passes.insert(job);
+    let queued = queued_len(&pipeline, job);
+    refuse_login(&pipeline, 0).await;
+    // The pool's own answer to a lane is a wait, not a refusal naming it.
+    match pipeline
+        .nntp
+        .try_acquire_blocking_body_lane(&[], weaver_nntp::ServerSet::EMPTY)
+    {
+        Ok(_) => panic!("a lane opened on a quarantined server"),
+        Err(error) => assert!(error.server().is_none(), "{error:?}"),
+    }
+
+    let refused = refused_probe_for_first_article(&mut pipeline, job, 0).await;
+    assert_eq!(
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+        0
+    );
+    assert!(pipeline.segment_terminal_states.is_empty());
+    assert!(!pipeline.login_refusals.contains_key(&job));
+    assert!(!pipeline.semantic_terminal_causes.contains_key(&job));
+    assert_eq!(pipeline.infrastructure_retries.len(), 1);
+    assert_eq!(queued_len(&pipeline, job), queued - 1);
+    assert!(!ended(&pipeline, job));
+    // In the second the refused article's retry is parked, and between
+    // probes once it is back in the queue, the job names the server.
+    let waiting = login_refused_reason(&pipeline, 0);
+    assert_eq!(
+        pipeline
+            .dispatch_wait_reason(job, pipeline.login_refusal_view())
+            .as_deref(),
+        Some(waiting.as_str())
+    );
+    // Nothing the job has queued is booked for the refusal.
+    assert_eq!(pipeline.retire_unservable_queued_work(job), 0);
+    assert!(!pipeline.no_server_can_serve(job, weaver_nntp::ServerSet::EMPTY));
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    assert_eq!(pipeline.infrastructure_retries.len(), 0);
+    assert!(!pipeline.download_wait_by_job.contains_key(&job));
+    assert_eq!(queued_len(&pipeline, job), queued);
+    assert_eq!(
+        pipeline
+            .dispatch_wait_reason(job, pipeline.login_refusal_view())
+            .as_deref(),
+        Some(waiting.as_str())
+    );
+    // A full disk holds the job whatever the servers do, so it is the
+    // reason first.
+    pipeline.disk_waiting.insert(job);
+    assert_eq!(
+        pipeline
+            .dispatch_wait_reason(job, pipeline.login_refusal_view())
+            .as_deref(),
+        Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON)
+    );
+    pipeline.disk_waiting.remove(&job);
+
+    // The next probe takes the login; the waiting article goes back to the
+    // queue and the job completes.
+    pipeline
+        .nntp
+        .pool()
+        .take_recovery_probe_for_test(0)
+        .answer();
+    assert!(!pipeline.nntp.pool().refuses_credentials(0));
+    assert_eq!(queued_len(&pipeline, job), queued);
+    assert_eq!(
+        pipeline.dispatch_wait_reason(job, pipeline.login_refusal_view()),
+        None,
+        "the login is taken: the job waits on nothing"
+    );
+    assert!(!pipeline.segment_terminal_states.contains_key(&refused));
+    drive(&mut pipeline, &scenario, job, |_| false).await;
+    let row = history(&mut pipeline, job).await;
+    assert_eq!(row.status, "complete");
+    assert_eq!(row.error_message, None);
+    assert_eq!(
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+        0
+    );
+}
+
+// Both fill servers refuse the login, and the job's one article is parked
+// for its refused-login retry with server 1 excluded. The job names only
+// server 0, the one the parked article waits on, and names it the same way
+// once the article is back in the queue.
+#[tokio::test]
+async fn a_parked_refused_article_names_only_the_servers_it_waits_on() {
+    let scenario = Scenario::new(vec![Post::plain("payload.bin", payload(ARTICLE, 9))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[0, 0]));
+    let spec = scenario.spec();
+    let job = admitted_job_id(&pipeline, &spec);
+    insert_active_job(&mut pipeline, job, spec).await;
+    refuse_login(&pipeline, 0).await;
+    refuse_login(&pipeline, 1).await;
+    let queue = &mut pipeline
+        .jobs
+        .get_mut(&job)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue;
+    let mut works = queue.drain_all();
+    assert_eq!(works.len(), 1);
+    let excluded = weaver_nntp::ServerSet::from([1]);
+    works[0].exclude_servers = excluded;
+    pipeline.download_wait_by_job.insert(
+        job,
+        crate::pipeline::DownloadWaitStatus {
+            reason: crate::pipeline::AUTH_WAIT_REASON,
+            retry_at_epoch_ms: None,
+            pending_count: 1,
+            exclude_servers: excluded,
+        },
+    );
+    let only_server_0 = login_refused_reason(&pipeline, 0);
+    assert_eq!(
+        pipeline
+            .dispatch_wait_reason(job, pipeline.login_refusal_view())
+            .as_deref(),
+        Some(only_server_0.as_str())
+    );
+    pipeline.download_wait_by_job.remove(&job);
+    let queue = &mut pipeline
+        .jobs
+        .get_mut(&job)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue;
+    for work in works {
+        queue.push(work);
+    }
+    assert_eq!(
+        pipeline
+            .dispatch_wait_reason(job, pipeline.login_refusal_view())
+            .as_deref(),
+        Some(only_server_0.as_str())
+    );
+}
+
+// The job's only server keeps refusing the login past its give-up time: the
+// probe refused then is the verdict, the job's articles are booked, the job
+// fails for health and its next duplicate is tried.
+#[tokio::test]
+async fn a_lone_server_refusing_the_login_past_its_give_up_time_fails_the_job_for_health() {
+    let scenario = Scenario::new(vec![Post::plain("payload.bin", payload(4 * ARTICLE, 6))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[0]));
+    let spec = scenario.spec();
+    let job = admitted_job_id(&pipeline, &spec);
+    let duplicate = parked_duplicate(&pipeline, &spec);
+    insert_active_job(&mut pipeline, job, spec).await;
+    pipeline.active_download_passes.insert(job);
+    refuse_login(&pipeline, 0).await;
+    refused_probe_for_first_article(&mut pipeline, job, 0).await;
+    assert!(
+        pipeline.segment_terminal_states.is_empty(),
+        "the first refusal waits"
+    );
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    assert_eq!(
+        pipeline
+            .dispatch_wait_reason(job, pipeline.login_refusal_view())
+            .as_deref(),
+        Some(login_refused_reason(&pipeline, 0).as_str())
+    );
+
+    // The server has refused the login for its whole give-up time, and the
+    // next lane for the job meets the refusal.
+    pipeline.nntp.pool().set_login_refusal_clock(
+        0,
+        std::time::Instant::now() + weaver_nntp::health::LOGIN_REFUSAL_GIVE_UP,
+    );
+    assert!(pipeline.nntp.pool().refuses_credentials(0));
+    assert_eq!(
+        pipeline.dispatch_wait_reason(job, pipeline.login_refusal_view()),
+        None,
+        "the refusal is the verdict: the job no longer waits on it"
+    );
+    refused_probe_for_first_article(&mut pipeline, job, 0).await;
+    assert!(pipeline.metrics.articles_not_found.load(Ordering::Relaxed) >= 1);
+    assert_eq!(pipeline.infrastructure_retries.len(), 0);
+
+    drive(&mut pipeline, &scenario, job, |_| false).await;
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job),
+        Some(JobStatus::Failed { .. })
+    ));
+    let row = history(&mut pipeline, job).await;
+    assert_eq!(row.status, "failed");
+    assert_eq!(
+        failure_kind(&pipeline, job),
+        Some(crate::history::HistoryFailureKind::Health)
+    );
+    let claims = pipeline.db.reconcile_semantic_promotion_claims(8).unwrap();
+    assert_eq!(
+        claims
+            .iter()
+            .map(|claim| (claim.trigger_job_id, claim.job_id))
+            .collect::<Vec<_>>(),
+        [(job, duplicate)]
+    );
+}
+
+// The job's only server refuses the login at one probe after another. Each
+// refusal inside the give-up time is a wait: the article goes back to the
+// queue, nothing is booked and the job names the server throughout. The
+// probe refused once the run is its give-up time old is the verdict, and
+// the job fails for health.
+#[tokio::test]
+async fn a_series_of_refused_probes_reaches_the_verdict_at_the_give_up_time() {
+    let scenario = Scenario::new(vec![Post::plain("payload.bin", payload(4 * ARTICLE, 7))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[0]));
+    let spec = scenario.spec();
+    let job = admitted_job_id(&pipeline, &spec);
+    insert_active_job(&mut pipeline, job, spec).await;
+    pipeline.active_download_passes.insert(job);
+    let queued = queued_len(&pipeline, job);
+    refuse_login(&pipeline, 0).await;
+    let began = std::time::Instant::now();
+    let give_up = weaver_nntp::health::LOGIN_REFUSAL_GIVE_UP;
+    let waiting = login_refused_reason(&pipeline, 0);
+    for into_the_run in [
+        give_up / 4,
+        give_up / 2,
+        give_up - std::time::Duration::from_secs(60),
+    ] {
+        pipeline
+            .nntp
+            .pool()
+            .set_login_refusal_clock(0, began + into_the_run);
+        refused_probe_for_first_article(&mut pipeline, job, 0).await;
+        assert!(!pipeline.nntp.pool().refuses_credentials(0));
+        assert_eq!(
+            pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+            0
+        );
+        assert!(pipeline.segment_terminal_states.is_empty());
+        assert_eq!(
+            pipeline
+                .dispatch_wait_reason(job, pipeline.login_refusal_view())
+                .as_deref(),
+            Some(waiting.as_str()),
+            "parked for its retry"
+        );
+        assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+        assert_eq!(queued_len(&pipeline, job), queued);
+        assert_eq!(
+            pipeline
+                .dispatch_wait_reason(job, pipeline.login_refusal_view())
+                .as_deref(),
+            Some(waiting.as_str()),
+            "back in the queue"
+        );
+    }
+
+    pipeline
+        .nntp
+        .pool()
+        .set_login_refusal_clock(0, began + give_up + std::time::Duration::from_secs(60));
+    assert!(pipeline.nntp.pool().refuses_credentials(0));
+    refused_probe_for_first_article(&mut pipeline, job, 0).await;
+    assert!(pipeline.metrics.articles_not_found.load(Ordering::Relaxed) >= 1);
+    assert_eq!(pipeline.infrastructure_retries.len(), 0);
+    assert_eq!(
+        pipeline.dispatch_wait_reason(job, pipeline.login_refusal_view()),
+        None
+    );
+    drive(&mut pipeline, &scenario, job, |_| false).await;
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job),
+        Some(JobStatus::Failed { .. })
+    ));
+    let row = history(&mut pipeline, job).await;
+    assert_eq!(row.status, "failed");
+    assert_eq!(
+        failure_kind(&pipeline, job),
+        Some(crate::history::HistoryFailureKind::Health)
+    );
+}
+
+// Two jobs whose only server is pool server 0, installed and downloading.
+async fn two_jobs_on_one_server(pipeline: &mut Pipeline, first: JobId, second: JobId) {
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[0]));
+    for (job, name, seed) in [(first, "first.bin", 11), (second, "second.bin", 12)] {
+        let mut spec = Scenario::new(vec![Post::plain(name, payload(4 * ARTICLE, seed))]).spec();
+        spec.name = format!("Waiting {}", job.0);
+        insert_active_job(pipeline, job, spec).await;
+        pipeline.active_download_passes.insert(job);
+    }
+}
+
+// How many articles of `job` are queued for download, none once the job
+// has nothing installed to queue.
+fn queued_or_none(pipeline: &Pipeline, job: JobId) -> usize {
+    pipeline
+        .jobs
+        .get(&job)
+        .and_then(|state| state.articles.active())
+        .map_or(0, |active| active.download_queue.len())
+}
+
+// Two jobs wait on the one server refusing the login. A transport failure
+// then quarantines the server across the run's give-up time: the hour
+// passes with nothing told and nothing booked, as through an outage. The
+// login is refused again at the probe one job's article carries. That
+// refusal is the verdict for both jobs: the turn that hears it books the
+// other job's waiting articles too, and the verdict is told once.
+#[tokio::test]
+async fn a_login_refused_past_the_give_up_time_books_every_job_that_waited() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let probed = JobId(51931);
+    let other = JobId(51932);
+    two_jobs_on_one_server(&mut pipeline, probed, other).await;
+    let queued = queued_or_none(&pipeline, other);
+    assert!(queued > 0);
+    refuse_login(&pipeline, 0).await;
+    let began = std::time::Instant::now();
+    let give_up = weaver_nntp::health::LOGIN_REFUSAL_GIVE_UP;
+    let pool = std::sync::Arc::clone(pipeline.nntp.pool());
+
+    pool.quarantine_for_transport_for_test(0);
+    pool.set_login_refusal_clock(0, began + give_up + std::time::Duration::from_secs(60));
+    assert_eq!(
+        pool.next_login_refusal_verdict(),
+        None,
+        "an outage past the hour is waited through"
+    );
+    pipeline.tell_login_refusal_verdicts();
+    assert_eq!(
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(queued_or_none(&pipeline, other), queued);
+
+    // The probe after the outage is refused.
+    pool.refuse_login_for_test(0, give_up);
+    assert!(pool.refuses_credentials(0));
+    assert!(pool.login_refusal_verdicts_untold().is_some());
+    refused_probe_for_first_article(&mut pipeline, probed, 0).await;
+    assert_eq!(queued_or_none(&pipeline, probed), 0);
+    assert_eq!(
+        queued_or_none(&pipeline, other),
+        0,
+        "the job no probe carried is booked in the same turn"
+    );
+    assert!(pipeline.login_refusals.contains_key(&other));
+    assert!(pool.login_refusal_verdicts_untold().is_none());
+    assert_eq!(pool.next_login_refusal_verdict(), None, "told once");
+}
+
+// One of two jobs waiting on a server refusing the login is paused when
+// the hour lands. The verdict's sweep books the other and leaves the paused
+// job's articles queued. Resumed while the server still refuses, it is
+// weighed by the ordinary path: the pool refuses the lane that draws its
+// first article, naming the server, and its waiting articles are booked.
+#[tokio::test]
+async fn a_job_paused_at_the_verdict_is_left_alone_and_booked_once_resumed() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let running = JobId(51933);
+    let paused = JobId(51934);
+    two_jobs_on_one_server(&mut pipeline, running, paused).await;
+    let queued = queued_or_none(&pipeline, paused);
+    assert!(queued > 0);
+    refuse_login(&pipeline, 0).await;
+    let queue = pipeline.shared_state.queue.clone();
+    queue.set_job_paused(paused, true).unwrap();
+    assert_eq!(pipeline.download_scheduler_eligible_jobs(), vec![running]);
+
+    let pool = std::sync::Arc::clone(pipeline.nntp.pool());
+    pool.set_login_refusal_clock(
+        0,
+        std::time::Instant::now() + weaver_nntp::health::LOGIN_REFUSAL_GIVE_UP,
+    );
+    pipeline.tell_login_refusal_verdicts();
+    assert_eq!(queued_or_none(&pipeline, running), 0);
+    assert!(pipeline.login_refusals.contains_key(&running));
+    assert_eq!(
+        queued_or_none(&pipeline, paused),
+        queued,
+        "a paused job's articles are left queued"
+    );
+    assert!(!pipeline.login_refusals.contains_key(&paused));
+    assert!(
+        pool.login_refusal_verdicts_untold().is_none(),
+        "the verdict is told all the same"
+    );
+
+    queue.set_job_paused(paused, false).unwrap();
+    assert!(pool.refuses_credentials(0), "the server still refuses");
+    assert!(
+        pipeline
+            .download_scheduler_eligible_jobs()
+            .contains(&paused)
+    );
+    match pipeline
+        .nntp
+        .try_acquire_blocking_body_lane(&[], weaver_nntp::ServerSet::EMPTY)
+    {
+        Ok(_) => panic!("a lane opened on a server refusing the login"),
+        Err(error) => assert_eq!(error.server(), Some(weaver_nntp::ServerId(0))),
+    }
+    refused_probe_for_first_article(&mut pipeline, paused, 0).await;
+    assert_eq!(queued_or_none(&pipeline, paused), 0);
+    assert!(pipeline.login_refusals.contains_key(&paused));
+}
+
+// Two fill servers, the second refusing the login within its give-up time:
+// the articles the first server has are fetched, and the one it lacks waits
+// for the refusing server, asked of it again, not booked.
+#[tokio::test]
+async fn an_article_only_a_server_refusing_the_login_could_bring_waits_for_it() {
+    let scenario = Scenario::new(vec![Post::plain("payload.bin", payload(4 * ARTICLE, 8))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(two_server_retention_client());
+    let spec = scenario.spec();
+    let job = admitted_job_id(&pipeline, &spec);
+    insert_active_job(&mut pipeline, job, spec).await;
+    pipeline.active_download_passes.insert(job);
+    refuse_login(&pipeline, 1).await;
+    let mut queued = pipeline
+        .jobs
+        .get_mut(&job)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .drain_all();
+    let lost = queued.remove(0);
+    for work in queued {
+        pipeline
+            .jobs
+            .get_mut(&job)
+            .unwrap()
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .push(work);
+    }
+    let lost = pipeline.dispatched(lost);
+    let (segment_id, retry_count, exclude_servers) =
+        (lost.segment_id, lost.retry_count, lost.exclude_servers);
+    pipeline.hold_test_lane_works(vec![lost], false);
+    pipeline
+        .handle_download_done(DownloadResult {
+            lane_id: 0,
+            job_id: job,
+            runtime_generation: pipeline.pool_generation,
+            segment_id,
+            data: Err(crate::pipeline::DownloadError::fetch(
+                crate::pipeline::DownloadFailureKind::ArticleNotFound,
+                "430 no such article",
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(0),
+            origin: crate::pipeline::DownloadResultOrigin::NormalPrimary,
+            retry_count,
+            exclude_servers,
+            release_connection_slot: true,
+        })
+        .await;
+    assert!(
+        !pipeline.segment_terminal_states.contains_key(&segment_id),
+        "the article waits for the refusing server"
+    );
+    assert_eq!(
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+        0
+    );
+    assert!(!pipeline.login_refusals.contains_key(&job));
+    // It is queued again, for the refusing server alone.
+    let requeued = pipeline.jobs[&job]
+        .articles
+        .active()
+        .unwrap()
+        .download_queue
+        .peek_first_matching(|work| work.segment_id == segment_id)
+        .map(|work| work.exclude_servers)
+        .expect("the article is queued again");
+    assert_eq!(requeued, weaver_nntp::ServerSet::from([0]));
+    assert!(!pipeline.no_server_can_serve(job, requeued));
+    assert_eq!(pipeline.retire_unservable_queued_work(job), 0);
+
+    // The other articles come from the first server; the lost one from the
+    // second once it takes the login. Nothing is booked on the way.
+    drive(&mut pipeline, &scenario, job, |_| false).await;
+    assert_eq!(history(&mut pipeline, job).await.status, "complete");
+    assert_eq!(
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+        0
+    );
+}
+
+// A job queued behind one whose only server refuses the login is not failed
+// while the refusal waits: nothing of it is booked, and its queue is whole.
+#[tokio::test]
+async fn a_job_queued_behind_a_server_refusing_the_login_is_not_failed() {
+    let scenario = Scenario::new(vec![Post::plain("payload.bin", payload(4 * ARTICLE, 9))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[0]));
+    let spec = scenario.spec();
+    let first = admitted_job_id(&pipeline, &spec);
+    insert_active_job(&mut pipeline, first, spec.clone()).await;
+    let mut behind_spec = spec;
+    behind_spec.name = format!("{} behind", behind_spec.name);
+    let behind = JobId(first.0 + 1000);
+    insert_active_job(&mut pipeline, behind, behind_spec).await;
+    let behind_queued = queued_len(&pipeline, behind);
+    refuse_login(&pipeline, 0).await;
+    refused_probe_for_first_article(&mut pipeline, first, 0).await;
+
+    for job in [first, behind] {
+        assert!(!ended(&pipeline, job), "{job:?}");
+        assert!(!pipeline.no_server_can_serve(job, weaver_nntp::ServerSet::EMPTY));
+        assert_eq!(pipeline.retire_unservable_queued_work(job), 0);
+        assert!(!pipeline.login_refusals.contains_key(&job));
+    }
+    assert_eq!(queued_len(&pipeline, behind), behind_queued);
+    assert!(pipeline.segment_terminal_states.is_empty());
+    assert_eq!(
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+        0
+    );
+}
+
 // A job whose recovery covers a lost article, with the payload's second
 // article answered "not found" by server 0. Server 1 refuses the login when
 // `refusing`, and is never asked; otherwise it answers "not found" too.
@@ -393,13 +1017,7 @@ async fn with_an_article_lost_by(
     insert_active_job(&mut pipeline, job, spec).await;
     pipeline.active_download_passes.insert(job);
     if refusing {
-        pipeline
-            .nntp
-            .pool()
-            .health()
-            .lock()
-            .await
-            .record_failure(1, true);
+        refuse_login_past_give_up(&pipeline, 1).await;
     }
 
     // The payload's second article is taken off the queue and answered "not
@@ -586,13 +1204,7 @@ async fn a_password_failure_after_an_article_moved_past_a_refusing_server_promot
     let duplicate = parked_duplicate(&pipeline, &spec);
     insert_active_job(&mut pipeline, job, spec).await;
     pipeline.active_download_passes.insert(job);
-    pipeline
-        .nntp
-        .pool()
-        .health()
-        .lock()
-        .await
-        .record_failure(1, true);
+    refuse_login_past_give_up(&pipeline, 1).await;
     let work = pipeline
         .jobs
         .get_mut(&job)
