@@ -27,9 +27,7 @@ pub(crate) async fn clear_restart_artifacts(
             &resources.staging_roots().await,
         );
         if working.is_some() {
-            use crate::jobs::working_dir::{
-                HistoryWorkingDir, prepare_history_working_dir,
-            };
+            use crate::jobs::working_dir::{HistoryWorkingDir, prepare_history_working_dir};
             if prepare_history_working_dir(&resources.intermediate_dir, working_dir, id).await?
                 != HistoryWorkingDir::Owned
             {

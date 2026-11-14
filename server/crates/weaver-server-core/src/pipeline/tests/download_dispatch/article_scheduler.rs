@@ -1248,7 +1248,11 @@ async fn a_lane_short_of_room_takes_no_whole_pipe_of_another_job_beside_its_own(
     );
     assert!(Arc::ptr_eq(
         &volume,
-        pipeline.graph_jobs[&next].disk().unwrap().working().volume()
+        pipeline.graph_jobs[&next]
+            .disk()
+            .unwrap()
+            .working()
+            .volume()
     ));
     // At its resume line the volume has an eighth of its limit left: 5
     // articles of 512 bytes on each of the 4 connections, less than a pipe
