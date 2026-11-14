@@ -191,3 +191,25 @@ async fn a_drain_mark_with_packets_queued_behind_it_is_counted() {
     assert_eq!(stats.drain_marks_with_packets_queued, 1);
     assert_eq!(stats.immediate_acks, 2);
 }
+
+// The ACK for packets held past a hole carries a SACK of the fewest bytes
+// that reach the last one held, and the counters say so: one ACK with a
+// SACK, two bytes of it for packets 3 and 12 while 2 is missing.
+#[tokio::test]
+async fn an_ack_with_a_sack_is_counted_with_its_bytes() {
+    let mut t = make_test_vsock(Default::default(), false);
+    let ack_nr = t.vsock.seq_nr - 1;
+    t.send_data(1, ack_nr, "a");
+    t.send_data(3, ack_nr, "c");
+    t.send_data(12, ack_nr, "l");
+    t.poll_once_assert_pending().await;
+    let sent = t.take_sent();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let sack = sent[0].header.extensions.selective_ack.unwrap();
+    // Bit 0 is packet 3 (two past the last in order), bit 9 is packet 12.
+    assert_eq!(sack.as_bytes(), [0b1, 0b10]);
+    let stats = t._socket.stats();
+    assert_eq!(stats.ack_packets_sent.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.acks_with_sack.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.sack_bytes_sent.load(Ordering::Relaxed), 2);
+}

@@ -1276,6 +1276,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let sent = self.send_control_packet(cx, &header)?;
         if sent {
             self.socket.stats.ack_packets_sent.increment(1);
+            if let Some(sack) = &header.extensions.selective_ack {
+                self.socket.stats.acks_with_sack.increment(1);
+                self.socket
+                    .stats
+                    .sack_bytes_sent
+                    .increment(sack.as_bytes().len() as u64);
+            }
         }
         Ok(sent)
     }
@@ -1934,6 +1941,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         // An ACK may report a packet whose send was recorded since the
         // poll began; it is timed from that send.
         self.take_departures();
+        if let Some(sack) = &msg.header.extensions.selective_ack {
+            self.socket.stats.sacks_received.increment(1);
+            self.socket
+                .stats
+                .sack_bits_received
+                .increment(sack.as_bitslice().count_ones() as u64);
+        }
         let in_flight_before = self
             .user_tx_segments
             .calc_flight_size(self.last_sent_seq_nr);

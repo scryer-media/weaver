@@ -76,6 +76,14 @@ pub struct UtpStats {
     pub rto_timeouts_count: AtomicU64,
     pub recovery_transmitted_new_segments_count: AtomicU64,
     pub recovery_rto_during_recovery_count: AtomicU64,
+    /// ACK packets sent on their own that carried a SACK.
+    pub acks_with_sack: AtomicU64,
+    /// Bytes of SACK bitfield sent, on ACK and data packets.
+    pub sack_bytes_sent: AtomicU64,
+    /// Packets received that carried a SACK.
+    pub sacks_received: AtomicU64,
+    /// Packets the SACKs received reported held: the bits set in them.
+    pub sack_bits_received: AtomicU64,
 }
 
 /// Relaxed counters for a socket, aggregated across its streams.
@@ -105,6 +113,10 @@ pub struct UtpStatsSnapshot {
     pub receive_drains: u64,
     pub stream_switch_marks: u64,
     pub drain_marks_with_packets_queued: u64,
+    pub acks_with_sack: u64,
+    pub sack_bytes_sent: u64,
+    pub sacks_received: u64,
+    pub sack_bits_received: u64,
 }
 
 impl UtpStats {
@@ -136,6 +148,10 @@ impl UtpStats {
             drain_marks_with_packets_queued: self
                 .drain_marks_with_packets_queued
                 .load(Ordering::Relaxed),
+            acks_with_sack: self.acks_with_sack.load(Ordering::Relaxed),
+            sack_bytes_sent: self.sack_bytes_sent.load(Ordering::Relaxed),
+            sacks_received: self.sacks_received.load(Ordering::Relaxed),
+            sack_bits_received: self.sack_bits_received.load(Ordering::Relaxed),
         }
     }
 }
@@ -196,6 +212,10 @@ impl std::ops::AddAssign for UtpStatsSnapshot {
         self.drain_marks_with_packets_queued = self
             .drain_marks_with_packets_queued
             .saturating_add(other.drain_marks_with_packets_queued);
+        self.acks_with_sack = self.acks_with_sack.saturating_add(other.acks_with_sack);
+        self.sack_bytes_sent = self.sack_bytes_sent.saturating_add(other.sack_bytes_sent);
+        self.sacks_received = self.sacks_received.saturating_add(other.sacks_received);
+        self.sack_bits_received = self.sack_bits_received.saturating_add(other.sack_bits_received);
     }
 }
 

@@ -874,7 +874,8 @@ impl OutOfOrderQueue {
             "the SACK read to the queue's end"
         );
 
-        Some(sack)
+        // Empty when every packet held lies past what a SACK can carry.
+        (!sack.is_empty()).then_some(sack)
     }
 
     pub fn add_remove(

@@ -69,4 +69,8 @@ struct SerializedUtpStatsSnapshot {
     receive_drains: u64,
     stream_switch_marks: u64,
     drain_marks_with_packets_queued: u64,
+    acks_with_sack: u64,
+    sack_bytes_sent: u64,
+    sacks_received: u64,
+    sack_bits_received: u64,
 }
