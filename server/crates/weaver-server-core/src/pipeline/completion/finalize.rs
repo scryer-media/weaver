@@ -15,7 +15,9 @@ mod output;
 #[cfg(test)]
 pub(in crate::pipeline) use output::member_crc32_by_path;
 #[cfg(test)]
-pub(in crate::pipeline) use output::{BEFORE_FIRST_MOVE, BEFORE_SPENT_REMOVAL, DESTINATION_ROOM};
+pub(in crate::pipeline) use output::{
+    BEFORE_FIRST_MOVE, BEFORE_SPENT_REMOVAL, CLAIM_FULL, DESTINATION_ROOM, PARTIAL_STAYS,
+};
 pub(crate) use output::{RestoredPostProcessing, release_failed_delivery};
 mod status;
 #[cfg(test)]

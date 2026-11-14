@@ -846,7 +846,17 @@ pub(super) enum MoveToCompleteFailure {
     Operational(String),
     // An operational failure whose cause is known: the disk `path` lies on
     // had no room for an entry. The job waits for room there.
-    OutOfSpace { path: PathBuf, message: String },
+    // `needs` is what the entries whose copy found no room still have to
+    // deliver: what is left of each in the working directory, which is what
+    // the move writes when it goes on. `again` are the names in the
+    // destination those copies were writing: a copy removes what it wrote as
+    // it fails, but not on every mount, so the move replaces them.
+    OutOfSpace {
+        path: PathBuf,
+        message: String,
+        needs: u64,
+        again: Vec<PathBuf>,
+    },
 }
 
 impl std::fmt::Display for MoveToCompleteFailure {
@@ -1596,7 +1606,11 @@ pub struct Pipeline {
     pub(super) full_disk: std::collections::BTreeMap<JobId, full_disk::FullDisk>,
     // The jobs let go whose final move goes on into the destination named,
     // started at the top of the next turn as a restart starts one.
-    pub(super) full_disk_moves: Vec<(JobId, PathBuf)>,
+    pub(super) full_disk_moves: Vec<(JobId, full_disk::Stage)>,
+    // The room promised to each job let go on the figure its step needs,
+    // counted against its disk until that step ends, so one reading does
+    // not promise the same room to two jobs. Empty unless such a job runs.
+    pub(super) full_disk_promised: std::collections::BTreeMap<JobId, full_disk::Promised>,
     // The removals of spool files a held job no longer reads, for a test to
     // wait on.
     #[cfg(test)]

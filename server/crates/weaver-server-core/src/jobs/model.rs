@@ -815,6 +815,9 @@ pub struct JobState {
     // relative to it: set when the move begins, or read back from the row of
     // a move a restart interrupted.
     pub delivery_left_behind: Vec<PathBuf>,
+    // The working directory the final move delivers from: set when the move
+    // begins, or read back from the row of a move a restart interrupted.
+    pub delivery_source: Option<PathBuf>,
     // Per-job working directory (subdirectory under intermediate_dir).
     // All download/decode/verify/repair/extract I/O happens here.
     pub working_dir: PathBuf,

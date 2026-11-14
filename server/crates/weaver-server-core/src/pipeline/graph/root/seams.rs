@@ -541,7 +541,14 @@ impl Pipeline {
             if let Some(device) = error.out_of_space() {
                 let root = self.full_disk_root(job_id, device);
                 warn!(job_id = job_id.0, error = %error, "graph job write found no room");
-                self.hold_job_for_full_disk(job_id, root);
+                // A repair or a staging removes what it wrote as it fails:
+                // the job then waits for the room that takes, not for more
+                // than the disk showed.
+                let needs = self
+                    .graph_jobs
+                    .get_mut(&job_id)
+                    .and_then(|graph| graph.take_gave_back());
+                self.hold_job_for_full_disk(job_id, root, needs);
                 return;
             }
             warn!(job_id = job_id.0, error = %error, "graph job step failed");

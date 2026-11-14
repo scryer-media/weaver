@@ -736,6 +736,7 @@ impl NamespaceWriter {
         // A repair whose output refused a write failed with it, and nothing
         // it came to is applied. The refusal is the error, whatever removing
         // the output then says.
+        self.gave_back(&returned.repaired);
         if let Some(error) = returned.repaired.failed() {
             let _ = returned.repaired.remove();
             return Err(error.into());

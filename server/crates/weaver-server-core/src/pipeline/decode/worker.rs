@@ -1704,7 +1704,8 @@ impl Pipeline {
                 context,
                 "disk write found no room; the job waits for room"
             );
-            self.hold_job_for_full_disk(job_id, crate::operations::StorageRoot::Intermediate);
+            // A spool write gives nothing back as it fails.
+            self.hold_job_for_full_disk(job_id, crate::operations::StorageRoot::Intermediate, None);
             return;
         }
         // No room for a part of a job that no longer fetches: it has ended,

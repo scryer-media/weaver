@@ -7,16 +7,26 @@
 // files hold, so the graph goes at once, with no checkpoint taken of it. The
 // job keeps its slot and fetches nothing more; once nothing of it is out it
 // parks as a paused job does, and waits, shown waiting for disk space, on
-// the same ledger and readings as a job the reserve holds. Only a reading
-// whose probe began after the write failed counts. One that shows more than
-// the disk showed before the write failed, and more than the reserve, shows
-// room was made, and lets the job go, as a resume of the job by its user
-// does at once. Its
-// articles are read back, its graph is restored from its last checkpoint, as
-// after a restart, and what that checkpoint does not hold is written or
-// fetched again. A job let go that fails again before it saved anything new
-// waits for more room than it has yet seen, so a disk whose readings never
-// change cannot send it round. A disk with no good reading keeps it waiting.
+// the same ledger and readings as a job the reserve holds. Only a good
+// reading whose probe began after the write failed counts.
+//
+// What such a reading has to show depends on what the step that failed did
+// with its own output. A step that removed what it had written as it failed
+// (a final move's copy, a repair's output, a recovery's scratch) gave that
+// room back, so the disk shows it free again with no room made: the job
+// carries the bytes that step needs free to run again, and is let go only
+// by a reading that shows at least that much, with more than the reserve
+// free to spend. A step that gave nothing back (a download write) has one
+// mark, what its disk showed as the write failed, and is let go by a reading
+// that shows more than the mark and more than the reserve free to spend. A
+// resume of the job by its user lets it go once, whatever the readings say.
+// A disk with no good reading keeps it waiting.
+//
+// A job let go in its download has its articles read back and its graph
+// restored from its last checkpoint, as after a restart, and what that
+// checkpoint does not hold is written or fetched again. One let go in its
+// final move goes on with the move from the working directory it has into
+// the destination it had claimed.
 //
 // Nothing here runs unless a write failed for want of room: every check on
 // a path that runs often is one test of an empty map.
@@ -36,20 +46,36 @@ use crate::operations::StorageRoot;
 // What a job waits for: room made on the disk its write failed on.
 // The disk a held job waits on: a root's, or the disk of a path that lies
 // on none of theirs.
+#[derive(Clone, PartialEq, Eq)]
 enum Disk {
     Root(StorageRoot),
     Path(PathBuf),
 }
 
+// Room promised to a job let go on the figure its step needs: the disk, and
+// how much of what it showed is the job's until its step ends.
+pub(crate) struct Promised {
+    disk: Disk,
+    bytes: u64,
+}
+
 // What the job was doing when its write failed, which is what it goes back
 // to when let go, the way a restart takes a job stored in that stage.
-pub(in crate::pipeline) enum Stage {
+pub(crate) enum Stage {
     // Fetching, verifying, repairing or unpacking: its graph is restored
     // from its last checkpoint.
     Graph,
     // Its final move, into this destination: the move goes on from what the
-    // failed attempt left.
-    Moving(PathBuf),
+    // failed attempt left. With it, the names in the destination whose copy
+    // found no room: whatever the destination holds under one of them is a
+    // copy cut short, which the move replaces from the working directory.
+    Moving(PathBuf, HashSet<PathBuf>),
+    // Its final move had no room to claim a destination: the move claims
+    // one and starts, leaving these consumed inputs where they are.
+    Claim(HashSet<PathBuf>),
+    // The same, for a move a restart found under way with no destination
+    // recorded: it is taken up as the restart took it.
+    Restored,
 }
 
 pub(crate) struct FullDisk {
@@ -64,6 +90,10 @@ pub(crate) struct FullDisk {
     // It is this wait's alone, and ends with it. `None` while the disk has
     // shown nothing: the first reading since the failure then sets it.
     mark: Option<u64>,
+    // What the step that failed needs free to run again, when it removed
+    // what it had written as it failed. A reading then has to show this
+    // much, and the mark is not consulted.
+    needs: Option<u64>,
     // A probe was running as the write failed: it began before the failure,
     // so the figure it publishes takes the mark's place, once.
     running: bool,
@@ -115,10 +145,18 @@ impl Pipeline {
     // last checkpoint, in what it holds and in what it counts. The figures
     // it showed still to come are kept. Waiting on the ledger asks for a
     // reading. The job parks once nothing of it is out, on a later turn.
-    pub(in crate::pipeline) fn hold_job_for_full_disk(&mut self, job_id: JobId, root: StorageRoot) {
+    // `needs` is what the step gave back to the disk as it failed, when it
+    // removed its own output.
+    pub(in crate::pipeline) fn hold_job_for_full_disk(
+        &mut self,
+        job_id: JobId,
+        root: StorageRoot,
+        needs: Option<u64>,
+    ) {
         if self.full_disk.contains_key(&job_id) {
             return;
         }
+        self.end_full_disk_promise(job_id);
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return;
         };
@@ -189,6 +227,7 @@ impl Pipeline {
                 stage: Stage::Graph,
                 since: look.begun,
                 mark: look.shown,
+                needs,
                 running: look.probe < look.begun,
                 moved: look.moved,
                 dir: self.root_dir(root),
@@ -268,6 +307,12 @@ impl Pipeline {
         }
         let reserve = self.extraction_limits.min_free_bytes;
         let mut woken = Vec::new();
+        // A promise to a job that left the pipeline ended with it.
+        if !self.full_disk_promised.is_empty() {
+            let jobs = &self.jobs;
+            self.full_disk_promised
+                .retain(|job_id, _| jobs.contains_key(job_id));
+        }
         for (job_id, hold) in &mut self.full_disk {
             let capacity = &self.storage_capacity;
             // The root waited on was pointed at another directory: the wait
@@ -318,13 +363,42 @@ impl Pipeline {
                     && look.good
                     && let Some(shown) = look.shown
                 {
-                    match hold.mark {
-                        None => hold.mark = Some(shown),
-                        Some(mark) => {
-                            hold.go |= shown > mark && spendable.is_some_and(|free| free > reserve);
+                    let spends = spendable.is_some_and(|free| free > reserve);
+                    match (hold.needs, hold.mark) {
+                        // The step gave its output back as it failed: the
+                        // disk has to show the room the step takes, on top
+                        // of what is promised to the jobs let go before it
+                        // whose steps have not ended: a job let go here is
+                        // promised its figure at once, so the next held job
+                        // of this pass is judged against it.
+                        (Some(needs), _) if !hold.go => {
+                            let promised = self
+                                .full_disk_promised
+                                .values()
+                                .filter(|promised| promised.disk == hold.disk)
+                                .fold(0u64, |sum, promised| sum.saturating_add(promised.bytes));
+                            if shown >= needs.saturating_add(promised) && spends {
+                                hold.go = true;
+                                self.full_disk_promised.insert(
+                                    *job_id,
+                                    Promised {
+                                        disk: hold.disk.clone(),
+                                        bytes: needs,
+                                    },
+                                );
+                            }
                         }
+                        (Some(_), _) => {}
+                        (None, None) => hold.mark = Some(shown),
+                        (None, Some(mark)) => hold.go |= shown > mark && spends,
                     }
                 }
+            }
+            // A move let go starts as a first move does, which waits while
+            // post-processing is paused: the job stays held until then.
+            let moves = !matches!(hold.stage, Stage::Graph);
+            if moves && self.shared_state.is_post_processing_paused() {
+                continue;
             }
             let paused = self
                 .jobs
@@ -339,7 +413,7 @@ impl Pipeline {
                                 !matches!(state.articles, JobArticles::Active(_))
                             })
                     }
-                    Stage::Moving(_) => true,
+                    Stage::Moving(..) | Stage::Claim(_) | Stage::Restored => true,
                 };
             if hold.go && parked {
                 woken.push(*job_id);
@@ -347,12 +421,12 @@ impl Pipeline {
         }
         for job_id in woken {
             match self.drop_full_disk_hold(job_id) {
-                Some(Stage::Moving(dest)) => {
+                Some(stage @ (Stage::Moving(..) | Stage::Claim(_) | Stage::Restored)) => {
                     info!(
                         job_id = job_id.0,
                         "the job held for a full disk goes on with its final move"
                     );
-                    self.full_disk_moves.push((job_id, dest));
+                    self.full_disk_moves.push((job_id, stage));
                 }
                 _ => {
                     info!(
@@ -371,36 +445,34 @@ impl Pipeline {
     // for room on the destination's disk, shown as any job held for a full
     // disk, and nothing of it is failed. What the move delivered stays in
     // the destination and what it did not stays where it was. The disk is a
-    // root's when the destination lies on one, by the devices the capacity
-    // cache already holds, and else the destination's own, read while a job
-    // waits on it.
-    pub(in crate::pipeline) async fn hold_move_for_full_disk(
+    // root's only when the capacity cache already holds the device of the
+    // path and of the root and they are one; nothing is looked at here. Any
+    // other path is waited on as itself, the disk that failed, and read
+    // while a job waits on it. `needs` is what the move needs free to go on,
+    // when the copy that failed removed what it wrote.
+    pub(in crate::pipeline) fn hold_move_for_full_disk(
         &mut self,
         job_id: JobId,
-        dest: PathBuf,
+        stage: Stage,
         path: &std::path::Path,
         message: &str,
+        needs: Option<u64>,
     ) {
         if !self.jobs.contains_key(&job_id) || self.full_disk.contains_key(&job_id) {
             return;
         }
+        self.end_full_disk_promise(job_id);
         warn!(
             job_id = job_id.0,
             path = %path.display(),
             error = message,
             "the final move found the disk full; the job waits for room"
         );
-        let mut disk = None;
-        for (root, dir) in [
-            (StorageRoot::Complete, self.complete_dir.clone()),
-            (StorageRoot::Intermediate, self.intermediate_dir.clone()),
-        ] {
-            if self.storage_capacity.same_filesystem(path, &dir).await {
-                disk = Some(Disk::Root(root));
-                break;
-            }
-        }
-        let disk = disk.unwrap_or_else(|| Disk::Path(path.to_path_buf()));
+        let disk = self
+            .storage_capacity
+            .known_root_of(path)
+            .filter(|root| matches!(root, StorageRoot::Complete | StorageRoot::Intermediate))
+            .map_or_else(|| Disk::Path(path.to_path_buf()), Disk::Root);
         let (look, dir) = match &disk {
             Disk::Root(root) => {
                 let look = self.storage_capacity.look(*root);
@@ -413,9 +485,10 @@ impl Pipeline {
             job_id,
             FullDisk {
                 disk,
-                stage: Stage::Moving(dest),
+                stage,
                 since: look.begun,
                 mark: look.shown,
+                needs,
                 running: look.probe < look.begun,
                 moved: look.moved,
                 dir,
@@ -427,20 +500,67 @@ impl Pipeline {
         self.report_job(job_id);
     }
 
-    // The final moves of the jobs let go start here, at the top of a turn,
-    // the way a restart starts a move it found interrupted: the job's row
-    // names the destination, and the move goes on into it.
+    // The final moves of the jobs let go start here, at the top of a turn.
+    // A move that had claimed its destination goes on into it from the
+    // working directory the job has, both as they stood when it stopped. A
+    // move that had not claims one, as it was doing.
     pub(in crate::pipeline) async fn resume_full_disk_moves(&mut self) {
         if self.full_disk_moves.is_empty() {
             return;
         }
-        for (job_id, dest) in std::mem::take(&mut self.full_disk_moves) {
-            let Some(state) = self.jobs.get_mut(&job_id) else {
+        for (job_id, stage) in std::mem::take(&mut self.full_disk_moves) {
+            if !self.jobs.contains_key(&job_id) {
                 continue;
-            };
-            state.working_dir = dest;
-            self.resume_restored_move(job_id).await;
+            }
+            // A cancel taken while the job was held is being archived: the
+            // move waits for its answer, and goes on only if the job is
+            // handed back.
+            if !self.begin_let_go_move(job_id) {
+                self.full_disk_moves.push((job_id, stage));
+                continue;
+            }
+            match stage {
+                Stage::Graph => {}
+                Stage::Moving(dest, again) => self.resume_held_move(job_id, dest, again).await,
+                Stage::Claim(left_behind) => {
+                    if let Err(error) = self.launch_move(job_id, None, left_behind).await {
+                        self.fail_job(job_id, error);
+                    }
+                }
+                Stage::Restored => self.resume_restored_move(job_id).await,
+            }
+            // A move that did not start, held again, failed or found
+            // finished, is not running: a started one reserved its
+            // destination.
+            if !self.reserved_complete_destinations.contains_key(&job_id)
+                && self.inflight_moves.remove(&job_id)
+            {
+                self.report_job(job_id);
+            }
         }
+    }
+
+    // The move of a job let go begins, before anything is awaited: in one
+    // write of the queue, a cancel already taken stops it, and with none the
+    // job shows as moving, so a cancel from then on is refused as for any
+    // moving job. No cancel is accepted between the two. The job counts as
+    // moving from here, so every report of it says so until the move ends.
+    // False when a cancel was taken first.
+    pub(in crate::pipeline) fn begin_let_go_move(&mut self, job_id: JobId) -> bool {
+        let begun = self.shared_state.queue.write(|inner| {
+            let Some(row) = inner.job_mut(job_id) else {
+                return crate::pipeline::queue::Change::unchanged(true);
+            };
+            if row.intents.cancelled.is_some() {
+                return crate::pipeline::queue::Change::unchanged(false);
+            }
+            row.report.moving = true;
+            crate::pipeline::queue::Change::changed(true)
+        });
+        if begun {
+            self.inflight_moves.insert(job_id);
+        }
+        begun
     }
 
     // The held job parked with no graph to say what it has in hand: its
@@ -469,7 +589,59 @@ impl Pipeline {
             return;
         }
         if let Some(hold) = self.full_disk.get_mut(&job_id) {
+            // Its step takes the room it needs all the same, so that much
+            // is promised to it like any job let go on its figure.
+            if let (false, Some(bytes)) = (hold.go, hold.needs) {
+                let disk = hold.disk.clone();
+                self.full_disk_promised
+                    .insert(job_id, Promised { disk, bytes });
+            }
             hold.go = true;
+        }
+    }
+
+    // The step of a job let go on the figure it needs ended: the job is held
+    // again, reached its final move from its download, finished its move, or
+    // is gone. The room promised to it is counted no longer, and the jobs
+    // still held on that disk are judged on a reading taken from now, since
+    // one from before shows room that step may have filled.
+    pub(in crate::pipeline) fn end_full_disk_promise(&mut self, job_id: JobId) {
+        if self.full_disk_promised.is_empty() {
+            return;
+        }
+        let Some(ended) = self.full_disk_promised.remove(&job_id) else {
+            return;
+        };
+        let begun = match &ended.disk {
+            Disk::Root(root) => Some(self.storage_capacity.look(*root).begun),
+            Disk::Path(path) => self.storage_capacity.path_look(path).map(|look| look.begun),
+        };
+        let Some(begun) = begun else {
+            return;
+        };
+        for hold in self.full_disk.values_mut() {
+            if hold.disk == ended.disk && hold.needs.is_some() && !hold.go {
+                hold.since = hold.since.max(begun);
+                hold.running = false;
+            }
+        }
+    }
+
+    // What is promised on the disks to the jobs let go, in all.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn full_disk_promised_bytes(&self) -> u64 {
+        self.full_disk_promised
+            .values()
+            .map(|promised| promised.bytes)
+            .sum()
+    }
+
+    // The names in the destination whose copy the held move cut short.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn full_disk_cut_short(&self, job_id: JobId) -> Vec<PathBuf> {
+        match self.full_disk.get(&job_id).map(|hold| &hold.stage) {
+            Some(Stage::Moving(_, again)) => again.iter().cloned().collect(),
+            _ => Vec::new(),
         }
     }
 
@@ -477,6 +649,20 @@ impl Pipeline {
     #[cfg(test)]
     pub(in crate::pipeline) fn full_disk_mark(&self, job_id: JobId) -> Option<u64> {
         self.full_disk.get(&job_id).and_then(|hold| hold.mark)
+    }
+
+    // What a reading of the held job's disk has to show at least.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn full_disk_needs(&self, job_id: JobId) -> Option<u64> {
+        self.full_disk.get(&job_id).and_then(|hold| hold.needs)
+    }
+
+    // Whether the held job waits on a path of its own, not on a root.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn full_disk_on_path(&self, job_id: JobId) -> bool {
+        self.full_disk
+            .get(&job_id)
+            .is_some_and(|hold| matches!(hold.disk, Disk::Path(_)))
     }
 
     // The job no longer waits for room after a full disk: it went on, or

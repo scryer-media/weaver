@@ -55,6 +55,17 @@ impl Database {
             .unwrap_or_default())
     }
 
+    // The same, from memory alone: none while the effects were never read,
+    // so a caller that must not read the database asks this.
+    pub(crate) fn job_script_effects_in_hand(&self, job_id: u64) -> Option<JobScriptEffects> {
+        self.script_runtime
+            .effects_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|cache| cache.get(&job_id).cloned().unwrap_or_default())
+    }
+
     pub(crate) fn warm_script_effects(&self) -> Result<(), StateError> {
         if self
             .script_runtime

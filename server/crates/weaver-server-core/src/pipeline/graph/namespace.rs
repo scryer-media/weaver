@@ -278,6 +278,9 @@ pub(crate) struct NamespaceWriter {
     // back (true), or the namespace whose members nothing held (false). One
     // archive is one event however many volumes it had.
     given_up: BTreeSet<(NodeId, bool)>,
+    // What a repair or a staging that failed gave back to the disk as it
+    // failed, until the job asks: the room it needs to run again.
+    gave_back: Option<u64>,
     // The budgets each member has spilled past, said once each.
     spills_said: BTreeSet<(NodeId, MemberId, Budget)>,
     // The members whose file the file system refused to create for its
@@ -390,6 +393,7 @@ impl NamespaceWriter {
             refused_in_batch: BTreeSet::new(),
             given_back: Vec::new(),
             given_up: BTreeSet::new(),
+            gave_back: None,
             spills_said: BTreeSet::new(),
             unnamable: BTreeSet::new(),
             unnamed_damage: Vec::new(),
@@ -499,6 +503,32 @@ impl NamespaceWriter {
 
     pub(crate) fn disk_held(&self) -> bool {
         self.caps.disk_held()
+    }
+
+    // What the write that just failed gave back to the disk, when it was a
+    // repair's or a staging's, which remove their output as they fail.
+    pub(crate) fn take_gave_back(&mut self) -> Option<u64> {
+        self.gave_back.take()
+    }
+
+    // A decode window of `needs` bytes, the free space its disk keeps
+    // included, found room in no folder: the job waits for that room on the
+    // disk of its working directory, the first folder a window goes in, as
+    // for a write that found that disk full.
+    pub(crate) fn window_found_no_room(&mut self, needs: u64) -> WriteError {
+        self.gave_back = Some(self.gave_back.unwrap_or(0).max(needs));
+        WriteError::Leaf(LeafError::Io {
+            path: self.working_dir.clone(),
+            source: std::io::Error::from(std::io::ErrorKind::StorageFull),
+            device: Device::Working,
+        })
+    }
+
+    fn gave_back(&mut self, staged: &loan::Repaired) {
+        let bytes = staged.gave_back();
+        if bytes > 0 {
+            self.gave_back = Some(self.gave_back.unwrap_or(0).max(bytes));
+        }
     }
 
     pub(crate) fn disk_ticket(&self) -> Option<u64> {
@@ -1621,6 +1651,7 @@ impl NamespaceWriter {
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let mut staged = loan::Repaired::again(&self.working_dir, node)?;
+        staged.will_write(ranges.iter().map(|(_, range)| range.len()).sum());
         let mut sources = Vec::new();
         let serial = tree.again_read(
             node,
@@ -1631,6 +1662,7 @@ impl NamespaceWriter {
                 sources.push(posted.provenance);
             },
         );
+        self.gave_back(&staged);
         let replayed = match staged.failed() {
             Some(error) => Err(WriteError::from(error)),
             None => self.again_staged(
@@ -1704,6 +1736,7 @@ impl NamespaceWriter {
                 sources.push(posted.provenance);
             },
         );
+        self.gave_back(&staged);
         if let Some(error) = staged.failed() {
             tree.again_done();
             let _ = staged.discard();

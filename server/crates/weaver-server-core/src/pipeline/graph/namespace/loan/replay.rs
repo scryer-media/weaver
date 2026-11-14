@@ -256,6 +256,7 @@ impl NamespaceWriter {
         mut replayed: Replayed,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        self.gave_back(&replayed.bytes);
         if let Some(error) = replayed.bytes.failed() {
             let _ = replayed.remove();
             return Err(error.into());

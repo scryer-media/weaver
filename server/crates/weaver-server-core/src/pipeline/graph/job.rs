@@ -961,6 +961,11 @@ impl GraphJob {
         self.writer.disk_held()
     }
 
+    // What the step that just failed gave back to the disk as it failed.
+    pub(crate) fn take_gave_back(&mut self) -> Option<u64> {
+        self.writer.take_gave_back()
+    }
+
     pub(crate) fn disk_ticket(&self) -> Option<u64> {
         self.writer.disk_ticket()
     }

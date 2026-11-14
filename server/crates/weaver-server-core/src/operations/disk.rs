@@ -1950,6 +1950,29 @@ impl StorageCapacity {
         })
     }
 
+    // The root whose disk `path` is known to lie on, from what is held
+    // already: a root's own directory, or the device last read for `path`
+    // itself, set against each root's device. Nothing is guessed from a
+    // folder above it, which a mount below may not share a disk with. No
+    // look is started and none is waited on; a path whose own device was
+    // never read answers `None`.
+    pub(crate) fn known_root_of(&self, path: &Path) -> Option<StorageRoot> {
+        let device = self.root_device(path).flatten().or_else(|| {
+            lock_paths(&self.paths)
+                .entries
+                .get(path)
+                .and_then(|entry| entry.device)
+                .and_then(|look| look.device)
+        })?;
+        [
+            StorageRoot::Complete,
+            StorageRoot::Intermediate,
+            StorageRoot::Data,
+        ]
+        .into_iter()
+        .find(|root| self.slot(*root).lock().device.flatten() == Some(device))
+    }
+
     // The entry for `path`, made when there is none. Past the cap, the
     // entry asked after longest ago with no look out is dropped first.
     fn entry<'a>(cache: &'a mut PathCache, path: &Path) -> &'a mut PathEntry {

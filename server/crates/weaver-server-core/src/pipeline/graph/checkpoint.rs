@@ -201,6 +201,10 @@ struct Slot {
     // `None` until a checkpoint is written or read: what the database holds
     // of the job is not known, so the next change is the whole job.
     held: Option<Held>,
+    // What the stored checkpoint a restore read says is in hand, by volume:
+    // decoded when a job is held before this run's first checkpoint, never
+    // at the restore, and gone once the root is encoded, which then says it.
+    restored: Option<std::collections::HashMap<usize, std::collections::HashSet<u32>>>,
     feed_verdict: Option<crate::jobs::feed_verdict::FeedVerdict>,
     // The change waiting for its barrier or for a queued write to take it.
     queued: Option<Delta>,
@@ -511,6 +515,8 @@ impl Pending {
         }
         let held = slot.held.get_or_insert_with(Held::default);
         let encoding = job.encode_root(&mut slot.root, job.next_node());
+        // The root as encoded now says what is in hand.
+        slot.restored = None;
         held.settled_bytes = job.settled_bytes();
         let root = root_row(encoding.version, encoding.bytes);
         if held.root.as_ref() != Some(&root) {
@@ -842,16 +848,61 @@ impl Pending {
             .map_or(0, |held| held.settled_bytes)
     }
 
+    // What the stored checkpoint a restore read says is not fetched again,
+    // by volume, decoded from the root row and parts the restore left here.
+    // Asked for only when a job is held before this run's first checkpoint,
+    // and then once.
+    fn stored_settled(
+        slot: &Slot,
+    ) -> Option<std::collections::HashMap<usize, std::collections::HashSet<u32>>> {
+        let root = slot.held.as_ref()?.root.as_ref()?;
+        let parts: Vec<Part> = slot
+            .root_parts
+            .iter()
+            .map(|(part, bytes)| Part {
+                key: *part as u64,
+                bytes: Arc::clone(bytes),
+            })
+            .collect();
+        let facts = facts::decode(version(root).ok()?, &root.facts, &parts).ok()?;
+        Some(
+            facts
+                .volumes
+                .iter()
+                .enumerate()
+                .map(|(volume, facts)| {
+                    let settled = facts
+                        .articles
+                        .iter()
+                        .filter(|(_, article)| *article != facts::ArticleFacts::Waiting)
+                        .map(|(ordinal, _)| *ordinal)
+                        .collect();
+                    (volume, settled)
+                })
+                .collect(),
+        )
+    }
+
     // The ordinals of `volume`'s articles the last checkpoint taken from
-    // the job says are not fetched again: what a restore has in hand. None
-    // while no checkpoint was taken from the job.
+    // the job says are not fetched again: what a restore has in hand. For a
+    // job restored and not yet checkpointed in this run, what its restore
+    // took from the stored checkpoint. None while no checkpoint was taken
+    // from the job.
     pub(in crate::pipeline) fn checkpoint_settled(
         &self,
         volume: usize,
     ) -> std::collections::HashSet<u32> {
-        let slot = self.slot();
-        if slot.held.is_none() {
+        let mut slot = self.slot();
+        let Some(held) = &slot.held else {
             return std::collections::HashSet::new();
+        };
+        // The rows are a restore's, and no checkpoint was taken since: what
+        // they say is decoded now, once, and kept until one is.
+        if slot.restored.is_none() && held.read.is_none() {
+            slot.restored = Self::stored_settled(&slot);
+        }
+        if let Some(restored) = &slot.restored {
+            return restored.get(&volume).cloned().unwrap_or_default();
         }
         slot.root.settled(volume)
     }

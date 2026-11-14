@@ -49,10 +49,16 @@ fn on_disk(room: &Arc<AtomicU64>) -> Scenario {
 }
 
 fn on_disk_posting(room: &Arc<AtomicU64>, posts: Vec<Post>) -> Scenario {
+    on_disk_keeping(room, posts, RESERVE)
+}
+
+// The same, the job held to keep `reserve` free and the disks reading
+// `room` bytes over it.
+fn on_disk_keeping(room: &Arc<AtomicU64>, posts: Vec<Post>, reserve: u64) -> Scenario {
     let room = Arc::clone(room);
     Scenario::new(posts)
-        .limits(super::caps::limits(|limits| {
-            limits.min_free_bytes = RESERVE
+        .limits(super::caps::limits(move |limits| {
+            limits.min_free_bytes = reserve
         }))
         .setup(move |pipeline| {
             let roots = [
@@ -65,7 +71,7 @@ fn on_disk_posting(room: &Arc<AtomicU64>, posts: Vec<Post>) -> Scenario {
                 UNREADABLE => Err(crate::operations::disk::DiskProbeError::InvalidPath),
                 room => Ok(DiskSpace {
                     total_bytes: RESERVE * 8,
-                    available_bytes: RESERVE + room,
+                    available_bytes: reserve + room,
                 }),
             });
             let capacity = StorageCapacity::with_probe(roots, NEVER, probe);
@@ -1076,7 +1082,7 @@ async fn a_job_held_for_a_full_disk_keeps_only_the_spooled_parts_its_checkpoint_
     pipeline.pending_unanchored_release.push(part(1));
     assert_eq!(pipeline.uu_spooled_segments, 2);
 
-    pipeline.hold_job_for_full_disk(JOB, StorageRoot::Intermediate);
+    pipeline.hold_job_for_full_disk(JOB, StorageRoot::Intermediate, None);
     for sweep in pipeline.full_disk_sweeps.drain(..) {
         sweep.await.unwrap();
     }
@@ -1339,7 +1345,7 @@ async fn a_second_wait_on_another_disk_takes_that_disks_figure() {
 
     // Its next write fails on the output disk, which still shows little.
     room.store(0, Ordering::Release);
-    pipeline.hold_job_for_full_disk(JOB, StorageRoot::Complete);
+    pipeline.hold_job_for_full_disk(JOB, StorageRoot::Complete, None);
     assert_eq!(
         pipeline.full_disk_mark(JOB),
         Some(RESERVE),
@@ -1494,7 +1500,7 @@ async fn a_job_held_for_a_full_disk_at_its_end_counts_what_is_past_its_checkpoin
         checkpointed < articles,
         "the graph is ahead of its last checkpoint"
     );
-    pipeline.hold_job_for_full_disk(JOB, StorageRoot::Intermediate);
+    pipeline.hold_job_for_full_disk(JOB, StorageRoot::Intermediate, None);
     // Held with nothing queued and nothing out, it is not taken for a job
     // whose download is done.
     pipeline.maybe_finish_download_pass(JOB);
@@ -1550,6 +1556,61 @@ async fn a_job_held_for_a_full_disk_at_its_end_counts_what_is_past_its_checkpoin
     );
 }
 
+// A job held, let go and restored from its stored checkpoint, whose write
+// fails again before the run takes a checkpoint of its own: what the stored
+// checkpoint holds still counts as in hand, and the job shows left what it
+// showed left the first time.
+#[tokio::test]
+async fn a_restored_job_held_again_before_its_first_checkpoint_keeps_what_was_stored_in_hand() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let body = payload(4 * ARTICLE, 127);
+    let scenario = on_disk_posting(&room, vec![Post::plain("ember.bin", body)]);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let articles = pipeline.jobs[&JOB].spec.files[0].segments.len();
+
+    // Two articles are in and written when a checkpoint is taken; the write
+    // of the next finds the disk full.
+    serve_one(&mut pipeline, &scenario).await;
+    serve_one(&mut pipeline, &scenario).await;
+    pipeline.pump_decode_queue();
+    while pipeline
+        .graph_jobs
+        .get(&JOB)
+        .is_some_and(|graph| graph.awaits_mail())
+    {
+        let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+        pipeline.graph_run_said(said);
+    }
+    pipeline.checkpoint_graph_job(JOB);
+    let stored = pipeline.graph_jobs[&JOB]
+        .pending()
+        .checkpoint_settled(0)
+        .len();
+    assert!(
+        (1..articles).contains(&stored),
+        "the checkpoint holds some of the job: {stored} of {articles}"
+    );
+    fill_after(Some(0));
+    until_full(&mut pipeline, &scenario).await;
+    let left = pipeline.jobs[&JOB].articles.queued_download_len();
+    assert_eq!(left, articles - stored);
+
+    fill_after(None);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 2 * PLENTY);
+    restarts(&mut pipeline).await;
+    assert!(pipeline.graph_jobs.contains_key(&JOB), "it was restored");
+
+    pipeline.hold_job_for_full_disk(JOB, StorageRoot::Intermediate, None);
+    pipeline.park_drained_jobs();
+    old_graph_heard(&mut pipeline).await;
+    assert_full_disk_held(&pipeline);
+    assert_eq!(
+        pipeline.jobs[&JOB].articles.queued_download_len(),
+        left,
+        "what the stored checkpoint holds is still in hand"
+    );
+}
+
 // A held job's old graph, still to hear its mail, says more than the job's
 // files hold: a cancel handed back for want of its archive takes no
 // checkpoint of it.
@@ -1566,7 +1627,7 @@ async fn a_cancel_handed_back_takes_no_checkpoint_of_a_held_jobs_old_graph() {
             .is_some_and(|job| job.awaits_mail())
     })
     .await;
-    pipeline.hold_job_for_full_disk(JOB, StorageRoot::Intermediate);
+    pipeline.hold_job_for_full_disk(JOB, StorageRoot::Intermediate, None);
     assert!(
         pipeline.retiring_graph_jobs.contains_key(&JOB),
         "the old graph still has something out"
@@ -1875,8 +1936,11 @@ async fn a_final_move_whose_destination_fills_waits_for_room_and_delivers_every_
     })
     .await;
     assert_move_held(&pipeline);
-    assert!(output.waited_on(), "it waits on the destination's disk");
-    assert_eq!(pipeline.storage_capacity.waited_paths(), 0);
+    // The device of the file that found no room was never read: the job
+    // waits on that file's own disk, not on a root taken from a folder
+    // above it.
+    assert!(!output.waited_on());
+    assert_eq!(pipeline.storage_capacity.waited_paths(), 1);
     let whole = delivered(&complete_dir)
         .iter()
         .filter(|(_, bytes)| bytes.len() == ARTICLE)
@@ -1902,7 +1966,7 @@ async fn a_final_move_whose_destination_fills_waits_for_room_and_delivers_every_
 
     destination_room(None);
     hears(&mut pipeline, &room, StorageRoot::Complete, 2 * PLENTY);
-    assert!(!output.waited_on());
+    assert_eq!(pipeline.storage_capacity.waited_paths(), 0);
     move_goes_on(&mut pipeline, &scenario, &complete_dir, &working_dir).await;
 }
 
@@ -2007,4 +2071,676 @@ async fn a_final_move_to_a_folder_on_its_own_disk_waits_on_that_disk() {
         "no one waits on the folder's disk, and it is read no more"
     );
     move_goes_on(&mut pipeline, &scenario, &library, &working_dir).await;
+}
+
+// The reserve of a job whose one file is larger than it.
+const KEPT: u64 = 1;
+
+// One file, on disks that keep `KEPT` free, whose destination has no room
+// for it: the job as its final move starts, and the file's size.
+async fn one_large_file(
+    room: &Arc<AtomicU64>,
+) -> (
+    tempfile::TempDir,
+    Pipeline,
+    std::path::PathBuf,
+    Scenario,
+    Vec<u8>,
+) {
+    let body = payload(3 * ARTICLE, 71);
+    let scenario = on_disk_keeping(room, vec![Post::plain("harbor.bin", body.clone())], KEPT);
+    let (temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
+    destination_room(Some(0));
+    drive(&mut pipeline, &scenario, JOB, |pipeline| {
+        pipeline.inflight_moves.contains(&JOB)
+    })
+    .await;
+    assert!(pipeline.inflight_moves.contains(&JOB), "the move started");
+    (temp_dir, pipeline, complete_dir, scenario, body)
+}
+
+// The one file is delivered once, whole, and the job completes.
+async fn one_file_delivered(
+    pipeline: &mut Pipeline,
+    scenario: &Scenario,
+    complete_dir: &Path,
+    body: &[u8],
+) {
+    assert!(!pipeline.held_for_full_disk(JOB), "the job was let go");
+    pipeline.resume_full_disk_moves().await;
+    assert!(pipeline.inflight_moves.contains(&JOB), "its move goes on");
+    drive(pipeline, scenario, JOB, |_| false).await;
+    assert_eq!(
+        job_status_for_assert(pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    let files = delivered(complete_dir);
+    assert_eq!(files.len(), 1, "the file once: {:?}", files.keys());
+    assert_eq!(file_named(&files, "harbor.bin"), body);
+    assert!(!pipeline.waits_for_disk_room());
+}
+
+// A file larger than the room its destination has: the copy fills the
+// disk, fails, and removes what it wrote, so the disk shows that room free
+// again with none made. A reading taken while the copy was writing showed
+// less. The job is held once, and the room the copy gave back does not let
+// it go, though it is more than the disk showed before: only a reading that
+// shows the room the file takes does. The file is then delivered once.
+#[tokio::test]
+async fn a_move_whose_copy_gave_its_room_back_waits_for_the_room_the_file_takes() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let (_temp_dir, mut pipeline, complete_dir, scenario, body) = one_large_file(&room).await;
+    let size = body.len() as u64;
+
+    // The disk is read while the copy is part written.
+    hears(&mut pipeline, &room, StorageRoot::Complete, size / 3);
+    drive(&mut pipeline, &scenario, JOB, |pipeline| {
+        pipeline.held_for_full_disk(JOB)
+    })
+    .await;
+    assert_move_held(&pipeline);
+    assert_eq!(
+        pipeline.full_disk_needs(JOB),
+        Some(size),
+        "the move needs the room its file takes"
+    );
+    assert!(
+        delivered(&complete_dir).is_empty(),
+        "the copy removed what it wrote"
+    );
+
+    // The disk shows what the copy gave back: more than it showed during
+    // the write, less than the file takes.
+    hears(&mut pipeline, &room, StorageRoot::Complete, 2 * size / 3);
+    assert_move_held(&pipeline);
+    hears(&mut pipeline, &room, StorageRoot::Complete, size - KEPT - 1);
+    assert_move_held(&pipeline);
+
+    destination_room(None);
+    hears(&mut pipeline, &room, StorageRoot::Complete, size);
+    one_file_delivered(&mut pipeline, &scenario, &complete_dir, &body).await;
+}
+
+// The disk read before the copy failed showed room enough for the file.
+// That reading, heard again once the job is held, does not let it go: only
+// a reading whose probe began after the failure counts.
+#[tokio::test]
+async fn a_reading_from_before_a_move_failed_does_not_let_the_job_go() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let (_temp_dir, mut pipeline, complete_dir, scenario, body) = one_large_file(&room).await;
+    // The disk fills as the copy is written; nothing reads it yet.
+    room.store(body.len() as u64 / 3, Ordering::Release);
+    drive(&mut pipeline, &scenario, JOB, |pipeline| {
+        pipeline.held_for_full_disk(JOB)
+    })
+    .await;
+    assert_move_held(&pipeline);
+    assert!(pipeline.full_disk_needs(JOB).is_some());
+
+    // The newest reading is the one from before the failure, or one taken
+    // since that shows the disk as it is: neither lets the job go.
+    pipeline.disk_reading();
+    assert_move_held(&pipeline);
+
+    destination_room(None);
+    hears(&mut pipeline, &room, StorageRoot::Complete, PLENTY);
+    one_file_delivered(&mut pipeline, &scenario, &complete_dir, &body).await;
+}
+
+// Twelve files whose move is held after the fifth: the job, where it works,
+// and where it delivers. `stamped` gives the working directory its
+// ownership marker.
+async fn held_after_five(
+    room: &Arc<AtomicU64>,
+    stamped: bool,
+) -> (
+    tempfile::TempDir,
+    Pipeline,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    Scenario,
+) {
+    let posts = twelve()
+        .into_iter()
+        .map(|(name, body)| Post::plain(&name, body))
+        .collect();
+    let scenario = on_disk_posting(room, posts);
+    let (temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
+    let working_dir = pipeline.jobs[&JOB].working_dir.clone();
+    if stamped {
+        crate::jobs::working_dir::stamp_working_dir(&pipeline.intermediate_dir, &working_dir, JOB)
+            .await
+            .unwrap();
+    }
+    destination_room(Some(5));
+    drive(&mut pipeline, &scenario, JOB, |pipeline| {
+        pipeline.held_for_full_disk(JOB)
+    })
+    .await;
+    assert_move_held(&pipeline);
+    destination_room(None);
+    // The disk reads no room over the reserve.
+    hears(&mut pipeline, room, StorageRoot::Complete, 0);
+    assert_move_held(&pipeline);
+    (temp_dir, pipeline, complete_dir, working_dir, scenario)
+}
+
+// The temp folder is changed while a job is held in its final move: the
+// job's working directory stays where it is, and once room is made the move
+// goes on from it and delivers every file, none left behind.
+#[tokio::test]
+async fn a_temp_folder_changed_during_a_held_move_loses_no_file() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let (temp_dir, mut pipeline, complete_dir, working_dir, scenario) =
+        held_after_five(&room, true).await;
+
+    let elsewhere = temp_dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    pipeline
+        .storage_capacity
+        .retarget(StorageRoot::Intermediate, elsewhere.clone());
+    pipeline.intermediate_dir = elsewhere;
+    pipeline.disk_reading();
+    assert_move_held(&pipeline);
+    assert!(working_dir.exists(), "the working directory stays");
+    assert_eq!(pipeline.jobs[&JOB].working_dir, working_dir);
+
+    hears(&mut pipeline, &room, StorageRoot::Complete, 2 * PLENTY);
+    move_goes_on(&mut pipeline, &scenario, &complete_dir, &working_dir).await;
+}
+
+// A held move whose working directory carries no ownership marker goes on
+// all the same: the job knows its own directory, and nothing looks for it.
+#[tokio::test]
+async fn a_held_move_whose_working_directory_has_no_marker_goes_on() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let (_temp_dir, mut pipeline, complete_dir, working_dir, scenario) =
+        held_after_five(&room, false).await;
+    hears(&mut pipeline, &room, StorageRoot::Complete, 2 * PLENTY);
+    move_goes_on(&mut pipeline, &scenario, &complete_dir, &working_dir).await;
+}
+
+// The folder a job delivers into cannot be made for want of room: the job
+// is held, not failed, waiting on that disk. Once room is made the move
+// claims its folder and delivers every file.
+#[tokio::test]
+async fn a_destination_that_cannot_be_made_for_want_of_room_holds_the_job() {
+    use crate::pipeline::completion::finalize::CLAIM_FULL;
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let posts = twelve()
+        .into_iter()
+        .map(|(name, body)| Post::plain(&name, body))
+        .collect();
+    let scenario = on_disk_posting(&room, posts);
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
+    let working_dir = pipeline.jobs[&JOB].working_dir.clone();
+    let output = Arc::clone(
+        pipeline
+            .storage_capacity
+            .reader(StorageRoot::Complete)
+            .ledger(),
+    );
+
+    CLAIM_FULL.store(true, Ordering::Release);
+    drive(&mut pipeline, &scenario, JOB, |pipeline| {
+        pipeline.held_for_full_disk(JOB)
+    })
+    .await;
+    assert_move_held(&pipeline);
+    assert!(output.waited_on(), "it waits on the destination's disk");
+    assert_eq!(pipeline.full_disk_needs(JOB), None);
+    // The job's completion is looked at again while it waits: no move
+    // starts.
+    pipeline.check_job_completion(JOB).await;
+    assert_move_held(&pipeline);
+
+    hears(&mut pipeline, &room, StorageRoot::Complete, PLENTY);
+    assert_move_held(&pipeline);
+
+    CLAIM_FULL.store(false, Ordering::Release);
+    hears(&mut pipeline, &room, StorageRoot::Complete, 2 * PLENTY);
+    assert!(!output.waited_on());
+    move_goes_on(&mut pipeline, &scenario, &complete_dir, &working_dir).await;
+}
+
+// A path whose disk was never read is waited on as itself, with no look at
+// its device as the job is held. So is a path below a root's folder whose
+// own device was never read: the folder above it may lie on another disk.
+// Only the root's own folder, whose device is known, is that root's disk.
+#[tokio::test]
+async fn a_failing_path_on_a_disk_not_known_is_waited_on_as_itself() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let scenario = on_disk(&room);
+    let (temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
+    let capacity = Arc::clone(&pipeline.storage_capacity);
+    let unseen = temp_dir.path().join("never-read").join("folder");
+    crate::runtime::fs::test_devices::assign(&pipeline.intermediate_dir, 1);
+    crate::runtime::fs::test_devices::assign(&pipeline.complete_dir, 2);
+    for root in StorageRoot::ALL {
+        let begun = capacity.probes_begun(root);
+        capacity.request_refresh(root);
+        capacity.wait_for_reading_begun_after(root, begun);
+    }
+    assert_eq!(
+        capacity.known_root_of(&complete_dir),
+        Some(StorageRoot::Complete)
+    );
+    assert_eq!(
+        capacity.known_root_of(&pipeline.intermediate_dir),
+        Some(StorageRoot::Intermediate)
+    );
+    let below = complete_dir.join("ember").join("a.bin");
+    assert_eq!(capacity.known_root_of(&below), None);
+    assert_eq!(
+        capacity.known_root_of(&pipeline.intermediate_dir.join("ember")),
+        None
+    );
+    assert_eq!(capacity.known_root_of(&unseen), None);
+
+    let asks = crate::operations::disk::same_filesystem_asks();
+    pipeline.hold_move_for_full_disk(
+        JOB,
+        crate::pipeline::full_disk::Stage::Restored,
+        &below,
+        "no room",
+        None,
+    );
+    assert!(
+        pipeline.full_disk_on_path(JOB),
+        "a path below a known folder is waited on as itself"
+    );
+    assert_eq!(capacity.waited_paths(), 1);
+    assert!(pipeline.drop_full_disk_hold(JOB).is_some());
+    assert_eq!(capacity.waited_paths(), 0);
+    pipeline.hold_move_for_full_disk(
+        JOB,
+        crate::pipeline::full_disk::Stage::Restored,
+        &unseen,
+        "no room",
+        None,
+    );
+    assert!(pipeline.full_disk_on_path(JOB), "the path is waited on");
+    assert_eq!(capacity.waited_paths(), 1);
+    assert_eq!(
+        crate::operations::disk::same_filesystem_asks(),
+        asks,
+        "no device was asked after"
+    );
+}
+
+// The cleanup of a cancelled job has run.
+async fn cleaned_up(pipeline: &Pipeline) {
+    while pipeline
+        .shared_state
+        .queue
+        .read(|inner| inner.pending_cleanup.contains(&JOB))
+    {
+        tokio::task::yield_now().await;
+    }
+}
+
+// A job held in its final move cannot be paused, and can be cancelled, with
+// its history deleted or kept: no hold, no wait on any disk, no working
+// directory and no part-filled destination are left.
+#[tokio::test]
+async fn a_job_held_in_its_final_move_is_cancelled_and_deleted_clean() {
+    for delete in [false, true] {
+        let room = Arc::new(AtomicU64::new(PLENTY));
+        let (_temp_dir, mut pipeline, complete_dir, working_dir, _scenario) =
+            held_after_five(&room, true).await;
+        let output = Arc::clone(
+            pipeline
+                .storage_capacity
+                .reader(StorageRoot::Complete)
+                .ledger(),
+        );
+        assert!(std::fs::read_dir(&complete_dir).unwrap().next().is_some());
+
+        let handle = handle(&pipeline);
+        assert!(
+            handle.pause_job(JOB).await.is_err(),
+            "a job held in its move is not paused"
+        );
+        if delete {
+            handle.cancel_job_and_delete_history(JOB).await.unwrap();
+        } else {
+            handle.cancel_job(JOB).await.unwrap();
+        }
+        pipeline.apply_queue_intents().await;
+        super::super::finish_cancel_jobs(&mut pipeline).await;
+        assert!(!pipeline.held_for_full_disk(JOB), "no hold is left");
+        assert!(!pipeline.waits_for_disk_room());
+        assert!(!output.waited_on());
+        assert_eq!(pipeline.storage_capacity.waited_paths(), 0);
+        assert!(!pipeline.reserved_complete_destinations.contains_key(&JOB));
+        cleaned_up(&pipeline).await;
+        assert!(!working_dir.exists(), "the working directory is gone");
+        assert!(
+            std::fs::read_dir(&complete_dir).unwrap().next().is_none(),
+            "the part-filled destination is gone"
+        );
+    }
+}
+
+// Post-processing is paused while a job is held in its final move: room
+// made does not start the move, as it starts no first move. The job goes on
+// when post-processing resumes.
+#[tokio::test]
+async fn a_held_move_let_go_waits_while_post_processing_is_paused() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let (_temp_dir, mut pipeline, complete_dir, working_dir, scenario) =
+        held_after_five(&room, true).await;
+    let handle = handle(&pipeline);
+    handle.pause_post_processing().await.unwrap();
+    pipeline.apply_queue_intents().await;
+
+    hears(&mut pipeline, &room, StorageRoot::Complete, 2 * PLENTY);
+    assert_move_held(&pipeline);
+    pipeline.resume_full_disk_moves().await;
+    assert!(!pipeline.inflight_moves.contains(&JOB), "no move starts");
+
+    handle.resume_post_processing().await.unwrap();
+    pipeline.apply_queue_intents().await;
+    move_goes_on(&mut pipeline, &scenario, &complete_dir, &working_dir).await;
+}
+
+// A name the destination and the working directory both hold when a held
+// move goes on: the destination keeps what it holds, as on a first move,
+// and every other file is delivered.
+#[tokio::test]
+async fn a_held_move_keeps_a_name_the_destination_already_holds() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let (_temp_dir, mut pipeline, complete_dir, working_dir, scenario) =
+        held_after_five(&room, true).await;
+    // A name no copy was cut short on: the names that were are moved again.
+    let waiting = "harbor-extra.bin";
+    assert!(
+        pipeline
+            .full_disk_cut_short(JOB)
+            .iter()
+            .all(|path| !path.ends_with(waiting))
+    );
+    std::fs::write(working_dir.join(waiting), b"from the working directory").unwrap();
+    let folder = std::fs::read_dir(&complete_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::write(folder.join(waiting), b"already here").unwrap();
+
+    hears(&mut pipeline, &room, StorageRoot::Complete, 2 * PLENTY);
+    assert!(!pipeline.held_for_full_disk(JOB), "the job was let go");
+    pipeline.resume_full_disk_moves().await;
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    let files = delivered(&complete_dir);
+    assert_eq!(
+        std::fs::read(folder.join(waiting)).unwrap(),
+        b"already here",
+        "{:?}",
+        files.keys()
+    );
+    for (name, body) in twelve() {
+        assert_eq!(file_named(&files, &name), body.as_slice(), "{name}");
+    }
+    assert!(
+        !matches!(
+            job_status_for_assert(&pipeline, JOB),
+            Some(JobStatus::Failed { .. })
+        ),
+        "{:?}",
+        job_status_for_assert(&pipeline, JOB)
+    );
+}
+
+// The copy that found no room left what it wrote in the destination. The
+// hold records that name, and the move let go replaces it from the working
+// directory: the file is whole, and there once.
+#[tokio::test]
+async fn a_copy_cut_short_that_stays_in_the_destination_is_delivered_whole() {
+    use crate::pipeline::completion::finalize::PARTIAL_STAYS;
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    PARTIAL_STAYS.store(true, Ordering::Release);
+    let (_temp_dir, mut pipeline, complete_dir, working_dir, scenario) =
+        held_after_five(&room, true).await;
+    PARTIAL_STAYS.store(false, Ordering::Release);
+    // Every file past the fifth found no room.
+    let cut_short = pipeline.full_disk_cut_short(JOB);
+    assert_eq!(cut_short.len(), 7, "{cut_short:?}");
+    for partial in &cut_short {
+        assert_eq!(
+            std::fs::metadata(partial).unwrap().len(),
+            ARTICLE as u64 / 2,
+            "half of the file stands in the destination"
+        );
+        assert!(
+            working_dir.join(partial.file_name().unwrap()).exists(),
+            "its source stays"
+        );
+    }
+
+    hears(&mut pipeline, &room, StorageRoot::Complete, 2 * PLENTY);
+    move_goes_on(&mut pipeline, &scenario, &complete_dir, &working_dir).await;
+}
+
+// A second job beside `JOB`, with one small file.
+const SECOND: JobId = JobId(93_012);
+
+async fn add_second(pipeline: &mut Pipeline) {
+    let spec = crate::pipeline::tests::segmented_job_spec("cinder", "cinder.bin", &[512; 4]);
+    let nzb_zstd = crate::pipeline::tests::nzb_zstd_for(&spec);
+    pipeline
+        .add_job(
+            SECOND,
+            spec,
+            std::path::PathBuf::from("cinder.nzb"),
+            nzb_zstd,
+            crate::jobs::AddJobOptions::default(),
+        )
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
+    assert!(pipeline.jobs.contains_key(&SECOND));
+}
+
+// Two jobs wait on one disk, each for 60 of the 100 a reading then shows.
+// One goes, and its 60 stay counted against the disk: the other waits, on
+// that reading and on any like it. When the first one's step has ended,
+// here by its being held again, the other is judged on a reading taken
+// after that, never on the one from before, and goes when that shows room.
+#[tokio::test]
+async fn room_promised_to_one_held_job_is_not_promised_to_the_next() {
+    use crate::pipeline::full_disk::Stage;
+    const UNIT: u64 = 1 << 20;
+    let room = Arc::new(AtomicU64::new(0));
+    let scenario = on_disk_keeping(
+        &room,
+        vec![Post::plain("harbor.bin", payload(ARTICLE, 7))],
+        KEPT,
+    );
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
+    add_second(&mut pipeline).await;
+    assert_eq!(pipeline.full_disk_promised_bytes(), 0);
+    for job in [JOB, SECOND] {
+        pipeline.hold_move_for_full_disk(
+            job,
+            Stage::Claim(Default::default()),
+            &complete_dir,
+            "no room",
+            Some(60 * UNIT),
+        );
+        assert!(pipeline.held_for_full_disk(job));
+        assert!(!pipeline.full_disk_on_path(job), "both wait on the root");
+    }
+
+    hears(&mut pipeline, &room, StorageRoot::Complete, 100 * UNIT);
+    let held = [JOB, SECOND].map(|job| pipeline.held_for_full_disk(job));
+    assert_eq!(
+        held.iter().filter(|held| **held).count(),
+        1,
+        "one goes and one waits: {held:?}"
+    );
+    let (went, waits) = if held[0] {
+        (SECOND, JOB)
+    } else {
+        (JOB, SECOND)
+    };
+    assert_eq!(pipeline.full_disk_promised_bytes(), 60 * UNIT);
+    // The same room read again is still promised.
+    hears(&mut pipeline, &room, StorageRoot::Complete, 100 * UNIT);
+    assert!(pipeline.held_for_full_disk(waits));
+    hears(&mut pipeline, &room, StorageRoot::Complete, 119 * UNIT);
+    assert!(pipeline.held_for_full_disk(waits));
+
+    // The first one's step ends: it found the disk full again, and waits
+    // with no figure of its own. Its step filled the disk.
+    room.store(59 * UNIT, Ordering::Release);
+    pipeline.hold_move_for_full_disk(
+        went,
+        Stage::Claim(Default::default()),
+        &complete_dir,
+        "no room",
+        None,
+    );
+    assert_eq!(pipeline.full_disk_promised_bytes(), 0);
+    // The reading from before that step ended showed room the step has
+    // filled since: heard again, it lets no one go, and neither does a
+    // reading taken since.
+    pipeline.disk_reading();
+    assert!(pipeline.held_for_full_disk(waits));
+    assert!(pipeline.held_for_full_disk(went));
+
+    // A new reading that shows too little keeps it; one that shows the room
+    // lets it go, and that room is promised to it.
+    hears(&mut pipeline, &room, StorageRoot::Complete, 59 * UNIT);
+    assert!(pipeline.held_for_full_disk(waits));
+    hears(&mut pipeline, &room, StorageRoot::Complete, 100 * UNIT);
+    assert!(!pipeline.held_for_full_disk(waits), "the other goes");
+    assert!(pipeline.held_for_full_disk(went));
+    assert_eq!(pipeline.full_disk_promised_bytes(), 60 * UNIT);
+}
+
+// A job held before it claimed its destination is let go. A cancel taken
+// before its move begins wins: no move starts, and the job is cancelled
+// clean. Once its move has begun, in the one step before anything is
+// awaited, a cancel is refused as for any moving job. Never both.
+#[tokio::test]
+async fn a_cancel_and_a_move_let_go_never_both_win() {
+    use crate::pipeline::completion::finalize::CLAIM_FULL;
+    for cancel_first in [true, false] {
+        let room = Arc::new(AtomicU64::new(PLENTY));
+        let posts = twelve()
+            .into_iter()
+            .map(|(name, body)| Post::plain(&name, body))
+            .collect();
+        let scenario = on_disk_posting(&room, posts);
+        let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
+        let working_dir = pipeline.jobs[&JOB].working_dir.clone();
+        CLAIM_FULL.store(true, Ordering::Release);
+        drive(&mut pipeline, &scenario, JOB, |pipeline| {
+            pipeline.held_for_full_disk(JOB)
+        })
+        .await;
+        assert_move_held(&pipeline);
+        CLAIM_FULL.store(false, Ordering::Release);
+        hears(&mut pipeline, &room, StorageRoot::Complete, PLENTY);
+        hears(&mut pipeline, &room, StorageRoot::Complete, 2 * PLENTY);
+        assert!(!pipeline.held_for_full_disk(JOB), "the job was let go");
+        let handle = handle(&pipeline);
+
+        if cancel_first {
+            handle.cancel_job(JOB).await.unwrap();
+            assert!(
+                !pipeline.begin_let_go_move(JOB),
+                "the cancel stops the move"
+            );
+            pipeline.resume_full_disk_moves().await;
+            assert!(!pipeline.inflight_moves.contains(&JOB), "no move starts");
+            assert!(!pipeline.reserved_complete_destinations.contains_key(&JOB));
+            pipeline.apply_queue_intents().await;
+            super::super::finish_cancel_jobs(&mut pipeline).await;
+            cleaned_up(&pipeline).await;
+            assert!(!working_dir.exists(), "the working directory is gone");
+            assert!(delivered(&complete_dir).is_empty(), "nothing was delivered");
+        } else {
+            assert!(pipeline.begin_let_go_move(JOB), "the move begins");
+            assert!(
+                handle.cancel_job(JOB).await.is_err(),
+                "a job whose move has begun is not cancelled"
+            );
+            // The move goes on as begun.
+            move_goes_on(&mut pipeline, &scenario, &complete_dir, &working_dir).await;
+        }
+    }
+}
+
+// A job held after part of its files were moved; the temp folder is then
+// pointed elsewhere, and weaver starts again: the job comes back from its
+// moving row, which names the destination and where the move comes from.
+// With or without an ownership marker on the working directory, the move is
+// not taken for finished: it goes on from the recorded source, and every
+// file is delivered.
+#[tokio::test]
+async fn a_restart_during_a_held_move_delivers_every_file_from_the_recorded_source() {
+    for stamped in [true, false] {
+        let room = Arc::new(AtomicU64::new(PLENTY));
+        let (temp_dir, mut pipeline, complete_dir, working_dir, scenario) =
+            held_after_five(&room, stamped).await;
+        assert_eq!(
+            pipeline.jobs[&JOB].delivery_source.as_deref(),
+            Some(working_dir.as_path()),
+            "the move's source is kept with the job"
+        );
+        let facts = pipeline.fresh_post_processing_facts(
+            JOB,
+            crate::post_processing::model::PipelineOutcome::Succeeded,
+        );
+        assert_eq!(facts.source.as_deref(), Some(working_dir.as_path()));
+        let stored: crate::post_processing::model::PostProcessingFacts =
+            serde_json::from_str(&serde_json::to_string(&facts).unwrap()).unwrap();
+        assert_eq!(
+            stored.source.as_deref(),
+            Some(working_dir.as_path()),
+            "the moving row carries it"
+        );
+        let dest = pipeline.full_disk_cut_short(JOB)[0]
+            .parent()
+            .unwrap()
+            .to_path_buf();
+
+        let elsewhere = temp_dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        pipeline
+            .storage_capacity
+            .retarget(StorageRoot::Intermediate, elsewhere.clone());
+        pipeline.intermediate_dir = elsewhere;
+
+        // The job as a restart restores it from its moving row: no hold, no
+        // destination reserved, the row's directory as where it stands, and
+        // the source the row recorded.
+        assert!(pipeline.drop_full_disk_hold(JOB).is_some());
+        pipeline.reserved_complete_destinations.remove(&JOB);
+        {
+            let state = pipeline.jobs.get_mut(&JOB).unwrap();
+            state.working_dir = dest;
+            state.delivery_source = stored.source;
+        }
+        pipeline.resume_restored_move(JOB).await;
+        assert!(
+            pipeline.inflight_moves.contains(&JOB),
+            "the move goes on: {:?}",
+            job_status_for_assert(&pipeline, JOB)
+        );
+        drive(&mut pipeline, &scenario, JOB, |_| false).await;
+        assert_eq!(
+            job_status_for_assert(&pipeline, JOB),
+            Some(JobStatus::Complete)
+        );
+        let files = delivered(&complete_dir);
+        assert_eq!(files.len(), 12, "each file once: {:?}", files.keys());
+        for (name, body) in twelve() {
+            assert_eq!(file_named(&files, &name), body.as_slice(), "{name}");
+        }
+        assert!(!working_dir.exists(), "the sources are gone");
+    }
 }

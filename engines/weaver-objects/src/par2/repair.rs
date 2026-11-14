@@ -119,6 +119,16 @@ pub(super) fn repair_set(
             )
         })
         .collect();
+    // Every slice of a bound member that is not valid is written, copied or
+    // rebuilt, so that many slices is what this repair writes.
+    let writes = validity
+        .iter()
+        .filter(|(file, _)| state.members().contains_key(file))
+        .map(|(_, valid)| valid.iter().filter(|valid| !**valid).count() as u64)
+        .sum::<u64>();
+    if writes > 0 {
+        access.will_write(writes.saturating_mul(slice_size));
+    }
     let mut donors = BTreeMap::new();
     let copied = copy_held(
         state,

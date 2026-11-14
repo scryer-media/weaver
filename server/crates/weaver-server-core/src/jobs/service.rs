@@ -644,6 +644,7 @@ impl Pipeline {
             failure_error: None,
             delivered: None,
             delivery_left_behind: Vec::new(),
+            delivery_source: None,
             working_dir: working_dir.clone(),
             downloaded_bytes: restart
                 .as_ref()
@@ -1081,6 +1082,7 @@ impl Pipeline {
             failure_error: Some(reason),
             delivered: None,
             delivery_left_behind: Vec::new(),
+            delivery_source: None,
             working_dir: request.working_dir.clone(),
             downloaded_bytes: 0,
             checkpointed_download_bytes: 0,
@@ -1185,6 +1187,7 @@ impl Pipeline {
             finalization_open,
             delivered,
             delivery_left_behind,
+            delivery_source,
             post_processing,
         } = restored;
         if self.jobs.contains_key(&job_id) {
@@ -1396,6 +1399,7 @@ impl Pipeline {
             },
             delivered: None,
             delivery_left_behind: Vec::new(),
+            delivery_source: None,
             working_dir,
             downloaded_bytes,
             checkpointed_download_bytes: downloaded_bytes,
@@ -1455,6 +1459,7 @@ impl Pipeline {
         if delivering && let Some(state) = self.jobs.get_mut(&job_id) {
             state.delivered = delivered;
             state.delivery_left_behind = delivery_left_behind;
+            state.delivery_source = delivery_source;
         }
         self.schedule_job_completion_check(job_id);
         // An interrupted move goes on once the install's turn is done; its
@@ -1586,6 +1591,8 @@ pub(crate) struct RestoredFacts {
     delivered: Option<crate::post_processing::model::DeliveredVerdict>,
     // What that delivery's move was told to leave in the working directory.
     delivery_left_behind: Vec<PathBuf>,
+    // The working directory that move delivers from.
+    delivery_source: Option<PathBuf>,
     // What a job restored in post-processing is finished or resumed from.
     post_processing: Option<crate::pipeline::RestoredPostProcessing>,
 }
@@ -1885,18 +1892,18 @@ async fn read_restored(
     );
     // A delivery that had begun keeps what its graph ruled, read back from
     // its row.
-    let (delivered, delivery_left_behind) = if delivering {
+    let (delivered, delivery_left_behind, delivery_source) = if delivering {
         match off_thread(db, move |db| db.job_post_processing_facts(job_id.0)).await {
-            Ok(facts) => facts.map_or((None, Vec::new()), |facts| {
-                (facts.delivered, facts.left_behind)
+            Ok(facts) => facts.map_or((None, Vec::new(), None), |facts| {
+                (facts.delivered, facts.left_behind, facts.source)
             }),
             Err(error) => {
                 tracing::warn!(job_id = job_id.0, %error, "could not read what the delivery ruled");
-                (None, Vec::new())
+                (None, Vec::new(), None)
             }
         }
     } else {
-        (None, Vec::new())
+        (None, Vec::new(), None)
     };
     let post_processing = if matches!(
         request.status,
@@ -1921,6 +1928,7 @@ async fn read_restored(
         finalization_open,
         delivered,
         delivery_left_behind,
+        delivery_source,
         post_processing,
     })
 }
