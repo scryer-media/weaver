@@ -1478,7 +1478,7 @@ fn reporting_what_is_outstanding(
 #[test]
 fn a_batchs_failures_are_reported_before_a_settle_of_it_can_end() {
     let dir = tempfile::tempdir().unwrap();
-    let (writers, lane, seen) = reporting_what_is_outstanding(|report| VolumeWriters::new(report));
+    let (writers, lane, seen) = reporting_what_is_outstanding(VolumeWriters::new);
     let volume = volume("one");
     let hold = writers.hold(&volume);
     let job = writers.submitter(&volume, 1);
@@ -1507,8 +1507,7 @@ fn a_batchs_failures_are_reported_before_a_settle_of_it_can_end() {
 #[test]
 fn a_failure_on_a_volume_with_no_thread_is_reported_before_a_settle_can_end() {
     let dir = tempfile::tempdir().unwrap();
-    let (writers, lane, seen) =
-        reporting_what_is_outstanding(|report| VolumeWriters::threadless(report));
+    let (writers, lane, seen) = reporting_what_is_outstanding(VolumeWriters::threadless);
     let volume = volume("one");
     let job = writers.submitter(&volume, 1);
     *lane.lock().unwrap() = Some(Arc::clone(&job.lane));

@@ -102,11 +102,7 @@ fn mount_path(_existing: &Path) -> Option<String> {
 // The highest of `path` and its ancestors that `device_of` still finds on
 // `device`, climbing until one is on another.
 #[cfg(any(test, all(unix, not(target_vendor = "apple"))))]
-fn top_on_device<'a>(
-    path: &'a Path,
-    device_of: impl Fn(&Path) -> Option<u64>,
-    device: u64,
-) -> &'a Path {
+fn top_on_device(path: &Path, device_of: impl Fn(&Path) -> Option<u64>, device: u64) -> &Path {
     let mut top = path;
     for above in path.ancestors().skip(1) {
         if device_of(above) != Some(device) {

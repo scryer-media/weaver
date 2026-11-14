@@ -107,6 +107,9 @@ impl std::fmt::Debug for Writing {
 
 type Probe = Box<dyn FnOnce() -> std::io::Result<()> + Send>;
 
+// What makes a volume's probe, given a directory on it that is there.
+type MakeProbe = dyn Fn(Arc<Volume>, PathBuf) -> Probe + Send + Sync;
+
 // What gives each volume its first write rate: the first time a job is
 // given a volume's writer, the volume's probe is left with that writer for
 // when it has nothing queued, and never again for that volume: the job's
@@ -115,7 +118,7 @@ type Probe = Box<dyn FnOnce() -> std::io::Result<()> + Send>;
 // nothing here looks at a disk.
 pub(crate) struct VolumeProbes {
     // The probe of a volume, given a directory on it that is there.
-    probe: Option<Arc<dyn Fn(Arc<Volume>, PathBuf) -> Probe + Send + Sync>>,
+    probe: Option<Arc<MakeProbe>>,
     // The volumes whose probe was queued: one entry for each device.
     seen: std::sync::Mutex<Vec<Arc<Volume>>>,
 }

@@ -238,10 +238,11 @@ impl Pipeline {
         }
         let eligible = self.download_scheduler_eligible_jobs();
         // Every job is asked, so every stopped volume has its wake.
-        !eligible.is_empty()
-            && eligible.iter().fold(true, |all, job_id| {
-                (self.volume_refuses_job(*job_id) || (room && self.ask_room_wake(*job_id))) && all
-            })
+        let mut all = !eligible.is_empty();
+        for job_id in &eligible {
+            all &= self.volume_refuses_job(*job_id) || (room && self.ask_room_wake(*job_id));
+        }
+        all
     }
 
     // Whether an idle hold is left as it is while the volumes refuse every

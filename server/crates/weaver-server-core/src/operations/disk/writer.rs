@@ -416,10 +416,7 @@ impl VolumeWriters {
             Arc::clone(volume),
             Arc::clone(&self.report),
             self.rates.clone(),
-            Arc::clone(&self.registry.stopped),
-            Arc::clone(&self.registry.loop_end),
-            (!inline).then(|| Arc::clone(&self.registry.returns)),
-            Arc::downgrade(&self.registry),
+            &self.registry,
             inline,
             threadless,
         );
@@ -1475,13 +1472,14 @@ impl Lane {
         volume: Arc<Volume>,
         report: Arc<ReportFn>,
         rates: Option<Arc<RateSignal>>,
-        stopped: Arc<AtomicBool>,
-        loop_end: Arc<LoopEnd>,
-        returns: Option<Arc<Returns>>,
-        registry: Weak<Registry>,
+        registry: &Arc<Registry>,
         inline: bool,
         threadless: bool,
     ) -> Arc<Self> {
+        let stopped = Arc::clone(&registry.stopped);
+        let loop_end = Arc::clone(&registry.loop_end);
+        let returns = (!inline).then(|| Arc::clone(&registry.returns));
+        let registry = Arc::downgrade(registry);
         let (send, queued) = mpsc::channel();
         let state = Arc::new(LaneState {
             volume,

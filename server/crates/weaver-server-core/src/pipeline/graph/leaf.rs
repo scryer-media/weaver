@@ -859,9 +859,8 @@ impl Leaf {
         self.revision += 1;
         self.written.clear();
         self.change(0, u64::MAX);
-        if self.queued.is_some() {
-            let create = self.create(None);
-            let queued = self.queued.as_mut().expect("checked above");
+        let create = self.queued.is_some().then(|| self.create(None));
+        if let (Some(create), Some(queued)) = (create, self.queued.as_mut()) {
             queued.let_go();
             queued.last = queued.to.truncate(self.identity, create);
             return Ok(());

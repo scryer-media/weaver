@@ -26,6 +26,9 @@ use crate::pipeline::graph::decoding::Decoding;
 use crate::pipeline::graph::envelope::{ReadFiles, Shelf, Shelved};
 use crate::pipeline::graph::leaf::read_exact_at;
 
+// The file a read is in, and the barrier its bytes wait on, if any.
+type ReadAt = (std::path::PathBuf, Option<Barrier>);
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Unreadable {
     #[error("the run was stopped")]
@@ -191,7 +194,7 @@ impl RunVolumes {
         &self,
         volume: VolumeIndex,
         range: ByteRange,
-    ) -> Result<(u64, Option<(std::path::PathBuf, Option<Barrier>)>), Unreadable> {
+    ) -> Result<(u64, Option<ReadAt>), Unreadable> {
         let mut state = self.shelf.lock();
         loop {
             if state.generation != self.generation || self.stopped() {
