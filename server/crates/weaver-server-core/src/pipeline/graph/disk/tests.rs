@@ -395,3 +395,52 @@ fn a_volume_is_over_its_budget_only_while_the_bytes_wait() {
     barrier.wait();
     assert!(!disk.over(budget));
 }
+
+// A job whose delivered files lie on another volume than its working
+// directory waits for both writers: one volume putting its part down
+// leaves the job's barrier standing until the other has, and a failure on
+// either stands against the job.
+#[test]
+fn a_job_on_two_volumes_waits_for_both() {
+    let through = writers();
+    let other = Arc::new(Volume::new(Some(2), "other".to_owned()));
+    let dir = tempfile::tempdir().unwrap();
+    let (working_dir, output_dir) = (dir.path().join("working"), dir.path().join("output"));
+    std::fs::create_dir_all(&working_dir).unwrap();
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let disk = JobDisk::new(
+        through.writers.submitter(&through.volume, 1),
+        Some((output_dir.clone(), through.writers.submitter(&other, 1))),
+    );
+    let (hold, other_hold) = (through.hold(), through.writers.hold(&other));
+    for root in [&working_dir, &output_dir] {
+        let path = root.join("lantern.bin");
+        let to = path.clone();
+        disk.under(&path)
+            .run(None, path, move || std::fs::write(&to, b"lantern"));
+    }
+    assert!(Arc::ptr_eq(disk.under(&output_dir.join("lantern.bin")).volume(), &other));
+    let barrier = disk.barrier();
+    assert!(!disk.quiet());
+    hold.open();
+    disk.working().barrier().wait();
+    assert!(working_dir.join("lantern.bin").exists());
+    assert!(!barrier.returned(), "the other volume still holds its part");
+    assert!(!disk.quiet());
+    assert!(!output_dir.join("lantern.bin").exists());
+    other_hold.fail_next(std::io::Error::other("the other disk is gone"));
+    other_hold.open();
+    barrier.wait();
+    assert!(disk.quiet());
+    assert!(barrier.returned());
+    assert!(!barrier.passed(), "a failure on either volume stands against the job");
+    let failures: Vec<_> = through
+        .reports
+        .iter()
+        .flat_map(|report| report.failures)
+        .take(1)
+        .collect();
+    assert_eq!(failures[0].key, 1);
+    assert_eq!(failures[0].error.to_string(), "the other disk is gone");
+    assert!(!output_dir.join("lantern.bin").exists());
+}

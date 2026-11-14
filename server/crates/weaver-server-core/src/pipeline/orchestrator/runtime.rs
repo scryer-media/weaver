@@ -195,9 +195,16 @@ impl Pipeline {
         let graph_runs = crate::pipeline::graph::engine::RunMail::default();
         let disk_mail = graph_runs.written();
         // A pipeline under test reads its files right after it writes
-        // them, so its writers run each operation as it is submitted.
+        // them, so its writers run each operation as it is submitted,
+        // unless the test asked for a thread per volume.
         #[cfg(test)]
-        let volume_writers_of = crate::operations::disk::writer::VolumeWriters::inline;
+        let volume_writers_of = |report| {
+            if crate::pipeline::graph::disk::threads::asked() {
+                crate::operations::disk::writer::VolumeWriters::new(report)
+            } else {
+                crate::operations::disk::writer::VolumeWriters::inline(report)
+            }
+        };
         #[cfg(not(test))]
         let volume_writers_of = crate::operations::disk::writer::VolumeWriters::new;
         let volume_rates = storage_capacity.volume_rate_signal();

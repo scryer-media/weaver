@@ -1625,6 +1625,7 @@ async fn a_repair_of_an_article_that_passed_its_checksum_retracts_what_the_engin
 }
 
 mod refusals;
+mod threads;
 
 // The articles of a recovery volume's head: enough for its first recovery
 // packet to pass, which is what tells the PAR2 object what the volume is.

@@ -38,6 +38,32 @@ pub(crate) fn job_disk(
     JobDisk::new(working, output)
 }
 
+// A test's say over how the pipelines it builds write: one thread per
+// volume, as outside tests, instead of each operation as it is submitted.
+#[cfg(test)]
+pub(crate) mod threads {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static ASKED: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) struct Threads(());
+
+    pub(crate) fn real() -> Threads {
+        ASKED.store(true, Ordering::SeqCst);
+        Threads(())
+    }
+
+    pub(crate) fn asked() -> bool {
+        ASKED.load(Ordering::SeqCst)
+    }
+
+    impl Drop for Threads {
+        fn drop(&mut self) {
+            ASKED.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
 impl Pipeline {
     // Whether a volume the job writes to holds the write budget or more for
     // its writer. Dispatch for the job stops while one does, and the batch
