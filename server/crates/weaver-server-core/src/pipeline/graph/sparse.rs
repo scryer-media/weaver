@@ -57,9 +57,6 @@ pub(crate) fn create_sparse<M: SparseMarker>(path: &Path, marker: &M) -> io::Res
 // gives a file its declared length when it is made. Where it cannot, every
 // file grows as it is written. Read by tests, which accept a sized file only
 // where one can be made.
-#[cfg(test)]
-pub(crate) const PRESIZES: bool = cfg!(any(windows, target_os = "linux", target_vendor = "apple"));
-
 // Whether a new file made in `dir` is given its declared length: the mark
 // and the filesystem asked directly, about a file of their own, with nothing
 // held. What a test on a real directory expects of it.
