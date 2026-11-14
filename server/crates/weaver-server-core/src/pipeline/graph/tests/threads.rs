@@ -899,6 +899,84 @@ async fn a_stopped_repair_is_taken_back_once_its_volume_has_settled() {
     drop(hold);
 }
 
+// A repair that comes back while the owner is stopping is applied within
+// the volume's limit like any other: the stop that sends producing threads
+// on does not send the loop on, so the loop stands still for the volume
+// with one run queued. When the stop's span ends with the volume still at
+// its limit the applying ends there: nothing more is queued, the job does
+// not fail, and it is left at its last written checkpoint.
+#[tokio::test]
+async fn a_repair_applied_during_a_stop_keeps_the_volumes_limit_until_the_stops_end() {
+    use crate::operations::disk::writer::HandClock;
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_419);
+    let data = payload(4 * ARTICLE, 4);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 2));
+    let (mut pipeline, _, _) = crate::pipeline::tests::new_direct_pipeline(&temp_dir).await;
+    const BUDGET: u64 = 1;
+    pipeline.volume_buffers.set_figure(BUDGET, u64::MAX);
+    insert_active_job(&mut pipeline, job_id, spec("lantern joined", &posts, ARTICLE)).await;
+    // Two articles apart are lost: the repair rebuilds two runs.
+    for ordinal in [1, 3] {
+        decode(&mut pipeline, job_id, &posts, 0, ordinal, true).await;
+    }
+    for ordinal in [0, 2] {
+        pipeline.book_terminal_segment(segment_id(job_id, 0, ordinal), SegmentTerminalState::Missing);
+    }
+    for index in 1..posts.len() as u32 {
+        decode_all(&mut pipeline, job_id, &posts, index).await;
+    }
+    assert!(pipeline.graph_jobs[&job_id].repair_out());
+    let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    let volume = Arc::clone(disk.working().volume());
+    let clock = Arc::new(HandClock::default());
+    let span = std::time::Duration::from_secs(30);
+    // The repair's return is in hand and everything before it is down when
+    // the stop is rung and the volume stands still.
+    let mut watcher = None;
+    while pipeline.graph_jobs[&job_id].repair_out() {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        if matches!(&said.heard, Heard::Repaired(returned) if matches!(returned.outcome, Some(RepairOutcome::Repaired { .. }))) {
+            disk.barrier().wait_aside();
+            let hold = pipeline.volume_writers.hold(&volume);
+            let writers = Arc::clone(&pipeline.volume_writers);
+            writers.end_loop_waits_at(Arc::clone(&clock) as _, span);
+            writers.stop_waits();
+            let (watched, clock) = (Arc::clone(&volume), Arc::clone(&clock));
+            watcher = Some(std::thread::spawn(move || {
+                // The loop stands on the limit with one run queued, the
+                // stop notwithstanding.
+                hold.wait_below_waiters(1);
+                let queued = watched.buffered_bytes.load(Ordering::SeqCst);
+                // The stop's span ends with the volume still at its limit.
+                clock.move_to(span);
+                writers.look_again();
+                (hold, queued)
+            }));
+        }
+        pipeline.graph_run_said(said);
+    }
+    let (hold, queued) = watcher.expect("the repair came back").join().unwrap();
+    assert!(queued >= BUDGET, "{queued}");
+    assert!(queued <= BUDGET + ARTICLE as u64, "{queued}");
+    // Nothing joined what the volume held once the span was over.
+    assert_eq!(volume.buffered_bytes.load(Ordering::SeqCst), queued);
+    assert!(volume.writer.loop_waits.load(Ordering::Relaxed) >= 1);
+    let graph = &pipeline.graph_jobs[&job_id];
+    assert!(graph.disk().unwrap().left_at_stop());
+    assert!(graph.pending().given_up(), "the job is left at its last checkpoint");
+    assert_ne!(
+        job_status_for_assert(&pipeline, job_id).map(|status| matches!(status, JobStatus::Failed { .. })),
+        Some(true)
+    );
+    hold.open();
+    pipeline.volume_writers.settle();
+    retire_pipeline_database(pipeline).await;
+    drop(hold);
+}
+
 // Two jobs, one whose delivered files lie on a volume of their own. That
 // volume at its own hard limit stops its job and no other: the job on the
 // other volume is handed work, and the stopped one is again once its volume

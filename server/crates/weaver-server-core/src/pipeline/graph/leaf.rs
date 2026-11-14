@@ -644,13 +644,14 @@ impl Leaf {
     pub(crate) fn len(&self) -> Result<u64, LeafError> {
         if let Some(settled) = self.settled() {
             settled.wait();
-            // A write that failed left the file short of what was sent to
-            // it: its length is not the length of what the leaf holds.
-            if settled.failed() {
+            // A write that failed, or one still out when a stop gave the
+            // volume up, left the file short of what was sent to it: its
+            // length is not the length of what the leaf holds.
+            if settled.unwritten() {
                 return Err(LeafError::Io {
                     path: self.path.clone(),
                     source: io::Error::other(
-                        "a write of the file failed, so its length on disk is not its own",
+                        "a write of the file failed or is still out, so its length on disk is not its own",
                     ),
                 });
             }

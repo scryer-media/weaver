@@ -368,7 +368,7 @@ impl NamespaceWriter {
         for ((volume, offset, bytes), provenance) in
             replayed.bytes.slices().zip(&replayed.provenance)
         {
-            self.below_budget();
+            self.below_budget()?;
             let mut effects = Vec::new();
             tree.replay_piece(
                 replayed.node,

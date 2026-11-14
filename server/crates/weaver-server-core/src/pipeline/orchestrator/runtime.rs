@@ -1947,9 +1947,29 @@ impl Pipeline {
             };
             self.handle_failed_job_released(released);
         }
+        // From here on the loop stands still for no volume without an end:
+        // a wait of its own for a volume that does not move is given up
+        // when the stop's span is over, and the job it was made for is
+        // left at its last checkpoint. The work still out has one span to
+        // come in.
+        self.volume_writers.end_loop_waits_at(
+            Arc::clone(&self.shutdown_settle.clock),
+            self.shutdown_settle.end(),
+        );
         // Unblock lanes waiting on deferred refills so they can finish their
         // batches and exit; dropping the senders answers them with an error.
         self.drain_inflight_download_and_decode_work().await;
+        // Every volume's writer puts down what it holds before the last
+        // checkpoint is taken, so that checkpoint records all of it. Every
+        // wait for a volume from here to the end of the stop shares one
+        // span, begun here: the settles, each of which has what the one
+        // before left of it, and the loop's own waits while it takes back
+        // what the runs came to. A volume that still holds writes when the
+        // span is over is left behind: what it holds is in no checkpoint,
+        // so it is fetched again.
+        let settle_end = self.shutdown_settle.end();
+        self.volume_writers
+            .end_loop_waits_at(Arc::clone(&self.shutdown_settle.clock), settle_end);
         // A graph job's run or repair still out on a thread speaks through
         // the run mail; heard here, so nothing of a job is out when the
         // pipeline is down and the checkpoint holds what it came to.
@@ -1961,13 +1981,6 @@ impl Pipeline {
             };
             self.handle_failed_job_released(released);
         }
-        // Every volume's writer puts down what it holds before the last
-        // checkpoint is taken, so that checkpoint records all of it. This
-        // wait and the one after the checkpoint share one span, begun here:
-        // the second has what the first left of it. A volume that still
-        // holds writes when the span is over is left behind: what it holds
-        // is in no checkpoint, so it is fetched again.
-        let settle_end = self.shutdown_settle.end();
         self.settle_volumes_until(settle_end, "the volume writers could not be drained at shutdown")
             .await;
         self.hear_volume_reports();

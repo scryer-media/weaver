@@ -844,7 +844,7 @@ impl NamespaceWriter {
             let contested = !tree.outranks(node, set);
             let (mut offered, mut landed) = (false, false);
             for (member, offset, bytes) in repaired.slices() {
-                self.below_budget();
+                self.below_budget()?;
                 let bytes = bytes?;
                 offered = true;
                 let arrival = Arrival {
@@ -1042,7 +1042,7 @@ impl NamespaceWriter {
             while at < piece.end {
                 let chunk = ByteRange::new(at, piece.end.min(at.saturating_add(READ_BACK)));
                 at = chunk.end;
-                self.below_budget();
+                self.below_budget()?;
                 let mut bytes = Vec::new();
                 if !self.access(tree).read_at(node, member, chunk, &mut bytes) {
                     if !arrived {

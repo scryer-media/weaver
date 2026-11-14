@@ -872,6 +872,51 @@ fn a_stop_ends_the_waits_of_producers_and_readers_on_a_volume_that_stands_still(
     assert_eq!(std::fs::read(&path).unwrap(), b"held");
 }
 
+// The loop's own wait on a volume's limit is not a producer's: the stop
+// that sends a producer on leaves the loop standing, so what the loop says
+// again while the owner stops is still held to the limit. The wait ends at
+// the end the stop gives its volumes, with the bytes still over, and the
+// key says it was left there.
+#[test]
+fn the_loops_wait_on_a_limit_outlasts_the_stop_and_ends_at_the_stops_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    job.write(1, 0, Bytes::from_static(b"held"), create(&path));
+    hold.wait_held();
+    let clock = Arc::new(HandClock::default());
+    let end = Duration::from_secs(30);
+    writers.end_loop_waits_at(Arc::clone(&clock) as Arc<dyn Clock + Send>, end);
+    std::thread::scope(|scope| {
+        let producer = scope.spawn(|| job.wait_below(0));
+        let looped = scope.spawn(|| job.loop_wait_below(0));
+        hold.wait_below_waiters(2);
+        // The loop's wait read the clock once before it stood still.
+        clock.wait_looks(1);
+        writers.stop_waits();
+        producer.join().unwrap();
+        // Woken by the stop, the loop's wait read the clock again and
+        // stands: it did not go on as the producer did.
+        clock.wait_looks(2);
+        assert!(!job.left());
+        clock.move_to(end);
+        writers.look_again();
+        assert!(!looped.join().unwrap(), "the wait was given up at the end");
+    });
+    assert!(job.left());
+    assert_eq!(count(&volume.buffered_bytes), 4);
+    // Past the end the loop does not stand still again, and queues nothing.
+    assert!(!job.loop_wait_below(0));
+    hold.open();
+    writers.settle();
+    assert_eq!(std::fs::read(&path).unwrap(), b"held");
+    // Below its line the loop's wait says so, whatever the clock reads.
+    assert!(job.loop_wait_below(0));
+}
+
 // A volume with no writer thread holds no producer: nothing will be written.
 #[test]
 fn a_producer_does_not_wait_on_a_volume_with_no_thread() {

@@ -520,6 +520,24 @@ impl Pipeline {
         if self.job_failure_started(job_id) {
             return;
         }
+        // A step in which the loop gave up a wait for a volume at the end
+        // of a stop came to nothing the disk bears out, whatever it
+        // returned: the bytes it waited for are not written. Nothing of the
+        // job fails for that and nothing more of it is checkpointed: it
+        // goes on from its last written checkpoint, and fetches the rest
+        // again.
+        if let Some(graph) = self.graph_jobs.get(&job_id)
+            && graph.disk().is_some_and(|disk| disk.left_at_stop())
+        {
+            if !graph.pending().given_up() {
+                warn!(
+                    job_id = job_id.0,
+                    "the stop ended with a volume still holding the job's writes; the job is left at its last checkpoint"
+                );
+            }
+            graph.pending().left_at_stop();
+            return;
+        }
         // What the step landed is said whatever the step came to: a file
         // whose download ended is said once, as it ended, before the job
         // fails on what the step did after.

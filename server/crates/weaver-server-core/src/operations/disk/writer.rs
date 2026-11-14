@@ -119,6 +119,55 @@ impl SettleBound {
     }
 }
 
+// Where the pipeline loop's own waits for a volume end once the owner is
+// stopping: the clock and the reading at which the stop gives a volume up,
+// the same one its settles go by. Until it is set the loop waits as long
+// as the volume takes.
+#[derive(Default)]
+struct LoopEnd {
+    set: AtomicBool,
+    at: Mutex<Option<(Arc<dyn Clock + Send>, Duration)>>,
+}
+
+impl LoopEnd {
+    // How long the loop may still wait and whether the clock runs by
+    // itself, once the end is set. One load before then.
+    fn more(&self) -> Option<(Duration, bool)> {
+        if !self.set.load(Ordering::SeqCst) {
+            return None;
+        }
+        let at = self.at.lock().unwrap_or_else(PoisonError::into_inner);
+        let (clock, end) = at.as_ref()?;
+        Some((end.saturating_sub(clock.now()), clock.runs()))
+    }
+
+    // Wait on `woke` while `over` says so and the end has not passed.
+    // Whether `over` came to say no: false when the wait was given up at
+    // the end. Only the loop waits here and only the loop sets the end, so
+    // setting it wakes nobody.
+    fn wait<'a>(
+        &self,
+        woke: &Condvar,
+        mut held: MutexGuard<'a, ()>,
+        over: impl Fn() -> bool,
+    ) -> (MutexGuard<'a, ()>, bool) {
+        loop {
+            if !over() {
+                return (held, true);
+            }
+            held = match self.more() {
+                Some((more, _)) if more.is_zero() => return (held, false),
+                Some((more, true)) => {
+                    woke.wait_timeout(held, more)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0
+                }
+                None | Some((_, false)) => woke.wait(held).unwrap_or_else(PoisonError::into_inner),
+            };
+        }
+    }
+}
+
 type ReportFn = dyn Fn(Report) + Send + Sync;
 type Then = Box<dyn FnOnce() + Send>;
 type Lanes = Vec<(usize, Arc<Lane>)>;
@@ -143,6 +192,9 @@ struct Registry {
     // Set once the owner is stopping: no thread but the pipeline loop
     // stands still for a volume from then on. Every lane holds it.
     stopped: Arc<AtomicBool>,
+    // Where the loop's own waits end once the owner is stopping. Every
+    // lane holds it.
+    loop_end: Arc<LoopEnd>,
     #[cfg(test)]
     ended: Condvar,
     // Times a thread was asked for.
@@ -251,6 +303,7 @@ impl VolumeWriters {
             Arc::clone(&self.report),
             self.rates.clone(),
             Arc::clone(&self.registry.stopped),
+            Arc::clone(&self.registry.loop_end),
             Arc::downgrade(&self.registry),
             inline,
             threadless,
@@ -356,11 +409,28 @@ impl VolumeWriters {
         left
     }
 
+    // The owner has begun to stop, and gives a volume up once `clock` reads
+    // `end`: the end its settles share. From now on the pipeline loop's own
+    // waits for a volume (`Barrier::wait`, `Submitter::read_after`,
+    // `Submitter::loop_wait_below`) end there too, with what they waited
+    // for still out; the key they waited on says so (`Submitter::left`).
+    // Called by the loop, which stands in none of those waits then.
+    pub(crate) fn end_loop_waits_at(&self, clock: Arc<dyn Clock + Send>, end: Duration) {
+        let loop_end = &self.registry.loop_end;
+        *loop_end.at.lock().unwrap_or_else(PoisonError::into_inner) = Some((clock, end));
+        loop_end.set.store(true, Ordering::SeqCst);
+    }
+
     // The owner is stopping. Every thread that stands still for a volume
     // without being the pipeline loop goes on, and none stands still again:
     // a producer in `Submitter::wait_below`, and a reader in
     // `Barrier::wait_aside`, which finds its operations still out. What a
     // volume holds is still written when its thread gets to it.
+    //
+    // The pipeline loop's own waits do not end here. The loop still keeps
+    // a volume's limit when it says a repair's output again
+    // (`Submitter::loop_wait_below`), and still waits for what it reads
+    // back; those waits end at `end_loop_waits_at`'s end.
     pub(crate) fn stop_waits(&self) {
         self.registry.stopped.store(true, Ordering::SeqCst);
         let lanes: Vec<Arc<Lane>> = self
@@ -390,7 +460,8 @@ impl VolumeWriters {
         }
     }
 
-    // Have a bounded settle look at its clock again, after a test moved it.
+    // Have a bounded settle, and a wait of the loop on a volume's limit,
+    // look at its clock again, after a test moved it.
     #[cfg(test)]
     pub(crate) fn look_again(&self) {
         let lanes: Vec<Arc<Lane>> = self
@@ -406,6 +477,12 @@ impl VolumeWriters {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             lane.state.woke.notify_all();
+            let _held = lane
+                .state
+                .below_waiting
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            lane.state.below.notify_all();
         }
     }
 
@@ -448,6 +525,9 @@ struct Key {
     failed: AtomicBool,
     // The caller gave the key up: the ones still queued are not run.
     abandoned: AtomicBool,
+    // A wait of the pipeline loop on the key was given up at the end of a
+    // stop, with what it waited for still out.
+    left: AtomicBool,
     // Refusals the caller has yet to hear and answer; no barrier of the key
     // passes while there are any.
     unheard: AtomicU32,
@@ -513,6 +593,7 @@ impl Key {
             id,
             failed: AtomicBool::new(false),
             abandoned: AtomicBool::new(false),
+            left: AtomicBool::new(false),
             unheard: AtomicU32::new(0),
             submitted: AtomicU64::new(0),
             returned: AtomicU64::new(0),
@@ -592,6 +673,24 @@ impl Key {
     // Wait until the key's operations through `seq` have returned, or
     // until `stopped` is set when one is given. Whoever sets it wakes the
     // wait under the key's lock.
+    // The pipeline loop's wait for the key's operations through `seq`:
+    // until they returned, or until the end of a stop passes with them
+    // still out, which the key then says of itself. Whether they returned.
+    fn wait_loop(&self, seq: u64, end: &LoopEnd) -> bool {
+        if self.has_returned(seq) {
+            return true;
+        }
+        let held = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        let (held, returned) = end.wait(&self.woke, held, || !self.has_returned(seq));
+        self.waiters.fetch_sub(1, Ordering::SeqCst);
+        drop(held);
+        if !returned {
+            self.left.store(true, Ordering::SeqCst);
+        }
+        returned
+    }
+
     fn wait(&self, seq: u64, stopped: Option<&AtomicBool>) {
         let over = || {
             self.has_returned(seq) || stopped.is_some_and(|stopped| stopped.load(Ordering::SeqCst))
@@ -715,12 +814,14 @@ impl Submitter {
     // than that wait, and whatever waits once the key has stopped, by a
     // failure or by being given up, or the volume has no writer thread:
     // nothing more of the key will be written then. Whatever waits, too,
-    // once the owner is stopping (`VolumeWriters::stop_waits`). The writer wakes it
-    // as the bytes fall; nothing is polled.
+    // once the owner is stopping (`VolumeWriters::stop_waits`): the thread
+    // is being ended and produces nothing more. The writer wakes it as the
+    // bytes fall; nothing is polled.
     //
     // Never for the pipeline loop, which must not stand still for a disk:
-    // the loop asks `VolumeWriters::wake_below` and goes on. The wait is
-    // not counted against the loop.
+    // the loop asks `VolumeWriters::wake_below` and goes on, or, where it
+    // produces what is written itself, waits in `loop_wait_below`. The
+    // wait is not counted against the loop.
     pub(crate) fn wait_below(&self, bytes: u64) {
         let state = &self.lane.state;
         let over = || {
@@ -751,6 +852,48 @@ impl Submitter {
         drop(held);
     }
 
+    // The same wait for the pipeline loop, in the one kind of work in which
+    // the loop itself produces what is written. A stop does not end it:
+    // the loop keeps the volume's limit for as long as it queues. It ends
+    // when the bytes fell, the key stopped, or the end of a stop passed
+    // with the bytes still over, which the key then says of itself.
+    // Whether the loop may queue more: false only at that end.
+    pub(crate) fn loop_wait_below(&self, bytes: u64) -> bool {
+        let state = &self.lane.state;
+        let over = || {
+            state.volume.buffered_bytes.load(Ordering::SeqCst) > bytes
+                && !self.key.failed.load(Ordering::SeqCst)
+                && !self.key.abandoned.load(Ordering::SeqCst)
+                && self.lane.threadless.is_none()
+        };
+        if !over() {
+            return true;
+        }
+        // Counted in before the look made under the lock, as in
+        // `wait_below`.
+        state.below_waiters.fetch_add(1, Ordering::SeqCst);
+        let held = state
+            .below_waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        #[cfg(test)]
+        state.below.notify_all();
+        let (held, below) = state.loop_end.wait(&state.below, held, over);
+        state.below_waiters.fetch_sub(1, Ordering::SeqCst);
+        drop(held);
+        if !below {
+            self.key.left.store(true, Ordering::SeqCst);
+        }
+        below
+    }
+
+    // Whether a wait of the pipeline loop on the key was given up at the
+    // end of a stop: something of the key is still out, and what the loop
+    // did after it is borne out by nothing on disk.
+    pub(crate) fn left(&self) -> bool {
+        self.key.left.load(Ordering::SeqCst)
+    }
+
     // Read `len` bytes at `offset` of the file at `path`, after everything
     // the key submitted before. The caller waits for the answer. This is
     // the pipeline loop's read: a wait here is counted as a loop wait. A
@@ -773,8 +916,13 @@ impl Submitter {
     ) -> io::Result<Vec<u8>> {
         if !self.key.has_returned(seq) {
             let began = Instant::now();
-            self.key.wait(seq, None);
+            let returned = self.key.wait_loop(seq, &self.lane.state.loop_end);
             self.lane.state.waited(began);
+            if !returned {
+                return Err(io::Error::other(
+                    "the owner is stopping and the file's writes are still out",
+                ));
+            }
         }
         if self.key.stopped() {
             return Err(io::Error::other("the file's writes were given up"));
@@ -914,19 +1062,22 @@ impl Barrier {
 
     // Wait until everything behind the barrier has returned, failed or not.
     // For the pipeline loop only: a wait that stops here is counted as a
-    // loop wait on the volume. Every other thread uses `wait_aside`.
+    // loop wait on the volume. Every other thread uses `wait_aside`. Once
+    // the owner is stopping the wait also ends at the end of the stop
+    // (`VolumeWriters::end_loop_waits_at`) with the operations still out:
+    // the caller asks `unwritten`.
     pub(crate) fn wait(&self) {
         if self.returned() {
             return;
         }
         let began = Instant::now();
-        self.key.wait(self.seq, None);
+        self.key.wait_loop(self.seq, &self.lane.loop_end);
         self.lane.waited(began);
     }
 
-    // What a thread asks after `wait_aside`: the operations are not all on
-    // disk, because one failed, the key was given up, or the wait ended at
-    // a stop with some still out. Nothing may be read back as if they were.
+    // What a caller asks after `wait` or `wait_aside`: the operations are
+    // not all on disk, because one failed, the key was given up, or the
+    // wait ended at a stop with some still out. Nothing may be read back as if they were.
     pub(crate) fn unwritten(&self) -> bool {
         self.failed() || !self.returned()
     }
@@ -1014,6 +1165,8 @@ struct LaneState {
     below: Condvar,
     // The owner is stopping: see `VolumeWriters::stop_waits`.
     stopped: Arc<AtomicBool>,
+    // Where the loop's own waits end once the owner is stopping.
+    loop_end: Arc<LoopEnd>,
     // The keys threads stand in `Barrier::wait_aside` for, so a stop can
     // wake them.
     aside: Mutex<Vec<Arc<Key>>>,
@@ -1081,6 +1234,7 @@ impl Lane {
         report: Arc<ReportFn>,
         rates: Option<Arc<RateSignal>>,
         stopped: Arc<AtomicBool>,
+        loop_end: Arc<LoopEnd>,
         registry: Weak<Registry>,
         inline: bool,
         threadless: bool,
@@ -1099,6 +1253,7 @@ impl Lane {
             below_waiting: Mutex::new(()),
             below: Condvar::new(),
             stopped,
+            loop_end,
             aside: Mutex::default(),
             #[cfg(test)]
             gate: Mutex::default(),

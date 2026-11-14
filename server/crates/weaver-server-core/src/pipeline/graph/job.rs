@@ -75,7 +75,8 @@ impl GraphError {
                 ExtractionError::from_io(message, source)
             }
             WriteError::Refused(failure) => ExtractionError::rejected(failure.clone()),
-            WriteError::UnknownMember { .. }
+            WriteError::LeftAtStop
+            | WriteError::UnknownMember { .. }
             | WriteError::StaleRecovery { .. }
             | WriteError::ProofUnreadable { .. } => ExtractionError::terminal(message),
         }

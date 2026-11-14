@@ -435,7 +435,13 @@ impl JobDisk {
     // no more than the limit and a slice is ever queued. Counted as a loop
     // wait on the volume. For those applications only: nothing else on the
     // loop may call it.
-    pub(crate) fn loop_wait_below(&self) {
+    //
+    // A stop does not end the wait: what the loop says again while the
+    // owner stops is held to the limit like any other. It ends at the end
+    // the stop gives its volumes; false then, and the caller queues no
+    // more of the job.
+    #[must_use]
+    pub(crate) fn loop_wait_below(&self) -> bool {
         use std::sync::atomic::Ordering;
         for submitter in self.each() {
             let volume = submitter.volume();
@@ -444,13 +450,24 @@ impl JobDisk {
                 continue;
             }
             let started = std::time::Instant::now();
-            submitter.wait_below(limit.saturating_sub(1));
+            let below = submitter.loop_wait_below(limit.saturating_sub(1));
             volume.writer.loop_waits.fetch_add(1, Ordering::Relaxed);
             volume
                 .writer
                 .loop_wait_nanos
                 .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if !below {
+                return false;
+            }
         }
+        true
+    }
+
+    // Whether a wait of the loop on one of the job's volumes was given up
+    // at the end of a stop (`Submitter::left`): the step that made it, and
+    // every later one, stands on bytes that are not written.
+    pub(crate) fn left_at_stop(&self) -> bool {
+        self.each().any(|submitter| submitter.left())
     }
 
     // What the volumes the job writes to ask of its lanes: the most held
