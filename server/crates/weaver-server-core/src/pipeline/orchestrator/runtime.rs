@@ -3,6 +3,9 @@
 
 use super::*;
 use crate::operations::instrumentation::PipelinePhase;
+use crate::runtime::shutdown_steps::{
+    bounded_shutdown_step, waited_shutdown_step, waited_shutdown_write,
+};
 
 const UU_SPOOL_MIN_BYTES: usize = 64 * 1024 * 1024;
 const UU_SPOOL_MAX_BYTES: usize = 4 * 1024 * 1024 * 1024;
@@ -51,8 +54,6 @@ impl Pipeline {
         std::time::Duration::from_secs(1);
     const STATE_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     const SHUTDOWN_DRAIN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-    // Bound on how long `drain` waits to join detached fire-and-forget writes.
-    const FIRE_AND_FORGET_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const DOWNLOAD_COMPLETION_DRAIN_LIMIT: usize = 128;
     // Delayed retries re-entered per busy turn: the retry channel's capacity.
     const RETRY_DRAIN_LIMIT: usize = 256;
@@ -463,6 +464,7 @@ impl Pipeline {
             #[cfg(test)]
             dispatch_hold_items_examined: Default::default(),
             last_download_dispatch_stall_log_at: None,
+            download_dispatch_liveness_since: None,
             download_dispatch_stall: None,
             download_stall_recovery,
             download_pass_fill_servers: None,
@@ -595,10 +597,11 @@ impl Pipeline {
         crate::runtime::perf_probe::record("pipeline.db_fire_and_forget.submit", started.elapsed());
     }
 
-    // Join all outstanding [`Self::db_fire_and_forget`] writes with a bounded
-    // timeout so shutdown does not drop in-flight persistence. Called from
-    // `drain` after the explicit awaited flushes. The JoinSet is moved out from
-    // under the lock first so no lock is held across the await.
+    // Join all outstanding [`Self::db_fire_and_forget`] writes so shutdown
+    // does not drop in-flight persistence: waited for to the last one, with
+    // one warning when they are slow. Called from `drain` after the explicit
+    // awaited flushes. The JoinSet is moved out from under the lock first so
+    // no lock is held across the await.
     async fn join_fire_and_forget_tasks(&self) {
         let mut tasks = {
             let mut guard = self
@@ -610,17 +613,10 @@ impl Pipeline {
         if tasks.is_empty() {
             return;
         }
-        let drain = async { while tasks.join_next().await.is_some() {} };
-        if tokio::time::timeout(Self::FIRE_AND_FORGET_DRAIN_TIMEOUT, drain)
-            .await
-            .is_err()
-        {
-            warn!(
-                remaining = tasks.len(),
-                timeout_secs = Self::FIRE_AND_FORGET_DRAIN_TIMEOUT.as_secs(),
-                "timed out joining fire-and-forget database writes during shutdown"
-            );
-        }
+        waited_shutdown_write("fire-and-forget database writes", async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await;
     }
 
     pub fn nntp_pool(&self) -> Arc<weaver_nntp::pool::NntpPool> {
@@ -1866,26 +1862,29 @@ impl Pipeline {
         self.db.stop_checkpoint_retries();
         // A failed job whose working directory is still being released
         // records its history before the pipeline is down.
-        while !self.releasing_failed_jobs.is_empty() {
-            let Some(released) = self.failed_release_rx.recv().await else {
-                break;
-            };
-            self.handle_failed_job_released(released);
-        }
+        self.hear_failed_job_releases().await;
         // Unblock lanes waiting on deferred refills so they can finish their
         // batches and exit; dropping the senders answers them with an error.
         self.drain_inflight_download_and_decode_work().await;
         // A graph job's run or repair still out on a thread speaks through
         // the run mail; heard here, so nothing of a job is out when the
         // pipeline is down and the checkpoint holds what it came to.
-        self.drain_graph_runs().await;
-        // A graph failure may start its release when the last worker ends.
-        while !self.releasing_failed_jobs.is_empty() {
-            let Some(released) = self.failed_release_rx.recv().await else {
-                break;
-            };
-            self.handle_failed_job_released(released);
+        //
+        // A repair or a replay out on its thread writes the job's files, and
+        // the checkpoint this drain takes must follow what it wrote, so with
+        // one out the drain is waited for to its end; each stops at its next
+        // read once shutdown has begun, so the wait is short. With only runs
+        // out the wait is for threads that write nothing the checkpoint
+        // depends on, so it is bounded. A job with a run still out when the
+        // bound ends is left as a kill would leave it: `checkpoint_graph_holds`
+        // passes it over and it keeps the checkpoint it last wrote.
+        if self.graph_drain_waits_for_loans() {
+            waited_shutdown_step("graph repairs", self.drain_graph_runs()).await;
+        } else {
+            bounded_shutdown_step("graph runs", self.drain_graph_runs()).await;
         }
+        // A graph failure may start its release when the last worker ends.
+        self.hear_failed_job_releases().await;
         self.checkpoint_graph_holds();
 
         if self.articles_in_flight > 0 || self.has_queued_or_active_decode() {
@@ -1906,26 +1905,48 @@ impl Pipeline {
         }
         self.flush_server_attribution();
         self.flush_support_facts();
-        if let Err(error) = self.shared_state.queue.clone().flush_bandwidth().await {
-            warn!(error = %error, "failed to flush pending bandwidth usage during drain");
+        // The database writes of the drain are waited for to their end: the
+        // process must not exit or start again while one of them runs. A slow
+        // one is warned about once, by name.
+        if let Err(error) = waited_shutdown_write(
+            "bandwidth usage flush",
+            self.shared_state.queue.clone().flush_bandwidth(),
+        )
+        .await
+        {
+            warn!(error = %error, "failed to flush pending bandwidth usage during drain")
         }
 
         // Join any detached fire-and-forget writes still in flight (runtime
         // writes such as a proven pipelining depth) so shutdown does not drop
-        // them. Bounded so a stuck write cannot hang shutdown forever.
+        // them.
         self.join_fire_and_forget_tasks().await;
         self.retry_kept_archives_at_drain();
-        match tokio::time::timeout(
-            Self::FIRE_AND_FORGET_DRAIN_TIMEOUT,
-            self.db.flush_write_queue(),
-        )
-        .await
+        if let Err(error) =
+            waited_shutdown_write("ordered database writes", self.db.flush_write_queue()).await
         {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => warn!(%error, "failed to flush ordered database writes during drain"),
-            Err(_) => warn!("timed out flushing ordered database writes during drain"),
+            warn!(%error, "failed to flush ordered database writes during drain")
         }
         self.warn_of_kept_archives();
+    }
+
+    // The release of a failed job's working directory is file work on
+    // another thread; the job's Failed outcome and history row are written
+    // here once it reports, because the history lists what the release left
+    // in the folder. The wait is not abandoned: a bound would leave the job
+    // an active row whose folder may already be gone, and the next start
+    // would restore it and download it again. A slow release is warned
+    // about once.
+    async fn hear_failed_job_releases(&mut self) {
+        waited_shutdown_step("failed job folder release", async {
+            while !self.releasing_failed_jobs.is_empty() {
+                let Some(released) = self.failed_release_rx.recv().await else {
+                    break;
+                };
+                self.handle_failed_job_released(released);
+            }
+        })
+        .await;
     }
 
     // A decode running, or an undecoded body queued for one. Only tests
@@ -2021,6 +2042,17 @@ impl Pipeline {
             let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
                 continue;
             };
+            if graph.awaits_mail() {
+                // Its run or repair outlasted the bound on the drain and
+                // still works on the job's files: nothing new is written
+                // about it.
+                warn!(
+                    job_id = job_id.0,
+                    "graph job still has work out at shutdown; keeping its last checkpoint"
+                );
+                self.flush_graph_checkpoint(job_id);
+                continue;
+            }
             if let Err(error) = graph.page_out_holds() {
                 warn!(job_id = job_id.0, %error, "could not page graph holds out at shutdown");
                 self.flush_graph_checkpoint(job_id);
@@ -2029,6 +2061,15 @@ impl Pipeline {
             self.checkpoint_graph_job(job_id);
             self.flush_graph_checkpoint(job_id);
         }
+    }
+
+    // Whether a graph job, live or retiring, has a repair, a replay or a
+    // verification out on its thread, which the shutdown drain waits for.
+    pub(in crate::pipeline) fn graph_drain_waits_for_loans(&self) -> bool {
+        self.graph_jobs
+            .values()
+            .chain(self.retiring_graph_jobs.values())
+            .any(|job| job.loan_out())
     }
 
     // Every run is heard out and stopped where it stands: a run waits for
