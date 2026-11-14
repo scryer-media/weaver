@@ -153,11 +153,17 @@ struct Files {
     // member. Those bytes were on scratch or in a spill file, never in the
     // member's own file, whether or not the hold was taken back.
     recorded: BTreeMap<MemberId, Spans>,
+    // Which namespace's files these are, distinct from every other made in
+    // the process: what was read of `leaves` by their marks is of these
+    // files alone, not of another the node had before.
+    born: u64,
 }
 
 impl Files {
     fn new(namespace: HoldsNamespace, accountant: Arc<HoldsAccountant>) -> Self {
+        static BORN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
+            born: BORN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             leaves: Marked::default(),
             holds: HoldLedger::new(namespace, accountant),
             scratch: None,
@@ -240,7 +246,9 @@ pub(crate) struct NamespaceWriter {
     renamed: Vec<MemberId>,
     // Members whose files wait to move to the names the ledger gave them,
     // in the order it gave them.
-    moves: Vec<moves::Waiting>,
+    moves: moves::Moves,
+    // Where every file sits and waits to move, kept for new files to ask.
+    kept: moves::Kept,
     // The names members left that the database may still give them, by the
     // ledger's key, each with the checkpoint that records they left once
     // one is taken.
@@ -391,7 +399,8 @@ impl NamespaceWriter {
             verifications: BTreeSet::new(),
             stopped: false,
             renamed: Vec::new(),
-            moves: Vec::new(),
+            moves: moves::Moves::default(),
+            kept: moves::Kept::default(),
             left: BTreeMap::new(),
             leaving: Vec::new(),
             spills_emptying: BTreeMap::new(),
