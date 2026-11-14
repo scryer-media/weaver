@@ -2257,6 +2257,49 @@ fn finished_job(job_id: u64) -> JobHistoryRow {
     }
 }
 
+// A bundle written before schema 91 never passed through the step that
+// trims a stored server list, so the restore runs it: 53 servers come back
+// as 50, by the upgrade's rule. Server 1 is the primary; of the others, on
+// level 1, the two disabled go first and then the newest. The same bundle
+// written at the current schema is restored as it is.
+#[test]
+fn a_bundle_older_than_the_server_limit_step_restores_within_the_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let source = Database::open(&root.path().join("source.db")).unwrap();
+    for id in 1..=53u32 {
+        let mut server = sample_server(id);
+        server.priority = u32::from(id != 1);
+        server.active = id != 10 && id != 20;
+        source.insert_server_past_limit(&server).unwrap();
+    }
+    let export = source.export_logical_backup().unwrap();
+    let tables = export.staging.path().join("tables");
+    let ids = |db: &Database| {
+        db.list_servers()
+            .unwrap()
+            .into_iter()
+            .map(|server| server.id)
+            .collect::<Vec<_>>()
+    };
+
+    let older = Database::open(&root.path().join("older.db")).unwrap();
+    older
+        .import_logical_backup(&tables, &export.tables, 90)
+        .unwrap();
+    assert_eq!(
+        ids(&older),
+        (1..=52)
+            .filter(|id| ![10, 20].contains(id))
+            .collect::<Vec<_>>()
+    );
+
+    let current = Database::open(&root.path().join("current.db")).unwrap();
+    current
+        .import_logical_backup(&tables, &export.tables, export.schema_version)
+        .unwrap();
+    assert_eq!(ids(&current).len(), 53);
+}
+
 // A finished job's stored NZB travels with its history in a backup, and
 // one in a bundle written while it sat on the history row restores to its
 // own table. An NZB no finished job owns stays out of the bundle.
@@ -2342,57 +2385,4 @@ fn a_finished_jobs_stored_nzb_travels_with_its_history() {
         .unwrap();
     assert_eq!(none, None);
     assert_eq!(query_count(&restored, "job_nzbs"), 1);
-}
-
-// A backup holding more servers than the limit, as an older version could
-// have written, restores trimmed by the rule the trim on load applies: the
-// restored database is read through it before anything runs.
-#[tokio::test]
-async fn a_restored_server_list_past_the_limit_is_trimmed_on_load() {
-    use crate::servers::persistence::past_limit_fixture::{ids, kept, sixty_on_ten_levels};
-    let source_db = open_temp_db();
-    populate_source_db(&source_db);
-    let source_config = sample_config();
-    source_db.save_config(&source_config).unwrap();
-    for server in sixty_on_ten_levels() {
-        source_db.insert_server_past_limit(&server).unwrap();
-    }
-    let (source_service, _, _) = build_service(source_db, source_config);
-    let artifact = source_service
-        .create_backup(Some("limit-secret".into()))
-        .await
-        .unwrap();
-
-    let target_root = tempfile::tempdir().unwrap();
-    let restored_root = target_root.path().join("restored");
-    let target_db = open_temp_db();
-    let mut target_config = sample_config();
-    target_config.data_dir = target_root.path().to_string_lossy().into_owned();
-    let (target_service, _, _) = build_service(target_db.clone(), target_config);
-    target_service
-        .restore_backup(
-            &artifact.path,
-            Some("limit-secret".into()),
-            RestoreOptions {
-                data_dir: restored_root.to_string_lossy().into_owned(),
-                intermediate_dir: None,
-                complete_dir: None,
-                category_remaps: vec![CategoryRemapInput {
-                    category_name: "movies".into(),
-                    new_dest_dir: target_root
-                        .path()
-                        .join("movies")
-                        .to_string_lossy()
-                        .into_owned(),
-                }],
-            },
-        )
-        .await
-        .unwrap();
-    drop(target_service);
-
-    let (restored_db, outcome) = apply_pending_restore(target_db, target_root.path()).unwrap();
-    assert!(outcome.is_some());
-    assert_eq!(ids(&restored_db.load_config().unwrap().servers), kept());
-    assert_eq!(ids(&restored_db.list_servers().unwrap()), kept());
 }

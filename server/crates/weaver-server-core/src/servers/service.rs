@@ -264,18 +264,9 @@ impl Database {
         })
     }
 
-    // Write `servers` as the whole stored list. A list past the server limit
-    // is trimmed first by the rule the trim on load applies, and a server it
-    // gives up that was stored goes through the rows a user delete removes.
-    // Returns the servers written.
-    pub(crate) fn replace_servers(
-        &self,
-        servers: &[ServerConfig],
-    ) -> Result<Vec<ServerConfig>, StateError> {
+    pub(crate) fn replace_servers(&self, servers: &[ServerConfig]) -> Result<(), StateError> {
         use crate::persistence::encryption::encrypt_secret_for_write;
 
-        let (kept, given_up) = crate::servers::persistence::keep_within_server_limit(servers);
-        let servers = kept.as_slice();
         let datastore = self.datastore();
         let encryption_key = self.encryption_key().cloned();
         self.run_sql_blocking({
@@ -283,7 +274,6 @@ impl Database {
             async move {
                 SqlRuntime::run_in_transaction(&datastore, "replace_servers", |tx| {
                     let servers = servers.clone();
-                    let given_up = given_up.clone();
                     let encryption_key = encryption_key.clone();
                     Box::pin(async move {
                         let existing_ids = tx
@@ -343,9 +333,7 @@ impl Database {
                             .await?;
                         }
                         for id in existing_ids {
-                            if given_up.contains(&id) {
-                                crate::servers::persistence::delete_server_rows(tx, id).await?;
-                            } else if !desired_ids.contains(&id) {
+                            if !desired_ids.contains(&id) {
                                 tx.execute(
                                     "DELETE FROM servers WHERE id = {}",
                                     &[SqlArg::I64(i64::from(id))],
@@ -358,7 +346,6 @@ impl Database {
                 })
                 .await
             }
-        })?;
-        Ok(kept)
+        })
     }
 }

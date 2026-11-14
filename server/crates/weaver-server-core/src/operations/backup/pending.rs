@@ -802,12 +802,8 @@ fn validate_restored_database(
                 "restored database does not match its encryption master key: {error}"
             ))
         })?;
-    // Read as stored: this runs more than once over one restore and checks
-    // the rows against the manifest, so it must not trim a server list past
-    // the server limit. The trim runs when the restored database is loaded
-    // for running.
     let config = db
-        .load_config_as_stored()
+        .load_config()
         .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
     config
         .validate()

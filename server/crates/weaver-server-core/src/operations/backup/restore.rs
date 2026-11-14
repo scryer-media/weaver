@@ -324,7 +324,7 @@ pub(crate) fn rewrite_backup_db_for_restore(
     let backup_db = Database::open(backup_db_path)
         .map_err(|e| BackupServiceError::Validation(e.to_string()))?;
     let rewritten = backup_db
-        .load_config_as_stored()
+        .load_config()
         .map_err(|e| BackupServiceError::Validation(e.to_string()))?;
     backup_db
         .checkpoint_sqlite()

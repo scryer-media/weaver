@@ -582,7 +582,7 @@ impl BackupService {
             tokio::task::spawn_blocking(move || {
                 let db = Database::open(&path)
                     .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-                db.load_config_as_stored()
+                db.load_config()
                     .map_err(|error| BackupServiceError::Validation(error.to_string()))
             })
             .await
@@ -638,7 +638,7 @@ async fn validate_logical_database(
                     ))
                 })?;
             validation_db
-                .load_config_as_stored()
+                .load_config()
                 .map_err(|error| BackupServiceError::Validation(error.to_string()))?
                 .validate()
                 .map_err(|errors| BackupServiceError::Validation(errors.join("; ")))

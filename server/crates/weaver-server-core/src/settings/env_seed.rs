@@ -352,8 +352,9 @@ pub fn apply_server_seed(
         .iter()
         .map(|server| server.config.clone())
         .collect();
-    config.servers = db.replace_servers(&servers)?;
-    Ok(config.servers.len())
+    db.replace_servers(&servers)?;
+    config.servers = servers;
+    Ok(seed.servers.len())
 }
 
 pub fn apply_seed(
@@ -1167,29 +1168,5 @@ mod tests {
         assert_eq!(seeded, 0);
         assert_eq!(config.servers[0].host, "ui.example.com");
         assert_eq!(db.list_servers().unwrap()[0].host, "ui.example.com");
-    }
-
-    // An environment seed past the server limit is stored trimmed by the
-    // rule the trim on load applies, and the running config holds what was
-    // stored.
-    #[test]
-    fn a_seed_past_the_server_limit_is_stored_trimmed() {
-        use crate::servers::persistence::past_limit_fixture::{ids, kept, sixty_on_ten_levels};
-        let db = Database::open_in_memory().unwrap();
-        let mut config = db.load_config().unwrap();
-        let seed = EnvSeedConfig {
-            servers: sixty_on_ten_levels()
-                .into_iter()
-                .map(|config| EnvSeedServer {
-                    config,
-                    pipelining_pinned: true,
-                })
-                .collect(),
-            ..Default::default()
-        };
-
-        assert_eq!(apply_server_seed(&db, &mut config, &seed).unwrap(), 50);
-        assert_eq!(ids(&config.servers), kept());
-        assert_eq!(ids(&db.list_servers().unwrap()), kept());
     }
 }
