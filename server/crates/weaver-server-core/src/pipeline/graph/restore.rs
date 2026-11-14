@@ -126,7 +126,7 @@ pub(crate) struct RestoreSeat {
         Arc<crate::operations::disk::writer::VolumeWriters>,
         Arc<crate::operations::StorageCapacity>,
         Arc<super::disk::VolumeProbes>,
-        u64,
+        Arc<crate::pipeline::download::volume_pace::VolumeBuffers>,
     ),
 }
 
@@ -163,7 +163,7 @@ impl Pipeline {
                 Arc::clone(&self.volume_writers),
                 Arc::clone(&self.storage_capacity),
                 Arc::clone(&self.volume_probes),
-                self.write_backlog_budget_bytes as u64,
+                Arc::clone(&self.volume_buffers),
             ),
         }
     }
@@ -290,7 +290,7 @@ impl RestoreSeat {
             job_id.0,
             &self.working_dir,
             self.output.as_ref().map(|(dir, _)| dir.as_path()),
-            self.volumes.3,
+            &self.volumes.3,
         );
         let storage = Storage {
             disk: Some(disk),

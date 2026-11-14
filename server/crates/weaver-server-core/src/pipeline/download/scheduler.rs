@@ -360,6 +360,13 @@ impl Pipeline {
         if let Err(blocked) = self.job_articles_built(job_id) {
             return ShareTaken::Blocked(blocked);
         }
+        // From a volume's soft limit the lanes fetching for its jobs ask
+        // for one article at a time, as every lane does under soft
+        // pressure. At its hard limit the job's queue answers for it.
+        let want = match self.volume_intake(job_id) {
+            crate::pipeline::download::volume_pace::VolumeIntake::OneAtATime => want.min(1),
+            _ => want,
+        };
         let Some(lane) = lane else {
             return match self.take_servable_works(job_id, server_idx, want, pressure) {
                 Ok(works) => ShareTaken::Works(works),

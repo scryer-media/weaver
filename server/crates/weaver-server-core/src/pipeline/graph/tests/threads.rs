@@ -260,8 +260,8 @@ async fn a_run_waits_on_its_own_thread_while_its_volume_holds_the_write_budget()
     let body = payload(3 * ARTICLE + 5, 6);
     let posts = vec![echo_volume(0, &body)];
     let (mut pipeline, _, _) = crate::pipeline::tests::new_direct_pipeline(&temp_dir).await;
-    // The job's disk takes the budget in force as the job is admitted.
-    pipeline.write_backlog_budget_bytes = ARTICLE;
+    // The job's volume is sized on this figure as the job is admitted.
+    pipeline.volume_buffers.set_figure(ARTICLE as u64, u64::MAX);
     insert_active_job(&mut pipeline, job_id, spec("lantern joined", &posts, ARTICLE)).await;
     let working_dir = pipeline.jobs[&job_id].working_dir.clone();
     // The run is kept at its start until every article is with the volume.
@@ -392,9 +392,9 @@ async fn a_repair_larger_than_the_write_budget_is_applied_within_it() {
     let mut posts = vec![Post::plain("lantern.bin", data.clone())];
     posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 2));
     let (mut pipeline, _, _) = crate::pipeline::tests::new_direct_pipeline(&temp_dir).await;
-    // The job's disk takes the budget in force as the job is admitted.
+    // The job's volume is sized on this figure as the job is admitted.
     const BUDGET: u64 = 1;
-    pipeline.write_backlog_budget_bytes = BUDGET as usize;
+    pipeline.volume_buffers.set_figure(BUDGET, u64::MAX);
     insert_active_job(&mut pipeline, job_id, spec("lantern joined", &posts, ARTICLE)).await;
     let working_dir = pipeline.jobs[&job_id].working_dir.clone();
     // Two articles apart are lost: the repair rebuilds two runs.
@@ -616,7 +616,7 @@ async fn a_job_held_by_a_full_write_buffer_is_dispatched_again_once_woken() {
     )
     .await;
     insert_active_job(&mut pipeline, job_id, spec("lantern joined", &posts, ARTICLE)).await;
-    pipeline.write_backlog_budget_bytes = ARTICLE;
+    pipeline.volume_buffers.set_figure(ARTICLE as u64, u64::MAX);
     let (volume, hold) = held(&pipeline, job_id);
     decode(&mut pipeline, job_id, &posts, 0, 0, true).await;
     assert!(volume.buffered_bytes.load(Ordering::Relaxed) >= ARTICLE as u64);
@@ -774,7 +774,7 @@ async fn a_stop_does_not_wait_for_a_run_held_by_the_write_budget_of_a_still_volu
     let body = payload(3 * ARTICLE + 5, 6);
     let posts = vec![echo_volume(0, &body)];
     let (mut pipeline, _, _) = crate::pipeline::tests::new_direct_pipeline(&temp_dir).await;
-    pipeline.write_backlog_budget_bytes = ARTICLE;
+    pipeline.volume_buffers.set_figure(ARTICLE as u64, u64::MAX);
     insert_active_job(&mut pipeline, job_id, spec("lantern joined", &posts, ARTICLE)).await;
     let working_dir = pipeline.jobs[&job_id].working_dir.clone();
     let gate = Arc::new(crate::pipeline::graph::engine::echo::RunGate::default());
@@ -838,4 +838,200 @@ async fn a_stop_does_not_wait_for_a_repair_held_by_a_still_volume() {
     );
     retire_pipeline_database(pipeline).await;
     drop(hold);
+}
+
+// Two jobs, one whose delivered files lie on a volume of their own. That
+// volume at its own hard limit stops its job and no other: the job on the
+// other volume is handed work, and the stopped one is again once its volume
+// has drained.
+#[tokio::test]
+async fn a_job_on_a_full_volume_stops_while_a_job_on_another_volume_is_dispatched() {
+    use crate::pipeline::download::volume_pace::VolumeIntake;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (intermediate, complete, movies) = (
+        temp_dir.path().join("intermediate"),
+        temp_dir.path().join("complete"),
+        temp_dir.path().join("movies"),
+    );
+    crate::runtime::fs::test_devices::assign(&intermediate, 1);
+    crate::runtime::fs::test_devices::assign(&complete, 2);
+    crate::runtime::fs::test_devices::assign(&movies, 3);
+    let (mut pipeline, _, _) = crate::pipeline::tests::new_direct_pipeline_at_roots(
+        temp_dir.path().join("data"),
+        intermediate,
+        complete,
+        temp_dir.path().join("weaver.db"),
+        16 * 1024 * 1024,
+        8,
+        None,
+    )
+    .await;
+    pipeline.config.write().await.categories = vec![crate::categories::CategoryConfig {
+        id: 0,
+        name: "movies".to_string(),
+        dest_dir: Some(movies.display().to_string()),
+        aliases: String::new(),
+    }];
+    let (slow_job, other_job) = (JobId(92_420), JobId(92_421));
+    let posts = [Post::plain("lantern.bin", payload(4 * ARTICLE, 1))];
+    let mut slow_spec = spec("lantern slow", &posts, ARTICLE);
+    slow_spec.category = Some("movies".to_string());
+    for (job_id, spec) in [
+        (slow_job, slow_spec),
+        (other_job, spec("lantern other", &posts, ARTICLE)),
+    ] {
+        let nzb_zstd = crate::pipeline::tests::nzb_zstd_for(&spec);
+        pipeline
+            .add_job(
+                job_id,
+                spec,
+                PathBuf::from("lantern.nzb"),
+                nzb_zstd,
+                crate::jobs::AddJobOptions::default(),
+            )
+            .await
+            .unwrap();
+        crate::pipeline::tests::activate_job(&mut pipeline, job_id).await;
+    }
+    let staging_dir = crate::pipeline::queue::staging_dir_for(&movies, slow_job);
+    let disk = pipeline.graph_jobs[&slow_job].disk().unwrap().clone();
+    let slow = Arc::clone(disk.under(&staging_dir).volume());
+    let shared = Arc::clone(disk.working().volume());
+    assert!(!Arc::ptr_eq(&slow, &shared));
+    assert!(Arc::ptr_eq(
+        &shared,
+        pipeline.graph_jobs[&other_job].disk().unwrap().working().volume()
+    ));
+    // Each volume has its own limits, given as its first job was admitted.
+    let (_, hard) = slow.buffer_limits();
+    assert!(hard < u64::MAX);
+    assert!(shared.buffer_limits().1 < u64::MAX);
+
+    // The slow volume holds its hard limit; the other holds nothing.
+    slow.buffered_bytes.store(hard, Ordering::SeqCst);
+    assert_eq!(pipeline.volume_intake(slow_job), VolumeIntake::Stopped);
+    assert_eq!(pipeline.volume_intake(other_job), VolumeIntake::Open);
+    let lease = pipeline
+        .lease_for_server_for_test(0)
+        .expect("the job on the other volume is handed work");
+    assert_eq!(lease.job_id, other_job);
+    assert!(pipeline.volume_holds_budget(slow_job));
+
+    // Drained, the slow volume's job is handed work again.
+    slow.buffered_bytes.store(0, Ordering::SeqCst);
+    assert_eq!(pipeline.volume_intake(slow_job), VolumeIntake::Open);
+    let lease = pipeline
+        .lease_for_server_for_test(0)
+        .expect("the drained volume's job is handed work");
+    assert_eq!(lease.job_id, slow_job);
+    retire_pipeline_database(pipeline).await;
+}
+
+// From a volume's soft limit a lane fetching for its job is handed one
+// article at a time, and a full handout again once the volume is below it.
+#[tokio::test]
+async fn a_volume_at_its_soft_limit_cuts_a_lanes_ask_to_one_article() {
+    use crate::pipeline::download::volume_pace::VolumeIntake;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_422);
+    let posts = [Post::plain("lantern.bin", payload(8 * ARTICLE, 1))];
+    let (mut pipeline, _, _) = crate::pipeline::tests::new_direct_pipeline_with_backlog(
+        &temp_dir,
+        16 * 1024 * 1024,
+        8,
+    )
+    .await;
+    insert_active_job(&mut pipeline, job_id, spec("lantern joined", &posts, ARTICLE)).await;
+    let volume = Arc::clone(pipeline.graph_jobs[&job_id].disk().unwrap().working().volume());
+    let (soft, hard) = volume.buffer_limits();
+    assert!(soft < hard && hard < u64::MAX);
+
+    // What is being decoded for the volume's jobs reaches its soft limit.
+    volume.arrived_bytes.store(soft, Ordering::SeqCst);
+    assert_eq!(pipeline.volume_intake(job_id), VolumeIntake::OneAtATime);
+    let lease = pipeline.lease_for_server_for_test(0).unwrap();
+    assert_eq!(lease.works.len(), 1);
+
+    volume.arrived_bytes.store(soft - 1, Ordering::SeqCst);
+    assert_eq!(pipeline.volume_intake(job_id), VolumeIntake::Open);
+    let lease = pipeline.lease_for_server_for_test(0).unwrap();
+    assert!(lease.works.len() > 1, "{}", lease.works.len());
+    volume.arrived_bytes.store(0, Ordering::SeqCst);
+    retire_pipeline_database(pipeline).await;
+}
+
+// What arrived for a job and waits for the loop counts on its volume. At
+// the volume's hard limit the job is handed nothing, and the hand-on that
+// brings the volume to its line wakes dispatch: the loop takes the wake
+// itself, with no writer in it.
+#[tokio::test]
+async fn a_job_stopped_by_what_is_being_decoded_is_woken_as_the_loop_hands_it_on() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_423);
+    let posts = [Post::plain("lantern.bin", payload(4 * ARTICLE, 1))];
+    let (mut pipeline, _, _) = crate::pipeline::tests::new_direct_pipeline_with_backlog(
+        &temp_dir,
+        16 * 1024 * 1024,
+        8,
+    )
+    .await;
+    insert_active_job(&mut pipeline, job_id, spec("lantern joined", &posts, ARTICLE)).await;
+    pipeline.volume_buffers.set_figure(2 * ARTICLE as u64, u64::MAX);
+    let volume = Arc::clone(pipeline.graph_jobs[&job_id].disk().unwrap().working().volume());
+    assert_eq!(volume.buffer_limits().1, 2 * ARTICLE as u64);
+
+    for _ in 0..2 {
+        pipeline.note_released_download_result_pending(job_id, ARTICLE as u64);
+    }
+    assert_eq!(volume.arrived_bytes.load(Ordering::SeqCst), 2 * ARTICLE as u64);
+    assert!(pipeline.volume_holds_budget(job_id));
+    assert!(pipeline.lease_for_server_for_test(0).is_none());
+    pipeline.download_dispatch_wake = false;
+
+    // Both results are handed on. The first leaves the volume above its
+    // line or wakes dispatch; the second leaves nothing and has woken it.
+    pipeline.finish_released_download_result_processing(job_id, ARTICLE as u64);
+    pipeline.finish_released_download_result_processing(job_id, ARTICLE as u64);
+    assert_eq!(volume.arrived_bytes.load(Ordering::SeqCst), 0);
+    assert!(pipeline.volume_arrived_by_job.is_empty());
+    assert!(pipeline.download_dispatch_wake);
+    assert!(!pipeline.volume_holds_budget(job_id));
+    assert!(pipeline.lease_for_server_for_test(0).is_some());
+    retire_pipeline_database(pipeline).await;
+}
+
+// Another hardware profile in force sizes every volume's limits again, on
+// that profile's figure.
+#[tokio::test]
+async fn a_profile_change_sizes_the_volume_limits_again() {
+    use crate::pipeline::download::volume_pace::{TYPICAL_ARTICLE_BYTES, total_buffer_budget_bytes};
+    use crate::runtime::HardwareProfile;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_424);
+    let posts = [Post::plain("lantern.bin", payload(ARTICLE, 1))];
+    let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
+    let volume = Arc::clone(pipeline.graph_jobs[&job_id].disk().unwrap().working().volume());
+    let machine = pipeline.tuner.system_profile().clone();
+    let memory = machine.memory.available_bytes;
+    let figure = |profile| {
+        total_buffer_budget_bytes(
+            profile,
+            memory,
+            pipeline.tuner.connection_limit(),
+            TYPICAL_ARTICLE_BYTES,
+        )
+    };
+    let before = pipeline.configured_hardware_profile;
+    let other = HardwareProfile::available(&machine)
+        .into_iter()
+        .find(|profile| *profile != before)
+        .expect("the test machine offers two profiles");
+    let (was, will) = (figure(before), figure(other));
+    assert_ne!(was, will);
+    assert_eq!(volume.buffer_limits(), (was * 70 / 100, was));
+
+    pipeline.set_configured_hardware_profile(other);
+
+    assert_eq!(volume.buffer_limits(), (will * 70 / 100, will));
+    retire_pipeline_database(pipeline).await;
 }

@@ -150,6 +150,8 @@ impl Pipeline {
             download::DOWNLOAD_STALL_RECOVERY_ENV,
         );
         let profile_tuning = hardware_profile.tuning(&profile);
+        let (volume_figure_bytes, volume_memory_ceiling_bytes) =
+            volume_buffer_figure(hardware_profile, &profile, total_connections);
         let tuner = RuntimeTuner::with_profile_tuning(profile, total_connections, profile_tuning);
         shared_state.set_sevenz_decode_memory_bytes(profile_tuning.sevenz_decode_memory_bytes);
         shared_state.set_hardware_profile_in_force(crate::HardwareProfileInForce {
@@ -531,6 +533,11 @@ impl Pipeline {
                 Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT,
             ),
             volume_probes,
+            volume_buffers: Arc::new(download::volume_pace::VolumeBuffers::new(
+                volume_figure_bytes,
+                volume_memory_ceiling_bytes,
+            )),
+            volume_arrived_by_job: HashMap::new(),
             window_ledgers: Default::default(),
             extraction_limits,
             process_memory_budget,
@@ -1460,6 +1467,12 @@ impl Pipeline {
                                 count_periodic_tick();
                                 self.refresh_download_pressure();
                                 self.publish_download_transport_health();
+                                // A volume whose measured rate moved has every
+                                // volume's limits sized again. With none
+                                // moved nothing is written.
+                                if self.volume_buffers.follow_rates() {
+                                    self.volume_room_changed();
+                                }
 
                                 if tracing::enabled!(tracing::Level::DEBUG) {
                                 let live = self.pipeline_is_live();
@@ -2179,8 +2192,10 @@ enum ShutdownDrainEvent {
     Decode(DecodeDone),
 }
 
-// The decoded bytes that may wait for the writer, sized from the memory
-// tier's base size (`BacklogSizing::base_bytes`) and the machine's memory.
+// The decoded bytes that may be parked in memory outside the volume
+// writers, sized from the memory tier's base size
+// (`BacklogSizing::base_bytes`) and the machine's memory. What waits on a
+// volume has that volume's own limits (`volume_buffer_figure`).
 pub(crate) fn compute_write_backlog_budget_bytes(
     profile: &SystemProfile,
     backlog_base_bytes: usize,
@@ -2231,6 +2246,24 @@ pub(crate) fn compute_decode_backlog_budget_bytes(
         .max(write_backlog_budget_bytes);
 
     target.min(memory_cap).max(1)
+}
+
+// The figure every volume's buffer limits are sized on, and the memory that
+// caps it: from the hardware profile in force, the machine's memory and what
+// the configured connections hold in flight.
+pub(super) fn volume_buffer_figure(
+    hardware_profile: crate::runtime::HardwareProfile,
+    profile: &SystemProfile,
+    connections: usize,
+) -> (u64, u64) {
+    let memory_ceiling_bytes = backlog_memory_ceiling_bytes(profile) as u64;
+    let figure_bytes = download::volume_pace::total_buffer_budget_bytes(
+        hardware_profile,
+        memory_ceiling_bytes,
+        connections,
+        download::volume_pace::TYPICAL_ARTICLE_BYTES,
+    );
+    (figure_bytes, memory_ceiling_bytes)
 }
 
 // The memory both backlog budgets are carved from: available memory with a

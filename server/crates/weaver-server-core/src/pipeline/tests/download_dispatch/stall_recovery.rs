@@ -214,7 +214,6 @@ async fn a_job_held_by_a_volume_at_its_write_budget_is_never_kicked_or_released(
     let mut pipeline = stalled_pipeline(&temp_dir).await;
     let job_id = JobId(40011);
     insert_stalled_job(&mut pipeline, job_id, 3).await;
-    let budget = pipeline.write_backlog_budget_bytes as u64;
     let volume = Arc::clone(
         pipeline.graph_jobs[&job_id]
             .disk()
@@ -222,6 +221,9 @@ async fn a_job_held_by_a_volume_at_its_write_budget_is_never_kicked_or_released(
             .working()
             .volume(),
     );
+    // The volume's own hard limit, given it as the job was admitted.
+    let budget = volume.buffer_limits().1;
+    assert!(budget < u64::MAX);
     let t0 = Instant::now();
     assert_eq!(pipeline.earliest_explained_dispatch_wait(t0), None);
 

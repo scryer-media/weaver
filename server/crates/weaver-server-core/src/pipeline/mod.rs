@@ -1912,7 +1912,9 @@ pub struct Pipeline {
     pub(super) write_buf_max_pending: usize,
     // Max in-memory raw article bytes queued or active for decode.
     pub(super) decode_backlog_budget_bytes: usize,
-    // Max in-memory decoded backlog before degrading to direct offset writes.
+    // Max in-memory decoded bytes parked outside the volume writers (UU
+    // and unanchored parks). What waits on a volume has that volume's own
+    // limits instead (`download::volume_pace`).
     pub(super) write_backlog_budget_bytes: usize,
     // Whether raw decode backlog is in a hard-pressure drain cycle.
     pub(super) download_decode_hard_pressure_latched: bool,
@@ -2073,6 +2075,12 @@ pub struct Pipeline {
     pub(super) shutdown_settle: crate::operations::disk::writer::SettleBound,
     // What queues each volume's first write-rate probe on its writer, once.
     pub(super) volume_probes: Arc<crate::pipeline::graph::disk::VolumeProbes>,
+    // The keeper of every volume's buffer limits.
+    pub(super) volume_buffers: Arc<download::volume_pace::VolumeBuffers>,
+    // For each job with released results waiting for the loop: the volume
+    // their bytes are counted on as arrived, and how many of them.
+    pub(super) volume_arrived_by_job:
+        HashMap<JobId, (Arc<crate::operations::disk::volume::Volume>, u64)>,
     // What decode windows took from each disk they go on, for every graph
     // job together.
     pub(super) window_ledgers: graph::window::WindowLedgers,

@@ -109,7 +109,7 @@ impl Pipeline {
                 waits.insert(job_id, now);
                 continue;
             }
-            // A job held by a volume at its write budget waits on the disk,
+            // A job held by a volume at its hard limit waits on the disk,
             // which has no deadline either: a slow or hung disk restarts
             // the clock and never has the job's articles called unservable.
             if self.volume_holds_budget(job_id) {

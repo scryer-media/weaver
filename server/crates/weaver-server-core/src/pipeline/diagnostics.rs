@@ -548,6 +548,8 @@ mod tests {
             write_rate: 3_200_000,
             throughput: 0,
             buffered_bytes: 65_536,
+            buffer_soft_bytes: 0,
+            buffer_limit_bytes: 0,
             idle_turns: 0,
             writer: Default::default(),
         });

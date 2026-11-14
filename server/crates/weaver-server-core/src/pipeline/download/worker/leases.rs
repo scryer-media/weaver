@@ -546,20 +546,18 @@ impl Pipeline {
         if checkpoint.holds_every_payload_article() && queue.recovery_work_count() == 0 {
             return Err(BlockedBy::only(SchedulerBlockClause::Checkpoint));
         }
-        // A volume the job writes to holds its budget of bytes for its
-        // writer: nothing more is fetched for the job until it is below.
-        // Each such volume is asked for one wake, an eighth of the budget
-        // lower so the loop is not woken per write; a volume that fell
-        // there in the meantime holds nothing.
+        // A volume the job writes to holds its own hard limit of bytes that
+        // arrived and are not written: nothing more is fetched for the job
+        // until it is below. Each such volume is asked for one wake, an
+        // eighth of its limit lower so the loop is not woken per write; a
+        // volume that fell there in the meantime holds nothing.
         if self.volume_holds_budget(job_id) {
-            let budget = self.write_backlog_budget_bytes as u64;
-            let line = budget.saturating_sub((budget / 8).max(1));
             let mut asked = false;
             if let Some(disk) = self.graph_jobs.get(&job_id).and_then(|graph| graph.disk()) {
                 for submitter in disk.each() {
                     let volume = submitter.volume();
-                    asked |= volume.buffered_bytes.load(Ordering::Relaxed) >= budget
-                        && self.volume_writers.wake_below(volume, line);
+                    asked |= volume.unwritten_bytes() >= volume.buffer_limits().1
+                        && self.volume_writers.wake_below(volume, volume.resume_line());
                 }
             }
             if asked {

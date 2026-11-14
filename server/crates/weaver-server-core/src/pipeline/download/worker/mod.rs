@@ -15,7 +15,7 @@ mod ownership;
 mod pressure;
 mod refill;
 mod spawn;
-mod volume_pace;
+pub(in crate::pipeline) mod volume_pace;
 
 #[cfg(test)]
 pub(in crate::pipeline::download) use leases::queued_files_may_pass;
