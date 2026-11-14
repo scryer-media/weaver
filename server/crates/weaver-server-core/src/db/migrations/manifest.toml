@@ -1670,3 +1670,20 @@ kind = "sql"
 file = "migrations/0119_torrent_adopted/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 120
+description = "a torrent removed while the database's disk is full keeps its history row until it is written"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0120_torrent_retiring/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0120_torrent_retiring/postgres.sql"
+engine = "postgres"
+scope = "all"

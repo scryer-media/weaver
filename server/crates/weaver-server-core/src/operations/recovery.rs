@@ -326,6 +326,20 @@ pub async fn recover_server_state(
     // read that fails stops the start, as the read of every row did.
     // A job's work that panicked would panic again as the job is restored,
     // so the markers the panic left are read before any job is.
+    // A torrent removed whose history row waited for room as the last run
+    // stopped is archived now, as a terminal NZB job's row is above: it
+    // does not come back.
+    match db.archive_retiring_torrents() {
+        Ok(written) if !written.is_empty() => info!(
+            job_ids = ?written.iter().map(|job_id| job_id.0).collect::<Vec<_>>(),
+            "archived torrents removed before their history could be written"
+        ),
+        Ok(_) => {}
+        Err(error) => warn!(
+            error = %error,
+            "could not archive the torrents a removal left retiring; they come back until the next start"
+        ),
+    }
     // The torrents come back too, each with its own job.
     let torrents: HashSet<crate::jobs::ids::JobId> = db.torrent_job_ids()?.into_iter().collect();
     let restoring: HashSet<crate::jobs::ids::JobId> =

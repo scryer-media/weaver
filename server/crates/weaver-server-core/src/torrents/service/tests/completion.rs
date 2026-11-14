@@ -185,3 +185,120 @@ async fn a_torrent_history_row_the_disk_has_no_room_for_waits_and_is_written() {
     assert!(rig.db.kept_archive_jobs().is_empty());
     rig.service.stop().await;
 }
+
+// A torrent removed while the database's disk has no room for its history
+// row stays in the queue as an NZB job's retiring row does, with the
+// disk-space wait, until the row is written; it then leaves the queue for
+// the finished jobs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removed_torrent_whose_history_waits_shows_the_disk_space_wait() {
+    use crate::persistence::ArchiveNews;
+    let rig = rig(set_clock());
+    let queue = queue();
+    let state = queue.state().clone();
+    rig.service.publish_to(queue);
+    rig.service.open().await.unwrap();
+    let (news, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    rig.db.hear_archive_news(move |said| {
+        let _ = news.send(said);
+    });
+    let files: [(&str, &[u8]); 1] = [("ember.mkv", &[0x5a_u8; 300])];
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(metainfo(
+            "ember", &files, 128, false,
+        ))))
+        .await
+        .unwrap();
+    let mut retired = rig.service.retired();
+    crate::persistence::connection::ARCHIVE_REFUSED
+        .lock()
+        .unwrap()
+        .push_back(crate::StateError::OutOfSpace(
+            "database or disk is full".into(),
+        ));
+    rig.service.remove(job_id, false, false).await.unwrap();
+    assert_eq!(heard.recv().await, Some(ArchiveNews::Kept(job_id)));
+    // The tick publishes the torrents as they stand, and the retiring one
+    // with them.
+    rig.service.tick().await;
+    let listed = state.list_jobs();
+    let row = listed
+        .iter()
+        .find(|job| job.job_id == job_id)
+        .expect("the retiring torrent stays in the queue");
+    assert_eq!(
+        row.download_wait_reason.as_deref(),
+        Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON)
+    );
+
+    rig.db.retry_kept_archives(0);
+    assert_eq!(
+        heard.recv().await,
+        Some(ArchiveNews::LetGo {
+            job_id,
+            written: true
+        })
+    );
+    retired.wait_for(|retired| *retired >= 1).await.unwrap();
+    // Once, among the finished jobs, with no wait.
+    let listed = state.list_jobs();
+    let rows: Vec<_> = listed.iter().filter(|job| job.job_id == job_id).collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].download_wait_reason, None);
+    rig.service.stop().await;
+}
+
+// A server stopped while a removed torrent's history row still waits for
+// room: the next start archives the torrent with that row, as it archives
+// an NZB job left terminal in the active table, and it does not come back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_whose_history_still_waits_at_a_stop_is_archived_by_the_next_start() {
+    use crate::persistence::ArchiveNews;
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (news, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    rig.db.hear_archive_news(move |said| {
+        let _ = news.send(said);
+    });
+    let files: [(&str, &[u8]); 1] = [("ember.mkv", &[0x5a_u8; 300])];
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(metainfo(
+            "ember", &files, 128, false,
+        ))))
+        .await
+        .unwrap();
+    crate::persistence::connection::ARCHIVE_REFUSED
+        .lock()
+        .unwrap()
+        .push_back(crate::StateError::OutOfSpace(
+            "database or disk is full".into(),
+        ));
+    rig.service.remove(job_id, false, false).await.unwrap();
+    assert_eq!(heard.recv().await, Some(ArchiveNews::Kept(job_id)));
+    rig.service.stop().await;
+    assert!(rig.db.get_torrent(job_id).unwrap().is_some());
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+
+    let data = rig.dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let recovered =
+        crate::operations::recover_server_state(&rig.db, &data, &rig.dir.path().join("work"))
+            .await
+            .unwrap();
+    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert_eq!(history.status, "cancelled");
+    assert_eq!(history.name, "ember");
+    assert!(rig.db.get_torrent(job_id).unwrap().is_none());
+    assert!(
+        recovered
+            .initial_history
+            .iter()
+            .any(|job| job.job_id == job_id)
+    );
+    let restarted = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    restarted.open().await.unwrap();
+    assert!(restarted.torrent(job_id).await.is_none());
+    restarted.stop().await;
+}

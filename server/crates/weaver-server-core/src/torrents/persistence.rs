@@ -129,6 +129,70 @@ impl crate::persistence::DatabaseWriterExecutor {
     }
 }
 
+impl crate::persistence::DatabaseWriterExecutor {
+    // A removal's history row the database's disk had no room for, kept on
+    // the torrent's own row: a stop before room comes leaves it there, and
+    // the next start writes it, as it archives an NZB job left terminal in
+    // the active table. The torrent's row goes once the history row is
+    // written, and this with it.
+    pub(crate) fn keep_torrent_retiring(&self, entry: &JobHistoryRow) -> Result<(), StateError> {
+        let id = stored(entry.job_id)?;
+        let kept = serde_json::to_string(entry)
+            .map_err(|error| StateError::Database(error.to_string()))?;
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "keep_torrent_retiring", |tx| {
+                let kept = kept.clone();
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE torrents SET retiring = {} WHERE job_id = {}",
+                        &[SqlArg::Text(kept), SqlArg::I64(id)],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+}
+
+impl Database {
+    // Start-up: each torrent a removal left retiring, its history row kept
+    // for want of room as the last run stopped, goes to history with that
+    // row and leaves the torrents, all in one transaction. The jobs written.
+    pub(crate) fn archive_retiring_torrents(&self) -> Result<Vec<JobId>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "archive_retiring_torrents", |tx| {
+                Box::pin(async move {
+                    let rows = tx
+                        .fetch_all(
+                            "SELECT job_id, retiring FROM torrents WHERE retiring IS NOT NULL",
+                            &[],
+                        )
+                        .await?;
+                    let mut written = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        let id = row.i64("job_id")?;
+                        let entry: JobHistoryRow = serde_json::from_str(&row.text("retiring")?)
+                            .map_err(|error| {
+                                StateError::Database(format!(
+                                    "a torrent's kept history row is not valid: {error}"
+                                ))
+                            })?;
+                        crate::history::persistence::insert_job_history_tx(tx, &entry).await?;
+                        delete_torrent_tx(tx, id).await?;
+                        written.push(JobId(entry.job_id));
+                    }
+                    Ok(written)
+                })
+            })
+            .await
+        })
+    }
+}
+
 fn stored(value: u64) -> Result<i64, StateError> {
     i64::try_from(value)
         .map_err(|_| StateError::Database(format!("{value} exceeds the database range")))

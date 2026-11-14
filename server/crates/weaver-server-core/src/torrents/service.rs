@@ -2211,6 +2211,10 @@ struct Inner {
     attaches: watch::Sender<u64>,
     retired: watch::Sender<u64>,
     written: watch::Sender<Written>,
+    // The torrents removed whose history row waits for room on the
+    // database's disk, as the queue shows them: retiring, with the
+    // disk-space wait an NZB job's retiring row shows.
+    retiring: Mutex<BTreeMap<JobId, JobInfo>>,
     queue: Mutex<Option<SchedulerHandle>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     tick: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -2280,6 +2284,7 @@ impl TorrentService {
                 attaches: watch::channel(0).0,
                 retired: watch::channel(0).0,
                 written: watch::channel(Written::default()).0,
+                retiring: Mutex::default(),
                 queue: Mutex::new(None),
                 tasks: Mutex::new(Vec::new()),
                 tick: Mutex::new(None),
@@ -2545,8 +2550,28 @@ impl TorrentService {
             .published
             .send_replace(Arc::new(Published { torrents, sessions }));
         if let Some(queue) = self.queue() {
-            queue.publish_owned_jobs(job_infos(views, now));
+            queue.publish_owned_jobs(self.with_retiring(job_infos(views, now)));
         }
+    }
+
+    // The torrents' jobs, and among them, by when each was added, the
+    // retiring ones whose history row waits for room.
+    fn with_retiring(&self, mut jobs: Vec<JobInfo>) -> Vec<JobInfo> {
+        let retiring = self
+            .inner
+            .retiring
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if retiring.is_empty() {
+            return jobs;
+        }
+        jobs.extend(retiring.values().cloned());
+        jobs.sort_by(|one, other| {
+            one.created_at_epoch_ms
+                .total_cmp(&other.created_at_epoch_ms)
+                .then(one.job_id.cmp(&other.job_id))
+        });
+        jobs
     }
 
     // Each route's session as it stands, for the exporter: read by the tick,
@@ -5411,6 +5436,9 @@ impl TorrentService {
                     job_id = job_id.0,
                     "a torrent's history waits for room on the database's disk"
                 );
+                if retires {
+                    self.show_retiring(&report);
+                }
                 let service = self.clone();
                 tokio::spawn(async move {
                     if written.await.is_err() {
@@ -5422,10 +5450,31 @@ impl TorrentService {
         }
     }
 
+    // A torrent removed whose history row the database's disk has no room
+    // for stays in the queue as an NZB job's retiring row does, saying it
+    // waits for disk space, until the row is written.
+    fn show_retiring(&self, report: &JobReport) {
+        let mut job = report.clone().job_info();
+        job.download_wait_reason = Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON.to_owned());
+        self.inner
+            .retiring
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(report.job_id, job.clone());
+        if let Some(queue) = self.queue() {
+            queue.publish_owned_job(job);
+        }
+    }
+
     // A torrent's job, its history row written: out to the queue's
     // finished jobs.
     async fn finished(&self, report: JobReport) {
         let job_id = report.job_id;
+        self.inner
+            .retiring
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&job_id);
         self.publish().await;
         if let Some(queue) = self.queue()
             && let Err(error) = queue.retire_job(report.job_info()).await

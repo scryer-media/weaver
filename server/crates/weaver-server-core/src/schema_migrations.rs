@@ -41,7 +41,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 119;
+const CURRENT_SCHEMA_VERSION: i64 = 120;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -1488,7 +1488,7 @@ mod tests {
         run_embedded_migrations_on_path_blocking(&db_path).unwrap();
 
         let pool = open_test_pool(&db_path).await;
-        assert_eq!(CURRENT_SCHEMA_VERSION, 119);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 120);
         assert_eq!(
             max_recorded_migration_version(&pool).await.unwrap(),
             Some(CURRENT_SCHEMA_VERSION)
@@ -2284,6 +2284,55 @@ mod tests {
                 .unwrap();
         assert_eq!(keys, vec!["torrent.session_slots".to_string()]);
         pool.close().await;
+    }
+
+    // A database at 119 upgrades to the current schema: each torrent it
+    // holds stays live, with no history row kept on it, and the start finds
+    // the torrents a removal left retiring by their index.
+    #[tokio::test]
+    async fn sqlite_migration_119_torrents_upgrade_with_no_kept_history_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("v119.db");
+        let pool = open_test_pool(&db_path).await;
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(119), true)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO torrents (job_id, infohash_v1, name, source, added_at_ms, state)
+             VALUES (7, ?, 'kept', 'magnet', 1, 'queued')",
+        )
+        .bind(vec![7_u8; 20])
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        let rows: Vec<(i64, Option<String>)> =
+            sqlx::query_as("SELECT job_id, retiring FROM torrents")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, vec![(7, None)]);
+        let detail: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+            "EXPLAIN QUERY PLAN SELECT job_id, retiring FROM torrents WHERE retiring IS NOT NULL",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            detail
+                .iter()
+                .any(|(_, _, _, step)| step.contains("idx_torrents_retiring")),
+            "{detail:?}"
+        );
+        pool.close().await;
+        let db = crate::Database::open(&db_path).unwrap();
+        db.validate_backup_catalog().unwrap();
     }
 
     #[tokio::test]
