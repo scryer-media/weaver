@@ -73,4 +73,5 @@ struct SerializedUtpStatsSnapshot {
     sack_bytes_sent: u64,
     sacks_received: u64,
     sack_bits_received: u64,
+    data_packets_with_sack: u64,
 }

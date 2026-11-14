@@ -34,7 +34,10 @@ use crate::{
     ingress::{Event as IngressEvent, Receiver as IngressReceiver, Stop},
     mtu::{SegmentSizes, SegmentSizesConfig, packet_mtu},
     pacer::Pacer,
-    raw::{Type, UtpHeader},
+    raw::{
+        Type, UtpHeader,
+        selective_ack::{SACK_EXTENSION_HEADER, SACK_MAX_BYTES},
+    },
     recovery::Recovery,
     rtte::RttEstimator,
     seq_nr::SeqNr,
@@ -384,9 +387,6 @@ macro_rules! send_data {
                 ($self.env.now() - $self.socket_created).as_micros() as u32;
             $header.timestamp_difference_microseconds = $self.delay.reply_us();
 
-            let mut h = [0u8; UTP_HEADER as usize];
-            let hlen = $header.serialize(&mut h)?;
-
             // A live probe must arrive whole to prove its size; a probe given
             // up on as too large may be fragmented, so it still arrives, on
             // every resend (utp_stream.cpp v2.0.15:1810-1812, 2045-2046).
@@ -398,6 +398,36 @@ macro_rules! send_data {
             } else {
                 None
             };
+
+            // While packets are held past a hole, a data packet reports
+            // them as an ACK does, a resend as they are held now
+            // (utp_stream.cpp v2.0.15:1536-1548, 1729-1736, 2026-2040).
+            // The SACK goes in what the payload leaves of the size an
+            // ordinary packet may have, so the packet grows past no proven
+            // size; a probe, sized to the byte, carries none.
+            let held = $self.user_rx.selective_ack();
+            let sack = held.and_then(|sack| {
+                if fragmenting.is_some() {
+                    return None;
+                }
+                let room = usize::from($self.segment_sizes.mss())
+                    .checked_sub($segment_iter_item.payload_size() + SACK_EXTENSION_HEADER)?;
+                sack.truncated(room)
+            });
+            // A hole this packet could not report still owes its ACK.
+            let sack_unsent = held.is_some() && sack.is_none();
+            // The long buffer is zeroed only for a packet with a SACK.
+            let mut bare = [0u8; UTP_HEADER as usize];
+            let mut with_sack;
+            let h: &mut [u8] = if sack.is_some() {
+                with_sack = [0u8; UTP_HEADER as usize + SACK_EXTENSION_HEADER + SACK_MAX_BYTES];
+                &mut with_sack
+            } else {
+                &mut bare
+            };
+            $header.extensions.selective_ack = sack;
+            let hlen = $header.serialize(h)?;
+            $header.extensions.selective_ack = None;
 
             // Sent from the ring in place; the writer waits on the lock only
             // for the length of one send.
@@ -442,7 +472,10 @@ macro_rules! send_data {
             // lost one does.
             let accepted = refused.is_none();
             if let Some(source) = refused {
-                let payload_size = $segment_iter_item.payload_size();
+                // The size refused is the whole packet's past its header,
+                // a SACK included.
+                let payload_size =
+                    $segment_iter_item.payload_size() + hlen - UTP_HEADER as usize;
                 debug!(
                     seq_nr = %$segment_iter_item.seq_nr(),
                     payload_size,
@@ -466,8 +499,21 @@ macro_rules! send_data {
             $self.totals.packets_sent += 1;
             if accepted {
                 $self.socket.stats.data_packets_sent.increment(1);
+                if let Some(sack) = &sack {
+                    $self.socket.stats.data_packets_with_sack.increment(1);
+                    $self
+                        .socket
+                        .stats
+                        .sack_bytes_sent
+                        .increment(sack.as_bytes().len() as u64);
+                }
             }
-            on_packet_sent!($self, $header);
+            if sack_unsent {
+                $self.last_sent_ack_nr = $header.ack_nr;
+                $self.last_sent_window = $header.wnd_size;
+            } else {
+                on_packet_sent!($self, $header);
+            }
 
             if $segment_iter_item.seq_nr().is_after($self.last_sent_seq_nr) {
                 $self.last_sent_seq_nr = $segment_iter_item.seq_nr();
@@ -1452,6 +1498,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let min_ss = self.segment_sizes.mss();
         let probe_room = self.congestion_controller.cwnd_bytes()
             > 3 * usize::from(min_ss.saturating_add(UTP_HEADER));
+        // While packets are held past a hole, a segment is cut short by the
+        // SACK its packet will carry, as libtorrent takes the SACK out of
+        // the packet's payload (v2.0.15 utp_stream.cpp:1536-1560), unless
+        // that would leave less than half a packet of payload.
+        let sack_reserve = self
+            .user_rx
+            .selective_ack()
+            .map(|sack| sack.as_bytes().len() + SACK_EXTENSION_HEADER)
+            .filter(|reserve| *reserve <= usize::from(min_ss) / 2)
+            .unwrap_or(0);
         // While a probe is due and the window is too small for it, no more
         // is cut than may be in flight, so the probe is cut once the window
         // has grown, not after everything written. Segments a SACK reported
@@ -1480,7 +1536,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             } else {
                 min_ss
             };
-            let max_payload_size = (ss as usize).min(remote_window_remaining);
+            let ss = if ss > min_ss {
+                usize::from(ss)
+            } else {
+                usize::from(ss) - sack_reserve
+            };
+            let max_payload_size = ss.min(remote_window_remaining);
             let payload_size = max_payload_size.min(remaining);
 
             // Run Nagle algorithm to prevent sending too many small segments.

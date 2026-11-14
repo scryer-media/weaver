@@ -111,8 +111,11 @@ async fn payload_after_the_remotes_fin_is_dropped() {
     assert_eq!(t.read_all_available().await.unwrap(), b"a");
 }
 
+// While a packet is held past a hole every data packet says so, a resend
+// with the SACK as it stands when it leaves (libtorrent v2.0.15
+// utp_stream.cpp:1536-1551 and, for a resend, :2026-2038).
 #[tokio::test]
-async fn data_never_carries_a_sack_and_a_resend_none_left_over() {
+async fn data_carries_the_sack_while_a_packet_is_held_and_a_resend_the_same() {
     setup_test_logging();
     let mut t = make_test_vsock(patient(), false);
     // Remote's 3 before its 1 and 2: a hole our ACKs report.
@@ -139,10 +142,13 @@ async fn data_never_carries_a_sack_and_a_resend_none_left_over() {
         .filter(|m| m.header.htype == Data)
         .collect();
     assert_eq!(data.len(), 2, "sent, then resent");
-    assert!(
-        data.iter()
-            .all(|m| m.header.extensions.selective_ack.is_none())
-    );
+    for m in &data {
+        let sack = m.header.extensions.selective_ack.as_ref().expect("a SACK");
+        // Bit 0 is the remote's 2, bit 1 its 3.
+        assert_eq!(sack.as_bytes(), [0b10], "{m:?}");
+    }
+    assert_eq!(data[0].payload(), b"hello");
+    assert_eq!(data[1].payload(), b"hello");
 }
 
 async fn with_a_packet_acknowledged(seq_nr: u16) -> super::TestVsock {

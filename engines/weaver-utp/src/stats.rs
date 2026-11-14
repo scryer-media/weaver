@@ -84,6 +84,8 @@ pub struct UtpStats {
     pub sacks_received: AtomicU64,
     /// Packets the SACKs received reported held: the bits set in them.
     pub sack_bits_received: AtomicU64,
+    /// Data packets sent that carried a SACK.
+    pub data_packets_with_sack: AtomicU64,
 }
 
 /// Relaxed counters for a socket, aggregated across its streams.
@@ -117,6 +119,7 @@ pub struct UtpStatsSnapshot {
     pub sack_bytes_sent: u64,
     pub sacks_received: u64,
     pub sack_bits_received: u64,
+    pub data_packets_with_sack: u64,
 }
 
 impl UtpStats {
@@ -152,6 +155,7 @@ impl UtpStats {
             sack_bytes_sent: self.sack_bytes_sent.load(Ordering::Relaxed),
             sacks_received: self.sacks_received.load(Ordering::Relaxed),
             sack_bits_received: self.sack_bits_received.load(Ordering::Relaxed),
+            data_packets_with_sack: self.data_packets_with_sack.load(Ordering::Relaxed),
         }
     }
 }
@@ -216,6 +220,7 @@ impl std::ops::AddAssign for UtpStatsSnapshot {
         self.sack_bytes_sent = self.sack_bytes_sent.saturating_add(other.sack_bytes_sent);
         self.sacks_received = self.sacks_received.saturating_add(other.sacks_received);
         self.sack_bits_received = self.sack_bits_received.saturating_add(other.sack_bits_received);
+        self.data_packets_with_sack = self.data_packets_with_sack.saturating_add(other.data_packets_with_sack);
     }
 }
 

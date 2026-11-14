@@ -11,6 +11,10 @@ use bitvec::{BitArr, order::Lsb0, slice::BitSlice};
 /// receives (utp_stream.cpp:1238-1281).
 pub const SACK_MAX_BYTES: usize = u8::MAX as usize;
 
+// What the extension adds to a packet before the SACK's own bytes: the next
+// extension's number and the length.
+pub(crate) const SACK_EXTENSION_HEADER: usize = 2;
+
 // The most bits Weaver sends: 252 bytes, the most whole four-byte words
 // the length byte allows.
 pub(crate) const SACK_SENT_MAX_BITS: usize = SACK_MAX_BYTES / 4 * 4 * 8;
@@ -61,6 +65,14 @@ impl SelectiveAck {
         } else {
             None
         }
+    }
+
+    /// The SACK cut to what `max_bytes` hold, for a packet with no room
+    /// for all of it: the packets nearest the hole. None when that leaves
+    /// no packet reported.
+    pub fn truncated(mut self, max_bytes: usize) -> Option<Self> {
+        self.len = self.len.min(max_bytes * 8);
+        self.as_bitslice().any().then_some(self)
     }
 
     /// How many packets the SACK speaks for, in bits.
