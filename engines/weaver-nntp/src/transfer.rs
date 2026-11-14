@@ -1074,6 +1074,29 @@ impl ServerTransferControl {
         self.rate_schedule.load(Ordering::Acquire) & RATE_SCHEDULE_TARGET_MASK
     }
 
+    // A fingerprint of a server's login identity: its host, port, username
+    // and password. A pool that comes into use with one other than the last
+    // pool's ends the server's run of login refusals, so the next refusal
+    // starts its give-up time afresh; anything else configured for the
+    // server (speed, routes, priority) leaves the run as it is.
+    pub(crate) fn login_fingerprint(
+        host: &str,
+        port: u16,
+        username: Option<&str>,
+        password: Option<&str>,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (host, port, username, password).hash(&mut hasher);
+        hasher.finish()
+    }
+
+    // When the server's present run of login refusals becomes the verdict.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn login_refusal_verdict_at(&self) -> Option<Instant> {
+        self.recovery.refusal_verdict_at()
+    }
+
     fn reconfigure_rate(&self, rate_bytes_per_sec: u64) {
         let _waiters = self
             .rate_wait_lock

@@ -2178,6 +2178,41 @@ fn hosts_client(hosts: &[usize]) -> weaver_nntp::client::NntpClient {
     })
 }
 
+// Pool server `server` refuses the login. A fill server's refusal waits: the
+// server may still serve the work only it could serve, as through any
+// outage. A backfill server's refusal is the answer at once.
+async fn refuse_login(pipeline: &Pipeline, server: usize) {
+    let pool = pipeline.nntp.pool();
+    pool.health().lock().await.record_failure(server, true);
+    if pool.is_backfill(server) {
+        assert!(
+            pool.refuses_credentials(server),
+            "backfill is never waited for"
+        );
+        return;
+    }
+    assert!(!pool.refuses_credentials(server), "a fresh refusal waits");
+    assert!(Pipeline::server_may_serve(
+        pool,
+        server,
+        weaver_nntp::ServerSet::EMPTY,
+        weaver_nntp::ServerSet::EMPTY,
+    ));
+}
+
+// Pool server `server` refuses the login, waits as [`refuse_login`] does,
+// and then has refused it for its whole give-up time: the refusal is the
+// verdict on the work only it could serve.
+async fn refuse_login_past_give_up(pipeline: &Pipeline, server: usize) {
+    refuse_login(pipeline, server).await;
+    let pool = pipeline.nntp.pool();
+    pool.set_login_refusal_clock(
+        server,
+        std::time::Instant::now() + weaver_nntp::health::LOGIN_REFUSAL_GIVE_UP,
+    );
+    assert!(pool.refuses_credentials(server));
+}
+
 // Two fill servers: index 0 holds 5 days of retention, index 1 is unlimited.
 fn two_server_retention_client() -> weaver_nntp::client::NntpClient {
     retention_client(&[5, 0])

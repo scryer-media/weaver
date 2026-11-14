@@ -1188,6 +1188,7 @@ async fn generation_wake_requeues_ten_thousand_segments_in_one_batch() {
             reason: "no eligible NNTP server",
             retry_at_epoch_ms: None,
             pending_count: RETRY_COUNT,
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
         },
     );
 

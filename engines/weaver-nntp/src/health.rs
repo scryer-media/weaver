@@ -62,6 +62,9 @@ pub enum DisableReason {
     FailureRatio,
 }
 
+// How long a fill server refusing the login is waited for, by default.
+pub const LOGIN_REFUSAL_GIVE_UP: Duration = Duration::from_hours(1);
+
 // Configuration thresholds for health state transitions.
 #[derive(Debug, Clone)]
 pub struct HealthConfig {
@@ -75,6 +78,10 @@ pub struct HealthConfig {
     pub max_backoff: Duration,
     // How long to disable a server after an authentication failure.
     pub auth_disable_duration: Duration,
+    // How long a fill server must refuse the login without a break before
+    // the refusal is a verdict on the work only it could serve. Until then
+    // that work waits for it, as through any other outage.
+    pub auth_give_up_after: Duration,
     // How long to cool down a server after a transport-level failure.
     pub transient_cooldown: Duration,
     // How long to cool down a server after a capacity-related failure.
@@ -96,6 +103,7 @@ impl Default for HealthConfig {
             base_backoff: Duration::from_secs(30),
             max_backoff: Duration::from_secs(60),
             auth_disable_duration: Duration::from_mins(5),
+            auth_give_up_after: LOGIN_REFUSAL_GIVE_UP,
             transient_cooldown: Duration::from_secs(10),
             capacity_cooldown: Duration::from_secs(5),
             // 10% sustained transport failure over 40+ attempts is pathological
@@ -138,6 +146,9 @@ pub struct ServerHealth {
     ratio_attempts: u32,
     // Failed attempts recorded in the current failure-ratio window.
     ratio_failures: u32,
+    // Where the last refused login left the server's run of refusals, for
+    // the tracker to report once.
+    login_refusal: Option<crate::recovery::LoginRefusalRun>,
 }
 
 impl ServerHealth {
@@ -165,6 +176,7 @@ impl ServerHealth {
             ratio_window_started: None,
             ratio_attempts: 0,
             ratio_failures: 0,
+            login_refusal: None,
         }
     }
 
@@ -257,12 +269,14 @@ impl ServerHealth {
         }
 
         if is_auth {
-            let Some(until) = self
-                .recovery
-                .quarantine_for_credentials(self.config.auth_disable_duration, self.recovery_event)
-            else {
+            let Some((until, run)) = self.recovery.quarantine_for_credentials(
+                self.config.auth_disable_duration,
+                self.config.auth_give_up_after,
+                self.recovery_event,
+            ) else {
                 return;
             };
+            self.login_refusal = Some(run);
             self.disable_count += 1;
             self.recovery_pending = true;
             self.state = ServerState::Disabled {
@@ -595,6 +609,17 @@ impl AvailabilityBoard {
     }
 }
 
+// The one line said when a server's run of login refusals has lasted its
+// give-up time and the work that waited on it has been weighed.
+pub(crate) fn warn_login_refusal_gave_up(server_idx: usize, give_up_after: Duration) {
+    tracing::warn!(
+        server = server_idx,
+        give_up_after_secs = give_up_after.as_secs(),
+        "server has refused the login for its whole give-up time; the work only it \
+         can serve is booked missing"
+    );
+}
+
 // Manages health state for multiple servers.
 #[derive(Debug)]
 pub struct HealthTracker {
@@ -615,6 +640,9 @@ impl HealthTracker {
         idx: usize,
         gate: Arc<crate::recovery::RecoveryGate>,
     ) {
+        // The gate's run of login refusals carries over: a pool rebuilt
+        // over the same server never ends it. What does is said where the
+        // pool becomes the one in use; see `NntpPool::activated`.
         self.servers[idx].recovery = gate;
     }
 
@@ -640,9 +668,33 @@ impl HealthTracker {
         let failures_before = self.servers[server_idx].failure_count;
         self.servers[server_idx].record_connection_outcome(ticket, success, auth, allow_ratio_trip);
         self.publish(server_idx);
+        self.report_login_refusal(server_idx);
         // A ticket reports only its first failure, so the count moves once.
         if probing && self.servers[server_idx].failure_count != failures_before {
             Self::warn_probe_failed(server_idx, &self.servers[server_idx]);
+        }
+    }
+
+    // One line when a server's run of login refusals begins, never per
+    // article or per probe. The line for a run that has lasted its give-up
+    // time is said where the verdict is told; see
+    // `NntpPool::mark_login_refusal_verdicts_told`. A backfill server's
+    // refusal is answered at once and holds nothing, so neither line is
+    // said for it.
+    fn report_login_refusal(&mut self, server_idx: usize) {
+        let backfill = self.backfill.get(server_idx).copied().unwrap_or(false);
+        let health = &mut self.servers[server_idx];
+        let run = health.login_refusal.take();
+        if backfill {
+            return;
+        }
+        match run {
+            Some(crate::recovery::LoginRefusalRun::Began) => tracing::warn!(
+                server = server_idx,
+                give_up_after_secs = health.config.auth_give_up_after.as_secs(),
+                "server refuses the login; the work only it can serve waits for it"
+            ),
+            Some(crate::recovery::LoginRefusalRun::Waiting) | None => {}
         }
     }
 
@@ -733,6 +785,7 @@ impl HealthTracker {
         let allow_ratio_trip = self.ratio_trip_allowed(server_idx);
         self.servers[server_idx].record_failure_gated(is_auth, allow_ratio_trip);
         self.publish(server_idx);
+        self.report_login_refusal(server_idx);
     }
 
     // Record a short-lived cooldown-worthy failure for the given server.
@@ -844,6 +897,7 @@ mod tests {
             base_backoff: NEVER_LAPSES,
             max_backoff: NEVER_LAPSES * 2,
             auth_disable_duration: NEVER_LAPSES,
+            auth_give_up_after: LOGIN_REFUSAL_GIVE_UP,
             transient_cooldown: NEVER_LAPSES,
             capacity_cooldown: NEVER_LAPSES,
             // High sample floor so consecutive-machine tests above never

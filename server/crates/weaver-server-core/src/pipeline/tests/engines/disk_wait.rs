@@ -104,7 +104,9 @@ async fn until_waiting(pipeline: &mut Pipeline, scenario: &Scenario) {
     assert!(pipeline.waits_for_disk_room(), "the job waits for room");
     assert!(working(pipeline).waited_on());
     assert_eq!(
-        pipeline.dispatch_wait_reason(JOB),
+        pipeline
+            .dispatch_wait_reason(JOB, pipeline.login_refusal_view())
+            .as_deref(),
         Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON)
     );
 }
@@ -170,7 +172,12 @@ async fn a_started_job_fetches_on_under_the_reserve_and_completes() {
     assert_eq!(pipeline.download_scheduler_eligible_jobs(), vec![JOB]);
     assert!(!pipeline.waits_for_disk_room());
     assert!(!ledger.waited_on(), "nothing waits on the disk");
-    assert_eq!(pipeline.dispatch_wait_reason(JOB), None);
+    assert_eq!(
+        pipeline
+            .dispatch_wait_reason(JOB, pipeline.login_refusal_view())
+            .as_deref(),
+        None
+    );
 
     drive(&mut pipeline, &scenario, JOB, |_| false).await;
     assert_eq!(
@@ -327,7 +334,9 @@ async fn a_paused_job_waiting_for_room_completes_once_there_is_room_and_it_resum
     pipeline.apply_queue_intents().await;
     assert!(!pipeline.waits_for_disk_room());
     assert_ne!(
-        pipeline.dispatch_wait_reason(JOB),
+        pipeline
+            .dispatch_wait_reason(JOB, pipeline.login_refusal_view())
+            .as_deref(),
         Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON)
     );
     drive(&mut pipeline, &scenario, JOB, |_| false).await;
@@ -858,7 +867,9 @@ fn assert_full_disk_held(pipeline: &Pipeline) {
         "the wait hears every reading"
     );
     assert_eq!(
-        pipeline.dispatch_wait_reason(JOB),
+        pipeline
+            .dispatch_wait_reason(JOB, pipeline.login_refusal_view())
+            .as_deref(),
         Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON)
     );
     assert!(
@@ -882,7 +893,12 @@ async fn full_disk_freed(pipeline: &mut Pipeline, scenario: &Scenario, room: &At
     assert!(!pipeline.held_for_full_disk(JOB));
     assert!(!pipeline.waits_for_disk_room());
     assert!(!working(pipeline).waited_on(), "no one waits on the disk");
-    assert_eq!(pipeline.dispatch_wait_reason(JOB), None);
+    assert_eq!(
+        pipeline
+            .dispatch_wait_reason(JOB, pipeline.login_refusal_view())
+            .as_deref(),
+        None
+    );
 
     restarts(pipeline).await;
     drive(pipeline, scenario, JOB, |_| false).await;
@@ -1914,7 +1930,9 @@ fn assert_move_held(pipeline: &Pipeline) {
     assert!(pipeline.waits_for_disk_room());
     assert!(!pipeline.inflight_moves.contains(&JOB));
     assert_eq!(
-        pipeline.dispatch_wait_reason(JOB),
+        pipeline
+            .dispatch_wait_reason(JOB, pipeline.login_refusal_view())
+            .as_deref(),
         Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON)
     );
 }

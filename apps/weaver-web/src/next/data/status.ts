@@ -6,6 +6,7 @@ import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { statusI18nKey } from "@/lib/status-tokens";
 import type { JobData } from "@/lib/job-types";
 import { latestPhase } from "./phase-bars";
+import { waitReasonDetail } from "./wait-reason";
 
 /**
  * Status vocabulary shared by every screen.
@@ -62,9 +63,7 @@ export function statusDetail(
     return job.error;
   }
   if (job.downloadWaitReason) {
-    const key = `next.status.wait.${job.downloadWaitReason.toLowerCase()}`;
-    const label = t(key);
-    return label === key ? job.downloadWaitReason.toLowerCase().replace(/_/g, " ") : label;
+    return waitReasonDetail(t, job.downloadWaitReason);
   }
   if (phase && phase.totalBytes > 0) {
     const percent = `${Math.round(phase.progressPercent)}%`;

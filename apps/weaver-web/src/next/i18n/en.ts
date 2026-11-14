@@ -730,6 +730,7 @@ export const nextEn: LocaleDictionary = {
   "next.general.maxConcurrentNzbsHelp": "Limit Usenet NZBs from start through repair, extraction and final completion. Shared across all providers.",
   "next.status.wait.nzb_slot": "Waiting for an NZB slot",
   "next.status.wait.disk_space": "Low disk space",
+  "next.status.wait.login_refused": "Waiting: login refused by {{server}}",
   "next.general.propagationDelayHelp": "Hold a new NZB this long before starting, so every article has reached the servers.",
   "next.general.seconds": "seconds",
   "next.general.srrdb": "SRRDB release lookup",
