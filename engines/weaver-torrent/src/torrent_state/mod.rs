@@ -1281,8 +1281,14 @@ impl ManagedTorrent {
     /// now. One that fails ends seed mode and every piece is checked again
     /// (libtorrent `torrent::leave_seed_mode` with `check_files`). None
     /// while the torrent neither runs nor is paused, or for no piece of it.
-    /// Reads the piece from disk: called off the async runtime.
+    ///
+    /// Blocks its thread: it reads the piece from disk, and it waits for a
+    /// blocking permit and for another's check of the piece without
+    /// yielding. Call it off the async runtime, as from
+    /// [`tokio::task::spawn_blocking`], never on a runtime's worker or on a
+    /// uTP thread.
     pub fn check_seeded(&self, piece: u32) -> Option<anyhow::Result<bool>> {
+        crate::spawn_utils::no_block_on_utp_thread();
         let metadata = self.metadata.load();
         let piece = metadata.as_ref()?.lengths().validate_piece_index(piece)?;
         let seed = &self.shared.options.seed;
@@ -1314,10 +1320,12 @@ impl ManagedTorrent {
                 &*paused.files,
                 self.shared.options.disable_v1_hashes,
             );
-            if matches!(
-                ops.check_piece_whole(piece),
-                Ok(crate::file_ops::Verdict::Passed)
-            ) {
+            let verdict = seed_mode::counted_read(
+                &self.shared.spawner,
+                u64::from(paused.metadata.lengths().piece_length(piece)),
+                || ops.check_piece_whole(piece),
+            );
+            if matches!(verdict, Ok(crate::file_ops::Verdict::Passed)) {
                 let checked = paused.files.on_piece_checked(piece);
                 seed.checked(piece);
                 return Some(checked.map(|()| true));

@@ -1488,13 +1488,18 @@ impl TorrentStateLive {
     // A peer's request for a block of `piece` waits here while the torrent
     // is in seed mode and the piece is not yet checked. The check runs on a
     // blocking thread of the session and holds one of the session's
-    // blocking permits, those the reads of blocks and the checks of
-    // downloaded pieces share: as many seed-mode pieces are read at once as
-    // the session has permits (`SessionOptions::runtime_worker_threads`, 8
-    // by default), however many peers ask. libtorrent runs these hashes on
-    // its `aio_threads` (10) and allows each peer three
-    // (peer_connection.cpp:5318-5319, v2.0.15). Waiting for another's check
-    // holds neither a thread nor a permit.
+    // blocking permits, as a TCP peer's upload read, an initial check, an
+    // add and a stream do: as many seed-mode pieces are read at once as the
+    // session has permits (`SessionOptions::runtime_worker_threads`, 8 by
+    // default), however many peers ask. A downloaded piece's check runs on
+    // the session's hashing thread and a uTP peer's upload read on the
+    // read threads, neither with a permit. libtorrent hashes a seed-mode
+    // piece with a hash job that has no `sequential_access` flag
+    // (peer_connection.cpp:5329-5337, v2.0.15), which goes to its generic
+    // disk threads, `aio_threads` (10), not to its hashing thread
+    // (mmap_disk_io.cpp:1683-1690), and allows each peer three
+    // (peer_connection.cpp:5318-5319). Waiting for another's check holds
+    // neither a thread nor a permit.
     pub(crate) async fn serve_seeded(
         self: &Arc<Self>,
         piece: ValidPieceIndex,
@@ -1545,12 +1550,11 @@ impl TorrentStateLive {
         if !seed.unchecked(piece) {
             return Ok(true);
         }
-        crate::session_stats::check::CHECK_STATS.seed_checks_started(1);
-        let verdict = {
-            let call = self.shared.spawner.stats().call(DiskOp::SeedCheck);
-            call.bytes(u64::from(self.lengths.piece_length(piece)));
-            self.file_ops().check_piece_whole(piece)
-        };
+        let verdict = crate::torrent_state::seed_mode::counted_read(
+            &self.shared.spawner,
+            u64::from(self.lengths.piece_length(piece)),
+            || self.file_ops().check_piece_whole(piece),
+        );
         if matches!(verdict, Ok(Verdict::Passed)) {
             self.files.on_piece_checked(piece)?;
             if seed.checked(piece) {

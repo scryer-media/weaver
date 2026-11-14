@@ -88,6 +88,23 @@ pub(crate) fn blocking_permit(
     futures::executor::block_on(spawner.owned_permit()).ok()
 }
 
+// The read of a seed-mode check, `read`, of a piece of `bytes`, counted
+// once whichever way the check came in, a peer's request or a call of a
+// running or a paused torrent: one seed-mode check started for the
+// process and one `seed_check` disk call for the session.
+pub(crate) fn counted_read<R>(
+    spawner: &crate::spawn_utils::BlockingSpawner,
+    bytes: u64,
+    read: impl FnOnce() -> R,
+) -> R {
+    crate::session_stats::check::CHECK_STATS.seed_checks_started(1);
+    let call = spawner
+        .stats()
+        .call(crate::session_stats::disk::DiskOp::SeedCheck);
+    call.bytes(bytes);
+    read()
+}
+
 impl SeedMode {
     // Seed mode over `pieces` pieces, those `verified` sets already checked
     // (libtorrent's `verified_pieces` in resume data, restored on a seed-mode

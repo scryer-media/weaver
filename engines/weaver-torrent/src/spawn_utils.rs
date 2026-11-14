@@ -193,6 +193,7 @@ impl BlockingSpawner {
         while permits.len() < most
             && let Ok(permit) = semaphore.try_acquire()
         {
+            self.stats.permit_taken();
             permits.push(permit);
         }
         let threads = permits.len();
@@ -429,6 +430,18 @@ mod tests {
         let counted = spawner.disk_snapshot();
         assert_eq!((counted.permit_acquisitions, counted.permit_waits), (2, 1));
         assert_eq!(spawner.semaphore().available_permits(), 1);
+    }
+
+    // Every blocking permit a call holds is one the permit counters see:
+    // a call that runs on two permits is two permits taken.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_permit_a_check_runs_on_is_counted() {
+        let spawner = BlockingSpawner::new(2);
+        let threads = spawner
+            .block_in_place_with_permits(2, |threads| threads)
+            .await;
+        assert_eq!(threads, 2);
+        assert_eq!(spawner.disk_snapshot().permit_acquisitions, 2);
     }
 
     // Says, when dropped, whether it was dropped on a uTP thread.

@@ -698,3 +698,91 @@ async fn test_permits_taken_by_an_add_a_seed_check_and_a_stream_are_counted() ->
     drop(stream);
     Ok(())
 }
+
+// One check of a seed-mode piece is one `seed_check` disk call however
+// many ask for the piece meanwhile (the one that waits on the running
+// check reads nothing), and the check a running torrent's own call runs
+// counts as one too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_seed_check_is_one_disk_call_and_a_joiner_none() -> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new(
+        "test_seed_disk_call",
+        PIECES * PIECE_LENGTH as usize,
+        PIECE_LENGTH,
+    )
+    .await?;
+    let dir = TempDir::with_prefix("test_seed_disk_call_out")?;
+    let (session, seed, gate, mut reaches) = seeding_gated(&t, &dir, 2).await?;
+    let seed_checks = || {
+        session.spawner.disk_snapshot().ops[crate::session_stats::disk::DiskOp::SeedCheck.index()]
+            .calls
+    };
+    assert_eq!(seed_checks(), 0);
+    let live = seed.live().context("the seed is not live")?;
+    let piece = piece_of(6)?;
+    let seed_mode = &seed.shared().options.seed;
+    let first = tokio::spawn({
+        let live = live.clone();
+        async move { live.serve_seeded(piece).await }
+    });
+    reaches.recv().await.context("no read came")?;
+    let second = tokio::spawn({
+        let live = live.clone();
+        async move { live.serve_seeded(piece).await }
+    });
+    while seed_mode.waiting(piece) < 1 {
+        tokio::task::yield_now().await;
+    }
+    gate.open();
+    assert!(first.await??);
+    assert!(second.await??);
+    assert_eq!(gate.counts().0, 1, "the piece is read once");
+    assert_eq!(seed_checks(), 1, "one check, one disk call");
+
+    let other = piece_of(3)?;
+    let checked = tokio::task::spawn_blocking({
+        let live = live.clone();
+        move || live.check_seeded(other)
+    })
+    .await??;
+    assert!(checked);
+    assert_eq!(seed_checks(), 2, "the running torrent's own check");
+    Ok(())
+}
+
+// A paused seed-mode torrent's check reads its piece on one of the
+// session's blocking permits, as a running one's does, and is counted as
+// the session's disk call as that one is.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_paused_seed_check_is_a_disk_call() -> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new(
+        "test_paused_disk_call",
+        PIECES * PIECE_LENGTH as usize,
+        PIECE_LENGTH,
+    )
+    .await?;
+    let dir = TempDir::with_prefix("test_paused_disk_call_out")?;
+    let (session, seed, gate, _reaches) = seeding_gated(&t, &dir, 2).await?;
+    let seed_checks = || {
+        session.spawner.disk_snapshot().ops[crate::session_stats::disk::DiskOp::SeedCheck.index()]
+            .calls
+    };
+    gate.open();
+    seed.pause()?;
+    assert!(seed.live().is_none());
+    let checked = tokio::task::spawn_blocking({
+        let seed = seed.clone();
+        move || seed.check_seeded(4)
+    })
+    .await?;
+    assert_eq!(checked.transpose()?, Some(true));
+    assert_eq!(gate.counts().0, 1, "the paused check read the piece");
+    assert_eq!(
+        seed_checks(),
+        1,
+        "the paused check is a seed_check disk call"
+    );
+    Ok(())
+}
