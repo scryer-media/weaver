@@ -659,7 +659,7 @@ async fn the_scan_floors_hand_out_what_a_whole_walk_does() {
         insert_active_job(
             &mut pipeline,
             UUENCODED,
-            segmented_job_spec("Seeded Uu", "payload.bin", &vec![128u32; 40]),
+            segmented_job_spec("Seeded Uu", "payload.bin", &[128u32; 40]),
         )
         .await;
         pipeline.active_download_passes.insert(UUENCODED);

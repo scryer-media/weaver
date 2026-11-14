@@ -44,10 +44,11 @@ impl GraphJobs {
     }
 
     pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut GraphJob> {
-        self.jobs.values_mut().map(|job| {
+        fn touch(job: &mut GraphJob) -> &mut GraphJob {
             job.touched();
             job
-        })
+        }
+        self.jobs.values_mut().map(touch)
     }
 
     // A graph put in starts its own count and holds no list.
