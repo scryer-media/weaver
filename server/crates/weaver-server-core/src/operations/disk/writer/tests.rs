@@ -39,52 +39,6 @@ fn count(counter: &AtomicU64) -> u64 {
     counter.load(Ordering::Relaxed)
 }
 
-// A clock that is a minute later each time it is looked at.
-struct Leaping(AtomicU64);
-
-impl Clock for Leaping {
-    fn now(&self) -> Duration {
-        Duration::from_secs(self.0.fetch_add(60, Ordering::Relaxed))
-    }
-
-    fn runs(&self) -> bool {
-        false
-    }
-}
-
-// A clock the test moves by hand, which counts the looks taken at it.
-#[derive(Default)]
-struct HandClock {
-    at: Mutex<(Duration, u32)>,
-    looked: Condvar,
-}
-
-impl HandClock {
-    fn move_to(&self, at: Duration) {
-        self.at.lock().unwrap().0 = at;
-    }
-
-    fn wait_looks(&self, looks: u32) {
-        let mut at = self.at.lock().unwrap();
-        while at.1 < looks {
-            at = self.looked.wait(at).unwrap();
-        }
-    }
-}
-
-impl Clock for HandClock {
-    fn now(&self) -> Duration {
-        let mut at = self.at.lock().unwrap();
-        at.1 += 1;
-        self.looked.notify_all();
-        at.0
-    }
-
-    fn runs(&self) -> bool {
-        false
-    }
-}
-
 #[test]
 fn a_barrier_passes_once_every_write_before_it_returned() {
     let dir = tempfile::tempdir().unwrap();
@@ -419,7 +373,12 @@ fn a_volume_keeps_one_thread_until_it_ends_and_settle_waits_for_it() {
     hold.wait_held();
     // No caller holds the key, and its write is still seen: a settle that
     // gives up at once finds it and the close behind it.
-    let left = writers.settle_within(Duration::from_secs(30), &Leaping(AtomicU64::new(0)));
+    // The clock and span are chosen beforehand, as a pipeline chooses its own.
+    let bound = SettleBound {
+        clock: Arc::new(Leaping(AtomicU64::new(0))),
+        span: Duration::from_secs(30),
+    };
+    let left = writers.settle_by(&bound);
     assert_eq!(
         left,
         [Unsettled {

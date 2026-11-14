@@ -95,6 +95,25 @@ impl Clock for WallClock {
     }
 }
 
+// The clock a bounded settle goes by and the span it gives a volume that
+// stands still, chosen by whoever will ask for the settle: the machine's
+// clock outside tests, and in a test one it moves by hand.
+#[derive(Clone)]
+pub(crate) struct SettleBound {
+    pub(crate) clock: Arc<dyn Clock + Send>,
+    pub(crate) span: Duration,
+}
+
+impl SettleBound {
+    // `span` by the machine's own clock.
+    pub(crate) fn wall(span: Duration) -> Self {
+        Self {
+            clock: Arc::new(WallClock::start()),
+            span,
+        }
+    }
+}
+
 type ReportFn = dyn Fn(Report) + Send + Sync;
 type Then = Box<dyn FnOnce() + Send>;
 type Lanes = Vec<(usize, Arc<Lane>)>;
@@ -269,6 +288,11 @@ impl VolumeWriters {
     // nothing does when everything returned.
     pub(crate) fn settle_within(&self, span: Duration, clock: &dyn Clock) -> Vec<Unsettled> {
         self.settle_each(Some((span, clock)))
+    }
+
+    // The bounded settle, by a clock and span chosen beforehand.
+    pub(crate) fn settle_by(&self, bound: &SettleBound) -> Vec<Unsettled> {
+        self.settle_within(bound.span, &*bound.clock)
     }
 
     fn settle_each(&self, bound: Option<(Duration, &dyn Clock)>) -> Vec<Unsettled> {
@@ -1759,6 +1783,60 @@ impl Hold {
 impl Drop for Hold {
     fn drop(&mut self) {
         self.0.leave();
+    }
+}
+
+// A clock that is a minute later each time it is looked at.
+#[cfg(test)]
+pub(crate) struct Leaping(pub(crate) AtomicU64);
+
+#[cfg(test)]
+impl Clock for Leaping {
+    fn now(&self) -> Duration {
+        Duration::from_secs(self.0.fetch_add(60, Ordering::Relaxed))
+    }
+
+    fn runs(&self) -> bool {
+        false
+    }
+}
+
+// A clock a test moves by hand, which counts the looks taken at it. A
+// settle that goes by it looks again only when `VolumeWriters::look_again`
+// wakes it, after the test moved the clock.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct HandClock {
+    at: Mutex<(Duration, u32)>,
+    looked: Condvar,
+}
+
+#[cfg(test)]
+impl HandClock {
+    pub(crate) fn move_to(&self, at: Duration) {
+        self.at.lock().unwrap().0 = at;
+    }
+
+    // Wait until the clock has been looked at `looks` times in all.
+    pub(crate) fn wait_looks(&self, looks: u32) {
+        let mut at = self.at.lock().unwrap();
+        while at.1 < looks {
+            at = self.looked.wait(at).unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+impl Clock for HandClock {
+    fn now(&self) -> Duration {
+        let mut at = self.at.lock().unwrap();
+        at.1 += 1;
+        self.looked.notify_all();
+        at.0
+    }
+
+    fn runs(&self) -> bool {
+        false
     }
 }
 

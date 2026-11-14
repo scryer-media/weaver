@@ -1922,6 +1922,10 @@ pub struct Pipeline {
     pub(super) volume_reports:
         tokio::sync::mpsc::UnboundedReceiver<crate::operations::disk::writer::Report>,
     pub(super) volume_budget_held: std::sync::atomic::AtomicBool,
+    // The clock the shutdown settle of the volume writers goes by, and how
+    // long a volume may stand still before it is left behind. The machine's
+    // clock outside tests; a test may put one it moves by hand here.
+    pub(super) shutdown_settle: crate::operations::disk::writer::SettleBound,
     // What queues each volume's first write-rate probe on its writer, once.
     pub(super) volume_probes: Arc<crate::pipeline::graph::disk::VolumeProbes>,
     // What decode windows took from each disk they go on, for every graph
