@@ -1087,45 +1087,61 @@ fn a_failure_on_a_volume_with_no_thread_is_reported_before_a_settle_can_end() {
     assert!(job.failed());
 }
 
-// The volume's own work waits for the writer to run out of work: writes
-// queued before it and after it are down before it begins, and it runs
-// once nothing is queued. A volume no caller holds runs it at once.
+// The volume's own work is left as a job's disk leaves it: through a
+// submitter of the volume's own that is let go at once, which queues a key
+// to forget behind the work. A volume a job holds and has not written to
+// keeps the work: neither that forgetting nor a handle closed is work that
+// starts it. It runs once the job's write is down and nothing is queued. A
+// settle does not wait for it. A volume no caller holds runs it at once.
 #[test]
 fn the_volumes_own_work_runs_only_when_nothing_is_queued() {
     let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
     let (writers, _reports) = writers();
     let (volume, other) = (volume("one"), volume("two"));
-    let hold = writers.hold(&volume);
+    // Watches the volume's thread and holds nothing of it back.
+    let watch = writers.hold(&volume);
+    watch.open();
     let job = writers.submitter(&volume, 1);
     let (began, begun) = mpsc::channel();
     let (go, gone) = mpsc::channel::<()>();
     let (ended, end) = mpsc::channel();
+    let read = path.clone();
     let own = move || {
-        began.send(()).unwrap();
+        // What the job's file holds as the work begins.
+        began.send(std::fs::read(&read).ok()).unwrap();
         // Stands until the test lets it go: a write behind it would too.
         let _ = gone.recv();
         ended.send(()).unwrap();
     };
 
-    // Left with a volume that is held and has written nothing: not run.
+    // Left with a volume that is held and has written nothing. The thread
+    // has taken the work and the forgetting, and stands: not run.
     writers.volume_submitter(&volume).when_idle(own);
-    job.write(1, 0, Bytes::from_static(b"first"), create(&dir.path().join("a")));
-    hold.wait_held();
+    watch.wait_parked();
     assert!(begun.try_recv().is_err(), "not ahead of the job's first write");
-    job.write(1, 5, Bytes::from_static(b"later"), None);
-    let written = job.barrier();
-    hold.open();
-    // Both writes come down while the volume's own work has yet to end.
-    written.wait();
-    assert!(written.passed());
-    assert_eq!(std::fs::read(dir.path().join("a")).unwrap(), b"firstlater");
-    assert!(end.try_recv().is_err());
-    // A settle does not wait for it either.
+    // The job's write comes down first. Out of work, the writer runs it.
+    job.write(1, 0, Bytes::from_static(b"first"), create(&path));
+    assert_eq!(begun.recv().unwrap().as_deref(), Some(&b"first"[..]));
+    // A settle does not wait for it.
     writers.settle();
-    // Out of work, the writer runs it.
-    begun.recv().unwrap();
+    assert!(end.try_recv().is_err());
     go.send(()).unwrap();
     end.recv().unwrap();
+
+    // A handle closed is no work either: work left after the job's write
+    // waits for the next one.
+    let (again, ran_again) = mpsc::channel();
+    writers
+        .volume_submitter(&volume)
+        .when_idle(move || again.send(()).unwrap());
+    job.release(1);
+    watch.wait_parked();
+    assert!(ran_again.try_recv().is_err(), "a handle closed is not work");
+    job.write(1, 5, Bytes::from_static(b"later"), create(&path));
+    ran_again.recv().unwrap();
+    job.barrier().wait();
+    assert_eq!(std::fs::read(&path).unwrap(), b"firstlater");
 
     // On a volume no caller holds it runs at once.
     let (ran, run) = mpsc::channel();
@@ -1133,19 +1149,28 @@ fn the_volumes_own_work_runs_only_when_nothing_is_queued() {
     run.recv().unwrap();
 }
 
-// The volume's own work is dropped unrun once the owner is stopping.
+// The volume's own work is dropped unrun once the owner is stopping: left
+// while the job's write is held before the disk, it would run as that write
+// came down, and the stop rung meanwhile drops it instead.
 #[test]
 fn the_volumes_own_work_is_dropped_at_a_stop() {
     let dir = tempfile::tempdir().unwrap();
     let (writers, _reports) = writers();
     let volume = volume("one");
+    let hold = writers.hold(&volume);
     let job = writers.submitter(&volume, 1);
+    job.write(1, 0, Bytes::from_static(b"kept"), create(&dir.path().join("a")));
+    // The thread stands before the write: nothing after it is looked at
+    // until the test lets it through.
+    hold.wait_held();
     let (ran, run) = mpsc::channel::<()>();
     writers.volume_submitter(&volume).when_idle(move || ran.send(()).unwrap());
     writers.stop_waits();
-    job.write(1, 0, Bytes::from_static(b"kept"), create(&dir.path().join("a")));
+    hold.open();
     job.barrier().wait();
+    assert_eq!(std::fs::read(dir.path().join("a")).unwrap(), b"kept");
     drop(job);
+    drop(hold);
     writers.wait_ended(&volume);
     assert!(run.recv().is_err(), "dropped, not run");
 }

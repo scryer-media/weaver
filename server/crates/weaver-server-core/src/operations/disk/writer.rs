@@ -1330,8 +1330,9 @@ impl Lane {
         while let Ok(mail) = queued.try_recv() {
             match mail {
                 Mail::Op(first) => {
-                    thread.batch(first, queued);
-                    thread.worked = true;
+                    if thread.batch(first, queued) {
+                        thread.worked = true;
+                    }
                 }
                 Mail::Idle(run) => thread.idle.push(run),
                 Mail::Left => {}
@@ -1517,7 +1518,10 @@ struct Thread {
     // Operations that reached the thread, and batches it began.
     arrived: u64,
     turn: u64,
-    // A batch ran since the thread last found nothing waiting.
+    // A batch that wrote, made, moved or removed something ran since the
+    // thread last found nothing waiting. A batch of nothing but a caller's
+    // bookkeeping, a handle closed or a key forgotten, is not work: it says
+    // nothing of whether the caller's writes have come.
     worked: bool,
     // The volume's own work, kept for when nothing is queued.
     idle: Vec<Idle>,
@@ -1565,17 +1569,25 @@ impl Thread {
                     match self.end(&queued) {
                         Ok(()) => return,
                         Err(Some(mail)) => mail,
-                        Err(None) => match queued.recv() {
-                            Ok(mail) => mail,
-                            Err(_) => return,
-                        },
+                        Err(None) => {
+                            #[cfg(test)]
+                            self.park(true);
+                            let mail = queued.recv();
+                            #[cfg(test)]
+                            self.park(false);
+                            match mail {
+                                Ok(mail) => mail,
+                                Err(_) => return,
+                            }
+                        }
                     }
                 }
             };
             match mail {
                 Mail::Op(first) => {
-                    self.batch(first, &queued);
-                    self.worked = true;
+                    if self.batch(first, &queued) {
+                        self.worked = true;
+                    }
                 }
                 Mail::Idle(run) => self.idle.push(run),
                 Mail::Left => {}
@@ -1587,7 +1599,9 @@ impl Thread {
     // last one, and run one piece of the volume's own work when the writer
     // has just run out of work or no caller holds the volume: a volume a
     // job holds and has not written to yet keeps it, so the job's first
-    // writes find the thread free. Whether a piece ran.
+    // writes find the thread free. Leaving the work here is itself followed
+    // by a key forgotten, which is no work and so does not start it.
+    // Whether a piece ran.
     fn run_idle(&mut self) -> bool {
         let worked = std::mem::take(&mut self.worked);
         if worked {
@@ -1639,8 +1653,9 @@ impl Thread {
         Ok(())
     }
 
-    // Run `first` and everything queued behind it as one batch.
-    fn batch(&mut self, first: Queued, queued: &mpsc::Receiver<Mail>) {
+    // Run `first` and everything queued behind it as one batch. Whether
+    // the batch was work: it held more than a caller's bookkeeping.
+    fn batch(&mut self, first: Queued, queued: &mpsc::Receiver<Mail>) -> bool {
         self.batch.push(Entry::new(first));
         while let Ok(more) = queued.try_recv() {
             match more {
@@ -1649,6 +1664,10 @@ impl Thread {
                 Mail::Left => {}
             }
         }
+        let work = self
+            .batch
+            .iter()
+            .any(|entry| !matches!(entry.op, Some(Op::Forget | Op::Release { .. })));
         let base = self.arrived;
         self.arrived += self.batch.len() as u64;
         self.turn += 1;
@@ -1696,6 +1715,19 @@ impl Thread {
         // After the report: a settle that waited for this batch finds its
         // failures already with the caller.
         self.state.returned(self.arrived);
+        work
+    }
+
+    // The thread stands with nothing queued, or goes on.
+    #[cfg(test)]
+    fn park(&self, parked: bool) {
+        let mut gate = self
+            .state
+            .gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        gate.parked = parked;
+        self.state.gate_moved.notify_all();
     }
 
     fn run_batch(&mut self, base: u64) {
@@ -2103,6 +2135,8 @@ struct Gate {
     permits: usize,
     // The thread stands before an operation with no permit for it.
     waiting: bool,
+    // The thread stands with nothing queued, its own work looked at.
+    parked: bool,
     fail_next: Option<io::Error>,
 }
 
@@ -2156,6 +2190,21 @@ impl Hold {
         let mut held = state.waiting.lock().unwrap_or_else(PoisonError::into_inner);
         while state.waiters.load(Ordering::SeqCst) == 0 {
             held = state.woke.wait(held).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    // Wait until everything submitted to the volume so far has returned
+    // and the thread stands with nothing queued: it has looked at the
+    // volume's own work since, and either ran it or kept it.
+    pub(crate) fn wait_parked(&self) {
+        let state = &self.0.state;
+        let sent = state.sent.load(Ordering::SeqCst);
+        let mut gate = self.gate();
+        while !(gate.parked && state.returned.load(Ordering::SeqCst) >= sent) {
+            gate = state
+                .gate_moved
+                .wait(gate)
+                .unwrap_or_else(PoisonError::into_inner);
         }
     }
 
