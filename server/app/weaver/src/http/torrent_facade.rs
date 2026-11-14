@@ -1931,9 +1931,6 @@ fn info_list(
     axum::Json(list).into_response()
 }
 
-// The rows of `size` a `torrents/info` page of `limit` after `offset`
-// keeps; `None` keeps them all. A negative offset counts back from the
-// end; a limit of 0 or less is none.
 // The places `info_page` takes, as a window the table can read without a
 // count: only an offset from the end needs how many torrents there are.
 fn info_window(limit: i64, offset: i64) -> Window {
@@ -1953,6 +1950,9 @@ fn info_window(limit: i64, offset: i64) -> Window {
     }
 }
 
+// The rows of `size` a `torrents/info` page of `limit` after `offset`
+// keeps; `None` keeps them all. A negative offset counts back from the
+// end; a limit of 0 or less is none.
 fn info_page(limit: i64, mut offset: i64, size: usize) -> Option<std::ops::Range<usize>> {
     let size = i64::try_from(size).unwrap_or(i64::MAX);
     if offset < 0 {

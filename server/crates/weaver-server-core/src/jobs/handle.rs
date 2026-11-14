@@ -149,7 +149,7 @@ impl SharedPipelineState {
     pub fn list_jobs(&self) -> Vec<JobInfo> {
         self.queue.read(|inner| {
             let mut live = inner.visible_jobs().peekable();
-            let mut owned = inner.torrents.iter().cloned().peekable();
+            let mut owned = inner.torrents().iter().cloned().peekable();
             std::iter::from_fn(|| match (live.peek(), owned.peek()) {
                 (Some(job), Some(other)) if other.created_at_epoch_ms < job.created_at_epoch_ms => {
                     owned.next()
@@ -178,7 +178,7 @@ impl SharedPipelineState {
                     .jobs
                     .iter()
                     .map(|row| &row.report.job.status)
-                    .chain(inner.torrents.iter().map(|job| &job.status)),
+                    .chain(inner.torrents().iter().map(|job| &job.status)),
             )
         })
     }
@@ -275,7 +275,7 @@ impl SharedPipelineState {
                         .map(|rate| (row.id, rate))
                 })
                 .collect();
-            rates.extend(job_download_rates(&inner.torrents));
+            rates.extend(job_download_rates(inner.torrents()));
             rates
         })
     }
@@ -285,13 +285,7 @@ impl SharedPipelineState {
             inner
                 .job(job_id)
                 .map(|row| row.info(&inner.globals))
-                .or_else(|| {
-                    inner
-                        .torrents
-                        .iter()
-                        .find(|job| job.job_id == job_id)
-                        .cloned()
-                })
+                .or_else(|| inner.torrent(job_id).cloned())
                 .or_else(|| {
                     self.queue
                         .history()
@@ -403,12 +397,11 @@ impl SharedPipelineState {
         self.queue.write(|inner| {
             // The same jobs as they stand: nothing changed, and nothing is
             // said, so an idle publish wakes no reader.
-            if inner.torrents == torrents {
+            if inner.torrents() == torrents.as_slice() {
                 return Change::unchanged(Vec::new());
             }
-            let events = owned_job_events(&inner.torrents, &torrents);
-            inner.torrents = torrents;
-            inner.reindex_torrents();
+            let events = owned_job_events(inner.torrents(), &torrents);
+            inner.replace_torrents(torrents);
             Change::changed(events)
         })
     }
@@ -420,21 +413,14 @@ impl SharedPipelineState {
             let job_id = job.job_id;
             // Only a job already published is looked for among the others.
             let at = inner.torrent_position(job_id);
-            if at.is_some_and(|at| inner.torrents[at] == job) {
+            if at.is_some_and(|at| inner.torrents()[at] == job) {
                 return Change::unchanged(Vec::new());
             }
-            let before = at.map_or(&[][..], |at| std::slice::from_ref(&inner.torrents[at]));
+            let before = at.map_or(&[][..], |at| std::slice::from_ref(&inner.torrents()[at]));
             let events = owned_job_events(before, std::slice::from_ref(&job));
             match at {
-                Some(at) => inner.torrents[at] = job,
-                None => {
-                    let key = (job.created_at_epoch_ms, job_id);
-                    let at = inner
-                        .torrents
-                        .partition_point(|was| (was.created_at_epoch_ms, was.job_id) <= key);
-                    inner.torrents.insert(at, job);
-                    inner.reindex_torrents();
-                }
+                Some(at) => inner.set_torrent(at, job),
+                None => inner.insert_torrent(job),
             }
             Change::changed(events)
         })
@@ -1870,10 +1856,7 @@ impl SchedulerHandle {
         queue.write(|inner| {
             let ended = info.ended_event();
             let job_id = info.job_id;
-            if let Some(at) = inner.torrent_position(job_id) {
-                inner.torrents.remove(at);
-                inner.reindex_torrents();
-            }
+            inner.remove_torrent(job_id);
             let mut history: Vec<_> = queue
                 .history()
                 .iter()

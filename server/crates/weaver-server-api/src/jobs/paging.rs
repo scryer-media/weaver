@@ -203,7 +203,7 @@ impl QueueWalk {
         };
         // The torrents fall in among the queue's rows by when each was
         // added, as the job list orders them.
-        let mut torrents = inner.torrents.iter().enumerate().peekable();
+        let mut torrents = inner.torrents().iter().enumerate().peekable();
         let push_torrent = |walk: &mut QueueWalk,
                             category_index: &mut HashMap<String, u32>,
                             index: usize,
@@ -973,7 +973,7 @@ impl PageRead {
                 .zip(&plan.sources)
                 .filter_map(|(id, source)| match source {
                     RowSource::Queue => inner.row(*id).map(|row| row.info(&inner.globals)),
-                    RowSource::Torrent(index) => inner.torrents.get(*index).cloned(),
+                    RowSource::Torrent(index) => inner.torrents().get(*index).cloned(),
                 })
                 .collect();
             PageRead {
@@ -997,7 +997,7 @@ pub(crate) fn read_listing(
     take: usize,
 ) -> Vec<JobInfo> {
     state.read_queue(|inner| {
-        let mut torrents = inner.torrents.iter().peekable();
+        let mut torrents = inner.torrents().iter().peekable();
         let mut listing = Vec::new();
         let mut skipped = 0;
         // Whether a kept row is passed over, copied, or ends the listing.
@@ -1062,7 +1062,7 @@ pub(crate) fn summary(
             summary.downloaded_bytes += view.job().downloaded_bytes;
             summary.count_state(row_state(&view));
         }
-        for job in &inner.torrents {
+        for job in inner.torrents() {
             summary.total_items += 1;
             summary.total_bytes += job.total_bytes;
             summary.downloaded_bytes += job.downloaded_bytes;
