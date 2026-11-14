@@ -128,7 +128,6 @@ const it: LocaleDictionary = {
   "metrics.commitPending": "Conferma in Attesa",
   "metrics.writeBufferedBytes": "Byte in Buffer di Scrittura",
   "metrics.writeBufferedSegments": "Segmenti in Buffer di Scrittura",
-  "metrics.diskWriteLatency": "Latenza Scrittura su Disco",
   "metrics.segmentsDownloaded": "Segmenti Scaricati",
   "metrics.segmentsDecoded": "Segmenti Decodificati",
   "metrics.segmentsCommitted": "Segmenti Confermati",

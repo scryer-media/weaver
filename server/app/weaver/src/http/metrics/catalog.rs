@@ -93,7 +93,7 @@ metric_families! {
     BYTES_DECODED = ("weaver_pipeline_bytes_decoded_total", Counter, [],
         "Total bytes decoded by the pipeline.");
     BYTES_COMMITTED = ("weaver_pipeline_bytes_committed_total", Counter, [],
-        "Total bytes committed to disk by the pipeline.");
+        "Total decoded bytes the pipeline accepted and handed to the volume writers. Counted at hand-off, before the bytes reach disk: the written-bytes counter of each volume counts what was written.");
     SEGMENTS_DOWNLOADED = ("weaver_pipeline_segments_downloaded_total", Counter, [],
         "Total segments downloaded.");
     SEGMENTS_DECODED = ("weaver_pipeline_segments_decoded_total", Counter, [],
@@ -223,11 +223,6 @@ metric_families! {
     VERIFY_ACTIVE = ("weaver_pipeline_verify_active", Gauge, [], "Active verification workers.");
     REPAIR_ACTIVE = ("weaver_pipeline_repair_active", Gauge, [], "Active repair workers.");
     EXTRACT_ACTIVE = ("weaver_pipeline_extract_active", Gauge, [], "Active extraction workers.");
-    DISK_WRITE_LATENCY_US = ("weaver_pipeline_disk_write_latency_microseconds", Gauge, [],
-        "Disk write latency in microseconds.",
-        deprecated_by = "weaver_pipeline_disk_write_latency_seconds");
-    DISK_WRITE_LATENCY_SECONDS = ("weaver_pipeline_disk_write_latency_seconds", Gauge, [],
-        "Disk write latency.");
 
     // ---- rates -------------------------------------------------------------
     CURRENT_DOWNLOAD_SPEED = ("weaver_pipeline_current_download_speed_bytes_per_second", Gauge, [],
@@ -551,8 +546,6 @@ metric_families! {
     // ---- pipeline stage histograms ----------------------------------------------------
     TURN_DURATION = ("weaver_pipeline_turn_duration_seconds", Histogram, [],
         "Pipeline turn duration, including awaited work and excluding the idle event wait.");
-    DISK_WRITE_DURATION = ("weaver_pipeline_disk_write_duration_seconds", Histogram, [],
-        "Time spent in individual disk write calls.");
     DECODE_TASK_DURATION = ("weaver_pipeline_decode_task_duration_seconds", Histogram, [],
         "Time spent decoding one article. Conditional: emitted only once the decode path has recorded a measurement.");
     EXTRACT_MEMBER_DURATION = ("weaver_pipeline_extract_member_duration_seconds", Histogram, [],
@@ -642,9 +635,9 @@ metric_families! {
     VOLUME_WRITER_ABANDONED_OPERATIONS = ("weaver_volume_writer_abandoned_operations_total", Counter, ["volume"],
         "Operations queued for a volume's writer and never run: their job gave its files up, or an earlier operation of the same job failed.");
     VOLUME_LOOP_WAITS = ("weaver_volume_loop_waits_total", Counter, ["volume"],
-        "Times the pipeline loop stood still until a volume's writer had caught up.");
+        "Times the pipeline loop itself stood still until a volume's writer had caught up. Waits of other threads, and of a shutdown, are not counted.");
     VOLUME_LOOP_WAIT_SECONDS = ("weaver_volume_loop_wait_seconds_total", Counter, ["volume"],
-        "Time the pipeline loop has stood still waiting for a volume's writer.");
+        "Time the pipeline loop itself has stood still waiting for a volume's writer. Waits of other threads, and of a shutdown, are not counted.");
     VOLUME_WRITER_THREADS = ("weaver_volume_writer_threads_total", Counter, ["volume"],
         "Writer threads started for a volume, one after another: a volume's thread ends when nothing writes to it and starts again at the next write.");
 

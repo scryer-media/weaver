@@ -852,7 +852,6 @@ fn populated_metrics_snapshot() -> MetricsSnapshot {
         verify_active: 1,
         repair_active: 0,
         extract_active: 2,
-        disk_write_latency_us: 16,
         segments_retried: 17,
         segments_failed_permanent: 18,
         parked_infrastructure_work: 29,
@@ -1355,7 +1354,6 @@ fn sample_job_lifecycle() -> instr::JobLifecycleMetricsSnapshot {
 fn sample_pipeline_histograms() -> instr::PipelineHistogramsSnapshot {
     instr::PipelineHistogramsSnapshot {
         turn_duration: sample_histogram(),
-        disk_write_duration: sample_histogram(),
         decode_task_duration: Some(sample_histogram()),
         extract_member_duration: Some(sample_histogram()),
     }

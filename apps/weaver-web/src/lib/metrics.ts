@@ -42,7 +42,6 @@ export interface MetricsSnapshot {
   verifyActive: number;
   repairActive: number;
   extractActive: number;
-  diskWriteLatencyUs: number;
   segmentsRetried: number;
   segmentsFailedPermanent: number;
   downloadFailuresArticleNotFound: number;
@@ -198,7 +197,6 @@ export const GAUGE_HISTORY_METRIC_NAMES = [
   "weaver_pipeline_decode_pressure_hard_limit_bytes",
   "weaver_pipeline_write_pressure_soft_limit_bytes",
   "weaver_pipeline_write_pressure_hard_limit_bytes",
-  "weaver_pipeline_disk_write_latency_microseconds",
   "weaver_pipeline_articles_per_second",
   "weaver_pipeline_decode_rate_mebibytes_per_second",
 ] as const;
@@ -263,7 +261,6 @@ export const PROM_METRIC_TO_SNAPSHOT_FIELD: Record<
   weaver_pipeline_decode_pressure_hard_limit_bytes: "decodePressureHardLimitBytes",
   weaver_pipeline_write_pressure_soft_limit_bytes: "writePressureSoftLimitBytes",
   weaver_pipeline_write_pressure_hard_limit_bytes: "writePressureHardLimitBytes",
-  weaver_pipeline_disk_write_latency_microseconds: "diskWriteLatencyUs",
   weaver_pipeline_articles_per_second: "articlesPerSec",
   weaver_pipeline_decode_rate_mebibytes_per_second: "decodeRateMbps",
 };
@@ -512,21 +509,6 @@ export const METRIC_CHART_DEFINITIONS: readonly MetricChartDefinition[] = [
         kind: "gauge",
         format: "count",
         scale: "right",
-      },
-    ],
-  },
-  {
-    id: "disk-write-latency",
-    titleKey: "metrics.diskWriteLatencyChart",
-    descriptionKey: "metrics.diskWriteLatencyDesc",
-    leftAxisFormat: "latencyUs",
-    lines: [
-      {
-        metric: "weaver_pipeline_disk_write_latency_microseconds",
-        labelKey: "metrics.diskWriteLatency",
-        colorToken: "red",
-        kind: "gauge",
-        format: "latencyUs",
       },
     ],
   },

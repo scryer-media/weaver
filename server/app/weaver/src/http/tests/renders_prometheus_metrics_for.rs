@@ -133,8 +133,10 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
 
     // Fixed units and dual-emitted renames.
     assert!(rendered.contains("weaver_pipeline_download_pressure_stall_seconds_total 1.5"));
-    assert!(rendered.contains("weaver_pipeline_disk_write_latency_microseconds 16"));
-    assert!(rendered.contains("weaver_pipeline_disk_write_latency_seconds 0.000016"));
+    // The old loop-side write timings are gone: each volume's own rows say
+    // what its disk took.
+    assert!(!rendered.contains("weaver_pipeline_disk_write_latency"));
+    assert!(!rendered.contains("weaver_pipeline_disk_write_duration"));
     assert!(rendered.contains("weaver_pipeline_download_lanes 3"));
     assert!(rendered.contains("weaver_pipeline_decode_rate_mebibytes_per_second 23.5"));
     assert!(rendered.contains("weaver_pipeline_decode_rate_bytes_per_second 24641536"));
@@ -269,7 +271,6 @@ fn renders_prometheus_download_observed_limiter_states() {
         verify_active: 0,
         repair_active: 0,
         extract_active: 0,
-        disk_write_latency_us: 0,
         segments_retried: 0,
         segments_failed_permanent: 0,
         parked_infrastructure_work: 0,
@@ -826,7 +827,7 @@ fn renders_collected_instrumentation_snapshots() {
         "weaver_server_article_latency_seconds",
         "weaver_job_duration_seconds",
         "weaver_job_stage_duration_seconds",
-        "weaver_pipeline_disk_write_duration_seconds",
+        "weaver_pipeline_turn_duration_seconds",
         "weaver_pipeline_decode_task_duration_seconds",
         "weaver_pipeline_extract_member_duration_seconds",
         "weaver_db_op_duration_seconds",
@@ -990,7 +991,7 @@ fn absent_instrumentation_omits_its_families() {
         "weaver_server_article_latency_seconds",
         "weaver_jobs_submitted_total",
         "weaver_job_duration_seconds",
-        "weaver_pipeline_disk_write_duration_seconds",
+        "weaver_pipeline_turn_duration_seconds",
         "weaver_db_runtime_info",
         "weaver_db_wal_checkpoint_passes_total",
         "weaver_db_wal_bytes",
@@ -1007,7 +1008,6 @@ fn absent_instrumentation_omits_its_families() {
     // Pipeline histograms present, but the two optional stages unmeasured.
     let pipeline = instr::PipelineHistogramsSnapshot {
         turn_duration: sample_histogram(),
-        disk_write_duration: sample_histogram(),
         decode_task_duration: None,
         extract_member_duration: None,
     };
@@ -1020,7 +1020,7 @@ fn absent_instrumentation_omits_its_families() {
     let partial = metrics::render_prometheus_metrics_input(&input);
     assert_valid_prometheus_exposition(&partial);
 
-    assert!(partial.contains("weaver_pipeline_disk_write_duration_seconds_bucket"));
+    assert!(partial.contains("weaver_pipeline_turn_duration_seconds_bucket"));
     assert!(!partial.contains("weaver_pipeline_decode_task_duration_seconds"));
     assert!(!partial.contains("weaver_pipeline_extract_member_duration_seconds"));
 

@@ -127,7 +127,6 @@ const ja: LocaleDictionary = {
   "metrics.commitPending": "コミット待ち",
   "metrics.writeBufferedBytes": "書き込みバッファバイト数",
   "metrics.writeBufferedSegments": "書き込みバッファセグメント数",
-  "metrics.diskWriteLatency": "ディスク書き込みレイテンシ",
   "metrics.segmentsDownloaded": "ダウンロード済みセグメント",
   "metrics.segmentsDecoded": "デコード済みセグメント",
   "metrics.segmentsCommitted": "コミット済みセグメント",

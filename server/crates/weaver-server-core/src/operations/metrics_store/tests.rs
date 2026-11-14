@@ -139,7 +139,6 @@ fn sample_snapshot(
         verify_active: 1,
         repair_active: 0,
         extract_active: 0,
-        disk_write_latency_us: 200,
         segments_retried: 0,
         segments_failed_permanent: 0,
         parked_infrastructure_work: 0,
@@ -214,7 +213,7 @@ fn uu_spool_gauges_append_after_legacy_history_slots() {
             "weaver_pipeline_download_pressure_state",
             "weaver_pipeline_download_pressure_reason",
             "weaver_pipeline_download_pressure_current_stall_seconds",
-            "weaver_pipeline_disk_write_latency_microseconds",
+            RETIRED_METRIC_KEY,
             "weaver_pipeline_articles_per_second",
             "weaver_pipeline_decode_rate_mebibytes_per_second",
         ]

@@ -495,11 +495,6 @@ pub const ARTICLE_LATENCY_BOUNDS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
 
-// Disk write batch duration, seconds.
-pub const DISK_WRITE_DURATION_BOUNDS: &[f64] = &[
-    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
-];
-
 // Decode task duration, seconds.
 pub const DECODE_TASK_DURATION_BOUNDS: &[f64] = &[
     0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
@@ -1205,7 +1200,6 @@ impl JobLifecycleMetrics {
 #[derive(Debug)]
 pub struct PipelineHistograms {
     pub turn_duration: AtomicHistogram,
-    pub disk_write_duration: AtomicHistogram,
     pub decode_task_duration: AtomicHistogram,
     pub extract_member_duration: AtomicHistogram,
     // Set once the corresponding histogram has a real feeding site. Until
@@ -1224,7 +1218,6 @@ impl Default for PipelineHistograms {
 impl PipelineHistograms {
     pub const fn new() -> Self {
         Self {
-            disk_write_duration: AtomicHistogram::new(DISK_WRITE_DURATION_BOUNDS),
             turn_duration: AtomicHistogram::new(&[0.0001, 0.001, 0.01, 0.1, 1.0, 10.0, 60.0]),
             decode_task_duration: AtomicHistogram::new(DECODE_TASK_DURATION_BOUNDS),
             extract_member_duration: AtomicHistogram::new(EXTRACT_MEMBER_DURATION_BOUNDS),
@@ -1242,7 +1235,6 @@ impl PipelineHistograms {
     pub fn snapshot(&self) -> PipelineHistogramsSnapshot {
         PipelineHistogramsSnapshot {
             turn_duration: self.turn_duration.snapshot(),
-            disk_write_duration: self.disk_write_duration.snapshot(),
             decode_task_duration: (self.decode_task_observed.load(Ordering::Relaxed) != 0)
                 .then(|| self.decode_task_duration.snapshot()),
             extract_member_duration: (self.extract_member_observed.load(Ordering::Relaxed) != 0)
@@ -1259,7 +1251,6 @@ impl PipelineHistograms {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PipelineHistogramsSnapshot {
     pub turn_duration: HistogramSnapshot,
-    pub disk_write_duration: HistogramSnapshot,
     pub decode_task_duration: Option<HistogramSnapshot>,
     pub extract_member_duration: Option<HistogramSnapshot>,
 }
