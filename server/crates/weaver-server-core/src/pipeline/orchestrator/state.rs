@@ -103,9 +103,50 @@ impl Pipeline {
             .filter(|file_id| file_id.job_id == job_id)
             .collect();
 
-        for file_id in file_ids {
+        if file_ids.is_empty() {
+            return;
+        }
+
+        for &file_id in &file_ids {
             // Memory and disk parks use distinct ledgers; each part is let
             // go as any part is, its spool file with it.
+            if let Some(uu) = self.uu_files.remove(&file_id) {
+                for part in uu.parked.into_values() {
+                    self.release_parked_bytes(part.bytes);
+                    self.release_uu_parked_segment();
+                }
+            }
+            for part in self
+                .unanchored_parked
+                .remove_file(file_id)
+                .into_iter()
+                .flat_map(BTreeMap::into_values)
+            {
+                self.release_parked_bytes(part.bytes);
+            }
+        }
+        // One pass over each list for the whole job, not one per file.
+        self.uu_park_requeues
+            .retain(|segment_id, _| !file_ids.contains(&segment_id.file_id));
+        self.unanchored_requeues
+            .retain(|segment_id, _| !file_ids.contains(&segment_id.file_id));
+        self.pending_unanchored_release
+            .retain(|segment_id| !file_ids.contains(&segment_id.file_id));
+    }
+
+    // The cleanup as it was, with a pass over each list per file, kept to
+    // compare the single pass against.
+    #[cfg(test)]
+    pub(crate) fn clear_job_write_backlog_per_file(&mut self, job_id: JobId) {
+        let file_ids: std::collections::HashSet<NzbFileId> = self
+            .uu_files
+            .keys()
+            .chain(self.unanchored_parked.keys())
+            .copied()
+            .filter(|file_id| file_id.job_id == job_id)
+            .collect();
+
+        for file_id in file_ids {
             if let Some(uu) = self.uu_files.remove(&file_id) {
                 for part in uu.parked.into_values() {
                     self.release_parked_bytes(part.bytes);
