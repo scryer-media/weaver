@@ -4489,13 +4489,14 @@ impl PeerHandler {
         if from_memory {
             // The whole piece waits in the storage's memory for the hashing
             // thread and then for its write: it is counted until both are
-            // done, and a connection that has one waiting already stops
-            // reading while the count is past its high mark (libtorrent
+            // done, and the connection stops reading with the piece that
+            // leaves the count past its high mark (libtorrent
             // `peer_connection::incoming_piece`, `m_outstanding_writing_bytes`
-            // against `max_queued_disk_bytes`).
+            // against `max_queued_disk_bytes`, allows each connection one
+            // block more; a whole piece more is not allowed here).
             let piece_len = u64::from(state.lengths.piece_length(chunk_info.piece_index));
             let (charge, waiting) = spawner.checks().charge_bytes(piece_len);
-            if self.disk.queued(charge) {
+            if self.disk.queued_piece(charge) {
                 spawner.stats().peer_stopped();
             }
             spawner.hash().push(HashJob {

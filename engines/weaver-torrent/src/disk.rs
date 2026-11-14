@@ -42,10 +42,16 @@ pub(crate) const MAX_QUEUED_DISK_BYTES: usize = 1024 * 1024;
 /// The bytes of whole pieces a storage holds in memory that may wait for
 /// their check and their write before the connections that completed them
 /// stop reading: by the pool's marks, reads stop at three quarters of it,
-/// 48 MiB, and go on at half, 32 MiB. The bound is soft by a piece for each
-/// connection, as the block bound is by a block. A piece is the unit that
-/// waits here, so the bound is one that holds some pieces, where the block
-/// bound holds some blocks.
+/// 48 MiB, and go on at half, 32 MiB. A connection whose piece leaves the
+/// count past the high mark stops with that piece (`PeerDisk::queued_piece`),
+/// so the count passes the mark by no more than the one piece each
+/// connection was completing as it was reached: bytes the storage held
+/// already, in the room it gave the piece. In bytes, the count is at most
+/// 48 MiB plus one piece for each connection of the session, or, with a
+/// piece larger than 48 MiB, that piece in place of the 48 MiB: with 100
+/// connections and 16 MiB pieces, 48 MiB + 1,600 MiB. A piece is the unit
+/// that waits here, so the bound is one that holds some pieces, where the
+/// block bound holds some blocks. Each session counts its own.
 pub(crate) const MAX_QUEUED_CHECK_BYTES: usize = 64 * 1024 * 1024;
 
 /// The session's block buffers, counted while they hold a block queued for
@@ -85,11 +91,12 @@ struct PoolState {
     generation: u64,
 }
 
-/// What the pool said when a block was queued: whether it is exceeded, and
-/// at which generation.
+/// What the pool said when a block was queued: whether it is exceeded,
+/// whether nothing else waits in it, and at which generation.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Charge {
     pub(crate) exceeded: bool,
+    pub(crate) alone: bool,
     pub(crate) generation: u64,
 }
 
@@ -180,6 +187,7 @@ impl BlockPool {
         }
         Charge {
             exceeded: state.exceeded,
+            alone: state.in_use == blocks,
             generation: state.generation,
         }
     }
@@ -374,7 +382,23 @@ impl PeerDisk {
     /// True when the connection stops reading for it.
     pub(crate) fn queued(&self, charge: Charge) -> bool {
         let before = self.outstanding.fetch_add(1, Ordering::AcqRel);
-        let stops = charge.exceeded && before > 0;
+        self.stops(charge, charge.exceeded && before > 0)
+    }
+
+    /// A whole piece the connection completed waits for its check and its
+    /// write, the pool having said `charge`. A piece is too much to allow
+    /// each connection one more past the mark: the connection stops reading
+    /// with the piece that leaves the pool exceeded, unless nothing else
+    /// waits in it, so one piece larger than the mark is not waited on by
+    /// its own connection alone.
+    ///
+    /// True when the connection stops reading for it.
+    pub(crate) fn queued_piece(&self, charge: Charge) -> bool {
+        self.outstanding.fetch_add(1, Ordering::AcqRel);
+        self.stops(charge, charge.exceeded && !charge.alone)
+    }
+
+    fn stops(&self, charge: Charge, stops: bool) -> bool {
         if stops {
             self.generation.store(charge.generation, Ordering::Release);
             self.blocked.store(true, Ordering::Release);
@@ -1423,5 +1447,72 @@ mod tests {
             (0, 3)
         );
         assert!(queue.inner.jobs.lock().is_idle());
+    }
+
+    // The count of whole pieces waiting is past its high mark with other
+    // connections' pieces. A connection with none waiting completes one: it
+    // stops with that piece, so it adds no second one past the mark. Once
+    // the count is empty, a connection whose one piece passes the mark by
+    // itself reads on.
+    #[test]
+    fn a_connection_adds_at_most_one_piece_past_the_high_mark() {
+        let piece = 4 * BLOCK_LEN as u64;
+        // 16 blocks: low mark 8, high mark 12.
+        let pool = BlockPool::new(16 * BLOCK_LEN);
+        let others = PeerDisk::default();
+        let (charge, others_waiting) = pool.charge_bytes(3 * piece);
+        assert!(charge.exceeded && charge.alone);
+        assert!(!others.queued_piece(charge), "nothing else waits");
+
+        let peer = PeerDisk::default();
+        let (first, first_waiting) = pool.charge_bytes(piece);
+        assert!(peer.queued_piece(first), "its first piece stops it");
+        assert!(peer.blocked());
+        assert_eq!(pool.in_use(), 12 + 4);
+
+        drop((others_waiting, first_waiting));
+        assert_eq!(pool.in_use(), 0);
+        let (large, _large_waiting) = pool.charge_bytes(4 * piece);
+        assert!(large.exceeded && large.alone);
+        assert!(!PeerDisk::default().queued_piece(large));
+    }
+
+    // Connections complete pieces in turn, each until it stops reading. No
+    // connection adds more than one piece once the count is past its high
+    // mark, so the count ends past the mark by less than one piece for each
+    // connection (`MAX_QUEUED_CHECK_BYTES`). A piece larger than the mark,
+    // waiting alone, stands in for the mark.
+    #[test]
+    fn the_pieces_waiting_pass_the_high_mark_by_at_most_one_piece_per_connection() {
+        // 16 blocks: high mark 12. Pieces of 5 blocks cross it mid-piece.
+        let (high, piece_blocks) = (12, 5);
+        let pool = BlockPool::new(16 * BLOCK_LEN);
+        let peers: Vec<PeerDisk> = (0..4).map(|_| PeerDisk::default()).collect();
+        let mut past_mark = vec![0usize; peers.len()];
+        let mut waiting = Vec::new();
+        while peers.iter().any(|peer| !peer.blocked()) {
+            for (i, peer) in peers.iter().enumerate().filter(|(_, p)| !p.blocked()) {
+                let (charge, span) = pool.charge_bytes((piece_blocks * BLOCK_LEN) as u64);
+                waiting.push(span);
+                if charge.exceeded {
+                    past_mark[i] += 1;
+                }
+                peer.queued_piece(charge);
+                assert!(past_mark[i] <= 1, "connection {i} added a second piece");
+            }
+        }
+        assert!(pool.in_use() < high + peers.len() * piece_blocks);
+        assert_eq!(pool.in_use(), 30);
+        drop(waiting);
+
+        // One piece of 20 blocks, alone: its connection reads on, and stops
+        // with its next.
+        let peer = PeerDisk::default();
+        let large = (20 * BLOCK_LEN) as u64;
+        let (alone, _alone_waiting) = pool.charge_bytes(large);
+        assert!(!peer.queued_piece(alone));
+        let (next, _next_waiting) = pool.charge_bytes(large);
+        assert!(peer.queued_piece(next));
+        assert_eq!(pool.in_use(), 20 + 20);
     }
 }

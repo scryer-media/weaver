@@ -682,7 +682,7 @@ metric_families! {
     TORRENT_DISK_PIECES_WAITING = ("weaver_torrent_disk_pieces_waiting", Gauge, ["route"],
         "Whole pieces held in memory that wait for their check or their write now.");
     TORRENT_DISK_PIECE_BYTES_WAITING = ("weaver_torrent_disk_piece_bytes_waiting", Gauge, ["route"],
-        "Bytes of the whole pieces held in memory that wait for their check or their write now, in whole blocks. A connection with a piece waiting stops reading its socket once this passes 48 MiB, and reads again at 32 MiB.");
+        "Bytes of the whole pieces held in memory that wait for their check or their write now, in whole blocks. A connection stops reading its socket with the piece that leaves this past 48 MiB, unless no other piece waits, and reads again once its own are written or this falls to 32 MiB.");
     TORRENT_PEER_SOCKET_CALLS = ("weaver_torrent_peer_socket_calls_total", Counter, ["route", "transport", "direction"],
         "Reads of peer sockets that returned bytes (in) and buffers written to them whole (out), since the session opened, by transport. A connection is counted once it is open: the handshakes that open it, the encryption's and BitTorrent's, either way, and the reads behind the last message it took, are not counted.");
     TORRENT_PEER_REQUEST_WRITES = ("weaver_torrent_peer_request_writes_total", Counter, ["route", "transport"],
