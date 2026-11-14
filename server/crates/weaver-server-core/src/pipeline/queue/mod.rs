@@ -99,7 +99,7 @@ pub struct QueueInner {
     // held. An admission of one takes it out, so the sweep never acts on a
     // reading older than a retry. Empty except while a page is swept.
     pub(crate) sweep_listed: std::collections::HashSet<JobId>,
-    pub(crate) pending_cleanup: std::collections::HashSet<JobId>,
+    pub(crate) pending_cleanup: PendingCleanup,
     pub(crate) nntp: Option<(u64, weaver_nntp::client::NntpClient, usize)>,
     // The endpoint's request count and the pipeline's latest answer, tagged
     // with the request count it answers.
@@ -109,6 +109,62 @@ pub struct QueueInner {
     // Bumped by every intent write, so the actor can tell a turn with no new
     // intent from one that needs a walk over the rows.
     intent_epoch: u64,
+}
+
+// The jobs whose leavings are still being cleared, each held by one or more
+// of: the cancel's cleanup of its folders, a move of its working folder
+// still out, a removal of a staging folder made for it after it left. Its id
+// is added, restarted or deleted from history again only once none holds it.
+#[derive(Default)]
+pub(crate) struct PendingCleanup(HashMap<JobId, u32>);
+
+// What holds a job in [`PendingCleanup`]. A job has at most one cancel's
+// cleanup and one move out, each a bit; each disowned read that made a
+// staging folder adds a removal, counted from `Staging` up.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum CleanupHolder {
+    Folders = 1,
+    Move = 2,
+    Staging = 4,
+}
+
+impl PendingCleanup {
+    pub(crate) fn contains(&self, id: &JobId) -> bool {
+        self.0.contains_key(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn folders_held(&self, id: &JobId) -> bool {
+        self.0
+            .get(id)
+            .is_some_and(|held| held & CleanupHolder::Folders as u32 != 0)
+    }
+
+    pub(crate) fn hold(&mut self, id: JobId, holder: CleanupHolder) {
+        let held = self.0.entry(id).or_default();
+        if holder == CleanupHolder::Staging {
+            *held += holder as u32;
+        } else {
+            *held |= holder as u32;
+        }
+    }
+
+    // `holder` is done; true when that let the job go.
+    pub(crate) fn done(&mut self, id: JobId, holder: CleanupHolder) -> bool {
+        let Some(held) = self.0.get_mut(&id) else {
+            return false;
+        };
+        if holder != CleanupHolder::Staging {
+            *held &= !(holder as u32);
+        } else if *held >= holder as u32 {
+            *held -= holder as u32;
+        }
+        let free = *held == 0;
+        if free {
+            self.0.remove(&id);
+        }
+        free
+    }
 }
 
 // Counts the actor's walks over every queue row, so a test can pin how many
@@ -588,6 +644,30 @@ impl Queue {
         change.value
     }
 
+    // One holder of a job's pending cleanup is done: one write, a change
+    // only when that let the job go, which wakes whoever waits for it.
+    pub(crate) fn release_cleanup(&self, id: JobId, holder: CleanupHolder) {
+        self.write(|inner| {
+            if inner.pending_cleanup.done(id, holder) {
+                Change::changed(())
+            } else {
+                Change::unchanged(())
+            }
+        });
+    }
+
+    // The job's marked staging folders under every destination root, as a
+    // restart clears them: the job's own path under each root, no listing.
+    pub(crate) async fn remove_job_staging(&self, id: JobId) {
+        let Some(resources) = self.resources.get() else {
+            return;
+        };
+        if let Err(error) = history::remove_job_staging(&resources.staging_roots().await, id).await
+        {
+            tracing::warn!(job_id = id.0, %error, "could not clear the staging directories of a cancelled job");
+        }
+    }
+
     pub fn revision(&self) -> u64 {
         *self.revision.borrow()
     }
@@ -653,6 +733,20 @@ impl Queue {
 mod label_tests {
     use super::*;
     use crate::{DownloadState, JobStatus, PostState, RunState};
+
+    // Two staging removals out for one id: the first to end leaves it held.
+    #[test]
+    fn staging_removals_are_counted() {
+        let (mut pending, id) = (PendingCleanup::default(), JobId(1));
+        pending.hold(id, CleanupHolder::Staging);
+        pending.hold(id, CleanupHolder::Staging);
+        pending.hold(id, CleanupHolder::Folders);
+        assert!(!pending.done(id, CleanupHolder::Folders));
+        assert!(!pending.done(id, CleanupHolder::Staging));
+        assert!(pending.contains(&id));
+        assert!(pending.done(id, CleanupHolder::Staging));
+        assert!(!pending.contains(&id));
+    }
 
     fn downloading(id: u64) -> JobInfo {
         JobInfo {

@@ -392,8 +392,19 @@ impl Pipeline {
                 .jobs
                 .iter()
                 .any(|row| row.id == job_id && row.intents.delete_history_after_cancel);
+            // A move of the job's working folder still out holds the job
+            // too, kept files or not: until it is heard, its folder may come
+            // or go under a restart's feet. Its guard lets it go.
+            use crate::pipeline::queue::CleanupHolder;
             if !keep_files {
-                inner.pending_cleanup.insert(job_id);
+                inner.pending_cleanup.hold(job_id, CleanupHolder::Folders);
+            }
+            if self
+                .moving_jobs
+                .get(&job_id)
+                .is_some_and(|(_, watch)| watch.cancel())
+            {
+                inner.pending_cleanup.hold(job_id, CleanupHolder::Move);
             }
             inner.remove_job(job_id);
             let _ = self.event_tx.send(PipelineEvent::JobCancelled { job_id });
@@ -416,9 +427,11 @@ impl Pipeline {
             let cleanup_db = self.db.clone();
             let queue = queue.clone();
             tokio::spawn(async move {
-                Self::cleanup_cancelled_job(cleanup_db, cleanup).await;
+                Self::cleanup_cancelled_job(cleanup_db, &queue, cleanup).await;
                 queue.write(|inner| {
-                    inner.pending_cleanup.remove(&job_id);
+                    inner
+                        .pending_cleanup
+                        .done(job_id, crate::pipeline::queue::CleanupHolder::Folders);
                     crate::pipeline::queue::Change::changed(())
                 });
             });
@@ -694,7 +707,11 @@ impl Pipeline {
         Some(state)
     }
 
-    async fn cleanup_cancelled_job(db: crate::Database, cleanup: CancelledJobCleanup) {
+    async fn cleanup_cancelled_job(
+        db: crate::Database,
+        queue: &crate::pipeline::queue::Queue,
+        cleanup: CancelledJobCleanup,
+    ) {
         let job_id = cleanup.job_id;
         // Let a cancelled post-processing script leave its
         // process group before its working directory is
@@ -714,6 +731,8 @@ impl Pipeline {
             tracing::warn!(job_id = job_id.0, %error, "retaining cancelled job directory while queue scripts are unresolved");
             return;
         }
+        // A staging folder a disowned read made, which the job never named.
+        queue.remove_job_staging(job_id).await;
         let own = !cleanup.destination_unruled || {
             let db = db.clone();
             tokio::task::spawn_blocking(move || db.job_script_effects(job_id.0))
