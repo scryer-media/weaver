@@ -2819,25 +2819,22 @@ fn forward_backend_sigaction() -> libc::sigaction {
 
 // How the backend announces the code its first-run setup page asks for. It
 // writes it to stderr only, never to tracing: a banner row in text logs, the
-// message of one record in JSON logs. The code follows the marker as
-// `K7P-M2X`.
+// message of one record in JSON logs. The code follows the marker as two
+// equal groups joined by a hyphen, `K7PM-2XQR`. The server owns the length
+// (`SETUP_CODE_LENGTH` in weaver-server-core); xtask does not build against
+// that crate, so it takes whatever pair of equal groups follows the marker
+// rather than repeating the number.
 const SETUP_CODE_PREFIX: &str = "Weaver one-time setup code: ";
 
 fn parse_setup_code_line(line: &str) -> Option<&str> {
     let (_, rest) = line.split_once(SETUP_CODE_PREFIX)?;
-    let code = rest.get(..7)?;
-    let shaped = code.bytes().enumerate().all(|(index, byte)| {
-        if index == 3 {
-            byte == b'-'
-        } else {
-            byte.is_ascii_alphanumeric()
-        }
-    });
-    let whole = !rest[7..]
-        .bytes()
-        .next()
-        .is_some_and(|next| next.is_ascii_alphanumeric() || next == b'-');
-    (shaped && whole).then_some(code)
+    let end = rest
+        .find(|next: char| !next.is_ascii_alphanumeric() && next != '-')
+        .unwrap_or(rest.len());
+    let code = &rest[..end];
+    let (first, second) = code.split_once('-')?;
+    let group = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric());
+    (group(first) && group(second) && first.len() == second.len()).then_some(code)
 }
 
 // The setup code a backend wrote to its log after `offset`. Skipping what

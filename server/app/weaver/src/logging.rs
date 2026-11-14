@@ -521,7 +521,7 @@ mod tests {
     fn setup_code_banner_is_boxed_and_launchers_can_find_the_code() {
         use weaver_server_core::auth::find_setup_code;
 
-        let banner = setup_code_announcement("K7P-M2X", LogFormat::Text, "unused");
+        let banner = setup_code_announcement("K7PM-2XQR", LogFormat::Text, "unused");
         let rows: Vec<&str> = banner.lines().filter(|row| !row.is_empty()).collect();
         let width = rows[0].len();
         assert!(rows.iter().all(|row| row.len() == width), "{banner}");
@@ -532,7 +532,7 @@ mod tests {
                 .lines()
                 .filter_map(find_setup_code)
                 .collect::<Vec<_>>(),
-            ["K7P-M2X"]
+            ["K7PM-2XQR"]
         );
     }
 
@@ -540,19 +540,19 @@ mod tests {
     fn setup_code_json_record_is_one_parseable_line() {
         use weaver_server_core::auth::find_setup_code;
 
-        let record = setup_code_announcement("K7P-M2X", LogFormat::Json, "2026-09-14T12:00:00Z");
+        let record = setup_code_announcement("K7PM-2XQR", LogFormat::Json, "2026-09-14T12:00:00Z");
         assert_eq!(record.lines().count(), 1);
         let value: serde_json::Value = serde_json::from_str(record.trim_end()).expect("json");
         assert_eq!(value["timestamp"], "2026-09-14T12:00:00Z");
         assert_eq!(value["level"], "WARN");
-        assert_eq!(value["fields"]["setup_code"], "K7P-M2X");
+        assert_eq!(value["fields"]["setup_code"], "K7PM-2XQR");
         assert!(
             value["fields"]["message"]
                 .as_str()
                 .unwrap()
-                .starts_with("ACTION REQUIRED: Weaver one-time setup code: K7P-M2X. ")
+                .starts_with("ACTION REQUIRED: Weaver one-time setup code: K7PM-2XQR. ")
         );
-        assert_eq!(find_setup_code(&record), Some("K7P-M2X"));
+        assert_eq!(find_setup_code(&record), Some("K7PM-2XQR"));
     }
 
     #[test]
