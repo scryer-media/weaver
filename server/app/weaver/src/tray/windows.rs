@@ -114,16 +114,24 @@ const FLYOUT_WINDOW_CLASS: &str = "ScryerMedia.Weaver.Desktop.v1.Flyout";
 // actually exit before it stops waiting and kills the child.
 const SERVER_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 
+// How long the server gets to stop when the session ends, or Restart Manager
+// closes the tray. Shorter than a stop the user asks for: Windows bounds
+// that stop itself, and ends the tray, with a "preventing sign-out" screen,
+// if it waits longer.
+const SESSION_END_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
 // `--shutdown` runs before the installer checks for files in use, and the
 // upgrade helper runs it before the installer; both wait on it, so it finishes
 // on its own clock whatever it finds: at most `SHUTDOWN_TRAY_EXIT_WAIT` for
-// the running tray, then `SHUTDOWN_STOP_POLICY`'s budget for whatever is left,
-// nineteen seconds in all.
+// the running tray, then `SHUTDOWN_STOP_POLICY`'s budget for whatever is left.
 //
-// The running tray's own exit stops its server graceful-first within
-// `shared::GRACEFUL_STOP_TIMEOUT`, then an adopted one within
-// `EXIT_STOP_POLICY`'s budget, which this wait covers with time to spare.
-const SHUTDOWN_TRAY_EXIT_WAIT: Duration = Duration::from_secs(13);
+// The running tray's own exit gives its server the full
+// `shared::GRACEFUL_STOP_TIMEOUT` to stop, then stops an adopted one within
+// `EXIT_STOP_POLICY`'s three seconds. This wait is that minute plus eight
+// seconds, so the sweep below never ends a server the tray is still waiting
+// on.
+const SHUTDOWN_TRAY_EXIT_WAIT: Duration =
+    shared::GRACEFUL_STOP_TIMEOUT.saturating_add(Duration::from_secs(8));
 // Ask whatever is still running from the installation to exit, poll eight
 // times half a second apart, then terminate it and give that two seconds.
 const SHUTDOWN_STOP_POLICY: StopPolicy = StopPolicy {
@@ -615,6 +623,8 @@ fn uninstall_cleanup() {
 
 struct TrayState {
     supervisor: ServerSupervisor,
+    // The session is ending: the stop at teardown keeps the short limit.
+    session_ending: bool,
     login_start: bool,
     icon_added: bool,
     // The app window, once it has been created. It is created hidden and
@@ -662,6 +672,7 @@ impl TrayState {
     fn new(supervisor: ServerSupervisor, login_start: bool) -> Self {
         Self {
             supervisor,
+            session_ending: false,
             login_start,
             icon_added: false,
             app_window: None,
@@ -1224,7 +1235,11 @@ impl TrayState {
         }
         // SAFETY: The icon belongs to this window and is being removed during teardown.
         unsafe { self.remove_icon(window) };
-        let _ = self.supervisor.stop();
+        let _ = if self.session_ending {
+            self.supervisor.stop_within(SESSION_END_STOP_TIMEOUT)
+        } else {
+            self.supervisor.stop()
+        };
         self.stop_adopted_server();
         self.supervisor.shutdown_logging();
     }
@@ -1287,6 +1302,7 @@ unsafe extern "system" fn window_proc(
             // restart registration brings the tray back afterwards.
             WM_ENDSESSION => {
                 if wparam != 0 {
+                    state.session_ending = true;
                     // SAFETY: This is the live window associated with the tray state.
                     unsafe { DestroyWindow(window) };
                 }

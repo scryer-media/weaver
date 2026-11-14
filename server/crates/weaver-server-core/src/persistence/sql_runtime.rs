@@ -633,6 +633,15 @@ impl SqlRuntime {
 }
 
 impl<'db> SqlTx<'db> {
+    // This transaction's connection, for code that also runs inside a
+    // transaction it does not own.
+    pub(crate) fn conn(&mut self) -> SqlConn<'_> {
+        match self {
+            SqlTx::Sqlite(tx) => SqlConn::Sqlite(tx),
+            SqlTx::Postgres(tx) => SqlConn::Postgres(tx),
+        }
+    }
+
     #[expect(
         clippy::disallowed_methods,
         reason = "writer gate: runs on a transaction run_in_transaction opened under the gate; Postgres has no writer gate"

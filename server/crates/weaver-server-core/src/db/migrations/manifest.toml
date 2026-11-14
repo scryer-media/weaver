@@ -1175,3 +1175,30 @@ kind = "sql"
 file = "migrations/0090_credential_scan_indexes/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 91
+description = "a history entry keeps when housekeeping swept a failed job's files, with an index for the sweep's page"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0091_history_swept/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0091_history_swept/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 92
+description = "a server list stored past the server limit is trimmed to it"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "trim_servers_to_limit_v92"
+scope = "all"

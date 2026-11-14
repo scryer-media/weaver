@@ -54,6 +54,8 @@ impl Pipeline {
     // Bound on how long `drain` waits to join detached fire-and-forget writes.
     const FIRE_AND_FORGET_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const DOWNLOAD_COMPLETION_DRAIN_LIMIT: usize = 128;
+    // Delayed retries re-entered per busy turn: the retry channel's capacity.
+    const RETRY_DRAIN_LIMIT: usize = 256;
     // Released results processed per orchestrator turn before the turn's
     // dispatch pass, barrier poll and chase reap run again. One result per
     // turn made every lane batch of 64 articles cost 64 full dispatch passes
@@ -272,8 +274,9 @@ impl Pipeline {
             scheduled_hardware_profile: None,
             metrics,
             jobs: HashMap::new(),
-            graph_jobs: HashMap::new(),
+            graph_jobs: Default::default(),
             retiring_graph_jobs: HashMap::new(),
+            moving_jobs: HashMap::new(),
             graph_status: Default::default(),
             graph_holds,
             graph_decode,
@@ -286,6 +289,7 @@ impl Pipeline {
             nzb_retired_busy: HashSet::new(),
             pending_renames: HashMap::new(),
             nzb_pause_releases,
+            resumes_stored: HashSet::new(),
             nzb_reprocess_pending: HashSet::new(),
             nzb_admitting: HashSet::new(),
             nzb_releasing: HashSet::new(),
@@ -306,7 +310,7 @@ impl Pipeline {
             pipeline_failure_stages: HashMap::new(),
             job_order: Vec::new(),
             stored_queue_order: Vec::new(),
-            active_downloads: 0,
+            articles_in_flight: 0,
             active_download_connections: 0,
             active_completion_critical_connections: 0,
             active_recovery: 0,
@@ -324,10 +328,10 @@ impl Pipeline {
             jobs_finalizing_download: HashSet::new(),
             pending_released_download_results_by_job: HashMap::new(),
             pending_released_download_result_bytes_by_job: HashMap::new(),
-            active_downloads_by_job: HashMap::new(),
+            articles_in_flight_by_job: HashMap::new(),
             active_download_connections_by_job: HashMap::new(),
             active_completion_critical_connections_by_job: HashMap::new(),
-            active_downloads_by_file: HashMap::new(),
+            articles_in_flight_by_file: HashMap::new(),
             active_decodes_by_job: Default::default(),
             active_decodes_by_file: HashMap::new(),
             active_decode_bytes: HashMap::new(),
@@ -383,6 +387,7 @@ impl Pipeline {
             retry_rx,
             infrastructure_retries: infrastructure_retry::InfrastructureRetryQueue::default(),
             pool_generation: 0,
+            pool_layouts: Default::default(),
             server_counters,
             job_stage_started_at: HashMap::new(),
             nntp_handoff_drained_tx,
@@ -448,18 +453,19 @@ impl Pipeline {
             download_pass_fill_servers: None,
             download_pass_provider_policy: None,
             download_retry_storm_window: None,
+            download_retry_storm: None,
             owned_lane_acquire_failure_log_throttle: Default::default(),
             dispatch_ineligible_log_throttle: Default::default(),
             dispatch_slot_wait_log_throttle: Default::default(),
             last_owned_lane_acquire_failure_at: None,
             download_lanes_under_cap_since: None,
-            last_download_lanes_under_cap_log_at: None,
+            download_lanes_under_cap_reported: false,
             write_buffered_bytes: 0,
             write_buffered_segments: 0,
             uu_spooled_bytes: 0,
             uu_spooled_segments: 0,
             uu_parked_segments: 0,
-            uu_files: HashMap::new(),
+            uu_files: Default::default(),
             uu_park_requeues: HashMap::new(),
             unanchored_parked: UnanchoredPark::default(),
             unanchored_requeues: HashMap::new(),
@@ -851,7 +857,7 @@ impl Pipeline {
                 }
 
                 let in_flight = self
-                    .active_downloads_by_job
+                    .articles_in_flight_by_job
                     .get(job_id)
                     .copied()
                     .unwrap_or(0);
@@ -910,7 +916,7 @@ impl Pipeline {
         if !self.pending_decode.is_empty() {
             return true;
         }
-        self.active_downloads > 0
+        self.articles_in_flight > 0
             || !self.active_download_connections_by_job.is_empty()
             || !self.active_decodes_by_job.is_empty()
             || !self.held_download_refills.is_empty()
@@ -1216,6 +1222,9 @@ impl Pipeline {
                 // A busy turn skips the wait below: it hears a reading, room
                 // given back or a waiter left idle as the wait would.
                 self.hear_disk_on_busy_turn();
+                // It skips the retries heard there too, and a link that keeps
+                // answering would keep them waiting for as long as it does.
+                self.drain_ready_retries();
             } else {
                 // Set by the periodic arms that found nothing to do; every
                 // other arm is an event.
@@ -1389,7 +1398,7 @@ impl Pipeline {
                                 if tracing::enabled!(tracing::Level::DEBUG) {
                                 let live = self.pipeline_is_live();
                                 let snapshot = self.metrics.raw_snapshot();
-                                let not_found = snapshot.articles_not_found;
+                                let articles_not_found = snapshot.articles_not_found;
                                 // Folded over every job, so only while something
                                 // is moving; an idle pipeline's health is unchanged.
                                 let min_health: Option<u32> = live.then(|| self.jobs.values()
@@ -1398,7 +1407,7 @@ impl Pipeline {
                                     .map(|s| (s.spec.total_bytes.saturating_sub(s.failed_bytes) * 1000 / s.spec.total_bytes) as u32)
                                     .min()).flatten();
                                 debug!(
-                                    active = self.active_downloads,
+                                    active = self.articles_in_flight,
                                     queue = snapshot.download_queue_depth,
                                     speed_mbps = format!("{:.1}", snapshot.current_download_speed as f64 / (1024.0 * 1024.0)),
                                     downloaded_mb = snapshot.bytes_downloaded / (1024 * 1024),
@@ -1411,7 +1420,8 @@ impl Pipeline {
                                     pressure_state = snapshot.download_pressure_state.as_str(),
                                     pressure_reason = snapshot.download_pressure_reason.as_str(),
                                     direct_write_evictions = snapshot.direct_write_evictions,
-                                    not_found,
+                                    articles_not_found,
+                                    not_found_answers = snapshot.download_failures_article_not_found,
                                     health = min_health.map(|h| format!("{:.1}%", h as f64 / 10.0)).unwrap_or_default(),
                                     "pipeline tick"
                                 );
@@ -1422,7 +1432,7 @@ impl Pipeline {
                                 count_periodic_tick();
                                 // A stall needs a transfer in flight; with none the
                                 // walk over every job would find nothing.
-                                idle_tick = self.active_downloads_by_job.is_empty();
+                                idle_tick = self.articles_in_flight_by_job.is_empty();
                                 if !idle_tick {
                                     self.auto_pause_stalled_downloads();
                                 }
@@ -1663,6 +1673,22 @@ impl Pipeline {
         }
     }
 
+    // Re-enters the delayed retries whose wait is over, at most one channel's
+    // worth a turn so a burst never holds the turn up.
+    fn drain_ready_retries(&mut self) {
+        let mut jobs = HashSet::new();
+        for _ in 0..Self::RETRY_DRAIN_LIMIT {
+            let Ok(retry) = self.retry_rx.try_recv() else {
+                break;
+            };
+            jobs.insert(retry.work.segment_id.file_id.job_id);
+            self.receive_retry_work(retry);
+        }
+        for job_id in jobs {
+            self.report_job_soon(job_id);
+        }
+    }
+
     fn drain_ready_lane_control_messages(&mut self) {
         loop {
             match self.download_lane_parked_rx.try_recv() {
@@ -1705,14 +1731,20 @@ impl Pipeline {
         if scheduled_pool_generation != self.pool_generation
             && (!work.exclude_servers.is_empty() || work.avoid_server.is_some())
         {
+            // Scheduled under an older pool: carry the tried servers and the
+            // hint over by server identity, never read them unmapped.
+            work.exclude_servers = self
+                .pool_layouts
+                .set(scheduled_pool_generation, work.exclude_servers);
+            work.avoid_server = work
+                .avoid_server
+                .and_then(|server| self.pool_layouts.index(scheduled_pool_generation, server));
             debug!(
                 segment = %work.segment_id,
                 scheduled_generation = scheduled_pool_generation,
                 current_generation = self.pool_generation,
-                "dropping stale server exclusions on retry after NNTP pool rebuild"
+                "carried server exclusions on retry across an NNTP pool rebuild"
             );
-            work.exclude_servers.clear();
-            work.avoid_server = None;
         }
         if infrastructure_retry {
             self.note_infrastructure_retry_requeued(work.segment_id.file_id.job_id);
@@ -1784,7 +1816,7 @@ impl Pipeline {
             self.maybe_finish_download_pass(job_id);
             return None;
         }
-        if self.no_server_can_serve(job_id, &work.exclude_servers) {
+        if self.no_server_can_serve(job_id, work.exclude_servers) {
             return Some(work);
         }
         // The job's root classes the work.
@@ -1831,9 +1863,9 @@ impl Pipeline {
         }
         self.checkpoint_graph_holds();
 
-        if self.active_downloads > 0 || self.has_queued_or_active_decode() {
+        if self.articles_in_flight > 0 || self.has_queued_or_active_decode() {
             warn!(
-                active_downloads = self.active_downloads,
+                articles_in_flight = self.articles_in_flight,
                 active_decodes = self.active_decodes_by_job.total(),
                 "shutdown drain ended with in-flight pipeline work"
             );
@@ -1841,15 +1873,15 @@ impl Pipeline {
             info!("shutdown drain completed active download/decode work");
         }
 
-        if self.active_downloads > 0 {
+        if self.articles_in_flight > 0 {
             info!(
-                active = self.active_downloads,
+                active = self.articles_in_flight,
                 "draining in-flight downloads"
             );
         }
         self.flush_server_attribution();
         self.flush_support_facts();
-        if let Err(error) = self.shared_state.queue.sample_bandwidth(true) {
+        if let Err(error) = self.shared_state.queue.clone().flush_bandwidth().await {
             warn!(error = %error, "failed to flush pending bandwidth usage during drain");
         }
 
@@ -1885,7 +1917,7 @@ impl Pipeline {
     }
 
     fn has_download_or_decode_drain_work(&self) -> bool {
-        self.active_downloads > 0 || self.has_decode_drain_work()
+        self.articles_in_flight > 0 || self.has_decode_drain_work()
     }
 
     async fn drain_inflight_download_and_decode_work(&mut self) {
@@ -1895,10 +1927,10 @@ impl Pipeline {
         while self.has_download_or_decode_drain_work() {
             let event = tokio::time::timeout(Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT, async {
                 tokio::select! {
-                    result = self.download_done_rx.recv(), if self.active_downloads > 0 => {
+                    result = self.download_done_rx.recv(), if self.articles_in_flight > 0 => {
                         result.map(ShutdownDrainEvent::Download)
                     }
-                    result = self.owned_download_lane_event_rx.recv(), if self.active_downloads > 0 => {
+                    result = self.owned_download_lane_event_rx.recv(), if self.articles_in_flight > 0 => {
                         result.map(ShutdownDrainEvent::OwnedDownload)
                     }
                     result = self.decode_done_rx.recv(), if self.has_decode_drain_work() => {
@@ -1936,7 +1968,7 @@ impl Pipeline {
                 }
                 Err(_) => {
                     warn!(
-                        active_downloads = self.active_downloads,
+                        articles_in_flight = self.articles_in_flight,
                         active_decodes = self.active_decodes_by_job.total(),
                         decode_pending = self.metrics.decode_pending.load(Ordering::Relaxed),
                         idle_timeout_secs = Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT.as_secs(),

@@ -821,3 +821,31 @@ fn long_zero_padding_and_bytes_after_the_end_blocks_are_kept_as_they_arrive() {
         }
     }
 }
+
+// A GNU sparse entry whose packed data is just over the 1 MiB an
+// entry that is not a file may keep refuses the archive once, cleanly; at
+// exactly 1 MiB it is envelope and the file behind it streams.
+#[test]
+fn a_sparse_entry_just_past_the_envelope_limit_refuses_once() {
+    for (size, refused) in [(1usize << 20, false), ((1 << 20) + 1, true)] {
+        let mut writer = Writer::default();
+        writer.raw(
+            header("holes.bin", "", size as u64, b'S', Dialect::Gnu),
+            &payload(7, size),
+        );
+        writer.file("after.bin", &payload(9, 800));
+        let archive = writer.finish().bytes;
+        let mut owner = Owner::new(archive.clone());
+        owner.whole(64 * 1024);
+        if refused {
+            assert_eq!(owner.said, [Emit::Refuse(Why::Unsupported)], "{size}");
+        } else {
+            clean(&owner);
+            assert_eq!(
+                owner.files(),
+                vec![("after.bin".to_owned(), payload(9, 800))]
+            );
+            assert_eq!(owner.posted().as_deref(), Some(archive.as_slice()));
+        }
+    }
+}

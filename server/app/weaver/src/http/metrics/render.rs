@@ -424,7 +424,11 @@ fn render_queues(out: &mut Encoder, snapshot: &MetricsSnapshot) {
         &[],
         snapshot.download_queue_depth as u64,
     );
-    out.sample(&f::ACTIVE_DOWNLOADS, &[], snapshot.active_downloads as u64);
+    out.sample(
+        &f::ARTICLES_IN_FLIGHT,
+        &[],
+        snapshot.articles_in_flight as u64,
+    );
     out.sample(&f::ACTIVE_DECODES, &[], snapshot.active_decodes as u64);
     out.sample(&f::DECODE_PENDING, &[], snapshot.decode_pending as u64);
     out.sample(&f::DECODE_PENDING_BYTES, &[], snapshot.decode_pending_bytes);
@@ -1610,7 +1614,7 @@ fn observed_download_limiter(
     // `idle` — "nothing to do" — when the truth is "nowhere to fetch from",
     // which is the exact state the next check exists to name.
     if required_queue_depth == 0
-        && snapshot.active_downloads == 0
+        && snapshot.articles_in_flight == 0
         && snapshot.parked_infrastructure_work == 0
     {
         return "idle";
@@ -1622,7 +1626,7 @@ fn observed_download_limiter(
     // `dispatch_limited` here would point the operator at the decode/write
     // path or at Weaver's own scheduler, when the problem is upstream of both.
     // It cannot mask an ordinary busy pipeline, which has active downloads.
-    if snapshot.parked_infrastructure_work > 0 && snapshot.active_downloads == 0 {
+    if snapshot.parked_infrastructure_work > 0 && snapshot.articles_in_flight == 0 {
         return "infrastructure_unavailable";
     }
     if snapshot.download_pressure_state != DownloadPressureState::Clear {
@@ -1652,13 +1656,13 @@ fn observed_download_limiter(
         .map(|server| server.connections_available)
         .sum::<usize>();
     if required_queue_depth > 0
-        && snapshot.active_downloads > 0
+        && snapshot.articles_in_flight > 0
         && total_connections > 0
         && available_connections == 0
     {
         return "network_limited";
     }
-    if snapshot.active_downloads > 0 {
+    if snapshot.articles_in_flight > 0 {
         return "active";
     }
     "dispatch_limited"

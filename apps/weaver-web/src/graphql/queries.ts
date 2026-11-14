@@ -542,7 +542,7 @@ const METRICS_FIELDS = `
     bytesDecoded
     bytesCommitted
     downloadQueueDepth
-    activeDownloads
+    articlesInFlight
     activeDecodes
     decodePending
     decodePendingBytes
@@ -1079,7 +1079,7 @@ export const SERVER_HEALTH_QUERY = gql`
       connectionsConfigured
       capacityPenaltyUntilEpochMs
       runtimeGeneration
-      latencyMs
+      measuredLatencyMs
       bodyLatencyMs
       bodyTransferMs
       bodyLatencyBand

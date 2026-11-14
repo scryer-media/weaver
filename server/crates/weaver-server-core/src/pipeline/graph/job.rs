@@ -165,6 +165,11 @@ pub(crate) struct GraphJob {
     // Where root members were last asked whether the sets proved them;
     // `None` before the first.
     sealed_at: Option<repair::Sealed>,
+    // Counts the mutable borrows of this job: nothing of it changes without
+    // one, so what was derived from it at a count holds while the count does.
+    moved: u64,
+    // The recovery indexes still to come as of a count.
+    indexes_kept: Option<(u64, Option<Arc<[u32]>>)>,
 }
 
 // Something a step of the job did that the job's events say.
@@ -268,7 +273,46 @@ impl GraphJob {
             notes: Vec::new(),
             fed: runs::Fed::default(),
             sealed_at: None,
+            moved: 0,
+            indexes_kept: None,
         }
+    }
+
+    // The job is about to be borrowed mutably: what was derived from it no
+    // longer holds unasked.
+    pub(crate) fn touched(&mut self) {
+        self.moved = self.moved.wrapping_add(1);
+    }
+
+    // [`Self::indexes_to_come`] by posted file number, as one shared list
+    // for as long as the job was not borrowed mutably. A borrow that left
+    // the answer as it was keeps the list it had, so its holders still
+    // match by pointer. The spec's declared roles do not change after the
+    // job is built, so `declared` is read only when the list is made again;
+    // a debug build makes it again on every ask and checks the kept one.
+    pub(crate) fn indexes_to_come_kept(
+        &mut self,
+        declared: impl IntoIterator<Item = (MemberId, super::metadata::RecoveryFormat)>,
+    ) -> Option<Arc<[u32]>> {
+        let numbered =
+            |held: Vec<MemberId>| -> Vec<u32> { held.into_iter().map(|member| member.0).collect() };
+        if let Some((at, kept)) = &self.indexes_kept
+            && *at == self.moved
+        {
+            debug_assert_eq!(
+                self.indexes_to_come(declared).map(numbered).as_deref(),
+                kept.as_deref(),
+                "the recovery indexes to come changed without a mutable borrow of the job"
+            );
+            return kept.clone();
+        }
+        let now = self.indexes_to_come(declared).map(numbered);
+        let kept = match (self.indexes_kept.take(), now) {
+            (Some((_, Some(kept))), Some(now)) if *kept == *now => Some(kept),
+            (_, now) => now.map(Arc::from),
+        };
+        self.indexes_kept = Some((self.moved, kept.clone()));
+        kept
     }
 
     // What the job did since this was last asked.

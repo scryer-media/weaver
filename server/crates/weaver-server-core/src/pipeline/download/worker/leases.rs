@@ -28,6 +28,44 @@ impl BlockedBy {
     }
 }
 
+// Whether any queued article could get past the index bootstrap, from each
+// listed file's queued count: one step per file the job lists. `Ok` when a
+// bootstrap file has an article queued, or when the queue holds an article
+// of a file the job does not list, which is left to the scan to judge.
+pub(in crate::pipeline::download) fn queued_files_may_pass(
+    files: usize,
+    bootstrap_files: &[u32],
+    queued_in_all: usize,
+    mut queued_in: impl FnMut(u32) -> usize,
+) -> Result<(), BlockedBy> {
+    let mut counted = 0usize;
+    let mut blocked = BlockedBy::default();
+    for file_index in (0..files).filter_map(|index| u32::try_from(index).ok()) {
+        let queued = queued_in(file_index);
+        if queued == 0 {
+            continue;
+        }
+        counted += queued;
+        if bootstrap_files.contains(&file_index) {
+            return Ok(());
+        }
+        blocked = blocked.with(SchedulerBlockClause::RecoveryMetadataBootstrap);
+    }
+    if counted != queued_in_all {
+        return Ok(());
+    }
+    Err(blocked)
+}
+
+// Whether a memo's list and a filter's are the one list, or both absent.
+fn same_list<T: ?Sized>(kept: Option<&Arc<T>>, now: Option<&Arc<T>>) -> bool {
+    match (kept, now) {
+        (None, None) => true,
+        (Some(kept), Some(now)) => Arc::ptr_eq(kept, now),
+        _ => false,
+    }
+}
+
 // One sampled answer to "may this server fetch this article of this job?",
 // reusable across a whole queue scan and across every article of one
 // handout. Built by [`Pipeline::servable_work_filter`], which is the only
@@ -44,10 +82,10 @@ pub(in crate::pipeline::download) struct ServableWorkFilter<'a> {
     // preference: it refuses the hinted server only while one of these the
     // article may use is available, so an article whose only alternative is
     // down is still served by the server it failed on.
-    hint_alternatives: Vec<usize>,
-    retention_excludes: Arc<Vec<usize>>,
-    bootstrap_files: Option<&'a [u32]>,
-    uu_cursor_ordinals: Option<&'a HashMap<NzbFileId, u32>>,
+    hint_alternatives: weaver_nntp::ServerSet,
+    retention_excludes: weaver_nntp::ServerSet,
+    bootstrap_files: Option<&'a Arc<[u32]>>,
+    uu_cursor_ordinals: Option<&'a Arc<HashMap<NzbFileId, u32>>>,
     checkpoint: CheckpointAdmission,
     // What the handout being built has taken, as the checkpoint weighs it.
     leased: CheckpointLease,
@@ -65,6 +103,88 @@ pub(in crate::pipeline::download) struct ServableWorkFilter<'a> {
     // estimate is skipped, so the scan that met it tells the server's quota,
     // which latches its blocked signal.
     quota_short: std::cell::Cell<Option<u64>>,
+    // Whether a rotation hint was weighed against `hint_alternatives`, so a
+    // refusal this filter made depends on them.
+    hint_weighed: std::cell::Cell<bool>,
+    // The largest article estimate the provider policy was asked about, so
+    // a memo's refusals are tied to the quotas only as far as they weighed
+    // them.
+    weighed: std::cell::Cell<u64>,
+    // The pool layout the filter's server indices belong to.
+    pool_generation: u64,
+}
+
+// What a server's refusals of a job's queued articles depended on, besides
+// the articles themselves: when all of it is unchanged, an article refused
+// once is refused again, and the walk can start past it.
+//
+// The provider policy is held as the sample the refusals were made under
+// and compared only as far as it can change their answer
+// ([`ProviderPolicy::answers_alike`]): bytes charged to a server with quota
+// to spare, or a server of a worse group going down, keep the memo.
+#[derive(Clone)]
+struct ScanConditions {
+    pool_generation: u64,
+    provider_policy: Arc<weaver_nntp::provider_policy::ProviderPolicy>,
+    // The largest article estimate weighed against the policy.
+    weighed: u64,
+    retention_excludes: weaver_nntp::ServerSet,
+    // Both are derived afresh for every ask, so the memo shares the ask's
+    // own copy rather than taking one.
+    bootstrap_files: Option<Arc<[u32]>>,
+    uu_cursor_ordinals: Option<Arc<HashMap<NzbFileId, u32>>>,
+    // The hint alternatives, only once a refusal weighed them.
+    hint_alternatives: Option<weaver_nntp::ServerSet>,
+}
+
+// The record a server's walk of a job's queue leaves: the conditions its
+// refusals were made under, and what they told the counters, so a walk that
+// starts past them reports what a full walk would.
+pub(in crate::pipeline::download) struct ScanMemo {
+    conditions: ScanConditions,
+    refused_by: BlockedBy,
+    quota_short: Option<u64>,
+}
+
+impl ScanMemo {
+    // Whether an article put into the queue after the walk is refused
+    // `server` under the conditions the walk's refusals were made, and so
+    // belongs with them below its floor. Answers the clauses a walk asks
+    // first: the article's own exclusions, then the provider policy. An
+    // article those admit is left to the next walk, whatever a later clause
+    // would say. A refusal joins the memo as the walk would have counted
+    // it, estimate included, so the memo still holds only while the policy
+    // answers alike for this article too.
+    pub(in crate::pipeline::download) fn refuses(
+        &mut self,
+        server: usize,
+        exclude_servers: weaver_nntp::ServerSet,
+        byte_estimate: u32,
+    ) -> bool {
+        use weaver_nntp::provider_policy::ArticleEligibility;
+        if exclude_servers.contains(server) {
+            self.refused_by = self.refused_by.with(SchedulerBlockClause::ServerExclusion);
+            return true;
+        }
+        let estimate = Pipeline::bandwidth_reservation_estimate(byte_estimate);
+        let clause = match self.conditions.provider_policy.eligibility(
+            server,
+            exclude_servers,
+            self.conditions.retention_excludes,
+            estimate,
+        ) {
+            ArticleEligibility::Eligible(_) => return false,
+            ArticleEligibility::BackfillProtected => SchedulerBlockClause::Backfill,
+            ArticleEligibility::OutOfQuota => {
+                self.quota_short.get_or_insert(estimate);
+                SchedulerBlockClause::ProviderPriority
+            }
+            _ => SchedulerBlockClause::ProviderPriority,
+        };
+        self.conditions.weighed = self.conditions.weighed.max(estimate);
+        self.refused_by = self.refused_by.with(clause);
+        true
+    }
 }
 
 // What [`Pipeline::servable_work_filter`] found for one job and one server.
@@ -94,17 +214,18 @@ impl ServableWorkFilter<'_> {
     // admits.
     fn refusal(&self, work: &QueuedWork<'_>) -> Option<SchedulerBlockClause> {
         let file_index = work.segment_id.file_id.file_index;
-        if work.exclude_servers.contains(&self.server_idx)
+        if work.exclude_servers.contains(self.server_idx)
             || (work.avoid_server == Some(self.server_idx) && self.hint_has_alternative(work))
         {
             return Some(SchedulerBlockClause::ServerExclusion);
         }
         use weaver_nntp::provider_policy::ArticleEligibility;
         let estimate = Pipeline::bandwidth_reservation_estimate(work.byte_estimate);
+        self.weighed.set(self.weighed.get().max(estimate));
         match self.provider_policy.eligibility(
             self.server_idx,
             work.exclude_servers,
-            &self.retention_excludes,
+            self.retention_excludes,
             estimate,
         ) {
             ArticleEligibility::Eligible(_) => {}
@@ -143,20 +264,101 @@ impl ServableWorkFilter<'_> {
     // Whether a server other than this one could take `work` now: available,
     // not excluded by the article, not ruled out by the job's retention.
     fn hint_has_alternative(&self, work: &QueuedWork<'_>) -> bool {
-        self.hint_alternatives.iter().any(|server| {
-            *server != self.server_idx
-                && !work.exclude_servers.contains(server)
-                && !self.retention_excludes.contains(server)
-                && matches!(
-                    self.provider_policy.eligibility(
-                        *server,
-                        work.exclude_servers,
-                        &self.retention_excludes,
-                        Pipeline::bandwidth_reservation_estimate(work.byte_estimate)
-                    ),
-                    weaver_nntp::provider_policy::ArticleEligibility::Eligible(_)
-                )
-        })
+        self.hint_weighed.set(true);
+        let estimate = Pipeline::bandwidth_reservation_estimate(work.byte_estimate);
+        self.weighed.set(self.weighed.get().max(estimate));
+        // An excluded server is never eligible, so the policy's one answer
+        // for the article covers every alternative at once.
+        self.provider_policy.any_eligible(
+            self.hint_alternatives,
+            self.server_idx,
+            work.exclude_servers,
+            self.retention_excludes,
+            estimate,
+        )
+    }
+
+    // Whether this filter's refusals hold for as long as the conditions a
+    // memo records do. The restart checkpoint is the one clause that also
+    // weighs what the handout has taken and a lead that moves with every
+    // byte written, so a walk in which it refused an article leaves no
+    // memo. It is asked last, only of an article every other clause admits,
+    // so a walk it refused nothing in rests on the other clauses alone,
+    // whether or not the job is under a restored checkpoint.
+    pub(in crate::pipeline::download) fn refusals_keep(&self) -> bool {
+        !self.checkpoint_blocked.get()
+    }
+
+    // Whether `memo` was recorded under the conditions this filter judges
+    // by, so every article its walk refused would be refused again.
+    fn conditions_hold(&self, conditions: &ScanConditions) -> bool {
+        conditions.pool_generation == self.pool_generation
+            && (Arc::ptr_eq(&conditions.provider_policy, &self.provider_policy)
+                || conditions.provider_policy.answers_alike(
+                    &self.provider_policy,
+                    self.server_idx,
+                    conditions.hint_alternatives.is_some(),
+                    conditions.weighed,
+                ))
+            && conditions.retention_excludes == self.retention_excludes
+            // Each list is the one its owner keeps until its answer changes,
+            // so the same list is the same answer and no content is read.
+            && same_list(conditions.bootstrap_files.as_ref(), self.bootstrap_files)
+            && same_list(
+                conditions.uu_cursor_ordinals.as_ref(),
+                self.uu_cursor_ordinals,
+            )
+            && conditions
+                .hint_alternatives
+                .as_ref()
+                .is_none_or(|alternatives| *alternatives == self.hint_alternatives)
+    }
+
+    // Takes up a walk where `memo`'s left off, when its conditions still
+    // hold: the refusals it counted are this filter's too. False when the
+    // walk must start from the head.
+    // A memo is only ever recorded by a walk the checkpoint refused nothing
+    // in (see [`Self::refusals_keep`]).
+    pub(in crate::pipeline::download) fn resume(&self, memo: &ScanMemo) -> bool {
+        if !self.conditions_hold(&memo.conditions) {
+            return false;
+        }
+        self.refused_by
+            .set(BlockedBy(self.refused_by.get().0 | memo.refused_by.0));
+        if self.quota_short.get().is_none() {
+            self.quota_short.set(memo.quota_short);
+        }
+        if memo.conditions.hint_alternatives.is_some() {
+            self.hint_weighed.set(true);
+        }
+        true
+    }
+
+    // The memo of this filter's walk, covering `prior`'s refusals too when
+    // the walk took up from it. The conditions are this filter's: the
+    // prior's held, so its refusals answer under this policy as they did,
+    // and the estimates and hint both walks weighed are kept.
+    pub(in crate::pipeline::download) fn memo(&self, prior: Option<ScanMemo>) -> ScanMemo {
+        let mut hint_alternatives = self.hint_weighed.get().then_some(self.hint_alternatives);
+        let mut weighed = self.weighed.get();
+        if let Some(prior) = prior.filter(|prior| self.conditions_hold(&prior.conditions)) {
+            hint_alternatives = prior.conditions.hint_alternatives.or(hint_alternatives);
+            weighed = weighed.max(prior.conditions.weighed);
+        }
+        let conditions = ScanConditions {
+            pool_generation: self.pool_generation,
+            provider_policy: Arc::clone(&self.provider_policy),
+            weighed,
+            retention_excludes: self.retention_excludes,
+            bootstrap_files: self.bootstrap_files.cloned(),
+            uu_cursor_ordinals: self.uu_cursor_ordinals.cloned(),
+            hint_alternatives,
+        };
+        ScanMemo {
+            conditions,
+            refused_by: self.refused_by.get(),
+            quota_short: self.quota_short.get(),
+        }
     }
 
     pub(in crate::pipeline::download) fn checkpoint_blocked(&self) -> bool {
@@ -227,7 +429,7 @@ impl Pipeline {
     pub(in crate::pipeline::download) fn recovery_metadata_bootstrap_files(
         &mut self,
         job_id: JobId,
-    ) -> Option<Vec<u32>> {
+    ) -> Option<Arc<[u32]>> {
         // The job's root namespace holds its own payload for the indexes the
         // post declares, as long as it says.
         self.graph_indexes_to_come(job_id)
@@ -236,8 +438,8 @@ impl Pipeline {
     // The recovery indexes the post declares that a graph job's root namespace
     // holds its payload for. Root members are numbered as the posted files
     // they are.
-    fn graph_indexes_to_come(&self, job_id: JobId) -> Option<Vec<u32>> {
-        let (graph, state) = (self.graph_jobs.get(&job_id)?, self.jobs.get(&job_id)?);
+    fn graph_indexes_to_come(&mut self, job_id: JobId) -> Option<Arc<[u32]>> {
+        let state = self.jobs.get(&job_id)?;
         let declared = state
             .spec
             .files
@@ -247,9 +449,7 @@ impl Pipeline {
                 crate::pipeline::graph::metadata::RecoveryFormat::declared_index(&file.role)
                     .map(|format| (weaver_graph::MemberId(index), format))
             });
-        graph
-            .indexes_to_come(declared)
-            .map(|held| held.into_iter().map(|member| member.0).collect())
+        self.graph_jobs.indexes_to_come(&job_id, declared)
     }
 
     // The single definition of "this server may fetch this queued article
@@ -278,11 +478,11 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         server_idx: usize,
-        bootstrap_files: Option<&'a [u32]>,
-        uu_cursor_ordinals: Option<&'a HashMap<NzbFileId, u32>>,
+        bootstrap_files: Option<&'a Arc<[u32]>>,
+        uu_cursor_ordinals: Option<&'a Arc<HashMap<NzbFileId, u32>>>,
     ) -> ServableWork<'a> {
         let retention_excludes = self.job_retention_excludes(job_id);
-        if retention_excludes.contains(&server_idx) {
+        if retention_excludes.contains(server_idx) {
             return ServableWork::RetentionExcluded;
         }
         let checkpoint = self.checkpoint_admission(job_id);
@@ -305,6 +505,9 @@ impl Pipeline {
             skipped: std::cell::Cell::new(0),
             refused_by: std::cell::Cell::new(BlockedBy::default()),
             quota_short: std::cell::Cell::new(None),
+            hint_weighed: std::cell::Cell::new(false),
+            weighed: std::cell::Cell::new(0),
+            pool_generation: self.pool_generation,
         })
     }
 
@@ -321,16 +524,23 @@ impl Pipeline {
     // per article; and a checkpoint that admits some payload sizes but not
     // others is asked article by article. Retention is decided for the whole
     // job before this is asked.
+    //
+    // The per-file part is walked only when a file's queued count changed or
+    // the list of index files is another one since the job was last asked
+    // (see [`DownloadQueue::bootstrap_answer`]); the number of files a job
+    // lists does not change after it is built. A debug build walks on every
+    // ask and checks the kept answer.
     fn queued_work_may_pass(
-        &self,
+        &mut self,
         job_id: JobId,
         checkpoint: CheckpointAdmission,
-        bootstrap_files: Option<&[u32]>,
+        bootstrap_files: Option<&Arc<[u32]>>,
     ) -> Result<(), BlockedBy> {
-        let Some(state) = self.jobs.get(&job_id) else {
+        let Some(state) = self.jobs.get_mut(&job_id) else {
             return Ok(());
         };
-        let Some(queue) = state.articles.download_queue() else {
+        let files = state.spec.files.len();
+        let Some(queue) = state.articles.download_queue_mut() else {
             return Err(BlockedBy::only(SchedulerBlockClause::Activation));
         };
         if checkpoint.holds_every_payload_article() && queue.recovery_work_count() == 0 {
@@ -339,27 +549,18 @@ impl Pipeline {
         let Some(bootstrap_files) = bootstrap_files else {
             return Ok(());
         };
-        let mut counted = 0usize;
-        let mut blocked = BlockedBy::default();
-        for file_index in (0..state.spec.files.len()).filter_map(|index| u32::try_from(index).ok())
-        {
-            let file_id = NzbFileId { job_id, file_index };
-            let queued = queue.queued_count_for_file(file_id) as usize;
-            if queued == 0 {
-                continue;
-            }
-            counted += queued;
-            if bootstrap_files.contains(&file_index) {
-                return Ok(());
-            }
-            blocked = blocked.with(SchedulerBlockClause::RecoveryMetadataBootstrap);
-        }
-        // Articles of a file the spec does not list were not looked at; let
-        // the scan judge them.
-        if counted != queue.len() {
-            return Ok(());
-        }
-        Err(blocked)
+        let walk = |queue: &DownloadQueue| {
+            queued_files_may_pass(files, bootstrap_files, queue.len(), |file_index| {
+                queue.queued_count_for_file(NzbFileId { job_id, file_index }) as usize
+            })
+        };
+        let answer = queue.bootstrap_answer(bootstrap_files, walk);
+        debug_assert_eq!(
+            answer,
+            walk(queue),
+            "the bootstrap answer changed without a change to a file's queued count"
+        );
+        answer
     }
 
     // The fill servers a hinted article of `job_id` could be sent to instead
@@ -368,9 +569,9 @@ impl Pipeline {
     // holds steered work, since nothing else reads the answer. A contended
     // ranking answers with every fill server, which keeps the hint, the
     // strict answer, for at most one pass.
-    fn rotation_hint_alternatives(&self, job_id: JobId) -> Vec<usize> {
-        if let Some(fill) = &self.download_pass_fill_servers {
-            return fill.clone();
+    fn rotation_hint_alternatives(&self, job_id: JobId) -> weaver_nntp::ServerSet {
+        if let Some(fill) = self.download_pass_fill_servers {
+            return fill;
         }
         if self
             .jobs
@@ -378,31 +579,34 @@ impl Pipeline {
             .and_then(|state| state.articles.download_queue())
             .is_none_or(|queue| queue.excluded_work_count() == 0)
         {
-            return Vec::new();
+            return weaver_nntp::ServerSet::EMPTY;
         }
-        let flags = self.nntp.pool().server_backfill_flags();
-        let is_fill = |idx: &usize| !flags.get(*idx).copied().unwrap_or(false);
-        match self.nntp.blocking_body_server_order(&[]) {
+        let fill = self.nntp.pool().fill_servers();
+        match self
+            .nntp
+            .blocking_body_server_order(weaver_nntp::ServerSet::EMPTY)
+        {
             Some(order) => order
                 .into_iter()
                 .map(|server| server.0)
-                .filter(is_fill)
-                .collect(),
-            None => (0..flags.len()).filter(is_fill).collect(),
+                .collect::<weaver_nntp::ServerSet>()
+                .intersection(fill),
+            None => fill,
         }
     }
 
     // The UU spool cursors a selection pass must respect, sampled once.
     //
     // Only a capped spool constrains selection; below the cap every encoding
-    // dispatches freely and the map is not worth building.
+    // dispatches freely and the map is not asked for. The files' owner hands
+    // out the one map it keeps until a cursor moves or a file comes or goes.
     pub(in crate::pipeline::download) fn selection_uu_cursor_ordinals(
-        &self,
+        &mut self,
         pressure: DownloadPressure,
-    ) -> Option<HashMap<NzbFileId, u32>> {
+    ) -> Option<Arc<HashMap<NzbFileId, u32>>> {
         pressure
             .uu_spool_admission_capped
-            .then(|| self.uu_spool_cursor_ordinals())
+            .then(|| self.uu_files.cursor_ordinals())
     }
 
     pub(in crate::pipeline::download) fn actual_download_lane_mode(

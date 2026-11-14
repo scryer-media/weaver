@@ -225,7 +225,9 @@ fn each_profile_sizes_extraction_par3_and_holds_limits() {
     assert_eq!(share.of(GIB), 128 * MIB);
 
     // The smallest profile's repair grant stops at 128 MiB.
-    let share = HardwareProfile::Efficient.tuning(&machine(4, 8)).par3_memory;
+    let share = HardwareProfile::Efficient
+        .tuning(&machine(4, 8))
+        .par3_memory;
     assert_eq!(share.of(GIB), 64 * MIB);
     assert_eq!(share.of(2 * GIB), 128 * MIB);
     assert_eq!(share.of(64 * GIB), 128 * MIB);

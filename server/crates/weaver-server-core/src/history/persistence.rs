@@ -200,6 +200,8 @@ impl Database {
                                 THEN NULL ELSE job_history.archived_file_count END,
                             archived_file_bytes = CASE WHEN excluded.archived_at IS NULL
                                 THEN NULL ELSE job_history.archived_file_bytes END,
+                            -- A rewritten entry is swept again.
+                            files_swept_at = NULL,
                             server_attribution = COALESCE(excluded.server_attribution, job_history.server_attribution)",
                         &args,
                     )
@@ -428,7 +430,7 @@ impl Database {
             SqlRuntime::run_in_transaction(&datastore, "stamp_history_archived", |tx| {
                 let ids = ids.clone();
                 Box::pin(async move {
-                    for chunk in ids.chunks(max_rows_for_tx(tx, 1).saturating_sub(1).max(1)) {
+                    for chunk in ids.chunks(max_rows_for_tx(tx, 1).saturating_sub(2).max(1)) {
                         let placeholders = vec!["{}"; chunk.len()].join(", ");
                         let mut args = Vec::with_capacity(chunk.len() + 1);
                         args.push(SqlArg::I64(archived_at));
@@ -451,6 +453,56 @@ impl Database {
         let job_ids = job_ids.iter().map(|id| id.0).collect::<Vec<_>>();
         self.invalidate_job_history_cache_for(&job_ids);
         Ok(())
+    }
+
+    // Says that housekeeping swept each failed entry at `swept_at`, epoch
+    // seconds, and has nothing more to do for it, in one transaction.
+    // Internal: no view of the entry reads it, so no cached entry changes. An
+    // entry already stamped keeps its first time, and one that is no longer
+    // the failure the sweep listed, as after a retry, is not stamped.
+    pub(crate) fn stamp_history_swept(
+        &self,
+        job_ids: &[JobId],
+        swept_at: i64,
+        finished_by: i64,
+    ) -> Result<(), StateError> {
+        if job_ids.is_empty() {
+            return Ok(());
+        }
+        let ids = job_ids
+            .iter()
+            .map(|job_id| {
+                i64::try_from(job_id.0)
+                    .map_err(|_| StateError::Database("job id is too large".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "stamp_history_swept", |tx| {
+                let ids = ids.clone();
+                Box::pin(async move {
+                    for chunk in ids.chunks(max_rows_for_tx(tx, 1).saturating_sub(2).max(1)) {
+                        let placeholders = vec!["{}"; chunk.len()].join(", ");
+                        let mut args = Vec::with_capacity(chunk.len() + 2);
+                        args.push(SqlArg::I64(swept_at));
+                        args.push(SqlArg::I64(finished_by));
+                        args.extend(chunk.iter().map(|id| SqlArg::I64(*id)));
+                        tx.execute(
+                            &format!(
+                                "UPDATE job_history SET files_swept_at = {{}}
+                                  WHERE status = 'failed' AND files_swept_at IS NULL
+                                    AND completed_at <= {{}}
+                                    AND job_id IN ({placeholders})"
+                            ),
+                            &args,
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
     }
 }
 

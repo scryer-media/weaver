@@ -87,6 +87,7 @@ impl Queue {
             }
             let mut row = JobRow::new(info);
             row.report.restoring = true;
+            row.report.on_disk = request.restart.as_ref().is_some_and(|read| read.on_disk);
             row.intents.restore = Some(request);
             inner.push_job(row);
             Change::changed(Ok(()))
@@ -123,6 +124,7 @@ impl Queue {
             if inner.contains_job(id) || !inner.admissions.insert(id) {
                 return Change::unchanged(Err(SchedulerError::JobExists(id)));
             }
+            inner.sweep_listed.remove(&id);
             Change::unchanged(Ok(()))
         })?;
         let reservation = Reservation {
@@ -182,6 +184,26 @@ impl PreparedAdd {
     }
 }
 
+// A restore whose outline was read while it waited out of the queue window:
+// its row states the files read, with the figures a restore read with its
+// outline shows, and the ticket goes back in the row to wait its turn.
+pub(crate) fn outline_read(row: &mut JobRow, request: crate::jobs::handle::RestoreJobRequest) {
+    let spec = &request.spec;
+    let figures = LeanFigures::of(spec, request.restart.as_ref().map(|read| &read.summaries));
+    let info = &mut row.report.job;
+    info.name = spec.name.clone();
+    info.total_bytes = spec.total_bytes;
+    info.total_files = spec.files.len() as u32;
+    info.progress = figures.progress();
+    info.remaining_bytes = figures.remaining_bytes;
+    info.wanted_bytes = figures.wanted_bytes;
+    info.optional_recovery_bytes = figures.optional_recovery_bytes;
+    info.optional_recovery_downloaded_bytes = figures.optional_recovery_downloaded_bytes;
+    info.remaining_par_files = figures.remaining_par_files;
+    info.password = spec.password.clone();
+    row.intents.restore = Some(request);
+}
+
 // The figures a job waiting its turn shows, from its spec and the summaries
 // of the article lists it let go, so the queue answers for a job outside the
 // window without installing it or reading its lists back. A file with no
@@ -230,6 +252,16 @@ impl LeanFigures {
         }
         figures
     }
+
+    // As the pipeline reports it: done is what is wanted less what is still
+    // to come.
+    pub(crate) fn progress(&self) -> f64 {
+        if self.wanted_bytes == 0 {
+            0.0
+        } else {
+            (self.wanted_bytes - self.remaining_bytes) as f64 / self.wanted_bytes as f64
+        }
+    }
 }
 
 pub(super) fn initial_info(
@@ -259,13 +291,7 @@ pub(super) fn initial_info(
         },
         finalizing_download: false,
         fetching_repair_data: false,
-        // As the pipeline reports it: done is what is wanted less what is
-        // still to come.
-        progress: if figures.wanted_bytes == 0 {
-            0.0
-        } else {
-            (figures.wanted_bytes - figures.remaining_bytes) as f64 / figures.wanted_bytes as f64
-        },
+        progress: figures.progress(),
         total_bytes: spec.total_bytes,
         downloaded_bytes: 0,
         optional_recovery_bytes: figures.optional_recovery_bytes,

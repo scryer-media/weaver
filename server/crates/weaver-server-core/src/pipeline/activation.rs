@@ -30,6 +30,12 @@ pub(crate) struct JobActivated {
     pub(crate) job_id: JobId,
     // The number the job's activation was told by when the read was sent.
     pub(crate) activation: u64,
+    // The working directory a job that never started moved to, under the
+    // intermediate folder set now. It moved whatever the read found.
+    pub(crate) moved_to: Option<PathBuf>,
+    // The working directory the job had when the read was sent: a move is
+    // taken only by what still names this one.
+    pub(crate) started_in: PathBuf,
     pub(crate) result: Result<ReadArticles, String>,
 }
 
@@ -157,11 +163,74 @@ impl StagingChoice {
     }
 }
 
+// A job that never started takes a working directory under the intermediate
+// folder set now, in the order that leaves its stored row naming a folder
+// that exists whatever stops in between: the new one is claimed and marked,
+// the row names it once that write commits, and only then the old one goes.
+// The row takes the new one only while it still names the one the job
+// started in. A row that cannot be written, or did not take it, gives the
+// new one up, and the job keeps what it has.
+async fn follow_working_dir(
+    db: &crate::Database,
+    job_id: JobId,
+    root: PathBuf,
+    current: PathBuf,
+    name: String,
+) -> Option<PathBuf> {
+    let from = current.clone();
+    let followed = tokio::task::spawn_blocking(move || {
+        crate::jobs::working_dir::follow_intermediate_dir(&root, &current, job_id, &name)
+    })
+    .await
+    .map_err(std::io::Error::other)
+    .and_then(|followed| followed);
+    let followed = match followed {
+        Ok(followed) => followed?,
+        Err(error) => {
+            warn!(job_id = job_id.0, dir = %from.display(), %error, "could not move the job's working directory to the intermediate folder; it keeps the one it has");
+            return None;
+        }
+    };
+    let dir = followed.path.clone();
+    let stored = dir.clone();
+    let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let moved_in_row = Arc::clone(&moved);
+    let recorded =
+        match db.try_queue_job_write_committed(job_id, "move_active_job_output_dir", move |db| {
+            let took = db.move_active_job_output_dir(job_id, &from, &stored)?;
+            moved_in_row.store(took, std::sync::atomic::Ordering::Release);
+            Ok(())
+        }) {
+            Ok(committed) => committed
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|written| written),
+            Err(error) => Err(error.to_string()),
+        };
+    if let Err(error) = &recorded {
+        warn!(job_id = job_id.0, dir = %dir.display(), %error, "could not record the job's new working directory; it keeps the one it has");
+    }
+    // The row is the arbiter: a row that no longer names the directory the
+    // job started in, or has gone, did not move, and the claim is given up.
+    let recorded = recorded.is_ok() && moved.load(std::sync::atomic::Ordering::Acquire);
+    let _ = tokio::task::spawn_blocking(move || {
+        if recorded {
+            followed.leave_old();
+        } else {
+            followed.abandon();
+        }
+    })
+    .await;
+    recorded.then_some(dir)
+}
+
 impl Pipeline {
     // Whether the job is waiting for its articles to be built: their read is
-    // out, or its earlier graph still has something out on a thread.
+    // out, its earlier graph still has something out on a thread, or an
+    // earlier activation is still moving its working directory.
     pub(in crate::pipeline) fn awaits_job_articles(&self, job_id: JobId) -> bool {
         self.retiring_graph_jobs.contains_key(&job_id)
+            || self.moving_jobs.contains_key(&job_id)
             || self
                 .jobs
                 .get(&job_id)
@@ -171,9 +240,12 @@ impl Pipeline {
     // Start reading a queued job's articles back. A job already activating
     // or active is left as it is, so the scheduler may ask on every pass. So
     // is a job whose earlier graph still has something out on a thread: its
-    // new graph is not built over the old one's runs.
+    // new graph is not built over the old one's runs. So is a job an earlier
+    // activation is still moving the working directory of: the next one
+    // reads the directory that move left it.
     pub(in crate::pipeline) fn request_job_activation(&mut self, job_id: JobId) {
-        if self.retiring_graph_jobs.contains_key(&job_id) {
+        if self.retiring_graph_jobs.contains_key(&job_id) || self.moving_jobs.contains_key(&job_id)
+        {
             return;
         }
         self.next_activation += 1;
@@ -205,7 +277,20 @@ impl Pipeline {
             category: category.clone(),
             storage: Arc::clone(&self.storage_capacity),
         };
+        // A job that never started follows the intermediate folder set now,
+        // and is given a working directory there again when the one it had
+        // is gone; one that started keeps the working directory it has.
+        let follow = Some((self.intermediate_dir.clone(), state.spec.name.clone()));
         state.articles = JobArticles::Activating(summaries, activation);
+        let follow = follow.filter(|_| {
+            !self
+                .shared_state
+                .queue
+                .read(|inner| inner.row(job_id).is_none_or(|row| self.job_started(row)))
+        });
+        if follow.is_some() {
+            self.moving_jobs.insert(job_id, activation);
+        }
         let seat = self
             .graph_restore_seat(None, &working_dir)
             .for_job(spec_password, &working_dir, staging_dir.as_deref())
@@ -227,7 +312,19 @@ impl Pipeline {
         let tx = self.job_activated_tx.clone();
         tokio::spawn(async move {
             let _ = written_rx.await;
+            let started_in = working_dir.clone();
+            let moved_to = match follow {
+                Some((root, name)) => {
+                    follow_working_dir(&db, job_id, root, working_dir, name).await
+                }
+                None => None,
+            };
+            let moved = moved_to.clone();
             let result = tokio::task::spawn_blocking(move || {
+                let seat = match moved {
+                    Some(dir) => seat.moved_to(dir),
+                    None => seat,
+                };
                 read_job_articles(
                     &db, job_id, category, metadata, &expected, ahead, memory, seat,
                 )
@@ -252,10 +349,47 @@ impl Pipeline {
                 .send(JobActivated {
                     job_id,
                     activation,
+                    moved_to,
+                    started_in,
                     result,
                 })
                 .await;
         });
+    }
+
+    // The installed job and its queue row take the directory a move made
+    // where they still name the one it started in. False when the directory
+    // is to go: nothing took it, nothing names it, and no one is working
+    // with the id. An id being admitted, or held by a history operation,
+    // may have taken the directory as its own, so it stays, and that job's
+    // own cleanup takes any directory that carries its marker.
+    pub(crate) fn take_moved_dir(&mut self, job_id: JobId, started_in: &Path, dir: &Path) -> bool {
+        let mut kept = false;
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            kept |= state.working_dir == dir;
+            if state.working_dir == started_in {
+                state.working_dir = dir.to_path_buf();
+                kept = true;
+            }
+        }
+        let (from, to) = (started_in.display().to_string(), dir.display().to_string());
+        kept | self.shared_state.queue.write(|inner| {
+            let busy =
+                inner.admissions.contains(&job_id) || inner.history_operations.contains(&job_id);
+            match inner.job_mut(job_id) {
+                Some(row)
+                    if !row.report.retiring
+                        && row.report.job.output_dir.as_deref() == Some(from.as_str()) =>
+                {
+                    row.report.job.output_dir = Some(to);
+                    crate::pipeline::queue::Change::changed(true)
+                }
+                Some(row) => crate::pipeline::queue::Change::unchanged(
+                    busy || row.report.job.output_dir.as_deref() == Some(to.as_str()),
+                ),
+                None => crate::pipeline::queue::Change::unchanged(busy),
+            }
+        })
     }
 
     // The read came back: build the job's articles, or fail the job if they
@@ -266,8 +400,39 @@ impl Pipeline {
         let JobActivated {
             job_id,
             activation,
+            moved_to,
+            started_in,
             result,
         } = done;
+        // The activation that had the job's working directory to move is
+        // heard: the job may be sent for again.
+        if self.moving_jobs.get(&job_id) == Some(&activation) {
+            self.moving_jobs.remove(&job_id);
+            self.download_dispatch_wake = true;
+        }
+        // A move is on disk, and on the job's stored row, whichever
+        // activation it came with and whether or not the job is still
+        // installed. The installed job and its queue row take the new
+        // directory only where they still name the one the move started in:
+        // a row being retired, and a job added again under the same id, are
+        // left as they are. A directory nothing took, and nothing names, is
+        // of a job that left, and goes as that job's own cleanup would have
+        // taken it.
+        if let Some(dir) = moved_to
+            && !self.take_moved_dir(job_id, &started_in, &dir)
+        {
+            tokio::task::spawn_blocking(move || {
+                let Some(root) = dir.parent() else {
+                    return;
+                };
+                if let Err(error) =
+                    crate::jobs::working_dir::remove_job_working_dir(root, &dir, job_id)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!(job_id = job_id.0, dir = %dir.display(), %error, "could not remove the working directory claimed for a job that left");
+                }
+            });
+        }
         if !self.jobs.get(&job_id).is_some_and(|state| {
             matches!(state.articles, JobArticles::Activating(_, current) if current == activation)
         }) {
@@ -547,7 +712,7 @@ impl Pipeline {
         self.graph_jobs
             .get(&job_id)
             .is_some_and(|graph| graph.rewalks_owed() || graph.working())
-            || counted(&self.active_downloads_by_job)
+            || counted(&self.articles_in_flight_by_job)
             || counted(&self.pending_released_download_results_by_job)
             || self
                 .active_decodes_by_job

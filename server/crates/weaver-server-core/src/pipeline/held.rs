@@ -281,8 +281,7 @@ impl Pipeline {
                                 ended: false,
                             },
                             source: SegmentSource {
-                                source_server_idx: None,
-                                exclude_servers: Vec::new(),
+                                servers: PoolServers::none(),
                             },
                         },
                     );
@@ -304,8 +303,7 @@ impl Pipeline {
                             result: *result,
                             bytes,
                             source: SegmentSource {
-                                source_server_idx: None,
-                                exclude_servers: Vec::new(),
+                                servers: PoolServers::none(),
                             },
                         },
                     );

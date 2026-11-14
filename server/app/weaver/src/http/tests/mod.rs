@@ -782,7 +782,7 @@ fn populated_metrics_snapshot() -> MetricsSnapshot {
         bytes_decoded: 8,
         bytes_committed: 7,
         download_queue_depth: 5,
-        active_downloads: 6,
+        articles_in_flight: 6,
         active_decodes: 2,
         decode_pending: 4,
         decode_pending_bytes: 4096,

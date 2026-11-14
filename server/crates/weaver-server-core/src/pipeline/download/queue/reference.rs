@@ -118,6 +118,7 @@ pub struct ReferenceQueue {
     completion_critical_work: ClassMap,
     ordinary_work: ClassMap,
     next_sequence: u64,
+    next_ahead_sequence: u64,
     // Queued items steered off a server: failure exclusions (escalated work
     // that may need a backfill lane) or a rotation hint. Maintained on
     // push/pop; recounted on the rare bulk-removal paths.
@@ -142,7 +143,8 @@ impl ReferenceQueue {
         Self {
             completion_critical_work: ClassMap::new(),
             ordinary_work: ClassMap::new(),
-            next_sequence: 0,
+            next_sequence: super::SEQUENCE_START,
+            next_ahead_sequence: super::SEQUENCE_START,
             excluded_work: 0,
             recovery_work: 0,
             queued_by_file: HashMap::new(),
@@ -164,14 +166,21 @@ impl ReferenceQueue {
 
     pub fn push(&mut self, work: DownloadWork) {
         let priority = work.priority;
-        let sequence = self.next_sequence;
-        self.next_sequence += 1;
+        let first_article = self.first_articles.contains(&work.segment_id);
+        let sequence = if super::walks_ahead(first_article, work.exclude_servers)
+            && self.next_ahead_sequence > 0
+        {
+            self.next_ahead_sequence -= 1;
+            self.next_ahead_sequence
+        } else {
+            self.next_sequence += 1;
+            self.next_sequence - 1
+        };
         if is_steered(&work) {
             self.excluded_work += 1;
         }
         self.recovery_work += usize::from(work.is_recovery);
         let completion_critical = work.completion_critical;
-        let first_article = self.first_articles.contains(&work.segment_id);
         let key = QueueKey {
             completion_rank: completion_rank_for(&work, first_article),
             priority,
@@ -215,23 +224,27 @@ impl ReferenceQueue {
         self.excluded_work
     }
 
-    // Drop failure exclusions from all queued work. Used when the server
-    // config is rebuilt: exclusion indices refer to the old pool layout and
-    // would mis-target (or spuriously exhaust) servers in the new one.
-    pub fn clear_exclude_servers(&mut self) {
+    // Carry failure exclusions and hints into a rebuilt pool by server
+    // identity: a server that left the pool, or is no longer the same
+    // server, drops out of every set.
+    pub fn remap_servers(&mut self, remap: &weaver_nntp::ServerRemap) {
         if self.excluded_work == 0 {
             return;
         }
+        let mut steered = 0;
         // Neither field is part of the key, so the entries are edited in place.
         for work in self
             .completion_critical_work
             .values_mut()
             .chain(self.ordinary_work.values_mut())
         {
-            work.exclude_servers.clear();
-            work.avoid_server = None;
+            work.exclude_servers = remap.set(work.exclude_servers);
+            work.avoid_server = work.avoid_server.and_then(|server| remap.index(server));
+            if is_steered(work) {
+                steered += 1;
+            }
         }
-        self.excluded_work = 0;
+        self.excluded_work = steered;
     }
 
     // Drop the rotation hint from all queued work, keeping exclusions: a 430

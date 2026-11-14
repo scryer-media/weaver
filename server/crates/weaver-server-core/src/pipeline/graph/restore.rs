@@ -200,6 +200,12 @@ impl RestoreSeat {
         &self.working_dir
     }
 
+    // The seat for a job whose working directory moved before it started.
+    pub(crate) fn moved_to(mut self, working_dir: PathBuf) -> Self {
+        self.working_dir = working_dir;
+        self
+    }
+
     // Read the job's checkpoint back and rebuild the job from it. A
     // checkpoint this build does not restore is none: the job starts afresh
     // and fetches every article, and its first checkpoint replaces the old

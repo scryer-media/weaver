@@ -115,7 +115,7 @@ async fn checkpoint_abandoned_lane_requeues_once_and_fences_late_events() {
             .len(),
         queued
     );
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     assert_eq!(pipeline.active_download_connections, 0);
     assert!(pipeline.rate_limit_reservations.is_empty());
     assert!(!pipeline.checkpoint_progress_articles.contains_key(&HOT));
@@ -160,7 +160,7 @@ async fn checkpoint_abandoned_lane_requeues_once_and_fences_late_events() {
         source_server_idx: None,
         origin: DownloadResultOrigin::NormalPrimary,
         retry_count: original.retry_count,
-        exclude_servers: original.exclude_servers.clone(),
+        exclude_servers: original.exclude_servers,
         release_connection_slot: false,
     };
     let late_success = late_result(Ok(DownloadPayload::Raw(Bytes::from_static(
@@ -200,7 +200,7 @@ async fn checkpoint_abandoned_lane_requeues_once_and_fences_late_events() {
         reason: LaneParkReason::Error,
         release_connection_slot: true,
     });
-    assert_eq!(pipeline.active_downloads, 1);
+    assert_eq!(pipeline.articles_in_flight, 1);
     assert_eq!(pipeline.active_download_connections, 1);
     assert_eq!(pipeline.rate_limit_reservations, reservations);
     assert_eq!(
@@ -263,7 +263,7 @@ async fn checkpoint_teardown_refunds_before_clearing_and_leaves_no_activity() {
         assert!(!pipeline.job_last_download_activity.contains_key(&HOT));
         assert!(!pipeline.download_lane_owners.contains_key(&lane_id));
         assert!(pipeline.rate_limit_reservations.is_empty());
-        assert_eq!(pipeline.active_downloads, 0);
+        assert_eq!(pipeline.articles_in_flight, 0);
         assert_eq!(pipeline.active_download_connections, 0);
         let remaining = pipeline.rate_limiter.time_until_ready().as_secs_f64();
         assert!(
@@ -289,7 +289,7 @@ async fn checkpoint_teardown_refunds_before_clearing_and_leaves_no_activity() {
                     source_server_idx: None,
                     origin: DownloadResultOrigin::NormalPrimary,
                     retry_count: original.retry_count,
-                    exclude_servers: original.exclude_servers.clone(),
+                    exclude_servers: original.exclude_servers,
                     release_connection_slot: true,
                 })
                 .await;
@@ -330,7 +330,7 @@ async fn checkpoint_teardown_refunds_before_clearing_and_leaves_no_activity() {
         );
         assert!(!pipeline.job_last_download_activity.contains_key(&HOT));
         assert!(!pipeline.pending_retries_by_job.contains_key(&HOT));
-        assert_eq!(pipeline.active_downloads, 0);
+        assert_eq!(pipeline.articles_in_flight, 0);
         assert_eq!(pipeline.active_download_connections, 0);
         pipeline.rate_limiter.set_rate(0);
         pipeline.dispatch_downloads();
@@ -352,7 +352,7 @@ async fn checkpoint_accepted_result_survives_pause_and_lane_retirement() {
     let (lane_id, segment_id) = pipeline.checkpoint_progress_articles[&HOT];
     pipeline.pause_job_runtime(HOT).unwrap();
     assert_eq!(
-        pipeline.active_downloads, 1,
+        pipeline.articles_in_flight, 1,
         "ordinary pause preserves in-flight ownership"
     );
     assert!(pipeline.download_lane_owners.contains_key(&lane_id));
@@ -374,7 +374,7 @@ async fn checkpoint_accepted_result_survives_pause_and_lane_retirement() {
                 source_server_idx: None,
                 origin: DownloadResultOrigin::NormalPrimary,
                 retry_count: 0,
-                exclude_servers: vec![],
+                exclude_servers: weaver_nntp::ServerSet::from([]),
                 release_connection_slot: false,
             }],
             unrequested_works: vec![],
@@ -385,7 +385,7 @@ async fn checkpoint_accepted_result_survives_pause_and_lane_retirement() {
     );
     assert_eq!(pending.len(), 1);
     assert_eq!(pipeline.retire_stalled_download_lanes(HOT), 0);
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     // The lane had nothing left in flight, so it is a hot worker between
     // leases: retirement leaves it up with its connection booked.
     assert_eq!(pipeline.active_download_connections, 1);
@@ -466,7 +466,7 @@ async fn checkpoint_progress_breaks_parked_retry_cycle_and_spills_to_a_peer() {
     )
     .await;
     pipeline.dispatch_downloads();
-    assert_eq!(pipeline.active_downloads_by_job.get(&HOT), Some(&1));
+    assert_eq!(pipeline.articles_in_flight_by_job.get(&HOT), Some(&1));
     assert_eq!(pipeline.pending_retries_by_job.get(&HOT), Some(&130));
     assert_eq!(pipeline.infrastructure_retries.len(), 130);
     assert_eq!(pipeline.infrastructure_retries.next_deadline(), None);
@@ -475,7 +475,7 @@ async fn checkpoint_progress_breaks_parked_retry_cycle_and_spills_to_a_peer() {
         pipeline.dispatch_downloads();
     }
     assert_eq!(
-        pipeline.active_downloads_by_job.get(&HOT),
+        pipeline.articles_in_flight_by_job.get(&HOT),
         Some(&1),
         "other connections cannot multiply the progress allowance"
     );
@@ -497,14 +497,14 @@ async fn checkpoint_progress_keeps_recovery_and_global_pressure_rules() {
     let mut pipeline = restored_with_parked_retries(&temp).await;
     pipeline.shared_state.set_paused(true);
     pipeline.dispatch_downloads();
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     pipeline.shared_state.set_paused(false);
     pipeline
         .metrics
         .write_buffered_bytes
         .store(u64::MAX, Ordering::Relaxed);
     pipeline.dispatch_downloads();
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     pipeline
         .metrics
         .write_buffered_bytes

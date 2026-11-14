@@ -92,7 +92,7 @@ async fn requeue_unservable(ids: Vec<String>) -> (BookingOutcome, usize) {
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let segment_id = job_beyond_retention(&mut pipeline, JobId(41980), ids).await;
     let work = pipeline
-        .download_retry_work(segment_id, 0, Vec::new())
+        .download_retry_work(segment_id, 0, weaver_nntp::ServerSet::EMPTY)
         .unwrap();
     pipeline.enqueue_download_work(work);
     (
@@ -108,7 +108,7 @@ async fn sweep_unservable(ids: Vec<String>) -> (BookingOutcome, usize, usize) {
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let segment_id = job_beyond_retention(&mut pipeline, JobId(41981), ids).await;
     let work = pipeline
-        .download_retry_work(segment_id, 0, Vec::new())
+        .download_retry_work(segment_id, 0, weaver_nntp::ServerSet::EMPTY)
         .unwrap();
     pipeline
         .jobs

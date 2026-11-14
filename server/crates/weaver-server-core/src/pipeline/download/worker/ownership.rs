@@ -52,8 +52,8 @@ impl Pipeline {
     // Record that a live lane now holds `works`.
     //
     // This and [`Self::accept_lane_work`] are the only writers of the
-    // in-flight gauges (`active_downloads`, `active_recovery`,
-    // `active_downloads_by_job`, `active_downloads_by_file`): an article
+    // in-flight gauges (`articles_in_flight`, `active_recovery`,
+    // `articles_in_flight_by_job`, `articles_in_flight_by_file`): an article
     // raises them when it enters a lane's `outstanding` record and lowers them
     // when it leaves, so each gauge is the count of what the live lanes hold
     // and cannot drift from it. A lease that names an article the lane already
@@ -71,16 +71,16 @@ impl Pipeline {
             }
         }
         for (segment_id, is_recovery) in entered {
-            self.active_downloads += 1;
+            self.articles_in_flight += 1;
             if is_recovery {
                 self.active_recovery += 1;
             }
             *self
-                .active_downloads_by_job
+                .articles_in_flight_by_job
                 .entry(segment_id.file_id.job_id)
                 .or_default() += 1;
             *self
-                .active_downloads_by_file
+                .articles_in_flight_by_file
                 .entry(segment_id.file_id)
                 .or_default() += 1;
         }
@@ -146,21 +146,21 @@ impl Pipeline {
     // that held it.
     fn note_lane_work_left(&mut self, work: &DownloadWork) {
         let segment_id = work.segment_id;
-        self.active_downloads = self.active_downloads.saturating_sub(1);
+        self.articles_in_flight = self.articles_in_flight.saturating_sub(1);
         if work.is_recovery {
             self.active_recovery = self.active_recovery.saturating_sub(1);
         }
         let job_id = segment_id.file_id.job_id;
-        if let Some(in_flight) = self.active_downloads_by_job.get_mut(&job_id) {
+        if let Some(in_flight) = self.articles_in_flight_by_job.get_mut(&job_id) {
             *in_flight = in_flight.saturating_sub(1);
             if *in_flight == 0 {
-                self.active_downloads_by_job.remove(&job_id);
+                self.articles_in_flight_by_job.remove(&job_id);
             }
         }
-        if let Some(in_flight) = self.active_downloads_by_file.get_mut(&segment_id.file_id) {
+        if let Some(in_flight) = self.articles_in_flight_by_file.get_mut(&segment_id.file_id) {
             *in_flight = in_flight.saturating_sub(1);
             if *in_flight == 0 {
-                self.active_downloads_by_file.remove(&segment_id.file_id);
+                self.articles_in_flight_by_file.remove(&segment_id.file_id);
             }
         }
     }
@@ -249,6 +249,42 @@ impl Pipeline {
     // nothing is lowered, because whatever took the article off the lane's
     // record lowered them already.
     pub(super) fn accept_lane_work(&mut self, lane_id: u64, segment: SegmentId) -> bool {
+        self.accept_lane_work_with(lane_id, segment, |_| {})
+    }
+
+    // Take back an article a lane returns unasked, as `accept_lane_work`
+    // does, with the tried servers and hint from the lane's record rather
+    // than the lease's copy: the record is carried across a pool rebuild,
+    // the copy a lane holds is numbered by the pool that leased it.
+    pub(super) fn accept_returned_lane_work(
+        &mut self,
+        lane_id: u64,
+        work: &mut DownloadWork,
+    ) -> bool {
+        let segment = work.segment_id;
+        self.accept_lane_work_with(lane_id, segment, |held| {
+            work.exclude_servers = held.exclude_servers;
+            work.avoid_server = held.avoid_server;
+        })
+    }
+
+    // Carry the tried servers and hint of every article a lane holds into
+    // a rebuilt pool. One pass over the held articles per rebuild.
+    pub(in crate::pipeline) fn remap_lane_holdings(&mut self, remap: &weaver_nntp::ServerRemap) {
+        for owner in self.download_lane_owners.values_mut() {
+            for work in owner.outstanding.values_mut() {
+                work.exclude_servers = remap.set(work.exclude_servers);
+                work.avoid_server = work.avoid_server.and_then(|server| remap.index(server));
+            }
+        }
+    }
+
+    fn accept_lane_work_with(
+        &mut self,
+        lane_id: u64,
+        segment: SegmentId,
+        held: impl FnOnce(&DownloadWork),
+    ) -> bool {
         let Some(owner) = self.download_lane_owners.get_mut(&lane_id) else {
             // Standalone fixtures inject outcomes from lane 0 without
             // booking it; such an outcome was never counted.
@@ -265,6 +301,7 @@ impl Pipeline {
         let Some(work) = work else {
             return false;
         };
+        held(&work);
         self.note_lane_work_left(&work);
         true
     }
@@ -375,10 +412,10 @@ impl Pipeline {
             }
         }
         let mut discrepancies = Vec::new();
-        if self.active_downloads != total {
+        if self.articles_in_flight != total {
             discrepancies.push(format!(
-                "active_downloads = {}, lanes hold {total}",
-                self.active_downloads
+                "articles_in_flight = {}, lanes hold {total}",
+                self.articles_in_flight
             ));
         }
         if self.active_recovery != recovery {
@@ -393,22 +430,22 @@ impl Pipeline {
                 .map(|(job_id, count)| (*job_id, *count))
                 .collect()
         };
-        if nonzero(&self.active_downloads_by_job) != by_job {
+        if nonzero(&self.articles_in_flight_by_job) != by_job {
             discrepancies.push(format!(
-                "active_downloads_by_job = {:?}, lanes hold {by_job:?}",
-                self.active_downloads_by_job
+                "articles_in_flight_by_job = {:?}, lanes hold {by_job:?}",
+                self.articles_in_flight_by_job
             ));
         }
         let files: HashMap<NzbFileId, usize> = self
-            .active_downloads_by_file
+            .articles_in_flight_by_file
             .iter()
             .filter(|(_, count)| **count != 0)
             .map(|(file_id, count)| (*file_id, *count))
             .collect();
         if files != by_file {
             discrepancies.push(format!(
-                "active_downloads_by_file = {:?}, lanes hold {by_file:?}",
-                self.active_downloads_by_file
+                "articles_in_flight_by_file = {:?}, lanes hold {by_file:?}",
+                self.articles_in_flight_by_file
             ));
         }
         // The connection gauges of a job that is gone are dropped with it,

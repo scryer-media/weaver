@@ -105,7 +105,7 @@ func TestRealUsenetPerfUsesSpecificJobAndCounterDeltas(t *testing.T) {
 			if request.Variables["id"] != 42 {
 				t.Error("sample not tied to submitted job")
 			}
-			fmt.Fprint(w, `{"data":{"metrics":{"bytesDownloaded":150,"currentDownloadSpeed":10,"activeDownloads":4,"downloadPressureState":"CLEAR","downloadPressureStallsTotal":3},"queueItem":{"id":42,"state":"DOWNLOADING"}}}`)
+			fmt.Fprint(w, `{"data":{"metrics":{"bytesDownloaded":150,"currentDownloadSpeed":10,"articlesInFlight":4,"downloadPressureState":"CLEAR","downloadPressureStallsTotal":3},"queueItem":{"id":42,"state":"DOWNLOADING"}}}`)
 		}
 	}))
 	defer server.Close()
@@ -122,7 +122,7 @@ func TestRealUsenetPerfUsesSpecificJobAndCounterDeltas(t *testing.T) {
 	if perf.CPUUsec != 1000 || perf.Throttled != 10 || perf.MemoryPeak != 4096 || perf.Progress[0].BytesDownloaded != 50 {
 		t.Fatal("performance totals mixed startup or earlier download counters into the measurement")
 	}
-	if perf.Progress[0].Pipeline.ActiveDownloads != 4 || perf.Progress[0].Pipeline.DownloadPressureState != "CLEAR" || perf.Progress[0].Pipeline.DownloadPressureStallsTotal != 3 {
+	if perf.Progress[0].Pipeline.ArticlesInFlight != 4 || perf.Progress[0].Pipeline.DownloadPressureState != "CLEAR" || perf.Progress[0].Pipeline.DownloadPressureStallsTotal != 3 {
 		t.Fatal("pipeline performance counters were not decoded")
 	}
 	if _, err := parseRealUsenetCounters("usage_usec 100\nthrottled_usec 0\nmemory_current 32\nmemory_peak 64"); err != nil {

@@ -47,7 +47,14 @@ async fn unavailable_provider_recovery_does_not_leave_602_retries_parked_forever
         .unwrap()
         .download_queue = DownloadQueue::new();
     assert!(matches!(
-        pipeline.nntp.body_server_availability(&[], &[], 0).await,
+        pipeline
+            .nntp
+            .body_server_availability(
+                weaver_nntp::ServerSet::EMPTY,
+                weaver_nntp::ServerSet::EMPTY,
+                0
+            )
+            .await,
         weaver_nntp::pool::BodyServerAvailability::Blocked
     ));
     for segment_number in 0..602 {
@@ -72,7 +79,7 @@ async fn unavailable_provider_recovery_does_not_leave_602_retries_parked_forever
                 source_server_idx: None,
                 origin: DownloadResultOrigin::NormalPrimary,
                 retry_count: 0,
-                exclude_servers: vec![],
+                exclude_servers: weaver_nntp::ServerSet::from([]),
                 release_connection_slot: false,
             })
             .await;
@@ -87,7 +94,14 @@ async fn unavailable_provider_recovery_does_not_leave_602_retries_parked_forever
     );
     drop(reservation);
     assert!(matches!(
-        pipeline.nntp.body_server_availability(&[], &[], 0).await,
+        pipeline
+            .nntp
+            .body_server_availability(
+                weaver_nntp::ServerSet::EMPTY,
+                weaver_nntp::ServerSet::EMPTY,
+                0
+            )
+            .await,
         weaver_nntp::pool::BodyServerAvailability::Eligible
     ));
     // No rebuild occurs when transient quota reservations are refunded. A

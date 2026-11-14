@@ -221,8 +221,11 @@ async fn split_metadata_repairs_missing_rar_with_a_staged_short_footer_donor() {
                     .handle_decode_done(DecodeDone::Success {
                         result,
                         source: SegmentSource {
-                            source_server_idx: Some(0),
-                            exclude_servers: Vec::new(),
+                            servers: crate::pipeline::PoolServers::stamped(
+                                pipeline.pool_generation,
+                                Some(0),
+                                weaver_nntp::ServerSet::EMPTY,
+                            ),
                         },
                     })
                     .await;

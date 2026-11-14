@@ -1179,7 +1179,7 @@ async fn try_run_then(
                     JOB,
                     scenario,
                     article,
-                    &work.exclude_servers,
+                    work.exclude_servers,
                     plan.as_ref(),
                 )
                 .await;
@@ -1525,15 +1525,7 @@ pub(in crate::pipeline::tests) async fn serve_work(
         work.segment_id.file_id.file_index,
         work.segment_id.segment_number,
     );
-    serve_from(
-        pipeline,
-        JOB,
-        scenario,
-        article,
-        &work.exclude_servers,
-        None,
-    )
-    .await;
+    serve_from(pipeline, JOB, scenario, article, work.exclude_servers, None).await;
 }
 
 // One article as the scenario's server answers it.
@@ -1552,7 +1544,15 @@ pub(in crate::pipeline::tests) async fn serve_job(
     scenario: &Scenario,
     article: (u32, u32),
 ) {
-    serve_from(pipeline, job, scenario, article, &[], None).await;
+    serve_from(
+        pipeline,
+        job,
+        scenario,
+        article,
+        weaver_nntp::ServerSet::EMPTY,
+        None,
+    )
+    .await;
 }
 
 // [`serve_job`] for an ask that excludes `exclude`: the first server it
@@ -1562,10 +1562,10 @@ async fn serve_from(
     job: JobId,
     scenario: &Scenario,
     (file, ordinal): (u32, u32),
-    exclude: &[usize],
+    exclude: weaver_nntp::ServerSet,
     leased: Option<&weaver_yenc::CheckpointPlan>,
 ) {
-    let server = (0..).find(|server| !exclude.contains(server)).unwrap();
+    let server = (0..).find(|server| !exclude.contains(*server)).unwrap();
     let segment_id = SegmentId {
         file_id: NzbFileId {
             job_id: job,
@@ -1628,8 +1628,11 @@ async fn serve_from(
                     segments: Vec::new(),
                 },
                 SegmentSource {
-                    source_server_idx: Some(server),
-                    exclude_servers: exclude.to_vec(),
+                    servers: crate::pipeline::PoolServers::stamped(
+                        pipeline.pool_generation,
+                        Some(server),
+                        exclude,
+                    ),
                 },
             )
             .await;
@@ -1685,8 +1688,11 @@ async fn serve_from(
                 segments,
             },
             SegmentSource {
-                source_server_idx: Some(server),
-                exclude_servers: exclude.to_vec(),
+                servers: crate::pipeline::PoolServers::stamped(
+                    pipeline.pool_generation,
+                    Some(server),
+                    exclude,
+                ),
             },
         )
         .await;
@@ -1955,7 +1961,7 @@ pub(in crate::pipeline::tests) async fn run_holding(scenario: &Scenario, held: u
                     work.segment_id.segment_number,
                 );
                 if article.0 == held {
-                    *pipeline.active_downloads_by_job.entry(JOB).or_insert(0) += 1;
+                    *pipeline.articles_in_flight_by_job.entry(JOB).or_insert(0) += 1;
                     out.push(work);
                     continue;
                 }
@@ -2016,7 +2022,7 @@ pub(in crate::pipeline::tests) async fn run_holding(scenario: &Scenario, held: u
         .map(|set| set.outcome)
         .collect();
 
-    pipeline.active_downloads_by_job.insert(JOB, 0);
+    pipeline.articles_in_flight_by_job.insert(JOB, 0);
     for work in std::mem::take(&mut out) {
         let article = (
             work.segment_id.file_id.file_index,
