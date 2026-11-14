@@ -366,6 +366,10 @@ pub struct TorrentStateLive {
     // found no room, so it fetches nothing and keeps seeding (libtorrent
     // `torrent::m_upload_mode`, `m_upload_mode_time`).
     upload_mode: watch::Sender<Option<UploadMode>>,
+    // How many times the retry task saw an upload mode that waits for its
+    // owner and left it be: what a test waits on to know it ran.
+    #[cfg(test)]
+    retry_declined: watch::Sender<u64>,
     // The torrent's files as its web seeds serve them.
     web_layout: web_seed::Layout,
     // Rings once per write that carried block bytes while an
@@ -561,6 +565,8 @@ impl TorrentStateLive {
             told_upload_only: AtomicBool::new(finished_at_start && !super_seeding),
             last_seen_complete: Mutex::new(None),
             upload_mode: watch::Sender::new(None),
+            #[cfg(test)]
+            retry_declined: watch::Sender::new(0),
             web_layout: web_seed::Layout::new(&paused.metadata, paused.shared.info_hash),
             uploaded_notify: Notify::new(),
             upload_watches: AtomicUsize::new(0),
@@ -589,13 +595,23 @@ impl TorrentStateLive {
                 let state = Arc::downgrade(&state);
                 async move {
                     loop {
-                        let Ok(Some(mode)) = entered
-                            .wait_for(|mode| mode.is_some_and(|mode| mode.retry))
-                            .await
-                            .map(|mode| *mode)
+                        let Ok(Some(mode)) =
+                            entered.wait_for(Option::is_some).await.map(|mode| *mode)
                         else {
                             return Ok(());
                         };
+                        // A mode its owner ends is left be until it
+                        // changes.
+                        if !mode.retry {
+                            #[cfg(test)]
+                            if let Some(state) = state.upgrade() {
+                                state.retry_declined.send_modify(|seen| *seen += 1);
+                            }
+                            if entered.changed().await.is_err() {
+                                return Ok(());
+                            }
+                            continue;
+                        }
                         tokio::time::sleep_until(mode.at + OPTIMISTIC_DISK_RETRY).await;
                         let Some(state) = state.upgrade() else {
                             return Ok(());

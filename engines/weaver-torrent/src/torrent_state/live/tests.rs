@@ -3788,9 +3788,15 @@ async fn a_full_disk_its_owner_wakes_lasts_until_the_owner_ends_it() {
         Some(Message::Extended(ExtendedMessage::UploadOnly(true)))
     ));
 
-    // Twice the retry passes and it stays in upload mode.
+    // The retry task saw the mode and left it to the owner: it waits for
+    // the mode to change, so no time passing ends it. Twice the retry
+    // passes and it stays in upload mode.
+    h.retry_declined
+        .subscribe()
+        .wait_for(|seen| *seen >= 1)
+        .await
+        .unwrap();
     tokio::time::advance(OPTIMISTIC_DISK_RETRY * 2).await;
-    tokio::task::yield_now().await;
     assert!(h.upload_mode());
     assert!(messages_sent(&mut asked_rx).is_empty());
 

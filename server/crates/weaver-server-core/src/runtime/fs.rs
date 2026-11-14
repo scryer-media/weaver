@@ -462,6 +462,31 @@ pub(crate) mod test_devices {
         (HeldDevice(gate), announced)
     }
 
+    // Directories whose device cannot be read while the returned guard
+    // lives, as a mount that fails its reads.
+    static REFUSED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(crate) struct RefusedDevice(PathBuf);
+
+    impl Drop for RefusedDevice {
+        fn drop(&mut self) {
+            REFUSED.lock().unwrap().retain(|dir| *dir != self.0);
+        }
+    }
+
+    pub(crate) fn refuse(dir: &Path) -> RefusedDevice {
+        REFUSED.lock().unwrap().push(dir.to_path_buf());
+        RefusedDevice(dir.to_path_buf())
+    }
+
+    pub(crate) fn refused(path: &Path) -> bool {
+        REFUSED
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|dir| path.starts_with(dir))
+    }
+
     pub(crate) fn of(path: &Path) -> Option<u64> {
         let held = HELD
             .lock()

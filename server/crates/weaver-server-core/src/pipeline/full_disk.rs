@@ -43,7 +43,7 @@ use crate::jobs::ids::JobId;
 use crate::jobs::model::{FileSummaries, FileSummary, JobArticles, RunState};
 use crate::operations::StorageRoot;
 pub(crate) use crate::operations::room_wait::Wants;
-use crate::operations::room_wait::{Disk, RoomWait};
+use crate::operations::room_wait::{Disk, Promised, RoomWait, Waiter};
 
 // The wait of the kept history archives: the folder read, how many
 // archives the writer said it keeps, the probe count as the wait began, and
@@ -60,26 +60,6 @@ pub(crate) struct ArchiveWait {
 // says nothing of what a write needs, and only keeps a retry that was
 // refused from being rung again by the noise of a busy disk.
 pub(in crate::pipeline) const ARCHIVE_RETRY_RISE: u64 = 16 << 20;
-
-// Room promised to a job let go on the figure its step needs: the disk, and
-// how much of what it showed is the job's until its step ends.
-pub(crate) struct Promised {
-    disk: Disk,
-    bytes: u64,
-    // The device of that disk as the capacity layer held it at the promise,
-    // so a job held on a root and one held on a path of the same physical
-    // disk are judged against each other. `None` while it was not known:
-    // the promise then counts only for jobs held on the very same root or
-    // path.
-    device: Option<u64>,
-}
-
-impl Promised {
-    // Whether the promise is on the disk `disk`, whose device is `device`.
-    fn on(&self, disk: &Disk, device: Option<u64>) -> bool {
-        self.disk == *disk || (device.is_some() && self.device == device)
-    }
-}
 
 // What the job was doing when its write failed, which is what it goes back
 // to when let go, the way a restart takes a job stored in that stage.
@@ -322,25 +302,31 @@ impl Pipeline {
         let reserve = self.extraction_limits.min_free_bytes;
         let mut woken = Vec::new();
         // A promise to a job that left the pipeline ended with it.
-        if !self.full_disk_promised.is_empty() {
+        let promises = self.storage_capacity.promises();
+        {
             let jobs = &self.jobs;
-            self.full_disk_promised
-                .retain(|job_id, _| jobs.contains_key(job_id));
+            promises.retain(Waiter::Usenet, |job_id| jobs.contains_key(&job_id));
+        }
+        // A torrent's step let go on its figure ended: the jobs held on its
+        // disk count readings from then.
+        for (ended, begun) in promises.take_ended(Waiter::Usenet) {
+            for hold in self.full_disk.values_mut().filter(|hold| !hold.go) {
+                hold.wait
+                    .promise_ended(&self.storage_capacity, &ended, begun);
+            }
         }
         for (job_id, hold) in &mut self.full_disk {
             let capacity = &self.storage_capacity;
             // A job let go here is promised its figure at once, so the next
-            // held job of this pass is judged against it.
-            let promised = &self.full_disk_promised;
+            // held job of this pass is judged against it. So is a torrent
+            // let go on the same disk.
             let room = hold.wait.judge(capacity, reserve, hold.go, |disk, device| {
-                promised
-                    .values()
-                    .filter(|promised| promised.on(disk, device))
-                    .fold(0u64, |sum, promised| sum.saturating_add(promised.bytes))
+                capacity.promises().on(disk, device)
             });
             if let Some((bytes, device)) = room {
                 hold.go = true;
-                self.full_disk_promised.insert(
+                capacity.promises().insert(
+                    Waiter::Usenet,
                     *job_id,
                     Promised {
                         disk: hold.wait.disk.clone(),
@@ -363,7 +349,14 @@ impl Pipeline {
             // its promise up, so the other jobs held on that disk are not
             // judged against room it is not taking: it is judged anew, by a
             // later reading, once it is resumed.
-            if paused && hold.go && self.full_disk_promised.remove(job_id).is_some() {
+            if paused
+                && hold.go
+                && self
+                    .storage_capacity
+                    .promises()
+                    .remove(Waiter::Usenet, *job_id)
+                    .is_some()
+            {
                 hold.go = false;
             }
             let parked = !paused
@@ -696,7 +689,8 @@ impl Pipeline {
             if let (false, Some(bytes)) = (hold.go, hold.wait.needs.or(hold.wait.rise)) {
                 let disk = hold.wait.disk.clone();
                 let device = disk.device(&self.storage_capacity);
-                self.full_disk_promised.insert(
+                self.storage_capacity.promises().insert(
+                    Waiter::Usenet,
                     job_id,
                     Promised {
                         disk,
@@ -715,44 +709,24 @@ impl Pipeline {
     // still held on that disk are judged on a reading taken from now, since
     // one from before shows room that step may have filled.
     pub(in crate::pipeline) fn end_full_disk_promise(&mut self, job_id: JobId) {
-        if self.full_disk_promised.is_empty() {
-            return;
-        }
-        let Some(ended) = self.full_disk_promised.remove(&job_id) else {
-            return;
-        };
-        let Some(begun) = ended.disk.begun(&self.storage_capacity) else {
+        let capacity = &self.storage_capacity;
+        let Some((ended, begun)) = capacity.promises().end(capacity, Waiter::Usenet, job_id) else {
             return;
         };
         // A job held on the same device under another root or path counts
         // its own disk's probes: readings of it count from now.
-        let capacity = &self.storage_capacity;
         for hold in self.full_disk.values_mut() {
             if hold.go {
                 continue;
             }
-            let wait = &mut hold.wait;
-            let begun = if wait.disk == ended.disk {
-                Some(begun)
-            } else if ended.on(&wait.disk, wait.disk.device(capacity)) {
-                wait.disk.begun(capacity)
-            } else {
-                None
-            };
-            if let Some(begun) = begun {
-                wait.since = wait.since.max(begun);
-                wait.running = false;
-            }
+            hold.wait.promise_ended(capacity, &ended, begun);
         }
     }
 
     // What is promised on the disks to the jobs let go, in all.
     #[cfg(test)]
     pub(in crate::pipeline) fn full_disk_promised_bytes(&self) -> u64 {
-        self.full_disk_promised
-            .values()
-            .map(|promised| promised.bytes)
-            .sum()
+        self.storage_capacity.promises().bytes_of(Waiter::Usenet)
     }
 
     // The names in the destination whose copy the held move cut short.

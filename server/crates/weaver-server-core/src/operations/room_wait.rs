@@ -17,9 +17,13 @@
 // must also leave more than the reserve free to spend. A disk with no good
 // reading keeps it waiting.
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 
-use super::disk::{StorageCapacity, StorageRoot};
+use super::disk::{CapacityReader, DiskLedger, StorageCapacity, StorageRoot};
+use crate::jobs::ids::JobId;
 
 // The disk a wait is on: a root's, or the disk of a path that lies on none
 // of theirs.
@@ -30,6 +34,37 @@ pub(crate) enum Disk {
 }
 
 impl Disk {
+    // The disk a write under `path` lands on: the working or complete
+    // root's when the capacity layer knows `path` lies on it, else the
+    // path's own. Nothing is looked at.
+    pub(crate) fn of_path(capacity: &StorageCapacity, path: &Path) -> Self {
+        Self::on(capacity.known_root_of(path), path)
+    }
+
+    // The disk a write under `path` lands on, looked up now, by the same
+    // choice: `None` while the root `path` lies on, or none, is not known,
+    // which is never taken for a disk off the roots'.
+    pub(crate) async fn look_up(capacity: &StorageCapacity, path: &Path) -> Option<Self> {
+        Some(Self::on(capacity.root_of_path(path).await?, path))
+    }
+
+    // `path`'s disk when it lies on `root`: the working or complete root's,
+    // else its own.
+    fn on(root: Option<StorageRoot>, path: &Path) -> Self {
+        root.filter(|root| matches!(root, StorageRoot::Complete | StorageRoot::Intermediate))
+            .map_or_else(|| Self::Path(path.to_path_buf()), Self::Root)
+    }
+
+    // The reading and ledger writes on this disk are booked by: a root's.
+    // A path off the roots' disks has none, and is read only while someone
+    // waits on it.
+    pub(crate) fn reader(&self, capacity: &StorageCapacity) -> Option<CapacityReader> {
+        match self {
+            Self::Root(root) => Some(capacity.reader(*root)),
+            Self::Path(_) => None,
+        }
+    }
+
     // The device the capacity layer holds for this disk already; nothing is
     // looked at.
     pub(crate) fn device(&self, capacity: &StorageCapacity) -> Option<u64> {
@@ -291,6 +326,288 @@ impl RoomWait {
             Disk::Path(path) => capacity.release_path(path),
         }
     }
+
+    // The step of a waiter let go on `ended`, a promise on a disk whose
+    // probes had begun `begun` times as it ended, is over: this wait, on
+    // that disk, counts readings from now, since one from before shows
+    // room that step may have filled. A wait on the same device under
+    // another root or path counts its own disk's probes.
+    pub(crate) fn promise_ended(
+        &mut self,
+        capacity: &StorageCapacity,
+        ended: &Promised,
+        begun: u64,
+    ) {
+        let begun = if self.disk == ended.disk {
+            Some(begun)
+        } else if ended.on(&self.disk, self.disk.device(capacity)) {
+            self.disk.begun(capacity)
+        } else {
+            None
+        };
+        if let Some(begun) = begun {
+            self.since = self.since.max(begun);
+            self.running = false;
+        }
+    }
+}
+
+// Room promised to a waiter let go on the figure its step needs: the disk,
+// and how much of what it showed is the waiter's until its step ends.
+#[derive(Clone, Debug)]
+pub(crate) struct Promised {
+    pub(crate) disk: Disk,
+    pub(crate) bytes: u64,
+    // The device of that disk as the capacity layer held it at the promise,
+    // so a waiter held on a root and one held on a path of the same
+    // physical disk are judged against each other. `None` while it was not
+    // known: the promise then counts only for waiters held on the very
+    // same root or path.
+    pub(crate) device: Option<u64>,
+}
+
+impl Promised {
+    // Whether the promise is on the disk `disk`, whose device is `device`.
+    pub(crate) fn on(&self, disk: &Disk, device: Option<u64>) -> bool {
+        self.disk == *disk || (device.is_some() && self.device == device)
+    }
+}
+
+// Whose a promise is: a usenet job's, or a torrent's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Waiter {
+    Usenet,
+    Torrent,
+}
+
+// The room promised to waiters let go on a reading, of every kind, held by
+// the capacity layer, so each kind judges its waits beside what the other
+// was promised. A promise lasts until its waiter's step ends. Each kind's
+// count is kept apart, so a kind with none of its own checks one count.
+#[derive(Default)]
+pub(crate) struct RoomPromises {
+    promised: Mutex<BTreeMap<(Waiter, JobId), Promised>>,
+    counts: [AtomicUsize; 2],
+    // The promises of one kind that ended, with how many probes of their
+    // disk had begun then, for the other kind's waits to count readings
+    // from: each kind takes those of the other at its next pass. A wait
+    // hears an end on its own disk, where it reads the count, or on its
+    // device, where it reads only that one ended. So the list is kept
+    // bounded by what is waited on, whether or not the other kind ever
+    // takes them: one entry per disk and device, holding the latest count;
+    // a root's while its device is the root's own, at most two per root; a
+    // path's while some wait reads that path. Past that an end is kept
+    // only by its device, one entry per device a root or a read path lies
+    // on that no entry above holds, and dropped once no wait can be on it.
+    // A wait that begins later counts readings from its own start, so an
+    // end dropped then is one no wait needs.
+    ended: [Mutex<Vec<(Promised, u64)>>; 2],
+    ends: [AtomicUsize; 2],
+}
+
+impl RoomPromises {
+    fn locked(&self) -> std::sync::MutexGuard<'_, BTreeMap<(Waiter, JobId), Promised>> {
+        self.promised.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn count(&self, waiter: Waiter) -> &AtomicUsize {
+        &self.counts[waiter as usize]
+    }
+
+    // Whether `waiter`'s kind holds no promise.
+    pub(crate) fn none_of(&self, waiter: Waiter) -> bool {
+        self.count(waiter).load(Ordering::Acquire) == 0
+    }
+
+    // `job_id` of `waiter`'s kind is promised `promised`, in place of any
+    // promise it held.
+    pub(crate) fn insert(&self, waiter: Waiter, job_id: JobId, promised: Promised) {
+        if self.locked().insert((waiter, job_id), promised).is_none() {
+            self.count(waiter).fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    // The promise to `job_id` of `waiter`'s kind ends: what it was.
+    pub(crate) fn remove(&self, waiter: Waiter, job_id: JobId) -> Option<Promised> {
+        if self.none_of(waiter) {
+            return None;
+        }
+        let removed = self.locked().remove(&(waiter, job_id));
+        if removed.is_some() {
+            self.count(waiter).fetch_sub(1, Ordering::AcqRel);
+        }
+        removed
+    }
+
+    // The promise to `job_id` of `waiter`'s kind ended with its step: what
+    // it was, and how many probes of its disk had begun. The other kind's
+    // waits hear of it at their next pass.
+    pub(crate) fn end(
+        &self,
+        capacity: &StorageCapacity,
+        waiter: Waiter,
+        job_id: JobId,
+    ) -> Option<(Promised, u64)> {
+        let ended = self.remove(waiter, job_id)?;
+        let begun = ended.disk.begun(capacity)?;
+        let other = match waiter {
+            Waiter::Usenet => Waiter::Torrent,
+            Waiter::Torrent => Waiter::Usenet,
+        } as usize;
+        {
+            let mut list = self.ended[other]
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            list.push((ended.clone(), begun));
+            compact(&mut list, capacity);
+            self.ends[other].store(list.len(), Ordering::Release);
+        }
+        Some((ended, begun))
+    }
+
+    // The promises of the other kind that ended since `waiter`'s kind last
+    // took them.
+    pub(crate) fn take_ended(&self, waiter: Waiter) -> Vec<(Promised, u64)> {
+        let at = waiter as usize;
+        if self.ends[at].load(Ordering::Acquire) == 0 {
+            return Vec::new();
+        }
+        let taken = std::mem::take(
+            &mut *self.ended[at]
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        self.ends[at].store(0, Ordering::Release);
+        taken
+    }
+
+    // Of `waiter`'s kind, only the promises `keep` keeps stay.
+    pub(crate) fn retain(&self, waiter: Waiter, mut keep: impl FnMut(JobId) -> bool) {
+        if self.none_of(waiter) {
+            return;
+        }
+        let mut promised = self.locked();
+        promised.retain(|(of, job_id), _| *of != waiter || keep(*job_id));
+        let left = promised.keys().filter(|(of, _)| *of == waiter).count();
+        self.count(waiter).store(left, Ordering::Release);
+    }
+
+    // What is promised on `disk`, whose device is `device`, to every
+    // waiter of either kind.
+    pub(crate) fn on(&self, disk: &Disk, device: Option<u64>) -> u64 {
+        if self.none_of(Waiter::Usenet) && self.none_of(Waiter::Torrent) {
+            return 0;
+        }
+        self.locked()
+            .values()
+            .filter(|promised| promised.on(disk, device))
+            .fold(0u64, |sum, promised| sum.saturating_add(promised.bytes))
+    }
+
+    // What is promised to `waiter`'s kind, in all.
+    #[cfg(test)]
+    pub(crate) fn bytes_of(&self, waiter: Waiter) -> u64 {
+        self.locked()
+            .iter()
+            .filter(|((of, _), _)| *of == waiter)
+            .map(|(_, promised)| promised.bytes)
+            .sum()
+    }
+}
+
+// `list` kept to what a wait can still hear of, as [`RoomPromises::ended`]
+// tells: ends on one disk and device fold into one, holding the latest
+// count, and an end on a disk no wait reads stays only as its device's.
+fn compact(list: &mut Vec<(Promised, u64)>, capacity: &StorageCapacity) {
+    let mut kept: Vec<(Promised, u64)> = Vec::with_capacity(list.len());
+    let mut by_device = Vec::new();
+    for (promised, begun) in list.drain(..) {
+        let read = match &promised.disk {
+            Disk::Root(root) => {
+                promised.device.is_none() || promised.device == capacity.root_slot_device(*root)
+            }
+            Disk::Path(path) => capacity.path_look(path).is_some(),
+        };
+        if !read {
+            by_device.push((promised, begun));
+            continue;
+        }
+        match kept
+            .iter_mut()
+            .find(|(at, _)| at.disk == promised.disk && at.device == promised.device)
+        {
+            Some((_, at)) => *at = (*at).max(begun),
+            None => kept.push((promised, begun)),
+        }
+    }
+    for (promised, begun) in by_device {
+        let Some(device) = promised.device else {
+            continue;
+        };
+        // Heard by its device alone, it needs no count of its own: one on
+        // that device already says as much, and its count is its own
+        // disk's, which is not this one's.
+        if !capacity.device_waited_on(device)
+            || kept.iter().any(|(at, _)| at.device == Some(device))
+        {
+            continue;
+        }
+        kept.push((promised, begun));
+    }
+    *list = kept;
+}
+
+// Whether the room a waiter sees, by [`waking_room`], holds `need`: any
+// room does with no reading to check, none with a reading at or under the
+// reserve.
+pub(crate) fn room_holds(room: Option<u64>, need: u64) -> bool {
+    room.is_none_or(|room| need <= room)
+}
+
+// A writer whose booking a ledger refused waits there for room, as a usenet
+// job whose write the reserve holds back does: it holds nothing promised
+// while it waits, and a reading that shows room above the reserve for all
+// it needs lets it go, its need promised at once so the next waiter woken
+// is judged without it. Waiters are woken in the order of their tickets.
+#[derive(Debug)]
+pub(crate) struct LedgerWait {
+    pub(crate) ticket: u64,
+    pub(crate) needs: u64,
+}
+
+impl LedgerWait {
+    // The wait begins: a reading is asked for, and the ledger counts one
+    // more waiter.
+    pub(crate) fn begin(ledger: &DiskLedger, needs: u64) -> Self {
+        Self {
+            ticket: ledger.wait(),
+            needs,
+        }
+    }
+
+    // A reading came: whether it lets the waiter go, by the judgement every
+    // ledger waiter wakes by. Let go, what it needs is promised to it and it
+    // waits no more.
+    pub(crate) fn wake(&self, ledger: &DiskLedger, reader: &CapacityReader, reserve: u64) -> bool {
+        if !ledger.book_woken(reader, reserve, self.needs) {
+            return false;
+        }
+        ledger.unwait();
+        true
+    }
+
+    // The wait ends with nothing promised: the waiter went on otherwise, or
+    // is gone.
+    pub(crate) fn end(&self, ledger: &DiskLedger) {
+        ledger.unwait();
+    }
+}
+
+// Whether a job ever downloaded, from the bytes it counts as downloaded:
+// one that has is not kept from starting by [`StartCheck`], since what it
+// writes next waits for room as a write that finds none does.
+pub(crate) fn ever_downloaded(downloaded_bytes: u64) -> bool {
+    downloaded_bytes > 0
 }
 
 // Whether jobs with bytes to fetch may start on a root's disk: the one
@@ -346,5 +663,134 @@ impl StartCheck {
             capacity.ledger(self.root).unwait();
         }
         room
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::operations::disk::DiskSpace;
+
+    // The promises one kind's ended stay bounded though the other kind
+    // never takes them, as on an install with no torrents: one per disk
+    // and device, holding the latest count, and a path's only while a
+    // wait reads it.
+    #[test]
+    fn ended_promises_stay_bounded_when_the_other_kind_never_takes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let capacity = StorageCapacity::with_probe(
+            [0, 1, 2].map(|_| dir.path().to_path_buf()),
+            Duration::from_secs(365 * 24 * 60 * 60),
+            Arc::new(|_: &Path| {
+                Ok(DiskSpace {
+                    total_bytes: 1 << 40,
+                    available_bytes: 1 << 30,
+                })
+            }),
+        );
+        let promises = capacity.promises();
+        let path = dir.path().join("off");
+        capacity.hold_path(&path);
+        let root = Disk::Root(StorageRoot::Complete);
+        for job in 0..1_000 {
+            for disk in [root.clone(), Disk::Path(path.clone())] {
+                let promised = Promised {
+                    disk,
+                    bytes: 1,
+                    device: None,
+                };
+                promises.insert(Waiter::Usenet, JobId(job), promised);
+                assert!(
+                    promises
+                        .end(&capacity, Waiter::Usenet, JobId(job))
+                        .is_some()
+                );
+            }
+        }
+        // No wait reads the path any more: its entry goes at the next end.
+        capacity.release_path(&path);
+        let promised = Promised {
+            disk: root.clone(),
+            bytes: 1,
+            device: None,
+        };
+        promises.insert(Waiter::Usenet, JobId(0), promised);
+        promises.end(&capacity, Waiter::Usenet, JobId(0));
+        let taken = promises.take_ended(Waiter::Torrent);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].0.disk, root);
+        assert_eq!(Some(taken[0].1), root.begun(&capacity));
+        assert!(promises.take_ended(Waiter::Usenet).is_empty());
+    }
+
+    // An end on a path no wait reads any more is still heard by a wait on
+    // a root of the same device: it stays as that device's.
+    #[test]
+    fn an_end_on_a_path_no_one_reads_reaches_a_wait_on_its_device() {
+        let complete = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        crate::runtime::fs::test_devices::assign(complete.path(), 74_001);
+        crate::runtime::fs::test_devices::assign(other.path(), 74_002);
+        let capacity = StorageCapacity::with_probe(
+            // Data, working, complete.
+            [
+                other.path().to_path_buf(),
+                other.path().to_path_buf(),
+                complete.path().to_path_buf(),
+            ],
+            Duration::from_secs(365 * 24 * 60 * 60),
+            Arc::new(|_: &Path| {
+                Ok(DiskSpace {
+                    total_bytes: 1 << 40,
+                    available_bytes: 1 << 30,
+                })
+            }),
+        );
+        for root in StorageRoot::ALL {
+            capacity.wait_for_probes(root, 1);
+        }
+        let promises = capacity.promises();
+        let path = complete.path().join("off");
+        capacity.hold_path(&path);
+        let root = Disk::Root(StorageRoot::Complete);
+        // A torrent's promise on the path ends; then the path's last wait.
+        promises.insert(
+            Waiter::Torrent,
+            JobId(1),
+            Promised {
+                disk: Disk::Path(path.clone()),
+                bytes: 1,
+                device: Some(74_001),
+            },
+        );
+        promises.end(&capacity, Waiter::Torrent, JobId(1)).unwrap();
+        capacity.release_path(&path);
+        // Another end compacts the list.
+        promises.insert(
+            Waiter::Torrent,
+            JobId(2),
+            Promised {
+                disk: Disk::Root(StorageRoot::Intermediate),
+                bytes: 1,
+                device: Some(74_002),
+            },
+        );
+        promises.end(&capacity, Waiter::Torrent, JobId(2)).unwrap();
+
+        let taken = promises.take_ended(Waiter::Usenet);
+        assert_eq!(taken.len(), 2);
+        // A wait on the complete root hears the path's end by its device.
+        let device = root.device(&capacity);
+        assert_eq!(device, Some(74_001));
+        let heard: Vec<&Promised> = taken
+            .iter()
+            .map(|(ended, _)| ended)
+            .filter(|ended| ended.on(&root, device))
+            .collect();
+        assert_eq!(heard.len(), 1);
+        assert_eq!(heard[0].disk, Disk::Path(path));
     }
 }

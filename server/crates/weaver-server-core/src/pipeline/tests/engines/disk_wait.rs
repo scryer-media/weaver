@@ -3462,6 +3462,100 @@ async fn a_job_held_on_a_root_and_one_on_a_path_of_its_disk_are_promised_the_sam
     assert_eq!(pipeline.full_disk_promised_bytes(), 120 * UNIT);
 }
 
+// A usenet job and a torrent held on one disk, each for 60 of the 100 a
+// reading then shows, are promised that room once: both are judged beside
+// the promises of either kind. Whichever goes, the other waits; once the
+// step of the one that went ends, the other counts readings from then,
+// and the next lets it go.
+#[tokio::test]
+async fn a_usenet_job_and_a_torrent_held_on_one_disk_are_promised_the_same_room_once() {
+    use crate::operations::room_wait::{Disk, Promised, RoomWait, Waiter, Wants};
+    use crate::pipeline::full_disk::Stage;
+    const UNIT: u64 = 1 << 20;
+    const TORRENT: JobId = JobId(93_013);
+    let room = Arc::new(AtomicU64::new(0));
+    let scenario = on_disk_keeping(
+        &room,
+        vec![Post::plain("harbor.bin", payload(ARTICLE, 7))],
+        KEPT,
+    );
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
+    add_second(&mut pipeline).await;
+    let capacity = Arc::clone(&pipeline.storage_capacity);
+    let reserve = pipeline.extraction_limits.min_free_bytes;
+    // The torrent's wait, judged as the torrent service judges it.
+    let judge = |wait: &mut RoomWait| {
+        let shown = wait.judge(&capacity, reserve, false, |disk, device| {
+            capacity.promises().on(disk, device)
+        });
+        if let Some((bytes, device)) = shown {
+            capacity.promises().insert(
+                Waiter::Torrent,
+                TORRENT,
+                Promised {
+                    disk: wait.disk.clone(),
+                    bytes,
+                    device,
+                },
+            );
+        }
+        shown.is_some()
+    };
+    let mut torrent = RoomWait::begin(
+        &capacity,
+        Disk::Root(StorageRoot::Complete),
+        complete_dir.clone(),
+        Wants::from(Some(60 * UNIT)),
+        reserve,
+    );
+    pipeline.hold_move_for_full_disk(
+        JOB,
+        Stage::Claim(Default::default()),
+        &complete_dir,
+        "no room",
+        Some(60 * UNIT),
+    );
+
+    // The usenet job is judged first and goes; the torrent waits beside it.
+    hears(&mut pipeline, &room, StorageRoot::Complete, 100 * UNIT);
+    assert!(!pipeline.held_for_full_disk(JOB));
+    assert!(
+        !judge(&mut torrent),
+        "the torrent waits beside the job's promise"
+    );
+
+    // The job's step ends: the next reading lets the torrent go.
+    pipeline.end_full_disk_promise(JOB);
+    for (ended, begun) in capacity.promises().take_ended(Waiter::Torrent) {
+        torrent.promise_ended(&capacity, &ended, begun);
+    }
+    hears(&mut pipeline, &room, StorageRoot::Complete, 100 * UNIT);
+    assert!(judge(&mut torrent), "the torrent goes");
+    torrent.end(&capacity);
+
+    // A usenet job held now waits beside the torrent's promise, until the
+    // torrent's piece lands and ends it.
+    pipeline.hold_move_for_full_disk(
+        SECOND,
+        Stage::Claim(Default::default()),
+        &complete_dir,
+        "no room",
+        Some(60 * UNIT),
+    );
+    hears(&mut pipeline, &room, StorageRoot::Complete, 100 * UNIT);
+    assert!(
+        pipeline.held_for_full_disk(SECOND),
+        "the job waits beside the torrent"
+    );
+    capacity
+        .promises()
+        .end(&capacity, Waiter::Torrent, TORRENT)
+        .unwrap();
+    hears(&mut pipeline, &room, StorageRoot::Complete, 100 * UNIT);
+    assert!(!pipeline.held_for_full_disk(SECOND), "the job goes");
+    assert_eq!(pipeline.full_disk_promised_bytes(), 60 * UNIT);
+}
+
 // The user's resume lets a held job go, whatever the readings say: one
 // that was paused while held goes at that one resume, and one a quota
 // holds, not paused, goes too.

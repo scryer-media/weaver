@@ -1769,10 +1769,6 @@ pub struct Pipeline {
     // The jobs let go whose final move goes on into the destination named,
     // started at the top of the next turn as a restart starts one.
     pub(super) full_disk_moves: Vec<(JobId, full_disk::Stage)>,
-    // The room promised to each job let go on the figure its step needs,
-    // counted against its disk until that step ends, so one reading does
-    // not promise the same room to two jobs. Empty unless such a job runs.
-    pub(super) full_disk_promised: std::collections::BTreeMap<JobId, full_disk::Promised>,
     // The wait of the history archives the database had no room for, on the
     // database's folder. None unless an archive is kept.
     pub(super) archive_wait: Option<full_disk::ArchiveWait>,

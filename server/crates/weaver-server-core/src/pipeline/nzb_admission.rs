@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::operations::room_wait::ever_downloaded;
 use crate::pipeline::queue::Change;
 
 pub(crate) const NZB_SLOT_WAIT_REASON: &str = "nzb_slot";
@@ -107,8 +108,8 @@ impl Pipeline {
             pending,
             cancelled_or_retiring: row.intents.cancelled.is_some() || row.report.retiring,
             intake: row.admission.is_some(),
-            started: row.report.job.downloaded_bytes > 0
-                || installed.is_some_and(|state| state.downloaded_bytes > 0),
+            started: ever_downloaded(row.report.job.downloaded_bytes)
+                || installed.is_some_and(|state| ever_downloaded(state.downloaded_bytes)),
         }
     }
 
