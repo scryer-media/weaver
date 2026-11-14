@@ -962,6 +962,13 @@ fn renders_collected_instrumentation_snapshots() {
         ("weaver_volume_loop_read_seconds_total", "0.75"),
         ("weaver_volume_aside_waits_total", "4"),
         ("weaver_volume_aside_wait_seconds_total", "2"),
+        ("weaver_volume_writer_opens_total", "11"),
+        ("weaver_volume_writer_open_seconds_total", "0.5"),
+        ("weaver_volume_writer_length_sets_total", "3"),
+        ("weaver_volume_writer_length_set_seconds_total", "1.25"),
+        ("weaver_volume_writer_length_sets_skipped_total", "8"),
+        ("weaver_volume_writer_closes_total", "10"),
+        ("weaver_volume_writer_close_seconds_total", "0.25"),
     ] {
         let line = format!("{row}{{volume=\"/mnt/nas\"}} {value}");
         assert!(rendered.contains(&line), "{line}");

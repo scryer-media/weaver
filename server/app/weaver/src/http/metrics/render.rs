@@ -1609,6 +1609,29 @@ fn render_volumes(out: &mut Encoder, volumes: &[VolumeSnapshot]) {
             labels,
             writer.aside_wait_nanos as f64 / 1e9,
         );
+        out.sample(&f::VOLUME_WRITER_OPENS, labels, writer.opens);
+        out.sample_f64(
+            &f::VOLUME_WRITER_OPEN_SECONDS,
+            labels,
+            writer.open_nanos as f64 / 1e9,
+        );
+        out.sample(&f::VOLUME_WRITER_LENGTH_SETS, labels, writer.length_sets);
+        out.sample_f64(
+            &f::VOLUME_WRITER_LENGTH_SET_SECONDS,
+            labels,
+            writer.length_set_nanos as f64 / 1e9,
+        );
+        out.sample(
+            &f::VOLUME_WRITER_LENGTH_SETS_SKIPPED,
+            labels,
+            writer.length_sets_skipped,
+        );
+        out.sample(&f::VOLUME_WRITER_CLOSES, labels, writer.closes);
+        out.sample_f64(
+            &f::VOLUME_WRITER_CLOSE_SECONDS,
+            labels,
+            writer.close_nanos as f64 / 1e9,
+        );
         out.sample(&f::VOLUME_WRITER_THREADS, labels, writer.threads);
         out.sample(&f::VOLUME_WRITER_WOKEN, labels, writer.woken);
     }

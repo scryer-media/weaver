@@ -5,7 +5,15 @@ use std::sync::Mutex;
 
 use super::*;
 
-fn open(path: &Path, _length: Option<u64>) -> io::Result<File> {
+// Opens the file with nothing said of its length: every close sets it.
+fn open(path: &Path, _length: Option<u64>) -> io::Result<Opened> {
+    Ok(Opened {
+        file: open_file(path)?,
+        length: None,
+    })
+}
+
+fn open_file(path: &Path) -> io::Result<File> {
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -88,7 +96,7 @@ fn a_written_buffer_is_let_go_on_the_writer() {
 }
 
 // Opens a file a second after the writer's clock, as a slow open would.
-fn open_slowly(path: &Path, length: Option<u64>) -> io::Result<File> {
+fn open_slowly(path: &Path, length: Option<u64>) -> io::Result<Opened> {
     step_clock(Duration::from_secs(1));
     open(path, length)
 }
@@ -1330,7 +1338,7 @@ fn an_operation_its_caller_makes_itself_is_no_failure_on_a_volume_with_no_thread
 // A refusal still to be heard is not a failure of the key.
 #[test]
 fn a_refused_name_is_not_a_failed_barrier() {
-    fn refuse(_: &Path, _: Option<u64>) -> io::Result<File> {
+    fn refuse(_: &Path, _: Option<u64>) -> io::Result<Opened> {
         Err(io::ErrorKind::InvalidFilename.into())
     }
     let dir = tempfile::tempdir().unwrap();
@@ -1622,4 +1630,251 @@ fn a_batch_stops_taking_writes_at_its_byte_cap() {
     assert_eq!(count(&volume.writer.batches), 3);
     drop((job, hold));
     writers.wait_ended(&volume);
+}
+
+// Opens a new file sized to its declared length, as a file system that makes
+// holes is given it, and says so.
+fn open_sized(path: &Path, length: Option<u64>) -> io::Result<Opened> {
+    let file = open_file(path)?;
+    let length = length.unwrap_or(0);
+    file.set_len(length)?;
+    Ok(Opened {
+        file,
+        length: Some(length),
+    })
+}
+
+// Opens a new file that grows as it is written, and says it is empty.
+fn open_grown(path: &Path, _length: Option<u64>) -> io::Result<Opened> {
+    Ok(Opened {
+        file: open_file(path)?,
+        length: Some(0),
+    })
+}
+
+fn made_by(path: &Path, length: u64, open: OpenFn) -> Create {
+    Create {
+        path: path.to_path_buf(),
+        length: Some(length),
+        open,
+    }
+}
+
+// A close sets a length only where the file is not at it already, and every
+// file ends at its close's length: sized and written to its end, sized and
+// written short of it, grown to it, grown short of it, and opened with
+// nothing said of its length.
+#[test]
+fn a_close_sets_the_length_only_where_the_file_is_not_at_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let job = writers.submitter(&volume, 1);
+    // File, opener, declared length, bytes written from the start, close.
+    let files: [(&str, OpenFn, u64, &'static [u8], u64); 5] = [
+        ("sized-whole", open_sized, 8, b"lanterns", 8),
+        ("sized-short", open_sized, 10, b"lantern", 7),
+        ("grown-whole", open_grown, 6, b"wicker", 6),
+        ("grown-short", open_grown, 6, b"wick", 6),
+        ("unsaid", open, 6, b"embers", 6),
+    ];
+    for (at, &(name, opener, declared, bytes, length)) in files.iter().enumerate() {
+        let path = dir.path().join(name);
+        let file = at as u64 + 1;
+        job.write(
+            file,
+            0,
+            Bytes::from_static(bytes),
+            Some(made_by(&path, declared, opener)),
+        );
+        job.close(file, length, made_by(&path, length, opener));
+    }
+    let barrier = job.barrier();
+    barrier.wait();
+    assert!(barrier.passed());
+    for (name, _, _, bytes, length) in files {
+        let read = std::fs::read(dir.path().join(name)).unwrap();
+        let mut expected = bytes.to_vec();
+        expected.resize(length as usize, 0);
+        assert_eq!(read, expected, "{name}");
+    }
+    let writer = &volume.writer;
+    assert_eq!(
+        count(&writer.length_sets_skipped),
+        2,
+        "the sized file written whole and the grown one"
+    );
+    assert_eq!(
+        count(&writer.length_sets),
+        3,
+        "the short sized file, the one grown short and the one unsaid"
+    );
+    assert_eq!(count(&writer.opens), 5);
+    assert_eq!(count(&writer.closes), 5);
+}
+
+// The opener the graph gives the writer, on whatever file system holds the
+// test, told to size every new file: a file written to its declared end is
+// not set again at its close, and one written short is cut to its length.
+#[test]
+fn a_file_sized_when_made_is_set_at_close_only_when_short() {
+    let _sized = crate::pipeline::graph::sparse::sizing::always();
+    let (skipped, sets) = close_through_the_graphs_opener();
+    assert_eq!((skipped, sets), (1, 1));
+}
+
+// The same opener told to size no file: each grows as it is written, and the
+// one whose close is its last byte is not set again.
+#[test]
+fn a_file_grown_by_its_writes_is_set_at_close_only_when_short() {
+    let _grown = crate::pipeline::graph::sparse::sizing::never();
+    let (skipped, sets) = close_through_the_graphs_opener();
+    assert_eq!((skipped, sets), (1, 1));
+}
+
+fn graphs_opener(path: &Path, length: Option<u64>) -> io::Result<Opened> {
+    use crate::pipeline::graph::sparse::{PlatformMarker, create_sized_known};
+    let (file, length) = create_sized_known(path, &PlatformMarker, length)?;
+    Ok(Opened { file, length })
+}
+
+// Two files declared at eight bytes: one written whole and closed at eight,
+// one written to five and closed there. Closes that set nothing, and length
+// sets made.
+fn close_through_the_graphs_opener() -> (u64, u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let (whole, short) = (dir.path().join("whole"), dir.path().join("short"));
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let job = writers.submitter(&volume, 1);
+    job.write(
+        1,
+        0,
+        Bytes::from_static(b"lanterns"),
+        Some(made_by(&whole, 8, graphs_opener)),
+    );
+    job.close(1, 8, made_by(&whole, 8, graphs_opener));
+    job.write(
+        2,
+        0,
+        Bytes::from_static(b"embers"),
+        Some(made_by(&short, 8, graphs_opener)),
+    );
+    job.close(2, 5, made_by(&short, 5, graphs_opener));
+    let barrier = job.barrier();
+    barrier.wait();
+    assert!(barrier.passed());
+    assert_eq!(std::fs::read(&whole).unwrap(), b"lanterns");
+    assert_eq!(std::fs::read(&short).unwrap(), b"ember");
+    (
+        count(&volume.writer.length_sets_skipped),
+        count(&volume.writer.length_sets),
+    )
+}
+
+// A truncate is a length set, and the file it leaves is at nothing: a close
+// at nothing after it sets no length again.
+#[test]
+fn a_truncated_file_is_known_to_be_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let job = writers.submitter(&volume, 1);
+    job.write(1, 0, Bytes::from_static(b"lantern"), create(&path));
+    job.truncate(1, made_by(&path, 0, open));
+    job.close(1, 0, made_by(&path, 0, open));
+    let barrier = job.barrier();
+    barrier.wait();
+    assert!(barrier.passed());
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    assert_eq!(count(&volume.writer.length_sets), 1);
+    assert_eq!(count(&volume.writer.length_sets_skipped), 1);
+}
+
+// The writer's opens, length sets and handle drops are counted with the time
+// inside them, on the stepped clock: each open here takes a second, each
+// other read of the clock a millisecond.
+#[test]
+fn opens_length_sets_and_drops_are_timed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    job.run(None, dir.path().to_path_buf(), || Ok(()));
+    hold.wait_held();
+    job.write(
+        1,
+        0,
+        Bytes::from_static(b"lan"),
+        Some(made_by(&first, 3, open_slowly)),
+    );
+    job.close(1, 7, made_by(&first, 7, open_slowly));
+    job.write(
+        2,
+        0,
+        Bytes::from_static(b"wick"),
+        Some(made_by(&second, 4, open_slowly)),
+    );
+    job.close(2, 4, made_by(&second, 4, open_slowly));
+    let barrier = job.barrier();
+    hold.open();
+    barrier.wait();
+    assert!(barrier.passed());
+    let writer = &volume.writer;
+    let second_ns = Duration::from_secs(1).as_nanos() as u64;
+    let milli_ns = Duration::from_millis(1).as_nanos() as u64;
+    assert_eq!(count(&writer.opens), 2);
+    assert!(count(&writer.open_nanos) >= 2 * second_ns);
+    // The test's opener says nothing of the length: both closes set it.
+    assert_eq!(count(&writer.length_sets), 2);
+    assert_eq!(count(&writer.length_set_nanos), 2 * milli_ns);
+    assert_eq!(count(&writer.length_sets_skipped), 0);
+    // Both handles go in one drop, once the batch runs nothing more of the
+    // key.
+    assert_eq!(count(&writer.closes), 2);
+    assert_eq!(count(&writer.close_nanos), milli_ns);
+    assert_eq!(std::fs::read(&first).unwrap(), b"lan\0\0\0\0");
+}
+
+// A reader of a closed file is told its bytes and length are placed before
+// another key's file in the same batch is opened, even when that file's
+// write came to the writer first.
+#[test]
+fn a_closed_file_is_placed_before_another_files_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let (closed_path, other_path) = (dir.path().join("closed"), dir.path().join("other"));
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let closing = writers.submitter(&volume, 1);
+    let other = writers.submitter(&volume, 2);
+    // The thread stands in a batch of its own before what follows comes.
+    other.run(None, dir.path().to_path_buf(), || Ok(()));
+    hold.wait_held();
+    other.write(1, 0, Bytes::from_static(b"more"), create(&other_path));
+    closing.write(1, 0, Bytes::from_static(b"head"), create(&closed_path));
+    closing.close(
+        1,
+        4,
+        Create {
+            path: closed_path.clone(),
+            length: None,
+            open,
+        },
+    );
+    hold.release(1);
+    hold.wait_held();
+    // Two operations of the batch run: the closed file's write and close.
+    hold.release(2);
+    hold.wait_held();
+    let closed = closing.barrier();
+    assert!(!closed.unwritten(), "the closed file is placed");
+    assert!(!other_path.exists(), "the other file is not opened yet");
+    assert_eq!(std::fs::read(&closed_path).unwrap(), b"head");
+    hold.open();
+    other.barrier().wait();
+    assert_eq!(std::fs::read(&other_path).unwrap(), b"more");
 }
