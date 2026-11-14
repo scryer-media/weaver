@@ -759,3 +759,65 @@ func TestRestartPollForEndsOnStateNotTheCaseTimeout(t *testing.T) {
 		t.Fatalf("reads = %d, want 3", reads)
 	}
 }
+
+func TestBodyHoldBudgetPaysForTheLongestBodiesAndOneCutBodyPerConnection(t *testing.T) {
+	lines := []int{10, 40, 20, 30, 50}
+	budget, most, err := bodyHoldBudget(lines, 2, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The two longest (50 + 40) and one longest body per connection (3 * 50).
+	if budget != 240 {
+		t.Fatalf("budget = %d, want 240", budget)
+	}
+	// 10 + 20 + 30 + 40 = 100 fits; all five, 150, fits too.
+	if most != 5 {
+		t.Fatalf("most = %d, want 5", most)
+	}
+	if _, most, _ = bodyHoldBudget(lines, 1, 1); most != 4 {
+		// Budget 100: 10 + 20 + 30 + 40 = 100 fits, adding 50 overshoots.
+		t.Fatalf("most = %d, want 4", most)
+	}
+	for _, bad := range [][2]int{{0, 1}, {6, 1}, {1, 0}} {
+		if _, _, err := bodyHoldBudget(lines, bad[0], bad[1]); err == nil {
+			t.Fatalf("need %d over %d connections: want an error", bad[0], bad[1])
+		}
+	}
+}
+
+func TestBodyHoldBudgetCompletesTheNeedInAnyServingOrder(t *testing.T) {
+	lines := []int{7, 3, 9, 4, 8, 2, 6}
+	const need, sessions = 3, 2
+	budget, _, err := bodyHoldBudget(lines, need, sessions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Worst case: every connection is cut short one line before the end of
+	// the longest body, and the completed ones are the longest.
+	cut := sessions * (9 - 1)
+	completed, spent := 0, cut
+	for _, count := range []int{9, 8, 7, 6, 4, 3, 2} {
+		if spent+count > budget {
+			break
+		}
+		spent += count
+		completed++
+	}
+	if completed < need {
+		t.Fatalf("budget %d completes %d bodies in the worst order, want at least %d", budget, completed, need)
+	}
+}
+
+func TestArticleBodyLinesCountsFromTheYencHeaderToTheTerminator(t *testing.T) {
+	wire := []byte("Message-ID: <a@b>\r\n\r\n=ybegin part=1 line=128 size=10 name=x\r\n=ypart begin=1 end=10\r\nabc\r\n=yend size=10 part=1\r\n.\r\n")
+	got, err := articleBodyLines(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 4 {
+		t.Fatalf("lines = %d, want 4", got)
+	}
+	if _, err := articleBodyLines([]byte("Message-ID: <a@b>\r\n\r\nplain\r\n.\r\n")); err == nil {
+		t.Fatal("an article with no yEnc header: want an error")
+	}
+}
