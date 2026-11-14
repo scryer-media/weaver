@@ -6,9 +6,10 @@
 // module says how large that limit is, how the room is shared between
 // volumes, and what a volume asks of its lanes given how full it is.
 //
-// What a limit counts: bytes that have arrived and are not yet written, which
-// is what is being decoded plus what waits for the writer. Articles leased to
-// a connection that have not arrived are not counted.
+// What a limit counts (`Volume::unwritten_bytes`): the articles leased to
+// lanes and not arrived, at their size in the post, what arrived and is
+// being decoded, and what waits for the writer. Nothing is counted past the
+// hard limit, but the one article a volume that counts nothing grants.
 //
 // The sizing functions here are pure: numbers in, numbers out, no clock and
 // no pipeline state. `VolumeBuffers` keeps what they are given and puts
@@ -247,31 +248,33 @@ pub(in crate::pipeline) enum VolumeIntake {
     Stopped,
 }
 
-// The state of a volume holding `arrived_unwritten_bytes`: the bytes that
-// have arrived and are not yet written. Below the hard limit it is open,
-// from the hard limit stopped. How much a lane is handed below it is the
-// room the volume has (`volume_share_of_lane`), in whole pipes; the soft
-// limit is a reported figure, not a line for leases.
-pub(in crate::pipeline) fn volume_intake(
-    arrived_unwritten_bytes: u64,
-    limits: VolumeLimits,
-) -> VolumeIntake {
-    if arrived_unwritten_bytes >= limits.hard_bytes {
+// The state of a volume counting `counted_bytes` against a hard
+// limit of `limits.hard_bytes`. Below it the volume is open, from it
+// stopped. How much a lane is handed below it is the room the volume has
+// (`volume_share_of_lane`); the soft limit is a reported figure, not a line
+// for leases.
+pub(in crate::pipeline) fn volume_intake(counted_bytes: u64, limits: VolumeLimits) -> VolumeIntake {
+    if counted_bytes >= limits.hard_bytes {
         VolumeIntake::Stopped
     } else {
         VolumeIntake::Open
     }
 }
 
-// The state of a volume as it stands: what has arrived for it and is not
-// written, against its own limits.
+// The state of a volume as it stands: what it counts, against the limit
+// leases stop at (`Volume::lease_limit`). A volume that counts nothing is
+// open whatever its limit, for the one article it grants then.
 pub(in crate::pipeline) fn intake_of(volume: &Volume) -> VolumeIntake {
-    let (soft_bytes, hard_bytes) = volume.buffer_limits();
+    let (soft_bytes, _) = volume.buffer_limits();
+    let counted = volume.unwritten_bytes();
+    if counted == 0 {
+        return VolumeIntake::Open;
+    }
     volume_intake(
-        volume.unwritten_bytes(),
+        counted,
         VolumeLimits {
             soft_bytes,
-            hard_bytes,
+            hard_bytes: volume.lease_limit(),
         },
     )
 }
@@ -990,16 +993,16 @@ mod tests {
         let buffers = VolumeBuffers::new(FIGURE, ROOMY);
         let held = volume(SATA);
         buffers.joined(&held);
-        held.buffered_bytes.store(100 * MIB, Ordering::Relaxed);
+        held.count_for_test(100 * MIB);
         assert_eq!(intake_of(&held), VolumeIntake::Open);
 
         assert!(!buffers.set_figure(FIGURE, ROOMY));
         assert!(buffers.set_figure(64 * MIB, ROOMY));
         assert_eq!(held.buffer_limits(), (64 * MIB * 70 / 100, 64 * MIB));
         assert_eq!(intake_of(&held), VolumeIntake::Stopped);
-        held.buffered_bytes.store(50 * MIB, Ordering::Relaxed);
+        held.count_for_test(50 * MIB);
         assert_eq!(intake_of(&held), VolumeIntake::Open);
-        held.buffered_bytes.store(0, Ordering::Relaxed);
+        held.count_for_test(0);
         assert_eq!(intake_of(&held), VolumeIntake::Open);
 
         // A volume seen later is sized on the figure in force.

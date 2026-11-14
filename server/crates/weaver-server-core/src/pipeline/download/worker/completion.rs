@@ -468,7 +468,8 @@ impl Pipeline {
     }
 
     pub(crate) fn release_download_result(&mut self, result: &DownloadResult) -> bool {
-        if !self.accept_lane_work(result.lane_id, result.segment_id) {
+        let arrived = Self::released_download_result_lead_bytes(result);
+        if !self.accept_lane_result(result.lane_id, result.segment_id, arrived) {
             let bytes = match &result.data {
                 #[cfg(test)]
                 Ok(DownloadPayload::Raw(raw)) => raw.len() as u64,
@@ -553,7 +554,19 @@ impl Pipeline {
         #[cfg(test)]
         self.audit_lane_holdings();
         if released {
+            // What arrived is handed on in this step, as a released result
+            // is (`process_released_download_done`).
+            let job_id = result.job_id;
+            let credit =
+                self.arm_volume_credit(job_id, Self::released_download_result_lead_bytes(&result));
             self.process_download_done(result).await;
+            self.settle_volume_credit(credit);
+            if !self
+                .pending_released_download_results_by_job
+                .contains_key(&job_id)
+            {
+                self.note_volume_handed_on(job_id);
+            }
         }
     }
 
@@ -578,48 +591,134 @@ impl Pipeline {
                 .entry(job_id)
                 .or_insert(0);
             *pending_bytes = pending_bytes.saturating_add(bytes);
-            self.note_volume_arrived(job_id, bytes);
         }
     }
 
-    // Count `bytes` that arrived for the job on the volume its articles
-    // are written to, until the loop has handed them on. One map entry per
-    // job with results waiting; nothing is walked.
-    fn note_volume_arrived(&mut self, job_id: JobId, bytes: u64) {
-        let (volume, held) = match self.volume_arrived_by_job.entry(job_id) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let Some(volume) = self
-                    .graph_jobs
-                    .get(&job_id)
-                    .and_then(|graph| graph.disk())
-                    .map(|disk| Arc::clone(disk.working().volume()))
-                else {
-                    return;
-                };
-                entry.insert((volume, 0))
-            }
+    // A result of `bytes` that arrived for the job is booked as waiting for
+    // the loop and counted on its volume, as an accepted lane result is
+    // (`Self::accept_lane_result`), for fixtures that book results no lane
+    // returned.
+    #[cfg(test)]
+    pub(crate) fn note_arrived_result_for_test(&mut self, job_id: JobId, bytes: u64) {
+        self.note_released_download_result_pending(job_id, bytes);
+        self.note_volume_arrived(job_id, bytes);
+    }
+
+    // The loop hands on one waiting result of the job of `bytes` whose
+    // writes took nothing, as `process_released_download_done` does.
+    #[cfg(test)]
+    pub(crate) fn hand_on_result_for_test(&mut self, job_id: JobId, bytes: u64) {
+        let credit = self.arm_volume_credit(job_id, bytes);
+        self.settle_volume_credit(credit);
+        self.finish_released_download_result_processing(job_id, bytes);
+    }
+
+    // An article of the job of `bytes` arrives and the loop starts to hand
+    // it on in one step, as `handle_download_done` does: its bytes count on
+    // the volume and become the step's loop credit. The fixture writes it
+    // and ends the step with `Self::end_hand_on_for_test`.
+    #[cfg(test)]
+    pub(crate) fn begin_hand_on_for_test(
+        &mut self,
+        job_id: JobId,
+        bytes: u64,
+    ) -> Option<Arc<crate::operations::disk::volume::Volume>> {
+        self.note_volume_arrived(job_id, bytes);
+        self.arm_volume_credit(job_id, bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn end_hand_on_for_test(
+        &mut self,
+        job_id: JobId,
+        credit: Option<Arc<crate::operations::disk::volume::Volume>>,
+    ) {
+        self.settle_volume_credit(credit);
+        if !self
+            .pending_released_download_results_by_job
+            .contains_key(&job_id)
+        {
+            self.note_volume_handed_on(job_id);
+        }
+    }
+
+    // Count `bytes` that arrived for the job, from no lane's reservation,
+    // on the volume its articles are written to (`Self::hold_volume_arrived`).
+    pub(in crate::pipeline) fn note_volume_arrived(&mut self, job_id: JobId, bytes: u64) {
+        let Some(volume) = self
+            .graph_jobs
+            .get(&job_id)
+            .and_then(|graph| graph.disk())
+            .map(|disk| Arc::clone(disk.working().volume()))
+        else {
+            return;
         };
+        self.hold_volume_arrived(job_id, &volume, bytes);
+        volume.charge(bytes);
+    }
+
+    // Hold `bytes` that arrived for the job as counted on `volume`, the
+    // volume its articles are written to, until the loop has handed them
+    // on. The caller counts them on the volume. One map entry per job with
+    // results waiting; nothing is walked.
+    pub(in crate::pipeline) fn hold_volume_arrived(
+        &mut self,
+        job_id: JobId,
+        volume: &Arc<crate::operations::disk::volume::Volume>,
+        bytes: u64,
+    ) {
+        let (_, held) = self
+            .volume_arrived_by_job
+            .entry(job_id)
+            .or_insert_with(|| (Arc::clone(volume), 0));
         *held = held.saturating_add(bytes);
         volume.arrived_bytes.fetch_add(bytes, Ordering::SeqCst);
     }
 
-    // The loop handed on `bytes` of the job that had arrived, or, with
-    // `last`, everything of it that had. They leave the volume's count, and
-    // dispatch that asked to be woken at the line the volume has now
-    // reached looks again.
-    fn note_volume_handed_on(&mut self, job_id: JobId, bytes: u64, last: bool) {
-        let Some((volume, held)) = self.volume_arrived_by_job.get_mut(&job_id) else {
+    // The loop is about to hand on `bytes` of the job that arrived: they
+    // become the volume's loop credit, which the writes of this step take
+    // first (`Submitter::write`). The volume, for `settle_volume_credit`.
+    fn arm_volume_credit(
+        &mut self,
+        job_id: JobId,
+        bytes: u64,
+    ) -> Option<Arc<crate::operations::disk::volume::Volume>> {
+        let (volume, held) = self.volume_arrived_by_job.get_mut(&job_id)?;
+        let moved = bytes.min(*held);
+        *held -= moved;
+        volume.arrived_bytes.fetch_sub(moved, Ordering::SeqCst);
+        volume.loop_credit.store(moved, Ordering::Relaxed);
+        Some(Arc::clone(volume))
+    }
+
+    // The step is done: what of the credit its writes did not take no
+    // longer counts.
+    fn settle_volume_credit(
+        &mut self,
+        volume: Option<Arc<crate::operations::disk::volume::Volume>>,
+    ) {
+        let Some(volume) = volume else {
             return;
         };
-        let gone = if last { *held } else { bytes.min(*held) };
-        *held -= gone;
-        volume.arrived_bytes.fetch_sub(gone, Ordering::SeqCst);
-        let woken = gone != 0 && volume.take_wake();
-        if last {
-            self.volume_arrived_by_job.remove(&job_id);
+        let left = volume.loop_credit.swap(0, Ordering::Relaxed);
+        volume.release(left);
+        if left != 0 && volume.take_wake() {
+            self.volume_room_changed();
         }
-        if woken {
+    }
+
+    // The job has no result left waiting: whatever of it is still counted
+    // as arrived no longer counts, and dispatch that asked to be woken at
+    // the line the volume has now reached looks again.
+    fn note_volume_handed_on(&mut self, job_id: JobId) {
+        let Some((volume, held)) = self.volume_arrived_by_job.remove(&job_id) else {
+            return;
+        };
+        if held != 0 {
+            volume.arrived_bytes.fetch_sub(held, Ordering::SeqCst);
+            volume.release(held);
+        }
+        if volume.take_wake() {
             self.volume_room_changed();
         }
     }
@@ -638,7 +737,9 @@ impl Pipeline {
             self.pending_released_download_results_by_job
                 .remove(&job_id);
         }
-        self.note_volume_handed_on(job_id, bytes, remove);
+        if remove {
+            self.note_volume_handed_on(job_id);
+        }
         if bytes != 0 {
             let remove_bytes = if let Some(pending_bytes) = self
                 .pending_released_download_result_bytes_by_job
@@ -659,7 +760,9 @@ impl Pipeline {
     pub(crate) async fn process_released_download_done(&mut self, result: DownloadResult) {
         let job_id = result.job_id;
         let lead_bytes = Self::released_download_result_lead_bytes(&result);
+        let credit = self.arm_volume_credit(job_id, lead_bytes);
         self.process_download_done(result).await;
+        self.settle_volume_credit(credit);
         self.finish_released_download_result_processing(job_id, lead_bytes);
         // `process_download_done` ran the drain sequence for this job while
         // *this* result was still booked as a pending released result — pending

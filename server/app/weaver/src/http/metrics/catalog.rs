@@ -184,7 +184,7 @@ metric_families! {
     LANE_REFILLS = ("weaver_pipeline_download_lane_refills_total", Counter, ["result"],
         "Lane refill scheduler decisions.");
     LANE_ROOM_WAITS = ("weaver_pipeline_download_lane_room_waits_total", Counter, ["event"],
-        "Saturated lane refills held until their volume fell to its resume line (held), and answered once it did (woken).");
+        "Lane refills held for their volume's room, at its resume line or at its budget (held), and answered once it had room (woken).");
     SCHEDULER_HANDOUTS = ("weaver_pipeline_download_scheduler_handouts_total", Counter, ["kind"],
         "Article handouts cut by the per-server scheduler, by kind.");
     SCHEDULER_IDLE_WITH_SERVABLE = ("weaver_pipeline_download_scheduler_idle_with_servable_total", Counter, [],
@@ -629,9 +629,13 @@ metric_families! {
     VOLUME_BUFFERED_BYTES = ("weaver_volume_buffered_bytes", Gauge, ["volume"],
         "Bytes waiting in memory for a volume's writer.");
     VOLUME_ARRIVED_BYTES = ("weaver_volume_arrived_bytes", Gauge, ["volume"],
-        "Bytes that arrived for the jobs writing to a volume and are not handed to its writer yet: being decoded. The buffer limits are read against these and `weaver_volume_buffered_bytes` together. Articles leased to a connection and not arrived are in neither.");
+        "Bytes that arrived for the jobs writing to a volume and are not handed to its writer yet: being decoded.");
+    VOLUME_COUNTED_BYTES = ("weaver_volume_counted_bytes", Gauge, ["volume"],
+        "Bytes counted against a volume's buffer limit: articles leased to connections for the jobs writing to it and not arrived, at the size the post gives them, what arrived and is being decoded, and what waits for its writer. Never above `weaver_volume_buffer_limit_bytes`, but for one article granted alone to a volume that counted nothing.");
+    VOLUME_COUNTED_PEAK_BYTES = ("weaver_volume_counted_peak_bytes", Gauge, ["volume"],
+        "The most bytes `weaver_volume_counted_bytes` has been since start.");
     VOLUME_BUFFER_LIMIT_BYTES = ("weaver_volume_buffer_limit_bytes", Gauge, ["volume"],
-        "The most bytes that may have arrived for a volume and not be written: at this many, fetching stops for the jobs that write to it. Conditional: emitted only once the volume has been given its limits.");
+        "The most bytes a volume may count (`weaver_volume_counted_bytes`): nothing is leased or queued for it past this many. Conditional: emitted only once the volume has been given its limits.");
     VOLUME_BUFFER_SOFT_LIMIT_BYTES = ("weaver_volume_buffer_soft_limit_bytes", Gauge, ["volume"],
         "Seven tenths of `weaver_volume_buffer_limit_bytes`: a reported figure; fetching does not change at it. Conditional: emitted only once the volume has been given its limits.");
     VOLUME_WRITER_BATCHES = ("weaver_volume_writer_batches_total", Counter, ["volume"],

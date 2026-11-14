@@ -530,7 +530,7 @@ impl VolumeWriters {
     // The owner has begun to stop, and gives a volume up once `clock` reads
     // `end`: the end its settles share. From now on the pipeline loop's own
     // waits for a volume (`Barrier::wait`, `Submitter::wait_for`,
-    // `Submitter::loop_wait_below`) end there too, with what they waited
+    // `Submitter::loop_wait_room`) end there too, with what they waited
     // for still out; the key they waited on says so (`Submitter::left`).
     // Called by the loop, which stands in none of those waits then.
     pub(crate) fn end_loop_waits_at(&self, clock: Arc<dyn Clock + Send>, end: Duration) {
@@ -547,7 +547,7 @@ impl VolumeWriters {
     //
     // The pipeline loop's own waits do not end here. The loop still keeps
     // a volume's limit when it says a repair's output again
-    // (`Submitter::loop_wait_below`), and still waits for what it reads
+    // (`Submitter::loop_wait_room`), and still waits for what it reads
     // back; those waits end at `end_loop_waits_at`'s end.
     pub(crate) fn stop_waits(&self) {
         self.registry.stopped.store(true, Ordering::SeqCst);
@@ -894,6 +894,15 @@ impl Submitter {
     // file whose name was refused is dropped: the refusal has said so. A
     // write to any other file that is neither open nor given a way to open
     // fails the key.
+    //
+    // Only the pipeline loop writes. What it queues counts against the
+    // volume's hard limit before it is queued: first out of the loop's
+    // credit (`Volume::loop_credit`), the arrived article it is handing on;
+    // past that, charged once it fits (`Volume::fits`), the loop standing
+    // still for the writer until then. A write longer than the loop's
+    // share is queued in pieces of that share, each charged as it fits.
+    // When that wait is given up at the end of a stop, the rest of the
+    // write is not queued (`Submitter::left`).
     pub(crate) fn write(
         &self,
         file: u64,
@@ -901,17 +910,62 @@ impl Submitter {
         bytes: Bytes,
         create: Option<Create>,
     ) -> u64 {
-        self.lane
-            .state
-            .volume
-            .buffered_bytes
-            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        self.submit(Op::Write {
-            file,
-            offset,
-            bytes,
-            create: create.map(Box::new),
-        })
+        let volume = &self.lane.state.volume;
+        let len = bytes.len() as u64;
+        let credit = volume.loop_credit.load(Ordering::Relaxed);
+        if credit >= len {
+            volume.loop_credit.store(credit - len, Ordering::Relaxed);
+            volume.buffered_bytes.fetch_add(len, Ordering::Relaxed);
+            return self.submit(Op::Write {
+                file,
+                offset,
+                bytes,
+                create: create.map(Box::new),
+            });
+        }
+        volume.loop_credit.store(0, Ordering::Relaxed);
+        self.write_charged(file, offset, bytes, create, credit)
+    }
+
+    // `write` past the loop's credit: `credit` of the bytes are paid.
+    #[cold]
+    fn write_charged(
+        &self,
+        file: u64,
+        mut offset: u64,
+        mut bytes: Bytes,
+        mut create: Option<Create>,
+        mut credit: u64,
+    ) -> u64 {
+        let volume = &self.lane.state.volume;
+        let share = volume.loop_share();
+        loop {
+            let len = bytes.len() as u64;
+            let piece = len.min(credit.saturating_add(share));
+            let charged = piece - credit.min(piece);
+            credit -= credit.min(piece);
+            if charged > 0 {
+                if !self.loop_wait_room(charged) {
+                    // The end of a stop passed with the volume still full:
+                    // nothing more is queued, and the key says it was left.
+                    return self.key.submitted.load(Ordering::Acquire);
+                }
+                volume.charge(charged);
+            }
+            let rest = bytes.split_off(piece as usize);
+            volume.buffered_bytes.fetch_add(piece, Ordering::Relaxed);
+            let seq = self.submit(Op::Write {
+                file,
+                offset,
+                bytes,
+                create: create.take().map(Box::new),
+            });
+            if rest.is_empty() {
+                return seq;
+            }
+            offset += piece;
+            bytes = rest;
+        }
     }
 
     // Cut `file` to nothing, when it is open or `create.path` is there.
@@ -992,7 +1046,7 @@ impl Submitter {
     //
     // Never for the pipeline loop, which must not stand still for a disk:
     // the loop asks `VolumeWriters::wake_below` and goes on, or, where it
-    // produces what is written itself, waits in `loop_wait_below`. The
+    // queues what is written itself, waits in `loop_wait_room`. The
     // wait is not counted against the loop.
     pub(crate) fn wait_below(&self, bytes: u64) {
         let state = &self.lane.state;
@@ -1027,16 +1081,17 @@ impl Submitter {
         drop(held);
     }
 
-    // The same wait for the pipeline loop, in the one kind of work in which
-    // the loop itself produces what is written. A stop does not end it:
-    // the loop keeps the volume's limit for as long as it queues. It ends
-    // when the bytes fell, the key stopped, or the end of a stop passed
-    // with the bytes still over, which the key then says of itself.
-    // Whether the loop may queue more: false only at that end.
-    pub(crate) fn loop_wait_below(&self, bytes: u64) -> bool {
+    // The pipeline loop's wait to queue `bytes` of its own: it stands
+    // still until they fit below the volume's hard limit (`Volume::fits`),
+    // counted as a budget wait. A stop does not end it: the loop keeps the
+    // volume's limit for as long as it queues. It ends when the bytes fit,
+    // the key stopped, or the end of a stop passed with them still over,
+    // which the key then says of itself. Whether the loop may queue more:
+    // false only at that end.
+    pub(crate) fn loop_wait_room(&self, bytes: u64) -> bool {
         let state = &self.lane.state;
         let over = || {
-            state.volume.buffered_bytes.load(Ordering::SeqCst) > bytes
+            !state.volume.fits(bytes)
                 && !self.key.failed.load(Ordering::SeqCst)
                 && !self.key.abandoned.load(Ordering::SeqCst)
                 && self.lane.threadless.is_none()
@@ -1044,6 +1099,7 @@ impl Submitter {
         if !over() {
             return true;
         }
+        let began = Instant::now();
         // Counted in before the look made under the lock, as in
         // `wait_below`.
         state.below_waiters.fetch_add(1, Ordering::SeqCst);
@@ -1056,6 +1112,7 @@ impl Submitter {
         let (held, below) = state.loop_end.wait(&state.below, held, over);
         state.below_waiters.fetch_sub(1, Ordering::SeqCst);
         drop(held);
+        state.waited(LoopWait::Budget, began);
         if !below {
             self.key.left.store(true, Ordering::SeqCst);
         }
@@ -1454,6 +1511,7 @@ fn unbuffer(state: &LaneState, report: &ReportFn, bytes: u64) {
     }
     let volume = &state.volume;
     volume.buffered_bytes.fetch_sub(bytes, Ordering::SeqCst);
+    volume.release(bytes);
     state.look_below();
     if volume.take_wake() {
         break_span();

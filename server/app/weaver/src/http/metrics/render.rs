@@ -1562,6 +1562,8 @@ fn render_volumes(out: &mut Encoder, volumes: &[VolumeSnapshot]) {
         }
         out.sample(&f::VOLUME_BUFFERED_BYTES, labels, volume.buffered_bytes);
         out.sample(&f::VOLUME_ARRIVED_BYTES, labels, volume.arrived_bytes);
+        out.sample(&f::VOLUME_COUNTED_BYTES, labels, volume.counted_bytes);
+        out.sample(&f::VOLUME_COUNTED_PEAK_BYTES, labels, volume.peak_bytes);
         // Zero is "not sized yet", which is told by the series being absent.
         if volume.buffer_limit_bytes > 0 {
             out.sample(

@@ -542,6 +542,7 @@ impl Pipeline {
                 volume_memory_ceiling_bytes,
             )),
             volume_arrived_by_job: HashMap::new(),
+            volume_reserved_by_job: HashMap::new(),
             window_ledgers: Default::default(),
             extraction_limits,
             process_memory_budget,

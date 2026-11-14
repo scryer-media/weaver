@@ -1155,11 +1155,12 @@ async fn the_share_never_starves_a_pipe() {
     );
 }
 
-// The volume's limit counts the bytes that arrived, not those leased, so
-// a lane may lease only its part of the room the job's volume has left:
-// that room over every connection, less what the lane already holds. On the
-// slow disk run the lanes held 262 MB of a job's queue while its volume read
-// near empty, and all of it arrived at once: 354.9 MB against 268.4 MB.
+// What the lanes hold is reserved on the volume as it is leased, so a lane
+// may lease only its part of the room the job's volume has left below its
+// lease limit, over every connection, and never more than that room holds.
+// On the slow disk run the lanes held 262 MB of a job's queue while its
+// volume read near empty, and all of it arrived at once: 354.9 MB against
+// 268.4 MB.
 #[tokio::test]
 async fn a_lane_leases_only_its_part_of_the_room_its_jobs_volume_has_left() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1175,40 +1176,58 @@ async fn a_lane_leases_only_its_part_of_the_room_its_jobs_volume_has_left() {
             .working()
             .volume(),
     );
-    // Room for 40 articles of 512 bytes on each of the 4 connections.
-    let hard = 4 * 40 * 512;
+    let hard = 87_382;
     volume.set_buffer_limits(hard, hard);
-    assert_eq!(pipeline.volume_room(hot), Some(hard));
+    let limit = volume.lease_limit();
+    assert_eq!(limit, 81_921);
+    assert_eq!(pipeline.volume_room(hot), Some(limit));
+    // The volume counts so much that room for 10 articles of 512 bytes is
+    // left on each of the 4 connections.
+    let room_for = |articles: u64| limit - articles * 512;
 
     // A lane holding 30 is given the 10 more its part of the room takes,
-    // though its ask and its share of the queue are larger.
+    // though its ask and its share of the queue are larger, and they are
+    // reserved as they are leased.
+    volume.count_for_test(room_for(40));
     let lane = lane_holding(&mut pipeline, hot, 30, 8);
     let works = taken(ask_as_lane(&mut pipeline, SERVER_A, 18, lane));
     assert_eq!(works.len(), 10);
     assert_eq!(single_job(&works), hot);
+    lease_to_lane(&mut pipeline, lane, works);
+    assert_eq!(volume.unwritten_bytes(), room_for(30));
 
-    // A lane holding its part has no room for a whole pipe of 9: it is
-    // answered once it has fetched one down, below 32, never trickled.
+    // Below the volume's resume line, a lane whose part of the room is
+    // short of a whole pipe of 9, with room left for others, is answered
+    // once it has fetched its pipe down to where one fits, never trickled.
+    volume.count_for_test(volume.resume_line() - 6 * 512);
+    let part = ((limit - volume.unwritten_bytes()) / 4 / 512) as usize;
+    assert!(part + 1 < 9, "{part}");
     let full = lane_holding(&mut pipeline, hot, 40, 8);
     assert_eq!(
         saturation(ask_as_lane(&mut pipeline, SERVER_A, 18, full)),
         SaturationWake {
             of: Some(hot),
-            below: 32,
+            below: 40 + part + 1 - 9,
             room: false,
         }
     );
 
-    // Bytes that arrived take room from every lane, but a lane is never
-    // held below a full pipe: one holding 2 of its 9 is handed nothing,
-    // and one holding none is handed a whole pipe. Above the volume's
-    // resume line the held lane waits for the volume, not for what it
-    // holds: it is answered once the volume has fallen to that line.
-    volume.arrived_bytes.store(hard - 4 * 512, Ordering::SeqCst);
-    assert!(volume.unwritten_bytes() > volume.resume_line());
+    // The room itself holds less than a whole pipe: the lane takes what
+    // fits, so the room is not left unused while the writer may run dry.
+    volume.count_for_test(room_for(4));
     let short = lane_holding(&mut pipeline, hot, 2, 8);
+    let works = taken(ask_as_lane(&mut pipeline, SERVER_A, 18, short));
+    assert_eq!(works.len(), 4, "what the room holds");
+    lease_to_lane(&mut pipeline, short, works);
+    assert_eq!(volume.unwritten_bytes(), limit);
+
+    // No article fits: the lane waits for the volume's line, not for what
+    // it holds, and is never handed one past the limit.
+    volume.count_for_test(limit - 100);
+    assert!(volume.unwritten_bytes() > volume.resume_line());
+    let none_fits = lane_holding(&mut pipeline, hot, 2, 8);
     assert_eq!(
-        saturation(ask_as_lane(&mut pipeline, SERVER_A, 18, short)),
+        saturation(ask_as_lane(&mut pipeline, SERVER_A, 18, none_fits)),
         SaturationWake {
             of: Some(hot),
             below: 0,
@@ -1219,9 +1238,18 @@ async fn a_lane_leases_only_its_part_of_the_room_its_jobs_volume_has_left() {
         pipeline.ask_room_wake(hot),
         "the volume holds a wake at its line"
     );
-    let empty = lane_holding(&mut pipeline, hot, 0, 8);
-    let works = taken(ask_as_lane(&mut pipeline, SERVER_A, 18, empty));
-    assert_eq!(works.len(), 9, "a whole pipe of 9");
+    assert_eq!(volume.unwritten_bytes(), limit - 100);
+    assert!(volume.peak_bytes() <= hard);
+}
+
+// Lease a lane's handout, as dispatch does once it is taken: what it
+// takes is reserved on the job's volume.
+fn lease_to_lane(pipeline: &mut Pipeline, lane: LaneShare, works: Vec<DownloadWork>) {
+    let pressure = pipeline.refresh_download_pressure();
+    let lane_mode = pipeline.download_lane_mode_for_server(SERVER_A, pressure, true);
+    pipeline
+        .lease_for_handout(lane.lane_id, SERVER_A, lane_mode, pressure, works)
+        .expect("the handout is leased");
 }
 
 fn saturation(handout: Handout) -> SaturationWake {

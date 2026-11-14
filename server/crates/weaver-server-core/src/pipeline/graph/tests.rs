@@ -92,6 +92,10 @@ async fn decode_as(
     let offset = ordinal as usize * ARTICLE;
     let crc = par2_rs::checksum::crc32(&body);
     let len = body.len() as u64;
+    // The article arrives and the loop hands it on, as a lane's result is:
+    // its bytes count on the volume from arrival and are the credit its
+    // writes take.
+    let credit = pipeline.begin_hand_on_for_test(job_id, len);
     pipeline
         .handle_decode_success(
             DecodeResult {
@@ -128,6 +132,7 @@ async fn decode_as(
             },
         )
         .await;
+    pipeline.end_hand_on_for_test(job_id, credit);
 }
 
 async fn decode_all(pipeline: &mut Pipeline, job_id: JobId, posts: &[Post], index: u32) {

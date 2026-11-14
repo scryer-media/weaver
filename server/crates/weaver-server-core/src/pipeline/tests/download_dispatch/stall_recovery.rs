@@ -222,14 +222,15 @@ async fn a_job_held_by_a_volume_at_its_write_budget_is_never_kicked_or_released(
             .working()
             .volume(),
     );
-    // The volume's own hard limit, given it as the job was admitted.
-    let budget = volume.buffer_limits().1;
+    // The limit the volume's leases stop at, from the hard limit it was
+    // given as the job was admitted.
+    let budget = volume.lease_limit();
     assert!(budget < u64::MAX);
     let t0 = Instant::now();
     assert_eq!(pipeline.earliest_explained_dispatch_wait(t0), None);
 
-    // The volume's writer holds the budget: the job waits on the disk.
-    volume.buffered_bytes.store(budget, Ordering::Relaxed);
+    // The volume counts the budget: the job waits on the disk.
+    volume.count_for_test(budget);
     assert_eq!(pipeline.earliest_explained_dispatch_wait(t0), Some(t0));
     let kick_due = t0 + DOWNLOAD_DISPATCH_STALL_KICK_AFTER;
     let release_due = kick_due + DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER;
@@ -251,7 +252,7 @@ async fn a_job_held_by_a_volume_at_its_write_budget_is_never_kicked_or_released(
     );
 
     // Below the budget the disk explains nothing any more.
-    volume.buffered_bytes.store(budget - 1, Ordering::Relaxed);
+    volume.count_for_test(budget - 1);
     assert_eq!(pipeline.earliest_explained_dispatch_wait(long_after), None);
 }
 
@@ -1026,8 +1027,8 @@ async fn a_job_held_by_its_volume_is_not_warned_of_as_a_stall() {
             .working()
             .volume(),
     );
-    let budget = volume.buffer_limits().1;
-    volume.buffered_bytes.store(budget, Ordering::Relaxed);
+    let budget = volume.lease_limit();
+    volume.count_for_test(budget);
     let lines = LivenessLines::default();
     let _capture = tracing::subscriber::set_default(lines.clone());
     let t0 = Instant::now();
@@ -1042,7 +1043,7 @@ async fn a_job_held_by_its_volume_is_not_warned_of_as_a_stall() {
     assert_eq!(lines.take(), Vec::<String>::new());
 
     // Below the limit the same passes are a stall again, and warned of.
-    volume.buffered_bytes.store(budget - 1, Ordering::Relaxed);
+    volume.count_for_test(budget - 1);
     let later = t0 + DOWNLOAD_DISPATCH_STALL_KICK_AFTER + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL;
     pipeline.dispatch_downloads_at(later);
     let heard = lines.take();

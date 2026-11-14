@@ -441,8 +441,9 @@ pub struct PipelineMetrics {
     pub download_lane_refill_parked_total: AtomicU64,
     pub download_lane_refill_deferred_total: AtomicU64,
     pub download_lane_refill_saturated_total: AtomicU64,
-    // Saturated refills held for their volume's room at its resume line,
-    // and those answered once it fell there.
+    // Refills held for their volume's room: saturated at its resume line,
+    // or idle while a volume held its job's budget. And those answered
+    // once the volume fell to its line or had room again.
     pub download_lane_room_held_total: AtomicU64,
     pub download_lane_room_woken_total: AtomicU64,
     pub download_pipeline_trial_success_total: AtomicU64,

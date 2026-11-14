@@ -214,24 +214,35 @@ impl Pipeline {
             .map_or(VolumeIntake::Open, JobDisk::intake)
     }
 
-    // The bytes the job's volumes may still take below their hard limits,
-    // the least of them: what may arrive for them before they hold their
-    // limit. `None` when the job writes through no writer or none of its
-    // volumes is sized.
+    // The bytes the job's volumes may still lease below their lease limits
+    // (`Volume::lease_room`), the least of them. `None` when the job writes
+    // through no writer or none of its volumes is sized.
     pub(in crate::pipeline) fn volume_room(&self, job_id: JobId) -> Option<u64> {
         let disk = self.graph_jobs.get(&job_id)?.disk()?;
         disk.each()
             .filter_map(|submitter| {
                 let volume = submitter.volume();
                 let (_, hard) = volume.buffer_limits();
-                (hard != u64::MAX).then(|| hard.saturating_sub(volume.unwritten_bytes()))
+                (hard != u64::MAX).then(|| volume.lease_room())
             })
             .min()
     }
 
-    // Whether a volume the job writes to holds its own hard limit or more
-    // of bytes that arrived and are not written. Dispatch for the job
-    // stops while one does, and whatever brings it below wakes dispatch.
+    // Whether every volume the job writes to counts nothing: each grants
+    // one article then, whatever its size (`Volume::reserve`).
+    pub(in crate::pipeline) fn volume_counts_nothing(&self, job_id: JobId) -> bool {
+        self.graph_jobs
+            .get(&job_id)
+            .and_then(|graph| graph.disk())
+            .is_some_and(|disk| {
+                disk.each()
+                    .all(|submitter| submitter.volume().unwritten_bytes() == 0)
+            })
+    }
+
+    // Whether a volume the job writes to counts its lease limit or more.
+    // Dispatch for the job stops while one does, and whatever brings it
+    // below wakes dispatch.
     pub(in crate::pipeline) fn volume_holds_budget(&self, job_id: JobId) -> bool {
         let held = self.volume_intake(job_id) == VolumeIntake::Stopped;
         if held {
@@ -468,6 +479,8 @@ pub(crate) struct JobDisk {
 
 // The bytes a volume may hold in memory for its writer before a thread
 // that produces a job's output waits for it: the volume's own hard limit.
+// It paces the thread only; what it hands the loop counts against the limit
+// as the loop queues it (`Submitter::write`).
 fn output_limit(submitter: &Submitter) -> u64 {
     submitter.volume().buffer_limits().1
 }
@@ -514,14 +527,11 @@ impl JobDisk {
         JobBarrier(self.each().map(|submitter| submitter.barrier()).collect())
     }
 
-    // The loop's own wait on a volume's hard limit, for the one kind of
-    // work in which the loop itself produces what is written: a repair's or
-    // a replay's output read back from its staging file and said again,
-    // slice after slice, in one step. Before the next slice is queued the
-    // loop stands still while a volume holds its limit for its writer, so
-    // no more than the limit and a slice is ever queued. Counted as a loop
-    // wait on the volume. For those applications only: nothing else on the
-    // loop may call it.
+    // The loop's own wait on a volume's hard limit, before the next slice
+    // of a repair's or a replay's output is read back and said again: the
+    // loop stands still until every volume the job writes to has its share
+    // of room (`Volume::loop_share`), so the slice is read only once it can
+    // be queued within the limit. Counted as a loop wait on the volume.
     //
     // A stop does not end the wait: what the loop says again while the
     // owner stops is held to the limit like any other. It ends at the end
@@ -529,24 +539,10 @@ impl JobDisk {
     // more of the job.
     #[must_use]
     pub(crate) fn loop_wait_below(&self) -> bool {
-        use std::sync::atomic::Ordering;
-        for submitter in self.each() {
-            let volume = submitter.volume();
-            let limit = output_limit(submitter);
-            if volume.buffered_bytes.load(Ordering::Relaxed) < limit {
-                continue;
-            }
-            let started = std::time::Instant::now();
-            let below = submitter.loop_wait_below(limit.saturating_sub(1));
-            volume.writer.loop_waited(
-                crate::operations::disk::volume::LoopWait::Budget,
-                started.elapsed().as_nanos() as u64,
-            );
-            if !below {
-                return false;
-            }
-        }
-        true
+        self.each().all(|submitter| {
+            let share = submitter.volume().loop_share();
+            submitter.loop_wait_room(share)
+        })
     }
 
     // Whether a wait of the loop on one of the job's volumes was given up

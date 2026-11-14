@@ -189,6 +189,15 @@ pub struct VolumeDiagnostics {
     pub write_rate_bytes_per_second: u64,
     // Bytes waiting in memory for the volume's writer.
     pub buffered_bytes: u64,
+    // Bytes counted against the volume's hard limit now (leased, being
+    // decoded, waiting for the writer), the most ever counted, and the
+    // limit; zero for a volume not sized.
+    #[serde(default)]
+    pub counted_bytes: u64,
+    #[serde(default)]
+    pub peak_counted_bytes: u64,
+    #[serde(default)]
+    pub buffer_limit_bytes: u64,
     pub written_bytes_total: u64,
     // Time spent inside write calls.
     pub write_seconds_total: f64,
@@ -206,6 +215,9 @@ impl From<crate::operations::instrumentation::VolumeSnapshot> for VolumeDiagnost
             device: volume.device,
             write_rate_bytes_per_second: volume.write_rate,
             buffered_bytes: volume.buffered_bytes,
+            counted_bytes: volume.counted_bytes,
+            peak_counted_bytes: volume.peak_bytes,
+            buffer_limit_bytes: volume.buffer_limit_bytes,
             written_bytes_total: volume.written_bytes,
             write_seconds_total: volume.write_nanos as f64 / 1e9,
             write_calls_total: volume.write_calls,
@@ -549,6 +561,8 @@ mod tests {
             throughput: 0,
             buffered_bytes: 65_536,
             arrived_bytes: 0,
+            counted_bytes: 70_000,
+            peak_bytes: 90_000,
             buffer_soft_bytes: 0,
             buffer_limit_bytes: 0,
             idle_turns: 0,
@@ -563,6 +577,9 @@ mod tests {
                 "device": 7,
                 "write_rate_bytes_per_second": 3_200_000,
                 "buffered_bytes": 65_536,
+                "counted_bytes": 70_000,
+                "peak_counted_bytes": 90_000,
+                "buffer_limit_bytes": 0,
                 "written_bytes_total": 8_000_000,
                 "write_seconds_total": 2.5,
                 "write_calls_total": 120,

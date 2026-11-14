@@ -1428,9 +1428,16 @@ pub struct VolumeSnapshot {
     // handed to its writer yet: being decoded. The limits below are read
     // against these and the buffered bytes together.
     pub arrived_bytes: u64,
-    // The volume's buffer limits, over the bytes that arrived for it and
-    // are not written: from the soft one its lanes ask for one article at
-    // a time, at the hard one they stop. Zero until the volume is sized.
+    // What counts against the hard limit: the articles leased to lanes and
+    // not arrived, what arrived and is being decoded, and what waits for
+    // the writer. Never more than the hard limit, but for one article
+    // granted alone to a volume that counted nothing.
+    pub counted_bytes: u64,
+    // The most `counted_bytes` has been.
+    pub peak_bytes: u64,
+    // The volume's buffer limits, over the bytes it counts: the soft one
+    // is a reported figure, nothing is leased or queued past the hard one.
+    // Zero until the volume is sized.
     pub buffer_soft_bytes: u64,
     pub buffer_limit_bytes: u64,
     // Times the volume's writer found nothing more to do after working.

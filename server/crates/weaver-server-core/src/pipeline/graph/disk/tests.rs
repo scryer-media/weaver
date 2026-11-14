@@ -442,8 +442,8 @@ fn a_failed_write_comes_back_under_the_jobs_key() {
     assert_eq!(through.buffered(), 0);
 }
 
-// The volume is stopped at its own hard limit while its writer holds that
-// many bytes, and no longer once they are written.
+// The volume is stopped once what its writer holds reaches the limit leases
+// stop at, and no longer once those bytes are written.
 #[test]
 fn a_volume_is_at_its_limit_only_while_the_bytes_wait() {
     use crate::pipeline::download::volume_pace::VolumeIntake;
@@ -454,40 +454,46 @@ fn a_volume_is_at_its_limit_only_while_the_bytes_wait() {
     assert_eq!(disk.intake(), VolumeIntake::Open);
     let (mut job, _dir, _) = job_through(&files(), Vec::new(), |_| Some(disk.clone()));
     fill(&mut job, 0);
-    let hard = through.buffered() + 1;
-    assert!(hard > 1);
-    through.volume.set_buffer_limits(hard, hard);
+    let held = through.buffered();
+    assert!(held > 1);
+    assert_eq!(through.volume.unwritten_bytes(), held);
+    through
+        .volume
+        .set_buffer_limits(2 * held + 16, 2 * held + 16);
     assert_eq!(disk.intake(), VolumeIntake::Open);
-    fill(&mut job, 1);
+    through.volume.set_buffer_limits(held + 1, held + 1);
+    assert!(through.volume.lease_limit() <= held);
     assert_eq!(disk.intake(), VolumeIntake::Stopped);
     let barrier = disk.barrier();
     hold.open();
     barrier.wait();
+    assert_eq!(through.volume.unwritten_bytes(), 0);
     assert_eq!(disk.intake(), VolumeIntake::Open);
 }
 
 // What arrived for the volume's jobs and is still being decoded counts
-// against its limits with what waits for its writer: at the hard limit
-// stopped, open below it, at the soft limit too. A limit lowered below
-// what the volume holds reads as stopped.
+// against its limit with what waits for its writer: stopped at the lease
+// limit, open below it. A limit lowered below what the volume counts reads
+// as stopped.
 #[test]
 fn a_volume_counts_what_is_being_decoded_with_what_waits_for_its_writer() {
     use crate::pipeline::download::volume_pace::VolumeIntake;
     let through = writers();
     let disk = through.disk();
     through.volume.set_buffer_limits(700, 1000);
-    through.volume.buffered_bytes.store(400, Ordering::Relaxed);
+    assert_eq!(through.volume.lease_limit(), 938);
+    through.volume.charge(400);
     assert_eq!(disk.intake(), VolumeIntake::Open);
-    through.volume.arrived_bytes.store(300, Ordering::Relaxed);
+    through.volume.charge(300);
     assert_eq!(through.volume.unwritten_bytes(), 700);
     assert_eq!(disk.intake(), VolumeIntake::Open);
-    through.volume.arrived_bytes.store(600, Ordering::Relaxed);
+    through.volume.charge(300);
     assert_eq!(disk.intake(), VolumeIntake::Stopped);
-    through.volume.arrived_bytes.store(0, Ordering::Relaxed);
+    through.volume.release(600);
     assert_eq!(disk.intake(), VolumeIntake::Open);
     through.volume.set_buffer_limits(280, 400);
     assert_eq!(disk.intake(), VolumeIntake::Stopped);
-    through.volume.buffered_bytes.store(0, Ordering::Relaxed);
+    through.volume.release(400);
 }
 
 // A job whose delivered files lie on another volume than its working

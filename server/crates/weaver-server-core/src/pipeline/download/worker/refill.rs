@@ -39,6 +39,10 @@ pub(crate) struct HeldDownloadRefill {
     // nothing. From then on it is an idle lane, held by the idle rules
     // (`idle_hold_stands`), with its volume's line as one more wake.
     idle_since: Option<Instant>,
+    // An idle lane held while a volume held its job's budget
+    // (`Pipeline::volume_holds_budget`): counted as held for room, and as
+    // woken when it is answered once the volumes have room.
+    for_room: bool,
 }
 
 impl Pipeline {
@@ -146,6 +150,7 @@ impl Pipeline {
             since,
             wake,
             mut idle_since,
+            for_room,
         } in held
         {
             let Some(SaturationWake { of, below, room }) = wake else {
@@ -155,8 +160,14 @@ impl Pipeline {
                         since,
                         wake,
                         idle_since,
+                        for_room,
                     });
                     continue;
+                }
+                if for_room && !volumes_refuse {
+                    self.metrics
+                        .download_lane_room_woken_total
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 self.answer_download_lane_refill(request, now, Some(since));
                 continue;
@@ -187,6 +198,7 @@ impl Pipeline {
                         since,
                         wake,
                         idle_since,
+                        for_room: false,
                     });
                     continue;
                 }
@@ -213,6 +225,7 @@ impl Pipeline {
                     since,
                     wake,
                     idle_since,
+                    for_room: false,
                 });
                 continue;
             }
@@ -367,12 +380,11 @@ impl Pipeline {
                 // dry, or on a park after returning every article it still
                 // holds. A count wake is below anything it holds by then and
                 // has been answered. A room wake is not: a lane is held for
-                // room only while it holds articles (its share for room is
-                // never less than a full pipe), and once it has fetched them
-                // down it is held as an idle lane is
-                // (`service_held_download_refills`): its wait is bounded by
-                // the idle window and ends for a probe, a pool change or a
-                // job with work on a volume that has room.
+                // room when not one more article fits below its volume's
+                // lease limit, and once it holds nothing it is held as an
+                // idle lane is (`service_held_download_refills`): its wait
+                // is bounded by the idle window and ends for a probe, a pool
+                // change or a job with work on a volume that has room.
                 self.metrics
                     .download_lane_refill_saturated_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -386,6 +398,7 @@ impl Pipeline {
                     since: held_since.unwrap_or(now),
                     wake: Some(wake),
                     idle_since: None,
+                    for_room: false,
                 });
                 return;
             }
@@ -484,7 +497,21 @@ impl Pipeline {
         let mut works = works.into_iter();
         for work in works.by_ref() {
             match self.reserve_download_work_for_dispatch(job_id, work) {
-                Ok(Some(work)) => reserved.push(work),
+                // The article is reserved on its job's volume, or goes back
+                // with the rest of the handout: a lease holds only what fits
+                // in the room the volume has left.
+                Ok(Some(work)) if self.reserve_lane_work(&work) => reserved.push(work),
+                Ok(Some(work)) => {
+                    self.enqueue_download_work(work);
+                    // Nothing fit: dispatch looks again once the volume has
+                    // fallen to where the article fits.
+                    if reserved.is_empty() {
+                        self.volume_budget_held
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        self.ask_room_wake(job_id);
+                    }
+                    break;
+                }
                 // The helper has already returned the refused article; the
                 // rest of the handout follows it below so the batch keeps
                 // the scheduler's order.
@@ -554,11 +581,21 @@ impl Pipeline {
             self.park_download_lane_refill(request, LaneParkReason::NoWork, held_since, now);
             return;
         }
+        // Held while a volume holds its job's budget: a hold for room.
+        let for_room = self
+            .volume_budget_held
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if for_room {
+            self.metrics
+                .download_lane_room_held_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.held_download_refills.push(HeldDownloadRefill {
             request,
             since,
             wake: None,
             idle_since: None,
+            for_room,
         });
     }
 

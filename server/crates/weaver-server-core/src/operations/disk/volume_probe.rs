@@ -426,7 +426,7 @@ mod tests {
                 })
             }),
         );
-        volume.buffered_bytes.store(MIB, Ordering::Relaxed);
+        volume.count_for_test(MIB);
         probe_once(Arc::clone(&volume), data.path().to_path_buf(), early)().unwrap();
         assert_eq!(
             asked.load(Ordering::Relaxed),

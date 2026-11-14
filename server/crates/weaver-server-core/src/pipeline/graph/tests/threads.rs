@@ -1144,7 +1144,7 @@ async fn a_job_on_a_full_volume_stops_while_a_job_on_another_volume_is_dispatche
     assert!(shared.buffer_limits().1 < u64::MAX);
 
     // The slow volume holds its hard limit; the other holds nothing.
-    slow.buffered_bytes.store(hard, Ordering::SeqCst);
+    slow.count_for_test(hard);
     assert_eq!(pipeline.volume_intake(slow_job), VolumeIntake::Stopped);
     assert_eq!(pipeline.volume_intake(other_job), VolumeIntake::Open);
     let lease = pipeline
@@ -1154,7 +1154,7 @@ async fn a_job_on_a_full_volume_stops_while_a_job_on_another_volume_is_dispatche
     assert!(pipeline.volume_holds_budget(slow_job));
 
     // Drained, the slow volume's job is handed work again.
-    slow.buffered_bytes.store(0, Ordering::SeqCst);
+    slow.count_for_test(0);
     assert_eq!(pipeline.volume_intake(slow_job), VolumeIntake::Open);
     let lease = pipeline
         .lease_for_server_for_test(0)
@@ -1362,14 +1362,14 @@ fn one_ask(pipeline: &mut Pipeline) -> usize {
     pipeline.download_refill_want(lane_mode)
 }
 
-// Below a volume's hard limit a lane fetching for its job is handed whole
-// pipes, at the soft limit as anywhere. Where the volume has no room for
-// another whole pipe on the lane, the lane is handed none of it, never a
-// trickle: above the volume's resume line it is told to wait until the
-// volume has fallen to that line. A lane that holds nothing is handed a
-// whole pipe.
+// Below a volume's lease limit a lane fetching for its job is handed whole
+// pipes, at the soft limit as anywhere. Where the volume has room for some
+// articles and not a whole pipe, a lane with room in its part is handed what
+// fits. Where it has room for none, no lane is handed any, the one holding
+// nothing included: above the volume's resume line each is told to wait
+// until the volume has fallen to that line.
 #[tokio::test]
-async fn a_lane_is_handed_whole_pipes_or_nothing_below_the_hard_limit() {
+async fn a_lane_is_handed_whole_pipes_or_what_fits_below_the_lease_limit() {
     use crate::pipeline::download::scheduler::SaturationWake;
     use crate::pipeline::download::volume_pace::VolumeIntake;
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1392,24 +1392,31 @@ async fn a_lane_is_handed_whole_pipes_or_nothing_below_the_hard_limit() {
             .volume(),
     );
     let (soft, hard) = volume.buffer_limits();
-    assert!(soft < hard && hard < u64::MAX);
+    assert!(soft < volume.lease_limit() && hard < u64::MAX);
     let whole = one_ask(&mut pipeline);
+    assert!(whole > 2, "{whole}");
     // The job's own share of a lane is more than a pipe: only the volume
     // holds the lane back here.
     assert!(pipeline.lane_share_of_job(job_id, whole) > whole + 1);
 
     // At the soft limit the lane is handed a whole ask.
-    volume.arrived_bytes.store(soft, Ordering::SeqCst);
+    volume.count_for_test(soft);
     assert_eq!(pipeline.volume_intake(job_id), VolumeIntake::Open);
     let lane_id = Pipeline::next_download_lane_id();
     assert_eq!(lane_asks(&mut pipeline, lane_id), vec![job_id; whole]);
+    // Each article handed was reserved on the volume at its size.
+    let article = (volume.unwritten_bytes() - soft) / whole as u64;
+    assert!(article > 0);
 
-    // A byte of room left: no room for another whole pipe on the lane.
-    volume.arrived_bytes.store(hard - 1, Ordering::SeqCst);
-    assert_eq!(pipeline.volume_intake(job_id), VolumeIntake::Open);
-    // Above its resume line the volume answers for the lane holding one
-    // ask: it waits until the volume has fallen to that line, not until
-    // it has fetched its pipe down.
+    // Room for two articles: a lane holding nothing is handed the two that
+    // fit, not a whole pipe and not nothing.
+    volume.count_for_test(volume.lease_limit() - 2 * article);
+    let second = Pipeline::next_download_lane_id();
+    assert_eq!(lane_asks(&mut pipeline, second), vec![job_id; 2]);
+    assert_eq!(volume.unwritten_bytes(), volume.lease_limit());
+
+    // Room for less than one: the lane holding work waits for the line.
+    volume.count_for_test(volume.lease_limit() - 1);
     assert_eq!(
         lane_handout(&mut pipeline, lane_id),
         Err(SaturationWake {
@@ -1422,20 +1429,27 @@ async fn a_lane_is_handed_whole_pipes_or_nothing_below_the_hard_limit() {
         pipeline.download_lane_holdings_of_job(lane_id, job_id),
         whole
     );
-    // A lane that holds nothing is handed a whole pipe.
-    let second = Pipeline::next_download_lane_id();
-    assert_eq!(lane_asks(&mut pipeline, second), vec![job_id; whole]);
+    // So does a lane that holds nothing: no lane is handed past the room.
+    let third = Pipeline::next_download_lane_id();
+    assert!(
+        matches!(
+            lane_handout(&mut pipeline, third),
+            Err(SaturationWake { room: true, .. })
+        ),
+        "a lane holding nothing is handed work past the volume's room"
+    );
+    assert_eq!(volume.unwritten_bytes(), volume.lease_limit() - 1);
 
     // With room again, the first lane is handed more.
-    volume.arrived_bytes.store(0, Ordering::SeqCst);
+    volume.count_for_test(0);
     assert!(!lane_asks(&mut pipeline, lane_id).is_empty());
     retire_pipeline_database(pipeline).await;
 }
 
 // A volume short of room holds its own job back on a lane, not the lane:
-// the lane's room goes to the next job, on a volume that has room. The
-// lane is handed a whole pipe of the job on the short volume; asked again
-// while it holds that, it is handed the other job's.
+// the lane's room goes to the next job, on a volume that has room. Once
+// the short volume has room again its job, first in the queue, is handed
+// work again.
 #[tokio::test]
 async fn a_volume_short_of_room_leaves_the_lanes_room_to_jobs_on_other_volumes() {
     use crate::pipeline::download::volume_pace::VolumeIntake;
@@ -1495,28 +1509,26 @@ async fn a_volume_short_of_room_leaves_the_lanes_room_to_jobs_on_other_volumes()
     let slow = Arc::clone(disk.under(&staging_dir).volume());
     let shared = Arc::clone(disk.working().volume());
     assert!(!Arc::ptr_eq(&slow, &shared));
-    let (_, hard) = slow.buffer_limits();
-    slow.arrived_bytes.store(hard - 1, Ordering::SeqCst);
+    // The first job's own volume has no room for an article.
+    slow.count_for_test(slow.lease_limit() - 1);
     assert_eq!(pipeline.volume_intake(slow_job), VolumeIntake::Open);
     assert_eq!(pipeline.volume_intake(other_job), VolumeIntake::Open);
-    let whole = one_ask(&mut pipeline);
 
     let lane_id = Pipeline::next_download_lane_id();
-    // Holding nothing, the lane is handed a whole pipe of the first job.
-    assert_eq!(lane_asks(&mut pipeline, lane_id), vec![slow_job; whole]);
-    // Holding that, its room goes to the job on the volume with room.
-    let rest = lane_asks(&mut pipeline, lane_id);
-    assert!(!rest.is_empty(), "{rest:?}");
-    assert!(rest.iter().all(|job_id| *job_id == other_job), "{rest:?}");
-    assert_eq!(
-        pipeline.download_lane_holdings_of_job(lane_id, slow_job),
-        whole
+    // The lane's room goes to the job on the volume with room.
+    let handed = lane_asks(&mut pipeline, lane_id);
+    assert!(!handed.is_empty(), "{handed:?}");
+    assert!(
+        handed.iter().all(|job_id| *job_id == other_job),
+        "{handed:?}"
     );
-    // A lane that holds none of the first job is handed a whole pipe of it.
-    let second = Pipeline::next_download_lane_id();
-    assert_eq!(lane_asks(&mut pipeline, second), vec![slow_job; whole]);
+    assert_eq!(pipeline.download_lane_holdings_of_job(lane_id, slow_job), 0);
 
-    slow.arrived_bytes.store(0, Ordering::SeqCst);
+    // With room again, a lane is handed the first job's work.
+    slow.count_for_test(0);
+    let second = Pipeline::next_download_lane_id();
+    let handed = lane_asks(&mut pipeline, second);
+    assert!(handed.contains(&slow_job), "{handed:?}");
     retire_pipeline_database(pipeline).await;
 }
 
@@ -1551,7 +1563,7 @@ async fn a_job_stopped_by_what_is_being_decoded_is_woken_as_the_loop_hands_it_on
     assert_eq!(volume.buffer_limits().1, 2 * ARTICLE as u64);
 
     for _ in 0..2 {
-        pipeline.note_released_download_result_pending(job_id, ARTICLE as u64);
+        pipeline.note_arrived_result_for_test(job_id, ARTICLE as u64);
     }
     assert_eq!(
         volume.arrived_bytes.load(Ordering::SeqCst),
@@ -1563,8 +1575,8 @@ async fn a_job_stopped_by_what_is_being_decoded_is_woken_as_the_loop_hands_it_on
 
     // Both results are handed on. The first leaves the volume above its
     // line or wakes dispatch; the second leaves nothing and has woken it.
-    pipeline.finish_released_download_result_processing(job_id, ARTICLE as u64);
-    pipeline.finish_released_download_result_processing(job_id, ARTICLE as u64);
+    pipeline.hand_on_result_for_test(job_id, ARTICLE as u64);
+    pipeline.hand_on_result_for_test(job_id, ARTICLE as u64);
     assert_eq!(volume.arrived_bytes.load(Ordering::SeqCst), 0);
     assert!(pipeline.volume_arrived_by_job.is_empty());
     assert!(pipeline.download_dispatch_wake);
