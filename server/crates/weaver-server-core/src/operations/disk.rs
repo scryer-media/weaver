@@ -1649,27 +1649,44 @@ impl HeldPaths {
     // One pass over the listed paths: each is probed with no lock held.
     // Whoever waits hears that the paths were read.
     fn sample(&self, probe: &ProbeFn, ledger: &DiskLedger) {
-        let paths: Vec<PathBuf> = self
+        let paths: Vec<(PathBuf, Option<u64>)> = self
             .lock()
             .iter_mut()
             .map(|held| {
                 held.begun += 1;
-                held.path.clone()
+                (held.path.clone(), held.device)
             })
             .collect();
-        for path in paths {
+        for (path, known) in paths {
             // A path removed while a job waits on it, as a destination
             // folder its user deleted to make room, is read at the nearest
             // folder above it that answers: the disk it will be made on
             // again.
-            let free = probe(&path)
-                .ok()
-                .or_else(|| path.ancestors().skip(1).find_map(|at| probe(at).ok()))
-                .map(|space| space.available_bytes);
-            let device = nearest_device(&path);
+            let (space, device) = match probe(&path) {
+                Ok(space) => (Some(space), nearest_device(&path)),
+                Err(_) => path
+                    .ancestors()
+                    .skip(1)
+                    .find_map(|at| {
+                        probe(at)
+                            .ok()
+                            .map(|space| (Some(space), nearest_device(at)))
+                    })
+                    .unwrap_or((None, None)),
+            };
+            // What answered lies on another device than the path was last
+            // read on, as the folder above a mount that went away does:
+            // room there is not room for the job, and a move let go on it
+            // would deliver under the mount point. It is a failed reading,
+            // and the job waits on, shown waiting. A path no device was yet
+            // read for takes the first that answers.
+            let other = matches!((known, device), (Some(known), Some(now)) if known != now);
+            let free = space.filter(|_| !other).map(|space| space.available_bytes);
             let mut list = self.lock();
             if let Some(held) = list.iter_mut().find(|held| held.path == path) {
-                if device.is_some() {
+                // The device first read stands: another is never taken in
+                // its place.
+                if held.device.is_none() {
                     held.device = device;
                 }
                 held.prior = held.free.map(|figure| (held.published, figure));
@@ -3450,6 +3467,47 @@ mod tests {
         let look = storage.path_look(gone).expect("the path is held");
         assert!(look.good, "the folder above answered");
         assert_eq!(look.shown, Some("/folders/tv".len() as u64));
+    }
+
+    // A held path that answered and then goes: the folder above it is
+    // taken while it lies on the device the path was read on, as after its
+    // user deleted the folder. A folder above on another device, as the
+    // mount point of a disk that went away, is a failed reading: the wait
+    // keeps the path's own device and its last figure.
+    #[test]
+    fn a_folder_above_a_held_path_is_taken_only_on_the_paths_own_device() {
+        for (name, above_device, taken) in [("same", 41, true), ("other", 42, false)] {
+            let mount = PathBuf::from(format!("/t4-{name}/mount"));
+            let held_path = mount.join("tv");
+            crate::runtime::fs::test_devices::assign(&mount, above_device);
+            crate::runtime::fs::test_devices::assign(&held_path, 41);
+            let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let probe: SharedProbeFn = {
+                let (gone, held_path) = (Arc::clone(&gone), held_path.clone());
+                Arc::new(move |path: &Path| {
+                    if path == held_path && gone.load(Ordering::Acquire) {
+                        return Err(DiskProbeError::Io(io::Error::from(io::ErrorKind::NotFound)));
+                    }
+                    Ok(DiskSpace {
+                        total_bytes: 1000,
+                        available_bytes: if path == held_path { 5 } else { 900 },
+                    })
+                })
+            };
+            let storage = StorageCapacity::with_probe(roots(), NEVER, Arc::clone(&probe));
+            storage.hold_path(&held_path);
+            let ledger = Arc::clone(&storage.slot(StorageRoot::Complete).ledger);
+            storage.held.sample(&*probe, &ledger);
+            assert_eq!(storage.held_path_device(&held_path), Some(41));
+            assert_eq!(storage.path_look(&held_path).unwrap().shown, Some(5));
+
+            gone.store(true, Ordering::Release);
+            storage.held.sample(&*probe, &ledger);
+            let look = storage.path_look(&held_path).unwrap();
+            assert_eq!(look.good, taken, "{name}");
+            assert_eq!(look.shown, Some(if taken { 900 } else { 5 }), "{name}");
+            assert_eq!(storage.held_path_device(&held_path), Some(41), "{name}");
+        }
     }
 
     // The paths held are bounded: past the cap, a new path drops the one
