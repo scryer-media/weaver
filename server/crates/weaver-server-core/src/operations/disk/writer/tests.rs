@@ -813,6 +813,34 @@ fn a_producer_does_not_wait_on_a_volume_with_no_thread() {
     assert!(job.barrier().failed());
 }
 
+// An operation its caller makes itself when the volume drops it is no
+// failure on a volume with no thread: the key does not fail, nothing is
+// reported under it, and a barrier behind it passes.
+#[test]
+fn an_operation_its_caller_makes_itself_is_no_failure_on_a_volume_with_no_thread() {
+    let reported = Arc::new(AtomicU64::new(0));
+    let count_reports = Arc::clone(&reported);
+    let writers = VolumeWriters::threadless(move |report| {
+        count_reports.fetch_add(report.failures.len() as u64, Ordering::SeqCst);
+    });
+    let volume = volume("one");
+    let job = writers.submitter(&volume, 7);
+    let (answer, answered) = mpsc::sync_channel(1);
+    job.ask(PathBuf::from("delivered"), move || {
+        let _ = answer.send(());
+    });
+    // Dropped unrun: the caller hears nothing and makes it itself.
+    assert!(answered.recv().is_err());
+    let barrier = job.barrier();
+    assert!(barrier.passed() && !barrier.failed());
+    assert_eq!(count(&reported), 0);
+    assert_eq!(count(&volume.writer.failed_operations), 0);
+    // Anything else of the key still fails as it did.
+    job.run(None, PathBuf::from("other"), || Ok(()));
+    assert!(job.barrier().failed());
+    assert_eq!(count(&reported), 1);
+}
+
 // A refusal still to be heard is not a failure of the key.
 #[test]
 fn a_refused_name_is_not_a_failed_barrier() {

@@ -671,6 +671,23 @@ impl Submitter {
             file,
             path,
             run: Box::new(run),
+            own: false,
+        })
+    }
+
+    // Run `run` on the writer thread as `run` does, for a caller that
+    // judges what it did by itself and does it itself when it is dropped
+    // unrun: `run` hands its result to the caller, and a volume with no
+    // thread to run it on is no failure of the key.
+    pub(crate) fn ask(&self, path: PathBuf, run: impl FnOnce() + Send + 'static) -> u64 {
+        self.submit(Op::Run {
+            file: None,
+            path,
+            run: Box::new(move || {
+                run();
+                Ok(())
+            }),
+            own: true,
         })
     }
 
@@ -802,6 +819,11 @@ impl Submitter {
             // Nothing sent to the volume will run, so all of it has
             // returned: a settle does not wait for it.
             state.returned(state.sent.load(Ordering::SeqCst));
+            // The caller makes this one itself: nothing failed.
+            if matches!(unsent.op, Op::Run { own: true, .. }) {
+                self.key.returned(seq);
+                return seq;
+            }
             let counts = &state.volume.writer;
             counts.failed_operations.fetch_add(1, Ordering::Relaxed);
             let first = !self.key.failed.swap(true, Ordering::AcqRel);
@@ -1177,6 +1199,9 @@ enum Op {
         file: Option<u64>,
         path: PathBuf,
         run: Box<dyn FnOnce() -> io::Result<()> + Send>,
+        // The caller judges the result and makes the operation itself
+        // when the volume drops it unrun.
+        own: bool,
     },
     // Close every handle the key left open and forget its files.
     Forget,
@@ -1760,7 +1785,9 @@ fn perform(
             held.open.remove(&file);
             closed
         }
-        Op::Run { file, path, run } => {
+        Op::Run {
+            file, path, run, ..
+        } => {
             if let Some(file) = file {
                 held.open.remove(&file);
             }

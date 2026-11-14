@@ -323,10 +323,10 @@ impl Renames {
     fn rename(&self, src: &Path, dst: &Path) -> std::io::Result<()> {
         let (answer, answered) = std::sync::mpsc::sync_channel(1);
         let (from, to) = (src.to_path_buf(), dst.to_path_buf());
-        // The writer hears no failure: the mover judges the result.
-        self.0.run(None, src.to_path_buf(), move || {
+        // The writer hears no failure: the mover judges the result, and a
+        // volume with no thread is none either.
+        self.0.ask(src.to_path_buf(), move || {
             let _ = answer.send(rename_path_for_publication(&from, &to));
-            Ok(())
         });
         // A volume with no thread drops the rename unrun: it is made here.
         answered
