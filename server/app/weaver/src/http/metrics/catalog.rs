@@ -584,6 +584,8 @@ metric_families! {
     TORRENT_TRACKER_FAILURES = ("weaver_torrent_tracker_consecutive_failures", Gauge,
         ["job_id", "category", "route", "tracker"],
         "Announces to the tracker that failed in a row since it last answered.");
+    TORRENTS = ("weaver_torrents", Gauge, ["route", "state"],
+        "Torrents by the route they run on and their state, every torrent counted once whatever metrics.per_job_series says. The route is empty for a torrent that has none yet.");
     TORRENT_SESSION_OPEN = ("weaver_torrent_session_open", Gauge, ["route"],
         "Whether the torrent session of each route that has one runs; 0 while the route is held.");
     TORRENT_SESSION_LISTENING = ("weaver_torrent_session_listening", Gauge, ["route"],

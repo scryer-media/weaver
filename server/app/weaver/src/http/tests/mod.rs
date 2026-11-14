@@ -1724,11 +1724,13 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
         incoming: sample_incoming(),
         unchoke_slots_held: 87,
         network: sample_torrent_network(),
-        lsd: Some(weaver_server_core::torrents::metrics::network::LsdSnapshot {
-            sent: 95,
-            received: 96,
-            peers_found: 97,
-        }),
+        lsd: Some(
+            weaver_server_core::torrents::metrics::network::LsdSnapshot {
+                sent: 95,
+                received: 96,
+                peers_found: 97,
+            },
+        ),
         limiter: weaver_server_core::torrents::metrics::network::LimiterSnapshot {
             waits: [98, 99],
             wait_nanos: [1_500_000_000, 0],
@@ -1804,6 +1806,8 @@ fn fully_populated_render() -> String {
     input.tunnel = Some(&tunnel);
     input.speed_tests = Some(&speed_tests);
     input.torrents = Some(&torrents);
+    // The fixture's seeding torrent has series of its own only under `All`.
+    input.per_job_series = weaver_server_core::settings::PerJobSeries::All;
     input.runtime_generation = 3;
     input.start_time_seconds = 1_700_000_000.0;
     collection.apply(&mut input);

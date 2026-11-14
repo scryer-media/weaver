@@ -8,7 +8,7 @@
 // from an exhaustive `match`. Both exist so that adding a variant or a counter
 // upstream is a compile error here rather than a silently missing series.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use weaver_server_core::bandwidth::schedule_metrics::{
     ActionOutcome, HoldReason, ScheduleMetricsSnapshot,
@@ -2268,15 +2268,31 @@ pub(crate) fn render_speed_tests(
 // session, then the event counters. Every family is written whole before the
 // next, so a family's samples stay together whatever the number of torrents.
 // Each torrent's own series, and its trackers', go as `mode` says, as a
-// job's do; the session and event series always go.
+// job's do; the count of torrents by state, the session and the event series
+// always go.
 pub(crate) fn render_torrents(out: &mut Encoder, metrics: &TorrentMetrics, mode: PerJobSeries) {
     let published = &metrics.published;
-    let torrents: Vec<(String, &TorrentSeries)> = published
-        .torrents
+    // One pass over the published torrents: each is counted under its route
+    // and state, and only those `mode` exports are kept for series of their
+    // own. A route with a session and no torrent counts zeros.
+    let mut counted: BTreeMap<&str, [u64; TORRENT_STATES.len()]> = published
+        .sessions
         .iter()
-        .filter(|torrent| torrent_is_exported(torrent.state, mode))
-        .map(|torrent| (torrent.job_id.0.to_string(), torrent))
+        .map(|session| (session.route.as_str(), [0; TORRENT_STATES.len()]))
         .collect();
+    let mut torrents: Vec<(String, &TorrentSeries)> = Vec::new();
+    for torrent in &published.torrents {
+        let states = counted.entry(torrent.route.as_str()).or_default();
+        if let Some(at) = TORRENT_STATES
+            .iter()
+            .position(|state| *state == torrent.state)
+        {
+            states[at] += 1;
+        }
+        if torrent_is_exported(torrent.state, mode) {
+            torrents.push((torrent.job_id.0.to_string(), torrent));
+        }
+    }
 
     // One sample per torrent, labelled by it and `extra`.
     fn each<'a, T>(
@@ -2654,6 +2670,16 @@ pub(crate) fn render_torrents(out: &mut Encoder, metrics: &TorrentMetrics, mode:
         |t| per_tracker(t, |tracker| vec![(Vec::new(), f64::from(tracker.fails))]),
         float,
     );
+
+    for (route, states) in &counted {
+        for (state, count) in TORRENT_STATES.iter().zip(states) {
+            out.sample(
+                &f::TORRENTS,
+                &[("route", *route), ("state", state.as_str())],
+                *count,
+            );
+        }
+    }
 
     render_torrent_sessions(out, &published.sessions);
 

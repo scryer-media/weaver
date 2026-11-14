@@ -1002,9 +1002,11 @@ fn absent_instrumentation_omits_its_families() {
     assert!(partial.contains("process_start_time_seconds 1700000000"));
 }
 
-// Each torrent's series follow the per-job knob as a job's do: `Active`
-// drops a stopped torrent, whose job is complete or failed, with its
-// trackers; the session series go under every setting.
+// Each torrent's series follow the per-job knob: `Active` gives them to a
+// torrent at work and to no seeding or stopped one, `All` to every torrent,
+// `Off` to none. The trackers' series go with their torrent's. What carries
+// no job is the same under every setting, and the count by state is of
+// every torrent.
 #[test]
 fn per_job_series_knob_controls_torrent_cardinality() {
     use weaver_server_core::settings::PerJobSeries;
@@ -1012,52 +1014,148 @@ fn per_job_series_knob_controls_torrent_cardinality() {
 
     let mut torrents = sample_torrent_metrics();
     let published = std::sync::Arc::make_mut(&mut torrents.published);
+    assert_eq!(published.torrents[0].state, TorrentState::Seeding);
+    assert!(!published.torrents[0].trackers.is_empty());
     let mut stopped = published.torrents[0].clone();
     stopped.job_id = JobId(9);
     stopped.state = TorrentState::Stopped;
     published.torrents.push(stopped);
+    let mut downloading = published.torrents[0].clone();
+    downloading.job_id = JobId(10);
+    downloading.state = TorrentState::Downloading;
+    published.torrents.push(downloading);
+    let count = published.torrents.len() as u64;
     let render_with = |mode| {
         let mut encoder = metrics::Encoder::new();
         metrics::render_torrents(&mut encoder, &torrents, mode);
         encoder.finish()
     };
+    let jobs = |rendered: &str, family: &str| rendered_label_values(rendered, family, "job_id");
 
+    // 7 seeds, 8 fetches its metadata and has no tracker yet, 9 is stopped,
+    // 10 downloads.
     let active = render_with(PerJobSeries::Active);
     assert_valid_prometheus_exposition(&active);
-    for family in ["weaver_torrent_state", "weaver_torrent_tracker_status"] {
-        assert!(
-            !rendered_label_values(&active, family, "job_id").contains(&"9".to_owned()),
-            "{family}: active mode must drop a stopped torrent"
-        );
-    }
+    assert_eq!(jobs(&active, "weaver_torrent_state"), ["8", "10"]);
     assert_eq!(
-        rendered_label_values(&active, "weaver_torrent_state", "job_id"),
-        ["7", "8"]
+        jobs(&active, "weaver_torrent_uploaded_bytes_total"),
+        ["8", "10"]
+    );
+    assert_eq!(jobs(&active, "weaver_torrent_tracker_status"), ["10"]);
+    assert!(
+        !active.contains(r#"job_id="7""#),
+        "a seeding torrent has no series"
+    );
+    assert!(
+        !active.contains(r#"job_id="9""#),
+        "a stopped torrent has no series"
     );
 
     let all = render_with(PerJobSeries::All);
     assert_valid_prometheus_exposition(&all);
+    assert_eq!(jobs(&all, "weaver_torrent_state"), ["7", "8", "9", "10"]);
     assert_eq!(
-        rendered_label_values(&all, "weaver_torrent_state", "job_id"),
-        ["7", "8", "9"]
-    );
-    assert!(
-        rendered_label_values(&all, "weaver_torrent_tracker_status", "job_id")
-            .contains(&"9".to_owned())
+        jobs(&all, "weaver_torrent_tracker_status"),
+        ["7", "9", "10"]
     );
 
     let off = render_with(PerJobSeries::Off);
     assert_valid_prometheus_exposition(&off);
-    assert!(rendered_label_values(&off, "weaver_torrent_state", "job_id").is_empty());
-    assert!(rendered_label_values(&off, "weaver_torrent_tracker_status", "job_id").is_empty());
-    let sessions = |rendered: &str| {
+    assert!(!off.contains("job_id="));
+
+    // The route's totals, the count by state and the event counters: the
+    // same lines under every setting.
+    let jobless = |rendered: &str| -> Vec<String> {
         rendered
             .lines()
             .filter(|line| !line.starts_with('#') && !line.contains("job_id="))
-            .count()
+            .map(str::to_owned)
+            .collect()
     };
-    assert_eq!(sessions(&off), sessions(&all));
-    assert!(sessions(&off) > 0);
+    assert!(
+        jobless(&off)
+            .iter()
+            .any(|line| line.starts_with("weaver_torrent_session_"))
+    );
+    assert_eq!(jobless(&active), jobless(&off));
+    assert_eq!(jobless(&all), jobless(&off));
+
+    for rendered in [&active, &all, &off] {
+        let by_state: Vec<u64> = rendered
+            .lines()
+            .filter(|line| line.starts_with("weaver_torrents{"))
+            .map(|line| line.rsplit(' ').next().unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(by_state.iter().sum::<u64>(), count);
+        // Every state of every route, the held route's zeros included.
+        assert_eq!(
+            by_state.len(),
+            published_routes(&torrents)
+                * weaver_server_core::torrents::metrics::TORRENT_STATES.len()
+        );
+    }
+    for (state, expected) in [
+        ("seeding", 1),
+        ("fetching_metadata", 1),
+        ("stopped", 1),
+        ("downloading", 1),
+        ("paused", 0),
+    ] {
+        let line =
+            format!(r#"weaver_torrents{{route="00aa11bb22cc33dd",state="{state}"}} {expected}"#);
+        assert!(off.lines().any(|rendered| rendered == line), "{line}");
+    }
+}
+
+fn published_routes(torrents: &weaver_server_core::torrents::metrics::TorrentMetrics) -> usize {
+    torrents.published.sessions.len()
+}
+
+// Under `Active` a torrent has series of its own in exactly the states in
+// which it works on its own data.
+#[test]
+fn active_gives_series_only_to_torrents_at_work() {
+    use weaver_server_core::settings::PerJobSeries;
+    use weaver_server_core::torrents::TorrentState;
+    use weaver_server_core::torrents::metrics::TORRENT_STATES;
+
+    let mut torrents = sample_torrent_metrics();
+    let published = std::sync::Arc::make_mut(&mut torrents.published);
+    let seed = published.torrents[0].clone();
+    published.torrents = TORRENT_STATES
+        .iter()
+        .enumerate()
+        .map(|(at, state)| {
+            let mut torrent = seed.clone();
+            torrent.job_id = JobId(100 + at as u64);
+            torrent.state = *state;
+            torrent
+        })
+        .collect();
+    let mut encoder = metrics::Encoder::new();
+    metrics::render_torrents(&mut encoder, &torrents, PerJobSeries::Active);
+    let rendered = encoder.finish();
+
+    let at_work = [
+        TorrentState::FetchingMetadata,
+        TorrentState::CheckingFiles,
+        TorrentState::Downloading,
+        TorrentState::Stalled,
+        TorrentState::Moving,
+    ];
+    let expected: Vec<String> = TORRENT_STATES
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| at_work.contains(state))
+        .map(|(at, _)| (100 + at).to_string())
+        .collect();
+    for family in ["weaver_torrent_state", "weaver_torrent_tracker_status"] {
+        assert_eq!(
+            rendered_label_values(&rendered, family, "job_id"),
+            expected,
+            "{family}"
+        );
+    }
 }
 
 #[test]
@@ -1068,7 +1166,7 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         metrics::render_torrents(
             &mut encoder,
             &torrents,
-            weaver_server_core::settings::PerJobSeries::Active,
+            weaver_server_core::settings::PerJobSeries::All,
         );
         encoder.finish()
     };
@@ -1337,11 +1435,14 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         );
     }
 
-    // A held route says it holds no session, and nothing else.
-    let held: Vec<&str> = rendered
+    // A held route says it holds no session and counts its torrents, here
+    // none, and nothing else.
+    let (held_torrents, held): (Vec<&str>, Vec<&str>) = rendered
         .lines()
         .filter(|line| line.contains(HELD))
-        .collect();
+        .partition(|line| line.starts_with("weaver_torrents{"));
+    assert_eq!(held_torrents.len(), 12, "{rendered}");
+    assert!(held_torrents.iter().all(|line| line.ends_with(" 0")));
     assert_eq!(
         held,
         [format!("weaver_torrent_session_open{{{HELD}}} 0")],
