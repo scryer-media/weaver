@@ -1903,6 +1903,27 @@ impl Pipeline {
         None
     }
 
+    // Wait, off the runtime, for every volume's writer to put down what it
+    // holds, until the stop's settle clock reads `end`. Each volume that
+    // still holds writes then is warned of and left.
+    async fn settle_volumes_until(&self, end: std::time::Duration, lost: &'static str) {
+        let writers = Arc::clone(&self.volume_writers);
+        let clock = Arc::clone(&self.shutdown_settle.clock);
+        match tokio::task::spawn_blocking(move || writers.settle_until(&*clock, end)).await {
+            Ok(left) => {
+                for volume in left {
+                    warn!(
+                        volume = %volume.label,
+                        operations = volume.operations,
+                        bytes = volume.bytes,
+                        "a volume's writer stood still at shutdown; what it held is left unwritten"
+                    );
+                }
+            }
+            Err(_) => warn!("{lost}"),
+        }
+    }
+
     pub(crate) async fn drain(&mut self) {
         self.db.stop_checkpoint_retries();
         // A failed job whose working directory is still being released
@@ -1928,24 +1949,14 @@ impl Pipeline {
             self.handle_failed_job_released(released);
         }
         // Every volume's writer puts down what it holds before the last
-        // checkpoint is taken, so that checkpoint records all of it. A
-        // volume on which nothing returns for the span is left behind:
-        // what it still holds is in no checkpoint, so it is fetched again.
-        let writers = Arc::clone(&self.volume_writers);
-        let bound = self.shutdown_settle.clone();
-        match tokio::task::spawn_blocking(move || writers.settle_by(&bound)).await {
-            Ok(left) => {
-                for volume in left {
-                    warn!(
-                        volume = %volume.label,
-                        operations = volume.operations,
-                        bytes = volume.bytes,
-                        "a volume's writer stood still at shutdown; what it held is left unwritten"
-                    );
-                }
-            }
-            Err(_) => warn!("the volume writers could not be drained at shutdown"),
-        }
+        // checkpoint is taken, so that checkpoint records all of it. This
+        // wait and the one after the checkpoint share one span, begun here:
+        // the second has what the first left of it. A volume that still
+        // holds writes when the span is over is left behind: what it holds
+        // is in no checkpoint, so it is fetched again.
+        let settle_end = self.shutdown_settle.end();
+        self.settle_volumes_until(settle_end, "the volume writers could not be drained at shutdown")
+            .await;
         self.hear_volume_reports();
         self.hear_graph_runs();
         self.checkpoint_graph_holds();
@@ -1953,14 +1964,11 @@ impl Pipeline {
         // and the checkpoint that records it waits for those writes: they
         // are put down as the rest was, and the checkpoints they bear out
         // are queued as the jobs hear it.
-        let writers = Arc::clone(&self.volume_writers);
-        let bound = self.shutdown_settle.clone();
-        if tokio::task::spawn_blocking(move || writers.settle_by(&bound))
-            .await
-            .is_err()
-        {
-            warn!("the volume writers could not be drained after the last checkpoint");
-        }
+        self.settle_volumes_until(
+            settle_end,
+            "the volume writers could not be drained after the last checkpoint",
+        )
+        .await;
         self.hear_volume_reports();
         self.hear_graph_runs();
 
