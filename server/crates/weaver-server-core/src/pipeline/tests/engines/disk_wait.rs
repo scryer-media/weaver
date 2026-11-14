@@ -21,9 +21,9 @@ use super::streams::xz;
 use crate::jobs::model::{JobArticles, JobStatus, RunState};
 use crate::operations::disk::DiskLedger;
 use crate::operations::{DiskSpace, StorageCapacity, StorageRoot};
-use crate::pipeline::Pipeline;
 use crate::pipeline::graph::leaf::counting::fill_after;
 use crate::pipeline::tests::job_status_for_assert;
+use crate::pipeline::{Pipeline, PipelineEvent};
 use crate::{JobId, SchedulerHandle};
 
 const RESERVE: u64 = 1 << 30;
@@ -3530,4 +3530,224 @@ async fn a_paused_held_job_is_promised_nothing() {
     assert!(pipeline.held_for_full_disk(JOB), "the paused one waits");
     assert!(!pipeline.held_for_full_disk(SECOND), "the other goes");
     assert_eq!(pipeline.full_disk_promised_bytes(), 60 * UNIT);
+}
+
+fn one_file(room: &Arc<AtomicU64>) -> Scenario {
+    on_disk_posting(
+        room,
+        vec![Post::plain("ember.bin", payload(4 * ARTICLE, 97))],
+    )
+}
+
+// The next `count` history archives find no room on the database's disk.
+fn refuse_archives(count: usize) {
+    use crate::persistence::connection::ARCHIVE_REFUSED;
+    let mut refused = ARCHIVE_REFUSED.lock().unwrap();
+    for _ in 0..count {
+        refused.push_back(crate::StateError::OutOfSpace(
+            "database or disk is full".into(),
+        ));
+    }
+}
+
+fn archives_yet_to_refuse() -> usize {
+    crate::persistence::connection::ARCHIVE_REFUSED
+        .lock()
+        .unwrap()
+        .len()
+}
+
+fn archives_written() -> u64 {
+    crate::persistence::connection::ARCHIVES_WRITTEN.load(Ordering::Relaxed)
+}
+
+// The loop hears what the database answered, until `until` holds.
+async fn hears_database(pipeline: &mut Pipeline, until: impl Fn(&Pipeline) -> bool) {
+    while !until(pipeline) {
+        let reply = pipeline.db_reply_rx.recv().await.expect("database replies");
+        pipeline.handle_db_reply(reply).await;
+    }
+}
+
+// How many times the job was said to be complete since the last look.
+fn completions(events: &mut tokio::sync::broadcast::Receiver<PipelineEvent>) -> usize {
+    let mut count = 0;
+    while let Ok(event) = events.try_recv() {
+        if matches!(event, PipelineEvent::JobCompleted { job_id } if job_id == JOB) {
+            count += 1;
+        }
+    }
+    count
+}
+
+// Whether the loop was told of a kept archive, in what it has yet to hear.
+fn told_of_kept_archives(pipeline: &mut Pipeline) -> bool {
+    let mut told = false;
+    while let Ok(reply) = pipeline.db_reply_rx.try_recv() {
+        told |= matches!(reply, crate::pipeline::db_reply::DbReply::KeptArchives);
+    }
+    told
+}
+
+fn in_queue(pipeline: &Pipeline) -> bool {
+    pipeline
+        .shared_state
+        .queue
+        .read(|inner| inner.jobs.iter().any(|row| row.id == JOB))
+}
+
+fn retiring(pipeline: &Pipeline) -> bool {
+    pipeline.shared_state.queue.read(|inner| {
+        inner
+            .jobs
+            .iter()
+            .any(|row| row.id == JOB && row.report.retiring)
+    })
+}
+
+// What of a history row does not depend on the run's clock or folder.
+fn history_facts(row: &crate::JobHistoryRow) -> String {
+    format!(
+        "{:?}",
+        (
+            (row.job_id, &row.job_hash, &row.name, &row.status),
+            (&row.error_message, row.total_bytes, row.downloaded_bytes),
+            (row.optional_recovery_bytes, row.failed_bytes, row.health),
+            (&row.category, &row.metadata, &row.server_attribution),
+            (row.nzb_path.is_some(), row.output_dir.is_some()),
+            row.archived_at.is_some(),
+        )
+    )
+}
+
+// The job's history archive is refused for want of room on the database's
+// disk. The row stays in the queue, retiring and shown waiting for disk
+// space; no history row is written and the job is not said to be complete.
+// A reading that shows no more tries nothing. A reading that shows the
+// reserve more tries once: refused again, the archive is kept again, and
+// the same reading tries nothing more. A further rise writes it, once: the
+// job is said to be complete once, its row leaves the queue, its history
+// row is the one a first write gives, and the database's folder is read no
+// longer.
+#[tokio::test]
+async fn an_archive_the_database_has_no_room_for_waits_and_is_written_when_room_shows() {
+    let disk_space = Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON);
+    // What a first write gives, on a pipeline of its own.
+    let first_time = {
+        let room = Arc::new(AtomicU64::new(PLENTY));
+        let scenario = one_file(&room);
+        let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+        drive(&mut pipeline, &scenario, JOB, |_| false).await;
+        pipeline.db.flush_write_queue().await.unwrap();
+        pipeline.db.get_job_history(JOB.0).unwrap().unwrap()
+    };
+    assert_eq!(archives_written(), 1);
+
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let scenario = one_file(&room);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let mut events = pipeline.event_tx.subscribe();
+    refuse_archives(2);
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    hears_database(&mut pipeline, |pipeline| pipeline.archive_wait.is_some()).await;
+    let shown = pipeline.shared_state.get_job(JOB).expect("the row stays");
+    assert_eq!(shown.status, JobStatus::Complete);
+    assert_eq!(shown.download_wait_reason.as_deref(), disk_space);
+    assert!(retiring(&pipeline));
+    assert!(pipeline.waits_for_disk_room());
+    assert_eq!(pipeline.storage_capacity.waited_paths(), 1);
+    assert_eq!(pipeline.db.kept_archive_jobs(), [JOB]);
+    assert!(pipeline.db.get_job_history(JOB.0).unwrap().is_none());
+    assert_eq!(completions(&mut events), 0);
+    assert_eq!((archives_yet_to_refuse(), archives_written()), (1, 1));
+
+    // No more shows: nothing is tried.
+    hears(&mut pipeline, &room, StorageRoot::Complete, PLENTY);
+    pipeline.db.flush_write_queue().await.unwrap();
+    assert_eq!((archives_yet_to_refuse(), archives_written()), (1, 1));
+
+    // The reserve more shows: one try, refused, kept again.
+    hears(&mut pipeline, &room, StorageRoot::Complete, 2 * PLENTY);
+    pipeline.db.flush_write_queue().await.unwrap();
+    assert_eq!((archives_yet_to_refuse(), archives_written()), (0, 1));
+    assert_eq!(pipeline.db.kept_archive_jobs(), [JOB]);
+    // The same reading rings nothing more.
+    hears(&mut pipeline, &room, StorageRoot::Complete, 2 * PLENTY);
+    pipeline.db.flush_write_queue().await.unwrap();
+    assert_eq!(archives_written(), 1);
+    assert!(retiring(&pipeline));
+    assert_eq!(completions(&mut events), 0);
+
+    // A further rise: written.
+    hears(&mut pipeline, &room, StorageRoot::Complete, 3 * PLENTY);
+    hears_database(&mut pipeline, |pipeline| pipeline.archive_wait.is_none()).await;
+    assert_eq!(archives_written(), 2);
+    assert_eq!(completions(&mut events), 1);
+    assert!(!in_queue(&pipeline), "the row left the queue");
+    assert!(pipeline.db.kept_archive_jobs().is_empty());
+    assert_eq!(pipeline.storage_capacity.waited_paths(), 0);
+    assert!(!pipeline.waits_for_disk_room());
+    let written = pipeline.db.get_job_history(JOB.0).unwrap().unwrap();
+    assert_eq!(history_facts(&written), history_facts(&first_time));
+    // A reading with nothing kept tries nothing.
+    hears(&mut pipeline, &room, StorageRoot::Complete, 8 * PLENTY);
+    pipeline.db.flush_write_queue().await.unwrap();
+    assert_eq!(archives_written(), 2);
+}
+
+// An archive that fails for any other reason is lost, as before: nothing is
+// kept, no path is read, and the row stays retiring with no wait shown.
+#[tokio::test]
+async fn an_archive_refused_for_another_reason_is_not_kept() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let scenario = one_file(&room);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let mut events = pipeline.event_tx.subscribe();
+    crate::persistence::connection::ARCHIVE_REFUSED
+        .lock()
+        .unwrap()
+        .push_back(crate::StateError::Database("the row is malformed".into()));
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    pipeline.db.flush_write_queue().await.unwrap();
+    assert_eq!((archives_yet_to_refuse(), archives_written()), (0, 0));
+    assert!(pipeline.db.kept_archive_jobs().is_empty());
+    hears(&mut pipeline, &room, StorageRoot::Complete, 4 * PLENTY);
+    pipeline.db.flush_write_queue().await.unwrap();
+    assert_eq!(archives_written(), 0);
+    assert!(pipeline.archive_wait.is_none());
+    assert_eq!(pipeline.storage_capacity.waited_paths(), 0);
+    assert!(!pipeline.waits_for_disk_room());
+    assert!(!told_of_kept_archives(&mut pipeline));
+    let shown = pipeline.shared_state.get_job(JOB).expect("the row stays");
+    assert_eq!(shown.download_wait_reason, None);
+    assert!(retiring(&pipeline));
+    assert!(pipeline.db.get_job_history(JOB.0).unwrap().is_none());
+    assert_eq!(completions(&mut events), 0);
+}
+
+// An archive that commits the first time holds no path, tells the loop
+// nothing and leaves nothing kept: a job that ends with room costs no
+// reading and no write beyond its own.
+#[tokio::test]
+async fn an_archive_written_the_first_time_holds_no_path() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let scenario = one_file(&room);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let mut events = pipeline.event_tx.subscribe();
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    loop {
+        let event = events.recv().await.expect("the job is said to be complete");
+        if matches!(event, PipelineEvent::JobCompleted { job_id } if job_id == JOB) {
+            break;
+        }
+    }
+    assert!(!in_queue(&pipeline), "the row left the queue");
+    assert!(!told_of_kept_archives(&mut pipeline));
+    assert!(pipeline.archive_wait.is_none());
+    assert!(pipeline.db.kept_archive_jobs().is_empty());
+    assert_eq!(pipeline.storage_capacity.waited_paths(), 0);
+    assert!(!pipeline.waits_for_disk_room());
+    hears(&mut pipeline, &room, StorageRoot::Complete, 4 * PLENTY);
+    pipeline.db.flush_write_queue().await.unwrap();
+    assert_eq!(archives_written(), 1);
 }

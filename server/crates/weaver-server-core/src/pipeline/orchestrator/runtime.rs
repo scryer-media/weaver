@@ -327,6 +327,7 @@ impl Pipeline {
             full_disk: std::collections::BTreeMap::new(),
             full_disk_moves: Vec::new(),
             full_disk_promised: std::collections::BTreeMap::new(),
+            archive_wait: None,
             #[cfg(test)]
             full_disk_sweeps: Vec::new(),
             nntp_handoff_draining: false,

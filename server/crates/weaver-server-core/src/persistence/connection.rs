@@ -834,6 +834,96 @@ enum DbWriteCommand {
     Flush {
         reply: oneshot::Sender<()>,
     },
+    // Every kept archive is tried again, once, in the order it was kept.
+    RetryKeptArchives,
+}
+
+// One job's archive the database had no room for, kept whole: what its
+// command held, its `committed` sender with it, and nothing more.
+struct KeptArchive {
+    job_id: crate::jobs::ids::JobId,
+    history: Box<crate::history::JobHistoryRow>,
+    typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
+    failure_kind: Option<crate::history::HistoryFailureKind>,
+    committed: Option<oneshot::Sender<()>>,
+}
+
+// The archives kept for want of room, in the order they were kept. `count`
+// says how many there are to whoever waits on one.
+struct KeptArchives {
+    list: Mutex<VecDeque<KeptArchive>>,
+    count: watch::Sender<usize>,
+}
+
+impl KeptArchives {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            list: Mutex::new(VecDeque::new()),
+            count: watch::channel(0).0,
+        })
+    }
+
+    fn list(&self) -> std::sync::MutexGuard<'_, VecDeque<KeptArchive>> {
+        self.list
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // Put `kept` at the back, and say how many are kept when that changed:
+    // an archive that commits with none kept says nothing.
+    fn keep(&self, kept: Vec<KeptArchive>) {
+        let count = {
+            let mut list = self.list();
+            list.extend(kept);
+            list.len()
+        };
+        self.count.send_if_modified(|said| {
+            let changed = *said != count;
+            *said = count;
+            changed
+        });
+    }
+}
+
+// Test seam: the errors the next archives answer with instead of writing,
+// and how many archives were written.
+#[cfg(test)]
+pub(crate) static ARCHIVE_REFUSED: Mutex<VecDeque<StateError>> = Mutex::new(VecDeque::new());
+#[cfg(test)]
+pub(crate) static ARCHIVES_WRITTEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+// Archive one job and cache its history row. Runs on the blocking pool.
+fn archive_one(
+    writer: &DatabaseWriterExecutor,
+    job_id: crate::jobs::ids::JobId,
+    history: &crate::history::JobHistoryRow,
+    typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
+    failure_kind: Option<crate::history::HistoryFailureKind>,
+) -> Result<(), StateError> {
+    #[cfg(test)]
+    if let Some(refused) = ARCHIVE_REFUSED.lock().unwrap().pop_front() {
+        return Err(refused);
+    }
+    // Capture the cache generation *before* the archive read so a concurrent
+    // history-delete that bumps the generation makes the conditional insert
+    // a no-op, rather than resurrecting the just-deleted row.
+    let observed_generation = writer.job_history_cache_generation();
+    let archived = writer
+        .archive_job_with_terminal_cause(job_id, history, typed_terminal_cause, failure_kind)
+        .inspect_err(|error| {
+            tracing::warn!(
+                job_id = job_id.0,
+                error = %error,
+                "failed to archive job on database writer path"
+            );
+        })?;
+    if let Some(row) = archived {
+        writer.cache_job_history_at(row, observed_generation);
+    }
+    #[cfg(test)]
+    ARCHIVES_WRITTEN.fetch_add(1, Ordering::Relaxed);
+    Ok(())
 }
 
 // Where an ordered write sits relative to the others on the Postgres writer.
@@ -872,7 +962,10 @@ impl DbWriteCommand {
             // Spans many jobs' lanes, so it is a barrier: every earlier write
             // for any of its jobs (a support facts save among them), every
             // event batch and every attribution checkpoint lands first.
-            Self::ArchiveJobs { .. } | Self::Write { lane: None, .. } | Self::Flush { .. } => None,
+            Self::ArchiveJobs { .. }
+            | Self::Write { lane: None, .. }
+            | Self::Flush { .. }
+            | Self::RetryKeptArchives => None,
         }
     }
 }
@@ -915,43 +1008,18 @@ async fn execute_write_command(
             failure_kind,
             committed,
         } => {
-            let writer = writer.clone();
-            let archived = tokio::task::spawn_blocking(move || {
-                // Capture the cache generation *before* the archive
-                // read so a concurrent history-delete that bumps the
-                // generation makes the conditional insert a no-op,
-                // rather than resurrecting the just-deleted row.
-                let observed_generation = writer.job_history_cache_generation();
-                match writer.archive_job_with_terminal_cause(
-                    job_id,
-                    history.as_ref(),
-                    typed_terminal_cause,
-                    failure_kind,
-                ) {
-                    Ok(Some(row)) => writer.cache_job_history_at(row, observed_generation),
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            job_id = job_id.0,
-                            error = %error,
-                            "failed to archive job on database writer path"
-                        );
-                        return false;
-                    }
-                }
-                true
-            })
-            .await;
-            if matches!(archived, Ok(true)) {
-                // An archived job no longer needs its cancelled checkpoint.
-                // Keep the failure until this transaction actually succeeds.
-                writer_db.checkpoint_failures.send_modify(|failures| {
-                    failures.remove(&job_id);
-                });
-                if let Some(committed) = committed {
-                    let _ = committed.send(());
-                }
-            }
+            let kept = VecDeque::from([KeptArchive {
+                job_id,
+                history,
+                typed_terminal_cause,
+                failure_kind,
+                committed,
+            }]);
+            run_archives(kept, writer, writer_db).await;
+        }
+        DbWriteCommand::RetryKeptArchives => {
+            let kept = std::mem::take(&mut *writer_db.kept_archives.list());
+            run_archives(kept, writer, writer_db).await;
         }
         DbWriteCommand::ArchiveJobs {
             jobs,
@@ -1067,6 +1135,51 @@ async fn execute_write_command(
             let _ = reply.send(());
         }
     }
+}
+
+// Archive `archives` in order, each once, in one pass on the blocking pool.
+// One that commits says so through its `committed` sender. One the database
+// had no room for is kept whole, in the same order, to be tried again when
+// its disk shows room. One that fails any other way drops its sender, which
+// its waiter reads as a lost archive.
+async fn run_archives(
+    archives: VecDeque<KeptArchive>,
+    writer: &DatabaseWriterExecutor,
+    writer_db: &Database,
+) {
+    let writer = writer.clone();
+    let failures = Arc::clone(&writer_db.checkpoint_failures);
+    let no_room = tokio::task::spawn_blocking(move || {
+        let mut no_room = Vec::new();
+        for mut archive in archives {
+            match archive_one(
+                &writer,
+                archive.job_id,
+                &archive.history,
+                archive.typed_terminal_cause,
+                archive.failure_kind,
+            ) {
+                Ok(()) => {
+                    // An archived job no longer needs its cancelled
+                    // checkpoint. Keep the failure until this transaction
+                    // actually succeeds.
+                    failures.send_modify(|failures| {
+                        failures.remove(&archive.job_id);
+                    });
+                    if let Some(committed) = archive.committed.take() {
+                        let _ = committed.send(());
+                    }
+                }
+                Err(StateError::OutOfSpace(_)) => no_room.push(archive),
+                Err(_) => {}
+            }
+        }
+        no_room
+    })
+    .await
+    .unwrap_or_default();
+    // Said even when none is kept: a pass that emptied the list says so.
+    writer_db.kept_archives.keep(no_room);
 }
 
 // SQLite shares ordered lanes, but only one SQL command executes at a time.
@@ -1193,6 +1306,7 @@ impl DbWriteCommand {
             Self::Write { label, .. } => label,
             Self::GraphCheckpoint { .. } => "save_graph_checkpoint",
             Self::Flush { .. } => "flush",
+            Self::RetryKeptArchives => "retry_kept_archives",
         }
     }
 }
@@ -1261,6 +1375,7 @@ pub struct Database {
     writer_tx: mpsc::Sender<QueuedWrite>,
     checkpoint_shutdown: watch::Sender<bool>,
     checkpoint_failures: Arc<watch::Sender<BTreeMap<crate::jobs::ids::JobId, String>>>,
+    kept_archives: Arc<KeptArchives>,
     // Count of in-flight background re-sends into the bounded writer queue
     // (archive jobs and generic ordered writes) spawned when `try_send` hit a
     // full queue. `flush_write_queue` waits for this to reach zero before its
@@ -1322,6 +1437,7 @@ impl Database {
             writer_tx,
             checkpoint_shutdown: watch::channel(false).0,
             checkpoint_failures: Arc::new(watch::channel(BTreeMap::new()).0),
+            kept_archives: KeptArchives::new(),
             pending_write_retries: Arc::new(AtomicUsize::new(0)),
             pending_write_notify: Arc::new(Notify::new()),
             write_overflow: Arc::new(Mutex::new(None)),
@@ -1353,6 +1469,7 @@ impl Database {
             writer_tx,
             checkpoint_shutdown: watch::channel(false).0,
             checkpoint_failures: Arc::new(watch::channel(BTreeMap::new()).0),
+            kept_archives: KeptArchives::new(),
             pending_write_retries: Arc::new(AtomicUsize::new(0)),
             pending_write_notify: Arc::new(Notify::new()),
             write_overflow: Arc::new(Mutex::new(None)),
@@ -1586,6 +1703,7 @@ impl Database {
             writer_tx: detached_tx,
             checkpoint_shutdown: self.checkpoint_shutdown.clone(),
             checkpoint_failures: self.checkpoint_failures.clone(),
+            kept_archives: self.kept_archives.clone(),
             pending_write_retries: self.pending_write_retries.clone(),
             pending_write_notify: self.pending_write_notify.clone(),
             write_overflow: Arc::new(Mutex::new(None)),
@@ -1670,6 +1788,29 @@ impl Database {
             "archive",
         )?;
         Ok(committed_rx)
+    }
+
+    // Says how many archives are kept for want of room, each time that
+    // changes.
+    pub(crate) fn kept_archive_count(&self) -> watch::Receiver<usize> {
+        self.kept_archives.count.subscribe()
+    }
+
+    // The jobs whose archive is kept for want of room, in the order kept.
+    pub(crate) fn kept_archive_jobs(&self) -> Vec<crate::jobs::ids::JobId> {
+        let list = self.kept_archives.list();
+        list.iter().map(|kept| kept.job_id).collect()
+    }
+
+    // Try every kept archive again, once, as one ordered write. With none
+    // kept nothing is queued.
+    pub(crate) fn retry_kept_archives(&self) {
+        if self.kept_archives.list().is_empty() {
+            return;
+        }
+        if let Err(error) = self.try_send_with_retry(DbWriteCommand::RetryKeptArchives, "archive") {
+            tracing::warn!(error = %error, "failed to queue the kept history archives");
+        }
     }
 
     // Queue several jobs' history archives as one ordered write, and hand

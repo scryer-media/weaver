@@ -43,6 +43,16 @@ use crate::jobs::ids::JobId;
 use crate::jobs::model::{FileSummaries, FileSummary, JobArticles, RunState};
 use crate::operations::StorageRoot;
 
+// The wait of the kept history archives: the folder read, the probe count
+// as the wait began, what the folder's disk showed free then, and whether a
+// probe was running then, as a job's hold has them.
+pub(crate) struct ArchiveWait {
+    dir: PathBuf,
+    since: u64,
+    mark: Option<u64>,
+    running: bool,
+}
+
 // What a job waits for: room made on the disk its write failed on.
 // The disk a held job waits on: a root's, or the disk of a path that lies
 // on none of theirs.
@@ -669,6 +679,86 @@ impl Pipeline {
             .and_then(|file| file.parent().map(std::path::Path::to_path_buf))
             .filter(|folder| folder.is_absolute())
             .unwrap_or_else(|| self.script_data_dir.clone())
+    }
+
+    // The writer kept an archive for want of room, or a kept one committed.
+    // While any is kept, each of their rows, retiring and with no runtime
+    // left, says it waits for disk space, and the database's folder is read
+    // as a held path. With none kept the path is let go.
+    pub(in crate::pipeline) fn kept_archives_heard(&mut self) {
+        let kept = self.db.kept_archive_jobs();
+        if kept.is_empty() {
+            if let Some(wait) = self.archive_wait.take() {
+                self.storage_capacity.release_path(&wait.dir);
+            }
+            return;
+        }
+        self.shared_state.queue.write(|inner| {
+            let mut shown = false;
+            for job_id in &kept {
+                if let Some(mut row) = inner.job_mut(*job_id)
+                    && row.report.retiring
+                    && row.report.job.download_wait_reason.is_none()
+                {
+                    row.report.job.download_wait_reason =
+                        Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON.into());
+                    shown = true;
+                }
+            }
+            if shown {
+                crate::pipeline::queue::Change::changed(())
+            } else {
+                crate::pipeline::queue::Change::unchanged(())
+            }
+        });
+        if self.archive_wait.is_none() {
+            let dir = self.database_dir();
+            let look = self.storage_capacity.hold_path(&dir);
+            warn!(
+                path = %dir.display(),
+                "a history write found the database's disk full; it waits for room"
+            );
+            self.archive_wait = Some(ArchiveWait {
+                dir,
+                since: look.begun,
+                mark: look.shown,
+                running: look.probe < look.begun,
+            });
+        }
+    }
+
+    // A reading came while archives are kept. The rule is the one a hold
+    // with no figure has: a good reading whose probe began after the wait
+    // did, showing the reserve more than the mark and more than the reserve
+    // free, rings the writer to try the kept archives, once. The mark moves
+    // to that reading, so an archive refused again waits for a further rise.
+    pub(in crate::pipeline) fn wake_kept_archives(&mut self) {
+        let Some(wait) = &mut self.archive_wait else {
+            return;
+        };
+        let Some(look) = self.storage_capacity.path_look(&wait.dir) else {
+            return;
+        };
+        if wait.running && look.probe >= wait.since {
+            if let Some(before) = look.figure_of(wait.since) {
+                wait.mark = Some(before);
+            }
+            wait.running = false;
+        }
+        if look.probe > wait.since
+            && look.good
+            && let Some(shown) = look.shown
+        {
+            let reserve = self.extraction_limits.min_free_bytes;
+            match wait.mark {
+                None => wait.mark = Some(shown),
+                Some(mark) if shown >= mark.saturating_add(reserve.max(1)) && shown > reserve => {
+                    wait.mark = Some(shown);
+                    self.db.retry_kept_archives();
+                }
+                Some(_) => {}
+            }
+        }
     }
 
     // The final moves of the jobs let go start here, at the top of a turn.

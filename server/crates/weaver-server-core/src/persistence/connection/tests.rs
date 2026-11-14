@@ -2197,6 +2197,63 @@ async fn postgres_job_lane_writes_keep_order_and_archive_last_when_configured() 
     admin_pool.close().await;
 }
 
+// Three archives the database had no room for are kept, in the order they
+// came, with nothing written. One retry tries each once, in that order: the
+// one write refused in that pass is the first archive's, which is kept
+// again, and the other two are written in that same pass. A second retry
+// writes the first. With none kept a retry queues nothing.
+#[tokio::test]
+async fn kept_archives_are_tried_again_in_order_in_one_pass() {
+    use std::sync::atomic::Ordering;
+    let no_room = || crate::StateError::OutOfSpace("database or disk is full".into());
+    let db = Database::open_in_memory().unwrap();
+    let jobs = [801_u64, 802, 803].map(crate::jobs::ids::JobId);
+    let mut committed = Vec::new();
+    for job_id in jobs {
+        db.create_active_job(&postgres_sample_job(job_id)).unwrap();
+        super::ARCHIVE_REFUSED.lock().unwrap().push_back(no_room());
+        committed.push(
+            db.try_queue_archive_job_with_terminal_cause(
+                job_id,
+                postgres_sample_history(job_id),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+    }
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(db.kept_archive_jobs(), jobs);
+    assert_eq!(*db.kept_archive_count().borrow(), 3);
+    assert_eq!(super::ARCHIVES_WRITTEN.load(Ordering::Relaxed), 0);
+    for committed in &mut committed {
+        assert!(committed.try_recv().is_err(), "nothing committed");
+    }
+
+    super::ARCHIVE_REFUSED.lock().unwrap().push_back(no_room());
+    db.retry_kept_archives();
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(db.kept_archive_jobs(), [jobs[0]]);
+    assert_eq!(*db.kept_archive_count().borrow(), 1);
+    assert_eq!(super::ARCHIVES_WRITTEN.load(Ordering::Relaxed), 2);
+    committed.pop().unwrap().await.unwrap();
+    committed.pop().unwrap().await.unwrap();
+    assert!(db.get_job_history(jobs[0].0).unwrap().is_none());
+    assert!(db.get_job_history(jobs[1].0).unwrap().is_some());
+    assert!(db.get_job_history(jobs[2].0).unwrap().is_some());
+
+    db.retry_kept_archives();
+    db.flush_write_queue().await.unwrap();
+    assert!(db.kept_archive_jobs().is_empty());
+    assert_eq!(*db.kept_archive_count().borrow(), 0);
+    committed.pop().unwrap().await.unwrap();
+    assert!(db.get_job_history(jobs[0].0).unwrap().is_some());
+
+    db.retry_kept_archives();
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(super::ARCHIVES_WRITTEN.load(Ordering::Relaxed), 3);
+}
+
 #[tokio::test]
 async fn schema_parity_when_postgres_configured() {
     let Some((admin_pool, schema, target_url)) = create_postgres_test_schema("schema_parity").await
