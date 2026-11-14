@@ -14,6 +14,7 @@ use weaver_server_core::torrents::metrics::dht::{DhtIgnored, DhtQuery, DhtQueryE
 use weaver_server_core::torrents::metrics::incoming::IncomingEnd;
 use weaver_server_core::torrents::metrics::swarm::Transport;
 use weaver_server_core::torrents::metrics::tracker::{AnnounceEvent, TrackerKind, TrackerResult};
+use weaver_server_core::torrents::metrics::web_seed::WebSeedResult;
 
 use super::catalog as f;
 use super::encode::Encoder;
@@ -87,6 +88,31 @@ pub(super) fn render(out: &mut Encoder, routes: &[SessionSeries]) {
     }
     dht(out, routes);
     incoming(out, routes);
+    web_seeds(out, routes);
+}
+
+fn web_seeds(out: &mut Encoder, routes: &[SessionSeries]) {
+    let open = || routes.iter().filter(|session| session.open);
+    for session in open() {
+        for result in WebSeedResult::ALL {
+            out.sample(
+                &f::TORRENT_WEB_SEED_REQUESTS,
+                &[
+                    ("route", session.route.as_str()),
+                    ("result", result.as_str()),
+                ],
+                session.web_seeds.requests[*result as usize],
+            );
+        }
+    }
+    let per_route = |out: &mut Encoder, family, value: fn(&SessionSeries) -> u64| {
+        for session in open() {
+            out.sample(family, &[("route", session.route.as_str())], value(session));
+        }
+    };
+    per_route(out, &f::TORRENT_WEB_SEED_BYTES, |s| s.web_seeds.bytes);
+    per_route(out, &f::TORRENT_WEB_SEED_WAITS, |s| s.web_seeds.waits);
+    per_route(out, &f::TORRENT_WEB_SEED_FAILED, |s| s.web_seeds.failed);
 }
 
 fn incoming(out: &mut Encoder, routes: &[SessionSeries]) {

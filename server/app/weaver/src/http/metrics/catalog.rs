@@ -735,6 +735,15 @@ metric_families! {
         "Connections peers opened to the session since it opened, by transport and how each ended its way in: accepted, or the reason it was turned away (session_limit, filtered, family, banned, privileged_port, tls, encryption, handshake, unknown_torrent, ourselves, not_allowed, not_live, already_connected, torrent_limit, not_wanted, error). One still in its handshake is not counted yet.");
     TORRENT_UNCHOKE_SLOTS_HELD = ("weaver_torrent_session_unchoke_slots_held", Gauge,
         ["route"], "Upload slots the session's unchoked peers hold now, across every torrent.");
+    TORRENT_WEB_SEED_REQUESTS = ("weaver_torrent_web_seed_requests_total", Counter,
+        ["route", "result"],
+        "HTTP requests the session sent to web seeds since it opened, by how each ended: ok (200 or 206), redirect (followed by a request of its own), unavailable (503), rejected (any other status), timeout or failed (not sent, or no answer read).");
+    TORRENT_WEB_SEED_BYTES = ("weaver_torrent_web_seed_received_bytes_total", Counter,
+        ["route"], "Body bytes web seeds sent the session since it opened. The same bytes are also in the session's received payload bytes once they are whole blocks.");
+    TORRENT_WEB_SEED_WAITS = ("weaver_torrent_web_seed_retry_waits_total", Counter,
+        ["route"], "Times a web seed was left to wait before being asked again since the session opened: its name did not resolve, it lacked a file, or it said it was unavailable.");
+    TORRENT_WEB_SEED_FAILED = ("weaver_torrent_web_seed_connections_failed_total", Counter,
+        ["route"], "Web seed connections that ended in failure since the session opened.");
 
     // ---- speed tests -------------------------------------------------------
     SPEED_TEST_RUNS = ("weaver_speed_test_runs_total", Counter, ["kind", "status"],

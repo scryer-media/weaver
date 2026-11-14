@@ -29,6 +29,7 @@ pub struct SessionStatsSnapshot {
     pub swarm: super::swarm::SwarmSnapshot,
     pub trackers: super::tracker::TrackerSnapshot,
     pub incoming: super::incoming::IncomingSnapshot,
+    pub web_seeds: super::web_seed::WebSeedSnapshot,
     /// Upload slots held by unchoked peers now.
     pub unchoke_slots_held: usize,
 }
@@ -46,6 +47,7 @@ impl From<(&SessionStats, ConnectStatsSnapshot)> for SessionStatsSnapshot {
             swarm: s.swarm.snapshot(),
             trackers: s.trackers.snapshot(),
             incoming: s.incoming.snapshot(),
+            web_seeds: s.web_seeds.snapshot(),
             unchoke_slots_held: 0,
         }
     }

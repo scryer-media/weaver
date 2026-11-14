@@ -1712,6 +1712,12 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
         dht_counts: sample_dht_counts(),
         incoming: sample_incoming(),
         unchoke_slots_held: 87,
+        web_seeds: weaver_server_core::torrents::metrics::web_seed::WebSeedSnapshot {
+            requests: [88, 0, 0, 89, 0, 0],
+            bytes: 90,
+            waits: 91,
+            failed: 92,
+        },
         connected: weaver_server_core::torrents::metrics::ConnectedPeers {
             tcp: 4,
             utp: 2,

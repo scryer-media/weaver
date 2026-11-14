@@ -20,6 +20,7 @@ pub use weaver_torrent::session_stats::incoming;
 pub use weaver_torrent::session_stats::snapshot::UtpStatsSnapshot;
 pub use weaver_torrent::session_stats::swarm;
 pub use weaver_torrent::session_stats::tracker;
+pub use weaver_torrent::session_stats::web_seed;
 use weaver_torrent::{FetchPhase, Session};
 
 use crate::jobs::JobId;
@@ -413,6 +414,8 @@ pub struct SessionSeries {
     pub incoming: incoming::IncomingSnapshot,
     /// Upload slots its unchoked peers hold now.
     pub unchoke_slots_held: u64,
+    /// What it asked of its torrents' web seeds, counted since it opened.
+    pub web_seeds: web_seed::WebSeedSnapshot,
     /// What it asked of its trackers, counted since it opened.
     pub trackers: tracker::TrackerSnapshot,
     /// Its connected peers over TCP, then over uTP, and how many of them
@@ -519,6 +522,7 @@ impl SessionSeries {
             swarm: stats.swarm,
             trackers: stats.trackers,
             incoming: stats.incoming,
+            web_seeds: stats.web_seeds,
             unchoke_slots_held: stats.unchoke_slots_held as u64,
             dht_counts: session
                 .get_dht()

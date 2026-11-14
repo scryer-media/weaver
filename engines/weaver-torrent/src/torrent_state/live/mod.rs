@@ -785,11 +785,11 @@ impl TorrentStateLive {
             .fetch_add(1, Ordering::Relaxed);
         // The session's IP filter, on the address the seed's host resolved to.
         let allowed = |addr| self.may_reach(addr);
-        let allow_idna = self
-            .shared
-            .session
-            .upgrade()
-            .is_some_and(|session| session.allow_idna);
+        let session = self.shared.session.upgrade();
+        let allow_idna = session.as_ref().is_some_and(|session| session.allow_idna);
+        let counts = session
+            .map(|session| session.stats.web_seeds.clone())
+            .unwrap_or_default();
         let connection = WebSeedConnection::new(
             clients,
             resolver,
@@ -798,7 +798,8 @@ impl TorrentStateLive {
             &link,
             &self.shared.user_agent,
         )
-        .allowing_idna(allow_idna);
+        .allowing_idna(allow_idna)
+        .counting(counts.clone());
         let res = tokio::select! {
             r = handler.task_peer_chunk_requester() => r,
             r = connection.run(&*handler, rx) => r,
@@ -807,6 +808,7 @@ impl TorrentStateLive {
             Ok(()) => handler.on_peer_died(None)?,
             Err(e) => {
                 debug!("web seed connection failed: {e:#}");
+                counts.failed();
                 link.failed();
                 handler.on_peer_died(Some(e))?;
             }

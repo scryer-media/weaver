@@ -22,6 +22,7 @@ pub mod incoming;
 pub mod snapshot;
 pub mod swarm;
 pub mod tracker;
+pub mod web_seed;
 
 pub use swarm::Transport;
 
@@ -40,6 +41,7 @@ pub struct SessionStats {
     pub swarm: Arc<swarm::SwarmStats>,
     pub trackers: Arc<tracker::TrackerStats>,
     pub incoming: incoming::IncomingStats,
+    pub web_seeds: Arc<web_seed::WebSeedStats>,
     pub down_speed_estimator: SpeedEstimator,
     pub up_speed_estimator: SpeedEstimator,
     pub startup_time: Instant,
@@ -53,6 +55,7 @@ impl SessionStats {
             swarm: Default::default(),
             trackers: Default::default(),
             incoming: Default::default(),
+            web_seeds: Default::default(),
             down_speed_estimator: SpeedEstimator::new(5),
             up_speed_estimator: SpeedEstimator::new(5),
             startup_time: Instant::now(),
