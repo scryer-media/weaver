@@ -216,8 +216,9 @@ impl Pipeline {
         }
     }
 
-    // A volume's writer finished a batch: dispatch that stopped for the
-    // volume's budget looks again.
+    // A volume's writer has something for the loop: a volume dispatch was
+    // stopped for fell below its line, or an operation failed and may
+    // have freed one. Dispatch that stopped for a volume looks again.
     pub(in crate::pipeline) fn volume_batch_returned(&mut self, report: Report) {
         for failure in report.failures {
             self.graph_disk_failed(failure);

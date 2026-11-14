@@ -1895,7 +1895,24 @@ impl Pipeline {
             Err(_) => warn!("the volume writers could not be drained at shutdown"),
         }
         self.hear_volume_reports();
+        self.hear_graph_runs();
         self.checkpoint_graph_holds();
+        // What the page-out put on scratch went through the writers too,
+        // and the checkpoint that records it waits for those writes: they
+        // are put down as the rest was, and the checkpoints they bear out
+        // are queued as the jobs hear it.
+        let writers = Arc::clone(&self.volume_writers);
+        if tokio::task::spawn_blocking(move || {
+            use crate::operations::disk::writer::WallClock;
+            writers.settle_within(Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT, &WallClock::start())
+        })
+        .await
+        .is_err()
+        {
+            warn!("the volume writers could not be drained after the last checkpoint");
+        }
+        self.hear_volume_reports();
+        self.hear_graph_runs();
 
         if self.active_downloads > 0 || self.has_queued_or_active_decode() {
             warn!(
@@ -2022,6 +2039,22 @@ impl Pipeline {
     fn checkpoint_graph_holds(&mut self) {
         let jobs: Vec<JobId> = self.graph_jobs.keys().copied().collect();
         for job_id in jobs {
+            // A job with an operation still out on a volume whose writer
+            // stood still through the drain is left as its last checkpoint
+            // has it: reading its files here would wait on that writer,
+            // and no checkpoint taken now could be borne out.
+            if self
+                .graph_jobs
+                .get(&job_id)
+                .and_then(|graph| graph.disk())
+                .is_some_and(|disk| !disk.quiet())
+            {
+                warn!(
+                    job_id = job_id.0,
+                    "a volume's writer still holds the job's files at shutdown; its holds are not paged out"
+                );
+                continue;
+            }
             // The steps no checkpoint has read yet are taken before the
             // page-out, so a failed one leaves the checkpoint of every step.
             self.take_stepped_graph_checkpoint(job_id);

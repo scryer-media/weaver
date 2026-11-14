@@ -1914,9 +1914,10 @@ pub struct Pipeline {
     // One background free-space sampler per configured root. Everything on
     // the pipeline that gates work on free space reads these readings.
     pub(super) storage_capacity: Arc<crate::operations::StorageCapacity>,
-    // The writer threads of the volumes graph jobs write to, what each says
-    // once per batch, and whether a job was refused dispatch because a
-    // volume held its budget of bytes, so the next batch wakes dispatch.
+    // The writer threads of the volumes graph jobs write to, what one says
+    // when dispatch should look again (a volume fell below the line it
+    // was stopped at, or an operation failed), and whether a job was
+    // refused dispatch because a volume held its budget of bytes.
     pub(super) volume_writers: Arc<crate::operations::disk::writer::VolumeWriters>,
     pub(super) volume_reports:
         tokio::sync::mpsc::UnboundedReceiver<crate::operations::disk::writer::Report>,

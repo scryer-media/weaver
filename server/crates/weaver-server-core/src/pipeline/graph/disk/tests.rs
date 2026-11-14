@@ -148,6 +148,29 @@ fn a_job_written_through_a_volume_matches_one_that_writes_itself() {
     assert_eq!(failures, 0);
 }
 
+// The bytes a checkpoint spares a restore are said only once the disk
+// bears its change out: while the volume holds the job's writes the floor
+// stays where the last borne-out checkpoint left it.
+#[test]
+fn settled_bytes_are_said_once_the_disk_bears_them_out() {
+    let through = writers();
+    let hold = through.hold();
+    let disk = through.disk();
+    let (mut job, _dir, _) = job_through(&files(), Vec::new(), |_| Some(disk.clone()));
+    for (volume, ordinal) in seeded() {
+        arrive(&mut job, volume, ordinal);
+    }
+    let pending = Pending::default();
+    assert!(!pending.put(&job, Vec::new()), "nothing may be written yet");
+    assert!(job.settled_bytes() > 0);
+    assert_eq!(pending.settled_bytes(), 0);
+    let barrier = disk.barrier();
+    hold.open();
+    barrier.wait();
+    assert!(pending.take().0.is_some());
+    assert_eq!(pending.settled_bytes(), job.settled_bytes());
+}
+
 // A checkpoint taken while a volume still holds the job's writes records
 // none of them: nothing reaches the database's writer until every write
 // submitted before it has returned.

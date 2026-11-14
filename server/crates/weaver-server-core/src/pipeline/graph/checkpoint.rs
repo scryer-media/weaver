@@ -251,6 +251,8 @@ struct Gated {
     barrier: Option<super::disk::JobBarrier>,
     // The job is told when `barrier` returns.
     told: bool,
+    // The bytes the change spares a restore, said once it is released.
+    settled: u64,
     #[cfg(test)]
     named: std::collections::BTreeSet<(u32, u32)>,
 }
@@ -536,7 +538,9 @@ impl Pending {
         }
         let held = slot.held.get_or_insert_with(Held::default);
         let encoding = job.encode_root(&mut slot.root, job.next_node());
-        held.settled_bytes = job.settled_bytes();
+        // What a restore is spared is said only once the disk bears the
+        // change out: see `release`.
+        let settled = job.settled_bytes();
         let root = root_row(encoding.version, encoding.bytes);
         if held.root.as_ref() != Some(&root) {
             delta.nodes.insert(root.key(), Some(root.clone()));
@@ -612,6 +616,11 @@ impl Pending {
         slot.tally.rows += delta.rows();
         slot.tally.facts += delta.facts();
         if delta.is_empty() {
+            if slot.gated.is_empty()
+                && let Some(held) = slot.held.as_mut()
+            {
+                held.settled_bytes = settled;
+            }
             return false;
         }
         slot.asked += 1;
@@ -641,6 +650,7 @@ impl Pending {
                     last.stamp = slot.asked;
                     last.barrier = barrier;
                     last.told = false;
+                    last.settled = settled;
                     #[cfg(test)]
                     {
                         last.named = named;
@@ -651,6 +661,7 @@ impl Pending {
                     stamp: slot.asked,
                     barrier,
                     told: false,
+                    settled,
                     #[cfg(test)]
                     named,
                 }),
@@ -661,6 +672,9 @@ impl Pending {
         #[cfg(test)]
         {
             slot.named.put = job.on_disk();
+        }
+        if let Some(held) = slot.held.as_mut() {
+            held.settled_bytes = settled;
         }
         slot.released = slot.asked;
         match &mut slot.queued {
@@ -705,6 +719,9 @@ impl Pending {
         {
             let gated = slot.gated.pop_front().expect("checked above");
             slot.released = gated.stamp;
+            if let Some(held) = slot.held.as_mut() {
+                held.settled_bytes = gated.settled;
+            }
             #[cfg(test)]
             {
                 slot.named.put = gated.named;
@@ -733,6 +750,7 @@ impl Pending {
         for later in all {
             first.delta.absorb(later.delta);
             first.stamp = later.stamp;
+            first.settled = later.settled;
             #[cfg(test)]
             {
                 first.named = later.named;
