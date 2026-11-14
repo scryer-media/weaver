@@ -1468,8 +1468,10 @@ impl Pipeline {
                                 self.refresh_download_pressure();
                                 self.publish_download_transport_health();
                                 // A volume whose measured rate moved has every
-                                // volume's limits sized again. With none
-                                // moved nothing is written.
+                                // volume's limits sized again, and limits
+                                // sized as a volume gained its first job or
+                                // lost its last are heard here. With neither
+                                // nothing is written.
                                 if self.volume_buffers.follow_rates() {
                                     self.volume_room_changed();
                                 }

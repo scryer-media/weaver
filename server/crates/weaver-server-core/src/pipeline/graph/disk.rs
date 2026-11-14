@@ -23,8 +23,9 @@ use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::job::GraphJob;
 
 // The writers of the volumes `working_dir` and `output_dir` lie on, for the
-// job `key`. A volume first seen here is given its buffer limits by
-// `buffers`.
+// job `key`. `buffers` counts the job among those writing to each volume
+// until the last copy of the job's disk is dropped, and sizes the volumes'
+// buffer limits as a volume gains its first job or loses its last.
 pub(crate) fn job_disk(
     writers: &VolumeWriters,
     capacity: &StorageCapacity,
@@ -32,10 +33,14 @@ pub(crate) fn job_disk(
     key: u64,
     working_dir: &Path,
     output_dir: Option<&Path>,
-    buffers: &VolumeBuffers,
+    buffers: &Arc<VolumeBuffers>,
 ) -> JobDisk {
     let volume = capacity.volume(working_dir);
-    buffers.seen(&volume);
+    let mut writing = Writing {
+        buffers: Arc::clone(buffers),
+        volumes: Vec::with_capacity(2),
+    };
+    writing.join(&volume);
     // The job holds the volume before the probe is queued: a volume held
     // and not written to yet keeps its probe for later.
     let working = writers.submitter(&volume, key);
@@ -43,13 +48,47 @@ pub(crate) fn job_disk(
     let output = output_dir.and_then(|dir| {
         let other = capacity.volume(dir);
         (!Arc::ptr_eq(&other, &volume)).then(|| {
-            buffers.seen(&other);
+            writing.join(&other);
             let output = writers.submitter(&other, key);
             probes.first_seen(writers, &other, dir);
             (dir.to_path_buf(), output)
         })
     });
-    JobDisk::new(working, output)
+    JobDisk {
+        working,
+        output,
+        _writing: Some(Arc::new(writing)),
+    }
+}
+
+// A job's place among those writing to its volumes, held by every copy of
+// its disk and given up when the last is dropped.
+struct Writing {
+    buffers: Arc<VolumeBuffers>,
+    volumes: Vec<Arc<Volume>>,
+}
+
+impl Writing {
+    fn join(&mut self, volume: &Arc<Volume>) {
+        self.buffers.joined(volume);
+        self.volumes.push(Arc::clone(volume));
+    }
+}
+
+impl Drop for Writing {
+    fn drop(&mut self) {
+        for volume in &self.volumes {
+            self.buffers.left(volume);
+        }
+    }
+}
+
+impl std::fmt::Debug for Writing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Writing")
+            .field("volumes", &self.volumes.len())
+            .finish()
+    }
 }
 
 type Probe = Box<dyn FnOnce() -> std::io::Result<()> + Send>;
@@ -382,6 +421,9 @@ pub(crate) struct JobDisk {
     working: Arc<Submitter>,
     // Where the delivered files lie and their volume, when it is another.
     output: Option<(PathBuf, Arc<Submitter>)>,
+    // The job's place among those writing to its volumes, when the volumes'
+    // buffer limits are kept for it.
+    _writing: Option<Arc<Writing>>,
 }
 
 // The bytes a volume may hold in memory for its writer before a thread
@@ -391,8 +433,13 @@ fn output_limit(submitter: &Submitter) -> u64 {
 }
 
 impl JobDisk {
+    #[cfg(test)]
     pub(crate) fn new(working: Arc<Submitter>, output: Option<(PathBuf, Arc<Submitter>)>) -> Self {
-        Self { working, output }
+        Self {
+            working,
+            output,
+            _writing: None,
+        }
     }
 
     // Stand still until no volume the job writes to holds more than its

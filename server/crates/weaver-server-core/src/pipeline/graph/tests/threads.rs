@@ -1064,6 +1064,89 @@ async fn a_job_on_a_full_volume_stops_while_a_job_on_another_volume_is_dispatche
     retire_pipeline_database(pipeline).await;
 }
 
+// A volume shares the buffer pool only while a job's disk writes to it.
+// Two volumes have the full figure each. A job on a third makes all three
+// share, for as long as any copy of that job's disk lives. When the last
+// copy is dropped the third volume shares nothing any more: the two still
+// written to have the full figure again, and the pipeline's next tick is
+// told that a limit changed.
+#[tokio::test]
+async fn a_volume_shares_the_buffer_pool_only_while_a_job_writes_to_it() {
+    use crate::pipeline::graph::disk::job_disk;
+    const FIGURE: u64 = 256 * 1024 * 1024;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (intermediate, complete, movies) = (
+        temp_dir.path().join("intermediate"),
+        temp_dir.path().join("complete"),
+        temp_dir.path().join("movies"),
+    );
+    crate::runtime::fs::test_devices::assign(&intermediate, 1);
+    crate::runtime::fs::test_devices::assign(&complete, 2);
+    crate::runtime::fs::test_devices::assign(&movies, 3);
+    let (pipeline, _, _) = crate::pipeline::tests::new_direct_pipeline_at_roots(
+        temp_dir.path().join("data"),
+        intermediate.clone(),
+        complete.clone(),
+        temp_dir.path().join("weaver.db"),
+        16 * 1024 * 1024,
+        8,
+        None,
+    )
+    .await;
+    pipeline.volume_buffers.set_figure(FIGURE, u64::MAX);
+    let disk_for = |key: u64, working: &std::path::Path, output: &std::path::Path| {
+        job_disk(
+            &pipeline.volume_writers,
+            &pipeline.storage_capacity,
+            &pipeline.volume_probes,
+            key,
+            working,
+            Some(output),
+            &pipeline.volume_buffers,
+        )
+    };
+    let hard = |disk: &crate::pipeline::graph::disk::JobDisk, under: &std::path::Path| {
+        disk.under(under).volume().buffer_limits().1
+    };
+    let (work_a, out_a) = (intermediate.join("a"), complete.join("a"));
+    let first = disk_for(1, &work_a, &out_a);
+    assert!(!Arc::ptr_eq(first.working().volume(), first.under(&out_a).volume()));
+    assert_eq!((hard(&first, &work_a), hard(&first, &out_a)), (FIGURE, FIGURE));
+    let _ = pipeline.volume_buffers.follow_rates();
+
+    // A second job on the same two volumes changes nothing.
+    let same = disk_for(2, &intermediate.join("b"), &complete.join("b"));
+    assert_eq!((hard(&first, &work_a), hard(&first, &out_a)), (FIGURE, FIGURE));
+    assert!(!pipeline.volume_buffers.follow_rates());
+
+    // A job whose output lies on a third volume: the three share.
+    let out_c = movies.join("c");
+    let third = disk_for(3, &intermediate.join("c"), &out_c);
+    let shared = hard(&first, &work_a);
+    assert!(shared < FIGURE, "{shared}");
+    assert!(hard(&third, &out_c) < FIGURE);
+    assert!(pipeline.volume_buffers.follow_rates());
+
+    // A copy of the job's disk still lives: the volume is still written to.
+    let copy = third.clone();
+    drop(third);
+    assert_eq!(hard(&first, &work_a), shared);
+    assert!(!pipeline.volume_buffers.follow_rates());
+
+    // The last copy is gone: the third volume shares nothing any more.
+    drop(copy);
+    assert_eq!((hard(&first, &work_a), hard(&first, &out_a)), (FIGURE, FIGURE));
+    assert!(pipeline.volume_buffers.follow_rates(), "the pipeline hears that a limit rose");
+    assert!(!pipeline.volume_buffers.follow_rates());
+
+    // A job leaving volumes others still write to changes nothing.
+    drop(same);
+    assert_eq!((hard(&first, &work_a), hard(&first, &out_a)), (FIGURE, FIGURE));
+    assert!(!pipeline.volume_buffers.follow_rates());
+    drop(first);
+    retire_pipeline_database(pipeline).await;
+}
+
 // From a volume's soft limit a lane fetching for its job is handed one
 // article at a time, and a full handout again once the volume is below it.
 #[tokio::test]

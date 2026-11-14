@@ -272,12 +272,14 @@ pub(in crate::pipeline) fn intake_of(volume: &Volume) -> VolumeIntake {
 }
 
 // The keeper of every volume's limits: the one place they are sized and
-// put on the volumes. It knows the volumes jobs were given a writer of,
-// with the write rate each was last sized on.
+// put on the volumes. It knows the volumes that have a job writing to them
+// now, with how many jobs each has and the write rate it was last sized on.
+// A volume no job writes to any more is forgotten: it shares nothing with
+// the others, whatever it is, the stand-in for an unread device included.
 //
-// Sizing is asked for when a volume is first seen, when the figure changes
-// (the profile in force, the connection count) and when a volume's measured
-// rate has moved. Nothing here runs per article.
+// Sizing is asked for when a volume gains its first job or loses its last,
+// when the figure changes (the profile in force, the connection count) and
+// when a volume's measured rate has moved. Nothing here runs per article.
 pub(crate) struct VolumeBuffers {
     sizing: Mutex<Sizing>,
 }
@@ -285,8 +287,19 @@ pub(crate) struct VolumeBuffers {
 struct Sizing {
     figure_bytes: u64,
     memory_ceiling_bytes: u64,
-    // Each known volume and the write rate its limit was sized on.
-    volumes: Vec<(Arc<Volume>, u64)>,
+    // Each volume a job writes to now.
+    volumes: Vec<Written>,
+    // A limit changed as a volume joined or left, and nobody was told yet:
+    // the pipeline's next tick hears it from `follow_rates`.
+    untold: bool,
+}
+
+struct Written {
+    volume: Arc<Volume>,
+    // The write rate the volume's limit was sized on.
+    sized_on: u64,
+    // The jobs writing to the volume now: never zero.
+    jobs: usize,
 }
 
 impl VolumeBuffers {
@@ -296,6 +309,7 @@ impl VolumeBuffers {
                 figure_bytes,
                 memory_ceiling_bytes,
                 volumes: Vec::new(),
+                untold: false,
             }),
         }
     }
@@ -304,19 +318,45 @@ impl VolumeBuffers {
         self.sizing.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    // A job was given `volume`'s writer. The first time, the volume joins
-    // the known ones and every limit is sized again.
-    pub(crate) fn seen(&self, volume: &Arc<Volume>) {
+    // A job was given `volume`'s writer. When it is the volume's first,
+    // the volume joins those written to and every limit is sized again.
+    // Otherwise one count is raised. Each call is answered by one `left`.
+    pub(crate) fn joined(&self, volume: &Arc<Volume>) {
         let mut sizing = self.lock();
-        if sizing
-            .volumes
-            .iter()
-            .any(|(known, _)| Arc::ptr_eq(known, volume))
-        {
+        if let Some(written) = sizing.find(volume) {
+            written.jobs += 1;
             return;
         }
-        sizing.volumes.push((Arc::clone(volume), 0));
-        sizing.size();
+        sizing.volumes.push(Written {
+            volume: Arc::clone(volume),
+            sized_on: 0,
+            jobs: 1,
+        });
+        if sizing.size() {
+            sizing.untold = true;
+        }
+    }
+
+    // A job that was given `volume`'s writer let it go. When it was the
+    // volume's last, the volume shares nothing with the others any more and
+    // their limits are sized again. Otherwise one count is lowered.
+    pub(crate) fn left(&self, volume: &Arc<Volume>) {
+        let mut sizing = self.lock();
+        let Some(at) = sizing
+            .volumes
+            .iter()
+            .position(|written| Arc::ptr_eq(&written.volume, volume))
+        else {
+            return;
+        };
+        sizing.volumes[at].jobs -= 1;
+        if sizing.volumes[at].jobs > 0 {
+            return;
+        }
+        sizing.volumes.swap_remove(at);
+        if sizing.size() {
+            sizing.untold = true;
+        }
     }
 
     // Size every limit on another figure. Whether a limit changed.
@@ -338,27 +378,39 @@ impl VolumeBuffers {
 
     // Size every limit again when a volume's measured rate has moved
     // materially from the one its limit was sized on. Whether a limit
-    // changed. With no rate moved this reads each volume's rate and writes
-    // nothing.
+    // changed, here or as a volume joined or left since the last call.
+    // With no rate moved and no such change this reads each volume's rate
+    // and writes nothing.
     pub(in crate::pipeline) fn follow_rates(&self) -> bool {
         let mut sizing = self.lock();
-        let moved = sizing.volumes.iter().any(|(volume, sized_on)| {
-            rate_moved(*sized_on, volume.write_rate.load(Ordering::Relaxed))
+        let moved = sizing.volumes.iter().any(|written| {
+            rate_moved(written.sized_on, written.volume.write_rate.load(Ordering::Relaxed))
         });
-        moved && sizing.size()
+        let sized = moved && sizing.size();
+        let untold = sizing.untold;
+        if untold {
+            sizing.untold = false;
+        }
+        sized || untold
     }
 }
 
 impl Sizing {
-    // Put each known volume's limits on it. Whether any changed.
+    fn find(&mut self, volume: &Arc<Volume>) -> Option<&mut Written> {
+        self.volumes
+            .iter_mut()
+            .find(|written| Arc::ptr_eq(&written.volume, volume))
+    }
+
+    // Put each written volume's limits on it. Whether any changed.
     fn size(&mut self) -> bool {
-        for (volume, sized_on) in &mut self.volumes {
-            *sized_on = volume.write_rate.load(Ordering::Relaxed);
+        for written in &mut self.volumes {
+            written.sized_on = written.volume.write_rate.load(Ordering::Relaxed);
         }
-        let rates: Vec<u64> = self.volumes.iter().map(|(_, rate)| *rate).collect();
+        let rates: Vec<u64> = self.volumes.iter().map(|written| written.sized_on).collect();
         let limits = volume_limits(self.figure_bytes, self.memory_ceiling_bytes, &rates);
         let mut changed = false;
-        for ((volume, _), limits) in self.volumes.iter().zip(limits) {
+        for (Written { volume, .. }, limits) in self.volumes.iter().zip(limits) {
             let now = (limits.soft_bytes, limits.hard_bytes);
             if volume.buffer_limits() != now {
                 volume.set_buffer_limits(now.0, now.1);
@@ -776,8 +828,9 @@ mod tests {
         volume.buffer_limits().1
     }
 
-    // A volume has no limit until it is seen, and the full figure from then
-    // on while there are no more than two. Seen again, nothing changes.
+    // A volume has no limit until a job writes to it, and the full figure
+    // from then on while there are no more than two. Another job on it
+    // changes nothing.
     #[test]
     fn volume_buffers_size_a_volume_when_it_is_first_seen() {
         let buffers = VolumeBuffers::new(FIGURE, ROOMY);
@@ -785,13 +838,56 @@ mod tests {
         assert_eq!(first.buffer_limits(), (u64::MAX, u64::MAX));
         assert_eq!(intake_of(&first), VolumeIntake::Open);
 
-        buffers.seen(&first);
+        buffers.joined(&first);
         assert_eq!(first.buffer_limits(), (FIGURE * 70 / 100, FIGURE));
-        buffers.seen(&second);
-        buffers.seen(&first);
+        buffers.joined(&second);
+        buffers.joined(&first);
         assert_eq!(hard(&first), FIGURE);
         assert_eq!(hard(&second), FIGURE);
         assert_eq!(buffers.lock().volumes.len(), 2);
+    }
+
+    // The pool is shared only among volumes a job writes to now. A fast
+    // drive, a hard disk and the stand-in for an unread device share two
+    // figures while each has a job, which holds the fast drive to a small
+    // share. When the stand-in's last job is gone it shares nothing any
+    // more: the two drives have the full figure each again, and the
+    // pipeline is told once that a limit changed. A volume that keeps a
+    // job keeps its place.
+    #[test]
+    fn volume_buffers_share_only_among_volumes_a_job_writes_to_now() {
+        let buffers = VolumeBuffers::new(FIGURE, ROOMY);
+        let (nvme, hdd, unread) = (volume(NVME), volume(HDD), volume(0));
+        buffers.joined(&nvme);
+        buffers.joined(&hdd);
+        assert_eq!((hard(&nvme), hard(&hdd)), (FIGURE, FIGURE));
+        assert!(buffers.follow_rates(), "the first limits are told");
+        assert!(!buffers.follow_rates());
+
+        // Two jobs write through the stand-in.
+        buffers.joined(&unread);
+        buffers.joined(&unread);
+        assert!(hard(&nvme) < FIGURE / 4, "{}", hard(&nvme));
+        assert!(buffers.follow_rates());
+
+        // One of them is gone: the stand-in is still written to.
+        buffers.left(&unread);
+        assert!(hard(&nvme) < FIGURE / 4);
+        assert!(!buffers.follow_rates(), "nothing was sized, nothing is told");
+
+        // The last is gone.
+        buffers.left(&unread);
+        assert_eq!((hard(&nvme), hard(&hdd)), (FIGURE, FIGURE));
+        assert_eq!(buffers.lock().volumes.len(), 2);
+        assert!(buffers.follow_rates(), "a limit rose");
+        assert!(!buffers.follow_rates(), "told once");
+
+        // Written to again, it shares again.
+        buffers.joined(&unread);
+        assert!(hard(&nvme) < FIGURE / 4);
+        // A volume nobody joined is left by nobody.
+        buffers.left(&volume(SATA));
+        assert_eq!(buffers.lock().volumes.len(), 3);
     }
 
     // Three volumes share two figures by the inverse of their speeds: the
@@ -802,7 +898,7 @@ mod tests {
         let buffers = VolumeBuffers::new(FIGURE, ROOMY);
         let (nvme, sata, hdd) = (volume(NVME), volume(SATA), volume(HDD));
         for seen in [&nvme, &sata, &hdd] {
-            buffers.seen(seen);
+            buffers.joined(seen);
         }
         assert_eq!(hard(&hdd), FIGURE);
         assert!(hard(&nvme).abs_diff(FIGURE / 11) <= ROUNDING, "{}", hard(&nvme));
@@ -826,10 +922,11 @@ mod tests {
         let buffers = VolumeBuffers::new(FIGURE, ROOMY);
         let (nvme, sata, unmeasured) = (volume(NVME), volume(SATA), volume(0));
         for seen in [&nvme, &sata, &unmeasured] {
-            buffers.seen(seen);
+            buffers.joined(seen);
         }
         let sized = |volumes: [&Arc<Volume>; 3]| volumes.map(|volume| hard(volume));
         let before = sized([&nvme, &sata, &unmeasured]);
+        assert!(buffers.follow_rates(), "the limits the volumes joined on are told");
         assert!(!buffers.follow_rates(), "nothing moved");
 
         sata.write_rate.store(SATA * 110 / 100, Ordering::Relaxed);
@@ -868,7 +965,7 @@ mod tests {
     fn volume_buffers_size_every_volume_on_another_figure() {
         let buffers = VolumeBuffers::new(FIGURE, ROOMY);
         let held = volume(SATA);
-        buffers.seen(&held);
+        buffers.joined(&held);
         held.buffered_bytes.store(100 * MIB, Ordering::Relaxed);
         assert_eq!(intake_of(&held), VolumeIntake::Open);
 
@@ -883,7 +980,7 @@ mod tests {
 
         // A volume seen later is sized on the figure in force.
         let later = volume(0);
-        buffers.seen(&later);
+        buffers.joined(&later);
         assert_eq!(hard(&later), 64 * MIB);
     }
 }
