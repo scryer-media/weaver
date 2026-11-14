@@ -208,6 +208,9 @@ struct Run {
     // The scratch refused it once: from here it is not lent, and its window
     // is placed in RAM.
     in_ram: bool,
+    // The scratch refused it and the machine could never hold its window
+    // in RAM: the job waits for the scratch's room.
+    no_ram: bool,
     // The run refused a window its policy lets it have: it starts again,
     // wider, once it ends, and what it says before then is not heard.
     rerun: bool,
@@ -229,6 +232,7 @@ impl Run {
             lends: false,
             lent: None,
             in_ram: false,
+            no_ram: false,
             rerun: false,
             whole: false,
         }
@@ -778,8 +782,20 @@ impl Runs {
         if let Some(refused) = refused
             && running
         {
+            // The run starts again in RAM only when the machine could ever
+            // hold it there. One it never could is not refused for want of
+            // disk room: the job waits for the room the window takes, as
+            // under a policy that lets nothing go above the ceiling.
+            let wide = run.window.max(refused).max(needed.unwrap_or(0));
+            if !self
+                .pool
+                .could_fit_above(wide.saturating_add(RUN_OVERHEAD), grant.above_ceiling())
+            {
+                run.no_ram = true;
+                return false;
+            }
             run.in_ram = true;
-            run.wide = Some(run.window.max(refused).max(needed.unwrap_or(0)));
+            run.wide = Some(wide);
             run.rerun = true;
             if let Some(volumes) = &run.volumes {
                 volumes.stop();
@@ -842,14 +858,20 @@ impl Runs {
     // disk keeps. The job waits for that room; it is not failed.
     pub(crate) fn window_needs(&self, node: NodeId) -> Option<u64> {
         let grant = self.hardware.grant();
-        let run = self
-            .runs
-            .get(&node)
-            .filter(|run| run.lends && grant.over_limit == OverLimit::ScratchThenFail)?;
+        let run = self.runs.get(&node).filter(|run| {
+            run.lends && (grant.over_limit == OverLimit::ScratchThenFail || run.no_ram)
+        })?;
         let (windows, start) = self.windows.as_ref().zip(run.lent)?;
         windows
             .refused(node, start)
             .map(|widest| widest.saturating_add(windows.kept_free()))
+    }
+
+    // Whether a quota refused a window's file since this was last asked.
+    pub(crate) fn window_quota(&self) -> bool {
+        self.windows
+            .as_ref()
+            .is_some_and(|windows| windows.take_quota())
     }
 
     // Whether a refusal stands in the job only because the policy holds runs
@@ -1013,6 +1035,7 @@ impl Runs {
         run.lends = false;
         run.lent = None;
         run.in_ram = false;
+        run.no_ram = false;
         run.rerun = false;
         let admissions = run
             .ticket

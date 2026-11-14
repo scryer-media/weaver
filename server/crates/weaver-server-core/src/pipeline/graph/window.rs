@@ -276,6 +276,8 @@ pub(crate) struct Windows {
     // The starts its lenders were handed for, counted.
     starts: AtomicU64,
     lent: Mutex<Lent>,
+    // A quota refused a window's file since this was last asked.
+    quota: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -340,7 +342,13 @@ impl Windows {
             serial: AtomicU64::new(0),
             starts: AtomicU64::new(0),
             lent: Mutex::new(Lent::default()),
+            quota: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    // Whether a quota refused a window's file since this was last asked.
+    pub(crate) fn take_quota(&self) -> bool {
+        self.quota.swap(false, Ordering::Relaxed)
     }
 
     // And, where the job's folder refuses one, under the data folder
@@ -497,6 +505,9 @@ impl Windows {
                 })
             }
             Err((step, error)) => {
+                if crate::operations::is_quota_exceeded(&error) {
+                    self.quota.store(true, Ordering::Relaxed);
+                }
                 place.ledger.lock().credit_against(basis, bytes);
                 Err((step, error.to_string()))
             }
