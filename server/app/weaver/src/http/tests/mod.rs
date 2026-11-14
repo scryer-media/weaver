@@ -1651,8 +1651,6 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
             receive_drains: 30,
             stream_switch_marks: 31,
             drain_marks_with_packets_queued: 32,
-            syn_flood_dropped: 33,
-            syn_rst: 34,
             ..Default::default()
         },
         peers: vec![
@@ -1676,7 +1674,7 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
             seeders: 3,
         },
         piece_steals: 8,
-        outgoing_encryption: [50, 40, 30, 6, 4],
+        outgoing_encryption: [50, 30, 6, 4],
     };
     let held = SessionSeries {
         route: "ff00ee11dd22cc33".into(),

@@ -665,16 +665,16 @@ metric_families! {
         "Magnet metadata fetches that ended since this process started, by outcome. Every outcome is emitted, so the series pre-exist at zero.");
     TORRENT_PEER_MESSAGES = ("weaver_torrent_peer_messages_total", Counter,
         ["route", "direction", "type"],
-        "Peer wire messages that crossed the session's connections since it opened, by direction and message type. Every type is emitted, so the series pre-exist at zero.");
+        "Peer wire messages that crossed the session's connections since it opened, by direction and message type. A message we send is counted once its write is done. Connections that only fetch a magnet's metadata are not counted. Every type is emitted, so the series pre-exist at zero.");
     TORRENT_PEER_HANDSHAKES = ("weaver_torrent_peer_handshakes_total", Counter,
         ["route", "transport", "direction", "encryption"],
-        "Peer connections that completed their handshake since the session opened, by transport, direction (in is a connection the peer opened) and encryption: plaintext, header_only (encrypted handshake, plain stream) or rc4.");
+        "Peer connections that completed their handshake since the session opened, by transport, direction (in is a connection the peer opened) and encryption: plaintext, header_only (encrypted handshake, plain stream) or rc4. Connections that only fetch a magnet's metadata are not counted.");
     TORRENT_PEER_DISCONNECTS = ("weaver_torrent_peer_disconnects_total", Counter,
         ["route", "phase", "reason"],
-        "Peer connections that ended since the session opened, by how far they had come (connecting is before the handshake completed) and why. closed is every close of our own, whatever decided it.");
+        "Peer connections that ended since the session opened, by how far they had come (connecting is before the handshake completed) and why. closed is every close of our own, whatever decided it. Connections that only fetch a magnet's metadata are not counted.");
     TORRENT_PEER_BYTES = ("weaver_torrent_peer_bytes_total", Counter,
         ["route", "transport", "direction", "kind"],
-        "Bytes that crossed the session's peer connections after their handshake, since the session opened, by transport, direction and kind: payload is block data, protocol everything else. Handshake bytes are only in the session totals.");
+        "Bytes that crossed the session's peer connections after their handshake, since the session opened, by transport, direction and kind: payload is block data, protocol everything else. Handshake bytes are not counted here, nor are connections that only fetch a magnet's metadata.");
     TORRENT_PEER_REQUEST_EVENTS = ("weaver_torrent_peer_request_events_total", Counter,
         ["route", "event"],
         "Block requests that were not simply served, since the session opened: ours timed_out (the peer is snubbed) or asked_already (not sent again); the peer's invalid, while_choked or queue_full (dropped).");
@@ -700,7 +700,7 @@ metric_families! {
         ["route"], "Pieces taken from a slower peer and given to a faster one, since the session opened.");
     TORRENT_SESSION_OUTGOING_ENCRYPTION = ("weaver_torrent_session_outgoing_encryption_total", Counter,
         ["route", "outcome"],
-        "Outgoing peer handshakes since the session opened, by encryption: plaintext (sent plain), attempted (sent encrypted), and of those attempted: rc4, header_only or failed.");
+        "Outgoing peer handshakes since the session opened, by how each ended: plaintext (sent plain), or sent encrypted and settled on rc4, on header_only, or failed. No outcome holds another, so the outcomes sum to the handshakes that ended.");
     TORRENT_UTP_SYN_FLOOD_DROPPED = ("weaver_torrent_utp_syn_flood_dropped_total", Counter,
         ["route"], "Incoming uTP connection requests dropped because too many were waiting, since the session opened.");
     TORRENT_UTP_SYN_RESETS = ("weaver_torrent_utp_syn_resets_total", Counter,

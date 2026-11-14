@@ -407,9 +407,9 @@ pub struct SessionSeries {
     pub connected: ConnectedPeers,
     /// Pieces its connections took from slower peers.
     pub piece_steals: u64,
-    /// Its outgoing handshakes by encryption: sent plain, tried encrypted,
-    /// then of those tried: RC4, header only, failed.
-    pub outgoing_encryption: [u64; 5],
+    /// Its outgoing handshakes by how each ended: sent plain, or sent
+    /// encrypted and settled on RC4, on header only, or failed.
+    pub outgoing_encryption: [u64; 4],
 }
 
 /// A session's connected peers.
@@ -498,7 +498,6 @@ impl SessionSeries {
                 let encryption = &connections.encryption;
                 [
                     encryption.plaintext,
-                    encryption.attempts,
                     encryption.rc4,
                     encryption.header_only,
                     encryption.failures,
@@ -586,13 +585,14 @@ mod tests {
                     6969 + next(seed) % 3
                 ),
             };
-            let some = |seed: &mut u64| (next(seed) % 3 != 0).then(|| (next(seed) % 500) as u32);
+            let some =
+                |seed: &mut u64| (!next(seed).is_multiple_of(3)).then(|| (next(seed) % 500) as u32);
             trackers.push(TorrentTracker {
                 tier: at as u32,
                 url: url.clone(),
                 named_by: NamedBy::Torrent,
                 status: STATUSES[(next(seed) % 4) as usize],
-                updating: next(seed) % 2 == 0,
+                updating: next(seed).is_multiple_of(2),
                 last_announce_ms: some(seed).map(i64::from),
                 next_announce_ms: some(seed).map(i64::from),
                 min_announce_ms: None,

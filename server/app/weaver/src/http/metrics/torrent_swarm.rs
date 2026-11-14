@@ -156,7 +156,7 @@ pub(super) fn render(out: &mut Encoder, routes: &[SessionSeries]) {
         &f::TORRENT_SESSION_OUTGOING_ENCRYPTION,
         "outcome",
         &|session| {
-            ["plaintext", "attempted", "rc4", "header_only", "failed"]
+            ["plaintext", "rc4", "header_only", "failed"]
                 .into_iter()
                 .zip(session.outgoing_encryption)
                 .collect()

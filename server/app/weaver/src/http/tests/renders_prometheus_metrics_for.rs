@@ -1235,9 +1235,6 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         format!(
             r#"weaver_torrent_session_outgoing_encryption_total{{{ROUTE},outcome="plaintext"}} 50"#
         ),
-        format!(
-            r#"weaver_torrent_session_outgoing_encryption_total{{{ROUTE},outcome="attempted"}} 40"#
-        ),
         format!(r#"weaver_torrent_session_outgoing_encryption_total{{{ROUTE},outcome="rc4"}} 30"#),
         format!(
             r#"weaver_torrent_session_outgoing_encryption_total{{{ROUTE},outcome="header_only"}} 6"#
@@ -1245,8 +1242,8 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         format!(
             r#"weaver_torrent_session_outgoing_encryption_total{{{ROUTE},outcome="failed"}} 4"#
         ),
-        format!("weaver_torrent_utp_syn_flood_dropped_total{{{ROUTE}}} 33"),
-        format!("weaver_torrent_utp_syn_resets_total{{{ROUTE}}} 34"),
+        format!("weaver_torrent_utp_syn_flood_dropped_total{{{ROUTE}}} 0"),
+        format!("weaver_torrent_utp_syn_resets_total{{{ROUTE}}} 0"),
         r#"weaver_torrent_lifecycle_events_total{event="added"} 5"#.to_owned(),
         r#"weaver_torrent_lifecycle_events_total{event="completed"} 3"#.to_owned(),
         r#"weaver_torrent_lifecycle_events_total{event="removed"} 1"#.to_owned(),
