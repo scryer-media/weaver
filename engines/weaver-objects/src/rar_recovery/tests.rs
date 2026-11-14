@@ -705,6 +705,39 @@ fn a_rebuilt_volume_is_judged_again_from_what_was_rebuilt() {
     assert_eq!(verdict(&job, lost), vec![SliceVerdict::Intact]);
 }
 
+// The same restore over volumes past the 1 MiB the set is staged,
+// written back and judged in: every piece of the rebuilt volume lands.
+#[test]
+fn a_rebuilt_volume_past_one_chunk_is_written_back_whole() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let mut job = job();
+    job.store.scratch = Some(dir.path().to_owned());
+    let part = 2 * (1 << 20) + 4099;
+    let volumes: Vec<Vec<u8>> = (0..3)
+        .map(|at| rar4_volume(&payload(at + 41, part), at as u16, at == 2))
+        .collect();
+    rev(&mut job, "lantern.part1.rev", &rar3_rev(&volumes));
+    volume(&mut job, &rar4_name(0), &volumes[0]);
+    volume(&mut job, &rar4_name(2), &volumes[2]);
+    let lost = job
+        .namespace
+        .announce(&rar4_name(1), Some(volumes[1].len() as u64));
+    job.namespace.get_mut(lost).expect("announced").closed = true;
+    job.store.members.insert(lost, vec![0; volumes[1].len()]);
+    job.store
+        .holes
+        .insert(lost, vec![ByteRange::new(0, volumes[1].len() as u64)]);
+    bind(&mut job);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Repaired { slices: 1 }
+    );
+    assert!(job.store.members[&lost] == volumes[1], "rebuilt bytes");
+    assert!(job.store.writes >= 3, "{} writes", job.store.writes);
+    assert_eq!(verdict(&job, lost), vec![SliceVerdict::Intact]);
+}
+
 // The restore rebuilds the volume, but its member, which has no length, takes
 // none of it: nothing was written, and the volume is still not whole.
 #[test]

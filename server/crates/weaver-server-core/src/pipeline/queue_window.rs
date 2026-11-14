@@ -138,7 +138,7 @@ impl Pipeline {
     }
 
     // The first jobs in dispatch order, priority then queue position, of the
-    // rows not cancelled, retiring or blocked.
+    // rows not cancelled, retiring, blocked, or paused before they started.
     pub(crate) fn queue_window_ranks(&self, inner: &QueueInner) -> HashSet<JobId> {
         let globals = &inner.globals;
         let size = window_size(
@@ -152,9 +152,32 @@ impl Pipeline {
                 && !row.report.retiring
                 && !self.blocked_restores.contains_key(&row.id)
                 && !self.window_unreadable.contains(&row.id)
+                && !self.paused_unstarted(row)
         });
         crate::pipeline::queue::order::keep_first(&mut ranked, size);
         ranked.into_iter().map(|key| key.job_id()).collect()
+    }
+
+    // A job paused before a byte of it came waits as its row: it takes no
+    // window place from the jobs behind it, and ranks again once resumed.
+    // Paused as the admission pass counts it, so a resume waiting for its
+    // slot ranks at once. A paused job that started keeps its place: one
+    // installed says so itself, and one a restart restored by its checkpoint.
+    pub(in crate::pipeline) fn paused_unstarted(&self, row: &JobRow) -> bool {
+        self.admission_paused(row) && !self.job_started(row)
+    }
+
+    // Whether a byte of the job ever came: a restart found its checkpoint,
+    // its row counts bytes, or, installed, it holds some. A job that started
+    // keeps its window place when paused, and its working directory when the
+    // intermediate folder changes.
+    pub(in crate::pipeline) fn job_started(&self, row: &JobRow) -> bool {
+        row.report.on_disk
+            || row.report.job.downloaded_bytes != 0
+            || row.report.job.failed_bytes != 0
+            || self.jobs.get(&row.id).is_some_and(|state| {
+                Self::effective_downloaded_bytes(state) != 0 || state.failed_bytes != 0
+            })
     }
 
     // Whether the row's job does something its row cannot carry: it holds a

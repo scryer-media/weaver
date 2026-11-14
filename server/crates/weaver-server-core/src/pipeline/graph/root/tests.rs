@@ -732,7 +732,7 @@ async fn moves_by_segment_leave_the_queues_as_walks_of_them_do() {
                         continue;
                     };
                     if *steered {
-                        work.exclude_servers = vec![1];
+                        work.exclude_servers = weaver_nntp::ServerSet::from([1]);
                         active.download_queue.push(work);
                     }
                 }
@@ -910,7 +910,11 @@ async fn retried_articles_of_a_file_share_the_one_group_list_the_queue_holds() {
     let retries: Vec<_> = (0..segments)
         .map(|ordinal| {
             pipeline
-                .download_retry_work(segment_id(job_id, 1, ordinal), 1, Vec::new())
+                .download_retry_work(
+                    segment_id(job_id, 1, ordinal),
+                    1,
+                    weaver_nntp::ServerSet::EMPTY,
+                )
                 .unwrap()
         })
         .collect();
@@ -977,7 +981,7 @@ async fn a_requeued_graph_article_comes_back_at_the_roots_priority_not_its_roles
     // retry rebuilt from the post says so; the root holds it ordinary.
     let first_volume = segment_id(job_id, 3, 1);
     let retry = pipeline
-        .download_retry_work(first_volume, 1, Vec::new())
+        .download_retry_work(first_volume, 1, weaver_nntp::ServerSet::EMPTY)
         .unwrap();
     assert_eq!(
         retry.priority,
@@ -1267,8 +1271,11 @@ async fn a_damaged_yenc_article_is_delivered_as_damaged() {
                 segments: Vec::new(),
             },
             SegmentSource {
-                source_server_idx: Some(0),
-                exclude_servers: Vec::new(),
+                servers: crate::pipeline::PoolServers::stamped(
+                    pipeline.pool_generation,
+                    Some(0),
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
             },
         )
         .await;

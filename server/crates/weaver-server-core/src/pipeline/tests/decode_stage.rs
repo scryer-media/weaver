@@ -36,8 +36,11 @@ async fn pump_decode_queue_releases_bytes_for_inactive_job() {
             segment_number: 0,
         },
         raw,
-        source_server_idx: None,
-        exclude_servers: Vec::new(),
+        servers: PoolServers::stamped(
+            pipeline.pool_generation,
+            None,
+            weaver_nntp::ServerSet::EMPTY,
+        ),
     });
     pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Failed {
         error: "inactive".to_string(),
@@ -104,8 +107,11 @@ async fn decode_tasks_record_one_wall_duration_each() {
                 segment_number,
             },
             raw,
-            source_server_idx: None,
-            exclude_servers: Vec::new(),
+            servers: PoolServers::stamped(
+                pipeline.pool_generation,
+                None,
+                weaver_nntp::ServerSet::EMPTY,
+            ),
         });
     }
 
@@ -152,8 +158,11 @@ async fn pump_decode_queue_respects_decode_thread_limit() {
                 segment_number: segment_number as u32,
             },
             raw,
-            source_server_idx: None,
-            exclude_servers: Vec::new(),
+            servers: PoolServers::stamped(
+                pipeline.pool_generation,
+                None,
+                weaver_nntp::ServerSet::EMPTY,
+            ),
         });
     }
 
@@ -291,7 +300,7 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
         },
         segment_number: 0,
     };
-    pipeline.active_downloads += 1;
+    pipeline.articles_in_flight += 1;
     let raw = Bytes::from_static(b"not a yenc article");
     let raw_size = raw.len() as u64;
     pipeline
@@ -306,7 +315,7 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -399,7 +408,7 @@ async fn decode_failure_retries_excluding_actual_source_server() {
         },
         segment_number: 0,
     };
-    pipeline.active_downloads += 1;
+    pipeline.articles_in_flight += 1;
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
@@ -414,7 +423,7 @@ async fn decode_failure_retries_excluding_actual_source_server() {
             source_server_idx: Some(0),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -426,16 +435,21 @@ async fn decode_failure_retries_excluding_actual_source_server() {
         .expect("decode channel should stay open");
     let DecodeDone::Failed {
         segment_id: failed_segment,
-        source_server_idx,
-        exclude_servers,
+        servers,
         ..
     } = &done
     else {
         panic!("expected decode failure");
     };
     assert_eq!(*failed_segment, segment_id);
-    assert_eq!(*source_server_idx, Some(0));
-    assert!(exclude_servers.is_empty());
+    assert_eq!(
+        *servers,
+        PoolServers::stamped(
+            pipeline.pool_generation,
+            Some(0),
+            weaver_nntp::ServerSet::EMPTY
+        )
+    );
 
     pipeline.handle_decode_done(done).await;
 
@@ -477,7 +491,7 @@ async fn a_decoded_article_leaves_its_jobs_report_to_the_tick_until_the_last() {
             file_id: NzbFileId { job_id, file_index },
             segment_number: 0,
         };
-        pipeline.active_downloads += 1;
+        pipeline.articles_in_flight += 1;
         pipeline
             .handle_download_done(DownloadResult {
                 lane_id: 0,
@@ -492,7 +506,7 @@ async fn a_decoded_article_leaves_its_jobs_report_to_the_tick_until_the_last() {
                 source_server_idx: Some(0),
                 origin: DownloadResultOrigin::NormalPrimary,
                 retry_count: 0,
-                exclude_servers: Vec::new(),
+                exclude_servers: weaver_nntp::ServerSet::EMPTY,
                 release_connection_slot: true,
             })
             .await;
@@ -586,7 +600,7 @@ async fn streamed_decode_failure_retries_excluding_actual_source_server() {
         },
         segment_number: 0,
     };
-    pipeline.active_downloads += 1;
+    pipeline.articles_in_flight += 1;
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
@@ -602,7 +616,7 @@ async fn streamed_decode_failure_retries_excluding_actual_source_server() {
             source_server_idx: Some(0),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -664,8 +678,11 @@ async fn queued_yenc_layout_mismatch_retries_before_decode_acceptance() {
                 segments: Vec::new(),
             },
             source: SegmentSource {
-                source_server_idx: Some(1),
-                exclude_servers: vec![2],
+                servers: PoolServers::stamped(
+                    pipeline.pool_generation,
+                    Some(1),
+                    weaver_nntp::ServerSet::from([2]),
+                ),
             },
         })
         .await;
@@ -717,7 +734,7 @@ async fn fused_yenc_layout_mismatch_retries_before_decode_acceptance() {
         segment_number: 0,
     };
     let mut events = pipeline.event_tx.subscribe();
-    pipeline.active_downloads += 1;
+    pipeline.articles_in_flight += 1;
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
@@ -752,7 +769,7 @@ async fn fused_yenc_layout_mismatch_retries_before_decode_acceptance() {
             source_server_idx: Some(2),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: vec![3],
+            exclude_servers: weaver_nntp::ServerSet::from([3]),
             release_connection_slot: true,
         })
         .await;
@@ -787,19 +804,19 @@ async fn fused_yenc_layout_mismatch_retries_before_decode_acceptance() {
 #[test]
 fn decode_retry_exclude_servers_appends_actual_source_server_once() {
     assert_eq!(
-        Pipeline::decode_retry_exclude_servers(&[], Some(1)),
+        Pipeline::decode_retry_exclude_servers(weaver_nntp::ServerSet::EMPTY, Some(1)),
         vec![1]
     );
     assert_eq!(
-        Pipeline::decode_retry_exclude_servers(&[1], Some(1)),
+        Pipeline::decode_retry_exclude_servers(weaver_nntp::ServerSet::from([1]), Some(1)),
         vec![1]
     );
     assert_eq!(
-        Pipeline::decode_retry_exclude_servers(&[1], Some(0)),
+        Pipeline::decode_retry_exclude_servers(weaver_nntp::ServerSet::from([1]), Some(0)),
         vec![1, 0]
     );
     assert_eq!(
-        Pipeline::decode_retry_exclude_servers(&[1, 0], None),
+        Pipeline::decode_retry_exclude_servers(weaver_nntp::ServerSet::from([1, 0]), None),
         vec![1, 0]
     );
 }
@@ -821,7 +838,15 @@ async fn repeated_data_decode_failures_mark_failed_bytes() {
     };
 
     for _ in 0..=MAX_SEGMENT_RETRIES {
-        pipeline.handle_decode_failure(segment_id, "crc mismatch", &[], Some(0));
+        pipeline.handle_decode_failure(
+            segment_id,
+            "crc mismatch",
+            PoolServers::stamped(
+                pipeline.pool_generation,
+                Some(0),
+                weaver_nntp::ServerSet::EMPTY,
+            ),
+        );
     }
 
     assert_eq!(
@@ -849,7 +874,15 @@ async fn single_server_decode_failure_gives_the_article_up_for_repair() {
 
     // The only server produced a bad body: there is nowhere left to retry,
     // so the article fails now instead of queueing work no lane may serve.
-    pipeline.handle_decode_failure(segment_id, "crc mismatch", &[], Some(0));
+    pipeline.handle_decode_failure(
+        segment_id,
+        "crc mismatch",
+        PoolServers::stamped(
+            pipeline.pool_generation,
+            Some(0),
+            weaver_nntp::ServerSet::EMPTY,
+        ),
+    );
 
     assert_eq!(
         pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
@@ -893,7 +926,15 @@ async fn decode_failure_moves_to_the_remaining_server_then_gives_up() {
 
     // Server 0 produced a bad body; server 1 is still untried, so the
     // article moves there.
-    pipeline.handle_decode_failure(segment_id, "crc mismatch", &[], Some(0));
+    pipeline.handle_decode_failure(
+        segment_id,
+        "crc mismatch",
+        PoolServers::stamped(
+            pipeline.pool_generation,
+            Some(0),
+            weaver_nntp::ServerSet::EMPTY,
+        ),
+    );
     let work = pipeline
         .retry_rx
         .recv()
@@ -908,7 +949,11 @@ async fn decode_failure_moves_to_the_remaining_server_then_gives_up() {
 
     // Server 1 produced a bad body too: every server has been tried, so the
     // article fails well inside the retry budget.
-    pipeline.handle_decode_failure(segment_id, "crc mismatch", &work.exclude_servers, Some(1));
+    pipeline.handle_decode_failure(
+        segment_id,
+        "crc mismatch",
+        PoolServers::stamped(pipeline.pool_generation, Some(1), work.exclude_servers),
+    );
     assert_eq!(
         pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
         Some(64)
@@ -920,6 +965,64 @@ async fn decode_failure_moves_to_the_remaining_server_then_gives_up() {
             .segments_failed_permanent
             .load(Ordering::Relaxed),
         1
+    );
+}
+
+// A body fetched under one pool and decoded after a rebuild that reordered
+// the servers and added one: the indices it carries name the old pool's
+// servers and are carried to the new pool by server, so its decode failure
+// is retried on the one server that has not had it, never judged against
+// the old indices. Read as current, "server 1 failed, server 0 excluded"
+// would name the wrong servers; dropped, it would ask both again.
+#[tokio::test]
+async fn a_decode_failure_after_a_rebuild_is_retried_on_the_new_pool() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[0, 0]));
+    let job_id = JobId(20019);
+    let spec = segmented_job_spec("Rebuilt Pool Decode Failure", "broken.bin", &[64, 4096]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+
+    // Fetched from server 1 with server 0 already excluded.
+    let fetched = PoolServers::stamped(
+        pipeline.pool_generation,
+        Some(1),
+        weaver_nntp::ServerSet::from([0]),
+    );
+    // The pool is rebuilt as old 1, old 0, and a new server.
+    let rebuilt_generation = pipeline.pool_generation + 1;
+    pipeline.activate_nntp(hosts_client(&[1, 0, 2]), 4, rebuilt_generation);
+    assert_eq!(
+        fetched.under(&pipeline.pool_layouts, pipeline.pool_generation),
+        (Some(0), weaver_nntp::ServerSet::from([1]))
+    );
+
+    pipeline.handle_decode_failure(segment_id, "crc mismatch", fetched);
+
+    let retry = pipeline
+        .retry_rx
+        .recv()
+        .await
+        .expect("the server that has not had it should draw a retry");
+    assert_eq!(retry.scheduled_pool_generation, rebuilt_generation);
+    assert_eq!(retry.work.exclude_servers, [0, 1]);
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
+        Some(0)
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        0
     );
 }
 
@@ -940,7 +1043,15 @@ async fn recovery_decode_failures_do_not_mark_health_failure() {
     };
 
     for _ in 0..=MAX_SEGMENT_RETRIES {
-        pipeline.handle_decode_failure(segment_id, "crc mismatch", &[], None);
+        pipeline.handle_decode_failure(
+            segment_id,
+            "crc mismatch",
+            PoolServers::stamped(
+                pipeline.pool_generation,
+                None,
+                weaver_nntp::ServerSet::EMPTY,
+            ),
+        );
     }
 
     assert_eq!(
@@ -1288,8 +1399,11 @@ async fn fail_job_clears_write_backlog_accounting() {
             result: parked,
             bytes: crate::pipeline::ParkedBytes::Memory(DecodedChunk::from(data)),
             source: SegmentSource {
-                source_server_idx: None,
-                exclude_servers: Vec::new(),
+                servers: PoolServers::stamped(
+                    pipeline.pool_generation,
+                    None,
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
             },
         },
     );
@@ -1362,8 +1476,11 @@ async fn disk_write_failure_fails_job_before_commit() {
                 checkpoint_plan: weaver_yenc::CheckpointPlan::None,
             },
             SegmentSource {
-                source_server_idx: None,
-                exclude_servers: Vec::new(),
+                servers: PoolServers::stamped(
+                    pipeline.pool_generation,
+                    None,
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
             },
         )
         .await;

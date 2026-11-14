@@ -279,7 +279,7 @@ impl Pipeline {
         let Some(uu) = self.uu_files.get(&seg_id.file_id) else {
             return false;
         };
-        if seg_id.segment_number != uu.next_index {
+        if seg_id.segment_number != uu.next_index.get() {
             // Only the ordinal the cursor is actually waiting on can wedge it.
             // A later failure is passed when the cursor reaches it.
             return false;
@@ -287,7 +287,7 @@ impl Pipeline {
         self.pass_given_up_uu(seg_id.file_id);
         self.uu_files
             .get(&seg_id.file_id)
-            .is_some_and(|uu| uu.parked.contains_key(&uu.next_index))
+            .is_some_and(|uu| uu.parked.contains_key(&uu.next_index.get()))
     }
 
     // Drop the job's terminal states, and the ledger derived from them.
@@ -595,12 +595,19 @@ impl Pipeline {
         // already holds the new generation and every old position has been
         // renumbered underneath it.
         let previous_stable_ids = std::mem::take(&mut self.download_lane_runtime.stable_ids);
-        let carried: HashMap<u32, ServerPipelineExplorer> = self
+        let previous_identities = std::mem::replace(
+            &mut self.download_lane_runtime.identities,
+            self.nntp.pool().server_identities(),
+        );
+        let carried: HashMap<u32, (usize, ServerPipelineExplorer)> = self
             .download_lane_runtime
             .servers
             .drain()
             .filter_map(|(server_idx, explorer)| {
-                Some((*previous_stable_ids.get(&server_idx)?, explorer))
+                Some((
+                    *previous_stable_ids.get(&server_idx)?,
+                    (server_idx, explorer),
+                ))
             })
             .collect();
         #[expect(clippy::type_complexity, reason = "one-shot seeding tuple")]
@@ -627,7 +634,9 @@ impl Pipeline {
                     .pool()
                     .stable_server_id(weaver_nntp::pool::ServerId(server_idx))
                     .map(|stable_id| stable_id.0);
-                let prior = stable_id.and_then(|stable_id| carried.get(&stable_id));
+                let prior = stable_id
+                    .and_then(|stable_id| carried.get(&stable_id))
+                    .map(|(_, explorer)| explorer);
                 let latency = prior
                     .and_then(|explorer| explorer.latency())
                     .or_else(|| self.probe_latency(server_idx));
@@ -649,6 +658,14 @@ impl Pipeline {
         for (server_idx, stable_id, supports_pipelining, proven_depth, latency, transfer) in seeds {
             let mut explorer = ServerPipelineExplorer::seeded(proven_depth, latency, transfer);
             explorer.note_supports_pipelining(supports_pipelining);
+            // The verdict was earned by one host, port and login. A server
+            // edited to another keeps its measurements and starts unpinned.
+            if let Some((was_at, prior)) = stable_id.and_then(|stable_id| carried.get(&stable_id))
+                && previous_identities.get(*was_at)
+                    == self.download_lane_runtime.identities.get(server_idx)
+            {
+                explorer.carry_pipelining_verdict(prior);
+            }
             self.download_lane_runtime
                 .servers
                 .insert(server_idx, explorer);
@@ -730,8 +747,8 @@ impl Pipeline {
         &mut self,
         lease: DownloadBatchLease,
     ) {
-        for work in lease.works {
-            if !self.accept_lane_work(lease.lane_id, work.segment_id) {
+        for mut work in lease.works {
+            if !self.accept_returned_lane_work(lease.lane_id, &mut work) {
                 continue;
             }
             self.restore_owned_lane_unrequested_work(lease.lane_id, work);
@@ -794,8 +811,8 @@ impl Pipeline {
                         "download.owned_lane.acquire_failed_capacity_requeue",
                         1,
                     );
-                    for work in works {
-                        if self.accept_lane_work(lane_id, work.segment_id) {
+                    for mut work in works {
+                        if self.accept_returned_lane_work(lane_id, &mut work) {
                             self.restore_owned_lane_unrequested_work(lane_id, work);
                         }
                     }
@@ -877,7 +894,7 @@ impl Pipeline {
                             work.completion_critical,
                         ),
                         retry_count: work.retry_count,
-                        exclude_servers: work.exclude_servers.clone(),
+                        exclude_servers: work.exclude_servers,
                         release_connection_slot: false,
                     };
                     if !self.release_download_result(&result) {
@@ -958,8 +975,8 @@ impl Pipeline {
                     );
                     pending.push_back(result);
                 }
-                for work in unrequested_works {
-                    if !self.accept_lane_work(lane_id, work.segment_id) {
+                for mut work in unrequested_works {
+                    if !self.accept_returned_lane_work(lane_id, &mut work) {
                         continue;
                     }
                     self.restore_owned_lane_unrequested_work(lane_id, work);

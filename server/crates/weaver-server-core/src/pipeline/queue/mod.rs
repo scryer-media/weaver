@@ -18,10 +18,14 @@ pub(crate) mod order;
 pub mod paging;
 pub(crate) use admission::{
     AdmissionResources, PreparedAdd, RestartAdmission, destination_root, destination_roots,
-    make_staging_dir, staging_dir_for, staging_dir_on,
+    make_staging_dir, outline_read, staging_dir_for, staging_dir_on,
 };
 #[cfg(test)]
 pub(crate) use counters::COUNTER_SAMPLES;
+#[cfg(test)]
+pub(crate) use history::FAILED_SWEEP_PAGE;
+#[cfg(test)]
+pub(crate) use history::SweepPlaces;
 pub(crate) use history::{clear_left_working_dirs, clear_restart_artifacts, remove_job_staging};
 
 /// The control plane's shared facts. A guard never leaves a synchronous
@@ -86,6 +90,10 @@ pub struct QueueInner {
     pub history_summary: crate::operations::metrics_store::JobStatusCounts,
     pub(crate) admissions: std::collections::HashSet<JobId>,
     pub(crate) history_operations: std::collections::HashSet<JobId>,
+    // The failed jobs the housekeeping sweep read as due and has not yet
+    // held. An admission of one takes it out, so the sweep never acts on a
+    // reading older than a retry. Empty except while a page is swept.
+    pub(crate) sweep_listed: std::collections::HashSet<JobId>,
     pub(crate) pending_cleanup: std::collections::HashSet<JobId>,
     pub(crate) nntp: Option<(u64, weaver_nntp::client::NntpClient, usize)>,
     // The endpoint's request count and the pipeline's latest answer, tagged
@@ -190,6 +198,9 @@ pub struct Report {
     pub download_work_pending: bool,
     pub observed_byte_at_ms: u64,
     pub propagation_until_epoch_ms: Option<f64>,
+    // A restart found a checkpoint of the job: some of its bytes are on
+    // disk, though nothing of it is installed to say how many.
+    pub(crate) on_disk: bool,
 }
 
 #[derive(Default)]
@@ -238,6 +249,7 @@ impl JobRow {
                 moving: false,
                 observed_byte_at_ms: 0,
                 propagation_until_epoch_ms: None,
+                on_disk: false,
             },
             counters: Arc::default(),
             phases: HashMap::new(),

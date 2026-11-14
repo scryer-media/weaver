@@ -1,0 +1,15 @@
+{
+  "slug": "adv-rar-far-part-with-rev",
+  "title": "E2E.Adversarial.Rar.Far.Part.With.Rev.2026-TESTGRP",
+  "description": "A file of noise named payload.part4000000000.rar, a recovery volume of noise for the same stem, and an intact payload. No count of missing volumes walks the four billion numbers below the name. The noise volume opens nothing and is short, the recovery volume is not payload, and the payload is delivered with its exact bytes: the job ends partial.",
+  "category": "2000",
+  "expected_outcome": "partial_delivery",
+  "adversarial": {
+    "group": "default",
+    "outcome": "partial",
+    "minOutputFiles": 1
+  },
+  "expectedOutputBLAKE3": {
+    "far-part.mkv": "380e7790a06d56c9587c6827686ed60e5e52ce58c538f51b5dbe179ee9422e28"
+  }
+}

@@ -59,8 +59,7 @@ fn send_blocking_decode_failure(
     tx: &mpsc::Sender<DecodeDone>,
     segment_id: SegmentId,
     raw_size: u64,
-    source_server_idx: Option<usize>,
-    exclude_servers: Vec<usize>,
+    servers: PoolServers,
     error: String,
 ) {
     let _profile_scope = crate::runtime::perf_probe::scope("download.decode.send_failure");
@@ -70,8 +69,7 @@ fn send_blocking_decode_failure(
         segment_id,
         raw_size,
         error,
-        source_server_idx,
-        exclude_servers,
+        servers,
     });
     crate::runtime::perf_probe::record(
         "download.decode.done_channel.blocking_send",
@@ -98,8 +96,7 @@ impl Pipeline {
         let PendingDecodeWork {
             segment_id,
             raw,
-            source_server_idx,
-            exclude_servers,
+            servers,
         } = work;
         let raw_size = raw.len() as u64;
         let counters = self
@@ -185,10 +182,7 @@ impl Pipeline {
                                 Vec::new()
                             },
                         },
-                        source: SegmentSource {
-                            source_server_idx,
-                            exclude_servers,
-                        },
+                        source: SegmentSource { servers },
                     });
                     crate::runtime::perf_probe::record(
                         "download.decode.done_channel.blocking_send",
@@ -199,14 +193,7 @@ impl Pipeline {
                     let error = e.to_string();
                     metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                     warn!(segment = %segment_id, error = %error, "yEnc decode failed");
-                    send_blocking_decode_failure(
-                        &tx,
-                        segment_id,
-                        raw_size,
-                        source_server_idx,
-                        exclude_servers,
-                        error,
-                    );
+                    send_blocking_decode_failure(&tx, segment_id, raw_size, servers, error);
                 }
             }
         });

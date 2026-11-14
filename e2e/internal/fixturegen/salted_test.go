@@ -158,7 +158,8 @@ func saltedWriterPath(path string) bool {
 		strings.Contains(path, "direct-store-par3-withheld-volume") ||
 		strings.Contains(path, "par3-rar5-encrypted-repair") ||
 		strings.Contains(path, "direct-store-rar4-encrypted") ||
-		strings.Contains(path, "direct-store-hp")
+		strings.Contains(path, "direct-store-hp") ||
+		strings.Contains(path, "adv-rar5-many-salted-entries")
 }
 
 func TestCommittedSaltedEntriesAreOnlyTheSaltedWriters(t *testing.T) {

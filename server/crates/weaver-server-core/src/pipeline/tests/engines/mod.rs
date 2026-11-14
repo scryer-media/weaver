@@ -128,6 +128,7 @@ mod settled_rulings;
 mod sevenz;
 mod sevenz_hex;
 mod sfv;
+mod size_bounds;
 mod solid_hex;
 mod spent;
 mod split;

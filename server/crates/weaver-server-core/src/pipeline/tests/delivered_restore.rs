@@ -528,7 +528,7 @@ async fn a_resumed_move_leaves_the_consumed_input_it_was_told_to_leave() {
                 source_server_idx: None,
                 origin: DownloadResultOrigin::NormalPrimary,
                 retry_count: 0,
-                exclude_servers: Vec::new(),
+                exclude_servers: weaver_nntp::ServerSet::EMPTY,
                 release_connection_slot: true,
             })
             .await;

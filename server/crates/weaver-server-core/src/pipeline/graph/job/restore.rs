@@ -82,6 +82,7 @@ impl GraphJob {
         .metered(storage.metrics);
         writer.restore_verifications(&snapshot.root.pending_verifications);
         writer.restore_members(&tree);
+        writer.note_recorded_holds(&tree, &snapshot.holds);
         for ((node, member), state) in &snapshot.files {
             if tree
                 .namespace(*node)
@@ -125,6 +126,8 @@ impl GraphJob {
             notes: Vec::new(),
             fed: super::runs::Fed::default(),
             sealed_at: None,
+            moved: 0,
+            indexes_kept: None,
         };
         for (node, index) in &snapshot.passwords {
             job.offer_again(*node, *index)?;
@@ -257,6 +260,7 @@ impl GraphJob {
             }
             refetched.push((volume, ordinal));
         }
+        self.writer.forget_recorded_holds();
         Ok(refetched)
     }
 

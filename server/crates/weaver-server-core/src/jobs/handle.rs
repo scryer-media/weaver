@@ -822,6 +822,8 @@ pub struct RestartRead {
     // installs wherever it stands, so its row says what it holds; one out
     // of the window leaves it again once read.
     pub(crate) outline_pending: bool,
+    // The job has a checkpoint: some of its bytes are on disk.
+    pub(crate) on_disk: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1628,6 +1630,18 @@ impl SchedulerHandle {
         &self,
     ) -> Vec<crate::operations::instrumentation::ServerMetricsSnapshot> {
         self.state.metrics().server_metrics.snapshot()
+    }
+
+    // What each server of the active generation answered to article
+    // requests: found and not found. Read on demand, like the snapshot above.
+    pub fn server_article_outcomes(
+        &self,
+        stable_server_id: u32,
+    ) -> Option<crate::operations::instrumentation::ServerArticleOutcomes> {
+        self.state
+            .metrics()
+            .server_metrics
+            .article_outcomes(stable_server_id)
     }
 
     // Job lifecycle counters and duration histograms. Read on demand; see

@@ -24,7 +24,7 @@ fn make_work(job_id: u64, file_index: u32, seg: u32, priority: u32) -> DownloadW
         retry_count: 0,
         is_recovery: false,
         completion_critical: false,
-        exclude_servers: vec![],
+        exclude_servers: weaver_nntp::ServerSet::from([]),
         avoid_server: None,
     }
 }
@@ -41,11 +41,11 @@ fn empty_queue() {
 fn excluded_work_count_tracks_push_pop_and_bulk_removal() {
     let mut q = DownloadQueue::new();
     let mut excluded = make_work(1, 0, 0, 10);
-    excluded.exclude_servers = vec![0];
+    excluded.exclude_servers = weaver_nntp::ServerSet::from([0]);
     q.push(excluded);
     q.push(make_work(1, 0, 1, 20));
     let mut other_job = make_work(2, 0, 0, 30);
-    other_job.exclude_servers = vec![1];
+    other_job.exclude_servers = weaver_nntp::ServerSet::from([1]);
     q.push(other_job);
     assert_eq!(q.excluded_work_count(), 2);
 
@@ -59,7 +59,7 @@ fn excluded_work_count_tracks_push_pop_and_bulk_removal() {
     assert_eq!(q.len(), 1);
 
     let mut again = make_work(3, 0, 0, 5);
-    again.exclude_servers = vec![2];
+    again.exclude_servers = weaver_nntp::ServerSet::from([2]);
     q.push(again);
     assert_eq!(
         q.extract_matching(|work| work.segment_id.file_id.job_id == JobId(3))
@@ -69,44 +69,56 @@ fn excluded_work_count_tracks_push_pop_and_bulk_removal() {
     assert_eq!(q.excluded_work_count(), 0);
 
     let mut last = make_work(4, 0, 0, 5);
-    last.exclude_servers = vec![3];
+    last.exclude_servers = weaver_nntp::ServerSet::from([3]);
     q.push(last);
     q.drain_all();
     assert_eq!(q.excluded_work_count(), 0);
 }
 
 #[test]
-fn clear_exclude_servers_drops_stale_indices_and_counter() {
+fn remap_servers_carries_tried_servers_by_identity() {
     let mut q = DownloadQueue::new();
     let mut excluded = make_work(1, 0, 0, 10);
-    excluded.exclude_servers = vec![4, 7];
+    excluded.exclude_servers = weaver_nntp::ServerSet::from([4, 7]);
     q.push(excluded);
-    q.push(make_work(1, 0, 1, 20));
-    assert_eq!(q.excluded_work_count(), 1);
+    let mut gone = make_work(1, 0, 1, 20);
+    gone.exclude_servers = weaver_nntp::ServerSet::from([5]);
+    q.push(gone);
+    q.push(make_work(1, 0, 2, 30));
+    assert_eq!(q.excluded_work_count(), 2);
 
-    q.clear_exclude_servers();
-    assert_eq!(q.excluded_work_count(), 0);
-    assert_eq!(q.len(), 2);
-    while let Some(work) = q.pop() {
-        assert!(work.exclude_servers.is_empty());
-    }
+    // Server 7 moves to 0, server 4 to 1, server 5 leaves the pool.
+    let old: Vec<u32> = (0..8).collect();
+    let remap = weaver_nntp::ServerRemap::between(&old, &[7, 4, 0, 1]);
+    q.remap_servers(&remap);
+    assert_eq!(q.excluded_work_count(), 1);
+    assert_eq!(q.len(), 3);
+    let sets: Vec<_> = std::iter::from_fn(|| q.pop())
+        .map(|work| work.exclude_servers.to_vec())
+        .collect();
+    assert!(sets.contains(&vec![0, 1]));
+    assert_eq!(sets.iter().filter(|set| set.is_empty()).count(), 2);
 }
 
 #[test]
-fn clear_exclude_servers_drops_hints_on_hint_only_work() {
+fn remap_servers_moves_hints_and_drops_a_departed_one() {
     let mut q = DownloadQueue::new();
-    let mut hinted = make_work(1, 0, 0, 10);
-    hinted.avoid_server = Some(3);
-    q.push(hinted);
-    q.push(make_work(1, 0, 1, 20));
-    assert_eq!(q.excluded_work_count(), 1);
+    let mut moved = make_work(1, 0, 0, 10);
+    moved.avoid_server = Some(3);
+    q.push(moved);
+    let mut departed = make_work(1, 0, 1, 20);
+    departed.avoid_server = Some(1);
+    q.push(departed);
+    assert_eq!(q.excluded_work_count(), 2);
 
-    q.clear_exclude_servers();
-    assert_eq!(q.excluded_work_count(), 0);
-    assert_eq!(q.len(), 2);
-    while let Some(work) = q.pop() {
-        assert_eq!(work.avoid_server, None);
-    }
+    let remap = weaver_nntp::ServerRemap::between(&[0u32, 1, 2, 3], &[3, 0, 2]);
+    q.remap_servers(&remap);
+    assert_eq!(q.excluded_work_count(), 1);
+    let hints: Vec<_> = std::iter::from_fn(|| q.pop())
+        .map(|work| work.avoid_server)
+        .collect();
+    assert!(hints.contains(&Some(0)));
+    assert!(hints.contains(&None));
 }
 
 #[test]
@@ -253,6 +265,69 @@ fn mixed_priorities() {
     assert_eq!(items[1].priority, 1); // First RAR
     assert_eq!(items[2].priority, 11); // Second RAR
     assert_eq!(items[3].priority, 1000); // PAR2 recovery
+}
+
+// The per-file walk behind the index bootstrap's answer is made once for a
+// queue and a list of index files, and again only after an item came or
+// went or the list is another one. The steps are counted by the lookup the
+// walk is given.
+#[test]
+fn an_unchanged_queue_answers_the_bootstrap_without_a_step_per_file() {
+    use crate::pipeline::download::worker::queued_files_may_pass;
+
+    const FILES: u32 = 3_000;
+    let mut q = DownloadQueue::new();
+    for file_index in 1..FILES {
+        q.push(make_work(1, file_index, 0, 10));
+    }
+    let steps = std::cell::Cell::new(0usize);
+    let ask = |q: &mut DownloadQueue, bootstrap: &Arc<[u32]>| {
+        steps.set(0);
+        let answer = q.bootstrap_answer(bootstrap, |q| {
+            queued_files_may_pass(FILES as usize, bootstrap, q.len(), |file_index| {
+                steps.set(steps.get() + 1);
+                q.queued_count_for_file(NzbFileId {
+                    job_id: JobId(1),
+                    file_index,
+                }) as usize
+            })
+        });
+        (answer.is_ok(), steps.get())
+    };
+
+    // The index, file 0, has nothing queued: every queued file is held.
+    let index: Arc<[u32]> = Arc::from(vec![0u32]);
+    assert_eq!(ask(&mut q, &index), (false, FILES as usize));
+    assert_eq!(ask(&mut q, &index), (false, 0));
+    assert_eq!(ask(&mut q, &index), (false, 0));
+
+    // An item taken, and one put back in its place, are each a change.
+    let taken = q.pop().unwrap();
+    assert_eq!(ask(&mut q, &index), (false, FILES as usize));
+    q.push(taken);
+    assert_eq!(ask(&mut q, &index), (false, FILES as usize));
+    assert_eq!(ask(&mut q, &index), (false, 0));
+
+    // A re-key changes no file's count.
+    q.rank_ordinary_file(
+        NzbFileId {
+            job_id: JobId(1),
+            file_index: 7,
+        },
+        5,
+        0,
+    );
+    assert_eq!(ask(&mut q, &index), (false, 0));
+
+    // Another list is asked afresh, and stops at its first queued file.
+    let other: Arc<[u32]> = Arc::from(vec![1u32]);
+    assert_eq!(ask(&mut q, &other), (true, 2));
+    assert_eq!(ask(&mut q, &other), (true, 0));
+
+    // The index's own article queued lets work pass.
+    q.push(make_work(1, 0, 0, 10));
+    assert_eq!(ask(&mut q, &index), (true, 1));
+    assert_eq!(ask(&mut q, &index), (true, 0));
 }
 
 #[test]

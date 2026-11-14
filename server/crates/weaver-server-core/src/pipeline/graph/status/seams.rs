@@ -3,7 +3,7 @@
 
 // The pipeline's hooks into a graph job's status.
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use weaver_graph::recovery::{RepairOutcome, SetRuling};
 use weaver_graph::slots::AskerId;
 use weaver_graph::{MemberId, NodeId};
@@ -372,9 +372,22 @@ impl Pipeline {
             return Err(message);
         }
 
+        // An unnamed file that never arrived beside a set extracted whole,
+        // such as a recovery volume the repair never needed, is no shortfall.
+        let excused: std::collections::HashSet<&str> = if delivery.extracted() {
+            delivery.unnamed.iter().map(String::as_str).collect()
+        } else {
+            Default::default()
+        };
         for row in &census {
             match row.claim {
                 Claim::Complete => {}
+                Claim::Missing { bytes } if excused.contains(row.name.as_str()) => debug!(
+                    job_id = job_id.0,
+                    member = %row.name,
+                    missing_bytes = bytes,
+                    "an unnamed posted file never arrived beside a set extracted whole"
+                ),
                 Claim::Damaged { bytes } => info!(
                     job_id = job_id.0,
                     member = %row.name,

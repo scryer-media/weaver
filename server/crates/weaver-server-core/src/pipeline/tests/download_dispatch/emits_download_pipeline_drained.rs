@@ -64,7 +64,7 @@ async fn dispatch_downloads_respects_hard_decode_byte_pressure() {
         .store(1024, Ordering::Relaxed);
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     assert_eq!(
         pipeline
             .metrics
@@ -169,9 +169,9 @@ async fn hot_download_batch_lease_stays_large_for_fresh_job_when_restart_lead_wo
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, segment_count as usize);
+    assert_eq!(pipeline.articles_in_flight, segment_count as usize);
     assert_eq!(
-        pipeline.active_downloads_by_job.get(&job_id),
+        pipeline.articles_in_flight_by_job.get(&job_id),
         Some(&(segment_count as usize))
     );
     assert_eq!(
@@ -239,8 +239,8 @@ async fn hot_download_batch_lease_caps_restored_job_for_restart_durable_lead() {
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 4);
-    assert_eq!(pipeline.active_downloads_by_job.get(&job_id), Some(&4));
+    assert_eq!(pipeline.articles_in_flight, 4);
+    assert_eq!(pipeline.articles_in_flight_by_job.get(&job_id), Some(&4));
     assert_eq!(
         pipeline
             .jobs
@@ -327,7 +327,7 @@ async fn dispatch_downloads_counts_completed_files_for_restart_durable_lead() {
         retry_count: 0,
         is_recovery: false,
         completion_critical: false,
-        exclude_servers: vec![],
+        exclude_servers: weaver_nntp::ServerSet::from([]),
         avoid_server: None,
     };
     assert!(pipeline.primary_download_within_restart_durable_lead(job_id, &next_work));
@@ -343,7 +343,7 @@ async fn dispatch_downloads_counts_completed_files_for_restart_durable_lead() {
 
     pipeline.dispatch_downloads();
 
-    assert!(pipeline.active_downloads > 0);
+    assert!(pipeline.articles_in_flight > 0);
     assert_eq!(
         pipeline
             .metrics
@@ -384,7 +384,7 @@ async fn capped_uu_spool_dispatches_only_the_missing_cursor_prefix() {
         retry_count: 0,
         is_recovery: false,
         completion_critical: false,
-        exclude_servers: Vec::new(),
+        exclude_servers: weaver_nntp::ServerSet::EMPTY,
         avoid_server: None,
     };
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
@@ -403,13 +403,7 @@ async fn capped_uu_spool_dispatches_only_the_missing_cursor_prefix() {
         .unwrap()
         .download_queue
         .push(work(0, "uu-prefix@example.invalid"));
-    pipeline.uu_files.insert(
-        file_id,
-        UuFileAssembly {
-            next_index: 0,
-            ..UuFileAssembly::default()
-        },
-    );
+    pipeline.uu_files.insert(file_id, UuFileAssembly::default());
     pipeline.uu_spool_max_segments = 0;
     pipeline.uu_spool_available_bytes_for_test = Some(Some(u64::MAX));
 
@@ -679,7 +673,7 @@ async fn released_result_bytes_block_dispatch_until_processing_clears_hysteresis
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     assert_eq!(
         pipeline
             .metrics
@@ -700,7 +694,7 @@ async fn released_result_bytes_block_dispatch_until_processing_clears_hysteresis
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: vec![],
+            exclude_servers: weaver_nntp::ServerSet::from([]),
             release_connection_slot: false,
         })
         .await;
@@ -720,7 +714,7 @@ async fn released_result_bytes_block_dispatch_until_processing_clears_hysteresis
     );
 
     pipeline.dispatch_downloads();
-    assert!(pipeline.active_downloads > 0);
+    assert!(pipeline.articles_in_flight > 0);
 }
 
 #[tokio::test]
@@ -757,7 +751,7 @@ async fn dispatch_downloads_allows_postprocessing_status_with_remaining_download
 
     // Both jobs dispatch: the second connection is not left idle once the
     // first job's single article has been handed out.
-    assert_eq!(pipeline.active_downloads, 2);
+    assert_eq!(pipeline.articles_in_flight, 2);
     for (job_id, status) in &cases {
         let state = pipeline.jobs.get(job_id).unwrap();
         assert_eq!(&state.status, status);
@@ -820,7 +814,7 @@ async fn dispatch_downloads_prefers_new_higher_priority_job_after_inflight_segme
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 2);
+    assert_eq!(pipeline.articles_in_flight, 2);
     assert_eq!(pipeline.active_download_connections, 2);
     assert_eq!(
         pipeline
@@ -846,8 +840,14 @@ async fn dispatch_downloads_prefers_new_higher_priority_job_after_inflight_segme
             .len(),
         0
     );
-    assert_eq!(pipeline.active_downloads_by_job.get(&low_job_id), Some(&1));
-    assert_eq!(pipeline.active_downloads_by_job.get(&high_job_id), Some(&1));
+    assert_eq!(
+        pipeline.articles_in_flight_by_job.get(&low_job_id),
+        Some(&1)
+    );
+    assert_eq!(
+        pipeline.articles_in_flight_by_job.get(&high_job_id),
+        Some(&1)
+    );
 }
 
 #[tokio::test]
@@ -1008,7 +1008,7 @@ async fn dispatch_downloads_prefers_earliest_job_within_priority_band() {
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 1);
+    assert_eq!(pipeline.articles_in_flight, 1);
     assert_eq!(
         pipeline
             .jobs
@@ -1259,7 +1259,7 @@ async fn dispatch_downloads_single_job_keeps_hot_runway() {
     let want =
         pipeline.download_refill_want(pipeline.download_lane_mode_for_server(0, pressure, true));
     assert_eq!(
-        pipeline.active_downloads_by_job.get(&job_id),
+        pipeline.articles_in_flight_by_job.get(&job_id),
         Some(&(8 * want))
     );
 }
@@ -1494,7 +1494,7 @@ async fn hot_clear_pressure_lane_leases_sequential_runway() {
     let pressure = pipeline.refresh_download_pressure();
     let want =
         pipeline.download_refill_want(pipeline.download_lane_mode_for_server(0, pressure, true));
-    assert_eq!(pipeline.active_downloads, want);
+    assert_eq!(pipeline.articles_in_flight, want);
     assert_eq!(
         pipeline
             .jobs
@@ -1642,7 +1642,7 @@ async fn released_download_result_fences_completion_until_processed() {
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: vec![],
+            exclude_servers: weaver_nntp::ServerSet::from([]),
             release_connection_slot: false,
         })
         .await;
@@ -1710,7 +1710,7 @@ async fn failed_job_retains_released_result_ledgers_until_terminal_processing() 
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: vec![],
+            exclude_servers: weaver_nntp::ServerSet::from([]),
             release_connection_slot: false,
         })
         .await;
@@ -1779,7 +1779,7 @@ async fn owned_download_lane_batch_event_releases_and_acks_results() {
                 source_server_idx: None,
                 origin: DownloadResultOrigin::NormalPrimary,
                 retry_count: 0,
-                exclude_servers: vec![],
+                exclude_servers: weaver_nntp::ServerSet::from([]),
                 release_connection_slot: false,
             }],
             unrequested_works: vec![],
@@ -1789,10 +1789,10 @@ async fn owned_download_lane_batch_event_releases_and_acks_results() {
         &mut pending,
     );
 
-    assert_eq!(pipeline.active_downloads, 0);
-    assert_eq!(pipeline.active_downloads_by_job.get(&job_id), None);
+    assert_eq!(pipeline.articles_in_flight, 0);
+    assert_eq!(pipeline.articles_in_flight_by_job.get(&job_id), None);
     assert_eq!(
-        pipeline.active_downloads_by_file.get(&segment_id.file_id),
+        pipeline.articles_in_flight_by_file.get(&segment_id.file_id),
         None
     );
     assert_eq!(pending.len(), 1);
@@ -1867,10 +1867,10 @@ async fn owned_download_lane_requeues_unrequested_tail_without_retry_result() {
         &mut pending,
     );
 
-    assert_eq!(pipeline.active_downloads, 0);
-    assert_eq!(pipeline.active_downloads_by_job.get(&job_id), None);
+    assert_eq!(pipeline.articles_in_flight, 0);
+    assert_eq!(pipeline.articles_in_flight_by_job.get(&job_id), None);
     assert_eq!(
-        pipeline.active_downloads_by_file.get(&segment_id.file_id),
+        pipeline.articles_in_flight_by_file.get(&segment_id.file_id),
         None
     );
     assert!(pending.is_empty());
@@ -1920,8 +1920,11 @@ async fn emits_download_pipeline_drained_once_before_later_completion_events() {
             segment_number: 0,
         },
         raw: Bytes::from_static(b"pending"),
-        source_server_idx: None,
-        exclude_servers: Vec::new(),
+        servers: PoolServers::stamped(
+            pipeline.pool_generation,
+            None,
+            weaver_nntp::ServerSet::EMPTY,
+        ),
     });
 
     pipeline.emit_download_finished_if_active(job_id);

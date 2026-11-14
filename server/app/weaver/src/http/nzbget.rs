@@ -1578,7 +1578,7 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         .decode_pending_bytes
         .saturating_add(metrics.decode_active_bytes)
         .saturating_add(metrics.write_buffered_bytes);
-    let thread_count = metrics.active_downloads;
+    let thread_count = metrics.articles_in_flight;
     let (remaining_lo, remaining_hi) = size_parts(remaining);
     let (forced_lo, forced_hi) = size_parts(forced);
     let (downloaded_lo, downloaded_hi) = size_parts(session_downloaded);
