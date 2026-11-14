@@ -53,7 +53,7 @@ const BANNED: &[&str] = &[
 // lift it for their own tests' loopback fixtures.
 const LIFTED: &[(&str, usize)] = &[
     ("engines/weaver-nntp/benches/body_server_availability.rs", 1),
-    ("engines/weaver-nntp/src/address_plan.rs", 2),
+    ("engines/weaver-nntp/src/address_plan.rs", 1),
     ("engines/weaver-nntp/src/lib.rs", 1),
     ("engines/weaver-nntp/src/route_dialer.rs", 1),
     ("engines/weaver-nntp/tests/demand_throughput.rs", 1),
@@ -69,7 +69,7 @@ const LIFTED: &[(&str, usize)] = &[
     ("engines/weaver-tunnel/src/egress.rs", 6),
     ("engines/weaver-tunnel/src/egress/multicast.rs", 1),
     ("engines/weaver-tunnel/src/lib.rs", 2),
-    ("engines/weaver-tunnel/src/pipe.rs", 5),
+    ("engines/weaver-tunnel/src/pipe.rs", 4),
     ("engines/weaver-tunnel/src/resolution.rs", 2),
     ("engines/weaver-tunnel/src/test_support/http_client.rs", 2),
     ("server/app/weaver/src/commands/nzb.rs", 1),
@@ -102,6 +102,22 @@ const DYLINT_LIBRARY: &str = "lints/host_name_lookup";
 // Every file that lifts the host name lookup lint, and how many times: only
 // the host resolver every Host-resolved leg shares.
 const DYLINT_LIFTED: &[(&str, usize)] = &[("engines/weaver-tunnel/src/resolution.rs", 2)];
+
+// The host resolver's two forms, built here so this file never counts as a
+// caller of either.
+const HOST_RESOLVER: [&str; 2] = [
+    concat!("host", "_lookup"),
+    concat!("host", "_lookup", "_blocking"),
+];
+
+// Every call of the host resolver, by form and file. There is one path for
+// a lookup, a leg's naming, and the host's own DNS is asked only from inside
+// it, where the naming is Host: one caller of each form, in the pipe's
+// private `host_dns`. A second caller is a lookup that skips the naming.
+const HOST_RESOLVER_CALLERS: &[(&str, &str, usize)] = &[
+    (HOST_RESOLVER[0], "engines/weaver-tunnel/src/pipe.rs", 1),
+    (HOST_RESOLVER[1], "engines/weaver-tunnel/src/pipe.rs", 1),
+];
 
 // How a PostgreSQL connection is opened: sqlx resolves the database host
 // with the host's own DNS. Built here so this file never counts as one.
@@ -291,6 +307,53 @@ fn every_lift_of_the_host_name_lookup_lint_is_pinned() {
         found, pinned,
         "the host name lookup lint is lifted somewhere new: resolve through the leg's naming \
          and dial the address instead, or pin the lift here once its reason is reviewed"
+    );
+}
+
+// Calls of the function `name` in `text`: each `name(` that is not part of
+// a longer name and is not its definition.
+fn calls_of(text: &str, name: &str) -> usize {
+    let call = format!("{name}(");
+    text.match_indices(&call)
+        .filter(|(at, _)| {
+            let before = &text[..*at];
+            !before
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                && !before.ends_with("fn ")
+        })
+        .count()
+}
+
+#[test]
+fn the_host_resolver_has_one_caller_of_each_form() {
+    let root = workspace();
+    let mut found = BTreeSet::new();
+    for name in HOST_RESOLVER {
+        let mut files = BTreeMap::new();
+        for dir in ["engines", "server", "shared", "xtask"] {
+            count_in(
+                &root,
+                &root.join(dir),
+                &|text| calls_of(text, name),
+                &mut files,
+            );
+        }
+        found.extend(
+            files
+                .into_iter()
+                .map(|(file, count)| (name.to_owned(), file, count)),
+        );
+    }
+    let pinned: BTreeSet<(String, String, usize)> = HOST_RESOLVER_CALLERS
+        .iter()
+        .map(|(name, file, count)| ((*name).to_owned(), (*file).to_owned(), *count))
+        .collect();
+    assert_eq!(
+        found, pinned,
+        "the host resolver is called somewhere new: resolve through the leg's naming, \
+         `Dialer::resolve`, which asks the host's DNS only where the naming is Host"
     );
 }
 

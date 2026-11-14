@@ -1240,36 +1240,13 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    // A dialer that resolves with the host's resolver, as a Host-named leg
-    // does.
-    struct HostNamed;
-
-    #[async_trait::async_trait]
-    impl Dialer for HostNamed {
-        async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
-            Err(DialError::Skipped("names only".into()))
-        }
-        async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
-            weaver_tunnel::resolution::host_lookup(host)
-                .await
-                .map(Resolution::Addresses)
-                .map_err(|e| DialError::Skipped(e.to_string()))
-        }
-        fn budget(&self) -> Duration {
-            Duration::from_secs(60)
-        }
-        fn describe(&self) -> String {
-            "host".into()
-        }
-    }
-
     // A name the session looks up on its leg, a UDP tracker's or a web
     // seed's alike, lands in the resolution record of the task that asked.
     #[tokio::test]
     async fn a_session_lookup_lands_in_the_resolution_record() {
         let recording = Arc::new(Recording::default());
         let resolved = recording
-            .scope(LegNames(Arc::new(HostNamed)).resolve("localhost", 6969))
+            .scope(LegNames(crate::torrents::net::system_dialer()).resolve("localhost", 6969))
             .await
             .unwrap();
         let Resolved::Addresses(found) = resolved else {
@@ -1279,9 +1256,10 @@ mod tests {
             .finish("localhost", 6969, None)
             .expect("the lookup was recorded");
         assert_eq!(noted.by, ResolvedBy::Host);
-        assert_eq!(
-            noted.addresses,
-            found.iter().map(SocketAddr::ip).collect::<Vec<_>>()
-        );
+        // The record keeps the host's order; the leg hands its answer on
+        // sorted.
+        let mut noted = noted.addresses;
+        noted.sort();
+        assert_eq!(noted, found.iter().map(SocketAddr::ip).collect::<Vec<_>>());
     }
 }

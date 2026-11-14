@@ -39,10 +39,12 @@ impl Dialer for AddressPlanned {
         ) {
             return self.egress.dial(target).await;
         }
-        let dialer = Arc::new(
-            crate::address_plan::TcpDialer::new(&target.host, target.port, self.egress.timeout())
-                .with_egress(self.egress.binding().clone()),
-        );
+        let dialer = Arc::new(crate::address_plan::TcpDialer::new(
+            &target.host,
+            target.port,
+            self.egress.timeout(),
+            self.egress.clone(),
+        ));
         let plan = self.plan.clone();
         let (socket, peer) = tokio::task::spawn_blocking(move || plan.connect(&dialer))
             .await

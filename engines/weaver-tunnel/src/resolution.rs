@@ -460,7 +460,7 @@ static HOST: LazyLock<ResolutionCache<io::Error>> = LazyLock::new(ResolutionCach
 )]
 // The one place a name reaches the host resolver: a leg whose naming is Host.
 #[cfg_attr(dylint_lib = "host_name_lookup", allow(host_name_lookup))]
-pub async fn host_lookup(host: &str) -> io::Result<Vec<IpAddr>> {
+pub(crate) async fn host_lookup(host: &str) -> io::Result<Vec<IpAddr>> {
     asking_host(host);
     noted_by_host(
         host,
@@ -480,7 +480,7 @@ pub async fn host_lookup(host: &str) -> io::Result<Vec<IpAddr>> {
 )]
 // The one place a name reaches the host resolver: a leg whose naming is Host.
 #[cfg_attr(dylint_lib = "host_name_lookup", allow(host_name_lookup))]
-pub fn host_lookup_blocking(host: &str) -> io::Result<Vec<IpAddr>> {
+pub(crate) fn host_lookup_blocking(host: &str) -> io::Result<Vec<IpAddr>> {
     asking_host(host);
     noted_by_host(
         host,

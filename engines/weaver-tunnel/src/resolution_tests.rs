@@ -408,13 +408,18 @@ fn the_host_order_is_kept_without_repeats() {
     assert_eq!(untimed([a, b, a].into_iter()).addresses, [a, b]);
 }
 
-// A lookup from a thread that may block is noted as the host's own DNS, as
-// the async lookup is.
+// A lookup from a thread that may block, a direct leg's, is noted as the
+// host's own DNS, as the async lookup is.
 #[tokio::test]
 async fn a_blocking_host_lookup_is_noted_as_the_hosts_dns() {
+    let egress = crate::pipe::Egress::new(
+        0,
+        crate::egress::SocketEgress::System,
+        Duration::from_secs(30),
+    );
     let recording = Arc::new(record::Recording::default());
     let found = recording
-        .scope(async { host_lookup_blocking("localhost").unwrap() })
+        .scope(async { egress.resolve_blocking("localhost").unwrap() })
         .await;
     let resolution = recording.finish("localhost", 0, None).unwrap();
     assert_eq!(resolution.by, record::ResolvedBy::Host);
