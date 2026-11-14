@@ -185,6 +185,13 @@ enum ShareTaken {
     Later,
 }
 
+// A lane's share of a job for the room the job's volume has left, and
+// whether the room itself, not the lane's part of it, set it.
+struct VolumeShare {
+    share: usize,
+    by_room: bool,
+}
+
 // Whether a job whose volume is short of room may pass its turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Turn {
@@ -396,52 +403,62 @@ impl Pipeline {
     }
 
     // How many of a job's articles one lane may hold for the room the
-    // job's volume has: its part of the bytes the volume may still take
-    // below its hard limit, over every connection, less what the lane
-    // already holds, counted in articles of the size the lane holds. Never
-    // less than a full pipe. A lane that holds nothing is sized by the
-    // job's next article. `None` when the job writes to no sized volume:
-    // the share stands.
+    // job's volume has left below its lease limit (`Volume::lease_room`),
+    // in articles of the size the lane holds: its part of that room over
+    // every connection, more than it holds now, and never less than a full
+    // pipe, but never more than the room holds either. A lane that holds
+    // nothing is sized by the job's next article. A volume that counts
+    // nothing holds one article whatever its size. `None` when the job
+    // writes to no sized volume: the share stands.
     //
-    // The limit counts bytes that arrived, not leased ones. Without this,
-    // the lanes leased up to a share of the job's whole queue while the
-    // volume read empty, and all of it arrived past the limit: 262 MB out
-    // on lanes at 23:31:27 MST on the slow disk run, then 354.9 MB
-    // buffered against 268.4 MB. With it, what is out on lanes and what
-    // arrived stay within the limit, past it by at most a full pipe on
-    // each lane: a lane is handed a whole pipe only where it fits under
-    // this share, and the share is less than a full pipe never.
+    // What the lanes hold is reserved on the volume as it is leased
+    // (`Pipeline::reserve_lane_work`), so the room is what is left after
+    // it, and the lease takes only what fits: this share and the lease
+    // grant by the one rule, and nothing is fetched past the limit.
     fn volume_share_of_lane(
         &self,
         job_id: JobId,
         lane_id: u64,
         holds: usize,
         full_pipe: usize,
-    ) -> Option<usize> {
+    ) -> Option<VolumeShare> {
         let room = self.volume_room(job_id)?;
         let (held, held_bytes) = self.download_lane_held_bytes(lane_id);
         let article = if held == 0 {
-            // A lane that holds nothing is sized by the job's next article.
-            self.jobs
-                .get(&job_id)
-                .and_then(|state| state.articles.download_queue())
-                .and_then(|queue| {
-                    queue
-                        .peek_in_class(false)
-                        .or_else(|| queue.peek_in_class(true))
-                })
-                .map_or(0, |work| u64::from(work.byte_estimate))
+            self.next_article_bytes(job_id)
         } else {
             held_bytes / held as u64
         }
         .max(1);
         let connections = self.tuner.params().max_concurrent_downloads.max(1) as u64;
-        let more = (room / connections).saturating_sub(held_bytes) / article;
-        Some(
-            holds
-                .saturating_add(usize::try_from(more).unwrap_or(usize::MAX))
-                .max(full_pipe),
-        )
+        let articles = |bytes: u64| usize::try_from(bytes / article).unwrap_or(usize::MAX);
+        let fits = if self.volume_counts_nothing(job_id) {
+            articles(room).max(1)
+        } else {
+            articles(room)
+        };
+        let part = holds
+            .saturating_add(articles(room / connections))
+            .max(full_pipe);
+        let room_holds = holds.saturating_add(fits);
+        Some(VolumeShare {
+            share: part.min(room_holds),
+            by_room: room_holds < part,
+        })
+    }
+
+    // The bytes the job's next article is reserved at; zero when nothing
+    // is queued.
+    pub(in crate::pipeline) fn next_article_bytes(&self, job_id: JobId) -> u64 {
+        self.jobs
+            .get(&job_id)
+            .and_then(|state| state.articles.download_queue())
+            .and_then(|queue| {
+                queue
+                    .peek_in_class(false)
+                    .or_else(|| queue.peek_in_class(true))
+            })
+            .map_or(0, |work| Self::reserved_bytes_of(work.byte_estimate))
     }
 
     // One job's answer to one lane: work within the lane's share, a lane
@@ -475,19 +492,23 @@ impl Pipeline {
         let full_pipe = lane.depth.max(1) + 1;
         // The volume's room decides only where it is short of the job's
         // share: the lane is then held to it.
-        let (share, room_short) =
+        let (share, room_short, by_room) =
             match self.volume_share_of_lane(job_id, lane.lane_id, holds, full_pipe) {
-                Some(volume_share) if volume_share < share => (volume_share, true),
-                _ => (share, false),
+                Some(volume) if volume.share < share => (volume.share, true, volume.by_room),
+                _ => (share, false, false),
             };
-        // A lease is a whole pipe or nothing; under a lane that asks for
-        // less, what it asks for.
+        // A lease is a whole pipe; under a lane that asks for less, what it
+        // asks for.
         let whole = full_pipe.min(want).max(1);
-        if room_short && holds.saturating_add(whole) > share {
+        // Asked last, a lane the volume's room holds short of a whole pipe
+        // takes what fits: the room is not left unused while the writer may
+        // run out of work, and it is no trickle, since a lane with nothing
+        // that fits waits for the volume's resume line below.
+        let takes_what_fits = turn == Turn::Last && by_room && share > holds;
+        if room_short && holds.saturating_add(whole) > share && !takes_what_fits {
             // The volume has no room for another whole pipe on this lane.
             // On the walk, the lane's room goes to the jobs after this one,
-            // on volumes that have room. Asked last, the lane waits until it
-            // has fetched a whole pipe of the job down, and is answered then.
+            // on volumes that have room.
             if turn == Turn::MayPass {
                 return ShareTaken::Later;
             }

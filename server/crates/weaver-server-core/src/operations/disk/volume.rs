@@ -3,6 +3,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// The most of a volume's hard limit kept for the pipeline loop's own
+// writes (`Volume::loop_share`).
+const LOOP_SHARE: u64 = 4 << 20;
+
 // One volume as the OS presents it: every path with the same device id.
 pub(crate) struct Volume {
     // The device id the disk owner holds for the volume's paths; `None`
@@ -27,11 +31,23 @@ pub(crate) struct Volume {
     // to its writer yet: what is being decoded. Only the pipeline loop
     // changes it.
     pub(crate) arrived_bytes: AtomicU64,
-    // The volume's buffer limits, over the bytes that have arrived and are
-    // not written (`unwritten_bytes`). At the hard limit its lanes stop; the
-    // soft limit is a reported figure. One pair for
-    // the volume, shared by every stream writing to it. `u64::MAX` until
-    // the volume is sized: no limit.
+    // What counts against the hard limit (`unwritten_bytes`): the articles
+    // leased to lanes for the jobs writing here and not arrived, at the
+    // size the post gives them, what arrived and is being decoded, and what
+    // waits for the writer. Only `reserve` and `charge` raise it, and only
+    // the pipeline loop calls them; the writer lowers it as it writes.
+    counted_bytes: AtomicU64,
+    // The most `counted_bytes` has been.
+    peak_bytes: AtomicU64,
+    // Bytes of `counted_bytes` the pipeline loop holds for what it is about
+    // to queue in one step: the arrived article it is handing on. Its
+    // writes take from here first and are charged only past it. Only the
+    // loop reads or changes it.
+    pub(crate) loop_credit: AtomicU64,
+    // The volume's buffer limits. Nothing is reserved or charged past the
+    // hard one (`reserve`, `charge`); the soft limit is a reported figure.
+    // One pair for the volume, shared by every stream writing to it.
+    // `u64::MAX` until the volume is sized: no limit.
     buffer_soft_bytes: AtomicU64,
     buffer_hard_bytes: AtomicU64,
     // One more than the count of unwritten bytes someone asked to be woken
@@ -188,6 +204,9 @@ impl Volume {
             write_seeks: AtomicU64::new(0),
             buffered_bytes: AtomicU64::new(0),
             arrived_bytes: AtomicU64::new(0),
+            counted_bytes: AtomicU64::new(0),
+            peak_bytes: AtomicU64::new(0),
+            loop_credit: AtomicU64::new(0),
             buffer_soft_bytes: AtomicU64::new(u64::MAX),
             buffer_hard_bytes: AtomicU64::new(u64::MAX),
             wake_line: AtomicU64::new(0),
@@ -198,13 +217,99 @@ impl Volume {
         }
     }
 
-    // The bytes that have arrived for the volume and are not written: what
-    // is being decoded for its jobs and what waits for its writer. Articles
-    // leased to a connection that have not arrived are not in it.
+    // The bytes counted against the volume's hard limit: leased and not
+    // arrived, being decoded, and waiting for its writer.
     pub(crate) fn unwritten_bytes(&self) -> u64 {
-        self.arrived_bytes
-            .load(Ordering::SeqCst)
-            .saturating_add(self.buffered_bytes.load(Ordering::SeqCst))
+        self.counted_bytes.load(Ordering::SeqCst)
+    }
+
+    // The most bytes ever counted against the volume at once.
+    pub(crate) fn peak_bytes(&self) -> u64 {
+        self.peak_bytes.load(Ordering::Relaxed)
+    }
+
+    // The part of the hard limit only the pipeline loop's own writes take:
+    // what it says again for a repair or a replay, an extraction's output,
+    // a delivery. Leases stop below it, so the loop always finds this much
+    // once the writer has written what it holds, and never waits on bytes
+    // only it can hand on.
+    pub(crate) fn loop_share(&self) -> u64 {
+        let (_, hard) = self.buffer_limits();
+        (hard / 16).clamp(1, LOOP_SHARE)
+    }
+
+    // The bytes below which leases are granted: the hard limit less the
+    // loop's share. `u64::MAX` when the volume is not sized.
+    pub(crate) fn lease_limit(&self) -> u64 {
+        let (_, hard) = self.buffer_limits();
+        if hard == u64::MAX {
+            return u64::MAX;
+        }
+        hard.saturating_sub(self.loop_share())
+    }
+
+    // The bytes a lease may still take.
+    pub(crate) fn lease_room(&self) -> u64 {
+        self.lease_limit().saturating_sub(self.unwritten_bytes())
+    }
+
+    // Reserve `bytes` for an article leased to a lane, if they fit below
+    // the lease limit. A volume that counts nothing grants one article
+    // whatever its size, so an article larger than the limit is still
+    // fetched, alone.
+    pub(crate) fn reserve(&self, bytes: u64) -> bool {
+        let limit = self.lease_limit();
+        let granted =
+            self.counted_bytes
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |counted| {
+                    (counted == 0 || counted.saturating_add(bytes) <= limit)
+                        .then(|| counted.saturating_add(bytes))
+                });
+        match granted {
+            Ok(counted) => {
+                self.peak_bytes
+                    .fetch_max(counted.saturating_add(bytes), Ordering::Relaxed);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    // Whether the loop may queue `bytes` more of its own: they fit below
+    // the hard limit, or the volume counts nothing, or its writer holds
+    // nothing it could write to make room.
+    pub(crate) fn fits(&self, bytes: u64) -> bool {
+        let (_, hard) = self.buffer_limits();
+        let counted = self.unwritten_bytes();
+        counted == 0
+            || counted.saturating_add(bytes) <= hard
+            || self.buffered_bytes.load(Ordering::SeqCst) == 0
+    }
+
+    // Count `bytes` the loop puts in: an arrived article, or a write past
+    // its credit once it `fits`.
+    pub(crate) fn charge(&self, bytes: u64) {
+        let counted = self.counted_bytes.fetch_add(bytes, Ordering::SeqCst);
+        self.peak_bytes
+            .fetch_max(counted.saturating_add(bytes), Ordering::Relaxed);
+    }
+
+    // An article reserved at `reserved` bytes arrived at `arrived`: it is
+    // counted at what arrived from here, in one step, so the count never
+    // dips below what is held while its reservation is given back.
+    pub(crate) fn settle(&self, reserved: u64, arrived: u64) {
+        if arrived <= reserved {
+            self.release(reserved - arrived);
+        } else {
+            self.charge(arrived - reserved);
+        }
+    }
+
+    // `bytes` reserved or charged no longer count: an article left its
+    // lane, or the writer wrote them.
+    pub(crate) fn release(&self, bytes: u64) {
+        let before = self.counted_bytes.fetch_sub(bytes, Ordering::SeqCst);
+        debug_assert!(before >= bytes, "a volume released more than it counted");
     }
 
     // Give the volume its soft and hard buffer limits. A limit lowered
@@ -220,6 +325,13 @@ impl Volume {
             self.buffer_soft_bytes.load(Ordering::Relaxed),
             self.buffer_hard_bytes.load(Ordering::Relaxed),
         )
+    }
+
+    // Count exactly `bytes`, as a test sets a volume's fill.
+    #[cfg(test)]
+    pub(crate) fn count_for_test(&self, bytes: u64) {
+        self.counted_bytes.store(bytes, Ordering::SeqCst);
+        self.peak_bytes.fetch_max(bytes, Ordering::Relaxed);
     }
 
     // The unwritten bytes at which whoever was stopped at the hard limit is
@@ -241,5 +353,62 @@ impl Volume {
                 .wake_line
                 .compare_exchange(ask, 0, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sized(hard: u64) -> Volume {
+        let volume = Volume::new(Some(1), "/v".into());
+        volume.set_buffer_limits(hard, hard);
+        volume
+    }
+
+    // Leases stop below the loop's share of the hard limit; the loop's own
+    // writes take that share, and nothing goes past the limit.
+    #[test]
+    fn leases_stop_at_the_lease_limit_and_the_loop_keeps_its_share() {
+        let volume = sized(1600);
+        assert_eq!(volume.loop_share(), 100);
+        assert_eq!(volume.lease_limit(), 1500);
+        assert!(volume.reserve(1000));
+        assert!(volume.reserve(500));
+        assert!(!volume.reserve(1), "the lease limit is reached");
+        assert_eq!(volume.lease_room(), 0);
+        assert_eq!(volume.unwritten_bytes(), 1500);
+        // The loop's share is left for the loop.
+        volume.buffered_bytes.store(1, Ordering::SeqCst);
+        assert!(volume.fits(100));
+        assert!(!volume.fits(101));
+        volume.charge(100);
+        assert_eq!(volume.unwritten_bytes(), 1600);
+        assert!(!volume.fits(1));
+        volume.release(600);
+        assert!(volume.reserve(500));
+        assert_eq!(volume.peak_bytes(), 1600);
+    }
+
+    // A volume that counts nothing grants one article larger than its
+    // whole limit, and only one.
+    #[test]
+    fn an_empty_volume_grants_one_article_larger_than_its_limit() {
+        let volume = sized(1600);
+        assert!(volume.reserve(5000));
+        assert!(!volume.reserve(1));
+        assert_eq!(volume.peak_bytes(), 5000);
+        volume.release(5000);
+        assert_eq!(volume.unwritten_bytes(), 0);
+        assert!(volume.reserve(1500));
+    }
+
+    // A volume not sized grants everything.
+    #[test]
+    fn a_volume_not_sized_grants_everything() {
+        let volume = Volume::new(None, "/v".into());
+        assert_eq!(volume.lease_limit(), u64::MAX);
+        assert!(volume.reserve(u64::MAX / 2));
+        assert!(volume.reserve(1 << 40));
     }
 }

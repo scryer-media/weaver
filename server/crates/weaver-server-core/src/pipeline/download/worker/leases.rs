@@ -575,44 +575,38 @@ impl Pipeline {
         answer
     }
 
-    // Whether a volume the job writes to holds its own hard limit of bytes
-    // that arrived and are not written: nothing more is fetched for the job
-    // until it is below. Each such volume is asked for one wake, an eighth
-    // of its limit lower so the loop is not woken per write; a volume that
-    // fell there in the meantime holds nothing. True only with a wake on
-    // its way, which wakes dispatch (`Self::volume_room_changed`).
+    // Whether a volume the job writes to counts its lease limit: nothing
+    // more is leased for the job until it is below. Each such volume is
+    // asked for one wake at its room line (`Self::ask_room_wake`); a volume
+    // that fell there in the meantime holds nothing. True only with a wake
+    // on its way, which wakes dispatch (`Self::volume_room_changed`).
     pub(in crate::pipeline) fn volume_refuses_job(&self, job_id: JobId) -> bool {
-        if !self.volume_holds_budget(job_id) {
-            return false;
-        }
-        let mut asked = false;
-        if let Some(disk) = self.graph_jobs.get(&job_id).and_then(|graph| graph.disk()) {
-            for submitter in disk.each() {
-                let volume = submitter.volume();
-                asked |= volume.unwritten_bytes() >= volume.buffer_limits().1
-                    && self.volume_writers.wake_below(volume, volume.resume_line());
-            }
-        }
-        asked
+        self.volume_holds_budget(job_id) && self.ask_room_wake(job_id)
     }
 
-    // Whether a volume the job writes to holds more than its resume line of
-    // bytes that arrived and are not written, with a wake asked for at that
-    // line. Each such volume is asked once; asking again for the same line
-    // costs a load. True only with a wake on its way, which wakes dispatch
+    // Whether a volume the job writes to counts more than its room line,
+    // with a wake asked for at that line. The line is an eighth of the hard
+    // limit below it (`Volume::resume_line`), so the loop is not woken per
+    // write, and lower still where that would leave no room for the job's
+    // next article below the lease limit: a lane woken there finds room.
+    // Each such volume is asked once; asking again for the same line costs
+    // a load. True only with a wake on its way, which wakes dispatch
     // (`Self::volume_room_changed`): a volume that fell to its line in the
     // meantime holds nothing.
     pub(in crate::pipeline) fn ask_room_wake(&self, job_id: JobId) -> bool {
         let Some(disk) = self.graph_jobs.get(&job_id).and_then(|graph| graph.disk()) else {
             return false;
         };
+        let need = self.next_article_bytes(job_id).max(1);
         let mut asked = false;
         for submitter in disk.each() {
             let volume = submitter.volume();
             if volume.buffer_limits().1 == u64::MAX {
                 continue;
             }
-            let line = volume.resume_line();
+            let line = volume
+                .resume_line()
+                .min(volume.lease_limit().saturating_sub(need));
             asked |=
                 volume.unwritten_bytes() > line && self.volume_writers.wake_below(volume, line);
         }

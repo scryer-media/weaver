@@ -1209,12 +1209,14 @@ fn the_loops_wait_on_a_limit_outlasts_the_stop_and_ends_at_the_stops_end() {
     let job = writers.submitter(&volume, 1);
     job.write(1, 0, Bytes::from_static(b"held"), create(&path));
     hold.wait_held();
+    // The four bytes held fill the volume: one more does not fit.
+    volume.set_buffer_limits(4, 4);
     let clock = Arc::new(HandClock::default());
     let end = Duration::from_secs(30);
     writers.end_loop_waits_at(Arc::clone(&clock) as Arc<dyn Clock + Send>, end);
     std::thread::scope(|scope| {
         let producer = scope.spawn(|| job.wait_below(0));
-        let looped = scope.spawn(|| job.loop_wait_below(0));
+        let looped = scope.spawn(|| job.loop_wait_room(1));
         hold.wait_below_waiters(2);
         // The loop's wait read the clock once before it stood still.
         clock.wait_looks(1);
@@ -1231,12 +1233,12 @@ fn the_loops_wait_on_a_limit_outlasts_the_stop_and_ends_at_the_stops_end() {
     assert!(job.left());
     assert_eq!(count(&volume.buffered_bytes), 4);
     // Past the end the loop does not stand still again, and queues nothing.
-    assert!(!job.loop_wait_below(0));
+    assert!(!job.loop_wait_room(1));
     hold.open();
     writers.settle();
     assert_eq!(std::fs::read(&path).unwrap(), b"held");
-    // Below its line the loop's wait says so, whatever the clock reads.
-    assert!(job.loop_wait_below(0));
+    // With room the loop's wait says so, whatever the clock reads.
+    assert!(job.loop_wait_room(1));
 }
 
 // The loop's read of a file whose writes sit on a stuck volume does not
@@ -1636,6 +1638,85 @@ fn a_batch_stops_taking_writes_at_its_byte_cap() {
     assert_eq!(count(&volume.writer.batches), 3);
     drop((job, hold));
     writers.wait_ended(&volume);
+}
+
+// The loop's writes count against the volume's hard limit before they are
+// queued, in pieces of at most its share (100 of 1600 here). With the volume
+// full the next write stands still for the writer, queues nothing
+// meanwhile, and goes once the writer has written one piece of what it
+// holds; the count never passes the limit.
+#[test]
+fn a_loop_write_on_a_full_volume_waits_for_room_and_never_counts_past_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    volume.set_buffer_limits(1600, 1600);
+    assert_eq!(volume.loop_share(), 100);
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    job.write(1, 0, Bytes::from(vec![1u8; 1000]), create(&path));
+    hold.wait_held();
+    job.write(1, 1000, Bytes::from(vec![2u8; 600]), None);
+    assert_eq!(volume.unwritten_bytes(), 1600);
+    std::thread::scope(|scope| {
+        let next = scope.spawn(|| job.write(1, 1600, Bytes::from(vec![3u8; 40]), None));
+        hold.wait_below_waiters(1);
+        assert_eq!(volume.unwritten_bytes(), 1600, "nothing more was queued");
+        assert_eq!(count(&volume.buffered_bytes), 1600);
+        // The first piece written leaves room for the third write.
+        hold.release(1);
+        next.join().unwrap();
+    });
+    assert_eq!(volume.unwritten_bytes(), 1540);
+    hold.open();
+    writers.settle();
+    assert_eq!(volume.unwritten_bytes(), 0);
+    assert_eq!(volume.peak_bytes(), 1600);
+    let written = std::fs::read(&path).unwrap();
+    assert_eq!(written.len(), 1640);
+    assert!(written[..1000].iter().all(|byte| *byte == 1));
+    assert!(written[1000..1600].iter().all(|byte| *byte == 2));
+    assert!(written[1600..].iter().all(|byte| *byte == 3));
+}
+
+// What the loop holds as credit, the arrived article it hands on, is
+// already counted: a write within it adds nothing to the count. Past it a
+// write longer than the loop's share goes in pieces of that share, each
+// counted as it fits.
+#[test]
+fn a_loop_write_takes_its_credit_first_and_goes_in_pieces_past_its_share() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    volume.set_buffer_limits(64, 64);
+    assert_eq!(volume.loop_share(), 4);
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    volume.charge(10);
+    volume.loop_credit.store(10, Ordering::Relaxed);
+    job.write(1, 0, Bytes::from(vec![1u8; 10]), create(&path));
+    assert_eq!(volume.unwritten_bytes(), 10, "the credit paid for it");
+    assert_eq!(count(&volume.loop_credit), 0);
+    hold.wait_held();
+    // Two of credit, then eighteen past it: pieces of 6, 4, 4, 4 and 2.
+    volume.charge(2);
+    volume.loop_credit.store(2, Ordering::Relaxed);
+    job.write(1, 10, Bytes::from(vec![2u8; 20]), None);
+    assert_eq!(volume.unwritten_bytes(), 30);
+    assert_eq!(count(&volume.writer.operations), 0);
+    hold.open();
+    writers.settle();
+    assert_eq!(
+        count(&volume.writer.operations),
+        6,
+        "one write and five pieces"
+    );
+    assert_eq!(volume.unwritten_bytes(), 0);
+    let written = std::fs::read(&path).unwrap();
+    assert_eq!(written.len(), 30);
+    assert!(written[10..].iter().all(|byte| *byte == 2));
 }
 
 // Opens a new file sized to its declared length, as a file system that makes

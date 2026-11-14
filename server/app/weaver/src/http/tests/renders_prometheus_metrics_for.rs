@@ -943,6 +943,8 @@ fn renders_collected_instrumentation_snapshots() {
     );
     assert!(rendered.contains("weaver_volume_buffered_bytes{volume=\"/mnt/nas\"} 65536"));
     assert!(rendered.contains("weaver_volume_arrived_bytes{volume=\"/mnt/nas\"} 4096"));
+    assert!(rendered.contains("weaver_volume_counted_bytes{volume=\"/mnt/nas\"} 69632"));
+    assert!(rendered.contains("weaver_volume_counted_peak_bytes{volume=\"/mnt/nas\"} 900000"));
     // A sized volume carries its limits; one not sized yet carries neither.
     assert!(rendered.contains("weaver_volume_buffer_limit_bytes{volume=\"/mnt/nas\"} 1000000"));
     assert!(rendered.contains("weaver_volume_buffer_soft_limit_bytes{volume=\"/mnt/nas\"} 700000"));

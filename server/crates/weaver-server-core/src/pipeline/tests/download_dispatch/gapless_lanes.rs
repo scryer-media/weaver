@@ -730,7 +730,7 @@ async fn a_lane_held_for_a_full_volume_is_asked_again_only_once_it_has_room() {
     // Two results wait for the loop: the volume holds its limit, and the
     // lane's ask is refused and held.
     for _ in 0..2 {
-        pipeline.note_released_download_result_pending(job_id, 512);
+        pipeline.note_arrived_result_for_test(job_id, 512);
     }
     assert!(pipeline.volume_holds_budget(job_id));
     let (response_tx, mut response_rx) = oneshot::channel();
@@ -755,8 +755,8 @@ async fn a_lane_held_for_a_full_volume_is_asked_again_only_once_it_has_room() {
     // The loop hands both results on: the volume has room, dispatch is
     // woken, and the next pass answers the lane.
     pipeline.download_dispatch_wake = false;
-    pipeline.finish_released_download_result_processing(job_id, 512);
-    pipeline.finish_released_download_result_processing(job_id, 512);
+    pipeline.hand_on_result_for_test(job_id, 512);
+    pipeline.hand_on_result_for_test(job_id, 512);
     assert!(pipeline.download_dispatch_wake);
     pipeline.service_held_download_refills();
     let lease = response_rx
@@ -819,11 +819,9 @@ async fn a_lane_held_for_room_is_asked_again_once_its_volume_falls_to_its_resume
         .expect("a lane with room is served");
     assert!(pipeline.download_lane_holdings(lane_id) > 0);
 
-    // One article of room left, above the resume line: the next ask is
-    // held for the volume.
-    for _ in 0..63 {
-        pipeline.note_released_download_result_pending(job_id, 512);
-    }
+    // Less than an article of room left, above the resume line: the next
+    // ask is held for the volume.
+    fill_to_room_short(&mut pipeline, job_id, &volume);
     assert!(volume.unwritten_bytes() > line && volume.unwritten_bytes() < hard);
     let (response_tx, mut response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(refill_request_on(lane_id, 0, response_tx));
@@ -833,9 +831,7 @@ async fn a_lane_held_for_room_is_asked_again_once_its_volume_falls_to_its_resume
 
     // The lane fetches everything it holds down: still above the line,
     // passes leave the hold as it is.
-    let owner = pipeline.download_lane_owners.get_mut(&lane_id).unwrap();
-    owner.outstanding.clear();
-    owner.outstanding_bytes = 0;
+    fetch_down(&mut pipeline, lane_id, job_id);
     pipeline.service_held_download_refills();
     assert!(response_rx.try_recv().is_err(), "held while above the line");
 
@@ -843,7 +839,7 @@ async fn a_lane_held_for_room_is_asked_again_once_its_volume_falls_to_its_resume
     // hold stands.
     pipeline.download_dispatch_wake = false;
     while volume.unwritten_bytes() - 512 > line {
-        pipeline.finish_released_download_result_processing(job_id, 512);
+        pipeline.hand_on_result_for_test(job_id, 512);
     }
     assert!(!pipeline.download_dispatch_wake, "no wake above the line");
     pipeline.service_held_download_refills();
@@ -852,7 +848,7 @@ async fn a_lane_held_for_room_is_asked_again_once_its_volume_falls_to_its_resume
 
     // The next one takes the volume to its line: dispatch is woken once,
     // and the pass answers the lane.
-    pipeline.finish_released_download_result_processing(job_id, 512);
+    pipeline.hand_on_result_for_test(job_id, 512);
     assert!(volume.unwritten_bytes() <= line);
     assert!(
         pipeline.download_dispatch_wake,
@@ -869,8 +865,41 @@ async fn a_lane_held_for_room_is_asked_again_once_its_volume_falls_to_its_resume
     assert_eq!(counted(&pipeline), (1, 1));
 }
 
+// Results of 512 bytes arrive for the job until less than one more article
+// fits below its volume's lease limit: one byte of room is left.
+fn fill_to_room_short(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    volume: &crate::operations::disk::volume::Volume,
+) {
+    let limit = volume.lease_limit();
+    while volume.unwritten_bytes() + 512 < limit {
+        pipeline.note_arrived_result_for_test(job_id, 512);
+    }
+    let rest = limit - 1 - volume.unwritten_bytes();
+    if rest != 0 {
+        pipeline.note_arrived_result_for_test(job_id, rest);
+    }
+    assert_eq!(volume.lease_room(), 1);
+}
+
+// Every article the lane holds arrives whole: its reservation is counted
+// on as arrived, and the result waits for the loop.
+fn fetch_down(pipeline: &mut Pipeline, lane_id: u64, job_id: JobId) {
+    let segments: Vec<_> = pipeline.download_lane_owners[&lane_id]
+        .outstanding
+        .values()
+        .map(|work| (work.segment_id, u64::from(work.byte_estimate)))
+        .collect();
+    for (segment, bytes) in segments {
+        assert!(pipeline.accept_lane_result(lane_id, segment, bytes));
+        pipeline.note_released_download_result_pending(job_id, bytes);
+    }
+    assert_eq!(pipeline.download_lane_holdings(lane_id), 0);
+}
+
 // A lane held for a volume above its resume line that has since fetched
-// everything it held down: the volume one article below its hard limit,
+// everything it held down: the volume one byte below its lease limit,
 // and the lane's ask still held for it, the lane's pipe empty. The lane,
 // its answer and the volume are returned.
 async fn room_held_idle_lane(
@@ -904,9 +933,7 @@ async fn room_held_idle_lane(
         .unwrap()
         .lease
         .expect("a lane with room is served");
-    for _ in 0..63 {
-        pipeline.note_released_download_result_pending(job_id, 512);
-    }
+    fill_to_room_short(pipeline, job_id, &volume);
     assert!(volume.unwritten_bytes() > volume.resume_line());
     let (response_tx, mut response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(refill_request_on(lane_id, 0, response_tx));
@@ -914,9 +941,7 @@ async fn room_held_idle_lane(
     assert_eq!(pipeline.room_held_download_refills_for_test(), 1);
     // The lane fetches what it holds down; its pipe is empty. While every
     // job waits for the volume, a pass leaves the hold.
-    let owner = pipeline.download_lane_owners.get_mut(&lane_id).unwrap();
-    owner.outstanding.clear();
-    owner.outstanding_bytes = 0;
+    fetch_down(pipeline, lane_id, job_id);
     pipeline.service_held_download_refills();
     assert!(response_rx.try_recv().is_err());
     assert_eq!(pipeline.room_held_download_refills_for_test(), 1);
