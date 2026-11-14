@@ -1528,7 +1528,12 @@ async fn dirty_bytes_at_the_barrier_force_a_write() {
     let pending = Pending::default();
     let (mail, _heard) = tokio::sync::mpsc::unbounded_channel();
     pending.put(&job, Vec::new());
-    pending.slot().dirty_bytes = super::CHECKPOINT_BYTES - 64;
+    // The first article is held in memory until the member is decided, so
+    // the checkpoint says none of it: a held byte is no checkpoint's to
+    // save. The second completes the member and both go to its file, which
+    // is when their 128 bytes count.
+    assert_eq!(pending.slot().dirty_bytes, 0);
+    pending.slot().dirty_bytes = super::CHECKPOINT_BYTES - 128;
     pending.queue(&db, id, &mail, false);
     db.flush_write_queue().await.unwrap();
     assert_eq!(writes(&db), 0);

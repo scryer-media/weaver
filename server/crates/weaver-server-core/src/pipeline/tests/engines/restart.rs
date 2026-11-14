@@ -1491,6 +1491,51 @@ async fn plain_files_under_par3_restarted_after_every_article_are_repaired_with_
     restart_row(Scenario::new(posts).damaged(0, 2)).await;
 }
 
+// Every file is given its declared length when it is made, on whatever
+// platform the test runs: a file's length then says nothing of how far its
+// bytes reach. Articles a restored member holds in memory, undecided under
+// its set, are in no file, and each restart fetches them again from what the
+// checkpoint says alone. One that took the file's length for them would
+// leave holes of zeros where they lay, more than the set's blocks mend.
+#[tokio::test]
+async fn articles_held_in_memory_over_a_sized_file_are_fetched_again_after_every_restart() {
+    let _sized = crate::pipeline::graph::sparse::sizing::always();
+    let files = [
+        ("lantern.bin", payload(6 * ARTICLE, 83)),
+        ("beacon.bin", payload(3 * ARTICLE + 9, 84)),
+    ];
+    let posts = with_par3(&files, &["lantern.bin", "beacon.bin"], "lantern");
+    restart_row(Scenario::new(posts).damaged(0, 2)).await;
+}
+
+// No file is given a length before its bytes, so each is as long as its
+// last byte written. The second file is small enough to be decided at its
+// first article: its first and last articles come first and go to its
+// file, which then reaches its end. Every article between them comes after
+// a restart, while the member is undecided under its set, and is held in
+// memory below the file's length. Each restart fetches those again: the
+// file's length covers them, and the checkpoint does not.
+#[tokio::test]
+async fn articles_held_in_memory_below_a_files_length_are_fetched_again_after_every_restart() {
+    let _grown = crate::pipeline::graph::sparse::sizing::never();
+    let files = [
+        ("lantern.bin", payload(6 * ARTICLE, 83)),
+        ("beacon.bin", payload(3 * ARTICLE + 9, 84)),
+    ];
+    let posts = with_par3(&files, &["lantern.bin", "beacon.bin"], "lantern");
+    // Sixteen bytes an article: the second file is thirteen of them.
+    let scenario = Scenario::new(posts).framed(16).first(&[(1, 0), (1, 12)]);
+    let whole = run(&scenario).await;
+    assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
+    let restarted = run_restarting(&scenario, &mut |_| {}).await;
+    assert_restarted(&restarted, &whole);
+    assert!(
+        (1..12).any(|ordinal| restarted.in_memory.contains(&(1, ordinal))),
+        "some article between the file's ends was held in memory at a restart: {:?}",
+        restarted.in_memory
+    );
+}
+
 // The members are bound by their bytes, so the restored set must still
 // know what it identified: a lost match would read them back again, and a
 // lost rename would deliver them under their hex names.
