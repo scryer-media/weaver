@@ -94,6 +94,7 @@ impl Pipeline {
             disk: Some(crate::pipeline::graph::disk::job_disk(
                 &self.volume_writers,
                 &self.storage_capacity,
+                &self.volume_probes,
                 job_id.0,
                 &state.working_dir,
                 state.staging_dir.as_deref(),

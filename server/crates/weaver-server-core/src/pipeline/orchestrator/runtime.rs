@@ -231,6 +231,19 @@ impl Pipeline {
                 }
             },
         ).ringing(volume_rates));
+        // Each volume's first write rate comes from a probe queued on its
+        // writer; the figures an earlier run kept are read here, off the
+        // runtime. A pipeline under test probes nothing.
+        let volume_probes = Arc::new(if cfg!(test) {
+            crate::pipeline::graph::disk::VolumeProbes::none()
+        } else {
+            let data_dir = data_dir.clone();
+            let store = tokio::task::spawn_blocking(move || {
+                crate::operations::disk::ProbeStore::open(&data_dir)
+            })
+            .await?;
+            crate::pipeline::graph::disk::VolumeProbes::stored(store)
+        });
         let extraction_limits = Arc::new(ExtractionLimits::from_env_with_profile_ceiling(
             &complete_dir,
             profile_tuning.extraction_memory_bytes,
@@ -508,6 +521,7 @@ impl Pipeline {
             volume_writers,
             volume_reports,
             volume_budget_held: std::sync::atomic::AtomicBool::new(false),
+            volume_probes,
             window_ledgers: Default::default(),
             extraction_limits,
             process_memory_budget,

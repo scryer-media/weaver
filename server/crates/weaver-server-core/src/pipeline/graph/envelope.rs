@@ -468,7 +468,7 @@ impl Shelf {
         match state.kept.entry(envelope) {
             Entry::Occupied(kept) => Ok(kept.into_mut()),
             Entry::Vacant(free) => {
-                let name = free_envelope_name(&self.dir, self.node, envelope);
+                let name = free_envelope_name(self.to.as_ref(), &self.dir, self.node, envelope);
                 let mut leaf = Leaf::at(&self.dir, &name).through(self.to.as_ref());
                 leaf.truncate()?;
                 Ok(free.insert(Kept::in_file(leaf)))
@@ -552,8 +552,29 @@ pub(crate) fn envelope_name(node: NodeId, envelope: u32) -> String {
 
 // The file a new envelope starts in: the one its node and number name, or,
 // while a file still sits there, the first free one after it.
-fn free_envelope_name(dir: &Path, node: NodeId, envelope: u32) -> String {
-    free_name(dir, &envelope_name(node, envelope))
+fn free_envelope_name(
+    to: Option<&Arc<crate::operations::disk::writer::Submitter>>,
+    dir: &Path,
+    node: NodeId,
+    envelope: u32,
+) -> String {
+    free_name_through(to, dir, &envelope_name(node, envelope))
+}
+
+// [`free_name`] for a file written through `to`. A file made through a
+// volume's writer is not on disk until its writer has run, and one removed
+// through it still is: the disk says which names are taken only once
+// everything submitted has returned, so that is waited for first. A name
+// is asked for once for each new file kept aside, never for each article.
+pub(crate) fn free_name_through(
+    to: Option<&Arc<crate::operations::disk::writer::Submitter>>,
+    dir: &Path,
+    name: &str,
+) -> String {
+    if let Some(to) = to {
+        to.barrier().wait();
+    }
+    free_name(dir, name)
 }
 
 // `name`, or, while a file still sits there, the first free one after it:

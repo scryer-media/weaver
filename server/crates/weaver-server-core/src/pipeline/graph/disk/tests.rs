@@ -444,3 +444,91 @@ fn a_job_on_two_volumes_waits_for_both() {
     assert_eq!(failures[0].error.to_string(), "the other disk is gone");
     assert!(!output_dir.join("lantern.bin").exists());
 }
+
+// A volume is probed once, the first time a job is given its writer: the
+// probe is queued on that volume's thread, a second job on the volume
+// queues none, and a second volume gets its own.
+#[test]
+fn a_volume_is_probed_once_when_a_job_first_writes_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (working_dir, output_dir) = (dir.path().join("working"), dir.path().join("output"));
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let through = writers();
+    let other = Arc::new(Volume::new(Some(2), "other".to_owned()));
+    let (said, probed) = mpsc::channel();
+    let said = Mutex::new(said);
+    let probes = super::VolumeProbes::with(move |volume, dir| {
+        let said = said.lock().unwrap().clone();
+        Box::new(move || {
+            let _ = said.send((volume.device, dir));
+            Ok(())
+        })
+    });
+    // The job's directory is not made yet: the probe is given the nearest
+    // one above it that is.
+    probes.first_seen(&through.writers, &through.volume, &working_dir.join("one"));
+    assert_eq!(probed.recv().unwrap(), (None, dir.path().to_path_buf()));
+    probes.first_seen(&through.writers, &through.volume, &working_dir.join("two"));
+    probes.first_seen(&through.writers, &other, &output_dir);
+    assert_eq!(probed.recv().unwrap(), (Some(2), output_dir.clone()));
+    probes.first_seen(&through.writers, &other, &output_dir);
+    // Every sender left is in a probe still queued: none is.
+    drop(probes);
+    assert!(probed.recv().is_err(), "no volume is probed twice");
+}
+
+// On a machine that will start no thread for a volume, a job's first
+// operation fails its key at once instead of waiting for ever: the failure
+// is reported under the job's key, the barrier returns without passing,
+// and nothing is held in memory for a thread that will never come.
+#[test]
+fn a_job_fails_at_once_where_no_writer_thread_can_start() {
+    let (send, reports) = mpsc::channel();
+    let send = Mutex::new(send);
+    let writers = VolumeWriters::threadless(move |report: Report| {
+        let _ = send.lock().unwrap().send(report);
+    });
+    let volume = Arc::new(Volume::new(None, "test".to_owned()));
+    let disk = JobDisk::new(writers.submitter(&volume, 1), None);
+    let (mut job, dir, _) = job_through(&files(), Vec::new(), |_| Some(disk.clone()));
+    for (at, ordinal) in seeded() {
+        arrive(&mut job, at, ordinal);
+    }
+    let barrier = disk.barrier();
+    assert!(barrier.returned());
+    assert!(!barrier.passed());
+    assert!(disk.failed());
+    let failures: Vec<_> = reports.try_iter().flat_map(|report| report.failures).collect();
+    assert!(!failures.is_empty());
+    assert!(failures.iter().all(|failure| failure.key == 1));
+    assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 0);
+    assert!(on_disk(dir.path()).is_empty());
+}
+
+// A name is free only when no file sits at it, and a file made through a
+// volume's writer sits there only once the writer has run: the name asked
+// for waits for what was submitted, and so never lands on a file whose
+// making is still queued.
+#[test]
+fn a_free_name_is_not_one_a_queued_file_will_take() {
+    let through = writers();
+    let hold = through.hold();
+    let disk = through.disk();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kept");
+    let to = path.clone();
+    disk.working()
+        .run(None, path, move || std::fs::write(&to, b"kept"));
+    let name = std::thread::scope(|scope| {
+        let asked = scope.spawn(|| {
+            crate::pipeline::graph::envelope::free_name_through(
+                Some(disk.working()),
+                dir.path(),
+                "kept",
+            )
+        });
+        hold.open();
+        asked.join().unwrap()
+    });
+    assert_eq!(name, "kept-1");
+}

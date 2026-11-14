@@ -1922,6 +1922,8 @@ pub struct Pipeline {
     pub(super) volume_reports:
         tokio::sync::mpsc::UnboundedReceiver<crate::operations::disk::writer::Report>,
     pub(super) volume_budget_held: std::sync::atomic::AtomicBool,
+    // What queues each volume's first write-rate probe on its writer, once.
+    pub(super) volume_probes: Arc<crate::pipeline::graph::disk::VolumeProbes>,
     // What decode windows took from each disk they go on, for every graph
     // job together.
     pub(super) window_ledgers: graph::window::WindowLedgers,

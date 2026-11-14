@@ -125,6 +125,7 @@ pub(crate) struct RestoreSeat {
     volumes: (
         Arc<crate::operations::disk::writer::VolumeWriters>,
         Arc<crate::operations::StorageCapacity>,
+        Arc<super::disk::VolumeProbes>,
     ),
 }
 
@@ -160,6 +161,7 @@ impl Pipeline {
             volumes: (
                 Arc::clone(&self.volume_writers),
                 Arc::clone(&self.storage_capacity),
+                Arc::clone(&self.volume_probes),
             ),
         }
     }
@@ -269,6 +271,7 @@ impl RestoreSeat {
         let disk = super::disk::job_disk(
             &self.volumes.0,
             &self.volumes.1,
+            &self.volumes.2,
             job_id.0,
             &self.working_dir,
             self.output.as_ref().map(|(dir, _)| dir.as_path()),

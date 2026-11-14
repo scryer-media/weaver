@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::operations::StorageCapacity;
+use crate::operations::disk::volume::Volume;
 use crate::operations::disk::writer::{Barrier, Failure, Report, Submitter, VolumeWriters};
 use crate::pipeline::Pipeline;
 use crate::pipeline::graph::job::GraphError;
@@ -25,17 +26,96 @@ use crate::pipeline::graph::job::GraphJob;
 pub(crate) fn job_disk(
     writers: &VolumeWriters,
     capacity: &StorageCapacity,
+    probes: &VolumeProbes,
     key: u64,
     working_dir: &Path,
     output_dir: Option<&Path>,
 ) -> JobDisk {
     let volume = capacity.volume(working_dir);
+    probes.first_seen(writers, &volume, working_dir);
     let working = writers.submitter(&volume, key);
     let output = output_dir.and_then(|dir| {
         let other = capacity.volume(dir);
-        (!Arc::ptr_eq(&other, &volume)).then(|| (dir.to_path_buf(), writers.submitter(&other, key)))
+        (!Arc::ptr_eq(&other, &volume)).then(|| {
+            probes.first_seen(writers, &other, dir);
+            (dir.to_path_buf(), writers.submitter(&other, key))
+        })
     });
     JobDisk::new(working, output)
+}
+
+// The key a volume's probe is queued under. A job's key is its id, which
+// the database numbers from one upwards and never reaches this.
+const PROBE_KEY: u64 = u64::MAX;
+
+type Probe = Box<dyn FnOnce() -> std::io::Result<()> + Send>;
+
+// What gives each volume its first write rate: the first time a job is
+// given a volume's writer, the volume's probe is queued on that writer,
+// ahead of the job's own writes, and never again for that volume. The
+// probe runs on the volume's thread; nothing here looks at a disk.
+pub(crate) struct VolumeProbes {
+    // The probe of a volume, given a directory on it that is there.
+    probe: Option<Arc<dyn Fn(Arc<Volume>, PathBuf) -> Probe + Send + Sync>>,
+    // The volumes whose probe was queued: one entry for each device.
+    seen: std::sync::Mutex<Vec<Arc<Volume>>>,
+}
+
+impl VolumeProbes {
+    // Probes that read and keep their figures in `store`.
+    pub(crate) fn stored(store: Arc<crate::operations::disk::ProbeStore>) -> Self {
+        Self::with(move |volume, dir| {
+            Box::new(crate::operations::disk::probe_once(
+                volume,
+                dir,
+                Arc::clone(&store),
+            ))
+        })
+    }
+
+    pub(crate) fn with(
+        probe: impl Fn(Arc<Volume>, PathBuf) -> Probe + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            probe: Some(Arc::new(probe)),
+            seen: Default::default(),
+        }
+    }
+
+    // No volume is probed.
+    pub(crate) fn none() -> Self {
+        Self {
+            probe: None,
+            seen: Default::default(),
+        }
+    }
+
+    fn first_seen(&self, writers: &VolumeWriters, volume: &Arc<Volume>, dir: &Path) {
+        let Some(probe) = &self.probe else {
+            return;
+        };
+        {
+            let mut seen = self
+                .seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if seen.iter().any(|known| Arc::ptr_eq(known, volume)) {
+                return;
+            }
+            seen.push(Arc::clone(volume));
+        }
+        // The job's directory may not be made yet: the probe is given the
+        // nearest directory above it that is, found on the volume's thread.
+        let (probe, probed, under) = (Arc::clone(probe), Arc::clone(volume), dir.to_path_buf());
+        writers
+            .submitter(volume, PROBE_KEY)
+            .run(None, dir.to_path_buf(), move || {
+                match under.ancestors().find(|dir| dir.is_dir()) {
+                    Some(dir) => probe(probed, dir.to_path_buf())(),
+                    None => Ok(()),
+                }
+            });
+    }
 }
 
 // A test's say over how the pipelines it builds write: one thread per
