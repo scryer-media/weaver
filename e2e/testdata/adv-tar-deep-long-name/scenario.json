@@ -1,15 +1,21 @@
 {
   "slug": "adv-tar-deep-long-name",
   "title": "E2E.Adversarial.Tar.Deep.Long.Name.2026-TESTGRP",
-  "description": "A tar member whose GNU long name runs through 262,000 one-letter directories, beside an ordinary member. The name ledger keeps every part, so creating the member's directories fails at the filesystem's path limit and the job fails on the namespace write; the deep member never lands.",
+  "description": "A tar member whose GNU long name runs through 262,000 one-letter directories, beside an ordinary member. No file system can hold the deep path, so that member is skipped and never lands; the ordinary member beside it is delivered with its exact bytes, and the job ends partial.",
   "category": "2000",
-  "expected_outcome": "extraction_failure",
+  "expected_outcome": "partial_delivery",
   "adversarial": {
     "group": "default",
-    "outcome": "failed",
-    "errorContains": "the namespace write path failed",
+    "outcome": "partial",
+    "minOutputFiles": 1,
+    "requiredOutputs": [
+      "beacon.txt"
+    ],
     "forbiddenOutputs": [
       "deep.txt"
     ]
+  },
+  "expectedOutputBLAKE3": {
+    "beacon.txt": "918f9174019cf5f7b6c457f88f612f7fc6a9c0ff65a3894e95227131fca6db58"
   }
 }

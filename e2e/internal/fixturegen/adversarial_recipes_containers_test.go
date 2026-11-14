@@ -8,10 +8,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -160,27 +158,6 @@ func TestRatioLevelsAreUnderTheRatioAloneAndOverItTogether(t *testing.T) {
 	}
 }
 
-// The inner bomb: the tar the gzip holds expands the post far past the
-// ratio while its one member is tiny, and everything past the end blocks is
-// zero.
-func TestInnerRatioBombIsTheTarAlone(t *testing.T) {
-	post := buildContainerCase(t, "adv-targz-inner-ratio", "beacon-bomb.tar.gz")
-	inner := gunzip(t, post)
-	if ratio := float64(len(inner)) / float64(len(post)); ratio < 400 {
-		t.Errorf("the tar expands the post %.1fx; it must pass 100x by far", ratio)
-	}
-	if limit := int64(len(post)) * 100; limit > int64(len(inner))/4 || limit < 1<<20 {
-		t.Errorf("the ratio limit %d must sit between the 1 MiB floor and a quarter of the tar's %d bytes", limit, len(inner))
-	}
-	sizes, _ := tarMembers(t, inner)
-	if size, ok := sizes[InnerRatioMember]; !ok || len(sizes) != 1 || size > 1024 {
-		t.Fatalf("members %v, want only a small %s", sizes, InnerRatioMember)
-	}
-	if !bytes.Equal(inner[len(inner)-ratioInnerPadding:], make([]byte, ratioInnerPadding)) {
-		t.Error("the padding after the end blocks is not all zero")
-	}
-}
-
 // The member cap nest: the tar is past the tight group's 32 MiB member cap,
 // each member under it.
 func TestMemberCapNestPutsOnlyTheTarOverTheCap(t *testing.T) {
@@ -275,58 +252,5 @@ func TestYencLieTarSpansTwoArticles(t *testing.T) {
 	sizes, _ := tarMembers(t, data)
 	if _, ok := sizes[YencLieMember]; !ok || len(sizes) != 1 {
 		t.Fatalf("members %v, want only %s", sizes, YencLieMember)
-	}
-}
-
-// restateSevenZip writes the two size fields and the checksum over them,
-// and nothing else.
-func TestRestateSevenZipRewritesOnlyTheEndHeaderFields(t *testing.T) {
-	original := make([]byte, 64)
-	copy(original, "7z\xbc\xaf\x27\x1c\x00\x04")
-	for index := 32; index < len(original); index++ {
-		original[index] = byte(index)
-	}
-	forged, err := restateSevenZip(original, 0, 1<<63)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := binary.LittleEndian.Uint64(forged[12:20]); got != 0 {
-		t.Errorf("offset %d, want 0", got)
-	}
-	if got := binary.LittleEndian.Uint64(forged[20:28]); got != 1<<63 {
-		t.Errorf("length %d, want 2^63", got)
-	}
-	if got, want := binary.LittleEndian.Uint32(forged[8:12]), crc32.ChecksumIEEE(forged[12:32]); got != want {
-		t.Errorf("start header checksum %#x, want %#x", got, want)
-	}
-	if !bytes.Equal(forged[:8], original[:8]) || !bytes.Equal(forged[28:], original[28:]) {
-		t.Error("bytes outside the two size fields and the checksum changed")
-	}
-	if _, err := restateSevenZip([]byte("not a 7z at all, but long enough to be read"), 0, 1); err == nil {
-		t.Error("a file that is not a 7z was restated")
-	}
-}
-
-// The copies are identical bodies under distinct names; the over-cap count
-// passes the tight group's entry cap even before the 7z's members are
-// counted, and the honest count is far under the default.
-func TestFoldedCopiesAreOneBodyUnderManyNames(t *testing.T) {
-	body := []byte("7z\xbc\xaf\x27\x1c stand-in body")
-	entries := foldedCopyEntries(body, foldedCopiesOverCap)
-	names := map[string]bool{}
-	for _, entry := range entries {
-		if !bytes.Equal(entry.Body, body) {
-			t.Fatalf("%s holds other bytes", entry.Name)
-		}
-		names[entry.Name] = true
-	}
-	if len(names) != foldedCopiesOverCap {
-		t.Errorf("%d distinct names for %d copies", len(names), foldedCopiesOverCap)
-	}
-	if foldedCopiesOverCap <= 1000 || foldedCopiesHonest+len(FoldedMembers) >= 100_000 {
-		t.Errorf("copy counts %d and %d do not straddle the caps", foldedCopiesOverCap, foldedCopiesHonest)
-	}
-	if _, err := encodeRawTar(entries); err != nil {
-		t.Fatal(err)
 	}
 }

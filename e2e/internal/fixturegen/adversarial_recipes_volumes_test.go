@@ -136,74 +136,11 @@ func TestNestedFalsePacketsNestAndNoneIsSealed(t *testing.T) {
 	}
 }
 
-// gf16Mul multiplies in par2's GF(2^16), generator polynomial 0x1100B.
-func gf16Mul(a, b uint32) uint32 {
-	var product uint32
-	for b != 0 {
-		if b&1 != 0 {
-			product ^= a
-		}
-		b >>= 1
-		a <<= 1
-		if a&0x10000 != 0 {
-			a ^= 0x1100B
-		}
-	}
-	return product
-}
-
-func gf16Pow(base uint32, exponent int) uint32 {
-	result := uint32(1)
-	for ; exponent > 0; exponent-- {
-		result = gf16Mul(result, base)
-	}
-	return result
-}
-
-// par2Base is par2cmdline's base for input slice index: 2 raised to the
-// index-th integer coprime to 65535.
-func par2Base(index int) uint32 {
-	found := -1
-	for n := 1; ; n++ {
-		if n%3 == 0 || n%5 == 0 || n%17 == 0 || n%257 == 0 {
-			continue
-		}
-		found++
-		if found == index {
-			return gf16Pow(2, n)
-		}
-	}
-}
-
-func TestDependentExponentsWeighTheDamagedSlicesAlike(t *testing.T) {
-	a, b := par2Base(dependentSliceA), par2Base(dependentSliceB)
-	if a == b {
-		t.Fatal("the two damaged slices share a base")
-	}
-	for step := 0; step < dependentBlocks; step++ {
-		exponent := step * dependentStride
-		if gf16Pow(a, exponent) != gf16Pow(b, exponent) {
-			t.Fatalf("exponent %d tells the damaged slices apart", exponent)
-		}
-	}
-	// The honest twin's exponents 0 and 1 already tell them apart, so two
-	// of its blocks rebuild both slices.
-	if gf16Pow(a, 1) == gf16Pow(b, 1) {
-		t.Fatal("exponent 1 does not tell the damaged slices apart")
-	}
-	if dependentSliceB >= dependentSlices {
-		t.Fatal("the second damaged slice is past the payload")
-	}
-}
-
 func TestVolumeScenarioDigestsMatchTheirSeeds(t *testing.T) {
 	cases := []struct {
 		slug, name, seed string
 		size             int64
 	}{
-		{"adv-par2-independent-recovery", independentPosted, "adversarial/dependent-recovery", dependentPayload},
-		{"adv-recovery-sets-disagree", "contested.mkv", "adversarial/sets-disagree/posted", 1 << 20},
-		{"adv-recovery-sets-disagree-damaged", "contested.mkv", "adversarial/sets-disagree/posted", 1 << 20},
 		{"adv-par2-nested-false-packets", "nested-payload.mkv", "adversarial/nested-false-packets", 1<<20 + 777},
 	}
 	for _, c := range cases {

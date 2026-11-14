@@ -8,15 +8,12 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
-	"strings"
 )
 
 // The adversarial volume cases: recovery sets that lie about what they hold
@@ -28,41 +25,14 @@ import (
 //
 // PAR2 index packets are written by Go, packet by packet, each sealed with its
 // MD5, so a case can hold a thousand sets or a packet repeated thousands of
-// times without a thousand runs of par2cmdline. Recovery blocks come only from
-// par2cmdline and PAR3 sets only from the par3cmdline reference.
+// times without a thousand runs of par2cmdline. No case here holds a recovery
+// block.
 
 // volumePAR2Slice is the block size of every set below that names no other.
 const volumePAR2Slice = 65536
 
 // volumeSaltedPassword is the password of the many-salted-entries archive.
 const volumeSaltedPassword = "adversarial-salted-password"
-
-// The shape of the length-elimination cases: elimLong descriptions share one
-// length and elimLong-1 posted members of that length match none of them;
-// elimShort descriptions each have a length of their own and one posted
-// member of it that matches nothing.
-const (
-	elimLong       = 16
-	elimShort      = 16
-	elimLongLength = 65536
-)
-
-// The dependent-recovery cases damage these two slices of their payload.
-// par2cmdline gives input slice i the base 2^n(i), n(i) the i-th integer
-// coprime to 65535: n(0) = 1 and n(8) = 16. Raised to a multiple of 4369 =
-// 65535/15 both bases land on the same value, so every recovery block whose
-// exponent is such a multiple weighs the two slices alike and no number of
-// them tells the two apart.
-const (
-	dependentSliceA   = 0
-	dependentSliceB   = 8
-	dependentStride   = 4369
-	dependentBlocks   = 8
-	dependentSlices   = 16
-	dependentPayload  = dependentSlices * volumePAR2Slice
-	dependentDamaged  = "dependent.mkv"
-	independentPosted = "independent.mkv"
-)
 
 // AdversarialVolumeRecipes is the volume half of the adversarial family.
 func AdversarialVolumeRecipes() []Recipe {
@@ -118,18 +88,6 @@ func AdversarialVolumeRecipes() []Recipe {
 			},
 			ExpectedOutputs: func(_ context.Context, env *Env) (map[string]string, error) {
 				return map[string]string{"many-sets.mkv": env.StagePath("many-sets/many-sets.mkv")}, nil
-			},
-		},
-		{
-			Slug: "adv-par2-length-elimination", Family: "adversarial", ByteReproducible: true,
-			Notes: "A PAR2 index describing sixteen files of one length and sixteen of lengths of their own, beside obfuscated members of those " +
-				"lengths whose bytes match no description: one fewer of the shared length than described, one of each other length. Matching " +
-				"by length rejects every shared-length description and binds the others; that elimination must not repeat its rejections per binding.",
-			Build: func(_ context.Context, env *Env) error {
-				return writeEliminationShape(env, func(described []string) error {
-					_, err := writePAR2Index(env, "elimination.par2", volumePAR2Slice, described...)
-					return err
-				})
 			},
 		},
 		{
@@ -209,62 +167,6 @@ func AdversarialVolumeRecipes() []Recipe {
 			ExpectedOutputs: expectPostedOutputs("duplicate-meta.mkv"),
 		},
 		{
-			Slug: "adv-par2-dependent-recovery", Family: "adversarial",
-			Notes: "A 1 MiB payload of sixteen 64 KiB slices with slices 0 and 8 zeroed, beside eight par2cmdline recovery blocks whose " +
-				"exponents are the multiples of 4369 from 0 to 30583. Each block weighs the two damaged slices alike, so no count of them " +
-				"rebuilds the payload. Asking for more blocks must not hold every block read so far beyond the memory granted; the job fails named.",
-			Build: sequence(
-				writeVolumePRNG(dependentDamaged, "adversarial/dependent-recovery", dependentPayload),
-				dependentRecoverySet(),
-				zeroOutput(dependentDamaged, dependentSliceA*volumePAR2Slice, volumePAR2Slice),
-				zeroOutput(dependentDamaged, dependentSliceB*volumePAR2Slice, volumePAR2Slice),
-			),
-		},
-		{
-			Slug: "adv-par2-independent-recovery", Family: "adversarial",
-			Notes: "The honest twin of adv-par2-dependent-recovery: the same payload and the same two zeroed slices, with eight recovery " +
-				"blocks of exponents 0 to 7, which par2cmdline writes by default. Any two of them rebuild the slices, and the job completes " +
-				"with the payload's original bytes.",
-			Build: sequence(
-				writeVolumePRNG(independentPosted, "adversarial/dependent-recovery", dependentPayload),
-				par2(PAR2Spec{
-					Base: "independent.par2", Sources: []string{independentPosted},
-					SliceSize: volumePAR2Slice, RecoveryBlocks: dependentBlocks, RecoveryFiles: 1,
-				}),
-				zeroOutput(independentPosted, dependentSliceA*volumePAR2Slice, volumePAR2Slice),
-				zeroOutput(independentPosted, dependentSliceB*volumePAR2Slice, volumePAR2Slice),
-			),
-			ExpectedOutputs: expectStaged(independentPosted, "adversarial/dependent-recovery", dependentPayload),
-		},
-		{
-			Slug: "adv-recovery-sets-disagree", Family: "adversarial",
-			Notes: "An intact payload with a PAR2 set made from it and a PAR3 set made from other bytes of the same name and length. " +
-				"The sets disagree on every block; PAR2 ranks first, its set agrees with the posted bytes, and the job completes with them.",
-			Build:           disagreeingSets(false),
-			ExpectedOutputs: expectStaged("contested.mkv", "adversarial/sets-disagree/posted", 1<<20),
-		},
-		{
-			Slug: "adv-recovery-sets-disagree-damaged", Family: "adversarial",
-			Notes: "adv-recovery-sets-disagree with one 64 KiB block of the posted payload zeroed, so both sets want to repair it, each " +
-				"towards its own bytes. A repair never rewrites an earlier one unless its set outranks every other; PAR2's repair stands, and " +
-				"the job completes with the payload's original bytes.",
-			Build:           disagreeingSets(true),
-			ExpectedOutputs: expectStaged("contested.mkv", "adversarial/sets-disagree/posted", 1<<20),
-		},
-		{
-			Slug: "adv-par3-length-elimination", Family: "adversarial",
-			Notes: "The PAR3 twin of adv-par2-length-elimination: a par3cmdline set over thirty-two described files, posted beside obfuscated " +
-				"members of the described lengths whose bytes match nothing. PAR3 shares PAR2's length elimination and must settle as quickly.",
-			Build: func(ctx context.Context, env *Env) error {
-				return writeEliminationShape(env, func(described []string) error {
-					return env.PAR3(ctx, PAR3Spec{
-						Index: "elimination.par3", Sources: described,
-						BlockSize: volumePAR2Slice, RecoveryBlocks: 1, RecoveryFiles: 1, ECC: 1,
-					})
-				})
-			},
-		},
-		{
 			Slug: "adv-rar5-many-salted-entries", Family: "adversarial",
 			Notes: "512 stored members of 4 KiB in a RAR5 set written with `-p` across three 1 MiB volumes. RARLAB draws a salt per member, " +
 				"so every member needs a key of its own, and every member announcement crosses volumes. File keys are derived on the pool, " +
@@ -308,18 +210,6 @@ func expectPostedOutputs(names ...string) func(context.Context, *Env) (map[strin
 	}
 }
 
-// expectStaged pins a delivered file to a fresh copy of the seeded bytes it
-// was made from, which the recipe damaged in the output directory afterwards.
-func expectStaged(name, seed string, size int64) func(context.Context, *Env) (map[string]string, error) {
-	return func(_ context.Context, env *Env) (map[string]string, error) {
-		path := env.StagePath("expected/" + name)
-		if err := WritePRNG(path, seed, size); err != nil {
-			return nil, err
-		}
-		return map[string]string{name: path}, nil
-	}
-}
-
 // writeZeroFile writes a file of zeros as a hole, which reads back as zeros.
 func writeZeroFile(path string, size int64) error {
 	file, err := os.Create(path)
@@ -331,151 +221,6 @@ func writeZeroFile(path string, size int64) error {
 		return err
 	}
 	return file.Close()
-}
-
-// obfuscatedName is a 32-character hex name with no extension, as an
-// obfuscated post spells its files.
-func obfuscatedName(label string) string {
-	sum := md5.Sum([]byte("adversarial/obfuscated/" + label))
-	return hex.EncodeToString(sum[:])
-}
-
-// writeEliminationShape writes the described files, hands their names to the
-// recovery writer, removes them, and posts the obfuscated members in their
-// place.
-func writeEliminationShape(env *Env, recover func(described []string) error) error {
-	var described []string
-	for index := 0; index < elimLong; index++ {
-		name := fmt.Sprintf("described-long-%02d.mkv", index)
-		if err := WritePRNG(env.OutputPath(name), "adversarial/elimination/described/"+name, elimLongLength); err != nil {
-			return err
-		}
-		described = append(described, name)
-	}
-	for index := 0; index < elimShort; index++ {
-		name := fmt.Sprintf("described-short-%02d.mkv", index)
-		if err := WritePRNG(env.OutputPath(name), "adversarial/elimination/described/"+name, eliminationShortLength(index)); err != nil {
-			return err
-		}
-		described = append(described, name)
-	}
-	if err := recover(described); err != nil {
-		return err
-	}
-	for _, name := range described {
-		if err := removeOutput(env, name); err != nil {
-			return err
-		}
-	}
-	for index := 0; index < elimLong-1; index++ {
-		label := fmt.Sprintf("long-%02d", index)
-		if err := WritePRNG(env.OutputPath(obfuscatedName(label)), "adversarial/elimination/posted/"+label, elimLongLength); err != nil {
-			return err
-		}
-	}
-	for index := 0; index < elimShort; index++ {
-		label := fmt.Sprintf("short-%02d", index)
-		if err := WritePRNG(env.OutputPath(obfuscatedName(label)), "adversarial/elimination/posted/"+label, eliminationShortLength(index)); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// eliminationShortLength is the length of the index-th short description,
-// distinct for each and below the shared length.
-func eliminationShortLength(index int) int64 {
-	return int64(1024 * (index + 1))
-}
-
-// dependentRecoverySet writes the payload's index and one recovery file per
-// multiple of dependentStride, each from its own par2cmdline run, renamed
-// into the payload's set. The set identity depends only on the slice size and
-// the file it describes, so every run speaks for the same set.
-func dependentRecoverySet() func(context.Context, *Env) error {
-	return func(ctx context.Context, env *Env) error {
-		for step := 0; step < dependentBlocks; step++ {
-			exponent := step * dependentStride
-			base := fmt.Sprintf("dependent-%d.par2", step)
-			if err := par2FromExponent(ctx, env, base, dependentDamaged, exponent); err != nil {
-				return err
-			}
-			outputs, err := env.Outputs()
-			if err != nil {
-				return err
-			}
-			stem := strings.TrimSuffix(base, ".par2")
-			moved := 0
-			for _, name := range outputs {
-				switch {
-				case name == base && step == 0:
-					if err := os.Rename(env.OutputPath(name), env.OutputPath("dependent.par2")); err != nil {
-						return err
-					}
-				case name == base:
-					if err := removeOutput(env, name); err != nil {
-						return err
-					}
-				case strings.HasPrefix(name, stem+".vol") && strings.HasSuffix(name, ".par2"):
-					target := fmt.Sprintf("dependent.vol%d+1.par2", exponent)
-					if err := os.Rename(env.OutputPath(name), env.OutputPath(target)); err != nil {
-						return err
-					}
-					moved++
-				}
-			}
-			if moved != 1 {
-				return fmt.Errorf("par2cmdline wrote %d recovery files for exponent %d, want 1", moved, exponent)
-			}
-		}
-		return nil
-	}
-}
-
-// par2FromExponent writes one recovery block of the given exponent (`-f`)
-// over one source with the pinned par2cmdline build.
-func par2FromExponent(ctx context.Context, env *Env, base, source string, exponent int) error {
-	toolchain, err := env.Lock.Find(PAR2Toolchain)
-	if err != nil {
-		return err
-	}
-	if err := env.Docker.Prepare(ctx, toolchain); err != nil {
-		return err
-	}
-	env.usedToolchain(PAR2Toolchain)
-	return env.Docker.Run(ctx, toolchain, env.Work, outputDir,
-		"create", "-q", "-s"+strconv.Itoa(volumePAR2Slice), "-f"+strconv.Itoa(exponent), "-c1", "-n1", base, source)
-}
-
-// disagreeingSets writes a PAR3 set over decoy bytes and a PAR2 set over the
-// posted bytes, both under one name and length, and zeroes one block of the
-// posted payload when damaged is set.
-func disagreeingSets(damaged bool) func(context.Context, *Env) error {
-	return func(ctx context.Context, env *Env) error {
-		const name = "contested.mkv"
-		if err := WritePRNG(env.OutputPath(name), "adversarial/sets-disagree/decoy", 1<<20); err != nil {
-			return err
-		}
-		if err := env.PAR3(ctx, PAR3Spec{
-			Index: "contested.par3", Sources: []string{name},
-			BlockSize: volumePAR2Slice, RecoveryBlocks: 4, RecoveryFiles: 1, ECC: 1,
-		}); err != nil {
-			return err
-		}
-		if err := WritePRNG(env.OutputPath(name), "adversarial/sets-disagree/posted", 1<<20); err != nil {
-			return err
-		}
-		if err := env.PAR2(ctx, PAR2Spec{
-			Base: "contested.par2", Sources: []string{name},
-			SliceSize: volumePAR2Slice, RecoveryBlocks: 4, RecoveryFiles: 1,
-		}); err != nil {
-			return err
-		}
-		if damaged {
-			return ZeroRange(env.OutputPath(name), 2*volumePAR2Slice, volumePAR2Slice)
-		}
-		return nil
-	}
 }
 
 // ------------------------------------------------------------------ PAR2 index

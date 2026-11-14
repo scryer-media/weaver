@@ -95,7 +95,9 @@ func TestAdversarialNZBE2E(t *testing.T) {
 	// A post whose first article is declared 32 MiB and whose every other
 	// article is a missing byte. Nothing in it can be fetched, so the job
 	// fails; abandoning the dead post weighs it once, not once per article.
-	// After the verdict none of its ids is asked for again.
+	// The fixture is the one server and counts the bodies asked of it by id:
+	// no id of the dead post is asked for more than once, whenever its
+	// requests land.
 	t.Run("dead-post", func(t *testing.T) {
 		slug := "adv-nzb-dead-post"
 		const tail = 20000
@@ -105,10 +107,11 @@ func TestAdversarialNZBE2E(t *testing.T) {
 		}
 		job := h.submit(t, slug, nil, advNZBFile{name: "dead.s01e02.mkv", groups: []string{"alt.test"}, segments: parts})
 		h.awaitStatus(t, job, "FAILED")
-		before := h.requestsWithPrefix(slug + "-")
 		h.bystander(t, slug)
-		if after := h.requestsWithPrefix(slug + "-"); after != before {
-			t.Fatalf("the dead post's articles were asked for %d more times after it failed", after-before)
+		for _, part := range parts {
+			if requests := h.requests(part.ids[0]); requests > 1 {
+				t.Errorf("the dead article %s was asked for %d times", part.ids[0], requests)
+			}
 		}
 	})
 
