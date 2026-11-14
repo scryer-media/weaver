@@ -611,8 +611,6 @@ fn writer_counts(volume: &Volume) -> crate::operations::instrumentation::VolumeW
         abandoned_operations: counts.abandoned_operations.load(Ordering::Relaxed),
         threads: counts.threads.load(Ordering::Relaxed),
         woken: counts.woken.load(Ordering::Relaxed),
-        buffers_returned: counts.buffers_returned.load(Ordering::Relaxed),
-        buffers_freed: counts.buffers_freed.load(Ordering::Relaxed),
     }
 }
 

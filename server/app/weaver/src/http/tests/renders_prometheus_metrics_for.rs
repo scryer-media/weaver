@@ -966,12 +966,6 @@ fn renders_collected_instrumentation_snapshots() {
         let line = format!("{row}{{volume=\"/mnt/nas\"}} {value}");
         assert!(rendered.contains(&line), "{line}");
     }
-    for (to, value) in [("returned", "30"), ("freed", "2")] {
-        let line = format!(
-            "weaver_volume_writer_buffers_total{{volume=\"/mnt/nas\",to=\"{to}\"}} {value}"
-        );
-        assert!(rendered.contains(&line), "{line}");
-    }
     // The loop's waits on a volume, by what it waited for.
     for (kind, waits, seconds) in [
         ("read", "1", "0.25"),

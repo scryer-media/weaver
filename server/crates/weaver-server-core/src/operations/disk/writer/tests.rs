@@ -69,83 +69,22 @@ fn a_barrier_passes_once_every_write_before_it_returned() {
     assert!(reports.try_recv().is_err(), "a clean batch says nothing");
 }
 
-// A written buffer's last share goes back to the pipeline loop while the
-// way back has room, and is freed on the writer past it; a buffer someone
-// else still shares frees nothing and goes nowhere. What came back leaves
-// with the loop's free.
+// A written buffer is let go on the writer as its write returns, so its
+// memory goes back while it is warm: once the write is waited on, the
+// caller's own share is the only one left.
 #[test]
-fn written_buffers_go_back_to_the_loop_up_to_a_bound() {
-    let returns = Returns::new(8);
-    let counts = super::super::volume::WriterCounts::default();
-    returns.give(Bytes::from(vec![1u8; 5]), &counts);
-    let shared = Bytes::from(vec![2u8; 2]);
-    returns.give(shared.clone(), &counts);
-    returns.give(Bytes::from(vec![3u8; 4]), &counts);
-    assert_eq!(count(&counts.buffers_returned), 1);
-    assert_eq!(count(&counts.buffers_freed), 1, "past the bound");
-    assert_eq!(count(&returns.bytes), 5);
-    returns.free();
-    assert_eq!(count(&returns.bytes), 0);
-    assert!(returns.held.lock().unwrap().is_empty());
-    returns.give(Bytes::from(vec![3u8; 4]), &counts);
-    assert_eq!(count(&counts.buffers_returned), 2, "room again once freed");
-    drop(shared);
-
-    // Through a volume's thread: the write's count falls as it returns, and
-    // its buffer waits for the loop.
+fn a_written_buffer_is_let_go_on_the_writer() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a");
     let (writers, _reports) = writers();
     let volume = volume("one");
     let job = writers.submitter(&volume, 7);
-    job.write(1, 0, Bytes::from(b"lantern".to_vec()), create(&path));
+    let bytes = Bytes::from(b"lantern".to_vec());
+    job.write(1, 0, bytes.clone(), create(&path));
     job.barrier().wait();
     assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 0);
-    assert_eq!(count(&volume.writer.buffers_returned), 1);
-    assert_eq!(count(&writers.registry.returns.bytes), 7);
-    writers.free_returned();
-    assert_eq!(count(&writers.registry.returns.bytes), 0);
-}
-
-// While the loop waits with nothing to drive, nothing is held for it: what
-// came back is freed as it parks, and a writer frees what it writes then in
-// place. Once the loop is back, buffers go back to it again.
-#[test]
-fn nothing_is_held_for_a_loop_that_waits_with_nothing_to_drive() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("a");
-    let (writers, _reports) = writers();
-    let volume = volume("one");
-    let job = writers.submitter(&volume, 7);
-    job.write(1, 0, Bytes::from(b"lantern".to_vec()), create(&path));
-    job.barrier().wait();
-    assert_eq!(count(&writers.registry.returns.bytes), 7);
-
-    let parked = writers.park_returns();
-    assert_eq!(
-        count(&writers.registry.returns.bytes),
-        0,
-        "freed as the loop parks"
-    );
-    job.write(1, 7, Bytes::from(b"wick".to_vec()), None);
-    job.barrier().wait();
-    assert_eq!(count(&writers.registry.returns.bytes), 0);
-    assert_eq!(
-        count(&volume.writer.buffers_freed),
-        1,
-        "freed by the writer"
-    );
-    assert_eq!(count(&volume.writer.buffers_returned), 1);
-
-    drop(parked);
-    job.write(1, 11, Bytes::from(b"oil".to_vec()), None);
-    job.barrier().wait();
-    assert_eq!(
-        count(&writers.registry.returns.bytes),
-        3,
-        "held for the loop again"
-    );
-    assert_eq!(std::fs::read(&path).unwrap(), b"lanternwickoil");
+    assert!(bytes.is_unique(), "the writer holds no share once written");
+    assert_eq!(std::fs::read(&path).unwrap(), b"lantern");
 }
 
 // Opens a file a second after the writer's clock, as a slow open would.

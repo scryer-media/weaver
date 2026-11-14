@@ -658,8 +658,6 @@ metric_families! {
         "Writer threads started for a volume, one after another: a volume's thread ends when nothing writes to it and starts again at the next write.");
     VOLUME_WRITER_WOKEN = ("weaver_volume_writer_woken_total", Counter, ["volume"],
         "Times a volume's writer woke to new operations after it had run out of them and waited.");
-    VOLUME_WRITER_BUFFERS = ("weaver_volume_writer_buffers_total", Counter, ["volume", "to"],
-        "Written buffers a volume's writer handed back to the pipeline loop to be freed there (`returned`), and those it freed itself because the way back was full (`freed`).");
 
     // ---- PAR3 recovery -----------------------------------------------------------------------------
     // Every series here is fed from `MetricsSnapshot::par3`, which is a plain

@@ -1611,13 +1611,6 @@ fn render_volumes(out: &mut Encoder, volumes: &[VolumeSnapshot]) {
         );
         out.sample(&f::VOLUME_WRITER_THREADS, labels, writer.threads);
         out.sample(&f::VOLUME_WRITER_WOKEN, labels, writer.woken);
-        for (to, value) in [
-            ("returned", writer.buffers_returned),
-            ("freed", writer.buffers_freed),
-        ] {
-            let labels: &[(&str, &str)] = &[("volume", volume.label.as_str()), ("to", to)];
-            out.sample(&f::VOLUME_WRITER_BUFFERS, labels, value);
-        }
     }
 }
 
