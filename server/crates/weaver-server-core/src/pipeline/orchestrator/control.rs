@@ -858,19 +858,29 @@ impl Pipeline {
         // written the figure in force stays until the next turn.
         if let Ok(config) = self.config.try_read() {
             let storage = &self.storage_capacity;
+            let folders: Vec<PathBuf> = config
+                .categories
+                .iter()
+                .map(|category| {
+                    crate::pipeline::queue::destination_root(
+                        &self.complete_dir,
+                        std::slice::from_ref(category),
+                        Some(&category.name),
+                    )
+                })
+                .collect();
+            drop(config);
+            // Each category's folder may be a mount of its own inside the
+            // complete directory: the disk owner is told the folders as
+            // they stand, and reads the device of one it had not heard of
+            // on a thread of its own.
+            storage.set_folders(&folders);
             let write_mbps = crate::operations::disk::slowest_measured_mbps(
                 [&self.intermediate_dir, &self.complete_dir]
                     .into_iter()
-                    .map(|dir| storage.write_rate(dir))
-                    .chain(config.categories.iter().map(|category| {
-                        storage.write_rate(&crate::pipeline::queue::destination_root(
-                            &self.complete_dir,
-                            std::slice::from_ref(category),
-                            Some(&category.name),
-                        ))
-                    })),
+                    .chain(&folders)
+                    .map(|dir| storage.write_rate(dir)),
             );
-            drop(config);
             if self.applied_sequential_write_mbps != Some(write_mbps) {
                 self.applied_sequential_write_mbps = Some(write_mbps);
                 self.tuner.set_sequential_write_mbps(write_mbps);

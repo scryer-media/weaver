@@ -1877,6 +1877,16 @@ impl StorageCapacity {
         })
     }
 
+    // What a root whose directory is `path` says of the device under it:
+    // `None` when no root lies there, and `Some(None)` while the root's
+    // device is not read, or could not be.
+    fn root_device_at(&self, path: &Path) -> Option<Option<u64>> {
+        self.slots.iter().find_map(|slot| {
+            let state = slot.lock();
+            (state.path == path).then_some(state.device.flatten())
+        })
+    }
+
     // The entry for `path`, made when there is none. Past the cap, the
     // entry asked after longest ago with no look out is dropped first.
     fn entry<'a>(cache: &'a mut PathCache, path: &Path) -> &'a mut PathEntry {

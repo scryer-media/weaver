@@ -1771,7 +1771,7 @@ impl Pipeline {
                 // per job.
                 let landing = dest.parent().unwrap_or(&dest).to_path_buf();
                 let renames = crate::runtime::panic_trap::spawn_blocking(move || {
-                    let volume = capacity.volume(&landing);
+                    let volume = capacity.read_volume(&landing);
                     Renames::through(writers.submitter(&volume, job_id.0))
                 })
                 .await

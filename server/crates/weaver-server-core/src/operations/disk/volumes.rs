@@ -21,8 +21,10 @@ use tracing::warn;
 use super::volume::Volume;
 use super::{StorageCapacity, lock_paths, nearest_device};
 
-// Paths remembered before the memory of them starts over. A job asks after
-// its own directories, so the count follows the jobs that ran.
+// Paths remembered at once. A job asks after its own directories, so the
+// count follows the jobs that ran. One more path than this drops the path
+// asked after longest ago, and no other: a path still asked after keeps
+// its volume.
 const REMEMBERED_PATHS: usize = 1024;
 
 // Paths that may wait to be read at once. One past that is not queued: it
@@ -43,10 +45,25 @@ pub(super) struct Volumes {
 
 #[derive(Default)]
 struct Known {
-    by_path: HashMap<PathBuf, Arc<Volume>>,
+    by_path: HashMap<PathBuf, Remembered>,
+    // Counts asks, so the path asked after longest ago is told apart.
+    asks: u64,
+    // The configured folders a delivery can land under besides the roots,
+    // each category's, as last told, and the device each was read on:
+    // `None` until its read returns, and when it could not be read. A
+    // folder may be a mount of its own inside a root, so nothing under it
+    // is answered from a directory above it.
+    folders: HashMap<PathBuf, Option<u64>>,
+    told: Vec<PathBuf>,
     by_device: HashMap<u64, Arc<Volume>>,
     // Volumes of paths the OS gave no device for, by label.
     unnumbered: HashMap<String, Arc<Volume>>,
+}
+
+struct Remembered {
+    volume: Arc<Volume>,
+    // The ask count at the latest ask.
+    asked: u64,
 }
 
 // The paths waiting for the reader thread, and whether it runs.
@@ -84,8 +101,8 @@ impl StorageCapacity {
     // asked after before, or a root or a reading above it gives its device
     // and that device's volume is known. Never a disk call.
     pub(crate) fn known_volume(&self, path: &Path) -> Option<Arc<Volume>> {
-        if let Some(volume) = self.volumes.lock().by_path.get(path) {
-            return Some(Arc::clone(volume));
+        if let Some(volume) = self.volumes.lock().recall(path) {
+            return Some(volume);
         }
         let device = self.held_device(path)??;
         let mut known = self.volumes.lock();
@@ -105,29 +122,124 @@ impl StorageCapacity {
             .collect()
     }
 
+    // The configured folders besides the roots, each category's, as they
+    // stand now: told at start-up and whenever they may have changed. Never
+    // a disk call: a folder not told before has its device read off this
+    // thread, and until that returns nothing under it is answered from a
+    // directory above it. Telling the same folders again does nothing.
+    pub(crate) fn set_folders(&self, folders: &[PathBuf]) {
+        let unread: Vec<PathBuf> = {
+            let mut known = self.volumes.lock();
+            if known.told == folders {
+                return;
+            }
+            let mut next: HashMap<PathBuf, Option<u64>> = HashMap::with_capacity(folders.len());
+            let mut unread = Vec::new();
+            for folder in folders {
+                match known.folders.get(folder) {
+                    Some(device) => {
+                        next.insert(folder.clone(), *device);
+                    }
+                    None if !next.contains_key(folder) => {
+                        next.insert(folder.clone(), None);
+                        unread.push(folder.clone());
+                    }
+                    None => {}
+                }
+            }
+            // What was remembered under a folder that came or went was
+            // answered by another rule: it is asked anew.
+            let changed: Vec<PathBuf> = known
+                .folders
+                .keys()
+                .filter(|folder| !next.contains_key(*folder))
+                .chain(unread.iter())
+                .cloned()
+                .collect();
+            known
+                .by_path
+                .retain(|path, _| !changed.iter().any(|folder| path.starts_with(folder)));
+            known.folders = next;
+            known.told = folders.to_vec();
+            unread
+        };
+        for folder in unread {
+            Volumes::read_later(&self.volumes, &folder);
+        }
+    }
+
     // The device the owner already holds for `path` or the nearest
-    // directory above it that it has read, without a disk call.
+    // directory above it that it has read, without a disk call. A root or
+    // a configured folder on the way up answers for everything under it,
+    // and answers nothing while its own device is not read: it may be a
+    // mount of its own, so the directory above it does not speak for it.
     fn held_device(&self, path: &Path) -> Option<Option<u64>> {
+        let folder = {
+            let known = self.volumes.lock();
+            match known.folders.is_empty() {
+                true => None,
+                false => path
+                    .ancestors()
+                    .find_map(|at| known.folders.get(at).map(|device| (at, *device))),
+            }
+        };
         let cache = lock_paths(&self.paths);
-        path.ancestors().find_map(|at| {
-            self.root_device(at).or_else(|| {
-                cache
-                    .entries
-                    .get(at)
-                    .and_then(|entry| entry.device.as_ref())
-                    .map(|look| look.device)
-                    .filter(Option::is_some)
-            })
-        })
+        for at in path.ancestors() {
+            if let Some((_, device)) = folder.filter(|(folder, _)| *folder == at) {
+                return Some(device);
+            }
+            if let Some(device) = self.root_device_at(at) {
+                return Some(device);
+            }
+            let looked = cache
+                .entries
+                .get(at)
+                .and_then(|entry| entry.device.as_ref())
+                .map(|look| look.device)
+                .filter(Option::is_some);
+            if looked.is_some() {
+                return looked;
+            }
+        }
+        None
     }
 }
 
 impl Known {
+    // The volume remembered for `path`, which is asked after now.
+    fn recall(&mut self, path: &Path) -> Option<Arc<Volume>> {
+        self.asks += 1;
+        let asked = self.asks;
+        let remembered = self.by_path.get_mut(path)?;
+        remembered.asked = asked;
+        Some(Arc::clone(&remembered.volume))
+    }
+
+    // Remember `path`'s volume. Past the cap the one path asked after
+    // longest ago is dropped for it, and no other.
     fn remember(&mut self, path: &Path, volume: &Arc<Volume>) {
-        if self.by_path.len() >= REMEMBERED_PATHS {
-            self.by_path.clear();
+        self.asks += 1;
+        let asked = self.asks;
+        if let Some(device) = self.folders.get_mut(path) {
+            *device = volume.device;
         }
-        self.by_path.insert(path.to_path_buf(), Arc::clone(volume));
+        if !self.by_path.contains_key(path)
+            && self.by_path.len() >= REMEMBERED_PATHS
+            && let Some(oldest) = self
+                .by_path
+                .iter()
+                .min_by_key(|(_, remembered)| remembered.asked)
+                .map(|(path, _)| path.clone())
+        {
+            self.by_path.remove(&oldest);
+        }
+        self.by_path.insert(
+            path.to_path_buf(),
+            Remembered {
+                volume: Arc::clone(volume),
+                asked,
+            },
+        );
     }
 }
 
@@ -424,5 +536,107 @@ mod tests {
         assert!(Arc::ptr_eq(&storage.volume(&asked), &read));
         assert!(Arc::ptr_eq(&storage.read_volume(&asked), &read));
         assert_eq!(looks(), before + 1, "known from memory from then on");
+    }
+
+    // A category's folder that is a mount of its own inside the complete
+    // directory: once the owner is told of it, nothing under it is answered
+    // from the complete directory's device, before its own device is read
+    // or after.
+    #[test]
+    fn a_configured_folder_inside_a_root_is_its_own_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let complete = dir.path().join("complete");
+        let shows = complete.join("shows");
+        test_devices::assign(&complete, 6);
+        test_devices::assign(&shows, 8);
+        let storage = owner(dir.path());
+        let job = shows.join("job-1");
+        // Not told of yet, the folder is a directory of the root's.
+        assert_eq!(storage.volume(&job).device, Some(6));
+        let (release, mut entered) = test_devices::hold(&shows);
+        let before = looks();
+
+        storage.set_folders(std::slice::from_ref(&shows));
+
+        // The folder's read is out on the reader thread. Until it returns
+        // the job's directory under it has no known device, and the root's
+        // is not handed out for it.
+        assert_eq!(entered.blocking_recv().as_deref(), Some(shows.as_path()));
+        assert!(storage.known_volume(&job).is_none());
+        assert!(storage.known_volume(&shows).is_none());
+        // A directory of the root's beside the folder is still the root's.
+        assert_eq!(storage.volume(&complete.join("films").join("job-2")).device, Some(6));
+        drop(release);
+        storage.volumes.wait_read();
+        let after = looks();
+        assert!(after > before);
+
+        let read = storage.volume(&job);
+        assert_eq!(read.device, Some(8));
+        assert!(Arc::ptr_eq(&storage.volume(&shows.join("job-3")), &read));
+        assert!(Arc::ptr_eq(&storage.read_volume(&job), &read));
+        // Told the same folders again: nothing is read again.
+        storage.set_folders(std::slice::from_ref(&shows));
+        assert!(!reading(&storage));
+        assert_eq!(looks(), after, "from memory from then on");
+
+        // The folder is a category's no longer: it is the root's again.
+        storage.set_folders(&[]);
+        assert_eq!(storage.volume(&job).device, Some(6));
+    }
+
+    // A root whose own device is not read answers nothing for what lies
+    // under it from a root above it.
+    #[test]
+    fn a_root_inside_another_does_not_take_the_outer_roots_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        test_devices::assign(&data, 3);
+        let storage = owner(dir.path());
+        let inner = data.join("intermediate");
+        test_devices::assign(&inner, 4);
+        let (release, mut entered) = test_devices::hold(&inner);
+        storage.retarget(StorageRoot::Intermediate, inner.clone());
+        assert_eq!(entered.blocking_recv().as_deref(), Some(inner.as_path()));
+        assert!(storage.known_volume(&inner.join("job-1")).is_none());
+        drop(release);
+        storage.reread_roots();
+        assert_eq!(storage.volume(&inner.join("job-1")).device, Some(4));
+    }
+
+    // Past the cap one path is dropped for each new one, the one asked
+    // after longest ago: a path still asked after keeps the volume that
+    // was read for it, and is not read again.
+    #[test]
+    fn a_path_still_asked_after_outlives_the_cap_on_remembered_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let live = elsewhere.path().join("job");
+        test_devices::assign(&live, 12);
+        test_devices::assign(&dir.path().join("intermediate"), 5);
+        let storage = owner(dir.path());
+        let read = storage.read_volume(&live);
+        let before = looks();
+        let under = |index: usize| dir.path().join("intermediate").join(format!("job-{index}"));
+
+        for index in 0..REMEMBERED_PATHS - 1 {
+            storage.volume(&under(index));
+        }
+        assert_eq!(storage.volumes.lock().by_path.len(), REMEMBERED_PATHS);
+        // Asked after again, the path is no longer the oldest.
+        assert!(Arc::ptr_eq(&storage.volume(&live), &read));
+        for index in REMEMBERED_PATHS..REMEMBERED_PATHS + 8 {
+            storage.volume(&under(index));
+        }
+
+        let known = storage.volumes.lock();
+        assert_eq!(known.by_path.len(), REMEMBERED_PATHS, "one out for each one in");
+        assert!(known.by_path.contains_key(&live));
+        assert!(!known.by_path.contains_key(&under(0)), "the oldest went");
+        assert!(known.by_path.contains_key(&under(REMEMBERED_PATHS - 2)));
+        drop(known);
+        assert!(Arc::ptr_eq(&storage.volume(&live), &read));
+        assert_eq!(looks(), before, "nothing was read again");
+        assert!(!reading(&storage));
     }
 }
