@@ -462,7 +462,19 @@ pub struct DownloadQueue {
     // steering every item carries drops them all, so a floor never hides an
     // item the server may take. Indexed by server; empty until one walks.
     scan_floors: Vec<Option<ScanFloor>>,
+    // What the files' queued counts last answered the index bootstrap, the
+    // list of index files it was answered for, and the counts' stamp then
+    // (see [`Self::counts_stamp`]). Read again only while both still match.
+    bootstrap_answer: Option<(CountsStamp, Arc<[u32]>, BootstrapAnswer)>,
 }
+
+// A value that differs after any change to a file's queued count: every item
+// put in takes one of the two sequences, each of which moves one way only,
+// and an item taken out with none put in shortens the queue. A re-key moves
+// neither and changes no count.
+type CountsStamp = (u64, u64, usize);
+
+type BootstrapAnswer = Result<(), crate::pipeline::download::worker::BlockedBy>;
 
 // Where a walk of the queue starts or stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -496,7 +508,37 @@ impl DownloadQueue {
             files: HashMap::new(),
             first_articles: HashSet::new(),
             scan_floors: Vec::new(),
+            bootstrap_answer: None,
         }
+    }
+
+    fn counts_stamp(&self) -> CountsStamp {
+        (
+            self.next_sequence,
+            self.next_ahead_sequence,
+            self.order.len(),
+        )
+    }
+
+    // The answer `walk` gives for the files' queued counts and
+    // `bootstrap_files`, walked only when a count changed or the list is
+    // another one since it was last asked. The list is held, so the same
+    // pointer is the same list.
+    pub(in crate::pipeline::download) fn bootstrap_answer(
+        &mut self,
+        bootstrap_files: &Arc<[u32]>,
+        walk: impl FnOnce(&Self) -> BootstrapAnswer,
+    ) -> BootstrapAnswer {
+        let at = self.counts_stamp();
+        if let Some((kept_at, files, answer)) = &self.bootstrap_answer
+            && *kept_at == at
+            && Arc::ptr_eq(files, bootstrap_files)
+        {
+            return *answer;
+        }
+        let answer = walk(self);
+        self.bootstrap_answer = Some((at, Arc::clone(bootstrap_files), answer));
+        answer
     }
 
     // Takes `server`'s floor, leaving it none: where its walk may start, and

@@ -3353,59 +3353,7 @@ async fn recovery_metadata_bootstrap_holds_graph_payload_until_indexes_settle() 
         let (mut pipeline, _, _) =
             new_direct_pipeline_with_backlog(&temp_dir, 16 * 1024 * 1024, 4).await;
         let job_id = JobId(40146);
-        let payload = (0..(7 * 128))
-            .map(|index| (index % 251) as u8)
-            .collect::<Vec<_>>();
-        let index = build_test_par2_index("payload.mkv", &payload, 64);
-        let payload_segments = (0..7)
-            .map(|number| {
-                segment_spec! {
-                    number: number,
-                    bytes: 128,
-                    message_id: format!("graph-payload-{number}@example.com"),
-                }
-            })
-            .collect::<Vec<_>>();
-        let spec = JobSpec {
-            name: "Graph PAR2 Bootstrap".to_string(),
-            password: None,
-            total_bytes: (index.len() + payload.len()) as u64,
-            category: None,
-            metadata: vec![],
-            files: vec![
-                FileSpec {
-                    filename: if par3 {
-                        "00-index.par3"
-                    } else {
-                        "00-index.par2"
-                    }
-                    .to_string(),
-                    role: if par3 {
-                        FileRole::Par3 { is_index: true }
-                    } else {
-                        FileRole::Par2 {
-                            is_index: true,
-                            recovery_block_count: 0,
-                        }
-                    },
-                    groups: vec!["alt.binaries.test".to_string()],
-                    posted_at_epoch: None,
-                    segments: vec![segment_spec! {
-                        number: 0,
-                        bytes: index.len() as u32,
-                        message_id: "graph-index@example.com".to_string(),
-                    }],
-                },
-                FileSpec {
-                    filename: "payload.mkv".to_string(),
-                    role: FileRole::Standalone,
-                    groups: vec!["alt.binaries.test".to_string()],
-                    posted_at_epoch: None,
-                    segments: payload_segments,
-                },
-            ],
-        };
-        insert_active_job(&mut pipeline, job_id, spec).await;
+        insert_active_job(&mut pipeline, job_id, index_and_payload_spec(par3)).await;
         let queued = pipeline
             .jobs
             .get(&job_id)
@@ -3452,19 +3400,124 @@ async fn recovery_metadata_bootstrap_holds_graph_payload_until_indexes_settle() 
                 0,
             )
             .unwrap();
-        let declared = [(
-            weaver_graph::MemberId(0),
-            if par3 {
-                crate::pipeline::graph::metadata::RecoveryFormat::Par3
-            } else {
-                crate::pipeline::graph::metadata::RecoveryFormat::Par2
-            },
-        )];
         assert_eq!(
-            graph.indexes_to_come(declared),
+            graph.indexes_to_come(declared_index(par3)),
             None,
             "a missing index must release payload"
         );
+    }
+}
+
+// A graph the pipeline changed while it was out of the map of graphs, as a
+// retiring one is, is asked again when it is put back: the list it held
+// from before does not come back with it.
+#[tokio::test]
+async fn a_graph_changed_out_of_the_map_holds_no_list_when_put_back() {
+    for par3 in [false, true] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) =
+            new_direct_pipeline_with_backlog(&temp_dir, 16 * 1024 * 1024, 4).await;
+        let job_id = JobId(40147);
+        insert_active_job(&mut pipeline, job_id, index_and_payload_spec(par3)).await;
+        assert_eq!(
+            pipeline
+                .graph_jobs
+                .indexes_to_come(&job_id, declared_index(par3))
+                .as_deref(),
+            Some(&[0u32][..])
+        );
+
+        let mut graph = pipeline.graph_jobs.remove(&job_id).unwrap();
+        graph
+            .lost(
+                weaver_graph::VolumeIndex(0),
+                0,
+                &mut crate::pipeline::graph::status::RepairSlots::default(),
+                0,
+            )
+            .unwrap();
+        pipeline.graph_jobs.insert(job_id, graph);
+
+        assert_eq!(
+            pipeline
+                .graph_jobs
+                .indexes_to_come(&job_id, declared_index(par3)),
+            None
+        );
+    }
+}
+
+fn declared_index(
+    par3: bool,
+) -> [(
+    weaver_graph::MemberId,
+    crate::pipeline::graph::metadata::RecoveryFormat,
+); 1] {
+    [(
+        weaver_graph::MemberId(0),
+        if par3 {
+            crate::pipeline::graph::metadata::RecoveryFormat::Par3
+        } else {
+            crate::pipeline::graph::metadata::RecoveryFormat::Par2
+        },
+    )]
+}
+
+// A recovery index of one article and a payload file of seven.
+fn index_and_payload_spec(par3: bool) -> JobSpec {
+    {
+        let payload = (0..(7 * 128))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let index = build_test_par2_index("payload.mkv", &payload, 64);
+        let payload_segments = (0..7)
+            .map(|number| {
+                segment_spec! {
+                    number: number,
+                    bytes: 128,
+                    message_id: format!("graph-payload-{number}@example.com"),
+                }
+            })
+            .collect::<Vec<_>>();
+        JobSpec {
+            name: "Graph PAR2 Bootstrap".to_string(),
+            password: None,
+            total_bytes: (index.len() + payload.len()) as u64,
+            category: None,
+            metadata: vec![],
+            files: vec![
+                FileSpec {
+                    filename: if par3 {
+                        "00-index.par3"
+                    } else {
+                        "00-index.par2"
+                    }
+                    .to_string(),
+                    role: if par3 {
+                        FileRole::Par3 { is_index: true }
+                    } else {
+                        FileRole::Par2 {
+                            is_index: true,
+                            recovery_block_count: 0,
+                        }
+                    },
+                    groups: vec!["alt.binaries.test".to_string()],
+                    posted_at_epoch: None,
+                    segments: vec![segment_spec! {
+                        number: 0,
+                        bytes: index.len() as u32,
+                        message_id: "graph-index@example.com".to_string(),
+                    }],
+                },
+                FileSpec {
+                    filename: "payload.mkv".to_string(),
+                    role: FileRole::Standalone,
+                    groups: vec!["alt.binaries.test".to_string()],
+                    posted_at_epoch: None,
+                    segments: payload_segments,
+                },
+            ],
+        }
     }
 }
 

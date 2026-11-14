@@ -267,6 +267,69 @@ fn mixed_priorities() {
     assert_eq!(items[3].priority, 1000); // PAR2 recovery
 }
 
+// The per-file walk behind the index bootstrap's answer is made once for a
+// queue and a list of index files, and again only after an item came or
+// went or the list is another one. The steps are counted by the lookup the
+// walk is given.
+#[test]
+fn an_unchanged_queue_answers_the_bootstrap_without_a_step_per_file() {
+    use crate::pipeline::download::worker::queued_files_may_pass;
+
+    const FILES: u32 = 3_000;
+    let mut q = DownloadQueue::new();
+    for file_index in 1..FILES {
+        q.push(make_work(1, file_index, 0, 10));
+    }
+    let steps = std::cell::Cell::new(0usize);
+    let ask = |q: &mut DownloadQueue, bootstrap: &Arc<[u32]>| {
+        steps.set(0);
+        let answer = q.bootstrap_answer(bootstrap, |q| {
+            queued_files_may_pass(FILES as usize, bootstrap, q.len(), |file_index| {
+                steps.set(steps.get() + 1);
+                q.queued_count_for_file(NzbFileId {
+                    job_id: JobId(1),
+                    file_index,
+                }) as usize
+            })
+        });
+        (answer.is_ok(), steps.get())
+    };
+
+    // The index, file 0, has nothing queued: every queued file is held.
+    let index: Arc<[u32]> = Arc::from(vec![0u32]);
+    assert_eq!(ask(&mut q, &index), (false, FILES as usize));
+    assert_eq!(ask(&mut q, &index), (false, 0));
+    assert_eq!(ask(&mut q, &index), (false, 0));
+
+    // An item taken, and one put back in its place, are each a change.
+    let taken = q.pop().unwrap();
+    assert_eq!(ask(&mut q, &index), (false, FILES as usize));
+    q.push(taken);
+    assert_eq!(ask(&mut q, &index), (false, FILES as usize));
+    assert_eq!(ask(&mut q, &index), (false, 0));
+
+    // A re-key changes no file's count.
+    q.rank_ordinary_file(
+        NzbFileId {
+            job_id: JobId(1),
+            file_index: 7,
+        },
+        5,
+        0,
+    );
+    assert_eq!(ask(&mut q, &index), (false, 0));
+
+    // Another list is asked afresh, and stops at its first queued file.
+    let other: Arc<[u32]> = Arc::from(vec![1u32]);
+    assert_eq!(ask(&mut q, &other), (true, 2));
+    assert_eq!(ask(&mut q, &other), (true, 0));
+
+    // The index's own article queued lets work pass.
+    q.push(make_work(1, 0, 0, 10));
+    assert_eq!(ask(&mut q, &index), (true, 1));
+    assert_eq!(ask(&mut q, &index), (true, 0));
+}
+
 #[test]
 fn queued_count_per_file_tracks_push_pop_removal_and_drain() {
     let mut q = DownloadQueue::new();

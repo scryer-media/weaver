@@ -51,8 +51,10 @@ impl GraphJobs {
         self.jobs.values_mut().map(touch)
     }
 
-    // A graph put in starts its own count and holds no list.
-    pub(crate) fn insert(&mut self, job_id: JobId, job: GraphJob) -> Option<GraphJob> {
+    // A graph put in may have been changed while it was out of this map,
+    // where no borrow is counted, so its counter moves as it comes in.
+    pub(crate) fn insert(&mut self, job_id: JobId, mut job: GraphJob) -> Option<GraphJob> {
+        job.touched();
         self.jobs.insert(job_id, job)
     }
 

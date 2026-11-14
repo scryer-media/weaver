@@ -16,6 +16,8 @@ mod pressure;
 mod refill;
 mod spawn;
 
+#[cfg(test)]
+pub(in crate::pipeline::download) use leases::queued_files_may_pass;
 pub(in crate::pipeline::download) use leases::{
     BlockedBy, ScanMemo, ServableWork, ServableWorkFilter,
 };

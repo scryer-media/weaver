@@ -28,6 +28,35 @@ impl BlockedBy {
     }
 }
 
+// Whether any queued article could get past the index bootstrap, from each
+// listed file's queued count: one step per file the job lists. `Ok` when a
+// bootstrap file has an article queued, or when the queue holds an article
+// of a file the job does not list, which is left to the scan to judge.
+pub(in crate::pipeline::download) fn queued_files_may_pass(
+    files: usize,
+    bootstrap_files: &[u32],
+    queued_in_all: usize,
+    mut queued_in: impl FnMut(u32) -> usize,
+) -> Result<(), BlockedBy> {
+    let mut counted = 0usize;
+    let mut blocked = BlockedBy::default();
+    for file_index in (0..files).filter_map(|index| u32::try_from(index).ok()) {
+        let queued = queued_in(file_index);
+        if queued == 0 {
+            continue;
+        }
+        counted += queued;
+        if bootstrap_files.contains(&file_index) {
+            return Ok(());
+        }
+        blocked = blocked.with(SchedulerBlockClause::RecoveryMetadataBootstrap);
+    }
+    if counted != queued_in_all {
+        return Ok(());
+    }
+    Err(blocked)
+}
+
 // Whether a memo's list and a filter's are the one list, or both absent.
 fn same_list<T: ?Sized>(kept: Option<&Arc<T>>, now: Option<&Arc<T>>) -> bool {
     match (kept, now) {
@@ -457,9 +486,7 @@ impl Pipeline {
             return ServableWork::RetentionExcluded;
         }
         let checkpoint = self.checkpoint_admission(job_id);
-        if let Err(blocked) =
-            self.queued_work_may_pass(job_id, checkpoint, bootstrap_files.map(|files| &**files))
-        {
+        if let Err(blocked) = self.queued_work_may_pass(job_id, checkpoint, bootstrap_files) {
             return ServableWork::NoQueuedFilePasses(blocked);
         }
         ServableWork::Scan(ServableWorkFilter {
@@ -497,16 +524,23 @@ impl Pipeline {
     // per article; and a checkpoint that admits some payload sizes but not
     // others is asked article by article. Retention is decided for the whole
     // job before this is asked.
+    //
+    // The per-file part is walked only when a file's queued count changed or
+    // the list of index files is another one since the job was last asked
+    // (see [`DownloadQueue::bootstrap_answer`]); the number of files a job
+    // lists does not change after it is built. A debug build walks on every
+    // ask and checks the kept answer.
     fn queued_work_may_pass(
-        &self,
+        &mut self,
         job_id: JobId,
         checkpoint: CheckpointAdmission,
-        bootstrap_files: Option<&[u32]>,
+        bootstrap_files: Option<&Arc<[u32]>>,
     ) -> Result<(), BlockedBy> {
-        let Some(state) = self.jobs.get(&job_id) else {
+        let Some(state) = self.jobs.get_mut(&job_id) else {
             return Ok(());
         };
-        let Some(queue) = state.articles.download_queue() else {
+        let files = state.spec.files.len();
+        let Some(queue) = state.articles.download_queue_mut() else {
             return Err(BlockedBy::only(SchedulerBlockClause::Activation));
         };
         if checkpoint.holds_every_payload_article() && queue.recovery_work_count() == 0 {
@@ -515,27 +549,18 @@ impl Pipeline {
         let Some(bootstrap_files) = bootstrap_files else {
             return Ok(());
         };
-        let mut counted = 0usize;
-        let mut blocked = BlockedBy::default();
-        for file_index in (0..state.spec.files.len()).filter_map(|index| u32::try_from(index).ok())
-        {
-            let file_id = NzbFileId { job_id, file_index };
-            let queued = queue.queued_count_for_file(file_id) as usize;
-            if queued == 0 {
-                continue;
-            }
-            counted += queued;
-            if bootstrap_files.contains(&file_index) {
-                return Ok(());
-            }
-            blocked = blocked.with(SchedulerBlockClause::RecoveryMetadataBootstrap);
-        }
-        // Articles of a file the spec does not list were not looked at; let
-        // the scan judge them.
-        if counted != queue.len() {
-            return Ok(());
-        }
-        Err(blocked)
+        let walk = |queue: &DownloadQueue| {
+            queued_files_may_pass(files, bootstrap_files, queue.len(), |file_index| {
+                queue.queued_count_for_file(NzbFileId { job_id, file_index }) as usize
+            })
+        };
+        let answer = queue.bootstrap_answer(bootstrap_files, walk);
+        debug_assert_eq!(
+            answer,
+            walk(queue),
+            "the bootstrap answer changed without a change to a file's queued count"
+        );
+        answer
     }
 
     // The fill servers a hinted article of `job_id` could be sent to instead
