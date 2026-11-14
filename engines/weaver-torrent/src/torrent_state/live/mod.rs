@@ -2225,9 +2225,9 @@ impl TorrentStateLive {
                 info_hash = ?self.shared.info_hash,
                 "a write found no room, only uploading: {error:#}"
             );
-            let owner =
-                self.shared.options.owner_wakes_full_disk && crate::storage::wants_room(error);
-            self.enter_upload_mode(!owner);
+            // An owner that wakes the torrent decides every refused write:
+            // it waits for room, or fails the torrent, with no retry here.
+            self.enter_upload_mode(!self.shared.options.owner_wakes_full_disk);
         }
         refused
     }

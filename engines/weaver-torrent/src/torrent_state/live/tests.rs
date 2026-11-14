@@ -3461,13 +3461,15 @@ async fn choking_a_peer_starts_its_count_of_unservable_requests_again() {
 }
 
 /// A memory storage that refuses the next `refusals` pieces it is handed,
-/// then the next `no_room` for want of space, and the next `no_room_writes`
-/// block writes for want of space.
+/// then the next `no_room` for want of space, the next `read_only` as a
+/// read-only file system does, and the next `no_room_writes` block writes
+/// for want of space.
 #[derive(Clone, Default)]
 struct RefusingStorageFactory {
     inner: MemoryStorageFactory,
     refusals: Arc<AtomicU32>,
     no_room: Arc<AtomicU32>,
+    read_only: Arc<AtomicU32>,
     no_room_writes: Arc<AtomicU32>,
 }
 
@@ -3475,6 +3477,7 @@ struct RefusingStorage {
     inner: Box<dyn TorrentStorage>,
     refusals: Arc<AtomicU32>,
     no_room: Arc<AtomicU32>,
+    read_only: Arc<AtomicU32>,
     no_room_writes: Arc<AtomicU32>,
 }
 
@@ -3501,6 +3504,7 @@ impl StorageFactory for RefusingStorageFactory {
             inner: Box::new(self.inner.create(shared, metadata)?),
             refusals: self.refusals.clone(),
             no_room: self.no_room.clone(),
+            read_only: self.read_only.clone(),
             no_room_writes: self.no_room_writes.clone(),
         })
     }
@@ -3547,6 +3551,7 @@ impl TorrentStorage for RefusingStorage {
             inner: self.inner.take()?,
             refusals: self.refusals.clone(),
             no_room: self.no_room.clone(),
+            read_only: self.read_only.clone(),
             no_room_writes: self.no_room_writes.clone(),
         }))
     }
@@ -3555,6 +3560,12 @@ impl TorrentStorage for RefusingStorage {
         anyhow::ensure!(!take_one(&self.refusals), "refused piece {piece:?}");
         if take_one(&self.no_room) {
             return Err(no_room());
+        }
+        if take_one(&self.read_only) {
+            return Err(anyhow::Error::from(std::io::Error::from(
+                std::io::ErrorKind::ReadOnlyFilesystem,
+            ))
+            .context("writing"));
         }
         self.inner.on_piece_completed(piece)
     }
@@ -3569,6 +3580,44 @@ impl Harness {
             .get_have_pieces()
             .as_slice()[index as usize]
     }
+}
+
+// A torrent added with `owner_wakes_full_disk` whose write is refused for
+// any cause, a read-only file system here, waits for its owner, which
+// fails the torrent: no retry spell of its own runs for a write its owner
+// refuses.
+#[tokio::test]
+async fn an_owner_decides_a_write_refused_for_no_want_of_room() {
+    let storage = RefusingStorageFactory::default();
+    storage.read_only.store(1, Ordering::SeqCst);
+    let add = AddTorrentOptions {
+        storage_factory: Some(storage.clone_box()),
+        owner_wakes_full_disk: true,
+        ..Default::default()
+    };
+    let h = Harness::build_added(
+        "owner_read_only",
+        3,
+        0x20,
+        isolated_session_opts(false),
+        add,
+    )
+    .await;
+    tokio::time::pause();
+    let (fetcher, _fetcher_rx) = h.peer_with("127.0.0.1:6881", &[0]).await;
+
+    h.take(&fetcher, 0);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&fetcher, (0, chunk), false).await.unwrap();
+    }
+    assert!(h.upload_mode());
+    h.retry_declined
+        .subscribe()
+        .wait_for(|seen| *seen >= 1)
+        .await
+        .unwrap();
+    tokio::time::advance(OPTIMISTIC_DISK_RETRY * 2).await;
+    assert!(h.upload_mode());
 }
 
 // libtorrent: the write completes before the hash job, and only then
