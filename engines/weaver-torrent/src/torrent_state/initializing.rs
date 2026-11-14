@@ -328,7 +328,10 @@ impl TorrentStateInitializing {
                     })
                     .enumerate()
                 {
-                    if fo.check_piece_whole(piece_id).is_err() {
+                    // A piece that does not read, and one whose hash does
+                    // not match, both say the files are not what the
+                    // resume data says.
+                    if !matches!(fo.check_piece_whole(piece_id), Ok(Verdict::Passed)) {
                         return true;
                     }
 
@@ -1316,5 +1319,61 @@ mod tests {
         async fn a_recheck_stopped_by_a_pause_reads_as_paused() -> anyhow::Result<()> {
             a_check_stopped_by_a_pause_reads_as_paused("recheck_paused", true).await
         }
+    }
+
+    // Resume data that says a torrent has every piece is not trusted when
+    // a piece it names does not hash: the files are checked, and the piece
+    // is found missing. A torrent is added and checked with its session
+    // keeping resume data, the session stops, a byte of the first piece
+    // changes on disk, and a new session over the same resume data picks
+    // the torrent up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_data_naming_a_piece_that_does_not_hash_is_not_trusted() -> anyhow::Result<()> {
+        use crate::tests::embedder_util::{TestTorrent, isolated_session_opts};
+        use crate::{AddTorrent, AddTorrentOptions, Session, SessionPersistenceConfig};
+        use anyhow::Context;
+
+        const PIECE: u32 = 1024;
+        let t = TestTorrent::new("resume_not_trusted", 8 * PIECE as usize, PIECE).await?;
+        let state = tempfile::TempDir::with_prefix("resume_not_trusted_state")?;
+        let opts = || crate::SessionOptions {
+            persistence: Some(SessionPersistenceConfig::Json {
+                folder: state.path().to_owned(),
+            }),
+            ..isolated_session_opts(false)
+        };
+        let total = {
+            let session = Session::new_with_opts(t.dir.path().to_owned(), opts()).await?;
+            let handle = session
+                .add_torrent(
+                    AddTorrent::from_bytes(t.torrent.clone()),
+                    Some(AddTorrentOptions {
+                        overwrite: true,
+                        ..Default::default()
+                    }),
+                )
+                .await?
+                .into_handle()
+                .context("expected a handle")?;
+            handle.wait_until_completed().await?;
+            let total = handle.stats().total_bytes;
+            session.stop().await;
+            total
+        };
+
+        let file = t.dir.path().join("0.data");
+        let mut bytes = std::fs::read(&file)?;
+        bytes[5] ^= 1;
+        std::fs::write(&file, bytes)?;
+
+        let session = Session::new_with_opts(t.dir.path().to_owned(), opts()).await?;
+        let handle = session
+            .with_torrents(|torrents| torrents.map(|(_, handle)| handle.clone()).next())
+            .context("the torrent was not picked up")?;
+        handle.wait_until_initialized().await?;
+        let stats = handle.stats();
+        assert_eq!(stats.total_bytes, total);
+        assert_eq!(stats.progress_bytes, total - u64::from(PIECE));
+        Ok(())
     }
 }
