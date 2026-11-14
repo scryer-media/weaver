@@ -24,8 +24,8 @@ fn ladder_client_with_quota(
         servers: levels
             .iter()
             .enumerate()
-            .map(
-                |(idx, &(group, backfill))| weaver_nntp::pool::ServerPoolConfig {
+            .map(|(idx, &(group, backfill))| {
+                let mut config = weaver_nntp::pool::ServerPoolConfig {
                     max_connections: 100,
                     group,
                     backfill,
@@ -35,8 +35,11 @@ fn ladder_client_with_quota(
                         .filter(|(metered, _)| *metered == idx)
                         .map(|(_, control)| Arc::clone(control)),
                     ..Default::default()
-                },
-            )
+                };
+                // Nothing dials; the name is what a failure's words say.
+                config.server.host = format!("s{idx}.example");
+                config
+            })
             .collect(),
         max_idle_age: Duration::from_secs(300),
         max_retries_per_server: 1,
@@ -244,11 +247,42 @@ struct DeadPostRun {
     per_article: HashMap<SegmentId, Vec<usize>>,
     reason: Option<String>,
     lost: u64,
+    // The articles booked missing, and booked unservable past a server
+    // refusing the login.
+    missing: usize,
+    unservable: usize,
+    cause: Option<crate::jobs::SemanticTerminalCause>,
 }
 
 async fn run_dead_post(levels: &[(u32, bool)], files: u32, articles: u32) -> DeadPostRun {
+    run_dead_post_refused(levels, files, articles, &[]).await
+}
+
+// As [`run_dead_post`], with the servers in `refusing` refusing the login
+// from the start, so none of them is ever asked.
+async fn run_dead_post_refused(
+    levels: &[(u32, bool)],
+    files: u32,
+    articles: u32,
+    refusing: &[usize],
+) -> DeadPostRun {
     let temp_dir = tempfile::tempdir().unwrap();
     let mut pipeline = ladder_pipeline(&temp_dir, levels).await;
+    for &server in refusing {
+        pipeline
+            .nntp
+            .pool()
+            .health()
+            .lock()
+            .await
+            .record_failure(server, true);
+    }
+    // A fill server that refuses keeps backfill shut, so the walk is the
+    // fill servers left; a backfill server that refuses is only passed.
+    let fill_refuses = refusing.iter().any(|server| !levels[*server].1);
+    let walk = (0..levels.len())
+        .filter(|server| !refusing.contains(server) && !(fill_refuses && levels[*server].1))
+        .count();
     let mut spec = segmented_job_spec("Dead Field Post", "f00.mkv", &vec![128; articles as usize]);
     let template = spec.files[0].clone();
     spec.files = (0..files)
@@ -291,6 +325,9 @@ async fn run_dead_post(levels: &[(u32, bool)], files: u32, articles: u32) -> Dea
         per_article: HashMap::new(),
         reason: None,
         lost: 0,
+        missing: 0,
+        unservable: 0,
+        cause: None,
     };
     let mut rounds = 0;
     loop {
@@ -308,7 +345,7 @@ async fn run_dead_post(levels: &[(u32, bool)], files: u32, articles: u32) -> Dea
             run.asks += 1;
             let asked = run.per_article.entry(work.segment_id).or_default();
             asked.push(server);
-            if asked.len() == levels.len() {
+            if asked.len() == walk {
                 run.walked_out.push((run.asks, work.segment_id));
             }
             answer_not_found(&mut pipeline, server, work).await;
@@ -320,7 +357,70 @@ async fn run_dead_post(levels: &[(u32, bool)], files: u32, articles: u32) -> Dea
     }
     run.reason = pipeline.post_probes.dead.get(&job_id).cloned();
     run.lost = pipeline.metrics.articles_not_found.load(Ordering::Relaxed);
+    let booked = |state: SegmentTerminalState| {
+        pipeline
+            .segment_terminal_states
+            .values()
+            .filter(|held| **held == state)
+            .count()
+    };
+    run.missing = booked(SegmentTerminalState::Missing);
+    run.unservable = booked(SegmentTerminalState::UnservableNotFound);
+    run.cause = pipeline.semantic_terminal_causes.get(&job_id).copied();
     run
+}
+
+// The same dead posts with one server refusing the login and never asked.
+// Every article that walks out is booked unservable, not missing, and the
+// post is given up on the same ask, in the same round, in the same words and
+// with the same count as on the same servers without the one that refuses,
+// where every article is booked missing.
+#[tokio::test]
+async fn a_dead_post_past_a_refusing_server_is_given_up_where_a_missing_one_is() {
+    let levels = field_levels();
+    let last = levels.len() - 1;
+    // The last backfill server refuses: the walk is every server before it.
+    // The first fill server refuses: backfill stays shut, and the walk is
+    // the fill servers after it.
+    let fills = levels.iter().filter(|level| !level.1).count();
+    for (refusing, without) in [(last, &levels[..last]), (0, &levels[1..fills])] {
+        for (files, articles) in [(25, 4), (6, 4)] {
+            let refused = run_dead_post_refused(&levels, files, articles, &[refusing]).await;
+            let plain = run_dead_post(without, files, articles).await;
+            eprintln!(
+                "server {refusing} refusing, {files} files: give-up after {:?} asks, round {:?}, \
+                 {} booked ({} unservable, {} missing): {:?}; without it: {:?} asks, round {:?}, \
+                 {} booked ({} missing): {:?}",
+                refused.asks_at_give_up,
+                refused.rounds_at_give_up,
+                refused.lost,
+                refused.unservable,
+                refused.missing,
+                refused.reason,
+                plain.asks_at_give_up,
+                plain.rounds_at_give_up,
+                plain.lost,
+                plain.missing,
+                plain.reason
+            );
+            assert!(refused.asks_at_give_up.is_some());
+            assert_eq!(refused.asks_at_give_up, plain.asks_at_give_up);
+            assert_eq!(refused.rounds_at_give_up, plain.rounds_at_give_up);
+            assert_eq!(refused.asks, plain.asks);
+            assert_eq!(refused.reason, plain.reason);
+            assert_eq!(refused.lost, plain.lost);
+            assert_eq!(refused.unservable, plain.missing);
+            assert!(refused.unservable > 0);
+            assert_eq!((refused.missing, plain.unservable), (0, 0));
+            // The cause is the missing articles either way: the servers
+            // asked said so, and the job's next duplicate is tried.
+            assert_eq!(refused.cause, plain.cause);
+            assert_eq!(
+                plain.cause,
+                Some(crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth)
+            );
+        }
+    }
 }
 
 // The field's shape: thirteen servers over five levels, 25 files of four
@@ -1012,33 +1112,41 @@ fn rewrite_queue(pipeline: &mut Pipeline, job_id: JobId, mut edit: impl FnMut(&m
     }
 }
 
-// An article every server it may use said "not found", while another server
-// refuses the credentials and is never asked, is booked missing and counts
-// to the post's missing articles.
-#[tokio::test]
-async fn a_not_found_walk_past_a_refusing_server_is_booked_missing() {
-    let levels = vec![(0, false), (1, false), (2, false)];
-    let refusing = 2;
-    let temp_dir = tempfile::tempdir().unwrap();
-    let mut pipeline = ladder_pipeline(&temp_dir, &levels).await;
+const ALPHA: JobId = JobId(42005);
+
+async fn refuse_login(pipeline: &Pipeline, server: usize) {
     pipeline
         .nntp
         .pool()
         .health()
         .lock()
         .await
-        .record_failure(refusing, true);
-    let job_id = JobId(42005);
+        .record_failure(server, true);
+}
+
+// Job "Alpha": one file of two articles and no recovery, on three fill
+// servers, `refusing` refusing the login. Its first article is offered to
+// every server and answered "not found" by each one handed it. Returns the
+// servers asked.
+async fn walk_alphas_first_article(
+    temp_dir: &TempDir,
+    refusing: Option<usize>,
+) -> (Pipeline, Vec<usize>) {
+    let levels = vec![(0, false), (1, false), (2, false)];
+    let mut pipeline = ladder_pipeline(temp_dir, &levels).await;
+    if let Some(server) = refusing {
+        refuse_login(&pipeline, server).await;
+    }
     insert_active_job(
         &mut pipeline,
-        job_id,
-        segmented_job_spec("Refused Head", "payload.bin", &[128, 128]),
+        ALPHA,
+        segmented_job_spec("Alpha", "payload.bin", &[128, 128]),
     )
     .await;
-    pipeline.active_download_passes.insert(job_id);
-    let head = held_segment(job_id, 0, 0);
+    pipeline.active_download_passes.insert(ALPHA);
+    let head = held_segment(ALPHA, 0, 0);
     let mut asked = Vec::new();
-    for server in [0, 1, refusing] {
+    for server in 0..levels.len() {
         let mut works = ask(&mut pipeline, server, 1);
         if let Some(work) = works.pop() {
             assert_eq!(work.segment_id, head);
@@ -1046,46 +1154,249 @@ async fn a_not_found_walk_past_a_refusing_server_is_booked_missing() {
             answer_not_found(&mut pipeline, server, work).await;
         }
     }
-    assert_eq!(asked, vec![0, 1], "the refusing server is never handed it");
+    (pipeline, asked)
+}
 
-    assert_eq!(
-        pipeline.segment_terminal_states.get(&head).copied(),
-        Some(SegmentTerminalState::Missing)
-    );
+// How each article of the job ended, by article number.
+fn ended(pipeline: &Pipeline, job_id: JobId) -> Vec<(u32, u32, SegmentTerminalState)> {
+    let mut ended: Vec<_> = pipeline
+        .segment_terminal_states
+        .iter()
+        .filter(|(segment, _)| segment.file_id.job_id == job_id)
+        .map(|(segment, state)| (segment.file_id.file_index, segment.segment_number, *state))
+        .collect();
+    ended.sort_by_key(|(file, number, _)| (*file, *number));
+    ended
+}
+
+// The reason a failed job gives.
+fn failed_for(pipeline: &Pipeline, job_id: JobId) -> Option<String> {
+    match pipeline.jobs.get(&job_id).map(|state| &state.status) {
+        Some(JobStatus::Failed { error }) => Some(error.clone()),
+        _ => None,
+    }
+}
+
+// An article every server asked said "not found", in a job where another
+// server refuses the login and is never asked, is booked unservable, not
+// missing. The job ends where it would have, its cause the missing articles,
+// with the refusing server named.
+#[tokio::test]
+async fn a_not_found_walk_past_a_refusing_server_is_booked_unservable_and_names_the_server() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, asked) = walk_alphas_first_article(&temp_dir, Some(2)).await;
+    assert_eq!(asked, vec![0, 1], "the refusing server is never handed it");
     assert_eq!(
         pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
         1
     );
-    // The post is missing that one article and no other. Its file cannot be
-    // whole and nothing can rebuild it, so the job ends there and the
-    // article it never asked for is abandoned, not missing.
+    // The file cannot be whole and nothing can rebuild it, so the job ends
+    // there, as it does on a missing article, and the article it never
+    // asked for is abandoned.
     assert_eq!(
-        pipeline
-            .segment_terminal_states
-            .values()
-            .filter(|state| **state == SegmentTerminalState::Missing)
-            .count(),
-        1
-    );
-    let mut ended: Vec<_> = pipeline
-        .segment_terminal_states
-        .iter()
-        .map(|(segment, state)| (segment.segment_number, *state))
-        .collect();
-    ended.sort_by_key(|(number, _)| *number);
-    assert_eq!(
-        ended,
+        ended(&pipeline, ALPHA),
         vec![
-            (0, SegmentTerminalState::Missing),
-            (1, SegmentTerminalState::Abandoned)
+            (0, 0, SegmentTerminalState::UnservableNotFound),
+            (0, 1, SegmentTerminalState::Abandoned)
         ]
     );
-    // The job ends on its health, for its missing article: the server that
-    // refuses the login was never asked, and is not what ended it.
+    let missing = Some(&crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth);
+    assert_eq!(pipeline.semantic_terminal_causes.get(&ALPHA), missing);
+    let words = pipeline.login_refusal_words(ALPHA).unwrap();
+    assert!(words.contains("s2.example"), "{words}");
+    assert!(!words.contains("s0.example") && !words.contains("s1.example"));
+    // Failing for want of articles, its reason carries those words and its
+    // cause stays the missing articles.
+    pipeline.fail_job_on_health(ALPHA, "the post cannot complete".into());
+    let reason = failed_for(&pipeline, ALPHA).unwrap();
+    assert_eq!(reason, format!("the post cannot complete; {words}"));
+    assert_eq!(pipeline.semantic_terminal_causes.get(&ALPHA), missing);
+}
+
+// Failing for any other reason, the same job's reason is its own.
+#[tokio::test]
+async fn a_failure_of_another_kind_past_a_refusing_server_says_nothing_of_it() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _) = walk_alphas_first_article(&temp_dir, Some(2)).await;
+    assert!(pipeline.login_refusal_words(ALPHA).is_some());
+    pipeline.fail_job(ALPHA, "the password is wrong".into());
+    assert_eq!(
+        failed_for(&pipeline, ALPHA).as_deref(),
+        Some("the password is wrong")
+    );
+    assert_eq!(
+        pipeline.semantic_terminal_causes.get(&ALPHA),
+        Some(&crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth)
+    );
+}
+
+// The ladder's servers in another order, or fewer of them: server `n` is the
+// same server in every client built here.
+fn ladder_servers(order: &[usize]) -> NntpClient {
+    NntpClient::new(NntpClientConfig {
+        servers: order
+            .iter()
+            .map(|&idx| {
+                let mut config = weaver_nntp::pool::ServerPoolConfig {
+                    max_connections: 100,
+                    stable_id: weaver_nntp::transfer::StableServerId(idx as u32),
+                    ..Default::default()
+                };
+                config.server.host = format!("s{idx}.example");
+                config
+            })
+            .collect(),
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 1,
+        soft_timeout: Duration::from_secs(15),
+    })
+}
+
+// The refusing servers a job holds follow the server list through a change
+// of it: a reordered server is still the one named, a removed one is not
+// named, and with none left there are no words. One server reads as one and
+// several as several.
+#[tokio::test]
+async fn the_refusing_servers_named_follow_a_reordered_and_a_shortened_server_list() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _) = walk_alphas_first_article(&temp_dir, Some(2)).await;
+    let rest = "never asked for the articles no other server had";
+    let one = |name: &str| Some(format!("server {name} refuses the login and was {rest}"));
+    assert_eq!(pipeline.login_refusal_words(ALPHA), one("s2.example:563"));
+
+    // Reordered: what was third is first, and is still the one named.
+    let generation = pipeline.pool_generation;
+    pipeline.activate_nntp(ladder_servers(&[2, 0, 1]), 8, generation + 1);
+    assert_eq!(pipeline.login_refusal_words(ALPHA), one("s2.example:563"));
+
+    // A second server refuses too: s0, now at the second place.
+    pipeline.note_login_refusals(ALPHA, [1usize].into_iter().collect());
+    pipeline.note_login_refusals(ALPHA, [0usize, 1].into_iter().collect());
+    assert_eq!(pipeline.login_refusals[&ALPHA].len(), 2);
+    assert_eq!(
+        pipeline.login_refusal_words(ALPHA),
+        Some(format!(
+            "servers s2.example:563, s0.example:563 refuse the login and were {rest}"
+        ))
+    );
+
+    // s2 leaves the list: only s0 is named.
+    pipeline.activate_nntp(ladder_servers(&[1, 0]), 8, generation + 2);
+    assert_eq!(pipeline.login_refusal_words(ALPHA), one("s0.example:563"));
+
+    // s0 leaves too: no words, and a failure for want of articles adds none.
+    pipeline.activate_nntp(ladder_servers(&[1]), 8, generation + 3);
+    assert_eq!(pipeline.login_refusal_words(ALPHA), None);
+    pipeline.fail_job_on_health(ALPHA, "the post cannot complete".into());
+    assert_eq!(
+        failed_for(&pipeline, ALPHA).as_deref(),
+        Some("the post cannot complete")
+    );
+}
+
+// The same job with no server refusing: every server is asked, the article
+// is booked missing, and the cause and the words are the missing-article
+// ones.
+#[tokio::test]
+async fn a_not_found_walk_over_every_server_is_still_booked_missing() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, asked) = walk_alphas_first_article(&temp_dir, None).await;
+    assert_eq!(asked, vec![0, 1, 2]);
+    assert_eq!(
+        ended(&pipeline, ALPHA),
+        vec![
+            (0, 0, SegmentTerminalState::Missing),
+            (0, 1, SegmentTerminalState::Abandoned)
+        ]
+    );
+    assert_eq!(
+        pipeline.semantic_terminal_causes.get(&ALPHA),
+        Some(&crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth)
+    );
+    assert_eq!(pipeline.login_refusal_words(ALPHA), None);
+    pipeline.fail_job(ALPHA, "the post cannot complete".into());
+    assert_eq!(
+        failed_for(&pipeline, ALPHA).as_deref(),
+        Some("the post cannot complete")
+    );
+    assert_eq!(
+        pipeline.semantic_terminal_causes.get(&ALPHA),
+        Some(&crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth)
+    );
+}
+
+// A job with both kinds: six files of four articles, no recovery. The first
+// article to walk out was asked of every server and is missing. Then one
+// server starts refusing the login, and each article that walks out after
+// was never asked of it and is unservable. The job's cause is the missing
+// articles, and its words name the refusing server.
+#[tokio::test]
+async fn a_job_with_missing_and_unservable_articles_books_each_as_it_is() {
+    let levels = vec![(0, false), (1, false), (2, false)];
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = ladder_pipeline(&temp_dir, &levels).await;
+    let mut spec = segmented_job_spec("Both Kinds", "f00.mkv", &[128; 4]);
+    let template = spec.files[0].clone();
+    spec.files = (0..6)
+        .map(|file| {
+            let mut spec = template.clone();
+            spec.filename = format!("f{file:02}.mkv");
+            for segment in &mut spec.segments {
+                segment.message_ids = crate::jobs::MessageIds::new(vec![format!(
+                    "f{file}-s{}@example.com",
+                    segment.ordinal
+                )]);
+            }
+            spec
+        })
+        .collect();
+    spec.total_bytes *= 6;
+    let job_id = JobId(42006);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.active_download_passes.insert(job_id);
+
+    // Every server asks each round, as a free lane would, and every article
+    // handed out is answered "not found". Server 2 starts refusing the login
+    // once the first article has walked out.
+    let mut refused = false;
+    loop {
+        let handed: Vec<(usize, DownloadWork)> = (0..levels.len())
+            .filter_map(|server| {
+                let mut works = ask(&mut pipeline, server, 1);
+                works.pop().map(|work| (server, work))
+            })
+            .collect();
+        if handed.is_empty() {
+            break;
+        }
+        for (server, work) in handed {
+            answer_not_found(&mut pipeline, server, work).await;
+        }
+        if !refused && !pipeline.segment_terminal_states.is_empty() {
+            refuse_login(&pipeline, 2).await;
+            refused = true;
+        }
+    }
+
+    let ended = ended(&pipeline, job_id);
+    let booked = |state| ended.iter().filter(|(_, _, held)| *held == state).count();
+    assert!(booked(SegmentTerminalState::Missing) >= 1, "{ended:?}");
+    assert!(
+        booked(SegmentTerminalState::UnservableNotFound) >= 1,
+        "{ended:?}"
+    );
+    assert_eq!(
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed) as usize,
+        booked(SegmentTerminalState::Missing) + booked(SegmentTerminalState::UnservableNotFound)
+    );
+    // The post is given up on its health, both kinds counted.
+    assert!(pipeline.post_probes.dead.contains_key(&job_id));
     assert_eq!(
         pipeline.semantic_terminal_causes.get(&job_id),
         Some(&crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth)
     );
+    let words = pipeline.login_refusal_words(job_id).unwrap();
+    assert!(words.contains("s2.example"), "{words}");
 }
 
 // A client over `servers`: each server's stable id and priority group. The

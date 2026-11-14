@@ -15,7 +15,7 @@ use super::super::{
     settle_inflight_moves, two_server_retention_client,
 };
 use super::harness::{
-    ARTICLE, JOB, Post, Scenario, admit, admit_with, collect, payload, serve_job,
+    ARTICLE, JOB, Post, Scenario, admit, admit_with, collect, par2_set, payload, serve_job,
 };
 use super::streams::xz;
 use crate::jobs::ids::JobId;
@@ -238,13 +238,288 @@ async fn the_last_server_refusing_credentials_fails_the_job() {
         job_status_for_assert(&pipeline, job)
     );
     assert_eq!(history(&mut pipeline, job).await.status, "failed");
+    // This older path is as it was: the cause is the refusal, no duplicate
+    // is promoted, and the reason gains no words naming the server.
+    let candidate = pipeline
+        .db
+        .semantic_candidate_snapshot(job)
+        .unwrap()
+        .expect("the job was admitted");
+    assert_eq!(
+        candidate.terminal_cause,
+        Some(crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage)
+    );
+    assert_eq!(
+        candidate.promotion_state,
+        crate::jobs::duplicate_persistence::SemanticPromotionState::None
+    );
+    assert!(!pipeline.login_refusals.contains_key(&job));
+    assert!(
+        !history(&mut pipeline, job)
+            .await
+            .error_message
+            .unwrap_or_default()
+            .contains("was never asked"),
+    );
+}
+
+// A job whose recovery covers a lost article, with the payload's second
+// article answered "not found" by server 0. Server 1 refuses the login when
+// `refusing`, and is never asked; otherwise it answers "not found" too.
+async fn with_an_article_lost(
+    refusing: bool,
+) -> (
+    tempfile::TempDir,
+    Pipeline,
+    Scenario,
+    JobId,
+    crate::pipeline::SegmentId,
+) {
+    let data = payload(4 * ARTICLE, 7);
+    let mut posts = vec![Post::plain("payload.bin", data.clone())];
+    posts.extend(par2_set("lantern", &[("payload.bin", &data)], 2));
+    let scenario = Scenario::new(posts);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    // Neither server's retention rules out a job posted now.
+    pipeline.nntp = std::sync::Arc::new(two_server_retention_client());
+    let spec = scenario.spec();
+    let job = admitted_job_id(&pipeline, &spec);
+    insert_active_job(&mut pipeline, job, spec).await;
+    pipeline.active_download_passes.insert(job);
+    if refusing {
+        pipeline
+            .nntp
+            .pool()
+            .health()
+            .lock()
+            .await
+            .record_failure(1, true);
+    }
+
+    // The payload's second article is taken off the queue and answered "not
+    // found" by server 0, the way a lane answers it.
+    let lost = crate::pipeline::SegmentId {
+        file_id: crate::jobs::ids::NzbFileId {
+            job_id: job,
+            file_index: 0,
+        },
+        segment_number: 1,
+    };
+    let queued = pipeline
+        .jobs
+        .get_mut(&job)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .drain_all();
+    let mut work = None;
+    for queued in pipeline.dispatched_all(queued) {
+        if queued.segment_id == lost {
+            work = Some(queued);
+        } else {
+            pipeline
+                .jobs
+                .get_mut(&job)
+                .unwrap()
+                .articles
+                .active_mut()
+                .unwrap()
+                .download_queue
+                .push(queued);
+        }
+    }
+    let work = work.expect("the payload's second article is queued");
+    let (retry_count, mut exclude_servers) = (work.retry_count, work.exclude_servers);
+    pipeline.hold_test_lane_works(vec![work], false);
+    // With no server refusing, server 1 has already said "not found".
+    if !refusing {
+        exclude_servers.insert(1);
+    }
+    pipeline
+        .handle_download_done(DownloadResult {
+            lane_id: 0,
+            job_id: job,
+            runtime_generation: pipeline.pool_generation,
+            segment_id: lost,
+            data: Err(crate::pipeline::DownloadError::fetch(
+                crate::pipeline::DownloadFailureKind::ArticleNotFound,
+                "430 no such article",
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(0),
+            origin: crate::pipeline::DownloadResultOrigin::NormalPrimary,
+            retry_count,
+            exclude_servers,
+            release_connection_slot: true,
+        })
+        .await;
+    (temp_dir, pipeline, scenario, job, lost)
+}
+
+// What a failed job's record holds: its reason, its cause and whether a
+// duplicate of it is promoted.
+async fn failed_record(
+    pipeline: &mut Pipeline,
+    job: JobId,
+) -> (
+    Option<String>,
+    Option<crate::jobs::SemanticTerminalCause>,
+    crate::jobs::duplicate_persistence::SemanticPromotionState,
+) {
+    let row = history(pipeline, job).await;
+    assert_eq!(row.status, "failed");
+    let candidate = pipeline
+        .db
+        .semantic_candidate_snapshot(job)
+        .unwrap()
+        .expect("the job was admitted");
+    (
+        row.error_message,
+        candidate.terminal_cause,
+        candidate.promotion_state,
+    )
+}
+
+// A job with an article a refusing server was never asked for, failed in
+// `stage` for `reason`, against the same job with no server refusing.
+async fn failed_past_a_refusal_and_without(
+    stage: JobStatus,
+    reason: &str,
+) -> [(
+    Option<String>,
+    Option<crate::jobs::SemanticTerminalCause>,
+    crate::jobs::duplicate_persistence::SemanticPromotionState,
+); 2] {
+    let mut records = Vec::new();
+    for refusing in [true, false] {
+        let (_temp_dir, mut pipeline, _, job, _) = with_an_article_lost(refusing).await;
+        assert_eq!(pipeline.login_refusal_words(job).is_some(), refusing);
+        pipeline.jobs.get_mut(&job).unwrap().status = stage.clone();
+        pipeline.fail_job(job, reason.to_string());
+        records.push(failed_record(&mut pipeline, job).await);
+    }
+    records.try_into().unwrap()
+}
+
+// A wrong password fails the job as it does with no server refusing: the
+// same reason with nothing added, the same cause, and a duplicate promoted.
+#[tokio::test]
+async fn a_wrong_password_past_a_refusing_server_keeps_its_own_cause_and_promotion() {
+    let reason = format!(
+        "{}the password is wrong",
+        crate::pipeline::extraction::error::PASSWORD_REQUIRED_MARKER
+    );
+    let [refused, plain] = failed_past_a_refusal_and_without(JobStatus::Extracting, &reason).await;
+    assert_eq!(refused, plain);
+    assert_eq!(refused.0.as_deref(), Some(reason.as_str()));
+    // The typed cause is the last one an article's failure recorded, the
+    // "not found", as it is on a job no server refuses. The history row
+    // reads the password failure from the reason.
+    assert_eq!(
+        refused.1,
+        Some(crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth)
+    );
+    assert_eq!(
+        refused.2,
+        crate::jobs::duplicate_persistence::SemanticPromotionState::Pending
+    );
+}
+
+// A repair that fails does the same.
+#[tokio::test]
+async fn a_failed_repair_past_a_refusing_server_keeps_its_own_cause_and_promotion() {
+    let reason = "repair failed: not enough recovery blocks";
+    let [refused, plain] = failed_past_a_refusal_and_without(JobStatus::Repairing, reason).await;
+    assert_eq!(refused, plain);
+    assert_eq!(refused.0.as_deref(), Some(reason));
+    assert_eq!(
+        refused.1,
+        Some(crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth)
+    );
+    assert_eq!(
+        refused.2,
+        crate::jobs::duplicate_persistence::SemanticPromotionState::Pending
+    );
+}
+
+// An unpack that fails does the same.
+#[tokio::test]
+async fn a_failed_unpack_past_a_refusing_server_keeps_its_own_cause_and_promotion() {
+    let reason = "extraction failed: the archive is damaged";
+    let [refused, plain] = failed_past_a_refusal_and_without(JobStatus::Extracting, reason).await;
+    assert_eq!(refused, plain);
+    assert_eq!(refused.0.as_deref(), Some(reason));
+    assert_eq!(
+        refused.1,
+        Some(crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth)
+    );
+    assert_eq!(
+        refused.2,
+        crate::jobs::duplicate_persistence::SemanticPromotionState::Pending
+    );
+}
+
+// The job failing for want of articles names the refusing server. Its cause
+// is still the missing articles, the servers asked having said so, and a
+// duplicate is promoted, as with no server refusing.
+#[tokio::test]
+async fn a_failure_for_want_of_articles_past_a_refusing_server_names_it() {
+    let mut records = Vec::new();
+    for refusing in [true, false] {
+        let (_temp_dir, mut pipeline, _, job, _) = with_an_article_lost(refusing).await;
+        pipeline.fail_job_on_health(job, "the post cannot complete".to_string());
+        records.push(failed_record(&mut pipeline, job).await);
+    }
+    assert_eq!(
+        records[0],
+        (
+            Some(
+                "the post cannot complete; server retention-1.example.com:563 refuses the login and \
+                 was never asked for the articles no other server had"
+                    .to_string()
+            ),
+            Some(crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth),
+            crate::jobs::duplicate_persistence::SemanticPromotionState::Pending
+        )
+    );
+    assert_eq!(
+        records[1],
+        (
+            Some("the post cannot complete".to_string()),
+            Some(crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth),
+            crate::jobs::duplicate_persistence::SemanticPromotionState::Pending
+        )
+    );
+}
+
+// A job its recovery covers. One payload article is not on the server asked,
+// and the other server refuses the login and is never asked: the article is
+// booked unservable, the set rebuilds it, and the job completes whole, with
+// no failure and no refusal in its record.
+#[tokio::test]
+async fn a_job_its_recovery_covers_completes_past_an_article_a_refusing_server_never_served() {
+    let (_temp_dir, mut pipeline, scenario, job, lost) = with_an_article_lost(true).await;
+    assert_eq!(
+        pipeline.segment_terminal_states.get(&lost).copied(),
+        Some(crate::pipeline::SegmentTerminalState::UnservableNotFound)
+    );
+    assert!(pipeline.login_refusal_words(job).is_some());
+
+    drive(&mut pipeline, &scenario, job, |_| false).await;
+
+    assert_eq!(history(&mut pipeline, job).await.status, "complete");
+    assert_eq!(history(&mut pipeline, job).await.error_message, None);
     assert_eq!(
         pipeline
             .db
             .semantic_candidate_snapshot(job)
             .unwrap()
             .and_then(|candidate| candidate.terminal_cause),
-        Some(crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage)
+        Some(crate::jobs::SemanticTerminalCause::Success)
     );
 }
 

@@ -18,6 +18,7 @@ impl Pipeline {
         self.download_wait_by_job.remove(&job_id);
         self.clear_terminal_segment_failures(job_id);
         self.terminal_reconciliations.remove(&job_id);
+        self.login_refusals.remove(&job_id);
         self.inflight_moves.remove(&job_id);
         self.deferred_moves.remove(&job_id);
         self.reserved_complete_destinations.remove(&job_id);
@@ -59,7 +60,7 @@ impl Pipeline {
         // A row already retiring is a cancel whose archive is in flight; its
         // done event decides the job.
         let cancelled = self.shared_state.queue.write(|inner| {
-            let Some(row) = inner.job_mut(job_id) else {
+            let Some(mut row) = inner.job_mut(job_id) else {
                 return crate::pipeline::queue::Change::unchanged(None);
             };
             if row.report.retiring {
@@ -255,7 +256,7 @@ impl Pipeline {
             Err(e) => {
                 tracing::error!(job_id = job_id.0, error = %e, "failed to queue job history archival");
                 self.shared_state.queue.write(|inner| {
-                    if let Some(row) = inner.job_mut(job_id) {
+                    if let Some(mut row) = inner.job_mut(job_id) {
                         row.report.retiring = false;
                     }
                     crate::pipeline::queue::Change::changed(())
@@ -272,12 +273,11 @@ impl Pipeline {
         // snapshot must already list the job as finished when a subscriber
         // reacts, or the history facade rejects the lookup as a still-live job.
         self.shared_state.queue.write(|inner| {
-            let row = if let Some(index) = inner.job_position(job_id) {
-                &mut inner.jobs[index]
-            } else {
+            let index = inner.job_position(job_id).unwrap_or_else(|| {
                 inner.push_job(crate::pipeline::queue::JobRow::new(finished.clone()));
-                inner.jobs.last_mut().expect("retiring job")
-            };
+                inner.jobs.len() - 1
+            });
+            let mut row = inner.row_mut_at(index);
             row.report.job = finished.clone();
             row.report.retiring = true;
             crate::pipeline::queue::Change::changed(())

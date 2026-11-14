@@ -703,7 +703,7 @@ impl Pipeline {
     // False when a cancel was taken first.
     pub(in crate::pipeline) fn begin_let_go_move(&mut self, job_id: JobId) -> bool {
         let begun = self.shared_state.queue.write(|inner| {
-            let Some(row) = inner.job_mut(job_id) else {
+            let Some(mut row) = inner.job_mut(job_id) else {
                 return crate::pipeline::queue::Change::unchanged(true);
             };
             if row.intents.cancelled.is_some() {

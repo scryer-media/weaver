@@ -307,6 +307,7 @@ impl Pipeline {
             queue_positions: Some(queue_positions),
             queue_positions_lost: Arc::default(),
             semantic_terminal_causes: HashMap::new(),
+            login_refusals: HashMap::new(),
             pipeline_failure_stages: HashMap::new(),
             job_order: Vec::new(),
             stored_queue_order: Vec::new(),

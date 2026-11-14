@@ -137,13 +137,13 @@ impl Pipeline {
                 return Change::unchanged(());
             }
             if let Some(job) = report {
-                let Some(row) = inner.job_mut(job_id) else {
+                let Some(mut row) = inner.job_mut(job_id) else {
                     return Change::unchanged(());
                 };
                 row.report.job = job;
                 row.report.moving = moving;
                 row.report.nzb_admitted = self.nzb_admitted.contains(&job_id);
-                let reason = self.stored_wait_reason(row);
+                let reason = self.stored_wait_reason(&row);
                 if reason == Some(crate::pipeline::nzb_admission::NZB_SLOT_WAIT_REASON) {
                     row.report.job.download_state = crate::DownloadState::Queued;
                 }

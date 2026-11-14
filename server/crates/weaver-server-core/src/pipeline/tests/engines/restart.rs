@@ -352,7 +352,9 @@ async fn restart_heard(
     // the coverage a crash loses before the writer's barrier is due.
     pipeline.flush_graph_checkpoint(JOB);
     in_memory.extend(pipeline.graph_jobs[&JOB].in_memory());
-    restart_as_it_stands(temp_dir, pipeline, scenario, inspect).await
+    // Boxed: the restore's future is large, and a caller's frame holds it
+    // once already.
+    Box::pin(restart_as_it_stands(temp_dir, pipeline, scenario, inspect)).await
 }
 
 // The pipeline dropped as it stands and the next made over the same

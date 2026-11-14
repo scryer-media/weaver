@@ -1537,7 +1537,7 @@ impl Pipeline {
         // An intent recorded before this boundary must hold the move.
         self.report_job(job_id);
         let (move_allowed, paused) = self.shared_state.queue.write(|inner| {
-            let Some(row) = inner.job_mut(job_id) else {
+            let Some(mut row) = inner.job_mut(job_id) else {
                 return crate::pipeline::queue::Change::unchanged((false, false));
             };
             if row.intents.cancelled.is_some() {
@@ -1933,7 +1933,7 @@ impl Pipeline {
         held: Option<HashSet<PathBuf>>,
     ) {
         self.shared_state.queue.write(|inner| {
-            let Some(row) = inner.job_mut(job_id) else {
+            let Some(mut row) = inner.job_mut(job_id) else {
                 return crate::pipeline::queue::Change::unchanged(());
             };
             row.report.moving = true;

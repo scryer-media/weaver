@@ -377,7 +377,7 @@ impl Pipeline {
             let busy =
                 inner.admissions.contains(&job_id) || inner.history_operations.contains(&job_id);
             match inner.job_mut(job_id) {
-                Some(row)
+                Some(mut row)
                     if !row.report.retiring
                         && row.report.job.output_dir.as_deref() == Some(from.as_str()) =>
                 {

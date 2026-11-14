@@ -338,15 +338,7 @@ impl Pipeline {
         warn_per_article: bool,
     ) -> weaver_nntp::ServerSet {
         let job_id = segment_id.file_id.job_id;
-        let retention = self.job_retention_excludes(job_id);
-        let pool = self.nntp.pool();
-        let refused_by: weaver_nntp::ServerSet = (0..pool.server_count())
-            .filter(|idx| {
-                !exclude_servers.contains(*idx)
-                    && !retention.contains(*idx)
-                    && pool.refuses_credentials(*idx)
-            })
-            .collect();
+        let refused_by = self.login_refused_unasked(job_id, exclude_servers);
         if warn_per_article {
             warn!(
                 segment = %segment_id,
@@ -383,6 +375,91 @@ impl Pipeline {
             self.note_gap_servers_support_fact(job_id, exclude_servers);
         }
         refused_by
+    }
+
+    // The servers refusing the login that an article of `job_id` carrying
+    // `exclude_servers` was never asked of: neither excluded for the article
+    // nor out of the post's retention. One pass over the server list, from
+    // what the pool and the job already hold.
+    pub(in crate::pipeline) fn login_refused_unasked(
+        &mut self,
+        job_id: JobId,
+        exclude_servers: weaver_nntp::ServerSet,
+    ) -> weaver_nntp::ServerSet {
+        let retention = self.job_retention_excludes(job_id);
+        let pool = self.nntp.pool();
+        (0..pool.server_count())
+            .filter(|idx| {
+                !exclude_servers.contains(*idx)
+                    && !retention.contains(*idx)
+                    && pool.refuses_credentials(*idx)
+            })
+            .collect()
+    }
+
+    // An article every other server answered not-found for was booked past
+    // `refused_by`: the job keeps which servers refused, by identity (stable
+    // id, host, port and account) so the set outlives a change of the server
+    // list as the tried servers of an article do. Nothing else changes
+    // here: the job's cause is whatever its failures record.
+    pub(in crate::pipeline) fn note_login_refusals(
+        &mut self,
+        job_id: JobId,
+        refused_by: weaver_nntp::ServerSet,
+    ) {
+        if refused_by.is_empty() {
+            return;
+        }
+        let pool = self.nntp.pool();
+        let configs = pool.server_configs();
+        let held = self.login_refusals.entry(job_id).or_default();
+        for server in refused_by.iter() {
+            let (Some(stable), Some(config)) = (
+                pool.stable_server_id(weaver_nntp::pool::ServerId(server)),
+                configs.get(server),
+            ) else {
+                continue;
+            };
+            // Compared in place: a server already held costs no allocation.
+            if !held.iter().any(|known| {
+                known.stable_id == stable
+                    && known.host == config.host
+                    && known.port == config.port
+                    && known.username == config.username
+            }) {
+                held.push(weaver_nntp::pool::ServerIdentity {
+                    stable_id: stable,
+                    host: config.host.clone(),
+                    port: config.port,
+                    username: config.username.clone(),
+                });
+            }
+        }
+    }
+
+    // The words a job failing for want of articles gains when a server
+    // refusing the login left articles of it unasked for, naming each such
+    // server still in the server list, in the list's order. A server since
+    // removed is not named, and with none left there are no words.
+    pub(in crate::pipeline) fn login_refusal_words(&self, job_id: JobId) -> Option<String> {
+        let refused_by = self.login_refusals.get(&job_id)?;
+        let names = self
+            .nntp
+            .pool()
+            .server_identities()
+            .into_iter()
+            .filter(|server| refused_by.contains(server))
+            .map(|server| format!("{}:{}", server.host, server.port))
+            .collect::<Vec<_>>();
+        let rest = "never asked for the articles no other server had";
+        match names.as_slice() {
+            [] => None,
+            [name] => Some(format!("server {name} refuses the login and was {rest}")),
+            names => Some(format!(
+                "servers {} refuse the login and were {rest}",
+                names.join(", ")
+            )),
+        }
     }
 
     // Book as missing every queued article of `job_id` that no server may

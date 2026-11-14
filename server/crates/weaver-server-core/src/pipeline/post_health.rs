@@ -639,7 +639,9 @@ impl Pipeline {
             segment_number: first,
         };
         match self.segment_terminal_states.get(&segment) {
-            Some(SegmentTerminalState::Missing) => Head::Lost,
+            Some(SegmentTerminalState::Missing | SegmentTerminalState::UnservableNotFound) => {
+                Head::Lost
+            }
             Some(_) => Head::Settled,
             None if self.graph_article_given_up(segment) => Head::Lost,
             None if self.graph_article_settled(segment) => Head::Settled,
