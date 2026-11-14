@@ -1343,30 +1343,25 @@ async fn a_job_stopped_by_what_is_being_decoded_is_woken_as_the_loop_hands_it_on
 // that profile's figure.
 #[tokio::test]
 async fn a_profile_change_sizes_the_volume_limits_again() {
-    use crate::pipeline::download::volume_pace::{TYPICAL_ARTICLE_BYTES, total_buffer_budget_bytes};
+    use crate::pipeline::orchestrator::volume_buffer_figure;
     use crate::runtime::HardwareProfile;
     let temp_dir = tempfile::tempdir().unwrap();
-    let job_id = JobId(92_424);
+    let job_id = JobId(92_426);
     let posts = [Post::plain("lantern.bin", payload(ARTICLE, 1))];
     let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
     let volume = Arc::clone(pipeline.graph_jobs[&job_id].disk().unwrap().working().volume());
+    // The machine is the one the test pipeline was built on, never the host,
+    // and the figure is the product's own, from that machine.
     let machine = pipeline.tuner.system_profile().clone();
-    let memory = machine.memory.available_bytes;
-    let figure = |profile| {
-        total_buffer_budget_bytes(
-            profile,
-            memory,
-            pipeline.tuner.connection_limit(),
-            TYPICAL_ARTICLE_BYTES,
-        )
-    };
+    let connections = pipeline.tuner.connection_limit();
+    let figure = |profile| volume_buffer_figure(profile, &machine, connections).0;
+    // The test pipeline's machine has four cores and 8 GiB: the balanced
+    // profile is in force, and the efficient one asks nothing of a machine.
     let before = pipeline.configured_hardware_profile;
-    let other = HardwareProfile::available(&machine)
-        .into_iter()
-        .find(|profile| *profile != before)
-        .expect("the test machine offers two profiles");
+    assert_eq!(before, HardwareProfile::Balanced);
+    let other = HardwareProfile::Efficient;
     let (was, will) = (figure(before), figure(other));
-    assert_ne!(was, will);
+    assert_ne!(was, will, "the pipeline's machine sizes these two profiles apart");
     assert_eq!(volume.buffer_limits(), (was * 70 / 100, was));
 
     pipeline.set_configured_hardware_profile(other);

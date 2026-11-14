@@ -2280,7 +2280,7 @@ pub(crate) fn compute_decode_backlog_budget_bytes(
 // The figure every volume's buffer limits are sized on, and the memory that
 // caps it: from the hardware profile in force, the machine's memory and what
 // the configured connections hold in flight.
-pub(super) fn volume_buffer_figure(
+pub(in crate::pipeline) fn volume_buffer_figure(
     hardware_profile: crate::runtime::HardwareProfile,
     profile: &SystemProfile,
     connections: usize,
