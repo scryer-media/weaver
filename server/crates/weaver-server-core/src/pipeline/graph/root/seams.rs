@@ -35,6 +35,8 @@ const WINDOW_PRIORITY: u32 = 3;
 #[cfg(test)]
 thread_local! {
     pub(crate) static DISK_WAIT_LOOKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // How many waits for room were said as they began, on this thread.
+    pub(crate) static DISK_WAITS_SAID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl Pipeline {
@@ -602,6 +604,12 @@ impl Pipeline {
             for job_id in began {
                 #[cfg(test)]
                 DISK_WAIT_LOOKS.with(|looks| looks.set(looks.get() + 1));
+                // Said once, as the wait begins.
+                if let Some((wait, dir)) =
+                    self.graph_jobs.get(&job_id).and_then(GraphJob::disk_wait)
+                {
+                    self.say_disk_wait(job_id, &wait, &dir);
+                }
                 self.disk_waiting.insert(job_id);
                 if self
                     .graph_jobs
@@ -637,6 +645,34 @@ impl Pipeline {
                 self.disk_woke(job_id);
             }
         }
+    }
+
+    // A job began to wait for room on a disk: said once per wait, with the
+    // folder it waits on, what it owes there that must fit above the
+    // reserve before it goes on, what the cached reading shows free, and
+    // the reserve.
+    fn say_disk_wait(&self, job_id: JobId, wait: &limits::DiskWait, dir: &std::path::Path) {
+        use crate::support::human_bytes;
+        #[cfg(test)]
+        DISK_WAITS_SAID.with(|said| said.set(said.get() + 1));
+        let name = self
+            .jobs
+            .get(&job_id)
+            .map_or("", |state| state.spec.name.as_str());
+        let disk = match wait.device {
+            limits::Device::Output => "output",
+            limits::Device::Working => "working",
+        };
+        warn!(
+            job_id = job_id.0,
+            job = %name,
+            disk,
+            folder = %dir.display(),
+            owes = %human_bytes(wait.owes),
+            free = %wait.free.map_or_else(|| "unknown".to_owned(), human_bytes),
+            reserve = %human_bytes(wait.reserve),
+            "graph job waits for disk room"
+        );
     }
 
     // The tickets the output and working ledgers have given out.

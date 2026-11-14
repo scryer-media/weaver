@@ -574,6 +574,19 @@ impl NamespaceWriter {
         self.caps.wake_idle()
     }
 
+    // What the job waits for room for, and the folder on the disk it waits
+    // on, or None when it does not wait. See `Caps::disk_wait`.
+    pub(crate) fn disk_wait(&self) -> Option<(super::limits::DiskWait, PathBuf)> {
+        let wait = self
+            .caps
+            .disk_wait((&self.output_free_disk, &self.free_disk))?;
+        let dir = match wait.device {
+            Device::Output => &self.output_dir,
+            Device::Working => &self.working_dir,
+        };
+        Some((wait, dir.clone()))
+    }
+
     // A run stopped for room takes back what it built while this is set:
     // see `Caps::rewriting`.
     pub(crate) fn rewriting(&mut self, rewriting: bool) {

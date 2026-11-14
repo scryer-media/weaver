@@ -397,6 +397,77 @@ async fn a_shutdown_is_not_held_by_a_job_waiting_for_room() {
     assert!(pipeline.waits_for_disk_room(), "nothing woke the job");
 }
 
+// A job that waits for room the disk could make is said to wait once, as
+// the wait begins: turns with nothing changed and readings short of room
+// say nothing more, and once room comes it completes.
+#[tokio::test]
+async fn a_wait_for_room_is_said_once_as_it_begins() {
+    let said = || crate::pipeline::graph::root::DISK_WAITS_SAID.with(std::cell::Cell::get);
+    let room = Arc::new(AtomicU64::new(0));
+    let scenario = on_disk(&room);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let before = said();
+    until_waiting(&mut pipeline, &scenario).await;
+    assert_eq!(said(), before + 1, "said as it began");
+
+    for _ in 0..3 {
+        pipeline.reconcile_disk_waits();
+        reading_of(&mut pipeline, &room, 0).await;
+    }
+    assert!(pipeline.graph_disk_held(JOB));
+    assert_eq!(said(), before + 1, "said once, not per turn or reading");
+
+    room_freed(&mut pipeline, &room).await;
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    assert_released(&pipeline, &working(&pipeline));
+}
+
+// A disk whose whole size is its reserve could never hold what the job
+// writes, as its reading tells it: the job is not failed for that. It waits,
+// as any job short of room does, is said to once, and completes when a
+// reading shows room.
+#[tokio::test]
+async fn a_job_on_a_disk_no_larger_than_its_reserve_waits_and_is_never_failed() {
+    let said = || crate::pipeline::graph::root::DISK_WAITS_SAID.with(std::cell::Cell::get);
+    let room = Arc::new(AtomicU64::new(0));
+    let scenario = on_disk_keeping(
+        &room,
+        vec![Post::plain(
+            "ember.bin.xz",
+            xz(&payload(3 * ARTICLE + 7, 91)),
+        )],
+        RESERVE * 8,
+    );
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let before = said();
+    drive(&mut pipeline, &scenario, JOB, |pipeline| {
+        pipeline.graph_disk_held(JOB)
+    })
+    .await;
+    pipeline.reconcile_disk_waits();
+    assert!(pipeline.disk_waiting.contains(&JOB), "it waits");
+    assert_eq!(said(), before + 1, "said once, as it began");
+    assert!(
+        !matches!(
+            job_status_for_assert(&pipeline, JOB),
+            Some(JobStatus::Failed { .. })
+        ),
+        "nothing fails it"
+    );
+
+    room_freed(&mut pipeline, &room).await;
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    assert_eq!(said(), before + 1);
+}
+
 // A job that waits for room when the pipeline goes down is restored by the
 // next one, which reads the disk afresh: with room there, it completes.
 #[tokio::test]
