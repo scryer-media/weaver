@@ -2295,6 +2295,9 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 files_under(&path)
+            } else if path.file_name() == Some(std::ffi::OsStr::new(".weaver-output-dir")) {
+                // The folder's marker is Weaver's, not a file in it.
+                Vec::new()
             } else {
                 vec![path]
             }
@@ -5502,7 +5505,7 @@ fn only_file(dir: &Path) -> PathBuf {
             let path = entry.unwrap().path();
             if path.is_dir() {
                 dirs.push(path);
-            } else {
+            } else if path.file_name() != Some(std::ffi::OsStr::new(".weaver-output-dir")) {
                 found.push(path);
             }
         }

@@ -329,22 +329,32 @@ pub async fn recover_server_state(
     // A torrent removed whose history row waited for room as the last run
     // stopped is archived now, as a terminal NZB job's row is above: it
     // does not come back.
-    match db.archive_retiring_torrents() {
-        Ok(written) if !written.is_empty() => info!(
-            job_ids = ?written.iter().map(|job_id| job_id.0).collect::<Vec<_>>(),
-            "archived torrents removed before their history could be written"
-        ),
-        Ok(_) => {}
-        Err(error) => warn!(
-            error = %error,
-            "could not archive the torrents a removal left retiring; they come back until the next start"
-        ),
-    }
+    // One that cannot be written stays retiring: never live, its folders
+    // kept, written by the torrent service through the kept archives.
+    let retiring = match db.archive_retiring_torrents() {
+        Ok(archived) => {
+            if !archived.written.is_empty() {
+                info!(
+                    job_ids = ?archived.written.iter().map(|job_id| job_id.0).collect::<Vec<_>>(),
+                    "archived torrents removed before their history could be written"
+                );
+            }
+            archived.left
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                "could not archive the torrents a removal left retiring; they stay retiring and are retried"
+            );
+            Vec::new()
+        }
+    };
     // The torrents come back too, each with its own job.
     let torrents: HashSet<crate::jobs::ids::JobId> = db.torrent_job_ids()?.into_iter().collect();
     // A torrent's unpacking directory carries its marker as a job's does:
-    // it is live while the torrent's row is.
+    // it is live while the torrent's row is, retiring or not.
     live_jobs.extend(torrents.iter().copied());
+    live_jobs.extend(retiring);
     let restoring: HashSet<crate::jobs::ids::JobId> =
         in_progress.iter().map(|(job_id, _)| *job_id).collect();
     let mut crashed = crate::runtime::panic_trap::boot_marks(data_dir, |job| {
@@ -494,10 +504,14 @@ pub async fn recover_server_state(
     }
     initial_history.truncate(FINISHED_JOBS_RUNTIME_CAP);
 
-    match cleanup_unreferenced_intermediate_dirs(
+    match cleanup_unlisted_intermediate_dirs(
         intermediate_dir,
         &referenced_intermediate_dirs,
         &live_jobs,
+        |unclaimed| {
+            db.listed_history_dirs(unclaimed)
+                .map_err(|error| std::io::Error::other(error.to_string()))
+        },
     ) {
         Ok(removed) if removed > 0 => {
             info!(
@@ -641,17 +655,38 @@ fn try_archive_unfinished_terminal_job(
 
 // A directory that still holds what it cannot give up stays for the next
 // start, and the others go all the same.
+#[cfg(test)]
 fn cleanup_unreferenced_intermediate_dirs(
     intermediate_dir: &Path,
     referenced_dirs: &HashSet<PathBuf>,
     live_jobs: &HashSet<crate::jobs::ids::JobId>,
 ) -> Result<usize, std::io::Error> {
+    cleanup_unlisted_intermediate_dirs(intermediate_dir, referenced_dirs, live_jobs, |_| {
+        Ok(HashSet::new())
+    })
+}
+
+// As `cleanup_unreferenced_intermediate_dirs`, leaving too each unclaimed
+// directory its owner's history row lists (`listed`, asked once for every
+// unclaimed directory): a torrent's kept unpacking folder, which its row
+// records as an NZB job's row records the working folder it kept, and which
+// an archive of that row takes.
+fn cleanup_unlisted_intermediate_dirs(
+    intermediate_dir: &Path,
+    referenced_dirs: &HashSet<PathBuf>,
+    live_jobs: &HashSet<crate::jobs::ids::JobId>,
+    listed: impl FnOnce(
+        &[(crate::jobs::ids::JobId, PathBuf)],
+    ) -> Result<HashSet<PathBuf>, std::io::Error>,
+) -> Result<usize, std::io::Error> {
     use crate::jobs::working_dir::{remove_unclaimed_working_dir, unclaimed_working_dirs};
     let unclaimed = unclaimed_working_dirs(intermediate_dir, |owner, path| {
         live_jobs.contains(&owner) || referenced_dirs.contains(path)
     })?;
+    let listed = listed(&unclaimed)?;
     Ok(unclaimed
         .iter()
+        .filter(|(_, path)| !listed.contains(path))
         .filter(|(owner, path)| remove_unclaimed_working_dir(intermediate_dir, path, *owner))
         .count())
 }

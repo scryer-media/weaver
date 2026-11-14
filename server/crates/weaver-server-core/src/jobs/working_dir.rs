@@ -1211,6 +1211,27 @@ pub(crate) fn mark_legacy_output_dir(dir: &Path) -> std::io::Result<()> {
     )
 }
 
+// Removes `dir` once it holds nothing but, at most, the marker naming
+// `job_id`: the folder a torrent's job made for its files, which goes once
+// they have, as an empty one did before it was marked. One holding anything
+// else, or another job's marker, stays. Whether it went.
+pub(crate) fn remove_emptied_output_dir(dir: &Path, job_id: JobId) -> std::io::Result<bool> {
+    let mut marker = false;
+    for entry in std::fs::read_dir(dir)? {
+        if entry?.file_name() != OUTPUT_DIR_MARKER || marker {
+            return Ok(false);
+        }
+        marker = true;
+    }
+    if marker {
+        if output_dir_owner(dir) != Some(OutputDirOwner::Job(job_id)) {
+            return Ok(false);
+        }
+        std::fs::remove_file(dir.join(OUTPUT_DIR_MARKER))?;
+    }
+    std::fs::remove_dir(dir).map(|()| true)
+}
+
 // Removes an output directory its marker proved Weaver's, the marker last:
 // everything else in it first, then the marker, then the directory. A
 // removal that fails part way leaves the marker, so a retry still proves the

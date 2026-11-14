@@ -2387,6 +2387,29 @@ mod tests {
                     .any(|(_, _, _, step)| step.contains("sqlite_autoindex_job_history_files")),
                 "from {from}: {detail:?}"
             );
+            // The live torrents under a folder history removes from are
+            // found by the folder columns' indexes, never a scan.
+            let detail: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+                "EXPLAIN QUERY PLAN SELECT job_id FROM torrents WHERE retiring IS NULL AND \
+                 (storage_dir = '/d' OR (storage_dir >= '/d/' AND storage_dir < '/d0') \
+                  OR files_dir = '/d' OR (files_dir >= '/d/' AND files_dir < '/d0') \
+                  OR storage_dir IN ('/') OR files_dir IN ('/'))",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            for index in ["idx_torrents_storage_dir", "idx_torrents_files_dir"] {
+                assert!(
+                    detail.iter().any(|(_, _, _, step)| step.contains(index)),
+                    "from {from}: {detail:?}"
+                );
+            }
+            assert!(
+                !detail
+                    .iter()
+                    .any(|(_, _, _, step)| step.starts_with("SCAN torrents")),
+                "from {from}: {detail:?}"
+            );
             pool.close().await;
             let db = crate::Database::open(&db_path).unwrap();
             db.validate_backup_catalog().unwrap();

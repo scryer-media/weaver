@@ -12,3 +12,10 @@ CREATE TABLE job_history_files (
     whole  BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (job_id, path)
 );
+
+-- An archive or delete from history leaves what a live torrent holds under
+-- the folder it removes from, and finds those torrents by the folder their
+-- files are in: equal to it, under it as a range, or above it. The range is
+-- by bytes, so the indexes are too.
+CREATE INDEX idx_torrents_storage_dir ON torrents (storage_dir COLLATE "C");
+CREATE INDEX idx_torrents_files_dir ON torrents (files_dir COLLATE "C");

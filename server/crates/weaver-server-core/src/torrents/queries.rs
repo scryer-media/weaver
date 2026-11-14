@@ -180,14 +180,17 @@ impl Database {
         })
     }
 
-    // The job of every torrent, read alone, for a start that needs only
-    // which torrents it brings back.
+    // The job of every torrent a start brings back, read alone: never one a
+    // removal left retiring, which goes to history instead.
     pub fn torrent_job_ids(&self) -> Result<Vec<JobId>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
-            let rows =
-                SqlRuntime::fetch_all(datastore.read_exec(), "SELECT job_id FROM torrents", &[])
-                    .await?;
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT job_id FROM torrents WHERE retiring IS NULL",
+                &[],
+            )
+            .await?;
             rows.iter()
                 .map(|row| Ok(JobId(count(row, "job_id")?)))
                 .collect()
@@ -233,7 +236,10 @@ impl Database {
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                &format!("SELECT {TORRENT_COLUMNS} FROM torrents ORDER BY added_at_ms, job_id"),
+                &format!(
+                    "SELECT {TORRENT_COLUMNS} FROM torrents WHERE retiring IS NULL \
+                     ORDER BY added_at_ms, job_id"
+                ),
                 &[],
             )
             .await?;
@@ -255,7 +261,7 @@ impl Database {
                         datastore.read_exec(),
                         &format!(
                             "SELECT {TORRENT_COLUMNS} FROM torrents WHERE category_id = {{}}
-                              ORDER BY added_at_ms, job_id"
+                              AND retiring IS NULL ORDER BY added_at_ms, job_id"
                         ),
                         &[SqlArg::I64(i64::from(id))],
                     )
@@ -266,7 +272,7 @@ impl Database {
                         datastore.read_exec(),
                         &format!(
                             "SELECT {TORRENT_COLUMNS} FROM torrents WHERE category_id IS NULL
-                              ORDER BY added_at_ms, job_id"
+                              AND retiring IS NULL ORDER BY added_at_ms, job_id"
                         ),
                         &[],
                     )
@@ -370,7 +376,8 @@ impl Database {
         })
     }
 
-    // Every torrent, in the order they were added, each with its files'
+    // Every torrent a start brings back, never one a removal left
+    // retiring, in the order they were added, each with its files'
     // levels and the pieces it checked in seed mode: what a boot reads of
     // the torrents' rows, in one read. A row that does not read fails the
     // read, as [`Self::list_torrents`] does; a level or seed-mode column
@@ -383,7 +390,7 @@ impl Database {
                 datastore.read_exec(),
                 &format!(
                     "SELECT {TORRENT_COLUMNS}, file_priorities, seed_verified \
-                       FROM torrents ORDER BY added_at_ms, job_id"
+                       FROM torrents WHERE retiring IS NULL ORDER BY added_at_ms, job_id"
                 ),
                 &[],
             )

@@ -2216,6 +2216,14 @@ struct Inner {
     // database's disk, as the queue shows them: retiring, with the
     // disk-space wait an NZB job's retiring row shows.
     retiring: Mutex<BTreeMap<JobId, JobInfo>>,
+    // The latest history row written for each job whose row is on its way,
+    // by turn: a waiter whose row a newer one took the place of is not the
+    // latest, and does nothing.
+    history_turns: Mutex<HashMap<JobId, u64>>,
+    next_history_turn: AtomicU64,
+    // Counts the waiters on a history row kept for room that have ended.
+    #[cfg(test)]
+    history_waits: watch::Sender<u64>,
     queue: Mutex<Option<SchedulerHandle>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     tick: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -2286,6 +2294,10 @@ impl TorrentService {
                 retired: watch::channel(0).0,
                 written: watch::channel(Written::default()).0,
                 retiring: Mutex::default(),
+                history_turns: Mutex::default(),
+                next_history_turn: AtomicU64::new(0),
+                #[cfg(test)]
+                history_waits: watch::channel(0).0,
                 queue: Mutex::new(None),
                 tasks: Mutex::new(Vec::new()),
                 tick: Mutex::new(None),
@@ -2770,7 +2782,9 @@ impl TorrentService {
         self.spawn_follow_trackers();
         self.spawn_follow_egress_limits();
         self.spawn_follow_interfaces();
-        self.restore().await
+        self.restore().await?;
+        self.retry_retiring().await;
+        Ok(())
     }
 
     // A session's local service discovery joins its groups on the
@@ -4058,7 +4072,7 @@ impl TorrentService {
                 let mut torrent = match self.insert(record, &parsed.trackers, &adopted) {
                     Ok(torrent) => torrent,
                     Err(error) => {
-                        give_back(&dir).await;
+                        give_back(&dir, job_id).await;
                         return Err(error);
                     }
                 };
@@ -4242,17 +4256,22 @@ impl TorrentService {
             category.map(|category| category.name.as_str()),
         )
         .map_err(AddError::Invalid)?;
-        claim_complete_destination_path(
+        let dir = claim_complete_destination_path(
             &parent,
             &admission::output_name(manifest),
             job_id,
             &HashSet::new(),
         )
         .await
-        .map(|dir| dir.to_string_lossy().into_owned())
         .map_err(|error| {
             AddError::State(format!("could not make the torrent's directory: {error}"))
-        })
+        })?;
+        let db = self.inner.db.clone();
+        let marked = dir.clone();
+        tokio::task::spawn_blocking(move || mark_storage(&db, &marked, job_id, false))
+            .await
+            .map_err(|error| AddError::State(error.to_string()))?;
+        Ok(dir.to_string_lossy().into_owned())
     }
 
     // Where a torrent's job writes, and where its files go when that is not
@@ -4305,7 +4324,16 @@ impl TorrentService {
             Some(parent) if foldered => {
                 let dir = parent.join(admission::output_name(manifest));
                 let adopted = found(dir.clone()).await?;
-                made(&dir)?;
+                let db = self.inner.db.clone();
+                let marked = dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    let existed = std::fs::symlink_metadata(&marked).is_ok();
+                    made(&marked)?;
+                    mark_storage(&db, &marked, job_id, existed);
+                    Ok::<_, AddError>(())
+                })
+                .await
+                .map_err(|error| AddError::State(error.to_string()))??;
                 Ok((dir.to_string_lossy().into_owned(), None, adopted))
             }
             Some(parent) => {
@@ -4612,7 +4640,7 @@ impl TorrentService {
         let mut live = self.inner.live.lock().await;
         let Some(torrent) = live.get_mut(&job_id) else {
             drop(live);
-            give_back(&dir).await;
+            give_back(&dir, job_id).await;
             return Ok(());
         };
         torrent.record.infohash_v1 = parsed.hashes.v1.map(|hash| hash.0);
@@ -5362,13 +5390,7 @@ impl TorrentService {
     // A torrent that left the live ones goes to history: its row, then out
     // of the torrents and into the finished jobs, listing of what it
     // `written` what is still there once its removal is done with it.
-    async fn retire(
-        &self,
-        mut torrent: Live,
-        status: &str,
-        error: Option<String>,
-        written: Wrote,
-    ) {
+    async fn retire(&self, mut torrent: Live, status: &str, error: Option<String>, written: Wrote) {
         let job_id = torrent.record.job_id;
         let files = history_files(written.deletion).await;
         self.inner.env.outside.leave(job_id.0);
@@ -5402,7 +5424,8 @@ impl TorrentService {
         // Its history row and its removal are one write: the job is never
         // in neither, so an event raised while it was live, still being
         // queued, finds it.
-        self.write_history(row, true, report, files).await;
+        self.write_history(row, true, report.job_info(), files)
+            .await;
     }
 
     // A torrent's job, finished as `status`: into history and the queue's
@@ -5418,7 +5441,8 @@ impl TorrentService {
             None => Vec::new(),
         };
         let row = report.history_row(status, Some(hash.0.to_vec()), now);
-        self.write_history(row, false, report, files).await;
+        self.write_history(row, false, report.job_info(), files)
+            .await;
     }
 
     // The job's history row goes through the database writer's archives,
@@ -5432,10 +5456,11 @@ impl TorrentService {
         &self,
         row: crate::history::JobHistoryRow,
         retires: bool,
-        report: JobReport,
+        job: JobInfo,
         files: Vec<HistoryFile>,
     ) {
-        let job_id = report.job_id;
+        let job_id = job.job_id;
+        let turn = self.history_turn(job_id);
         let queued = self
             .inner
             .db
@@ -5444,7 +5469,10 @@ impl TorrentService {
             Ok(both) => both,
             Err(error) => {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's history");
-                return self.finished(report).await;
+                if self.end_history_turn(job_id, turn) {
+                    self.finished(job).await;
+                }
+                return;
             }
         };
         let landed = tokio::select! {
@@ -5457,10 +5485,13 @@ impl TorrentService {
         };
         match landed {
             Some(landed) => {
+                if !self.end_history_turn(job_id, turn) {
+                    return;
+                }
                 if !landed {
                     tracing::warn!(job_id = job_id.0, "could not record a torrent's history");
                 }
-                self.finished(report).await;
+                self.finished(job).await;
             }
             None => {
                 tracing::info!(
@@ -5468,30 +5499,71 @@ impl TorrentService {
                     "a torrent's history waits for room on the database's disk"
                 );
                 if retires {
-                    self.show_retiring(&report);
+                    self.show_retiring(&job);
                 }
                 let service = self.clone();
                 tokio::spawn(async move {
-                    if written.await.is_err() {
-                        tracing::warn!(job_id = job_id.0, "could not record a torrent's history");
+                    let landed = written.await.is_ok();
+                    // One a newer row took the place of was let go for it:
+                    // the newer row's waiter finishes the job.
+                    if service.end_history_turn(job_id, turn) {
+                        if !landed {
+                            tracing::warn!(
+                                job_id = job_id.0,
+                                "could not record a torrent's history"
+                            );
+                        }
+                        service.finished(job).await;
                     }
-                    service.finished(report).await;
+                    #[cfg(test)]
+                    service.inner.history_waits.send_modify(|ended| *ended += 1);
                 });
             }
         }
     }
 
+    // A new turn for the job's history row, the latest from now on.
+    fn history_turn(&self, job_id: JobId) -> u64 {
+        let turn = self.inner.next_history_turn.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .history_turns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(job_id, turn);
+        turn
+    }
+
+    // Whether `turn` is still the job's latest, ending it when it is.
+    fn end_history_turn(&self, job_id: JobId, turn: u64) -> bool {
+        let mut turns = self
+            .inner
+            .history_turns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if turns.get(&job_id) != Some(&turn) {
+            return false;
+        }
+        turns.remove(&job_id);
+        true
+    }
+
+    // Counts the waiters on a history row kept for room that have ended.
+    #[cfg(test)]
+    pub(crate) fn history_waits(&self) -> watch::Receiver<u64> {
+        self.inner.history_waits.subscribe()
+    }
+
     // A torrent removed whose history row the database's disk has no room
     // for stays in the queue as an NZB job's retiring row does, saying it
     // waits for disk space, until the row is written.
-    fn show_retiring(&self, report: &JobReport) {
-        let mut job = report.clone().job_info();
+    fn show_retiring(&self, job: &JobInfo) {
+        let mut job = job.clone();
         job.download_wait_reason = Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON.to_owned());
         self.inner
             .retiring
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(report.job_id, job.clone());
+            .insert(job.job_id, job.clone());
         if let Some(queue) = self.queue() {
             queue.publish_owned_job(job);
         }
@@ -5499,8 +5571,8 @@ impl TorrentService {
 
     // A torrent's job, its history row written: out to the queue's
     // finished jobs.
-    async fn finished(&self, report: JobReport) {
-        let job_id = report.job_id;
+    async fn finished(&self, job: JobInfo) {
+        let job_id = job.job_id;
         self.inner
             .retiring
             .lock()
@@ -5508,11 +5580,42 @@ impl TorrentService {
             .remove(&job_id);
         self.publish().await;
         if let Some(queue) = self.queue()
-            && let Err(error) = queue.retire_job(report.job_info()).await
+            && let Err(error) = queue.retire_job(job).await
         {
             tracing::warn!(job_id = job_id.0, error = %error, "a torrent did not reach history");
         }
         self.inner.retired.send_modify(|retired| *retired += 1);
+    }
+
+    // The torrents a removal left retiring that the start could not write
+    // to history: never live, each is written through the kept archives as
+    // a removal's row is, shown retiring while it waits for room. One whose
+    // kept row does not read stays retiring, said.
+    async fn retry_retiring(&self) {
+        let db = self.inner.db.clone();
+        let rows = match tokio::task::spawn_blocking(move || db.retiring_torrents()).await {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "could not read the torrents a removal left retiring");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "could not read the torrents a removal left retiring");
+                return;
+            }
+        };
+        for (job_id, kept) in rows {
+            match kept {
+                Ok((history, files)) => {
+                    let mut job = crate::operations::backup::job_info_from_history(history.clone());
+                    job.protocol = crate::jobs::Protocol::Torrent;
+                    self.write_history(history, true, job, files).await;
+                }
+                Err(error) => {
+                    tracing::warn!(job_id = job_id.0, error = %error, "a removed torrent's kept history row does not read; it stays retiring");
+                }
+            }
+        }
     }
 
     /// Remove a torrent. A private torrent whose seeding goal is not met
@@ -6160,12 +6263,22 @@ impl TorrentService {
             })
             .await;
         if let Err(error) = started {
-            give_back(&to.to_string_lossy()).await;
+            give_back(&to.to_string_lossy(), job_id).await;
             return Err(error);
         }
         let outcome = tokio::task::spawn_blocking(move || {
             store.files().relocate(|dir| {
+                // Its marker is made for the folder's path, so the moved
+                // folder takes one made for where it went, as the job's own.
+                let owned = crate::jobs::working_dir::output_dir_owner(dir)
+                    == Some(crate::jobs::working_dir::OutputDirOwner::Job(job_id));
                 relocate::move_directory(dir, &to)?;
+                if owned
+                    && let Err(error) =
+                        crate::jobs::working_dir::mark_weaver_owned_output_dir(&to, job_id)
+                {
+                    tracing::warn!(job_id = job_id.0, dir = %to.display(), error = %error, "could not mark a torrent's moved folder; history leaves its files");
+                }
                 Ok((to.clone(), (to, false)))
             })
         })
@@ -6400,7 +6513,7 @@ impl TorrentService {
             Err(error) => {
                 tracing::warn!(job_id = job_id.0, error = %error, "a torrent's move failed; it stays where it was");
                 if let Some(Moving::Dir(claimed)) = moving {
-                    give_back(&claimed.to_string_lossy()).await;
+                    give_back(&claimed.to_string_lossy(), job_id).await;
                 }
                 Err(ActionError::State(format!(
                     "the torrent's move failed, and it stays where it was: {error}"
@@ -8097,9 +8210,47 @@ fn held_by(error: SessionError) -> Held {
 
 // Give back a directory claimed for a torrent that was not added, when
 // nothing went into it.
-async fn give_back(dir: &str) {
-    if let Err(error) = tokio::fs::remove_dir(dir).await {
-        tracing::debug!(dir, error = %error, "a claimed torrent directory stays");
+async fn give_back(dir: &str, job_id: JobId) {
+    let path = PathBuf::from(dir);
+    let removed = tokio::task::spawn_blocking(move || {
+        crate::jobs::working_dir::remove_emptied_output_dir(&path, job_id)
+    })
+    .await;
+    match removed {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => tracing::debug!(dir, "a claimed torrent directory holds files, and stays"),
+        Ok(Err(error)) => {
+            tracing::debug!(dir, error = %error, "a claimed torrent directory stays");
+        }
+        Err(error) => tracing::debug!(dir, error = %error, "a claimed torrent directory stays"),
+    }
+}
+
+// The marker of the folder a torrent's files go in, `dir`, naming its job:
+// the one job that may remove from it once the torrent is in history. A
+// folder Weaver made for the torrent (`existed` false) takes it; one that
+// was there takes it only from a job that is gone, neither a torrent nor an
+// active job, as when a torrent removed with its files kept is added again
+// over them. An unmarked folder that was there, or one another live job's
+// marker holds, stays as it is: nothing in history removes from it.
+fn mark_storage(db: &Database, dir: &Path, job_id: JobId, existed: bool) {
+    use crate::jobs::working_dir::{OutputDirOwner, output_dir_owner};
+    let take = !existed
+        || match output_dir_owner(dir) {
+            Some(OutputDirOwner::Job(owner)) if owner != job_id => {
+                let torrent = db
+                    .torrent_job_ids_among(&[owner])
+                    .map_or(true, |live| !live.is_empty());
+                let active = db
+                    .load_active_job_root_phase(owner)
+                    .map_or(true, |phase| phase.is_some());
+                !torrent && !active
+            }
+            _ => false,
+        };
+    if take && let Err(error) = crate::jobs::working_dir::mark_weaver_owned_output_dir(dir, job_id)
+    {
+        tracing::warn!(job_id = job_id.0, dir = %dir.display(), error = %error, "could not mark a torrent's folder; history leaves its files");
     }
 }
 
@@ -8497,44 +8648,195 @@ async fn history_files(deletion: Deletion) -> Vec<HistoryFile> {
     })
 }
 
+// The paths live torrents hold under the folders history removes from: their
+// own files, and what unpacking placed beside them, with every folder above
+// each, so a listed folder that goes whole is known to hold one.
+#[derive(Debug, Default)]
+pub(crate) struct LiveHeld {
+    paths: HashSet<PathBuf>,
+    above: HashSet<PathBuf>,
+}
+
+impl LiveHeld {
+    // What the live torrents whose files may lie under `dirs` hold there, in
+    // one read for every folder of the call (`live_torrents_over`); each
+    // torrent's files by its metainfo, as its store lays them out.
+    pub(crate) fn under(db: &Database, dirs: &[PathBuf]) -> Result<Self, StateError> {
+        let mut held = Self::default();
+        for live in db.live_torrents_over(dirs)? {
+            let base = PathBuf::from(&live.base);
+            let names = live
+                .metainfo
+                .as_deref()
+                .map(|bytes| match parse(bytes) {
+                    Ok(parsed) => parsed.manifest.paths,
+                    Err(error) => {
+                        tracing::warn!(job_id = live.job_id.0, error = %error, "could not read a live torrent's files; history leaves its folder");
+                        vec![String::new()]
+                    }
+                })
+                .unwrap_or_default();
+            let paths = names
+                .iter()
+                .map(|name| {
+                    name.split('/')
+                        .filter(|part| !part.is_empty())
+                        .collect::<PathBuf>()
+                })
+                .chain(live.outputs.iter().map(PathBuf::from))
+                .map(|name| base.join(name));
+            for path in paths {
+                held.above
+                    .extend(path.ancestors().skip(1).map(Path::to_path_buf));
+                held.paths.insert(path);
+            }
+        }
+        Ok(held)
+    }
+
+    // Whether a live torrent holds `path`, is in it, or, for one that goes
+    // `whole`, holds anything in it.
+    fn holds(&self, path: &Path, whole: bool) -> bool {
+        path.ancestors().any(|at| self.paths.contains(at)) || (whole && self.above.contains(path))
+    }
+}
+
+// What an archive from history, or a delete with files, did with what a
+// torrent's job listed: how many paths were there and went, and the folders
+// it left because nothing proves Weaver may remove from them.
+#[derive(Debug, Default)]
+pub(crate) struct ListedRemoval {
+    pub(crate) removed: usize,
+    pub(crate) not_managed: Vec<PathBuf>,
+}
+
 // An archive from history, or a delete with files, of a torrent's job whose
-// torrent is gone: the files its row lists go as a removal of the torrent
-// with its files takes them (`delete_written`), each folder above them that
-// this empties with them, up to `dir`, the folder its row records, which
-// stays. A listed path not under `dir`, or one that climbs out of it, is
-// never touched. How many of them were there to remove.
-pub(crate) fn remove_history_files(dir: &Path, files: &[HistoryFile]) -> usize {
-    let inside = |path: &Path| {
-        path.is_absolute()
-            && path != dir
-            && path.starts_with(dir)
+// torrent is gone: the files its row lists go, under `dir`, the folder its
+// row records, and only while that folder's marker names the job, read now
+// (`output_dir_owner`), the proof an NZB job's archive takes of its output
+// folder. A folder with no marker, or another job's, has nothing removed
+// and is not managed. Under a proven folder a listed path stays when a live
+// torrent holds it (`held`), when a folder between `dir` and it is a link,
+// or when it climbs out; the folders each removal empties go, deepest
+// first, never `dir`'s own parents, and `dir` goes once its marker is all
+// it holds. A listed path outside `dir` is the torrent's in a shared
+// folder, and stays, not managed; one under `intermediate`, its unpacking
+// folder, goes by its marker as an NZB job's working folder does.
+pub(crate) fn remove_history_files(
+    job_id: JobId,
+    intermediate: &Path,
+    dir: &Path,
+    files: &[HistoryFile],
+    held: &LiveHeld,
+) -> ListedRemoval {
+    let mut removal = ListedRemoval::default();
+    let mut outside = BTreeSet::new();
+    let mut inside = Vec::new();
+    for file in files {
+        let path = PathBuf::from(&file.path);
+        let plain = path.is_absolute()
             && path.components().all(|part| {
                 !matches!(
                     part,
                     std::path::Component::ParentDir | std::path::Component::CurDir
                 )
-            })
-    };
-    let mut deletion = Deletion {
-        dir: dir.to_path_buf(),
-        ..Deletion::default()
-    };
-    let mut there = 0;
-    for file in files {
-        let path = PathBuf::from(&file.path);
-        if !inside(&path) {
-            tracing::warn!(file = %path.display(), dir = %dir.display(), "a torrent's listed file is not under its folder, and stays");
+            });
+        if plain && path.starts_with(intermediate) {
             continue;
         }
-        there += usize::from(std::fs::symlink_metadata(&path).is_ok());
-        if file.whole {
-            deletion.made.push(path);
+        if !plain || path == dir || !path.starts_with(dir) {
+            // Said by the folder it is in, read without climbing: a
+            // relative path names no folder, and is left unsaid.
+            if path.is_absolute() && std::fs::symlink_metadata(&path).is_ok() {
+                let mut at = PathBuf::new();
+                for part in path.components() {
+                    match part {
+                        std::path::Component::ParentDir => {
+                            at.pop();
+                        }
+                        std::path::Component::CurDir => {}
+                        part => at.push(part),
+                    }
+                }
+                outside.insert(at.parent().map_or_else(|| at.clone(), Path::to_path_buf));
+            }
+            continue;
+        }
+        inside.push((path, file.whole));
+    }
+    removal.not_managed.extend(outside);
+    match std::fs::symlink_metadata(dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return removal,
+        _ => {}
+    }
+    if crate::jobs::working_dir::output_dir_owner(dir)
+        != Some(crate::jobs::working_dir::OutputDirOwner::Job(job_id))
+    {
+        tracing::warn!(job_id = job_id.0, dir = %dir.display(), "a torrent's folder does not carry its job's marker; history leaves its files");
+        removal.not_managed.push(dir.to_path_buf());
+        return removal;
+    }
+    // A link between the folder and a file would take the removal out of
+    // it: each folder on the way is read once, never followed.
+    let mut linked: HashMap<PathBuf, bool> = HashMap::new();
+    let mut through_link = |path: &Path| {
+        path.ancestors()
+            .skip(1)
+            .take_while(|at| *at != dir)
+            .any(|at| {
+                *linked.entry(at.to_path_buf()).or_insert_with(|| {
+                    std::fs::symlink_metadata(at).is_ok_and(|found| found.file_type().is_symlink())
+                })
+            })
+    };
+    let mut folders = BTreeSet::new();
+    for (path, whole) in inside {
+        if held.holds(&path, whole) {
+            continue;
+        }
+        if through_link(&path) {
+            tracing::warn!(file = %path.display(), "a torrent's listed file is under a link, and stays");
+            continue;
+        }
+        let found = match std::fs::symlink_metadata(&path) {
+            Ok(found) => found,
+            Err(_) => continue,
+        };
+        let removed = if found.is_dir() && whole {
+            std::fs::remove_dir_all(&path)
+        } else if found.is_dir() {
+            tracing::warn!(file = %path.display(), "a folder is where a torrent's file was, and stays");
+            continue;
         } else {
-            deletion.paths.push(path);
+            std::fs::remove_file(&path)
+        };
+        match removed {
+            Ok(()) => removal.removed += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(file = %path.display(), error = %error, "could not remove a torrent's listed file");
+            }
+        }
+        for folder in path.ancestors().skip(1).take_while(|at| *at != dir) {
+            // The folders above one already taken were taken with it.
+            if !folders.insert((folder.components().count(), folder.to_path_buf())) {
+                break;
+            }
         }
     }
-    delete_written(&deletion);
-    there
+    // Deepest first, so a folder emptied by the one below it goes too; one
+    // that is not empty stays, as `remove_dir` leaves it.
+    for (_, folder) in folders.iter().rev() {
+        let _ = std::fs::remove_dir(folder);
+    }
+    match crate::jobs::working_dir::remove_emptied_output_dir(dir, job_id) {
+        Ok(true) => removal.removed += 1,
+        Ok(false) => {}
+        Err(error) => {
+            tracing::debug!(dir = %dir.display(), error = %error, "a torrent's folder stays");
+        }
+    }
+    removal
 }
 
 // libtorrent `storage_utils::delete_files`: the torrent's files go, here
@@ -8590,13 +8892,26 @@ pub(super) fn delete_written(deletion: &Deletion) {
         deletion
             .claimed
             .iter()
+            .chain(deletion.own.then_some(&deletion.dir))
             .map(|folder| (folder.components().count(), folder.clone())),
     );
     // Deepest first, so a folder emptied by the one below it goes too; one
     // that is not empty stays, as `remove_dir` leaves it.
+    // The torrent's own folder and the one claimed for it carry its job's
+    // marker, which goes with them once it is all they hold.
     for (_, folder) in folders.iter().rev() {
-        if !deletion.kept_dirs.contains(folder) {
-            let _ = std::fs::remove_dir(folder);
+        if deletion.kept_dirs.contains(folder) {
+            continue;
+        }
+        let marked =
+            (deletion.own && *folder == deletion.dir) || deletion.claimed.as_ref() == Some(folder);
+        match deletion.owner.filter(|_| marked) {
+            Some(owner) => {
+                let _ = crate::jobs::working_dir::remove_emptied_output_dir(folder, owner);
+            }
+            None => {
+                let _ = std::fs::remove_dir(folder);
+            }
         }
     }
 }
