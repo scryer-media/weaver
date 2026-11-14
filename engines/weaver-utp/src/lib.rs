@@ -49,7 +49,8 @@ pub use stream::UtpStream;
 pub use stream_rx::UtpStreamReadHalf;
 pub use stream_tx::UtpStreamWriteHalf;
 pub use traits::{
-    DatagramSend, DefaultUtpEnvironment, Fragmenting, PollSendToVectored, Transport, UtpEnvironment,
+    DatagramSend, DefaultUtpEnvironment, Fragmenting, PollSendToVectored, Received, Transport,
+    UtpEnvironment,
 };
 pub use udp_error::{is_message_size_error, message_size_error};
 

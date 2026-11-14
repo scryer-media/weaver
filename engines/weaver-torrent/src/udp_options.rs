@@ -256,6 +256,208 @@ mod runs {
     }
 }
 
+/// The most datagrams one [`recv_many`] returns and one [`send_many`]
+/// carries.
+pub(crate) const RECV_MANY_DATAGRAMS: usize = 64;
+pub(crate) const SEND_MANY_DATAGRAMS: usize = 32;
+
+/// Whether one system call receives several datagrams, and sends several
+/// to several addresses, on this host: Linux (recvmmsg and sendmmsg).
+pub(crate) const TAKES_MANY: bool = cfg!(any(target_os = "linux", target_os = "android"));
+
+/// Receives the datagrams that wait on `socket` in one system call, at
+/// most `into.len()` and [`RECV_MANY_DATAGRAMS`] of them, each into its
+/// entry's two buffers, with its length and sender: at most `spill.len()`
+/// bytes of each, and one cut short reads as that many. How many came.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn recv_many(
+    socket: &impl AsSocket,
+    into: &mut [weaver_utp::Received],
+) -> io::Result<usize> {
+    many::recv(socket.as_raw_fd(), into)
+}
+
+/// Sends datagrams that lie end to end in `bytes` in one system call:
+/// `parts` gives each one's length and address, at most
+/// [`SEND_MANY_DATAGRAMS`] of them are sent. How many went, counted from
+/// the first; it fails when the first could not be sent.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn send_many(
+    socket: &impl AsSocket,
+    bytes: &[u8],
+    parts: &[(usize, SocketAddr)],
+) -> io::Result<usize> {
+    many::send(socket.as_raw_fd(), bytes, parts)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod many {
+    use std::{
+        io, mem,
+        net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+        os::fd::RawFd,
+    };
+
+    use nix::libc;
+
+    use super::{RECV_MANY_DATAGRAMS, SEND_MANY_DATAGRAMS};
+
+    // An address of either family fits the IPv6 one's room.
+    type Name = libc::sockaddr_in6;
+
+    // Writes `addr` as the host names it; its length.
+    fn name(addr: SocketAddr, out: &mut Name) -> libc::socklen_t {
+        match addr {
+            SocketAddr::V4(v4) => {
+                let named = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as libc::sa_family_t,
+                    sin_port: v4.port().to_be(),
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                    },
+                    sin_zero: [0; 8],
+                };
+                // SAFETY: `out` is valid for writes of an IPv6 address,
+                // which is larger than an IPv4 one and aligned at least as
+                // strictly.
+                unsafe { std::ptr::from_mut(out).cast::<libc::sockaddr_in>().write(named) };
+                mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
+            }
+            SocketAddr::V6(v6) => {
+                *out = libc::sockaddr_in6 {
+                    sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                    sin6_port: v6.port().to_be(),
+                    sin6_flowinfo: v6.flowinfo(),
+                    sin6_addr: libc::in6_addr {
+                        s6_addr: v6.ip().octets(),
+                    },
+                    sin6_scope_id: v6.scope_id(),
+                };
+                mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
+            }
+        }
+    }
+
+    // The address the host wrote, when it is an IP one.
+    fn named(name: &Name) -> Option<SocketAddr> {
+        match libc::c_int::from(name.sin6_family) {
+            libc::AF_INET => {
+                // SAFETY: the host wrote an IPv4 address, which is smaller
+                // than `name` and aligned no more strictly; any bytes are a
+                // valid one.
+                let v4 = unsafe { std::ptr::from_ref(name).cast::<libc::sockaddr_in>().read() };
+                Some(SocketAddr::V4(SocketAddrV4::new(
+                    Ipv4Addr::from(v4.sin_addr.s_addr.to_ne_bytes()),
+                    u16::from_be(v4.sin_port),
+                )))
+            }
+            libc::AF_INET6 => Some(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(name.sin6_addr.s6_addr),
+                u16::from_be(name.sin6_port),
+                name.sin6_flowinfo,
+                name.sin6_scope_id,
+            ))),
+            _ => None,
+        }
+    }
+
+    pub(super) fn recv(fd: RawFd, into: &mut [weaver_utp::Received]) -> io::Result<usize> {
+        let most = into.len().min(RECV_MANY_DATAGRAMS);
+        // SAFETY: message headers, buffer descriptions and addresses are
+        // plain data for which all zeroes is a valid value.
+        let mut names: [Name; RECV_MANY_DATAGRAMS] = unsafe { mem::zeroed() };
+        let mut bufs: [[libc::iovec; 2]; RECV_MANY_DATAGRAMS] = unsafe { mem::zeroed() };
+        let mut msgs: [libc::mmsghdr; RECV_MANY_DATAGRAMS] = unsafe { mem::zeroed() };
+        for (i, entry) in into[..most].iter_mut().enumerate() {
+            let tail = entry.spill.len().saturating_sub(entry.head.len());
+            bufs[i] = [
+                libc::iovec {
+                    iov_base: entry.head.as_mut_ptr().cast(),
+                    iov_len: entry.head.len(),
+                },
+                libc::iovec {
+                    iov_base: entry.spill.as_mut_ptr().cast(),
+                    iov_len: tail,
+                },
+            ];
+            let msg = &mut msgs[i].msg_hdr;
+            msg.msg_name = (&raw mut names[i]).cast();
+            msg.msg_namelen = mem::size_of::<Name>() as libc::socklen_t;
+            msg.msg_iov = bufs[i].as_mut_ptr();
+            msg.msg_iovlen = 2;
+        }
+        // SAFETY: the first `most` headers each name an address and two
+        // buffers that are valid for writes of the lengths given and
+        // outlive the call: the arrays above and the entries' buffers,
+        // which `into` borrows exclusively. `fd` is an open socket for the
+        // call, which does not wait.
+        let got = unsafe {
+            libc::recvmmsg(
+                fd,
+                msgs.as_mut_ptr(),
+                most as libc::c_uint,
+                libc::MSG_DONTWAIT as _,
+                std::ptr::null_mut(),
+            )
+        };
+        if got < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let got = got as usize;
+        for (i, entry) in into[..got].iter_mut().enumerate() {
+            let cut = msgs[i].msg_hdr.msg_flags & libc::MSG_TRUNC != 0;
+            match named(&names[i]) {
+                Some(from) => {
+                    entry.len = if cut {
+                        entry.spill.len()
+                    } else {
+                        msgs[i].msg_len as usize
+                    };
+                    entry.from = from;
+                }
+                // A datagram from no IP address is read as an empty one,
+                // which is no packet.
+                None => entry.len = 0,
+            }
+        }
+        Ok(got)
+    }
+
+    pub(super) fn send(fd: RawFd, bytes: &[u8], parts: &[(usize, SocketAddr)]) -> io::Result<usize> {
+        let most = parts.len().min(SEND_MANY_DATAGRAMS);
+        // SAFETY: message headers, buffer descriptions and addresses are
+        // plain data for which all zeroes is a valid value.
+        let mut names: [Name; SEND_MANY_DATAGRAMS] = unsafe { mem::zeroed() };
+        let mut bufs: [libc::iovec; SEND_MANY_DATAGRAMS] = unsafe { mem::zeroed() };
+        let mut msgs: [libc::mmsghdr; SEND_MANY_DATAGRAMS] = unsafe { mem::zeroed() };
+        let mut at = 0;
+        for (i, (len, target)) in parts[..most].iter().enumerate() {
+            let datagram = bytes
+                .get(at..at + len)
+                .ok_or(io::ErrorKind::InvalidInput)?;
+            at += len;
+            bufs[i] = libc::iovec {
+                iov_base: datagram.as_ptr().cast_mut().cast(),
+                iov_len: datagram.len(),
+            };
+            let msg = &mut msgs[i].msg_hdr;
+            msg.msg_namelen = name(*target, &mut names[i]);
+            msg.msg_name = (&raw mut names[i]).cast();
+            msg.msg_iov = &raw mut bufs[i];
+            msg.msg_iovlen = 1;
+        }
+        // SAFETY: the first `most` headers each name an address and one
+        // buffer inside `bytes`, all of which outlive the call, which only
+        // reads them. `fd` is an open socket for the call.
+        let sent = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), most as libc::c_uint, 0) };
+        if sent < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(sent as usize)
+        }
+    }
+}
+
 // Linux asks for path-MTU discovery that never fragments.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod sys {

@@ -96,6 +96,14 @@ pub struct UtpStats {
     pub send_run_datagrams: AtomicU64,
     /// Calls for more than one datagram that failed as a whole; their datagrams then went one at a time.
     pub send_run_errors: AtomicU64,
+    /// Reads of the socket that returned datagrams.
+    pub receive_calls: AtomicU64,
+    /// Datagrams those reads returned: several a read where the host has a call for it.
+    pub receive_call_datagrams: AtomicU64,
+    /// Sends that carried datagrams for several addresses in one call.
+    pub send_batches: AtomicU64,
+    /// Datagrams those sends carried.
+    pub send_batch_datagrams: AtomicU64,
 }
 
 /// Relaxed counters for a socket, aggregated across its streams.
@@ -135,6 +143,10 @@ pub struct UtpStatsSnapshot {
     pub send_runs: u64,
     pub send_run_datagrams: u64,
     pub send_run_errors: u64,
+    pub receive_calls: u64,
+    pub receive_call_datagrams: u64,
+    pub send_batches: u64,
+    pub send_batch_datagrams: u64,
 }
 
 impl UtpStats {
@@ -176,6 +188,10 @@ impl UtpStats {
             send_runs: self.send_runs.load(Ordering::Relaxed),
             send_run_datagrams: self.send_run_datagrams.load(Ordering::Relaxed),
             send_run_errors: self.send_run_errors.load(Ordering::Relaxed),
+            receive_calls: self.receive_calls.load(Ordering::Relaxed),
+            receive_call_datagrams: self.receive_call_datagrams.load(Ordering::Relaxed),
+            send_batches: self.send_batches.load(Ordering::Relaxed),
+            send_batch_datagrams: self.send_batch_datagrams.load(Ordering::Relaxed),
         }
     }
 }
@@ -246,6 +262,10 @@ impl std::ops::AddAssign for UtpStatsSnapshot {
         self.send_runs = self.send_runs.saturating_add(other.send_runs);
         self.send_run_datagrams = self.send_run_datagrams.saturating_add(other.send_run_datagrams);
         self.send_run_errors = self.send_run_errors.saturating_add(other.send_run_errors);
+        self.receive_calls = self.receive_calls.saturating_add(other.receive_calls);
+        self.receive_call_datagrams = self.receive_call_datagrams.saturating_add(other.receive_call_datagrams);
+        self.send_batches = self.send_batches.saturating_add(other.send_batches);
+        self.send_batch_datagrams = self.send_batch_datagrams.saturating_add(other.send_batch_datagrams);
     }
 }
 

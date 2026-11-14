@@ -512,17 +512,79 @@ impl<T, E> AcceptQueue<T, E> {
 /// A read takes at most `u16::MAX` bytes in all, the spill buffer's
 /// length. Normal UDP datagrams carry at most u16::MAX - 8 payload bytes;
 /// one that fills the read is dropped as too long.
+///
+/// A transport that receives several datagrams in a call reads into
+/// `many`, one entry with buffers of its own for each; each datagram's
+/// buffers then change places with `head` and `spill` while it is handled.
 pub(crate) struct RecvBufs {
     head: Box<[u8]>,
     spill: Box<[u8]>,
+    many: Vec<crate::Received>,
+}
+
+// What one receive call returned.
+enum Got {
+    // One datagram in `head` and `spill`: its length and sender.
+    One(usize, SocketAddr),
+    // This many datagrams, in the first entries of `many`.
+    Many(usize),
 }
 
 impl RecvBufs {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::receiving(1)
+    }
+
+    // Buffers for a transport that returns at most `most` datagrams a
+    // call. Each entry has a spill buffer of its own, as any datagram of a
+    // call may be a long one: RECEIVE_BATCH of them at most, for the
+    // socket's life.
+    fn receiving(most: usize) -> Self {
+        let spill = || vec![0; u16::MAX as usize].into_boxed_slice();
+        let many = if most > 1 {
+            (0..most.min(RECEIVE_BATCH))
+                .map(|_| crate::Received {
+                    head: crate::rx_buf::take(),
+                    spill: spill(),
+                    len: 0,
+                    from: SocketAddr::from(([0, 0, 0, 0], 0)),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
             head: crate::rx_buf::take(),
-            spill: vec![0; u16::MAX as usize].into_boxed_slice(),
+            spill: spill(),
+            many,
         }
+    }
+
+    // The next receive call: at most `most` datagrams.
+    async fn recv_next<T: Transport>(
+        &mut self,
+        transport: &T,
+        most: usize,
+    ) -> std::io::Result<Got> {
+        if self.many.is_empty() {
+            let (len, from) = self.recv(transport).await?;
+            return Ok(Got::One(len, from));
+        }
+        let most = most.clamp(1, self.many.len());
+        poll_fn(|cx| transport.poll_recv_many(cx, &mut self.many[..most]))
+            .await
+            .map(Got::Many)
+    }
+
+    // The buffers of the `index`th datagram of the last call change places
+    // with `head` and `spill`: once to handle it there, and once more to
+    // give the entry buffers for the next call.
+    fn swap(&mut self, index: usize) -> (usize, SocketAddr) {
+        let entry = &mut self.many[index];
+        std::mem::swap(&mut self.head, &mut entry.head);
+        std::mem::swap(&mut self.spill, &mut entry.spill);
+        (entry.len, entry.from)
     }
 
     // The longest datagram read: one this long may have been cut short.
@@ -623,6 +685,8 @@ fn poll_outgoing<T: Transport, E: UtpEnvironment>(
     };
     let start = outgoing.sent;
     let run_most = transport.send_run_most();
+    let many_most = transport.send_many_most().min(crate::outbox::SEND_MANY_MOST);
+    let mut parts = [(0, socket.local_addr); crate::outbox::SEND_MANY_MOST];
     'batches: loop {
         if outgoing.batch.is_drained() && !outbox.take(&mut outgoing.batch, cx.waker()) {
             break;
@@ -658,6 +722,54 @@ fn poll_outgoing<T: Transport, E: UtpEnvironment>(
                     Some(Poll::Ready(_)) => {
                         socket.stats.send_run_errors.increment(1);
                     }
+                    Some(Poll::Pending) if !tokio::task::coop::has_budget_remaining() => {
+                        break 'batches;
+                    }
+                    None | Some(Poll::Pending) => {
+                        if sent.is_some() {
+                            socket.stats.send_poll_pending.increment(1);
+                        }
+                        outbox.stall();
+                        outbox.set_sent(outgoing.sent);
+                        return if outgoing.sent == start {
+                            Poll::Pending
+                        } else {
+                            Poll::Ready(())
+                        };
+                    }
+                }
+            }
+            // Datagrams for several addresses that lie together leave in
+            // one call too where the transport has one: the ACKs of the
+            // streams one read of the socket woke.
+            if many_most > 1
+                && let Some((bytes, count)) =
+                    outgoing.batch.front_many(&mut parts[..many_most], run_most > 1)
+            {
+                let now = env.now();
+                let stamp = ((now - socket.created).as_micros() as u32).to_be_bytes();
+                let mut at = 0;
+                for (len, _) in &parts[..count] {
+                    if let Some(timestamp) = bytes.get_mut(at + 4..at + 8) {
+                        timestamp.copy_from_slice(&stamp);
+                    }
+                    at += len;
+                }
+                let sent = socket.poll_send_gated(&mut outgoing.gate, cx, true, |cx| {
+                    transport.poll_send_many(cx, bytes, &parts[..count])
+                });
+                match sent {
+                    Some(Poll::Ready(Ok(taken))) if taken > 0 => {
+                        let taken = taken.min(count);
+                        socket.stats.send_batches.increment(1);
+                        socket.stats.send_batch_datagrams.increment(taken as u64);
+                        outgoing.batch.advance_run(taken, now);
+                        outgoing.sent += taken as u64;
+                        continue;
+                    }
+                    // The first could not be sent: it goes alone below,
+                    // which names the failure for its stream.
+                    Some(Poll::Ready(_)) => {}
                     Some(Poll::Pending) if !tokio::task::coop::has_budget_remaining() => {
                         break 'batches;
                     }
@@ -925,7 +1037,11 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         }
     }
     pub(crate) async fn run_forever(mut self) -> crate::Result<()> {
-        let mut read_buf = RecvBufs::new();
+        let mut read_buf = RecvBufs::receiving(
+            self.transport
+                .as_deref()
+                .map_or(1, Transport::recv_many_most),
+        );
         let mut completions = 0;
         let mut receive_errors = 0;
 
@@ -1035,10 +1151,9 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 ),
                 None => Poll::Pending,
             }), if self.socket.outbox.is_some() => {},
-            recv = read_buf.recv(self.transport.as_deref().ok_or(Error::DispatcherDead)?) => {
-                let received = self.env.now();
-                self.on_datagram(recv, received, read_buf, receive_errors).await?;
-                return self.read_batch(read_buf, receive_errors, 1).await;
+            recv = read_buf.recv_next(self.transport.as_deref().ok_or(Error::DispatcherDead)?, RECEIVE_BATCH) => {
+                let read = self.on_received(recv, read_buf, receive_errors).await?;
+                return self.read_batch(read_buf, receive_errors, read).await;
             }
         }
 
@@ -1074,7 +1189,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         while read < RECEIVE_BATCH {
             let recv = {
                 let transport = self.transport.as_deref().ok_or(Error::DispatcherDead)?;
-                let mut next = std::pin::pin!(read_buf.recv(transport));
+                let mut next = std::pin::pin!(read_buf.recv_next(transport, RECEIVE_BATCH - read));
                 poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx))).await
             };
             let Poll::Ready(recv) = recv else {
@@ -1085,23 +1200,63 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 self.flush_unflushed();
                 return Ok(false);
             };
-            read += 1;
-            let received = self.env.now();
-            if let Err(error) = self
-                .on_datagram(recv, received, read_buf, receive_errors)
-                .await
-            {
-                // libtorrent drains on a fatal error too
-                // (session_impl.cpp:2719).
-                self.read_cut = false;
-                self.flush_unflushed();
-                return Err(error);
+            match self.on_received(recv, read_buf, receive_errors).await {
+                Ok(count) => read += count,
+                Err(error) => {
+                    // libtorrent drains on a fatal error too
+                    // (session_impl.cpp:2719).
+                    self.read_cut = false;
+                    self.flush_unflushed();
+                    return Err(error);
+                }
             }
         }
         self.read_cut = true;
         self.socket.stats.receive_cuts.increment(1);
         self.flush_unflushed();
         Ok(true)
+    }
+
+    // Handles what one receive call returned, in order, each datagram
+    // stamped with the time the call returned. How many datagrams the call
+    // counts as in a read: those it returned, or one for a call that
+    // failed.
+    async fn on_received(
+        &mut self,
+        recv: std::io::Result<Got>,
+        read_buf: &mut RecvBufs,
+        receive_errors: &mut usize,
+    ) -> crate::Result<usize> {
+        let received = self.env.now();
+        let count = match recv {
+            Ok(Got::Many(count)) => count,
+            Ok(Got::One(len, from)) => {
+                self.socket.stats.receive_calls.increment(1);
+                self.socket.stats.receive_call_datagrams.increment(1);
+                self.on_datagram(Ok((len, from)), received, read_buf, receive_errors)
+                    .await?;
+                return Ok(1);
+            }
+            Err(error) => {
+                self.on_datagram(Err(error), received, read_buf, receive_errors)
+                    .await?;
+                return Ok(1);
+            }
+        };
+        self.socket.stats.receive_calls.increment(1);
+        self.socket
+            .stats
+            .receive_call_datagrams
+            .increment(count as u64);
+        for index in 0..count {
+            let datagram = read_buf.swap(index);
+            let handled = self
+                .on_datagram(Ok(datagram), received, read_buf, receive_errors)
+                .await;
+            read_buf.swap(index);
+            handled?;
+        }
+        Ok(count.max(1))
     }
 
     async fn on_datagram(

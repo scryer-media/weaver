@@ -665,6 +665,14 @@ metric_families! {
         ["route"], "uTP datagrams sent by the calls that take more than one, since the session opened.");
     TORRENT_UTP_SEND_RUN_ERRORS = ("weaver_torrent_utp_send_run_errors_total", Counter,
         ["route"], "Calls for more than one uTP datagram that failed as a whole, after which the datagrams went one at a time, since the session opened.");
+    TORRENT_UTP_RECEIVE_CALLS = ("weaver_torrent_utp_receive_calls_total", Counter,
+        ["route"], "Total uTP socket receive calls that returned datagrams");
+    TORRENT_UTP_RECEIVE_CALL_DATAGRAMS = ("weaver_torrent_utp_receive_call_datagrams_total", Counter,
+        ["route"], "Total datagrams uTP socket receive calls returned");
+    TORRENT_UTP_SEND_BATCHES = ("weaver_torrent_utp_send_batches_total", Counter,
+        ["route"], "Total uTP sends of datagrams for several addresses in one system call");
+    TORRENT_UTP_SEND_BATCH_DATAGRAMS = ("weaver_torrent_utp_send_batch_datagrams_total", Counter,
+        ["route"], "Total uTP datagrams sent for several addresses in one system call");
     TORRENT_UTP_MAX_CWND = ("weaver_torrent_utp_max_congestion_window_bytes", Gauge,
         ["route"], "Largest uTP congestion window any stream of the session reached, in bytes.");
     TORRENT_SESSION_PEERS = ("weaver_torrent_session_peers", Gauge, ["route", "state"],

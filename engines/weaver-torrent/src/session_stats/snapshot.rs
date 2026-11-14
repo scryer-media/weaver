@@ -79,4 +79,8 @@ struct SerializedUtpStatsSnapshot {
     send_runs: u64,
     send_run_datagrams: u64,
     send_run_errors: u64,
+    receive_calls: u64,
+    receive_call_datagrams: u64,
+    send_batches: u64,
+    send_batch_datagrams: u64,
 }

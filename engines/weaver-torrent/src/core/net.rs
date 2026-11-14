@@ -137,6 +137,47 @@ pub trait DatagramSocket: Send + Sync + 'static {
         self.poll_send_to(cx, first, target).map_ok(|_| 1)
     }
 
+    /// How many datagrams, to any addresses, one
+    /// [`DatagramSocket::poll_send_many`] may take: 1 for a socket that
+    /// sends each datagram with a call of its own.
+    fn send_many_most(&self) -> usize {
+        1
+    }
+
+    /// Sends datagrams that lie end to end in `bytes`: `parts` gives each
+    /// one's length and address, in order. Ready with how many were sent,
+    /// counted from the first; it fails when the first cannot be sent. A
+    /// socket with no call for several datagrams sends the first alone.
+    fn poll_send_many(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        parts: &[(usize, SocketAddr)],
+    ) -> Poll<io::Result<usize>> {
+        let (len, target) = parts[0];
+        self.poll_send_to(cx, &bytes[..len], target).map_ok(|_| 1)
+    }
+
+    /// How many datagrams one [`DatagramSocket::poll_recv_many`] may
+    /// return: 1 for a socket that receives each datagram with a call of
+    /// its own, which is then never asked for several.
+    fn recv_many_most(&self) -> usize {
+        1
+    }
+
+    /// Receives the datagrams that wait, at most `into.len()` of them, in
+    /// the order they came, each into the buffers of its own entry from the
+    /// first on, as [`Self::poll_recv_from_split`] reads one. Ready with
+    /// how many: never none.
+    fn poll_recv_many(
+        &self,
+        cx: &mut Context<'_>,
+        into: &mut [weaver_utp::Received],
+    ) -> Poll<io::Result<usize>> {
+        let _ = (cx, into);
+        Poll::Ready(Err(io::ErrorKind::Unsupported.into()))
+    }
+
     /// The largest IP packet the socket's route carries, where it knows
     /// it, such as a tunnel's MTU; uTP sends nothing larger.
     fn link_mtu(&self) -> Option<u16> {

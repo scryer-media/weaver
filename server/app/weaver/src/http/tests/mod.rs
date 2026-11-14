@@ -1635,6 +1635,10 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
             send_runs: 40,
             send_run_datagrams: 41,
             send_run_errors: 42,
+            receive_calls: 43,
+            receive_call_datagrams: 44,
+            send_batches: 45,
+            send_batch_datagrams: 46,
             ..Default::default()
         },
         peers: vec![

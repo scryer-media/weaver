@@ -35,6 +35,16 @@ pub enum Fragmenting {
     Allowed,
 }
 
+/// One datagram of a [`Transport::poll_recv_many`], and the two buffers it
+/// was read into: its first `head.len()` bytes are in `head` and the rest
+/// at the start of `spill`. One cut short reads as `spill.len()` bytes.
+pub struct Received {
+    pub head: Box<[u8]>,
+    pub spill: Box<[u8]>,
+    pub len: usize,
+    pub from: SocketAddr,
+}
+
 /// A stream's send readiness registration. Dropping it releases that
 /// stream's registration, including a waiter left by a pending poll.
 pub trait DatagramSend: Send + Sync + Unpin {
@@ -108,6 +118,48 @@ pub trait Transport: PollSendToVectored + Send + Sync + Unpin + 'static {
     ) -> Poll<std::io::Result<usize>> {
         let first = &bytes[..segment.min(bytes.len())];
         self.poll_send_to(cx, first, target).map_ok(|_| 1)
+    }
+
+    /// How many datagrams, to any addresses, one
+    /// [`Transport::poll_send_many`] may take: 1 for a transport that sends
+    /// each datagram with a call of its own.
+    fn send_many_most(&self) -> usize {
+        1
+    }
+
+    /// Sends datagrams that lie end to end in `bytes`: `parts` gives each
+    /// one's length and address, in order. Ready with how many were sent,
+    /// counted from the first: all of them or fewer, never none. Called
+    /// only with more than one datagram, and with no more than
+    /// [`Transport::send_many_most`]. When the first cannot be sent the
+    /// call fails, and that datagram is sent again alone.
+    fn poll_send_many(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        parts: &[(usize, SocketAddr)],
+    ) -> Poll<std::io::Result<usize>> {
+        let (len, target) = parts[0];
+        self.poll_send_to(cx, &bytes[..len], target).map_ok(|_| 1)
+    }
+
+    /// How many datagrams one [`Transport::poll_recv_many`] may return: 1
+    /// for a transport that receives each datagram with a call of its own,
+    /// which is then never asked for several.
+    fn recv_many_most(&self) -> usize {
+        1
+    }
+
+    /// Receives the datagrams that wait, at most `into.len()` of them, in
+    /// the order they came, each into the buffers of its own entry from the
+    /// first on. Ready with how many: never none.
+    fn poll_recv_many(
+        &self,
+        cx: &mut Context<'_>,
+        into: &mut [Received],
+    ) -> Poll<std::io::Result<usize>> {
+        let _ = (cx, into);
+        Poll::Ready(Err(std::io::ErrorKind::Unsupported.into()))
     }
 
     /// Whether the socket's streams may run on uTP threads other than the
