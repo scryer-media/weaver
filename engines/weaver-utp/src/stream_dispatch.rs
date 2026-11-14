@@ -1365,8 +1365,20 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     // timer. So each such packet gets its ACK then, as TCP answers every
     // out-of-order segment (RFC 5681 4.2): the first carries the SACK and
     // the rest repeat it.
+    //
+    // The sender counts an ACK as a duplicate only when it leaves the
+    // cumulative ACK where it was (libtorrent v2.0.15
+    // utp_stream.cpp:2723-2728). When the read also took packets in order,
+    // the first ACK moves it and counts for nothing, so the duplicates all
+    // follow it.
     fn send_due_ack(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<bool> {
-        let repeats = self.duplicate_acks_owed();
+        let duplicates = self.duplicate_acks_owed();
+        let first_moves_ack = self.last_consumed_remote_seq_nr != self.last_sent_ack_nr;
+        let repeats = if first_moves_ack {
+            duplicates
+        } else {
+            duplicates.saturating_sub(1)
+        };
         let sent = self.send_ack(cx)?;
         if sent {
             self.socket.stats.immediate_acks.increment(1);
@@ -1380,14 +1392,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         Ok(sent)
     }
 
-    // ACKs beyond the first that the packets taken past a hole are owed.
-    // A data packet sent meanwhile leaves the count as it is.
+    // The duplicate ACKs the packets taken past a hole are owed. A data
+    // packet sent meanwhile leaves the count as it is.
     fn duplicate_acks_owed(&self) -> u8 {
         let held = self.user_rx.assembler_packets();
         if held > SACK_DUP_THRESH as usize {
             return 0;
         }
-        self.reordered_unacked.min(held as u8).saturating_sub(1)
+        self.reordered_unacked.min(held as u8)
     }
 
     fn maybe_send_fin(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<bool> {

@@ -125,10 +125,14 @@ async fn data_cut_while_a_hole_is_known_leaves_room_for_the_sack() {
     t.send_data(3, ack_nr, "c");
     t.poll_once_assert_pending().await;
     t.send_queued().await;
+    // The ACK that moves the cumulative ACK to 1, and the duplicate packet
+    // 3 is owed.
     let acks = t.take_sent();
-    assert_eq!(acks.len(), 1, "{acks:?}");
-    assert_eq!(acks[0].header.htype, State);
-    assert!(acks[0].header.extensions.selective_ack.is_some());
+    assert_eq!(acks.len(), 2, "{acks:?}");
+    for ack in &acks {
+        assert_eq!(ack.header.htype, State);
+        assert!(ack.header.extensions.selective_ack.is_some());
+    }
 
     let mss = usize::from(t.vsock.segment_sizes.mss());
     t.stream
@@ -152,8 +156,8 @@ async fn data_cut_while_a_hole_is_known_leaves_room_for_the_sack() {
     }
     let stats = t._socket.stats();
     assert!(stats.data_packets_with_sack.load(Ordering::Relaxed) >= 2);
-    // No ACK went out on its own after the first: the data carried it.
-    assert_eq!(stats.acks_with_sack.load(Ordering::Relaxed), 1);
+    // No ACK went out on its own after the first two: the data carried it.
+    assert_eq!(stats.acks_with_sack.load(Ordering::Relaxed), 2);
 }
 
 // A full packet cut before the hole was known has no room for the SACK.

@@ -6,12 +6,13 @@
 use std::{sync::atomic::Ordering, task::Poll, time::Duration};
 
 use futures::FutureExt;
+use tokio::io::AsyncWriteExt;
 
 use crate::{
     SocketOpts,
     constants::ACK_DELAY,
     raw::{Type::*, UtpHeader},
-    stream_dispatch::tests::make_test_vsock,
+    stream_dispatch::tests::{calc_mtu_for_mss, make_test_vsock},
     test_util::setup_test_logging,
 };
 
@@ -101,8 +102,9 @@ async fn full_packets_in_one_drain_get_one_ack() {
 }
 
 // Out-of-order packets defer their ACK to the drain like any other DATA
-// (utp_stream.cpp v2.0.15:3004-3034). Two arrived past the hole, so two
-// ACKs leave there: the first carries the SACK and the second repeats it.
+// (utp_stream.cpp v2.0.15:3004-3034). Two arrived past the hole in the read
+// that also took packet 1, so three ACKs leave there: the first moves the
+// cumulative ACK and the two that repeat it are the duplicates.
 #[tokio::test(start_paused = true)]
 async fn out_of_order_packets_are_acked_at_the_drain_with_a_sack() {
     let mut t = make_test_vsock(Default::default(), false);
@@ -114,7 +116,11 @@ async fn out_of_order_packets_are_acked_at_the_drain_with_a_sack() {
     let sent = t.take_sent();
     assert_eq!(
         sent,
-        vec![cmphead!(State, ack_nr = 1), cmphead!(State, ack_nr = 1)]
+        vec![
+            cmphead!(State, ack_nr = 1),
+            cmphead!(State, ack_nr = 1),
+            cmphead!(State, ack_nr = 1)
+        ]
     );
     for ack in &sent {
         assert_eq!(
@@ -201,7 +207,8 @@ async fn a_drain_mark_with_packets_queued_behind_it_is_counted() {
 // The ACK for packets held past a hole carries a SACK of the fewest bytes
 // that reach the last one held, and the counters say so: two bytes of it
 // for packets 3 and 12 while 2 is missing. Two packets came past the hole
-// in the one read, so the ACK goes twice.
+// in the read that took packet 1, so the ACK that moves the cumulative ACK
+// is repeated twice.
 #[tokio::test]
 async fn an_ack_with_a_sack_is_counted_with_its_bytes() {
     let mut t = make_test_vsock(Default::default(), false);
@@ -211,18 +218,18 @@ async fn an_ack_with_a_sack_is_counted_with_its_bytes() {
     t.send_data(12, ack_nr, "l");
     t.poll_once_assert_pending().await;
     let sent = t.take_sent();
-    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent.len(), 3, "{sent:?}");
     for ack in &sent {
         let sack = ack.header.extensions.selective_ack.unwrap();
         // Bit 0 is packet 3 (two past the last in order), bit 9 is packet 12.
         assert_eq!(sack.as_bytes(), [0b1, 0b10]);
     }
     let stats = t._socket.stats();
-    assert_eq!(stats.ack_packets_sent.load(Ordering::Relaxed), 2);
-    assert_eq!(stats.acks_with_sack.load(Ordering::Relaxed), 2);
-    assert_eq!(stats.sack_bytes_sent.load(Ordering::Relaxed), 4);
+    assert_eq!(stats.ack_packets_sent.load(Ordering::Relaxed), 3);
+    assert_eq!(stats.acks_with_sack.load(Ordering::Relaxed), 3);
+    assert_eq!(stats.sack_bytes_sent.load(Ordering::Relaxed), 6);
     assert_eq!(stats.immediate_acks.load(Ordering::Relaxed), 1);
-    assert_eq!(stats.duplicate_acks_sent.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.duplicate_acks_sent.load(Ordering::Relaxed), 2);
 }
 
 // A packet is lost and exactly three behind it arrive in one read, the
@@ -267,6 +274,99 @@ async fn three_packets_past_a_hole_in_one_read_get_three_acks() {
         [0b11111]
     );
     assert_eq!(repeated(&t), 2);
+}
+
+// A sender with packets 101 to 105 out and none acknowledged.
+async fn sender_with_five_out() -> (crate::stream_dispatch::tests::TestVsock, UtpHeader) {
+    let mut t = make_test_vsock(
+        SocketOpts {
+            link_mtu: Some(calc_mtu_for_mss(5)),
+            disable_nagle: true,
+            ..Default::default()
+        },
+        false,
+    );
+    let ack = UtpHeader {
+        htype: State,
+        seq_nr: 0.into(),
+        ack_nr: 100.into(),
+        wnd_size: 1024 * 1024,
+        ..Default::default()
+    };
+    t.send_msg(ack, "");
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(b"aaaaabbbbbcccccdddddeeeee")
+        .await
+        .unwrap();
+    let sent = t.poll_until_sent(5).await;
+    let seqs: Vec<u16> = sent
+        .iter()
+        .filter(|m| m.header.htype == Data)
+        .map(|m| m.header.seq_nr.0)
+        .collect();
+    assert_eq!(seqs, [101, 102, 103, 104, 105]);
+    (t, ack)
+}
+
+// The ACKs a receiver sends for packets 1, 3, 4 and 5 (2 lost), given to a
+// sender for whom they are 101, 103, 104 and 105. `earlier` has packet 1
+// read, and acknowledged, before the others arrive. Returns how many ACKs
+// the receiver sent and whether the sender resent 102 on them.
+async fn acks_for_a_tail_hole_reach_a_sender(earlier: bool) -> (usize, bool) {
+    let mut rx = make_test_vsock(Default::default(), false);
+    let ack_nr = rx.vsock.seq_nr - 1;
+    let mut acks = Vec::new();
+    rx.send_data(1, ack_nr, "a");
+    if earlier {
+        rx.poll_once_assert_pending().await;
+        rx.send_queued().await;
+        acks.extend(rx.take_sent());
+    }
+    for seq in 3..=5u16 {
+        rx.send_data(seq, ack_nr, "x");
+    }
+    rx.poll_once_assert_pending().await;
+    rx.send_queued().await;
+    acks.extend(rx.take_sent());
+
+    let (mut tx, template) = sender_with_five_out().await;
+    for ack in &acks {
+        assert_eq!(ack.header.htype, State);
+        assert_eq!(ack.header.ack_nr, 1.into());
+        tx.send_msg(
+            UtpHeader {
+                ack_nr: ack.header.ack_nr + 100,
+                extensions: ack.header.extensions,
+                ..template
+            },
+            "",
+        );
+        // Each ACK in its own read at the sender.
+        tx.poll_once_assert_pending().await;
+    }
+    tx.send_queued().await;
+    let resent = tx
+        .take_sent()
+        .iter()
+        .any(|m| m.header.htype == Data && m.header.seq_nr == 102.into());
+    (acks.len(), resent)
+}
+
+// Packet 1 was acknowledged in an earlier read: the three ACKs for 3, 4 and
+// 5 all repeat it, and the sender resends 102 on the third.
+#[tokio::test(start_paused = true)]
+async fn three_past_a_hole_after_an_earlier_ack_draw_a_fast_resend() {
+    assert_eq!(acks_for_a_tail_hole_reach_a_sender(true).await, (4, true));
+}
+
+// Packet 1 arrives in the same read as 3, 4 and 5. The first ACK moves the
+// sender's cumulative ACK and is no duplicate, so three more follow it and
+// the sender resends 102 without waiting for its timer.
+#[tokio::test(start_paused = true)]
+async fn in_order_and_three_past_a_hole_in_one_read_draw_a_fast_resend() {
+    assert_eq!(acks_for_a_tail_hole_reach_a_sender(false).await, (4, true));
 }
 
 // Packets that arrive in order owe one ACK a read however many they are.
