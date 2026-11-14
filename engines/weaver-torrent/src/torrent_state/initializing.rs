@@ -493,8 +493,11 @@ impl TorrentStateInitializing {
                 (self.metadata.lengths().total_pieces() as usize)
                     .min(self.shared.spawner.check_threads()),
                 |threads| {
+                    let stats = self.shared.spawner.stats();
+                    let call = stats.call(crate::session_stats::disk::DiskOp::InitialCheck);
+                    let before = self.checked_bytes.load(Ordering::Relaxed);
                     self.check.store(CHECK_READING, Ordering::Release);
-                    FileOps::new(
+                    let outcome = FileOps::new(
                         &self.metadata,
                         &self.files,
                         self.shared.options.disable_v1_hashes,
@@ -504,7 +507,13 @@ impl TorrentStateInitializing {
                         &self.checked_bytes,
                         &self.pause_requested,
                         from.map(|(at, _)| at),
-                    )
+                    );
+                    call.bytes(
+                        self.checked_bytes
+                            .load(Ordering::Relaxed)
+                            .saturating_sub(before),
+                    );
+                    outcome
                 },
             )
             .await?;

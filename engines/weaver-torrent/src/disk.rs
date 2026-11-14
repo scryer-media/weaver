@@ -35,6 +35,21 @@ pub(crate) const BLOCK_LEN: usize = CHUNK_SIZE as usize;
 /// default, settings_pack.cpp:277).
 pub(crate) const MAX_QUEUED_DISK_BYTES: usize = 1024 * 1024;
 
+/// The bytes of whole pieces a storage holds in memory that may wait for
+/// their check and their write before the connections that completed them
+/// stop reading: by the pool's marks, reads stop at three quarters of it,
+/// 48 MiB, and go on at half, 32 MiB. A connection whose piece leaves the
+/// count past the high mark stops with that piece (`PeerDisk::queued_piece`),
+/// so the count passes the mark by no more than the one piece each
+/// connection was completing as it was reached: bytes the storage held
+/// already, in the room it gave the piece. In bytes, the count is at most
+/// 48 MiB plus one piece for each connection of the session, or, with a
+/// piece larger than 48 MiB, that piece in place of the 48 MiB: with 100
+/// connections and 16 MiB pieces, 48 MiB + 1,600 MiB. A piece is the unit
+/// that waits here, so the bound is one that holds some pieces, where the
+/// block bound holds some blocks. Each session counts its own.
+pub(crate) const MAX_QUEUED_CHECK_BYTES: usize = 64 * 1024 * 1024;
+
 /// The session's block buffers, counted while they hold a block queued for
 /// the disk.
 #[derive(Clone)]
@@ -53,6 +68,12 @@ struct PoolInner {
     below: Notify,
     // Buffers ever allocated, for the steady-state check.
     allocated: AtomicUsize,
+    // Blocks queued for the disk now, as `PoolState::in_use` counts them:
+    // kept apart so a scrape reads it without the pool's lock.
+    queued: AtomicUsize,
+    // Spans of bytes counted without a buffer of the pool's now
+    // (`BlockPool::charge_bytes`).
+    spans: AtomicUsize,
 }
 
 struct PoolState {
@@ -66,11 +87,12 @@ struct PoolState {
     generation: u64,
 }
 
-/// What the pool said when a block was queued: whether it is exceeded, and
-/// at which generation.
+/// What the pool said when a block was queued: whether it is exceeded,
+/// whether nothing else waits in it, and at which generation.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Charge {
     pub(crate) exceeded: bool,
+    pub(crate) alone: bool,
     pub(crate) generation: u64,
 }
 
@@ -89,6 +111,8 @@ impl BlockPool {
             kept: max_use * 2,
             below: Notify::new(),
             allocated: AtomicUsize::new(0),
+            queued: AtomicUsize::new(0),
+            spans: AtomicUsize::new(0),
         }))
     }
 
@@ -132,16 +156,51 @@ impl BlockPool {
     pub(crate) fn charge(&self, block: &mut BlockBuf) -> Charge {
         debug_assert!(!block.charged);
         block.charged = true;
+        self.add(1)
+    }
+
+    /// `bytes` held elsewhere wait for the disk, as a whole piece its
+    /// storage keeps in memory does until it is checked and written: they
+    /// count against the bound as so many blocks do, by the same marks,
+    /// until the span is dropped.
+    pub(crate) fn charge_bytes(&self, bytes: u64) -> (Charge, Span) {
+        let blocks = usize::try_from(bytes.div_ceil(BLOCK_LEN as u64)).unwrap_or(usize::MAX);
+        self.0.spans.fetch_add(1, Ordering::Relaxed);
+        let span = Span {
+            pool: self.clone(),
+            blocks,
+        };
+        (self.add(blocks), span)
+    }
+
+    fn add(&self, blocks: usize) -> Charge {
         let inner = &*self.0;
+        inner.queued.fetch_add(blocks, Ordering::Relaxed);
         let mut state = inner.state.lock();
-        state.in_use += 1;
+        state.in_use += blocks;
         if state.in_use >= inner.low_watermark + (inner.max_use - inner.low_watermark) / 2 {
             state.exceeded = true;
         }
         Charge {
             exceeded: state.exceeded,
+            alone: state.in_use == blocks,
             generation: state.generation,
         }
+    }
+
+    // `blocks` no longer wait, with the pool's lock held; whether the pool
+    // fell to its low mark for it, which the caller rings once the lock is
+    // let go.
+    fn sub(&self, state: &mut PoolState, blocks: usize) -> bool {
+        let inner = &*self.0;
+        inner.queued.fetch_sub(blocks, Ordering::Relaxed);
+        state.in_use -= blocks;
+        if state.exceeded && state.in_use <= inner.low_watermark {
+            state.exceeded = false;
+            state.generation += 1;
+            return true;
+        }
+        false
     }
 
     /// Whether the pool fell to its low mark since `generation`.
@@ -158,15 +217,7 @@ impl BlockPool {
     fn give_back(&self, buf: Box<[u8]>, charged: bool) {
         let inner = &*self.0;
         let mut state = inner.state.lock();
-        let mut fell = false;
-        if charged {
-            state.in_use -= 1;
-            if state.exceeded && state.in_use <= inner.low_watermark {
-                state.exceeded = false;
-                state.generation += 1;
-                fell = true;
-            }
-        }
+        let fell = charged && self.sub(&mut state, 1);
         if state.free.len() < inner.kept && !buf.is_empty() {
             state.free.push(buf);
         }
@@ -174,6 +225,16 @@ impl BlockPool {
         if fell {
             inner.below.notify_waiters();
         }
+    }
+
+    /// Bytes of blocks queued for the disk now, read without a lock.
+    pub(crate) fn queued_bytes(&self) -> u64 {
+        (self.0.queued.load(Ordering::Relaxed) * BLOCK_LEN) as u64
+    }
+
+    /// Spans counted now ([`Self::charge_bytes`]), read without a lock.
+    pub(crate) fn spans(&self) -> u64 {
+        self.0.spans.load(Ordering::Relaxed) as u64
     }
 
     /// Blocks queued for the disk now.
@@ -191,6 +252,24 @@ impl BlockPool {
     #[cfg(test)]
     pub(crate) fn max_use(&self) -> usize {
         self.0.max_use
+    }
+}
+
+/// Bytes counted against a pool's bound without a buffer of its own
+/// ([`BlockPool::charge_bytes`]), until this is dropped.
+pub(crate) struct Span {
+    pool: BlockPool,
+    blocks: usize,
+}
+
+impl Drop for Span {
+    fn drop(&mut self) {
+        let inner = &*self.pool.0;
+        inner.spans.fetch_sub(1, Ordering::Relaxed);
+        let fell = self.pool.sub(&mut inner.state.lock(), self.blocks);
+        if fell {
+            inner.below.notify_waiters();
+        }
     }
 }
 
@@ -295,12 +374,32 @@ impl PeerDisk {
     /// `charge`. Every peer may have one write outstanding whatever the
     /// pool says: one that had one already stops reading when the pool is
     /// exceeded (libtorrent `peer_connection::incoming_piece`).
-    pub(crate) fn queued(&self, charge: Charge) {
+    ///
+    /// True when the connection stops reading for it.
+    pub(crate) fn queued(&self, charge: Charge) -> bool {
         let before = self.outstanding.fetch_add(1, Ordering::AcqRel);
-        if charge.exceeded && before > 0 {
+        self.stops(charge, charge.exceeded && before > 0)
+    }
+
+    /// A whole piece the connection completed waits for its check and its
+    /// write, the pool having said `charge`. A piece is too much to allow
+    /// each connection one more past the mark: the connection stops reading
+    /// with the piece that leaves the pool exceeded, unless nothing else
+    /// waits in it, so one piece larger than the mark is not waited on by
+    /// its own connection alone.
+    ///
+    /// True when the connection stops reading for it.
+    pub(crate) fn queued_piece(&self, charge: Charge) -> bool {
+        self.outstanding.fetch_add(1, Ordering::AcqRel);
+        self.stops(charge, charge.exceeded && !charge.alone)
+    }
+
+    fn stops(&self, charge: Charge, stops: bool) -> bool {
+        if stops {
             self.generation.store(charge.generation, Ordering::Release);
             self.blocked.store(true, Ordering::Release);
         }
+        stops
     }
 
     /// A write of the connection's is done, or dropped (libtorrent
@@ -357,6 +456,12 @@ pub(crate) trait DiskJob: Send + 'static + Sized {
         0
     }
 
+    /// True for jobs that share nothing of their key's: a thread takes one
+    /// of them at a time, and a key with more waiting goes to the back of
+    /// the keys that wait. So the keys are served in turn, and one key's
+    /// jobs run on as many threads as no other key waits for.
+    const SIDE_BY_SIDE: bool = false;
+
     /// Runs every job a thread took in one wake, in order.
     fn run_batch(batch: &mut VecDeque<Self>) {
         for job in batch.drain(..) {
@@ -368,8 +473,9 @@ pub(crate) trait DiskJob: Send + 'static + Sized {
 /// The session's disk work, done on blocking threads off the async runtime.
 /// A thread takes every queued job of one key, runs them, and looks again,
 /// so one wake runs a batch, and it stays on a key while that key has work.
-/// The jobs of one key never run on two threads at once; another thread
-/// starts only for a key no thread is on (libtorrent's `aio_threads` pool,
+/// The jobs of one key never run on two threads at once, unless they are
+/// [`DiskJob::SIDE_BY_SIDE`]; another thread starts only for a key no
+/// thread is on, or one whose jobs run side by side (libtorrent's `aio_threads` pool,
 /// which starts threads as jobs queue, `disk_io_thread_pool::job_queued`).
 /// Each key has a lane of its own, and the keys with jobs and no thread wait
 /// in turn, so queueing a job and taking a key's jobs cost the same however
@@ -393,13 +499,16 @@ struct QueueInner<J> {
     // Rung when the last thread finds the queue empty.
     idle: Notify,
     wakes: AtomicUsize,
+    // Jobs waiting for a thread, as `Jobs::queued` counts them: kept apart
+    // so a scrape reads it without the queue's lock.
+    waiting: AtomicUsize,
 }
 
 // One key's jobs, in the order queued.
 struct Lane<J> {
     jobs: VecDeque<J>,
-    // A thread is on the key.
-    busy: bool,
+    // Threads on the key.
+    busy: usize,
     // The key waits in `ready`.
     ready: bool,
 }
@@ -422,12 +531,12 @@ impl<J: DiskJob> Jobs<J> {
         let key = job.key();
         let lane = self.lanes.entry(key).or_insert_with(|| Lane {
             jobs: VecDeque::new(),
-            busy: false,
+            busy: 0,
             ready: false,
         });
         lane.jobs.push_back(job);
         self.queued += 1;
-        if lane.busy || lane.ready {
+        if lane.ready || (lane.busy > 0 && !J::SIDE_BY_SIDE) {
             return false;
         }
         lane.ready = true;
@@ -438,13 +547,23 @@ impl<J: DiskJob> Jobs<J> {
 
 impl<J> Jobs<J> {
     // Every queued job of the key that has waited longest with no thread on
-    // it, in order, and that key, now busy.
-    fn take(&mut self, batch: &mut VecDeque<J>) -> Option<usize> {
+    // it, in order, and that key, now busy. Of a key whose jobs run side by
+    // side, the first job only: the key waits again behind the others while
+    // it has more.
+    fn take(&mut self, batch: &mut VecDeque<J>, side_by_side: bool) -> Option<usize> {
         let key = self.ready.pop_front()?;
         let lane = self.lanes.get_mut(&key)?;
-        lane.ready = false;
-        lane.busy = true;
-        std::mem::swap(&mut lane.jobs, batch);
+        lane.busy += 1;
+        if side_by_side {
+            batch.extend(lane.jobs.pop_front());
+            lane.ready = !lane.jobs.is_empty();
+            if lane.ready {
+                self.ready.push_back(key);
+            }
+        } else {
+            lane.ready = false;
+            std::mem::swap(&mut lane.jobs, batch);
+        }
         self.queued -= batch.len();
         self.busy += 1;
         Some(key)
@@ -455,14 +574,16 @@ impl<J> Jobs<J> {
         let Some(lane) = self.lanes.get_mut(&key) else {
             return;
         };
-        if !lane.busy {
+        if lane.busy == 0 {
             return;
         }
-        lane.busy = false;
+        lane.busy -= 1;
         self.busy -= 1;
         if lane.jobs.is_empty() {
-            self.lanes.remove(&key);
-        } else {
+            if lane.busy == 0 {
+                self.lanes.remove(&key);
+            }
+        } else if !lane.ready {
             lane.ready = true;
             self.ready.push_back(key);
         }
@@ -493,15 +614,18 @@ impl<J: DiskJob> DiskQueue<J> {
                 threads: threads.max(1),
                 idle: Notify::new(),
                 wakes: AtomicUsize::new(0),
+                waiting: AtomicUsize::new(0),
             }),
         }
     }
 
     pub(crate) fn push(&self, job: J) {
+        self.inner.waiting.fetch_add(1, Ordering::Relaxed);
         let mut jobs = self.inner.jobs.lock();
         // A thread is started when none is looking for work, and this job's
-        // key has no thread on it nor jobs already waiting for one.
-        let start = jobs.push(job) && jobs.wants_thread(self.inner.threads);
+        // key has no thread on it nor jobs already waiting for one, or its
+        // jobs run side by side.
+        let start = (jobs.push(job) || J::SIDE_BY_SIDE) && jobs.wants_thread(self.inner.threads);
         if start {
             jobs.running += 1;
         }
@@ -509,6 +633,17 @@ impl<J: DiskJob> DiskQueue<J> {
         if start {
             spawn_drain(&self.inner);
         }
+    }
+
+    /// Whether `other` is this queue.
+    #[cfg(test)]
+    pub(crate) fn is(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Jobs waiting for a thread now, read without a lock.
+    pub(crate) fn waiting(&self) -> u64 {
+        self.inner.waiting.load(Ordering::Relaxed) as u64
     }
 
     /// Times a disk thread was woken.
@@ -577,12 +712,13 @@ impl<J: DiskJob> Drain<J> {
         self.started = true;
         let mut batch = VecDeque::new();
         loop {
-            {
+            let beside = {
                 let mut jobs = inner.jobs.lock();
                 if let Some(key) = self.key.take() {
                     jobs.release(key);
                 }
-                self.key = jobs.take(&mut batch);
+                self.key = jobs.take(&mut batch, J::SIDE_BY_SIDE);
+                inner.waiting.fetch_sub(batch.len(), Ordering::Relaxed);
                 if self.key.is_none() {
                     self.inner = None;
                     jobs.running -= 1;
@@ -593,6 +729,16 @@ impl<J: DiskJob> Drain<J> {
                     }
                     return;
                 }
+                // A key whose jobs run side by side may wait still, with
+                // this thread on one of its jobs and no other looking.
+                let beside = J::SIDE_BY_SIDE && jobs.wants_thread(inner.threads);
+                if beside {
+                    jobs.running += 1;
+                }
+                beside
+            };
+            if beside {
+                spawn_drain(&inner);
             }
             J::run_batch(&mut batch);
             debug_assert!(batch.is_empty());
@@ -621,6 +767,7 @@ impl<J: DiskJob> Drop for Drain<J> {
             } else {
                 if jobs.running == 0 {
                     jobs.ready.clear();
+                    inner.waiting.fetch_sub(jobs.queued, Ordering::Relaxed);
                     jobs.queued = 0;
                     dropped.extend(jobs.lanes.drain().map(|(_, lane)| lane.jobs));
                 }
@@ -743,6 +890,45 @@ mod tests {
         assert_eq!(peer.outstanding(), 2);
     }
 
+    // Whole pieces are counted by the same marks, each as its blocks: a
+    // peer with one waiting stops at the high mark, 48 of 64 blocks, and
+    // reads again once the count falls to the low one, 32, its own pieces
+    // still waiting. The pieces waiting are counted too.
+    #[tokio::test(start_paused = true)]
+    async fn pieces_waiting_stop_a_peer_at_the_high_mark_until_the_low_one() {
+        let pool = BlockPool::new(64 * BLOCK_LEN);
+        let piece = 8 * BLOCK_LEN as u64;
+        let peer = PeerDisk::default();
+        let mut mine = Vec::new();
+        for waiting in 1..=6 {
+            let (charge, span) = pool.charge_bytes(piece);
+            assert_eq!(charge.exceeded, waiting == 6, "{waiting}");
+            assert_eq!(peer.queued(charge), waiting == 6);
+            mine.push(span);
+        }
+        assert_eq!(pool.spans(), 6);
+        assert_eq!(pool.queued_bytes(), 6 * piece);
+        // A piece that is not whole blocks counts the block it ends in.
+        let (_, odd) = pool.charge_bytes(BLOCK_LEN as u64 + 1);
+        assert_eq!(pool.in_use(), 50);
+        drop(odd);
+
+        let room = peer.room(&pool);
+        tokio::pin!(room);
+        assert!(futures::poll!(room.as_mut()).is_pending());
+        mine.pop();
+        peer.written();
+        assert_eq!(pool.in_use(), 40);
+        assert!(futures::poll!(room.as_mut()).is_pending());
+        mine.pop();
+        peer.written();
+        assert_eq!(pool.in_use(), 32);
+        room.await;
+        assert!(!peer.blocked());
+        assert_eq!(peer.outstanding(), 4);
+        assert_eq!(pool.spans(), 4);
+    }
+
     struct Count(Arc<AtomicUsize>);
 
     impl DiskJob for Count {
@@ -822,6 +1008,122 @@ mod tests {
         let at = |e: &str| log.iter().position(|x| x == e).unwrap();
         assert!(at("a1:end") < at("a2:start"), "{log:?}");
         assert_eq!(queue.wakes(), 2, "one thread per key");
+    }
+
+    struct Beside(Gated);
+
+    impl DiskJob for Beside {
+        const SIDE_BY_SIDE: bool = true;
+
+        fn key(&self) -> usize {
+            self.0.key
+        }
+
+        fn run(self) {
+            self.0.run();
+        }
+    }
+
+    // A key whose jobs run side by side takes every thread while no other
+    // key waits, and takes turns with one that does: the other key's job
+    // waits for one job of the busy key, not for all it has queued.
+    #[test]
+    fn side_by_side_jobs_take_every_thread_and_keys_take_turns() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let queue = DiskQueue::new(rt.handle().clone(), 2);
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let job = |key, name, entered, release| {
+            Beside(Gated {
+                key,
+                name,
+                log: log.clone(),
+                entered,
+                release,
+            })
+        };
+        // Two jobs of key 1 hold both threads.
+        let (a1_in, a1_entered) = std::sync::mpsc::channel();
+        let (a1_go, a1_release) = std::sync::mpsc::channel();
+        queue.push(job(1, "a1", Some(a1_in), Some(a1_release)));
+        a1_entered.recv().unwrap();
+        let (a2_in, a2_entered) = std::sync::mpsc::channel();
+        let (a2_go, a2_release) = std::sync::mpsc::channel();
+        queue.push(job(1, "a2", Some(a2_in), Some(a2_release)));
+        a2_entered.recv().unwrap();
+        assert_eq!(queue.wakes(), 2, "one thread for each of the key's jobs");
+
+        // More of key 1 queue, then one of key 2.
+        queue.push(job(1, "a3", None, None));
+        queue.push(job(1, "a4", None, None));
+        queue.push(job(1, "a5", None, None));
+        let (b_in, b_entered) = std::sync::mpsc::channel();
+        queue.push(job(2, "b1", Some(b_in), None));
+        // The thread a1 held runs one job of key 1, then key 2's.
+        a1_go.send(()).unwrap();
+        b_entered.recv().unwrap();
+        a2_go.send(()).unwrap();
+        rt.block_on(queue.idle());
+        let log = log.lock();
+        let at = |e: &str| log.iter().position(|x| x == e).unwrap();
+        assert!(at("a3:start") < at("b1:start"), "{log:?}");
+        assert!(at("b1:start") < at("a4:start"), "{log:?}");
+    }
+
+    // Both threads are held by two other keys while six jobs of key 1
+    // queue, the first of them held, and then one of key 2. Key 2's job
+    // starts on the second thread that comes free: none of key 1's queued
+    // jobs runs ahead of it.
+    #[test]
+    fn a_busy_keys_side_by_side_jobs_do_not_hold_back_another_keys() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let queue = DiskQueue::new(rt.handle().clone(), 2);
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let job = |key, name, entered, release| {
+            Beside(Gated {
+                key,
+                name,
+                log: log.clone(),
+                entered,
+                release,
+            })
+        };
+        let (c_in, c_entered) = std::sync::mpsc::channel();
+        let (c_go, c_release) = std::sync::mpsc::channel();
+        queue.push(job(3, "c", Some(c_in), Some(c_release)));
+        c_entered.recv().unwrap();
+        let (d_in, d_entered) = std::sync::mpsc::channel();
+        let (d_go, d_release) = std::sync::mpsc::channel();
+        queue.push(job(4, "d", Some(d_in), Some(d_release)));
+        d_entered.recv().unwrap();
+
+        let (a0_go, a0_release) = std::sync::mpsc::channel();
+        queue.push(job(1, "a0", None, Some(a0_release)));
+        for name in ["a1", "a2", "a3", "a4", "a5"] {
+            queue.push(job(1, name, None, None));
+        }
+        let (b_in, b_entered) = std::sync::mpsc::channel();
+        queue.push(job(2, "b", Some(b_in), None));
+        c_go.send(()).unwrap();
+        d_go.send(()).unwrap();
+        b_entered.recv().unwrap();
+        a0_go.send(()).unwrap();
+        rt.block_on(queue.idle());
+        let log = log.lock();
+        let b_started = log.iter().position(|e| e == "b:start").unwrap();
+        let ended = |log: &[String]| {
+            log.iter()
+                .filter(|e| e.starts_with('a') && e.ends_with(":end"))
+                .count()
+        };
+        assert_eq!(ended(&log[..b_started]), 0, "{log:?}");
+        assert_eq!(ended(&log), 6, "{log:?}");
+        assert_eq!(queue.wakes(), 2);
     }
 
     struct Panics;
@@ -951,5 +1253,72 @@ mod tests {
             (0, 3)
         );
         assert!(queue.inner.jobs.lock().is_idle());
+    }
+
+    // The count of whole pieces waiting is past its high mark with other
+    // connections' pieces. A connection with none waiting completes one: it
+    // stops with that piece, so it adds no second one past the mark. Once
+    // the count is empty, a connection whose one piece passes the mark by
+    // itself reads on.
+    #[test]
+    fn a_connection_adds_at_most_one_piece_past_the_high_mark() {
+        let piece = 4 * BLOCK_LEN as u64;
+        // 16 blocks: low mark 8, high mark 12.
+        let pool = BlockPool::new(16 * BLOCK_LEN);
+        let others = PeerDisk::default();
+        let (charge, others_waiting) = pool.charge_bytes(3 * piece);
+        assert!(charge.exceeded && charge.alone);
+        assert!(!others.queued_piece(charge), "nothing else waits");
+
+        let peer = PeerDisk::default();
+        let (first, first_waiting) = pool.charge_bytes(piece);
+        assert!(peer.queued_piece(first), "its first piece stops it");
+        assert!(peer.blocked());
+        assert_eq!(pool.in_use(), 12 + 4);
+
+        drop((others_waiting, first_waiting));
+        assert_eq!(pool.in_use(), 0);
+        let (large, _large_waiting) = pool.charge_bytes(4 * piece);
+        assert!(large.exceeded && large.alone);
+        assert!(!PeerDisk::default().queued_piece(large));
+    }
+
+    // Connections complete pieces in turn, each until it stops reading. No
+    // connection adds more than one piece once the count is past its high
+    // mark, so the count ends past the mark by less than one piece for each
+    // connection (`MAX_QUEUED_CHECK_BYTES`). A piece larger than the mark,
+    // waiting alone, stands in for the mark.
+    #[test]
+    fn the_pieces_waiting_pass_the_high_mark_by_at_most_one_piece_per_connection() {
+        // 16 blocks: high mark 12. Pieces of 5 blocks cross it mid-piece.
+        let (high, piece_blocks) = (12, 5);
+        let pool = BlockPool::new(16 * BLOCK_LEN);
+        let peers: Vec<PeerDisk> = (0..4).map(|_| PeerDisk::default()).collect();
+        let mut past_mark = vec![0usize; peers.len()];
+        let mut waiting = Vec::new();
+        while peers.iter().any(|peer| !peer.blocked()) {
+            for (i, peer) in peers.iter().enumerate().filter(|(_, p)| !p.blocked()) {
+                let (charge, span) = pool.charge_bytes((piece_blocks * BLOCK_LEN) as u64);
+                waiting.push(span);
+                if charge.exceeded {
+                    past_mark[i] += 1;
+                }
+                peer.queued_piece(charge);
+                assert!(past_mark[i] <= 1, "connection {i} added a second piece");
+            }
+        }
+        assert!(pool.in_use() < high + peers.len() * piece_blocks);
+        assert_eq!(pool.in_use(), 30);
+        drop(waiting);
+
+        // One piece of 20 blocks, alone: its connection reads on, and stops
+        // with its next.
+        let peer = PeerDisk::default();
+        let large = (20 * BLOCK_LEN) as u64;
+        let (alone, _alone_waiting) = pool.charge_bytes(large);
+        assert!(!peer.queued_piece(alone));
+        let (next, _next_waiting) = pool.charge_bytes(large);
+        assert!(peer.queued_piece(next));
+        assert_eq!(pool.in_use(), 20 + 20);
     }
 }

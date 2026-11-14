@@ -19,6 +19,7 @@ use crate::{Session, torrent_state::peers::stats::AggregatePeerStatsAtomic};
 
 pub mod check;
 pub mod dht;
+pub mod disk;
 pub mod incoming;
 pub mod network;
 pub mod snapshot;
@@ -115,6 +116,7 @@ impl Session {
     pub fn stats_snapshot(&self) -> SessionStatsSnapshot {
         let mut snapshot =
             SessionStatsSnapshot::from((&*self.stats, self.connector.stats().snapshot()));
+        snapshot.disk = self.spawner.disk_snapshot();
         for socket in &self.utp_sockets {
             snapshot.utp += socket.0.stats().snapshot();
         }

@@ -627,9 +627,15 @@ mod tests {
         }
     }
 
-    // The targets clients were built for.
+    // The targets clients were built for, and the clients, kept as a
+    // session's embedder keeps them: a test client's bridge to the system
+    // egress lives only while a client of it does, and `get` lets go of
+    // its own once the answer's head is in, before it reads the body.
     #[derive(Default)]
-    struct Targets(std::sync::Mutex<Vec<(String, u16, Vec<IpAddr>)>>);
+    struct Targets(
+        std::sync::Mutex<Vec<(String, u16, Vec<IpAddr>)>>,
+        std::sync::Mutex<Vec<reqwest::Client>>,
+    );
 
     impl HttpClients for Targets {
         fn client(
@@ -643,7 +649,10 @@ mod tests {
                 target.port,
                 target.addrs.to_vec(),
             ));
-            crate::test_support::client(reqwest::Client::builder().no_proxy(), None, shape)
+            let client =
+                crate::test_support::client(reqwest::Client::builder().no_proxy(), None, shape)?;
+            self.1.lock().unwrap().push(client.clone());
+            Ok(client)
         }
     }
 

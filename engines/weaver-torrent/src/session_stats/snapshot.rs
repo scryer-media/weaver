@@ -36,6 +36,8 @@ pub struct SessionStatsSnapshot {
     pub limiter: super::network::LimiterSnapshot,
     /// Upload slots held by unchoked peers now.
     pub unchoke_slots_held: usize,
+    /// The session's disk calls, blocking permits and peer sockets.
+    pub disk: super::disk::DiskStatsSnapshot,
 }
 
 impl From<(&SessionStats, ConnectStatsSnapshot)> for SessionStatsSnapshot {
@@ -56,6 +58,7 @@ impl From<(&SessionStats, ConnectStatsSnapshot)> for SessionStatsSnapshot {
             lsd: None,
             limiter: Default::default(),
             unchoke_slots_held: 0,
+            disk: Default::default(),
         }
     }
 }

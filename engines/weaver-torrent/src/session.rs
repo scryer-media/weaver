@@ -491,7 +491,7 @@ pub struct Session {
     pub(crate) db: RwLock<SessionDatabase>,
     next_id: AtomicUsize,
     pub(crate) bitv_factory: Arc<dyn BitVFactory>,
-    spawner: BlockingSpawner,
+    pub(crate) spawner: BlockingSpawner,
 
     // Network
     // The DHT's, and every torrent's that names none of its own.

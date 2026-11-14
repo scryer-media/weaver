@@ -15,13 +15,25 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use weaver_torrent::session_stats::Transport;
 pub use weaver_torrent::session_stats::dht;
+pub use weaver_torrent::session_stats::disk::{
+    DiskOp, DiskOpSnapshot, DiskStatsSnapshot, SocketSnapshot,
+};
 pub use weaver_torrent::session_stats::incoming;
 pub use weaver_torrent::session_stats::network;
 pub use weaver_torrent::session_stats::snapshot::UtpStatsSnapshot;
 pub use weaver_torrent::session_stats::swarm;
 pub use weaver_torrent::session_stats::tracker;
 pub use weaver_torrent::session_stats::web_seed;
+
+pub use super::files::{FileCallsSnapshot, FileStatsSnapshot};
+
+/// The file calls of every torrent and the handle pool since the process
+/// started, read from their counters without a lock.
+pub fn file_stats() -> FileStatsSnapshot {
+    super::files::STATS.snapshot()
+}
 use weaver_torrent::{FetchPhase, Session};
 
 use crate::jobs::JobId;
@@ -396,6 +408,8 @@ pub struct SessionSeries {
     pub blocked_incoming: u64,
     pub blocked_outgoing: u64,
     pub utp: UtpStatsSnapshot,
+    /// Its disk calls, blocking permits and peer sockets.
+    pub disk: DiskStatsSnapshot,
     /// Its peers across every torrent, by state.
     pub peers: Vec<(&'static str, u32)>,
     /// Outgoing connections by transport and address family: attempted,
@@ -489,6 +503,7 @@ impl SessionSeries {
             blocked_incoming: stats.counters.blocked_incoming,
             blocked_outgoing: stats.counters.blocked_outgoing,
             utp: stats.utp,
+            disk: stats.disk,
             peers: SESSION_PEER_STATES
                 .into_iter()
                 .zip([

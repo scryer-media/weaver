@@ -22,6 +22,10 @@ pub(crate) struct PeerCountersAtomic {
     /// channel).
     pub fetched_protocol_bytes: AtomicU64,
     pub uploaded_protocol_bytes: AtomicU64,
+    /// Bytes of IP and TCP headers the reads and writes of the peer's
+    /// sockets are taken to have cost (libtorrent `stat`, the IP overhead
+    /// of each channel, which a read and a write both add to).
+    pub ip_overhead_bytes: AtomicU64,
     pub total_time_connecting_ms: AtomicU64,
     pub incoming_connections: AtomicU32,
     pub outgoing_connection_attempts: AtomicU32,
