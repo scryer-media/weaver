@@ -818,7 +818,7 @@ metric_families! {
     TORRENT_RATE_LIMIT_WAIT_SECONDS = ("weaver_torrent_rate_limit_wait_seconds_total", Counter,
         ["route", "direction"], "Time those requests waited in all.");
     TORRENT_CHECK_READ_CALLS = ("weaver_torrent_check_read_calls_total", Counter, [],
-        "Read calls the piece checks made to storage since this process started: the check of a torrent's files, and the check of a seed-mode piece the first time a peer asks for it. Counted for the whole process, not per session.");
+        "Read calls the piece checks made to storage since this process started: the check of a torrent's files, the start-up check of pieces whose every block was written but not yet checked, and the check of a seed-mode piece, the first time a peer asks for it or when the API asks for it of a running or a paused torrent. Counted for the whole process, not per session.");
     TORRENT_CHECK_READ_BYTES = ("weaver_torrent_check_read_bytes_total", Counter, [],
         "Bytes those read calls read.");
     TORRENT_CHECK_READ_SECONDS = ("weaver_torrent_check_read_seconds_total", Counter, [],
