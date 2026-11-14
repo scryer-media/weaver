@@ -851,16 +851,25 @@ impl Pending {
     // What the stored checkpoint a restore read says is not fetched again,
     // by volume: taken by the restore, off the pipeline's thread, from the
     // root facts it had already decoded, and kept until this run's first
-    // checkpoint says it instead.
-    pub(crate) fn stored_settled(&self, root: &RootFacts) {
+    // checkpoint says it instead. The articles in `refetched` are ones the
+    // restore found not on disk and fetches again: they are not in hand.
+    pub(crate) fn stored_settled(&self, root: &RootFacts, refetched: &[(VolumeIndex, u32)]) {
+        let again: std::collections::HashSet<(u32, u32)> = refetched
+            .iter()
+            .map(|(volume, ordinal)| (volume.0, *ordinal))
+            .collect();
         let settled = root
             .volumes
             .iter()
-            .map(|facts| {
+            .zip(0u32..)
+            .map(|(facts, volume)| {
                 facts
                     .articles
                     .iter()
-                    .filter(|(_, article)| *article != facts::ArticleFacts::Waiting)
+                    .filter(|(ordinal, article)| {
+                        *article != facts::ArticleFacts::Waiting
+                            && !again.contains(&(volume, *ordinal))
+                    })
                     .map(|(ordinal, _)| *ordinal)
                     .collect()
             })
