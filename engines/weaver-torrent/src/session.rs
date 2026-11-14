@@ -8316,7 +8316,10 @@ mod tests {
         assert_eq!(blocked_incoming(&session), 0);
         use crate::session_stats::{Transport, incoming::IncomingEnd};
         let ends = session.stats.incoming.snapshot().ends;
-        assert_eq!(ends[Transport::Tcp as usize][IncomingEnd::Family as usize], 1);
+        assert_eq!(
+            ends[Transport::Tcp as usize][IncomingEnd::Family as usize],
+            1
+        );
 
         assert_eq!(check_once(&session, "192.0.2.1:6881"), None);
         session.stop().await;
