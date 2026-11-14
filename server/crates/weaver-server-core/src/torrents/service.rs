@@ -48,7 +48,7 @@ use crate::pipeline::graph::job::Storage;
 use crate::pipeline::graph::limits::{self, Caps};
 use crate::pipeline::graph::status::RepairSlots;
 use crate::pipeline::graph::window::ScratchLedger;
-use crate::pipeline::post_health::names_a_piece;
+use crate::pipeline::graph::status::{Delivery, Failure};
 use crate::post_processing::model::{QueueEvent, vars};
 use crate::proxies::{
     Consumer, LegTenancy, LegTenant, NetworkRuntime, ResolvedBy, SessionTraffic, TorrentScope,
@@ -8335,12 +8335,6 @@ pub(super) fn delete_written(deletion: &Deletion) {
     }
 }
 
-// How a torrent's job ends when unpacking left it short of what it would
-// deliver, from the files it `delivered` whole (AGENTS.md, "Job status:
-// Partial"): partial when one of them is a file people open, read as a
-// graph job's delivery reads one (`Delivery::status`), and failed for `why`
-// when none is. An archive volume, a split part and recovery data are never
-// usable files, whole or not.
 // What placing a torrent's unpacked files came to.
 enum Placing {
     // Not yet: the next settle asks again.
@@ -8361,17 +8355,20 @@ fn unplaced(work: &Path, error: &impl std::fmt::Display) -> String {
     )
 }
 
+// How a torrent's job ends when unpacking left it short of what it would
+// deliver, from the files it `delivered` whole (AGENTS.md, "Job status:
+// Partial"): as a graph job's delivery ends (`Delivery::status`), the one
+// judgement both kinds of job take. Partial when one of them is a usable end
+// file, failed for `why` when none is. An archive volume, a split part and
+// recovery data are never usable files, whole or not.
 fn short_status(delivered: &[String], why: &str) -> JobStatus {
-    let usable = delivered
-        .iter()
-        .any(|name| !names_a_piece(name) && weaver_graph::known_type(name));
-    if usable {
-        JobStatus::Partial
-    } else {
-        JobStatus::Failed {
-            error: why.to_owned(),
-        }
-    }
+    let failure = Failure {
+        objects: Vec::new(),
+        message: why.to_owned(),
+        rejection: None,
+        from_feed: false,
+    };
+    Delivery::of_whole_files(delivered.iter().cloned()).status(Some(&failure))
 }
 
 // Whether the torrent's job unpacks, as its metainfo fixed it.

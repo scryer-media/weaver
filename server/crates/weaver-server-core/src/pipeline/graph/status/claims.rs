@@ -221,6 +221,45 @@ impl Delivery {
         walk.delivery
     }
 
+    // Files that came whole to disk with no tree to walk, such as a
+    // torrent's own files and what its unpacking placed beside them, each
+    // by the name it is delivered under, read as the walk reads a whole
+    // leaf: one whose name makes it a piece of something else
+    // (`names_a_piece`), an archive volume, a split part or recovery data,
+    // is delivered as it stands and is no usable file; any other is whole.
+    // A directory is no file. Its `status` is then every delivery's.
+    pub(crate) fn of_whole_files(names: impl IntoIterator<Item = String>) -> Self {
+        let mut delivery = Self::default();
+        for name in names {
+            if Leaf::is_directory(&name) {
+                continue;
+            }
+            let whole = !crate::pipeline::post_health::names_a_piece(&name);
+            delivery.deliver(
+                Delivered {
+                    from: name.clone(),
+                    name,
+                    depth: 0,
+                    whole,
+                    crc32: None,
+                },
+                None,
+            );
+        }
+        delivery
+    }
+
+    // One file the delivery hands over: whole, never arrived under a name
+    // that says nothing (`unarrived`), or as it stands.
+    fn deliver(&mut self, file: Delivered, unarrived: Option<Unarrived>) {
+        match (file.whole, unarrived) {
+            (true, _) => self.whole.push(file.name.clone()),
+            (false, Some(Unarrived::Unnamed)) => self.unnamed.push(file.name.clone()),
+            (false, _) => self.damaged.push(file.name.clone()),
+        }
+        self.files.push(file);
+    }
+
     // How a job that has nothing left to wait for ends, from the rulings:
     // complete when nothing it hands over is short or withheld and no
     // recovery set ruled it cannot rebuild what it covers, partial when some
@@ -409,19 +448,16 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
                 || (!(self.piece)(node, member.id)
                     && !self.unopened(node, member)
                     && self.tree.refused_by(node, member.id).is_none()));
-        let delivery = &mut self.delivery;
-        match (whole, unarrived) {
-            (true, _) => delivery.whole.push(name.clone()),
-            (false, Some(Unarrived::Unnamed)) => delivery.unnamed.push(name.clone()),
-            (false, _) => delivery.damaged.push(name.clone()),
-        }
-        delivery.files.push(Delivered {
-            name,
-            from: member.name.clone(),
-            depth: self.tree.depth(node),
-            whole,
-            crc32: member.crc32,
-        });
+        self.delivery.deliver(
+            Delivered {
+                name,
+                from: member.name.clone(),
+                depth: self.tree.depth(node),
+                whole,
+                crc32: member.crc32,
+            },
+            unarrived,
+        );
     }
 
     fn namespace(&mut self, node: NodeId, short: bool) {
