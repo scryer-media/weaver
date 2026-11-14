@@ -399,9 +399,11 @@ impl Pipeline {
     // job's volume has: its part of the bytes the volume may still take
     // below its hard limit, over every connection, less what the lane
     // already holds, counted in articles of the size the lane holds. Never
-    // less than a full pipe. A lane that holds nothing is sized by the
-    // job's next article. `None` when the job writes to no sized volume:
-    // the share stands.
+    // less than a full pipe on the lane, counting what it holds of other
+    // jobs: a lane carrying 8 of one job at depth 8 has a floor of 1 for
+    // the next. A lane that holds nothing is sized by the job's next
+    // article. `None` when the job writes to no sized volume: the share
+    // stands.
     //
     // The limit counts bytes that arrived, not leased ones. Without this,
     // the lanes leased up to a share of the job's whole queue while the
@@ -411,6 +413,12 @@ impl Pipeline {
     // arrived stay within the limit, past it by at most a full pipe on
     // each lane: a lane is handed a whole pipe only where it fits under
     // this share, and the share is less than a full pipe never.
+    //
+    // The floor is the lane's, not each job's. Kept per job, a lane holding
+    // 8 of one job was handed a whole pipe of the next: on the slow disk run
+    // with 8 connections and 7 jobs each lane took 9 of one job and 9 of
+    // another, 144 articles and 106.5 MB in one second, and the volume held
+    // 346.9 MB against 268.4 MB.
     fn volume_share_of_lane(
         &self,
         job_id: JobId,
@@ -437,10 +445,11 @@ impl Pipeline {
         .max(1);
         let connections = self.tuner.params().max_concurrent_downloads.max(1) as u64;
         let more = (room / connections).saturating_sub(held_bytes) / article;
+        let others = held.saturating_sub(holds);
         Some(
             holds
                 .saturating_add(usize::try_from(more).unwrap_or(usize::MAX))
-                .max(full_pipe),
+                .max(full_pipe.saturating_sub(others)),
         )
     }
 
@@ -495,17 +504,26 @@ impl Pipeline {
             // asked again once the volume has fallen to that line, one wake
             // for every lane held there. Below the line, where the room is
             // short only for the lane's part of it, the lane waits until it
-            // has fetched a whole pipe of the job down.
+            // has fetched a whole pipe of the job down; or, where what it
+            // carries of other jobs leaves no whole pipe under its floor,
+            // until it has fetched all it carries down to where one fits.
             return match self.job_servable_work_for_server(job_id, server_idx, pressure, true) {
                 Ok(()) if self.ask_room_wake(job_id) => ShareTaken::Saturated(SaturationWake {
                     of: Some(job_id),
                     below: 0,
                     room: true,
                 }),
-                Ok(()) => ShareTaken::Saturated(SaturationWake {
-                    of: Some(job_id),
-                    below: share + 1 - whole,
-                    room: false,
+                Ok(()) => ShareTaken::Saturated(match (share + 1).checked_sub(whole) {
+                    Some(below) if below > 0 => SaturationWake {
+                        of: Some(job_id),
+                        below,
+                        room: false,
+                    },
+                    _ => SaturationWake {
+                        of: None,
+                        below: full_pipe + 1 - whole,
+                        room: false,
+                    },
                 }),
                 Err(blocked) => ShareTaken::Blocked(blocked),
             };
