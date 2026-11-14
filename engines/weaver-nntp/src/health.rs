@@ -399,10 +399,11 @@ impl ServerHealth {
     // back to Degraded. A separate gate admits one fresh demanded connection;
     // cached stragglers cannot decide the recovery outcome.
     pub fn check_reenable(&mut self) {
-        self.check_reenable_at(Instant::now());
+        let _ = self.check_reenable_at(Instant::now());
     }
 
-    fn check_reenable_at(&mut self, now: Instant) {
+    // True when the state changed, so the tracker publishes only then.
+    fn check_reenable_at(&mut self, now: Instant) -> bool {
         match self.state {
             ServerState::Disabled { until, .. } if now >= until => {
                 let probe_failures = 0;
@@ -410,6 +411,7 @@ impl ServerHealth {
                 self.state = ServerState::Degraded {
                     consecutive_failures: probe_failures,
                 };
+                true
             }
             ServerState::CoolingDown {
                 until,
@@ -422,8 +424,9 @@ impl ServerHealth {
                     },
                     None => ServerState::Healthy,
                 };
+                true
             }
-            _ => {}
+            _ => false,
         }
     }
 
@@ -589,6 +592,15 @@ impl AvailabilityBoard {
         if let Some(slot) = self.until.get(idx) {
             slot.store(raw, Ordering::Release);
         }
+    }
+
+    // Every server's entry as stored, for the tests that compare boards.
+    #[cfg(test)]
+    fn raw(&self) -> Vec<u64> {
+        self.until
+            .iter()
+            .map(|slot| slot.load(Ordering::Acquire))
+            .collect()
     }
 
     // Whether the server accepts work now.
@@ -795,22 +807,25 @@ impl HealthTracker {
         self.publish(server_idx);
     }
 
-    // Whether the given server is available for work.
+    // Whether the given server is available for work. Every other change
+    // of state publishes as it is made, so a re-check that changed nothing
+    // leaves the board as it stands.
     pub fn is_available(&mut self, server_idx: usize) -> bool {
         let now = self.reenable_now();
-        self.servers[server_idx].check_reenable_at(now);
-        self.publish(server_idx);
+        if self.servers[server_idx].check_reenable_at(now) {
+            self.publish(server_idx);
+        }
         self.servers[server_idx].is_available()
     }
 
-    // Check all disabled servers and re-enable any whose backoff has expired.
+    // Check all disabled servers and re-enable any whose backoff has
+    // expired, publishing only the ones that changed.
     pub fn check_reenable_all(&mut self) {
         let now = self.reenable_now();
-        for server in &mut self.servers {
-            server.check_reenable_at(now);
-        }
         for idx in 0..self.servers.len() {
-            self.publish(idx);
+            if self.servers[idx].check_reenable_at(now) {
+                self.publish(idx);
+            }
         }
     }
 
@@ -820,6 +835,15 @@ impl HealthTracker {
             return now;
         }
         Instant::now()
+    }
+
+    // Publish every server whether it changed or not, as every re-check
+    // once did, for the tests that hold the board to that.
+    #[cfg(test)]
+    fn publish_all(&self) {
+        for idx in 0..self.servers.len() {
+            self.publish(idx);
+        }
     }
 
     #[cfg(test)]
@@ -1279,6 +1303,61 @@ mod tests {
         health.record_connection_outcome(&probe.0, true, false, false);
         assert_eq!(*health.state(), ServerState::Healthy);
         assert_eq!(health.consecutive_failures, 0);
+    }
+
+    // A re-check publishes only a server whose state it changed. Stepped
+    // from before to after the end of a cooldown and of a disable, the board
+    // holds what publishing every server on every re-check would have left,
+    // and answers and orders the servers as that did.
+    #[test]
+    fn a_recheck_that_changes_nothing_leaves_the_board_as_publishing_would() {
+        let config = HealthConfig {
+            transient_cooldown: Duration::from_secs(60),
+            base_backoff: Duration::from_secs(120),
+            ..test_config()
+        };
+        let mut tracker = HealthTracker::new(3, config);
+        let board = tracker.availability();
+        tracker.record_cooldown(0, CooldownReason::Transport);
+        for _ in 0..5 {
+            tracker.record_failure(1, false);
+        }
+        let ends = |tracker: &HealthTracker, idx: usize| match tracker.server(idx).state() {
+            ServerState::CoolingDown { until, .. } | ServerState::Disabled { until, .. } => *until,
+            state => panic!("server {idx} has no end in {state:?}"),
+        };
+        let cooled = ends(&tracker, 0);
+        let enabled = ends(&tracker, 1);
+        assert!(matches!(
+            tracker.server(1).state(),
+            ServerState::Disabled { .. }
+        ));
+        assert!(cooled < enabled);
+
+        let tick = Duration::from_nanos(1);
+        let steps = [
+            (cooled - tick, [false, false, true], vec![2]),
+            (cooled, [true, false, true], vec![0, 2]),
+            (cooled + tick, [true, false, true], vec![0, 2]),
+            (enabled - tick, [true, false, true], vec![0, 2]),
+            (enabled, [true, true, true], vec![0, 2, 1]),
+            (enabled + tick, [true, true, true], vec![0, 2, 1]),
+        ];
+        for (at, available, order) in steps {
+            tracker.set_reenable_clock(at);
+            let read = |board: &AvailabilityBoard| [0, 1, 2].map(|idx| board.is_available(idx));
+            // The board alone, before the tracker re-checks anything.
+            assert_eq!(read(&board), available, "{at:?}");
+            assert_eq!(tracker.ordered_servers(), order, "{at:?}");
+            let asked = [0, 1, 2].map(|idx| tracker.is_available(idx));
+            let kept = board.raw();
+            assert_eq!(asked, available, "{at:?}");
+            assert_eq!(read(&board), available, "{at:?}");
+
+            tracker.publish_all();
+            assert_eq!(board.raw(), kept, "{at:?}");
+            assert_eq!(read(&board), available, "{at:?}");
+        }
     }
 
     #[test]

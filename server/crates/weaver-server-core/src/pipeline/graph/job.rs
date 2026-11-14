@@ -603,10 +603,35 @@ impl GraphJob {
     }
 
     // Seam for completion, status and health: where the job stands, read
-    // off the tree. Stable.
+    // off the tree. Stable. Payload still to fetch wins over everything
+    // else, so while it is there, which is every article but the last, the
+    // walks of the sets and members are not taken.
     pub(crate) fn phase(&self) -> RootPhase {
+        if self.payload_waiting() {
+            return RootPhase::Downloading;
+        }
+        let extracting = phase::extracting(&self.tree) || self.runs.live();
+        RootPhase::derive(false, self.activity(), extracting)
+    }
+
+    // The phase read the long way, every walk taken, for the tests that hold
+    // the short way to it.
+    #[cfg(test)]
+    fn full_phase(&self) -> RootPhase {
         let extracting = phase::extracting(&self.tree) || self.runs.live();
         RootPhase::derive(self.payload_waiting(), self.activity(), extracting)
+    }
+
+    // The phase, checked against the long way.
+    #[cfg(test)]
+    pub(crate) fn checked_phase(&self) -> RootPhase {
+        let phase = self.phase();
+        assert_eq!(
+            phase,
+            self.full_phase(),
+            "the short way reads another phase"
+        );
+        phase
     }
 
     // What the recovery sets are doing: repairing while a repair run is out
@@ -1248,7 +1273,12 @@ impl GraphJob {
     }
 
     // The phase, when it changed since the last call.
+    // Under test every report is held to the long way, so each step of the
+    // pipeline tests checks the short way too.
     pub(crate) fn phase_change(&mut self) -> Option<RootPhase> {
+        #[cfg(test)]
+        let phase = self.checked_phase();
+        #[cfg(not(test))]
         let phase = self.phase();
         (self.reported != Some(phase)).then(|| {
             self.reported = Some(phase);
