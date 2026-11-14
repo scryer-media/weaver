@@ -1518,6 +1518,33 @@ pub(crate) fn db_err(error: impl std::fmt::Display) -> StateError {
 // SQLite's result code for a write the disk had no room for; an extended
 // code keeps it in its low byte.
 const SQLITE_FULL: u32 = 13;
+// SQLite's I/O error code, and the extended codes of it a disk with no
+// room, or a quota, gives a write. SQLite says SQLITE_FULL only for a write
+// the system refused as a full disk; a write a quota refused is an I/O
+// error on the write. A sync can be where a network or delayed-allocation
+// filesystem first says it has no room, and the shared-memory file is
+// grown by a write that a full disk refuses. A truncate takes no room and
+// is left an error. These codes also carry I/O errors that are not want of
+// room: such a write is held with the others, which loses nothing a
+// failure would have kept.
+const SQLITE_IOERR: u32 = 10;
+const SQLITE_IOERR_WRITE: u32 = SQLITE_IOERR | (3 << 8);
+const SQLITE_IOERR_FSYNC: u32 = SQLITE_IOERR | (4 << 8);
+const SQLITE_IOERR_SHMSIZE: u32 = SQLITE_IOERR | (19 << 8);
+
+// Whether SQLite's result code, extended or not, says the write found no
+// room.
+fn sqlite_code_out_of_space(code: u32) -> bool {
+    code & 0xff == SQLITE_FULL
+        || matches!(
+            code,
+            SQLITE_IOERR_WRITE | SQLITE_IOERR_FSYNC | SQLITE_IOERR_SHMSIZE
+        )
+}
+
+// The SQLSTATE a Postgres server gives a statement its disk had no room
+// for.
+const PG_DISK_FULL: &str = "53100";
 
 // A SQLite write's error, kept apart when the database's disk had no room
 // for it: by SQLite's own code, or by the kind of the I/O error under it.
@@ -1526,7 +1553,7 @@ pub(crate) fn sqlite_write_err(error: sqlx::Error) -> StateError {
         sqlx::Error::Database(database) => database
             .code()
             .and_then(|code| code.parse::<u32>().ok())
-            .is_some_and(|code| code & 0xff == SQLITE_FULL),
+            .is_some_and(sqlite_code_out_of_space),
         sqlx::Error::Io(io) => crate::operations::is_out_of_space(io),
         _ => false,
     };
@@ -1546,6 +1573,10 @@ pub(crate) fn pg_db_err(error: sqlx::Error) -> StateError {
         .and_then(|db| db.code())
         .map(|code| code.into_owned())
     {
+        // The server's disk had no room: kept apart, as SQLite's is.
+        if code == PG_DISK_FULL {
+            return StateError::OutOfSpace(format!("sqlstate={code}; {error}"));
+        }
         return StateError::Database(format!("sqlstate={code}; {error}"));
     }
     // Transport/pool failures carry no SQLSTATE. Crucially, an abruptly dropped
@@ -1572,6 +1603,83 @@ pub(crate) fn pg_db_err(error: sqlx::Error) -> StateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A database error with `code`, as either engine's driver gives one.
+    #[derive(Debug)]
+    struct Coded(&'static str);
+
+    impl std::fmt::Display for Coded {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "coded {}", self.0)
+        }
+    }
+
+    impl std::error::Error for Coded {}
+
+    impl sqlx::error::DatabaseError for Coded {
+        fn message(&self) -> &str {
+            "coded"
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.0.into())
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn coded(code: &'static str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(Coded(code)))
+    }
+
+    // Each code a full disk or a quota gives a SQLite write is kept apart
+    // as want of room, plain or extended; a truncate's, a read's and a
+    // constraint's are not.
+    #[test]
+    fn a_sqlite_write_the_disk_or_a_quota_refused_is_out_of_space() {
+        for code in ["13", "269", "778", "1034", "4874"] {
+            assert!(
+                matches!(sqlite_write_err(coded(code)), StateError::OutOfSpace(_)),
+                "{code}"
+            );
+        }
+        for code in ["10", "266", "1546", "1290", "19", "2067", "5"] {
+            assert!(
+                matches!(sqlite_write_err(coded(code)), StateError::Database(_)),
+                "{code}"
+            );
+        }
+    }
+
+    // A Postgres statement its server's disk had no room for is kept apart
+    // as want of room, with its SQLSTATE; any other keeps its class.
+    #[test]
+    fn a_postgres_statement_the_disk_refused_is_out_of_space() {
+        let StateError::OutOfSpace(message) = pg_db_err(coded("53100")) else {
+            panic!("disk full is want of room");
+        };
+        assert!(message.starts_with("sqlstate=53100;"), "{message}");
+        for code in ["53200", "53300", "40001", "23505"] {
+            assert!(
+                matches!(pg_db_err(coded(code)), StateError::Database(_)),
+                "{code}"
+            );
+        }
+    }
 
     #[test]
     fn transaction_row_sizing_respects_engine_limits_and_boundaries() {
