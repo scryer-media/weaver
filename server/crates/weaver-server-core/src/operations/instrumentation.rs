@@ -1388,8 +1388,13 @@ pub struct VolumeSnapshot {
     pub write_seeks: u64,
     // Bytes per second inside write calls; zero until measured.
     pub write_rate: u64,
+    // Bytes per second written to it over the last window, whether or not
+    // the volume was the limit; zero when nothing was written.
+    pub throughput: u64,
     // Bytes waiting in memory for the volume's writer.
     pub buffered_bytes: u64,
+    // Times the volume's writer found nothing more to do after working.
+    pub idle_turns: u64,
     // What the volume's writer did and what waiting on it cost.
     pub writer: VolumeWriterSnapshot,
 }

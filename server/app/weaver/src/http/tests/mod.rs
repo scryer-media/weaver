@@ -1426,7 +1426,9 @@ fn sample_volumes() -> Vec<instr::VolumeSnapshot> {
             write_calls: 120,
             write_seeks: 9,
             write_rate: 3_200_000,
+            throughput: 1_100_000,
             buffered_bytes: 65_536,
+            idle_turns: 12,
             writer: instr::VolumeWriterSnapshot {
                 batches: 40,
                 operations: 130,
@@ -1447,29 +1449,10 @@ fn sample_volumes() -> Vec<instr::VolumeSnapshot> {
             write_calls: 0,
             write_seeks: 0,
             write_rate: 0,
+            throughput: 0,
             buffered_bytes: 0,
+            idle_turns: 0,
             writer: Default::default(),
-        },
-    ]
-}
-
-fn sample_volume_rates() -> Vec<weaver_server_core::operations::VolumeWriteRate> {
-    use weaver_server_core::operations::VolumeWriteRate;
-    vec![
-        VolumeWriteRate {
-            label: "/mnt/nas".to_string(),
-            storage_kind: "network",
-            write_rate: Some(3_200_000),
-            throughput: Some(1_100_000),
-            buffered_bytes: 65_536,
-        },
-        // Seen, never written to: nothing is being written to it.
-        VolumeWriteRate {
-            label: "/mnt/scratch".to_string(),
-            storage_kind: "unknown",
-            write_rate: None,
-            throughput: None,
-            buffered_bytes: 0,
         },
     ]
 }
@@ -1506,7 +1489,6 @@ struct CollectionFixtures {
     process: instr::ProcessMetricsSnapshot,
     disk_space: Vec<instr::DiskSpaceSnapshot>,
     volumes: Vec<instr::VolumeSnapshot>,
-    volume_rates: Vec<weaver_server_core::operations::VolumeWriteRate>,
     http_metrics: instr::HttpMetricsSnapshot,
 }
 
@@ -1521,7 +1503,6 @@ impl CollectionFixtures {
             process: sample_process_metrics(),
             disk_space: sample_disk_space(),
             volumes: sample_volumes(),
-            volume_rates: sample_volume_rates(),
             http_metrics: sample_http_metrics(),
         }
     }
@@ -1537,7 +1518,6 @@ impl CollectionFixtures {
         input.process = Some(&self.process);
         input.disk_space = &self.disk_space;
         input.volumes = &self.volumes;
-        input.volume_rates = &self.volume_rates;
         input.http_metrics = Some(&self.http_metrics);
     }
 }

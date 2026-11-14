@@ -546,7 +546,9 @@ mod tests {
             write_calls: 120,
             write_seeks: 9,
             write_rate: 3_200_000,
+            throughput: 0,
             buffered_bytes: 65_536,
+            idle_turns: 0,
             writer: Default::default(),
         });
         let json = serde_json::to_value(&listed).unwrap();
