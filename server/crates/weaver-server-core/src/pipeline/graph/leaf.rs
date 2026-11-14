@@ -108,6 +108,10 @@ struct Queued {
     open: bool,
     // The last operation submitted for the file.
     last: u64,
+    // The release that gave the file's handle back, while it is still the
+    // last operation submitted for the file: the writer holds no handle
+    // then, and another release would have nothing to give back.
+    released: u64,
 }
 
 impl Drop for Queued {
@@ -225,6 +229,7 @@ impl Leaf {
             file: self.identity,
             open: false,
             last: 0,
+            released: 0,
         });
         self
     }
@@ -772,10 +777,16 @@ impl Leaf {
     // coverage. A spent or partial file need not have closed at a whole
     // length, but must still release its handle before unlink or delivery.
     pub(crate) fn release_handle(&mut self) {
+        // Asked again with nothing submitted for the file since, it queues
+        // nothing: a delivery that looks again while it waits for the
+        // volume's writer must find the writer's work done at some point,
+        // not one more release behind every look.
         if let Some(queued) = &mut self.queued
             && queued.last > 0
+            && queued.last != queued.released
         {
             queued.last = queued.to.release(self.identity);
+            queued.released = queued.last;
             queued.open = false;
         }
         self.file = None;
