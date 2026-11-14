@@ -2098,14 +2098,16 @@ impl Pipeline {
         let jobs: Vec<JobId> = self.graph_jobs.keys().copied().collect();
         for job_id in jobs {
             // A job with an operation still out on a volume whose writer
-            // stood still through the drain is left as its last checkpoint
+            // stood still through the drain, or with a repair the stop
+            // ended before the volume let go, is left as its last checkpoint
             // has it: reading its files here would wait on that writer,
             // and no checkpoint taken now could be borne out.
             if self
                 .graph_jobs
                 .get(&job_id)
-                .and_then(|graph| graph.disk())
-                .is_some_and(|disk| !disk.quiet())
+                .is_some_and(|graph| {
+                    graph.pending().given_up() || graph.disk().is_some_and(|disk| !disk.quiet())
+                })
             {
                 warn!(
                     job_id = job_id.0,
@@ -2135,6 +2137,17 @@ impl Pipeline {
     // job. A repair out on its thread is heard to its end, and whatever its
     // ruling starts is stopped in turn.
     async fn drain_graph_runs(&mut self) {
+        // A run or a repair that stands still for a volume's writer on its
+        // own thread goes on and ends as stopped, reading back nothing: its
+        // last mail is not waited for behind a volume that does not move.
+        // What the volume holds has the stop's span to be put down, after
+        // this. The runs are stopped first, so one that goes on says no
+        // more.
+        let limit = self.graph_slot_limit();
+        for job in self.graph_jobs.values_mut() {
+            job.stop_runs(limit);
+        }
+        self.volume_writers.stop_waits();
         loop {
             self.hear_graph_runs();
             let limit = self.graph_slot_limit();

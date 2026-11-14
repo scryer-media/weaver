@@ -692,10 +692,10 @@ impl Leaf {
     ) -> Result<(), LeafError> {
         if let Some(settled) = self.settled() {
             settled.wait_aside();
-            if settled.failed() {
+            if settled.unwritten() {
                 return Err(LeafError::Io {
                     path: self.path.clone(),
-                    source: io::Error::other("a write of the file failed before it was read"),
+                    source: io::Error::other("the writes of the file are not down for it to be read"),
                 });
             }
         }

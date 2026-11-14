@@ -752,6 +752,52 @@ fn a_producers_wait_ends_when_its_key_fails_or_is_given_up() {
     assert!(!given_path.exists());
 }
 
+// Once the owner is stopping, no thread but the loop stands still for a
+// volume: a producer over its line goes on, and a reader waiting for its
+// operations finds them still out. Neither waits again after. What the
+// volume holds is still written once its thread moves.
+#[test]
+fn a_stop_ends_the_waits_of_producers_and_readers_on_a_volume_that_stands_still() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let (volume, later) = (volume("one"), volume("two"));
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    job.write(1, 0, Bytes::from_static(b"held"), create(&path));
+    hold.wait_held();
+    let barrier = job.barrier();
+    std::thread::scope(|scope| {
+        let producer = scope.spawn(|| job.wait_below(0));
+        let reader = scope.spawn(|| barrier.wait_aside());
+        hold.wait_below_waiters(1);
+        while barrier.key.waiters.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        writers.stop_waits();
+        producer.join().unwrap();
+        reader.join().unwrap();
+    });
+    assert!(!barrier.returned() && !barrier.failed());
+    assert_eq!(count(&volume.buffered_bytes), 4);
+    // A wait begun after the stop does not stand still either, on this
+    // volume or on one first used after it.
+    job.wait_below(0);
+    barrier.wait_aside();
+    let later_hold = writers.hold(&later);
+    let other = writers.submitter(&later, 2);
+    other.write(1, 0, Bytes::from_static(b"more"), create(&dir.path().join("b")));
+    other.wait_below(0);
+    other.barrier().wait_aside();
+    assert!(!other.barrier().returned());
+    assert_eq!(count(&volume.writer.loop_waits), 0);
+    later_hold.open();
+    hold.open();
+    writers.settle();
+    assert!(barrier.returned() && !barrier.failed());
+    assert_eq!(std::fs::read(&path).unwrap(), b"held");
+}
+
 // A volume with no writer thread holds no producer: nothing will be written.
 #[test]
 fn a_producer_does_not_wait_on_a_volume_with_no_thread() {

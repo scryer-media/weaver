@@ -894,6 +894,20 @@ impl Pending {
         self.forget();
     }
 
+    // The stop left the job with something of it not taken back, because a
+    // volume's writer still held its operations: what the job says now is
+    // not borne out, so the changes waiting are dropped as a failed write's
+    // are and no checkpoint is taken again. The job restarts from the last
+    // one written.
+    pub(in crate::pipeline) fn left_at_stop(&self) {
+        self.forget();
+    }
+
+    // Whether no checkpoint is taken of the job any more.
+    pub(in crate::pipeline) fn given_up(&self) -> bool {
+        self.slot().control.cancelled()
+    }
+
     fn forget(&self) {
         let mut slot = self.slot();
         slot.control.cancel();

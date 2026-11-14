@@ -335,7 +335,7 @@ impl Volumes for RunVolumes {
             settled.wait_aside();
             // A write of the volume failed: its file does not hold what
             // the coverage says, and the failure fails the job.
-            if settled.failed() {
+            if settled.unwritten() {
                 return Err(Unreadable::Stopped.into());
             }
         }

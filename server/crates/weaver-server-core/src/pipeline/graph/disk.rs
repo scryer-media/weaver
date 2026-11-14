@@ -559,11 +559,10 @@ impl JobBarrier {
         }
     }
 
-    // An operation of the job failed on a volume, or the job gave its
-    // files up: what was submitted is not all on disk, and nothing may be
-    // read back as if it were.
-    pub(crate) fn failed(&self) -> bool {
-        self.0.iter().any(Barrier::failed)
+    // What a thread asks after `wait_aside`: whether it must read nothing
+    // back. See `Barrier::unwritten`.
+    pub(crate) fn unwritten(&self) -> bool {
+        self.0.iter().any(Barrier::unwritten)
     }
 
     // Wait until every operation behind it returned, counted against the

@@ -140,6 +140,9 @@ pub(crate) struct VolumeWriters {
 #[derive(Default)]
 struct Registry {
     lanes: Mutex<Lanes>,
+    // Set once the owner is stopping: no thread but the pipeline loop
+    // stands still for a volume from then on. Every lane holds it.
+    stopped: Arc<AtomicBool>,
     #[cfg(test)]
     ended: Condvar,
     // Times a thread was asked for.
@@ -247,6 +250,7 @@ impl VolumeWriters {
             Arc::clone(volume),
             Arc::clone(&self.report),
             self.rates.clone(),
+            Arc::clone(&self.registry.stopped),
             Arc::downgrade(&self.registry),
             inline,
             threadless,
@@ -345,6 +349,40 @@ impl VolumeWriters {
             state.waited(started);
         }
         left
+    }
+
+    // The owner is stopping. Every thread that stands still for a volume
+    // without being the pipeline loop goes on, and none stands still again:
+    // a producer in `Submitter::wait_below`, and a reader in
+    // `Barrier::wait_aside`, which finds its operations still out. What a
+    // volume holds is still written when its thread gets to it.
+    pub(crate) fn stop_waits(&self) {
+        self.registry.stopped.store(true, Ordering::SeqCst);
+        let lanes: Vec<Arc<Lane>> = self
+            .registry
+            .lock()
+            .iter()
+            .map(|(_, lane)| Arc::clone(lane))
+            .collect();
+        for lane in lanes {
+            let state = &lane.state;
+            {
+                let _held = state
+                    .below_waiting
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                state.below.notify_all();
+            }
+            let keys = state
+                .aside
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            for key in keys {
+                let _held = key.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+                key.woke.notify_all();
+            }
+        }
     }
 
     // Have a bounded settle look at its clock again, after a test moved it.
@@ -546,13 +584,19 @@ impl Key {
         }
     }
 
-    fn wait(&self, seq: u64) {
-        if self.has_returned(seq) {
+    // Wait until the key's operations through `seq` have returned, or
+    // until `stopped` is set when one is given. Whoever sets it wakes the
+    // wait under the key's lock.
+    fn wait(&self, seq: u64, stopped: Option<&AtomicBool>) {
+        let over = || {
+            self.has_returned(seq) || stopped.is_some_and(|stopped| stopped.load(Ordering::SeqCst))
+        };
+        if over() {
             return;
         }
         let mut held = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
         self.waiters.fetch_add(1, Ordering::SeqCst);
-        while !self.has_returned(seq) {
+        while !over() {
             held = self.woke.wait(held).unwrap_or_else(PoisonError::into_inner);
         }
         self.waiters.fetch_sub(1, Ordering::SeqCst);
@@ -635,7 +679,8 @@ impl Submitter {
     // an extraction, on the volume's budget. Returns at once when no more
     // than that wait, and whatever waits once the key has stopped, by a
     // failure or by being given up, or the volume has no writer thread:
-    // nothing more of the key will be written then. The writer wakes it
+    // nothing more of the key will be written then. Whatever waits, too,
+    // once the owner is stopping (`VolumeWriters::stop_waits`). The writer wakes it
     // as the bytes fall; nothing is polled.
     //
     // Never for the pipeline loop, which must not stand still for a disk:
@@ -648,6 +693,7 @@ impl Submitter {
                 && !self.key.failed.load(Ordering::SeqCst)
                 && !self.key.abandoned.load(Ordering::SeqCst)
                 && self.lane.threadless.is_none()
+                && !state.stopped.load(Ordering::SeqCst)
         };
         if !over() {
             return;
@@ -689,7 +735,7 @@ impl Submitter {
     ) -> io::Result<Vec<u8>> {
         if !self.key.has_returned(seq) {
             let began = Instant::now();
-            self.key.wait(seq);
+            self.key.wait(seq, None);
             self.lane.state.waited(began);
         }
         if self.key.stopped() {
@@ -829,14 +875,32 @@ impl Barrier {
             return;
         }
         let began = Instant::now();
-        self.key.wait(self.seq);
+        self.key.wait(self.seq, None);
         self.lane.waited(began);
     }
 
+    // What a thread asks after `wait_aside`: the operations are not all on
+    // disk, because one failed, the key was given up, or the wait ended at
+    // a stop with some still out. Nothing may be read back as if they were.
+    pub(crate) fn unwritten(&self) -> bool {
+        self.failed() || !self.returned()
+    }
+
     // The same wait for a thread the loop does not wait for, which is not
-    // counted.
+    // counted. It also ends once the owner is stopping
+    // (`VolumeWriters::stop_waits`), with the operations still out: the
+    // caller asks `returned` and reads nothing back when they are.
     pub(crate) fn wait_aside(&self) {
-        self.key.wait(self.seq);
+        if self.returned() {
+            return;
+        }
+        let aside = || self.lane.aside.lock().unwrap_or_else(PoisonError::into_inner);
+        aside().push(Arc::clone(&self.key));
+        self.key.wait(self.seq, Some(&self.lane.stopped));
+        let mut aside = aside();
+        if let Some(at) = aside.iter().position(|key| Arc::ptr_eq(key, &self.key)) {
+            aside.swap_remove(at);
+        }
     }
 
     // Whether a test holds the volume's thread.
@@ -901,6 +965,11 @@ struct LaneState {
     below_waiters: AtomicUsize,
     below_waiting: Mutex<()>,
     below: Condvar,
+    // The owner is stopping: see `VolumeWriters::stop_waits`.
+    stopped: Arc<AtomicBool>,
+    // The keys threads stand in `Barrier::wait_aside` for, so a stop can
+    // wake them.
+    aside: Mutex<Vec<Arc<Key>>>,
     #[cfg(test)]
     gate: Mutex<Gate>,
     #[cfg(test)]
@@ -973,6 +1042,7 @@ impl Lane {
         volume: Arc<Volume>,
         report: Arc<ReportFn>,
         rates: Option<Arc<RateSignal>>,
+        stopped: Arc<AtomicBool>,
         registry: Weak<Registry>,
         inline: bool,
         threadless: bool,
@@ -990,6 +1060,8 @@ impl Lane {
             below_waiters: AtomicUsize::new(0),
             below_waiting: Mutex::new(()),
             below: Condvar::new(),
+            stopped,
+            aside: Mutex::default(),
             #[cfg(test)]
             gate: Mutex::default(),
             #[cfg(test)]

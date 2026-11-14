@@ -28,7 +28,11 @@ fn held(pipeline: &Pipeline, job_id: JobId) -> (Arc<Volume>, Hold) {
     (volume, hold)
 }
 
-// The loop never stood still for the volume's writer.
+// The loop never stood still for the volume's writer. Asked only where the
+// test forces the answer: while the volume's thread is held, so a wait of
+// the loop would never return, or after work the loop took no part in.
+// Once the thread runs free the loop may read a file whose last write is
+// still queued, and whether it waits then is up to the machine.
 fn no_loop_waits(volume: &Volume) {
     assert_eq!(volume.writer.loop_waits.load(Ordering::Relaxed), 0);
 }
@@ -84,6 +88,9 @@ async fn a_write_that_fails_on_a_volumes_thread_fails_the_job() {
     let (volume, hold) = held(&pipeline, job_id);
     hold.fail_next(std::io::Error::other("the disk said no"));
     decode_all(&mut pipeline, job_id, &posts, 0).await;
+    // Asked while the volume stands still: a wait of the loop would not
+    // have come back.
+    no_loop_waits(&volume);
     hold.open();
     while !matches!(
         job_status_for_assert(&pipeline, job_id),
@@ -99,7 +106,6 @@ async fn a_write_that_fails_on_a_volumes_thread_fails_the_job() {
     );
     settle_failed_releases(&mut pipeline).await;
     assert!(!pipeline.jobs.contains_key(&job_id));
-    no_loop_waits(&volume);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -119,6 +125,9 @@ async fn a_delivery_that_waited_for_a_failed_write_fails_the_job_once() {
     pipeline.start_move_to_complete(job_id).await.unwrap();
     assert!(pipeline.moves_awaiting_disk.contains(&job_id));
     assert!(!pipeline.inflight_moves.contains(&job_id));
+    // Asked while the volume stands still: a wait of the loop would not
+    // have come back.
+    no_loop_waits(&volume);
     hold.open();
     while !matches!(
         job_status_for_assert(&pipeline, job_id),
@@ -140,7 +149,6 @@ async fn a_delivery_that_waited_for_a_failed_write_fails_the_job_once() {
         .filter(|event| matches!(event, PipelineEvent::JobFailed { job_id: id, .. } if *id == job_id))
         .count();
     assert_eq!(failed, 1);
-    no_loop_waits(&volume);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -178,7 +186,6 @@ async fn a_repair_lent_while_its_bytes_are_queued_waits_on_its_own_thread() {
         .barrier()
         .wait_aside();
     assert_eq!(read(&working_dir.join("lantern.bin")), data);
-    no_loop_waits(&volume);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -212,7 +219,6 @@ async fn a_delivery_is_renamed_by_the_thread_of_the_volume_it_lands_on() {
     assert!(volume.writer.operations.load(Ordering::Relaxed) > before);
     pipeline.handle_move_to_complete_done(done).await;
     assert!(!working_dir.join("lantern.bin").exists());
-    no_loop_waits(&volume);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -240,7 +246,6 @@ async fn a_run_reads_its_volume_once_the_volumes_thread_put_it_down() {
         .barrier()
         .wait_aside();
     assert_eq!(read(&working_dir.join("echo-0.mkv")), body);
-    no_loop_waits(&volume);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -286,7 +291,6 @@ async fn a_run_waits_on_its_own_thread_while_its_volume_holds_the_write_budget()
         .barrier()
         .wait_aside();
     assert_eq!(read(&working_dir.join("echo-0.mkv")), body);
-    no_loop_waits(&volume);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -414,7 +418,6 @@ async fn a_repair_larger_than_the_write_budget_is_applied_within_it() {
         let said = pipeline.graph_runs.recv().await.unwrap();
         if matches!(&said.heard, Heard::Repaired(returned) if matches!(returned.outcome, Some(RepairOutcome::Repaired { .. }))) {
             disk.barrier().wait_aside();
-            no_loop_waits(&volume);
             let hold = pipeline.volume_writers.hold(&volume);
             let watched = Arc::clone(&volume);
             watcher = Some(std::thread::spawn(move || {
@@ -453,6 +456,9 @@ async fn a_job_paused_with_bytes_queued_is_kept_until_they_are_written() {
     pipeline.pause_job_runtime(job_id).unwrap();
     assert!(!pipeline.graph_jobs.contains_key(&job_id));
     assert!(pipeline.retiring_graph_jobs.contains_key(&job_id));
+    // Asked while the volume stands still: a wait of the loop would not
+    // have come back.
+    no_loop_waits(&volume);
     hold.open();
     hear_retirement(&mut pipeline, job_id).await;
     assert_eq!(
@@ -463,7 +469,6 @@ async fn a_job_paused_with_bytes_queued_is_kept_until_they_are_written() {
         job_status_for_assert(&pipeline, job_id),
         Some(JobStatus::Paused)
     ));
-    no_loop_waits(&volume);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -511,8 +516,9 @@ async fn a_job_paused_with_a_quiet_disk_is_kept_for_what_its_run_said_before() {
     assert!(!disk.quiet());
     hold.open();
     hear_retirement(&mut pipeline, job_id).await;
+    // Ending the job queued its own last operations.
+    disk.barrier().wait_aside();
     assert!(disk.quiet());
-    no_loop_waits(&volume);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -530,6 +536,9 @@ async fn a_write_that_fails_after_its_job_stopped_fails_the_job() {
     decode(&mut pipeline, job_id, &posts, 0, 0, true).await;
     pipeline.pause_job_runtime(job_id).unwrap();
     assert!(pipeline.retiring_graph_jobs.contains_key(&job_id));
+    // Asked while the volume stands still: a wait of the loop would not
+    // have come back.
+    no_loop_waits(&volume);
     hold.open();
     hear_retirement(&mut pipeline, job_id).await;
     let status = job_status_for_assert(&pipeline, job_id).unwrap();
@@ -537,7 +546,6 @@ async fn a_write_that_fails_after_its_job_stopped_fails_the_job() {
         matches!(&status, JobStatus::Failed { error } if error.contains("the disk said no")),
         "{status:?}"
     );
-    no_loop_waits(&volume);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -571,6 +579,9 @@ async fn a_job_cancelled_with_bytes_queued_ends_once_its_volume_let_go() {
     }
     assert!(pipeline.retiring_graph_jobs.contains_key(&job_id));
     assert!(pipeline.jobs.contains_key(&job_id));
+    // Asked while the volume stands still: a wait of the loop would not
+    // have come back.
+    no_loop_waits(&volume);
     hold.open();
     hear_retirement(&mut pipeline, job_id).await;
     assert!(!pipeline.jobs.contains_key(&job_id));
@@ -585,7 +596,6 @@ async fn a_job_cancelled_with_bytes_queued_ends_once_its_volume_let_go() {
             .status,
         "cancelled"
     );
-    no_loop_waits(&volume);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -613,6 +623,9 @@ async fn a_job_held_by_a_full_write_buffer_is_dispatched_again_once_woken() {
     assert!(pipeline.volume_holds_budget(job_id));
     assert!(pipeline.lease_for_server_for_test(0).is_none());
     pipeline.download_dispatch_wake = false;
+    // Asked while the volume stands still: a wait of the loop would not
+    // have come back.
+    no_loop_waits(&volume);
     hold.open();
     let report = pipeline.volume_reports.recv().await.unwrap();
     assert!(report.below);
@@ -620,7 +633,6 @@ async fn a_job_held_by_a_full_write_buffer_is_dispatched_again_once_woken() {
     assert!(pipeline.download_dispatch_wake);
     assert!(!pipeline.volume_holds_budget(job_id));
     assert!(pipeline.lease_for_server_for_test(0).is_some());
-    no_loop_waits(&volume);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -735,4 +747,95 @@ async fn a_restart_after_a_stop_that_left_writes_held_fetches_them_again() {
     assert_eq!(read(&working_dir.join("lantern.bin")), posts[0].bytes);
     drop(hold);
     retire_pipeline_database(pipeline).await;
+}
+
+// Stop the pipeline with a clock a minute later at each look, so a volume
+// that stands still is given up the first time the stop finds it so.
+async fn stop_past_a_still_volume(pipeline: &mut Pipeline) {
+    use crate::operations::disk::writer::{Leaping, SettleBound};
+    pipeline.shutdown_settle = SettleBound {
+        clock: Arc::new(Leaping(std::sync::atomic::AtomicU64::new(0))),
+        span: std::time::Duration::from_secs(30),
+    };
+    let handle =
+        crate::SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    handle.shutdown().await.unwrap();
+    pipeline.run().await;
+}
+
+// A stop while a run stands on its own thread for a volume that holds the
+// write budget and does not move: the run goes on, says nothing more, and
+// the stop does not wait for the volume past its span.
+#[tokio::test]
+async fn a_stop_does_not_wait_for_a_run_held_by_the_write_budget_of_a_still_volume() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_416);
+    let body = payload(3 * ARTICLE + 5, 6);
+    let posts = vec![echo_volume(0, &body)];
+    let (mut pipeline, _, _) = crate::pipeline::tests::new_direct_pipeline(&temp_dir).await;
+    pipeline.write_backlog_budget_bytes = ARTICLE;
+    insert_active_job(&mut pipeline, job_id, spec("lantern joined", &posts, ARTICLE)).await;
+    let working_dir = pipeline.jobs[&job_id].working_dir.clone();
+    let gate = Arc::new(crate::pipeline::graph::engine::echo::RunGate::default());
+    pipeline
+        .graph_jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .set_builder(Box::new(Echoes {
+            volumes: 1,
+            gate: Some(Arc::clone(&gate)),
+            ..Echoes::default()
+        }));
+    let (volume, hold) = held(&pipeline, job_id);
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    gate.started().await;
+    gate.release();
+    hold.wait_below_waiters(1);
+    let queued = volume.buffered_bytes.load(Ordering::Relaxed);
+    assert!(queued > ARTICLE as u64);
+    stop_past_a_still_volume(&mut pipeline).await;
+    // The run said nothing more: no byte joined what the volume held.
+    assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), queued);
+    assert!(!working_dir.join("echo-0.mkv").exists());
+    assert_ne!(
+        job_status_for_assert(&pipeline, job_id).map(|status| matches!(status, JobStatus::Failed { .. })),
+        Some(true)
+    );
+    retire_pipeline_database(pipeline).await;
+    drop(hold);
+}
+
+// A stop while a repair stands on its own thread for writes a volume holds
+// and does not put down: the repair ends as stopped, having read nothing,
+// and the stop does not wait for the volume past its span.
+#[tokio::test]
+async fn a_stop_does_not_wait_for_a_repair_held_by_a_still_volume() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_417);
+    let data = payload(4 * ARTICLE, 4);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 2));
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let (volume, hold) = held(&pipeline, job_id);
+    decode(&mut pipeline, job_id, &posts, 0, 0, false).await;
+    for ordinal in 1..4 {
+        decode(&mut pipeline, job_id, &posts, 0, ordinal, true).await;
+    }
+    for index in 1..posts.len() as u32 {
+        decode_all(&mut pipeline, job_id, &posts, index).await;
+    }
+    assert!(pipeline.graph_jobs[&job_id].repair_out());
+    let queued = volume.buffered_bytes.load(Ordering::Relaxed);
+    assert!(queued > 0);
+    stop_past_a_still_volume(&mut pipeline).await;
+    assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), queued);
+    assert!(!working_dir.join("lantern.bin").exists());
+    assert_ne!(
+        job_status_for_assert(&pipeline, job_id).map(|status| matches!(status, JobStatus::Failed { .. })),
+        Some(true)
+    );
+    retire_pipeline_database(pipeline).await;
+    drop(hold);
 }

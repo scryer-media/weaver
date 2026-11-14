@@ -98,7 +98,7 @@ impl Verification {
                 settled.wait_aside();
                 // A write of the file failed: there is nothing to check,
                 // and the failure fails the job.
-                if settled.failed() {
+                if settled.unwritten() {
                     return Ok(None);
                 }
             }

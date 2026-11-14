@@ -304,6 +304,16 @@ impl GraphJob {
         if !self.loans.returned(set, serial) {
             return Ok(returned.repaired.remove().map_err(WriteError::from)?);
         }
+        // A repair the stop ended while a volume's writer still holds
+        // operations of the job is not taken back: taking it back reads the
+        // job's files, and the loop would stand behind that writer, which
+        // may never move. The job is left as its last checkpoint has it,
+        // and no checkpoint is taken of it again.
+        if returned.stopped() && self.disk().is_some_and(|disk| !disk.quiet()) {
+            self.pending().left_at_stop();
+            let _ = returned.repaired.remove();
+            return Ok(());
+        }
         let mut out = Vec::new();
         let objects = self.runs.hardware();
         let rebuilt = self.writer.returned(

@@ -257,7 +257,7 @@ impl Lent {
         settled.wait_aside();
         // A write of the job's failed: its files are not as the loop said
         // them, so the loan reads nothing. The failure fails the job.
-        if settled.failed() {
+        if settled.unwritten() {
             self.unwritten = true;
             return;
         }
