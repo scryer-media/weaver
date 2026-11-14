@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-10.
+// Modified by the Weaver authors, 2026-11-13.
 
 // NewReno fast recovery, counting duplicates from SACKs.
 use std::time::Duration;
@@ -286,7 +286,8 @@ impl Recovery {
                 }
 
                 let high_rxt = high_ack;
-                let pipe_estimate = tx_segs.calc_pipe(high_rxt, last_sent_seq_nr, rtt, now);
+                let pipe_estimate =
+                    tx_segs.calc_pipe(high_rxt, last_sent_seq_nr, next_seq_nr - 1, rtt, now);
                 let cwnd = congestion_controller.recovery_window();
 
                 let rec = Recovering {

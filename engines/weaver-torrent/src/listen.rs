@@ -344,6 +344,10 @@ async fn bind_shared_utp(
     connection_slots: Option<&crate::connection_slots::ConnectionSlots>,
     shared: bool,
 ) -> anyhow::Result<(UtpSocket, Option<DhtShare>)> {
+    // Bound on the session's runtime: the factory's own tasks (a tunnel's
+    // send worker, a proxy's association) live there. A kernel socket is
+    // registered by uTP with the uTP thread its I/O runs on; the DHT
+    // sharing it holds those threads, so they outlive the uTP socket.
     let transport = factory
         .bind_utp(listen_addr, receive_buffer)
         .await
@@ -351,6 +355,7 @@ async fn bind_shared_utp(
     let share = shared.then(|| DhtShare {
         socket: Arc::clone(&transport),
         tap: Arc::new(DhtTap::default()),
+        shards: utp_opts.shards.clone(),
     });
     let tap = share.as_ref().map(|share| Arc::clone(&share.tap));
     let sock = weaver_utp::UtpSocket::new_with_opts_and_init(
@@ -375,10 +380,13 @@ pub(crate) trait Accept {
         false
     }
 
+    /// The connection's address, the thread its transport runs on when it
+    /// has one of its own, and its halves.
     async fn accept(
         &self,
     ) -> anyhow::Result<(
         SocketAddr,
+        Option<tokio::runtime::Handle>,
         (
             impl AsyncReadVectored + Send + 'static,
             impl AsyncWrite + Unpin + Send + 'static,
@@ -392,6 +400,7 @@ impl Accept for Box<dyn StreamListener + '_> {
         &self,
     ) -> anyhow::Result<(
         SocketAddr,
+        Option<tokio::runtime::Handle>,
         (
             impl AsyncReadVectored + Send + 'static,
             impl AsyncWrite + Unpin + Send + 'static,
@@ -400,7 +409,7 @@ impl Accept for Box<dyn StreamListener + '_> {
         let (addr, read, write) = StreamListener::accept(self.as_ref())
             .await
             .context("error accepting TCP")?;
-        Ok((addr, (read, write)))
+        Ok((addr, None, (read, write)))
     }
 }
 
@@ -418,6 +427,7 @@ impl Accept for UtpSocket {
         &self,
     ) -> anyhow::Result<(
         SocketAddr,
+        Option<tokio::runtime::Handle>,
         (
             impl AsyncReadVectored + Send + 'static,
             impl AsyncWrite + Unpin + Send + 'static,
@@ -425,8 +435,9 @@ impl Accept for UtpSocket {
     )> {
         let stream = self.accept().await.context("error accepting uTP")?;
         let addr = stream.remote_addr();
+        let home = stream.home().cloned();
         let (read, write) = stream.split();
-        Ok((addr, (read, write)))
+        Ok((addr, home, (read, write)))
     }
 }
 
@@ -457,5 +468,34 @@ mod tests {
         assert!(!<UtpSocket as Accept>::is_closed(&anyhow::anyhow!(
             "too many open files"
         )));
+    }
+    // The DHT sharing a uTP socket's datagram socket still sends on it after
+    // the uTP socket has shut down and gone: the uTP thread the socket's I/O
+    // is registered on runs while the DHT holds the socket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_dht_sends_on_a_shared_socket_after_utp_ends() {
+        let opts = weaver_utp::SocketOpts {
+            shards: Some(weaver_utp::Shards::new("utp-dht-share", 1)),
+            ..Default::default()
+        };
+        let (sock, share) = bind_shared_utp(
+            crate::test_support::socket_factory().as_ref(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            opts,
+            crate::udp_options::STREAM_WINDOW,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let dht = share.unwrap().dht_socket();
+        sock.shutdown().await.unwrap();
+        drop(sock);
+
+        let peer = crate::test_support::loopback_udp().await;
+        dht.send_to(b"ping", peer.bind_addr()).await.unwrap();
+        let mut buf = [0u8; 16];
+        let (len, from) = peer.recv_from(&mut buf).await.unwrap();
+        assert_eq!((&buf[..len], from), (&b"ping"[..], dht.bind_addr()));
     }
 }

@@ -150,6 +150,10 @@ impl Pieces for Intake {
         self.inner.read(file, offset, out)
     }
 
+    fn will_read(&self, file: usize, offset: u64, len: u64) {
+        self.inner.will_read(file, offset, len);
+    }
+
     fn readv(&self, file: usize, offset: u64, outs: &mut [&mut [u8]]) -> io::Result<()> {
         self.inner.readv(file, offset, outs)
     }

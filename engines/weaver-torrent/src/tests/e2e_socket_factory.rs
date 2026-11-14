@@ -40,6 +40,57 @@ pub(super) struct CountingFactory {
     listen_tcp: AtomicUsize,
     accept_tcp: Arc<AtomicUsize>,
     bind_udp: AtomicUsize,
+    // Hands out datagram sockets that, as a tunnel's, keep their uTP
+    // streams beside their I/O.
+    tunnel: bool,
+}
+
+/// A datagram socket that leaves `spreads_streams` at its default, as a
+/// tunnel's socket does.
+struct AsTunnel(Arc<dyn DatagramSocket>);
+
+impl DatagramSocket for AsTunnel {
+    fn bind_addr(&self) -> SocketAddr {
+        self.0.bind_addr()
+    }
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>> {
+        self.0.recv_from(buf)
+    }
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<usize>> {
+        self.0.send_to(buf, target)
+    }
+    fn poll_send_to(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+        target: SocketAddr,
+    ) -> std::task::Poll<io::Result<usize>> {
+        self.0.poll_send_to(cx, buf, target)
+    }
+    fn poll_send_to_vectored(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+        target: SocketAddr,
+    ) -> std::task::Poll<io::Result<usize>> {
+        self.0.poll_send_to_vectored(cx, bufs, target)
+    }
+    fn register_io(&self) -> io::Result<()> {
+        self.0.register_io()
+    }
+    fn link_mtu(&self) -> Option<u16> {
+        self.0.link_mtu()
+    }
+    fn shutdown(&self) -> BoxFuture<'_, io::Result<()>> {
+        self.0.shutdown()
+    }
 }
 
 impl CountingFactory {
@@ -105,7 +156,12 @@ impl SocketFactory for CountingFactory {
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
         Box::pin(async move {
             self.bind_udp.fetch_add(1, Ordering::SeqCst);
-            crate::test_support::udp_at(addr).await
+            let socket = crate::test_support::udp_at(addr).await?;
+            Ok(if self.tunnel {
+                Arc::new(AsTunnel(socket))
+            } else {
+                socket
+            })
         })
     }
 }
@@ -271,6 +327,49 @@ async fn test_e2e_socket_factory_utp() -> anyhow::Result<()> {
     assert_eq!(CountingFactory::count(&client.bind_udp), 2);
     assert_eq!(CountingFactory::count(&server.listen_tcp), 0);
     assert_eq!(CountingFactory::count(&client.connect_tcp), 0);
+    Ok(())
+}
+
+// A peer over a socket that does not spread its streams, as a tunnel's,
+// runs where its stream does: on the session's first uTP thread, the one
+// that reads and sends on the socket. On a host with one core the session
+// has that thread alone, and the test shows only that the peers ran on it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_over_a_tunnel_socket_runs_on_the_thread_that_reads_and_sends() -> anyhow::Result<()>
+{
+    use crate::peer_connection::{ON_UTP_IO_THREAD, ON_UTP_THREADS};
+    let tunnel = || {
+        Arc::new(CountingFactory {
+            tunnel: true,
+            ..Default::default()
+        })
+    };
+    let (server, client) = (tunnel(), tunnel());
+    let utp_only = || ListenerOptions {
+        mode: ListenerMode::UtpOnly,
+        listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
+        ..Default::default()
+    };
+    transfer_through_factories(
+        "a_peer_over_a_tunnel_socket",
+        utp_only(),
+        Some(utp_only()),
+        Some(ConnectionOptions {
+            enable_tcp: false,
+            ..Default::default()
+        }),
+        &server,
+        &client,
+    )
+    .await?;
+    let [incoming, outgoing] = [0, 1].map(|way| ON_UTP_THREADS[way].load(Ordering::Relaxed));
+    assert!(incoming > 0, "no incoming connection ran on a uTP thread");
+    assert!(outgoing > 0, "no outgoing connection ran on a uTP thread");
+    assert_eq!(
+        ON_UTP_IO_THREAD.load(Ordering::Relaxed),
+        incoming + outgoing,
+        "a connection ran off the thread that reads and sends"
+    );
     Ok(())
 }
 

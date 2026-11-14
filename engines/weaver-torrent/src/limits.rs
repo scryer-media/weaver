@@ -16,10 +16,13 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
+
+use crate::session_stats::network::LimiterSnapshot;
 
 /// One direction's limit. Serialized as a number of bytes per second, with
 /// `null` for unlimited and `0` for closed, so rows written when the field was
@@ -300,6 +303,10 @@ struct Limit {
     changed: Notify,
     // Bytes this limit has granted and not had back.
     granted: watch::Sender<u64>,
+    // Requests this limit was asked with that were granted only after a
+    // wait, and how long they waited in all.
+    waits: AtomicU64,
+    wait_nanos: AtomicU64,
 }
 
 // A request waiting on one or two channels, the torrent's and the
@@ -354,10 +361,10 @@ async fn acquire(limits: [Option<&Limit>; 2], want: u64) -> u64 {
         }
         return at_once;
     }
+    let since = Instant::now();
     let waiting = Waiting {
-        on: limits.map(|limit| {
-            limit.map(|limit| (limit, limit.budget.lock().enqueue(want, Instant::now())))
-        }),
+        on: limits
+            .map(|limit| limit.map(|limit| (limit, limit.budget.lock().enqueue(want, since)))),
     };
     loop {
         let [first, second] = waiting
@@ -383,9 +390,12 @@ async fn acquire(limits: [Option<&Limit>; 2], want: u64) -> u64 {
             .any(|(limit, id)| limit.budget.lock().done(id))
         {
             let mut granted = 0;
+            let waited = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
             for (limit, id) in waiting.each() {
                 granted = limit.budget.lock().remove(id);
                 limit.granted(granted);
+                limit.waits.fetch_add(1, Ordering::Relaxed);
+                limit.wait_nanos.fetch_add(waited, Ordering::Relaxed);
             }
             std::mem::forget(waiting);
             return granted;
@@ -432,6 +442,8 @@ impl Limit {
             }),
             changed: Notify::new(),
             granted: watch::Sender::new(0),
+            waits: AtomicU64::new(0),
+            wait_nanos: AtomicU64::new(0),
         }
     }
 
@@ -510,6 +522,24 @@ impl Limits {
             return 0;
         }
         acquire([Some(self.limit(channel)), None], want).await
+    }
+
+    /// The requests these limits were asked with that waited, and for how
+    /// long: a request of a torrent's peer waits on the torrent's limits
+    /// and the session's together, and is counted on both whichever held
+    /// it.
+    pub fn waited(&self) -> LimiterSnapshot {
+        let read = |limit: &Limit| {
+            (
+                limit.waits.load(Ordering::Relaxed),
+                limit.wait_nanos.load(Ordering::Relaxed),
+            )
+        };
+        let (down, up) = (read(&self.down), read(&self.up));
+        LimiterSnapshot {
+            waits: [down.0, up.0],
+            wait_nanos: [down.1, up.1],
+        }
     }
 
     /// `bytes` granted on `channel` that will not cross go back to it
@@ -633,6 +663,11 @@ mod tests {
         let (small, large) = tokio::join!(small, large);
         assert_eq!(small, (1000, 4 * ROUND));
         assert_eq!(large, (4 * 250 + 16 * 500, 20 * ROUND));
+        // Both waited, and the time each waited is counted on the channel.
+        let waited = limits.waited();
+        assert_eq!(waited.waits, [2, 0]);
+        let nanos = u64::try_from((24 * ROUND).as_nanos()).unwrap();
+        assert_eq!(waited.wait_nanos, [nanos, 0]);
         assert_eq!(*limits.watch_download_granted().borrow(), 10_000);
     }
 

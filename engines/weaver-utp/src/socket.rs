@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-12.
+// Modified by the Weaver authors, 2026-11-14.
 
 use std::{
     collections::{BTreeMap, VecDeque, btree_map::Entry},
@@ -139,14 +139,14 @@ pub struct SocketOpts {
     /// unanswered; with none set, every SYN is taken up.
     pub connections_limit: Option<NonZeroUsize>,
 
+    /// Threads of their own for the socket's tasks: its I/O task runs on
+    /// the first, and so do its streams. With none, the tasks run on the
+    /// runtime the socket is made on.
+    pub shards: Option<crate::Shards>,
+
     /// If true, will wait for ACK of FIN. By default we don't wait
     /// as it's not required for torrents.
     pub dont_wait_for_lastack: bool,
-
-    /// How many times should the MTU probes be retransmitted. By default it's 1, so that
-    /// MTU probing can handle a bit of packet loss. If it's 0, we would mark RTO'ed probes as failed
-    /// sooner and thus perf would be better.
-    pub mtu_probe_max_retransmissions: Option<usize>,
 
     #[cfg(test)]
     pub(crate) benchmark_delayed_acks: bool,
@@ -196,7 +196,6 @@ impl SocketOpts {
                 .remote_inactivity_timeout
                 .unwrap_or(DEFAULT_REMOTE_INACTIVITY_TIMEOUT),
             wait_for_last_ack: !self.dont_wait_for_lastack,
-            mtu_probe_max_retransmissions: self.mtu_probe_max_retransmissions.unwrap_or(1),
             #[cfg(test)]
             benchmark_delayed_acks: self.benchmark_delayed_acks,
         })
@@ -220,8 +219,6 @@ pub(crate) struct ValidatedSocketOpts {
     pub remote_inactivity_timeout: Duration,
 
     pub wait_for_last_ack: bool,
-
-    pub mtu_probe_max_retransmissions: usize,
 
     #[cfg(test)]
     pub benchmark_delayed_acks: bool,
@@ -501,6 +498,140 @@ impl<T, E> AcceptQueue<T, E> {
     }
 }
 
+/// The buffers a socket receives into. A datagram is read into a pooled
+/// buffer, and on into the spill buffer when it is longer; a packet with a
+/// payload keeps the pooled buffer, and the next datagram gets another.
+/// A read takes at most `u16::MAX` bytes in all, the spill buffer's
+/// length. Normal UDP datagrams carry at most u16::MAX - 8 payload bytes;
+/// one that fills the read is dropped as too long.
+///
+/// A transport that receives several datagrams in a call reads into
+/// `many`, one entry with buffers of its own for each; each datagram's
+/// buffers then change places with `head` and `spill` while it is handled.
+pub(crate) struct RecvBufs {
+    head: Box<[u8]>,
+    spill: Box<[u8]>,
+    many: Vec<crate::Received>,
+}
+
+// What one receive call returned.
+enum Got {
+    // One datagram in `head` and `spill`: its length and sender.
+    One(usize, SocketAddr),
+    // This many datagrams, in the first entries of `many`.
+    Many(usize),
+}
+
+impl RecvBufs {
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
+        Self::receiving(1)
+    }
+
+    // Buffers for a transport that returns at most `most` datagrams a
+    // call: RECEIVE_BATCH entries at most, each a pooled buffer, for the
+    // socket's life. A pooled buffer holds any datagram a path of a common
+    // MTU delivers, and the entries share the one spill buffer for a
+    // longer one, so only a long datagram followed by another in one call
+    // is lost. libtorrent reads every datagram into 1500 bytes and loses
+    // the rest of a longer one (udp_socket.hpp v2.0.15:159,
+    // udp_socket.cpp:206).
+    fn receiving(most: usize) -> Self {
+        let mut many = Vec::new();
+        if most > 1 {
+            many.extend((0..most.min(RECEIVE_BATCH)).map(|_| crate::Received {
+                head: crate::rx_buf::take(),
+                len: 0,
+                from: SocketAddr::from(([0, 0, 0, 0], 0)),
+            }));
+        }
+        Self {
+            head: crate::rx_buf::take(),
+            spill: vec![0; u16::MAX as usize].into_boxed_slice(),
+            many,
+        }
+    }
+
+    // The next receive call: at most `most` datagrams.
+    async fn recv_next<T: Transport>(
+        &mut self,
+        transport: &T,
+        most: usize,
+    ) -> std::io::Result<Got> {
+        if self.many.is_empty() {
+            let (len, from) = self.recv(transport).await?;
+            return Ok(Got::One(len, from));
+        }
+        let most = most.clamp(1, self.many.len());
+        let many = &mut self.many[..most];
+        let spill = &mut self.spill;
+        match poll_fn(|cx| transport.poll_recv_many(cx, many, spill)).await {
+            // A transport that says it receives several and does not is
+            // read one datagram a call from here on.
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                self.many = Vec::new();
+                let (len, from) = self.recv(transport).await?;
+                Ok(Got::One(len, from))
+            }
+            got => got.map(Got::Many),
+        }
+    }
+
+    // The buffer of the `index`th datagram of the last call changes places
+    // with `head`: once to handle it there, and once more to give the
+    // entry a buffer for the next call.
+    fn swap(&mut self, index: usize) -> (usize, SocketAddr) {
+        let entry = &mut self.many[index];
+        std::mem::swap(&mut self.head, &mut entry.head);
+        (entry.len, entry.from)
+    }
+
+    // The longest datagram read: one this long may have been cut short.
+    fn capacity(&self) -> usize {
+        self.spill.len()
+    }
+
+    fn recv<'a, T: Transport>(
+        &'a mut self,
+        transport: &'a T,
+    ) -> impl Future<Output = std::io::Result<(usize, SocketAddr)>> + Send + 'a {
+        transport.recv_from_split(&mut self.head, &mut self.spill)
+    }
+
+    // The `len`-byte datagram just received, as a packet. Its payload stays
+    // in the pooled buffer; a datagram longer than that buffer is joined
+    // into bytes of its own, once, and its payload then cut out of it, so a
+    // long header holds no memory while the packet waits.
+    fn message(&mut self, len: usize, received: Instant) -> Option<UtpMessage> {
+        if len > self.head.len() {
+            let mut joined = Vec::with_capacity(len);
+            joined.extend_from_slice(&self.head);
+            joined.extend_from_slice(&self.spill[..len - self.head.len()]);
+            let (header, at) = UtpMessage::parse(&joined)?;
+            let mut data = crate::Payload::from(joined);
+            data.advance(at);
+            data.settle();
+            return Some(UtpMessage {
+                header,
+                data,
+                received,
+            });
+        }
+        let (header, at) = UtpMessage::parse(&self.head[..len])?;
+        let data = if at == len {
+            crate::Payload::empty()
+        } else {
+            let head = std::mem::replace(&mut self.head, crate::rx_buf::take());
+            crate::Payload::in_buffer(head, at, len)
+        };
+        Some(UtpMessage {
+            header,
+            data,
+            received,
+        })
+    }
+}
+
 pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
     env: E,
     socket: Arc<SocketState<T, E>>,
@@ -515,9 +646,15 @@ pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
     next_connection_id: SeqNr,
     tombstones: Tombstones,
     reset_budget: ResetBudget,
-    // The stream holding packets of the current read that were neither
-    // marked nor woken yet.
-    unflushed: Option<StreamRecvKey>,
+    // The stream that took the last packet, with its queue: a run of
+    // packets for one stream finds it here without a lookup. Cleared as
+    // that stream leaves the map.
+    last_stream: Option<(StreamRecvKey, crate::ingress::Queue)>,
+    // The queues of the streams that took packets in the current read,
+    // each once: marked and woken when the read ends. Empty between reads.
+    unflushed: Vec<crate::ingress::Queue>,
+    // The last read stopped at the batch limit, not at an empty socket.
+    read_cut: bool,
     // The streams' datagrams taken from the outbox, sent from the front.
     outgoing: Outgoing,
 }
@@ -546,11 +683,123 @@ fn poll_outgoing<T: Transport, E: UtpEnvironment>(
         return Poll::Pending;
     };
     let start = outgoing.sent;
+    let run_most = transport.send_run_most();
+    let many_most = transport
+        .send_many_most()
+        .min(crate::outbox::SEND_MANY_MOST);
+    let mut parts = [(0, socket.local_addr); crate::outbox::SEND_MANY_MOST];
     'batches: loop {
         if outgoing.batch.is_drained() && !outbox.take(&mut outgoing.batch, cx.waker()) {
             break;
         }
-        while let Some((buf, queued)) = outgoing.batch.front() {
+        while !outgoing.batch.is_drained() {
+            // Datagrams for one address that lie together leave in one
+            // call where the transport has one, each stamped with the
+            // time of that call.
+            if run_most > 1
+                && let Some((bytes, segment, count, addr)) = outgoing.batch.front_run(run_most)
+            {
+                let now = env.now();
+                let stamp = ((now - socket.created).as_micros() as u32).to_be_bytes();
+                for datagram in bytes.chunks_mut(segment) {
+                    if let Some(timestamp) = datagram.get_mut(4..8) {
+                        timestamp.copy_from_slice(&stamp);
+                    }
+                }
+                let sent = socket.poll_send_gated(&mut outgoing.gate, cx, true, |cx| {
+                    transport.poll_send_run(cx, bytes, segment, addr)
+                });
+                match sent {
+                    Some(Poll::Ready(Ok(taken))) if taken > 0 => {
+                        let taken = taken.min(count);
+                        socket.stats.send_runs.increment(1);
+                        socket.stats.send_run_datagrams.increment(taken as u64);
+                        outgoing.batch.advance_run(taken, now);
+                        outgoing.sent += taken as u64;
+                        continue;
+                    }
+                    // The run failed as a whole: its first datagram goes
+                    // alone below, which names the failure for its stream.
+                    Some(Poll::Ready(_)) => {
+                        socket.stats.send_run_errors.increment(1);
+                    }
+                    Some(Poll::Pending) if !tokio::task::coop::has_budget_remaining() => {
+                        break 'batches;
+                    }
+                    None | Some(Poll::Pending) => {
+                        if sent.is_some() {
+                            socket.stats.send_poll_pending.increment(1);
+                        }
+                        outbox.stall();
+                        outbox.set_sent(outgoing.sent);
+                        return if outgoing.sent == start {
+                            Poll::Pending
+                        } else {
+                            Poll::Ready(())
+                        };
+                    }
+                }
+            }
+            // Datagrams for several addresses that lie together leave in
+            // one call too where the transport has one: the ACKs of the
+            // streams one read of the socket woke.
+            if many_most > 1
+                && let Some((bytes, count)) = outgoing
+                    .batch
+                    .front_many(&mut parts[..many_most], run_most > 1)
+            {
+                let now = env.now();
+                let stamp = ((now - socket.created).as_micros() as u32).to_be_bytes();
+                let mut at = 0;
+                for (len, _) in &parts[..count] {
+                    // Within the datagram: one too short for a header has
+                    // no timestamp.
+                    if *len >= 8 {
+                        bytes[at + 4..at + 8].copy_from_slice(&stamp);
+                    }
+                    at += len;
+                }
+                let sent = socket.poll_send_gated(&mut outgoing.gate, cx, true, |cx| {
+                    transport.poll_send_many(cx, bytes, &parts[..count])
+                });
+                match sent {
+                    Some(Poll::Ready(Ok(taken))) if taken > 0 => {
+                        let taken = taken.min(count);
+                        // A call that took one datagram sent nothing
+                        // together.
+                        if taken > 1 {
+                            socket.stats.send_batches.increment(1);
+                            socket.stats.send_batch_datagrams.increment(taken as u64);
+                        }
+                        outgoing.batch.advance_run(taken, now);
+                        outgoing.sent += taken as u64;
+                        continue;
+                    }
+                    // The first could not be sent: it goes alone below,
+                    // which names the failure for its stream.
+                    Some(Poll::Ready(_)) => {
+                        socket.stats.send_batch_errors.increment(1);
+                    }
+                    Some(Poll::Pending) if !tokio::task::coop::has_budget_remaining() => {
+                        break 'batches;
+                    }
+                    None | Some(Poll::Pending) => {
+                        if sent.is_some() {
+                            socket.stats.send_poll_pending.increment(1);
+                        }
+                        outbox.stall();
+                        outbox.set_sent(outgoing.sent);
+                        return if outgoing.sent == start {
+                            Poll::Pending
+                        } else {
+                            Poll::Ready(())
+                        };
+                    }
+                }
+            }
+            let Some((buf, queued)) = outgoing.batch.front() else {
+                break;
+            };
             let now = env.now();
             let stamp = (now - socket.created).as_micros() as u32;
             if let Some(timestamp) = buf.get_mut(4..8) {
@@ -696,6 +945,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     ) -> Option<RegisteredStream> {
         let (retired, mut guard) = self.socket.retirements.registration();
         guard.disarm();
+        self.forget_unflushed(&key);
         self.streams.insert(
             key,
             RegisteredStream {
@@ -763,6 +1013,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     async fn on_control(&mut self, control: ControlRequest) {
         match control {
             ControlRequest::Shutdown(key) => {
+                self.forget_unflushed(&key);
                 self.streams.remove(&key);
             }
             ControlRequest::ConnectRequest(remote, _token, requester) => {
@@ -796,8 +1047,11 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         }
     }
     pub(crate) async fn run_forever(mut self) -> crate::Result<()> {
-        // Normal UDP datagrams carry at most u16::MAX - 8 payload bytes.
-        let mut read_buf = [0u8; u16::MAX as usize];
+        let mut read_buf = RecvBufs::receiving(
+            self.transport
+                .as_deref()
+                .map_or(1, Transport::recv_many_most),
+        );
         let mut completions = 0;
         let mut receive_errors = 0;
 
@@ -847,7 +1101,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     // True when a read of the socket stopped at the batch limit.
     async fn run_once(
         &mut self,
-        read_buf: &mut [u8],
+        read_buf: &mut RecvBufs,
         receive_errors: &mut usize,
     ) -> crate::Result<bool> {
         let retirements = Arc::clone(&self.socket.retirements);
@@ -858,7 +1112,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         self.cleanup_accept_queue()?;
         self.send_outgoing().await?;
 
-        if self.unflushed.is_some() {
+        if self.read_cut {
             // A read cut at the batch limit goes on before anything waits,
             // but the socket's other work that is ready runs first, one
             // item a turn, so a socket that never empties holds back no
@@ -907,10 +1161,9 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 ),
                 None => Poll::Pending,
             }), if self.socket.outbox.is_some() => {},
-            recv = self.transport.as_deref().ok_or(Error::DispatcherDead)?.recv_from(read_buf) => {
-                let received = self.env.now();
-                self.on_datagram(recv, received, read_buf, receive_errors).await?;
-                return self.read_batch(read_buf, receive_errors, 1).await;
+            recv = read_buf.recv_next(self.transport.as_deref().ok_or(Error::DispatcherDead)?, RECEIVE_BATCH) => {
+                let read = self.on_received(recv, read_buf, receive_errors).await?;
+                return self.read_batch(read_buf, receive_errors, read).await;
             }
         }
 
@@ -920,52 +1173,107 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     // Reads the socket until it would block, as libtorrent does
     // (v2.0.15 session_impl.cpp:2616-2677), at most RECEIVE_BATCH
     // datagrams at a time so the socket's other work and its streams get a
-    // turn. Once the socket is empty the stream that took the last packets
-    // is marked and woken, which is when it sends the ACK it owes
-    // (session_impl.cpp:2727, utp_socket_manager.cpp:255-261). At the limit
-    // that stream is only woken; the read goes on after a yield.
+    // turn. When the read ends, at an empty socket or at the limit, every
+    // stream that took packets in it is marked and woken once, which is
+    // when it sends the ACK it owes (session_impl.cpp:2727,
+    // utp_socket_manager.cpp:255-261). libtorrent holds one deferred ACK
+    // and so sends it as soon as a packet for another stream comes
+    // (utp_socket_manager.cpp:163-172), from inside the read; here each
+    // stream's ACK waits for the end of the read, so streams whose packets
+    // arrive mixed send one ACK a read each, not one a packet.
+    //
+    // The mark is made at the limit too, where libtorrent goes on reading
+    // without one (session_impl.cpp:2618, :2673). A socket that packets
+    // reach as fast as they are read never comes up empty, and its streams
+    // would then owe their ACKs to the delayed-ACK timer alone: at 1,400
+    // bytes a packet a sender's window of 1 MiB is 15 reads of 50, so the
+    // sender would stall before the timer. The mark at the limit costs at
+    // most one ACK for 50 datagrams. After a read cut at the limit the read
+    // goes on after a yield.
     async fn read_batch(
         &mut self,
-        read_buf: &mut [u8],
+        read_buf: &mut RecvBufs,
         receive_errors: &mut usize,
         mut read: usize,
     ) -> crate::Result<bool> {
         while read < RECEIVE_BATCH {
             let recv = {
                 let transport = self.transport.as_deref().ok_or(Error::DispatcherDead)?;
-                let mut next = std::pin::pin!(transport.recv_from(read_buf));
+                let mut next = std::pin::pin!(read_buf.recv_next(transport, RECEIVE_BATCH - read));
                 poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx))).await
             };
             let Poll::Ready(recv) = recv else {
-                if self.unflushed.is_some() {
+                if !self.unflushed.is_empty() {
                     self.socket.stats.receive_drains.increment(1);
                 }
+                self.read_cut = false;
                 self.flush_unflushed();
                 return Ok(false);
             };
-            read += 1;
-            let received = self.env.now();
-            if let Err(error) = self
-                .on_datagram(recv, received, read_buf, receive_errors)
-                .await
-            {
-                // libtorrent drains on a fatal error too
-                // (session_impl.cpp:2719).
-                self.flush_unflushed();
-                return Err(error);
+            match self.on_received(recv, read_buf, receive_errors).await {
+                Ok(count) => read += count,
+                Err(error) => {
+                    // libtorrent drains on a fatal error too
+                    // (session_impl.cpp:2719).
+                    self.read_cut = false;
+                    self.flush_unflushed();
+                    return Err(error);
+                }
             }
         }
-        if let Some(stream) = self.unflushed.and_then(|key| self.streams.get(&key)) {
-            stream.tx.wake();
-        }
+        self.read_cut = true;
+        self.socket.stats.receive_cuts.increment(1);
+        self.flush_unflushed();
         Ok(true)
+    }
+
+    // Handles what one receive call returned, in order, each datagram
+    // stamped with the time the call returned. How many datagrams the call
+    // counts as in a read: those it returned, or one for a call that
+    // failed.
+    async fn on_received(
+        &mut self,
+        recv: std::io::Result<Got>,
+        read_buf: &mut RecvBufs,
+        receive_errors: &mut usize,
+    ) -> crate::Result<usize> {
+        let received = self.env.now();
+        let count = match recv {
+            Ok(Got::Many(count)) => count,
+            Ok(Got::One(len, from)) => {
+                self.socket.stats.receive_calls.increment(1);
+                self.socket.stats.receive_call_datagrams.increment(1);
+                self.on_datagram(Ok((len, from)), received, read_buf, receive_errors)
+                    .await?;
+                return Ok(1);
+            }
+            Err(error) => {
+                self.on_datagram(Err(error), received, read_buf, receive_errors)
+                    .await?;
+                return Ok(1);
+            }
+        };
+        self.socket.stats.receive_calls.increment(1);
+        self.socket
+            .stats
+            .receive_call_datagrams
+            .increment(count as u64);
+        for index in 0..count {
+            let datagram = read_buf.swap(index);
+            let handled = self
+                .on_datagram(Ok(datagram), received, read_buf, receive_errors)
+                .await;
+            read_buf.swap(index);
+            handled?;
+        }
+        Ok(count.max(1))
     }
 
     async fn on_datagram(
         &mut self,
         recv: std::io::Result<(usize, SocketAddr)>,
         received: Instant,
-        read_buf: &[u8],
+        read_buf: &mut RecvBufs,
         receive_errors: &mut usize,
     ) -> crate::Result<()> {
         let (len, addr) = match recv {
@@ -983,12 +1291,13 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             }
             Err(error) => return Err(Error::Recv(error)),
         };
-        if len >= read_buf.len() {
+        if len >= read_buf.capacity() {
             self.socket.stats.invalid_packets.increment(1);
+            self.socket.stats.datagrams_too_long.increment(1);
             trace!(len, ?addr, "dropping datagram at receive buffer limit");
             return Ok(());
         }
-        let message = match UtpMessage::deserialize(&read_buf[..len], received) {
+        let message = match read_buf.message(len, received) {
             Some(msg) => msg,
             None => {
                 self.socket.stats.invalid_packets.increment(1);
@@ -999,10 +1308,27 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         self.on_recv(addr, message).await
     }
 
-    // Marks and wakes the stream holding packets of the current read.
+    // Marks and wakes each stream holding packets of the current read.
     fn flush_unflushed(&mut self) {
-        if let Some(stream) = self.unflushed.take().and_then(|key| self.streams.get(&key)) {
-            stream.tx.flush();
+        let streams = self.unflushed.len() as u64;
+        if streams > 0 {
+            self.socket.stats.streams_marked.increment(streams);
+        }
+        for queue in self.unflushed.drain(..) {
+            queue.flush();
+        }
+    }
+
+    // A stream leaving the map, or one put in its place, is no longer the
+    // one that took the last packet. A mark its queue is still owed is
+    // made at the end of the read, and does a closed queue no harm.
+    fn forget_unflushed(&mut self, key: &StreamRecvKey) {
+        if self
+            .last_stream
+            .as_ref()
+            .is_some_and(|(last, _)| last == key)
+        {
+            self.last_stream = None;
         }
     }
 
@@ -1054,20 +1380,31 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 .any(|syn| syn.remote == key.0 && (syn.header.connection_id + 1).0 == key.1)
     }
 
+    // Takes out the streams and connects whose owners let them go. Only a
+    // retirement makes one go: a connect's waiter is dropped only with its
+    // retirement guard (UtpSocket::connect), so a closed waiter is always
+    // also a retirement, and an idle turn walks nothing. The test-only
+    // `ControlRequest::ConnectRequest` disarms its guard at once: a connect
+    // admitted that way whose waiter is dropped goes only at the next
+    // retirement of anything else.
     fn reap_retired(&mut self) {
-        if self.socket.retirements.take_dirty() {
-            let tombstones = &mut self.tombstones;
-            self.streams.retain(|key, stream| {
-                let live = !stream.retired.is_retired();
-                if !live {
-                    tombstones.bury(*key, stream.send_id);
-                }
-                live
-            });
+        if !self.socket.retirements.take_dirty() {
+            return;
         }
+        let tombstones = &mut self.tombstones;
+        let last_stream = &mut self.last_stream;
+        self.streams.retain(|key, stream| {
+            let live = !stream.retired.is_retired();
+            if !live {
+                tombstones.bury(*key, stream.send_id);
+                if last_stream.as_ref().is_some_and(|(last, _)| last == key) {
+                    *last_stream = None;
+                }
+            }
+            live
+        });
         // A connect given up is remembered too: the remote may yet answer
         // the SYN, and its receive id is one above the one the SYN carried.
-        let tombstones = &mut self.tombstones;
         self.connecting.retain(|remote, pending| {
             pending.by_id.retain(|_, connect| {
                 let live = !connect.retired.is_retired() && !connect.requester.tx.is_closed();
@@ -1232,6 +1569,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         let args = StreamArgs::new_outgoing(&msg.header, start, msg.received)
             .with_parent_span(conn.requester.created_span.clone());
         let send_id = args.conn_id_send();
+        self.forget_unflushed(&recv_key);
         self.streams.insert(
             recv_key,
             RegisteredStream {
@@ -1246,6 +1584,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             trace!(?recv_key, "created stream and passed to connector");
         } else {
             debug!(?recv_key, "connecting receiver is dead. dropping");
+            self.forget_unflushed(&recv_key);
             self.streams.remove(&recv_key);
         }
 
@@ -1273,6 +1612,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         let send_id = args.conn_id_send();
         let starter = UtpStreamStarter::new_registered(&self.socket, syn.remote, rx, args, guard);
 
+        self.forget_unflushed(&recv_key);
         self.streams.insert(
             recv_key,
             RegisteredStream {
@@ -1288,6 +1628,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             }
             Err(starter) => {
                 starter.disarm();
+                self.forget_unflushed(&recv_key);
                 self.streams.remove(&recv_key);
                 MatchSynWithAccept::ReceiverDead(Box::new(syn))
             }
@@ -1354,27 +1695,40 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         let addr = canonical_socket_addr(addr);
         let key = (addr, message.header.connection_id.0);
 
-        // A packet for another stream than the last one's sends that
-        // stream's owed ACK first (libtorrent v2.0.15
-        // utp_socket_manager.cpp:158-173), so its packets are marked here.
-        if self.unflushed.is_some_and(|last| last != key) {
-            self.socket.stats.stream_switch_marks.increment(1);
-            self.flush_unflushed();
+        // A stream's first packet of a read lists its queue for the mark
+        // and the wake the end of the read owes it.
+        if let Some((last, queue)) = &self.last_stream
+            && *last == key
+        {
+            // The same stream as the packet before: no lookup.
+            #[cfg(test)]
+            assert!(
+                self.streams
+                    .get(&key)
+                    .is_some_and(|stream| queue.is_of(&stream.tx)),
+                "the held queue is not the stream's"
+            );
+            return match queue.push(message) {
+                Ok(true) => {
+                    self.unflushed.push(queue.share());
+                    Ok(())
+                }
+                Ok(false) => Ok(()),
+                Err(_) => self.on_dead_stream(key),
+            };
         }
         if let Some(stream) = self.streams.get(&key) {
-            if stream.tx.push(message).is_ok() {
-                self.unflushed = Some(key);
-            } else {
-                trace!(
-                    ?key,
-                    "stream dead, but wasn't cleaned up yet, this is probably a race"
-                );
-                self.unflushed = None;
-                if let Some(stream) = self.streams.remove(&key) {
-                    self.tombstones.bury(key, stream.send_id);
+            return match stream.tx.push(message) {
+                Ok(first) => {
+                    let queue = stream.tx.queue();
+                    if first {
+                        self.unflushed.push(queue.share());
+                    }
+                    self.last_stream = Some((key, queue));
+                    Ok(())
                 }
-            }
-            return Ok(());
+                Err(_) => self.on_dead_stream(key),
+            };
         }
 
         trace!(?key, "no matching live streams");
@@ -1392,6 +1746,20 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             Type::Data => {
                 self.reset_unknown_stream(addr, &message.header);
             }
+        }
+        Ok(())
+    }
+
+    // A stream whose queue refused a packet as closed: it ended without
+    // being taken out yet.
+    fn on_dead_stream(&mut self, key: StreamRecvKey) -> crate::Result<()> {
+        trace!(
+            ?key,
+            "stream dead, but wasn't cleaned up yet, this is probably a race"
+        );
+        self.forget_unflushed(&key);
+        if let Some(stream) = self.streams.remove(&key) {
+            self.tombstones.bury(key, stream.send_id);
         }
         Ok(())
     }
@@ -1667,8 +2035,15 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         let local_addr = transport.bind_addr();
         let link_mtu = transport.link_mtu();
         let sends_from_one_task = transport.sends_from_one_task();
+        // The transport's I/O is registered with the runtime its I/O task
+        // runs on: the first uTP thread, or the caller's when there is none.
+        {
+            let io = opts.shards.as_ref().and_then(crate::Shards::io);
+            let _entered = io.as_ref().map(tokio::runtime::Handle::enter);
+            transport.register_io().map_err(Error::Register)?;
+        }
         let transport = Arc::new(transport);
-        let runtime = Runtime::new(transport, &opts.cancellation_token);
+        let runtime = Runtime::new(transport, &opts.cancellation_token, opts.shards.clone());
 
         let (accept_tx, accept_rx) = mpsc::channel(ACCEPT_QUEUE_MAX_ACCEPTORS);
         let pending_connects = pending_connects(opts.connections_limit);
@@ -1712,7 +2087,9 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             control_sends: Vec::new(),
             tombstones: Tombstones::default(),
             reset_budget: ResetBudget::default(),
-            unflushed: None,
+            last_stream: None,
+            unflushed: Vec::new(),
+            read_cut: false,
             outgoing: Outgoing::default(),
             socket: state,
             transport: None,

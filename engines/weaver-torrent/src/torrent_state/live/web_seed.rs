@@ -42,6 +42,7 @@ use crate::{
     },
     peer_connection::{PeerConnectionHandler, WriterRequest},
     peer_protocol::{Handshake, Message, Piece, Request},
+    session_stats::web_seed::{WebSeedResult, WebSeedStats},
     stream_connect::ConnectionKind,
     torrent_state::TorrentMetadata,
     torrent_state::live::peers::holepunch::is_local,
@@ -694,6 +695,8 @@ pub(crate) struct WebSeedConnection<'a> {
     user_agent: &'a str,
     // Whether a host with an internationalized label may be asked.
     allow_idna: bool,
+    // The session's web seed counts.
+    counts: Arc<WebSeedStats>,
     // The clients built for this connection, by host, port and address, so
     // its requests to one address share their connections.
     pinned: Mutex<PinnedClients>,
@@ -718,8 +721,15 @@ impl<'a> WebSeedConnection<'a> {
             link,
             user_agent,
             allow_idna: false,
+            counts: Arc::default(),
             pinned: Mutex::default(),
         }
+    }
+
+    /// Counts the connection's requests in `counts`.
+    pub fn counting(mut self, counts: Arc<WebSeedStats>) -> Self {
+        self.counts = counts;
+        self
     }
 
     /// Lets the connection ask hosts with an internationalized label, on
@@ -930,6 +940,7 @@ impl<'a> WebSeedConnection<'a> {
                 match found {
                     Ok(found) => (name.to_owned(), found),
                     Err(e) => {
+                        self.counts.waits();
                         self.link.retry_after(Some(WEB_SEED_NAME_LOOKUP_RETRY));
                         return Err(e);
                     }
@@ -1011,8 +1022,12 @@ impl<'a> WebSeedConnection<'a> {
             if let Some((first, last)) = range {
                 request = request.header(header::RANGE, format!("bytes={first}-{last}"));
             }
-            let response = self.send(request).await?;
+            let response = self
+                .send(request)
+                .await
+                .inspect_err(|e| self.counts.requested(unanswered(e)))?;
             let status = response.status();
+            self.counts.requested(answered(status));
             if !status.is_redirection() {
                 return Ok((response, target));
             }
@@ -1055,6 +1070,7 @@ impl<'a> WebSeedConnection<'a> {
         if !is_ok_status(status) {
             // The server lacks the file, or cannot serve it now.
             self.link.file_missing(slice.file);
+            self.counts.waits();
             self.link.retry_after(retry_after(&response));
             return Err(anyhow!("{url}: {status}"));
         }
@@ -1126,6 +1142,7 @@ impl<'a> WebSeedConnection<'a> {
                 .ok()
                 .and_then(wait_seconds)
                 .unwrap_or(HTTPSEED_DEFAULT_RETRY);
+            self.counts.waits();
             self.link.retry_after(Some(wait));
             return Err(anyhow!("{url}: {status}"));
         }
@@ -1168,12 +1185,32 @@ impl<'a> WebSeedConnection<'a> {
                 return Err(anyhow!("{url}: the body is longer than the range"));
             }
             left -= chunk.len() as u64;
+            self.counts.received(chunk.len());
             blocks.push(&chunk).await?;
         }
         if left > 0 {
             return Err(anyhow!("{url}: the body ended {left} bytes short"));
         }
         Ok(())
+    }
+}
+
+// How a request that got a status is counted.
+fn answered(status: StatusCode) -> WebSeedResult {
+    match status.as_u16() {
+        200 | 206 => WebSeedResult::Ok,
+        300..=399 => WebSeedResult::Redirect,
+        503 => WebSeedResult::Unavailable,
+        _ => WebSeedResult::Rejected,
+    }
+}
+
+// How a request that got none is counted.
+fn unanswered(error: &anyhow::Error) -> WebSeedResult {
+    if error.is::<tokio::time::error::Elapsed>() {
+        WebSeedResult::Timeout
+    } else {
+        WebSeedResult::Failed
     }
 }
 
@@ -1719,13 +1756,21 @@ mod tests {
             ("b", 30000, false),
         ]);
         let (_seeds, link) = one_seed(server.url("/seed"), WebSeedKind::Url);
-        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA);
+        let counts = Arc::new(WebSeedStats::default());
+        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA)
+            .counting(counts.clone());
         let fake = Fake::default();
 
         let requests = blocks(&layout, 0..3);
         drive(&conn, &fake, &requests, requests.len())
             .await
             .unwrap();
+        // One request per file, and the bytes of both bodies.
+        let counted = counts.snapshot();
+        assert_eq!(counted.requests[WebSeedResult::Ok as usize], 2);
+        assert_eq!(counted.requests.iter().sum::<u64>(), 2);
+        assert_eq!(counted.bytes, 70000);
+        assert_eq!((counted.waits, counted.failed), (0, 0));
 
         assert_eq!(fake.bitfield.lock().clone(), Some(vec![0b1110_0000]));
         assert!(fake.unchoked.load(Ordering::SeqCst));
@@ -1769,11 +1814,16 @@ mod tests {
             ("b", 30000, false),
         ]);
         let (seeds, link) = one_seed(server.url("/seed/"), WebSeedKind::Url);
-        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA);
+        let counts = Arc::new(WebSeedStats::default());
+        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA)
+            .counting(counts.clone());
         let fake = Fake::default();
 
         let failed = drive(&conn, &fake, &blocks(&layout, 2..3), 1).await;
         assert!(failed.is_err(), "{failed:?}");
+        let counted = counts.snapshot();
+        assert_eq!(counted.requests[WebSeedResult::Unavailable as usize], 1);
+        assert_eq!((counted.waits, counted.bytes), (1, 0));
         link.failed();
         let now = Instant::now();
         assert_eq!(entry(&seeds, |e| e.lacks.files.clone()), HashSet::from([2]));

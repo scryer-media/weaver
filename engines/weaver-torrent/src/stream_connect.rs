@@ -221,14 +221,28 @@ gen_stats!(PerFamilyAtomic PerFamilySnapshot, [], [
 ]);
 // Outgoing handshakes: how many encrypted ones were tried, how many of
 // those ended in a fully encrypted or header-only stream, how many failed,
-// and how many plaintext ones were sent.
+// how many were dropped before they ended, and how many plaintext ones were
+// sent. Every attempt has one of the four ends.
 gen_stats!(EncryptionStatsAtomic EncryptionStatsSnapshot, [
     attempts u64,
     rc4 u64,
     header_only u64,
     failures u64,
+    cancelled u64,
     plaintext u64
 ], []);
+
+// An encrypted handshake under way: counted as cancelled if it is dropped
+// before it ends, as when its torrent is paused or removed.
+struct Unended<'a>(Option<&'a EncryptionStatsAtomic>);
+
+impl Drop for Unended<'_> {
+    fn drop(&mut self) {
+        if let Some(stats) = self.0.take() {
+            stats.cancelled(1);
+        }
+    }
+}
 gen_stats!(ConnectStatsAtomic ConnectStatsSnapshot, [], [
     tcp PerFamilyAtomic PerFamilySnapshot,
     utp PerFamilyAtomic PerFamilySnapshot,
@@ -305,6 +319,7 @@ impl StreamConnector {
     /// tries what `encrypt` says then. The returned halves carry the peer's
     /// reply, the meter counts every byte they move, the encryption handshake
     /// and ours included, and the [`Encryption`] says how the handshake went.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub async fn connect_and_send_handshake(
         &self,
@@ -323,11 +338,49 @@ impl StreamConnector {
         Meter,
         Encryption,
     )> {
+        self.connect_and_send_handshake_homed(
+            addr,
+            transports,
+            guard,
+            info_hash,
+            handshake,
+            encrypt,
+            connect_timeout,
+            rw_timeout,
+        )
+        .await
+        .map(|(connected, _home)| connected)
+    }
+
+    /// As [`Self::connect_and_send_handshake`], with the thread the
+    /// connection's transport runs on when it has one of its own: a uTP
+    /// stream's.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn connect_and_send_handshake_homed(
+        &self,
+        addr: SocketAddr,
+        transports: Transports,
+        guard: Guard<'_>,
+        info_hash: &Id20,
+        handshake: &[u8],
+        encrypt: impl FnOnce() -> bool,
+        connect_timeout: Duration,
+        rw_timeout: Duration,
+    ) -> Result<(
+        (
+            ConnectionKind,
+            BoxAsyncReadVectored,
+            mse::Outbound,
+            Meter,
+            Encryption,
+        ),
+        Option<tokio::runtime::Handle>,
+    )> {
         // The attempts still running when the time runs out end as timed
         // out: the flag is set before the dial, and with it its attempts, is
         // dropped.
         let expired = AtomicBool::new(false);
-        let (kind, r, w) = {
+        let (kind, r, w, home) = {
             let dial = self.dial(addr, transports, &expired);
             tokio::pin!(dial);
             match tokio::time::timeout(connect_timeout, &mut dial).await {
@@ -356,7 +409,7 @@ impl StreamConnector {
                     w.write_all(handshake).map_err(Error::WriteHandshake),
                 )
                 .await?;
-                return Ok((kind, r, w.into(), meter, Encryption::None));
+                return Ok(((kind, r, w.into(), meter, Encryption::None), home));
             }
         };
 
@@ -374,16 +427,18 @@ impl StreamConnector {
                 w.write_all(handshake).map_err(Error::WriteHandshake),
             )
             .await?;
-            return Ok((kind, r, w.into(), meter, Encryption::None));
+            return Ok(((kind, r, w.into(), meter, Encryption::None), home));
         }
 
         stats.attempts(1);
+        let mut unended = Unended(Some(stats));
         let offer = mse::outgoing_offer(policy);
         let established = with_timeout("encryption handshake", rw_timeout, async {
             Ok(mse::initiate(r, w, info_hash, offer, handshake).await?)
         })
-        .await
-        .inspect_err(|e| {
+        .await;
+        unended.0 = None;
+        let established = established.inspect_err(|e| {
             stats.failures(1);
             debug!(?addr, "encrypted handshake failed: {e:#}");
         })?;
@@ -394,11 +449,14 @@ impl StreamConnector {
             stats.header_only(1);
         }
         Ok((
-            kind,
-            established.reader,
-            established.writer,
-            meter,
-            encryption,
+            (
+                kind,
+                established.reader,
+                established.writer,
+                meter,
+                encryption,
+            ),
+            home,
         ))
     }
 
@@ -482,17 +540,25 @@ impl StreamConnector {
         addr: SocketAddr,
         transports: Transports,
     ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
-        self.dial(addr, transports, &AtomicBool::new(false)).await
+        self.dial(addr, transports, &AtomicBool::new(false))
+            .await
+            .map(|(kind, r, w, _home)| (kind, r, w))
     }
 
-    // Connect as `connect` does. An attempt dropped unfinished counts as
-    // timed out when `expired` is set by then, and as failed otherwise.
+    // Connect as `connect` does, with the thread a uTP stream runs on. An
+    // attempt dropped unfinished counts as timed out when `expired` is set
+    // by then, and as failed otherwise.
     async fn dial(
         &self,
         addr: SocketAddr,
         transports: Transports,
         expired: &AtomicBool,
-    ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
+    ) -> Result<(
+        ConnectionKind,
+        BoxAsyncReadVectored,
+        BoxAsyncWrite,
+        Option<tokio::runtime::Handle>,
+    )> {
         let addr = crate::network::canonical_socket_addr(addr);
         if addr.port() == 0 {
             return Err(Error::Anyhow(anyhow::anyhow!(
@@ -590,7 +656,7 @@ impl StreamConnector {
                 tcp_res = &mut tcp_connect, if tcp_err.is_none() => {
                     match tcp_res {
                         Ok(Some((r, w))) => {
-                            return Ok((ConnectionKind::Tcp, r, w));
+                            return Ok((ConnectionKind::Tcp, r, w, None));
                         },
                         Ok(None) => {
                             tcp_err = Some(None);
@@ -605,8 +671,9 @@ impl StreamConnector {
                 utp_res = &mut utp_connect, if utp_err.is_none() => {
                     match utp_res {
                         Ok(Some(stream)) => {
+                            let home = stream.home().cloned();
                             let (r, w) = stream.split();
-                            return Ok((ConnectionKind::Utp, Box::new(r), Box::new(w)));
+                            return Ok((ConnectionKind::Utp, Box::new(r), Box::new(w), home));
                         },
                         Ok(None) => {
                             utp_err = Some(None);
@@ -1090,6 +1157,38 @@ mod tests {
         assert_eq!(
             (stats.attempts, stats.failures, stats.plaintext),
             (1, 1, 0),
+            "{stats:?}"
+        );
+    }
+
+    // An encrypted handshake dropped while it waits for the peer's answer
+    // has an end of its own, so the ends sum to the attempts.
+    #[tokio::test(start_paused = true)]
+    async fn an_encrypted_handshake_dropped_before_it_ends_is_counted_cancelled() {
+        use tokio::io::AsyncReadExt;
+        let (connector, mut dialed) = dialing(EncryptionPolicy::Require).await;
+        // The peer reads the first byte of our key and answers nothing.
+        let began = async {
+            let (_, mut theirs) = dialed.recv().await.unwrap();
+            let mut first = [0u8; 1];
+            theirs.read_exact(&mut first).await.unwrap();
+            theirs
+        };
+        tokio::select! {
+            biased;
+            sent = send_handshake(&connector, || true) => panic!("it ended: {sent:?}"),
+            _theirs = began => {}
+        }
+        let stats = connector.stats().encryption.snapshot();
+        assert_eq!(
+            (
+                stats.attempts,
+                stats.cancelled,
+                stats.failures,
+                stats.rc4,
+                stats.header_only
+            ),
+            (1, 1, 0, 0, 0),
             "{stats:?}"
         );
     }

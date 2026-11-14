@@ -51,8 +51,30 @@ pub trait DatagramSocket: Send + Sync + 'static {
     /// The local address the socket is bound to.
     fn bind_addr(&self) -> SocketAddr;
 
+    /// Registers the socket's I/O with the runtime entered now. A socket
+    /// made for uTP waits for this, so its I/O runs on uTP's own runtime;
+    /// every other socket is registered when it is made, and needs nothing.
+    fn register_io(&self) -> io::Result<()> {
+        Ok(())
+    }
+
     fn recv_from<'a>(&'a self, buf: &'a mut [u8])
     -> BoxFuture<'a, io::Result<(usize, SocketAddr)>>;
+
+    /// Receives one datagram of at most `spill.len()` bytes: its first
+    /// `head.len()` bytes into `head`, the rest from the start of `spill`,
+    /// in one read with no buffer of its own. A datagram cut short reads as
+    /// `spill.len()` bytes. `None` when the socket cannot, as a tunnel's
+    /// cannot: [`Self::recv_from`] is used instead.
+    fn poll_recv_from_split(
+        &self,
+        cx: &mut Context<'_>,
+        head: &mut [u8],
+        spill: &mut [u8],
+    ) -> Option<Poll<io::Result<(usize, SocketAddr)>>> {
+        let _ = (cx, head, spill);
+        None
+    }
 
     fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddr)
     -> BoxFuture<'a, io::Result<usize>>;
@@ -94,6 +116,78 @@ pub trait DatagramSocket: Send + Sync + 'static {
         self.poll_send_to_vectored(cx, bufs, target)
     }
 
+    /// Whether uTP streams over the socket may run on a uTP thread other
+    /// than the one that reads and sends on it: a kernel socket, which
+    /// keeps nothing per stream. A tunnel's streams stay beside its I/O.
+    fn spreads_streams(&self) -> bool {
+        false
+    }
+
+    /// How many datagrams one [`DatagramSocket::poll_send_run`] may take: 1
+    /// for a socket that sends each datagram with a call of its own.
+    fn send_run_most(&self) -> usize {
+        1
+    }
+
+    /// Sends datagrams that lie end to end in `bytes`, all to `target`:
+    /// each is `segment` bytes long but the last, which may be shorter.
+    /// Ready with how many were sent, counted from the first. A socket with
+    /// no call for several datagrams sends the first alone.
+    fn poll_send_run(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        segment: usize,
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        let first = &bytes[..segment.min(bytes.len())];
+        self.poll_send_to(cx, first, target).map_ok(|_| 1)
+    }
+
+    /// How many datagrams, to any addresses, one
+    /// [`DatagramSocket::poll_send_many`] may take: 1 for a socket that
+    /// sends each datagram with a call of its own.
+    fn send_many_most(&self) -> usize {
+        1
+    }
+
+    /// Sends datagrams that lie end to end in `bytes`: `parts` gives each
+    /// one's length and address, in order. Ready with how many were sent,
+    /// counted from the first; it fails when the first cannot be sent. A
+    /// socket with no call for several datagrams sends the first alone.
+    fn poll_send_many(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        parts: &[(usize, SocketAddr)],
+    ) -> Poll<io::Result<usize>> {
+        let (len, target) = parts[0];
+        self.poll_send_to(cx, &bytes[..len], target).map_ok(|_| 1)
+    }
+
+    /// How many datagrams one [`DatagramSocket::poll_recv_many`] may
+    /// return: 1 for a socket that receives each datagram with a call of
+    /// its own, which is then never asked for several.
+    fn recv_many_most(&self) -> usize {
+        1
+    }
+
+    /// Receives the datagrams that wait, at most `into.len()` of them, in
+    /// the order they came, each into its own entry from the first on,
+    /// with `spill` shared among them as
+    /// [`weaver_utp::Transport::poll_recv_many`] has it. Ready with how
+    /// many: never none. A socket that does not receive several fails as
+    /// unsupported, and is then read one datagram a call.
+    fn poll_recv_many(
+        &self,
+        cx: &mut Context<'_>,
+        into: &mut [weaver_utp::Received],
+        spill: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let _ = (cx, into, spill);
+        Poll::Ready(Err(io::ErrorKind::Unsupported.into()))
+    }
+
     /// The largest IP packet the socket's route carries, where it knows
     /// it, such as a tunnel's MTU; uTP sends nothing larger.
     fn link_mtu(&self) -> Option<u16> {
@@ -102,6 +196,10 @@ pub trait DatagramSocket: Send + Sync + 'static {
 }
 
 impl DatagramSocket for tokio::net::UdpSocket {
+    fn spreads_streams(&self) -> bool {
+        true
+    }
+
     fn bind_addr(&self) -> SocketAddr {
         self.local_addr()
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)))

@@ -1281,19 +1281,49 @@ impl ManagedTorrent {
     /// now. One that fails ends seed mode and every piece is checked again
     /// (libtorrent `torrent::leave_seed_mode` with `check_files`). None
     /// while the torrent neither runs nor is paused, or for no piece of it.
-    /// Reads the piece from disk: called off the async runtime.
+    ///
+    /// Blocks its thread: it reads the piece from disk, and it waits for a
+    /// blocking permit and for another's check of the piece without
+    /// yielding. Call it off the async runtime, as from
+    /// [`tokio::task::spawn_blocking`], never on a runtime's worker or on a
+    /// uTP thread.
     pub fn check_seeded(&self, piece: u32) -> Option<anyhow::Result<bool>> {
+        crate::spawn_utils::no_block_on_utp_thread();
         let metadata = self.metadata.load();
         let piece = metadata.as_ref()?.lengths().validate_piece_index(piece)?;
-        if let Some(live) = self.live() {
-            return Some(live.check_seeded(piece));
-        }
-        let left = {
+        let seed = &self.shared.options.seed;
+        let left = loop {
+            if let Some(live) = self.live() {
+                match live.check_seeded(piece) {
+                    // The run was paused before the check began: the
+                    // torrent is looked at again, paused or running anew.
+                    // A run that ended and is still the torrent's, as at
+                    // the session's end, gives its error.
+                    Err(_)
+                        if live.ended()
+                            && !self.live().is_some_and(|now| Arc::ptr_eq(&now, &live)) =>
+                    {
+                        continue;
+                    }
+                    checked => return Some(checked),
+                }
+            }
+            if !matches!(self.locked.read().state, ManagedTorrentState::Paused(_)) {
+                return None;
+            }
+            if !seed.unchecked(piece) {
+                return Some(Ok(true));
+            }
+            // One of the session's blocking permits for the read, as a
+            // running torrent's check of the piece holds. It is waited
+            // for before the torrent's state is held, so nothing that
+            // would change or read that state waits with it; the state is
+            // looked at again once the permit is had.
+            let _permit = seed_mode::blocking_permit(&self.shared.spawner);
             let g = self.locked.read();
             let ManagedTorrentState::Paused(paused) = &g.state else {
-                return None;
+                continue;
             };
-            let seed = &self.shared.options.seed;
             if !seed.unchecked(piece) {
                 return Some(Ok(true));
             }
@@ -1302,12 +1332,17 @@ impl ManagedTorrent {
                 &*paused.files,
                 self.shared.options.disable_v1_hashes,
             );
-            if matches!(ops.check_piece(piece), Ok(crate::file_ops::Verdict::Passed)) {
+            let verdict = seed_mode::counted_read(
+                &self.shared.spawner,
+                u64::from(paused.metadata.lengths().piece_length(piece)),
+                || ops.check_piece_whole(piece),
+            );
+            if matches!(verdict, Ok(crate::file_ops::Verdict::Passed)) {
                 let checked = paused.files.on_piece_checked(piece);
                 seed.checked(piece);
                 return Some(checked.map(|()| true));
             }
-            seed.leave()
+            break seed.leave();
         };
         if left {
             warn!(

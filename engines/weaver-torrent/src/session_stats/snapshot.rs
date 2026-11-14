@@ -26,6 +26,18 @@ pub struct SessionStatsSnapshot {
     pub connections: ConnectStatsSnapshot,
     #[serde(with = "SerializedUtpStatsSnapshot")]
     pub utp: UtpStatsSnapshot,
+    pub swarm: super::swarm::SwarmSnapshot,
+    pub trackers: super::tracker::TrackerSnapshot,
+    pub incoming: super::incoming::IncomingSnapshot,
+    pub web_seeds: super::web_seed::WebSeedSnapshot,
+    pub network: super::network::NetworkSnapshot,
+    /// `None` while the session runs no local service discovery.
+    pub lsd: Option<super::network::LsdSnapshot>,
+    pub limiter: super::network::LimiterSnapshot,
+    /// Upload slots held by unchoked peers now.
+    pub unchoke_slots_held: usize,
+    /// The session's disk calls, blocking permits and peer sockets.
+    pub disk: super::disk::DiskStatsSnapshot,
 }
 
 impl From<(&SessionStats, ConnectStatsSnapshot)> for SessionStatsSnapshot {
@@ -38,6 +50,15 @@ impl From<(&SessionStats, ConnectStatsSnapshot)> for SessionStatsSnapshot {
             uptime_seconds: s.startup_time.elapsed().as_secs(),
             connections: c,
             utp: Default::default(),
+            swarm: s.swarm.snapshot(),
+            trackers: s.trackers.snapshot(),
+            incoming: s.incoming.snapshot(),
+            web_seeds: s.web_seeds.snapshot(),
+            network: s.network.snapshot(),
+            lsd: None,
+            limiter: Default::default(),
+            unchoke_slots_held: 0,
+            disk: Default::default(),
         }
     }
 }
@@ -67,6 +88,22 @@ struct SerializedUtpStatsSnapshot {
     out_of_order_packets: u64,
     streams_given_up: u64,
     receive_drains: u64,
-    stream_switch_marks: u64,
+    streams_marked: u64,
     drain_marks_with_packets_queued: u64,
+    acks_with_sack: u64,
+    sack_bytes_sent: u64,
+    sacks_received: u64,
+    sack_bits_received: u64,
+    data_packets_with_sack: u64,
+    duplicate_acks_sent: u64,
+    receive_cuts: u64,
+    send_runs: u64,
+    send_run_datagrams: u64,
+    send_run_errors: u64,
+    receive_calls: u64,
+    receive_call_datagrams: u64,
+    send_batches: u64,
+    send_batch_datagrams: u64,
+    datagrams_too_long: u64,
+    send_batch_errors: u64,
 }

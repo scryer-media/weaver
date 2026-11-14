@@ -244,7 +244,9 @@ async fn a_magnet_or_an_infohash_goes_to_the_torrent_client() {
     let hash = "0123456789abcdef0123456789abcdef01234567";
     // The client takes a magnet whatever its route's state: on the offline
     // route the torrent is held, not refused.
-    let response = rig.submit_text(&format!("magnet:?xt=urn:btih:{hash}")).await;
+    let response = rig
+        .submit_text(&format!("magnet:?xt=urn:btih:{hash}"))
+        .await;
     assert_no_errors(&response);
     let data = response_data(&response)["submit"].clone();
     assert_eq!(data["accepted"], true);

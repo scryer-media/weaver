@@ -170,6 +170,12 @@ impl Choker {
         self.slots.load(Ordering::Relaxed)
     }
 
+    /// The upload slots unchoked peers hold now, those of a run that ended
+    /// since the last round included.
+    pub fn held(&self) -> usize {
+        self.held.lock().unchoked.len()
+    }
+
     /// Hand out `slots` upload slots from the next round on, which begins
     /// now (libtorrent `session_impl::update_unchoke_limit`).
     pub fn set_slots(&self, slots: usize) {

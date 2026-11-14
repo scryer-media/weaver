@@ -23,8 +23,89 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
 use tokio::time::Instant;
+use weaver_torrent::session_stats::disk::FileEnds;
 
 use super::layout::PieceLayout;
+
+// What every torrent's file calls and the handle pool did since the process
+// started: one relaxed add per call, read by a scrape without a lock. The
+// handles are shared by every route, so these are not counted by route.
+#[derive(Debug, Default)]
+pub(crate) struct FileStats {
+    // Files opened because no handle was open under their key, and handles
+    // closed to make room for one or for going unused.
+    opens: AtomicU64,
+    closed_for_room: AtomicU64,
+    closed_idle: AtomicU64,
+    // Positional calls. Their bytes and their time are counted once, by the
+    // session whose disk call they serve.
+    writes: AtomicU64,
+    reads: AtomicU64,
+    // Calls that did not start where the last one of the same file ended.
+    write_seeks: AtomicU64,
+    read_seeks: AtomicU64,
+}
+
+/// One direction of the file calls.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FileCallsSnapshot {
+    pub calls: u64,
+    /// Calls that did not start where the last one of the same file ended.
+    pub seeks: u64,
+}
+
+/// The file calls of every torrent, and the handle pool, since the process
+/// started.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FileStatsSnapshot {
+    pub opens: u64,
+    pub closed_for_room: u64,
+    pub closed_idle: u64,
+    pub writes: FileCallsSnapshot,
+    pub reads: FileCallsSnapshot,
+}
+
+pub(crate) static STATS: FileStats = FileStats::new();
+
+impl FileStats {
+    const fn new() -> Self {
+        Self {
+            opens: AtomicU64::new(0),
+            closed_for_room: AtomicU64::new(0),
+            closed_idle: AtomicU64::new(0),
+            writes: AtomicU64::new(0),
+            reads: AtomicU64::new(0),
+            write_seeks: AtomicU64::new(0),
+            read_seeks: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> FileStatsSnapshot {
+        FileStatsSnapshot {
+            opens: self.opens.load(Ordering::Relaxed),
+            closed_for_room: self.closed_for_room.load(Ordering::Relaxed),
+            closed_idle: self.closed_idle.load(Ordering::Relaxed),
+            writes: FileCallsSnapshot {
+                calls: self.writes.load(Ordering::Relaxed),
+                seeks: self.write_seeks.load(Ordering::Relaxed),
+            },
+            reads: FileCallsSnapshot {
+                calls: self.reads.load(Ordering::Relaxed),
+                seeks: self.read_seeks.load(Ordering::Relaxed),
+            },
+        }
+    }
+}
+
+// A call of `len` bytes at `offset` of a file whose last call of the kind
+// ended at `last_end`: counted in `calls`, and in `seeks` when it does not
+// start there.
+fn counted(last_end: &AtomicU64, offset: u64, len: usize, calls: &AtomicU64, seeks: &AtomicU64) {
+    calls.fetch_add(1, Ordering::Relaxed);
+    if last_end.swap(offset + len as u64, Ordering::Relaxed) != offset {
+        seeks.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 // qBittorrent's `FilePoolSize` default; libtorrent's own `file_pool_size`
 // is 40.
@@ -107,6 +188,7 @@ impl HandlePool {
         }
         // Opened outside the lock: another open never waits on it.
         let file = Arc::new(open()?);
+        STATS.opens.fetch_add(1, Ordering::Relaxed);
         let mut handles = self.handles();
         if let Some(file) = handles.used(key, now) {
             return Ok(file);
@@ -115,6 +197,7 @@ impl HandlePool {
             && let Some(oldest) = (0..handles.open.len()).min_by_key(|&at| handles.open[at].turn)
         {
             handles.open.swap_remove(oldest);
+            STATS.closed_for_room.fetch_add(1, Ordering::Relaxed);
         }
         handles.turns += 1;
         let turn = handles.turns;
@@ -152,9 +235,16 @@ impl HandlePool {
             let next = {
                 let mut handles = self.handles();
                 let now = Instant::now();
+                let before = handles.open.len();
                 handles
                     .open
                     .retain(|handle| now.duration_since(handle.used) < IDLE);
+                let closed = before - handles.open.len();
+                if closed > 0 {
+                    STATS
+                        .closed_idle
+                        .fetch_add(closed as u64, Ordering::Relaxed);
+                }
                 let Some(oldest) = handles.open.iter().map(|handle| handle.used).min() else {
                     handles.sweeping = false;
                     return;
@@ -238,6 +328,8 @@ pub(crate) struct Files {
     names: Vec<Option<PathBuf>>,
     at: RwLock<At>,
     pool: &'static HandlePool,
+    // Where each file's last read and last write ended.
+    ends: Vec<FileEnds>,
 }
 
 // A metainfo name as a path under the directory, or why it cannot be one:
@@ -281,6 +373,7 @@ impl Files {
             .collect::<io::Result<Vec<_>>>()?;
         let at = At::new(dir, names.len());
         Ok(Self {
+            ends: names.iter().map(|_| FileEnds::default()).collect(),
             names,
             at: RwLock::new(at),
             pool,
@@ -327,6 +420,15 @@ impl Files {
         let at = self.at();
         let path = at.dir.join(name);
         let handle = self.pool.open(at.writes[file], || open_for_write(&path))?;
+        // The write and its counters, in one place: a write handed to
+        // another writer takes its counters with it.
+        counted(
+            &self.ends[file].write,
+            offset,
+            bytes.len(),
+            &STATS.writes,
+            &STATS.write_seeks,
+        );
         write_all_at(&handle, offset, bytes)
     }
 
@@ -337,7 +439,28 @@ impl Files {
         let at = self.at();
         let path = at.dir.join(name);
         let handle = self.pool.open(at.reads[file], || File::open(&path))?;
+        counted(
+            &self.ends[file].read,
+            offset,
+            out.len(),
+            &STATS.reads,
+            &STATS.read_seeks,
+        );
         read_exact_at(&handle, offset, out)
+    }
+
+    // The file's `len` bytes from `offset` are about to be read in order:
+    // the system is told, and reads them ahead. A file not there is left
+    // to the read that follows.
+    pub(crate) fn will_read(&self, file: usize, offset: u64, len: u64) {
+        let Ok(name) = self.name(file) else {
+            return;
+        };
+        let at = self.at();
+        let path = at.dir.join(name);
+        if let Ok(handle) = self.pool.open(at.reads[file], || File::open(&path)) {
+            advise_will_need(&handle, offset, len);
+        }
     }
 
     // `outs` filled one after the other from the file's bytes at `offset`,
@@ -347,6 +470,14 @@ impl Files {
         let at = self.at();
         let path = at.dir.join(name);
         let handle = self.pool.open(at.reads[file], || File::open(&path))?;
+        let len = outs.iter().map(|out| out.len()).sum();
+        counted(
+            &self.ends[file].read,
+            offset,
+            len,
+            &STATS.reads,
+            &STATS.read_seeks,
+        );
         weaver_torrent::storage::filesystem::pread_exact_vectored(&handle, offset, outs)
     }
 
@@ -451,6 +582,35 @@ thread_local! {
     pub(crate) static LOOKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+// The system is told the file's `len` bytes from `offset` are about to be
+// read, and starts reading them. Advice only: a refusal changes nothing.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn advise_will_need(file: &File, offset: u64, len: u64) {
+    use std::os::fd::AsRawFd;
+
+    // The system reads ahead no more per call than the device's largest
+    // request, 128 KiB on many, so the range is told in steps of that.
+    const STEP: u64 = 128 << 10;
+    let mut at = offset;
+    let end = offset.saturating_add(len);
+    while at < end {
+        let (Ok(from), Ok(step)) = (
+            libc::off_t::try_from(at),
+            libc::off_t::try_from(STEP.min(end - at)),
+        ) else {
+            return;
+        };
+        // SAFETY: the descriptor is open for as long as `file` is
+        // borrowed, and the call only advises the system about its cache.
+        let _ =
+            unsafe { libc::posix_fadvise(file.as_raw_fd(), from, step, libc::POSIX_FADV_WILLNEED) };
+        at += STEP;
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn advise_will_need(_file: &File, _offset: u64, _len: u64) {}
+
 fn open_for_write(path: &Path) -> io::Result<File> {
     let open = || {
         OpenOptions::new()
@@ -519,6 +679,38 @@ mod tests {
             std::fs::metadata(dir.path().join("c.bin")).unwrap().len(),
             4
         );
+    }
+
+    // Told what is read next, a file is not made, changed or grown: one
+    // not there is still not there, one there reads back the same, past
+    // its end included, and padding is no file to tell of.
+    #[test]
+    fn telling_what_is_read_next_changes_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = Files::in_pool(
+            &layout(&[("a.bin", 8), (".pad/4", 4), ("c.bin", 4)]),
+            dir.path().into(),
+            pool(),
+        )
+        .unwrap();
+        files.write(0, 0, b"abcdwxyz").unwrap();
+        files.will_read(0, 0, 8);
+        files.will_read(0, 4, 1 << 30);
+        files.will_read(1, 0, 4);
+        files.will_read(2, 0, 4);
+        files.will_read(9, 0, 4);
+        let mut out = [0; 8];
+        files.read(0, 0, &mut out).unwrap();
+        assert_eq!(&out, b"abcdwxyz");
+        assert_eq!(
+            std::fs::metadata(dir.path().join("a.bin")).unwrap().len(),
+            8
+        );
+        assert_eq!(
+            files.read(2, 0, &mut out[..4]).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!dir.path().join("c.bin").exists());
     }
 
     // A name that would climb out of the directory, or root itself, is no

@@ -48,12 +48,14 @@ impl UtpMessage {
     pub fn new_test(header: UtpHeader, payload: &[u8]) -> Self {
         UtpMessage {
             header,
-            data: payload.to_owned(),
+            data: Payload::from(payload.to_vec()),
             received: Instant::now(),
         }
     }
 
-    pub fn deserialize(buf: &[u8], received: Instant) -> Option<Self> {
+    /// The header of the uTP packet `buf`, and where its payload starts;
+    /// None when it is not a valid one.
+    pub(crate) fn parse(buf: &[u8]) -> Option<(UtpHeader, usize)> {
         let (header, hsize) = UtpHeader::deserialize(buf)?;
 
         let payload_size = buf.len() - hsize;
@@ -72,10 +74,21 @@ impl UtpMessage {
                 }
             }
         }
+        Some((header, hsize))
+    }
 
+    /// The packet `buf`, its payload copied out.
+    #[cfg(test)]
+    pub fn deserialize(buf: &[u8], received: Instant) -> Option<Self> {
+        let (header, at) = Self::parse(buf)?;
+        let data = if at == buf.len() {
+            Payload::empty()
+        } else {
+            Payload::from(buf[at..].to_vec())
+        };
         Some(Self {
             header,
-            data: buf[hsize..].to_owned(),
+            data,
             received,
         })
     }

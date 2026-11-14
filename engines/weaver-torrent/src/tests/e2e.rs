@@ -314,6 +314,32 @@ async fn _test_e2e_download(mode: ListenerMode, drop_checks: &DropChecks) {
         }
 
         info!("handle is completed");
+        // Over uTP, the connections ran on the uTP threads, both ways: the
+        // seeds' incoming ones and this session's outgoing ones. A disk call
+        // on a uTP thread would have panicked (`no_block_on_utp_thread`).
+        if matches!(mode, ListenerMode::UtpOnly) {
+            for (way, count) in ["incoming", "outgoing"]
+                .iter()
+                .zip(&crate::peer_connection::ON_UTP_THREADS)
+            {
+                assert!(
+                    count.load(std::sync::atomic::Ordering::Relaxed) > 0,
+                    "no {way} connection ran on a uTP thread"
+                );
+            }
+            // A kernel socket's streams, and so their connections, run past
+            // the first uTP thread, which is left to the sockets. A host
+            // with one core gives a session one uTP thread, and everything
+            // runs on it.
+            if weaver_utp::Shards::new("count", crate::session::UTP_THREADS).threads() > 1 {
+                assert_eq!(
+                    crate::peer_connection::ON_UTP_IO_THREAD
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    0,
+                    "a connection ran on the thread that reads and sends"
+                );
+            }
+        }
         tokio::time::timeout(Duration::from_secs(5), session.delete(id.into(), false))
             .await
             .context("timeout deleting torrent")

@@ -154,7 +154,10 @@ async fn one_poll_stops_draining_ingress_even_when_sending_requests_a_restart() 
 }
 
 #[tokio::test]
-async fn a_partly_read_packet_is_the_only_extra_payload_outside_receive_capacity() {
+// The unread rest of a partly read packet still counts against the receive
+// capacity, as libtorrent counts bytes until they are read (utp_stream.cpp
+// v2.0.15:677): nothing is held past the capacity.
+async fn a_partly_read_packet_counts_its_unread_bytes_against_receive_capacity() {
     let mut t = make_test_vsock(
         SocketOpts {
             link_mtu: Some(calc_mtu_for_mss(4)),
@@ -170,19 +173,23 @@ async fn a_partly_read_packet_is_the_only_extra_payload_outside_receive_capacity
     stream.read_exact(&mut first).await.unwrap();
     assert_eq!(&first, b"a");
 
-    for (sequence, payload) in [(2, "bbbb"), (3, "cccc"), (4, "dddd")] {
+    for (sequence, payload) in [(2, "bbbb"), (3, "cccc")] {
         t.send_data(sequence, 100, payload);
         t.poll_once_assert_pending().await;
     }
-    assert_eq!(t.vsock.user_rx.len_test(), 8);
+    // Three unread bytes of the first and the four of the second: the
+    // third does not fit.
+    assert_eq!(t.vsock.user_rx.len_test(), 7);
     assert_eq!(t.vsock.user_rx.assembler_packets(), 0);
-    assert_eq!(t.vsock.last_consumed_remote_seq_nr, 3.into());
-    let mut rest = [0u8; 11];
+    assert_eq!(t.vsock.last_consumed_remote_seq_nr, 2.into());
+    let mut rest = [0u8; 7];
     stream.read_exact(&mut rest).await.unwrap();
-    assert_eq!(&rest, b"aaabbbbcccc");
-    t.send_data(4, 100, "dddd");
-    t.poll_once_assert_pending().await;
-    assert_eq!(stream.read_all_available().await.unwrap(), b"dddd");
+    assert_eq!(&rest, b"aaabbbb");
+    for (sequence, payload) in [(3, "cccc"), (4, "dddd")] {
+        t.send_data(sequence, 100, payload);
+        t.poll_once_assert_pending().await;
+    }
+    assert_eq!(stream.read_all_available().await.unwrap(), b"ccccdddd");
 }
 
 #[tokio::test(start_paused = true)]

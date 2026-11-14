@@ -22,7 +22,11 @@ async fn a_mapped_peer_transfers_both_ways_through_a_same_port_datagram_pair() -
     )?;
     assert_eq!(v6.bind_addr().port(), v4.bind_addr().port());
     let local = SocketAddr::from((Ipv4Addr::LOCALHOST, v4.bind_addr().port()));
-    let paired = Arc::new(PairedUdp { v6, v4 });
+    let paired = Arc::new(PairedUdp {
+        v6,
+        v4,
+        v4_first: Default::default(),
+    });
     let peer_transport = crate::test_support::udp((Ipv4Addr::LOCALHOST, 0)).await;
     let peer_address = peer_transport.bind_addr();
     let mapped_peer = SocketAddr::from((Ipv4Addr::LOCALHOST.to_ipv6_mapped(), peer_address.port()));

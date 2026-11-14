@@ -12,6 +12,20 @@ use std::{io, net::SocketAddr};
 
 use tracing::{debug, warn};
 
+/// A datagram socket the options are read and set on: one registered with
+/// a runtime or one not yet.
+#[cfg(unix)]
+pub(crate) trait AsSocket: std::os::fd::AsFd + std::os::fd::AsRawFd {}
+#[cfg(unix)]
+impl<T: std::os::fd::AsFd + std::os::fd::AsRawFd> AsSocket for T {}
+#[cfg(windows)]
+pub(crate) trait AsSocket:
+    std::os::windows::io::AsSocket + std::os::windows::io::AsRawSocket
+{
+}
+#[cfg(windows)]
+impl<T: std::os::windows::io::AsSocket + std::os::windows::io::AsRawSocket> AsSocket for T {}
+
 /// The receive window each uTP stream is given.
 pub(crate) const STREAM_WINDOW: usize = 1024 * 1024;
 
@@ -27,11 +41,7 @@ pub(crate) fn receive_buffer_for(connections_limit: usize) -> usize {
 /// Set `socket`, asked for at `requested`, for uTP, with a receive buffer of
 /// `receive_buffer` bytes. Neither setting is needed for the socket to work:
 /// one the host refuses is logged, and the socket is used as it is.
-pub(crate) fn set_for_utp(
-    socket: &tokio::net::UdpSocket,
-    requested: SocketAddr,
-    receive_buffer: usize,
-) {
+pub(crate) fn set_for_utp(socket: &impl AsSocket, requested: SocketAddr, receive_buffer: usize) {
     if requested.is_ipv4() {
         if let Err(error) = set_dont_fragment(socket, Family::V4) {
             warn!(%requested, %error, "the socket's IPv4 datagrams may be fragmented");
@@ -103,27 +113,24 @@ pub(crate) enum Family {
 }
 
 // Whether `socket`, an IPv6 one, takes IPv4 peers too.
-fn takes_ipv4(socket: &tokio::net::UdpSocket) -> bool {
+pub(crate) fn takes_ipv4(socket: &impl AsSocket) -> bool {
     socket2::SockRef::from(socket)
         .only_v6()
         .is_ok_and(|only_v6| !only_v6)
 }
 
 /// Forbid fragmenting `socket`'s datagrams of `family`.
-pub(crate) fn set_dont_fragment(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+pub(crate) fn set_dont_fragment(socket: &impl AsSocket, family: Family) -> io::Result<()> {
     sys::set(socket, family)
 }
 
 /// Whether `socket`'s datagrams of `family` are never fragmented.
-pub(crate) fn dont_fragment(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<bool> {
+pub(crate) fn dont_fragment(socket: &impl AsSocket, family: Family) -> io::Result<bool> {
     sys::get(socket, family)
 }
 
 /// Allow fragmenting `socket`'s datagrams of `family`.
-pub(crate) fn clear_dont_fragment(
-    socket: &tokio::net::UdpSocket,
-    family: Family,
-) -> io::Result<()> {
+pub(crate) fn clear_dont_fragment(socket: &impl AsSocket, family: Family) -> io::Result<()> {
     sys::clear(socket, family)
 }
 
@@ -135,7 +142,7 @@ pub(crate) fn clear_dont_fragment(
 /// that test the path's size, so no probe goes out while it is allowed.
 /// Where the option cannot be switched off the datagram goes as any other.
 pub(crate) fn send_fragmenting(
-    socket: &tokio::net::UdpSocket,
+    socket: &impl AsSocket,
     family: Family,
     send: impl FnOnce() -> io::Result<usize>,
 ) -> io::Result<usize> {
@@ -153,10 +160,333 @@ pub(crate) fn send_fragmenting(
     sent
 }
 
+/// The most datagrams one [`send_run`] carries, and the most bytes: Linux
+/// takes 64 segments in a call (UDP_MAX_SEGMENTS, include/linux/udp.h) and
+/// their sum must fit one UDP datagram's length.
+pub(crate) const SEND_RUN_DATAGRAMS: usize = 64;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) const SEND_RUN_BYTES: usize = 65_000;
+
+/// Whether one system call can send several datagrams on `socket`: Linux
+/// with UDP segmentation (4.18 and later). No other host has a public call
+/// for it.
+pub(crate) fn sends_runs(socket: &impl AsSocket) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        runs::supported(socket.as_raw_fd())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = socket;
+        false
+    }
+}
+
+/// Sends `bytes` to `target` in one system call as datagrams of `segment`
+/// bytes each, the last one shorter when `bytes` does not divide. The
+/// kernel takes all of them or none.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn send_run(
+    socket: &impl AsSocket,
+    bytes: &[u8],
+    segment: u16,
+    target: &socket2::SockAddr,
+) -> io::Result<usize> {
+    runs::send(socket.as_raw_fd(), bytes, segment, target)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod runs {
+    use std::{io, mem, os::fd::RawFd};
+
+    use nix::libc;
+
+    pub(super) fn supported(fd: RawFd) -> bool {
+        super::unix::get_int(fd, libc::SOL_UDP, libc::UDP_SEGMENT).is_ok()
+    }
+
+    pub(super) fn send(
+        fd: RawFd,
+        bytes: &[u8],
+        segment: u16,
+        target: &socket2::SockAddr,
+    ) -> io::Result<usize> {
+        // Room for one control message that holds the segment size, kept
+        // at the alignment a control message header needs.
+        let mut control = [0u64; 4];
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: bytes.len(),
+        };
+        // SAFETY: a message header is plain data for which all zeroes is a
+        // valid value.
+        let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+        msg.msg_name = target.as_ptr().cast_mut().cast();
+        msg.msg_namelen = target.len();
+        msg.msg_iov = &raw mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        // SAFETY: CMSG_SPACE and CMSG_LEN only compute sizes.
+        let (space, len) = unsafe {
+            (
+                libc::CMSG_SPACE(mem::size_of::<u16>() as u32),
+                libc::CMSG_LEN(mem::size_of::<u16>() as u32),
+            )
+        };
+        debug_assert!(space as usize <= mem::size_of_val(&control));
+        msg.msg_controllen = space as _;
+        // SAFETY: `msg` names `control`, which is aligned for a control
+        // message header and has room for the one message of `space`
+        // bytes, so the first header and its data lie inside it. `bytes`,
+        // `target` and `control` outlive the call, which only reads them,
+        // and `fd` is an open socket for the call.
+        let sent = unsafe {
+            let header = libc::CMSG_FIRSTHDR(&raw const msg);
+            (*header).cmsg_level = libc::SOL_UDP;
+            (*header).cmsg_type = libc::UDP_SEGMENT;
+            (*header).cmsg_len = len as _;
+            libc::CMSG_DATA(header)
+                .cast::<u16>()
+                .write_unaligned(segment);
+            libc::sendmsg(fd, &raw const msg, 0)
+        };
+        if sent < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(sent as usize)
+        }
+    }
+}
+
+/// The most datagrams one [`recv_many`] returns and one [`send_many`]
+/// carries.
+pub(crate) const RECV_MANY_DATAGRAMS: usize = 64;
+pub(crate) const SEND_MANY_DATAGRAMS: usize = 32;
+
+/// Whether one system call receives several datagrams, and sends several
+/// to several addresses, on this host: Linux (recvmmsg and sendmmsg).
+pub(crate) const TAKES_MANY: bool = cfg!(any(target_os = "linux", target_os = "android"));
+
+/// Receives the datagrams that wait on `socket` in one system call, at
+/// most `into.len()` and [`RECV_MANY_DATAGRAMS`] of them, each into its
+/// entry's buffer, with its length and sender. What of a datagram does not
+/// fit its entry's buffer is read into `spill`, which the entries share:
+/// at most `spill.len()` bytes of a datagram are read in all, and the last
+/// long datagram of a call is whole. One before it in the call, and one
+/// cut short, read as `spill.len()` bytes. How many came.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn recv_many(
+    socket: &impl AsSocket,
+    into: &mut [weaver_utp::Received],
+    spill: &mut [u8],
+) -> io::Result<usize> {
+    many::recv(socket.as_raw_fd(), into, spill)
+}
+
+/// Sends datagrams that lie end to end in `bytes` in one system call:
+/// `parts` gives each one's length and address, at most
+/// [`SEND_MANY_DATAGRAMS`] of them are sent. How many went, counted from
+/// the first; it fails when the first could not be sent.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn send_many(
+    socket: &impl AsSocket,
+    bytes: &[u8],
+    parts: &[(usize, SocketAddr)],
+) -> io::Result<usize> {
+    many::send(socket.as_raw_fd(), bytes, parts)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod many {
+    use std::{
+        io, mem,
+        net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+        os::fd::RawFd,
+    };
+
+    use nix::libc;
+
+    use super::{RECV_MANY_DATAGRAMS, SEND_MANY_DATAGRAMS};
+
+    // An address of either family fits the IPv6 one's room.
+    type Name = libc::sockaddr_in6;
+
+    // Writes `addr` as the host names it; its length.
+    fn name(addr: SocketAddr, out: &mut Name) -> libc::socklen_t {
+        match addr {
+            SocketAddr::V4(v4) => {
+                let named = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as libc::sa_family_t,
+                    sin_port: v4.port().to_be(),
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                    },
+                    sin_zero: [0; 8],
+                };
+                // SAFETY: `out` is valid for writes of an IPv6 address,
+                // which is larger than an IPv4 one and aligned at least as
+                // strictly.
+                unsafe {
+                    std::ptr::from_mut(out)
+                        .cast::<libc::sockaddr_in>()
+                        .write(named)
+                };
+                mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
+            }
+            SocketAddr::V6(v6) => {
+                *out = libc::sockaddr_in6 {
+                    sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                    sin6_port: v6.port().to_be(),
+                    sin6_flowinfo: v6.flowinfo(),
+                    sin6_addr: libc::in6_addr {
+                        s6_addr: v6.ip().octets(),
+                    },
+                    sin6_scope_id: v6.scope_id(),
+                };
+                mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
+            }
+        }
+    }
+
+    // The address the host wrote, when it is an IP one.
+    fn named(name: &Name) -> Option<SocketAddr> {
+        match libc::c_int::from(name.sin6_family) {
+            libc::AF_INET => {
+                // SAFETY: the host wrote an IPv4 address, which is smaller
+                // than `name` and aligned no more strictly; any bytes are a
+                // valid one.
+                let v4 = unsafe { std::ptr::from_ref(name).cast::<libc::sockaddr_in>().read() };
+                Some(SocketAddr::V4(SocketAddrV4::new(
+                    Ipv4Addr::from(v4.sin_addr.s_addr.to_ne_bytes()),
+                    u16::from_be(v4.sin_port),
+                )))
+            }
+            libc::AF_INET6 => Some(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(name.sin6_addr.s6_addr),
+                u16::from_be(name.sin6_port),
+                name.sin6_flowinfo,
+                name.sin6_scope_id,
+            ))),
+            _ => None,
+        }
+    }
+
+    pub(super) fn recv(
+        fd: RawFd,
+        into: &mut [weaver_utp::Received],
+        spill: &mut [u8],
+    ) -> io::Result<usize> {
+        let most = into.len().min(RECV_MANY_DATAGRAMS);
+        // SAFETY: message headers, buffer descriptions and addresses are
+        // plain data for which all zeroes is a valid value.
+        let mut names: [Name; RECV_MANY_DATAGRAMS] = unsafe { mem::zeroed() };
+        let mut bufs: [[libc::iovec; 2]; RECV_MANY_DATAGRAMS] = unsafe { mem::zeroed() };
+        let mut msgs: [libc::mmsghdr; RECV_MANY_DATAGRAMS] = unsafe { mem::zeroed() };
+        let spill_at = spill.as_mut_ptr();
+        for (i, entry) in into[..most].iter_mut().enumerate() {
+            bufs[i] = [
+                libc::iovec {
+                    iov_base: entry.head.as_mut_ptr().cast(),
+                    iov_len: entry.head.len(),
+                },
+                // Every datagram's second buffer is the one `spill`: the
+                // host fills the datagrams in order, so a long one's rest
+                // stays there unless a later long one follows it.
+                libc::iovec {
+                    iov_base: spill_at.cast(),
+                    iov_len: spill.len().saturating_sub(entry.head.len()),
+                },
+            ];
+            let msg = &mut msgs[i].msg_hdr;
+            msg.msg_name = (&raw mut names[i]).cast();
+            msg.msg_namelen = mem::size_of::<Name>() as libc::socklen_t;
+            msg.msg_iov = bufs[i].as_mut_ptr();
+            msg.msg_iovlen = 2;
+        }
+        // SAFETY: the first `most` headers each name an address and two
+        // buffers that are valid for writes of the lengths given and
+        // outlive the call: the arrays above, the entries' buffers, which
+        // `into` borrows exclusively, and `spill`, borrowed exclusively
+        // and named by every header, which the host only writes bytes to.
+        // `fd` is an open socket for the call, which does not wait.
+        let got = unsafe {
+            libc::recvmmsg(
+                fd,
+                msgs.as_mut_ptr(),
+                most as libc::c_uint,
+                libc::MSG_DONTWAIT as _,
+                std::ptr::null_mut(),
+            )
+        };
+        if got < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let got = got as usize;
+        // The rest of a long datagram is whole only for the last long one.
+        let mut long_after = false;
+        for (i, entry) in into[..got].iter_mut().enumerate().rev() {
+            let cut = msgs[i].msg_hdr.msg_flags & libc::MSG_TRUNC != 0;
+            let len = msgs[i].msg_len as usize;
+            let long = len > entry.head.len();
+            match named(&names[i]) {
+                Some(from) => {
+                    entry.len = if cut || (long && long_after) {
+                        spill.len()
+                    } else {
+                        len
+                    };
+                    entry.from = from;
+                }
+                // A datagram from no IP address is read as an empty one,
+                // which is no packet.
+                None => entry.len = 0,
+            }
+            long_after |= long;
+        }
+        Ok(got)
+    }
+
+    pub(super) fn send(
+        fd: RawFd,
+        bytes: &[u8],
+        parts: &[(usize, SocketAddr)],
+    ) -> io::Result<usize> {
+        let most = parts.len().min(SEND_MANY_DATAGRAMS);
+        // SAFETY: message headers, buffer descriptions and addresses are
+        // plain data for which all zeroes is a valid value.
+        let mut names: [Name; SEND_MANY_DATAGRAMS] = unsafe { mem::zeroed() };
+        let mut bufs: [libc::iovec; SEND_MANY_DATAGRAMS] = unsafe { mem::zeroed() };
+        let mut msgs: [libc::mmsghdr; SEND_MANY_DATAGRAMS] = unsafe { mem::zeroed() };
+        let mut at = 0;
+        for (i, (len, target)) in parts[..most].iter().enumerate() {
+            let datagram = bytes.get(at..at + len).ok_or(io::ErrorKind::InvalidInput)?;
+            at += len;
+            bufs[i] = libc::iovec {
+                iov_base: datagram.as_ptr().cast_mut().cast(),
+                iov_len: datagram.len(),
+            };
+            let msg = &mut msgs[i].msg_hdr;
+            msg.msg_namelen = name(*target, &mut names[i]);
+            msg.msg_name = (&raw mut names[i]).cast();
+            msg.msg_iov = &raw mut bufs[i];
+            msg.msg_iovlen = 1;
+        }
+        // SAFETY: the first `most` headers each name an address and one
+        // buffer inside `bytes`, all of which outlive the call, which only
+        // reads them. `fd` is an open socket for the call.
+        let sent = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), most as libc::c_uint, 0) };
+        if sent < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(sent as usize)
+        }
+    }
+}
+
 // Linux asks for path-MTU discovery that never fragments.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod sys {
-    use std::{io, os::fd::AsRawFd};
+    use std::io;
 
     use nix::libc;
 
@@ -177,14 +507,14 @@ mod sys {
         }
     }
 
-    pub(super) fn set(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+    pub(super) fn set(socket: &impl super::AsSocket, family: Family) -> io::Result<()> {
         let (level, name, value) = option(family);
         super::unix::set_int(socket.as_raw_fd(), level, name, value)
     }
 
     // Never set don't-fragment, as libtorrent switches it off
     // (socket.hpp v2.0.15:248-249).
-    pub(super) fn clear(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+    pub(super) fn clear(socket: &impl super::AsSocket, family: Family) -> io::Result<()> {
         let (level, name, _) = option(family);
         let value = match family {
             Family::V4 => libc::IP_PMTUDISC_DONT,
@@ -193,7 +523,7 @@ mod sys {
         super::unix::set_int(socket.as_raw_fd(), level, name, value)
     }
 
-    pub(super) fn get(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<bool> {
+    pub(super) fn get(socket: &impl super::AsSocket, family: Family) -> io::Result<bool> {
         let (level, name, value) = option(family);
         Ok(super::unix::get_int(socket.as_raw_fd(), level, name)? == value)
     }
@@ -202,7 +532,7 @@ mod sys {
 // Apple's systems and FreeBSD carry a flag for it.
 #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
 mod sys {
-    use std::{io, os::fd::AsRawFd};
+    use std::io;
 
     use nix::libc;
 
@@ -215,17 +545,17 @@ mod sys {
         }
     }
 
-    pub(super) fn set(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+    pub(super) fn set(socket: &impl super::AsSocket, family: Family) -> io::Result<()> {
         let (level, name) = option(family);
         super::unix::set_int(socket.as_raw_fd(), level, name, 1)
     }
 
-    pub(super) fn clear(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+    pub(super) fn clear(socket: &impl super::AsSocket, family: Family) -> io::Result<()> {
         let (level, name) = option(family);
         super::unix::set_int(socket.as_raw_fd(), level, name, 0)
     }
 
-    pub(super) fn get(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<bool> {
+    pub(super) fn get(socket: &impl super::AsSocket, family: Family) -> io::Result<bool> {
         let (level, name) = option(family);
         Ok(super::unix::get_int(socket.as_raw_fd(), level, name)? != 0)
     }
@@ -233,7 +563,7 @@ mod sys {
 
 #[cfg(windows)]
 mod sys {
-    use std::{io, os::windows::io::AsRawSocket};
+    use std::io;
 
     use windows::Win32::Networking::WinSock::{
         IP_DONTFRAGMENT, IPPROTO_IP, IPPROTO_IPV6, IPV6_DONTFRAG, SOCKET, WSAGetLastError,
@@ -254,15 +584,15 @@ mod sys {
         io::Error::from_raw_os_error(unsafe { WSAGetLastError() }.0)
     }
 
-    pub(super) fn set(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+    pub(super) fn set(socket: &impl super::AsSocket, family: Family) -> io::Result<()> {
         set_to(socket, family, 1)
     }
 
-    pub(super) fn clear(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+    pub(super) fn clear(socket: &impl super::AsSocket, family: Family) -> io::Result<()> {
         set_to(socket, family, 0)
     }
 
-    fn set_to(socket: &tokio::net::UdpSocket, family: Family, value: i32) -> io::Result<()> {
+    fn set_to(socket: &impl super::AsSocket, family: Family, value: i32) -> io::Result<()> {
         let (level, name) = option(family);
         let value = value.to_ne_bytes();
         // SAFETY: the socket is open for as long as `socket` is borrowed, and
@@ -278,7 +608,7 @@ mod sys {
         if done == 0 { Ok(()) } else { Err(last_error()) }
     }
 
-    pub(super) fn get(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<bool> {
+    pub(super) fn get(socket: &impl super::AsSocket, family: Family) -> io::Result<bool> {
         let (level, name) = option(family);
         let mut value = [0u8; 4];
         let mut len = value.len() as i32;
@@ -313,18 +643,18 @@ mod sys {
 
     use super::Family;
 
-    pub(super) fn set(_: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+    pub(super) fn set(_: &impl super::AsSocket, family: Family) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("this host has no option to forbid fragmenting {family:?} datagrams"),
         ))
     }
 
-    pub(super) fn clear(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+    pub(super) fn clear(socket: &impl super::AsSocket, family: Family) -> io::Result<()> {
         set(socket, family)
     }
 
-    pub(super) fn get(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<bool> {
+    pub(super) fn get(socket: &impl super::AsSocket, family: Family) -> io::Result<bool> {
         set(socket, family).map(|()| false)
     }
 }

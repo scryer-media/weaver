@@ -156,6 +156,19 @@ pub(crate) fn normalize_checkpoint(
     })
 }
 
+/// Whether the spot check of a piece the resume data names says the files
+/// are not what the resume data says: the piece does not read, or its
+/// bytes do not hash to the torrent's. A piece that cannot be told, a v2
+/// piece whose file's hashes are not held yet, leaves the resume data
+/// trusted: those hashes are kept only once every file's are held, so a
+/// v2 torrent stopped before that has none to check against.
+fn says_files_differ(checked: &anyhow::Result<Verdict>) -> bool {
+    matches!(
+        checked,
+        Ok(Verdict::Failed | Verdict::Inconsistent) | Err(_)
+    )
+}
+
 impl TorrentStateInitializing {
     /// Whether the check reads every piece back and trusts nothing saved.
     pub(crate) fn is_full_check(&self) -> bool {
@@ -328,7 +341,7 @@ impl TorrentStateInitializing {
                     })
                     .enumerate()
                 {
-                    if fo.check_piece(piece_id).is_err() {
+                    if says_files_differ(&fo.check_piece_whole(piece_id)) {
                         return true;
                     }
 
@@ -388,7 +401,7 @@ impl TorrentStateInitializing {
                 );
                 finished
                     .iter()
-                    .map(|piece| (*piece, fo.check_piece(*piece)))
+                    .map(|piece| (*piece, fo.check_piece_whole(*piece)))
                     .collect::<Vec<_>>()
             })
             .await;
@@ -480,8 +493,11 @@ impl TorrentStateInitializing {
                 (self.metadata.lengths().total_pieces() as usize)
                     .min(self.shared.spawner.check_threads()),
                 |threads| {
+                    let stats = self.shared.spawner.stats();
+                    let call = stats.call(crate::session_stats::disk::DiskOp::InitialCheck);
+                    let before = self.checked_bytes.load(Ordering::Relaxed);
                     self.check.store(CHECK_READING, Ordering::Release);
-                    FileOps::new(
+                    let outcome = FileOps::new(
                         &self.metadata,
                         &self.files,
                         self.shared.options.disable_v1_hashes,
@@ -491,7 +507,13 @@ impl TorrentStateInitializing {
                         &self.checked_bytes,
                         &self.pause_requested,
                         from.map(|(at, _)| at),
-                    )
+                    );
+                    call.bytes(
+                        self.checked_bytes
+                            .load(Ordering::Relaxed)
+                            .saturating_sub(before),
+                    );
+                    outcome
                 },
             )
             .await?;
@@ -1316,5 +1338,72 @@ mod tests {
         async fn a_recheck_stopped_by_a_pause_reads_as_paused() -> anyhow::Result<()> {
             a_check_stopped_by_a_pause_reads_as_paused("recheck_paused", true).await
         }
+    }
+
+    // Resume data that says a torrent has every piece is not trusted when
+    // a piece it names does not hash: the files are checked, and the piece
+    // is found missing. A torrent is added and checked with its session
+    // keeping resume data, the session stops, a byte of the first piece
+    // changes on disk, and a new session over the same resume data picks
+    // the torrent up.
+    #[test]
+    fn a_spot_checked_piece_that_cannot_be_told_leaves_resume_data_trusted() {
+        use super::says_files_differ;
+        use crate::file_ops::Verdict;
+        assert!(!says_files_differ(&Ok(Verdict::Passed)));
+        assert!(!says_files_differ(&Ok(Verdict::Unknown)));
+        assert!(says_files_differ(&Ok(Verdict::Failed)));
+        assert!(says_files_differ(&Ok(Verdict::Inconsistent)));
+        assert!(says_files_differ(&Err(anyhow::anyhow!("no file"))));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_data_naming_a_piece_that_does_not_hash_is_not_trusted() -> anyhow::Result<()> {
+        use crate::tests::embedder_util::{TestTorrent, isolated_session_opts};
+        use crate::{AddTorrent, AddTorrentOptions, Session, SessionPersistenceConfig};
+        use anyhow::Context;
+
+        const PIECE: u32 = 1024;
+        let t = TestTorrent::new("resume_not_trusted", 8 * PIECE as usize, PIECE).await?;
+        let state = tempfile::TempDir::with_prefix("resume_not_trusted_state")?;
+        let opts = || crate::SessionOptions {
+            persistence: Some(SessionPersistenceConfig::Json {
+                folder: state.path().to_owned(),
+            }),
+            ..isolated_session_opts(false)
+        };
+        let total = {
+            let session = Session::new_with_opts(t.dir.path().to_owned(), opts()).await?;
+            let handle = session
+                .add_torrent(
+                    AddTorrent::from_bytes(t.torrent.clone()),
+                    Some(AddTorrentOptions {
+                        overwrite: true,
+                        ..Default::default()
+                    }),
+                )
+                .await?
+                .into_handle()
+                .context("expected a handle")?;
+            handle.wait_until_completed().await?;
+            let total = handle.stats().total_bytes;
+            session.stop().await;
+            total
+        };
+
+        let file = t.dir.path().join("0.data");
+        let mut bytes = std::fs::read(&file)?;
+        bytes[5] ^= 1;
+        std::fs::write(&file, bytes)?;
+
+        let session = Session::new_with_opts(t.dir.path().to_owned(), opts()).await?;
+        let handle = session
+            .with_torrents(|torrents| torrents.map(|(_, handle)| handle.clone()).next())
+            .context("the torrent was not picked up")?;
+        handle.wait_until_initialized().await?;
+        let stats = handle.stats();
+        assert_eq!(stats.total_bytes, total);
+        assert_eq!(stats.progress_bytes, total - u64::from(PIECE));
+        Ok(())
     }
 }

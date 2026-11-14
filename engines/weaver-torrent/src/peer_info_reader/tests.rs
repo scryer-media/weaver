@@ -408,6 +408,57 @@ async fn metadata_data_and_reject_before_the_extended_handshake_are_ignored() {
     assert_eq!(fetched.unwrap().1.as_ref(), metadata.as_ref());
 }
 
+// A connection that only fetches metadata is counted as any other of the
+// session's: its handshake, its messages each way, its bytes, and its end
+// as a close of our own once the metadata is in.
+#[tokio::test(start_paused = true)]
+async fn a_metadata_connection_is_counted_in_the_sessions_connection_counts() {
+    use crate::session_stats::swarm::{
+        ByteKind, ClosePhase, CloseReason, Direction, MessageKind, SwarmStats, Transport,
+    };
+
+    let (metadata, hashes) = metadata(10);
+    let (connector, mut dials) = connector().await;
+    let peer = async {
+        let (_, stream) = dials.recv().await.unwrap();
+        let mut peer = MockPeer::greet(stream, hashes).await;
+        peer.send_extended_handshake(u32::try_from(metadata.len()).unwrap())
+            .await;
+        let piece = peer.next_request().await.unwrap();
+        peer.send_piece(&metadata, piece).await;
+        peer
+    };
+    let swarm = Arc::new(SwarmStats::default());
+    let fetch = MetadataFetch::counted_in(hashes, None, swarm.clone());
+
+    let (fetched, _peer) = tokio::join!(fetch_into(addr(1), fetch, connector), peer);
+    assert_eq!(fetched.unwrap().1.as_ref(), metadata.as_ref());
+
+    let counted = swarm.snapshot();
+    let handshakes: u64 = counted
+        .handshakes
+        .as_flattened()
+        .as_flattened()
+        .iter()
+        .sum();
+    assert_eq!(handshakes, 1);
+    let ut_metadata = MessageKind::Metadata as usize;
+    assert_eq!(counted.messages[Direction::Out as usize][ut_metadata], 1);
+    assert_eq!(counted.messages[Direction::In as usize][ut_metadata], 1);
+    let protocol = |direction: Direction| -> u64 {
+        Transport::ALL
+            .iter()
+            .map(|t| counted.bytes[*t as usize][direction as usize][ByteKind::Protocol as usize])
+            .sum()
+    };
+    assert!(protocol(Direction::In) > 0 && protocol(Direction::Out) > 0);
+    assert_eq!(
+        counted.closes[ClosePhase::Live as usize][CloseReason::Closed as usize],
+        1
+    );
+    assert_eq!(counted.closes.as_flattened().iter().sum::<u64>(), 1);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_metadata_piece_sent_again_is_ignored() {
     // Two pieces: the first answered twice before the second.
@@ -440,6 +491,7 @@ async fn a_metadata_piece_sent_again_is_ignored() {
 fn handler(fetch: &Arc<MetadataFetch>) -> (Handler, mpsc::UnboundedReceiver<WriterRequest>) {
     let (writer_tx, writer_rx) = mpsc::unbounded_channel();
     let handler = Handler {
+        transport: Arc::default(),
         addr: addr(1),
         peers: no_peers(),
         fetch: fetch.clone(),
@@ -714,6 +766,7 @@ fn reader(info: &Bytes) -> (Handler, mpsc::UnboundedReceiver<WriterRequest>, Fou
     let request_tx = writer_tx.clone();
     tokio::spawn(async move { sender.send(&request_tx).await });
     let handler = Handler {
+        transport: Arc::default(),
         addr: addr(1),
         peers: no_peers(),
         fetch: MetadataFetch::new(hashes_of(info), None),

@@ -713,6 +713,10 @@ impl Pieces for TorrentStore {
         self.read_in(&self.aside(), file, offset, out)
     }
 
+    fn will_read(&self, file: usize, offset: u64, len: u64) {
+        self.files.will_read(file, offset, len);
+    }
+
     fn readv(&self, file: usize, mut offset: u64, outs: &mut [&mut [u8]]) -> io::Result<()> {
         let aside = self.aside();
         if !aside.get(file).copied().unwrap_or(false) {

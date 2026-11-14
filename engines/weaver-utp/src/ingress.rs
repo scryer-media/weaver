@@ -3,8 +3,9 @@
 
 // A stream's inbox. The socket's receive loop queues the datagrams of one
 // read of the UDP socket without waking the stream, then marks where that
-// read ended and wakes it once. The mark is where the stream sends the ACK
-// it owes, as libtorrent sends its deferred ACK when the socket is drained
+// read ended and wakes it once, however its packets were mixed with other
+// streams'. The mark is where the stream sends the ACK it owes, as
+// libtorrent sends its deferred ACK when the socket is drained
 // (v2.0.15 utp_socket_manager.cpp:255-261, session_impl.cpp:2727).
 
 use std::{
@@ -12,7 +13,7 @@ use std::{
     num::NonZeroUsize,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
 };
@@ -30,6 +31,7 @@ struct Limits {
     control_packets: usize,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Usage {
     bytes: usize,
@@ -37,9 +39,15 @@ struct Usage {
     control_packets: usize,
 }
 
+// What the inbox holds, counted without a lock: the receive loop reserves
+// and the stream releases, each on its own thread. A reservation adds
+// first and takes back what went past a limit, so a release racing it can
+// only make room, never refuse one that fits.
 struct Budget {
     limits: Limits,
-    usage: Mutex<Usage>,
+    bytes: AtomicUsize,
+    data_packets: AtomicUsize,
+    control_packets: AtomicUsize,
 }
 
 struct Reservation {
@@ -48,22 +56,29 @@ struct Reservation {
     data: bool,
 }
 
+// Adds one to `count` unless that passes `limit`.
+fn take_one(count: &AtomicUsize, limit: usize) -> bool {
+    if count.fetch_add(1, Ordering::AcqRel) >= limit {
+        count.fetch_sub(1, Ordering::AcqRel);
+        return false;
+    }
+    true
+}
+
 impl Budget {
     fn reserve(self: &Arc<Self>, bytes: usize, data: bool) -> Option<Reservation> {
-        let mut usage = self.usage.lock();
         if data {
-            if usage.data_packets >= self.limits.data_packets
-                || bytes > self.limits.bytes.saturating_sub(usage.bytes)
-            {
+            if !take_one(&self.data_packets, self.limits.data_packets) {
                 return None;
             }
-            usage.data_packets += 1;
-            usage.bytes += bytes;
-        } else {
-            if usage.control_packets >= self.limits.control_packets {
+            let before = self.bytes.fetch_add(bytes, Ordering::AcqRel);
+            if before.saturating_add(bytes) > self.limits.bytes {
+                self.bytes.fetch_sub(bytes, Ordering::AcqRel);
+                self.data_packets.fetch_sub(1, Ordering::AcqRel);
                 return None;
             }
-            usage.control_packets += 1;
+        } else if !take_one(&self.control_packets, self.limits.control_packets) {
+            return None;
         }
         Some(Reservation {
             budget: Arc::clone(self),
@@ -71,16 +86,25 @@ impl Budget {
             data,
         })
     }
+
+    #[cfg(test)]
+    fn usage(&self) -> Usage {
+        Usage {
+            bytes: self.bytes.load(Ordering::Acquire),
+            data_packets: self.data_packets.load(Ordering::Acquire),
+            control_packets: self.control_packets.load(Ordering::Acquire),
+        }
+    }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        let mut usage = self.budget.usage.lock();
+        let budget = &self.budget;
         if self.data {
-            usage.data_packets -= 1;
-            usage.bytes -= self.bytes;
+            budget.data_packets.fetch_sub(1, Ordering::AcqRel);
+            budget.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
         } else {
-            usage.control_packets -= 1;
+            budget.control_packets.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -96,10 +120,9 @@ struct Inbox {
     // Packets ever queued, and ever taken.
     pushed: u64,
     taken: u64,
-    // Drain marks, each the count of packets queued when the receive loop
-    // read the UDP socket empty or turned to another stream's packet. A
-    // mark follows at least one packet, so there is at most one more mark
-    // than packets queued, and the budget bounds both.
+    // Drain marks, each the count of packets queued when a read of the UDP
+    // socket ended. A mark follows at least one packet, so there is at most
+    // one more mark than packets queued, and the budget bounds both.
     marks: VecDeque<u64>,
     // A packet was queued since the last drain mark.
     unmarked: bool,
@@ -151,7 +174,9 @@ fn with_limits(limits: Limits) -> (Sender, Receiver) {
     let shared = Arc::new(Shared {
         budget: Arc::new(Budget {
             limits,
-            usage: Mutex::new(Usage::default()),
+            bytes: AtomicUsize::new(0),
+            data_packets: AtomicUsize::new(0),
+            control_packets: AtomicUsize::new(0),
         }),
         inbox: Mutex::new(Inbox {
             items: VecDeque::new(),
@@ -199,17 +224,19 @@ impl Drop for Sender {
     }
 }
 
-impl Sender {
+impl Shared {
     // Queues a packet without waking the stream. Full inboxes drop
     // datagrams rather than blocking the shared socket. A refused DATA
-    // payload can still carry its peer's ACK and window.
-    pub fn push(&self, mut message: UtpMessage) -> Result<(), Closed> {
-        let budget = &self.shared.budget;
+    // payload can still carry its peer's ACK and window. True when the
+    // packet is the first queued since the last mark: the stream then owes
+    // a flush at the end of the read.
+    fn push(&self, mut message: UtpMessage) -> Result<bool, Closed> {
+        let budget = &self.budget;
         let (reservation, payload_dropped) = if message.header.htype == Type::Data {
             match budget.reserve(message.data.len(), true) {
                 Some(reservation) => (Some(reservation), false),
                 None => {
-                    message.data = Vec::new();
+                    message.data = crate::Payload::empty();
                     (budget.reserve(0, false), true)
                 }
             }
@@ -217,22 +244,22 @@ impl Sender {
             // Only DATA delivers a payload; any other packet still acts on
             // its header, a FIN with payload included.
             if !message.data.is_empty() {
-                message.data = Vec::new();
+                message.data = crate::Payload::empty();
             }
             (budget.reserve(0, false), false)
         };
         let Some(reservation) = reservation else {
-            if self.shared.inbox.lock().receiver_closed {
+            if self.inbox.lock().receiver_closed {
                 return Err(Closed);
             }
-            return Ok(());
+            return Ok(false);
         };
         let event = Event {
             message,
             payload_dropped,
             _reservation: reservation,
         };
-        let mut inbox = self.shared.inbox.lock();
+        let mut inbox = self.inbox.lock();
         if inbox.receiver_closed {
             drop(inbox);
             drop(event);
@@ -240,14 +267,13 @@ impl Sender {
         }
         inbox.items.push_back(event);
         inbox.pushed += 1;
-        inbox.unmarked = true;
-        Ok(())
+        Ok(!std::mem::replace(&mut inbox.unmarked, true))
     }
 
     // Marks the end of the packets queued so far and wakes the stream.
-    pub fn flush(&self) {
+    fn flush(&self) {
         let waker = {
-            let mut inbox = self.shared.inbox.lock();
+            let mut inbox = self.inbox.lock();
             if !inbox.unmarked {
                 return;
             }
@@ -260,19 +286,50 @@ impl Sender {
             waker.wake();
         }
     }
+}
 
-    // Wakes the stream to take what is queued, without a mark.
-    pub fn wake(&self) {
-        let waker = {
-            let mut inbox = self.shared.inbox.lock();
-            if inbox.items.is_empty() && inbox.marks.is_empty() {
-                return;
-            }
-            inbox.waker.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+/// A stream's queue as the socket's read holds it between packets: it
+/// pushes, marks and wakes as the sender does, without keeping the queue
+/// open or taking its lock to be made or dropped.
+pub(crate) struct Queue(Arc<Shared>);
+
+impl Queue {
+    // True when the packet is the stream's first since its last mark.
+    pub fn push(&self, message: UtpMessage) -> Result<bool, Closed> {
+        self.0.push(message)
+    }
+
+    pub fn share(&self) -> Queue {
+        Queue(Arc::clone(&self.0))
+    }
+
+    pub fn flush(&self) {
+        self.0.flush();
+    }
+
+    // Whether this is the queue `sender` sends to.
+    #[cfg(test)]
+    pub fn is_of(&self, sender: &Sender) -> bool {
+        Arc::ptr_eq(&self.0, &sender.shared)
+    }
+}
+
+impl Sender {
+    // Queues a packet without waking the stream. Full inboxes drop
+    // datagrams rather than blocking the shared socket. A refused DATA
+    // payload can still carry its peer's ACK and window.
+    pub fn push(&self, message: UtpMessage) -> Result<bool, Closed> {
+        self.shared.push(message)
+    }
+
+    // Marks the end of the packets queued so far and wakes the stream.
+    #[cfg(test)]
+    pub fn flush(&self) {
+        self.shared.flush();
+    }
+
+    pub fn queue(&self) -> Queue {
+        Queue(Arc::clone(&self.shared))
     }
 
     // Hands the stream a failed send and wakes it. A failure for good
@@ -303,14 +360,14 @@ impl Sender {
     // One packet read alone: queued, marked and woken.
     #[cfg(test)]
     pub fn send(&self, message: UtpMessage) -> Result<(), Closed> {
-        self.push(message)?;
+        self.shared.push(message)?;
         self.flush();
         Ok(())
     }
 
     #[cfg(test)]
     fn usage(&self) -> Usage {
-        *self.shared.budget.usage.lock()
+        self.shared.budget.usage()
     }
 }
 
@@ -483,7 +540,7 @@ mod tests {
         assert!(header.payload_dropped);
         assert_eq!(header.message.header.htype, Type::Data);
         assert!(header.message.payload().is_empty());
-        assert_eq!(header.message.data.capacity(), 0);
+        assert_eq!(header.message.data.held(), 0);
         drop(data);
         assert_eq!(
             tx.usage(),
@@ -626,7 +683,6 @@ mod tests {
         tx.flush();
         assert_eq!(rx.shape(), "");
         tx.push(message(Type::Data, b"a")).unwrap();
-        tx.wake();
         assert_eq!(rx.shape(), "P");
         tx.push(message(Type::Data, b"b")).unwrap();
         tx.flush();

@@ -8,7 +8,7 @@
 // from an exhaustive `match`. Both exist so that adding a variant or a counter
 // upstream is a compile error here rather than a silently missing series.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use weaver_server_core::bandwidth::schedule_metrics::{
     ActionOutcome, HoldReason, ScheduleMetricsSnapshot,
@@ -2268,15 +2268,31 @@ pub(crate) fn render_speed_tests(
 // session, then the event counters. Every family is written whole before the
 // next, so a family's samples stay together whatever the number of torrents.
 // Each torrent's own series, and its trackers', go as `mode` says, as a
-// job's do; the session and event series always go.
+// job's do; the count of torrents by state, the session and the event series
+// always go.
 pub(crate) fn render_torrents(out: &mut Encoder, metrics: &TorrentMetrics, mode: PerJobSeries) {
     let published = &metrics.published;
-    let torrents: Vec<(String, &TorrentSeries)> = published
-        .torrents
+    // One pass over the published torrents: each is counted under its route
+    // and state, and only those `mode` exports are kept for series of their
+    // own. A route with a session and no torrent counts zeros.
+    let mut counted: BTreeMap<&str, [u64; TORRENT_STATES.len()]> = published
+        .sessions
         .iter()
-        .filter(|torrent| torrent_is_exported(torrent.state, mode))
-        .map(|torrent| (torrent.job_id.0.to_string(), torrent))
+        .map(|session| (session.route.as_str(), [0; TORRENT_STATES.len()]))
         .collect();
+    let mut torrents: Vec<(String, &TorrentSeries)> = Vec::new();
+    for torrent in &published.torrents {
+        let states = counted.entry(torrent.route.as_str()).or_default();
+        if let Some(at) = TORRENT_STATES
+            .iter()
+            .position(|state| *state == torrent.state)
+        {
+            states[at] += 1;
+        }
+        if torrent_is_exported(torrent.state, mode) {
+            torrents.push((torrent.job_id.0.to_string(), torrent));
+        }
+    }
 
     // One sample per torrent, labelled by it and `extra`.
     fn each<'a, T>(
@@ -2655,6 +2671,16 @@ pub(crate) fn render_torrents(out: &mut Encoder, metrics: &TorrentMetrics, mode:
         float,
     );
 
+    for (route, states) in &counted {
+        for (state, count) in TORRENT_STATES.iter().zip(states) {
+            out.sample(
+                &f::TORRENTS,
+                &[("route", *route), ("state", state.as_str())],
+                *count,
+            );
+        }
+    }
+
     render_torrent_sessions(out, &published.sessions);
 
     for (event, count) in &metrics.events {
@@ -2665,6 +2691,247 @@ pub(crate) fn render_torrents(out: &mut Encoder, metrics: &TorrentMetrics, mode:
             &f::TORRENT_METADATA_FETCHES,
             &[("outcome", outcome.as_str())],
             *count,
+        );
+    }
+    super::torrent_services::render_checks(out, &metrics.check);
+}
+
+// A session's disk calls, blocking permits and peer sockets: every sample
+// is one counter the session keeps, read without a lock.
+fn render_torrent_disk(out: &mut Encoder, routes: &[SessionSeries]) {
+    use weaver_server_core::torrents::metrics::{DiskOp, DiskOpSnapshot, Transport};
+    let sessions = || routes.iter().filter(|session| session.open);
+    let seconds = |nanos: u64| nanos as f64 / 1e9;
+    // The operations the server's storage runs: it holds a piece in memory
+    // until it is checked, so no block is written alone and no downloaded
+    // piece is read back to be hashed.
+    let ops = || {
+        DiskOp::ALL
+            .into_iter()
+            .filter(|op| !matches!(op, DiskOp::BlockWrite | DiskOp::HashFiles))
+    };
+    for (family, value) in [
+        (
+            &f::TORRENT_DISK_CALLS,
+            (|op: &DiskOpSnapshot| op.calls) as fn(&DiskOpSnapshot) -> u64,
+        ),
+        (&f::TORRENT_DISK_BYTES, |op: &DiskOpSnapshot| op.bytes),
+    ] {
+        for session in sessions() {
+            for op in ops() {
+                out.sample(
+                    family,
+                    &[
+                        ("route", session.route.as_str()),
+                        ("operation", op.as_str()),
+                    ],
+                    value(&session.disk.ops[op.index()]),
+                );
+            }
+        }
+    }
+    for session in sessions() {
+        for op in ops() {
+            out.sample_f64(
+                &f::TORRENT_DISK_SECONDS,
+                &[
+                    ("route", session.route.as_str()),
+                    ("operation", op.as_str()),
+                ],
+                seconds(session.disk.ops[op.index()].nanos),
+            );
+        }
+    }
+    for (family, value) in [
+        (
+            &f::TORRENT_DISK_IN_FLIGHT,
+            (|op: &DiskOpSnapshot| op.in_flight) as fn(&DiskOpSnapshot) -> u64,
+        ),
+        (&f::TORRENT_DISK_IN_FLIGHT_MAX, |op: &DiskOpSnapshot| {
+            op.most_in_flight
+        }),
+    ] {
+        for session in sessions() {
+            for op in ops() {
+                out.sample(
+                    family,
+                    &[
+                        ("route", session.route.as_str()),
+                        ("operation", op.as_str()),
+                    ],
+                    value(&session.disk.ops[op.index()]),
+                );
+            }
+        }
+    }
+    for session in sessions() {
+        for &transport in Transport::ALL {
+            out.sample(
+                &f::TORRENT_DISK_UPLOAD_READ_BLOCKS,
+                &[
+                    ("route", session.route.as_str()),
+                    ("transport", transport.as_str()),
+                ],
+                session.disk.upload_read_blocks[transport as usize],
+            );
+        }
+    }
+    for (family, value) in [
+        (
+            &f::TORRENT_DISK_PERMIT_ACQUISITIONS,
+            (|s: &SessionSeries| s.disk.permit_acquisitions) as fn(&SessionSeries) -> u64,
+        ),
+        (&f::TORRENT_DISK_PERMIT_WAITS, |s: &SessionSeries| {
+            s.disk.permit_waits
+        }),
+    ] {
+        for session in sessions() {
+            out.sample(family, &[("route", session.route.as_str())], value(session));
+        }
+    }
+    for session in sessions() {
+        out.sample_f64(
+            &f::TORRENT_DISK_PERMIT_WAIT_SECONDS,
+            &[("route", session.route.as_str())],
+            seconds(session.disk.permit_wait_nanos),
+        );
+    }
+    for (family, value) in [
+        (
+            &f::TORRENT_DISK_PERMITS_IN_USE,
+            (|s: &SessionSeries| s.disk.permits_in_use) as fn(&SessionSeries) -> u64,
+        ),
+        (&f::TORRENT_DISK_PERMITS, |s: &SessionSeries| s.disk.permits),
+    ] {
+        for session in sessions() {
+            out.sample(family, &[("route", session.route.as_str())], value(session));
+        }
+    }
+    for session in sessions() {
+        out.sample(
+            &f::TORRENT_DISK_READ_JOBS_QUEUED,
+            &[("route", session.route.as_str())],
+            session.disk.read_jobs_queued,
+        );
+    }
+    for session in sessions() {
+        out.sample(
+            &f::TORRENT_DISK_PIECE_CHECK_WAITS,
+            &[("route", session.route.as_str())],
+            session.disk.check_waits,
+        );
+    }
+    for session in sessions() {
+        out.sample_f64(
+            &f::TORRENT_DISK_PIECE_CHECK_WAIT_SECONDS,
+            &[("route", session.route.as_str())],
+            seconds(session.disk.check_wait_nanos),
+        );
+    }
+    for session in sessions() {
+        out.sample(
+            &f::TORRENT_DISK_HASH_JOBS_QUEUED,
+            &[("route", session.route.as_str())],
+            session.disk.hash_jobs_queued,
+        );
+    }
+    for session in sessions() {
+        out.sample_f64(
+            &f::TORRENT_DISK_HASH_BUSY_SECONDS,
+            &[("route", session.route.as_str())],
+            seconds(session.disk.hash_busy_nanos),
+        );
+    }
+    for (family, value) in [
+        (
+            &f::TORRENT_DISK_PIECES_WAITING,
+            (|s: &SessionSeries| s.disk.check_pieces_waiting) as fn(&SessionSeries) -> u64,
+        ),
+        (&f::TORRENT_DISK_PIECE_BYTES_WAITING, |s: &SessionSeries| {
+            s.disk.check_bytes_waiting
+        }),
+    ] {
+        for session in sessions() {
+            out.sample(family, &[("route", session.route.as_str())], value(session));
+        }
+    }
+    for session in sessions() {
+        for &transport in Transport::ALL {
+            let socket = &session.disk.sockets[transport as usize];
+            for (direction, calls) in [("in", socket.receive_calls), ("out", socket.send_calls)] {
+                out.sample(
+                    &f::TORRENT_PEER_SOCKET_CALLS,
+                    &[
+                        ("route", session.route.as_str()),
+                        ("transport", transport.as_str()),
+                        ("direction", direction),
+                    ],
+                    calls,
+                );
+            }
+        }
+    }
+    for session in sessions() {
+        for &transport in Transport::ALL {
+            out.sample(
+                &f::TORRENT_PEER_REQUEST_WRITES,
+                &[
+                    ("route", session.route.as_str()),
+                    ("transport", transport.as_str()),
+                ],
+                session.disk.sockets[transport as usize].request_sends,
+            );
+        }
+    }
+    for session in sessions() {
+        for &transport in Transport::ALL {
+            out.sample(
+                &f::TORRENT_PEER_REQUESTS_SENT,
+                &[
+                    ("route", session.route.as_str()),
+                    ("transport", transport.as_str()),
+                ],
+                session.disk.sockets[transport as usize].requests_sent,
+            );
+        }
+    }
+    for session in sessions() {
+        out.sample(
+            &f::TORRENT_PEER_READ_BUFFER_GROWTHS,
+            &[("route", session.route.as_str())],
+            session.disk.read_buffer_growths,
+        );
+    }
+    for session in sessions() {
+        out.sample(
+            &f::TORRENT_PEER_BATCH_BUFFERS,
+            &[("route", session.route.as_str())],
+            session.disk.batch_buffers,
+        );
+    }
+    // The files and their handles are shared by every route.
+    let files = weaver_server_core::torrents::metrics::file_stats();
+    let directions = [("read", files.reads), ("write", files.writes)];
+    for (direction, calls) in directions {
+        out.sample(
+            &f::TORRENT_DISK_FILE_CALLS,
+            &[("direction", direction)],
+            calls.calls,
+        );
+    }
+    for (direction, calls) in directions {
+        out.sample(
+            &f::TORRENT_DISK_FILE_SEEKS,
+            &[("direction", direction)],
+            calls.seeks,
+        );
+    }
+    out.sample(&f::TORRENT_DISK_FILE_OPENS, &[], files.opens);
+    for (reason, closed) in [("room", files.closed_for_room), ("idle", files.closed_idle)] {
+        out.sample(
+            &f::TORRENT_DISK_FILE_HANDLES_CLOSED,
+            &[("reason", reason)],
+            closed,
         );
     }
 }
@@ -2809,13 +3076,63 @@ fn render_torrent_sessions(out: &mut Encoder, routes: &[SessionSeries]) {
         (&f::TORRENT_UTP_RECEIVE_DRAINS, |s: &SessionSeries| {
             s.utp.receive_drains
         }),
-        (&f::TORRENT_UTP_STREAM_SWITCH_MARKS, |s: &SessionSeries| {
-            s.utp.stream_switch_marks
+        (&f::TORRENT_UTP_STREAMS_MARKED, |s: &SessionSeries| {
+            s.utp.streams_marked
         }),
         (
             &f::TORRENT_UTP_DRAIN_MARKS_WITH_PACKETS_QUEUED,
             |s: &SessionSeries| s.utp.drain_marks_with_packets_queued,
         ),
+        (&f::TORRENT_UTP_ACKS_WITH_SACK, |s: &SessionSeries| {
+            s.utp.acks_with_sack
+        }),
+        (
+            &f::TORRENT_UTP_DATA_PACKETS_WITH_SACK,
+            |s: &SessionSeries| s.utp.data_packets_with_sack,
+        ),
+        (&f::TORRENT_UTP_SACK_BYTES_SENT, |s: &SessionSeries| {
+            s.utp.sack_bytes_sent
+        }),
+        (&f::TORRENT_UTP_SACKS_RECEIVED, |s: &SessionSeries| {
+            s.utp.sacks_received
+        }),
+        (&f::TORRENT_UTP_SACK_BITS_RECEIVED, |s: &SessionSeries| {
+            s.utp.sack_bits_received
+        }),
+        (&f::TORRENT_UTP_DUPLICATE_ACKS_SENT, |s: &SessionSeries| {
+            s.utp.duplicate_acks_sent
+        }),
+        (&f::TORRENT_UTP_RECEIVE_CUTS, |s: &SessionSeries| {
+            s.utp.receive_cuts
+        }),
+        (&f::TORRENT_UTP_SEND_RUNS, |s: &SessionSeries| {
+            s.utp.send_runs
+        }),
+        (&f::TORRENT_UTP_SEND_RUN_DATAGRAMS, |s: &SessionSeries| {
+            s.utp.send_run_datagrams
+        }),
+        (&f::TORRENT_UTP_SEND_RUN_ERRORS, |s: &SessionSeries| {
+            s.utp.send_run_errors
+        }),
+        (&f::TORRENT_UTP_RECEIVE_CALLS, |s: &SessionSeries| {
+            s.utp.receive_calls
+        }),
+        (
+            &f::TORRENT_UTP_RECEIVE_CALL_DATAGRAMS,
+            |s: &SessionSeries| s.utp.receive_call_datagrams,
+        ),
+        (&f::TORRENT_UTP_SEND_BATCHES, |s: &SessionSeries| {
+            s.utp.send_batches
+        }),
+        (&f::TORRENT_UTP_SEND_BATCH_DATAGRAMS, |s: &SessionSeries| {
+            s.utp.send_batch_datagrams
+        }),
+        (&f::TORRENT_UTP_DATAGRAMS_TOO_LONG, |s: &SessionSeries| {
+            s.utp.datagrams_too_long
+        }),
+        (&f::TORRENT_UTP_SEND_BATCH_ERRORS, |s: &SessionSeries| {
+            s.utp.send_batch_errors
+        }),
         (&f::TORRENT_UTP_MAX_CWND, |s: &SessionSeries| {
             s.utp.max_congestion_window_bytes
         }),
@@ -2828,6 +3145,7 @@ fn render_torrent_sessions(out: &mut Encoder, routes: &[SessionSeries]) {
             );
         }
     }
+    render_torrent_disk(out, routes);
     for session in sessions() {
         for (state, count) in &session.peers {
             out.sample(
@@ -2895,4 +3213,6 @@ fn render_torrent_sessions(out: &mut Encoder, routes: &[SessionSeries]) {
             );
         }
     }
+    super::torrent_swarm::render(out, routes);
+    super::torrent_services::render(out, routes);
 }

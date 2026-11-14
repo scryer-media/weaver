@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-12.
+// Modified by the Weaver authors, 2026-11-14.
 
 mod arrival_time;
 mod basics;
@@ -22,9 +22,12 @@ mod outbox;
 mod pacing;
 mod packet_validation;
 mod probe_payload;
+mod probe_resends;
 mod refused_sends;
+mod resend_after_timeout;
 mod retransmit_timer;
 mod rtte;
+mod sack_on_data;
 mod sequence_wrap;
 mod shutdown;
 mod small_window;
@@ -80,7 +83,7 @@ impl TestVsock {
         message.received = self.env.now();
         // Like one socket read: the packets queued before the next poll
         // form one drain.
-        self.tx.push(message).unwrap()
+        self.tx.push(message).unwrap();
     }
 
     fn send_data(&mut self, seq_nr: impl Into<SeqNr>, ack_nr: impl Into<SeqNr>, payload: &str) {

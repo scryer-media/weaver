@@ -870,6 +870,24 @@ impl ChunkTracker {
         true
     }
 
+    /// Breaks and queues again every piece still taken that we do not
+    /// have: when a torrent pauses, a piece out for its hash check has no
+    /// one left to finish the check, so it is fetched again on resume.
+    pub fn release_taken(&mut self) {
+        let taken: Vec<ValidPieceIndex> = self
+            .taken
+            .iter_ones()
+            .filter_map(|id| {
+                u32::try_from(id)
+                    .ok()
+                    .and_then(|id| self.lengths.validate_piece_index(id))
+            })
+            .collect();
+        for piece in taken {
+            self.mark_piece_broken_if_not_have(piece);
+        }
+    }
+
     pub fn mark_piece_broken_if_not_have(&mut self, index: ValidPieceIndex) {
         if self.is_piece_have(index) {
             return;

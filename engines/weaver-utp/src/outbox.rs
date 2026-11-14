@@ -32,6 +32,8 @@ use crate::traits::Fragmenting;
 pub(crate) const OUTBOX_BYTES: usize = 256 * 1024;
 /// Datagrams one batch holds.
 pub(crate) const OUTBOX_PACKETS: usize = 1024;
+/// The most datagrams for several addresses that leave in one call.
+pub(crate) const SEND_MANY_MOST: usize = 32;
 
 #[derive(Debug)]
 pub(crate) struct Queued {
@@ -71,10 +73,15 @@ struct Recorded {
 
 impl Departures {
     pub(crate) fn push(&self, at: Option<Instant>) {
+        self.push_run(at, 1);
+    }
+
+    /// Records `count` departures at once, all at `at`.
+    pub(crate) fn push_run(&self, at: Option<Instant>, count: usize) {
         let waker = {
             let mut recorded = self.recorded.lock();
             let first = recorded.left.is_empty();
-            recorded.left.push_back(at);
+            recorded.left.extend(std::iter::repeat_n(at, count));
             self.any.store(true, Ordering::Release);
             if first { recorded.waker.take() } else { None }
         };
@@ -163,6 +170,101 @@ impl Batch {
 
     pub(crate) fn advance(&mut self) {
         self.next += 1;
+    }
+
+    /// The datagrams from the front that one call can send, when they are
+    /// more than one: all to one address, none marked for a send of its
+    /// own, each as long as the first but the last, which may be shorter,
+    /// and at most `most` of them. Their bytes, which lie end to end, the
+    /// first's length, their count and the address.
+    pub(crate) fn front_run(
+        &mut self,
+        most: usize,
+    ) -> Option<(&mut [u8], usize, usize, SocketAddr)> {
+        let first = self.packets.get(self.next)?;
+        if first.fragmenting.is_some() || first.len == 0 {
+            return None;
+        }
+        let (addr, segment) = (first.addr, first.len);
+        let start = first.start as usize;
+        let mut count = 1;
+        let mut end = start + segment as usize;
+        for queued in self.packets[self.next + 1..]
+            .iter()
+            .take(most.saturating_sub(1))
+        {
+            if queued.addr != addr
+                || queued.fragmenting.is_some()
+                || queued.len > segment
+                || queued.len == 0
+            {
+                break;
+            }
+            count += 1;
+            end += queued.len as usize;
+            if queued.len < segment {
+                break;
+            }
+        }
+        (count > 1).then(|| (&mut self.bytes[start..end], segment as usize, count, addr))
+    }
+
+    /// The datagrams from the front that one call for several addresses
+    /// can send, when they are more than one: none marked for a send of
+    /// its own, none empty, at most `parts.len()` of them. With `runs`,
+    /// they stop before two that lie together for one address at one
+    /// length, which begin a run for [`Self::front_run`]. Each one's length
+    /// and address is written to `parts`; their bytes, which lie end to
+    /// end, and their count are returned.
+    pub(crate) fn front_many(
+        &mut self,
+        parts: &mut [(usize, SocketAddr)],
+        runs: bool,
+    ) -> Option<(&mut [u8], usize)> {
+        let waiting = &self.packets[self.next..];
+        let start = waiting.first()?.start as usize;
+        let mut count = 0;
+        let mut end = start;
+        for (i, queued) in waiting.iter().take(parts.len()).enumerate() {
+            if queued.fragmenting.is_some() || queued.len == 0 {
+                break;
+            }
+            if runs
+                && waiting.get(i + 1).is_some_and(|next| {
+                    next.addr == queued.addr && next.len == queued.len && next.fragmenting.is_none()
+                })
+            {
+                break;
+            }
+            parts[count] = (queued.len as usize, queued.addr);
+            count += 1;
+            end += queued.len as usize;
+        }
+        (count > 1).then(|| (&mut self.bytes[start..end], count))
+    }
+
+    /// The first `count` datagrams left at `at`: each one's stream is
+    /// told, the datagrams of one stream that lie together at once.
+    pub(crate) fn advance_run(&mut self, count: usize, at: Instant) {
+        let run = &self.packets[self.next..self.next + count];
+        let mut i = 0;
+        while i < run.len() {
+            let Some(departures) = &run[i].departures else {
+                i += 1;
+                continue;
+            };
+            let mut same = 1;
+            while run
+                .get(i + same)
+                .and_then(|queued| queued.departures.as_ref())
+                .is_some_and(|other| Arc::ptr_eq(other, departures))
+            {
+                same += 1;
+            }
+            departures.push_run(Some(at), same);
+            i += same;
+        }
+        self.next += count;
     }
 
     fn clear(&mut self) {
@@ -348,5 +450,129 @@ mod tests {
         drained.advance();
         assert!(!outbox.take(&mut drained, Waker::noop()));
         assert_eq!(queue(&outbox, 0, 20), Some(2));
+    }
+
+    // A run is the datagrams from the front that go to one address and are
+    // as long as the first, with at most one shorter one to end it.
+    #[test]
+    fn a_run_is_datagrams_of_one_length_for_one_address() {
+        const OTHER: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 2);
+        let outbox = Outbox::new();
+        let departures = Arc::new(Departures::default());
+        let to = |byte: u8, len: usize, addr, departures: Option<&Arc<Departures>>| {
+            let payload = vec![byte; len];
+            outbox
+                .try_queue(&[IoSlice::new(&payload)], addr, 7, departures)
+                .unwrap();
+        };
+        // Three of 30 bytes and a shorter one, then a longer one, then two
+        // for another address, then one alone.
+        to(1, 30, ADDR, Some(&departures));
+        to(2, 30, ADDR, Some(&departures));
+        to(3, 30, ADDR, None);
+        to(4, 10, ADDR, Some(&departures));
+        to(5, 40, ADDR, None);
+        to(6, 40, OTHER, None);
+        to(7, 40, OTHER, None);
+        to(8, 40, ADDR, None);
+        let mut batch = Batch::default();
+        assert!(outbox.take(&mut batch, Waker::noop()));
+
+        // No more than asked for.
+        let (bytes, segment, count, addr) = batch.front_run(2).unwrap();
+        assert_eq!((bytes.len(), segment, count, addr), (60, 30, 2, ADDR));
+
+        let (bytes, segment, count, addr) = batch.front_run(64).unwrap();
+        assert_eq!((segment, count, addr), (30, 4, ADDR));
+        assert_eq!(bytes.len(), 100);
+        assert_eq!([bytes[0], bytes[30], bytes[60], bytes[90]], [1, 2, 3, 4]);
+        let at = Instant::now();
+        batch.advance_run(4, at);
+        let mut left = VecDeque::new();
+        departures.take(&mut left);
+        assert_eq!(left, [Some(at); 3]);
+
+        // The longer datagram is followed by another address: no run.
+        assert!(batch.front_run(64).is_none());
+        assert_eq!(batch.front().unwrap().0[0], 5);
+        batch.advance();
+        let (bytes, segment, count, addr) = batch.front_run(64).unwrap();
+        assert_eq!((bytes.len(), segment, count, addr), (80, 40, 2, OTHER));
+        batch.advance_run(2, at);
+        assert!(batch.front_run(64).is_none());
+        batch.advance();
+        assert!(batch.is_drained());
+        assert!(batch.front_run(64).is_none());
+    }
+
+    // Datagrams for several addresses that lie together leave in one call:
+    // no more than asked for, and none of a run for one address, which
+    // leaves in a call of its own.
+    #[test]
+    fn datagrams_for_several_addresses_leave_together_up_to_a_run() {
+        let other = |port| SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let outbox = Outbox::new();
+        let departures = Arc::new(Departures::default());
+        let to = |byte: u8, len: usize, addr, departures: Option<&Arc<Departures>>| {
+            let payload = vec![byte; len];
+            outbox
+                .try_queue(&[IoSlice::new(&payload)], addr, 7, departures)
+                .unwrap();
+        };
+        // Three for three addresses, one of them longer, then two that
+        // begin a run, then one alone.
+        to(1, 20, other(2), Some(&departures));
+        to(2, 26, other(3), None);
+        to(3, 20, other(4), Some(&departures));
+        to(4, 30, ADDR, None);
+        to(5, 30, ADDR, None);
+        to(6, 20, other(2), None);
+        let mut batch = Batch::default();
+        assert!(outbox.take(&mut batch, Waker::noop()));
+        let mut parts = [(0, ADDR); 8];
+
+        // No more than there is room for.
+        let (bytes, count) = batch.front_many(&mut parts[..2], true).unwrap();
+        assert_eq!((bytes.len(), count), (46, 2));
+
+        let (bytes, count) = batch.front_many(&mut parts, true).unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(bytes.len(), 66);
+        assert_eq!([bytes[0], bytes[20], bytes[46]], [1, 2, 3]);
+        assert_eq!(parts[..3], [(20, other(2)), (26, other(3)), (20, other(4))]);
+        // A transport with no call for a run takes the run's datagrams too.
+        assert_eq!(batch.front_many(&mut parts, false).unwrap().1, 6);
+
+        let at = Instant::now();
+        batch.advance_run(3, at);
+        let mut left = VecDeque::new();
+        departures.take(&mut left);
+        assert_eq!(left, [Some(at); 2]);
+
+        // The run is next: it is not taken here.
+        assert!(batch.front_many(&mut parts, true).is_none());
+        assert_eq!(batch.front_run(64).unwrap().2, 2);
+        batch.advance_run(2, at);
+        // One alone is not several.
+        assert!(batch.front_many(&mut parts, true).is_none());
+        batch.advance();
+        assert!(batch.front_many(&mut parts, true).is_none());
+    }
+
+    // A datagram marked for a send of its own never rides in a run.
+    #[test]
+    fn a_datagram_sent_allowing_fragments_ends_a_run() {
+        let outbox = Outbox::new();
+        for byte in 0..3 {
+            assert!(queue(&outbox, byte, 30).is_some());
+        }
+        let mut batch = Batch::default();
+        assert!(outbox.take(&mut batch, Waker::noop()));
+        batch.packets[2].fragmenting = Some(crate::Fragmenting::Allowed);
+        let (_, _, count, _) = batch.front_run(64).unwrap();
+        assert_eq!(count, 2);
+        batch.advance_run(2, Instant::now());
+        assert!(batch.front_run(64).is_none());
+        assert!(batch.front().is_some());
     }
 }

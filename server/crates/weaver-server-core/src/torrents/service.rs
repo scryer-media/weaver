@@ -5433,7 +5433,9 @@ impl TorrentService {
         let torrent = live.get(&job_id).ok_or(ActionError::NotFound(job_id))?;
         if torrent.private && !confirm_unmet_goal {
             let policy = settings.policy(&torrent.record, torrent.rule(&self.rules()));
-            if let Some(left) = status::goal_left(&policy, &torrent.counters, torrent.have_bytes, now) {
+            if let Some(left) =
+                status::goal_left(&policy, &torrent.counters, torrent.have_bytes, now)
+            {
                 return Err(ActionError::UnmetGoal(left));
             }
         }
@@ -6913,7 +6915,8 @@ impl TorrentService {
                     continue;
                 }
                 let policy = settings.policy(&torrent.record, torrent.rule(&rules));
-                if status::goal_left(&policy, &torrent.counters, torrent.have_bytes, now).is_some() {
+                if status::goal_left(&policy, &torrent.counters, torrent.have_bytes, now).is_some()
+                {
                     continue;
                 }
                 let finished = self.script_event(

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-10.
+// Modified by the Weaver authors, 2026-11-13.
 
 /// The receiving side of uTP stream abstraction.
 ///
@@ -50,7 +50,7 @@ enum OoqMessage {
 
 impl Default for OoqMessage {
     fn default() -> Self {
-        OoqMessage::Payload(Vec::new())
+        OoqMessage::Payload(Payload::empty())
     }
 }
 
@@ -67,6 +67,7 @@ mod msgq {
     use std::collections::VecDeque;
 
     use super::{OoqMessage, UserRxMessage};
+    use crate::rx_buf::QUEUE_SMALL;
 
     pub struct MsgQueue {
         queue: VecDeque<UserRxMessage>,
@@ -97,6 +98,16 @@ mod msgq {
             self.len_bytes >= self.capacity
         }
 
+        // Bytes taken off the queue but not yet read, still counted.
+        pub fn hold(&mut self, n: usize) {
+            self.len_bytes += n;
+        }
+
+        // Held bytes now read.
+        pub fn release(&mut self, n: usize) {
+            self.len_bytes -= n;
+        }
+
         pub fn pop_front(&mut self) -> Option<UserRxMessage> {
             let msg = self.queue.pop_front()?;
             self.len_bytes -= msg.len_bytes();
@@ -108,17 +119,48 @@ mod msgq {
             if self.capacity - self.len_bytes < len {
                 return Err(msg);
             }
-            self.queue.push_back(match msg {
+            self.push_back(match msg {
                 OoqMessage::Payload(payload) => UserRxMessage::Payload(payload),
                 OoqMessage::Eof => UserRxMessage::Eof,
             });
-            self.len_bytes += len;
             Ok(())
         }
 
+        // The window counts payload bytes only, whatever buffers hold them.
+        // Small payloads are packed into the room left in the buffer of the
+        // one before, so every entry but the last holds more than
+        // QUEUE_SMALL bytes, in a buffer of at most twice that: the buffers
+        // held stay under twice the bytes queued, plus one buffer. A
+        // payload past QUEUE_SMALL behind another such stays in its own
+        // buffer, uncopied.
         pub(crate) fn push_back(&mut self, msg: UserRxMessage) {
             self.len_bytes += msg.len_bytes();
-            self.queue.push_back(msg);
+            let UserRxMessage::Payload(mut payload) = msg else {
+                self.queue.push_back(msg);
+                return;
+            };
+            if let Some(UserRxMessage::Payload(last)) = self.queue.back_mut()
+                && (payload.len() <= QUEUE_SMALL || last.len() <= QUEUE_SMALL)
+            {
+                last.take_from(&mut payload);
+                if payload.is_empty() {
+                    return;
+                }
+            }
+            payload.settle();
+            self.queue.push_back(UserRxMessage::Payload(payload));
+        }
+
+        // Bytes of buffer the queue holds.
+        #[cfg(test)]
+        pub fn held(&self) -> usize {
+            self.queue
+                .iter()
+                .map(|msg| match msg {
+                    UserRxMessage::Payload(payload) => payload.held(),
+                    _ => 0,
+                })
+                .sum()
         }
     }
 }
@@ -135,6 +177,11 @@ use crate::{
 
 pub struct UtpStreamReadHalf {
     current: Option<BeingRead>,
+    // Taken off the shared queue and not yet read, in order.
+    ready: VecDeque<UserRxMessage>,
+    // Bytes taken off the shared queue and not yet read that the window
+    // still counts.
+    owed: usize,
     is_eof: bool,
     shared: Arc<UserRxShared>,
 }
@@ -151,6 +198,9 @@ impl UtpStreamReadHalf {
     ) -> Poll<std::io::Result<usize>> {
         let mut written = 0usize;
         let mut dispatcher_dead = false;
+        let space: usize = bufs.iter().map(|b| b.len()).sum();
+        // The dispatcher's waker, taken with the payloads that made room.
+        let mut dispatcher_waker = None;
         // The slice being filled, and how far into it.
         let mut buf_idx = 0usize;
         let mut buf_pos = 0usize;
@@ -187,39 +237,85 @@ impl UtpStreamReadHalf {
                 break;
             }
 
-            let mut g = self.shared.locked.lock();
-            if let Some(msg) = g.queue.pop_front() {
-                match msg {
-                    UserRxMessage::Eof => {
-                        drop(g);
-                        self.is_eof = true;
-                        break;
-                    }
-                    UserRxMessage::Payload(payload) => {
-                        drop(g);
-                        self.current = Some(BeingRead { payload, offset: 0 })
-                    }
-                    UserRxMessage::Error(msg) => {
-                        return Poll::Ready(Err(std::io::Error::other(msg)));
+            if self.ready.is_empty() {
+                // One lock takes every payload the slices have room for
+                // (the last perhaps in part), and what follows them.
+                let this = &mut *self;
+                let mut g = this.shared.locked.lock();
+                // Every byte taken before is read by now.
+                g.queue.release(std::mem::take(&mut this.owed));
+                let mut room = space - written;
+                while room > 0 {
+                    match g.queue.pop_front() {
+                        Some(UserRxMessage::Payload(payload)) => {
+                            // The window opens by the bytes read, as
+                            // libtorrent's does (utp_stream.cpp v2.0.15:677):
+                            // the part of the last payload these slices
+                            // cannot take stays counted until it is read.
+                            this.owed = payload.len().saturating_sub(room);
+                            g.queue.hold(this.owed);
+                            room = room.saturating_sub(payload.len());
+                            this.ready.push_back(UserRxMessage::Payload(payload));
+                        }
+                        Some(msg) => {
+                            this.ready.push_back(msg);
+                            break;
+                        }
+                        None => break,
                     }
                 }
-            } else {
-                if g.vsock_closed {
-                    dispatcher_dead = true;
-                } else {
-                    update_optional_waker(&mut g.reader_waker, cx);
+                if this.ready.is_empty() {
+                    if g.vsock_closed {
+                        dispatcher_dead = true;
+                    } else {
+                        update_optional_waker(&mut g.reader_waker, cx);
+                    }
+                    break;
                 }
-                break;
+                if room < space - written && dispatcher_waker.is_none() {
+                    dispatcher_waker = g.dispatcher_waker.take();
+                }
+            }
+            match self.ready.pop_front() {
+                Some(UserRxMessage::Eof) => {
+                    self.is_eof = true;
+                    break;
+                }
+                Some(UserRxMessage::Payload(payload)) => {
+                    self.current = Some(BeingRead { payload, offset: 0 })
+                }
+                Some(UserRxMessage::Error(msg)) => {
+                    if let Some(waker) = dispatcher_waker {
+                        waker.wake();
+                    }
+                    return Poll::Ready(Err(std::io::Error::other(msg)));
+                }
+                None => break,
             }
         }
 
-        if written > 0 {
-            let mut g = self.shared.locked.lock();
-            let waker = g.dispatcher_waker.take();
-            drop(g);
-            if let Some(waker) = waker {
-                waker.wake();
+        // Bytes still counted against the window that were read since: the
+        // window opens by them now. Only reads smaller than a payload get
+        // here; a read that takes all it was given leaves none.
+        if self.owed > 0 && self.ready.is_empty() {
+            let unread = self
+                .current
+                .as_ref()
+                .map_or(0, |current| current.payload.len() - current.offset);
+            let read = self.owed.saturating_sub(unread);
+            if read > 0 {
+                self.owed -= read;
+                let mut g = self.shared.locked.lock();
+                g.queue.release(read);
+                if dispatcher_waker.is_none() {
+                    dispatcher_waker = g.dispatcher_waker.take();
+                }
             }
+        }
+        if let Some(waker) = dispatcher_waker {
+            waker.wake();
+        }
+        if written > 0 {
             return Poll::Ready(Ok(written));
         }
 
@@ -238,8 +334,15 @@ impl UtpStreamReadHalf {
     pub async fn read_all_available(&mut self) -> std::io::Result<Vec<u8>> {
         let mut buf = vec![0u8; 2 * 1024 * 1024];
         let mut offset = 0;
+        if let Some(current) = self.current.take() {
+            let rest = &current.payload[current.offset..];
+            buf[..rest.len()].copy_from_slice(rest);
+            offset = rest.len();
+        }
+        let mut ready = std::mem::take(&mut self.ready);
         let mut g = self.shared.locked.lock();
-        while let Some(m) = g.queue.pop_front() {
+        g.queue.release(std::mem::take(&mut self.owed));
+        while let Some(m) = ready.pop_front().or_else(|| g.queue.pop_front()) {
             match m {
                 UserRxMessage::Payload(payload) => {
                     buf[offset..offset + payload.len()].copy_from_slice(&payload);
@@ -334,6 +437,8 @@ impl UserRx {
         });
         let read_half = UtpStreamReadHalf {
             current: None,
+            ready: VecDeque::new(),
+            owed: 0,
             shared: shared.clone(),
             is_eof: false,
         };
@@ -362,6 +467,25 @@ impl UserRx {
         }
     }
 
+    /// Has the reader wake the stream on its next read while the window
+    /// last announced is too small for a packet of the remote's. Until the
+    /// window is announced again the remote may hold a packet it cannot
+    /// send, and only a read makes the room to announce. A read that came
+    /// since the window was last measured wakes the stream at once.
+    pub fn wake_on_read_below(&mut self, announced: u32, cx: &mut std::task::Context<'_>) {
+        if (announced as usize) >= self.max_incoming_payload.get() {
+            return;
+        }
+        let mut g = self.shared.locked.lock();
+        if g.reader_dropped {
+            return;
+        }
+        if g.queue.window() != self.last_remaining_rx_window {
+            cx.waker().wake_by_ref();
+        }
+        update_optional_waker(&mut g.dispatcher_waker, cx);
+    }
+
     /// Inform the read half that the socket is closed - there will be no more data.
     pub fn mark_vsock_closed(&self) {
         let mut g = self.shared.locked.lock();
@@ -380,22 +504,20 @@ impl UserRx {
     /// Returns the number of bytes flushed.
     pub fn flush(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<usize> {
         let filled_front_bytes: usize = self.ooq.filled_front_bytes();
-        let mut remaining_rx_window = {
-            let mut g = self.shared.locked.lock();
-            let remaining_window = g.queue.window();
-            if remaining_window.saturating_sub(filled_front_bytes) < self.max_incoming_payload.get()
-            {
-                update_optional_waker(&mut g.dispatcher_waker, cx);
-            }
-            remaining_window
-        };
+        // One lock for the window, every packet handed over and the reader's
+        // waker.
+        let mut g = self.shared.locked.lock();
+        let mut remaining_rx_window = g.queue.window();
+        if remaining_rx_window.saturating_sub(filled_front_bytes) < self.max_incoming_payload.get()
+        {
+            update_optional_waker(&mut g.dispatcher_waker, cx);
+        }
 
         // Flush as many items as possible from the beginning of out of order queue to the user RX
         let mut flushed_bytes = 0;
         let mut flushed_packets = 0;
 
         while let Some(len) = self.ooq.send_front_if_fits(remaining_rx_window, |msg| {
-            let mut g = self.shared.locked.lock();
             if g.reader_dropped {
                 debug_every_ms!(5000, "reader is dead, could not send UtpMesage to it");
                 return Err(msg);
@@ -407,9 +529,14 @@ impl UserRx {
             remaining_rx_window -= len;
             flushed_packets += 1;
         }
+        let waker = if flushed_packets > 0 {
+            g.reader_waker.take()
+        } else {
+            None
+        };
+        drop(g);
 
         if flushed_packets > 0 {
-            let waker = self.shared.locked.lock().reader_waker.take();
             if let Some(w) = waker {
                 w.wake();
             }
@@ -460,10 +587,10 @@ impl UserRx {
         self.ooq.is_empty()
     }
 
-    /// How many packets does ooq have
-    #[cfg(test)]
+    /// How many packets are held past a hole. Packets in order that the
+    /// reader has not been handed yet are not counted.
     pub fn assembler_packets(&self) -> usize {
-        self.ooq.stored_packets()
+        self.ooq.stored_packets() - self.ooq.filled_front
     }
 
     /// The main function for the dispatcher - gets called when new data arrives at a particular offset.
@@ -483,6 +610,13 @@ impl UserRx {
             .saturating_sub(self.ooq.stored_bytes());
         if msg.payload().len() > remaining {
             return Ok(AssemblerAddRemoveResult::Unavailable);
+        }
+        // The remote's packets may be larger than the size this stream
+        // started with.
+        if let Some(len) = NonZeroUsize::new(msg.payload().len())
+            && len > self.max_incoming_payload
+        {
+            self.max_incoming_payload = len;
         }
         match self.ooq.add_remove(msg, offset)? {
             res @ AssemblerAddRemoveResult::Consumed {
@@ -539,6 +673,13 @@ pub struct OutOfOrderQueue {
     len: usize,
     len_bytes: usize,
     capacity: usize,
+    // One bit per slot, set while the slot holds a packet: the SACK is
+    // read from these words, not from the slots. A ring over slot
+    // positions counted from the queue's start: slot `i` is position
+    // `front + i`, and positions wrap at the ring's size, a power of two
+    // no smaller than the capacity.
+    occupied: Box<[u64]>,
+    front: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -560,6 +701,7 @@ fn ooq_slot_is_default(slot: &OoqMessage) -> bool {
 
 impl OutOfOrderQueue {
     pub fn new(capacity: NonZeroUsize) -> Self {
+        let ring = capacity.get().next_power_of_two().max(64);
         Self {
             data: VecDeque::from(vec![Default::default(); capacity.get()]),
             filled_front: 0,
@@ -567,7 +709,47 @@ impl OutOfOrderQueue {
             len: 0,
             len_bytes: 0,
             capacity: capacity.get(),
+            occupied: vec![0; ring / 64].into_boxed_slice(),
+            front: 0,
         }
+    }
+
+    // The word and bit of slot `slot`.
+    fn occupancy_bit(&self, slot: usize) -> (usize, u64) {
+        let position = self.front.wrapping_add(slot) & (self.occupied.len() * 64 - 1);
+        (position / 64, 1 << (position % 64))
+    }
+
+    // The slots from `start` to `end` that hold a packet, in order, read
+    // from the occupancy words.
+    fn occupied_slots(&self, start: usize, end: usize) -> impl Iterator<Item = usize> + '_ {
+        let ring = self.occupied.len() * 64;
+        let mut slot = start;
+        let mut word = 0u64;
+        let mut word_start = start;
+        std::iter::from_fn(move || {
+            loop {
+                if word != 0 {
+                    let found = word_start + word.trailing_zeros() as usize;
+                    word &= word - 1;
+                    return Some(found);
+                }
+                if slot >= end {
+                    return None;
+                }
+                let position = self.front.wrapping_add(slot) % ring;
+                let offset = position % 64;
+                let take = (64 - offset).min(end - slot);
+                let low = if take == 64 {
+                    u64::MAX
+                } else {
+                    (1 << take) - 1
+                };
+                word = (self.occupied[position / 64] >> offset) & low;
+                word_start = slot;
+                slot += take;
+            }
+        })
     }
 
     fn filled_front_bytes(&self) -> usize {
@@ -607,6 +789,9 @@ impl OutOfOrderQueue {
         self.filled_front_bytes -= len;
         self.len -= 1;
         self.len_bytes -= len;
+        let (word, bit) = self.occupancy_bit(0);
+        self.occupied[word] &= !bit;
+        self.front = self.front.wrapping_add(1);
         self.data.push_back(Default::default());
         Some(len)
     }
@@ -624,13 +809,24 @@ impl OutOfOrderQueue {
         self.filled_front
     }
 
-    #[cfg(test)]
     fn stored_packets(&self) -> usize {
         self.len
     }
 
     fn stored_bytes(&self) -> usize {
         self.len_bytes
+    }
+
+    // Bytes of buffer the slots hold.
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.data
+            .iter()
+            .map(|msg| match msg {
+                OoqMessage::Payload(payload) => payload.held(),
+                OoqMessage::Eof => 0,
+            })
+            .sum()
     }
 
     #[cfg(test)]
@@ -673,19 +869,23 @@ impl OutOfOrderQueue {
         let end = self.data.len().min(start + SACK_SENT_MAX_BITS);
         let held = self.len - self.filled_front;
         let unacked = self
-            .data
-            .range(start..end)
-            .enumerate()
-            .filter_map(|(idx, data)| {
-                if ooq_slot_is_default(data) {
-                    None
-                } else {
-                    Some(idx)
-                }
-            })
+            .occupied_slots(start, end)
+            .map(|slot| slot - start)
             .take(held);
         let sack = SelectiveAck::new(unacked);
 
+        // The words agree with the slots, every one of them. These checks
+        // are cfg(test): they run in weaver-utp's own tests only, not when
+        // another crate's tests drive a stream.
+        #[cfg(test)]
+        for (index, data) in self.data.iter().enumerate() {
+            let (word, bit) = self.occupancy_bit(index);
+            assert_eq!(
+                self.occupied[word] & bit != 0,
+                !ooq_slot_is_default(data),
+                "slot {index}"
+            );
+        }
         #[cfg(test)]
         assert_eq!(
             sack,
@@ -699,7 +899,8 @@ impl OutOfOrderQueue {
             "the SACK read to the queue's end"
         );
 
-        Some(sack)
+        // Empty when every packet held lies past what a SACK can carry.
+        (!sack.is_empty()).then_some(sack)
     }
 
     pub fn add_remove(
@@ -740,6 +941,8 @@ impl OutOfOrderQueue {
         self.len += 1;
         self.len_bytes += msg.len_bytes();
         *slot = msg;
+        let (word, bit) = self.occupancy_bit(effective_offset);
+        self.occupied[word] |= bit;
 
         let range = self.filled_front..self.data.len();
         // Advance "filled" if a contiguous data range was found.
@@ -834,8 +1037,8 @@ mod tests {
     async fn a_vectored_read_leaves_the_callers_slices_as_they_came() {
         setup_test_logging();
         let (user_rx, mut read) = user_rx(64);
-        user_rx.enqueue_test(UserRxMessage::Payload(b"abcde".to_vec()));
-        user_rx.enqueue_test(UserRxMessage::Payload(b"fghij".to_vec()));
+        user_rx.enqueue_test(UserRxMessage::Payload(b"abcde".to_vec().into()));
+        user_rx.enqueue_test(UserRxMessage::Payload(b"fghij".to_vec().into()));
 
         let mut a = [0u8; 3];
         let mut b = [0u8; 4];
@@ -869,6 +1072,38 @@ mod tests {
         assert_eq!(&a, b"abc");
         assert_eq!(&b, b"defg");
         assert_eq!(&c[..3], b"hij");
+    }
+
+    /// A read takes off the shared queue only the payloads the slices have
+    /// room for, the last perhaps in part, and the window opens by the bytes
+    /// read alone. What follows comes on the next reads in order, the end
+    /// last. The four small payloads here share one buffer.
+    #[tokio::test]
+    async fn a_read_takes_only_the_payloads_it_has_room_for() {
+        setup_test_logging();
+        let (user_rx, mut read) = user_rx(64);
+        for p in [&b"abcd"[..], b"efgh", b"ijkl", b"mnop"] {
+            user_rx.enqueue_test(UserRxMessage::Payload(p.to_vec().into()));
+        }
+        user_rx.enqueue_test(UserRxMessage::Eof);
+        async fn next(read: &mut UtpStreamReadHalf, len: usize) -> Vec<u8> {
+            let mut buf = vec![0u8; len];
+            let n = poll_fn(|cx| {
+                std::pin::Pin::new(&mut *read)
+                    .poll_read_vectored(cx, &mut [std::io::IoSliceMut::new(&mut buf)])
+            })
+            .await
+            .unwrap();
+            buf.truncate(n);
+            buf
+        }
+        assert_eq!(next(&mut read, 6).await, b"abcdef");
+        assert_eq!(user_rx.len_test(), 10);
+        assert_eq!(next(&mut read, 3).await, b"ghi");
+        assert_eq!(user_rx.len_test(), 7);
+        assert_eq!(next(&mut read, 64).await, b"jklmnop");
+        assert_eq!(user_rx.len_test(), 0);
+        assert_eq!(next(&mut read, 64).await, b"");
     }
 
     #[test]
@@ -908,7 +1143,7 @@ mod tests {
         let msg = msg(0, b"b");
 
         // fill RX
-        user_rx.enqueue_test(UserRxMessage::Payload(b"a".to_vec()));
+        user_rx.enqueue_test(UserRxMessage::Payload(b"a".to_vec().into()));
 
         assert!(user_rx.shared.is_full_test());
 
@@ -946,7 +1181,7 @@ mod tests {
         let missing = msg(0, b"b");
 
         // fill RX
-        user_rx.enqueue_test(UserRxMessage::Payload(b"aa".to_vec()));
+        user_rx.enqueue_test(UserRxMessage::Payload(b"aa".to_vec().into()));
 
         assert_eq!(
             user_rx.add_remove_test(out_of_order, 1).await.unwrap(),
@@ -992,6 +1227,19 @@ mod tests {
         read.read_exact(&mut bytes).await.unwrap();
         assert_eq!(&bytes, b"bc");
         assert_eq!(user_rx.ooq.stored_bytes() + user_rx.len_test(), 0);
+    }
+
+    // Two packets in order wait to be handed to the reader and one is held
+    // past a hole: one packet is past a hole, not three.
+    #[tokio::test]
+    async fn packets_in_order_not_yet_handed_over_are_not_past_a_hole() {
+        let (mut user_rx, _read) = user_rx(100);
+        user_rx.add_remove_test(msg(0, b"a"), 0).await.unwrap();
+        user_rx.add_remove_test(msg(1, b"b"), 0).await.unwrap();
+        user_rx.add_remove_test(msg(3, b"d"), 1).await.unwrap();
+        assert_eq!(user_rx.ooq.stored_packets(), 3);
+        assert_eq!(user_rx.ooq.filled_front(), 2);
+        assert_eq!(user_rx.assembler_packets(), 1);
     }
 
     #[tokio::test]
@@ -1121,6 +1369,36 @@ mod tests {
         assert_eq!(asm.stored_packets(), 1);
     }
 
+    // The SACK read from the occupancy words equals the one read from the
+    // slots (asserted inside selective_ack) while the queue's start goes
+    // round the words' ring many times, with holes of every width.
+    #[test]
+    fn the_sack_agrees_with_the_slots_as_the_queue_turns() {
+        setup_test_logging();
+        let mut asm = OutOfOrderQueue::new(NonZeroUsize::new(40).unwrap());
+        let mut drained = 0usize;
+        for round in 0..300usize {
+            // Packets past a hole at the front, every `step`-th slot.
+            let step = 1 + round % 5;
+            for offset in (1..39).step_by(step) {
+                asm.add_remove(msg(0, b"x"), offset).unwrap();
+            }
+            let sack = asm.selective_ack().unwrap();
+            assert!(sack.iter().any(|bit| bit), "round {round}");
+            // Each hole filled in turn, everything held drains.
+            while !asm.is_empty() {
+                asm.add_remove(msg(0, b"x"), 0).unwrap();
+                asm.selective_ack();
+            }
+            while asm.send_front_if_fits(usize::MAX, |_| Ok(())).is_some() {
+                drained += 1;
+            }
+            assert!(asm.selective_ack().is_none());
+            assert_eq!(asm.stored_packets(), 0);
+        }
+        assert!(drained > 64 * 10);
+    }
+
     #[test]
     fn test_asm_duplicate_msg_ignored() {
         setup_test_logging();
@@ -1140,5 +1418,200 @@ mod tests {
             asm.add_remove(msg_2, 2).unwrap(),
             AssemblerAddRemoveResult::AlreadyPresent
         );
+    }
+
+    // A packet as the socket's receive path makes it: `len` payload bytes at
+    // `at` in a pooled receive buffer, after the header.
+    fn pooled(seq_nr: u16, at: usize, len: usize) -> UtpMessage {
+        let mut buf = crate::rx_buf::take();
+        buf[at..at + len].fill(seq_nr as u8);
+        UtpMessage {
+            header: crate::raw::UtpHeader {
+                htype: crate::raw::Type::Data,
+                seq_nr: seq_nr.into(),
+                ..Default::default()
+            },
+            data: crate::Payload::in_buffer(buf, at, at + len),
+            received: tokio::time::Instant::now(),
+        }
+    }
+
+    // Delivers in-order packets of the given payload lengths, each at
+    // `at` in its buffer, to a stream whose reader is not reading, until
+    // the window is full. Returns the bytes accepted and the bytes of
+    // buffer the stream's queue then holds.
+    async fn fill_unread(window: usize, at: usize, lens: &[usize]) -> (usize, usize) {
+        let (mut rx, _read) = user_rx(window);
+        let mut accepted = 0;
+        for (seq, &len) in lens.iter().cycle().enumerate() {
+            match rx
+                .add_remove_test(pooled(seq as u16, at, len), 0)
+                .await
+                .unwrap()
+            {
+                AssemblerAddRemoveResult::Consumed {
+                    sequence_numbers: 1,
+                    bytes,
+                } => accepted += bytes,
+                AssemblerAddRemoveResult::Unavailable => break,
+                other => panic!("packet {seq}: {other:?}"),
+            }
+            poll_fn(|cx| {
+                rx.flush(cx).unwrap();
+                Poll::Ready(())
+            })
+            .await;
+        }
+        let g = rx.shared.locked.lock();
+        assert_eq!(g.queue.len_bytes(), accepted);
+        (accepted, g.queue.held())
+    }
+
+    // One-byte packets to a stream that is not read (stopped at the disk's
+    // high mark, or by a rate limit): the window still takes one byte per
+    // byte of it, as on the wire, and the buffers held stay under twice
+    // the bytes queued plus one buffer, not one buffer per packet.
+    #[tokio::test]
+    async fn one_byte_packets_share_receive_buffers() {
+        setup_test_logging();
+        const WINDOW: usize = 16 * 1024;
+        let (accepted, held) = fill_unread(WINDOW, 20, &[1]).await;
+        assert_eq!(accepted, WINDOW);
+        assert!(
+            held < 2 * accepted + crate::rx_buf::RX_BUF_LEN,
+            "{held} bytes of buffers for {accepted} bytes queued"
+        );
+    }
+
+    // Small and large payloads in turn, and small payloads behind a header
+    // that fills most of their buffer: still under twice plus one buffer.
+    #[tokio::test]
+    async fn mixed_and_long_headed_packets_share_receive_buffers() {
+        setup_test_logging();
+        const WINDOW: usize = 64 * 1024;
+        for (at, lens) in [
+            (20, &[1, 1025][..]),
+            (20, &[1025, 1][..]),
+            (20, &[9, 1400, 9, 9, 1400][..]),
+            (2000, &[1, 47][..]),
+            (1100, &[300, 948][..]),
+        ] {
+            let (accepted, held) = fill_unread(WINDOW, at, lens).await;
+            assert!(accepted > WINDOW - 1500, "{at} {lens:?}: {accepted}");
+            assert!(
+                held < 2 * accepted + crate::rx_buf::RX_BUF_LEN,
+                "{at} {lens:?}: {held} bytes of buffers for {accepted} bytes queued"
+            );
+        }
+    }
+
+    // Full-size packets behind one another are queued in the buffers they
+    // were received into: no copy until the reader's.
+    #[tokio::test]
+    async fn full_size_packets_stay_in_their_buffers() {
+        setup_test_logging();
+        let (mut rx, _read) = user_rx(64 * 1024);
+        let mut at = Vec::new();
+        for seq in 0..8u16 {
+            let msg = pooled(seq, 20, 1400);
+            at.push(msg.data.as_ptr());
+            rx.add_remove_test(msg, 0).await.unwrap();
+            poll_fn(|cx| {
+                rx.flush(cx).unwrap();
+                Poll::Ready(())
+            })
+            .await;
+        }
+        let mut g = rx.shared.locked.lock();
+        for (seq, at) in at.into_iter().enumerate() {
+            match g.queue.pop_front() {
+                Some(UserRxMessage::Payload(payload)) => {
+                    assert_eq!(payload.as_ptr(), at, "packet {seq}");
+                    assert_eq!(payload.len(), 1400);
+                    assert!(payload.iter().all(|&b| b == seq as u8));
+                }
+                other => panic!("packet {seq}: {other:?}"),
+            }
+        }
+    }
+
+    // Packed payloads read back as the bytes sent, in order.
+    #[tokio::test]
+    async fn packed_payloads_read_back_in_order() {
+        setup_test_logging();
+        let (mut rx, mut read) = user_rx(64 * 1024);
+        let lens = [1, 1025, 7, 1400, 3, 2, 1000, 1100, 1];
+        let mut expected = Vec::new();
+        for (seq, &len) in lens.iter().enumerate() {
+            expected.extend(std::iter::repeat_n(seq as u8, len));
+            rx.add_remove_test(pooled(seq as u16, 20, len), 0)
+                .await
+                .unwrap();
+            poll_fn(|cx| {
+                rx.flush(cx).unwrap();
+                Poll::Ready(())
+            })
+            .await;
+        }
+        let mut got = vec![0; expected.len()];
+        read.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, expected);
+    }
+
+    // Packed or not, the window opens by the bytes read, never by more:
+    // two five-byte packets share a buffer, and reads of three bytes open
+    // it three bytes at a time.
+    #[tokio::test]
+    async fn the_window_opens_by_the_bytes_read() {
+        setup_test_logging();
+        let (mut rx, mut read) = user_rx(64);
+        for seq in 0..2u16 {
+            rx.add_remove_test(pooled(seq, 20, 5), 0).await.unwrap();
+            poll_fn(|cx| {
+                rx.flush(cx).unwrap();
+                Poll::Ready(())
+            })
+            .await;
+        }
+        let window = || rx.shared.locked.lock().queue.window();
+        assert_eq!(window(), 54);
+        let mut buf = [0u8; 3];
+        for (step, open) in [57, 60, 63].into_iter().enumerate() {
+            read.read_exact(&mut buf).await.unwrap();
+            assert_eq!(window(), open, "after read {step}");
+        }
+        let mut last = [0u8; 1];
+        read.read_exact(&mut last).await.unwrap();
+        assert_eq!(window(), 64);
+    }
+
+    // The out-of-order queue holds one packet per slot, and has one slot
+    // per 1100 bytes of the window, at least 16: one-byte packets there
+    // hold at most 2 KiB per 1100 bytes of window, plus 16 buffers.
+    #[tokio::test]
+    async fn the_reorder_queue_holds_a_bounded_number_of_buffers() {
+        setup_test_logging();
+        for window in [16 * 1024, 1024 * 1024] {
+            let (mut rx, _read) = user_rx(window);
+            // Packet 0 never comes: everything waits out of order.
+            for offset in 1.. {
+                match rx
+                    .add_remove_test(pooled(offset as u16, 20, 1), offset)
+                    .await
+                    .unwrap()
+                {
+                    AssemblerAddRemoveResult::Consumed { .. } => {}
+                    AssemblerAddRemoveResult::Unavailable => break,
+                    other => panic!("packet {offset}: {other:?}"),
+                }
+            }
+            let held = rx.ooq.held();
+            let slots = super::reorder_capacity(NonZeroUsize::new(window).unwrap()).get();
+            assert_eq!(held, (slots - 1) * crate::rx_buf::RX_BUF_LEN);
+            assert!(
+                held <= window * 2048 / 1100 + 16 * crate::rx_buf::RX_BUF_LEN,
+                "{window}: {held}"
+            );
+        }
     }
 }

@@ -89,6 +89,90 @@ pub(crate) const SEND_BUFFER_LOW_WATERMARK: u64 = 128 * 1024;
 const SEND_BUFFER_WATERMARK: u64 = 4 * 1024 * 1024;
 const SEND_BUFFER_WATERMARK_FACTOR: u64 = 100;
 
+/// The peer's send buffer, which its writer and the torrent share: the
+/// blocks handed to the writer and not yet taken, and the payload handed and
+/// not yet sent. The writer takes and settles blocks here, on its own
+/// thread, without the torrent's peer map; the torrent reads it when it
+/// hands blocks, each upload scheduler turn, and when the peer asks
+/// (libtorrent keeps these on the peer, `m_reading_bytes` and the send
+/// buffer, all on its network thread).
+#[derive(Debug)]
+pub(crate) struct UploadLedger(parking_lot::Mutex<Ledger>);
+
+#[derive(Debug)]
+struct Ledger {
+    // The blocks handed to the writer and not yet taken by it, in the order
+    // handed. The writer sends a block only by taking it from here, so a
+    // Cancel or a Choke that drops it first keeps it from going out.
+    handed: VecDeque<ChunkInfo>,
+    // The payload handed to the writer and not yet sent, taken or not: the
+    // peer's send buffer, held to its watermark (libtorrent
+    // `peer_connection::m_reading_bytes` and `send_buffer_size`).
+    unsent: u64,
+    // The watermark and the blocks queued and not handed, as the torrent
+    // last saw them; the writer decides from these whether the peer wants a
+    // turn. A stale count asks for a turn that hands nothing, or waits for
+    // the next request, which looks again.
+    watermark: u64,
+    queued: usize,
+    // Whether the peer has a turn with the upload scheduler on its way.
+    turn_due: bool,
+    // When the writer last took a block to send.
+    last_taken: Option<Instant>,
+}
+
+impl Default for UploadLedger {
+    fn default() -> Self {
+        UploadLedger(parking_lot::Mutex::new(Ledger {
+            handed: VecDeque::new(),
+            unsent: 0,
+            watermark: SEND_BUFFER_LOW_WATERMARK,
+            queued: 0,
+            turn_due: false,
+            last_taken: None,
+        }))
+    }
+}
+
+impl Ledger {
+    fn done(&mut self, chunk: &ChunkInfo) {
+        self.unsent = self.unsent.saturating_sub(u64::from(chunk.size));
+    }
+
+    // True once, until the turn is taken, while blocks wait and the send
+    // buffer is under its watermark.
+    fn wants_turn(&mut self) -> bool {
+        let wants = !self.turn_due && self.queued > 0 && self.unsent < self.watermark;
+        self.turn_due |= wants;
+        wants
+    }
+}
+
+impl UploadLedger {
+    /// The writer takes the handed `chunk` to send it; false when a Cancel or
+    /// a Choke dropped it first. With it, whether the peer wants a turn.
+    pub(crate) fn claim(&self, chunk: &ChunkInfo) -> (bool, bool) {
+        let mut ledger = self.0.lock();
+        let at = ledger.handed.iter().position(|handed| handed == chunk);
+        let claimed = at.and_then(|at| ledger.handed.remove(at)).is_some();
+        if claimed {
+            ledger.last_taken = Some(Instant::now());
+        }
+        (claimed, ledger.wants_turn())
+    }
+
+    /// The handed `chunks` are off the writer's hands, sent or not served:
+    /// their room is free (libtorrent `peer_connection::on_send_data`).
+    /// Whether the peer wants a turn.
+    pub(crate) fn done(&self, chunks: &[ChunkInfo]) -> bool {
+        let mut ledger = self.0.lock();
+        for chunk in chunks {
+            ledger.done(chunk);
+        }
+        ledger.wants_turn()
+    }
+}
+
 // libtorrent `settings_pack::request_queue_time`: the requests outstanding to
 // a peer cover this long of its delivery.
 const REQUEST_QUEUE_TIME: Duration = Duration::from_secs(3);
@@ -1002,9 +1086,9 @@ pub(crate) struct LivePeerState {
     // connection went live until we do (libtorrent
     // `m_became_uninteresting`).
     became_uninteresting: Instant,
-    // When we last queued a block the peer asked for, or took one off its
-    // queue to send; the time the connection went live until we do
-    // (libtorrent `m_last_incoming_request`, `m_last_sent_payload`).
+    // When we last queued a block the peer asked for; the time the
+    // connection went live until we do. The writer's last take is in the
+    // ledger (libtorrent `m_last_incoming_request`, `m_last_sent_payload`).
     last_upload: Instant,
 
     // When we choked the peer; None while we do not. It starts choked when
@@ -1076,16 +1160,8 @@ pub(crate) struct LivePeerState {
     // The blocks the peer asked us for and that are not handed to the
     // writer yet, in the order asked (libtorrent `m_requests`).
     upload_queue: VecDeque<ChunkInfo>,
-    // The blocks handed to the writer and not yet taken by it, in the order
-    // handed. The writer sends a block only by taking it from here, so a
-    // Cancel or a Choke that drops it first keeps it from going out.
-    upload_handed: VecDeque<ChunkInfo>,
-    // The payload handed to the writer and not yet sent, taken or not: the
-    // peer's send buffer, held to its watermark (libtorrent
-    // `peer_connection::m_reading_bytes` and `send_buffer_size`).
-    upload_unsent: u64,
-    // Whether the peer has a turn with the upload scheduler on its way.
-    upload_turn_due: bool,
+    // The blocks handed to the writer, and its send buffer.
+    upload: Arc<UploadLedger>,
 
     // The requests the peer sent that we could not serve since we last
     // choked it (libtorrent `peer_connection::m_num_invalid_requests`).
@@ -1160,6 +1236,10 @@ pub(crate) struct LivePeerState {
     // `stat_channel::second_tick` keeps).
     pub download_rate: SpeedEstimator,
     pub upload_rate: SpeedEstimator,
+    // All the peer sends us on this connection, payload and protocol, per
+    // second over the same window (libtorrent `stat::download_rate`, the
+    // payload and protocol channels summed, stat.hpp:195-200).
+    received_rate: SpeedEstimator,
 }
 
 /// How often the torrent samples each connection's payload rates.
@@ -1229,9 +1309,7 @@ impl LivePeerState {
             snubbed: false,
             request_slots_changed: Default::default(),
             upload_queue: Default::default(),
-            upload_handed: VecDeque::new(),
-            upload_unsent: 0,
-            upload_turn_due: false,
+            upload: Arc::default(),
             invalid_requests: 0,
             super_seeded: [None; 2],
             supports_holepunch: false,
@@ -1250,6 +1328,7 @@ impl LivePeerState {
             encryption: Encryption::None,
             download_rate: rate_estimator(),
             upload_rate: rate_estimator(),
+            received_rate: rate_estimator(),
         }
     }
 
@@ -1264,6 +1343,16 @@ impl LivePeerState {
         let moved = self.this_connection(counters);
         self.download_rate.add_snapshot(moved.fetched, None, now);
         self.upload_rate.add_snapshot(moved.uploaded, None, now);
+        // The estimator takes differences, so the protocol bytes of the
+        // peer's earlier connections cancel out. The headers its packets
+        // are taken to have cost count too (libtorrent
+        // `stat::download_rate`, stat.hpp:195 in v2.0.15: payload,
+        // protocol and IP overhead).
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        let protocol = counters.fetched_protocol_bytes.load(relaxed);
+        let overhead = counters.ip_overhead_bytes.load(relaxed);
+        self.received_rate
+            .add_snapshot(moved.fetched + protocol + overhead, None, now);
     }
 
     /// The peer named its DHT node at `port` (BEP 5 PORT). Whether that is
@@ -1409,7 +1498,11 @@ impl LivePeerState {
     /// their headers, or half again what it sends a round at its rate,
     /// whichever is more (libtorrent `peer_connection::wanted_transfer`,
     /// `m_outstanding_bytes + 30` against `download_rate * 3 / 2` over a
-    /// tick).
+    /// tick). The rate is of all it sends, protocol and the headers of its
+    /// packets too, so a peer that only asks us for blocks is read as fast
+    /// as its requests come, not a request at a time. What is left of the
+    /// frame being read is the reader's to add (`Quota::admit`; libtorrent's
+    /// `packet_bytes_remaining() + 30`).
     pub fn download_wanted(&self) -> u64 {
         let outstanding: u64 = self
             .inflight_requests
@@ -1417,7 +1510,7 @@ impl LivePeerState {
             .map(|chunk| u64::from(chunk.size))
             .sum();
         let at_rate = u64::try_from(
-            u128::from(self.download_rate.bps()) * 3 / 2 * crate::limits::ROUND.as_millis() / 1000,
+            u128::from(self.received_rate.bps()) * 3 / 2 * crate::limits::ROUND.as_millis() / 1000,
         )
         .unwrap_or(u64::MAX);
         (outstanding + crate::peer_connection::WANTED_SLACK).max(at_rate)
@@ -1667,7 +1760,7 @@ impl LivePeerState {
         chunk: ChunkInfo,
         chunks_per_piece: u32,
     ) -> Result<bool, Refused> {
-        if self.upload_handed.contains(&chunk) || self.upload_queue.contains(&chunk) {
+        if self.upload_queue.contains(&chunk) || self.upload.0.lock().handed.contains(&chunk) {
             return Err(Refused::Queued);
         }
         if self.upload_queue.len() >= MAX_ALLOWED_IN_REQUEST_QUEUE as usize {
@@ -1708,19 +1801,27 @@ impl LivePeerState {
 
     /// Whether the writer has room under its watermark and the peer asked
     /// for a block: the upload scheduler owes the peer a turn.
+    #[cfg(test)]
     pub(crate) fn ready_to_hand(&self) -> bool {
-        !self.upload_queue.is_empty() && self.upload_unsent < self.send_buffer_watermark()
+        !self.upload_queue.is_empty() && self.upload.0.lock().unsent < self.send_buffer_watermark()
+    }
+
+    /// The peer's send buffer, shared with its writer.
+    pub(crate) fn upload_ledger(&self) -> Arc<UploadLedger> {
+        self.upload.clone()
     }
 
     /// Whether the peer is to be given a turn with the upload scheduler:
-    /// it is [ready](Self::ready_to_hand) and has none on its way. True
-    /// once, until the turn is taken. The watermark follows the upload
-    /// rate, so a peer can become ready with nothing happening to it; the
-    /// next event that asks finds it so.
+    /// the writer has room under its watermark, the peer asked for a block,
+    /// and it has none on its way. True once, until the turn is taken. The
+    /// watermark follows the upload rate, so a peer can become ready with
+    /// nothing happening to it; the next event that asks finds it so.
     pub(crate) fn wants_turn(&mut self) -> bool {
-        let wants = !self.upload_turn_due && self.ready_to_hand();
-        self.upload_turn_due |= wants;
-        wants
+        let watermark = self.send_buffer_watermark();
+        let mut ledger = self.upload.0.lock();
+        ledger.watermark = watermark;
+        ledger.queued = self.upload_queue.len();
+        ledger.wants_turn()
     }
 
     /// The peer's turn with the upload scheduler: the blocks it asked for
@@ -1728,37 +1829,39 @@ impl LivePeerState {
     /// unsent reaches its watermark (libtorrent
     /// `peer_connection::fill_send_buffer`). How many were handed.
     pub(crate) fn hand_upload(&mut self) -> usize {
-        self.upload_turn_due = false;
         let watermark = self.send_buffer_watermark();
+        let mut ledger = self.upload.0.lock();
+        ledger.turn_due = false;
+        ledger.watermark = watermark;
         let mut handed = 0;
-        while self.upload_unsent < watermark {
+        while ledger.unsent < watermark {
             let Some(chunk) = self.upload_queue.pop_front() else {
                 break;
             };
-            self.upload_unsent += u64::from(chunk.size);
-            self.upload_handed.push_back(chunk);
+            ledger.unsent += u64::from(chunk.size);
+            ledger.handed.push_back(chunk);
             let _ = self.tx.send(WriterRequest::ReadChunkRequest(chunk));
             handed += 1;
         }
+        ledger.queued = self.upload_queue.len();
         handed
     }
 
     /// The handed `chunk` is off the writer's hands, sent or not served:
     /// its room in the send buffer is free (libtorrent
     /// `peer_connection::on_send_data`).
+    #[cfg(test)]
     pub(crate) fn upload_done(&mut self, chunk: &ChunkInfo) {
-        self.upload_unsent = self.upload_unsent.saturating_sub(u64::from(chunk.size));
+        self.upload.0.lock().done(chunk);
     }
 
     /// Takes `chunk` off the blocks handed to the writer, if it is there,
     /// with its room in the send buffer.
     fn unhand(&mut self, chunk: &ChunkInfo) -> Option<ChunkInfo> {
-        let at = self
-            .upload_handed
-            .iter()
-            .position(|handed| handed == chunk)?;
-        let chunk = self.upload_handed.remove(at)?;
-        self.upload_done(&chunk);
+        let mut ledger = self.upload.0.lock();
+        let at = ledger.handed.iter().position(|handed| handed == chunk)?;
+        let chunk = ledger.handed.remove(at)?;
+        ledger.done(&chunk);
         Some(chunk)
     }
 
@@ -1870,13 +1973,16 @@ impl LivePeerState {
         self.choked_at = Some(now);
         self.invalid_requests = 0;
         let _ = self.tx.send(WriterRequest::Message(Message::Choke));
-        let (kept, handed): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut self.upload_handed)
+        let upload = self.upload.clone();
+        let mut ledger = upload.0.lock();
+        let (kept, handed): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut ledger.handed)
             .into_iter()
             .partition(|chunk| self.allows_fast(chunk.piece_index));
-        self.upload_handed = kept;
+        ledger.handed = kept;
         for chunk in &handed {
-            self.upload_done(chunk);
+            ledger.done(chunk);
         }
+        drop(ledger);
         let (kept, dropped): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut self.upload_queue)
             .into_iter()
             .partition(|chunk| self.allows_fast(chunk.piece_index));
@@ -1945,13 +2051,9 @@ impl LivePeerState {
     /// The writer takes the handed `chunk` to send it. False when a Cancel or
     /// a Choke dropped it first, and it is not sent. A block taken keeps its
     /// room in the send buffer until [it is done](Self::upload_done).
+    #[cfg(test)]
     pub fn claim_upload(&mut self, chunk: &ChunkInfo) -> bool {
-        let at = self.upload_handed.iter().position(|handed| handed == chunk);
-        let claimed = at.and_then(|at| self.upload_handed.remove(at)).is_some();
-        if claimed {
-            self.last_upload = Instant::now();
-        }
-        claimed
+        self.upload.claim(chunk).0
     }
 
     /// The peer said at `now` whether it is interested
@@ -2000,12 +2102,19 @@ impl LivePeerState {
         upload_only: bool,
         full: bool,
     ) -> Option<TimedOut> {
-        let served = self.last_unchoke.max(self.last_upload);
+        let (unsent, taken) = {
+            let ledger = self.upload.0.lock();
+            (ledger.unsent, ledger.last_taken)
+        };
+        let served = self
+            .last_unchoke
+            .max(self.last_upload)
+            .max(taken.unwrap_or(self.last_upload));
         if upload_only
             && self.peer_interested
             && !self.is_choked()
             && self.upload_queue.is_empty()
-            && self.upload_unsent == 0
+            && unsent == 0
             && now.saturating_duration_since(served) > NO_REQUEST_TIMEOUT
         {
             return Some(TimedOut::NoRequest);
@@ -2518,6 +2627,56 @@ mod tests {
         assert_eq!(live.desired_queue_size(500), 12);
         deliver(&mut live, block(11), quarter).await;
         assert_eq!(live.desired_queue_size(500), 12);
+    }
+
+    // libtorrent peer_connection::wanted_transfer asks for half again what
+    // the peer sends in a tick at `stat::download_rate`, which sums payload
+    // and protocol (stat.hpp:195-200): a peer that sends only requests is
+    // read at the rate they come, not a frame at a time.
+    #[test]
+    fn a_read_asks_for_what_the_peer_sends_protocol_too() {
+        let live = live_now();
+        let counters = stats::atomic::PeerStats::default().counters;
+        let start = std::time::Instant::now();
+        live.sample_rates(&counters, start);
+        assert_eq!(live.download_wanted(), 30);
+
+        // A megabyte of requests in a second: half again over a round of
+        // half a second.
+        counters
+            .fetched_protocol_bytes
+            .fetch_add(1_000_000, std::sync::atomic::Ordering::Relaxed);
+        live.sample_rates(&counters, start + Duration::from_secs(1));
+        assert_eq!(live.download_wanted(), 750_000);
+    }
+
+    // libtorrent `stat::download_rate` sums the IP overhead with payload and
+    // protocol (stat.hpp:195 in v2.0.15), and `trancieve_ip_packet`
+    // (stat.hpp:150) estimates it for every receive and send: a peer whose
+    // requests come a small packet each is asked for the headers' worth too.
+    #[test]
+    fn a_read_asks_for_the_headers_of_the_peers_packets_too() {
+        use crate::read_buf::{IP_HEADER, ip_packets};
+        // A packet's worth or less is one packet; a byte more is two.
+        assert_eq!(ip_packets(0), [1, 1]);
+        assert_eq!(ip_packets(17), [1, 1]);
+        assert_eq!(ip_packets(1440), [1, 1]);
+        assert_eq!(ip_packets(1441), [1, 2]);
+        assert_eq!(ip_packets(1460), [1, 2]);
+        assert_eq!(ip_packets(1461), [2, 2]);
+        assert_eq!(ip_packets(1 << 20), [719, 729]);
+        assert_eq!(IP_HEADER, [40, 60]);
+
+        let live = live_now();
+        let counters = stats::atomic::PeerStats::default().counters;
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        let start = std::time::Instant::now();
+        live.sample_rates(&counters, start);
+        // In a second, 10,000 requests of 17 bytes, a packet each over IPv4.
+        counters.fetched_protocol_bytes.fetch_add(170_000, relaxed);
+        counters.ip_overhead_bytes.fetch_add(400_000, relaxed);
+        live.sample_rates(&counters, start + Duration::from_secs(1));
+        assert_eq!(live.download_wanted(), 570_000 * 3 / 2 / 2);
     }
 
     // libtorrent snub_peer: a snub ends slow start and holds the queue to
