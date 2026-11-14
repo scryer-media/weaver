@@ -1879,7 +1879,14 @@ async fn pausing_all_is_one_hold_over_each_torrents_own_pause() {
             weaver_server_core::torrents::model::TorrentIntent::Resumed,
         ),
     ] {
-        let job_id = rig.context.by_hash(&hash).await.unwrap().job_id;
+        let job_id = rig
+            .context
+            .by_hash(&hash)
+            .await
+            .ok()
+            .flatten()
+            .unwrap()
+            .job_id;
         assert_eq!(rig.db.get_torrent(job_id).unwrap().unwrap().intent, intent);
     }
 }
@@ -1891,7 +1898,14 @@ async fn the_client_deletes_a_private_torrent_short_of_its_goal() {
     let hash = rig.torrents().await[0]["hash"].as_str().unwrap().to_owned();
     // Weaver's own removal still asks for a confirmation.
     let torrents = rig.context.inner.torrents.as_ref().unwrap();
-    let job_id = rig.context.by_hash(&hash).await.unwrap().job_id;
+    let job_id = rig
+        .context
+        .by_hash(&hash)
+        .await
+        .ok()
+        .flatten()
+        .unwrap()
+        .job_id;
     assert!(matches!(
         torrents.remove(job_id, false, false).await,
         Err(ActionError::UnmetGoal(_))

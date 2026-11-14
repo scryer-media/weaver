@@ -101,7 +101,8 @@ async fn a_picked_page_is_the_page_of_every_view() {
         let picked = rig
             .service
             .picked(Pick::default(), page(offset, first), Shown::LISTED)
-            .await;
+            .await
+            .unwrap();
         let old: Vec<TorrentView> = every.iter().skip(offset).take(first).cloned().collect();
         assert_eq!(picked, old, "page {offset}+{first}");
     }
@@ -129,7 +130,8 @@ async fn a_picked_page_is_the_page_of_every_view() {
             page(5, 20),
             Shown::LISTED,
         )
-        .await;
+        .await
+        .unwrap();
     assert_eq!(
         picked,
         old.iter().skip(5).take(20).cloned().collect::<Vec<_>>()
@@ -174,7 +176,8 @@ async fn a_picked_page_is_the_page_of_every_view() {
                     Window::Every,
                     Shown::WHOLE,
                 )
-                .await;
+                .await
+                .unwrap();
             assert!(!old.is_empty() || private == Some(true));
             assert_eq!(picked, old, "private {private:?}, category {category:?}");
         }
@@ -184,7 +187,8 @@ async fn a_picked_page_is_the_page_of_every_view() {
     let bare = rig
         .service
         .picked(Pick::default(), Window::Every, Shown::BARE)
-        .await;
+        .await
+        .unwrap();
     assert_eq!(rig.service.job_ids().await, ids(&every));
     let old: Vec<TorrentView> = every
         .iter()
@@ -203,12 +207,79 @@ async fn a_picked_page_is_the_page_of_every_view() {
         assert_eq!(
             rig.service
                 .torrent_by_hash(&format!(" {} ", view.infohash.to_uppercase()))
-                .await,
+                .await
+                .unwrap(),
             rig.service.torrent(view.job_id).await
         );
     }
-    assert_eq!(rig.service.torrent_by_hash("nothex").await, None);
-    assert_eq!(rig.service.torrent_by_hash(&"cd".repeat(20)).await, None);
+    assert_eq!(rig.service.torrent_by_hash("nothex").await.unwrap(), None);
+    assert_eq!(
+        rig.service.torrent_by_hash(&"cd".repeat(20)).await.unwrap(),
+        None
+    );
+    rig.service.stop().await;
+}
+
+// The table cannot be read: a list that reads it fails, never answering an
+// empty list or no torrent, and a list of every torrent, which reads no
+// table, still answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_list_that_cannot_read_the_table_fails() {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(metainfo(
+                "t",
+                &[("t/a.bin", &[7; 3000])],
+                1024,
+                false,
+            )))
+        })
+        .await
+        .unwrap();
+    settled(&rig.service, 1).await;
+    let hash = rig.service.torrent(job_id).await.unwrap().infohash;
+    let datastore = rig.db.datastore();
+    rig.db
+        .run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                "ALTER TABLE torrents RENAME TO torrents_away",
+                &[] as &[SqlArg],
+            )
+            .await?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(
+        rig.service
+            .picked(Pick::default(), page(0, 10), Shown::LISTED)
+            .await
+            .is_err()
+    );
+    let named = [hash.as_str()];
+    let by_hashes = Pick {
+        hashes: Some(&named),
+        ..Pick::default()
+    };
+    assert!(
+        rig.service
+            .picked_rows(by_hashes, Window::Every, Shown::LISTED)
+            .await
+            .is_err()
+    );
+    assert!(rig.service.torrent_by_hash(&hash).await.is_err());
+    let every = rig
+        .service
+        .picked(Pick::default(), Window::Every, Shown::BARE)
+        .await
+        .unwrap();
+    assert_eq!(ids(&every), vec![job_id]);
     rig.service.stop().await;
 }
 
@@ -320,7 +391,8 @@ async fn a_row_reads_the_totals_its_files_give() {
     let whole = rig
         .service
         .picked(Pick::default(), Window::Every, Shown::WHOLE)
-        .await;
+        .await
+        .unwrap();
     assert_eq!(whole.len(), jobs.len());
     // Every shape is there: one file named as the torrent, one file in a
     // folder, many files, and a file not fetched.
@@ -344,7 +416,8 @@ async fn a_row_reads_the_totals_its_files_give() {
     let rows = rig
         .service
         .picked_rows(Pick::default(), Window::Every, Shown::LISTED)
-        .await;
+        .await
+        .unwrap();
     assert_eq!(rows.len(), whole.len());
     for ((view, totals), old) in rows.iter().zip(&whole) {
         assert_eq!(*view, without(old));
@@ -355,7 +428,8 @@ async fn a_row_reads_the_totals_its_files_give() {
     let rows = rig
         .service
         .picked_rows(Pick::default(), Window::Every, Shown::WHOLE)
-        .await;
+        .await
+        .unwrap();
     assert_eq!(
         rows.iter()
             .map(|(view, _)| view.clone())
@@ -380,11 +454,13 @@ async fn a_row_reads_the_totals_its_files_give() {
             let picked = rig
                 .service
                 .picked(pick, page(offset, first), Shown::WHOLE)
-                .await;
+                .await
+                .unwrap();
             let rows = rig
                 .service
                 .picked_rows(pick, page(offset, first), Shown::LISTED)
-                .await;
+                .await
+                .unwrap();
             assert_eq!(
                 rows,
                 picked

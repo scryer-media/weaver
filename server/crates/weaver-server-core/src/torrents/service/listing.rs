@@ -265,13 +265,20 @@ impl Pick<'_> {
     // they were added, read from the table with no torrent's lock held: the
     // page itself, or with a privacy to keep, every torrent the table
     // keeps, for `Picked::under` to keep those of that privacy and take the
-    // page from them.
+    // page from them. A pick of every torrent, or of every one of a
+    // privacy, reads no table: `Picked::under` takes them from the live
+    // torrents it walks anyway.
     pub(super) fn picked(
         &self,
         settings: &TorrentSettings,
         db: &crate::persistence::Database,
         window: Window,
     ) -> Result<Picked, crate::StateError> {
+        if self.hashes.is_none() && self.category.is_none() && matches!(window, Window::Every) {
+            return Ok(Picked::Live {
+                private: self.private,
+            });
+        }
         let filter = self.filter(settings);
         if let Some(private) = self.private {
             let kept = db.torrent_list_ids(&filter, 0, None)?;
@@ -307,6 +314,9 @@ pub(super) enum Picked {
         private: bool,
         window: Window,
     },
+    /// Every live torrent, or every one of `private`'s privacy: the table
+    /// was not read.
+    Live { private: Option<bool> },
 }
 
 impl Picked {
@@ -330,6 +340,15 @@ impl Picked {
                 let places = window.places(kept.len());
                 kept[places].to_vec()
             }
+            Self::Live { private } => {
+                let mut kept: Vec<(i64, JobId)> = live
+                    .values()
+                    .filter(|torrent| private.is_none_or(|private| torrent.private == private))
+                    .map(|torrent| (torrent.record.added_at_ms, torrent.record.job_id))
+                    .collect();
+                kept.sort_unstable();
+                kept.into_iter().map(|(_, job_id)| job_id).collect()
+            }
         }
     }
 }
@@ -346,26 +365,28 @@ impl TorrentService {
         Pick::default().ids(&settings, &*self.inner.live.lock().await)
     }
 
-    // The ids `pick` keeps at `window`'s places, read from the table; none,
-    // with a warning, when the table cannot be read.
-    fn picked_ids(&self, pick: Pick<'_>, window: Window) -> Picked {
+    // The ids `pick` keeps at `window`'s places, read from the table.
+    fn picked_ids(&self, pick: Pick<'_>, window: Window) -> Result<Picked, crate::StateError> {
         pick.picked(&self.settings(), &self.inner.db, window)
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "could not read the torrent list");
-                Picked::Page(Vec::new())
-            })
     }
 
     /// The torrents `pick` keeps, in the order they were added, and of
-    /// those the ones at `window`'s places. Only their views are built.
-    pub async fn picked(&self, pick: Pick<'_>, window: Window, shown: Shown) -> Vec<TorrentView> {
-        let picked = self.picked_ids(pick, window);
+    /// those the ones at `window`'s places. Only their views are built. An
+    /// error when the table cannot be read, never an empty list.
+    pub async fn picked(
+        &self,
+        pick: Pick<'_>,
+        window: Window,
+        shown: Shown,
+    ) -> Result<Vec<TorrentView>, crate::StateError> {
+        let picked = self.picked_ids(pick, window)?;
         let now = self.inner.clock.now_ms();
-        self.listed_by(shown, false, false, now, move |_, live| picked.under(live))
+        Ok(self
+            .listed_by(shown, false, false, now, move |_, live| picked.under(live))
             .await
             .into_iter()
             .map(|(view, ..)| view)
-            .collect()
+            .collect())
     }
 
     /// The torrents `picked` gives, each with the totals of its files: what
@@ -375,14 +396,15 @@ impl TorrentService {
         pick: Pick<'_>,
         window: Window,
         shown: Shown,
-    ) -> Vec<(TorrentView, FileTotals)> {
-        let picked = self.picked_ids(pick, window);
+    ) -> Result<Vec<(TorrentView, FileTotals)>, crate::StateError> {
+        let picked = self.picked_ids(pick, window)?;
         let now = self.inner.clock.now_ms();
-        self.listed_by(shown, false, true, now, move |_, live| picked.under(live))
+        Ok(self
+            .listed_by(shown, false, true, now, move |_, live| picked.under(live))
             .await
             .into_iter()
             .map(|(view, _, totals)| (view, totals.expect("asked for")))
-            .collect()
+            .collect())
     }
 
     /// The torrents of `ids` there are, as [`TorrentService::torrents`]
@@ -406,17 +428,24 @@ impl TorrentService {
 
     /// The torrent whose `TorrentView::infohash` is `hash`, in any case, as
     /// [`TorrentService::torrent`] gives it: found through the table's
-    /// index of hashes, not by a walk of every torrent.
-    pub async fn torrent_by_hash(&self, hash: &str) -> Option<TorrentView> {
+    /// index of hashes, not by a walk of every torrent. An error when the
+    /// table cannot be read, never none.
+    pub async fn torrent_by_hash(
+        &self,
+        hash: &str,
+    ) -> Result<Option<TorrentView>, crate::StateError> {
         let hashes = [hash];
         let pick = Pick {
             hashes: Some(&hashes),
             ..Pick::default()
         };
-        let Picked::Page(found) = self.picked_ids(pick, page(0, 1)) else {
-            unreachable!("a pick with no privacy reads its page from the table")
+        let Picked::Page(found) = self.picked_ids(pick, page(0, 1))? else {
+            unreachable!("a pick of hashes reads its page from the table")
         };
-        self.torrent(*found.first()?).await
+        Ok(match found.first() {
+            Some(job_id) => self.torrent(*job_id).await,
+            None => None,
+        })
     }
 }
 
