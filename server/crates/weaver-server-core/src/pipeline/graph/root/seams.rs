@@ -394,9 +394,7 @@ impl Pipeline {
             } else {
                 let _ = graph.run_said(said, &mut self.graph_status.repairs, 0);
             }
-            if !graph.holds_retirement() {
-                self.finish_graph_retirement(job_id);
-            }
+            self.settle_graph_retirement(job_id);
             self.wake_repair_waiters();
             self.wake_memory_waiters();
             return;

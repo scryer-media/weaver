@@ -467,6 +467,55 @@ async fn a_job_paused_with_bytes_queued_is_kept_until_they_are_written() {
     retire_pipeline_database(pipeline).await;
 }
 
+// A job paused with a run out and nothing waiting for the disk asks its
+// volume for no word. What the run said before the pause is heard after it
+// and queues writes: the job is kept for them, is told when they are down,
+// and goes then.
+#[tokio::test]
+async fn a_job_paused_with_a_quiet_disk_is_kept_for_what_its_run_said_before() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_415);
+    let body = payload(3 * ARTICLE + 5, 6);
+    let posts = [echo_volume(0, &body)];
+    let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
+    echo_engines(&mut pipeline, job_id, 1);
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    // Everything the run says, to its end, is taken and not yet heard.
+    let mut unheard = Vec::new();
+    loop {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        let ended = matches!(said.heard, Heard::Ended);
+        unheard.push(said);
+        if ended {
+            break;
+        }
+    }
+    let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    disk.barrier().wait_aside();
+    assert!(disk.quiet());
+    pipeline.pause_job_runtime(job_id).unwrap();
+    assert!(pipeline.retiring_graph_jobs.contains_key(&job_id));
+    let volume = Arc::clone(disk.working().volume());
+    let hold = pipeline.volume_writers.hold(&volume);
+    for said in unheard {
+        pipeline.graph_run_said(said);
+    }
+    assert!(volume.buffered_bytes.load(Ordering::Relaxed) > 0);
+    // The run is over, and the last of the job's mail is heard: only the
+    // writes that mail queued hold the job.
+    while pipeline.retiring_graph_jobs[&job_id].awaits_mail() {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+    }
+    assert!(!disk.quiet());
+    hold.open();
+    hear_retirement(&mut pipeline, job_id).await;
+    assert!(disk.quiet());
+    no_loop_waits(&volume);
+    retire_pipeline_database(pipeline).await;
+}
+
 // A write of a paused job that fails after the pause still fails the job:
 // the failure is heard while the stopped graph waits for its volume.
 #[tokio::test]

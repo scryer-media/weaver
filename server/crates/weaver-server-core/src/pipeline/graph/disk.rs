@@ -218,16 +218,31 @@ impl Pipeline {
         {
             graph.pending().queue_released(&self.db, job_id, &mail);
         }
-        if self
-            .retiring_graph_jobs
-            .get(&job_id)
-            .is_some_and(|graph| !graph.holds_retirement())
-        {
-            self.finish_graph_retirement(job_id);
+        if self.retiring_graph_jobs.contains_key(&job_id) {
+            self.settle_graph_retirement(job_id);
             self.wake_repair_waiters();
             self.wake_memory_waiters();
         }
         self.retry_move_after_disk(job_id);
+    }
+
+    // A stopped job after something of it was heard: it goes when nothing
+    // holds it any more. One held only by file operations its volumes'
+    // writers still have is told when they returned, and is asked after
+    // again then. The operations are whatever is queued now: mail heard
+    // after the job stopped may have queued more than its stop waited for.
+    pub(in crate::pipeline) fn settle_graph_retirement(&mut self, job_id: JobId) {
+        let Some(graph) = self.retiring_graph_jobs.get(&job_id) else {
+            return;
+        };
+        if !graph.holds_retirement() {
+            self.finish_graph_retirement(job_id);
+        } else if !graph.awaits_mail()
+            && let Some(disk) = graph.disk()
+        {
+            disk.barrier()
+                .then_tell_of_the_rest(job_id, &self.graph_runs.written());
+        }
     }
 
     // Hear every batch report that is waiting. Whether any was.
@@ -493,6 +508,36 @@ impl JobBarrier {
                 heard: crate::pipeline::graph::engine::Heard::DiskReturned,
             });
         });
+    }
+
+    // As `then_tell`, asking only the volumes whose operations are still
+    // out: a job that asks again each time it hears is not answered at once
+    // by a volume that already returned while another has not. The job
+    // hears once when none is out.
+    pub(crate) fn then_tell_of_the_rest(
+        &self,
+        job_id: JobId,
+        mail: &tokio::sync::mpsc::UnboundedSender<crate::pipeline::graph::engine::Said>,
+    ) {
+        let tell = {
+            let mail = mail.clone();
+            move || {
+                let _ = mail.send(crate::pipeline::graph::engine::Said {
+                    scope: job_id.0,
+                    node: weaver_graph::NodeId::ROOT,
+                    generation: 0,
+                    heard: crate::pipeline::graph::engine::Heard::DiskReturned,
+                });
+            }
+        };
+        let mut asked = false;
+        for barrier in self.0.iter().filter(|barrier| !barrier.returned()) {
+            asked = true;
+            barrier.then(tell.clone());
+        }
+        if !asked {
+            tell();
+        }
     }
 
     // Every operation behind it returned, failed or not.
