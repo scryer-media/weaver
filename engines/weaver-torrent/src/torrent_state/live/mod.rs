@@ -1545,11 +1545,21 @@ impl TorrentStateLive {
         Ok(served)
     }
 
+    // The check holds the run's turn at its storage while it reads it and
+    // tells it the piece passed, as a downloaded piece's check does: the
+    // run's end waits for the one under way, and one that would begin after
+    // it finds no turn and reads nothing, an error that tells those waiting
+    // on its claim nothing (libtorrent's stop job fences every disk job of
+    // the storage, the seed-mode hash job among them,
+    // `mmap_disk_io::async_stop_torrent`, mmap_disk_io.cpp:980, v2.0.15).
     fn check_unchecked(&self, piece: ValidPieceIndex) -> anyhow::Result<bool> {
         let seed = &self.shared.options.seed;
         if !seed.unchecked(piece) {
             return Ok(true);
         }
+        let Some(_turn) = self.storage_turn() else {
+            anyhow::bail!("the run ended before the seed-mode check of piece {piece} began");
+        };
         let verdict = crate::torrent_state::seed_mode::counted_read(
             &self.shared.spawner,
             u64::from(self.lengths.piece_length(piece)),
@@ -1946,6 +1956,11 @@ impl TorrentStateLive {
         // every turn asked for after it is cancelled is given back at once.
         let turn = self.storage_fence.read_recursive();
         (!self.cancellation_token.is_cancelled()).then_some(turn)
+    }
+
+    /// Whether the run has ended, or is ending: its storage turns are over.
+    pub(crate) fn ended(&self) -> bool {
+        self.cancellation_token.is_cancelled()
     }
 
     pub fn pause(&self) -> anyhow::Result<TorrentStatePaused> {

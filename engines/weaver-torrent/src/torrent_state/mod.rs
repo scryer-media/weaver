@@ -1294,7 +1294,19 @@ impl ManagedTorrent {
         let seed = &self.shared.options.seed;
         let left = loop {
             if let Some(live) = self.live() {
-                return Some(live.check_seeded(piece));
+                match live.check_seeded(piece) {
+                    // The run was paused before the check began: the
+                    // torrent is looked at again, paused or running anew.
+                    // A run that ended and is still the torrent's, as at
+                    // the session's end, gives its error.
+                    Err(_)
+                        if live.ended()
+                            && !self.live().is_some_and(|now| Arc::ptr_eq(&now, &live)) =>
+                    {
+                        continue;
+                    }
+                    checked => return Some(checked),
+                }
             }
             if !matches!(self.locked.read().state, ManagedTorrentState::Paused(_)) {
                 return None;

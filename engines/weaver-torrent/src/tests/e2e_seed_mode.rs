@@ -214,7 +214,8 @@ async fn test_seed_mode_piece_that_fails_its_check_ends_seed_mode_and_checks_eve
 
 // One file's bytes, read only. Every read waits at a gate until the test
 // opens it, and the gate counts the reads: how many were asked for, how
-// many wait at it now, and the most that waited at once.
+// many wait at it now, and the most that waited at once. It also tells
+// whether the storage was handed on while a read was under way.
 #[derive(Default)]
 struct Gate {
     state: std::sync::Mutex<Gated>,
@@ -227,6 +228,7 @@ struct Gated {
     reads: usize,
     reading: usize,
     most: usize,
+    taken_while_reading: bool,
 }
 
 impl Gate {
@@ -311,6 +313,9 @@ impl crate::storage::TorrentStorage for GatedFactory {
     }
 
     fn take(&self) -> anyhow::Result<Box<dyn crate::storage::TorrentStorage>> {
+        let mut state = self.gate.state.lock().unwrap();
+        state.taken_while_reading |= state.reading > 0;
+        drop(state);
         Ok(Box::new(self.clone()))
     }
 }
@@ -784,5 +789,121 @@ async fn test_a_paused_seed_check_is_a_disk_call() -> anyhow::Result<()> {
         1,
         "the paused check is a seed_check disk call"
     );
+    Ok(())
+}
+
+// A run that ends drops the seed-mode check still waiting for its blocking
+// permit, as it drops a queued write or check of a downloaded piece: the
+// check reads nothing of the storage handed to the next run, the piece is
+// left unchecked, and seed mode does not end.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_seed_mode_check_queued_when_its_run_ends_reads_nothing() -> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new(
+        "test_seed_check_queued_at_end",
+        PIECES * PIECE_LENGTH as usize,
+        PIECE_LENGTH,
+    )
+    .await?;
+    let dir = TempDir::with_prefix("test_seed_check_queued_at_end_out")?;
+    let (_session, seed, gate, _reaches) = seeding_gated(&t, &dir, 1).await?;
+    gate.open();
+    let live = seed.live().context("the seed is not live")?;
+    let piece = piece_of(5)?;
+    let seed_mode = &seed.shared().options.seed;
+    let held = live.shared.spawner.semaphore().acquire_owned().await?;
+    let asked = tokio::spawn({
+        let live = live.clone();
+        async move { live.serve_seeded(piece).await }
+    });
+    while !seed_mode.claimed(piece) {
+        tokio::task::yield_now().await;
+    }
+
+    seed.pause()?;
+    drop(held);
+    let served = asked.await?;
+    assert_eq!(gate.counts().0, 0, "the ended run's check read nothing");
+    assert!(served.is_err(), "the check did not run: {served:?}");
+    assert!(seed_mode.unchecked(piece));
+    assert!(seed.seed_mode());
+    Ok(())
+}
+
+// A run that ends waits for the seed-mode check under way before its
+// storage is handed on: the storage is not taken while the check's read
+// waits at the gate, and the check ends as it would have.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_seed_mode_check_under_way_when_its_run_ends_is_waited_for() -> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new(
+        "test_seed_check_under_way_at_end",
+        PIECES * PIECE_LENGTH as usize,
+        PIECE_LENGTH,
+    )
+    .await?;
+    let dir = TempDir::with_prefix("test_seed_check_under_way_at_end_out")?;
+    let (_session, seed, gate, mut reaches) = seeding_gated(&t, &dir, 2).await?;
+    let live = seed.live().context("the seed is not live")?;
+    let piece = piece_of(1)?;
+    let asked = tokio::spawn({
+        let live = live.clone();
+        async move { live.serve_seeded(piece).await }
+    });
+    reaches.recv().await.context("no read came")?;
+
+    let paused = tokio::task::spawn_blocking({
+        let seed = seed.clone();
+        move || seed.pause()
+    });
+    while seed.shared().ending_run.lock().is_none() {
+        tokio::task::yield_now().await;
+    }
+    gate.open();
+    assert!(asked.await??, "the check under way passed");
+    paused.await??;
+    assert!(
+        !gate.state.lock().unwrap().taken_while_reading,
+        "the storage was handed on while the check read it"
+    );
+    assert!(!seed.shared().options.seed.unchecked(piece));
+    assert!(seed.seed_mode());
+    Ok(())
+}
+
+// A torrent's own seed-mode check that waited for its permit across a
+// pause checks the piece of the paused torrent: the ended run's check
+// reads nothing, and the paused torrent's reads the piece once.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_torrents_seed_check_across_a_pause_checks_the_paused_torrent() -> anyhow::Result<()>
+{
+    setup_test_logging();
+    let t = TestTorrent::new(
+        "test_seed_check_across_pause",
+        PIECES * PIECE_LENGTH as usize,
+        PIECE_LENGTH,
+    )
+    .await?;
+    let dir = TempDir::with_prefix("test_seed_check_across_pause_out")?;
+    let (_session, seed, gate, _reaches) = seeding_gated(&t, &dir, 1).await?;
+    gate.open();
+    let live = seed.live().context("the seed is not live")?;
+    let piece = piece_of(6)?;
+    let seed_mode = &seed.shared().options.seed;
+    let held = live.shared.spawner.semaphore().acquire_owned().await?;
+    let checked = tokio::task::spawn_blocking({
+        let seed = seed.clone();
+        move || seed.check_seeded(piece.get())
+    });
+    while !seed_mode.claimed(piece) {
+        tokio::task::yield_now().await;
+    }
+
+    seed.pause()?;
+    drop(held);
+    assert_eq!(checked.await?.transpose()?, Some(true));
+    assert_eq!(gate.counts().0, 1, "read once, by the paused torrent");
+    assert!(!seed_mode.unchecked(piece));
+    assert!(seed.seed_mode());
     Ok(())
 }
