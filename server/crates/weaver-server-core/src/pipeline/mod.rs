@@ -1993,6 +1993,10 @@ pub struct Pipeline {
     pending_graph_terminals: HashMap<JobId, health::PendingGraphTerminal>,
     // Final moves admitted after the post-processing hold is lifted.
     pub(super) deferred_moves: HashSet<JobId>,
+    // Jobs whose delivery waits for a volume's writer: the last of their
+    // file operations to return, or a failed one's report. The mail that
+    // says either starts the delivery again.
+    pub(super) moves_awaiting_disk: HashSet<JobId>,
     // Complete destinations reserved for in-flight moves so concurrent jobs do not collide.
     pub(super) reserved_complete_destinations: HashMap<JobId, PathBuf>,
     // Shared state for control plane reads (API handlers read without channel round-trip).

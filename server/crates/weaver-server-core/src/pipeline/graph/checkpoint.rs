@@ -868,6 +868,14 @@ impl Pending {
     // A write failed or was never queued, so what the database holds is not
     // known: the next checkpoint writes the whole job, and queues it. A move
     // waiting on a commit hears so, and waits on the next one.
+    // A volume's writer failed an operation the waiting changes counted
+    // on, and the job is stopped, so no later checkpoint corrects them:
+    // they are dropped as a failed write's are, and whoever waits for
+    // their commit hears it failed.
+    pub(in crate::pipeline) fn disk_failed(&self) {
+        self.forget();
+    }
+
     fn forget(&self) {
         let mut slot = self.slot();
         slot.control.cancel();

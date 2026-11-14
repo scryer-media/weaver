@@ -1344,22 +1344,32 @@ impl Pipeline {
             .unwrap_or_default();
         // Those closes, and every write before them, go through the volumes'
         // writers. Nothing is removed or moved until the last of them has
-        // returned; a failed one fails the job through its batch report.
+        // returned and none failed. The loop does not wait for that here:
+        // the delivery steps back, and starts again when the job's mail
+        // says the operations returned. One that failed says so in the
+        // same mail, after it returned: a refused name skips its member
+        // and the delivery is judged again, and anything else fails the
+        // job with its own error, once.
         if let Some(barrier) = self
             .graph_jobs
             .get(&job_id)
             .and_then(|graph| graph.disk_barrier())
             .filter(|barrier| !barrier.passed())
         {
-            let waited = barrier.clone();
-            crate::runtime::panic_trap::spawn_blocking(move || waited.wait())
-                .await
-                .map_err(|error| format!("waiting for the job's last file operation: {error}"))?;
-            self.hear_volume_reports();
-            if !barrier.passed() {
-                return Err("a file operation of the job failed before delivery".to_string());
+            if !barrier.returned() {
+                barrier.then_tell(job_id, &self.graph_runs.written());
             }
+            self.moves_awaiting_disk.insert(job_id);
+            self.shared_state.queue.write(|inner| match inner.job_mut(job_id) {
+                Some(row) => {
+                    row.report.moving = false;
+                    crate::pipeline::queue::Change::changed(())
+                }
+                None => crate::pipeline::queue::Change::unchanged(()),
+            });
+            return Ok(());
         }
+        self.moves_awaiting_disk.remove(&job_id);
         #[cfg(test)]
         {
             let hook = BEFORE_SPENT_REMOVAL.lock().unwrap().take();

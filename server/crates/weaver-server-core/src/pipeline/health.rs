@@ -107,12 +107,16 @@ impl Pipeline {
             .entry(job_id)
             .or_insert(failure_stage);
         self.cancel_graph_checkpoint_retries(job_id);
-        if self
+        let live = self
             .graph_jobs
             .get(&job_id)
-            .is_some_and(|graph| graph.holds_retirement())
-        {
+            .is_some_and(|graph| graph.holds_retirement());
+        if live {
             self.retire_graph_job(job_id);
+        }
+        // A job stopped earlier whose graph is still kept, for its mail or
+        // for a volume's writer, fails when that retirement ends too.
+        if live || self.retiring_graph_jobs.contains_key(&job_id) {
             self.transition_postprocessing_status(
                 job_id,
                 JobStatus::Failed {

@@ -1367,6 +1367,8 @@ async fn disk_write_failure_fails_job_before_commit() {
             },
         )
         .await;
+    // The volume's writer says the write failed in the job's mail.
+    pipeline.hear_graph_runs();
 
     let status = job_status_for_assert(&pipeline, job_id).unwrap();
     assert!(

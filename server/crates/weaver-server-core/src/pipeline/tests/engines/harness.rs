@@ -1200,11 +1200,13 @@ async fn try_run_then(
             break;
         }
         // A run or a repair out on a thread speaks through the pipeline's mail, as the
-        // orchestrator hears it: what it says is the job's next move.
+        // orchestrator hears it: what it says is the job's next move. So
+        // does a volume's writer, to a delivery that waits for it.
         if pipeline
             .graph_jobs
             .get(&JOB)
             .is_some_and(|job| job.awaits_mail())
+            || pipeline.moves_awaiting_disk.contains(&JOB)
         {
             let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
             if let Some(heard) = &scenario.heard {

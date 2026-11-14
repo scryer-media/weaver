@@ -474,16 +474,38 @@ impl GraphJob {
     // The file system refused the name of a file a volume's writer was to
     // make: its member is skipped as damaged, as a refusal met while
     // writing it would skip it.
-    pub(crate) fn name_refused(&mut self, file: u64) -> Result<(), GraphError> {
+    //
+    // False when the refusal skips nothing and stands as a failure: the
+    // job has no such file, or an object reads the member.
+    pub(crate) fn name_refused(&mut self, file: u64) -> Result<bool, GraphError> {
         let mut out = Vec::new();
-        self.writer.name_refused(
+        let Some(node) = self.writer.name_refused(
             &mut self.tree,
             &mut *self.builder,
             &self.root,
             file,
             &mut out,
-        )?;
-        self.heard(out)
+        )?
+        else {
+            return Ok(false);
+        };
+        // The object that made the member left it out: what it unpacked
+        // is short of what it holds, by bytes nothing brings. A run that
+        // meets such bytes refuses its object as it ends; this refusal may
+        // come after the run has, so the object is refused here, and its
+        // volumes are handed over as they stand.
+        if node != NodeId::ROOT {
+            self.writer.said(
+                &mut self.tree,
+                &mut *self.builder,
+                &self.root,
+                node,
+                weaver_graph::Emit::Refuse(weaver_graph::Why::Unrepairable),
+                &mut out,
+            )?;
+        }
+        self.heard(out)?;
+        Ok(true)
     }
 
     // Keep ownership until stopped workers report that they ended.

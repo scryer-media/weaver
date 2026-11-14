@@ -2515,7 +2515,10 @@ impl NamespaceWriter {
     // reads, such as a recovery volume, still fail the job.
     // A volume's writer could not make the file of the leaf `file`: the
     // file system refused its name. The member is skipped as `write_file`
-    // skips one whose name is refused as it writes.
+    // skips one whose name is refused as it writes, and its namespace is
+    // returned. `None` when nothing is skipped and the refusal stands as a
+    // failure, as it does there: no leaf has that file, or an object reads
+    // the member.
     pub(crate) fn name_refused(
         &mut self,
         tree: &mut Tree,
@@ -2523,7 +2526,7 @@ impl NamespaceWriter {
         segments: &dyn Segments,
         file: u64,
         out: &mut Vec<Effect>,
-    ) -> Result<(), WriteError> {
+    ) -> Result<Option<NodeId>, WriteError> {
         let found = self.files.iter().find_map(|(node, files)| {
             files
                 .leaves
@@ -2532,13 +2535,14 @@ impl NamespaceWriter {
                 .map(|(member, _)| (*node, *member))
         });
         let Some((node, member)) = found else {
-            return Ok(());
+            return Ok(None);
         };
         if tree.child_of(node, member).is_some() {
-            return Ok(());
+            return Ok(None);
         }
         self.skip_named(tree, (node, member));
-        self.release_held(tree, builder, segments, out)
+        self.release_held(tree, builder, segments, out)?;
+        Ok(Some(node))
     }
 
     fn skip_unnamable(

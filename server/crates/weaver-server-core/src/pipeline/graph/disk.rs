@@ -124,6 +124,7 @@ impl Pipeline {
             self.wake_repair_waiters();
             self.wake_memory_waiters();
         }
+        self.retry_move_after_disk(job_id);
     }
 
     // Hear every batch report that is waiting. Whether any was.
@@ -138,18 +139,23 @@ impl Pipeline {
 
     // A volume's writer could not complete an operation on one of a job's
     // files. A failed write fails its job as a write the job made itself
-    // would, and a refused name skips its member.
+    // would, and a refused name skips its member. A refusal that names no
+    // member to skip, or a member an object reads, stands as a failure.
     pub(in crate::pipeline) fn graph_disk_failed(&mut self, failure: Failure) {
         let job_id = JobId(failure.key);
         let refused =
             failure.creating && failure.error.kind() == std::io::ErrorKind::InvalidFilename;
+        if self.retiring_graph_jobs.contains_key(&job_id) {
+            self.retiring_disk_failed(job_id, failure, refused);
+            return;
+        }
+        let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
+            return;
+        };
         if refused {
-            let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
-                return;
-            };
             let skipped = match failure.file {
                 Some(file) => graph.name_refused(file),
-                None => Ok(()),
+                None => Ok(false),
             };
             // What the waiting checkpoints say of the file is undone by
             // the next one, and they are written only with it.
@@ -157,11 +163,14 @@ impl Pipeline {
             if let Some(disk) = graph.disk() {
                 disk.heard_refusal(&failure.path);
             }
-            self.after_graph_result(job_id, skipped);
-            return;
-        }
-        if !self.graph_jobs.contains_key(&job_id) {
-            return;
+            match skipped {
+                Ok(false) => {}
+                skipped => {
+                    self.after_graph_result(job_id, skipped.map(|_| ()));
+                    self.retry_move_after_disk(job_id);
+                    return;
+                }
+            }
         }
         tracing::warn!(
             job_id = job_id.0,
@@ -169,11 +178,42 @@ impl Pipeline {
             error = %failure.error,
             "a volume's writer could not complete a file operation"
         );
-        let error = GraphError::Write(WriteError::Leaf(LeafError::Io {
-            path: failure.path,
-            source: failure.error,
-        }));
-        self.after_graph_result(job_id, Err(error));
+        self.moves_awaiting_disk.remove(&job_id);
+        self.after_graph_result(job_id, Err(disk_error(failure)));
+    }
+
+    // The same for a job that was stopped while the operation was queued.
+    // Its last checkpoints waited for that operation and say more than the
+    // disk holds: they are dropped, so a restore reads the last one the
+    // disk bore out and fetches the rest again, and whoever waited for
+    // their commit hears it will not come. A refused name is met again by
+    // the job's next run, which skips the member then. Anything else ends
+    // the job Failed once the rest of its retirement is over.
+    fn retiring_disk_failed(&mut self, job_id: JobId, failure: Failure, refused: bool) {
+        let Some(graph) = self.retiring_graph_jobs.get(&job_id) else {
+            return;
+        };
+        graph.pending().disk_failed();
+        if refused {
+            if let Some(disk) = graph.disk() {
+                disk.heard_refusal(&failure.path);
+            }
+            return;
+        }
+        tracing::warn!(
+            job_id = job_id.0,
+            path = %failure.path.display(),
+            error = %failure.error,
+            "a volume's writer could not complete a file operation of a stopped job"
+        );
+        self.fail_job_on_extraction_error(job_id, disk_error(failure).to_extraction());
+    }
+
+    // A delivery that waited for the job's file operations looks again.
+    fn retry_move_after_disk(&mut self, job_id: JobId) {
+        if self.moves_awaiting_disk.remove(&job_id) {
+            self.schedule_job_completion_check(job_id);
+        }
     }
 
     // A volume's writer finished a batch: dispatch that stopped for the
@@ -189,6 +229,13 @@ impl Pipeline {
             self.download_dispatch_wake = true;
         }
     }
+}
+
+fn disk_error(failure: Failure) -> GraphError {
+    GraphError::Write(WriteError::Leaf(LeafError::Io {
+        path: failure.path,
+        source: failure.error,
+    }))
 }
 
 #[derive(Clone, Debug)]
@@ -296,7 +343,6 @@ impl JobBarrier {
     }
 
     // Every operation behind it returned, failed or not.
-    #[cfg(test)]
     pub(crate) fn returned(&self) -> bool {
         self.0.iter().all(Barrier::returned)
     }
