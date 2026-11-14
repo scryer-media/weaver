@@ -87,6 +87,9 @@ pub struct QueueInner {
     job_positions: HashMap<JobId, usize>,
     // The rows in a phase, the only ones the metrics tick samples.
     phased_jobs: std::collections::HashSet<JobId>,
+    // How many rows have work waiting (see [`JobRow::work_waits`]), moved
+    // by `push_job`, `remove_job`, `reindex_jobs` and every [`RowMut`].
+    waiting: usize,
     pub history_summary: crate::operations::metrics_store::JobStatusCounts,
     pub(crate) admissions: std::collections::HashSet<JobId>,
     pub(crate) history_operations: std::collections::HashSet<JobId>,
@@ -269,6 +272,25 @@ impl JobRow {
                 > self.report.observed_byte_at_ms
     }
 
+    // Whether the status [`Self::info`] gives the row is queued, downloading
+    // or checking, read from the few fields that status is made from: the
+    // reported status and a pause or resume the pipeline has not applied.
+    // No global enters it.
+    pub(crate) fn work_waits(&self) -> bool {
+        let status = &self.report.job.status;
+        if self.intents.pause_seq > self.report.seen_intent_seq {
+            match self.intents.paused {
+                Some(true) => return false,
+                Some(false) if *status == crate::JobStatus::Paused => return true,
+                _ => {}
+            }
+        }
+        matches!(
+            status,
+            crate::JobStatus::Queued | crate::JobStatus::Downloading | crate::JobStatus::Checking
+        )
+    }
+
     pub fn info(&self, globals: &Globals) -> JobInfo {
         let mut job = self.report.job.clone();
         let activity = self.download_activity();
@@ -352,9 +374,51 @@ impl QueueInner {
     }
 
     // The row for `id` to change, found through the position index.
-    pub(crate) fn job_mut(&mut self, id: JobId) -> Option<&mut JobRow> {
+    pub(crate) fn job_mut(&mut self, id: JobId) -> Option<RowMut<'_>> {
         let position = self.job_position(id)?;
-        self.jobs.get_mut(position)
+        Some(self.row_mut_at(position))
+    }
+
+    // The row at `position` to change. Every change to a row that can move
+    // its status goes through this guard, which keeps the count of rows
+    // with work waiting in step as it is let go.
+    pub(crate) fn row_mut_at(&mut self, position: usize) -> RowMut<'_> {
+        self.row_mut_with_globals(position).0
+    }
+
+    // The same, with the globals to read beside it.
+    pub(crate) fn row_mut_with_globals(&mut self, position: usize) -> (RowMut<'_>, &Globals) {
+        let row = &mut self.jobs[position];
+        (
+            RowMut {
+                waited: row.work_waits(),
+                row,
+                waiting: &mut self.waiting,
+            },
+            &self.globals,
+        )
+    }
+
+    /// Whether any job has work waiting: its status is queued, downloading
+    /// or checking. Answered from a count kept as rows change, not by a
+    /// walk of the rows.
+    pub fn work_waiting(&self) -> bool {
+        debug_assert_eq!(
+            self.waiting,
+            self.jobs
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        row.view(&self.globals).status(),
+                        crate::JobStatus::Queued
+                            | crate::JobStatus::Downloading
+                            | crate::JobStatus::Checking
+                    )
+                })
+                .count(),
+            "the count of jobs with work waiting is out of step with the rows"
+        );
+        self.waiting > 0
     }
 
     pub(crate) fn contains_job(&self, id: JobId) -> bool {
@@ -379,6 +443,7 @@ impl QueueInner {
             self.phased_jobs.insert(row.id);
         }
         self.job_positions.insert(row.id, self.jobs.len());
+        self.waiting += usize::from(row.work_waits());
         self.jobs.push(row);
     }
 
@@ -388,6 +453,7 @@ impl QueueInner {
         self.job_positions.remove(&id);
         self.phased_jobs.remove(&id);
         let row = self.jobs.remove(position);
+        self.waiting -= usize::from(row.work_waits());
         for (offset, later) in self.jobs[position..].iter().enumerate() {
             self.job_positions.insert(later.id, position + offset);
         }
@@ -413,6 +479,41 @@ impl QueueInner {
             .filter(|row| !row.phases.is_empty())
             .map(|row| row.id)
             .collect();
+        // This walk already visits every row, so the count is taken again
+        // in it: rows may have been dropped.
+        self.waiting = self.jobs.iter().filter(|row| row.work_waits()).count();
+    }
+}
+
+// A queue row borrowed to change. Letting it go moves the queue's count of
+// rows with work waiting by what the change did to this row: one compare.
+pub(crate) struct RowMut<'a> {
+    row: &'a mut JobRow,
+    waiting: &'a mut usize,
+    waited: bool,
+}
+
+impl std::ops::Deref for RowMut<'_> {
+    type Target = JobRow;
+
+    fn deref(&self) -> &JobRow {
+        self.row
+    }
+}
+
+impl std::ops::DerefMut for RowMut<'_> {
+    fn deref_mut(&mut self) -> &mut JobRow {
+        self.row
+    }
+}
+
+impl Drop for RowMut<'_> {
+    fn drop(&mut self) {
+        match (self.waited, self.row.work_waits()) {
+            (false, true) => *self.waiting += 1,
+            (true, false) => *self.waiting -= 1,
+            _ => {}
+        }
     }
 }
 
@@ -531,9 +632,9 @@ impl Queue {
             let ids: Vec<_> = live.iter().map(|job| job.job_id).collect();
             let mut reports: HashMap<_, _> =
                 live.into_iter().map(|job| (job.job_id, job)).collect();
-            for row in &mut inner.jobs {
-                if let Some(job) = reports.remove(&row.id) {
-                    row.report.job = job;
+            for position in 0..inner.jobs.len() {
+                if let Some(job) = reports.remove(&inner.jobs[position].id) {
+                    inner.row_mut_at(position).report.job = job;
                 }
             }
             for id in ids {
@@ -683,7 +784,7 @@ mod label_tests {
 
         // The pipeline applies the pause and reports it.
         queue.write(|inner| {
-            let row = &mut inner.jobs[0];
+            let mut row = inner.row_mut_at(0);
             row.report.seen_intent_seq = row.intents.seq;
             row.report.job.status = JobStatus::Paused;
             row.report.job.download_state = DownloadState::Queued;
@@ -708,5 +809,146 @@ mod label_tests {
             inner.jobs[0].info(&globals)
         });
         assert_eq!(held.run_state, RunState::Paused);
+    }
+
+    // The count the queue keeps, checked against a walk of the rows as the
+    // system query used to make it.
+    fn waiting_count(queue: &Queue) -> usize {
+        queue.read(|inner| {
+            let walked = inner
+                .jobs
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        row.view(&inner.globals).status(),
+                        JobStatus::Queued | JobStatus::Downloading | JobStatus::Checking
+                    )
+                })
+                .count();
+            assert_eq!(inner.waiting, walked);
+            assert_eq!(inner.work_waiting(), walked > 0);
+            walked
+        })
+    }
+
+    fn with_status(id: u64, status: JobStatus) -> JobInfo {
+        JobInfo {
+            status,
+            ..downloading(id)
+        }
+    }
+
+    // What the pipeline does when it has applied a row's intents.
+    fn apply_intents(queue: &Queue, id: u64, status: JobStatus) {
+        queue.write(|inner| {
+            let mut row = inner.job_mut(JobId(id)).unwrap();
+            row.report.seen_intent_seq = row.intents.seq;
+            row.report.job.status = status;
+            Change::changed(())
+        });
+    }
+
+    #[test]
+    fn queue_count_of_jobs_with_work_waiting_matches_a_walk_through_every_change() {
+        // Built from rows: one of each waiting status, and two that do not wait.
+        let queue = Queue::new(vec![
+            with_status(1, JobStatus::Queued),
+            with_status(2, JobStatus::Downloading),
+            with_status(3, JobStatus::Checking),
+            with_status(4, JobStatus::Extracting),
+            with_status(5, JobStatus::Paused),
+        ]);
+        assert_eq!(waiting_count(&queue), 3);
+
+        // A row added, waiting and not.
+        queue.write(|inner| {
+            inner.push_job(JobRow::new(with_status(6, JobStatus::Queued)));
+            inner.push_job(JobRow::new(with_status(7, JobStatus::Complete)));
+            Change::changed(())
+        });
+        assert_eq!(waiting_count(&queue), 4);
+
+        // A pause asked for counts before the pipeline applies it, and the
+        // same after it does.
+        queue.set_job_paused(JobId(1), true).unwrap();
+        assert_eq!(waiting_count(&queue), 3);
+        apply_intents(&queue, 1, JobStatus::Paused);
+        assert_eq!(waiting_count(&queue), 3);
+
+        // A resume asked for counts before the pipeline applies it too.
+        queue.set_job_paused(JobId(1), false).unwrap();
+        assert_eq!(waiting_count(&queue), 4);
+        apply_intents(&queue, 1, JobStatus::Queued);
+        assert_eq!(waiting_count(&queue), 4);
+
+        // A pause the pipeline refuses is taken back.
+        queue.set_job_paused(JobId(2), true).unwrap();
+        assert_eq!(waiting_count(&queue), 3);
+        queue.write(|inner| {
+            let mut row = inner.job_mut(JobId(2)).unwrap();
+            row.report.seen_intent_seq = row.intents.seq;
+            row.intents.paused = None;
+            Change::changed(())
+        });
+        assert_eq!(waiting_count(&queue), 4);
+
+        // A batch pause, part of it already paused.
+        for outcome in queue.set_jobs_paused([JobId(3), JobId(5)], true).values() {
+            outcome.as_ref().unwrap();
+        }
+        assert_eq!(waiting_count(&queue), 3);
+
+        // The pipeline reports a job on, out of the waiting statuses and back.
+        queue.report_jobs(vec![with_status(6, JobStatus::Extracting)]);
+        assert_eq!(waiting_count(&queue), 2);
+        queue.report_jobs(vec![with_status(4, JobStatus::Downloading)]);
+        assert_eq!(waiting_count(&queue), 3);
+
+        // The whole-queue pause moves no row's status.
+        queue.write(|inner| {
+            inner.globals.paused = true;
+            Change::changed(())
+        });
+        assert_eq!(waiting_count(&queue), 3);
+        queue.write(|inner| {
+            inner.globals.speed_test_paused = true;
+            inner.globals.paused = false;
+            Change::changed(())
+        });
+        assert_eq!(waiting_count(&queue), 3);
+
+        // A reorder keeps every row.
+        queue
+            .reorder_jobs(vec![(JobId(4), crate::jobs::handle::QueueMoveTarget::Top)])
+            .unwrap();
+        assert_eq!(waiting_count(&queue), 3);
+
+        // A job finishing is written to its row, then the row leaves.
+        queue.write(|inner| {
+            let position = inner.job_position(JobId(4)).unwrap();
+            let mut row = inner.row_mut_at(position);
+            row.report.job = with_status(4, JobStatus::Complete);
+            row.report.retiring = true;
+            Change::changed(())
+        });
+        assert_eq!(waiting_count(&queue), 2);
+        queue.write(|inner| {
+            inner.remove_job(JobId(4));
+            inner.remove_job(JobId(2));
+            Change::changed(())
+        });
+        assert_eq!(waiting_count(&queue), 1);
+
+        // Rows dropped in bulk.
+        queue.write(|inner| {
+            inner.retain_jobs(|row| row.id != JobId(1));
+            Change::changed(())
+        });
+        assert_eq!(waiting_count(&queue), 0);
+        queue.write(|inner| {
+            inner.retain_jobs(|_| false);
+            Change::changed(())
+        });
+        assert_eq!(waiting_count(&queue), 0);
     }
 }

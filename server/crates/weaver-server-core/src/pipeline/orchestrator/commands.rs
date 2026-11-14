@@ -270,7 +270,7 @@ impl Pipeline {
         // Taken: the rows are being archived, and these intents are acted on.
         self.shared_state.queue.write(|inner| {
             for &id in ids.iter() {
-                if let Some(row) = inner.job_mut(id) {
+                if let Some(mut row) = inner.job_mut(id) {
                     row.report.retiring = true;
                     row.report.seen_intent_seq = row.intents.seq;
                 }
@@ -403,7 +403,7 @@ impl Pipeline {
         }
         self.shared_state.queue.write(|inner| {
             for &id in ids {
-                if let Some(row) = inner.job_mut(id) {
+                if let Some(mut row) = inner.job_mut(id) {
                     row.intents.cancelled = None;
                     row.intents.delete_history_after_cancel = false;
                     row.report.retiring = false;

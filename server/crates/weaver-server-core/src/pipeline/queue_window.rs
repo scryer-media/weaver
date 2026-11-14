@@ -357,8 +357,8 @@ impl Pipeline {
         self.update_queue_metrics();
         self.shared_state.queue.write(|inner| {
             for id in &evicted_set {
-                if let Some(row) = inner.job_mut(*id) {
-                    let reason = self.stored_wait_reason(row);
+                if let Some(mut row) = inner.job_mut(*id) {
+                    let reason = self.stored_wait_reason(&row);
                     row.report.job.download_wait_reason = reason.map(str::to_owned);
                 }
             }

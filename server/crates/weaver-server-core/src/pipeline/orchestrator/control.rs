@@ -415,7 +415,7 @@ impl Pipeline {
             }
             self.apply_pending_job_update(job_id);
             self.shared_state.queue.write(|inner| {
-                if let Some(row) = inner.job_mut(job_id) {
+                if let Some(mut row) = inner.job_mut(job_id) {
                     row.report.seen_intent_seq = intents.seq;
                     if refused && row.intents.pause_seq == intents.pause_seq {
                         row.intents.paused = None;
@@ -487,7 +487,7 @@ impl Pipeline {
             }
             self.pending_renames.remove(&id);
             self.shared_state.queue.write(|inner| {
-                if let Some(row) = inner.job_mut(id)
+                if let Some(mut row) = inner.job_mut(id)
                     && row.intents.rename_to.as_ref() == Some(&name)
                 {
                     row.intents.rename_to = None;
@@ -525,8 +525,8 @@ impl Pipeline {
     fn restate_wait_reasons(&self, ids: impl Iterator<Item = JobId>) {
         self.shared_state.queue.write(|inner| {
             for id in ids {
-                if let Some(row) = inner.job_mut(id) {
-                    let reason = self.stored_wait_reason(row);
+                if let Some(mut row) = inner.job_mut(id) {
+                    let reason = self.stored_wait_reason(&row);
                     row.report.job.download_wait_reason = reason.map(str::to_owned);
                 }
             }
@@ -684,8 +684,8 @@ impl Pipeline {
                     self.shared_state
                         .queue
                         .write(|inner| match inner.job_mut(id) {
-                            Some(row) => {
-                                crate::pipeline::queue::outline_read(row, request);
+                            Some(mut row) => {
+                                crate::pipeline::queue::outline_read(&mut row, request);
                                 Change::changed(())
                             }
                             None => Change::unchanged(()),
@@ -709,7 +709,7 @@ impl Pipeline {
             }
             self.report_job(id);
             self.shared_state.queue.write(|inner| {
-                if let Some(row) = inner.job_mut(id) {
+                if let Some(mut row) = inner.job_mut(id) {
                     row.report.restoring = false;
                 }
                 Change::changed(())
@@ -806,7 +806,7 @@ impl Pipeline {
             return;
         };
         let update = self.shared_state.queue.write(|inner| {
-            let Some(row) = inner.job_mut(job_id) else {
+            let Some(mut row) = inner.job_mut(job_id) else {
                 return Change::unchanged(None);
             };
             let Some(update) = row.intents.update.take() else {
