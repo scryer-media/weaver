@@ -161,9 +161,7 @@ fn full_rustls_reads_never_grow_the_read_buffer() {
         socket.recv_buffer_size().unwrap() >= 2 * read_size,
         "the kernel refused a receive buffer of two chunks"
     );
-    socket
-        .connect(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .unwrap();
+    weaver_tunnel::test_support::loopback::connect_socket(&socket, ([127, 0, 0, 1], port)).unwrap();
     let tcp: TcpStream = socket.into();
     let watch = tcp.try_clone().unwrap();
     let mut stream = BlockingManualTlsStream::connect(

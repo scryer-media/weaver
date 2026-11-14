@@ -5,9 +5,8 @@ use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn bottom() -> Arc<Egress> {
-    Arc::new(Egress::new(
+    Arc::new(crate::test_support::loopback::egress(
         4,
-        SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()),
         Duration::from_secs(30),
     ))
 }
@@ -147,7 +146,7 @@ async fn connect_proxy(
                 .unwrap()
                 .starts_with(&format!("CONNECT {expected} HTTP/1.1\r\n"))
         );
-        let mut upstream = tokio::net::TcpStream::connect(next).await.unwrap();
+        let mut upstream = crate::test_support::loopback::connect(next).await.unwrap();
         stream
             .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
             .await
@@ -1059,6 +1058,10 @@ async fn a_fallback_rung_whose_proxy_resolves_is_handed_the_name() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "builds egresses only to classify their errors; it never dials or binds"
+)]
 fn unresolved_destination_and_bound_route_failures_have_distinct_evidence() {
     let unresolved = DialError::destination(io::Error::new(
         io::ErrorKind::AddrNotAvailable,
@@ -1445,7 +1448,7 @@ impl Dialer for Mapped {
             .lock()
             .unwrap()
             .push((target.host.clone(), target.port));
-        let stream = tokio::net::TcpStream::connect(self.to)
+        let stream = crate::test_support::loopback::connect(self.to)
             .await
             .map_err(DialError::Destination)?;
         Ok(Dialed {

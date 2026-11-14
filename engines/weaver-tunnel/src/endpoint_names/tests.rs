@@ -2,7 +2,6 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
-use crate::egress::SocketEgress;
 use crate::metrics::Resolver;
 use crate::pipe::Egress;
 use crate::resolution::record;
@@ -11,9 +10,8 @@ use crate::{NoopTunnelObserver, TunnelProvider, WireGuardTunnelProvider};
 use std::time::Duration;
 
 fn egress() -> Arc<Egress> {
-    Arc::new(Egress::new(
+    Arc::new(crate::test_support::loopback::egress(
         4,
-        SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()),
         Duration::from_secs(30),
     ))
 }

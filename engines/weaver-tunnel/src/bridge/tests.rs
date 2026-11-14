@@ -136,7 +136,9 @@ async fn unauthenticated_and_wrong_credentials_never_dial() {
         Some(("fixture-user", "wrong")),
         Some(("wrong", "secret-only-in-memory")),
     ] {
-        let mut client = TcpStream::connect(bridge.addr().unwrap()).await.unwrap();
+        let mut client = crate::test_support::loopback::connect(bridge.addr().unwrap())
+            .await
+            .unwrap();
         assert!(
             socks_connect(&mut client, "private.invalid", 443, credentials)
                 .await
@@ -145,7 +147,9 @@ async fn unauthenticated_and_wrong_credentials_never_dial() {
     }
     assert_eq!(fixture.calls.load(Ordering::Relaxed), 0);
     assert!(!format!("{bridge:?}").contains("secret-only-in-memory"));
-    let mut client = TcpStream::connect(bridge.addr().unwrap()).await.unwrap();
+    let mut client = crate::test_support::loopback::connect(bridge.addr().unwrap())
+        .await
+        .unwrap();
     socks_connect(
         &mut client,
         "private.invalid",
@@ -168,7 +172,9 @@ async fn caller_disconnect_cancels_pending_dial() {
         ..Default::default()
     });
     let bridge = bridge(fixture.clone());
-    let mut client = TcpStream::connect(bridge.addr().unwrap()).await.unwrap();
+    let mut client = crate::test_support::loopback::connect(bridge.addr().unwrap())
+        .await
+        .unwrap();
     authenticate(&mut client, &bridge).await;
     client
         .write_all(&socks_request("unresolved.invalid", 119).unwrap())
@@ -188,7 +194,9 @@ async fn dialing_preserves_pipelined_client_bytes() {
         ..Default::default()
     });
     let bridge = bridge(fixture.clone());
-    let mut client = TcpStream::connect(bridge.addr().unwrap()).await.unwrap();
+    let mut client = crate::test_support::loopback::connect(bridge.addr().unwrap())
+        .await
+        .unwrap();
     authenticate(&mut client, &bridge).await;
     let mut request = socks_request("unresolved.invalid", 119).unwrap();
     request.extend_from_slice(b"ping");

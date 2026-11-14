@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::{
-    egress::SocketEgress,
     pipe::{Fallback, HopFailure, Naming},
     test_support::proxy::ProxyServerDouble,
     transport::{TransportKind, TransportProxy},
@@ -11,9 +10,8 @@ use crate::{
 use tokio::{net::UdpSocket, sync::Semaphore};
 
 fn bottom() -> Arc<Egress> {
-    Arc::new(Egress::new(
+    Arc::new(crate::test_support::loopback::egress(
         4,
-        SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()),
         Duration::from_secs(30),
     ))
 }
@@ -77,7 +75,9 @@ async fn open(
 }
 
 async fn peer() -> (UdpSocket, SocketAddr) {
-    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let socket = crate::test_support::loopback::bind_udp((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
     let address = socket.local_addr().unwrap();
     (socket, address)
 }

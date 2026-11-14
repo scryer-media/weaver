@@ -412,17 +412,20 @@ fn the_host_order_is_kept_without_repeats() {
 // host's own DNS, as the async lookup is.
 #[tokio::test]
 async fn a_blocking_host_lookup_is_noted_as_the_hosts_dns() {
-    let egress = crate::pipe::Egress::new(
-        0,
-        crate::egress::SocketEgress::System,
-        Duration::from_secs(30),
-    );
+    let egress = crate::test_support::loopback::egress(0, Duration::from_secs(30));
     let recording = Arc::new(record::Recording::default());
     let found = recording
         .scope(async { egress.resolve_blocking("localhost").unwrap() })
         .await;
     let resolution = recording.finish("localhost", 0, None).unwrap();
     assert_eq!(resolution.by, record::ResolvedBy::Host);
-    assert_eq!(resolution.addresses, found);
+    // The loopback egress keeps the host's IPv4 answers, in its order.
+    let host_v4: Vec<IpAddr> = resolution
+        .addresses
+        .iter()
+        .copied()
+        .filter(IpAddr::is_ipv4)
+        .collect();
+    assert_eq!(host_v4, found);
     assert_eq!(resolution.error, None);
 }

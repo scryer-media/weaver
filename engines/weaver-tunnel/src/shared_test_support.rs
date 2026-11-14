@@ -8,6 +8,8 @@ pub mod dns;
 #[cfg(feature = "test-support")]
 #[path = "test_support/http3.rs"]
 pub mod http3;
+#[path = "test_support/loopback.rs"]
+pub mod loopback;
 #[path = "test_support/natpmp.rs"]
 pub mod natpmp;
 #[path = "test_support/proxy.rs"]

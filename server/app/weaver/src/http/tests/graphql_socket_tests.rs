@@ -101,6 +101,10 @@ impl SocketServer {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "dials this test's own server on loopback"
+    )]
     async fn open(&self, headers: &[(header::HeaderName, String)]) -> Result<Client, SocketError> {
         let mut request = format!("ws://{}/graphql/ws", self.addr)
             .into_client_request()

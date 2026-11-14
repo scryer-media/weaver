@@ -1259,9 +1259,8 @@ fn a_kept_pin_that_keeps_refusing_races_once_per_holdoff_not_on_every_connect() 
 // the egress gave them.
 #[test]
 fn a_direct_dialer_resolves_through_its_egress() {
-    let egress = Arc::new(weaver_tunnel::pipe::Egress::new(
+    let egress = Arc::new(weaver_tunnel::test_support::loopback::egress(
         0,
-        weaver_tunnel::egress::SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()),
         Duration::from_secs(30),
     ));
     let dialer = TcpDialer::new("localhost", 119, Duration::from_secs(30), egress.clone());

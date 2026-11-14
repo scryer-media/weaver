@@ -49,17 +49,14 @@ const BANNED: &[&str] = &[
 ];
 
 // Every file that lifts the ban, and how many times. Each lift names why the
-// call there is the route itself, or reaches only this machine; crate roots
-// lift it for their own tests' loopback fixtures.
+// call there is the route itself, or reaches only this machine; tests open
+// their sockets through the shared loopback fixtures.
 const LIFTED: &[(&str, usize)] = &[
     ("engines/weaver-nntp/benches/body_server_availability.rs", 1),
     ("engines/weaver-nntp/src/address_plan.rs", 1),
-    ("engines/weaver-nntp/src/lib.rs", 1),
     ("engines/weaver-nntp/src/route_dialer.rs", 1),
     ("engines/weaver-nntp/tests/demand_throughput.rs", 1),
-    ("engines/weaver-nntp/tests/proxy_routing.rs", 1),
     ("engines/weaver-nntp/tests/socket_budget.rs", 1),
-    ("engines/weaver-nntp/tests/wireguard_throughput.rs", 1),
     // The LSD's groups, on the local network alone.
     ("engines/weaver-torrent/src/lsd.rs", 1),
     // The kernel route's own dial, datagram bind and listener, from its
@@ -68,12 +65,19 @@ const LIFTED: &[(&str, usize)] = &[
     ("engines/weaver-torrent/src/tests/e2e_session_stop.rs", 1),
     ("engines/weaver-tunnel/src/egress.rs", 6),
     ("engines/weaver-tunnel/src/egress/multicast.rs", 1),
-    ("engines/weaver-tunnel/src/lib.rs", 2),
     ("engines/weaver-tunnel/src/pipe.rs", 4),
+    // A test that builds egresses only to classify their errors.
+    ("engines/weaver-tunnel/src/pipe_tests.rs", 1),
     ("engines/weaver-tunnel/src/resolution.rs", 2),
     ("engines/weaver-tunnel/src/test_support/http_client.rs", 2),
+    // The loopback fixtures every crate's tests open their own sockets with.
+    ("engines/weaver-tunnel/src/test_support/loopback.rs", 8),
     ("server/app/weaver/src/commands/nzb.rs", 1),
-    ("server/app/weaver/src/main.rs", 1),
+    // The GraphQL socket tests dial their own server on loopback.
+    (
+        "server/app/weaver/src/http/tests/graphql_socket_tests.rs",
+        1,
+    ),
     ("server/app/weaver/src/tray/shared.rs", 1),
     ("server/crates/weaver-server-core/src/lib.rs", 1),
     (
@@ -89,6 +93,18 @@ const LIFTED: &[(&str, usize)] = &[
     // the leg.
     ("server/crates/weaver-server-core/src/torrents/net.rs", 1),
     ("xtask/src/main.rs", 1),
+];
+
+// The lifts of the route ban that cover a whole crate, file or module
+// rather than one item: an inner attribute (`#![...]`), an `allow` (which,
+// unlike `expect`, stays silent when nothing under it trips the ban), a lift
+// with no reason, or one on a `mod`. Every other lift is an `expect` with
+// its reason on the one fixture or call it covers. Each file here, and how
+// many such lifts it holds.
+const BLANKET_LIFTED: &[(&str, usize)] = &[
+    // One lint carries the route ban and the writer gate, and the crate's
+    // tests write their own rows: see the lift's own comment.
+    ("server/crates/weaver-server-core/src/lib.rs", 1),
 ];
 
 // Built here so this file never counts as a lift of the host name lookup
@@ -259,6 +275,77 @@ fn route_lifts(text: &str) -> usize {
     text.match_indices(LIFT)
         .filter(|(at, _)| !writer_gate_lift(&text[at + LIFT.len()..]))
         .count()
+}
+
+// Lifts of the route ban in `text` that cover more than one item: see
+// `BLANKET_LIFTED`.
+fn blanket_route_lifts(text: &str) -> usize {
+    text.match_indices(LIFT)
+        .filter(|(at, _)| !writer_gate_lift(&text[at + LIFT.len()..]))
+        .filter(|(at, _)| {
+            let before = &text[..*at];
+            let Some(start) = before.rfind("#[").max(before.rfind("#![")) else {
+                return true;
+            };
+            let opening = &before[start..];
+            let rest = &text[at + LIFT.len()..];
+            let Some(close) = rest.find(")]") else {
+                return true;
+            };
+            let item = rest[close + 2..].trim_start();
+            // Any further attributes on the same item come before it.
+            let item = item
+                .lines()
+                .map(str::trim_start)
+                .find(|line| !line.is_empty() && !line.starts_with("#[") && !line.starts_with("//"))
+                .unwrap_or_default();
+            opening.starts_with("#![")
+                || opening.contains("allow(")
+                || !rest[..close].contains("reason")
+                || item.starts_with("mod ")
+                || item.starts_with("pub mod ")
+                || item.starts_with("pub(crate) mod ")
+        })
+        .count()
+}
+
+#[test]
+fn no_lift_of_the_route_ban_covers_a_whole_crate_or_file() {
+    let root = workspace();
+    let mut found = BTreeMap::new();
+    for dir in ["engines", "server", "shared", "xtask"] {
+        count_in(&root, &root.join(dir), &blanket_route_lifts, &mut found);
+    }
+    let pinned: BTreeMap<String, usize> = BLANKET_LIFTED
+        .iter()
+        .map(|(path, count)| ((*path).to_owned(), *count))
+        .collect();
+    assert_eq!(
+        found, pinned,
+        "the route ban is lifted for a whole crate, file or module: lift it with \
+         an `expect` with its reason on the one shared fixture \
+         or call that needs it instead"
+    );
+}
+
+#[test]
+fn a_blanket_lift_is_told_from_a_scoped_one() {
+    let lift = |attribute: &str| format!("{attribute}\nfn fixture() {{}}\n");
+    for blanket in [
+        format!("#![cfg_attr(test, allow({LIFT}))]\n"),
+        format!("#![allow({LIFT})]\n"),
+        format!("#![expect({LIFT}, reason = \"tests\")]\n"),
+        lift(&format!("#[allow({LIFT})]")),
+        lift(&format!("#[expect({LIFT})]")),
+        format!("#[expect({LIFT}, reason = \"fixtures\")]\n#[cfg(test)]\nmod fixtures;\n"),
+    ] {
+        assert_eq!(blanket_route_lifts(&blanket), 1, "{blanket}");
+    }
+    let scoped = format!(
+        "#[expect(\n    {LIFT},\n    reason = \"a loopback fixture\"\n)]\npub fn connect() {{}}\n"
+    );
+    assert_eq!(blanket_route_lifts(&scoped), 0);
+    assert_eq!(route_lifts(&scoped), 1);
 }
 
 // `count` of every Rust file under `dir`, for the files where it is not zero.

@@ -1,8 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Tests dial their own loopback fixtures.
-#![cfg_attr(test, allow(clippy::disallowed_methods))]
+// Kept for now, and pinned as blanket in the route guard: one lint carries
+// both the route ban and the writer gate, and this crate's tests trip it 163
+// times, 135 of them their own SQL writes (fixture rows, migration tests),
+// so the route sites cannot be scoped alone without first moving those
+// writes behind the writer gate's own fixtures.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests write their own fixture rows and dial their own loopback fixtures"
+    )
+)]
 #![deny(clippy::await_holding_lock)]
 
 pub mod application_upgrade;
