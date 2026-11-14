@@ -182,7 +182,7 @@ impl Pipeline {
             self.shared_state.queue.write(|inner| {
                 let mut changed = false;
                 for id in &self.nzb_pause_releases {
-                    if let Some(row) = inner.job_mut(*id)
+                    if let Some(mut row) = inner.job_mut(*id)
                         && row.intents.restore.is_some()
                     {
                         row.intents.paused = Some(true);
@@ -581,7 +581,10 @@ impl Pipeline {
         // it stands, and a slot let go is free for the next candidate.
         self.queue_walk_due = true;
         self.shared_state.queue.write(|inner| {
-            if inner.job_mut(id).is_some_and(|row| self.restate_slot(row)) {
+            if inner
+                .job_mut(id)
+                .is_some_and(|mut row| self.restate_slot(&mut row))
+            {
                 Change::changed(())
             } else {
                 Change::unchanged(())

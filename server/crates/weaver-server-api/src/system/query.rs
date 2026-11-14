@@ -324,16 +324,7 @@ impl SystemQuery {
         let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
         let work_waiting = ctx.look_ahead().field("activity").exists()
             && !handle.is_globally_paused()
-            && state.read_queue(|inner| {
-                inner.jobs.iter().any(|row| {
-                    matches!(
-                        row.view(&inner.globals).status(),
-                        weaver_server_core::JobStatus::Queued
-                            | weaver_server_core::JobStatus::Downloading
-                            | weaver_server_core::JobStatus::Checking
-                    )
-                })
-            });
+            && state.read_queue(|inner| inner.work_waiting());
         match live_pool.or(fallback_pool) {
             Some(pool) => {
                 Ok(

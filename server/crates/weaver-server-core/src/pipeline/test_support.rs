@@ -118,11 +118,7 @@ pub async fn seed_job(pipeline: &mut Pipeline, job: crate::JobInfo) {
         job.download_wait_reason = pipeline.job_dispatch_hold_reason(id).map(str::to_owned);
     }
     pipeline.shared_state.queue.write(|inner| {
-        let row = inner
-            .jobs
-            .iter_mut()
-            .find(|row| row.id == id)
-            .expect("admitted fixture");
+        let mut row = inner.job_mut(id).expect("admitted fixture");
         row.report.job = job;
         row.report.download_active = false;
         queue::Change::changed(())

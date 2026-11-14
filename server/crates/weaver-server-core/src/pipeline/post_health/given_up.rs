@@ -155,7 +155,12 @@ impl GivenUp {
         if end != Some(SegmentTerminalState::Abandoned) {
             file.lost += 1;
         }
-        if end.is_none_or(|end| end == SegmentTerminalState::Missing) {
+        if end.is_none_or(|end| {
+            matches!(
+                end,
+                SegmentTerminalState::Missing | SegmentTerminalState::UnservableNotFound
+            )
+        }) {
             file.missing += 1;
             file.missing_bytes += bytes;
             let start = self

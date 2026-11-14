@@ -33,9 +33,12 @@ impl Queue {
         started: f64,
     ) {
         self.write(|inner| {
-            if let Some(row) = inner.job_mut(id)
-                && let std::collections::hash_map::Entry::Vacant(entry) = row.phases.entry(phase)
-            {
+            let began = inner.job_mut(id).is_some_and(|mut row| {
+                let row = &mut *row;
+                let std::collections::hash_map::Entry::Vacant(entry) = row.phases.entry(phase)
+                else {
+                    return false;
+                };
                 // A later phase shows from the moment it opens, so a phase
                 // the drivers never sample still says when it started.
                 if phase != JobPhase::Downloading {
@@ -59,6 +62,9 @@ impl Queue {
                     first: None,
                     rate: RateSeries::new(),
                 });
+                true
+            });
+            if began {
                 inner.phased_jobs.insert(id);
                 return Change::changed(());
             }
@@ -68,22 +74,26 @@ impl Queue {
 
     pub(crate) fn end_phase(&self, id: JobId, phase: JobPhase) {
         self.write(|inner| {
-            if let Some(row) = inner.job_mut(id) {
-                row.phases.remove(&phase);
-                row.sampled_phases.retain(|sample| sample.phase != phase);
-                row.report
-                    .job
-                    .phase_progress
-                    .retain(|sample| sample.phase != phase);
-                if row.phases.is_empty() {
-                    // A row out of every phase is no longer sampled; a later
-                    // phase starts its download series afresh from the gauge.
-                    row.download_rate = None;
-                    inner.phased_jobs.remove(&id);
-                }
-                return Change::changed(());
+            let Some(mut row) = inner.job_mut(id) else {
+                return Change::unchanged(());
+            };
+            row.phases.remove(&phase);
+            row.sampled_phases.retain(|sample| sample.phase != phase);
+            row.report
+                .job
+                .phase_progress
+                .retain(|sample| sample.phase != phase);
+            let idle = row.phases.is_empty();
+            if idle {
+                // A row out of every phase is no longer sampled; a later
+                // phase starts its download series afresh from the gauge.
+                row.download_rate = None;
             }
-            Change::unchanged(())
+            drop(row);
+            if idle {
+                inner.phased_jobs.remove(&id);
+            }
+            Change::changed(())
         });
     }
 
@@ -180,9 +190,10 @@ impl Queue {
             let epoch = crate::jobs::epoch_ms_now();
             let phased: Vec<JobId> = inner.phased_jobs().collect();
             for id in phased {
-                let Some(row) = inner.job_mut(id) else {
+                let Some(mut row) = inner.job_mut(id) else {
                     continue;
                 };
+                let row = &mut *row;
                 // A row's download series advances on every tick while the
                 // row is in a phase, and starts from the gauge's own sample
                 // instants: the gauge integrates the transfer total each

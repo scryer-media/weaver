@@ -60,7 +60,8 @@ impl Queue {
             for id in ids {
                 let outcome = match inner.job_mut(id) {
                     None => Err(SchedulerError::JobNotFound(id)),
-                    Some(row) => {
+                    Some(mut row) => {
+                        let row = &mut *row;
                         let job = &row.report.job;
                         if row.report.retiring {
                             Err(SchedulerError::Conflict("job is being archived".into()))
@@ -172,8 +173,7 @@ fn set_row_paused(
     let Some(position) = inner.job_position(job_id) else {
         return Err(SchedulerError::JobNotFound(job_id));
     };
-    let globals = &inner.globals;
-    let row = &mut inner.jobs[position];
+    let (mut row, globals) = inner.row_mut_with_globals(position);
     if row.intents.cancelled.is_some() {
         return Err(SchedulerError::JobNotFound(job_id));
     }
@@ -213,12 +213,13 @@ fn update_row(
     id: JobId,
     update: JobUpdate,
 ) -> Result<bool, SchedulerError> {
-    let Some(row) = inner
+    let Some(mut row) = inner
         .job_mut(id)
         .filter(|row| row.intents.cancelled.is_none())
     else {
         return Err(SchedulerError::JobNotFound(id));
     };
+    let row = &mut *row;
     if row.report.retiring {
         return Err(SchedulerError::Conflict("job is being archived".into()));
     }

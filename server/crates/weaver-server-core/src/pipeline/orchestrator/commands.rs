@@ -270,7 +270,7 @@ impl Pipeline {
         // Taken: the rows are being archived, and these intents are acted on.
         self.shared_state.queue.write(|inner| {
             for &id in ids.iter() {
-                if let Some(row) = inner.job_mut(id) {
+                if let Some(mut row) = inner.job_mut(id) {
                     row.report.retiring = true;
                     row.report.seen_intent_seq = row.intents.seq;
                 }
@@ -403,7 +403,7 @@ impl Pipeline {
         }
         self.shared_state.queue.write(|inner| {
             for &id in ids {
-                if let Some(row) = inner.job_mut(id) {
+                if let Some(mut row) = inner.job_mut(id) {
                     row.intents.cancelled = None;
                     row.intents.delete_history_after_cancel = false;
                     row.report.retiring = false;
@@ -633,6 +633,10 @@ impl Pipeline {
         self.segment_terminal_states
             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
         self.given_up.remove(&job_id);
+        // A restore keeps the job id: neither the cause nor the refusing
+        // servers of this run may reach the next.
+        self.semantic_terminal_causes.remove(&job_id);
+        self.login_refusals.remove(&job_id);
         self.rate_limit_reservations
             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
         self.job_last_download_activity.remove(&job_id);

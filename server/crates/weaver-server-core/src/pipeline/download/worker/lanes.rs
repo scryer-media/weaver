@@ -306,6 +306,7 @@ impl Pipeline {
         }
         self.files_counted_missing
             .retain(|file_id| file_id.job_id != job_id);
+        self.login_refusals.remove(&job_id);
     }
 
     pub(in crate::pipeline) fn health_counted_segment_bytes(&self, segment_id: SegmentId) -> u64 {
