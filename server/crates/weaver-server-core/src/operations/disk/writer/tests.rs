@@ -761,3 +761,30 @@ fn a_refused_name_is_not_a_failed_barrier() {
     assert!(barrier.passed());
     assert!(reports.try_recv().is_err(), "the refusal was the only word");
 }
+
+// A write that reaches the writer for a file that is not open, with no way
+// to open it and no refusal on record, fails its key: it is not dropped.
+#[test]
+fn a_write_to_a_file_that_is_not_open_fails_its_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, after) = (dir.path().join("a"), dir.path().join("after"));
+    let (writers, reports) = writers();
+    let volume = volume("one");
+    let job = writers.submitter(&volume, 1);
+    job.write(1, 0, Bytes::from_static(b"head"), create(&path));
+    job.release(1);
+    // The handle is closed, and this write brings no way to open it again.
+    job.write(1, 4, Bytes::from_static(b"tail"), None);
+    job.write(2, 0, Bytes::from_static(b"never"), create(&after));
+    let barrier = job.barrier();
+    barrier.wait_aside();
+    assert!(barrier.failed());
+    // The report follows the batch the failure was in.
+    let failures = reports.recv().unwrap().failures;
+    assert_eq!(failures.len(), 1);
+    assert_eq!((failures[0].key, failures[0].file), (1, Some(1)));
+    assert!(!failures[0].creating);
+    assert_eq!(std::fs::read(&path).unwrap(), b"head");
+    assert!(!after.exists(), "nothing of a failed key is written after");
+    assert_eq!(count(&volume.buffered_bytes), 0);
+}

@@ -588,8 +588,9 @@ impl Submitter {
 
     // Write `bytes` at `offset` of `file`, opening it through `create` when
     // it is not open. The bytes are handed over, not copied. A write to a
-    // file that is neither open nor given a way to open is dropped: the
-    // open that failed has said so.
+    // file whose name was refused is dropped: the refusal has said so. A
+    // write to any other file that is neither open nor given a way to open
+    // fails the key.
     pub(crate) fn write(&self, file: u64, offset: u64, bytes: Bytes, create: Option<Create>) -> u64 {
         self.lane
             .state
@@ -1155,7 +1156,8 @@ struct Open {
 
 impl Held {
     // The open handle of `file`, opened through `create` when it is not
-    // open. `None` for a file with no handle and no way to open one.
+    // open. `None` for a file whose name was refused; an error for any other
+    // file with no handle and no way to open one.
     fn opened(
         &mut self,
         file: u64,
@@ -1163,12 +1165,18 @@ impl Held {
         creating: &mut bool,
     ) -> io::Result<Option<&mut Open>> {
         if !self.open.contains_key(&file) {
-            let Some(create) = create else {
-                return Ok(None);
-            };
+            // The writes of a file whose name was refused are dropped: the
+            // refusal has said so.
             if self.refused.contains(&file) {
                 return Ok(None);
             }
+            // Any other write to a file that is not open must bring the way
+            // to open it. One that does not would be lost without a word.
+            let Some(create) = create else {
+                return Err(io::Error::other(
+                    "a write reached the volume's writer for a file that is not open, with no way to open it",
+                ));
+            };
             *creating = true;
             let opened = (create.open)(&create.path, create.length)?;
             *creating = false;
