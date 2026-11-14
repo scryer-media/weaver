@@ -5,10 +5,12 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
-use std::{io::IoSliceMut, time::Duration};
+use std::{collections::VecDeque, io::IoSliceMut, time::Duration};
 
+use crate::disk::{BLOCK_LEN, Block, BlockBuf, BlockPool};
 use crate::peer_protocol::{
-    Handshake, Message, MessageDeserializeError, PartialBlock, extended::PeerExtendedMessageIds,
+    Handshake, Message, MessageDeserializeError, PIECE_MESSAGE_PREAMBLE_LEN, PartialBlock,
+    extended::PeerExtendedMessageIds, may_start_piece, piece_header,
 };
 use crate::{Error, Result};
 use crate::{
@@ -47,7 +49,81 @@ pub struct ReadBuf {
     // The extensions we advertised on the connection: a message under the id
     // of another is not read (see `ExtendedMessage::deserialize_advertised`).
     advertised: PeerExtendedMessageIds,
+    // Where the blocks of Piece messages are received, when they are taken
+    // apart from the other messages.
+    blocks: Option<Box<Blocks>>,
 }
+
+/// A Piece message's header: length, id, index and begin.
+const HEADER: usize = PIECE_MESSAGE_PREAMBLE_LEN;
+
+/// The most blocks one read offers buffers for: about as much as one read
+/// into the buffer takes at its largest.
+const MOST_SLOTS: usize = GROWN_MAX / BLOCK_LEN;
+
+/// What a read returns: a message read in the buffer, or a block received
+/// into its own buffer.
+pub enum Incoming<'a> {
+    Message(Message<'a>),
+    Block(Block),
+}
+
+/// The blocks of Piece messages, each received into a buffer of its own.
+///
+/// A read offers, after the rest of the block being received, a run of
+/// slots, each a Piece header's room and then a block buffer: when the
+/// messages that follow are blocks, as they are while a peer uploads to us,
+/// each block lands in its own buffer straight off the socket. Bytes that
+/// turn out to be another message are moved into the connection's buffer,
+/// as are a header cut short by the end of a read and a block whose header
+/// was read into that buffer: those are the only bytes of a block copied
+/// before the block is written.
+struct Blocks {
+    pool: BlockPool,
+    // The block being received, its header read.
+    filling: Option<Filling>,
+    // Blocks received whole and not yet read.
+    ready: VecDeque<Block>,
+    // Buffers for the slots of the next read.
+    spares: Vec<BlockBuf>,
+    // The headers' room in the slots.
+    heads: Box<[[u8; HEADER]; MOST_SLOTS]>,
+    // Slots a read offers, from 1 to MOST_SLOTS: doubled after a read that
+    // filled every slot, halved after one that filled a quarter of them or
+    // less, or found another message in one.
+    slots: usize,
+    // Bytes of a read moved into the connection's buffer, or out of it into
+    // a block's, and the bytes of the blocks received.
+    moved: u64,
+    received: u64,
+}
+
+struct Filling {
+    index: u32,
+    begin: u32,
+    len: usize,
+    got: usize,
+    buf: BlockBuf,
+}
+
+impl Filling {
+    fn into_block(self) -> Block {
+        Block::new(self.index, self.begin, self.len, self.buf)
+    }
+}
+
+/// How a read with slots starts.
+#[derive(Clone, Copy)]
+enum Lead {
+    // The rest of the block being received.
+    Filling(usize),
+    // The rest of a Piece header the connection's buffer holds part of: the
+    // first slot's header is read there.
+    Prefix(usize),
+    Nothing,
+}
+
+const MOST_SLICES: usize = 2 + 2 * MOST_SLOTS;
 
 /// How much a read may take off the socket: as much as the connection holds
 /// download quota for (libtorrent `peer_connection::setup_receive` reads at
@@ -96,7 +172,31 @@ impl ReadBuf {
             consumed: 0,
             wanted: BUFLEN,
             advertised: PeerExtendedMessageIds::ours(),
+            blocks: None,
         }
+    }
+
+    /// The blocks of Piece messages are received into buffers of `pool`'s,
+    /// and read as [`Incoming::Block`] by [`Self::read_next`].
+    pub fn receive_blocks_into(&mut self, pool: BlockPool) {
+        self.blocks = Some(Box::new(Blocks {
+            pool,
+            filling: None,
+            ready: VecDeque::new(),
+            spares: Vec::new(),
+            heads: Box::new([[0u8; HEADER]; MOST_SLOTS]),
+            slots: 1,
+            moved: 0,
+            received: 0,
+        }));
+    }
+
+    /// Bytes moved into the connection's buffer or out of it into a
+    /// block's, and the bytes of the blocks received, so far.
+    pub fn moved(&self) -> (u64, u64) {
+        self.blocks
+            .as_ref()
+            .map_or((0, 0), |b| (b.moved, b.received))
     }
 
     /// The extensions we advertised on the connection, in our extended
@@ -108,6 +208,10 @@ impl ReadBuf {
     /// Bytes received and not yet read as a message.
     pub fn buffered(&self) -> usize {
         self.len
+            + self.blocks.as_ref().map_or(0, |b| {
+                b.filling.as_ref().map_or(0, |f| HEADER + f.got)
+                    + b.ready.iter().map(|r| HEADER + r.len()).sum::<usize>()
+            })
     }
 
     /// Bytes of the messages read so far.
@@ -118,6 +222,14 @@ impl ReadBuf {
     /// The Piece message being read, when part of its block arrived and
     /// the rest did not.
     pub fn partial_block(&self) -> Option<PartialBlock> {
+        if let Some(f) = self.blocks.as_ref().and_then(|b| b.filling.as_ref()) {
+            return (f.got > 0).then(|| PartialBlock {
+                index: f.index,
+                begin: f.begin,
+                len: u32::try_from(f.len).unwrap_or(u32::MAX),
+                received: u32::try_from(f.got).unwrap_or(u32::MAX),
+            });
+        }
         let (first, second) = as_slices!(self);
         PartialBlock::at_front(first, second)
     }
@@ -275,36 +387,8 @@ impl ReadBuf {
             };
 
             match err {
-                MessageDeserializeError::NotEnoughData(mut need_additional_bytes, ..) => {
-                    // The frame is within its rule, so the buffer grows to it.
-                    if self.len + need_additional_bytes > self.buf.len() {
-                        self.relocate(self.len + need_additional_bytes);
-                    }
-                    while need_additional_bytes > 0 {
-                        let room = self.buf.len() - self.len;
-                        let admitted = quota.admit(need_additional_bytes, room).await;
-                        let size = with_timeout(
-                            "reading",
-                            timeout,
-                            conn.read_vectored(&mut self.unfilled_ioslices(admitted))
-                                .map_err(Error::Write),
-                        )
-                        .await?;
-                        if size == 0 {
-                            return Err(Error::PeerDisconnected);
-                        }
-                        // A read that filled all the room, more than the
-                        // frame needed, may have left more in the socket:
-                        // the buffer doubles. One that took a quarter of it
-                        // or less halves it.
-                        if size == room && size > need_additional_bytes {
-                            self.wanted = (self.buf.len() * 2).min(GROWN_MAX);
-                        } else if size <= self.buf.len() / 4 {
-                            self.wanted = (self.buf.len() / 2).max(BUFLEN);
-                        }
-                        self.len += size;
-                        need_additional_bytes = need_additional_bytes.saturating_sub(size)
-                    }
+                MessageDeserializeError::NotEnoughData(need, ..) => {
+                    self.read_more(conn, timeout, quota, need).await?;
                 }
                 MessageDeserializeError::NeedContiguous => {
                     self.make_contiguous()?;
@@ -314,6 +398,472 @@ impl ReadBuf {
             }
         }
     }
+
+    /// Reads at least `need` more bytes into the buffer.
+    async fn read_more(
+        &mut self,
+        conn: &mut BoxAsyncReadVectored,
+        timeout: Duration,
+        quota: &mut impl ReadQuota,
+        mut need_additional_bytes: usize,
+    ) -> Result<()> {
+        // The frame is within its rule, so the buffer grows to it.
+        if self.len + need_additional_bytes > self.buf.len() {
+            self.relocate(self.len + need_additional_bytes);
+        }
+        while need_additional_bytes > 0 {
+            let room = self.buf.len() - self.len;
+            let admitted = quota.admit(need_additional_bytes, room).await;
+            let size = with_timeout(
+                "reading",
+                timeout,
+                conn.read_vectored(&mut self.unfilled_ioslices(admitted))
+                    .map_err(Error::Write),
+            )
+            .await?;
+            if size == 0 {
+                return Err(Error::PeerDisconnected);
+            }
+            // A read that filled all the room, more than the
+            // frame needed, may have left more in the socket:
+            // the buffer doubles. One that took a quarter of it
+            // or less halves it.
+            if size == room && size > need_additional_bytes {
+                self.wanted = (self.buf.len() * 2).min(GROWN_MAX);
+            } else if size <= self.buf.len() / 4 {
+                self.wanted = (self.buf.len() / 2).max(BUFLEN);
+            }
+            self.len += size;
+            need_additional_bytes = need_additional_bytes.saturating_sub(size)
+        }
+        Ok(())
+    }
+
+    /// The next message or block, as [`Self::read_message`] reads the next
+    /// message, the blocks of Piece messages received into their own
+    /// buffers once [`Self::receive_blocks_into`] named a pool.
+    pub async fn read_next(
+        &mut self,
+        conn: &mut BoxAsyncReadVectored,
+        timeout: Duration,
+        num_pieces: Option<u32>,
+        quota: &mut impl ReadQuota,
+    ) -> Result<Incoming<'_>> {
+        if self.blocks.is_none() {
+            return self
+                .read_message(conn, timeout, num_pieces, quota)
+                .await
+                .map(Incoming::Message);
+        }
+        if self.buf.len() != self.wanted && self.len <= self.wanted {
+            self.relocate(self.wanted);
+        }
+        loop {
+            let blocks = self
+                .blocks
+                .as_deref_mut()
+                .expect("blocks are received apart");
+            if let Some(block) = blocks.ready.pop_front() {
+                self.consumed += (HEADER + block.len()) as u64;
+                return Ok(Incoming::Block(block));
+            }
+            if blocks.filling.is_none() && self.len > 0 {
+                if self.len >= HEADER {
+                    if let Some(header) = piece_header(&self.front()) {
+                        self.fill_from_buffer(header);
+                        continue;
+                    }
+                } else if may_start_piece(&self.front()[..self.len]) {
+                    self.read_blocks(conn, timeout, quota).await?;
+                    continue;
+                }
+                let err = {
+                    // The borrow checker workaround of `read_message`, for
+                    // the same reason.
+                    let this = unsafe { &mut *(self as *mut Self) };
+                    let (first, second) = as_slices!(this);
+                    match Message::deserialize_advertised(
+                        first,
+                        second,
+                        num_pieces,
+                        &this.advertised,
+                    ) {
+                        Ok((msg, size)) => {
+                            advance!(this, size);
+                            this.consumed += size as u64;
+                            return Ok(Incoming::Message(msg));
+                        }
+                        Err(e) => e,
+                    }
+                };
+                match err {
+                    MessageDeserializeError::NotEnoughData(need, ..) => {
+                        self.read_more(conn, timeout, quota, need).await?;
+                    }
+                    MessageDeserializeError::NeedContiguous => {
+                        self.make_contiguous()?;
+                    }
+                    e => return Err(Error::Deserialize(e)),
+                }
+                continue;
+            }
+            self.read_blocks(conn, timeout, quota).await?;
+        }
+    }
+
+    /// The first bytes held, up to a Piece header's length.
+    fn front(&self) -> [u8; HEADER] {
+        let mut header = [0u8; HEADER];
+        let (first, second) = as_slices!(self);
+        for (to, from) in header.iter_mut().zip(first.iter().chain(second)) {
+            *to = *from;
+        }
+        header
+    }
+
+    /// A Piece header is at the front of the buffer: its block moves into a
+    /// block buffer, as much of it as the buffer holds.
+    fn fill_from_buffer(&mut self, (index, begin, len): (u32, u32, usize)) {
+        self.advance(HEADER);
+        let got = len.min(self.len);
+        let mut buf = {
+            let blocks = self
+                .blocks
+                .as_deref_mut()
+                .expect("blocks are received apart");
+            blocks.spares.pop().unwrap_or_else(|| blocks.pool.take())
+        };
+        let (first, second) = as_slices!(self);
+        let a = got.min(first.len());
+        buf.as_mut_slice()[..a].copy_from_slice(&first[..a]);
+        buf.as_mut_slice()[a..got].copy_from_slice(&second[..got - a]);
+        advance!(self, got);
+        let blocks = self
+            .blocks
+            .as_deref_mut()
+            .expect("blocks are received apart");
+        blocks.moved += got as u64;
+        blocks.received += got as u64;
+        let filling = Filling {
+            index,
+            begin,
+            len,
+            got,
+            buf,
+        };
+        if got == len {
+            blocks.ready.push_back(filling.into_block());
+        } else {
+            blocks.filling = Some(filling);
+        }
+    }
+
+    /// One read, offering the rest of the block being received and then
+    /// slots for the blocks that follow.
+    async fn read_blocks(
+        &mut self,
+        conn: &mut BoxAsyncReadVectored,
+        timeout: Duration,
+        quota: &mut impl ReadQuota,
+    ) -> Result<()> {
+        let blocks = self
+            .blocks
+            .as_deref_mut()
+            .expect("blocks are received apart");
+        let slots = blocks.slots;
+        blocks.pool.fill(&mut blocks.spares, slots);
+        let lead = match &blocks.filling {
+            Some(f) => Lead::Filling(f.len - f.got),
+            None if self.len > 0 => Lead::Prefix(HEADER - self.len),
+            None => Lead::Nothing,
+        };
+        let (lead_len, need) = match lead {
+            Lead::Filling(n) | Lead::Prefix(n) => (n, n),
+            Lead::Nothing => (0, HEADER),
+        };
+        let room = lead_len + slots * (HEADER + BLOCK_LEN);
+        let admitted = quota.admit(need, room).await;
+
+        // The slices, in the order the read fills them, and how much of
+        // each slot it offers.
+        let mut offered = [(0usize, 0usize); MOST_SLOTS];
+        let size = {
+            let mut slices: [IoSliceMut<'_>; MOST_SLICES] =
+                std::array::from_fn(|_| IoSliceMut::new(&mut []));
+            let mut used = 0;
+            let mut budget = admitted;
+            let Self {
+                buf,
+                start,
+                len,
+                blocks,
+                ..
+            } = self;
+            let blocks = blocks.as_deref_mut().expect("blocks are received apart");
+            match lead {
+                Lead::Filling(_) => {
+                    let f = blocks.filling.as_mut().expect("a block is being received");
+                    let rest = &mut f.buf.as_mut_slice()[f.got..f.len];
+                    let n = rest.len().min(budget);
+                    slices[used] = IoSliceMut::new(&mut rest[..n]);
+                    used += 1;
+                    budget -= n;
+                }
+                Lead::Prefix(p) => {
+                    let n = p.min(budget);
+                    for s in unfilled(buf, *start, *len, n) {
+                        slices[used] = s;
+                        used += 1;
+                    }
+                    budget -= n;
+                }
+                Lead::Nothing => {}
+            }
+            let heads = &mut blocks.heads[..];
+            for (i, (head, spare)) in heads.iter_mut().zip(blocks.spares.iter_mut()).enumerate() {
+                if i == slots || budget == 0 {
+                    break;
+                }
+                let prefixed = i == 0 && matches!(lead, Lead::Prefix(_));
+                let h = if prefixed { 0 } else { HEADER.min(budget) };
+                budget -= h;
+                let b = BLOCK_LEN.min(budget);
+                budget -= b;
+                offered[i] = (h, b);
+                if h > 0 {
+                    slices[used] = IoSliceMut::new(&mut head[..h]);
+                    used += 1;
+                }
+                if b > 0 {
+                    slices[used] = IoSliceMut::new(&mut spare.as_mut_slice()[..b]);
+                    used += 1;
+                }
+            }
+            with_timeout(
+                "reading",
+                timeout,
+                conn.read_vectored(&mut slices[..used])
+                    .map_err(Error::Write),
+            )
+            .await?
+        };
+        if size == 0 {
+            return Err(Error::PeerDisconnected);
+        }
+        self.take_read(
+            lead,
+            &offered[..slots.min(MOST_SLOTS)],
+            size,
+            room == admitted,
+        );
+        Ok(())
+    }
+
+    /// Sorts the `size` bytes a read put in the slices `read_blocks` offered:
+    /// the rest of the block being received, then each slot's header and
+    /// block, in order.
+    fn take_read(
+        &mut self,
+        lead: Lead,
+        offered: &[(usize, usize)],
+        size: usize,
+        all_offered: bool,
+    ) {
+        let mut left = size;
+        match lead {
+            Lead::Filling(rest) => {
+                let blocks = self
+                    .blocks
+                    .as_deref_mut()
+                    .expect("blocks are received apart");
+                let t = left.min(rest);
+                left -= t;
+                blocks.received += t as u64;
+                let f = blocks.filling.as_mut().expect("a block is being received");
+                f.got += t;
+                if f.got == f.len {
+                    let f = blocks.filling.take().expect("a block is being received");
+                    blocks.ready.push_back(f.into_block());
+                }
+            }
+            Lead::Prefix(p) => {
+                let t = left.min(p);
+                left -= t;
+                self.len += t;
+                if t < p {
+                    return;
+                }
+            }
+            Lead::Nothing => {}
+        }
+        let offered_total: usize = offered.iter().map(|(h, b)| h + b).sum();
+
+        // The slots that hold blocks: the first `taken`, each one's header,
+        // and how much of the last arrived. Then where the bytes that are not
+        // a block begin, if any: a slot and an offset in it, counting its
+        // header's room first.
+        let mut found = [(0u32, 0u32, 0usize); MOST_SLOTS];
+        let mut taken = 0;
+        let mut last_got = 0;
+        let mut other: Option<(usize, usize)> = None;
+        for (i, &(h, b)) in offered.iter().enumerate() {
+            if left == 0 {
+                break;
+            }
+            let prefixed = i == 0 && matches!(lead, Lead::Prefix(_));
+            let header = if prefixed {
+                self.front()
+            } else if left < h || h < HEADER {
+                // A header cut short by the end of the read: the
+                // buffer's next read completes it.
+                other = Some((i, 0));
+                break;
+            } else {
+                self.blocks
+                    .as_deref()
+                    .expect("blocks are received apart")
+                    .heads[i]
+            };
+            let in_head = if prefixed { 0 } else { HEADER };
+            match piece_header(&header) {
+                Some((index, begin, len)) => {
+                    let got = (left - in_head).min(b);
+                    if prefixed {
+                        self.advance(HEADER);
+                    }
+                    found[taken] = (index, begin, len);
+                    taken += 1;
+                    last_got = got;
+                    left -= in_head + got;
+                    if got > len {
+                        // A block shorter than its slot, and more after it.
+                        other = Some((i, in_head + len));
+                        left += got - len;
+                        last_got = len;
+                        break;
+                    }
+                    if got < len {
+                        break;
+                    }
+                }
+                None => {
+                    other = Some((i, 0));
+                    break;
+                }
+            }
+        }
+
+        // Bytes after the blocks move into the buffer, in order: `left` of
+        // them, from `other` on.
+        if let Some((slot, offset)) = other {
+            let blocks = self
+                .blocks
+                .as_deref_mut()
+                .expect("blocks are received apart");
+            blocks.slots = (blocks.slots / 2).max(1);
+            blocks.moved += left as u64;
+            let mut skip = offset;
+            for (j, &(h, b)) in offered.iter().enumerate().skip(slot) {
+                if left == 0 {
+                    break;
+                }
+                let prefixed = j == 0 && matches!(lead, Lead::Prefix(_));
+                let h = if prefixed { 0 } else { h };
+                for part in 0..2 {
+                    let room = if part == 0 { h } else { b };
+                    let from = skip.min(room);
+                    skip -= from;
+                    let n = (room - from).min(left);
+                    if n == 0 {
+                        continue;
+                    }
+                    left -= n;
+                    let Self {
+                        buf,
+                        start,
+                        len,
+                        blocks,
+                        ..
+                    } = &mut *self;
+                    let blocks = blocks.as_deref().expect("blocks are received apart");
+                    let bytes: &[u8] = if part == 0 {
+                        &blocks.heads[j][from..from + n]
+                    } else {
+                        &blocks.spares[j].as_slice()[from..from + n]
+                    };
+                    ring_push(buf, start, len, bytes);
+                }
+            }
+        }
+
+        let blocks = self
+            .blocks
+            .as_deref_mut()
+            .expect("blocks are received apart");
+        for (k, buf) in blocks.spares.drain(..taken).enumerate() {
+            let (index, begin, len) = found[k];
+            let got = if k + 1 == taken { last_got } else { len };
+            blocks.received += got as u64;
+            let filling = Filling {
+                index,
+                begin,
+                len,
+                got,
+                buf,
+            };
+            if got == len {
+                blocks.ready.push_back(filling.into_block());
+            } else {
+                blocks.filling = Some(filling);
+            }
+        }
+        if other.is_none() {
+            if all_offered && size >= offered_total {
+                blocks.slots = (blocks.slots * 2).min(MOST_SLOTS);
+            } else if size <= offered_total / 4 {
+                blocks.slots = (blocks.slots / 2).max(1);
+            }
+        }
+        blocks.spares.truncate(blocks.slots);
+    }
+}
+
+/// Appends `bytes` to the `len` bytes held from `start` in the ring `buf`,
+/// growing it to fit them (it shrinks back between messages, as
+/// `ReadBuf::read_message` has it).
+fn ring_push(buf: &mut Box<[u8]>, start: &mut usize, len: &mut usize, bytes: &[u8]) {
+    if *len + bytes.len() > buf.len() {
+        let mut new = vec![0u8; *len + bytes.len()].into_boxed_slice();
+        let size = buf.len();
+        let first = (*len).min(size - *start);
+        new[..first].copy_from_slice(&buf[*start..*start + first]);
+        new[first..*len].copy_from_slice(&buf[..*len - first]);
+        *buf = new;
+        *start = 0;
+    }
+    let size = buf.len();
+    let at = (*start + *len) % size;
+    let first = bytes.len().min(size - at);
+    buf[at..at + first].copy_from_slice(&bytes[..first]);
+    buf[..bytes.len() - first].copy_from_slice(&bytes[first..]);
+    *len += bytes.len();
+}
+
+/// The room after the `len` bytes held from `start` in the ring `buf`, at
+/// most `max` bytes of it.
+fn unfilled(buf: &mut [u8], start: usize, len: usize, max: usize) -> [IoSliceMut<'_>; 2] {
+    let size = buf.len();
+    let write_start = (start.saturating_add(len)) % size;
+    let available_len = size.saturating_sub(len).min(max);
+    let first_len = (size.saturating_sub(write_start)).min(available_len);
+    let second_len = available_len.saturating_sub(first_len);
+    let (second, first) = buf.split_at_mut(write_start);
+    let first_len = first_len.min(first.len());
+    let second_len = second_len.min(second.len());
+    [
+        IoSliceMut::new(&mut first[..first_len]),
+        IoSliceMut::new(&mut second[..second_len]),
+    ]
 }
 
 #[cfg(test)]
@@ -336,7 +886,9 @@ mod tests {
         vectored_traits::AsyncReadVectoredIntoCompat,
     };
 
-    use super::{BUFLEN, GROWN_MAX, ReadBuf, ReadQuota, Unlimited};
+    use super::{BUFLEN, GROWN_MAX, HEADER, Incoming, MOST_SLOTS, ReadBuf, ReadQuota, Unlimited};
+    use crate::disk::BlockPool;
+    use crate::peer_protocol::Piece;
 
     #[test]
     fn test_ringbuf_ranges() {
@@ -588,6 +1140,204 @@ mod tests {
         tokio::join!(reader, writer);
     }
 
+    // A reader of `data` that fills every slice it is given, up to `cap`
+    // bytes a read, as a socket does.
+    struct Script {
+        data: Vec<u8>,
+        at: usize,
+        cap: usize,
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl tokio::io::AsyncRead for Script {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let n = buf.remaining().min(this.cap).min(this.data.len() - this.at);
+            buf.put_slice(&this.data[this.at..this.at + n]);
+            this.at += n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl crate::vectored_traits::AsyncReadVectored for Script {
+        fn poll_read_vectored(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            vec: &mut [std::io::IoSliceMut<'_>],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            this.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut left = this.cap.min(this.data.len() - this.at);
+            let mut total = 0;
+            for s in vec.iter_mut() {
+                let n = s.len().min(left);
+                s[..n].copy_from_slice(&this.data[this.at..this.at + n]);
+                this.at += n;
+                left -= n;
+                total += n;
+            }
+            std::task::Poll::Ready(Ok(total))
+        }
+    }
+
+    enum Sent {
+        Block(u32, Vec<u8>),
+        Have(u32),
+    }
+
+    fn wire_of(sent: &[Sent]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        let mut frame = vec![0u8; MAX_MSG_LEN];
+        for s in sent {
+            let len = match s {
+                Sent::Block(i, data) => Message::Piece(Piece::from_data(*i, 0, data))
+                    .serialize(&mut frame, &Default::default),
+                Sent::Have(i) => Message::Have(*i).serialize(&mut frame, &Default::default),
+            }
+            .unwrap();
+            wire.extend_from_slice(&frame[..len]);
+        }
+        wire
+    }
+
+    fn block_of(i: u32, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|k| k.to_le_bytes()[0] ^ i.wrapping_mul(2_654_435_761).to_le_bytes()[k % 4])
+            .collect()
+    }
+
+    // Reads `sent` off a socket that hands at most `cap` bytes a read, and
+    // checks every message comes out whole and in order. Returns the bytes
+    // moved and the pool's allocations.
+    async fn read_all(sent: &[Sent], cap: usize) -> (u64, usize, usize) {
+        let pool = BlockPool::new(crate::disk::MAX_QUEUED_DISK_BYTES);
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut reader: BoxAsyncReadVectored = Box::new(Script {
+            data: wire_of(sent),
+            at: 0,
+            cap,
+            reads: reads.clone(),
+        });
+        let mut rb = ReadBuf::new();
+        rb.receive_blocks_into(pool.clone());
+        for s in sent {
+            let got = rb
+                .read_next(&mut reader, Duration::from_secs(10), None, &mut Unlimited)
+                .await
+                .unwrap();
+            match (s, got) {
+                (Sent::Block(i, data), Incoming::Block(b)) => {
+                    assert_eq!((b.index, b.begin), (*i, 0));
+                    assert_eq!(b.data(), &data[..], "block {i}");
+                }
+                (Sent::Have(i), Incoming::Message(Message::Have(n))) => assert_eq!(*i, n),
+                (_, Incoming::Block(b)) => panic!("unexpected {b:?}"),
+                (_, Incoming::Message(m)) => panic!("unexpected {m:?}"),
+            }
+        }
+        assert_eq!(rb.consumed(), script_len(sent));
+        assert_eq!(rb.buffered(), 0);
+        let (moved, received) = rb.moved();
+        let blocks: u64 = sent
+            .iter()
+            .map(|s| match s {
+                Sent::Block(_, d) => d.len() as u64,
+                Sent::Have(_) => 0,
+            })
+            .sum();
+        assert_eq!(received, blocks);
+        drop(rb);
+        (
+            moved,
+            pool.allocated(),
+            reads.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    fn script_len(sent: &[Sent]) -> u64 {
+        wire_of(sent).len() as u64
+    }
+
+    // Blocks back to back land in their own buffers off the socket: no byte
+    // of them is copied, the reads grow to many blocks each, and the pool
+    // allocates no more than one read's buffers.
+    #[tokio::test(start_paused = true)]
+    async fn blocks_back_to_back_are_received_into_their_own_buffers() {
+        let sent: Vec<_> = (0..400)
+            .map(|i| Sent::Block(i, block_of(i, 16384)))
+            .collect();
+        let (moved, allocated, reads) = read_all(&sent, usize::MAX).await;
+        assert_eq!(moved, 0);
+        assert!(allocated <= 2 * MOST_SLOTS, "{allocated}");
+        assert!(reads < 40, "{reads}");
+    }
+
+    // Reads cut anywhere: only the headers cut short move, and every block
+    // comes out whole.
+    #[tokio::test(start_paused = true)]
+    async fn reads_cut_anywhere_move_only_cut_headers() {
+        let sent: Vec<_> = (0..64)
+            .map(|i| Sent::Block(i, block_of(i, 16384)))
+            .collect();
+        for cap in [1, 7, 13, 14, 1000, 16397, 16398, 40_000, 100_003] {
+            let (moved, _, reads) = read_all(&sent, cap).await;
+            assert!(
+                moved <= (HEADER as u64) * reads as u64,
+                "cap {cap}: {moved}"
+            );
+        }
+    }
+
+    // Other messages between blocks, and blocks shorter than a slot, move
+    // into the buffer and come out in order, at any read size.
+    #[tokio::test(start_paused = true)]
+    async fn other_messages_between_blocks_come_out_in_order() {
+        let mut sent = Vec::new();
+        for i in 0..80u32 {
+            let len = if i % 9 == 4 {
+                1 + (i as usize * 97) % 16384
+            } else {
+                16384
+            };
+            sent.push(Sent::Block(i, block_of(i, len)));
+            if i % 7 == 3 {
+                sent.push(Sent::Have(i));
+                sent.push(Sent::Have(i + 1000));
+            }
+        }
+        for cap in [3, 13, 500, 16397, 70_000, usize::MAX] {
+            read_all(&sent, cap).await;
+        }
+    }
+
+    // A connection that ends inside a block reports the block cut short.
+    #[tokio::test(start_paused = true)]
+    async fn a_block_cut_short_is_reported() {
+        let data = block_of(5, 16384);
+        let wire = wire_of(&[Sent::Block(5, data)]);
+        let mut reader = reader_of(&wire[..HEADER + 1000]).await;
+        let mut rb = ReadBuf::new();
+        rb.receive_blocks_into(BlockPool::new(crate::disk::MAX_QUEUED_DISK_BYTES));
+        let res = rb
+            .read_next(&mut reader, Duration::from_secs(1), None, &mut Unlimited)
+            .await;
+        assert!(res.is_err());
+        assert_eq!(
+            rb.partial_block(),
+            Some(crate::peer_protocol::PartialBlock {
+                index: 5,
+                begin: 0,
+                len: 16384,
+                received: 1000,
+            })
+        );
+    }
+
     // A reader of `bytes`, all written before the first read.
     async fn reader_of(bytes: &[u8]) -> BoxAsyncReadVectored {
         let (mut w, r) = tokio::io::duplex(bytes.len() + 1);
@@ -781,5 +1531,184 @@ mod tests {
             }
         }
         assert_eq!(rb.buf.len(), BUFLEN);
+    }
+
+    // A seeded random mix of blocks of any length and short messages
+    // whose first bytes look like a Piece header's (Request and Cancel are 13
+    // bytes long, as a Piece header is; KeepAlive is 4), read off a socket
+    // whose every read returns a random amount, under a quota that admits a
+    // random amount. Every message comes out whole, in order, and nothing is
+    // left over.
+    struct Rand(u64);
+    impl Rand {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn upto(&mut self, n: usize) -> usize {
+            1 + usize::try_from(self.next() % n as u64).unwrap()
+        }
+    }
+
+    struct RandScript {
+        data: Vec<u8>,
+        at: usize,
+        rand: Rand,
+    }
+
+    impl tokio::io::AsyncRead for RandScript {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let cap = this.rand.upto(40_000);
+            let n = buf.remaining().min(cap).min(this.data.len() - this.at);
+            buf.put_slice(&this.data[this.at..this.at + n]);
+            this.at += n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl crate::vectored_traits::AsyncReadVectored for RandScript {
+        fn poll_read_vectored(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            vec: &mut [std::io::IoSliceMut<'_>],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            // Mostly small reads, sometimes large ones.
+            let cap = if this.rand.next().is_multiple_of(4) {
+                this.rand.upto(200_000)
+            } else {
+                this.rand.upto(40)
+            };
+            let mut left = cap.min(this.data.len() - this.at);
+            let mut total = 0;
+            for s in vec.iter_mut() {
+                let n = s.len().min(left);
+                s[..n].copy_from_slice(&this.data[this.at..this.at + n]);
+                this.at += n;
+                left -= n;
+                total += n;
+            }
+            std::task::Poll::Ready(Ok(total))
+        }
+    }
+
+    struct RandQuota(Rand);
+    impl ReadQuota for RandQuota {
+        async fn admit(&mut self, _need: usize, room: usize) -> usize {
+            self.0.upto(room)
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Mixed {
+        Block(u32, u32, Vec<u8>),
+        Have(u32),
+        KeepAlive,
+        Unchoke,
+        Request(u32, u32, u32),
+        Cancel(u32, u32, u32),
+        Port(u16),
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_random_mix_at_random_read_sizes_comes_out_whole_and_in_order() {
+        use crate::peer_protocol::Request;
+        for seed in 1..=40u64 {
+            let mut rand = Rand(0x9e37_79b9_7f4a_7c15 ^ seed.wrapping_mul(0x2545_f491_4f6c_dd1d));
+            let mut sent = Vec::new();
+            for i in 0..300u32 {
+                let m = match rand.next() % 10 {
+                    0..=4 => {
+                        let len = if rand.next().is_multiple_of(3) {
+                            rand.upto(16384)
+                        } else {
+                            16384
+                        };
+                        let begin = (rand.next() % 64) as u32 * 16384;
+                        Mixed::Block(i, begin, block_of(i, len))
+                    }
+                    5 => Mixed::Have(i),
+                    6 => Mixed::KeepAlive,
+                    7 => Mixed::Unchoke,
+                    8 => Mixed::Request(i, 16384 * (i % 7), 16384),
+                    _ => match rand.next() % 2 {
+                        0 => Mixed::Cancel(i, 0, 16384),
+                        _ => Mixed::Port((i % 65_000) as u16),
+                    },
+                };
+                sent.push(m);
+            }
+            let mut wire = Vec::new();
+            let mut frame = vec![0u8; MAX_MSG_LEN];
+            for m in &sent {
+                let len = match m {
+                    Mixed::Block(i, b, d) => Message::Piece(Piece::from_data(*i, *b, &d[..])),
+                    Mixed::Have(i) => Message::Have(*i),
+                    Mixed::KeepAlive => Message::KeepAlive,
+                    Mixed::Unchoke => Message::Unchoke,
+                    Mixed::Request(i, b, l) => Message::Request(Request::new(*i, *b, *l)),
+                    Mixed::Cancel(i, b, l) => Message::Cancel(Request::new(*i, *b, *l)),
+                    Mixed::Port(p) => Message::Port(*p),
+                }
+                .serialize(&mut frame, &Default::default)
+                .unwrap();
+                wire.extend_from_slice(&frame[..len]);
+            }
+            let total = wire.len() as u64;
+            let pool = BlockPool::new(crate::disk::MAX_QUEUED_DISK_BYTES);
+            let mut reader: BoxAsyncReadVectored = Box::new(RandScript {
+                data: wire,
+                at: 0,
+                rand: Rand(seed.wrapping_mul(0x1234_5678_9abc_def1) | 1),
+            });
+            let mut quota = RandQuota(Rand(seed.wrapping_mul(0x0fed_cba9_8765_4321) | 1));
+            let mut rb = ReadBuf::new();
+            rb.receive_blocks_into(pool.clone());
+            let mut held = Vec::new();
+            for (k, want) in sent.iter().enumerate() {
+                let got = match rb
+                    .read_next(&mut reader, Duration::from_secs(10), None, &mut quota)
+                    .await
+                    .unwrap_or_else(|e| panic!("seed {seed} message {k}: {e:#}"))
+                {
+                    Incoming::Block(b) => {
+                        let m = Mixed::Block(b.index, b.begin, b.data().to_vec());
+                        // Blocks are kept alive, as queued writes are, so a
+                        // buffer reused too soon would show.
+                        held.push(b);
+                        m
+                    }
+                    Incoming::Message(Message::Have(n)) => Mixed::Have(n),
+                    Incoming::Message(Message::KeepAlive) => Mixed::KeepAlive,
+                    Incoming::Message(Message::Unchoke) => Mixed::Unchoke,
+                    Incoming::Message(Message::Request(r)) => {
+                        Mixed::Request(r.index, r.begin, r.length)
+                    }
+                    Incoming::Message(Message::Cancel(r)) => {
+                        Mixed::Cancel(r.index, r.begin, r.length)
+                    }
+                    Incoming::Message(Message::Port(p)) => Mixed::Port(p),
+                    Incoming::Message(m) => panic!("seed {seed} message {k}: {m:?}"),
+                };
+                assert!(got == *want, "seed {seed} message {k}: {got:?} != {want:?}");
+            }
+            assert_eq!(rb.consumed(), total, "seed {seed}");
+            assert_eq!(rb.buffered(), 0, "seed {seed}");
+            // Every received block's bytes are still its own.
+            let mut blocks = sent.iter().filter_map(|m| match m {
+                Mixed::Block(_, _, d) => Some(d),
+                _ => None,
+            });
+            for b in &held {
+                assert_eq!(b.data(), &blocks.next().unwrap()[..], "seed {seed}");
+            }
+        }
     }
 }

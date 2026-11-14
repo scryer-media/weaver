@@ -212,6 +212,28 @@ impl DhtTap {
         let _ = inbox.try_send((datagram.into(), from));
         true
     }
+
+    /// [`Self::take`] for a `len`-byte datagram read into `head` and on
+    /// into `spill`: one longer than `head` is joined only when the DHT
+    /// takes it.
+    fn take_split(&self, head: &[u8], spill: &[u8], len: usize, from: SocketAddr) -> bool {
+        let len = len.min(spill.len());
+        if len <= head.len() {
+            return self.take(&head[..len], from);
+        }
+        let Some(inbox) = self.inbox.get() else {
+            return false;
+        };
+        let tail = &spill[..len - head.len()];
+        if !(head.first() == Some(&b'd') && tail.last() == Some(&b'e')) {
+            return false;
+        }
+        let mut datagram = Vec::with_capacity(len);
+        datagram.extend_from_slice(head);
+        datagram.extend_from_slice(tail);
+        let _ = inbox.try_send((datagram.into(), from));
+        true
+    }
 }
 
 /// A uTP socket's datagram socket the DHT may share, from the uTP socket of
@@ -219,6 +241,9 @@ impl DhtTap {
 pub(crate) struct DhtShare {
     pub(crate) socket: Arc<dyn DatagramSocket>,
     pub(crate) tap: Arc<DhtTap>,
+    // The uTP threads the socket's I/O is registered on, kept running while
+    // the DHT sends on it, after the uTP socket has ended too.
+    pub(crate) shards: Option<weaver_utp::Shards>,
 }
 
 impl DhtShare {
@@ -237,6 +262,7 @@ impl DhtShare {
         Arc::new(SharedDhtSocket {
             socket: self.socket,
             messages: tokio::sync::Mutex::new(messages),
+            _shards: self.shards,
         })
     }
 }
@@ -245,6 +271,8 @@ impl DhtShare {
 struct SharedDhtSocket {
     socket: Arc<dyn DatagramSocket>,
     messages: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(Box<[u8]>, SocketAddr)>>,
+    // Dropped after `socket`: the threads its I/O is registered on.
+    _shards: Option<weaver_utp::Shards>,
 }
 
 impl DatagramSocket for SharedDhtSocket {
@@ -323,6 +351,10 @@ impl Transport for DatagramTransport {
         true
     }
 
+    fn register_io(&self) -> io::Result<()> {
+        self.0.register_io()
+    }
+
     fn shutdown(&self) -> impl Future<Output = io::Result<()>> + Send {
         self.0.shutdown()
     }
@@ -332,6 +364,39 @@ impl Transport for DatagramTransport {
             let (len, from) = self.0.recv_from(buf).await?;
             match &self.1 {
                 Some(tap) if tap.take(&buf[..len.min(buf.len())], from) => {}
+                _ => return Ok((len, from)),
+            }
+        }
+    }
+
+    // A kernel socket reads each datagram straight into the two buffers;
+    // a tunnel's socket reads into `spill`, and the datagram's start moves
+    // to `head`.
+    async fn recv_from_split(
+        &self,
+        head: &mut [u8],
+        spill: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr)> {
+        loop {
+            let split =
+                std::future::poll_fn(|cx| match self.0.poll_recv_from_split(cx, head, spill) {
+                    None => Poll::Ready(None),
+                    Some(Poll::Ready(received)) => Poll::Ready(Some(received)),
+                    Some(Poll::Pending) => Poll::Pending,
+                })
+                .await;
+            let (len, from) = match split {
+                Some(received) => received?,
+                None => {
+                    let (len, from) = self.0.recv_from(spill).await?;
+                    let first = len.min(head.len());
+                    head[..first].copy_from_slice(&spill[..first]);
+                    spill.copy_within(first..len, 0);
+                    (len, from)
+                }
+            };
+            match &self.1 {
+                Some(tap) if tap.take_split(head, spill, len, from) => {}
                 _ => return Ok((len, from)),
             }
         }
@@ -436,13 +501,25 @@ impl KernelSockets {
             reason = "the kernel's own route binds on its device, or the host's"
         )]
         let (socket, dual_stack) = self.egress.bind_udp_reusing(addr, reuse)?;
-        let socket = tokio::net::UdpSocket::from_std(socket)?;
-        Ok(KernelUdp {
-            local: socket.local_addr()?,
-            socket,
-            dual_stack,
-            size_sends: parking_lot::Mutex::new(()),
-        })
+        KernelUdp::registered(socket, dual_stack)
+    }
+
+    // A datagram socket at `addr` as `kernel_udp` binds it, set for uTP
+    // with a receive buffer of `receive_buffer` bytes, and left for uTP to
+    // register with the runtime its I/O runs on.
+    fn kernel_utp(
+        &self,
+        addr: SocketAddr,
+        reuse: bool,
+        receive_buffer: usize,
+    ) -> io::Result<KernelUdp> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the kernel's own route binds on its device, or the host's"
+        )]
+        let (socket, dual_stack) = self.egress.bind_udp_reusing(addr, reuse)?;
+        crate::udp_options::set_for_utp(&socket, addr, receive_buffer);
+        KernelUdp::unregistered(socket, dual_stack)
     }
 
     // The datagram sockets at `addr`, each set for uTP with a receive buffer
@@ -452,24 +529,18 @@ impl KernelSockets {
         addr: SocketAddr,
         utp: Option<usize>,
     ) -> io::Result<Arc<dyn DatagramSocket>> {
-        let set = |socket: KernelUdp, at: SocketAddr| {
-            if let Some(receive_buffer) = utp {
-                crate::udp_options::set_for_utp(&socket.socket, at, receive_buffer);
-            }
-            socket
+        let bind = |at, reuse| match utp {
+            Some(receive_buffer) => self.kernel_utp(at, reuse, receive_buffer),
+            None => self.kernel_udp(at, reuse),
         };
         if !self.paired(addr) {
-            return Ok(Arc::new(set(self.kernel_udp(addr, reuses(addr))?, addr)));
+            return Ok(Arc::new(bind(addr, reuses(addr))?));
         }
-        let (v6, v4) = bind_pair(
-            addr,
-            |at, reuse| self.kernel_udp(at, reuse),
-            |socket| socket.local.port(),
-        )?;
-        let (v6_addr, v4_addr) = (v6.local, v4.local);
+        let (v6, v4) = bind_pair(addr, bind, |socket| socket.local.port())?;
         Ok(Arc::new(PairedUdp {
-            v6: set(v6, v6_addr),
-            v4: set(v4, v4_addr),
+            v6,
+            v4,
+            v4_first: Default::default(),
         }))
     }
 }
@@ -657,6 +728,9 @@ impl StreamListener for PairedListener {
 struct PairedUdp {
     v6: KernelUdp,
     v4: KernelUdp,
+    // Which family's socket is read first, in turn, so a busy one does not
+    // starve the other.
+    v4_first: std::sync::atomic::AtomicBool,
 }
 
 impl PairedUdp {
@@ -677,12 +751,17 @@ impl DatagramSocket for PairedUdp {
         self.v6.bind_addr()
     }
 
+    fn register_io(&self) -> io::Result<()> {
+        self.v6.register()?;
+        self.v4.register()
+    }
+
     fn recv_from<'a>(
         &'a self,
         buf: &'a mut [u8],
     ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>> {
         Box::pin(async move {
-            let (v6, v4) = (&self.v6.socket, &self.v4.socket);
+            let (v6, v4) = (self.v6.io()?, self.v4.io()?);
             loop {
                 let socket = tokio::select! {
                     ready = v6.readable() => { ready?; v6 }
@@ -694,6 +773,28 @@ impl DatagramSocket for PairedUdp {
                 }
             }
         })
+    }
+
+    fn poll_recv_from_split(
+        &self,
+        cx: &mut Context<'_>,
+        head: &mut [u8],
+        spill: &mut [u8],
+    ) -> Option<Poll<io::Result<(usize, SocketAddr)>>> {
+        let v4_first = self
+            .v4_first
+            .fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+        let order = if v4_first {
+            [&self.v4, &self.v6]
+        } else {
+            [&self.v6, &self.v4]
+        };
+        for socket in order {
+            if let Poll::Ready(received) = socket.poll_recv_split(cx, head, spill) {
+                return Some(Poll::Ready(received));
+            }
+        }
+        Some(Poll::Pending)
     }
 
     fn send_to<'a>(
@@ -740,7 +841,11 @@ impl DatagramSocket for PairedUdp {
 /// A kernel datagram socket: the address it is bound at, and whether it
 /// takes IPv4 as well as IPv6.
 pub(crate) struct KernelUdp {
-    socket: tokio::net::UdpSocket,
+    // Registered with a runtime's reactor when it is made, or, for one uTP
+    // runs over, by uTP with the runtime its I/O task runs on, once.
+    socket: std::sync::OnceLock<tokio::net::UdpSocket>,
+    // Bound and set, waiting for that registration.
+    unregistered: parking_lot::Mutex<Option<std::net::UdpSocket>>,
     local: SocketAddr,
     dual_stack: bool,
     // Held by the sends that test a uTP path's size alone: a send that
@@ -750,6 +855,91 @@ pub(crate) struct KernelUdp {
 }
 
 impl KernelUdp {
+    // `socket`, registered with the runtime entered now.
+    fn registered(socket: std::net::UdpSocket, dual_stack: bool) -> io::Result<Self> {
+        let udp = Self::unregistered(socket, dual_stack)?;
+        udp.register()?;
+        Ok(udp)
+    }
+
+    // `socket`, bound and set, for [`Self::register`] to register later.
+    fn unregistered(socket: std::net::UdpSocket, dual_stack: bool) -> io::Result<Self> {
+        socket.set_nonblocking(true)?;
+        Ok(KernelUdp {
+            local: socket.local_addr()?,
+            socket: std::sync::OnceLock::new(),
+            unregistered: parking_lot::Mutex::new(Some(socket)),
+            dual_stack,
+            size_sends: parking_lot::Mutex::new(()),
+        })
+    }
+
+    // Registers the socket with the runtime entered: nothing when it is
+    // registered already. A registration that failed fails again: the
+    // socket is gone.
+    fn register(&self) -> io::Result<()> {
+        if self.socket.get().is_some() {
+            return Ok(());
+        }
+        let Some(socket) = self.unregistered.lock().take() else {
+            return match self.socket.get() {
+                Some(_) => Ok(()),
+                None => Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "the socket's registration failed",
+                )),
+            };
+        };
+        let _ = self.socket.set(tokio::net::UdpSocket::from_std(socket)?);
+        Ok(())
+    }
+
+    // The registered socket.
+    fn io(&self) -> io::Result<&tokio::net::UdpSocket> {
+        self.socket.get().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "the socket is not registered with a runtime",
+            )
+        })
+    }
+
+    // One datagram read into `head` and on into `spill`, in one system call
+    // (recvmsg with two buffers), at most `spill.len()` bytes in all; one
+    // cut short reads as `spill.len()` bytes. Its sender is named as
+    // `recv_from` names it.
+    fn poll_recv_split(
+        &self,
+        cx: &mut Context<'_>,
+        head: &mut [u8],
+        spill: &mut [u8],
+    ) -> Poll<io::Result<(usize, SocketAddr)>> {
+        let socket = self.io()?;
+        let most = spill.len();
+        let tail = most.saturating_sub(head.len());
+        loop {
+            std::task::ready!(socket.poll_recv_ready(cx))?;
+            let received = socket.try_io(tokio::io::Interest::READABLE, || {
+                let mut bufs = [
+                    socket2::MaybeUninitSlice::new(as_uninit(head)),
+                    socket2::MaybeUninitSlice::new(as_uninit(&mut spill[..tail])),
+                ];
+                socket2::SockRef::from(socket).recv_from_vectored(&mut bufs)
+            });
+            match received {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => return Poll::Ready(Err(error)),
+                Ok((len, flags, from)) => {
+                    let from = from.as_socket().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "a datagram from no IP address")
+                    })?;
+                    let len = if flags.is_truncated() { most } else { len };
+                    return Poll::Ready(Ok((len, canonical_socket_addr(from))));
+                }
+            }
+        }
+    }
+
     // `target` as the socket names it: an IPv4 one by its IPv4-mapped IPv6
     // address on a socket that takes both families.
     fn toward(&self, target: SocketAddr) -> SocketAddr {
@@ -762,11 +952,18 @@ impl KernelUdp {
     }
 }
 
-/// Set a kernel datagram socket bound at `requested` for uTP to run over it,
-/// as [`SocketFactory::bind_utp`] asks: its datagrams never fragmented, and
-/// its receive buffer `receive_buffer` bytes as far as the host allows.
-pub fn set_for_utp(socket: &tokio::net::UdpSocket, requested: SocketAddr, receive_buffer: usize) {
-    crate::udp_options::set_for_utp(socket, requested, receive_buffer);
+/// A kernel datagram socket bound at `requested`, made for uTP to run over,
+/// as [`SocketFactory::bind_utp`] asks: its datagrams never fragmented, its
+/// receive buffer `receive_buffer` bytes as far as the host allows, and its
+/// I/O registered by uTP with the runtime uTP reads and sends it on.
+pub fn utp_datagrams(
+    socket: std::net::UdpSocket,
+    requested: SocketAddr,
+    receive_buffer: usize,
+) -> io::Result<Arc<dyn DatagramSocket>> {
+    crate::udp_options::set_for_utp(&socket, requested, receive_buffer);
+    let dual_stack = crate::udp_options::takes_ipv4(&socket);
+    Ok(Arc::new(KernelUdp::unregistered(socket, dual_stack)?))
 }
 
 /// Datagrams the kernel sockets sent from slices, each in one system call.
@@ -787,8 +984,8 @@ impl KernelSockets {
         addr: SocketAddr,
         receive_buffer: usize,
     ) -> io::Result<Arc<KernelUdp>> {
-        let socket = self.kernel_udp(addr, reuses(addr))?;
-        crate::udp_options::set_for_utp(&socket.socket, addr, receive_buffer);
+        let socket = self.kernel_utp(addr, reuses(addr), receive_buffer)?;
+        socket.register()?;
         Ok(Arc::new(socket))
     }
 }
@@ -797,18 +994,39 @@ impl KernelSockets {
 impl KernelUdp {
     /// A datagram already waiting, without waiting for one.
     pub(crate) fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        self.socket.try_recv_from(buf)
+        self.io()?.try_recv_from(buf)
     }
 
     /// The kernel socket itself.
     pub(crate) fn socket(&self) -> &tokio::net::UdpSocket {
-        &self.socket
+        self.io().expect("a registered socket")
     }
+}
+
+// `buf` as bytes a read may fill.
+fn as_uninit(buf: &mut [u8]) -> &mut [std::mem::MaybeUninit<u8>] {
+    // SAFETY: `MaybeUninit<u8>` has the layout of `u8`, and every byte of
+    // `buf` is initialized; the only writer through the result is a socket
+    // read, which writes initialized bytes, so `buf` stays initialized.
+    unsafe { &mut *(std::ptr::from_mut::<[u8]>(buf) as *mut [std::mem::MaybeUninit<u8>]) }
 }
 
 impl DatagramSocket for KernelUdp {
     fn bind_addr(&self) -> SocketAddr {
         self.local
+    }
+
+    fn register_io(&self) -> io::Result<()> {
+        self.register()
+    }
+
+    fn poll_recv_from_split(
+        &self,
+        cx: &mut Context<'_>,
+        head: &mut [u8],
+        spill: &mut [u8],
+    ) -> Option<Poll<io::Result<(usize, SocketAddr)>>> {
+        Some(self.poll_recv_split(cx, head, spill))
     }
 
     // A datagram from an IPv4 peer is from its IPv4 address, whichever
@@ -818,7 +1036,7 @@ impl DatagramSocket for KernelUdp {
         buf: &'a mut [u8],
     ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>> {
         Box::pin(async move {
-            let (len, from) = self.socket.recv_from(buf).await?;
+            let (len, from) = self.io()?.recv_from(buf).await?;
             Ok((len, canonical_socket_addr(from)))
         })
     }
@@ -828,7 +1046,7 @@ impl DatagramSocket for KernelUdp {
         buf: &'a [u8],
         target: SocketAddr,
     ) -> BoxFuture<'a, io::Result<usize>> {
-        Box::pin(self.socket.send_to(buf, self.toward(target)))
+        Box::pin(async move { self.io()?.send_to(buf, self.toward(target)).await })
     }
 
     fn poll_send_to(
@@ -837,7 +1055,7 @@ impl DatagramSocket for KernelUdp {
         buf: &[u8],
         target: SocketAddr,
     ) -> Poll<io::Result<usize>> {
-        self.socket.poll_send_to(cx, buf, self.toward(target))
+        self.io()?.poll_send_to(cx, buf, self.toward(target))
     }
 
     // One datagram from every slice, in one system call, without joining
@@ -850,7 +1068,7 @@ impl DatagramSocket for KernelUdp {
         target: SocketAddr,
     ) -> Poll<io::Result<usize>> {
         let target = self.toward(target);
-        let socket = &self.socket;
+        let socket = self.io()?;
         loop {
             std::task::ready!(socket.poll_send_ready(cx))?;
             match socket.try_io(tokio::io::Interest::WRITABLE, || {
@@ -890,7 +1108,7 @@ impl DatagramSocket for KernelUdp {
             SocketAddr::V6(_) => crate::udp_options::Family::V6,
         };
         let target = self.toward(target);
-        let socket = &self.socket;
+        let socket = self.io()?;
         loop {
             std::task::ready!(socket.poll_send_ready(cx))?;
             let sent = {
@@ -993,6 +1211,8 @@ mod tests {
             Err(error) if withheld(&error) => return,
             Err(error) => panic!("{error}"),
         };
+        // Registered, as uTP registers it with the runtime it runs on.
+        socket.register_io().unwrap();
         let port = socket.bind_addr().port();
         assert_eq!(socket.bind_addr(), (Ipv6Addr::UNSPECIFIED, port).into());
         let mut buf = [0u8; 16];
@@ -1163,6 +1383,7 @@ mod pair_tests {
             v4: sockets
                 .kernel_udp((Ipv4Addr::LOCALHOST, 0).into(), false)
                 .unwrap(),
+            v4_first: Default::default(),
         };
         let peer = crate::test_support::udp((Ipv4Addr::LOCALHOST, 0)).await;
         let port = peer.bind_addr().port();
@@ -1175,5 +1396,78 @@ mod pair_tests {
         let mut buf = [0u8; 8];
         let (len, from) = peer.recv_from(&mut buf).await.unwrap();
         assert_eq!((&buf[..len], from), (&b"out"[..], paired.v4.bind_addr()));
+    }
+
+    // A kernel socket reads a datagram straight into the two buffers: a
+    // short one stays in the first, a long one runs on into the second, and
+    // a long DHT message on a shared socket is joined for the DHT. Both
+    // families of a pair are read.
+    #[tokio::test]
+    async fn a_kernel_socket_reads_a_datagram_into_two_buffers() {
+        use weaver_utp::Transport;
+
+        let sockets = KernelSockets::new(None).unwrap();
+        let paired = std::sync::Arc::new(PairedUdp {
+            v6: sockets
+                .kernel_udp((Ipv6Addr::LOCALHOST, 0).into(), false)
+                .unwrap(),
+            v4: sockets
+                .kernel_udp((Ipv4Addr::LOCALHOST, 0).into(), false)
+                .unwrap(),
+            v4_first: Default::default(),
+        });
+        let tap = std::sync::Arc::new(super::DhtTap::default());
+        let share = super::DhtShare {
+            socket: paired.clone(),
+            tap: tap.clone(),
+            shards: None,
+        };
+        let dht = share.dht_socket();
+        let transport = super::DatagramTransport(paired.clone(), Some(tap));
+        let peer4 = sockets
+            .bind_kernel_udp((Ipv4Addr::LOCALHOST, 0).into())
+            .unwrap();
+        let peer6 = sockets
+            .bind_kernel_udp((Ipv6Addr::LOCALHOST, 0).into())
+            .unwrap();
+        let (mut head, mut spill) = (vec![0u8; 2048], vec![0u8; usize::from(u16::MAX)]);
+
+        let short = vec![1u8; 100];
+        peer4.send_to(&short, paired.v4.bind_addr()).await.unwrap();
+        let (len, from) = transport
+            .recv_from_split(&mut head, &mut spill)
+            .await
+            .unwrap();
+        assert_eq!((len, from), (100, peer4.bind_addr()));
+        assert_eq!(&head[..100], &short[..]);
+
+        let long: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        peer6.send_to(&long, paired.v6.bind_addr()).await.unwrap();
+        let (len, from) = transport
+            .recv_from_split(&mut head, &mut spill)
+            .await
+            .unwrap();
+        assert_eq!((len, from), (5000, peer6.bind_addr()));
+        assert_eq!(&head[..], &long[..2048]);
+        assert_eq!(&spill[..5000 - 2048], &long[2048..]);
+
+        // A DHT message longer than the first buffer goes to the DHT whole,
+        // and the next datagram to uTP.
+        let mut message = vec![b'x'; 3000];
+        message[0] = b'd';
+        message[2999] = b'e';
+        peer4
+            .send_to(&message, paired.v4.bind_addr())
+            .await
+            .unwrap();
+        peer4.send_to(&short, paired.v4.bind_addr()).await.unwrap();
+        let (len, _) = transport
+            .recv_from_split(&mut head, &mut spill)
+            .await
+            .unwrap();
+        assert_eq!(len, 100);
+        let mut got = vec![0u8; 4000];
+        let (len, from) = dht.recv_from(&mut got).await.unwrap();
+        assert_eq!((&got[..len], from), (&message[..], peer4.bind_addr()));
     }
 }

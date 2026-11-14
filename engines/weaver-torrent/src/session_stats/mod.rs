@@ -17,6 +17,7 @@ use tracing::debug_span;
 
 use crate::{Session, torrent_state::peers::stats::AggregatePeerStatsAtomic};
 
+pub mod check;
 pub mod snapshot;
 
 gen_stats!(SessionCountersAtomic SessionCountersSnapshot, [

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-12.
+// Modified by the Weaver authors, 2026-11-13.
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -82,6 +82,9 @@ pub enum Error {
 
     #[error("dispatcher dead")]
     DispatcherDead,
+
+    #[error("error registering the transport: {0}")]
+    Register(std::io::Error),
 }
 
 impl Error {

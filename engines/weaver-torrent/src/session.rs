@@ -1711,6 +1711,11 @@ impl Session {
                     opts.connection_speed,
                 )),
             };
+            // One uTP thread for the session's uTP sockets, started with the
+            // first: each socket's I/O and its streams run there, as
+            // libtorrent runs uTP on its one network thread. A
+            // single-threaded runtime keeps them on itself.
+            let utp_shards = utp_shards();
             // The port the peer listener was asked for: 0 when the factory
             // chooses it.
             let asked_listen_port = opts.listen.as_ref().map(|l| l.listen_addr.port());
@@ -1720,6 +1725,7 @@ impl Session {
                 session_utp_opts(
                     listen_opts.utp_opts.get_or_insert_with(Default::default),
                     connections_limit,
+                    utp_shards.as_ref(),
                 );
                 Some(
                     listen_opts
@@ -1752,7 +1758,7 @@ impl Session {
                     dont_wait_for_lastack: true,
                     ..Default::default()
                 };
-                session_utp_opts(&mut utp_opts, connection_slots.limit());
+                session_utp_opts(&mut utp_opts, connection_slots.limit(), utp_shards.as_ref());
                 let address = if opts.ipv4_only {
                     SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
                 } else {
@@ -2376,7 +2382,7 @@ impl Session {
                 () = backoff.as_mut(), if resting => resting = false,
                 r = l.accept(), if !resting && futs.len() < max_pending_incoming_handshake_checks => {
                     match r {
-                        Ok((addr, (read, write))) => {
+                        Ok((addr, home, (read, write))) => {
                             trace!("accepted connection from {addr}");
                             let session = session.upgrade().context("session is dead")?;
                             // Dropping the halves closes a connection past the
@@ -2388,7 +2394,7 @@ impl Session {
                             let span = debug_span!(parent: session.rs(), "incoming", addr=%addr);
                             futs.push(
                                 session.check_incoming_connection(addr, A::KIND, tls, Box::new(read), Box::new(write))
-                                    .map_ok(|(live, checked)| (live, checked, slot))
+                                    .map_ok(|(live, checked)| (live, checked, slot, home))
                                     .map_err(|e| {
                                         debug!("error checking incoming connection: {e:#}");
                                         e
@@ -2413,9 +2419,9 @@ impl Session {
                 // other check unpolled until the next accept. The failure is
                 // logged where the check is pushed.
                 Some(r) = futs.next(), if !futs.is_empty() => {
-                    let Ok((live, checked, slot)) = r else { continue };
+                    let Ok((live, checked, slot, home)) = r else { continue };
                     let (addr, kind) = (checked.addr, checked.kind);
-                    match live.add_incoming_peer(checked, slot) {
+                    match live.add_incoming_peer(checked, slot, home) {
                         Ok(AddIncomingPeerResult::Added) => {
                             if let Some(session) = session.upgrade() {
                                 session.settle_over_limit(&live, addr);
@@ -4525,10 +4531,40 @@ fn tracker_stats(
 }
 
 // The initial uTP connection limit when the caller left it unset.
-fn session_utp_opts(utp: &mut weaver_utp::SocketOpts, connections_limit: usize) {
+fn session_utp_opts(
+    utp: &mut weaver_utp::SocketOpts,
+    connections_limit: usize,
+    shards: Option<&weaver_utp::Shards>,
+) {
+    if utp.shards.is_none() {
+        utp.shards = shards.cloned();
+    }
     if utp.connections_limit.is_none() {
         utp.connections_limit = std::num::NonZeroUsize::new(connections_limit);
     }
+}
+
+// uTP threads per session. One until measurements with the peers on the
+// uTP threads say more pay: with them on the session's runtime, 2 and 3
+// threads measured within noise of 1 at 8 streams on loopback.
+const UTP_THREADS: usize = 1;
+
+// The session's uTP threads, when the runtime has threads to spare for
+// them, named apart from other sessions' within the 15 bytes Linux keeps of
+// a thread's name (`utp{session}-{index}`). None start until a uTP socket
+// places a task.
+fn utp_shards() -> Option<weaver_utp::Shards> {
+    static SESSIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if tokio::runtime::Handle::current().runtime_flavor()
+        != tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        return None;
+    }
+    let session = SESSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(weaver_utp::Shards::new(
+        &format!("utp{session}"),
+        UTP_THREADS,
+    ))
 }
 
 #[cfg(test)]
@@ -7131,7 +7167,7 @@ mod tests {
             let slot = slots.try_accept().unwrap();
             assert!(!slots.exceeds_limit(&slot));
             let (checked, theirs) = incoming(addr, fullest.info_hash());
-            let added = fullest_live.add_incoming_peer(checked, slot).unwrap();
+            let added = fullest_live.add_incoming_peer(checked, slot, None).unwrap();
             assert!(matches!(added, AddIncomingPeerResult::Added));
             ends.push(theirs);
         }
@@ -7142,7 +7178,7 @@ mod tests {
         assert!(slots.try_accept().is_none());
         let (checked, _newcomer_end) = incoming("127.0.0.3:6881", other.info_hash());
         let newcomer = checked.addr;
-        let added = other_live.add_incoming_peer(checked, slot).unwrap();
+        let added = other_live.add_incoming_peer(checked, slot, None).unwrap();
         assert!(matches!(added, AddIncomingPeerResult::Added));
         session.settle_over_limit(&other_live, newcomer);
 
@@ -8495,7 +8531,7 @@ mod tests {
     #[test]
     fn the_session_caps_utp_syns_without_setting_a_receive_buffer() {
         let mut utp = weaver_utp::SocketOpts::default();
-        super::session_utp_opts(&mut utp, 200);
+        super::session_utp_opts(&mut utp, 200, None);
         assert!(utp.vsock_rx_bufsize_bytes.is_none());
         assert_eq!(utp.connections_limit.map(|n| n.get()), Some(200));
     }

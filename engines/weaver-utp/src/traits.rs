@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-12.
+// Modified by the Weaver authors, 2026-11-13.
 
 use std::{
     future::Future,
@@ -87,6 +87,22 @@ pub trait Transport: PollSendToVectored + Send + Sync + Unpin + 'static {
         false
     }
 
+    /// Whether the socket's streams may run on uTP threads other than the
+    /// one its I/O task runs on. Only a transport whose every datagram the
+    /// I/O task sends ([`Transport::sends_from_one_task`]) and that keeps
+    /// no state of its own per stream may say so: a kernel socket. A
+    /// tunnel keeps its streams beside its I/O task.
+    fn spreads_streams(&self) -> bool {
+        false
+    }
+
+    /// Registers the transport's I/O with the runtime entered now, the one
+    /// the socket's I/O task runs on. Called once, before anything is sent
+    /// or received. A transport made ready to use needs nothing.
+    fn register_io(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
     /// Stop and join work owned by this transport after its streams stop.
     fn shutdown(&self) -> impl Future<Output = std::io::Result<()>> + Send {
         async { Ok(()) }
@@ -96,6 +112,25 @@ pub trait Transport: PollSendToVectored + Send + Sync + Unpin + 'static {
         &'a self,
         buf: &'a mut [u8],
     ) -> impl Future<Output = std::io::Result<(usize, SocketAddr)>> + Send + Sync + 'a;
+
+    /// Receives one datagram of at most `spill.len()` bytes: its first
+    /// `head.len()` bytes into `head`, the rest from the start of `spill`,
+    /// so a datagram that fits `head` stays there. A transport that cannot
+    /// read into two buffers at once reads into `spill` and moves the
+    /// datagram's start to `head`.
+    fn recv_from_split<'a>(
+        &'a self,
+        head: &'a mut [u8],
+        spill: &'a mut [u8],
+    ) -> impl Future<Output = std::io::Result<(usize, SocketAddr)>> + Send + 'a {
+        async move {
+            let (len, from) = self.recv_from(spill).await?;
+            let first = len.min(head.len());
+            head[..first].copy_from_slice(&spill[..first]);
+            spill.copy_within(first..len, 0);
+            Ok((len, from))
+        }
+    }
 
     fn send_to<'a>(
         &'a self,

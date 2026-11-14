@@ -89,6 +89,7 @@ use crate::peer_protocol::{
         ut_pex::{MAX_PEX_MESSAGE_LEN, PexPeerInfo, UtPex},
     },
 };
+use crate::spawn_utils::DropOffShard;
 use anyhow::Context;
 use futures::FutureExt;
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -100,6 +101,7 @@ use crate::{
     Error,
     chunk_tracker::{ChunkMarkingResult, ChunkTracker, HaveNeededSelected},
     connection_slots::{ConnectionSlot, ConnectionSlots},
+    disk::{Block, BlockPool, DiskJob, PeerDisk},
     file_info::FileInfo,
     file_ops::{FileOps, Verdict, inconsistent_hashes},
     limits::{Channel, LimitKind},
@@ -120,7 +122,7 @@ use self::{
     choker::CHOKED_REQUEST_GRACE,
     peer::{
         DisconnectRank, InflightRequest, LivePeerState, MAX_ALLOWED_IN_REQUEST_QUEUE, PeerRx,
-        PeerState, PeerTx, Refused, RemoveInflightRequestResult, empty_bitfield,
+        PeerState, PeerTx, Refused, RemoveInflightRequestResult, UploadLedger, empty_bitfield,
         info::PeerInfo,
         ingest_bitfield, opening_rank, rate_estimator,
         stats::{
@@ -248,7 +250,9 @@ pub struct TorrentStateLive {
     metadata: Arc<TorrentMetadata>,
     _locked: RwLock<TorrentStateLocked>,
 
-    pub(crate) files: FileStorage,
+    // Closed off the uTP threads: the last hold of the run may be a peer's
+    // task on one.
+    pub(crate) files: DropOffShard<FileStorage>,
 
     per_piece_locks: Vec<RwLock<()>>,
 
@@ -482,7 +486,7 @@ impl TorrentStateLive {
                 fatal_errors_tx: Some(fatal_errors_tx),
                 unflushed_bitv_bytes: 0,
             }),
-            files: paused.files,
+            files: DropOffShard::new(paused.files, &paused.shared.spawner),
             stats: AtomicStats {
                 have_bytes: AtomicU64::new(have_bytes),
                 ..Default::default()
@@ -764,6 +768,8 @@ impl TorrentStateLive {
             answers: AnswerBacklog::default(),
             counters,
             first_message_received: AtomicBool::new(false),
+            disk: Default::default(),
+            upload: Default::default(),
             cancel_token: self.cancellation_token.child_token(),
             client_name_and_version: self.shared.client_name_and_version().to_owned(),
         };
@@ -811,7 +817,19 @@ impl TorrentStateLive {
         name: impl Into<Cow<'static, str>>,
         fut: impl std::future::Future<Output = crate::Result<()>> + Send + 'static,
     ) {
-        spawn_with_cancel(
+        self.spawn_on(None, span, name, fut);
+    }
+
+    /// As [`Self::spawn`], on `home`'s runtime when given.
+    pub(crate) fn spawn_on(
+        &self,
+        home: Option<&tokio::runtime::Handle>,
+        span: tracing::Span,
+        name: impl Into<Cow<'static, str>>,
+        fut: impl std::future::Future<Output = crate::Result<()>> + Send + 'static,
+    ) {
+        crate::core::spawn_utils::spawn_with_cancel_on(
+            home,
             span,
             name,
             self.cancellation_token.clone(),
@@ -830,10 +848,13 @@ impl TorrentStateLive {
     /// Takes an incoming connection that holds `slot` under the session's
     /// cap. At the torrent's own cap it displaces a connection that ranks
     /// lower, or is refused (libtorrent `torrent::attach_peer`).
+    /// A connection over uTP gives the thread its stream runs on as `home`:
+    /// its task runs there.
     pub(crate) fn add_incoming_peer(
         self: &Arc<Self>,
         checked_peer: CheckedIncomingConnection,
         slot: ConnectionSlot,
+        home: Option<tokio::runtime::Handle>,
     ) -> anyhow::Result<AddIncomingPeerResult> {
         if !self.wants_peers() {
             debug!(addr = %checked_peer.addr, "finished with upload closed, refusing incoming peer");
@@ -924,10 +945,13 @@ impl TorrentStateLive {
             answers: AnswerBacklog::default(),
             counters,
             first_message_received: AtomicBool::new(false),
+            disk: Default::default(),
+            upload: Default::default(),
             cancel_token: self.cancellation_token.child_token(),
             client_name_and_version: self.shared.client_name_and_version().to_owned(),
         }));
-        self.spawn(
+        self.spawn_on(
+            home.as_ref(),
             debug_span!(
                 parent: self.shared.span.clone(),
                 "manage_incoming_peer",
@@ -1042,58 +1066,127 @@ impl TorrentStateLive {
             answers: AnswerBacklog::default(),
             counters,
             first_message_received: AtomicBool::new(false),
+            disk: Default::default(),
+            upload: Default::default(),
             cancel_token: state.cancellation_token.child_token(),
             client_name_and_version: state.shared.client_name_and_version().to_owned(),
         };
         let handler = PeerLifetime(Some(handler));
-        let _token_guard = handler.cancel_token.clone().drop_guard();
+        let token_guard = handler.cancel_token.clone().drop_guard();
 
         let options = PeerConnectionOptions {
             connect_timeout: Some(connect_timeout),
             ..options
         };
-        let peer_connection = PeerConnection::new(
-            addr,
-            state.shared.info_hashes,
-            state.shared.peer_id,
-            &*handler,
-            Some(options),
-            state.shared.spawner.clone(),
-            state.shared.connector.clone(),
-        )
-        .over(transports)
-        .under(state.shared.ssl.clone());
-        let requester = aframe!(
-            handler
-                .task_peer_chunk_requester()
-                .instrument(debug_span!("chunk_requester"))
-        );
-        let conn_manager = aframe!(
-            peer_connection
-                .manage_peer_outgoing(rx)
-                .instrument(debug_span!("peer_connection"))
-        );
 
         handler
             .counters
             .outgoing_connection_attempts
             .fetch_add(1, Ordering::Relaxed);
-        let res = tokio::select! {
-            r = requester => {r}
-            r = conn_manager => {r}
+        let mut rx = Some(rx);
+        let ran = {
+            let peer_connection = state.outgoing_connection(addr, &handler, options, transports);
+            let requester = aframe!(
+                handler
+                    .task_peer_chunk_requester()
+                    .instrument(debug_span!("chunk_requester"))
+            );
+            tokio::pin!(requester);
+            let connecting = aframe!(
+                peer_connection
+                    .connect_outgoing()
+                    .instrument(debug_span!("peer_connection"))
+            );
+            tokio::select! {
+                r = &mut requester => Ran::Ended(r),
+                r = connecting => match r {
+                    // A uTP stream runs on a thread of its own: the
+                    // connection moves there, so the stream and the peer
+                    // that reads and writes it hand bytes to one another
+                    // without waking another thread.
+                    Ok(connected)
+                        if connected.home.is_some() && !weaver_utp::on_shard_thread() =>
+                    {
+                        Ran::Moving(Box::new(connected))
+                    }
+                    Ok(connected) => {
+                        let rx = rx.take().expect("the connection's queue is taken once");
+                        let managed = aframe!(
+                            peer_connection
+                                .manage_connected(connected, rx)
+                                .instrument(debug_span!("peer_connection"))
+                        );
+                        Ran::Ended(tokio::select! {
+                            r = &mut requester => r,
+                            r = managed => r,
+                        })
+                    }
+                    Err(e) => Ran::Ended(Err(e)),
+                },
+            }
+        };
+        let connected = match ran {
+            Ran::Ended(res) => return peer_ended(handler, res),
+            Ran::Moving(connected) => *connected,
         };
 
-        match res {
-            // We disconnected the peer ourselves as we don't need it
-            Ok(()) => {
-                handler.on_peer_died(None)?;
-            }
-            Err(e) => {
-                debug!("error managing peer: {:#}", e);
-                handler.on_peer_died(Some(e))?;
-            }
-        }
+        // The rest of the connection runs on the stream's thread, as a task
+        // of the torrent's run.
+        let home = connected
+            .home
+            .clone()
+            .expect("a moving connection has a home");
+        let rx = rx.take().expect("the connection's queue is taken once");
+        let run = state.clone();
+        let moved = async move {
+            let _token_guard = token_guard;
+            let _held = _held;
+            let peer_connection = run.outgoing_connection(addr, &handler, options, transports);
+            let requester = aframe!(
+                handler
+                    .task_peer_chunk_requester()
+                    .instrument(debug_span!("chunk_requester"))
+            );
+            let managed = aframe!(
+                peer_connection
+                    .manage_connected(connected, rx)
+                    .instrument(debug_span!("peer_connection"))
+            );
+            let res = tokio::select! {
+                r = requester => r,
+                r = managed => r,
+            };
+            drop(peer_connection);
+            peer_ended(handler, res)
+        };
+        state.spawn_on(
+            Some(&home),
+            tracing::Span::current(),
+            format!("[{}][addr={addr}]manage_outgoing_peer", state.shared.id),
+            moved,
+        );
         Ok(())
+    }
+
+    /// The connection to `addr` an outgoing peer's task runs.
+    fn outgoing_connection<'a>(
+        &self,
+        addr: SocketAddr,
+        handler: &'a PeerHandler,
+        options: PeerConnectionOptions,
+        transports: crate::stream_connect::Transports,
+    ) -> PeerConnection<&'a PeerHandler> {
+        PeerConnection::new(
+            addr,
+            self.shared.info_hashes,
+            self.shared.peer_id,
+            handler,
+            Some(options),
+            self.shared.spawner.clone(),
+            self.shared.connector.clone(),
+        )
+        .over(transports)
+        .under(self.shared.ssl.clone())
     }
 
     async fn task_peer_adder(self: Arc<Self>) -> crate::Result<()> {
@@ -1327,12 +1420,107 @@ impl TorrentStateLive {
     // is served; the connection stays either way, and the check of every
     // piece closes it as ours, as `torrent::force_recheck` does
     // (`disconnect_all`).
+    //
+    // A piece is checked once however many ask for it meanwhile: the first
+    // to ask checks it and the rest wait for what that check finds
+    // (libtorrent skips a request whose piece is `verifying_piece`,
+    // peer_connection.cpp:5316, v2.0.15). The wait here blocks its thread,
+    // for a permit as for another's check: called off the async runtime.
     pub(crate) fn check_seeded(&self, piece: ValidPieceIndex) -> anyhow::Result<bool> {
+        use crate::torrent_state::seed_mode::Claim;
+        let seed = &self.shared.options.seed;
+        loop {
+            if !seed.unchecked(piece) {
+                return Ok(true);
+            }
+            match seed.claim(piece) {
+                Claim::Check(checking) => {
+                    // The check holds one of the session's blocking
+                    // permits, as a peer's does, and only while it runs.
+                    let _permit =
+                        crate::torrent_state::seed_mode::blocking_permit(&self.shared.spawner);
+                    return self.check_claimed(piece, checking);
+                }
+                Claim::Wait(mut found) => {
+                    // A check that ended in an error told nothing: the
+                    // piece is claimed again.
+                    if let Ok(served) = found.blocking_recv() {
+                        crate::session_stats::check::CHECK_STATS.seed_checks_joined(1);
+                        return Ok(served);
+                    }
+                }
+            }
+        }
+    }
+
+    // A peer's request for a block of `piece` waits here while the torrent
+    // is in seed mode and the piece is not yet checked. The check runs on a
+    // blocking thread of the session and holds one of the session's
+    // blocking permits, those the reads of blocks and the checks of
+    // downloaded pieces share: as many seed-mode pieces are read at once as
+    // the session has permits (`SessionOptions::runtime_worker_threads`, 8
+    // by default), however many peers ask. libtorrent runs these hashes on
+    // its `aio_threads` (10) and allows each peer three
+    // (peer_connection.cpp:5318-5319, v2.0.15). Waiting for another's check
+    // holds neither a thread nor a permit.
+    pub(crate) async fn serve_seeded(
+        self: &Arc<Self>,
+        piece: ValidPieceIndex,
+    ) -> anyhow::Result<bool> {
+        use crate::torrent_state::seed_mode::Claim;
+        let seed = &self.shared.options.seed;
+        loop {
+            if !seed.unchecked(piece) {
+                return Ok(true);
+            }
+            match seed.claim(piece) {
+                Claim::Check(checking) => {
+                    let permit = self.shared.spawner.semaphore().acquire_owned().await?;
+                    let state = Arc::clone(self);
+                    // On the session's pool: a uTP thread's runtime has a
+                    // pool of its own, which nothing bounds.
+                    return self
+                        .shared
+                        .spawner
+                        .spawn_blocking(move || {
+                            let _permit = permit;
+                            state.check_claimed(piece, checking)
+                        })
+                        .await?;
+                }
+                Claim::Wait(mut found) => {
+                    if let Ok(served) = found.recv().await {
+                        crate::session_stats::check::CHECK_STATS.seed_checks_joined(1);
+                        return Ok(served);
+                    }
+                }
+            }
+        }
+    }
+
+    // The check of a seed-mode piece by the one that claimed it. Those
+    // that wait on the claim hear what it found; an error tells them
+    // nothing and lets go of the claim.
+    fn check_claimed(
+        &self,
+        piece: ValidPieceIndex,
+        checking: crate::torrent_state::seed_mode::Checking,
+    ) -> anyhow::Result<bool> {
+        let served = self.check_unchecked(piece)?;
+        checking.found(served);
+        Ok(served)
+    }
+
+    fn check_unchecked(&self, piece: ValidPieceIndex) -> anyhow::Result<bool> {
         let seed = &self.shared.options.seed;
         if !seed.unchecked(piece) {
             return Ok(true);
         }
-        if matches!(self.file_ops().check_piece(piece), Ok(Verdict::Passed)) {
+        crate::session_stats::check::CHECK_STATS.seed_checks_started(1);
+        if matches!(
+            self.file_ops().check_piece_whole(piece),
+            Ok(Verdict::Passed)
+        ) {
             self.files.on_piece_checked(piece)?;
             if seed.checked(piece) {
                 debug!("every piece passed its check: seed mode ends");
@@ -2356,6 +2544,11 @@ impl Pick {
 struct PeerHandler {
     state: Arc<TorrentStateLive>,
     counters: Arc<AtomicPeerCounters>,
+    // The connection's writes queued for the disk threads.
+    disk: Arc<PeerDisk>,
+    // The peer's send buffer, which the writer takes blocks from and
+    // settles them in without the peer map; had from the live peer once.
+    upload: std::sync::OnceLock<Arc<UploadLedger>>,
     // Semantically, we don't need a lock here, as this is only requested from
     // one future (requester + manage_peer).
     //
@@ -2450,6 +2643,25 @@ impl PeerConnectionHandler for &'_ PeerHandler {
 
     fn on_handshake_encryption(&self, encryption: crate::mse::Encryption) {
         self.state.peers.handshake_encryption(self.addr, encryption);
+    }
+
+    async fn on_received_block(&self, block: Block) -> anyhow::Result<()> {
+        // As a Piece message first (see `on_received_message`).
+        if !self.first_message_received.swap(true, Ordering::Relaxed) {
+            self.state.peers.connection_delivered(self.addr);
+            self.on_have_all_or_none(0).context("on_have_none")?;
+        }
+        self.queue_block(block).await.context("on_received_piece")
+    }
+
+    fn block_pool(&self) -> Option<BlockPool> {
+        Some(self.state.shared.spawner.pool().clone())
+    }
+
+    async fn disk_room(&self) {
+        if self.disk.blocked() {
+            self.disk.room(self.state.shared.spawner.pool()).await;
+        }
     }
 
     async fn on_received_message(&self, message: Message<'_>) -> anyhow::Result<()> {
@@ -2703,14 +2915,13 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     // A block cancelled or choked off while the writer held it gave its
     // room back then, and the writer's claim of it is the next word from
     // the writer: the peer may want a turn by now.
+    // Taken from the peer's send buffer, on the writer's thread, without
+    // the peer map.
     fn claim_upload(&self, chunk: &ChunkInfo) -> bool {
-        let (claimed, turn) = self
-            .state
-            .peers
-            .with_live_mut(self.addr, "claim_upload", |live| {
-                (live.claim_upload(chunk), live.wants_turn())
-            })
-            .unwrap_or_default();
+        let Some(upload) = self.upload_ledger() else {
+            return false;
+        };
+        let (claimed, turn) = upload.claim(chunk);
         if turn {
             self.state.upload_turn(self.addr);
         }
@@ -2718,17 +2929,16 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     }
 
     fn upload_done(&self, chunk: &ChunkInfo) {
-        let turn = self
-            .state
-            .peers
-            .with_live_mut(self.addr, "upload_done", |live| {
-                live.upload_done(chunk);
-                live.wants_turn()
-            })
-            .unwrap_or_default();
-        // The send buffer fell below its watermark: the peer's next blocks
-        // wait their turn.
-        if turn {
+        self.uploads_done(std::slice::from_ref(chunk));
+    }
+
+    // One write's blocks free their room under one hold of the send buffer.
+    // The send buffer fell below its watermark: the peer's next blocks wait
+    // their turn.
+    fn uploads_done(&self, chunks: &[ChunkInfo]) {
+        if let Some(upload) = self.upload_ledger()
+            && upload.done(chunks)
+        {
             self.state.upload_turn(self.addr);
         }
     }
@@ -2736,15 +2946,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     // A seed-mode piece is checked on a blocking thread, and the peer's
     // writer waits for it (libtorrent `peer_connection::fill_send_buffer`
     // queues `disk_interface::async_hash` and keeps the request until
-    // `on_seed_mode_hashed`): the hash holds none of the permits the reads
-    // of blocks share.
+    // `on_seed_mode_hashed`).
     async fn serves(&self, chunk: &ChunkInfo) -> anyhow::Result<bool> {
-        let piece = chunk.piece_index;
-        if !self.state.shared.options.seed.unchecked(piece) {
-            return Ok(true);
-        }
-        let state = Arc::clone(&self.state);
-        tokio::task::spawn_blocking(move || state.check_seeded(piece)).await?
+        self.state.serve_seeded(chunk.piece_index).await
     }
 
     fn read_chunk(&self, chunk: &ChunkInfo, buf: &mut [u8]) -> anyhow::Result<()> {
@@ -2757,6 +2961,13 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         bufs: &mut [&mut [u8]],
     ) -> std::result::Result<(), (usize, anyhow::Error)> {
         self.state.file_ops().read_chunks(self.addr, chunks, bufs)
+    }
+
+    fn chunk_reader(&self) -> Option<Arc<dyn crate::peer_connection::ChunkReader>> {
+        Some(Arc::new(UploadReader {
+            state: self.state.clone(),
+            addr: self.addr,
+        }))
     }
 
     fn on_extended_handshake(&self, hs: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
@@ -2948,6 +3159,18 @@ impl PeerConnectionHandler for &'_ PeerHandler {
 }
 
 impl PeerHandler {
+    // The peer's send buffer, once the peer is live.
+    fn upload_ledger(&self) -> Option<&Arc<UploadLedger>> {
+        if let Some(upload) = self.upload.get() {
+            return Some(upload);
+        }
+        let upload = self
+            .state
+            .peers
+            .with_live(self.addr, |live| live.upload_ledger())?;
+        Some(self.upload.get_or_init(|| upload))
+    }
+
     /// Queues `answer` for the writer, counted until it is written. False
     /// once the writer is gone.
     fn answer(&self, answer: Answer) -> bool {
@@ -4097,27 +4320,31 @@ impl PeerHandler {
         self.notify_request_slots_changed();
     }
 
-    async fn on_received_piece(&self, piece: Piece<ByteBuf<'_>>) -> anyhow::Result<()> {
+    /// Checks the block the peer sent names a chunk of the torrent, counts
+    /// it, and takes it off the peer's requests: the block's chunk.
+    fn received_block(&self, index: u32, begin: u32, len: usize) -> anyhow::Result<ChunkInfo> {
         let piece_index = self
             .state
             .lengths
-            .validate_piece_index(piece.index)
-            .with_context(|| format!("peer sent an invalid piece {}", piece.index))?;
+            .validate_piece_index(index)
+            .with_context(|| format!("peer sent an invalid piece {index}"))?;
         let chunk_info = match self.state.lengths.chunk_info_from_received_data(
             piece_index,
-            piece.begin,
-            piece.len().try_into().context("bug")?,
+            begin,
+            len.try_into().context("bug")?,
         ) {
             Some(i) => i,
             None => {
-                anyhow::bail!("peer sent us an invalid piece {:?}", piece,);
+                anyhow::bail!(
+                    "peer sent us an invalid piece: index={index} begin={begin} len={len}"
+                );
             }
         };
 
         // Peer chunk/byte counters.
         self.counters
             .fetched_bytes
-            .fetch_add(piece.len() as u64, Ordering::Relaxed);
+            .fetch_add(len as u64, Ordering::Relaxed);
         self.counters.fetched_chunks.fetch_add(1, Ordering::Relaxed);
 
         // A block we had stopped waiting for, or never asked for, is data
@@ -4133,11 +4360,11 @@ impl PeerHandler {
                 match h.remove_inflight_request(&chunk_info) {
                     RemoveInflightRequestResult::Expected => {}
                     RemoveInflightRequestResult::LateCanceled => {
-                        trace!(?piece, "peer sent a block after we cancelled it");
+                        trace!(?chunk_info, "peer sent a block after we cancelled it");
                     }
                     RemoveInflightRequestResult::Unexpected => {
                         debug!(
-                            ?piece,
+                            ?chunk_info,
                             inflight = ?h.inflight_requests_debug(),
                             "peer sent a block we did not ask for"
                         );
@@ -4150,285 +4377,57 @@ impl PeerHandler {
         self.state
             .stats
             .fetched_bytes
-            .fetch_add(piece.len() as u64, Ordering::Relaxed);
+            .fetch_add(len as u64, Ordering::Relaxed);
         self.state
             .session_stats
             .counters
             .fetched_bytes
-            .fetch_add(piece.len() as u64, Ordering::Relaxed);
+            .fetch_add(len as u64, Ordering::Relaxed);
 
-        // Writes the block, and when it was the piece's last, hands back the
-        // piece's download time and senders for its check.
-        fn land_block(
-            state: &TorrentStateLive,
-            addr: PeerHandle,
-            piece: &Piece<ByteBuf<'_>>,
-            chunk_info: &ChunkInfo,
-        ) -> anyhow::Result<Option<(Option<Duration>, crate::piece_tracker::Senders)>> {
-            // A block we lack is written, whoever owns its piece now. While
-            // it is, no one steals the piece, so that by the time we are done
-            // writing AND if it was the last block, we can actually checksum
-            // etc.
-            let (ppl_guard, cancel) = {
-                let mut g = state.lock_write("check_steal");
+        Ok(chunk_info)
+    }
 
-                let ppl = state
-                    .per_piece_locks
-                    .get(piece.index as usize)
-                    .map(|l| l.read());
+    async fn on_received_piece(&self, piece: Piece<ByteBuf<'_>>) -> anyhow::Result<()> {
+        let chunk_info = self.received_block(piece.index, piece.begin, piece.len())?;
+        self.land_here(&piece, chunk_info).await
+    }
 
-                let admit = |p| state.files.reserve_piece(p, &state.room_notify);
-                match g
-                    .get_pieces_mut()?
-                    .admitted_block_arrived(chunk_info, addr, admit)
-                {
-                    Arrival::Write { cancel } => (ppl, cancel),
-                    Arrival::Discard => {
-                        state.add_redundant_bytes(piece.len() as u64);
-                        debug!(
-                            "{chunk_info:?} is had, arrived from another first, or has no room, ignoring"
-                        );
-                        return Ok(None);
-                    }
-                }
-            };
-            // The block was asked of other peers too: they need not send it
-            // (libtorrent `torrent::cancel_block`).
-            for other in cancel {
-                state
-                    .peers
-                    .with_live_mut(other, "cancel_duplicate", |live| {
-                        live.cancel_inflight_request(chunk_info)
-                    });
-            }
-
-            // While we hold per piece lock, noone can steal it.
-            // So we can proceed writing knowing that the piece is ours now and will still be by the time
-            // the write is finished.
-            //
-
-            // A block whose write failed is no longer being written, and is
-            // fetched again (libtorrent `peer_connection::on_disk_write_complete`
-            // calls `piece_picker::write_failed`, then
-            // `torrent::handle_disk_error`).
-            if let Err(e) = state.file_ops().write_chunk(addr, piece, chunk_info) {
-                state
-                    .lock_write("write_failed")
-                    .get_pieces_mut()?
-                    .write_failed(chunk_info);
-                if state.handle_disk_error(&e) {
-                    return Ok(None);
-                }
-                error!(
-                    id = state.shared.id,
-                    info_hash = ?state.shared.info_hash,
-                    "FATAL: error writing chunk to disk: {e:#}"
-                );
-                return state.on_fatal_error(e).map(|()| None);
-            }
-
-            let piece_index = chunk_info.piece_index;
-            let full_piece_download = {
-                let mut g = state.lock_write("mark_chunk_downloaded");
-                let chunk_marking_result = g.get_pieces_mut()?.mark_chunk_downloaded(piece, addr);
-                trace!(?piece, chunk_marking_result=?chunk_marking_result);
-
-                match chunk_marking_result {
-                    Some(ChunkMarkingResult::Completed) => {
-                        trace!("piece={} done, will write and checksum", piece.index);
-                        // Out of flight and the queue, so no one takes it during
-                        // its hash check.
-                        Some(g.get_pieces_mut()?.take_inflight(piece_index))
-                    }
-                    Some(ChunkMarkingResult::PreviouslyCompleted) => {
-                        // TODO: we might need to send cancellations here.
-                        debug!("piece={} was done by someone else, ignoring", piece.index);
-                        return Ok(None);
-                    }
-                    Some(ChunkMarkingResult::NotCompleted) => None,
-                    None => {
-                        anyhow::bail!(
-                            "bogus data received: {:?}, cannot map this to a chunk, dropping peer",
-                            piece
-                        );
-                    }
-                }
-            };
-
-            // We don't care about per piece lock anymore, as it's removed from inflight pieces.
-            // It shouldn't impact perf anyway, but dropping just in case.
-            drop(ppl_guard);
-
-            Ok(full_piece_download)
+    /// A block received into its own buffer moves to the disk threads, which
+    /// write it, check its piece when it was the last, and hand the buffer
+    /// back (libtorrent `peer_connection::incoming_piece` queues
+    /// `disk_interface::async_write`, and the torrent takes the completion,
+    /// `peer_connection::on_disk_write_complete`). A block the storage keeps
+    /// in memory is copied there here.
+    async fn queue_block(&self, mut block: Block) -> anyhow::Result<()> {
+        let chunk_info = self.received_block(block.index, block.begin, block.len())?;
+        if self.state.files.writes_to_memory() {
+            return self.land_here(&block.piece(), chunk_info).await;
         }
+        let pool = block.buf_mut().pool().clone();
+        self.disk.queued(pool.charge(block.buf_mut()));
+        self.state.shared.spawner.disk().push(WriteJob {
+            state: self.state.clone(),
+            tx: self.tx.clone(),
+            addr: self.addr,
+            counters: self.counters.clone(),
+            chunk: chunk_info,
+            block,
+            written: Written(Some(self.disk.clone())),
+            _run: self.state.tasks.token(),
+        });
+        Ok(())
+    }
 
-        // Checks a piece whose last block landed, and hands it to the
-        // storage if it passed. The time is known when the piece was in
-        // flight: one whose last block came after it was given back has none.
-        fn check_landed_piece(
-            state: &TorrentStateLive,
-            addr: PeerHandle,
-            counters: &AtomicPeerCounters,
-            chunk_info: &ChunkInfo,
-            full_piece_download_time: Option<Duration>,
-            senders: crate::piece_tracker::Senders,
-        ) -> anyhow::Result<()> {
-            let index = chunk_info.piece_index.get();
-            let piece_index = chunk_info.piece_index;
-            let read_block = |who: PeerHandle, chunk: &ChunkInfo, buf: &mut [u8]| {
-                state.file_ops().read_chunk(who, chunk, buf)
-            };
-
-            match state
-                .file_ops()
-                .check_piece(chunk_info.piece_index)
-                .with_context(|| format!("error checking piece={index}"))?
-            {
-                Verdict::Inconsistent => {
-                    return state.on_fatal_error(inconsistent_hashes(chunk_info.piece_index));
-                }
-                Verdict::Passed => {
-                    state.layer_fetch.piece_passed(piece_index);
-                    let failed = state.peers.piece_passed(piece_index);
-                    // Before the storage takes the piece, while the good bytes
-                    // are still there to read back.
-                    for sender in smart_ban::senders_of_bad_blocks(&failed, read_block) {
-                        state.ban_for_bad_data(sender.ip());
-                    }
-                    // The piece is ours only once the storage has taken it
-                    // (libtorrent: the write completes before the hash job,
-                    // and only then `torrent::piece_passed`). One it refuses
-                    // is downloaded again, and its senders are neither
-                    // credited nor blamed: on a disk error libtorrent
-                    // `torrent::on_piece_verified` calls neither
-                    // `piece_passed` nor `piece_failed`. A refusal for want
-                    // of room puts the torrent in upload mode
-                    // (`torrent::handle_disk_error`).
-                    if let Err(e) = state.files.on_piece_completed(piece_index) {
-                        warn!(
-                            id = state.shared.id,
-                            info_hash = ?state.shared.info_hash,
-                            "the storage refused piece={index}: {e:#}"
-                        );
-                        state.handle_disk_error(&e);
-                        return state.requeue_piece(piece_index);
-                    }
-                    state
-                        .lock_write("mark_piece_downloaded")
-                        .get_pieces_mut()?
-                        .mark_piece_hash_ok(piece_index);
-                    // Every peer that sent a block of it earns a point and
-                    // leaves parole (libtorrent `torrent::piece_passed`).
-                    for peer in senders.participants() {
-                        state
-                            .peers
-                            .with_peer_mut(peer, "piece_passed", |p| p.piece_passed(&state.peers));
-                    }
-
-                    // Global piece counters.
-                    let piece_len = state.lengths.piece_length(chunk_info.piece_index) as u64;
-                    state
-                        .stats
-                        .downloaded_and_checked_bytes
-                        // This counter is used to compute "is_finished", so using
-                        // stronger ordering.
-                        .fetch_add(piece_len, Ordering::Release);
-                    state
-                        .stats
-                        .downloaded_and_checked_pieces
-                        // This counter is used to compute "is_finished", so using
-                        // stronger ordering.
-                        .fetch_add(1, Ordering::Release);
-                    state
-                        .stats
-                        .have_bytes
-                        .fetch_add(piece_len, Ordering::Relaxed);
-                    if let Some(time) = full_piece_download_time {
-                        #[allow(clippy::cast_possible_truncation)]
-                        state
-                            .stats
-                            .total_piece_download_ms
-                            .fetch_add(time.as_millis() as u64, Ordering::Relaxed);
-
-                        // Per-peer piece counters.
-                        counters.on_piece_completed(piece_len, time);
-                    }
-
-                    trace!(piece = index, "successfully downloaded and verified");
-
-                    state.on_piece_completed(chunk_info.piece_index)?;
-
-                    state.transmit_haves(chunk_info.piece_index);
-                    state.update_interest_of_holders(chunk_info.piece_index);
-                }
-                Verdict::Failed => {
-                    warn!(
-                        id = state.shared.id,
-                        info_hash = ?state.shared.info_hash,
-                        ?addr,
-                        "checksum for piece={} did not validate", index
-                    );
-                    // The whole piece counts as corrupt (libtorrent
-                    // `torrent::piece_failed` calls `add_failed_bytes` with
-                    // the piece size).
-                    state.stats.failed_bytes.fetch_add(
-                        u64::from(state.lengths.piece_length(piece_index)),
-                        Ordering::Relaxed,
-                    );
-                    // Before the storage lets go of the failed bytes.
-                    let blocks =
-                        smart_ban::read_back(&state.lengths, piece_index, &senders, read_block);
-                    for liar in state.peers.piece_failed(piece_index, blocks) {
-                        state.ban_for_bad_data(liar.ip());
-                    }
-                    // Checked by v2, a piece of more than one sender has its
-                    // block hashes fetched, which name the senders of its bad
-                    // blocks; until then no one is blamed (libtorrent
-                    // `torrent::piece_failed` calls `verify_block_hashes`).
-                    // Otherwise, or when one peer sent it all, every sender
-                    // is blamed, and the sole sender known to be bad
-                    // (libtorrent `torrent::piece_failed`,
-                    // `torrent::penalize_peers`).
-                    let v2_request = state.metadata.v2.as_ref().and_then(|v2| {
-                        let request = hash_fetch::block_request(
-                            v2,
-                            state.lengths.default_piece_length().into(),
-                            piece_index.get(),
-                        )?;
-                        Some((request, v2.share(piece_index.get())?))
-                    });
-                    match v2_request {
-                        Some((request, share)) if !senders.sole_sender() => {
-                            let failed = hash_fetch::failed_blocks(
-                                &state.lengths,
-                                piece_index,
-                                share,
-                                &senders,
-                                read_block,
-                            );
-                            state
-                                .layer_fetch
-                                .verify_blocks(request, piece_index, failed);
-                        }
-                        _ => state.penalize_peers(
-                            senders.participants(),
-                            piece_index,
-                            senders.sole_sender(),
-                        ),
-                    }
-                    state.requeue_piece(piece_index)?;
-                }
-                // No hash to check the piece against: nobody is to blame
-                // (libtorrent `torrent::on_piece_verified` neither passes nor
-                // fails it).
-                Verdict::Unknown => state.requeue_piece(piece_index)?,
-            };
-            Ok(())
-        }
-
-        let state = &*self.state;
+    /// Writes the block on this connection's turn, and checks its piece
+    /// when it was the last.
+    async fn land_here(
+        &self,
+        piece: &Piece<ByteBuf<'_>>,
+        chunk_info: ChunkInfo,
+    ) -> anyhow::Result<()> {
+        let state = &self.state;
         let spawner = &state.shared.spawner;
-        let land = || land_block(state, self.addr, &piece, &chunk_info);
+        let land = || land_block(state, self.addr, piece, &chunk_info);
         // A block the storage copies into memory is copied here, on this
         // thread: only a write that reaches a file, and the check of a
         // piece, which hashes it and writes it out, take a blocking thread.
@@ -4446,7 +4445,7 @@ impl PeerHandler {
         // posts the hash job bound to the torrent, `shared_from_this()`, and
         // `torrent::on_piece_verified` takes its verdict whatever became of
         // the sender).
-        if let Some((time, senders)) = landed {
+        if let Some((time, senders, piece_check)) = landed {
             let state = self.state.clone();
             let addr = self.addr;
             let counters = self.counters.clone();
@@ -4454,11 +4453,17 @@ impl PeerHandler {
                 let spawner = state.shared.spawner.clone();
                 spawner
                     .block_in_place_with_semaphore(|| {
-                        check_landed_piece(&state, addr, &counters, &chunk_info, time, senders)
+                        let checked =
+                            check_landed_piece(&state, addr, &counters, &chunk_info, time, senders);
+                        piece_check.done();
+                        checked
                     })
                     .await
             };
-            tokio::task::spawn(check.in_current_span())
+            // On the session's runtime, which may block in place: from a uTP
+            // thread, `tokio::task::spawn` would run it on that thread.
+            spawner
+                .spawn(check.in_current_span())
                 .await
                 .context("the piece check ended")?
                 .with_context(|| format!("error processing received chunk {chunk_info:?}"))?;
@@ -4596,6 +4601,589 @@ impl PeerHandler {
     fn notify_request_slots_changed(&self) {
         if let Some(notify) = self.request_slots_changed() {
             notify.notify_waiters();
+        }
+    }
+}
+
+/// What became of a block handed to the disk: dropped, written, or written
+/// as its piece's last, with the piece's download time and senders and the
+/// piece's check, which owns the piece from when it left flight.
+type Landed = anyhow::Result<Option<(Option<Duration>, crate::piece_tracker::Senders, PieceCheck)>>;
+
+// Writes the block, and when it was the piece's last, hands back the
+// piece's download time and senders for its check.
+fn land_block(
+    state: &Arc<TorrentStateLive>,
+    addr: PeerHandle,
+    piece: &Piece<ByteBuf<'_>>,
+    chunk_info: &ChunkInfo,
+) -> Landed {
+    let mut landed = Vec::with_capacity(1);
+    land_blocks(state, &[(addr, piece, *chunk_info)], &mut landed);
+    landed.pop().unwrap_or(Ok(None))
+}
+
+// Writes a batch of blocks of one torrent, taking the torrent's lock once
+// to admit them all and once to mark them all, rather than twice per block
+// (libtorrent runs the completions of a disk thread's batch together on the
+// network thread, `disk_io_thread::call_job_handlers`). `landed` gets one
+// entry per block, in order.
+fn land_blocks(
+    state: &Arc<TorrentStateLive>,
+    blocks: &[(PeerHandle, &Piece<ByteBuf<'_>>, ChunkInfo)],
+    landed: &mut Vec<Landed>,
+) {
+    let first = landed.len();
+    landed.extend(blocks.iter().map(|_| Ok(None)));
+    let landed = &mut landed[first..];
+    // Dropped after every lock below, so a panic that unwinds through them
+    // finds them free.
+    let mut admitted = Admitted {
+        state,
+        chunks: Vec::new(),
+    };
+    // A block we lack is written, whoever owns its piece now. While it is,
+    // no one steals the piece: its lock is held, read, until the block is
+    // marked, so that when it was the last block its piece is ours to
+    // check. Each piece's lock is taken once, however many of its blocks
+    // the batch holds.
+    let mut held: Vec<(u32, RwLockReadGuard<'_, ()>)> = Vec::new();
+    let mut cancels: Vec<(usize, Vec<PeerHandle>)> = Vec::new();
+    {
+        let mut g = state.lock_write("check_steal");
+        let pieces = match g.get_pieces_mut() {
+            Ok(pieces) => pieces,
+            Err(e) => {
+                let e = anyhow::Error::from(e);
+                for slot in landed.iter_mut() {
+                    *slot = Err(anyhow::anyhow!("{e:#}"));
+                }
+                return;
+            }
+        };
+        for (i, (addr, piece, chunk_info)) in blocks.iter().enumerate() {
+            if !held.iter().any(|(index, _)| *index == piece.index)
+                && let Some(lock) = state.per_piece_locks.get(piece.index as usize)
+            {
+                held.push((piece.index, lock.read()));
+            }
+            let admit = |p| state.files.reserve_piece(p, &state.room_notify);
+            match pieces.admitted_block_arrived(chunk_info, *addr, admit) {
+                Arrival::Write { cancel } => {
+                    admitted.chunks.push(*chunk_info);
+                    cancels.push((i, cancel));
+                }
+                Arrival::Discard => {
+                    state.add_redundant_bytes(piece.len() as u64);
+                    debug!(
+                        "{chunk_info:?} is had, arrived from another first, or has no room, ignoring"
+                    );
+                }
+            }
+        }
+    }
+    // The block was asked of other peers too: they need not send it
+    // (libtorrent `torrent::cancel_block`).
+    let mut written = Vec::with_capacity(cancels.len());
+    for (i, cancel) in cancels {
+        let chunk_info = &blocks[i].2;
+        for other in cancel {
+            state
+                .peers
+                .with_live_mut(other, "cancel_duplicate", |live| {
+                    live.cancel_inflight_request(chunk_info)
+                });
+        }
+        let (addr, piece, chunk_info) = &blocks[i];
+        // A block whose write failed is no longer being written, and is
+        // fetched again (libtorrent `peer_connection::on_disk_write_complete`
+        // calls `piece_picker::write_failed`, then
+        // `torrent::handle_disk_error`).
+        match state.file_ops().write_chunk(*addr, piece, chunk_info) {
+            Ok(()) => written.push(i),
+            Err(e) => {
+                admitted
+                    .chunks
+                    .retain(|c| c.absolute_index != chunk_info.absolute_index);
+                landed[i] = write_failed(state, chunk_info, e);
+            }
+        }
+    }
+    if written.is_empty() {
+        return;
+    }
+
+    let mut g = state.lock_write("mark_chunk_downloaded");
+    let pieces = match g.get_pieces_mut() {
+        Ok(pieces) => pieces,
+        Err(e) => {
+            let e = anyhow::Error::from(e);
+            for i in written {
+                landed[i] = Err(anyhow::anyhow!("{e:#}"));
+            }
+            return;
+        }
+    };
+    for i in written {
+        let (addr, piece, chunk_info) = &blocks[i];
+        let chunk_marking_result = pieces.mark_chunk_downloaded(piece, *addr);
+        trace!(?piece, chunk_marking_result=?chunk_marking_result);
+        landed[i] = match chunk_marking_result {
+            Some(ChunkMarkingResult::Completed) => {
+                trace!("piece={} done, will write and checksum", piece.index);
+                // Out of flight and the queue, so no one takes it during
+                // its hash check. From here its check owns it: dropped
+                // before a verdict, as by a panic in this batch, it puts
+                // the piece back. Never dropped while `g` is held: the
+                // slot it sits in outlives this function's locks.
+                let (time, senders) = pieces.take_inflight(chunk_info.piece_index);
+                let check = PieceCheck {
+                    piece: chunk_info.piece_index,
+                    state: Some(state.clone()),
+                };
+                Ok(Some((time, senders, check)))
+            }
+            Some(ChunkMarkingResult::PreviouslyCompleted) => {
+                // TODO: we might need to send cancellations here.
+                debug!("piece={} was done by someone else, ignoring", piece.index);
+                Ok(None)
+            }
+            Some(ChunkMarkingResult::NotCompleted) => Ok(None),
+            None => Err(anyhow::anyhow!(
+                "bogus data received: {:?}, cannot map this to a chunk, dropping peer",
+                piece
+            )),
+        };
+    }
+    admitted.chunks.clear();
+    // The pieces' locks go once their blocks are marked: a completed one is
+    // out of flight now.
+    drop(g);
+    drop(held);
+}
+
+/// Blocks admitted to be written and not yet marked. A panic between the
+/// two lets them go, so a later copy is taken (libtorrent
+/// `piece_picker::write_failed`).
+struct Admitted<'a> {
+    state: &'a TorrentStateLive,
+    chunks: Vec<ChunkInfo>,
+}
+
+impl Drop for Admitted<'_> {
+    fn drop(&mut self) {
+        if self.chunks.is_empty() {
+            return;
+        }
+        if let Ok(pieces) = self.state.lock_write("write_failed").get_pieces_mut() {
+            for chunk in &self.chunks {
+                pieces.write_failed(chunk);
+            }
+        }
+    }
+}
+
+// A block whose write failed: fetched again, and the disk error handled.
+fn write_failed(state: &TorrentStateLive, chunk_info: &ChunkInfo, e: anyhow::Error) -> Landed {
+    state
+        .lock_write("write_failed")
+        .get_pieces_mut()?
+        .write_failed(chunk_info);
+    if state.handle_disk_error(&e) {
+        return Ok(None);
+    }
+    error!(
+        id = state.shared.id,
+        info_hash = ?state.shared.info_hash,
+        "FATAL: error writing chunk to disk: {e:#}"
+    );
+    state.on_fatal_error(e).map(|()| None)
+}
+
+// Checks a piece whose last block landed, and hands it to the
+// storage if it passed. The time is known when the piece was in
+// flight: one whose last block came after it was given back has none.
+fn check_landed_piece(
+    state: &TorrentStateLive,
+    addr: PeerHandle,
+    counters: &AtomicPeerCounters,
+    chunk_info: &ChunkInfo,
+    full_piece_download_time: Option<Duration>,
+    senders: crate::piece_tracker::Senders,
+) -> anyhow::Result<()> {
+    let index = chunk_info.piece_index.get();
+    let piece_index = chunk_info.piece_index;
+    let read_block = |who: PeerHandle, chunk: &ChunkInfo, buf: &mut [u8]| {
+        state.file_ops().read_chunk(who, chunk, buf)
+    };
+
+    match state
+        .file_ops()
+        .check_piece(chunk_info.piece_index)
+        .with_context(|| format!("error checking piece={index}"))?
+    {
+        Verdict::Inconsistent => {
+            return state.on_fatal_error(inconsistent_hashes(chunk_info.piece_index));
+        }
+        Verdict::Passed => {
+            state.layer_fetch.piece_passed(piece_index);
+            let failed = state.peers.piece_passed(piece_index);
+            // Before the storage takes the piece, while the good bytes
+            // are still there to read back.
+            for sender in smart_ban::senders_of_bad_blocks(&failed, read_block) {
+                state.ban_for_bad_data(sender.ip());
+            }
+            // The piece is ours only once the storage has taken it
+            // (libtorrent: the write completes before the hash job,
+            // and only then `torrent::piece_passed`). One it refuses
+            // is downloaded again, and its senders are neither
+            // credited nor blamed: on a disk error libtorrent
+            // `torrent::on_piece_verified` calls neither
+            // `piece_passed` nor `piece_failed`. A refusal for want
+            // of room puts the torrent in upload mode
+            // (`torrent::handle_disk_error`).
+            if let Err(e) = state.files.on_piece_completed(piece_index) {
+                warn!(
+                    id = state.shared.id,
+                    info_hash = ?state.shared.info_hash,
+                    "the storage refused piece={index}: {e:#}"
+                );
+                state.handle_disk_error(&e);
+                return state.requeue_piece(piece_index);
+            }
+            state
+                .lock_write("mark_piece_downloaded")
+                .get_pieces_mut()?
+                .mark_piece_hash_ok(piece_index);
+            // Every peer that sent a block of it earns a point and
+            // leaves parole (libtorrent `torrent::piece_passed`).
+            for peer in senders.participants() {
+                state
+                    .peers
+                    .with_peer_mut(peer, "piece_passed", |p| p.piece_passed(&state.peers));
+            }
+
+            // Global piece counters.
+            let piece_len = state.lengths.piece_length(chunk_info.piece_index) as u64;
+            state
+                .stats
+                .downloaded_and_checked_bytes
+                // This counter is used to compute "is_finished", so using
+                // stronger ordering.
+                .fetch_add(piece_len, Ordering::Release);
+            state
+                .stats
+                .downloaded_and_checked_pieces
+                // This counter is used to compute "is_finished", so using
+                // stronger ordering.
+                .fetch_add(1, Ordering::Release);
+            state
+                .stats
+                .have_bytes
+                .fetch_add(piece_len, Ordering::Relaxed);
+            if let Some(time) = full_piece_download_time {
+                #[allow(clippy::cast_possible_truncation)]
+                state
+                    .stats
+                    .total_piece_download_ms
+                    .fetch_add(time.as_millis() as u64, Ordering::Relaxed);
+
+                // Per-peer piece counters.
+                counters.on_piece_completed(piece_len, time);
+            }
+
+            trace!(piece = index, "successfully downloaded and verified");
+
+            state.on_piece_completed(chunk_info.piece_index)?;
+
+            state.transmit_haves(chunk_info.piece_index);
+            state.update_interest_of_holders(chunk_info.piece_index);
+        }
+        Verdict::Failed => {
+            warn!(
+                id = state.shared.id,
+                info_hash = ?state.shared.info_hash,
+                ?addr,
+                "checksum for piece={} did not validate", index
+            );
+            // The whole piece counts as corrupt (libtorrent
+            // `torrent::piece_failed` calls `add_failed_bytes` with
+            // the piece size).
+            state.stats.failed_bytes.fetch_add(
+                u64::from(state.lengths.piece_length(piece_index)),
+                Ordering::Relaxed,
+            );
+            // Before the storage lets go of the failed bytes.
+            let blocks = smart_ban::read_back(&state.lengths, piece_index, &senders, read_block);
+            for liar in state.peers.piece_failed(piece_index, blocks) {
+                state.ban_for_bad_data(liar.ip());
+            }
+            // Checked by v2, a piece of more than one sender has its
+            // block hashes fetched, which name the senders of its bad
+            // blocks; until then no one is blamed (libtorrent
+            // `torrent::piece_failed` calls `verify_block_hashes`).
+            // Otherwise, or when one peer sent it all, every sender
+            // is blamed, and the sole sender known to be bad
+            // (libtorrent `torrent::piece_failed`,
+            // `torrent::penalize_peers`).
+            let v2_request = state.metadata.v2.as_ref().and_then(|v2| {
+                let request = hash_fetch::block_request(
+                    v2,
+                    state.lengths.default_piece_length().into(),
+                    piece_index.get(),
+                )?;
+                Some((request, v2.share(piece_index.get())?))
+            });
+            match v2_request {
+                Some((request, share)) if !senders.sole_sender() => {
+                    let failed = hash_fetch::failed_blocks(
+                        &state.lengths,
+                        piece_index,
+                        share,
+                        &senders,
+                        read_block,
+                    );
+                    state
+                        .layer_fetch
+                        .verify_blocks(request, piece_index, failed);
+                }
+                _ => {
+                    state.penalize_peers(senders.participants(), piece_index, senders.sole_sender())
+                }
+            }
+            state.requeue_piece(piece_index)?;
+        }
+        // No hash to check the piece against: nobody is to blame
+        // (libtorrent `torrent::on_piece_verified` neither passes nor
+        // fails it).
+        Verdict::Unknown => state.requeue_piece(piece_index)?,
+    };
+    Ok(())
+}
+
+/// Reads the blocks a connection uploads, on the thread it is handed to.
+struct UploadReader {
+    state: Arc<TorrentStateLive>,
+    addr: PeerHandle,
+}
+
+impl crate::peer_connection::ChunkReader for UploadReader {
+    fn read_chunks(
+        &self,
+        chunks: &[ChunkInfo],
+        bufs: &mut [&mut [u8]],
+    ) -> std::result::Result<(), (usize, anyhow::Error)> {
+        self.state.file_ops().read_chunks(self.addr, chunks, bufs)
+    }
+}
+
+/// How an outgoing connection's first part ended: the connection over, or
+/// open and moving to its stream's thread.
+enum Ran {
+    Ended(crate::Result<()>),
+    Moving(Box<crate::peer_connection::Connected>),
+}
+
+/// Tells the torrent a connection ended, and how.
+fn peer_ended(handler: PeerLifetime, res: crate::Result<()>) -> crate::Result<()> {
+    match res {
+        // We disconnected the peer ourselves as we don't need it
+        Ok(()) => handler.on_peer_died(None)?,
+        Err(e) => {
+            debug!("error managing peer: {:#}", e);
+            handler.on_peer_died(Some(e))?;
+        }
+    }
+    Ok(())
+}
+
+/// A block received into its own buffer, queued for the disk threads. The
+/// job belongs to the torrent: however the connection that received the
+/// block ends, the block is written and its piece checked, and the run's end
+/// waits for it.
+pub(crate) struct WriteJob {
+    state: Arc<TorrentStateLive>,
+    tx: PeerTx,
+    addr: PeerHandle,
+    counters: Arc<AtomicPeerCounters>,
+    chunk: ChunkInfo,
+    // Before `written`: the buffer goes back before the peer is told.
+    block: Block,
+    written: Written,
+    _run: tokio_util::task::task_tracker::TaskTrackerToken,
+}
+
+/// Tells the peer its write is done, however the write ends: landed, or
+/// dropped unrun, as a job of a torrent paused or of a disk thread that
+/// panicked or never started is. A peer stopped at the high mark reads
+/// again once its writes are done.
+struct Written(Option<Arc<PeerDisk>>);
+
+impl Drop for Written {
+    fn drop(&mut self) {
+        if let Some(disk) = self.0.take() {
+            disk.written();
+        }
+    }
+}
+
+impl DiskJob for WriteJob {
+    // One torrent's writes run on one thread at a time: writes racing on
+    // the same files cost each other more than they gain.
+    fn key(&self) -> usize {
+        Arc::as_ptr(&self.state) as usize
+    }
+
+    fn run(self) {
+        let mut one = std::collections::VecDeque::from([self]);
+        Self::run_batch(&mut one);
+    }
+
+    // The batch is landed a torrent at a time: each run of jobs of one
+    // torrent takes the torrent's lock twice, not twice per block.
+    fn run_batch(batch: &mut std::collections::VecDeque<Self>) {
+        let mut landed = Vec::new();
+        while let Some(head) = batch.front() {
+            let state = head.state.clone();
+            let run = batch
+                .iter()
+                .take_while(|job| Arc::ptr_eq(&job.state, &state))
+                .count();
+            let jobs: Vec<WriteJob> = batch.drain(..run).collect();
+            // A torrent paused or removed writes nothing more: the blocks
+            // are fetched again in a later run (libtorrent aborts the jobs
+            // of a storage it closes, `peer_connection::on_disk_write_complete`
+            // marks the block cancelled).
+            if state.cancellation_token.is_cancelled() {
+                drop(jobs);
+                continue;
+            }
+            landed.clear();
+            {
+                let pieces: Vec<_> = jobs.iter().map(|job| job.block.piece()).collect();
+                let blocks: Vec<_> = jobs
+                    .iter()
+                    .zip(&pieces)
+                    .map(|(job, piece)| (job.addr, piece, job.chunk))
+                    .collect();
+                land_blocks(&state, &blocks, &mut landed);
+            }
+            for (job, landed) in jobs.into_iter().zip(landed.drain(..)) {
+                job.landed(landed);
+            }
+        }
+    }
+}
+
+impl WriteJob {
+    // The block is written or dropped: its buffer goes back, and when it was
+    // its piece's last, the piece is checked on a hashing thread, so the
+    // writes queued behind it do not wait for the check (libtorrent
+    // `torrent::verify_piece` posts `async_hash`).
+    fn landed(self, landed: Landed) {
+        let WriteJob {
+            state,
+            tx,
+            addr,
+            counters,
+            chunk,
+            block,
+            written,
+            _run,
+        } = self;
+        drop(block);
+        drop(written);
+        match landed {
+            Ok(None) => {}
+            Ok(Some((time, senders, check))) => {
+                let hash = state.shared.spawner.hash().clone();
+                hash.push(HashJob {
+                    check,
+                    state,
+                    tx,
+                    addr,
+                    counters,
+                    chunk,
+                    time,
+                    senders,
+                    _run,
+                });
+            }
+            Err(e) => chunk_failed(&tx, addr, &chunk, e),
+        }
+    }
+}
+
+// The connection that sent the block ends for its error.
+fn chunk_failed(tx: &PeerTx, addr: PeerHandle, chunk: &ChunkInfo, e: anyhow::Error) {
+    debug!(?addr, "error processing received chunk {chunk:?}: {e:#}");
+    let _ = tx.send(WriterRequest::Disconnect(Err(
+        e.context(format!("error processing received chunk {chunk:?}"))
+    )));
+}
+
+/// The check of a piece whose last block was written. Like the write, it
+/// belongs to the torrent and runs whatever became of the connection
+/// (libtorrent `torrent::on_piece_verified` takes the verdict whatever
+/// became of the sender), and the run's end waits for it.
+pub(crate) struct HashJob {
+    state: Arc<TorrentStateLive>,
+    tx: PeerTx,
+    addr: PeerHandle,
+    counters: Arc<AtomicPeerCounters>,
+    chunk: ChunkInfo,
+    time: Option<Duration>,
+    senders: crate::piece_tracker::Senders,
+    check: PieceCheck,
+    _run: tokio_util::task::task_tracker::TaskTrackerToken,
+}
+
+/// A piece out of flight and out of the queue for its check, which no one
+/// else takes until its verdict. A check dropped before it gives one, as
+/// one whose disk thread panicked or never started is, puts the piece back
+/// to be fetched again, so it is not lost.
+struct PieceCheck {
+    piece: ValidPieceIndex,
+    state: Option<Arc<TorrentStateLive>>,
+}
+
+impl PieceCheck {
+    fn done(mut self) {
+        self.state = None;
+    }
+}
+
+impl Drop for PieceCheck {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take()
+            && let Err(e) = state.requeue_piece(self.piece)
+        {
+            debug!(piece = ?self.piece, "a dropped check: {e:#}");
+        }
+    }
+}
+
+impl DiskJob for HashJob {
+    fn key(&self) -> usize {
+        Arc::as_ptr(&self.state) as usize
+    }
+
+    fn run(self) {
+        let HashJob {
+            state,
+            tx,
+            addr,
+            counters,
+            chunk,
+            time,
+            senders,
+            check,
+            _run,
+        } = self;
+        let checked = check_landed_piece(&state, addr, &counters, &chunk, time, senders);
+        check.done();
+        if let Err(e) = checked {
+            chunk_failed(&tx, addr, &chunk, e);
         }
     }
 }

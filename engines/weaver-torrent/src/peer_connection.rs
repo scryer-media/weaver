@@ -29,14 +29,19 @@ use crate::peer_protocol::{
     max_frame_len, serialize_piece_preamble,
 };
 use crate::{
-    Error, Result, limits::Channel, meter::Meter, read_buf::ReadQuota,
-    session::CheckedIncomingConnection, stream_connect::ConnectionKind,
+    Error, Result,
+    disk::{Block, BlockPool},
+    limits::Channel,
+    meter::Meter,
+    read_buf::{Incoming, ReadQuota},
+    session::CheckedIncomingConnection,
+    stream_connect::ConnectionKind,
 };
 use futures::TryFutureExt;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
-use tracing::{Instrument, trace, trace_span};
+use tracing::{Instrument, debug, trace, trace_span};
 
 use crate::mse::{Encryption, EncryptionPolicy};
 use crate::{
@@ -46,6 +51,17 @@ use crate::{
     stream_connect::{Guard, StreamConnector, Transports},
     type_aliases::BoxAsyncReadVectored,
 };
+
+/// Reads blocks to upload, from any thread.
+pub trait ChunkReader: Send + Sync {
+    /// Each of `chunks` read into its buffer of `bufs`; on an error, the
+    /// first block not read and why.
+    fn read_chunks(
+        &self,
+        chunks: &[ChunkInfo],
+        bufs: &mut [&mut [u8]],
+    ) -> std::result::Result<(), (usize, anyhow::Error)>;
+}
 
 pub trait PeerConnectionHandler {
     fn on_connected(&self, _connection_time: Duration) {}
@@ -80,6 +96,23 @@ pub trait PeerConnectionHandler {
         extended_handshake: &ExtendedHandshake<ByteBuf>,
     ) -> anyhow::Result<()>;
     async fn on_received_message(&self, msg: Message<'_>) -> anyhow::Result<()>;
+    /// A Piece message received into a block buffer of its own, from the
+    /// pool [`Self::block_pool`] names. A handler that names none is never
+    /// handed one.
+    async fn on_received_block(&self, block: Block) -> anyhow::Result<()> {
+        self.on_received_message(Message::Piece(block.piece()))
+            .await
+    }
+    /// The pool the connection receives blocks into, when the handler takes
+    /// them by [`Self::on_received_block`]; without one every Piece message
+    /// is read in the connection's buffer.
+    fn block_pool(&self) -> Option<BlockPool> {
+        None
+    }
+    /// Waits until the connection may read again, when the disk is behind
+    /// the blocks the connection queued for it (libtorrent's `bw_disk`
+    /// state). A handler that queues nothing never waits.
+    async fn disk_room(&self) {}
     fn on_uploaded_bytes(&self, bytes: u32);
     /// One write handed the connection's writer `bytes` of block payload,
     /// each block already told to [`Self::on_uploaded_bytes`]. Told once per
@@ -124,6 +157,13 @@ pub trait PeerConnectionHandler {
     /// The block `chunk` the writer took is sent, or dropped unserved: its
     /// room in the peer's send buffer is free for the next.
     fn upload_done(&self, _chunk: &ChunkInfo) {}
+    /// The blocks `chunks` one write sent: [`Self::upload_done`] for each,
+    /// told together.
+    fn uploads_done(&self, chunks: &[ChunkInfo]) {
+        for chunk in chunks {
+            self.upload_done(chunk);
+        }
+    }
     /// Whether the block `chunk` the writer took is read and sent. False
     /// drops it unsent and keeps the connection; an error ends it. A
     /// handler with nothing to check first serves every block.
@@ -131,6 +171,12 @@ pub trait PeerConnectionHandler {
         Ok(true)
     }
     fn read_chunk(&self, chunk: &ChunkInfo, buf: &mut [u8]) -> anyhow::Result<()>;
+    /// What reads the blocks the connection uploads on another thread, for
+    /// a connection on a thread that must not block. None reads them with
+    /// [`Self::read_chunks`] where the connection runs.
+    fn chunk_reader(&self) -> Option<Arc<dyn ChunkReader>> {
+        None
+    }
     /// Each of `chunks` read into its buffer of `bufs`. On an error, the
     /// first block not read and why: the blocks before it are read whole.
     /// A handler with no faster way reads them one at a time.
@@ -411,6 +457,35 @@ pub(crate) async fn with_timeout<T>(
     }
 }
 
+/// Connections run on a uTP thread so far, incoming and outgoing.
+#[cfg(test)]
+pub(crate) static ON_UTP_THREADS: [std::sync::atomic::AtomicUsize; 2] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
+#[cfg(test)]
+fn count_on_utp_thread(outgoing: bool) {
+    if weaver_utp::on_shard_thread() {
+        ON_UTP_THREADS[usize::from(outgoing)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// An outgoing connection open, our handshake sent and the peer's still to
+/// read.
+pub(crate) struct Connected {
+    kind: ConnectionKind,
+    read: BoxAsyncReadVectored,
+    write: crate::mse::Outbound,
+    meter: Meter,
+    encryption: crate::mse::Encryption,
+    write_buf: Box<[u8]>,
+    greeting: Id20,
+    /// The thread the connection's transport runs on, when it has one of
+    /// its own: a uTP stream's.
+    pub home: Option<tokio::runtime::Handle>,
+}
+
 struct ManagePeerArgs {
     handshake_supports_extended: bool,
     speaks_v2: bool,
@@ -566,6 +641,22 @@ fn lend_batch_buf() -> Box<[u8]> {
         .unwrap_or_else(|| vec![0u8; BATCH_LEN].into_boxed_slice())
 }
 
+/// The payloads of `buf` at `spans`, each a start and an end, in order and
+/// apart.
+fn payloads_in<'a>(buf: &'a mut [u8], spans: &[(usize, usize)]) -> Vec<&'a mut [u8]> {
+    let mut payloads = Vec::with_capacity(spans.len());
+    let mut rest = buf;
+    let mut at = 0;
+    for &(start, end) in spans {
+        let (_, after) = std::mem::take(&mut rest).split_at_mut(start - at);
+        let (payload, after) = after.split_at_mut(end - start);
+        payloads.push(payload);
+        rest = after;
+        at = end;
+    }
+    payloads
+}
+
 fn return_batch_buf(buf: Box<[u8]>) {
     let mut kept = BATCH_BUFS
         .lock()
@@ -646,6 +737,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
         mut incoming: CheckedIncomingConnection,
     ) -> Result<()> {
+        #[cfg(test)]
+        count_on_utp_thread(false);
         // A peer speaks v2 when it greets with the truncated v2 hash or
         // offers v2, which a torrent without v2 refuses (libtorrent
         // `bt_peer_connection::on_receive_handshake`).
@@ -704,6 +797,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         &self,
         outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
     ) -> Result<()> {
+        let connected = self.connect_outgoing().await?;
+        self.manage_connected(connected, outgoing_chan).await
+    }
+
+    /// Connects to the peer and sends our handshake.
+    pub(crate) async fn connect_outgoing(&self) -> Result<Connected> {
         let handshake_timeout = self.options.handshake_timeout();
         let connect_timeout = self
             .options
@@ -720,9 +819,9 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         // Connecting includes sending our handshake: an encrypted connection
         // carries it inside the encryption handshake.
         let now = Instant::now();
-        let (ckind, mut read, write, meter, encryption) = self
+        let ((kind, read, write, meter, encryption), home) = self
             .connector
-            .connect_and_send_handshake(
+            .connect_and_send_handshake_homed(
                 self.addr,
                 self.transports,
                 match &self.ssl {
@@ -736,10 +835,40 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 handshake_timeout,
             )
             .await?;
+        self.handler.on_connected(now.elapsed());
+        Ok(Connected {
+            kind,
+            read,
+            write,
+            meter,
+            encryption,
+            write_buf,
+            greeting,
+            home,
+        })
+    }
 
+    /// Runs a connection [`Self::connect_outgoing`] opened, from the peer's
+    /// handshake on.
+    pub(crate) async fn manage_connected(
+        &self,
+        connected: Connected,
+        outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
+    ) -> Result<()> {
+        let Connected {
+            kind: ckind,
+            mut read,
+            write,
+            meter,
+            encryption,
+            write_buf,
+            greeting,
+            home: _,
+        } = connected;
+        let handshake_timeout = self.options.handshake_timeout();
+        #[cfg(test)]
+        count_on_utp_thread(true);
         async move {
-            self.handler.on_connected(now.elapsed());
-
             let mut read_buf = ReadBuf::new();
             let h = read_buf
                 .read_handshake(&mut read, handshake_timeout)
@@ -819,6 +948,10 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             handler: &self.handler,
             buf: read_buf,
         };
+        // Blocks go into buffers of their own when the handler takes them.
+        if let Some(pool) = self.handler.block_pool() {
+            unread.buf.receive_blocks_into(pool);
+        }
 
         let rwtimeout = self.options.read_write_timeout();
 
@@ -861,6 +994,17 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             self.handler.on_protocol_bytes(Channel::Upload, esz as u64);
         }
 
+        // A connection on a uTP thread reads the blocks it uploads on the
+        // session's disk threads, its buffer handed there and back: nothing
+        // that blocks runs on a uTP thread. Its reads run in order under a
+        // key of its own.
+        let upload_reader = if weaver_utp::on_shard_thread() {
+            self.handler.chunk_reader()
+        } else {
+            None
+        };
+        let read_key = crate::off_shard::reader_key();
+
         let writer = async move {
             let keep_alive_interval = self.options.keep_alive_interval();
 
@@ -888,6 +1032,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             let longest_frame = write_buf.len() - PIECE_MESSAGE_DEFAULT_LEN;
             let mut carried: Option<WriterRequest> = None;
             let mut batch: Vec<Framed> = Vec::new();
+            let mut sent: Vec<ChunkInfo> = Vec::new();
             loop {
                 let first = match carried.take() {
                     Some(req) => req,
@@ -1040,28 +1185,54 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 let mut failed = None;
                 if batch.iter().any(|framed| framed.read) {
                     // Each block read: where its frame is in the batch and
-                    // the buffer, the block, and its payload's room.
+                    // the buffer, the block, and where its payload goes.
                     let mut places = Vec::new();
                     let mut chunks = Vec::new();
-                    let mut payloads: Vec<&mut [u8]> = Vec::new();
-                    let mut rest = &mut buf[..filled];
+                    let mut spans = Vec::new();
                     let mut at = 0;
                     for (i, framed) in batch.iter().enumerate() {
-                        let (frame, after) = std::mem::take(&mut rest).split_at_mut(framed.len);
-                        rest = after;
                         if let (true, Some(chunk)) = (framed.read, framed.chunk) {
                             places.push((i, at));
                             chunks.push(chunk);
-                            payloads.push(&mut frame[PIECE_MESSAGE_PREAMBLE_LEN..]);
+                            spans.push((at + PIECE_MESSAGE_PREAMBLE_LEN, at + framed.len));
                         }
                         at += framed.len;
                     }
-                    let read = self
-                        .spawner
-                        .block_in_place_with_semaphore(|| {
-                            self.handler.read_chunks(&chunks, &mut payloads)
-                        })
-                        .await;
+                    let read = match &upload_reader {
+                        Some(reader) => {
+                            // The buffer the frames are in goes to the
+                            // blocking thread and comes back filled.
+                            let owned = match lent.take() {
+                                Some(lent) => (lent, true),
+                                None => (std::mem::take(&mut write_buf), false),
+                            };
+                            let reader = reader.clone();
+                            let (owned, read) = self
+                                .spawner
+                                .read_off_shard(read_key, move || {
+                                    let (mut buf, was_lent) = owned;
+                                    let mut payloads = payloads_in(&mut buf, &spans);
+                                    let read = reader.read_chunks(&chunks, &mut payloads);
+                                    drop(payloads);
+                                    ((buf, was_lent), read)
+                                })
+                                .await
+                                .ok_or(Error::TorrentIsNotLive)?;
+                            match owned {
+                                (buf, true) => lent = Some(buf),
+                                (buf, false) => write_buf = buf,
+                            }
+                            read
+                        }
+                        None => {
+                            let mut payloads = payloads_in(buf, &spans);
+                            self.spawner
+                                .block_in_place_with_semaphore(|| {
+                                    self.handler.read_chunks(&chunks, &mut payloads)
+                                })
+                                .await
+                        }
+                    };
                     if let Err((k, e)) = read {
                         let (i, at) = places[k];
                         batch.truncate(i);
@@ -1070,6 +1241,10 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     }
                 }
 
+                let buf: &mut [u8] = match &mut lent {
+                    Some(lent) => lent,
+                    None => &mut write_buf,
+                };
                 if filled > 0 {
                     send(
                         &mut up,
@@ -1095,8 +1270,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     if let Some(chunk) = framed.chunk {
                         sent_payload += u64::from(chunk.size);
                         self.handler.on_uploaded_bytes(chunk.size);
-                        self.handler.upload_done(&chunk);
+                        sent.push(chunk);
                     }
+                }
+                if !sent.is_empty() {
+                    self.handler.uploads_done(&sent);
+                    sent.clear();
                 }
                 if sent_payload > 0 {
                     self.handler.on_payload_written(sent_payload);
@@ -1121,10 +1300,29 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 if let Some(answers) = self.handler.answers() {
                     answers.below(ANSWER_BACKLOG_LIMIT).await;
                 }
+                // A connection the disk is behind waits for it first.
+                self.handler.disk_room().await;
                 let read_before = reading.consumed();
-                let message = reading
-                    .read_message(&mut read, rwtimeout, num_pieces, &mut down)
-                    .await?;
+                let message = match reading
+                    .read_next(&mut read, rwtimeout, num_pieces, &mut down)
+                    .await?
+                {
+                    Incoming::Message(message) => message,
+                    Incoming::Block(block) => {
+                        trace!("received: {:?}", &block);
+                        let payload = block.len() as u64;
+                        tokio::task::coop::consume_budget().await;
+                        self.handler
+                            .on_received_block(block)
+                            .await
+                            .map_err(Error::Anyhow)?;
+                        self.handler.on_protocol_bytes(
+                            Channel::Download,
+                            reading.consumed() - read_before - payload,
+                        );
+                        continue;
+                    }
+                };
                 trace!("received: {:?}", &message);
                 let payload = match &message {
                     Message::Piece(piece) => piece.len() as u64,
@@ -1179,7 +1377,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             Ok::<_, Error>(())
         };
 
-        tokio::select! {
+        let ended = tokio::select! {
             r = reader => {
                 if let Err(e) = r.as_ref() {
                     trace!("reader finished with error: {e:#}");
@@ -1196,7 +1394,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 }
                 r
             }
-        }
+        };
+        // Payload bytes copied on their way to a block buffer: the headers
+        // a read cut short, and what followed a block a read guessed wrong.
+        let (moved, received) = unread.buf.moved();
+        debug!(moved, received, "connection's block bytes moved");
+        ended
     }
 }
 
@@ -2495,8 +2698,9 @@ mod tests {
             assert_eq!(granted - returned, sent);
             assert_eq!(protocol, sent - 2 * u64::from(BLOCK));
             // Both blocks and the have queued behind them are paid for and
-            // written together; then each block's protocol bytes, its
-            // payload, and done, in order, and the have's.
+            // written together; then each block's protocol bytes and its
+            // payload, in order, the have's, and the write's blocks done
+            // together.
             let tail: Vec<_> = told
                 .iter()
                 .filter(|t| matches!(t, Told::Uploaded(_) | Told::Done(_)))
@@ -2506,23 +2710,23 @@ mod tests {
                 tail,
                 [
                     Told::Uploaded(BLOCK),
-                    Told::Done(0),
                     Told::Uploaded(BLOCK),
+                    Told::Done(0),
                     Told::Done(1)
                 ]
             );
             let done0 = told.iter().position(|t| *t == Told::Done(0)).unwrap();
             assert_eq!(
-                told[done0 - 3..done0 + 5],
+                told[done0 - 6..done0 + 2],
                 [
                     Told::Granted(2 * (13 + u64::from(BLOCK)) + 9),
                     Told::Protocol(13),
                     Told::Uploaded(BLOCK),
-                    Told::Done(0),
                     Told::Protocol(13),
                     Told::Uploaded(BLOCK),
-                    Told::Done(1),
                     Told::Protocol(9),
+                    Told::Done(0),
+                    Told::Done(1),
                 ]
             );
             // The one write that carried both blocks is told once, after
@@ -2533,7 +2737,7 @@ mod tests {
                 .cloned()
                 .collect();
             assert_eq!(written, [Told::Written(2 * u64::from(BLOCK))]);
-            assert_eq!(told[done0 + 5], Told::Written(2 * u64::from(BLOCK)));
+            assert_eq!(told[done0 + 2], Told::Written(2 * u64::from(BLOCK)));
         }
         // The two blocks' payloads, as the receiver sees them.
         for piece in 0..2u32 {
@@ -2718,8 +2922,8 @@ mod tests {
             tail,
             [
                 Told::Uploaded(BLOCK),
-                Told::Done(0),
                 Told::Uploaded(BLOCK),
+                Told::Done(0),
                 Told::Done(1)
             ]
         );

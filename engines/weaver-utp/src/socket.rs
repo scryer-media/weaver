@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-12.
+// Modified by the Weaver authors, 2026-11-13.
 
 use std::{
     collections::{BTreeMap, VecDeque, btree_map::Entry},
@@ -138,6 +138,11 @@ pub struct SocketOpts {
     /// the socket holds more than twice as many streams is dropped
     /// unanswered; with none set, every SYN is taken up.
     pub connections_limit: Option<NonZeroUsize>,
+
+    /// Threads of their own for the socket's tasks: its I/O task runs on
+    /// the first, and so do its streams. With none, the tasks run on the
+    /// runtime the socket is made on.
+    pub shards: Option<crate::Shards>,
 
     /// If true, will wait for ACK of FIN. By default we don't wait
     /// as it's not required for torrents.
@@ -501,6 +506,71 @@ impl<T, E> AcceptQueue<T, E> {
     }
 }
 
+/// The buffers a socket receives into. A datagram is read into a pooled
+/// buffer, and on into the spill buffer when it is longer; a packet with a
+/// payload keeps the pooled buffer, and the next datagram gets another.
+/// A read takes at most `u16::MAX` bytes in all, the spill buffer's
+/// length. Normal UDP datagrams carry at most u16::MAX - 8 payload bytes;
+/// one that fills the read is dropped as too long.
+pub(crate) struct RecvBufs {
+    head: Box<[u8]>,
+    spill: Box<[u8]>,
+}
+
+impl RecvBufs {
+    pub(crate) fn new() -> Self {
+        Self {
+            head: crate::rx_buf::take(),
+            spill: vec![0; u16::MAX as usize].into_boxed_slice(),
+        }
+    }
+
+    // The longest datagram read: one this long may have been cut short.
+    fn capacity(&self) -> usize {
+        self.spill.len()
+    }
+
+    fn recv<'a, T: Transport>(
+        &'a mut self,
+        transport: &'a T,
+    ) -> impl Future<Output = std::io::Result<(usize, SocketAddr)>> + Send + 'a {
+        transport.recv_from_split(&mut self.head, &mut self.spill)
+    }
+
+    // The `len`-byte datagram just received, as a packet. Its payload stays
+    // in the pooled buffer; a datagram longer than that buffer is joined
+    // into bytes of its own, once, and its payload then cut out of it, so a
+    // long header holds no memory while the packet waits.
+    fn message(&mut self, len: usize, received: Instant) -> Option<UtpMessage> {
+        if len > self.head.len() {
+            let mut joined = Vec::with_capacity(len);
+            joined.extend_from_slice(&self.head);
+            joined.extend_from_slice(&self.spill[..len - self.head.len()]);
+            let (header, at) = UtpMessage::parse(&joined)?;
+            let mut data = crate::Payload::from(joined);
+            data.advance(at);
+            data.settle();
+            return Some(UtpMessage {
+                header,
+                data,
+                received,
+            });
+        }
+        let (header, at) = UtpMessage::parse(&self.head[..len])?;
+        let data = if at == len {
+            crate::Payload::empty()
+        } else {
+            let head = std::mem::replace(&mut self.head, crate::rx_buf::take());
+            crate::Payload::in_buffer(head, at, len)
+        };
+        Some(UtpMessage {
+            header,
+            data,
+            received,
+        })
+    }
+}
+
 pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
     env: E,
     socket: Arc<SocketState<T, E>>,
@@ -516,8 +586,9 @@ pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
     tombstones: Tombstones,
     reset_budget: ResetBudget,
     // The stream holding packets of the current read that were neither
-    // marked nor woken yet.
-    unflushed: Option<StreamRecvKey>,
+    // marked nor woken yet, with its queue: a run of packets for one stream
+    // finds it here without a lookup. Cleared as that stream leaves the map.
+    unflushed: Option<(StreamRecvKey, crate::ingress::Queue)>,
     // The streams' datagrams taken from the outbox, sent from the front.
     outgoing: Outgoing,
 }
@@ -696,6 +767,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     ) -> Option<RegisteredStream> {
         let (retired, mut guard) = self.socket.retirements.registration();
         guard.disarm();
+        self.forget_unflushed(&key);
         self.streams.insert(
             key,
             RegisteredStream {
@@ -763,6 +835,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     async fn on_control(&mut self, control: ControlRequest) {
         match control {
             ControlRequest::Shutdown(key) => {
+                self.forget_unflushed(&key);
                 self.streams.remove(&key);
             }
             ControlRequest::ConnectRequest(remote, _token, requester) => {
@@ -796,8 +869,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         }
     }
     pub(crate) async fn run_forever(mut self) -> crate::Result<()> {
-        // Normal UDP datagrams carry at most u16::MAX - 8 payload bytes.
-        let mut read_buf = [0u8; u16::MAX as usize];
+        let mut read_buf = RecvBufs::new();
         let mut completions = 0;
         let mut receive_errors = 0;
 
@@ -847,7 +919,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     // True when a read of the socket stopped at the batch limit.
     async fn run_once(
         &mut self,
-        read_buf: &mut [u8],
+        read_buf: &mut RecvBufs,
         receive_errors: &mut usize,
     ) -> crate::Result<bool> {
         let retirements = Arc::clone(&self.socket.retirements);
@@ -907,7 +979,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 ),
                 None => Poll::Pending,
             }), if self.socket.outbox.is_some() => {},
-            recv = self.transport.as_deref().ok_or(Error::DispatcherDead)?.recv_from(read_buf) => {
+            recv = read_buf.recv(self.transport.as_deref().ok_or(Error::DispatcherDead)?) => {
                 let received = self.env.now();
                 self.on_datagram(recv, received, read_buf, receive_errors).await?;
                 return self.read_batch(read_buf, receive_errors, 1).await;
@@ -926,14 +998,14 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     // that stream is only woken; the read goes on after a yield.
     async fn read_batch(
         &mut self,
-        read_buf: &mut [u8],
+        read_buf: &mut RecvBufs,
         receive_errors: &mut usize,
         mut read: usize,
     ) -> crate::Result<bool> {
         while read < RECEIVE_BATCH {
             let recv = {
                 let transport = self.transport.as_deref().ok_or(Error::DispatcherDead)?;
-                let mut next = std::pin::pin!(transport.recv_from(read_buf));
+                let mut next = std::pin::pin!(read_buf.recv(transport));
                 poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx))).await
             };
             let Poll::Ready(recv) = recv else {
@@ -955,8 +1027,8 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 return Err(error);
             }
         }
-        if let Some(stream) = self.unflushed.and_then(|key| self.streams.get(&key)) {
-            stream.tx.wake();
+        if let Some((_, tx)) = &self.unflushed {
+            tx.wake();
         }
         Ok(true)
     }
@@ -965,7 +1037,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         &mut self,
         recv: std::io::Result<(usize, SocketAddr)>,
         received: Instant,
-        read_buf: &[u8],
+        read_buf: &mut RecvBufs,
         receive_errors: &mut usize,
     ) -> crate::Result<()> {
         let (len, addr) = match recv {
@@ -983,12 +1055,12 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             }
             Err(error) => return Err(Error::Recv(error)),
         };
-        if len >= read_buf.len() {
+        if len >= read_buf.capacity() {
             self.socket.stats.invalid_packets.increment(1);
             trace!(len, ?addr, "dropping datagram at receive buffer limit");
             return Ok(());
         }
-        let message = match UtpMessage::deserialize(&read_buf[..len], received) {
+        let message = match read_buf.message(len, received) {
             Some(msg) => msg,
             None => {
                 self.socket.stats.invalid_packets.increment(1);
@@ -1001,8 +1073,16 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
 
     // Marks and wakes the stream holding packets of the current read.
     fn flush_unflushed(&mut self) {
-        if let Some(stream) = self.unflushed.take().and_then(|key| self.streams.get(&key)) {
-            stream.tx.flush();
+        if let Some((_, tx)) = self.unflushed.take() {
+            tx.flush();
+        }
+    }
+
+    // A stream leaving the map, or one put in its place, is no longer the
+    // one the current read holds packets for.
+    fn forget_unflushed(&mut self, key: &StreamRecvKey) {
+        if self.unflushed.as_ref().is_some_and(|(last, _)| last == key) {
+            self.unflushed = None;
         }
     }
 
@@ -1054,20 +1134,31 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 .any(|syn| syn.remote == key.0 && (syn.header.connection_id + 1).0 == key.1)
     }
 
+    // Takes out the streams and connects whose owners let them go. Only a
+    // retirement makes one go: a connect's waiter is dropped only with its
+    // retirement guard (UtpSocket::connect), so a closed waiter is always
+    // also a retirement, and an idle turn walks nothing. The test-only
+    // `ControlRequest::ConnectRequest` disarms its guard at once: a connect
+    // admitted that way whose waiter is dropped goes only at the next
+    // retirement of anything else.
     fn reap_retired(&mut self) {
-        if self.socket.retirements.take_dirty() {
-            let tombstones = &mut self.tombstones;
-            self.streams.retain(|key, stream| {
-                let live = !stream.retired.is_retired();
-                if !live {
-                    tombstones.bury(*key, stream.send_id);
-                }
-                live
-            });
+        if !self.socket.retirements.take_dirty() {
+            return;
         }
+        let tombstones = &mut self.tombstones;
+        let unflushed = &mut self.unflushed;
+        self.streams.retain(|key, stream| {
+            let live = !stream.retired.is_retired();
+            if !live {
+                tombstones.bury(*key, stream.send_id);
+                if unflushed.as_ref().is_some_and(|(last, _)| last == key) {
+                    *unflushed = None;
+                }
+            }
+            live
+        });
         // A connect given up is remembered too: the remote may yet answer
         // the SYN, and its receive id is one above the one the SYN carried.
-        let tombstones = &mut self.tombstones;
         self.connecting.retain(|remote, pending| {
             pending.by_id.retain(|_, connect| {
                 let live = !connect.retired.is_retired() && !connect.requester.tx.is_closed();
@@ -1232,6 +1323,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         let args = StreamArgs::new_outgoing(&msg.header, start, msg.received)
             .with_parent_span(conn.requester.created_span.clone());
         let send_id = args.conn_id_send();
+        self.forget_unflushed(&recv_key);
         self.streams.insert(
             recv_key,
             RegisteredStream {
@@ -1246,6 +1338,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             trace!(?recv_key, "created stream and passed to connector");
         } else {
             debug!(?recv_key, "connecting receiver is dead. dropping");
+            self.forget_unflushed(&recv_key);
             self.streams.remove(&recv_key);
         }
 
@@ -1273,6 +1366,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         let send_id = args.conn_id_send();
         let starter = UtpStreamStarter::new_registered(&self.socket, syn.remote, rx, args, guard);
 
+        self.forget_unflushed(&recv_key);
         self.streams.insert(
             recv_key,
             RegisteredStream {
@@ -1288,6 +1382,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             }
             Err(starter) => {
                 starter.disarm();
+                self.forget_unflushed(&recv_key);
                 self.streams.remove(&recv_key);
                 MatchSynWithAccept::ReceiverDead(Box::new(syn))
             }
@@ -1357,24 +1452,33 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         // A packet for another stream than the last one's sends that
         // stream's owed ACK first (libtorrent v2.0.15
         // utp_socket_manager.cpp:158-173), so its packets are marked here.
-        if self.unflushed.is_some_and(|last| last != key) {
-            self.socket.stats.stream_switch_marks.increment(1);
-            self.flush_unflushed();
+        match &self.unflushed {
+            Some((last, queue)) if *last == key => {
+                // The same stream as the packet before: no lookup.
+                #[cfg(test)]
+                assert!(
+                    self.streams
+                        .get(&key)
+                        .is_some_and(|stream| queue.is_of(&stream.tx)),
+                    "the held queue is not the stream's"
+                );
+                if queue.push(message).is_ok() {
+                    return Ok(());
+                }
+                return self.on_dead_stream(key);
+            }
+            Some(_) => {
+                self.socket.stats.stream_switch_marks.increment(1);
+                self.flush_unflushed();
+            }
+            None => {}
         }
         if let Some(stream) = self.streams.get(&key) {
             if stream.tx.push(message).is_ok() {
-                self.unflushed = Some(key);
-            } else {
-                trace!(
-                    ?key,
-                    "stream dead, but wasn't cleaned up yet, this is probably a race"
-                );
-                self.unflushed = None;
-                if let Some(stream) = self.streams.remove(&key) {
-                    self.tombstones.bury(key, stream.send_id);
-                }
+                self.unflushed = Some((key, stream.tx.queue()));
+                return Ok(());
             }
-            return Ok(());
+            return self.on_dead_stream(key);
         }
 
         trace!(?key, "no matching live streams");
@@ -1392,6 +1496,20 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             Type::Data => {
                 self.reset_unknown_stream(addr, &message.header);
             }
+        }
+        Ok(())
+    }
+
+    // A stream whose queue refused a packet as closed: it ended without
+    // being taken out yet.
+    fn on_dead_stream(&mut self, key: StreamRecvKey) -> crate::Result<()> {
+        trace!(
+            ?key,
+            "stream dead, but wasn't cleaned up yet, this is probably a race"
+        );
+        self.unflushed = None;
+        if let Some(stream) = self.streams.remove(&key) {
+            self.tombstones.bury(key, stream.send_id);
         }
         Ok(())
     }
@@ -1667,8 +1785,15 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         let local_addr = transport.bind_addr();
         let link_mtu = transport.link_mtu();
         let sends_from_one_task = transport.sends_from_one_task();
+        // The transport's I/O is registered with the runtime its I/O task
+        // runs on: the first uTP thread, or the caller's when there is none.
+        {
+            let io = opts.shards.as_ref().and_then(crate::Shards::io);
+            let _entered = io.as_ref().map(tokio::runtime::Handle::enter);
+            transport.register_io().map_err(Error::Register)?;
+        }
         let transport = Arc::new(transport);
-        let runtime = Runtime::new(transport, &opts.cancellation_token);
+        let runtime = Runtime::new(transport, &opts.cancellation_token, opts.shards.clone());
 
         let (accept_tx, accept_rx) = mpsc::channel(ACCEPT_QUEUE_MAX_ACCEPTORS);
         let pending_connects = pending_connects(opts.connections_limit);

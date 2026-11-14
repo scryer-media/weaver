@@ -1285,15 +1285,27 @@ impl ManagedTorrent {
     pub fn check_seeded(&self, piece: u32) -> Option<anyhow::Result<bool>> {
         let metadata = self.metadata.load();
         let piece = metadata.as_ref()?.lengths().validate_piece_index(piece)?;
-        if let Some(live) = self.live() {
-            return Some(live.check_seeded(piece));
-        }
-        let left = {
+        let seed = &self.shared.options.seed;
+        let left = loop {
+            if let Some(live) = self.live() {
+                return Some(live.check_seeded(piece));
+            }
+            if !matches!(self.locked.read().state, ManagedTorrentState::Paused(_)) {
+                return None;
+            }
+            if !seed.unchecked(piece) {
+                return Some(Ok(true));
+            }
+            // One of the session's blocking permits for the read, as a
+            // running torrent's check of the piece holds. It is waited
+            // for before the torrent's state is held, so nothing that
+            // would change or read that state waits with it; the state is
+            // looked at again once the permit is had.
+            let _permit = seed_mode::blocking_permit(&self.shared.spawner);
             let g = self.locked.read();
             let ManagedTorrentState::Paused(paused) = &g.state else {
-                return None;
+                continue;
             };
-            let seed = &self.shared.options.seed;
             if !seed.unchecked(piece) {
                 return Some(Ok(true));
             }
@@ -1302,12 +1314,15 @@ impl ManagedTorrent {
                 &*paused.files,
                 self.shared.options.disable_v1_hashes,
             );
-            if matches!(ops.check_piece(piece), Ok(crate::file_ops::Verdict::Passed)) {
+            if matches!(
+                ops.check_piece_whole(piece),
+                Ok(crate::file_ops::Verdict::Passed)
+            ) {
                 let checked = paused.files.on_piece_checked(piece);
                 seed.checked(piece);
                 return Some(checked.map(|()| true));
             }
-            seed.leave()
+            break seed.leave();
         };
         if left {
             warn!(

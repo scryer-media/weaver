@@ -51,8 +51,30 @@ pub trait DatagramSocket: Send + Sync + 'static {
     /// The local address the socket is bound to.
     fn bind_addr(&self) -> SocketAddr;
 
+    /// Registers the socket's I/O with the runtime entered now. A socket
+    /// made for uTP waits for this, so its I/O runs on uTP's own runtime;
+    /// every other socket is registered when it is made, and needs nothing.
+    fn register_io(&self) -> io::Result<()> {
+        Ok(())
+    }
+
     fn recv_from<'a>(&'a self, buf: &'a mut [u8])
     -> BoxFuture<'a, io::Result<(usize, SocketAddr)>>;
+
+    /// Receives one datagram of at most `spill.len()` bytes: its first
+    /// `head.len()` bytes into `head`, the rest from the start of `spill`,
+    /// in one read with no buffer of its own. A datagram cut short reads as
+    /// `spill.len()` bytes. `None` when the socket cannot, as a tunnel's
+    /// cannot: [`Self::recv_from`] is used instead.
+    fn poll_recv_from_split(
+        &self,
+        cx: &mut Context<'_>,
+        head: &mut [u8],
+        spill: &mut [u8],
+    ) -> Option<Poll<io::Result<(usize, SocketAddr)>>> {
+        let _ = (cx, head, spill);
+        None
+    }
 
     fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddr)
     -> BoxFuture<'a, io::Result<usize>>;

@@ -230,6 +230,40 @@ pub fn serialize_piece_preamble(chunk: &ChunkInfo, mut buf: &mut [u8]) -> usize 
     PIECE_MESSAGE_PREAMBLE_LEN
 }
 
+/// The block a Piece message's header names, when `header` is one, of a
+/// block of 1 to [`CHUNK_SIZE`] bytes: its index, begin and length.
+pub(crate) fn piece_header(header: &[u8; PIECE_MESSAGE_PREAMBLE_LEN]) -> Option<(u32, u32, usize)> {
+    if header[INTEGER_LEN] != MSGID_PIECE {
+        return None;
+    }
+    let len = BE::read_u32(&header[0..4])
+        .checked_sub(u32::try_from(MSGID_LEN + INTEGER_LEN * 2).ok()?)?;
+    if len == 0 || len > CHUNK_SIZE {
+        return None;
+    }
+    Some((
+        BE::read_u32(&header[5..9]),
+        BE::read_u32(&header[9..13]),
+        len as usize,
+    ))
+}
+
+/// Whether `start`, the first bytes of a frame and fewer than a Piece
+/// message's header, may begin a Piece message of a block.
+pub(crate) fn may_start_piece(start: &[u8]) -> bool {
+    let mut lo = [0u8; INTEGER_LEN];
+    let mut hi = [0xffu8; INTEGER_LEN];
+    for (i, b) in start.iter().take(INTEGER_LEN).enumerate() {
+        lo[i] = *b;
+        hi[i] = *b;
+    }
+    let least = u32::try_from(MSGID_LEN + INTEGER_LEN * 2 + 1).unwrap_or(u32::MAX);
+    let most = u32::try_from(MSGID_LEN + INTEGER_LEN * 2).unwrap_or(0) + CHUNK_SIZE;
+    BE::read_u32(&hi) >= least
+        && BE::read_u32(&lo) <= most
+        && start.get(INTEGER_LEN).is_none_or(|id| *id == MSGID_PIECE)
+}
+
 /// A Piece message cut short: the block it names, and how many of its
 /// bytes arrived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

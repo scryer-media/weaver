@@ -8,16 +8,43 @@
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
+use crate::disk::{BlockPool, DiskQueue, MAX_QUEUED_DISK_BYTES};
+use crate::torrent_state::{HashJob, WriteJob};
+
+/// Threads that check pieces. libtorrent's default is one
+/// (settings_pack.cpp:353); a second starts only while a backlog waits, as a
+/// check here also reads the piece back.
+const HASH_THREADS: usize = 2;
+
 /// A tool to limit the number of blocking threads used concurrently to prevent
 /// runtime starvation.
 ///
 /// Also shortcuts for single-threaded tokio runtime to simply call the function, unlike
 /// "tokio::task::block_in_place" which would panic.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BlockingSpawner {
     allow_block_in_place: bool,
     concurrent_block_in_place_semaphore: Arc<Semaphore>,
     permits: usize,
+    // The session's runtime, whose blocking threads take work handed off a
+    // thread that must not block.
+    handle: tokio::runtime::Handle,
+    // The blocks received from peers, and the threads that write them.
+    pool: BlockPool,
+    disk: DiskQueue<WriteJob>,
+    // The threads that check a piece whose last block was written.
+    hash: DiskQueue<HashJob>,
+    // The threads that read the blocks peers on uTP threads upload.
+    reads: DiskQueue<crate::off_shard::ReadJob>,
+}
+
+impl std::fmt::Debug for BlockingSpawner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockingSpawner")
+            .field("allow_block_in_place", &self.allow_block_in_place)
+            .field("permits", &self.permits)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BlockingSpawner {
@@ -34,12 +61,40 @@ impl BlockingSpawner {
                 max_blocking_threads.max(1),
             )),
             permits: max_blocking_threads.max(1),
+            pool: BlockPool::new(MAX_QUEUED_DISK_BYTES),
+            // As many disk threads as blocking permits (libtorrent's
+            // `aio_threads`, a pool of its own beside the network thread).
+            disk: DiskQueue::new(handle.clone(), max_blocking_threads.max(1)),
+            // Checks have threads of their own, so a write never waits behind
+            // one (libtorrent `settings_pack::hashing_threads`, a pool beside
+            // `aio_threads`, mmap_disk_io.cpp:1685).
+            hash: DiskQueue::new(handle.clone(), HASH_THREADS),
+            // Uploads are read on threads as many again (libtorrent reads
+            // on its `aio_threads` too).
+            reads: DiskQueue::new(handle.clone(), max_blocking_threads.max(1)),
+            handle,
         }
+    }
+
+    /// The session's block buffers.
+    pub(crate) fn pool(&self) -> &BlockPool {
+        &self.pool
+    }
+
+    /// The threads that write received blocks.
+    pub(crate) fn disk(&self) -> &DiskQueue<WriteJob> {
+        &self.disk
+    }
+
+    /// The threads that check pieces.
+    pub(crate) fn hash(&self) -> &DiskQueue<HashJob> {
+        &self.hash
     }
 
     /// Only call this if you can't call the async function block_in_place_with_semaphore
     /// E.g. if you you have non-send objects on the stack.
     pub fn block_in_place<F: FnOnce() -> R, R>(&self, f: F) -> R {
+        no_block_on_utp_thread();
         if self.allow_block_in_place {
             return tokio::task::block_in_place(f);
         }
@@ -49,6 +104,7 @@ impl BlockingSpawner {
 
     /// like "block_in_place" but limit concurrency.
     pub async fn block_in_place_with_semaphore<F: FnOnce() -> R, R>(&self, f: F) -> R {
+        no_block_on_utp_thread();
         if self.allow_block_in_place {
             let _permit = self
                 .concurrent_block_in_place_semaphore
@@ -69,6 +125,7 @@ impl BlockingSpawner {
         most: usize,
         f: F,
     ) -> R {
+        no_block_on_utp_thread();
         let semaphore = &self.concurrent_block_in_place_semaphore;
         let mut permits = vec![semaphore.acquire().await.unwrap()];
         while permits.len() < most
@@ -95,6 +152,91 @@ impl BlockingSpawner {
     pub fn semaphore(&self) -> Arc<Semaphore> {
         self.concurrent_block_in_place_semaphore.clone()
     }
+
+    /// Runs `f` on one of the session's blocking threads, with no permit:
+    /// from any thread, a uTP thread too, the work runs on the session's
+    /// pool, never on the calling runtime's own.
+    pub(crate) fn spawn_blocking<F, R>(&self, f: F) -> tokio::task::JoinHandle<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.handle.spawn_blocking(f)
+    }
+
+    /// Runs `fut` on the session's runtime, from any thread: a task that
+    /// blocks in place must not land on a uTP thread's runtime.
+    pub(crate) fn spawn<F>(&self, fut: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.handle.spawn(fut)
+    }
+
+    /// Runs `f` on a disk thread for a reader on a uTP thread, its reads in
+    /// order under `key`, and hands the result back with the others that
+    /// finish meanwhile, in one wake of the uTP thread. None when the
+    /// session's runtime shut down before it ran, or it panicked.
+    pub(crate) fn read_off_shard<F, R>(&self, key: usize, f: F) -> crate::off_shard::ReadDone<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        crate::off_shard::read_off_shard(&self.reads, key, f)
+    }
+}
+
+/// A value whose drop never runs on a uTP thread. Dropped on one, it goes
+/// to the session's blocking threads and is dropped there: a torrent's
+/// storage closes its files when dropped, and libtorrent closes files on
+/// its disk threads, never its network thread.
+pub(crate) struct DropOffShard<T: Send + 'static> {
+    value: std::mem::ManuallyDrop<T>,
+    handle: tokio::runtime::Handle,
+}
+
+impl<T: Send + 'static> DropOffShard<T> {
+    /// `value`, dropped off a uTP thread on `spawner`'s blocking threads.
+    pub(crate) fn new(value: T, spawner: &BlockingSpawner) -> Self {
+        Self {
+            value: std::mem::ManuallyDrop::new(value),
+            handle: spawner.handle.clone(),
+        }
+    }
+}
+
+impl<T: Send + 'static> std::ops::Deref for DropOffShard<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T: Send + 'static> Drop for DropOffShard<T> {
+    fn drop(&mut self) {
+        // SAFETY: `value` is taken once, here, and never used after.
+        let value = unsafe { std::mem::ManuallyDrop::take(&mut self.value) };
+        if weaver_utp::on_shard_thread() {
+            // A runtime shut down drops the closure where it is.
+            drop(self.handle.spawn_blocking(move || drop(value)));
+        } else {
+            drop(value);
+        }
+    }
+}
+
+/// Checks, in debug builds and tests, that the calling thread may block: a
+/// uTP thread may not, as every stream on it would wait.
+#[track_caller]
+pub(crate) fn no_block_on_utp_thread() {
+    if cfg!(any(test, debug_assertions)) {
+        assert!(
+            !weaver_utp::on_shard_thread(),
+            "a blocking call on a uTP thread"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -107,5 +249,89 @@ mod tests {
         assert_eq!(BlockingSpawner::new(3).check_threads(), 1);
         assert_eq!(BlockingSpawner::new(1).check_threads(), 1);
         assert_eq!(BlockingSpawner::new(0).check_threads(), 1);
+    }
+
+    // Work handed off another runtime's thread, as a uTP thread's, runs on
+    // the session's runtime: a task there may block in place, and a
+    // blocking call runs on the session's pool.
+    #[test]
+    fn work_handed_from_another_runtime_runs_on_the_sessions() {
+        let session = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let spawner = session.block_on(async { BlockingSpawner::new(4) });
+        let other = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (in_place, flavor) = other.block_on(async {
+            let in_place = spawner
+                .spawn(async { tokio::task::block_in_place(|| 7) })
+                .await
+                .unwrap();
+            let flavor = spawner
+                .spawn_blocking(|| tokio::runtime::Handle::current().runtime_flavor())
+                .await
+                .unwrap();
+            (in_place, flavor)
+        });
+        assert_eq!(in_place, 7);
+        assert_eq!(flavor, tokio::runtime::RuntimeFlavor::MultiThread);
+    }
+    // Says, when dropped, whether it was dropped on a uTP thread.
+    struct Dropped(Option<tokio::sync::oneshot::Sender<bool>>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(weaver_utp::on_shard_thread());
+            }
+        }
+    }
+
+    // A value dropped by a task on a uTP thread, as a peer's task drops the
+    // last hold of a torrent's storage, is dropped on the session's
+    // blocking threads instead; dropped anywhere else, it is dropped there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_value_dropped_on_a_utp_thread_is_dropped_off_it() {
+        use std::net::Ipv4Addr;
+
+        let spawner = BlockingSpawner::new(2);
+        let factory = crate::test_support::socket_factory();
+        let bind = |shards| {
+            crate::listen::bind_utp(
+                factory.as_ref(),
+                (Ipv4Addr::LOCALHOST, 0).into(),
+                weaver_utp::SocketOpts {
+                    shards,
+                    ..Default::default()
+                },
+                crate::udp_options::STREAM_WINDOW,
+                None,
+            )
+        };
+        let server = bind(Some(weaver_utp::Shards::new("utp-drop-test", 1)))
+            .await
+            .unwrap();
+        let client = bind(None).await.unwrap();
+        let (accepted, connected) =
+            tokio::join!(server.accept(), client.connect(server.bind_addr()));
+        let accepted = accepted.unwrap();
+        let home = accepted.home().cloned().expect("a stream on a uTP thread");
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let held = super::DropOffShard::new(Dropped(Some(tx)), &spawner);
+        home.spawn(async move {
+            assert!(weaver_utp::on_shard_thread());
+            drop(held);
+        })
+        .await
+        .unwrap();
+        assert!(!rx.await.unwrap(), "dropped on the uTP thread");
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        drop(super::DropOffShard::new(Dropped(Some(tx)), &spawner));
+        assert_eq!(rx.try_recv(), Ok(false), "dropped where it was");
+        drop((accepted, connected));
     }
 }

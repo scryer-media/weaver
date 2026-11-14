@@ -4,7 +4,7 @@
 use std::{future::Future, io, sync::Arc};
 
 use parking_lot::Mutex;
-use tokio::{sync::watch, task::JoinSet};
+use tokio::{runtime::Handle, sync::watch, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::{Error, traits::Transport};
@@ -37,6 +37,9 @@ struct State<T> {
     transport: Option<Arc<T>>,
     tasks: JoinSet<()>,
     closing: bool,
+    // Where the tasks run, when not on the runtime the socket was made on.
+    // Kept until every task has finished.
+    shards: Option<crate::Shards>,
 }
 
 pub(crate) struct Runtime<T> {
@@ -46,13 +49,18 @@ pub(crate) struct Runtime<T> {
 }
 
 impl<T: Transport> Runtime<T> {
-    pub(crate) fn new(transport: Arc<T>, parent: &CancellationToken) -> Arc<Self> {
+    pub(crate) fn new(
+        transport: Arc<T>,
+        parent: &CancellationToken,
+        shards: Option<crate::Shards>,
+    ) -> Arc<Self> {
         let (completed, _) = watch::channel(None);
         let runtime = Arc::new(Self {
             state: Mutex::new(State {
                 transport: Some(transport),
                 tasks: JoinSet::new(),
                 closing: false,
+                shards,
             }),
             cancellation: parent.child_token(),
             completed,
@@ -102,6 +110,28 @@ impl<T: Transport> Runtime<T> {
         self: &Arc<Self>,
         build: impl FnOnce(Arc<T>) -> F,
     ) -> crate::Result<()> {
+        self.spawn(build, false).map(drop)
+    }
+
+    // A stream's task: on the least loaded shard when there are several.
+    // Returns the shard it runs on, when it runs on one.
+    pub(crate) fn register_stream<F: Future<Output = ()> + Send + 'static>(
+        self: &Arc<Self>,
+        build: impl FnOnce(Arc<T>) -> F,
+    ) -> crate::Result<Option<Handle>> {
+        self.spawn(build, true)
+    }
+
+    fn spawn<F: Future<Output = ()> + Send + 'static>(
+        self: &Arc<Self>,
+        build: impl FnOnce(Arc<T>) -> F,
+        stream: bool,
+    ) -> crate::Result<Option<Handle>> {
+        // The threads start, the first time, before the state lock is taken.
+        let shards = self.state.lock().shards.clone();
+        if let Some(shards) = shards {
+            shards.start();
+        }
         let mut state = self.state.lock();
         while let Some(result) = state.tasks.try_join_next() {
             if let Err(error) = result {
@@ -114,8 +144,44 @@ impl<T: Transport> Runtime<T> {
             return Err(Error::DispatcherDead);
         }
         let transport = state.transport.clone().ok_or(Error::DispatcherDead)?;
-        state.tasks.spawn(build(transport));
-        Ok(())
+        let spread = transport.sends_from_one_task() && transport.spreads_streams();
+        // Boxed once here: the I/O task's future is large, and each arm
+        // below would otherwise hold its own copy on the stack.
+        let task: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(build(transport));
+        let state = &mut *state;
+        let home = match &state.shards {
+            Some(shards) if stream => match shards.place_stream(spread) {
+                Some((handle, placed)) => {
+                    state.tasks.spawn_on(
+                        async move {
+                            let _placed = placed;
+                            task.await;
+                        },
+                        &handle,
+                    );
+                    Some(handle)
+                }
+                None => {
+                    state.tasks.spawn(task);
+                    None
+                }
+            },
+            Some(shards) => match shards.io() {
+                Some(io) => {
+                    state.tasks.spawn_on(task, &io);
+                    Some(io)
+                }
+                None => {
+                    state.tasks.spawn(task);
+                    None
+                }
+            },
+            None => {
+                state.tasks.spawn(task);
+                None
+            }
+        };
+        Ok(home)
     }
 
     pub(crate) fn request_shutdown(&self) {
@@ -127,20 +193,25 @@ impl<T: Transport> Runtime<T> {
     }
 
     fn close(&self, mut failure: Option<Failure>) {
-        let (mut tasks, transport) = {
+        let (mut tasks, transport, shards) = {
             let mut state = self.state.lock();
             if state.closing {
                 return;
             }
             state.closing = true;
             self.cancellation.cancel();
-            (std::mem::take(&mut state.tasks), state.transport.take())
+            (
+                std::mem::take(&mut state.tasks),
+                state.transport.take(),
+                state.shards.take(),
+            )
         };
         let completed = self.completed.clone();
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             tasks.abort_all();
             drop(tasks);
             drop(transport);
+            drop(shards);
             completed.send_replace(Some(Err(Failure::new(io::Error::other(
                 "runtime unavailable during shutdown",
             )))));
@@ -175,6 +246,8 @@ impl<T: Transport> Runtime<T> {
                 }
             }
             completed.send_replace(Some(failure.map_or(Ok(()), Err)));
+            // The shards outlive every task that ran on them.
+            drop(shards);
         });
     }
 

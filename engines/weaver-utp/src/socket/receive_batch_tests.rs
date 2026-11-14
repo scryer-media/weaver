@@ -31,7 +31,7 @@ struct Rig {
     dispatcher: Dispatcher<MockUtpTransport, MockUtpEnvironment>,
     _socket: std::sync::Arc<UtpSocket<MockUtpTransport, MockUtpEnvironment>>,
     wire: UnboundedSender<(SocketAddr, Vec<u8>)>,
-    buf: Vec<u8>,
+    buf: crate::socket::RecvBufs,
     errors: usize,
 }
 
@@ -49,7 +49,7 @@ impl Rig {
             dispatcher,
             _socket: socket,
             wire,
-            buf: vec![0u8; u16::MAX as usize],
+            buf: crate::socket::RecvBufs::new(),
             errors: 0,
         }
     }
@@ -209,4 +209,49 @@ async fn a_socket_that_never_empties_still_admits_connects_and_accepts() {
     assert!(rig.dispatcher.connecting.contains_key(&ADDR_3));
     connect.abort();
     accept.abort();
+}
+
+// A data packet's payload stays in the pooled buffer it was received into,
+// and the next datagram gets another: no copy and no allocation. One longer
+// than that buffer is read on into the spill buffer and joined once.
+#[test]
+fn a_payload_stays_in_the_buffer_it_was_received_into() {
+    let mut bufs = crate::socket::RecvBufs::new();
+    let header = UtpHeader {
+        htype: Type::Data,
+        connection_id: ID_A.into(),
+        ..Default::default()
+    };
+    let hlen = header.serialize(&mut bufs.head).unwrap();
+    bufs.head[hlen..hlen + 100].fill(7);
+    let at = bufs.head.as_ptr();
+    let message = bufs
+        .message(hlen + 100, tokio::time::Instant::now())
+        .unwrap();
+    assert_eq!(message.data.as_ptr(), at.wrapping_add(hlen));
+    assert_eq!(&*message.data, &[7; 100][..]);
+    assert_ne!(
+        bufs.head.as_ptr(),
+        at,
+        "the next datagram gets another buffer"
+    );
+
+    // 3,000 bytes: the pooled buffer's 2,048, then the spill buffer.
+    let long = 3000;
+    let hlen = header.serialize(&mut bufs.head).unwrap();
+    bufs.head[hlen..].fill(8);
+    let tail = long - bufs.head.len();
+    bufs.spill[..tail].fill(9);
+    let message = bufs.message(long, tokio::time::Instant::now()).unwrap();
+    assert_eq!(message.data.len(), long - hlen);
+    assert!(
+        message.data[..crate::rx_buf::RX_BUF_LEN - hlen]
+            .iter()
+            .all(|b| *b == 8)
+    );
+    assert!(
+        message.data[crate::rx_buf::RX_BUF_LEN - hlen..]
+            .iter()
+            .all(|b| *b == 9)
+    );
 }

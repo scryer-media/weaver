@@ -242,6 +242,8 @@ impl Harness {
             answers: Default::default(),
             counters,
             first_message_received: AtomicBool::new(false),
+            disk: Default::default(),
+            upload: Default::default(),
             cancel_token: self.live.cancellation_token.child_token(),
             client_name_and_version: String::new(),
         };
@@ -2429,7 +2431,7 @@ async fn a_block_cut_short_by_the_connection_ending_counts_as_redundant() {
 
     let h = Harness::new("partial_block_redundant").await;
     let (checked, slot, mut theirs) = h.incoming("192.0.2.1:6881");
-    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    let added = h.live.add_incoming_peer(checked, slot, None).unwrap();
     assert!(matches!(added, AddIncomingPeerResult::Added));
 
     let mut frame = (9 + CHUNK_SIZE).to_be_bytes().to_vec();
@@ -2470,7 +2472,7 @@ async fn a_block_cut_short_by_a_pause_counts_as_redundant_once() {
         meter: Default::default(),
     };
     let slot = h._session.connection_slots.try_accept().unwrap();
-    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    let added = h.live.add_incoming_peer(checked, slot, None).unwrap();
     assert!(matches!(added, AddIncomingPeerResult::Added));
 
     let mut frame = (9 + CHUNK_SIZE).to_be_bytes().to_vec();
@@ -2514,7 +2516,7 @@ async fn the_end_of_a_run_waits_for_its_connections_to_count_the_block_they_were
         meter: Default::default(),
     };
     let slot = h._session.connection_slots.try_accept().unwrap();
-    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    let added = h.live.add_incoming_peer(checked, slot, None).unwrap();
     assert!(matches!(added, AddIncomingPeerResult::Added));
 
     let mut frame = (9 + CHUNK_SIZE).to_be_bytes().to_vec();
@@ -2565,7 +2567,7 @@ async fn a_torrent_paused_mid_piece_announces_the_payload_it_received() {
         meter: Default::default(),
     };
     let slot = h._session.connection_slots.try_accept().unwrap();
-    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    let added = h.live.add_incoming_peer(checked, slot, None).unwrap();
     assert!(matches!(added, AddIncomingPeerResult::Added));
     let mut frame = (9 + CHUNK_SIZE).to_be_bytes().to_vec();
     frame.push(7);
@@ -5487,7 +5489,7 @@ async fn an_incoming_connection_at_the_cap_replaces_the_oldest_connect_while_man
     }
 
     let (checked, slot, _theirs) = h.incoming("192.0.2.1:6881");
-    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    let added = h.live.add_incoming_peer(checked, slot, None).unwrap();
     assert!(matches!(added, AddIncomingPeerResult::Added));
     let [(oldest, oldest_rx), (newer, newer_rx)] = &mut connects[..] else {
         unreachable!()
@@ -5521,7 +5523,7 @@ async fn an_incoming_connection_at_the_cap_replaces_a_connection_that_ranks_lowe
     ];
 
     let (checked, slot, _theirs) = h.incoming("192.0.2.1:6881");
-    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    let added = h.live.add_incoming_peer(checked, slot, None).unwrap();
     assert!(matches!(added, AddIncomingPeerResult::Added));
     assert!(asked_to_close(&mut on_parole_rx));
     assert!(!asked_to_close(&mut kept_rx));
@@ -5542,7 +5544,7 @@ async fn an_incoming_connection_at_the_cap_that_ranks_no_higher_is_refused() {
     let _held = [h.hold(a.addr, &a.tx), h.hold(b.addr, &b.tx)];
 
     let (checked, slot, _theirs) = h.incoming("192.0.2.1:6881");
-    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    let added = h.live.add_incoming_peer(checked, slot, None).unwrap();
     assert!(matches!(
         added,
         AddIncomingPeerResult::ConcurrencyLimitReached
@@ -5571,7 +5573,7 @@ async fn an_incoming_encrypted_connection_is_advertised_encrypted_in_our_pex() {
         } else {
             crate::mse::Encryption::None
         };
-        let added = h.live.add_incoming_peer(checked, slot).unwrap();
+        let added = h.live.add_incoming_peer(checked, slot, None).unwrap();
         assert!(matches!(added, AddIncomingPeerResult::Added));
         // Our handshake and the first byte after it, which is written once
         // the connection has told the torrent how the peer greeted.
@@ -6490,6 +6492,8 @@ impl Harness {
             answers: Default::default(),
             counters,
             first_message_received: AtomicBool::new(true),
+            disk: Default::default(),
+            upload: Default::default(),
             cancel_token: self.live.cancellation_token.child_token(),
             client_name_and_version: String::new(),
         };
@@ -7665,7 +7669,7 @@ async fn quiet_peers_harness(name: &str) -> Harness {
 async fn handshaken_as(h: &Harness, addr: &str, peer_id: Id20) -> tokio::io::DuplexStream {
     use tokio::io::AsyncReadExt;
     let (checked, slot, mut theirs) = h.incoming_as(addr, peer_id);
-    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    let added = h.live.add_incoming_peer(checked, slot, None).unwrap();
     assert!(matches!(added, AddIncomingPeerResult::Added));
     let mut handshake = [0; 68];
     theirs.read_exact(&mut handshake).await.unwrap();
@@ -7707,7 +7711,7 @@ async fn a_second_connection_from_a_client_whose_id_is_below_ours_is_closed() {
     let mut first = handshaken_as(&h, "192.0.2.1:6881", client).await;
 
     let (checked, slot, mut second) = h.incoming_as("[2001:db8::1]:6881", client);
-    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    let added = h.live.add_incoming_peer(checked, slot, None).unwrap();
     assert!(matches!(added, AddIncomingPeerResult::Added));
     let mut written = Vec::new();
     second.read_to_end(&mut written).await.unwrap();
@@ -7778,5 +7782,446 @@ async fn a_connection_to_ourselves_is_closed_and_its_address_never_dialed_again(
     assert_eq!(
         h.peers.next_candidate(tokio::time::Instant::now()),
         peers::NextCandidate::None
+    );
+}
+
+/// A memory storage that writes as a file storage does (off the network
+/// threads, through the disk queue), counts the bytes it writes, and holds the one
+/// write it is armed for until released.
+#[derive(Clone, Default)]
+struct GatedStorageFactory {
+    inner: MemoryStorageFactory,
+    gate: Arc<Gate>,
+}
+
+#[derive(Default)]
+struct Gate {
+    armed: AtomicBool,
+    // Bytes written.
+    written: AtomicUsize,
+    entered: Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>,
+    release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl Gate {
+    /// Arms the gate: the next write is held until the returned sender is
+    /// sent to, and the returned receiver hears when it is held.
+    fn arm(
+        &self,
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered_tx, entered) = tokio::sync::mpsc::unbounded_channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        *self.entered.lock() = Some(entered_tx);
+        *self.release.lock() = Some(release_rx);
+        self.armed.store(true, Ordering::SeqCst);
+        (entered, release)
+    }
+}
+
+struct GatedStorage {
+    inner: Box<dyn TorrentStorage>,
+    gate: Arc<Gate>,
+}
+
+impl StorageFactory for GatedStorageFactory {
+    type Storage = GatedStorage;
+
+    fn create(
+        &self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+    ) -> anyhow::Result<GatedStorage> {
+        Ok(GatedStorage {
+            inner: Box::new(self.inner.create(shared, metadata)?),
+            gate: self.gate.clone(),
+        })
+    }
+
+    fn clone_box(&self) -> BoxStorageFactory {
+        self.clone().boxed()
+    }
+}
+
+impl TorrentStorage for GatedStorage {
+    fn init(
+        &mut self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+    ) -> anyhow::Result<()> {
+        self.inner.init(shared, metadata)
+    }
+
+    fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        self.inner.pread_exact(file_id, offset, buf)
+    }
+
+    fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+        if self.gate.armed.swap(false, Ordering::SeqCst) {
+            let entered = self.gate.entered.lock().take().unwrap();
+            let release = self.gate.release.lock().take().unwrap();
+            entered.send(()).unwrap();
+            release.recv().unwrap();
+        }
+        self.gate.written.fetch_add(buf.len(), Ordering::SeqCst);
+        self.inner.pwrite_all(file_id, offset, buf)
+    }
+
+    fn remove_file(&self, file_id: usize, filename: &std::path::Path) -> anyhow::Result<()> {
+        self.inner.remove_file(file_id, filename)
+    }
+
+    fn remove_directory_if_empty(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.inner.remove_directory_if_empty(path)
+    }
+
+    fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+        self.inner.ensure_file_length(file_id, length)
+    }
+
+    fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+        Ok(Box::new(GatedStorage {
+            inner: self.inner.take()?,
+            gate: self.gate.clone(),
+        }))
+    }
+
+    fn on_piece_completed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+        self.inner.on_piece_completed(piece)
+    }
+}
+
+impl Harness {
+    /// The peer is asked for chunk `chunk` of piece `index`, and it arrives
+    /// in a pool buffer, as a connection receives it, to be queued for the
+    /// disk.
+    async fn send_block(&self, peer: &PeerHandler, (index, chunk): (u32, u32)) {
+        let info = self.chunk(index, chunk);
+        self.peers
+            .with_live_mut(peer.addr, "test", |live| live.add_inflight_request(info))
+            .unwrap();
+        let start = (index * PIECE_LENGTH + chunk * CHUNK_SIZE) as usize;
+        let len = CHUNK_SIZE as usize;
+        let mut buf = self.live.shared.spawner.pool().take();
+        buf.as_mut_slice()[..len].copy_from_slice(&self.content[start..start + len]);
+        peer.on_received_block(Block::new(index, chunk * CHUNK_SIZE, len, buf))
+            .await
+            .unwrap();
+    }
+}
+
+// The connection that brought the last block of piece 0 ends while that
+// block is being written on a disk thread. The torrent, not the connection,
+// owns the write's completion (libtorrent `on_disk_write_complete` runs
+// whatever became of the peer): the block lands, the piece is checked, and
+// the torrent completes. The buffer goes back to the pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_last_block_whose_connection_ends_mid_write_is_landed_and_checked() {
+    let storage = GatedStorageFactory::default();
+    // Piece 1 is had: the torrent completes once piece 0 is.
+    let h = Harness::build_on(
+        "last_block_cancel",
+        0x40,
+        isolated_session_opts(false),
+        storage.clone_box(),
+    )
+    .await;
+    let pool = h.live.shared.spawner.pool().clone();
+    let (owner, _owner_rx) = h.peer("127.0.0.1:6881");
+    h.take(&owner, 0);
+    let last = CHUNKS_PER_PIECE - 1;
+    for chunk in 0..last {
+        h.send(&owner, (0, chunk), false).await.unwrap();
+    }
+    assert_eq!(h.missing_chunks(0), vec![last]);
+
+    let (mut entered, release) = storage.gate.arm();
+    h.send_block(&owner, (0, last)).await;
+    entered.recv().await.unwrap();
+    assert_eq!(pool.in_use(), 1);
+    // The connection ends mid-write.
+    owner.on_peer_died(None).unwrap();
+    release.send(()).unwrap();
+
+    h.handle().wait_until_completed().await.unwrap();
+    assert!(h.have(0));
+    h.live.shared.spawner.disk().idle().await;
+    assert_eq!(pool.in_use(), 0);
+}
+
+// The torrent pauses with one block being written and one queued behind
+// it. The write under way finishes, and the run does not end before it
+// does; the queued block is not written, its buffer goes back, and nothing
+// is left in the pool's count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pause_with_blocks_queued_writes_none_after_it_and_returns_their_buffers() {
+    let storage = GatedStorageFactory::default();
+    let h = Harness::build_on(
+        "pause_with_blocks_queued",
+        0x40,
+        isolated_session_opts(false),
+        storage.clone_box(),
+    )
+    .await;
+    let pool = h.live.shared.spawner.pool().clone();
+    let (owner, _owner_rx) = h.peer("127.0.0.1:6881");
+    h.take(&owner, 0);
+
+    let (mut entered, release) = storage.gate.arm();
+    h.send_block(&owner, (0, 0)).await;
+    entered.recv().await.unwrap();
+    // One disk thread is busy with the held write: the next block waits in
+    // the queue behind it.
+    h.send_block(&owner, (0, 1)).await;
+    assert_eq!(pool.in_use(), 2);
+
+    let _paused = h.live.pause().unwrap();
+    let run = h.live.shared.ending_run.lock().clone().unwrap();
+    let mut ended = Box::pin(run.wait());
+    assert!(futures::poll!(ended.as_mut()).is_pending());
+
+    release.send(()).unwrap();
+    ended.await;
+    h.live.shared.spawner.disk().idle().await;
+    // The held write went through; the queued one never did.
+    assert_eq!(
+        storage.gate.written.load(Ordering::SeqCst),
+        CHUNK_SIZE as usize
+    );
+    assert_eq!(pool.in_use(), 0);
+    assert_eq!(owner.disk.outstanding(), 0);
+}
+
+// A connection whose blocks fill the pool to its high mark, one write of
+// its own already outstanding, stops reading; once its writes are done it
+// reads again (libtorrent `peer_connection::incoming_piece` sets `bw_disk`,
+// `on_disk_write_complete` clears it). The disk thread woke once for the
+// batch, not once per block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_stops_reading_at_the_pools_high_mark_and_reads_again_once_written() {
+    let storage = GatedStorageFactory::default();
+    let add = AddTorrentOptions {
+        storage_factory: Some(storage.clone_box()),
+        ..Default::default()
+    };
+    let out = TempDir::with_prefix("disk_back_pressure").unwrap();
+    let opts = SessionOptions {
+        // One disk thread: every block queued behind the held one waits.
+        runtime_worker_threads: Some(1),
+        ..isolated_session_opts(false)
+    };
+    let session = Session::new_with_opts(out.path().into(), opts)
+        .await
+        .unwrap();
+    let h = Harness::added_to(session, out, "disk_back_pressure", 16, &[0, 0], add).await;
+    let pool = h.live.shared.spawner.pool().clone();
+    let high = pool.max_use() / 2 + pool.max_use() / 4;
+    let (owner, _owner_rx) = h.peer("127.0.0.1:6881");
+
+    // The connection takes every piece.
+    owner.on_i_am_unchoked();
+    let mut pieces = Vec::new();
+    while let Some(piece) = owner.acquire_next_piece().unwrap().piece() {
+        pieces.push(piece.get());
+    }
+    let blocks: Vec<(u32, u32)> = pieces
+        .iter()
+        .flat_map(|&index| (0..CHUNKS_PER_PIECE).map(move |chunk| (index, chunk)))
+        .take(high)
+        .collect();
+    assert_eq!(blocks.len(), high);
+
+    let (mut entered, release) = storage.gate.arm();
+    for (sent, &block) in blocks.iter().enumerate() {
+        h.send_block(&owner, block).await;
+        if sent == 0 {
+            entered.recv().await.unwrap();
+        }
+        // Below the high mark the connection reads on.
+        assert_eq!(
+            owner.disk.blocked(),
+            sent + 1 == high,
+            "after {sent} blocks"
+        );
+    }
+    assert_eq!(pool.in_use(), high);
+    let handler = &owner;
+    let mut room = Box::pin(handler.disk_room());
+    assert!(futures::poll!(room.as_mut()).is_pending());
+
+    release.send(()).unwrap();
+    room.await;
+    assert!(!owner.disk.blocked());
+    h.live.shared.spawner.disk().idle().await;
+    assert_eq!(pool.in_use(), 0);
+    // One wake: the thread that wrote the held block took every block
+    // queued behind it as one batch.
+    assert_eq!(h.live.shared.spawner.disk().wakes(), 1);
+}
+
+/// A memory storage, writing as a file storage does, whose one armed read
+/// (the check of a piece reading it back) is held until released.
+#[derive(Clone, Default)]
+struct ReadGatedStorageFactory {
+    inner: MemoryStorageFactory,
+    gate: Arc<Gate>,
+}
+
+struct ReadGatedStorage {
+    inner: Box<dyn TorrentStorage>,
+    gate: Arc<Gate>,
+}
+
+impl StorageFactory for ReadGatedStorageFactory {
+    type Storage = ReadGatedStorage;
+
+    fn create(
+        &self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+    ) -> anyhow::Result<ReadGatedStorage> {
+        Ok(ReadGatedStorage {
+            inner: Box::new(self.inner.create(shared, metadata)?),
+            gate: self.gate.clone(),
+        })
+    }
+
+    fn clone_box(&self) -> BoxStorageFactory {
+        self.clone().boxed()
+    }
+}
+
+impl TorrentStorage for ReadGatedStorage {
+    fn init(
+        &mut self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+    ) -> anyhow::Result<()> {
+        self.inner.init(shared, metadata)
+    }
+
+    fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        if self.gate.armed.swap(false, Ordering::SeqCst) {
+            let entered = self.gate.entered.lock().take().unwrap();
+            let release = self.gate.release.lock().take().unwrap();
+            entered.send(()).unwrap();
+            release.recv().unwrap();
+        }
+        self.inner.pread_exact(file_id, offset, buf)
+    }
+
+    fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+        self.inner.pwrite_all(file_id, offset, buf)
+    }
+
+    fn remove_file(&self, file_id: usize, filename: &std::path::Path) -> anyhow::Result<()> {
+        self.inner.remove_file(file_id, filename)
+    }
+
+    fn remove_directory_if_empty(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.inner.remove_directory_if_empty(path)
+    }
+
+    fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+        self.inner.ensure_file_length(file_id, length)
+    }
+
+    fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+        Ok(Box::new(ReadGatedStorage {
+            inner: self.inner.take()?,
+            gate: self.gate.clone(),
+        }))
+    }
+
+    fn on_piece_completed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+        self.inner.on_piece_completed(piece)
+    }
+}
+
+// Every block of piece 0 is written; the last write takes the piece out of
+// flight and queues its check on a hashing thread. The torrent pauses while
+// that check reads the piece back. The paused state lets the piece go, so
+// the check that ends after the pause, which finds the torrent gone, leaves
+// nothing stuck: resumed, the piece is fetched again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pause_while_a_piece_is_checked_lets_the_piece_go() {
+    let storage = ReadGatedStorageFactory::default();
+    let h = Harness::build_on(
+        "pause_mid_check",
+        0x40,
+        isolated_session_opts(false),
+        storage.clone_box(),
+    )
+    .await;
+    let (owner, _owner_rx) = h.peer("127.0.0.1:6881");
+    h.take(&owner, 0);
+    let (mut entered, release) = storage.gate.arm();
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send_block(&owner, (0, chunk)).await;
+    }
+    // The check of piece 0 is reading it back.
+    entered.recv().await.unwrap();
+    let paused = h.live.pause().unwrap();
+    let run = h.live.shared.ending_run.lock().clone().unwrap();
+    release.send(()).unwrap();
+    run.wait().await;
+
+    let piece = h.piece(0);
+    let chunks = &paused.chunk_tracker;
+    assert!(!chunks.is_piece_have(piece), "the check did not pass it");
+    assert_eq!(
+        chunks.received_chunks(piece),
+        0,
+        "piece 0 kept its blocks as received and is not queued: stuck (queued: {:?})",
+        chunks
+            .iter_queued_pieces()
+            .map(|p| p.get())
+            .collect::<Vec<_>>()
+    );
+}
+
+// The last block of piece 0 lands and takes the piece out of flight. What
+// came of it is dropped before its check is queued, as a panic later in the
+// same batch drops it (a later block's marking, or an earlier job's
+// completion). The piece's check owns it from when it left flight, so the
+// drop puts it back in the queue with no blocks: not stuck until a pause.
+#[tokio::test]
+async fn a_landed_piece_dropped_before_its_check_goes_back_to_the_queue() {
+    let h = Harness::new("landed_dropped").await;
+    let (owner, _owner_rx) = h.peer("127.0.0.1:6881");
+    h.take(&owner, 0);
+    let last = CHUNKS_PER_PIECE - 1;
+    for chunk in 0..last {
+        h.send(&owner, (0, chunk), false).await.unwrap();
+    }
+    let info = h.chunk(0, last);
+    h.peers
+        .with_live_mut(owner.addr, "test", |live| live.add_inflight_request(info))
+        .unwrap();
+    let chunk = owner
+        .received_block(0, last * CHUNK_SIZE, CHUNK_SIZE as usize)
+        .unwrap();
+    let start = (last * CHUNK_SIZE) as usize;
+    let block = h.content[start..start + CHUNK_SIZE as usize].to_vec();
+    let landed = land_block(
+        &h.live,
+        owner.addr,
+        &Piece::from_data(0, last * CHUNK_SIZE, &block[..]),
+        &chunk,
+    )
+    .unwrap();
+    assert!(landed.is_some(), "the last block completes piece 0");
+    assert!(
+        !h.queued_pieces().contains(&0),
+        "out of the queue for its check"
+    );
+
+    drop(landed);
+    assert!(h.queued_pieces().contains(&0), "piece 0 is stuck");
+    assert_eq!(
+        h.missing_chunks(0),
+        (0..CHUNKS_PER_PIECE).collect::<Vec<_>>()
     );
 }

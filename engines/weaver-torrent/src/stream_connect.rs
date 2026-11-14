@@ -305,6 +305,7 @@ impl StreamConnector {
     /// tries what `encrypt` says then. The returned halves carry the peer's
     /// reply, the meter counts every byte they move, the encryption handshake
     /// and ours included, and the [`Encryption`] says how the handshake went.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub async fn connect_and_send_handshake(
         &self,
@@ -323,11 +324,49 @@ impl StreamConnector {
         Meter,
         Encryption,
     )> {
+        self.connect_and_send_handshake_homed(
+            addr,
+            transports,
+            guard,
+            info_hash,
+            handshake,
+            encrypt,
+            connect_timeout,
+            rw_timeout,
+        )
+        .await
+        .map(|(connected, _home)| connected)
+    }
+
+    /// As [`Self::connect_and_send_handshake`], with the thread the
+    /// connection's transport runs on when it has one of its own: a uTP
+    /// stream's.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn connect_and_send_handshake_homed(
+        &self,
+        addr: SocketAddr,
+        transports: Transports,
+        guard: Guard<'_>,
+        info_hash: &Id20,
+        handshake: &[u8],
+        encrypt: impl FnOnce() -> bool,
+        connect_timeout: Duration,
+        rw_timeout: Duration,
+    ) -> Result<(
+        (
+            ConnectionKind,
+            BoxAsyncReadVectored,
+            mse::Outbound,
+            Meter,
+            Encryption,
+        ),
+        Option<tokio::runtime::Handle>,
+    )> {
         // The attempts still running when the time runs out end as timed
         // out: the flag is set before the dial, and with it its attempts, is
         // dropped.
         let expired = AtomicBool::new(false);
-        let (kind, r, w) = {
+        let (kind, r, w, home) = {
             let dial = self.dial(addr, transports, &expired);
             tokio::pin!(dial);
             match tokio::time::timeout(connect_timeout, &mut dial).await {
@@ -356,7 +395,7 @@ impl StreamConnector {
                     w.write_all(handshake).map_err(Error::WriteHandshake),
                 )
                 .await?;
-                return Ok((kind, r, w.into(), meter, Encryption::None));
+                return Ok(((kind, r, w.into(), meter, Encryption::None), home));
             }
         };
 
@@ -374,7 +413,7 @@ impl StreamConnector {
                 w.write_all(handshake).map_err(Error::WriteHandshake),
             )
             .await?;
-            return Ok((kind, r, w.into(), meter, Encryption::None));
+            return Ok(((kind, r, w.into(), meter, Encryption::None), home));
         }
 
         stats.attempts(1);
@@ -394,11 +433,14 @@ impl StreamConnector {
             stats.header_only(1);
         }
         Ok((
-            kind,
-            established.reader,
-            established.writer,
-            meter,
-            encryption,
+            (
+                kind,
+                established.reader,
+                established.writer,
+                meter,
+                encryption,
+            ),
+            home,
         ))
     }
 
@@ -482,17 +524,25 @@ impl StreamConnector {
         addr: SocketAddr,
         transports: Transports,
     ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
-        self.dial(addr, transports, &AtomicBool::new(false)).await
+        self.dial(addr, transports, &AtomicBool::new(false))
+            .await
+            .map(|(kind, r, w, _home)| (kind, r, w))
     }
 
-    // Connect as `connect` does. An attempt dropped unfinished counts as
-    // timed out when `expired` is set by then, and as failed otherwise.
+    // Connect as `connect` does, with the thread a uTP stream runs on. An
+    // attempt dropped unfinished counts as timed out when `expired` is set
+    // by then, and as failed otherwise.
     async fn dial(
         &self,
         addr: SocketAddr,
         transports: Transports,
         expired: &AtomicBool,
-    ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
+    ) -> Result<(
+        ConnectionKind,
+        BoxAsyncReadVectored,
+        BoxAsyncWrite,
+        Option<tokio::runtime::Handle>,
+    )> {
         let addr = crate::network::canonical_socket_addr(addr);
         if addr.port() == 0 {
             return Err(Error::Anyhow(anyhow::anyhow!(
@@ -590,7 +640,7 @@ impl StreamConnector {
                 tcp_res = &mut tcp_connect, if tcp_err.is_none() => {
                     match tcp_res {
                         Ok(Some((r, w))) => {
-                            return Ok((ConnectionKind::Tcp, r, w));
+                            return Ok((ConnectionKind::Tcp, r, w, None));
                         },
                         Ok(None) => {
                             tcp_err = Some(None);
@@ -605,8 +655,9 @@ impl StreamConnector {
                 utp_res = &mut utp_connect, if utp_err.is_none() => {
                     match utp_res {
                         Ok(Some(stream)) => {
+                            let home = stream.home().cloned();
                             let (r, w) = stream.split();
-                            return Ok((ConnectionKind::Utp, Box::new(r), Box::new(w)));
+                            return Ok((ConnectionKind::Utp, Box::new(r), Box::new(w), home));
                         },
                         Ok(None) => {
                             utp_err = Some(None);
