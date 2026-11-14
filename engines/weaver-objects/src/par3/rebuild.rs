@@ -292,8 +292,10 @@ pub(super) fn repair_set(
         .filter(|(member, _)| member.is_some())
         .map(|(_, extent)| extent.range.end.saturating_sub(extent.range.start))
         .fold(tails, u64::saturating_add);
+    // Each is written twice: into the staged output, and into the member
+    // while the staged output still stands.
     if writes > 0 {
-        access.will_write(writes);
+        access.will_write(writes.saturating_mul(2));
     }
     let memory = budget.memory_or(super::REPAIR_MEMORY_LIMIT);
     let copied = copy_held(&held, &unproven, memory.max(READ), access);

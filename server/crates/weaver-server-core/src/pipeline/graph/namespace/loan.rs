@@ -426,6 +426,11 @@ impl Repaired {
         self.gave_back
     }
 
+    // What the repair said it writes in all.
+    pub(crate) fn writes(&self) -> u64 {
+        self.writes
+    }
+
     // Each run's member and how many bytes it holds, in the order written.
     pub(crate) fn sizes(&self) -> impl Iterator<Item = (MemberId, u64)> + '_ {
         self.runs.iter().map(|(member, _, at)| (*member, at.len()))

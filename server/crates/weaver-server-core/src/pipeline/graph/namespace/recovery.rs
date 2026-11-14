@@ -835,33 +835,53 @@ impl NamespaceWriter {
         });
         let applied = (|| {
             let mut rejected = tree.rejected_inputs(node, repaired.members());
-            self.bind_recoveries(tree, builder, segments, node, out)?;
             let mut rewritten = std::collections::BTreeSet::new();
-            // Whether every slice was turned away. A slice lands only where
-            // no repair wrote before it, unless the set outranks every other
-            // set beside it: a set that disagrees with another's repair loses
-            // there to an equal or a higher one, so no two rewrite each other
-            // in turn.
-            let contested = !tree.outranks(node, set);
             let (mut offered, mut landed) = (false, false);
-            for (member, offset, bytes) in repaired.slices() {
-                let bytes = bytes?;
-                offered = true;
-                let arrival = Arrival {
-                    node,
-                    member,
-                    offset,
-                    // A repair's output: nothing proved it on the way.
-                    bytes: bytes.into(),
-                    provenance: Provenance::Repaired,
-                };
-                let write = Write::new(&arrival);
-                if self.place_as(tree, builder, segments, (arrival, contested), write, out)? > 0 {
-                    landed = true;
-                    rewritten.insert(member);
+            let placed = (|| {
+                self.bind_recoveries(tree, builder, segments, node, out)?;
+                // Whether every slice was turned away. A slice lands only
+                // where no repair wrote before it, unless the set outranks
+                // every other set beside it: a set that disagrees with
+                // another's repair loses there to an equal or a higher one,
+                // so no two rewrite each other in turn.
+                let contested = !tree.outranks(node, set);
+                for (member, offset, bytes) in repaired.slices() {
+                    let bytes = bytes?;
+                    offered = true;
+                    let arrival = Arrival {
+                        node,
+                        member,
+                        offset,
+                        // A repair's output: nothing proved it on the way.
+                        bytes: bytes.into(),
+                        provenance: Provenance::Repaired,
+                    };
+                    let write = Write::new(&arrival);
+                    if self.place_as(tree, builder, segments, (arrival, contested), write, out)? > 0
+                    {
+                        landed = true;
+                        rewritten.insert(member);
+                    }
                 }
+                Ok::<_, WriteError>(())
+            })();
+            // The staged output goes whether or not its slices landed: one
+            // a member had no room for is not left on the disk while the
+            // job waits. The repair runs again, so the job waits for all it
+            // writes, staged and placed.
+            let writes = repaired.writes();
+            let removed = repaired.remove();
+            if let Err(error) = placed {
+                if let WriteError::Leaf(super::LeafError::Io { source, .. }) = &error
+                    && crate::operations::is_out_of_space(source)
+                    && writes > 0
+                {
+                    self.gave_back = Some(self.gave_back.unwrap_or(0).max(writes));
+                    self.left_to_write = None;
+                }
+                return Err(error);
             }
-            repaired.remove()?;
+            removed?;
             for (member, range) in found {
                 let marked = (node, member, range, Provenance::Refuted);
                 self.redeliver(tree, builder, segments, marked, out)?;
