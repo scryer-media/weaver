@@ -1225,6 +1225,14 @@ impl Barrier {
         self.key.woke.notify_all();
     }
 
+    // Wait until `count` threads stand in a wait on the barrier's key.
+    #[cfg(test)]
+    pub(crate) fn wait_waiters(&self, count: usize) {
+        while self.key.waiters.load(Ordering::SeqCst) < count {
+            std::thread::yield_now();
+        }
+    }
+
     // Whether a test holds the volume's thread.
     #[cfg(test)]
     pub(crate) fn test_held(&self) -> bool {

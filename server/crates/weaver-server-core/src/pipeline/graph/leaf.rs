@@ -121,13 +121,106 @@ struct Queued {
     // before any operation that closes, cuts, moves or removes the file is
     // submitted, so no operation of the writer finds it held.
     reader: OnceLock<File>,
+    // The last operation submitted for the file that is not a write of
+    // bytes into it as it stands: the write that made or opened it, a cut,
+    // a close, a start over, a move. Every read of the file waits for it.
+    shaped: u64,
+    // The writes submitted since, that may still be out, keyed by where
+    // each starts and its number, to where it ends, and the same in the
+    // order they were submitted, so those that returned are let go. A read
+    // waits beside `shaped` only for the writes it overlaps: bytes written
+    // long ago are not waited for again behind the file's newest write.
+    out: BTreeMap<(u64, u64), u64>,
+    sent: std::collections::VecDeque<(u64, u64)>,
+    // The longest write in `out`, which bounds how far before a read one
+    // that overlaps it can start.
+    longest: u64,
+    // The last close of a file already made, and the length it gave it: it
+    // changes no byte below that length, so only a read that reaches past
+    // it waits for the close.
+    closed: Option<(u64, u64)>,
 }
 
 impl Queued {
+    fn new(to: &Arc<Submitter>, file: u64) -> Self {
+        Self {
+            to: Arc::clone(to),
+            file,
+            open: false,
+            last: 0,
+            released: 0,
+            reader: OnceLock::new(),
+            shaped: 0,
+            out: BTreeMap::new(),
+            sent: std::collections::VecDeque::new(),
+            longest: 0,
+            closed: None,
+        }
+    }
+
     // The loop's handle goes before the writer is asked to close, cut,
     // move or remove the file.
     fn let_go(&mut self) {
         self.reader.take();
+    }
+
+    // `seq` changes the file as a whole: every read after waits for it, so
+    // no write before it needs to be kept apart.
+    fn shape(&mut self, seq: u64) {
+        self.last = seq;
+        self.shaped = seq;
+        self.out.clear();
+        self.sent.clear();
+        self.longest = 0;
+        self.closed = None;
+    }
+
+    // `seq` closes the file, already made, at `length`.
+    fn close(&mut self, seq: u64, length: u64) {
+        self.last = seq;
+        self.closed = Some(match self.closed {
+            Some((_, before)) => (seq, before.min(length)),
+            None => (seq, length),
+        });
+    }
+
+    // `seq` writes `offset..end` of the file as it stands. The writes before
+    // it that returned are let go first: the oldest is looked at, one look
+    // for each write, so the work stays constant per write.
+    fn wrote(&mut self, seq: u64, offset: u64, end: u64) {
+        self.last = seq;
+        while let Some(&(oldest, start)) = self.sent.front() {
+            if !self.to.barrier_at(oldest).returned() {
+                break;
+            }
+            self.sent.pop_front();
+            self.out.remove(&(start, oldest));
+        }
+        if self.out.is_empty() {
+            self.longest = 0;
+        }
+        if end == offset {
+            return;
+        }
+        self.out.insert((offset, seq), end);
+        self.sent.push_back((seq, offset));
+        self.longest = self.longest.max(end - offset);
+    }
+
+    // The operation a read of `offset..end` waits for: the last that shaped
+    // the file, a close that cut short of the range's end, or the last write
+    // still kept that overlaps the range.
+    fn read_after(&self, offset: u64, end: u64) -> u64 {
+        let closed = self
+            .closed
+            .filter(|(_, length)| end > *length)
+            .map_or(0, |(seq, _)| seq);
+        let from = (offset.saturating_sub(self.longest), 0);
+        self.out
+            .range(from..(end, 0))
+            .filter(|(_, written_to)| **written_to > offset)
+            .map(|((_, seq), _)| *seq)
+            .fold(self.shaped.max(closed), u64::max)
     }
 }
 
@@ -244,14 +337,7 @@ impl Leaf {
 
     // The leaf's file operations go to a volume's writer from here on.
     pub(crate) fn through(mut self, to: Option<&Arc<Submitter>>) -> Self {
-        self.queued = to.map(|to| Queued {
-            to: Arc::clone(to),
-            file: self.identity,
-            open: false,
-            last: 0,
-            released: 0,
-            reader: OnceLock::new(),
-        });
+        self.queued = to.map(|to| Queued::new(to, self.identity));
         self
     }
 
@@ -260,7 +346,8 @@ impl Leaf {
     // one. Nothing for a leaf that runs its own operations.
     pub(crate) fn after(mut self, made: u64) -> Self {
         if let Some(queued) = &mut self.queued {
-            queued.last = queued.last.max(made);
+            let made = queued.last.max(made);
+            queued.shape(made);
         }
         self
     }
@@ -352,9 +439,10 @@ impl Leaf {
     pub(crate) fn create_directory(&mut self) -> Result<(), LeafError> {
         if let Some(queued) = &mut self.queued {
             let path = self.path.clone();
-            queued.last = queued
+            let made = queued
                 .to
                 .run(None, path.clone(), move || std::fs::create_dir_all(&path));
+            queued.shape(made);
             self.on_disk = true;
             return Ok(());
         }
@@ -411,7 +499,15 @@ impl Leaf {
             let create = (!open).then(|| self.create(length));
             let queued = self.queued.as_mut().expect("checked above");
             queued.open = true;
-            queued.last = queued.to.write(self.identity, offset, owned(bytes), create);
+            let made = create.is_some();
+            let seq = queued.to.write(self.identity, offset, owned(bytes), create);
+            // A write that opens the file makes it, or opens it again at a
+            // declared length: every read waits for it.
+            if made {
+                queued.shape(seq);
+            } else {
+                queued.wrote(seq, span.0, span.1);
+            }
             self.on_disk = true;
         } else {
             let file = self.file.as_ref().expect("opened above");
@@ -733,12 +829,18 @@ impl Leaf {
         len: usize,
         into: &mut Vec<u8>,
     ) -> Result<(), LeafError> {
-        // Through a writer, the read waits only through the last operation
-        // submitted for this file, whatever else its volume has queued.
+        // Through a writer, the read waits only for this file's operations
+        // that put the bytes read there: the last that shaped the file, and
+        // the writes still out that overlap them, whatever else its volume
+        // has queued. A read of bytes written long ago does not stand behind
+        // a write the loop just made elsewhere in the file, so a repair's
+        // slices, a replay and a delivery said again, which read one piece
+        // and write the one before it, never wait on their own writes.
         if let Some(queued) = self.queued.as_ref().filter(|queued| queued.last > 0) {
+            let end = offset.saturating_add(len as u64);
             queued
                 .to
-                .wait_for(queued.last)
+                .wait_for(queued.read_after(offset, end))
                 .map_err(LeafError::io(&self.path))?;
             let began = Instant::now();
             let start = into.len();
@@ -822,9 +924,16 @@ impl Leaf {
         if self.queued.is_some() {
             self.cut(length)?;
             let create = self.create(Some(length));
+            let made = self.on_disk;
             let queued = self.queued.as_mut().expect("checked above");
             queued.let_go();
-            queued.last = queued.to.close(self.identity, length, create);
+            let closed = queued.to.close(self.identity, length, create);
+            // A close of a file not made yet makes it: every read waits.
+            if made {
+                queued.close(closed, length);
+            } else {
+                queued.shape(closed);
+            }
             queued.open = false;
             self.on_disk = true;
             return Ok(());
@@ -850,6 +959,8 @@ impl Leaf {
             && queued.last != queued.released
         {
             queued.let_go();
+            // A release changes no byte, length or name of the file: a read
+            // after it waits for what it waited for before.
             queued.last = queued.to.release(self.identity);
             queued.released = queued.last;
             queued.open = false;
@@ -866,7 +977,8 @@ impl Leaf {
         let create = self.queued.is_some().then(|| self.create(None));
         if let (Some(create), Some(queued)) = (create, self.queued.as_mut()) {
             queued.let_go();
-            queued.last = queued.to.truncate(self.identity, create);
+            let emptied = queued.to.truncate(self.identity, create);
+            queued.shape(emptied);
             return Ok(());
         }
         if self.file.is_none() && !self.path.try_exists().map_err(LeafError::io(&self.path))? {
@@ -906,7 +1018,7 @@ impl Leaf {
             let (from, to, directory) = (self.path.clone(), path.clone(), self.directory);
             queued.let_go();
             queued.open = false;
-            queued.last = queued.to.run(Some(self.identity), from.clone(), move || {
+            let moved = queued.to.run(Some(self.identity), from.clone(), move || {
                 if directory {
                     std::fs::create_dir_all(&to)?;
                     return remove_directory(&from).map_err(LeafError::into_io);
@@ -916,6 +1028,7 @@ impl Leaf {
                 }
                 crate::runtime::fs::rename_path_exclusive(&from, &to)
             });
+            queued.shape(moved);
         } else if had_file && path != self.path && self.directory {
             // A directory is shared and holds no bytes of its own: it is
             // made where it is wanted, whoever else already made it, and
@@ -1351,6 +1464,159 @@ mod tests {
         assert_eq!(cut.folded(7000, crc), None);
         folding(&mut cut, 3000, bytes(4000, 3));
         assert_eq!(cut.folded(7000, crc), Some(file_crc(&cut, 7000)));
+    }
+
+    struct Through {
+        writers: crate::operations::disk::writer::VolumeWriters,
+        volume: Arc<crate::operations::disk::volume::Volume>,
+        to: Arc<Submitter>,
+    }
+
+    fn through() -> Through {
+        let writers = crate::operations::disk::writer::VolumeWriters::new(|_| {});
+        let volume = Arc::new(crate::operations::disk::volume::Volume::new(
+            None,
+            "test".to_owned(),
+        ));
+        let to = writers.submitter(&volume, 1);
+        Through {
+            writers,
+            volume,
+            to,
+        }
+    }
+
+    impl Through {
+        // How many times, and for how long in all, the loop stood for the
+        // writer before a read.
+        fn read_waits(&self) -> u64 {
+            use crate::operations::disk::volume::LoopWait;
+            self.volume.writer.loop_waits_by_kind[LoopWait::Read as usize]
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    // A read through a volume's writer waits only for the writes that put
+    // its bytes there, never behind a later write elsewhere in the file. A
+    // repair's slices, a replay and a delivery said again each read one
+    // piece and then write it: while the writer is held on the write of one
+    // piece, the read back of the next is made at once, the loop goes on
+    // with another file, and once the writer is let through the file and
+    // its fold hold every write. The loop stood for the writer not once.
+    #[test]
+    fn a_read_back_does_not_wait_for_a_later_write_of_other_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let through = through();
+        let mut leaf = Leaf::at(dir.path(), "lantern.bin").through(Some(&through.to));
+        let mut other = Leaf::at(dir.path(), "other.bin").through(Some(&through.to));
+        folding(&mut leaf, 0, bytes(4096, 1));
+        folding(&mut leaf, 4096, bytes(4096, 2));
+        other.write(0, &bytes(4096, 7), None).unwrap();
+        through.writers.settle();
+        let hold = through.writers.hold(&through.volume);
+        // Each rewrite reads back what it replaces, folded with a digest,
+        // and the second reads behind the first, which the writer holds.
+        folding(&mut leaf, 4096, bytes(4096, 3));
+        folding(&mut leaf, 0, bytes(4096, 4));
+        hold.wait_held();
+        let held = through.to.barrier();
+        assert!(held.test_held() && !held.returned(), "the rewrites are out");
+        // Another file's work goes on meanwhile, its close and a read below
+        // the length it closed at included.
+        other.write(4096, &bytes(4096, 8), None).unwrap();
+        other.close(8192).unwrap();
+        let mut read = Vec::new();
+        other.read(0, 4096, &mut read).unwrap();
+        assert_eq!(read, bytes(4096, 7));
+        assert!(!held.returned(), "nothing was let through");
+        assert_eq!(through.read_waits(), 0);
+        hold.open();
+        through.writers.settle();
+        let mut all = Vec::new();
+        leaf.read(0, 8192, &mut all).unwrap();
+        assert_eq!(&all[..4096], &bytes(4096, 4)[..]);
+        assert_eq!(&all[4096..], &bytes(4096, 3)[..]);
+        let crc = Algorithm::Crc32;
+        assert_eq!(leaf.folded(8192, crc), Some(crc.hash(&all).value));
+        assert_eq!(
+            std::fs::read(other.path()).unwrap(),
+            [bytes(4096, 7), bytes(4096, 8)].concat()
+        );
+        assert_eq!(through.read_waits(), 0);
+    }
+
+    // A read of bytes whose write is still out waits for that write, and
+    // reads what it put there; so does a read after anything that shapes
+    // the file as a whole, a start over here.
+    #[test]
+    fn a_read_of_bytes_still_out_waits_for_their_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let through = through();
+        let mut leaf = Leaf::at(dir.path(), "lantern.bin").through(Some(&through.to));
+        leaf.write(0, &bytes(4096, 1), None).unwrap();
+        leaf.write(4096, &bytes(4096, 2), None).unwrap();
+        through.writers.settle();
+        let hold = through.writers.hold(&through.volume);
+        leaf.write(1000, &bytes(100, 3), None).unwrap();
+        let barrier = through.to.barrier();
+        hold.wait_held();
+        std::thread::scope(|scope| {
+            let read = scope.spawn(|| {
+                let mut read = Vec::new();
+                leaf.read(900, 300, &mut read).unwrap();
+                read
+            });
+            barrier.wait_waiters(1);
+            hold.open();
+            let read = read.join().unwrap();
+            assert_eq!(&read[..100], &bytes(4096, 1)[900..1000]);
+            assert_eq!(&read[100..200], &bytes(100, 3)[..]);
+            assert_eq!(&read[200..], &bytes(4096, 1)[1100..1200]);
+        });
+        assert_eq!(through.read_waits(), 1);
+        through.writers.settle();
+        let hold = through.writers.hold(&through.volume);
+        leaf.truncate().unwrap();
+        leaf.write(0, &bytes(10, 4), None).unwrap();
+        let barrier = through.to.barrier();
+        hold.wait_held();
+        std::thread::scope(|scope| {
+            // Bytes from before the start over are not read: the read waits
+            // for it, and for the write after it.
+            let read = scope.spawn(|| {
+                let mut read = Vec::new();
+                leaf.read(0, 10, &mut read).unwrap();
+                read
+            });
+            barrier.wait_waiters(1);
+            hold.open();
+            assert_eq!(read.join().unwrap(), bytes(10, 4));
+        });
+        assert_eq!(through.read_waits(), 2);
+    }
+
+    // What a read waits for: the operation that shaped the file, the writes
+    // it overlaps, and a close only when it reaches past the closed length.
+    #[test]
+    fn a_read_waits_for_what_put_its_bytes_there() {
+        let through = through();
+        let mut queued = Queued::new(&through.to, 1);
+        queued.shape(1);
+        queued.wrote(2, 0, 100);
+        queued.wrote(3, 100, 200);
+        assert_eq!(queued.read_after(0, 50), 2);
+        assert_eq!(queued.read_after(150, 160), 3);
+        assert_eq!(queued.read_after(50, 150), 3);
+        assert_eq!(queued.read_after(300, 400), 1);
+        queued.close(4, 150);
+        assert_eq!(queued.read_after(0, 50), 2);
+        assert_eq!(queued.read_after(100, 150), 3);
+        assert_eq!(queued.read_after(100, 151), 4);
+        queued.close(5, 300);
+        assert_eq!(queued.read_after(140, 200), 5, "cut at 150 before");
+        queued.shape(6);
+        assert_eq!(queued.read_after(0, 50), 6);
+        assert_eq!(queued.read_after(0, 1000), 6);
     }
 
     // Runs either side of 4 GiB, in a sparse file that writes a few
