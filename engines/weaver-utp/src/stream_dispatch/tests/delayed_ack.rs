@@ -258,7 +258,10 @@ async fn three_packets_past_a_hole_in_one_read_get_three_acks() {
     }
     let repeated = |t: &_| {
         let t: &crate::stream_dispatch::tests::TestVsock = t;
-        t._socket.stats().duplicate_acks_sent.load(Ordering::Relaxed)
+        t._socket
+            .stats()
+            .duplicate_acks_sent
+            .load(Ordering::Relaxed)
     };
     assert_eq!(repeated(&t), 2);
 
@@ -416,7 +419,10 @@ async fn packets_in_order_in_one_read_get_one_ack() {
     t.poll_once_assert_pending().await;
     assert_eq!(t.take_sent().len(), 1);
     assert_eq!(
-        t._socket.stats().duplicate_acks_sent.load(Ordering::Relaxed),
+        t._socket
+            .stats()
+            .duplicate_acks_sent
+            .load(Ordering::Relaxed),
         0
     );
 }

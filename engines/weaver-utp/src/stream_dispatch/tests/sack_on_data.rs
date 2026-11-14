@@ -179,7 +179,7 @@ async fn a_full_packet_cut_earlier_leaves_the_ack_owed() {
         .iter()
         .filter(|m| m.header.htype == Data)
         .map(|m| m.header.seq_nr)
-        .last()
+        .next_back()
         .expect("data sent");
     assert!(
         first

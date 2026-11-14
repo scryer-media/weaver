@@ -692,7 +692,9 @@ fn poll_outgoing<T: Transport, E: UtpEnvironment>(
     };
     let start = outgoing.sent;
     let run_most = transport.send_run_most();
-    let many_most = transport.send_many_most().min(crate::outbox::SEND_MANY_MOST);
+    let many_most = transport
+        .send_many_most()
+        .min(crate::outbox::SEND_MANY_MOST);
     let mut parts = [(0, socket.local_addr); crate::outbox::SEND_MANY_MOST];
     'batches: loop {
         if outgoing.batch.is_drained() && !outbox.take(&mut outgoing.batch, cx.waker()) {
@@ -750,8 +752,9 @@ fn poll_outgoing<T: Transport, E: UtpEnvironment>(
             // one call too where the transport has one: the ACKs of the
             // streams one read of the socket woke.
             if many_most > 1
-                && let Some((bytes, count)) =
-                    outgoing.batch.front_many(&mut parts[..many_most], run_most > 1)
+                && let Some((bytes, count)) = outgoing
+                    .batch
+                    .front_many(&mut parts[..many_most], run_most > 1)
             {
                 let now = env.now();
                 let stamp = ((now - socket.created).as_micros() as u32).to_be_bytes();
@@ -1328,7 +1331,11 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     // one that took the last packet. A mark its queue is still owed is
     // made at the end of the read, and does a closed queue no harm.
     fn forget_unflushed(&mut self, key: &StreamRecvKey) {
-        if self.last_stream.as_ref().is_some_and(|(last, _)| last == key) {
+        if self
+            .last_stream
+            .as_ref()
+            .is_some_and(|(last, _)| last == key)
+        {
             self.last_stream = None;
         }
     }

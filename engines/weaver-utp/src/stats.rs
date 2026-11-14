@@ -254,28 +254,42 @@ impl std::ops::AddAssign for UtpStatsSnapshot {
             .saturating_add(other.out_of_order_packets);
         self.streams_given_up = self.streams_given_up.saturating_add(other.streams_given_up);
         self.receive_drains = self.receive_drains.saturating_add(other.receive_drains);
-        self.streams_marked = self
-            .streams_marked
-            .saturating_add(other.streams_marked);
+        self.streams_marked = self.streams_marked.saturating_add(other.streams_marked);
         self.drain_marks_with_packets_queued = self
             .drain_marks_with_packets_queued
             .saturating_add(other.drain_marks_with_packets_queued);
         self.acks_with_sack = self.acks_with_sack.saturating_add(other.acks_with_sack);
         self.sack_bytes_sent = self.sack_bytes_sent.saturating_add(other.sack_bytes_sent);
         self.sacks_received = self.sacks_received.saturating_add(other.sacks_received);
-        self.sack_bits_received = self.sack_bits_received.saturating_add(other.sack_bits_received);
-        self.data_packets_with_sack = self.data_packets_with_sack.saturating_add(other.data_packets_with_sack);
-        self.duplicate_acks_sent = self.duplicate_acks_sent.saturating_add(other.duplicate_acks_sent);
+        self.sack_bits_received = self
+            .sack_bits_received
+            .saturating_add(other.sack_bits_received);
+        self.data_packets_with_sack = self
+            .data_packets_with_sack
+            .saturating_add(other.data_packets_with_sack);
+        self.duplicate_acks_sent = self
+            .duplicate_acks_sent
+            .saturating_add(other.duplicate_acks_sent);
         self.receive_cuts = self.receive_cuts.saturating_add(other.receive_cuts);
         self.send_runs = self.send_runs.saturating_add(other.send_runs);
-        self.send_run_datagrams = self.send_run_datagrams.saturating_add(other.send_run_datagrams);
+        self.send_run_datagrams = self
+            .send_run_datagrams
+            .saturating_add(other.send_run_datagrams);
         self.send_run_errors = self.send_run_errors.saturating_add(other.send_run_errors);
         self.receive_calls = self.receive_calls.saturating_add(other.receive_calls);
-        self.receive_call_datagrams = self.receive_call_datagrams.saturating_add(other.receive_call_datagrams);
+        self.receive_call_datagrams = self
+            .receive_call_datagrams
+            .saturating_add(other.receive_call_datagrams);
         self.send_batches = self.send_batches.saturating_add(other.send_batches);
-        self.send_batch_datagrams = self.send_batch_datagrams.saturating_add(other.send_batch_datagrams);
-        self.datagrams_too_long = self.datagrams_too_long.saturating_add(other.datagrams_too_long);
-        self.send_batch_errors = self.send_batch_errors.saturating_add(other.send_batch_errors);
+        self.send_batch_datagrams = self
+            .send_batch_datagrams
+            .saturating_add(other.send_batch_datagrams);
+        self.datagrams_too_long = self
+            .datagrams_too_long
+            .saturating_add(other.datagrams_too_long);
+        self.send_batch_errors = self
+            .send_batch_errors
+            .saturating_add(other.send_batch_errors);
     }
 }
 

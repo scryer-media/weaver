@@ -177,7 +177,10 @@ impl Batch {
     /// own, each as long as the first but the last, which may be shorter,
     /// and at most `most` of them. Their bytes, which lie end to end, the
     /// first's length, their count and the address.
-    pub(crate) fn front_run(&mut self, most: usize) -> Option<(&mut [u8], usize, usize, SocketAddr)> {
+    pub(crate) fn front_run(
+        &mut self,
+        most: usize,
+    ) -> Option<(&mut [u8], usize, usize, SocketAddr)> {
         let first = self.packets.get(self.next)?;
         if first.fragmenting.is_some() || first.len == 0 {
             return None;
@@ -186,7 +189,10 @@ impl Batch {
         let start = first.start as usize;
         let mut count = 1;
         let mut end = start + segment as usize;
-        for queued in self.packets[self.next + 1..].iter().take(most.saturating_sub(1)) {
+        for queued in self.packets[self.next + 1..]
+            .iter()
+            .take(most.saturating_sub(1))
+        {
             if queued.addr != addr
                 || queued.fragmenting.is_some()
                 || queued.len > segment
@@ -533,10 +539,7 @@ mod tests {
         assert_eq!(count, 3);
         assert_eq!(bytes.len(), 66);
         assert_eq!([bytes[0], bytes[20], bytes[46]], [1, 2, 3]);
-        assert_eq!(
-            parts[..3],
-            [(20, other(2)), (26, other(3)), (20, other(4))]
-        );
+        assert_eq!(parts[..3], [(20, other(2)), (26, other(3)), (20, other(4))]);
         // A transport with no call for a run takes the run's datagrams too.
         assert_eq!(batch.front_many(&mut parts, false).unwrap().1, 6);
 

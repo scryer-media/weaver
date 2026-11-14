@@ -245,7 +245,9 @@ mod runs {
             (*header).cmsg_level = libc::SOL_UDP;
             (*header).cmsg_type = libc::UDP_SEGMENT;
             (*header).cmsg_len = len as _;
-            libc::CMSG_DATA(header).cast::<u16>().write_unaligned(segment);
+            libc::CMSG_DATA(header)
+                .cast::<u16>()
+                .write_unaligned(segment);
             libc::sendmsg(fd, &raw const msg, 0)
         };
         if sent < 0 {
@@ -324,7 +326,11 @@ mod many {
                 // SAFETY: `out` is valid for writes of an IPv6 address,
                 // which is larger than an IPv4 one and aligned at least as
                 // strictly.
-                unsafe { std::ptr::from_mut(out).cast::<libc::sockaddr_in>().write(named) };
+                unsafe {
+                    std::ptr::from_mut(out)
+                        .cast::<libc::sockaddr_in>()
+                        .write(named)
+                };
                 mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
             }
             SocketAddr::V6(v6) => {
@@ -440,7 +446,11 @@ mod many {
         Ok(got)
     }
 
-    pub(super) fn send(fd: RawFd, bytes: &[u8], parts: &[(usize, SocketAddr)]) -> io::Result<usize> {
+    pub(super) fn send(
+        fd: RawFd,
+        bytes: &[u8],
+        parts: &[(usize, SocketAddr)],
+    ) -> io::Result<usize> {
         let most = parts.len().min(SEND_MANY_DATAGRAMS);
         // SAFETY: message headers, buffer descriptions and addresses are
         // plain data for which all zeroes is a valid value.
@@ -449,9 +459,7 @@ mod many {
         let mut msgs: [libc::mmsghdr; SEND_MANY_DATAGRAMS] = unsafe { mem::zeroed() };
         let mut at = 0;
         for (i, (len, target)) in parts[..most].iter().enumerate() {
-            let datagram = bytes
-                .get(at..at + len)
-                .ok_or(io::ErrorKind::InvalidInput)?;
+            let datagram = bytes.get(at..at + len).ok_or(io::ErrorKind::InvalidInput)?;
             at += len;
             bufs[i] = libc::iovec {
                 iov_base: datagram.as_ptr().cast_mut().cast(),

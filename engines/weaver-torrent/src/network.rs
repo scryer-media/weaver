@@ -1184,7 +1184,11 @@ impl KernelUdp {
 
     // `most` where the host has calls for several datagrams, else 1.
     fn many_most(&self, most: usize) -> usize {
-        if crate::udp_options::TAKES_MANY { most } else { 1 }
+        if crate::udp_options::TAKES_MANY {
+            most
+        } else {
+            1
+        }
     }
 
     // Datagrams that lie end to end in `bytes`, with each one's length and
@@ -1904,18 +1908,20 @@ mod pair_tests {
             ),
         ] {
             let sender = sockets.kernel_udp(bind, false).unwrap();
-            assert_eq!(sender.send_run_most(), crate::udp_options::SEND_RUN_DATAGRAMS);
+            assert_eq!(
+                sender.send_run_most(),
+                crate::udp_options::SEND_RUN_DATAGRAMS
+            );
             let peer = sockets.bind_kernel_udp(peer).unwrap();
             let mut bytes = Vec::new();
             for byte in 1..=4u8 {
                 bytes.extend_from_slice(&[byte; 100]);
             }
             bytes.extend_from_slice(&[5u8; 40]);
-            let sent = std::future::poll_fn(|cx| {
-                sender.poll_send_run(cx, &bytes, 100, peer.bind_addr())
-            })
-            .await
-            .unwrap();
+            let sent =
+                std::future::poll_fn(|cx| sender.poll_send_run(cx, &bytes, 100, peer.bind_addr()))
+                    .await
+                    .unwrap();
             assert_eq!(sent, 5);
             let mut buf = [0u8; 2048];
             for (byte, len) in [(1u8, 100), (2, 100), (3, 100), (4, 100), (5, 40)] {
@@ -1952,7 +1958,10 @@ mod pair_tests {
         // More datagrams than a call takes.
         assert_eq!(send(vec![0u8; 20 * 70], 20).await, SEND_RUN_DATAGRAMS);
         // More bytes than a call takes.
-        assert_eq!(send(vec![0u8; 1400 * 60], 1400).await, SEND_RUN_BYTES / 1400);
+        assert_eq!(
+            send(vec![0u8; 1400 * 60], 1400).await,
+            SEND_RUN_BYTES / 1400
+        );
     }
 
     // A kernel socket reads a datagram straight into the two buffers: a
@@ -2087,10 +2096,9 @@ mod pair_tests {
         ) -> Vec<(Option<Vec<u8>>, SocketAddr)> {
             let mut got = Vec::new();
             while got.len() < want {
-                let count =
-                    std::future::poll_fn(|cx| transport.poll_recv_many(cx, into, spill))
-                        .await
-                        .unwrap();
+                let count = std::future::poll_fn(|cx| transport.poll_recv_many(cx, into, spill))
+                    .await
+                    .unwrap();
                 assert!(count > 0);
                 for entry in &into[..count] {
                     let bytes = (entry.len < spill.len()).then(|| {
@@ -2190,9 +2198,10 @@ mod pair_tests {
             .await
             .unwrap();
         assert_eq!(sent, 3);
-        let sent = std::future::poll_fn(|cx| paired.poll_send_many(cx, &bytes[1453..], &parts[3..]))
-            .await
-            .unwrap();
+        let sent =
+            std::future::poll_fn(|cx| paired.poll_send_many(cx, &bytes[1453..], &parts[3..]))
+                .await
+                .unwrap();
         assert_eq!(sent, 1);
 
         let mut buf = vec![0u8; 2000];
@@ -2201,7 +2210,10 @@ mod pair_tests {
         let (len, _) = one.recv_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..len], &[3u8; 33][..]);
         let (len, from) = other.recv_from(&mut buf).await.unwrap();
-        assert_eq!((&buf[..len], from), (&[2u8; 1400][..], paired.v4.bind_addr()));
+        assert_eq!(
+            (&buf[..len], from),
+            (&[2u8; 1400][..], paired.v4.bind_addr())
+        );
         let (len, from) = sixth.recv_from(&mut buf).await.unwrap();
         assert_eq!((&buf[..len], from), (&[4u8; 50][..], paired.v6.bind_addr()));
     }
