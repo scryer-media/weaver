@@ -508,6 +508,9 @@ mod tests {
         test_devices::assign(&shows, 9);
         let storage = owner(dir.path());
         assert!(!storage.same_filesystem(&intermediate, &shows).await);
+        // The look reads on after it tells the device: it is waited for
+        // before the looks are counted.
+        storage.looks_returned().await;
         let before = looks();
 
         let output = storage.volume(&shows.join(".weaver-staging").join("7"));

@@ -394,9 +394,12 @@ mod tests {
         }
         // Where the mark is refused no file would be sized and none asks;
         // where metadata names no device there is nothing to hold by.
-        let marked = PlatformMarker
-            .mark_sparse(&File::open(temp.path().join("ember-0.bin")).unwrap())
-            .is_ok();
+        // The mark is asked of a file open for writing, as a new file is.
+        let first = File::options()
+            .write(true)
+            .open(temp.path().join("ember-0.bin"))
+            .unwrap();
+        let marked = PlatformMarker.mark_sparse(&first).is_ok();
         let asks = match (marked, cfg!(unix)) {
             (false, _) => 0,
             (true, true) => 1,
