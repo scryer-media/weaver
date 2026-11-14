@@ -1344,12 +1344,15 @@ impl LivePeerState {
         self.download_rate.add_snapshot(moved.fetched, None, now);
         self.upload_rate.add_snapshot(moved.uploaded, None, now);
         // The estimator takes differences, so the protocol bytes of the
-        // peer's earlier connections cancel out.
-        let protocol = counters
-            .fetched_protocol_bytes
-            .load(std::sync::atomic::Ordering::Relaxed);
+        // peer's earlier connections cancel out. The headers its packets
+        // are taken to have cost count too (libtorrent
+        // `stat::download_rate`, stat.hpp:195 in v2.0.15: payload,
+        // protocol and IP overhead).
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        let protocol = counters.fetched_protocol_bytes.load(relaxed);
+        let overhead = counters.ip_overhead_bytes.load(relaxed);
         self.received_rate
-            .add_snapshot(moved.fetched + protocol, None, now);
+            .add_snapshot(moved.fetched + protocol + overhead, None, now);
     }
 
     /// The peer named its DHT node at `port` (BEP 5 PORT). Whether that is
@@ -1495,9 +1498,11 @@ impl LivePeerState {
     /// their headers, or half again what it sends a round at its rate,
     /// whichever is more (libtorrent `peer_connection::wanted_transfer`,
     /// `m_outstanding_bytes + 30` against `download_rate * 3 / 2` over a
-    /// tick). The rate is of all it sends, protocol too, so a peer that
-    /// only asks us for blocks is read as fast as its requests come, not a
-    /// request at a time.
+    /// tick). The rate is of all it sends, protocol and the headers of its
+    /// packets too, so a peer that only asks us for blocks is read as fast
+    /// as its requests come, not a request at a time. What is left of the
+    /// frame being read is the reader's to add (`Quota::admit`; libtorrent's
+    /// `packet_bytes_remaining() + 30`).
     pub fn download_wanted(&self) -> u64 {
         let outstanding: u64 = self
             .inflight_requests
@@ -2643,6 +2648,35 @@ mod tests {
             .fetch_add(1_000_000, std::sync::atomic::Ordering::Relaxed);
         live.sample_rates(&counters, start + Duration::from_secs(1));
         assert_eq!(live.download_wanted(), 750_000);
+    }
+
+    // libtorrent `stat::download_rate` sums the IP overhead with payload and
+    // protocol (stat.hpp:195 in v2.0.15), and `trancieve_ip_packet`
+    // (stat.hpp:150) estimates it for every receive and send: a peer whose
+    // requests come a small packet each is asked for the headers' worth too.
+    #[test]
+    fn a_read_asks_for_the_headers_of_the_peers_packets_too() {
+        use crate::read_buf::{IP_HEADER, ip_packets};
+        // A packet's worth or less is one packet; a byte more is two.
+        assert_eq!(ip_packets(0), [1, 1]);
+        assert_eq!(ip_packets(17), [1, 1]);
+        assert_eq!(ip_packets(1440), [1, 1]);
+        assert_eq!(ip_packets(1441), [1, 2]);
+        assert_eq!(ip_packets(1460), [1, 2]);
+        assert_eq!(ip_packets(1461), [2, 2]);
+        assert_eq!(ip_packets(1 << 20), [719, 729]);
+        assert_eq!(IP_HEADER, [40, 60]);
+
+        let live = live_now();
+        let counters = stats::atomic::PeerStats::default().counters;
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        let start = std::time::Instant::now();
+        live.sample_rates(&counters, start);
+        // In a second, 10,000 requests of 17 bytes, a packet each over IPv4.
+        counters.fetched_protocol_bytes.fetch_add(170_000, relaxed);
+        counters.ip_overhead_bytes.fetch_add(400_000, relaxed);
+        live.sample_rates(&counters, start + Duration::from_secs(1));
+        assert_eq!(live.download_wanted(), 570_000 * 3 / 2 / 2);
     }
 
     // libtorrent snub_peer: a snub ends slow start and holds the queue to

@@ -56,12 +56,36 @@ pub struct ReadBuf {
     socket: SocketReads,
 }
 
-/// What a connection's socket reads did: how many returned bytes, and how
-/// many times the buffer was made larger for one.
+/// What a connection's socket reads did: how many returned bytes, how many
+/// times the buffer was made larger for one, and the packets the bytes of
+/// each are taken to have come in, over IPv4 and over IPv6
+/// ([`ip_packets`]).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SocketReads {
     pub calls: u64,
     pub growths: u64,
+    pub packets: [u64; 2],
+}
+
+/// The bytes of the IP and TCP headers of a packet, over IPv4 and over
+/// IPv6, as libtorrent estimates them (`stat::trancieve_ip_packet`,
+/// stat.hpp:150 in v2.0.15: a 20 or 40 byte IP header and 20 more).
+pub(crate) const IP_HEADER: [u64; 2] = [40, 60];
+
+/// The packets `bytes` moved by one read or write are taken to have crossed
+/// in, over IPv4 and over IPv6: one for each 1500 byte packet's worth less
+/// its header, and one at least (libtorrent `stat::trancieve_ip_packet`).
+pub(crate) fn ip_packets(bytes: usize) -> [u64; 2] {
+    IP_HEADER.map(|header| (bytes as u64).div_ceil(1500 - header).max(1))
+}
+
+impl SocketReads {
+    fn read(&mut self, bytes: usize) {
+        self.calls += 1;
+        for (packets, more) in self.packets.iter_mut().zip(ip_packets(bytes)) {
+            *packets += more;
+        }
+    }
 }
 
 /// A Piece message's header: length, id, index and begin.
@@ -454,7 +478,7 @@ impl ReadBuf {
             } else if size <= self.buf.len() / 4 {
                 self.wanted = (self.buf.len() / 2).max(BUFLEN);
             }
-            self.socket.calls += 1;
+            self.socket.read(size);
             self.len += size;
             need_additional_bytes = need_additional_bytes.saturating_sub(size)
         }
@@ -672,7 +696,7 @@ impl ReadBuf {
         if size == 0 {
             return Err(Error::PeerDisconnected);
         }
-        self.socket.calls += 1;
+        self.socket.read(size);
         self.take_read(
             lead,
             &offered[..slots.min(MOST_SLOTS)],

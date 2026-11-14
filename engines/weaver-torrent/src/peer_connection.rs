@@ -136,6 +136,11 @@ pub trait PeerConnectionHandler {
     /// handshakes and every message but a piece's block (libtorrent
     /// `stat::sent_bytes`, `received_bytes`, the protocol half).
     fn on_protocol_bytes(&self, _channel: Channel, _bytes: u64) {}
+    /// A read or a write of the socket is taken to have cost `bytes` of IP
+    /// and TCP headers, the packet's and its acknowledgement's (libtorrent
+    /// `peer_connection::trancieve_ip_packet`, called for every receive and
+    /// every send).
+    fn on_ip_overhead(&self, _bytes: u64) {}
     /// The connection ended while the peer was sending `block`: the bytes
     /// of it that arrived are dropped. Told once, however the connection
     /// ended.
@@ -1065,6 +1070,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         };
         let stats = self.spawner.stats().clone();
         let stats = &*stats;
+        // The headers each read and write is taken to cost, by the peer's
+        // address family.
+        let family = usize::from(self.addr.is_ipv6());
+        let written_overhead = move |bytes: usize| {
+            crate::read_buf::ip_packets(bytes)[family] * crate::read_buf::IP_HEADER[family]
+        };
         // The extended handshake went out before the transport was known
         // here, in one buffer. The handshakes that open a connection, the
         // encryption's and BitTorrent's, are counted on neither side: a
@@ -1092,6 +1103,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 .await?;
                 stats.sent(transport);
                 self.handler.on_protocol_bytes(Channel::Upload, len as u64);
+                self.handler.on_ip_overhead(written_overhead(len));
                 trace!("sent bitfield");
             }
 
@@ -1345,6 +1357,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     )
                     .await?;
                     stats.sent(transport);
+                    self.handler.on_ip_overhead(written_overhead(filled));
                     if requests > 0 {
                         stats.requests_sent(transport, requests);
                     }
@@ -1401,6 +1414,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 // once.
                 if let Some(reads) = reading.take_socket_reads() {
                     stats.received(transport, reads.calls);
+                    self.handler
+                        .on_ip_overhead(reads.packets[family] * crate::read_buf::IP_HEADER[family]);
                     if reads.growths > 0 {
                         stats.read_buffers_grew(reads.growths);
                     }

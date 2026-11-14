@@ -2837,6 +2837,12 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         }
     }
 
+    fn on_ip_overhead(&self, bytes: u64) {
+        self.counters
+            .ip_overhead_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
     /// The part of a block of the torrent that arrived is not used.
     fn on_partial_block(&self, block: PartialBlock) {
         let lengths = &self.state.lengths;
