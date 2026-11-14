@@ -327,6 +327,10 @@ impl DatagramSocket for SharedDhtSocket {
         self.socket.link_mtu()
     }
 
+    fn spreads_streams(&self) -> bool {
+        self.socket.spreads_streams()
+    }
+
     fn send_run_most(&self) -> usize {
         self.socket.send_run_most()
     }
@@ -450,6 +454,10 @@ impl Transport for DatagramTransport {
 
     fn link_mtu(&self) -> Option<u16> {
         self.0.link_mtu()
+    }
+
+    fn spreads_streams(&self) -> bool {
+        self.0.spreads_streams()
     }
 
     fn send_run_most(&self) -> usize {
@@ -912,6 +920,10 @@ impl DatagramSocket for PairedUdp {
     ) -> Poll<io::Result<usize>> {
         let (socket, target) = self.toward(target);
         socket.poll_send_to_vectored_fragmenting(cx, bufs, target, fragmenting)
+    }
+
+    fn spreads_streams(&self) -> bool {
+        true
     }
 
     // The larger of the two families' answers: a run toward the family
@@ -1407,6 +1419,10 @@ impl DatagramSocket for KernelUdp {
                 }
             }
         }
+    }
+
+    fn spreads_streams(&self) -> bool {
+        true
     }
 
     fn send_run_most(&self) -> usize {

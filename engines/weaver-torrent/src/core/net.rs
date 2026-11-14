@@ -116,6 +116,13 @@ pub trait DatagramSocket: Send + Sync + 'static {
         self.poll_send_to_vectored(cx, bufs, target)
     }
 
+    /// Whether uTP streams over the socket may run on a uTP thread other
+    /// than the one that reads and sends on it: a kernel socket, which
+    /// keeps nothing per stream. A tunnel's streams stay beside its I/O.
+    fn spreads_streams(&self) -> bool {
+        false
+    }
+
     /// How many datagrams one [`DatagramSocket::poll_send_run`] may take: 1
     /// for a socket that sends each datagram with a call of its own.
     fn send_run_most(&self) -> usize {
@@ -189,6 +196,10 @@ pub trait DatagramSocket: Send + Sync + 'static {
 }
 
 impl DatagramSocket for tokio::net::UdpSocket {
+    fn spreads_streams(&self) -> bool {
+        true
+    }
+
     fn bind_addr(&self) -> SocketAddr {
         self.local_addr()
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)))
