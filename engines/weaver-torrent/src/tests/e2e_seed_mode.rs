@@ -503,3 +503,146 @@ async fn test_seed_mode_check_off_the_runtime_waits_for_a_blocking_permit() -> a
     assert_eq!(gate.counts(), (1, 0, 1));
     Ok(())
 }
+
+// Adversary: the first asker of a piece is cancelled while it waits for a
+// blocking permit, two others waiting on its claim. They are not left
+// waiting: one claims the piece again and both are served, the piece read
+// once.
+#[tokio::test(flavor = "multi_thread")]
+async fn adversary_seed_mode_first_asker_cancelled_before_its_permit() -> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new(
+        "adv_seed_cancel_permit",
+        PIECES * PIECE_LENGTH as usize,
+        PIECE_LENGTH,
+    )
+    .await?;
+    let dir = TempDir::with_prefix("adv_seed_cancel_permit_out")?;
+    let (_session, seed, gate, mut reaches) = seeding_gated(&t, &dir, 2).await?;
+    gate.open();
+    let live = seed.live().context("the seed is not live")?;
+    let piece = piece_of(5)?;
+    let seed_mode = &seed.shared().options.seed;
+    let permits = live.shared.spawner.semaphore();
+    let all = u32::try_from(permits.available_permits())?;
+    let taken = permits.clone().acquire_many_owned(all).await?;
+
+    let first = tokio::spawn({
+        let live = live.clone();
+        async move { live.serve_seeded(piece).await }
+    });
+    // The first holds the claim once a second can only wait on it.
+    loop {
+        match seed_mode.claim(piece) {
+            crate::torrent_state::seed_mode::Claim::Wait(_) => break,
+            crate::torrent_state::seed_mode::Claim::Check(_) => tokio::task::yield_now().await,
+        }
+    }
+    let second = tokio::spawn({
+        let live = live.clone();
+        async move { live.serve_seeded(piece).await }
+    });
+    let third = tokio::task::spawn_blocking({
+        let live = live.clone();
+        move || live.check_seeded(piece)
+    });
+    while seed_mode.waiting(piece) < 2 {
+        tokio::task::yield_now().await;
+    }
+    first.abort();
+    assert!(first.await.is_err_and(|e| e.is_cancelled()));
+    drop(taken);
+    assert!(second.await??);
+    assert!(third.await??);
+    assert!(!seed_mode.unchecked(piece));
+    assert_eq!(gate.counts().0, 1, "the piece is read once");
+    while reaches.try_recv().is_ok() {}
+    Ok(())
+}
+
+// Adversary: the first asker is cancelled while its check reads the piece.
+// The check runs on and the waiters hear what it found.
+#[tokio::test(flavor = "multi_thread")]
+async fn adversary_seed_mode_first_asker_cancelled_while_its_check_reads() -> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new(
+        "adv_seed_cancel_read",
+        PIECES * PIECE_LENGTH as usize,
+        PIECE_LENGTH,
+    )
+    .await?;
+    let dir = TempDir::with_prefix("adv_seed_cancel_read_out")?;
+    let (_session, seed, gate, mut reaches) = seeding_gated(&t, &dir, 2).await?;
+    let live = seed.live().context("the seed is not live")?;
+    let piece = piece_of(6)?;
+    let seed_mode = &seed.shared().options.seed;
+    let first = tokio::spawn({
+        let live = live.clone();
+        async move { live.serve_seeded(piece).await }
+    });
+    reaches.recv().await.context("no read came")?;
+    let second = tokio::spawn({
+        let live = live.clone();
+        async move { live.serve_seeded(piece).await }
+    });
+    while seed_mode.waiting(piece) < 1 {
+        tokio::task::yield_now().await;
+    }
+    first.abort();
+    assert!(first.await.is_err_and(|e| e.is_cancelled()));
+    gate.open();
+    assert!(second.await??);
+    assert!(!seed_mode.unchecked(piece));
+    assert_eq!(gate.counts().0, 1, "the piece is read once");
+    // The permit the cancelled check held came back.
+    let permits = live.shared.spawner.semaphore();
+    let _all = permits.acquire_many_owned(2).await?;
+    Ok(())
+}
+
+// The check of a paused seed-mode torrent's piece waits for its blocking
+// permit before it holds the torrent's state: with every permit taken the
+// check waits, and the state can still be written and read. Had it waited
+// for the permit with the state held for reading, the writer here would
+// wait with it, and every reader after the writer.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_paused_seed_check_waits_for_its_permit_without_the_state_lock() -> anyhow::Result<()>
+{
+    setup_test_logging();
+    let t = TestTorrent::new(
+        "test_seed_paused_lock",
+        PIECES * PIECE_LENGTH as usize,
+        PIECE_LENGTH,
+    )
+    .await?;
+    let dir = TempDir::with_prefix("test_seed_paused_lock_out")?;
+    let (_session, seed, gate, _reaches) = seeding_gated(&t, &dir, 2).await?;
+    gate.open();
+    seed.pause()?;
+    assert!(seed.live().is_none());
+    let permits = seed.shared().spawner.semaphore();
+    let all = u32::try_from(permits.available_permits())?;
+    let taken = permits.clone().acquire_many_owned(all).await?;
+
+    let check = tokio::task::spawn_blocking({
+        let seed = seed.clone();
+        move || seed.check_seeded(4)
+    });
+    // A writer of the state, then a reader, each get in while the check
+    // has no permit.
+    tokio::task::spawn_blocking({
+        let seed = seed.clone();
+        move || {
+            drop(seed.locked.write());
+            drop(seed.locked.read());
+        }
+    })
+    .await?;
+    assert_eq!(gate.counts().0, 0, "nothing is read without a permit");
+    assert!(!check.is_finished());
+
+    drop(taken);
+    assert_eq!(check.await?.transpose()?, Some(true));
+    assert_eq!(gate.counts().0, 1);
+    Ok(())
+}

@@ -1442,10 +1442,10 @@ impl TorrentStateLive {
                     return self.check_claimed(piece, checking);
                 }
                 Claim::Wait(mut found) => {
-                    crate::session_stats::check::CHECK_STATS.seed_checks_joined(1);
                     // A check that ended in an error told nothing: the
                     // piece is claimed again.
                     if let Ok(served) = found.blocking_recv() {
+                        crate::session_stats::check::CHECK_STATS.seed_checks_joined(1);
                         return Ok(served);
                     }
                 }
@@ -1489,8 +1489,8 @@ impl TorrentStateLive {
                         .await?;
                 }
                 Claim::Wait(mut found) => {
-                    crate::session_stats::check::CHECK_STATS.seed_checks_joined(1);
                     if let Ok(served) = found.recv().await {
+                        crate::session_stats::check::CHECK_STATS.seed_checks_joined(1);
                         return Ok(served);
                     }
                 }

@@ -6,8 +6,9 @@
 // Weaver authors from 2026-10-20 onward.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::buffers::{ByteBuf, ByteBufOwned};
 use crate::core::{
@@ -185,14 +186,14 @@ struct Span<'a> {
     len: usize,
 }
 
-/// The read side of a check: the pieces of one torrent's files, each read
-/// whole, a piece's share of a file in one read. Asked for the pieces in
-/// piece order it reads every file front to back, each read starting where
-/// the one before it ended, so a spinning disk is read without a seek
-/// between pieces (libtorrent issues a check's hash jobs in piece order to
-/// its one hashing thread, torrent.cpp:2524-2546 and settings_pack.cpp:353,
+/// The read side of a check: the pieces of one torrent's files, read a
+/// slice at a read. Asked for the pieces in piece order, and the slices of
+/// a piece in order, it reads every file front to back, each read starting
+/// where the one before it ended, so a spinning disk is read without a
+/// seek (libtorrent issues a check's hash jobs in piece order to its one
+/// hashing thread, torrent.cpp:2524-2546 and settings_pack.cpp:353,
 /// v2.0.15; it maps the file and leaves the size of a read to the kernel's
-/// read-ahead, where the read here is the piece).
+/// read-ahead, where the read here is the slice).
 pub(crate) struct PieceReader<'o, 'a> {
     ops: &'o FileOps<'a>,
     // Where each file was found to end: nothing at or past it is read.
@@ -210,15 +211,21 @@ impl<'o, 'a> PieceReader<'o, 'a> {
         }
     }
 
-    /// Whether `piece`'s data is there, read into `into`, which is as long
-    /// as the piece. A file that ends at some offset, or is not there at
-    /// all, is broken from there and not read there again: every piece of
-    /// it from there on is needed. Any other miss fails that piece alone
-    /// (libtorrent `torrent::on_piece_hashed` skips the rest of a file only
-    /// on eof, a missing file or a file too short).
-    pub(crate) fn read(&mut self, piece: ValidPieceIndex, into: &mut [u8]) -> anyhow::Result<bool> {
+    /// Whether the data of `piece` from `from` on is there, read into
+    /// `into`: the whole piece, or a slice of one too large to hold. A
+    /// file that ends at some offset, or is not there at all, is broken
+    /// from there and not read there again: every piece of it from there
+    /// on is needed. Any other miss fails that piece alone (libtorrent
+    /// `torrent::on_piece_hashed` skips the rest of a file only on eof, a
+    /// missing file or a file too short).
+    pub(crate) fn read(
+        &mut self,
+        piece: ValidPieceIndex,
+        from: usize,
+        into: &mut [u8],
+    ) -> anyhow::Result<bool> {
         let mut filled = 0;
-        for span in self.ops.piece_spans(piece) {
+        for span in self.ops.piece_spans(piece, from, into.len()) {
             if span.at >= self.broken[span.file] {
                 return Ok(false);
             }
@@ -244,36 +251,254 @@ impl<'o, 'a> PieceReader<'o, 'a> {
     }
 }
 
-/// A piece a check's reader read whole, on its way to a hasher.
-struct ReadPiece {
+/// A piece on its way from a check's reader to the one hasher that takes
+/// it: its slices in the order they were read, and how the read ended.
+struct Stream {
     piece: ValidPieceIndex,
-    bytes: Vec<u8>,
-    // The storage wants the bytes if the piece passes.
+    // The storage wants the bytes if the piece passes: the piece is one
+    // slice, in a buffer of its own.
     wanted: bool,
+    slices: Mutex<Slices>,
+    // Rung when a slice joins, and when the read ended.
+    more: Condvar,
 }
 
-/// What a check's reader and its hashers share: the pieces read and not
-/// yet taken by a hasher, and the buffers the hashers are done with.
+#[derive(Default)]
+struct Slices {
+    // What the reader hashed of the piece before it handed it on, and the
+    // time that took.
+    begun: Option<(PieceDigest, Duration)>,
+    read: VecDeque<Vec<u8>>,
+    // Set once nothing more joins: whether the whole piece was there.
+    end: Option<anyhow::Result<bool>>,
+}
+
+impl Stream {
+    fn end(&self, end: anyhow::Result<bool>) {
+        self.slices.lock().end = Some(end);
+        self.more.notify_all();
+    }
+}
+
+/// The memory a check reads into.
 ///
-/// The reader runs at most `most` pieces ahead of the hashers, one for
-/// each hasher. With the piece each hasher holds and the one in the
-/// reader's hand, a check on `t` threads holds at most `2 * t - 1` piece
-/// buffers: on 4 threads, 7 MiB at 1 MiB pieces and 112 MiB at 16 MiB
-/// pieces. The buffers are used again, piece after piece.
+/// `slice` is the most one read buffer holds, and the unit the reader
+/// hands a hasher: a piece up to it is read in one read, a larger one in
+/// slices of it, in order, each hashed as it comes, by the one hasher
+/// that took the piece.
+///
+/// `ahead` is the most the buffers of a torrent's check hold together:
+/// the slices read and waiting for a hasher, those being hashed, and the
+/// buffers kept to read into again. The reader waits for a hasher to be
+/// done with a buffer before it takes one past this, so a check holds at
+/// most `ahead` and one slice. 64 MiB lets four threads each hash a
+/// 16 MiB piece at once; at 1 MiB pieces a check on four threads holds
+/// 7 MiB, a piece waiting for each hasher. libtorrent holds 4 MiB of
+/// blocks for its one hashing thread (`checking_mem_usage`, 256 blocks of
+/// 16 KiB, settings_pack.cpp:354, v2.0.15); the rest here is what hashing
+/// on several threads holds.
+///
+/// 256 KiB was the fastest slice measured on a hot cache (64 KiB, 256 KiB,
+/// 1 MiB and 16 MiB tried at 1 MiB and 16 MiB pieces): it is hashed from
+/// the processor's cache, and a hasher is handed 4 of them per MiB.
+///
+/// One piece is held past this: a piece the storage wants as hashed is
+/// handed to it whole, so it is read whole, one at a time, into a buffer
+/// of its own, however large.
+///
+/// The check of a single piece (a seed-mode piece a peer asks for, a
+/// resumed torrent's pieces) holds one buffer of at most `slice`.
+#[derive(Clone, Copy)]
+pub(crate) struct CheckMemory {
+    pub(crate) slice: usize,
+    pub(crate) ahead: usize,
+}
+
+pub(crate) const CHECK_MEMORY: CheckMemory = CheckMemory {
+    slice: 256 << 10,
+    ahead: 64 << 20,
+};
+
+/// What a check's reader and its hashers share: the pieces read, or being
+/// read, that no hasher took yet, and the buffers the hashers are done
+/// with. The reader runs at most `most` pieces ahead of the hashers, one
+/// for each hasher, and no further than [`CheckMemory`] allows.
 struct ReadAhead {
     line: Mutex<Line>,
     // Rung when a piece joins the line, and when the reader ends.
     read: Condvar,
+    // Rung when a hasher is done with a buffer.
+    room: Condvar,
+    // The hashers waiting for a piece.
+    idle: AtomicUsize,
     most: usize,
+    memory: CheckMemory,
     // A hasher met an error: the reader reads no further.
     failed: AtomicBool,
 }
 
 #[derive(Default)]
 struct Line {
-    pieces: VecDeque<ReadPiece>,
+    pieces: VecDeque<Arc<Stream>>,
     spare: Vec<Vec<u8>>,
     ended: bool,
+    // The bytes of every buffer the check holds: on their way to a
+    // hasher, with a hasher, in the reader's hand, and spare.
+    held: usize,
+    // The most `held` has been.
+    most_held: usize,
+}
+
+impl Line {
+    fn hold(&mut self, bytes: usize) {
+        self.held += bytes;
+        self.most_held = self.most_held.max(self.held);
+    }
+
+    // The check is done with a buffer: kept to read into again while the
+    // check holds no more than it may, and let go otherwise.
+    fn spare(&mut self, bytes: Vec<u8>, memory: CheckMemory) {
+        if self.held <= memory.ahead {
+            self.spare.push(bytes);
+        } else {
+            self.held -= bytes.capacity();
+        }
+    }
+}
+
+impl ReadAhead {
+    // Whether the reader may hold `len` bytes more now. It may not while
+    // that takes the check past what it may hold and a hasher has a
+    // buffer to be done with; the reader holds none when it asks.
+    fn has_room(&self, line: &Line, len: usize) -> bool {
+        self.most == 0 || line.held == 0 || line.held + len <= self.memory.ahead
+    }
+
+    // A buffer of `len` bytes to read into: one the check is done with,
+    // or a new one. A buffer for a hasher is waited for while the check
+    // holds all it may; the one the reader hashes from is not.
+    fn buffer(&self, len: usize, for_hasher: bool) -> Vec<u8> {
+        let mut line = self.line.lock();
+        let mut bytes = loop {
+            if let Some(bytes) = line.spare.pop() {
+                break bytes;
+            }
+            if !for_hasher || self.has_room(&line, len) {
+                break Vec::new();
+            }
+            self.room.wait(&mut line);
+        };
+        let had = bytes.capacity();
+        if had < len {
+            bytes.reserve_exact(len - bytes.len());
+            line.hold(bytes.capacity() - had);
+        }
+        drop(line);
+        bytes.resize(len, 0);
+        bytes
+    }
+
+    // A buffer of `len` bytes that goes to the storage: a new one, in the
+    // place of a spare buffer, which is let go, and of as many more as the
+    // check would otherwise hold more than it may. So the check holds no
+    // more buffers for the pieces the storage wants than for the rest.
+    fn own_buffer(&self, len: usize) -> Vec<u8> {
+        let mut line = self.line.lock();
+        loop {
+            if let Some(spare) = line.spare.pop() {
+                line.held -= spare.capacity();
+            }
+            while line.held + len > self.memory.ahead {
+                let Some(spare) = line.spare.pop() else {
+                    break;
+                };
+                line.held -= spare.capacity();
+            }
+            if self.has_room(&line, len) {
+                break;
+            }
+            self.room.wait(&mut line);
+        }
+        line.hold(len);
+        drop(line);
+        vec![0u8; len]
+    }
+
+    // A buffer the check is done with.
+    fn done_with(&self, bytes: Vec<u8>) {
+        self.line.lock().spare(bytes, self.memory);
+        self.room.notify_one();
+    }
+
+    // A buffer of `len` bytes went to the storage, or was dropped.
+    fn gone(&self, len: usize) {
+        self.line.lock().held -= len;
+        self.room.notify_one();
+    }
+
+    // Whether a hasher waits with no piece to take.
+    fn hungry(&self) -> bool {
+        self.idle.load(Ordering::Relaxed) > 0 && self.line.lock().pieces.is_empty()
+    }
+
+    // `piece`, of `len` bytes, joins the line for a hasher to take while it
+    // is read, unless as many wait as may or the check has no room for it.
+    // With `begun`, what the reader hashed of it, it joins whatever waits.
+    fn open(
+        &self,
+        piece: ValidPieceIndex,
+        len: usize,
+        begun: Option<(PieceDigest, Duration)>,
+    ) -> Option<Arc<Stream>> {
+        let mut line = self.line.lock();
+        if begun.is_none() && (line.pieces.len() >= self.most || !self.has_room(&line, len)) {
+            return None;
+        }
+        let stream = Arc::new(Stream {
+            piece,
+            wanted: false,
+            slices: Mutex::new(Slices {
+                begun,
+                ..Default::default()
+            }),
+            more: Condvar::new(),
+        });
+        line.pieces.push_back(stream.clone());
+        drop(line);
+        self.read.notify_one();
+        Some(stream)
+    }
+
+    // The piece the storage wants, read whole into `bytes`, joins the line
+    // for a hasher, unless as many wait as may: true when it went, `bytes`
+    // left empty.
+    fn hand_on(&self, piece: ValidPieceIndex, bytes: &mut Vec<u8>) -> bool {
+        let mut line = self.line.lock();
+        if line.pieces.len() >= self.most {
+            return false;
+        }
+        line.pieces.push_back(Arc::new(Stream {
+            piece,
+            wanted: true,
+            slices: Mutex::new(Slices {
+                begun: None,
+                read: VecDeque::from([std::mem::take(bytes)]),
+                end: Some(Ok(true)),
+            }),
+            more: Condvar::new(),
+        }));
+        drop(line);
+        self.read.notify_one();
+        true
+    }
+}
+
+/// How the reader's own hashing of a piece ended: with its verdict, or
+/// with the piece handed to a hasher from an offset on, and what was
+/// hashed of it.
+enum Hashed {
+    Here(bool),
+    HandedOn(usize, Box<(PieceDigest, Duration)>),
 }
 
 type Checked = Vec<(ValidPieceIndex, anyhow::Result<bool>)>;
@@ -365,12 +590,14 @@ impl<'a> FileOps<'a> {
     }
 
     /// The pieces whose data is already there. One thread, the caller's,
-    /// reads the pieces whole and in piece order; the other `threads - 1`
-    /// hash what it read (libtorrent `torrent::start_checking` issues a
+    /// reads the pieces in piece order, a slice at a read; the other
+    /// `threads - 1` hash what it read, a piece on one of them, slice by
+    /// slice as it is read (libtorrent `torrent::start_checking` issues a
     /// hash job per piece in piece order, torrent.cpp:2524-2546, v2.0.15,
     /// and keeps a few outstanding, :2497-2504). The reader runs at most a
-    /// piece per hasher ahead; past that, and with no thread but its own,
-    /// it hashes the piece it holds before it reads the next. The verdicts
+    /// piece per hasher ahead, within the memory [`CHECK_MEMORY`] allows;
+    /// past that, and with no thread but its own, it hashes what it reads
+    /// itself, until a hasher has nothing to take. The verdicts
     /// land in the bitfield in piece order, the first error by piece ending
     /// the check; pausing stops the reader at the next piece, every piece
     /// read is still hashed, and the check comes back as where it stopped.
@@ -386,6 +613,41 @@ impl<'a> FileOps<'a> {
         pause_requested: &AtomicBool,
         from: Option<CheckedSoFar>,
     ) -> anyhow::Result<CheckOutcome> {
+        self.check_within(CHECK_MEMORY, threads, progress, pause_requested, from)
+            .0
+    }
+
+    /// [`Self::initial_check_from`] within `memory`, and the most bytes its
+    /// buffers held at once.
+    fn check_within(
+        &self,
+        memory: CheckMemory,
+        threads: usize,
+        progress: &AtomicU64,
+        pause_requested: &AtomicBool,
+        from: Option<CheckedSoFar>,
+    ) -> (anyhow::Result<CheckOutcome>, usize) {
+        let mut ahead = ReadAhead {
+            line: Mutex::default(),
+            read: Condvar::new(),
+            room: Condvar::new(),
+            idle: AtomicUsize::new(0),
+            most: 0,
+            memory,
+            failed: AtomicBool::new(false),
+        };
+        let outcome = self.check_through(&mut ahead, threads, progress, pause_requested, from);
+        (outcome, ahead.line.into_inner().most_held)
+    }
+
+    fn check_through(
+        &self,
+        ahead: &mut ReadAhead,
+        threads: usize,
+        progress: &AtomicU64,
+        pause_requested: &AtomicBool,
+        from: Option<CheckedSoFar>,
+    ) -> anyhow::Result<CheckOutcome> {
         let lengths = self.torrent.lengths();
         let total = lengths.total_pieces() as usize;
         let (start, mut have_pieces) = match from {
@@ -396,17 +658,13 @@ impl<'a> FileOps<'a> {
             ),
         };
         let hashers = threads.clamp(1, (total - start).max(1)) - 1;
-        let ahead = ReadAhead {
-            line: Mutex::default(),
-            read: Condvar::new(),
-            most: hashers,
-            failed: AtomicBool::new(false),
-        };
+        ahead.most = hashers;
+        let ahead = &*ahead;
         let mut checked = std::thread::scope(|s| {
             let others: Vec<_> = (0..hashers)
-                .map(|_| s.spawn(|| self.hash_as_read(&ahead)))
+                .map(|_| s.spawn(|| self.hash_as_read(ahead)))
                 .collect();
-            let mut checked = self.read_in_order(start..total, &ahead, progress, pause_requested);
+            let mut checked = self.read_in_order(start..total, ahead, progress, pause_requested);
             for other in others {
                 checked.extend(
                     other
@@ -448,10 +706,11 @@ impl<'a> FileOps<'a> {
         Ok(CheckOutcome::Done(have_pieces))
     }
 
-    /// The reader of a check: `pieces` read whole, in order, on the calling
-    /// thread, each handed to the hashers through `ahead`, or hashed here
-    /// when as many wait as may. Returns the verdicts reached here: the
-    /// pieces not there, and those hashed here.
+    /// The reader of a check: `pieces` read in order on the calling thread,
+    /// a slice at a read. A piece goes to the hashers through `ahead`,
+    /// slice by slice as it is read, or is hashed here when as many wait
+    /// as may. Returns the verdicts reached here: those of the pieces
+    /// hashed here.
     fn read_in_order(
         &self,
         pieces: std::ops::Range<usize>,
@@ -469,10 +728,10 @@ impl<'a> FileOps<'a> {
             }
         }
         let _ended = Ended(ahead);
+        let memory = ahead.memory;
         let lengths = self.torrent.lengths();
         let mut reader = PieceReader::new(self);
         let mut checked = Vec::new();
-        let mut spare: Option<Vec<u8>> = None;
         for index in pieces {
             if pause_requested.load(Ordering::Relaxed) || ahead.failed.load(Ordering::Relaxed) {
                 break;
@@ -483,49 +742,50 @@ impl<'a> FileOps<'a> {
             else {
                 break;
             };
-            let len = lengths.piece_length(piece);
-            progress.fetch_add(len.into(), Ordering::Relaxed);
+            let len = lengths.piece_length(piece) as usize;
+            progress.fetch_add(len as u64, Ordering::Relaxed);
             // A piece the storage wants as hashed is handed to it in the
-            // buffer it was read into, so that buffer is its own.
-            let wanted = self.files.wants_hashed_piece(piece);
-            let mut bytes = if wanted {
-                vec![0u8; len as usize]
+            // buffer it was read into, so that buffer is its own, and
+            // whole.
+            let had = if self.files.wants_hashed_piece(piece) {
+                let mut bytes = ahead.own_buffer(len);
+                let had = match reader.read(piece, 0, &mut bytes) {
+                    Ok(true) if ahead.hand_on(piece, &mut bytes) => continue,
+                    Ok(true) => {
+                        let started = Instant::now();
+                        let mut digest = self.digest(piece);
+                        digest.update(&bytes);
+                        let had = self.had(piece, digest);
+                        CHECK_STATS.hashed(started.elapsed());
+                        if matches!(had, Ok(true)) {
+                            self.files.on_piece_hashed(piece, bytes.into());
+                        }
+                        had
+                    }
+                    read => read,
+                };
+                ahead.gone(len);
+                had
+            } else if let Some(stream) = ahead.open(piece, len, None) {
+                self.read_to(&mut reader, &stream, 0, len, ahead);
+                continue;
             } else {
-                let mut bytes = spare
-                    .take()
-                    .or_else(|| ahead.line.lock().spare.pop())
-                    .unwrap_or_default();
-                bytes.resize(len as usize, 0);
-                bytes
+                let mut bytes = ahead.buffer(len.min(memory.slice), false);
+                let had = self.hash_in_slices(&mut reader, piece, &mut bytes, ahead);
+                ahead.done_with(bytes);
+                match had {
+                    Ok(Hashed::Here(had)) => Ok(had),
+                    Ok(Hashed::HandedOn(from, begun)) => {
+                        if let Some(stream) = ahead.open(piece, len, Some(*begun)) {
+                            self.read_to(&mut reader, &stream, from, len, ahead);
+                        }
+                        continue;
+                    }
+                    Err(err) => Err(err),
+                }
             };
-            let read = reader.read(piece, &mut bytes);
-            if !matches!(read, Ok(true)) {
-                let stop = read.is_err();
-                checked.push((piece, read));
-                if !wanted {
-                    spare = Some(bytes);
-                }
-                if stop {
-                    break;
-                }
-                continue;
-            }
-            let mut line = ahead.line.lock();
-            if line.pieces.len() < ahead.most {
-                line.pieces.push_back(ReadPiece {
-                    piece,
-                    bytes,
-                    wanted,
-                });
-                drop(line);
-                ahead.read.notify_one();
-                continue;
-            }
-            drop(line);
-            let (had, bytes) = self.hash_read(piece, bytes, wanted);
             let stop = had.is_err();
             checked.push((piece, had));
-            spare = bytes;
             if stop {
                 break;
             }
@@ -533,73 +793,198 @@ impl<'a> FileOps<'a> {
         checked
     }
 
+    /// The bytes of the piece of `stream` from `from` up to `len` read
+    /// through `reader`, a slice at a read, each handed to the piece's
+    /// hasher as it is read.
+    fn read_to(
+        &self,
+        reader: &mut PieceReader<'_, 'a>,
+        stream: &Stream,
+        mut from: usize,
+        len: usize,
+        ahead: &ReadAhead,
+    ) {
+        // The piece's hasher is not left waiting, however the read ends.
+        struct Ended<'s>(&'s Stream);
+        impl Drop for Ended<'_> {
+            fn drop(&mut self) {
+                let mut slices = self.0.slices.lock();
+                if slices.end.is_none() {
+                    slices.end = Some(Ok(false));
+                }
+                drop(slices);
+                self.0.more.notify_all();
+            }
+        }
+        let _ended = Ended(stream);
+        while from < len {
+            let mut bytes = ahead.buffer((len - from).min(ahead.memory.slice), true);
+            match reader.read(stream.piece, from, &mut bytes) {
+                Ok(true) => {
+                    from += bytes.len();
+                    stream.slices.lock().read.push_back(bytes);
+                    stream.more.notify_one();
+                }
+                read => {
+                    ahead.done_with(bytes);
+                    stream.end(read);
+                    return;
+                }
+            }
+        }
+        stream.end(Ok(true));
+    }
+
     /// A hasher of a check: the pieces the reader read, taken from `ahead`
     /// as they come, until the reader ended and none waits.
     fn hash_as_read(&self, ahead: &ReadAhead) -> Checked {
         let mut checked = Vec::new();
-        let mut spare: Option<Vec<u8>> = None;
         loop {
-            let read = {
+            let stream = {
                 let mut line = ahead.line.lock();
-                line.spare.extend(spare.take());
                 loop {
-                    if let Some(read) = line.pieces.pop_front() {
-                        break Some(read);
+                    if let Some(stream) = line.pieces.pop_front() {
+                        break Some(stream);
                     }
                     if line.ended {
                         break None;
                     }
+                    ahead.idle.fetch_add(1, Ordering::Relaxed);
                     ahead.read.wait(&mut line);
+                    ahead.idle.fetch_sub(1, Ordering::Relaxed);
                 }
             };
-            let Some(read) = read else {
+            let Some(stream) = stream else {
                 break;
             };
-            let (had, bytes) = self.hash_read(read.piece, read.bytes, read.wanted);
+            let had = self.hash_read(&stream, ahead);
             if had.is_err() {
                 ahead.failed.store(true, Ordering::Relaxed);
             }
-            checked.push((read.piece, had));
-            spare = bytes;
+            checked.push((stream.piece, had));
         }
         checked
     }
 
-    /// Whether a piece read whole into `bytes` is the torrent's. One the
-    /// storage wanted goes to it in that buffer if it passes; any other
-    /// buffer comes back to be read into again.
-    fn hash_read(
+    /// Whether the piece of `stream` is the torrent's: its slices hashed
+    /// in order as the reader hands them on. One the storage wanted goes
+    /// to it in its buffer if it passes; any other buffer goes back to be
+    /// read into again.
+    fn hash_read(&self, stream: &Stream, ahead: &ReadAhead) -> anyhow::Result<bool> {
+        let begun = stream.slices.lock().begun.take();
+        let (mut digest, mut hashing) =
+            begun.unwrap_or_else(|| (self.digest(stream.piece), Duration::ZERO));
+        let mut kept = None;
+        let end = loop {
+            let mut read = {
+                let mut slices = stream.slices.lock();
+                loop {
+                    if !slices.read.is_empty() {
+                        break std::mem::take(&mut slices.read);
+                    }
+                    if slices.end.is_some() {
+                        break VecDeque::new();
+                    }
+                    stream.more.wait(&mut slices);
+                }
+            };
+            if read.is_empty() {
+                break stream.slices.lock().end.take().unwrap_or(Ok(false));
+            }
+            let started = Instant::now();
+            for slice in &read {
+                digest.update(slice);
+            }
+            hashing += started.elapsed();
+            if stream.wanted {
+                kept = read.pop_front();
+                continue;
+            }
+            let mut line = ahead.line.lock();
+            for slice in read {
+                line.spare(slice, ahead.memory);
+            }
+            drop(line);
+            ahead.room.notify_one();
+        };
+        let had = match end {
+            Ok(true) => {
+                let started = Instant::now();
+                let had = self.had(stream.piece, digest);
+                CHECK_STATS.hashed(hashing + started.elapsed());
+                had
+            }
+            end => end,
+        };
+        if let Some(bytes) = kept {
+            let len = bytes.len();
+            if matches!(had, Ok(true)) {
+                self.files.on_piece_hashed(stream.piece, bytes.into());
+            }
+            ahead.gone(len);
+        }
+        had
+    }
+
+    /// Whether `piece` is the torrent's: read through `reader` a slice of
+    /// `into` at a time, in order, and hashed here as it is read, until a
+    /// hasher waits with nothing to take: the piece is then that hasher's
+    /// from the slice reached, with what was hashed of it here.
+    fn hash_in_slices(
         &self,
+        reader: &mut PieceReader<'_, 'a>,
         piece: ValidPieceIndex,
-        bytes: Vec<u8>,
-        wanted: bool,
-    ) -> (anyhow::Result<bool>, Option<Vec<u8>>) {
-        let started = Instant::now();
+        into: &mut [u8],
+        ahead: &ReadAhead,
+    ) -> anyhow::Result<Hashed> {
+        let len = self.torrent.lengths().piece_length(piece) as usize;
         let mut digest = self.digest(piece);
-        digest.update(&bytes);
+        let mut hashing = Duration::ZERO;
+        let mut from = 0;
+        while from < len {
+            if ahead.hungry() {
+                return Ok(Hashed::HandedOn(from, Box::new((digest, hashing))));
+            }
+            let most = into.len();
+            let slice = &mut into[..(len - from).min(most)];
+            if !reader.read(piece, from, slice)? {
+                return Ok(Hashed::Here(false));
+            }
+            let started = Instant::now();
+            digest.update(slice);
+            hashing += started.elapsed();
+            from += slice.len();
+        }
+        let started = Instant::now();
+        let had = self.had(piece, digest);
+        CHECK_STATS.hashed(hashing + started.elapsed());
+        had.map(Hashed::Here)
+    }
+
+    /// Whether the piece `digest` hashed is the torrent's, for a check of
+    /// what is on disk.
+    fn had(&self, piece: ValidPieceIndex, digest: PieceDigest) -> anyhow::Result<bool> {
         // A piece whose v1 hash fails is not checked against v2: its data
         // is most likely missing (libtorrent `torrent::on_piece_hashed`).
         let (v1, v2) = self.hashes_match(piece, digest);
-        CHECK_STATS.hashed(started);
-        let had = match Verdict::of(v1, v2.filter(|_| v1 != Some(false))) {
+        match Verdict::of(v1, v2.filter(|_| v1 != Some(false))) {
             Verdict::Passed => Ok(true),
             Verdict::Failed | Verdict::Unknown => Ok(false),
             Verdict::Inconsistent => Err(inconsistent_hashes(piece)),
-        };
-        if !wanted {
-            return (had, Some(bytes));
         }
-        if matches!(had, Ok(true)) {
-            self.files.on_piece_hashed(piece, bytes.into());
-        }
-        (had, None)
     }
 
-    /// The shares of `piece` its files hold, in file order.
-    fn piece_spans(&self, piece: ValidPieceIndex) -> impl Iterator<Item = Span<'a>> + use<'a> {
+    /// The shares its files hold of the `len` bytes of `piece` from `from`
+    /// on, in file order.
+    fn piece_spans(
+        &self,
+        piece: ValidPieceIndex,
+        from: usize,
+        len: usize,
+    ) -> impl Iterator<Item = Span<'a>> + use<'a> {
         let lengths = self.torrent.lengths();
-        let start = lengths.piece_offset(piece);
-        let len = u64::from(lengths.piece_length(piece));
+        let start = lengths.piece_offset(piece) + from as u64;
+        let len = len as u64;
         let file_infos = self.file_infos;
         let first = file_infos.partition_point(|fi| fi.offset_in_torrent + fi.len <= start);
         let mut done = 0u64;
@@ -640,15 +1025,23 @@ impl<'a> FileOps<'a> {
         read
     }
 
-    /// `piece` read whole into `into`, which is as long as the piece: a
-    /// piece's share of a file in one read call.
-    fn read_whole(&self, piece: ValidPieceIndex, into: &mut [u8]) -> anyhow::Result<()> {
+    /// The bytes of `piece` from `from` on read into `into`: a piece's
+    /// share of a file in one read call.
+    fn read_whole(
+        &self,
+        piece: ValidPieceIndex,
+        from: usize,
+        into: &mut [u8],
+    ) -> anyhow::Result<()> {
         let mut filled = 0;
-        for span in self.piece_spans(piece) {
+        for span in self.piece_spans(piece, from, into.len()) {
             let share = into
                 .get_mut(span.from..span.from + span.len)
                 .context("broken torrent metadata")?;
-            self.read_span(&span, share, 0).with_context(|| {
+            // A slice that goes on in the file the one before it ended in
+            // starts where that one ended.
+            let after = if from > 0 && filled == 0 { span.at } else { 0 };
+            self.read_span(&span, share, after).with_context(|| {
                 format!(
                     "error reading {} bytes, file_id: {} (\"{:?}\")",
                     span.len, span.file, span.info.relative_filename
@@ -669,15 +1062,31 @@ impl<'a> FileOps<'a> {
 
     /// [`Self::check_piece`] of a piece that was not just written, as a
     /// seed-mode piece a peer first asks for: its share of each file is
-    /// read in one read call, not a part at a time.
+    /// read in one read call, not a part at a time, into one buffer of at
+    /// most [`CheckMemory::slice`], a larger piece a slice at a time.
     pub fn check_piece_whole(&self, piece_index: ValidPieceIndex) -> anyhow::Result<Verdict> {
+        self.check_piece_sliced(piece_index, CHECK_MEMORY.slice)
+    }
+
+    fn check_piece_sliced(
+        &self,
+        piece_index: ValidPieceIndex,
+        slice: usize,
+    ) -> anyhow::Result<Verdict> {
         self.check_piece_read(piece_index, |h| {
-            let len = self.torrent.lengths().piece_length(piece_index);
-            let mut bytes = vec![0u8; len as usize];
-            self.read_whole(piece_index, &mut bytes)?;
-            let started = Instant::now();
-            h.update(&bytes);
-            CHECK_STATS.hashed(started);
+            let len = self.torrent.lengths().piece_length(piece_index) as usize;
+            let mut bytes = vec![0u8; len.min(slice)];
+            let mut hashing = Duration::ZERO;
+            let mut from = 0;
+            while from < len {
+                let slice = &mut bytes[..(len - from).min(slice)];
+                self.read_whole(piece_index, from, slice)?;
+                let started = Instant::now();
+                h.update(slice);
+                hashing += started.elapsed();
+                from += slice.len();
+            }
+            CHECK_STATS.hashed(hashing);
             Ok(())
         })
     }
@@ -2035,6 +2444,9 @@ mod tests {
         reads: std::sync::Mutex<Vec<(usize, u64, usize, std::thread::ThreadId)>>,
         pause_at: Option<(usize, u64, std::sync::Arc<AtomicBool>)>,
         wants: bool,
+        // The pieces of a one-file torrent the storage wants as hashed,
+        // and the torrent's piece length.
+        wants_in: Option<(std::ops::Range<u32>, u32)>,
         held: std::sync::Mutex<(usize, usize)>,
     }
 
@@ -2045,6 +2457,7 @@ mod tests {
                 reads: Default::default(),
                 pause_at: None,
                 wants: false,
+                wants_in: None,
                 held: Default::default(),
             }
         }
@@ -2072,7 +2485,11 @@ mod tests {
             {
                 pause.store(true, Ordering::Relaxed);
             }
-            if self.wants {
+            let wanted = self.wants
+                || self.wants_in.as_ref().is_some_and(|(pieces, len)| {
+                    pieces.contains(&u32::try_from(offset / u64::from(*len)).unwrap())
+                });
+            if wanted {
                 let mut held = self.held.lock().unwrap();
                 held.0 += 1;
                 held.1 = held.1.max(held.0);
@@ -2108,8 +2525,12 @@ mod tests {
             self.files.on_piece_checked(piece)
         }
 
-        fn wants_hashed_piece(&self, _piece: ValidPieceIndex) -> bool {
+        fn wants_hashed_piece(&self, piece: ValidPieceIndex) -> bool {
             self.wants
+                || self
+                    .wants_in
+                    .as_ref()
+                    .is_some_and(|(pieces, _)| pieces.contains(&piece.get()))
         }
 
         fn on_piece_hashed(&self, _piece: ValidPieceIndex, _bytes: bytes::Bytes) {
@@ -2180,22 +2601,181 @@ mod tests {
         }
     }
 
-    /// The reader is never more than a piece for each hasher ahead of the
-    /// hashers: with the piece each hasher holds and the one in its own
-    /// hand, a check on `t` threads holds at most `2 * t - 1` pieces.
+    /// The buffers of a check hold no more than its memory allows and one
+    /// buffer more, on any number of threads, whether the storage wants
+    /// every piece as hashed, none, or a stretch of them between pieces it
+    /// does not want; and never more than a piece waiting for each hasher,
+    /// one with each hasher and one in the reader's hand.
     #[test]
-    fn a_check_holds_no_more_pieces_than_its_threads_allow() {
-        let (metadata, payload) = v1_torrent(&[("a", 300 * 1024)], 1024);
-        for threads in [1, 2, 4] {
-            let mut storage = Recording::new(Files::new(&metadata, &payload));
-            storage.wants = true;
-            FileOps::new(&metadata, &storage, true)
-                .initial_check(threads, &AtomicU64::new(0), &AtomicBool::new(false))
-                .unwrap();
-            let (held, most) = storage.held.into_inner().unwrap();
-            assert_eq!(held, 0);
-            assert!((1..2 * threads).contains(&most), "{most} on {threads}");
+    fn a_check_holds_no_more_bytes_than_its_memory_allows() {
+        const PIECE: usize = 1024;
+        let (metadata, payload) = v1_torrent(&[("a", 300 * PIECE)], PIECE);
+        let memory = CheckMemory {
+            slice: PIECE,
+            ahead: 3 * PIECE,
+        };
+        let roomy = CheckMemory {
+            slice: PIECE,
+            ahead: 1000 * PIECE,
+        };
+        let stats = CHECK_STATS.snapshot();
+        let mut checks = 0;
+        for threads in [1, 2, 4, 9] {
+            for wants in [None, Some(0..300), Some(100..200)] {
+                let all = wants == Some(0..300);
+                let mut storage = Recording::new(Files::new(&metadata, &payload));
+                storage.wants_in = wants.map(|pieces| (pieces, u32::try_from(PIECE).unwrap()));
+                let ops = FileOps::new(&metadata, &storage, true);
+                let check = |memory| {
+                    let (outcome, most) = ops.check_within(
+                        memory,
+                        threads,
+                        &AtomicU64::new(0),
+                        &AtomicBool::new(false),
+                        None,
+                    );
+                    let CheckOutcome::Done(have) = outcome.unwrap() else {
+                        panic!("paused");
+                    };
+                    assert_eq!(have.count_ones(), 300);
+                    most
+                };
+                let most = check(memory);
+                assert!(
+                    (PIECE..=memory.ahead + PIECE).contains(&most),
+                    "{most} bytes on {threads}"
+                );
+                let most = check(roomy);
+                assert!(
+                    (PIECE..=(2 * threads - 1) * PIECE).contains(&most),
+                    "{most} bytes on {threads} with room"
+                );
+                checks += 2;
+                // The pieces the storage wanted and was not yet handed.
+                let (held, most) = storage.held.into_inner().unwrap();
+                assert_eq!(held, 0);
+                if all {
+                    assert!((1..2 * threads).contains(&most), "{most} on {threads}");
+                }
+            }
         }
+        // The process's counters saw these checks, whatever else ran.
+        let counted = CHECK_STATS.snapshot();
+        assert!(counted.read_calls - stats.read_calls >= checks * 300);
+        assert!(counted.read_bytes - stats.read_bytes >= checks * 300 * PIECE as u64);
+        assert!(counted.pieces_hashed - stats.pieces_hashed >= checks * 300);
+    }
+
+    /// A piece larger than one buffer is read a slice at a time, in order,
+    /// on the one reader, into one buffer, to the verdict the piece read
+    /// whole gets; one the storage wants as hashed still reaches it whole.
+    #[test]
+    fn a_piece_larger_than_a_buffer_is_read_in_slices_to_the_same_verdict() {
+        const SLICE: usize = 5000;
+        let memory = CheckMemory {
+            slice: SLICE,
+            ahead: 4 * SLICE,
+        };
+        let hybrid_t = checking_torrent();
+        let hybrid_m = metadata(&hybrid_t.torrent_bytes());
+        let hybrid_p = hybrid_t.v1_payload();
+        let (v1_m, v1_p) = v1_torrent(&[("a", 100), ("b", 9 * 16384 + 5), ("c", 30_000)], 16384);
+        for (metadata, payload) in [(&v1_m, &v1_p), (&hybrid_m, &hybrid_p)] {
+            let mut damaged = payload.clone();
+            let middle = damaged.len() / 2;
+            damaged[middle] ^= 1;
+            for payload in [payload, &damaged] {
+                for threads in [1, 4] {
+                    let whole = {
+                        let files = Files::new(metadata, payload);
+                        let progress = AtomicU64::new(0);
+                        let have = FileOps::new(metadata, &files, false)
+                            .initial_check(threads, &progress, &AtomicBool::new(false))
+                            .unwrap();
+                        left(metadata, &files, have, &progress)
+                    };
+                    let storage = Recording::new(Files::new(metadata, payload));
+                    let progress = AtomicU64::new(0);
+                    let (outcome, most) = FileOps::new(metadata, &storage, false).check_within(
+                        memory,
+                        threads,
+                        &progress,
+                        &AtomicBool::new(false),
+                        None,
+                    );
+                    let CheckOutcome::Done(have) = outcome.unwrap() else {
+                        panic!("paused");
+                    };
+                    assert_eq!(left(metadata, &storage.files, have, &progress), whole);
+                    if threads == 1 {
+                        assert_eq!(most, SLICE, "one buffer of a slice");
+                    } else {
+                        assert!(
+                            (SLICE..=memory.ahead + SLICE).contains(&most),
+                            "{most} bytes on {threads}"
+                        );
+                    }
+                    // Every read is a slice at most, from one thread, and
+                    // goes on in its file where the one before it ended.
+                    let reads = storage.reads.into_inner().unwrap();
+                    let mut ends = std::collections::HashMap::new();
+                    for (file, offset, len, thread) in &reads {
+                        assert!(*len <= SLICE);
+                        assert_eq!(*thread, reads[0].3);
+                        let end = ends.entry(*file).or_insert(0u64);
+                        assert_eq!(*offset, *end, "file {file}");
+                        *end = offset + *len as u64;
+                    }
+                }
+            }
+        }
+
+        // Wanted, a piece is read whole whatever its size, and handed over.
+        let mut storage = Recording::new(Files::new(&v1_m, &v1_p));
+        storage.wants = true;
+        let (outcome, most) = FileOps::new(&v1_m, &storage, true).check_within(
+            memory,
+            1,
+            &AtomicU64::new(0),
+            &AtomicBool::new(false),
+            None,
+        );
+        assert!(matches!(outcome.unwrap(), CheckOutcome::Done(_)));
+        assert_eq!(most, 16384, "one piece at a time on one thread");
+        assert!(
+            storage
+                .reads
+                .into_inner()
+                .unwrap()
+                .iter()
+                .any(|(_, _, len, _)| *len == 16384)
+        );
+    }
+
+    /// The check of one piece reads a piece larger than its buffer a slice
+    /// at a time, to the verdict the piece read a part at a time gets.
+    #[test]
+    fn one_piece_larger_than_a_buffer_is_checked_in_slices_to_the_same_verdict() {
+        const SLICE: usize = 5000;
+        let (metadata, mut payload) =
+            v1_torrent(&[("a", 100), ("b", 5 * 16384), ("c", 20_000)], 16384);
+        payload[3 * 16384 + 7] ^= 1;
+        let storage = Recording::new(Files::new(&metadata, &payload));
+        let ops = FileOps::new(&metadata, &storage, true);
+        let mut verdicts = Vec::new();
+        for piece in metadata.lengths().iter_piece_infos() {
+            let piece = piece.piece_index;
+            let parts = ops.check_piece(piece).unwrap();
+            storage.reads.lock().unwrap().clear();
+            assert_eq!(ops.check_piece_sliced(piece, SLICE).unwrap(), parts);
+            let reads = storage.reads.lock().unwrap();
+            assert!(reads.iter().all(|(_, _, len, _)| *len <= SLICE), "{piece}");
+            let read: usize = reads.iter().map(|(_, _, len, _)| len).sum();
+            assert_eq!(read, metadata.lengths().piece_length(piece) as usize);
+            verdicts.push(parts);
+        }
+        assert!(verdicts.contains(&Verdict::Failed));
+        assert!(verdicts.contains(&Verdict::Passed));
     }
 
     /// A pause asked for while a piece is read stops the check at the next
@@ -2309,6 +2889,437 @@ mod tests {
                     }
                     assert!(verdicts.contains(&None), "no piece failed to read");
                     assert!(verdicts.contains(&Some(Verdict::Passed)));
+                }
+            }
+        }
+    }
+
+    /// Adversary proofs for the check reader (review of ruling A1).
+    mod adversary {
+        use super::*;
+
+        /// A v1 torrent of `files` laid end to end, a file marked `true`
+        /// padding (BEP 47 `attr` p), its bytes zero in the payload.
+        fn padded_v1(
+            files: &[(&str, usize, bool)],
+            piece_length: usize,
+        ) -> (TorrentMetadata, Vec<u8>) {
+            let total: usize = files.iter().map(|(_, len, _)| len).sum();
+            let mut data = payload(total, 5);
+            let mut at = 0;
+            for (_, len, pad) in files {
+                if *pad {
+                    data[at..at + len].fill(0);
+                }
+                at += len;
+            }
+            let pieces: Vec<u8> = data
+                .chunks(piece_length)
+                .flat_map(|piece| {
+                    let mut h = Sha1::new();
+                    h.update(piece);
+                    h.finish()
+                })
+                .collect();
+            let mut torrent = b"d4:infod5:filesl".to_vec();
+            for (name, len, pad) in files {
+                let attr = if *pad { "4:attr1:p" } else { "" };
+                torrent.extend(
+                    format!("d{attr}6:lengthi{len}e4:pathl{}:{name}ee", name.len()).bytes(),
+                );
+            }
+            torrent.extend(
+                format!(
+                    "e4:name1:x12:piece lengthi{piece_length}e6:pieces{}:",
+                    pieces.len()
+                )
+                .bytes(),
+            );
+            torrent.extend(pieces);
+            torrent.extend(b"ee");
+            (metadata(&torrent), data)
+        }
+
+        type Damage = (String, Box<dyn Fn(&mut Files)>);
+
+        /// Every damage of one file: a flipped byte, cut short by one byte,
+        /// gone, and a range not in hand.
+        fn damages_of(file: usize, len: usize) -> Vec<Damage> {
+            let mut out: Vec<Damage> = vec![
+                (
+                    format!("flip {file}"),
+                    Box::new(move |f: &mut Files| f.0[file][len / 2] ^= 1),
+                ),
+                (
+                    format!("short {file}"),
+                    Box::new(move |f: &mut Files| f.0[file].truncate(len - 1)),
+                ),
+                (
+                    format!("missing {file}"),
+                    Box::new(move |f: &mut Files| f.0[file].clear()),
+                ),
+                (
+                    format!("hole {file}"),
+                    Box::new(move |f: &mut Files| f.3.push((file, 0..len as u64))),
+                ),
+            ];
+            if len > 2 {
+                out.push((
+                    format!("cut mid {file}"),
+                    Box::new(move |f: &mut Files| f.0[file].truncate(len / 2)),
+                ));
+            }
+            out
+        }
+
+        fn reference(
+            metadata: &TorrentMetadata,
+            payload: &[u8],
+            damage: &dyn Fn(&mut Files),
+            threads: usize,
+        ) -> Left {
+            let mut files = Files::new(metadata, payload);
+            damage(&mut files);
+            let progress = AtomicU64::new(0);
+            let outcome = check_reading_on_every_thread(
+                &FileOps::new(metadata, &files, true),
+                threads,
+                &progress,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let CheckOutcome::Done(have) = outcome else {
+                panic!("paused");
+            };
+            left(metadata, &files, have, &progress)
+        }
+
+        fn same_as_reference(
+            label: &str,
+            metadata: &TorrentMetadata,
+            payload: &[u8],
+            damages: &[Damage],
+        ) {
+            let whole: Damage = ("whole".into(), Box::new(|_: &mut Files| {}));
+            for (name, damage) in std::iter::once(&whole).chain(damages) {
+                let want = reference(metadata, payload, damage, 1);
+                assert_eq!(
+                    reference(metadata, payload, damage, 4),
+                    want,
+                    "{label} {name}: reference not stable"
+                );
+                if name != "whole" && !name.starts_with("pad") {
+                    assert!(want.0.contains(&false), "{label} {name}: damage not seen");
+                }
+                for threads in [1, 2, 3, 4, 9] {
+                    let mut files = Files::new(metadata, payload);
+                    damage(&mut files);
+                    let progress = AtomicU64::new(0);
+                    let have = FileOps::new(metadata, &files, true)
+                        .initial_check(threads, &progress, &AtomicBool::new(false))
+                        .unwrap();
+                    assert_eq!(
+                        left(metadata, &files, have, &progress),
+                        want,
+                        "{label} {name} threads {threads}"
+                    );
+                }
+            }
+        }
+
+        fn every_file_damage(
+            metadata: &TorrentMetadata,
+            pick: impl Fn(usize) -> bool,
+        ) -> Vec<Damage> {
+            metadata
+                .file_infos
+                .iter()
+                .enumerate()
+                .filter(|(i, fi)| fi.len > 0 && !fi.attrs.padding && pick(*i))
+                .flat_map(|(i, fi)| damages_of(i, usize::try_from(fi.len).unwrap()))
+                .collect()
+        }
+
+        #[test]
+        fn adversary_padding_files_get_the_old_verdicts() {
+            let (m, p) = padded_v1(
+                &[
+                    ("a", 100, false),
+                    ("p1", 16284, true),
+                    ("b", 40000, false),
+                    ("p2", 9152, true),
+                    ("c", 5, false),
+                ],
+                16384,
+            );
+            assert_eq!(m.file_infos.iter().filter(|fi| fi.attrs.padding).count(), 2);
+            let mut damages = every_file_damage(&m, |_| true);
+            // The bytes a storage holds for a padding file are never read.
+            for pad in [1usize, 3] {
+                damages.push((
+                    format!("pad junk {pad}"),
+                    Box::new(move |f: &mut Files| f.0[pad].iter_mut().for_each(|b| *b = 0xa5)),
+                ));
+                damages.push((
+                    format!("pad gone {pad}"),
+                    Box::new(move |f: &mut Files| f.0[pad].clear()),
+                ));
+            }
+            same_as_reference("padding", &m, &p, &damages);
+        }
+
+        #[test]
+        fn adversary_file_boundaries_on_piece_boundaries_get_the_old_verdicts() {
+            let (m, p) = v1_torrent(&[("a", 16384), ("b", 32768), ("c", 16389)], 16384);
+            same_as_reference("boundary", &m, &p, &every_file_damage(&m, |_| true));
+        }
+
+        #[test]
+        fn adversary_zero_length_files_get_the_old_verdicts() {
+            let (m, p) = v1_torrent(
+                &[
+                    ("z0", 0),
+                    ("a", 16384),
+                    ("z1", 0),
+                    ("z2", 0),
+                    ("b", 100),
+                    ("z3", 0),
+                ],
+                16384,
+            );
+            same_as_reference("zero", &m, &p, &every_file_damage(&m, |_| true));
+        }
+
+        #[test]
+        fn adversary_thousands_of_tiny_files_in_one_piece_get_the_old_verdicts() {
+            let names: Vec<String> = (0..2000).map(|i| format!("t{i:04}")).collect();
+            let mut files: Vec<(&str, usize)> = names.iter().map(|n| (n.as_str(), 8)).collect();
+            files.push(("big", 30000));
+            let (m, p) = v1_torrent(&files, 16384);
+            assert_eq!(m.lengths().total_pieces(), 3);
+            let pick = |i: usize| [0, 1, 999, 1998, 1999, 2000].contains(&i);
+            let mut damages = every_file_damage(&m, pick);
+            damages.push((
+                "two tiny gone".into(),
+                Box::new(|f: &mut Files| {
+                    f.0[10].clear();
+                    f.0[1500].clear();
+                }),
+            ));
+            same_as_reference("tiny", &m, &p, &damages);
+            // And tiny files spread over several pieces.
+            let spread: Vec<(&str, usize)> = names.iter().map(|n| (n.as_str(), 7)).collect();
+            let (m, p) = v1_torrent(&spread, 4096);
+            assert!(m.lengths().total_pieces() > 3);
+            same_as_reference("spread", &m, &p, &every_file_damage(&m, |i| i % 97 == 0));
+        }
+
+        /// The pieces a storage wants as hashed reach it with the bytes the
+        /// old check handed it, whatever else is wrong.
+        #[test]
+        fn adversary_wanted_pieces_reach_the_storage_as_before() {
+            let (m, p) = padded_v1(
+                &[
+                    ("a", 100, false),
+                    ("p1", 16284, true),
+                    ("b", 70000, false),
+                    ("c", 9, false),
+                ],
+                16384,
+            );
+            let wanted: Vec<u32> = (0..m.lengths().total_pieces())
+                .filter(|i| i % 2 == 0)
+                .collect();
+            let run = |new: bool, threads: usize, damage: &dyn Fn(&mut Files)| {
+                let mut files = Files::new(&m, &p);
+                damage(&mut files);
+                let storage = Wanting {
+                    files,
+                    wanted: wanted.clone(),
+                    hashed: Default::default(),
+                };
+                let ops = FileOps::new(&m, &storage, true);
+                if new {
+                    ops.initial_check(threads, &AtomicU64::new(0), &AtomicBool::new(false))
+                        .unwrap();
+                } else {
+                    check_reading_on_every_thread(
+                        &ops,
+                        threads,
+                        &AtomicU64::new(0),
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap();
+                }
+                let mut hashed = storage.hashed.into_inner().unwrap();
+                hashed.sort_by_key(|(piece, _)| *piece);
+                hashed
+            };
+            let none = |_: &mut Files| {};
+            let flip = |f: &mut Files| f.0[2][20000] ^= 1;
+            let cut = |f: &mut Files| f.0[2].truncate(30000);
+            for damage in [&none as &dyn Fn(&mut Files), &flip, &cut] {
+                let want = run(false, 1, damage);
+                for threads in [1, 2, 4, 9] {
+                    assert_eq!(run(true, threads, damage), want, "threads {threads}");
+                }
+            }
+        }
+
+        /// A storage over `Files` that panics on a named piece, in a read of
+        /// it or as it is handed over hashed.
+        struct Panics {
+            files: Files,
+            piece_length: u64,
+            read_panic: Option<u64>,
+            hashed_panic: Option<u32>,
+        }
+
+        impl TorrentStorage for Panics {
+            fn init(
+                &mut self,
+                shared: &ManagedTorrentShared,
+                metadata: &TorrentMetadata,
+            ) -> anyhow::Result<()> {
+                self.files.init(shared, metadata)
+            }
+            fn pread_exact(
+                &self,
+                file_id: usize,
+                offset: u64,
+                buf: &mut [u8],
+            ) -> anyhow::Result<()> {
+                if self.read_panic == Some(offset / self.piece_length) {
+                    panic!("adversary read panic");
+                }
+                self.files.pread_exact(file_id, offset, buf)
+            }
+            fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+                self.files.pwrite_all(file_id, offset, buf)
+            }
+            fn remove_file(&self, file_id: usize, filename: &Path) -> anyhow::Result<()> {
+                self.files.remove_file(file_id, filename)
+            }
+            fn remove_directory_if_empty(&self, path: &Path) -> anyhow::Result<()> {
+                self.files.remove_directory_if_empty(path)
+            }
+            fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+                self.files.ensure_file_length(file_id, length)
+            }
+            fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+                self.files.take()
+            }
+            fn wants_hashed_piece(&self, _piece: ValidPieceIndex) -> bool {
+                self.hashed_panic.is_some()
+            }
+            fn on_piece_hashed(&self, piece: ValidPieceIndex, _bytes: bytes::Bytes) {
+                if self.hashed_panic == Some(piece.get()) {
+                    panic!("adversary hasher panic");
+                }
+            }
+        }
+
+        /// A panic on the reader's thread or a hasher's ends the check in
+        /// that panic: nothing waits for ever (the runner bounds a hang).
+        #[test]
+        fn adversary_a_panic_in_the_reader_or_a_hasher_ends_the_check() {
+            let (m, p) = v1_torrent(&[("a", 64 * 1024)], 1024);
+            for threads in [1, 2, 4, 9] {
+                for (read_panic, hashed_panic) in [
+                    (Some(5), None),
+                    (None, Some(5)),
+                    (Some(0), None),
+                    (None, Some(63)),
+                ] {
+                    let storage = Panics {
+                        files: Files::new(&m, &p),
+                        piece_length: 1024,
+                        read_panic,
+                        hashed_panic,
+                    };
+                    let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        FileOps::new(&m, &storage, true)
+                            .initial_check(threads, &AtomicU64::new(0), &AtomicBool::new(false))
+                            .map(|_| ())
+                    }));
+                    let err = ended.expect_err("the panic was swallowed");
+                    let msg = err
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| err.downcast_ref::<String>().cloned())
+                        .unwrap_or_default();
+                    assert!(msg.starts_with("adversary"), "{msg} threads {threads}");
+                    // Nothing was told to the storage: a panic is not a verdict.
+                    assert!(storage.files.2.lock().unwrap().is_empty());
+                    assert!(storage.files.4.lock().unwrap().is_empty());
+                }
+            }
+        }
+
+        /// A pause at every point of a check leaves pieces from 0 to `next`
+        /// checked and told in order, and the check resumed from there ends
+        /// where a check that never paused ended.
+        #[test]
+        fn adversary_a_pause_anywhere_resumes_to_the_same_end() {
+            let (m, p) = v1_torrent(&[("a", 40 * 1024 + 3), ("b", 7000), ("c", 20 * 1024)], 1024);
+            let mut damaged = Files::new(&m, &p);
+            damaged.0[0][5000] ^= 1;
+            damaged.0[1].truncate(3000);
+            let want = {
+                let progress = AtomicU64::new(0);
+                let have = FileOps::new(&m, &damaged, true)
+                    .initial_check(1, &progress, &AtomicBool::new(false))
+                    .unwrap();
+                left(&m, &damaged, have, &progress).0
+            };
+            let total = m.lengths().total_pieces() as u64;
+            for threads in [1, 2, 4] {
+                for at_byte in (0..m.file_infos[0].len).step_by(4096) {
+                    let mut files = Files::new(&m, &p);
+                    files.0[0][5000] ^= 1;
+                    files.0[1].truncate(3000);
+                    let pause = std::sync::Arc::new(AtomicBool::new(false));
+                    let mut storage = Recording::new(files);
+                    storage.pause_at = Some((0, at_byte, pause.clone()));
+                    let ops = FileOps::new(&m, &storage, true);
+                    let progress = AtomicU64::new(0);
+                    let first = ops
+                        .initial_check_from(threads, &progress, &pause, None)
+                        .unwrap();
+                    let CheckOutcome::Paused(so_far) = first else {
+                        panic!("did not pause at {at_byte}");
+                    };
+                    let next = so_far.next as u64;
+                    assert!(next < total);
+                    let failed = storage.files.2.lock().unwrap().clone();
+                    let found = storage.files.4.lock().unwrap().clone();
+                    let mut told: Vec<u32> = failed.iter().chain(&found).copied().collect();
+                    told.sort_unstable();
+                    assert_eq!(
+                        told,
+                        (0..u32::try_from(next).unwrap()).collect::<Vec<_>>(),
+                        "at {at_byte} threads {threads}"
+                    );
+                    pause.store(false, Ordering::Relaxed);
+                    storage.pause_at = None;
+                    let ops = FileOps::new(&m, &storage, true);
+                    let CheckOutcome::Done(have) = ops
+                        .initial_check_from(
+                            threads,
+                            &progress,
+                            &AtomicBool::new(false),
+                            Some(so_far),
+                        )
+                        .unwrap()
+                    else {
+                        panic!("paused again");
+                    };
+                    let had: Vec<bool> = have
+                        .iter()
+                        .by_vals()
+                        .take(usize::try_from(total).unwrap())
+                        .collect();
+                    assert_eq!(had, want, "at {at_byte} threads {threads}");
                 }
             }
         }

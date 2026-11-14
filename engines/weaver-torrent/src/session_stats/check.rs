@@ -8,7 +8,7 @@
 //! call or per piece.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 gen_stats!(CheckStatsAtomic CheckStatsSnapshot, [
     // Read calls a check made to a storage.
@@ -29,7 +29,8 @@ gen_stats!(CheckStatsAtomic CheckStatsSnapshot, [
     // Seed-mode pieces whose check was started.
     seed_checks_started u64,
     // Askers of a seed-mode piece that waited on a check already running
-    // and took its verdict.
+    // and took its verdict. One whose wait ended without a verdict, the
+    // check having ended in an error, is not counted.
     seed_checks_joined u64
 ], []);
 
@@ -52,20 +53,19 @@ impl CheckStatsAtomic {
         self.read_calls.fetch_add(1, Ordering::Relaxed);
         self.read_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
         self.read_nanos
-            .fetch_add(nanos_since(started), Ordering::Relaxed);
+            .fetch_add(nanos(started.elapsed()), Ordering::Relaxed);
         if seek {
             self.read_seeks.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    /// One piece hashed, its hashing begun at `started`.
-    pub(crate) fn hashed(&self, started: Instant) {
+    /// One piece hashed, in `spent`.
+    pub(crate) fn hashed(&self, spent: Duration) {
         self.pieces_hashed.fetch_add(1, Ordering::Relaxed);
-        self.hash_nanos
-            .fetch_add(nanos_since(started), Ordering::Relaxed);
+        self.hash_nanos.fetch_add(nanos(spent), Ordering::Relaxed);
     }
 }
 
-fn nanos_since(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+fn nanos(spent: Duration) -> u64 {
+    u64::try_from(spent.as_nanos()).unwrap_or(u64::MAX)
 }
