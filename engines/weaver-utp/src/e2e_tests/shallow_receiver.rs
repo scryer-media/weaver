@@ -717,7 +717,17 @@ async fn a_short_path_resends_on_sack_evidence_and_times_out_only_on_its_tail() 
         drain_every: Duration::from_millis(1),
     };
     let mut tail_timeouts = 0;
-    let lengths = [3_477_000, 4_110_000, 4 * 1024 * 1024, 5_035_000, 5_165_000];
+    // 4_593_732 and 4_666_332 end in an overflow at 0.5 ms; the overflows
+    // at the end are a few packets wide, 72 kB apart.
+    let lengths = [
+        3_477_000,
+        4_110_000,
+        4 * 1024 * 1024,
+        4_593_732,
+        4_666_332,
+        5_035_000,
+        5_165_000,
+    ];
     for bytes in lengths
         .into_iter()
         .chain((0..48).map(|i| 3_400_000 + i * 41_000))

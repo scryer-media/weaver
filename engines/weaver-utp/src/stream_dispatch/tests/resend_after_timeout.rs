@@ -304,3 +304,103 @@ async fn a_reordering_wait_alone_resends_in_the_window() {
 async fn a_reordering_wait_alone_does_not_resend_past_the_window() {
     reorder_wait_resend(true).await;
 }
+
+// reorder_wait_resend(window_full), with the ACK that shows 106-110 lost
+// read twice in one pass (two ACKs in one read, as a batched receive hands
+// them): the pass grants 10 resends and spends 5. With no ACK since, the
+// reordering wait runs out and marks 101 lost. The ACKs' budget ended with
+// their pass, so the wait grants the resend and it asks the window: 101 does
+// not go past a full recovery window. libtorrent resends only while handling
+// an ACK (v2.0.15 utp_stream.cpp:1340-1355, 2814-2833) and checks the window
+// for a resend that is not a fast resend (:1990-1997).
+#[tokio::test]
+async fn a_budget_left_by_acks_ends_with_their_pass() {
+    setup_test_logging();
+    let mut t = make_test_vsock(
+        SocketOpts {
+            link_mtu: Some(calc_mtu_for_mss(5)),
+            ..Default::default()
+        },
+        false,
+    );
+    t.vsock.rtte.force_timeout(Duration::from_secs(10));
+    t.vsock.congestion_controller.set_window(5 * 64);
+    t.send_msg(ack(100, &[]), "");
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(&[b'x'; 5 * 16])
+        .await
+        .unwrap();
+    t.poll_once_assert_pending().await;
+    assert_eq!(sent(&mut t), (101..=116).collect::<Vec<_>>());
+
+    t.env.increment_now(Duration::from_millis(10));
+    t.send_msg(ack(100, &[0, 1, 2, 3]), "");
+    t.poll_once_assert_pending().await;
+    assert_eq!(sent(&mut t), [101]);
+
+    t.env.increment_now(Duration::from_millis(50));
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(&[b'x'; 5])
+        .await
+        .unwrap();
+    t.poll_once_assert_pending().await;
+    assert_eq!(sent(&mut t), [117]);
+
+    // 102-105 and 111-117 arrived: 106-110 are lost.
+    let sacked: Vec<usize> = (0..4).chain(9..16).collect();
+    t.env.increment_now(Duration::from_millis(200));
+    t.send_msg(ack(100, &sacked), "");
+    t.send_msg(ack(100, &sacked), "");
+    t.poll_once_assert_pending().await;
+    assert_eq!(sent(&mut t), (106..=110).collect::<Vec<_>>());
+    assert_eq!(t.vsock.fast_resend_budget, 5, "the ACKs' budget left");
+    let wait_ends = t
+        .vsock
+        .recovery
+        .reorder_at()
+        .expect("101 waits out the reordering");
+
+    let mss = t.vsock.segment_sizes.mss() as usize;
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(&[b'x'; 5 * 1000])
+        .await
+        .unwrap();
+    while t.env.now() + Duration::from_millis(1) < wait_ends {
+        t.env.increment_now(Duration::from_millis(1));
+        t.poll_once_assert_pending().await;
+        t.take_sent();
+    }
+    let rec_cwnd = t.vsock.recovery.recovering_mut().unwrap().cwnd();
+    let pipe = t
+        .vsock
+        .recovery
+        .recovering_mut()
+        .unwrap()
+        .pipe_estimate
+        .pipe;
+    let cc = t.vsock.congestion_controller.window();
+    let unsegmented = t.vsock.this_poll.unsegmented_data;
+    assert!(
+        rec_cwnd <= mss,
+        "rec cwnd {rec_cwnd} pipe {pipe} cc {cc} mss {mss} unsegmented {unsegmented} segs {}",
+        t.vsock.user_tx_segments.total_len_packets()
+    );
+    assert_eq!(
+        t.vsock.fast_resend_budget, 0,
+        "the ACKs' budget ended with their pass"
+    );
+
+    t.env.increment_now(wait_ends - t.env.now());
+    t.poll_once_assert_pending().await;
+    let at_wait_end = sent(&mut t);
+    assert!(
+        !at_wait_end.contains(&101),
+        "no ACK, full window, yet: {at_wait_end:?}"
+    );
+}

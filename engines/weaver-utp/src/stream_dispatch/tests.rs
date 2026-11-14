@@ -22,6 +22,7 @@ mod outbox;
 mod pacing;
 mod packet_validation;
 mod probe_payload;
+mod probe_resends;
 mod refused_sends;
 mod resend_after_timeout;
 mod retransmit_timer;

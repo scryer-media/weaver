@@ -10,7 +10,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::{
     Error, SocketOpts,
-    raw::{Type::*, UtpHeader},
+    raw::{Type::*, UtpHeader, selective_ack::SelectiveAck},
     seq_nr::SeqNr,
     stream_dispatch::{
         StreamArgs, UtpStreamStarter,
@@ -63,13 +63,25 @@ async fn a_new_stream_probes_up_to_the_link() {
 // the delay target, so the congestion window grows.
 const PATH_DELAY_US: u32 = 10_000;
 
+// How the test peer acknowledges.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Acks {
+    // Once per round, with a SACK of what it holds past a hole.
+    SackPerRound,
+    // Once per round, no SACK.
+    PerRound,
+    // Once per packet that arrives, no SACK.
+    PerPacket,
+}
+
 // A stream sending 512 KiB over a path that carries payloads of up to
 // `passes` bytes and drops larger ones whole, unless the send allowed them
 // to be fragmented: those arrive. The peer holds what arrives and acks, 10
 // ms after each send that brought something, every packet it holds in
-// order; when nothing new arrived, the clock steps a millisecond, the
-// pacer's tick. The payloads sent, in order.
-async fn over_a_path(passes: usize) -> (super::TestVsock, Vec<usize>) {
+// order, as `acks` says; when nothing new arrived, the clock steps a
+// millisecond, the pacer's tick. The payloads sent, in order, and how many
+// sends the path dropped.
+async fn over_a_path(passes: usize, acks: Acks) -> (super::TestVsock, Vec<usize>, usize) {
     let env = MockUtpEnvironment::new();
     let args = test_stream_args(&env, false);
     let transport = RememberingTransport::new(ADDR_1);
@@ -91,6 +103,7 @@ async fn over_a_path(passes: usize) -> (super::TestVsock, Vec<usize>) {
         .await
         .unwrap();
     let mut sizes = Vec::new();
+    let mut dropped = 0;
     // The packets held past a hole, and the first the peer has not got.
     let mut held = std::collections::BTreeSet::new();
     let mut next: Option<SeqNr> = None;
@@ -102,40 +115,66 @@ async fn over_a_path(passes: usize) -> (super::TestVsock, Vec<usize>) {
         let sent = t.take_sent_fragmenting();
         let data = sent.iter().filter(|(msg, _)| msg.header.get_type() == Data);
         sizes.extend(data.clone().map(|(msg, _)| msg.payload().len()));
-        let mut arrived = false;
+        let mut ack_nrs = Vec::new();
         for (msg, fragmenting) in data {
             let next = next.get_or_insert(msg.header.seq_nr);
-            if (msg.payload().len() <= passes || *fragmenting == Some(crate::Fragmenting::Allowed))
-                && msg.header.seq_nr.is_at_or_after(*next)
-            {
+            let carried =
+                msg.payload().len() <= passes || *fragmenting == Some(crate::Fragmenting::Allowed);
+            if !carried {
+                dropped += 1;
+                continue;
+            }
+            let new = msg.header.seq_nr.is_at_or_after(*next);
+            if new {
                 held.insert(msg.header.seq_nr.0);
-                arrived = true;
             }
             while held.remove(&next.0) {
                 *next += 1;
             }
+            if new || acks == Acks::PerPacket {
+                ack_nrs.push(*next - 1);
+            }
         }
-        match next.filter(|_| arrived).map(|next| next - 1) {
-            Some(ack_nr) => {
-                t.env.increment_now(Duration::from_millis(10));
-                let timestamp_microseconds = t.vsock.timestamp_microseconds();
-                t.send_msg(
-                    UtpHeader {
-                        htype: State,
-                        seq_nr: 1.into(),
-                        ack_nr,
-                        timestamp_microseconds,
-                        timestamp_difference_microseconds: PATH_DELAY_US,
-                        wnd_size: 1024 * 1024,
+        if acks != Acks::PerPacket {
+            ack_nrs = ack_nrs.last().copied().into_iter().collect();
+        }
+        if ack_nrs.is_empty() {
+            t.env.increment_now(Duration::from_millis(1));
+            continue;
+        }
+        t.env.increment_now(Duration::from_millis(10));
+        for ack_nr in ack_nrs {
+            let timestamp_microseconds = t.vsock.timestamp_microseconds();
+            // What it holds past the hole, as a SACK: bit 0 is the packet
+            // after the one the hole begins at.
+            let sacked = held
+                .iter()
+                .map(|&seq_nr| usize::from(seq_nr.wrapping_sub(ack_nr.0).wrapping_sub(2)))
+                .filter(|&offset| offset < 64);
+            let selective_ack = if acks == Acks::SackPerRound {
+                SelectiveAck::new_test(sacked)
+            } else {
+                None
+            };
+            t.send_msg(
+                UtpHeader {
+                    htype: State,
+                    seq_nr: 1.into(),
+                    ack_nr,
+                    timestamp_microseconds,
+                    timestamp_difference_microseconds: PATH_DELAY_US,
+                    wnd_size: 1024 * 1024,
+                    extensions: crate::raw::Extensions {
+                        selective_ack,
                         ..Default::default()
                     },
-                    "",
-                );
-            }
-            None => t.env.increment_now(Duration::from_millis(1)),
+                    ..Default::default()
+                },
+                "",
+            );
         }
     }
-    (t, sizes)
+    (t, sizes, dropped)
 }
 
 // On a path that carries 1500-byte packets, each acked probe raises the
@@ -144,7 +183,7 @@ async fn over_a_path(passes: usize) -> (super::TestVsock, Vec<usize>) {
 #[tokio::test]
 async fn a_stream_probes_up_to_full_size_segments() {
     setup_test_logging();
-    let (t, sizes) = over_a_path(usize::MAX).await;
+    let (t, sizes, _) = over_a_path(usize::MAX, Acks::SackPerRound).await;
     assert_eq!(sizes[0], 528, "the floor first");
     assert_eq!(t.vsock.segment_sizes.mss(), 1452);
     assert_eq!(sizes.iter().max(), Some(&1452));
@@ -156,22 +195,35 @@ async fn a_stream_probes_up_to_full_size_segments() {
 // may not fragment does: each probe past it is lost and lowers the
 // ceiling, and its data goes again at a size proven or probed lower. The
 // stream settles at the largest payload that passes, 1000 less IPv4, UDP
-// and uTP headers, and sends the rest at it.
+// and uTP headers, and sends the rest at it, whether the peer sends SACKs
+// or not. Without them a probe with fewer than three packets behind it is
+// found lost only by the timer. Each halving step loses at most one probe,
+// and each lost probe costs at most one timeout: from the floor's 528 to
+// the link's 1452 that is at most ten (2^10 > 1452 - 528).
 #[tokio::test]
 async fn a_stream_settles_at_the_largest_size_the_path_passes() {
     setup_test_logging();
     const PASSES: usize = 1000 - 48;
-    let (t, sizes) = over_a_path(PASSES).await;
-    assert!(sizes.iter().any(|&size| size > PASSES), "a probe was lost");
-    assert_eq!(usize::from(t.vsock.segment_sizes.mss()), PASSES);
-    assert!(
-        !t.vsock.segment_sizes.is_probing(),
-        "the ceiling met the floor"
-    );
-    let found = sizes.iter().position(|&size| size == PASSES).unwrap();
-    let after = &sizes[found..];
-    assert!(after.iter().all(|&size| size <= PASSES));
-    assert!(after.len() >= 300, "{} sent at the size found", after.len());
+    for acks in [Acks::SackPerRound, Acks::PerRound, Acks::PerPacket] {
+        let (t, sizes, dropped) = over_a_path(PASSES, acks).await;
+        let timeouts = t._socket.stats().snapshot().timeouts;
+        assert!(dropped > 0, "{acks:?}: a probe was lost");
+        assert!(dropped <= 10, "{acks:?}: {dropped} probes lost");
+        assert!(timeouts <= dropped as u64, "{acks:?}: {timeouts} timeouts");
+        assert_eq!(usize::from(t.vsock.segment_sizes.mss()), PASSES, "{acks:?}");
+        assert!(
+            !t.vsock.segment_sizes.is_probing(),
+            "{acks:?}: the ceiling met the floor"
+        );
+        let found = sizes.iter().position(|&size| size == PASSES).unwrap();
+        let after = &sizes[found..];
+        assert!(after.iter().all(|&size| size <= PASSES), "{acks:?}");
+        assert!(
+            after.len() >= 300,
+            "{acks:?}: {} sent at the size found",
+            after.len()
+        );
+    }
 }
 
 // A peer's large DATA proves the path toward us, not the path toward it:
@@ -327,6 +379,10 @@ async fn a_stream_finds_the_paths_size_by_halving() {
         .map(payload_of)
         .collect();
     assert_eq!(sizes, expected);
+    // Each probe too large is found lost by the duplicate ACKs the packets
+    // behind it draw, never by the timer: a probe that waited for timeouts,
+    // one or two, shows here.
+    assert_eq!(t._socket.stats().snapshot().timeouts, 0, "timeouts");
 }
 
 // A host whose path carries 1000-byte packets refuses a larger one when it
@@ -500,10 +556,13 @@ async fn a_refused_resend_waits_as_a_lost_one() {
     setup_test_logging();
     let mut peer = Peer::new();
     let (mut t, written) = settled_at_full_size(&mut peer).await;
-    // What is in flight now never arrives.
+    // What goes out next never arrives.
     peer.acks = false;
     peer.passes = 0;
-    peer.round(&mut t).await;
+    let settled_at = peer.tried.len();
+    while peer.tried.len() == settled_at {
+        peer.round(&mut t).await;
+    }
     let lost_from = peer.ack_nr.wrapping_add(1);
     peer.acks = true;
     peer.set_mtu(&mut t, 1000);
@@ -651,8 +710,6 @@ async fn a_stream_that_dies_on_a_probe_lowers_the_ceiling() {
     let mut t = make_test_vsock(
         SocketOpts {
             remote_inactivity_timeout: Some(Duration::from_secs(60)),
-            // The probe stays whole until the stream gives up on it.
-            mtu_probe_max_retransmissions: Some(10),
             ..Default::default()
         },
         false,

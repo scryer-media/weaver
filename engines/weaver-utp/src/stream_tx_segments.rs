@@ -207,10 +207,6 @@ impl SegmentForSending<'_> {
         self.segment.size_given_up
     }
 
-    pub fn retransmit_count(&self) -> usize {
-        self.segment.retransmit_count()
-    }
-
     // Gives up on this probe as too large: it goes again whole as ordinary
     // data, and its delivery proves no size. Returns its payload size.
     pub fn give_up_probe(&mut self) -> usize {
@@ -539,6 +535,17 @@ impl Segments {
             .then_some(index)
     }
 
+    // Forgets the live MTU probe, wherever it is: it goes again as ordinary
+    // data allowed to fragment, and its delivery proves no size. Returns
+    // its payload size, and whether it is the oldest unacknowledged packet.
+    pub fn forget_mtu_probe(&mut self) -> Option<(usize, bool)> {
+        let index = self.live_probe_index()?;
+        let s = &mut self.segments[index];
+        s.is_mtu_probe = false;
+        s.size_given_up = true;
+        Some((s.payload_size, index == 0))
+    }
+
     // Whether an MTU probe is out and unanswered: no other is cut meanwhile.
     pub fn has_live_mtu_probe(&self) -> bool {
         self.live_probe_index().is_some()
@@ -570,23 +577,19 @@ impl Segments {
         true
     }
 
-    /// Gives up on the live MTU probe once its timer has expired often
-    /// enough. A probe that was sent keeps its bytes and its sequence
-    /// number: the peer may hold it, and drops by sequence number alone
-    /// anything sent again under it. It stays as ordinary data, to be resent
-    /// whole, as libtorrent resends a timed-out probe (utp_stream.cpp
-    /// v2.0.15:1975-1984, 3412-3421).
-    pub fn expire_mtu_probe(
-        &mut self,
-        retransmit_timed_out: bool,
-        max_probe_retransmissions: usize,
-    ) -> ExpiredProbe {
+    /// Gives up on the live MTU probe at its first timeout. A probe that
+    /// was sent keeps its bytes and its sequence number: the peer may hold
+    /// it, and drops by sequence number alone anything sent again under it.
+    /// It stays as ordinary data, to be resent whole and allowed to
+    /// fragment, as libtorrent resends a timed-out probe (utp_stream.cpp
+    /// v2.0.15:2045-2046, 3412-3421, 3498).
+    pub fn expire_mtu_probe(&mut self, retransmit_timed_out: bool) -> ExpiredProbe {
         let Some(index) = self.live_probe_index() else {
             return ExpiredProbe::Empty;
         };
         let seq_nr = self.snd_una + index as u16;
         let s = &mut self.segments[index];
-        if retransmit_timed_out && s.retransmit_count() >= max_probe_retransmissions {
+        if retransmit_timed_out {
             s.is_mtu_probe = false;
             s.size_given_up = true;
             ExpiredProbe::Expired {
@@ -1491,7 +1494,7 @@ mod tests {
                     }
                 }
                 _ => {
-                    let _ = segs.expire_mtu_probe(true, 0);
+                    let _ = segs.expire_mtu_probe(true);
                 }
             }
             if next(2) == 0 {

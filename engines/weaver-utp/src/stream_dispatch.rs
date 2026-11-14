@@ -68,6 +68,28 @@ fn stops_short_of_go_back(
         && !(seg.is_lost() && seg.seq_nr().is_at_or_after(fast_resend_seq_nr))
 }
 
+// A probe that is resent is a probe no more: libtorrent sends don't-fragment
+// only on a probe's first send (v2.0.15 utp_stream.cpp:1810-1812), never on a
+// resend (:2045-2046), so the resend may arrive fragmented and its delivery
+// proves no size. Lost from the head, behind packets that arrived, it was
+// too large, and the ceiling falls below it (:1975-1984); lost behind the
+// head it may be congestion, and the ceiling stays. Either way its loss
+// cuts no window (:1346-1349). Returns whether it was a probe.
+fn give_up_resent_probe(
+    seg: &mut SegmentForSending<'_>,
+    head: Option<SeqNr>,
+    segment_sizes: &mut SegmentSizes,
+) -> bool {
+    if !seg.is_mtu_probe() {
+        return false;
+    }
+    let size = seg.give_up_probe();
+    if Some(seg.seq_nr()) == head {
+        segment_sizes.on_probe_failed(size);
+    }
+    true
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VirtualSocketState {
     SynReceived,
@@ -206,17 +228,22 @@ struct VirtualSocket<T, Env> {
     fast_resend_seq_nr: SeqNr,
     // Resends on loss evidence the packets received last allow:
     // `FAST_RESENDS_PER_ACK` for each, or for a reordering wait that ran
-    // out. What is left lost waits for the next ACK, which spaces the
-    // resends at the rate the peer's packets arrive.
+    // out. It lasts only the pass that granted it. What is left lost waits
+    // for the next ACK, which spaces the resends at the rate the peer's
+    // packets arrive.
     fast_resend_budget: usize,
-    // The budget came from a reordering wait in recovery that ran out with
-    // no ACK to grant one. libtorrent resends only on an ACK, so those
-    // resends are no fast resends and ask the window (utp_stream.cpp
-    // v2.0.15:1990-1997).
+    // The budget came from a reordering wait that ran out with no ACK to
+    // grant one, or outlived the pass of the ACK that granted it.
+    // libtorrent resends only on an ACK, so those resends are no fast
+    // resends and ask the window (utp_stream.cpp v2.0.15:1990-1997).
     budget_from_timer: bool,
     // The socket refused a resend that budget was spent on; the budget
     // stays for that resend, and later ACKs add to it.
     resend_refused: bool,
+    // The last send pass walked the resends with the budget, and neither
+    // the socket nor the pacer held one back: the budget is spent. A pass
+    // that stopped short keeps it for the pass that sends.
+    budget_spent: bool,
     // Where the stream is in its socket's writable wakes.
     send_gate: crate::socket::SendGate,
     // Data packets queued for the socket's I/O task, until their sends.
@@ -713,6 +740,22 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 && !(self.fin_sends > 0 && self.state.our_fin_if_unacked().is_some());
             #[cfg(test)]
             let cause = self.expiry_cause();
+            // A timeout forgets the probe out, wherever it is: libtorrent
+            // clears m_mtu_seq at every timeout (v2.0.15 utp_stream.cpp:3498)
+            // and resends it, as all else, with no don't-fragment flag
+            // (:2045-2046). The ceiling falls below it when it was all that
+            // was out (:3412-3421), and, unlike libtorrent, when it is the
+            // oldest packet out: the packets before it arrived and it did
+            // not, the evidence the duplicate-ACK resend acts on
+            // (:1975-1984). libtorrent's head check cannot fire once the
+            // timeout cleared the probe, so a peer sending no SACK, with
+            // fewer than three packets behind each probe, would lose every
+            // probe to the timer and never stop probing.
+            if let Some((size, is_head)) = self.user_tx_segments.forget_mtu_probe()
+                && (only_packet_outstanding || is_head)
+            {
+                self.segment_sizes.on_probe_failed(size);
+            }
             let seg = self.user_tx_segments.iter_mut_for_sending(None).next();
             if let Some(mut seg) = seg {
                 if self.timers.retransmit.report_expiry() {
@@ -731,7 +774,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     }
                 };
                 // Only a lone probe can attribute the timeout solely to its size.
-                let sole_probe = seg.is_mtu_probe() && only_packet_outstanding;
+                let sole_probe = only_packet_outstanding;
                 if !sole_probe {
                     let timeouts = self.rtte.timeouts() as usize + 1;
                     if timeouts > self.socket_opts.num_resends || !self.confirmed {
@@ -762,16 +805,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         "giving up: retransmissions exhausted"
                     );
                     return Err(Error::MaxRetransmissionsReached);
-                }
-                // A probe at the head with more sent behind it, resent once
-                // already, was too large: the packets before it arrived and
-                // it did not. It goes again whole as ordinary data, and the
-                // ceiling falls below it. libtorrent resends it as a probe at
-                // a timeout and gives up on it at its next resend (v2.0.15
-                // utp_stream.cpp:1773, 1975-1984, 3498).
-                if !sole_probe && seg.is_mtu_probe() && seg.retransmit_count() > 0 {
-                    let size = seg.give_up_probe();
-                    self.segment_sizes.on_probe_failed(size);
                 }
                 if send_data!(self, cx, header, seg)? {
                     if self.fast_resend_seq_nr == seg.seq_nr() {
@@ -960,16 +993,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     }
                 }
 
-                // A probe resent from the head was too large: the packets
-                // before it arrived and it did not. It goes again whole as
-                // ordinary data, and the ceiling falls below it (libtorrent
-                // v2.0.15 utp_stream.cpp:1975-1984). Its loss is no
-                // congestion (:1346-1349).
-                let was_probe = seg.is_mtu_probe();
-                if was_probe && Some(seg.seq_nr()) == head {
-                    let size = seg.give_up_probe();
-                    self.segment_sizes.on_probe_failed(size);
-                }
+                let was_probe = give_up_resent_probe(&mut seg, head, &mut self.segment_sizes);
                 if send_data!(self, cx, header, seg)? {
                     event!(
                         RECOVERY_TRACING_LOG_LEVEL,
@@ -1089,8 +1113,25 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         self.this_poll.now,
                     )
                     .reorder_at;
-                self.fast_resend_budget = self.fast_resend_budget.max(FAST_RESENDS_PER_ACK);
+                // With no ACK's budget, the wait that ran out grants one,
+                // and those resends ask the window as in recovery: libtorrent
+                // lets a resend that is no fast resend past a full window
+                // only when nothing is in flight (utp_stream.cpp
+                // v2.0.15:1990-1997).
+                if self.fast_resend_budget == 0 {
+                    self.fast_resend_budget = FAST_RESENDS_PER_ACK;
+                    self.budget_from_timer = true;
+                }
             }
+            // Every packet up to the go-back point counts in flight, those
+            // resent here among them.
+            let in_flight = self
+                .user_tx_segments
+                .calc_flight_size(self.last_sent_seq_nr);
+            let window = self
+                .congestion_controller
+                .window()
+                .min(self.last_remote_window as usize);
             let sack_depth = self.user_tx_segments.sack_depth();
             let highest_sent_seq_nr = self.highest_sent_seq_nr;
             let head = self.user_tx_segments.first_seq_nr();
@@ -1111,20 +1152,17 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 if !seg.is_lost() {
                     continue;
                 }
+                if self.budget_from_timer
+                    && in_flight > 0
+                    && seg.payload_size() > window.saturating_sub(in_flight)
+                {
+                    break;
+                }
                 if !is_oldest && !self.pacer.allows(seg.payload_size()) {
                     paced = Some(seg.payload_size());
                     break;
                 }
-                // A probe resent from the head was too large: the packets
-                // before it arrived and it did not. It goes again whole as
-                // ordinary data, and the ceiling falls below it (libtorrent
-                // v2.0.15 utp_stream.cpp:1975-1984). Its loss is no
-                // congestion (:1346-1349).
-                let was_probe = seg.is_mtu_probe();
-                if was_probe && Some(seg.seq_nr()) == head {
-                    let size = seg.give_up_probe();
-                    self.segment_sizes.on_probe_failed(size);
-                }
+                let was_probe = give_up_resent_probe(&mut seg, head, &mut self.segment_sizes);
                 if !send_data!(self, cx, header, seg)? {
                     self.resend_refused = true;
                     return Ok(());
@@ -1164,6 +1202,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
         }
         self.resend_refused = false;
+        self.budget_spent = paced.is_none();
 
         // The peer's advertised window bounds every byte sent and not yet
         // acknowledged, those presumed lost included: the peer must still
@@ -1586,7 +1625,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             self.timers.retransmit.expired(self.this_poll.now)
                 && self.user_tx_segments.sole_outstanding_is_mtu_probe()
                 && !(self.fin_sends > 0 && self.state.our_fin_if_unacked().is_some()),
-            self.socket_opts.mtu_probe_max_retransmissions,
         ) {
             ExpiredProbe::Expired {
                 rewind_to,
@@ -1943,6 +1981,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             );
         }
 
+        let budget_spent = std::mem::take(&mut self.budget_spent);
         if processed > 0 {
             let grant = processed.saturating_mul(FAST_RESENDS_PER_ACK);
             self.budget_from_timer = false;
@@ -1951,13 +1990,26 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             } else {
                 grant
             };
+        } else if budget_spent {
+            // The ACKs' budget ends with the pass that spent it: libtorrent
+            // fast-resends only while it handles an ACK (utp_stream.cpp
+            // v2.0.15:1340-1355, 2814-2833). A resend the socket refused, or
+            // the pacer held back, keeps its budget until it goes; libtorrent
+            // has no pacer and sends it with the ACK.
+            self.fast_resend_budget = 0;
+            self.budget_from_timer = false;
+        } else if self.fast_resend_budget > 0 {
+            // Kept past its ACK's pass, the budget's resends ask the window,
+            // as libtorrent's resends that are no fast resends do
+            // (:1990-1997).
+            self.budget_from_timer = true;
         }
         if let Some(rec) = self.recovery.recovering_mut() {
             // A resend outrun by later deliveries may have waited long
             // enough to count lost, with no ACK to count it: the pipe is
-            // counted again on every pass. Budget the last ACK left goes on
-            // as that ACK's; with none left, the wait that ran out grants
-            // it, and those resends ask the window.
+            // counted again on every pass. The wait that ran out grants a
+            // budget, and those resends ask the window, as libtorrent's
+            // resends that are no fast resends do (:1990-1997).
             if processed == 0
                 && self.fast_resend_budget == 0
                 && rec
@@ -2194,8 +2246,20 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .user_tx_segments
                 .remove_up_to_ack(msg.received, &msg.header),
         };
+        let mss_before = self.segment_sizes.mss();
         self.segment_sizes
             .on_payload_delivered(result.on_ack_result.max_acked_payload_size);
+        // A proven larger size reaches the segments cut at the old one and
+        // not yet sent: they go back to be cut again, as libtorrent sizes
+        // each packet when it sends it (v2.0.15 utp_stream.cpp:1532, 1559).
+        if self.segment_sizes.mss() > mss_before {
+            let dropped = self.user_tx_segments.drop_unsent();
+            trace!(
+                dropped,
+                mss = self.segment_sizes.mss(),
+                "unsent segments go back to be cut larger"
+            );
+        }
         self.congestion_controller
             .set_mss(self.segment_sizes.mss() as usize);
 
@@ -3017,6 +3081,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             fast_resend_budget: 0,
             budget_from_timer: false,
             resend_refused: false,
+            budget_spent: false,
             send_gate: crate::socket::SendGate::for_stream(conn_id_recv.0),
             departing: Departing::default(),
             confirmed: !matches!(

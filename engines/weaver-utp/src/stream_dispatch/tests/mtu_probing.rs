@@ -13,66 +13,64 @@ use crate::{
     stream_dispatch::tests::{PROBE_WINDOW, make_test_vsock},
 };
 
+// A probe alone in flight that the timer finds unanswered was too large:
+// libtorrent lowers the ceiling below it at that first timeout, counts no
+// timeout and keeps the window (v2.0.15 utp_stream.cpp:3412-3421), and
+// resends it with no don't-fragment flag (:2045-2046, 3498).
 #[tokio::test]
-async fn abandoning_a_probe_counts_its_last_timeout_without_backoff() {
-    for retries in [0, 1] {
-        let mut t = make_test_vsock(
-            SocketOpts {
-                mtu_probe_max_retransmissions: Some(retries),
-                disable_nagle: true,
-                ..Default::default()
-            },
-            false,
-        );
-        // A window above three floor packets: the second packet is a probe.
-        t.vsock.congestion_controller.set_window(PROBE_WINDOW);
-        let floor = usize::from(t.vsock.segment_sizes.mss());
-        let probe = usize::from(t.vsock.segment_sizes.probe_size());
-        t.stream
-            .as_mut()
-            .unwrap()
-            .write_all(&vec![7; floor + probe])
-            .await
-            .unwrap();
-        t.poll_once_assert_pending().await;
-        let sent = t.take_sent();
-        let sizes: Vec<usize> = sent.iter().map(|m| m.payload().len()).collect();
-        assert_eq!(sizes, [floor, probe]);
-        t.send_msg(
-            UtpHeader {
-                htype: State,
-                seq_nr: 1.into(),
-                ack_nr: sent[0].header.seq_nr,
-                wnd_size: 1024 * 1024,
-                ..Default::default()
-            },
-            "",
-        );
-        t.poll_once_assert_pending().await;
-        t.assert_sent_empty();
-        let window = t.vsock.congestion_controller.window();
+async fn a_lone_probe_is_given_up_at_its_first_timeout_without_backoff() {
+    let mut t = make_test_vsock(
+        SocketOpts {
+            disable_nagle: true,
+            ..Default::default()
+        },
+        false,
+    );
+    t.transport.set_controls_fragmenting();
+    // A window above three floor packets: the second packet is a probe.
+    t.vsock.congestion_controller.set_window(PROBE_WINDOW);
+    let floor = usize::from(t.vsock.segment_sizes.mss());
+    let probe = usize::from(t.vsock.segment_sizes.probe_size());
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(&vec![7; floor + probe])
+        .await
+        .unwrap();
+    t.poll_once_assert_pending().await;
+    let sent = t.take_sent();
+    let sizes: Vec<usize> = sent.iter().map(|m| m.payload().len()).collect();
+    assert_eq!(sizes, [floor, probe]);
+    t.send_msg(
+        UtpHeader {
+            htype: State,
+            seq_nr: 1.into(),
+            ack_nr: sent[0].header.seq_nr,
+            wnd_size: 1024 * 1024,
+            ..Default::default()
+        },
+        "",
+    );
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
+    let window = t.vsock.congestion_controller.window();
 
-        for expiry in 1..=retries + 1 {
-            t.env.increment_now(t.vsock.rtte.retransmission_timeout());
-            t.poll_once_assert_pending().await;
-            assert_eq!(t._socket.stats().snapshot().timeouts, expiry as u64);
-            let sent = t.take_sent();
-            assert!(!sent.is_empty());
-            // Each expiry resends the probe whole; the last gives up on its
-            // size, so it goes as ordinary data and the ceiling falls below it.
-            assert_eq!(sent.len(), 1);
-            assert_eq!(sent[0].payload().len(), probe);
-            assert_eq!(
-                usize::from(t.vsock.segment_sizes.max_ss()) < probe,
-                expiry > retries
-            );
-            assert_eq!(t.vsock.rtte.timeouts(), 0);
-            assert_eq!(t.vsock.congestion_controller.window(), window);
-        }
-        t.poll_once_assert_pending().await;
-        assert_eq!(t._socket.stats().snapshot().timeouts, (retries + 1) as u64);
-        assert_eq!(t._socket.stats().snapshot().packets_lost, 0);
-    }
+    t.env.increment_now(t.vsock.rtte.retransmission_timeout());
+    t.poll_once_assert_pending().await;
+    assert_eq!(t._socket.stats().snapshot().timeouts, 1);
+    let sent: Vec<(u16, usize, Option<crate::Fragmenting>)> = t
+        .take_sent_fragmenting()
+        .into_iter()
+        .map(|(m, f)| (m.header.seq_nr.0, m.payload().len(), f))
+        .collect();
+    assert_eq!(sent, [(102, probe, Some(crate::Fragmenting::Allowed))]);
+    assert!(usize::from(t.vsock.segment_sizes.max_ss()) < probe);
+    assert!(!t.vsock.user_tx_segments.has_live_mtu_probe());
+    assert_eq!(t.vsock.rtte.timeouts(), 0);
+    assert_eq!(t.vsock.congestion_controller.window(), window);
+    t.poll_once_assert_pending().await;
+    assert_eq!(t._socket.stats().snapshot().timeouts, 1);
+    assert_eq!(t._socket.stats().snapshot().packets_lost, 0);
 }
 
 // A probe goes out with a floor packet's worth of data written behind it.
@@ -141,12 +139,10 @@ enum Behind {
 // Put a probe in flight, with what is written behind it.
 async fn probe_in_flight(
     behind: Behind,
-    retries: usize,
     forced_rto: Option<Duration>,
 ) -> (super::TestVsock, usize) {
     let mut t = make_test_vsock(
         SocketOpts {
-            mtu_probe_max_retransmissions: Some(retries),
             disable_nagle: true,
             ..Default::default()
         },
@@ -208,7 +204,6 @@ fn expire_retransmit(t: &mut super::TestVsock) {
 async fn an_unsent_probe_does_not_hide_the_data_timeout() {
     let mut t = make_test_vsock(
         SocketOpts {
-            mtu_probe_max_retransmissions: Some(0),
             disable_nagle: true,
             ..Default::default()
         },
@@ -261,7 +256,7 @@ async fn an_unsent_probe_does_not_hide_the_data_timeout() {
 
 #[tokio::test]
 async fn a_probe_with_unsent_queued_data_keeps_its_timeout_exemption() {
-    let (mut t, _) = probe_in_flight(Behind::Unsent, 1, None).await;
+    let (mut t, _) = probe_in_flight(Behind::Unsent, None).await;
     // The segment cut behind the probe is queued, but not in flight.
     assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 2);
     assert_eq!(t.vsock.user_tx_segments.outstanding_packets(), 1);
@@ -275,22 +270,36 @@ async fn a_probe_with_unsent_queued_data_keeps_its_timeout_exemption() {
     assert_eq!(t.vsock.congestion_controller.window(), window);
 }
 
+// libtorrent forgets the probe at a timeout with more than the probe out
+// (v2.0.15 utp_stream.cpp:3498), and the probe goes again as ordinary data
+// allowed to fragment (:2045-2046). The probe is the oldest packet out:
+// the one before it arrived and it did not, so the ceiling falls below it,
+// a deliberate difference from libtorrent, whose head check (:1975-1984)
+// cannot fire once the timeout cleared the probe. The timeout is a real one.
 #[tokio::test]
 async fn a_probe_with_other_sent_data_takes_a_real_timeout() {
-    let (mut t, floor) = probe_in_flight(Behind::Sent, 1, None).await;
+    let (mut t, floor) = probe_in_flight(Behind::Sent, None).await;
+    t.transport.set_controls_fragmenting();
     assert_eq!(t.vsock.user_tx_segments.outstanding_packets(), 2);
+    let probe = usize::from(t.vsock.segment_sizes.probe_size());
     expire_retransmit(&mut t);
     t.poll_once_assert_pending().await;
     assert_eq!(t.vsock.rtte.timeouts(), 1);
     assert_eq!(t.vsock.congestion_controller.window(), floor);
-    assert_eq!(t.take_sent()[0].header.seq_nr, 102.into());
+    let (resent, fragmenting) = t.take_sent_fragmenting().remove(0);
+    assert_eq!(resent.header.seq_nr, 102.into());
+    assert_eq!(fragmenting, Some(crate::Fragmenting::Allowed));
+    assert!(!t.vsock.user_tx_segments.has_live_mtu_probe());
+    assert!(
+        usize::from(t.vsock.segment_sizes.max_ss()) < probe,
+        "the ceiling falls"
+    );
 }
 
 #[tokio::test]
 async fn a_probe_with_an_unacked_fin_is_not_abandoned_as_a_lone_probe() {
     // Exercise the RTO before the local-FIN final-chance timer expires.
-    let (mut t, floor) =
-        probe_in_flight(Behind::Nothing, 0, Some(Duration::from_millis(500))).await;
+    let (mut t, floor) = probe_in_flight(Behind::Nothing, Some(Duration::from_millis(500))).await;
     // Dropping both halves sends FIN once all buffered data has been sent.
     drop(t.stream.take());
     t.poll_once_assert_pending().await;
@@ -298,16 +307,14 @@ async fn a_probe_with_an_unacked_fin_is_not_abandoned_as_a_lone_probe() {
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].header.get_type(), Fin);
     assert_eq!(sent[0].header.seq_nr, 103.into());
+    let probe = usize::from(t.vsock.segment_sizes.probe_size());
     expire_retransmit(&mut t);
     t.poll_once_assert_pending().await;
     assert_eq!(t.vsock.rtte.timeouts(), 1);
     assert_eq!(t.vsock.congestion_controller.window(), floor);
     let sent = t.take_sent();
     assert_eq!(sent[0].header.seq_nr, 102.into());
-    assert_eq!(
-        sent[0].payload().len(),
-        usize::from(t.vsock.segment_sizes.probe_size())
-    );
+    assert_eq!(sent[0].payload().len(), probe, "the probe goes again whole");
 }
 
 // A full send buffer refilled by each ACK hands the stream one packet's

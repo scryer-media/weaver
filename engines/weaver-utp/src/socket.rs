@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-13.
+// Modified by the Weaver authors, 2026-11-14.
 
 use std::{
     collections::{BTreeMap, VecDeque, btree_map::Entry},
@@ -148,11 +148,6 @@ pub struct SocketOpts {
     /// as it's not required for torrents.
     pub dont_wait_for_lastack: bool,
 
-    /// How many times should the MTU probes be retransmitted. By default it's 1, so that
-    /// MTU probing can handle a bit of packet loss. If it's 0, we would mark RTO'ed probes as failed
-    /// sooner and thus perf would be better.
-    pub mtu_probe_max_retransmissions: Option<usize>,
-
     #[cfg(test)]
     pub(crate) benchmark_delayed_acks: bool,
 }
@@ -201,7 +196,6 @@ impl SocketOpts {
                 .remote_inactivity_timeout
                 .unwrap_or(DEFAULT_REMOTE_INACTIVITY_TIMEOUT),
             wait_for_last_ack: !self.dont_wait_for_lastack,
-            mtu_probe_max_retransmissions: self.mtu_probe_max_retransmissions.unwrap_or(1),
             #[cfg(test)]
             benchmark_delayed_acks: self.benchmark_delayed_acks,
         })
@@ -225,8 +219,6 @@ pub(crate) struct ValidatedSocketOpts {
     pub remote_inactivity_timeout: Duration,
 
     pub wait_for_last_ack: bool,
-
-    pub mtu_probe_max_retransmissions: usize,
 
     #[cfg(test)]
     pub benchmark_delayed_acks: bool,

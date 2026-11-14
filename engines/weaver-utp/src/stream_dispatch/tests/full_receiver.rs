@@ -379,12 +379,14 @@ async fn a_sender_inside_the_advertised_window_is_never_dropped_for_room() {
     assert!(run.error.is_none(), "{run:?}");
     assert_eq!(run.peer.delivered, 2 * 1024 * 1024, "{run:?}");
     assert_eq!(run.peer.dropped_full, 0, "{run:?}");
-    // Every resend that a later send's delivery outran goes again a round
-    // trip and a quarter on, without the timer. A resend on SACK evidence
-    // does not wait for the window (libtorrent v2.0.15
-    // utp_stream.cpp:1990-1997), and no timer expires in this run.
-    assert_eq!(run.totals.fast_resends, 531, "{run:?}");
-    assert_eq!(run.totals.timer_expiries, 0, "{run:?}");
+    // A resend on SACK evidence does not wait for the window (libtorrent
+    // v2.0.15 utp_stream.cpp:1990-1997). A resend that a later send's
+    // delivery outran, with no ACK since, asks the window when its
+    // reordering wait runs out, as libtorrent resends only on an ACK
+    // (:1340-1355, 2814-2833): twice here the window is full and no ACK
+    // comes, and the timer resends it.
+    assert_eq!(run.totals.fast_resends, 526, "{run:?}");
+    assert_eq!(run.totals.timer_expiries, 2, "{run:?}");
 }
 
 // Eight packets leave, 101 to 108. The last is lost once on the way. Nothing sent after it can
