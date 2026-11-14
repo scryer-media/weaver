@@ -3069,11 +3069,7 @@ impl TorrentService {
     // job's as an NZB job's working directory is: `torrent-<id>`, or the
     // job's own suffixed name when an NZB job's marker holds that one.
     fn unpacking_dir(&self, job_id: JobId) -> PathBuf {
-        crate::jobs::working_dir::own_named_dir(
-            &self.inner.env.work,
-            &format!("torrent-{}", job_id.0),
-            job_id,
-        )
+        unpacking_dir(&self.inner.env.work, job_id)
     }
 
     // Where a torrent's side store is: in Weaver's working directory, beside
@@ -5297,7 +5293,8 @@ impl TorrentService {
         self.inner.signal.want_pass();
         self.inner.counters.event(TorrentEvent::Failed);
         self.detach(&mut torrent).await;
-        self.retire(torrent, "failed", Some(error)).await;
+        let written = read_written(self.written_of(&torrent)).await;
+        self.retire(torrent, "failed", Some(error), written).await;
         self.queue_script_event(stopped);
     }
 
@@ -5342,9 +5339,7 @@ impl TorrentService {
     // `placed` beside them.
     async fn short(&self, job_id: JobId, store: &TorrentStore, why: String, placed: &[String]) {
         self.completed(job_id).await;
-        let mut delivered = store.whole_names();
-        delivered.extend(placed.iter().cloned());
-        let status = short_status(&delivered, &why);
+        let status = short_status(&store.whole_names(), placed, &why);
         let settings = self.settings();
         let now = self.inner.clock.now_ms();
         let (report, hash) = {
@@ -5365,10 +5360,17 @@ impl TorrentService {
     }
 
     // A torrent that left the live ones goes to history: its row, then out
-    // of the torrents and into the finished jobs.
-    async fn retire(&self, mut torrent: Live, status: &str, error: Option<String>) {
+    // of the torrents and into the finished jobs, listing of what it
+    // `written` what is still there once its removal is done with it.
+    async fn retire(
+        &self,
+        mut torrent: Live,
+        status: &str,
+        error: Option<String>,
+        written: Wrote,
+    ) {
         let job_id = torrent.record.job_id;
-        let files = history_files(&self.written_paths(&torrent));
+        let files = history_files(written.deletion).await;
         self.inner.env.outside.leave(job_id.0);
         // A copy out of the side store under way ends before the store goes.
         if let Some(task) = torrent.leveling.take().and_then(|leveling| leveling.task) {
@@ -5406,11 +5408,14 @@ impl TorrentService {
     // A torrent's job, finished as `status`: into history and the queue's
     // finished jobs, listing the files it wrote so far.
     async fn finish(&self, report: JobReport, status: &str, hash: Id20, now: i64) {
-        let files = {
+        let of = {
             let live = self.inner.live.lock().await;
             live.get(&report.job_id)
-                .map(|torrent| history_files(&self.written_paths(torrent)))
-                .unwrap_or_default()
+                .map(|torrent| self.written_of(torrent))
+        };
+        let files = match of {
+            Some(of) => history_files(read_written(of).await.deletion).await,
+            None => Vec::new(),
         };
         let row = report.history_row(status, Some(hash.0.to_vec()), now);
         self.write_history(row, false, report, files).await;
@@ -5577,7 +5582,7 @@ impl TorrentService {
             fetch.abort();
             self.inner.counters.fetch(FetchOutcome::Cancelled);
         }
-        let written = self.written_paths(&torrent);
+        let written = read_written(self.written_of(&torrent)).await;
         self.detach(&mut torrent).await;
         // Nothing of its unpacking writes as its files go.
         if let Some(tee) = torrent.store.as_ref().and_then(|store| store.tee()) {
@@ -5587,77 +5592,58 @@ impl TorrentService {
         if let Some(store) = &torrent.store {
             store.forget();
         }
-        if delete_files {
-            let deleted = tokio::task::spawn_blocking(move || delete_written(&written));
-            if let Err(error) = deleted.await {
+        let written = if delete_files {
+            let deleted = tokio::task::spawn_blocking(move || {
+                delete_written(&written.deletion);
+                written
+            });
+            deleted.await.unwrap_or_else(|error| {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not delete a torrent's files");
-            }
-        }
+                Wrote::default()
+            })
+        } else {
+            written
+        };
         // The job's outcome: complete, short of what unpacking would
         // deliver, refused by unpacking, or cut short.
         let (status, error) = match (torrent.complete(), torrent.refusal()) {
             (true, None) => ("complete", None),
             (true, Some(why)) => {
-                let mut delivered = torrent
+                let own = torrent
                     .store
                     .as_ref()
                     .map(|store| store.whole_names())
                     .unwrap_or_default();
-                delivered.extend(self.inner.db.torrent_outputs(job_id).unwrap_or_else(|error| {
-                    tracing::warn!(job_id = job_id.0, error = %error, "could not read what a torrent unpacked");
-                    Vec::new()
-                }));
-                let status = short_status(&delivered, &why);
+                let status = short_status(&own, &written.outputs, &why);
                 (status.persisted_status(), Some(why))
             }
             (false, Some(refusal)) => ("failed", Some(refusal)),
             (false, None) => ("cancelled", None),
         };
         self.inner.counters.event(TorrentEvent::Removed);
-        self.retire(torrent, status, error).await;
+        self.retire(torrent, status, error, written).await;
         self.queue_script_event(ended);
         Ok(())
     }
 
-    // What a deletion of the torrent's files removes (libtorrent
-    // `storage_utils::delete_files`): its listed files Weaver made, what
-    // unpacking placed beside them, and its tee's directory, nothing else.
-    // A file that was there before the torrent stays; so does a folder
-    // that was. On a failed read of what was there, every listed file is.
-    fn written_paths(&self, torrent: &Live) -> Deletion {
-        let job_id = torrent.record.job_id;
-        let Some(store) = &torrent.store else {
-            return Deletion::default();
-        };
-        let adopted = self.inner.db.torrent_adopted(job_id).unwrap_or_else(|error| {
-            tracing::warn!(job_id = job_id.0, error = %error, "could not read what was on disk before a torrent");
-            Adopted {
-                all_files: true,
-                dirs: vec![String::new()],
-                ..Adopted::default()
-            }
-        });
-        let outputs = self.inner.db.torrent_outputs(job_id).unwrap_or_else(|error| {
-            tracing::warn!(job_id = job_id.0, error = %error, "could not read what a torrent unpacked");
-            Vec::new()
-        });
-        // A torrent placed in a shared folder has a folder of its own
-        // claimed beside it, and the shared one is never its to remove.
-        let claimed = torrent
-            .record
-            .files_dir
-            .as_ref()
-            .and(torrent.record.storage_dir.as_deref())
-            .map(PathBuf::from);
-        let mut deletion = deletion(store.files(), &adopted, &outputs, claimed);
-        // With or without a tee: one whose unpacked files were not placed
-        // keeps its directory past it. It goes only as the torrent's job's.
-        deletion.work = Some((
-            self.inner.env.work.clone(),
-            self.unpacking_dir(job_id),
-            job_id,
-        ));
-        deletion
+    // What reading the torrent's written files takes, cloned under the
+    // live lock so the read itself runs off it and off the runtime
+    // (`read_written`).
+    fn written_of(&self, torrent: &Live) -> WrittenOf {
+        WrittenOf {
+            db: self.inner.db.clone(),
+            job_id: torrent.record.job_id,
+            store: torrent.store.clone(),
+            // A torrent placed in a shared folder has a folder of its own
+            // claimed beside it, and the shared one is never its to remove.
+            claimed: torrent
+                .record
+                .files_dir
+                .as_ref()
+                .and(torrent.record.storage_dir.as_deref())
+                .map(PathBuf::from),
+            work: self.inner.env.work.clone(),
+        }
     }
 
     async fn with_torrent<T>(
@@ -8356,9 +8342,80 @@ pub(super) fn move_listed(
     })
 }
 
+// What reading a torrent's written files takes (`TorrentService::written_of`).
+pub(super) struct WrittenOf {
+    db: Database,
+    job_id: JobId,
+    store: Option<Arc<TorrentStore>>,
+    claimed: Option<PathBuf>,
+    work: PathBuf,
+}
+
+// What a torrent wrote: what a deletion of its files takes, and the files
+// unpacking placed beside them, as its row keeps them.
+#[derive(Debug, Default)]
+pub(super) struct Wrote {
+    pub(super) deletion: Deletion,
+    pub(super) outputs: Vec<String>,
+}
+
+// `written_paths`, off the runtime: its two database reads and the marker
+// read of its unpacking directory block.
+pub(super) async fn read_written(of: WrittenOf) -> Wrote {
+    let job_id = of.job_id;
+    tokio::task::spawn_blocking(move || written_paths(&of))
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(job_id = job_id.0, error = %error, "could not read what a torrent wrote");
+            Wrote::default()
+        })
+}
+
+// What a deletion of the torrent's files removes (libtorrent
+// `storage_utils::delete_files`): its listed files Weaver made, what
+// unpacking placed beside them, and its tee's directory, nothing else.
+// A file that was there before the torrent stays; so does a folder
+// that was. On a failed read of what was there, every listed file is.
+fn written_paths(of: &WrittenOf) -> Wrote {
+    let job_id = of.job_id;
+    let Some(store) = &of.store else {
+        return Wrote::default();
+    };
+    let adopted = of.db.torrent_adopted(job_id).unwrap_or_else(|error| {
+        tracing::warn!(job_id = job_id.0, error = %error, "could not read what was on disk before a torrent");
+        Adopted {
+            all_files: true,
+            dirs: vec![String::new()],
+            ..Adopted::default()
+        }
+    });
+    let outputs = of.db.torrent_outputs(job_id).unwrap_or_else(|error| {
+        tracing::warn!(job_id = job_id.0, error = %error, "could not read what a torrent unpacked");
+        Vec::new()
+    });
+    let mut deletion = deletion(store.files(), &adopted, &outputs, of.claimed.clone());
+    deletion.owner = Some(job_id);
+    // With or without a tee: one whose unpacked files were not placed
+    // keeps its directory past it. It goes only as the torrent's job's.
+    deletion.work = Some((of.work.clone(), unpacking_dir(&of.work, job_id), job_id));
+    Wrote { deletion, outputs }
+}
+
+// The directory a torrent's unpacking works in, under `work`, marked the
+// torrent's job's as an NZB job's working directory is: `torrent-<id>`, or
+// the job's own suffixed name when another job's marker holds that one.
+// Found by its marker first, so the name a job's folder took is the one it
+// keeps (`own_named_dir`).
+pub(super) fn unpacking_dir(work: &Path, job_id: JobId) -> PathBuf {
+    crate::jobs::working_dir::own_named_dir(work, &format!("torrent-{}", job_id.0), job_id)
+}
+
 // What a deletion of a torrent's files removes: see `written_paths`.
 #[derive(Debug, Default)]
 pub(super) struct Deletion {
+    // The job whose marker on `dir` or `claimed` lets that folder go once
+    // the marker is all it holds.
+    pub(super) owner: Option<JobId>,
     // The torrent's own files Weaver made, each removed only as a file.
     pub(super) paths: Vec<PathBuf>,
     // What its job made of them, files or folders, removed whole.
@@ -8397,6 +8454,7 @@ pub(super) fn deletion(
     let made = outputs.iter().map(|output| dir.join(output)).collect();
     let kept_dirs = adopted.dirs.iter().map(|folder| dir.join(folder)).collect();
     Deletion {
+        owner: None,
         paths,
         made,
         own: claimed.is_none(),
@@ -8408,17 +8466,35 @@ pub(super) fn deletion(
 }
 
 // What a history row lists of a deletion: the torrent's own files, each to
-// go only as a file, and what its job made, to go whole.
-fn history_files(deletion: &Deletion) -> Vec<HistoryFile> {
-    let listed = deletion.paths.iter().map(|path| (path, false));
-    let made = deletion.made.iter().map(|path| (path, true));
-    listed
-        .chain(made)
-        .map(|(path, whole)| HistoryFile {
-            path: path.to_string_lossy().into_owned(),
-            whole,
-        })
-        .collect()
+// go only as a file, what its job made, to go whole, and its unpacking
+// directory while it carries the job's marker, as an NZB job's row records
+// the working directory it kept. Only what is on disk as the row is written:
+// never a path a removal of the torrent with its files just took. Read off
+// the runtime.
+async fn history_files(deletion: Deletion) -> Vec<HistoryFile> {
+    tokio::task::spawn_blocking(move || {
+        let listed = deletion.paths.iter().map(|path| (path.clone(), false));
+        let made = deletion.made.iter().map(|path| (path.clone(), true));
+        let work = deletion.work.as_ref().and_then(|(root, work, job_id)| {
+            let owned = crate::jobs::working_dir::working_dir_owner(root, work)
+                .is_ok_and(|owner| owner == Some(*job_id));
+            owned.then(|| (work.clone(), true))
+        });
+        listed
+            .chain(made)
+            .chain(work)
+            .filter(|(path, _)| std::fs::symlink_metadata(path).is_ok())
+            .map(|(path, whole)| HistoryFile {
+                path: path.to_string_lossy().into_owned(),
+                whole,
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!(error = %error, "could not list what a torrent wrote");
+        Vec::new()
+    })
 }
 
 // An archive from history, or a delete with files, of a torrent's job whose
@@ -8546,19 +8622,21 @@ fn unplaced(work: &Path, error: &impl std::fmt::Display) -> String {
 }
 
 // How a torrent's job ends when unpacking left it short of what it would
-// deliver, from the files it `delivered` whole (AGENTS.md, "Job status:
-// Partial"): as a graph job's delivery ends (`Delivery::status`), the one
-// judgement both kinds of job take. Partial when one of them is a usable end
-// file, failed for `why` when none is. An archive volume, a split part and
-// recovery data are never usable files, whole or not.
-fn short_status(delivered: &[String], why: &str) -> JobStatus {
+// deliver, from its own files it has whole, `own`, and the files unpacking
+// placed beside them, `unpacked` (AGENTS.md, "Job status: Partial"): as a
+// graph job's delivery ends (`Delivery::status`), the one judgement both
+// kinds of job take. Partial when one of them is a usable end file, failed
+// for `why` when none is. An archive volume, a split part and recovery data
+// are never usable files, whole or not, and an own file that is furniture
+// is no file of the delivery, as an NZB job's root furniture is not.
+fn short_status(own: &[String], unpacked: &[String], why: &str) -> JobStatus {
     let failure = Failure {
         objects: Vec::new(),
         message: why.to_owned(),
         rejection: None,
         from_feed: false,
     };
-    Delivery::of_whole_files(delivered.iter().cloned()).status(Some(&failure))
+    Delivery::of_whole_files(own.iter().cloned(), unpacked.iter().cloned()).status(Some(&failure))
 }
 
 // Whether the torrent's job unpacks, as its metainfo fixed it.

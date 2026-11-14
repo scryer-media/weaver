@@ -38,7 +38,7 @@ fn usenet_status(files: &[(&str, bool)], why: &str) -> JobStatus {
     let delivery = Delivery::read(
         &tree,
         |_| true,
-        |_| false,
+        crate::pipeline::graph::status::root_furniture(),
         |_, _| false,
         |_, _| None,
         piece,
@@ -61,7 +61,7 @@ fn torrent_status(files: &[(&str, bool)], why: &str) -> JobStatus {
         .filter(|(_, whole)| *whole)
         .map(|(name, _)| (*name).to_owned())
         .collect();
-    short_status(&whole, why)
+    short_status(&whole, &[], why)
 }
 
 const WHY: &str = "unpacking refused the archive";
@@ -96,6 +96,24 @@ fn three_plain_files_one_short_are_partial_for_both_kinds() {
     ];
     assert_eq!(usenet_status(&files, WHY), JobStatus::Partial);
     assert_eq!(torrent_status(&files, WHY), JobStatus::Partial);
+}
+
+// Furniture is no usable file for either kind, by the one rule an NZB
+// job's root furniture follows (`par2_damage_ignorable`, nfo, sfv, srr and
+// nzb by default): a whole .nfo beside a refused archive fails both.
+#[test]
+fn a_whole_nfo_beside_a_refused_archive_fails_for_both_kinds() {
+    let files = [
+        ("ember.nfo", true),
+        ("ember.srr", true),
+        ("ember.part1.rar", true),
+        ("ember.part2.rar", false),
+    ];
+    let failed = JobStatus::Failed {
+        error: WHY.to_owned(),
+    };
+    assert_eq!(usenet_status(&files, WHY), failed);
+    assert_eq!(torrent_status(&files, WHY), failed);
 }
 
 // Whole recovery, check and split files, beside an archive volume, are each
