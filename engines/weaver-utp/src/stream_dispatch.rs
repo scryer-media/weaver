@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-12.
+// Modified by the Weaver authors, 2026-11-14.
 
 #[cfg(test)]
 mod tests;
@@ -27,14 +27,17 @@ use crate::{
     congestion::{DelaySample, ledbat::Ledbat},
     constants::{
         ACK_DELAY, FAST_RESENDS_PER_ACK, MAX_UDP_PAYLOAD, RECOVERY_TRACING_LOG_LEVEL,
-        RTTE_TRACING_LOG_LEVEL, SEQUENCE_HALF_SPACE, SYNACK_RESEND_INTERNAL, UTP_HEADER,
-        calc_pipe_expiry,
+        RTTE_TRACING_LOG_LEVEL, SACK_DUP_THRESH, SEQUENCE_HALF_SPACE, SYNACK_RESEND_INTERNAL,
+        UTP_HEADER, calc_pipe_expiry,
     },
     delay::DelayTracker,
     ingress::{Event as IngressEvent, Receiver as IngressReceiver, Stop},
     mtu::{SegmentSizes, SegmentSizesConfig, packet_mtu},
     pacer::Pacer,
-    raw::{Type, UtpHeader},
+    raw::{
+        Type, UtpHeader,
+        selective_ack::{SACK_EXTENSION_HEADER, SACK_MAX_BYTES},
+    },
     recovery::Recovery,
     rtte::RttEstimator,
     seq_nr::SeqNr,
@@ -44,10 +47,48 @@ use crate::{
     stream::UtpStream,
     stream_rx::{AssemblerAddRemoveResult, UserRx},
     stream_tx::{UserTx, UtpStreamWriteHalf},
-    stream_tx_segments::{ExpiredProbe, OnAckResult, Segments},
+    stream_tx_segments::{ExpiredProbe, OnAckResult, SegmentForSending, Segments},
     traits::{Transport, UtpEnvironment},
     utils::update_optional_waker,
 };
+
+// After a timer expiry rewound the send point to the head, the packets
+// sent before the expiry and not yet resent lie past it. A SACK walk resends
+// one of them on its evidence as libtorrent does (v2.0.15
+// utp_stream.cpp:1235, 1269, 1352-1355, 3550-3551): lost, at or after the
+// fast-resend mark, and the packet the go-back would send next, so the
+// go-back's point moves past it with the send and does not send it again.
+// Any other packet there ends the walk and waits for the go-back.
+fn stops_short_of_go_back(
+    seg: &SegmentForSending<'_>,
+    last_sent_seq_nr: SeqNr,
+    fast_resend_seq_nr: SeqNr,
+) -> bool {
+    seg.seq_nr().is_after(last_sent_seq_nr)
+        && !(seg.is_lost() && seg.seq_nr().is_at_or_after(fast_resend_seq_nr))
+}
+
+// A probe that is resent is a probe no more: libtorrent sends don't-fragment
+// only on a probe's first send (v2.0.15 utp_stream.cpp:1810-1812), never on a
+// resend (:2045-2046), so the resend may arrive fragmented and its delivery
+// proves no size. Lost from the head, behind packets that arrived, it was
+// too large, and the ceiling falls below it (:1975-1984); lost behind the
+// head it may be congestion, and the ceiling stays. Either way its loss
+// cuts no window (:1346-1349). Returns whether it was a probe.
+fn give_up_resent_probe(
+    seg: &mut SegmentForSending<'_>,
+    head: Option<SeqNr>,
+    segment_sizes: &mut SegmentSizes,
+) -> bool {
+    if !seg.is_mtu_probe() {
+        return false;
+    }
+    let size = seg.give_up_probe();
+    if Some(seg.seq_nr()) == head {
+        segment_sizes.on_probe_failed(size);
+    }
+    true
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VirtualSocketState {
@@ -187,12 +228,22 @@ struct VirtualSocket<T, Env> {
     fast_resend_seq_nr: SeqNr,
     // Resends on loss evidence the packets received last allow:
     // `FAST_RESENDS_PER_ACK` for each, or for a reordering wait that ran
-    // out. What is left lost waits for the next ACK, which spaces the
-    // resends at the rate the peer's packets arrive.
+    // out. It lasts only the pass that granted it. What is left lost waits
+    // for the next ACK, which spaces the resends at the rate the peer's
+    // packets arrive.
     fast_resend_budget: usize,
+    // The budget came from a reordering wait that ran out with no ACK to
+    // grant one, or outlived the pass of the ACK that granted it.
+    // libtorrent resends only on an ACK, so those resends are no fast
+    // resends and ask the window (utp_stream.cpp v2.0.15:1990-1997).
+    budget_from_timer: bool,
     // The socket refused a resend that budget was spent on; the budget
     // stays for that resend, and later ACKs add to it.
     resend_refused: bool,
+    // The last send pass walked the resends with the budget, and neither
+    // the socket nor the pacer held one back: the budget is spent. A pass
+    // that stopped short keeps it for the pass that sends.
+    budget_spent: bool,
     // Where the stream is in its socket's writable wakes.
     send_gate: crate::socket::SendGate,
     // Data packets queued for the socket's I/O task, until their sends.
@@ -241,6 +292,11 @@ struct VirtualSocket<T, Env> {
     ack_deferred: bool,
     // The receive loop drained with an ACK deferred: send it now.
     ack_due: bool,
+    // Packets taken past a hole since the last ACK left.
+    reordered_unacked: u8,
+    // An ACK went for the packets counted there and more are still owed:
+    // the next that leaves the cumulative ACK where it was is a repeat.
+    ack_repeating: bool,
 
     // Incoming queue. The main UDP socket writes here, and we need to consume these
     // as fast as possible.
@@ -384,9 +440,6 @@ macro_rules! send_data {
                 ($self.env.now() - $self.socket_created).as_micros() as u32;
             $header.timestamp_difference_microseconds = $self.delay.reply_us();
 
-            let mut h = [0u8; UTP_HEADER as usize];
-            let hlen = $header.serialize(&mut h)?;
-
             // A live probe must arrive whole to prove its size; a probe given
             // up on as too large may be fragmented, so it still arrives, on
             // every resend (utp_stream.cpp v2.0.15:1810-1812, 2045-2046).
@@ -398,6 +451,52 @@ macro_rules! send_data {
             } else {
                 None
             };
+
+            // While packets are held past a hole, a data packet reports
+            // them as an ACK does, a resend as they are held now
+            // (utp_stream.cpp v2.0.15:1536-1548, 1729-1736, 2026-2040).
+            // The SACK goes in what the payload leaves of the size an
+            // ordinary packet may have, so the packet grows past no proven
+            // size; a probe, sized to the byte, carries none.
+            let held = $self.user_rx.selective_ack();
+            let sack = held.and_then(|sack| {
+                if fragmenting.is_some() {
+                    return None;
+                }
+                let room = usize::from($self.segment_sizes.mss())
+                    .checked_sub($segment_iter_item.payload_size() + SACK_EXTENSION_HEADER)?;
+                sack.truncated(room)
+            });
+            // A hole this packet could not report, or reported only in
+            // part with its SACK cut to the room left, still owes its ACK.
+            // So does a hole with no more than SACK_DUP_THRESH packets held
+            // past it, though this packet reports it: a sender counts
+            // neither a data packet nor so short a SACK toward a resend
+            // (libtorrent v2.0.15 utp_stream.cpp:2723-2728, ST_STATE only;
+            // :1306-1320), so only the ACKs owed for the packets taken out
+            // of order tell it, and a data packet does not pay them.
+            let duplicates_owed = {
+                let past_hole = $self.user_rx.assembler_packets();
+                $self.reordered_unacked > 0
+                    && past_hole > 0
+                    && past_hole <= SACK_DUP_THRESH as usize
+            };
+            let sack_cut = held.is_some_and(|held| {
+                sack.is_none_or(|sack| sack.len() < held.len())
+            });
+            let sack_unsent = sack_cut || duplicates_owed;
+            // The long buffer is zeroed only for a packet with a SACK.
+            let mut bare = [0u8; UTP_HEADER as usize];
+            let mut with_sack;
+            let h: &mut [u8] = if sack.is_some() {
+                with_sack = [0u8; UTP_HEADER as usize + SACK_EXTENSION_HEADER + SACK_MAX_BYTES];
+                &mut with_sack
+            } else {
+                &mut bare
+            };
+            $header.extensions.selective_ack = sack;
+            let hlen = $header.serialize(h)?;
+            $header.extensions.selective_ack = None;
 
             // Sent from the ring in place; the writer waits on the lock only
             // for the length of one send.
@@ -442,7 +541,10 @@ macro_rules! send_data {
             // lost one does.
             let accepted = refused.is_none();
             if let Some(source) = refused {
-                let payload_size = $segment_iter_item.payload_size();
+                // The size refused is the whole packet's past its header,
+                // a SACK included.
+                let payload_size =
+                    $segment_iter_item.payload_size() + hlen - UTP_HEADER as usize;
                 debug!(
                     seq_nr = %$segment_iter_item.seq_nr(),
                     payload_size,
@@ -466,8 +568,23 @@ macro_rules! send_data {
             $self.totals.packets_sent += 1;
             if accepted {
                 $self.socket.stats.data_packets_sent.increment(1);
+                if let Some(sack) = &sack {
+                    $self.socket.stats.data_packets_with_sack.increment(1);
+                    $self
+                        .socket
+                        .stats
+                        .sack_bytes_sent
+                        .increment(sack.as_bytes().len() as u64);
+                }
             }
-            on_packet_sent!($self, $header);
+            if sack_unsent {
+                $self.last_sent_ack_nr = $header.ack_nr;
+                $self.last_sent_window = $header.wnd_size;
+            } else {
+                on_packet_sent!($self, $header);
+                $self.reordered_unacked = 0;
+                $self.ack_repeating = false;
+            }
 
             if $segment_iter_item.seq_nr().is_after($self.last_sent_seq_nr) {
                 $self.last_sent_seq_nr = $segment_iter_item.seq_nr();
@@ -548,9 +665,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 let Some(seq_nr) = self.this_poll.refused_unsent.take() else {
                     return Err(Error::Send(source));
                 };
-                // A refused probe is the last segment; any other refused
-                // segment never sent is the first of the unsent ones, all
-                // at the back. They are cut again at the lowered size.
+                // A refused probe goes with the segments cut after it, none
+                // of them sent yet; any other refused segment never sent is
+                // the first of the unsent ones, all at the back. They are
+                // cut again at the lowered size.
                 if self.user_tx_segments.pop_mtu_probe(seq_nr) {
                     debug!("popped too large MTU probe, will retry");
                     self.segment_sizes.disarm_cooldown();
@@ -622,6 +740,22 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 && !(self.fin_sends > 0 && self.state.our_fin_if_unacked().is_some());
             #[cfg(test)]
             let cause = self.expiry_cause();
+            // A timeout forgets the probe out, wherever it is: libtorrent
+            // clears m_mtu_seq at every timeout (v2.0.15 utp_stream.cpp:3498)
+            // and resends it, as all else, with no don't-fragment flag
+            // (:2045-2046). The ceiling falls below it when it was all that
+            // was out (:3412-3421), and, unlike libtorrent, when it is the
+            // oldest packet out: the packets before it arrived and it did
+            // not, the evidence the duplicate-ACK resend acts on
+            // (:1975-1984). libtorrent's head check cannot fire once the
+            // timeout cleared the probe, so a peer sending no SACK, with
+            // fewer than three packets behind each probe, would lose every
+            // probe to the timer and never stop probing.
+            if let Some((size, is_head)) = self.user_tx_segments.forget_mtu_probe()
+                && (only_packet_outstanding || is_head)
+            {
+                self.segment_sizes.on_probe_failed(size);
+            }
             let seg = self.user_tx_segments.iter_mut_for_sending(None).next();
             if let Some(mut seg) = seg {
                 if self.timers.retransmit.report_expiry() {
@@ -640,7 +774,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     }
                 };
                 // Only a lone probe can attribute the timeout solely to its size.
-                let sole_probe = seg.is_mtu_probe() && only_packet_outstanding;
+                let sole_probe = only_packet_outstanding;
                 if !sole_probe {
                     let timeouts = self.rtte.timeouts() as usize + 1;
                     if timeouts > self.socket_opts.num_resends || !self.confirmed {
@@ -812,40 +946,36 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let mut lost_left = false;
         if let Some(rec) = self.recovery.recovering_mut() {
             in_recovery = true;
-            // A resend outrun by later deliveries may have waited long
-            // enough to count lost, with no ACK since to count it.
-            if rec
-                .pipe_estimate
-                .reorder_at
-                .is_some_and(|at| at <= self.this_poll.now)
-            {
-                rec.pipe_estimate = self.user_tx_segments.calc_pipe(
-                    rec.high_rxt,
-                    self.last_sent_seq_nr,
-                    self.rtte.roundtrip_time(),
-                    self.this_poll.now,
-                );
-                self.fast_resend_budget = self.fast_resend_budget.max(FAST_RESENDS_PER_ACK);
-            }
             let sack_depth = self.user_tx_segments.sack_depth();
-            let last_sent_seq_nr = self.last_sent_seq_nr;
+            let highest_sent_seq_nr = self.highest_sent_seq_nr;
             let fast_resend_seq_nr = self.fast_resend_seq_nr;
+            let head = self.user_tx_segments.first_seq_nr();
             let mut it = self
                 .user_tx_segments
                 .iter_mut_for_sending(None)
                 .take(sack_depth + 1)
-                .take_while(|seg| seg.seq_nr().is_at_or_before(last_sent_seq_nr))
+                .take_while(|seg| seg.seq_nr().is_at_or_before(highest_sent_seq_nr))
                 .filter(|seg| seg.send_count() > 0);
 
             let mut cwnd = rec.cwnd();
             let mut sent = 0;
             let mss = self.segment_sizes.mss() as usize;
             let mut force_head = rec.total_retransmitted_segments() == 0;
-            while (force_head || cwnd > mss) && self.fast_resend_budget > 0 {
+            // A resend on SACK evidence does not ask the window, only the
+            // per-ACK budget bounds it (libtorrent v2.0.15
+            // utp_stream.cpp:1990-1997: the window is checked only when the
+            // resend is not a fast resend). A budget the reordering wait
+            // granted with no ACK asks it.
+            while self.fast_resend_budget > 0
+                && (!self.budget_from_timer || force_head || cwnd > mss)
+            {
                 let mut seg = match it.next() {
                     Some(seg) => seg,
                     None => break,
                 };
+                if stops_short_of_go_back(&seg, self.last_sent_seq_nr, self.fast_resend_seq_nr) {
+                    break;
+                }
 
                 // The first packet recovery resends is the oldest, lost or
                 // not, as the duplicates that began recovery point at it,
@@ -863,6 +993,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     }
                 }
 
+                let was_probe = give_up_resent_probe(&mut seg, head, &mut self.segment_sizes);
                 if send_data!(self, cx, header, seg)? {
                     event!(
                         RECOVERY_TRACING_LOG_LEVEL,
@@ -878,7 +1009,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     // Each loss may cut the window, once per window of
                     // packets and cut timer (libtorrent v2.0.15
                     // utp_stream.cpp:1346-1349, 2833 and 2116-2121).
-                    if !seg.is_mtu_probe() {
+                    if !was_probe {
                         self.congestion_controller.on_enter_recovery(
                             self.this_poll.now,
                             seg.seq_nr(),
@@ -909,7 +1040,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
             if self.fast_resend_budget == 0 {
-                lost_left = it.any(|seg| seg.is_lost());
+                let go_back_at = self.last_sent_seq_nr;
+                lost_left = it
+                    .take_while(|seg| seg.seq_nr().is_at_or_before(go_back_at))
+                    .any(|seg| seg.is_lost());
             }
             if let Some(at) = paced.and_then(|payload| self.pacer.ready_at(payload)) {
                 self.timers.pace.set(at);
@@ -974,32 +1108,61 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     .calc_pipe(
                         self.user_tx_segments.acked_seq_nr(),
                         self.last_sent_seq_nr,
+                        self.highest_sent_seq_nr,
                         self.rtte.roundtrip_time(),
                         self.this_poll.now,
                     )
                     .reorder_at;
-                self.fast_resend_budget = self.fast_resend_budget.max(FAST_RESENDS_PER_ACK);
+                // With no ACK's budget, the wait that ran out grants one,
+                // and those resends ask the window as in recovery: libtorrent
+                // lets a resend that is no fast resend past a full window
+                // only when nothing is in flight (utp_stream.cpp
+                // v2.0.15:1990-1997).
+                if self.fast_resend_budget == 0 {
+                    self.fast_resend_budget = FAST_RESENDS_PER_ACK;
+                    self.budget_from_timer = true;
+                }
             }
+            // Every packet up to the go-back point counts in flight, those
+            // resent here among them.
+            let in_flight = self
+                .user_tx_segments
+                .calc_flight_size(self.last_sent_seq_nr);
+            let window = self
+                .congestion_controller
+                .window()
+                .min(self.last_remote_window as usize);
             let sack_depth = self.user_tx_segments.sack_depth();
-            let last_sent_seq_nr = self.last_sent_seq_nr;
+            let highest_sent_seq_nr = self.highest_sent_seq_nr;
+            let head = self.user_tx_segments.first_seq_nr();
             let mut oldest = true;
             let mut it = self
                 .user_tx_segments
                 .iter_mut_for_sending(None)
                 .take(sack_depth + 1)
-                .take_while(|seg| seg.seq_nr().is_at_or_before(last_sent_seq_nr))
+                .take_while(|seg| seg.seq_nr().is_at_or_before(highest_sent_seq_nr))
                 .filter(|seg| seg.send_count() > 0);
             while self.fast_resend_budget > 0
                 && let Some(mut seg) = it.next()
             {
                 let is_oldest = std::mem::take(&mut oldest);
+                if stops_short_of_go_back(&seg, self.last_sent_seq_nr, self.fast_resend_seq_nr) {
+                    break;
+                }
                 if !seg.is_lost() {
                     continue;
+                }
+                if self.budget_from_timer
+                    && in_flight > 0
+                    && seg.payload_size() > window.saturating_sub(in_flight)
+                {
+                    break;
                 }
                 if !is_oldest && !self.pacer.allows(seg.payload_size()) {
                     paced = Some(seg.payload_size());
                     break;
                 }
+                let was_probe = give_up_resent_probe(&mut seg, head, &mut self.segment_sizes);
                 if !send_data!(self, cx, header, seg)? {
                     self.resend_refused = true;
                     return Ok(());
@@ -1012,7 +1175,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 );
                 // A packet sent after the expiry and lost is a new loss;
                 // one sent before it is counted already (the loss gate).
-                if !seg.is_mtu_probe() {
+                if !was_probe {
                     self.congestion_controller.on_enter_recovery(
                         self.this_poll.now,
                         seg.seq_nr(),
@@ -1032,10 +1195,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.pacer.charge(seg.payload_size());
             }
             if self.fast_resend_budget == 0 {
-                lost_left = it.any(|seg| seg.is_lost());
+                let go_back_at = self.last_sent_seq_nr;
+                lost_left = it
+                    .take_while(|seg| seg.seq_nr().is_at_or_before(go_back_at))
+                    .any(|seg| seg.is_lost());
             }
         }
         self.resend_refused = false;
+        self.budget_spent = paced.is_none();
 
         // The peer's advertised window bounds every byte sent and not yet
         // acknowledged, those presumed lost included: the peer must still
@@ -1143,9 +1310,21 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if self.timers.ack_delay_timer.expired(self.this_poll.now) {
             if self.ack_deferred {
                 trace!("delayed ack expired, sending ACK");
+                let moves_ack = self.last_consumed_remote_seq_nr != self.last_sent_ack_nr;
                 let sent = self.send_ack(cx)?;
                 if sent {
                     self.socket.stats.delayed_acks.increment(1);
+                    // The duplicates owed for packets past a hole follow
+                    // a delayed ACK as they follow one sent at a drain.
+                    if !moves_ack {
+                        self.reordered_unacked = self.reordered_unacked.saturating_sub(1);
+                    }
+                    if self.duplicate_acks_owed() > 0 {
+                        self.ack_repeating = true;
+                        self.send_due_ack(cx)?;
+                    } else {
+                        self.reordered_unacked = 0;
+                    }
                 }
                 return Ok(sent);
             } else {
@@ -1276,18 +1455,78 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let sent = self.send_control_packet(cx, &header)?;
         if sent {
             self.socket.stats.ack_packets_sent.increment(1);
+            if let Some(sack) = &header.extensions.selective_ack {
+                self.socket.stats.acks_with_sack.increment(1);
+                self.socket
+                    .stats
+                    .sack_bytes_sent
+                    .increment(sack.as_bytes().len() as u64);
+            }
         }
         Ok(sent)
     }
 
     // Sends the ACK owed when the receive loop drained: libtorrent's
     // send_deferred_ack (v2.0.15 utp_stream.cpp:252-258).
+    //
+    // A sender resends a lost packet early on a SACK naming more than
+    // SACK_DUP_THRESH packets past it, or on that many ACKs repeating the
+    // cumulative ACK (libtorrent v2.0.15 utp_stream.cpp:1297-1320,
+    // :2723-2728, :2814). While the SACK names no more than the threshold,
+    // one ACK for several packets taken past the hole would count as one
+    // duplicate, and a hole near the end of a burst would wait for the
+    // timer. So each such packet gets its ACK then, as TCP answers every
+    // out-of-order segment (RFC 5681 4.2): the first carries the SACK and
+    // the rest repeat it.
+    //
+    // The sender counts an ACK as a duplicate only when it leaves the
+    // cumulative ACK where it was (libtorrent v2.0.15
+    // utp_stream.cpp:2723-2728). When the read also took packets in order,
+    // the first ACK moves it and counts for nothing, so the duplicates all
+    // follow it.
     fn send_due_ack(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<bool> {
-        let sent = self.send_ack(cx)?;
-        if sent {
-            self.socket.stats.immediate_acks.increment(1);
+        let duplicates = self.duplicate_acks_owed();
+        let mut moves_ack = self.last_consumed_remote_seq_nr != self.last_sent_ack_nr;
+        let mut left = if moves_ack {
+            duplicates + 1
+        } else {
+            duplicates.max(1)
+        };
+        let mut sent = false;
+        while left > 0 {
+            if !self.send_ack(cx)? {
+                // The socket took no more: what is left stays owed, and
+                // goes when it is writable again, counted as the repeats
+                // they are.
+                self.ack_due = true;
+                return Ok(sent);
+            }
+            let moved = std::mem::take(&mut moves_ack);
+            if self.ack_repeating && !moved {
+                self.socket.stats.duplicate_acks_sent.increment(1);
+            } else {
+                self.socket.stats.immediate_acks.increment(1);
+            }
+            if !moved {
+                self.reordered_unacked = self.reordered_unacked.saturating_sub(1);
+            }
+            self.ack_repeating = true;
+            sent = true;
+            left -= 1;
         }
+        self.reordered_unacked = 0;
+        self.ack_repeating = false;
         Ok(sent)
+    }
+
+    // The duplicate ACKs the packets taken past a hole are owed. A data
+    // packet sent meanwhile leaves the count as it is.
+    fn duplicate_acks_owed(&self) -> u8 {
+        let held = self.user_rx.assembler_packets();
+        if held > SACK_DUP_THRESH as usize {
+            return 0;
+        }
+        self.reordered_unacked.min(held as u8)
     }
 
     fn maybe_send_fin(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<bool> {
@@ -1386,7 +1625,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             self.timers.retransmit.expired(self.this_poll.now)
                 && self.user_tx_segments.sole_outstanding_is_mtu_probe()
                 && !(self.fin_sends > 0 && self.state.our_fin_if_unacked().is_some()),
-            self.socket_opts.mtu_probe_max_retransmissions,
         ) {
             ExpiredProbe::Expired {
                 rewind_to,
@@ -1409,12 +1647,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
                 self.segment_sizes.on_probe_failed(payload_size);
             }
-            ExpiredProbe::NotExpired => {
-                trace!("MTU probe hasnt expired yet");
-                return Ok(());
-            }
+            // While the probe is unanswered, what is written behind it goes
+            // out in packets of the proven size, as libtorrent sends no
+            // second probe while one is out and cuts the rest at
+            // m_mtu_floor (v2.0.15 utp_stream.cpp:1497-1506, 1528-1532).
+            ExpiredProbe::NotExpired => trace!("MTU probe out: cutting at the proven size"),
             ExpiredProbe::Empty => {}
         }
+        let mut probe_out = self.user_tx_segments.has_live_mtu_probe();
 
         let segmented_len = self.user_tx_segments.total_len_bytes();
 
@@ -1445,12 +1685,25 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let min_ss = self.segment_sizes.mss();
         let probe_room = self.congestion_controller.cwnd_bytes()
             > 3 * usize::from(min_ss.saturating_add(UTP_HEADER));
+        // While packets are held past a hole, a segment is cut short by the
+        // SACK its packet will carry, as libtorrent takes the SACK out of
+        // the packet's payload (v2.0.15 utp_stream.cpp:1536-1560), unless
+        // that would leave less than half a packet of payload.
+        let sack_reserve = self
+            .user_rx
+            .selective_ack()
+            .map(|sack| sack.as_bytes().len() + SACK_EXTENSION_HEADER)
+            .filter(|reserve| *reserve <= usize::from(min_ss) / 2)
+            .unwrap_or(0);
         // While a probe is due and the window is too small for it, no more
         // is cut than may be in flight, so the probe is cut once the window
-        // has grown, not after everything written. Segments a SACK reported
-        // delivered are out of the network and do not count. A stream with
-        // no probe due cuts as far ahead as before.
-        let mut hold = (!probe_room).then(|| {
+        // has grown, not after everything written. While a probe is out, no
+        // more is cut than may be in flight either, so only the packets sent
+        // before its answer take the proven size: libtorrent sizes each
+        // packet as it sends it (v2.0.15 utp_stream.cpp:1528-1532). Segments
+        // a SACK reported delivered are out of the network and do not count.
+        // A stream with no probe due or out cuts as far ahead as before.
+        let mut hold = (!probe_room || probe_out).then(|| {
             (
                 self.congestion_controller.window(),
                 self.user_tx_segments.undelivered_bytes(),
@@ -1461,19 +1714,27 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let mut starved = remaining == 0;
         while remaining > 0 && remote_window_remaining > 0 {
             if let Some((window, undelivered)) = hold
-                && self.segment_sizes.probe_due()
+                && (probe_out || self.segment_sizes.probe_due())
                 && undelivered >= window
             {
-                trace!(window, "probe due, window too small: segmenting no further");
+                trace!(
+                    window,
+                    probe_out, "probe due or out: segmenting no further than the window"
+                );
                 starved = false;
                 break;
             }
-            let ss = if probe_room {
+            let ss = if probe_room && !probe_out {
                 self.segment_sizes.next_segment_size()
             } else {
                 min_ss
             };
-            let max_payload_size = (ss as usize).min(remote_window_remaining);
+            let ss = if ss > min_ss {
+                usize::from(ss)
+            } else {
+                usize::from(ss) - sack_reserve
+            };
+            let max_payload_size = ss.min(remote_window_remaining);
             let payload_size = max_payload_size.min(remaining);
 
             // Run Nagle algorithm to prevent sending too many small segments.
@@ -1503,8 +1764,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             trace!(bytes = payload_size, "segmented");
 
             if is_mtu_probe {
-                trace!(payload_size, "MTU probing, not segmenting more data");
-                break;
+                trace!(payload_size, "MTU probe cut, the rest at the proven size");
+                probe_out = true;
+                hold.get_or_insert((
+                    self.congestion_controller.window(),
+                    self.user_tx_segments.undelivered_bytes(),
+                ));
             }
         }
 
@@ -1716,18 +1981,49 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             );
         }
 
+        let budget_spent = std::mem::take(&mut self.budget_spent);
         if processed > 0 {
             let grant = processed.saturating_mul(FAST_RESENDS_PER_ACK);
+            self.budget_from_timer = false;
             self.fast_resend_budget = if self.resend_refused {
                 self.fast_resend_budget.saturating_add(grant)
             } else {
                 grant
             };
+        } else if budget_spent {
+            // The ACKs' budget ends with the pass that spent it: libtorrent
+            // fast-resends only while it handles an ACK (utp_stream.cpp
+            // v2.0.15:1340-1355, 2814-2833). A resend the socket refused, or
+            // the pacer held back, keeps its budget until it goes; libtorrent
+            // has no pacer and sends it with the ACK.
+            self.fast_resend_budget = 0;
+            self.budget_from_timer = false;
+        } else if self.fast_resend_budget > 0 {
+            // Kept past its ACK's pass, the budget's resends ask the window,
+            // as libtorrent's resends that are no fast resends do
+            // (:1990-1997).
+            self.budget_from_timer = true;
         }
         if let Some(rec) = self.recovery.recovering_mut() {
+            // A resend outrun by later deliveries may have waited long
+            // enough to count lost, with no ACK to count it: the pipe is
+            // counted again on every pass. The wait that ran out grants a
+            // budget, and those resends ask the window, as libtorrent's
+            // resends that are no fast resends do (:1990-1997).
+            if processed == 0
+                && self.fast_resend_budget == 0
+                && rec
+                    .pipe_estimate
+                    .reorder_at
+                    .is_some_and(|at| at <= self.this_poll.now)
+            {
+                self.fast_resend_budget = FAST_RESENDS_PER_ACK;
+                self.budget_from_timer = true;
+            }
             rec.pipe_estimate = self.user_tx_segments.calc_pipe(
                 rec.high_rxt,
                 self.last_sent_seq_nr,
+                self.highest_sent_seq_nr,
                 self.rtte.roundtrip_time(),
                 self.this_poll.now,
             );
@@ -1741,6 +2037,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .calc_pipe(
                     self.user_tx_segments.acked_seq_nr(),
                     self.last_sent_seq_nr,
+                    self.highest_sent_seq_nr,
                     self.rtte.roundtrip_time(),
                     self.this_poll.now,
                 )
@@ -1934,6 +2231,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         // An ACK may report a packet whose send was recorded since the
         // poll began; it is timed from that send.
         self.take_departures();
+        if let Some(sack) = &msg.header.extensions.selective_ack {
+            self.socket.stats.sacks_received.increment(1);
+            self.socket
+                .stats
+                .sack_bits_received
+                .increment(sack.as_bitslice().count_ones() as u64);
+        }
         let in_flight_before = self
             .user_tx_segments
             .calc_flight_size(self.last_sent_seq_nr);
@@ -1942,8 +2246,20 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .user_tx_segments
                 .remove_up_to_ack(msg.received, &msg.header),
         };
+        let mss_before = self.segment_sizes.mss();
         self.segment_sizes
             .on_payload_delivered(result.on_ack_result.max_acked_payload_size);
+        // A proven larger size reaches the segments cut at the old one and
+        // not yet sent: they go back to be cut again, as libtorrent sizes
+        // each packet when it sends it (v2.0.15 utp_stream.cpp:1532, 1559).
+        if self.segment_sizes.mss() > mss_before {
+            let dropped = self.user_tx_segments.drop_unsent();
+            trace!(
+                dropped,
+                mss = self.segment_sizes.mss(),
+                "unsent segments go back to be cut larger"
+            );
+        }
         self.congestion_controller
             .set_mss(self.segment_sizes.mss() as usize);
 
@@ -2058,6 +2374,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                             self.socket.stats.consumed_bytes.increment(bytes as u64);
                         } else {
                             self.socket.stats.out_of_order_packets.increment(1);
+                            self.reordered_unacked = self.reordered_unacked.saturating_add(1);
                             debug_every_ms!(500, header=%hdr.short_repr(), offset, ?self.last_consumed_remote_seq_nr, "out of order");
                         }
 
@@ -2489,6 +2806,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 continue;
             }
 
+            if !self.state.is_remote_fin_or_later() {
+                self.user_rx.wake_on_read_below(self.last_sent_window, cx);
+            }
             self.update_tail_probe_timer();
             self.arm_next_poll(cx);
 
@@ -2759,7 +3079,9 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             rto_retransmissions: 0,
             fast_resend_seq_nr: seq_nr,
             fast_resend_budget: 0,
+            budget_from_timer: false,
             resend_refused: false,
+            budget_spent: false,
             send_gate: crate::socket::SendGate::for_stream(conn_id_recv.0),
             departing: Departing::default(),
             confirmed: !matches!(
@@ -2771,6 +3093,8 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             idle_since: None,
             ack_deferred: false,
             ack_due: false,
+            reordered_unacked: 0,
+            ack_repeating: false,
             rx,
             user_tx_segments: Segments::new(seq_nr),
             user_tx,

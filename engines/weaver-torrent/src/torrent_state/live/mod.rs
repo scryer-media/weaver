@@ -1136,9 +1136,7 @@ impl TorrentStateLive {
                     // connection moves there, so the stream and the peer
                     // that reads and writes it hand bytes to one another
                     // without waking another thread.
-                    Ok(connected)
-                        if connected.home.is_some() && !weaver_utp::on_shard_thread() =>
-                    {
+                    Ok(connected) if runs_elsewhere(connected.home.as_ref()) => {
                         Ran::Moving(Box::new(connected))
                     }
                     Ok(connected) => {
@@ -5292,6 +5290,15 @@ impl crate::peer_connection::ChunkReader for UploadReader {
 enum Ran {
     Ended(crate::Result<()>),
     Moving(Box<crate::peer_connection::Connected>),
+}
+
+/// Whether a connection's stream runs on a runtime other than the one the
+/// connect ran on, so the connection moves there. A session has more than
+/// one uTP thread: being on one of them is not being on the stream's.
+fn runs_elsewhere(home: Option<&tokio::runtime::Handle>) -> bool {
+    home.is_some_and(|home| {
+        !tokio::runtime::Handle::try_current().is_ok_and(|here| here.id() == home.id())
+    })
 }
 
 /// Tells the torrent a connection ended, and how.

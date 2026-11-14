@@ -8961,3 +8961,23 @@ async fn a_torrent_that_wants_a_piece_again_finishes_again() {
         h.live.on_piece_completed(h.piece(1)).unwrap()
     }));
 }
+
+// An outgoing connection moves to its stream's runtime when it was opened
+// on any other, a different uTP thread among them, and stays when it was
+// opened there or has no stream thread.
+#[test]
+fn a_connection_moves_unless_it_runs_on_its_streams_runtime() {
+    let runtime = || {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+    };
+    let (first, second) = (runtime(), runtime());
+    let (first_home, second_home) = (first.handle().clone(), second.handle().clone());
+    first.block_on(async {
+        assert!(!runs_elsewhere(None));
+        assert!(!runs_elsewhere(Some(&first_home)));
+        assert!(runs_elsewhere(Some(&second_home)));
+    });
+    assert!(runs_elsewhere(Some(&first_home)));
+}

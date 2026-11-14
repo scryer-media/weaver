@@ -474,10 +474,24 @@ pub(crate) static ON_UTP_THREADS: [std::sync::atomic::AtomicUsize; 2] = [
     std::sync::atomic::AtomicUsize::new(0),
 ];
 
+/// Connections run so far on a session's first uTP thread, the one that
+/// reads and sends on its sockets.
+#[cfg(test)]
+pub(crate) static ON_UTP_IO_THREAD: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(test)]
 fn count_on_utp_thread(outgoing: bool) {
+    use std::sync::atomic::Ordering;
     if weaver_utp::on_shard_thread() {
-        ON_UTP_THREADS[usize::from(outgoing)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ON_UTP_THREADS[usize::from(outgoing)].fetch_add(1, Ordering::Relaxed);
+        // A session's uTP threads are named `utp{session}-{index}`.
+        if std::thread::current()
+            .name()
+            .is_some_and(|name| name.ends_with("-0"))
+        {
+            ON_UTP_IO_THREAD.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 

@@ -3076,13 +3076,63 @@ fn render_torrent_sessions(out: &mut Encoder, routes: &[SessionSeries]) {
         (&f::TORRENT_UTP_RECEIVE_DRAINS, |s: &SessionSeries| {
             s.utp.receive_drains
         }),
-        (&f::TORRENT_UTP_STREAM_SWITCH_MARKS, |s: &SessionSeries| {
-            s.utp.stream_switch_marks
+        (&f::TORRENT_UTP_STREAMS_MARKED, |s: &SessionSeries| {
+            s.utp.streams_marked
         }),
         (
             &f::TORRENT_UTP_DRAIN_MARKS_WITH_PACKETS_QUEUED,
             |s: &SessionSeries| s.utp.drain_marks_with_packets_queued,
         ),
+        (&f::TORRENT_UTP_ACKS_WITH_SACK, |s: &SessionSeries| {
+            s.utp.acks_with_sack
+        }),
+        (
+            &f::TORRENT_UTP_DATA_PACKETS_WITH_SACK,
+            |s: &SessionSeries| s.utp.data_packets_with_sack,
+        ),
+        (&f::TORRENT_UTP_SACK_BYTES_SENT, |s: &SessionSeries| {
+            s.utp.sack_bytes_sent
+        }),
+        (&f::TORRENT_UTP_SACKS_RECEIVED, |s: &SessionSeries| {
+            s.utp.sacks_received
+        }),
+        (&f::TORRENT_UTP_SACK_BITS_RECEIVED, |s: &SessionSeries| {
+            s.utp.sack_bits_received
+        }),
+        (&f::TORRENT_UTP_DUPLICATE_ACKS_SENT, |s: &SessionSeries| {
+            s.utp.duplicate_acks_sent
+        }),
+        (&f::TORRENT_UTP_RECEIVE_CUTS, |s: &SessionSeries| {
+            s.utp.receive_cuts
+        }),
+        (&f::TORRENT_UTP_SEND_RUNS, |s: &SessionSeries| {
+            s.utp.send_runs
+        }),
+        (&f::TORRENT_UTP_SEND_RUN_DATAGRAMS, |s: &SessionSeries| {
+            s.utp.send_run_datagrams
+        }),
+        (&f::TORRENT_UTP_SEND_RUN_ERRORS, |s: &SessionSeries| {
+            s.utp.send_run_errors
+        }),
+        (&f::TORRENT_UTP_RECEIVE_CALLS, |s: &SessionSeries| {
+            s.utp.receive_calls
+        }),
+        (
+            &f::TORRENT_UTP_RECEIVE_CALL_DATAGRAMS,
+            |s: &SessionSeries| s.utp.receive_call_datagrams,
+        ),
+        (&f::TORRENT_UTP_SEND_BATCHES, |s: &SessionSeries| {
+            s.utp.send_batches
+        }),
+        (&f::TORRENT_UTP_SEND_BATCH_DATAGRAMS, |s: &SessionSeries| {
+            s.utp.send_batch_datagrams
+        }),
+        (&f::TORRENT_UTP_DATAGRAMS_TOO_LONG, |s: &SessionSeries| {
+            s.utp.datagrams_too_long
+        }),
+        (&f::TORRENT_UTP_SEND_BATCH_ERRORS, |s: &SessionSeries| {
+            s.utp.send_batch_errors
+        }),
         (&f::TORRENT_UTP_MAX_CWND, |s: &SessionSeries| {
             s.utp.max_congestion_window_bytes
         }),

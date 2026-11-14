@@ -643,10 +643,42 @@ metric_families! {
         ["route"], "uTP streams ended because their packets went unanswered (resends or timeouts used up, or FIN never acknowledged), since the session opened.");
     TORRENT_UTP_RECEIVE_DRAINS = ("weaver_torrent_utp_receive_drains_total", Counter,
         ["route"], "Reads of the uTP socket that ended with it empty after taking packets for a stream, since the session opened.");
-    TORRENT_UTP_STREAM_SWITCH_MARKS = ("weaver_torrent_utp_stream_switch_marks_total", Counter,
-        ["route"], "uTP packets read for another stream than the packet before, since the session opened.");
+    TORRENT_UTP_STREAMS_MARKED = ("weaver_torrent_utp_streams_marked_total", Counter,
+        ["route"], "uTP streams marked to send the ACK they owe at the end of a socket read, one mark for each stream that took packets in the read, since the session opened.");
     TORRENT_UTP_DRAIN_MARKS_WITH_PACKETS_QUEUED = ("weaver_torrent_utp_drain_marks_with_packets_queued_total", Counter,
         ["route"], "Times a uTP stream owed an ACK at the end of a read while more of its packets were already queued, since the session opened.");
+    TORRENT_UTP_ACKS_WITH_SACK = ("weaver_torrent_utp_acks_with_sack_total", Counter,
+        ["route"], "uTP ACK packets sent that carried a selective ACK, since the session opened.");
+    TORRENT_UTP_DATA_PACKETS_WITH_SACK = ("weaver_torrent_utp_data_packets_with_sack_total", Counter,
+        ["route"], "uTP data packets sent that carried a selective ACK, since the session opened.");
+    TORRENT_UTP_SACK_BYTES_SENT = ("weaver_torrent_utp_sack_bytes_sent_total", Counter,
+        ["route"], "Bytes of selective ACK bitmask sent on uTP ACK and data packets, since the session opened.");
+    TORRENT_UTP_SACKS_RECEIVED = ("weaver_torrent_utp_sacks_received_total", Counter,
+        ["route"], "uTP packets received that carried a selective ACK, since the session opened.");
+    TORRENT_UTP_SACK_BITS_RECEIVED = ("weaver_torrent_utp_sack_bits_received_total", Counter,
+        ["route"], "Packets named as held by the selective ACKs received, summed over those ACKs, since the session opened.");
+    TORRENT_UTP_DUPLICATE_ACKS_SENT = ("weaver_torrent_utp_duplicate_acks_sent_total", Counter,
+        ["route"], "uTP ACKs repeated for packets taken past a hole, one for each such packet beyond the first, while the selective ACK named too few for the sender to resend on it alone, since the session opened.");
+    TORRENT_UTP_RECEIVE_CUTS = ("weaver_torrent_utp_receive_cuts_total", Counter,
+        ["route"], "Reads of the uTP socket that stopped at the batch limit with datagrams still waiting, since the session opened.");
+    TORRENT_UTP_SEND_RUNS = ("weaver_torrent_utp_send_runs_total", Counter,
+        ["route"], "System calls that sent more than one queued uTP datagram at once, since the session opened.");
+    TORRENT_UTP_SEND_RUN_DATAGRAMS = ("weaver_torrent_utp_send_run_datagrams_total", Counter,
+        ["route"], "uTP datagrams sent by the calls that take more than one, since the session opened.");
+    TORRENT_UTP_SEND_RUN_ERRORS = ("weaver_torrent_utp_send_run_errors_total", Counter,
+        ["route"], "Calls for more than one uTP datagram that failed as a whole, after which the datagrams went one at a time, since the session opened.");
+    TORRENT_UTP_RECEIVE_CALLS = ("weaver_torrent_utp_receive_calls_total", Counter,
+        ["route"], "Total uTP socket receive calls that returned datagrams for uTP; a call that returned only DHT messages is not counted");
+    TORRENT_UTP_RECEIVE_CALL_DATAGRAMS = ("weaver_torrent_utp_receive_call_datagrams_total", Counter,
+        ["route"], "Total datagrams uTP socket receive calls returned for uTP; DHT messages on a shared socket are not counted");
+    TORRENT_UTP_SEND_BATCHES = ("weaver_torrent_utp_send_batches_total", Counter,
+        ["route"], "Total uTP system calls that sent two or more datagrams for several addresses");
+    TORRENT_UTP_SEND_BATCH_DATAGRAMS = ("weaver_torrent_utp_send_batch_datagrams_total", Counter,
+        ["route"], "Total uTP datagrams sent by system calls that sent two or more for several addresses");
+    TORRENT_UTP_DATAGRAMS_TOO_LONG = ("weaver_torrent_utp_datagrams_too_long_total", Counter,
+        ["route"], "Total datagrams a uTP socket dropped as longer than its receive buffers");
+    TORRENT_UTP_SEND_BATCH_ERRORS = ("weaver_torrent_utp_send_batch_errors_total", Counter,
+        ["route"], "Total uTP sends for several addresses in one system call that failed");
     TORRENT_UTP_MAX_CWND = ("weaver_torrent_utp_max_congestion_window_bytes", Gauge,
         ["route"], "Largest uTP congestion window any stream of the session reached, in bytes.");
     TORRENT_DISK_CALLS = ("weaver_torrent_disk_calls_total", Counter, ["route", "operation"],

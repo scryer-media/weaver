@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-12.
+// Modified by the Weaver authors, 2026-11-14.
 
 // uTP doesn't resegment, so we pre-segment TX once.
 // We also store the delivered state of the segments here.
@@ -139,6 +139,12 @@ pub struct Segments {
 
     // The payload of segments a SACK reported delivered and still queued.
     delivered_bytes: usize,
+
+    // The sequence number of the last MTU probe cut. It is the live probe
+    // while that segment is queued, still a probe and not delivered; data
+    // cut after it may sit behind it, as libtorrent sends floor packets
+    // behind its probe (utp_stream.cpp v2.0.15:1528-1532).
+    probe_seq_nr: Option<SeqNr>,
 }
 
 pub struct SegmentForSending<'a> {
@@ -199,6 +205,14 @@ impl SegmentForSending<'_> {
     // A probe given up on as too large, resent as ordinary data.
     pub fn size_given_up(&self) -> bool {
         self.segment.size_given_up
+    }
+
+    // Gives up on this probe as too large: it goes again whole as ordinary
+    // data, and its delivery proves no size. Returns its payload size.
+    pub fn give_up_probe(&mut self) -> usize {
+        self.segment.is_mtu_probe = false;
+        self.segment.size_given_up = true;
+        self.segment.payload_size
     }
 
     pub fn is_delivered(&self) -> bool {
@@ -322,6 +336,7 @@ impl Segments {
             flight_end: 0,
             flight_bytes: 0,
             delivered_bytes: 0,
+            probe_seq_nr: None,
         }
     }
 
@@ -491,6 +506,9 @@ impl Segments {
         if self.segments.len() >= MAX_RESERVED_DATA_PACKETS {
             return false;
         }
+        if is_mtu_probe {
+            self.probe_seq_nr = Some(self.next_seq_nr());
+        }
         self.segments.push_back(Segment {
             payload_size: payload_len,
             payload_offset_absolute: self.offset,
@@ -508,47 +526,78 @@ impl Segments {
         true
     }
 
-    pub fn pop_mtu_probe(&mut self, seq_nr: SeqNr) -> bool {
-        let last_segment_seq_nr = self.snd_una + self.segments.len() as u16 - 1;
-        match self.segments.back() {
-            Some(s) if last_segment_seq_nr == seq_nr && s.is_mtu_probe && !s.is_delivered => {
-                self.uncount_back();
-                let s = self.segments.pop_back().unwrap();
-                self.len_bytes -= s.payload_size;
-                self.offset = s.payload_offset_absolute;
-                self.check_running_totals();
-                true
-            }
-            _ => false,
-        }
+    // The index of the live MTU probe: queued, a probe and not delivered.
+    fn live_probe_index(&self) -> Option<usize> {
+        let index = usize::from(self.probe_seq_nr?.forward_distance_from(self.snd_una));
+        self.segments
+            .get(index)
+            .is_some_and(|s| s.is_mtu_probe && !s.is_delivered)
+            .then_some(index)
     }
 
-    /// Gives up on the MTU probe at the back once its timer has expired
-    /// often enough. A probe that was sent keeps its bytes and its sequence
-    /// number: the peer may hold it, and drops by sequence number alone
-    /// anything sent again under it. It stays as ordinary data, to be resent
-    /// whole, as libtorrent resends a timed-out probe (utp_stream.cpp
-    /// v2.0.15:1975-1984, 3412-3421).
-    pub fn expire_mtu_probe(
-        &mut self,
-        retransmit_timed_out: bool,
-        max_probe_retransmissions: usize,
-    ) -> ExpiredProbe {
-        let seq_nr = self.next_seq_nr() - 1;
-        match self.segments.back_mut() {
-            Some(s) if s.is_delivered || !s.is_mtu_probe => ExpiredProbe::Empty,
-            Some(s)
-                if retransmit_timed_out && s.retransmit_count() >= max_probe_retransmissions =>
-            {
-                s.is_mtu_probe = false;
-                s.size_given_up = true;
-                ExpiredProbe::Expired {
-                    payload_size: s.payload_size,
-                    rewind_to: seq_nr - 1,
-                }
+    // Forgets the live MTU probe, wherever it is: it goes again as ordinary
+    // data allowed to fragment, and its delivery proves no size. Returns
+    // its payload size, and whether it is the oldest unacknowledged packet.
+    pub fn forget_mtu_probe(&mut self) -> Option<(usize, bool)> {
+        let index = self.live_probe_index()?;
+        let s = &mut self.segments[index];
+        s.is_mtu_probe = false;
+        s.size_given_up = true;
+        Some((s.payload_size, index == 0))
+    }
+
+    // Whether an MTU probe is out and unanswered: no other is cut meanwhile.
+    pub fn has_live_mtu_probe(&self) -> bool {
+        self.live_probe_index().is_some()
+    }
+
+    // Drops the live probe at `seq_nr` the host refused, and the segments
+    // cut after it, when none of those was ever sent: they are cut again
+    // at the lowered size.
+    pub fn pop_mtu_probe(&mut self, seq_nr: SeqNr) -> bool {
+        let Some(index) = self.live_probe_index() else {
+            return false;
+        };
+        if self.snd_una + index as u16 != seq_nr
+            || self
+                .segments
+                .iter()
+                .skip(index + 1)
+                .any(|s| s.send_count() > 0)
+        {
+            return false;
+        }
+        while self.segments.len() > index {
+            self.uncount_back();
+            let s = self.segments.pop_back().unwrap();
+            self.len_bytes -= s.payload_size;
+            self.offset = s.payload_offset_absolute;
+        }
+        self.check_running_totals();
+        true
+    }
+
+    /// Gives up on the live MTU probe at its first timeout. A probe that
+    /// was sent keeps its bytes and its sequence number: the peer may hold
+    /// it, and drops by sequence number alone anything sent again under it.
+    /// It stays as ordinary data, to be resent whole and allowed to
+    /// fragment, as libtorrent resends a timed-out probe (utp_stream.cpp
+    /// v2.0.15:2045-2046, 3412-3421, 3498).
+    pub fn expire_mtu_probe(&mut self, retransmit_timed_out: bool) -> ExpiredProbe {
+        let Some(index) = self.live_probe_index() else {
+            return ExpiredProbe::Empty;
+        };
+        let seq_nr = self.snd_una + index as u16;
+        let s = &mut self.segments[index];
+        if retransmit_timed_out {
+            s.is_mtu_probe = false;
+            s.size_given_up = true;
+            ExpiredProbe::Expired {
+                payload_size: s.payload_size,
+                rewind_to: seq_nr - 1,
             }
-            Some(_) => ExpiredProbe::NotExpired,
-            None => ExpiredProbe::Empty,
+        } else {
+            ExpiredProbe::NotExpired
         }
     }
 
@@ -727,10 +776,17 @@ impl Segments {
 
     // Pipe is the estimate of how much outstanding data is in the network.
     // used during SACK-based recovery not to overwhelm the network.
+    // `high_sent` is the newest packet ever sent. After a timer expiry
+    // rewound `high_data` to the head, the packets past it are marked lost
+    // or not on the SACKs as well, so a hole among them can be resent on
+    // that evidence as libtorrent resends it (v2.0.15 utp_stream.cpp:
+    // 1235-1355, 3550-3551); they are not in the pipe, as libtorrent's
+    // timeout takes them out of its bytes in flight (:3505-3513).
     pub fn calc_pipe(
         &mut self,
         high_rxt: SeqNr,
         high_data: SeqNr,
+        high_sent: SeqNr,
         rtt: Duration,
         now: Instant,
     ) -> Pipe {
@@ -746,9 +802,11 @@ impl Segments {
         // after a resend say the resend was lost too.
         let mut latest = [None::<Instant>; SACK_DUP_THRESH as usize + 1];
 
-        let take = high_data
-            .signed_offset_from(self.snd_una)
-            .map_or(0, |offset| offset.max(0) as usize);
+        // Every segment sent, the newest at `high_data` with them: the
+        // flight size counts the same segments (RFC 6675 section 4,
+        // SetPipe, runs from HighACK to HighData).
+        let take = self.flight_take(high_data);
+        let marked = self.flight_take(high_sent).max(take);
 
         // After this we don't consider the packet being in the network.
         // rtt/2 might be a bit too aggressive.
@@ -756,7 +814,7 @@ impl Segments {
 
         for (offset, seq_nr, segment, last_sent) in self
             .segments
-            .range_mut(..take)
+            .range_mut(..marked)
             .enumerate()
             .rev()
             .filter_map(|(offset, seg)| {
@@ -775,7 +833,8 @@ impl Segments {
                 continue;
             }
 
-            if seq_nr.is_at_or_before(high_rxt) {
+            let counted = offset < take;
+            if counted && seq_nr.is_at_or_before(high_rxt) {
                 pipe += segment.payload_size;
             }
 
@@ -805,6 +864,9 @@ impl Segments {
                 delivered_segs > SACK_DUP_THRESH as usize
             };
             segment.is_lost = offset <= self.sack_depth + 1 && evidence;
+            if !counted {
+                continue;
+            }
 
             // A segment in flight past the expiry has likely left the
             // network, so it no longer counts against the pipe.
@@ -814,10 +876,8 @@ impl Segments {
 
             if !segment.is_expired && !segment.is_lost {
                 let expires = last_sent + expiry_threshold;
-                recalc_timer = match recalc_timer {
-                    Some(ts) if expires < ts => Some(expires),
-                    _ => Some(expires),
-                }
+                // The earliest expiry among the segments still counted.
+                recalc_timer = Some(recalc_timer.map_or(expires, |ts: Instant| ts.min(expires)));
             }
         }
 
@@ -978,7 +1038,7 @@ mod tests {
         }
         segments.remove_up_to_ack(sent, &make_sack_header(9, [0, 1, 2]));
         let rtt = Duration::from_millis(100);
-        let pipe = segments.calc_pipe(9.into(), 17.into(), rtt, sent + rtt * 10);
+        let pipe = segments.calc_pipe(9.into(), 17.into(), 17.into(), rtt, sent + rtt * 10);
         let head = segments.iter_mut_for_sending(None).next().unwrap();
         assert_eq!(head.seq_nr(), 10.into());
         assert!(head.is_expired());
@@ -986,7 +1046,7 @@ mod tests {
         assert_eq!(pipe.pipe, 0);
 
         segments.remove_up_to_ack(sent, &make_sack_header(9, [0, 1, 2, 3]));
-        segments.calc_pipe(9.into(), 17.into(), rtt, sent + rtt * 10);
+        segments.calc_pipe(9.into(), 17.into(), 17.into(), rtt, sent + rtt * 10);
         assert!(
             segments
                 .iter_mut_for_sending(None)
@@ -1225,7 +1285,7 @@ mod tests {
         }
         // 11-14 SACKed: 10 is lost and resent.
         ftx.remove_up_to_ack(t0, &make_sack_header(9, [0, 1, 2, 3]));
-        ftx.calc_pipe(9.into(), 15.into(), rtt, t0);
+        ftx.calc_pipe(9.into(), 15.into(), 15.into(), rtt, t0);
         let t1 = t0 + rtt;
         {
             let mut head = ftx.iter_mut_for_sending(None).next().unwrap();
@@ -1235,7 +1295,7 @@ mod tests {
         }
         // The same evidence again, plus 15, sent before the resend.
         ftx.remove_up_to_ack(t1, &make_sack_header(9, [0, 1, 2, 3, 4]));
-        ftx.calc_pipe(10.into(), 15.into(), rtt, t1);
+        ftx.calc_pipe(10.into(), 15.into(), 15.into(), rtt, t1);
         assert!(!ftx.iter_mut_for_sending(None).next().unwrap().is_lost());
 
         // 16-21 go out after the resend; three SACKed are not enough, four
@@ -1245,10 +1305,10 @@ mod tests {
             item.on_sent(t2, &stats);
         }
         ftx.remove_up_to_ack(t2, &make_sack_header(9, [0, 1, 2, 3, 4, 5, 6, 7]));
-        ftx.calc_pipe(10.into(), 21.into(), rtt, t2);
+        ftx.calc_pipe(10.into(), 21.into(), 21.into(), rtt, t2);
         assert!(!ftx.iter_mut_for_sending(None).next().unwrap().is_lost());
         ftx.remove_up_to_ack(t2, &make_sack_header(9, [8]));
-        ftx.calc_pipe(10.into(), 21.into(), rtt, t2);
+        ftx.calc_pipe(10.into(), 21.into(), 21.into(), rtt, t2);
         let head = ftx.iter_mut_for_sending(None).next().unwrap();
         assert_eq!(head.seq_nr(), 10.into());
         assert!(head.is_lost());
@@ -1434,7 +1494,7 @@ mod tests {
                     }
                 }
                 _ => {
-                    let _ = segs.expire_mtu_probe(true, 0);
+                    let _ = segs.expire_mtu_probe(true);
                 }
             }
             if next(2) == 0 {
@@ -1450,5 +1510,108 @@ mod tests {
         );
         // More removed from the front than lie before the wrap.
         assert!(acked > usize::from(u16::MAX - 65_000), "acked={acked}");
+    }
+}
+
+#[cfg(test)]
+mod pipe_tests {
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
+    use super::{Segments, SeqNr};
+    use crate::raw::{UtpHeader, selective_ack::SelectiveAck};
+    use crate::stats::UtpStats;
+
+    const SIZE: usize = 1000;
+    const SRTT: Duration = Duration::from_millis(100);
+    const MS: Duration = Duration::from_millis(1);
+
+    fn sack(ack_nr: u16, seqs: impl IntoIterator<Item = u16>) -> UtpHeader {
+        UtpHeader {
+            ack_nr: ack_nr.into(),
+            extensions: crate::raw::Extensions {
+                selective_ack: SelectiveAck::new_test(
+                    seqs.into_iter().map(|s| usize::from(s - ack_nr - 2)),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn queue(first: u16, last: u16) -> Segments {
+        let mut segs = Segments::new(first.into());
+        for _ in first..=last {
+            assert!(segs.enqueue(SIZE, false));
+        }
+        segs
+    }
+
+    fn send(segs: &mut Segments, seqs: std::ops::RangeInclusive<u16>, at: Instant) {
+        let stats = UtpStats::default();
+        for mut item in segs.iter_mut_for_sending(None) {
+            if seqs.contains(&item.seq_nr().0) {
+                item.on_sent(at, &stats);
+            }
+        }
+    }
+
+    // As the recovery send path does: send again, then clear the loss mark.
+    fn resend_as_lost(segs: &mut Segments, seq: u16, at: Instant) {
+        let stats = UtpStats::default();
+        let mut item = segs
+            .iter_mut_for_sending(None)
+            .find(|s| s.seq_nr() == SeqNr(seq))
+            .unwrap();
+        item.on_sent(at, &stats);
+        item.on_resent_as_lost();
+    }
+
+    // Three packets sent and none acknowledged: all three are in the pipe,
+    // the newest with them, as all three are in the flight.
+    #[test]
+    fn the_pipe_counts_the_newest_packet_sent() {
+        let t0 = Instant::now();
+        let mut segs = queue(10, 12);
+        send(&mut segs, 10..=12, t0);
+        assert_eq!(segs.walk_flight_size_to(12.into()), 3 * SIZE);
+        let pipe = segs.calc_pipe(9.into(), 12.into(), 12.into(), SRTT, t0);
+        assert_eq!(pipe.pipe, 3 * SIZE);
+    }
+
+    // Packet 10 is resent at t1. The only packet sent after the resend is
+    // the newest, 20, and it arrives. The resend was outrun, so it is due a
+    // round trip and a quarter after it left.
+    #[test]
+    fn a_resend_outrun_by_the_newest_packet_is_due() {
+        let t0 = Instant::now();
+        let t1 = t0 + SRTT;
+        let mut segs = queue(10, 20);
+        send(&mut segs, 10..=19, t0);
+        segs.remove_up_to_ack(t1, &sack(9, 11..=15));
+        segs.calc_pipe(9.into(), 19.into(), 19.into(), SRTT, t1);
+        resend_as_lost(&mut segs, 10, t1);
+        send(&mut segs, 20..=20, t1 + 10 * MS);
+        segs.remove_up_to_ack(t1 + 110 * MS, &sack(9, 11..=20));
+        let pipe = segs.calc_pipe(10.into(), 20.into(), 20.into(), SRTT, t1 + 110 * MS);
+        assert_eq!(pipe.reorder_at, Some(t1 + 125 * MS));
+    }
+
+    // Packets 10 to 12 leave at t0 and 10 is sent again 50 ms later. The
+    // pipe is counted again when the first of them expires: 11, at t0 +
+    // 75 ms, not the resent 10 at t0 + 125 ms.
+    #[test]
+    fn the_pipe_timer_is_the_earliest_expiry() {
+        let t0 = Instant::now();
+        let mut segs = queue(10, 12);
+        send(&mut segs, 10..=12, t0);
+        let stats = UtpStats::default();
+        segs.iter_mut_for_sending(None)
+            .next()
+            .unwrap()
+            .on_sent(t0 + 50 * MS, &stats);
+        let pipe = segs.calc_pipe(10.into(), 12.into(), 12.into(), SRTT, t0 + 60 * MS);
+        assert_eq!(pipe.recalc_timer, Some(t0 + 75 * MS));
     }
 }

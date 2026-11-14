@@ -326,6 +326,24 @@ impl DatagramSocket for SharedDhtSocket {
     fn link_mtu(&self) -> Option<u16> {
         self.socket.link_mtu()
     }
+
+    fn spreads_streams(&self) -> bool {
+        self.socket.spreads_streams()
+    }
+
+    fn send_run_most(&self) -> usize {
+        self.socket.send_run_most()
+    }
+
+    fn poll_send_run(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        segment: usize,
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        self.socket.poll_send_run(cx, bytes, segment, target)
+    }
 }
 
 impl PollSendToVectored for DatagramTransport {
@@ -436,6 +454,73 @@ impl Transport for DatagramTransport {
 
     fn link_mtu(&self) -> Option<u16> {
         self.0.link_mtu()
+    }
+
+    fn spreads_streams(&self) -> bool {
+        self.0.spreads_streams()
+    }
+
+    fn send_run_most(&self) -> usize {
+        self.0.send_run_most()
+    }
+
+    fn poll_send_run(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        segment: usize,
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        self.0.poll_send_run(cx, bytes, segment, target)
+    }
+
+    fn send_many_most(&self) -> usize {
+        self.0.send_many_most()
+    }
+
+    fn poll_send_many(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        parts: &[(usize, SocketAddr)],
+    ) -> Poll<io::Result<usize>> {
+        self.0.poll_send_many(cx, bytes, parts)
+    }
+
+    fn recv_many_most(&self) -> usize {
+        self.0.recv_many_most()
+    }
+
+    // The datagrams of one call the DHT takes are handed to it; the rest
+    // close up in their order.
+    fn poll_recv_many(
+        &self,
+        cx: &mut Context<'_>,
+        into: &mut [weaver_utp::Received],
+        spill: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            let got = std::task::ready!(self.0.poll_recv_many(cx, into, spill))?;
+            let Some(tap) = &self.1 else {
+                return Poll::Ready(Ok(got));
+            };
+            let mut kept = 0;
+            for i in 0..got {
+                let entry = &into[i];
+                // One that reads as long as `spill` is not whole, and no
+                // message for the DHT.
+                if entry.len < spill.len()
+                    && tap.take_split(&entry.head, spill, entry.len, entry.from)
+                {
+                    continue;
+                }
+                into.swap(kept, i);
+                kept += 1;
+            }
+            if kept > 0 {
+                return Poll::Ready(Ok(kept));
+            }
+        }
     }
 }
 
@@ -836,6 +921,76 @@ impl DatagramSocket for PairedUdp {
         let (socket, target) = self.toward(target);
         socket.poll_send_to_vectored_fragmenting(cx, bufs, target, fragmenting)
     }
+
+    fn spreads_streams(&self) -> bool {
+        true
+    }
+
+    // The larger of the two families' answers: a run toward the family
+    // whose socket sends one datagram a call goes out one at a time below.
+    fn send_run_most(&self) -> usize {
+        self.v6.run_most().max(self.v4.run_most())
+    }
+
+    fn poll_send_run(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        segment: usize,
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        let (socket, target) = self.toward(target);
+        if socket.run_most() == 1 {
+            let first = &bytes[..segment.min(bytes.len())];
+            return socket.poll_send_to(cx, first, target).map_ok(|_| 1);
+        }
+        socket.send_run(cx, bytes, segment, target)
+    }
+
+    fn send_many_most(&self) -> usize {
+        self.v6.many_most(crate::udp_options::SEND_MANY_DATAGRAMS)
+    }
+
+    // The datagrams from the first on that go out on one family's socket.
+    fn poll_send_many(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        parts: &[(usize, SocketAddr)],
+    ) -> Poll<io::Result<usize>> {
+        let (socket, _) = self.toward(parts[0].1);
+        let same = parts
+            .iter()
+            .take_while(|(_, target)| std::ptr::eq(self.toward(*target).0, socket))
+            .count();
+        socket.send_many(cx, bytes, &parts[..same])
+    }
+
+    fn recv_many_most(&self) -> usize {
+        self.v6.many_most(crate::udp_options::RECV_MANY_DATAGRAMS)
+    }
+
+    fn poll_recv_many(
+        &self,
+        cx: &mut Context<'_>,
+        into: &mut [weaver_utp::Received],
+        spill: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let v4_first = self
+            .v4_first
+            .fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+        let order = if v4_first {
+            [&self.v4, &self.v6]
+        } else {
+            [&self.v6, &self.v4]
+        };
+        for socket in order {
+            if let Poll::Ready(received) = socket.recv_many(cx, into, spill) {
+                return Poll::Ready(received);
+            }
+        }
+        Poll::Pending
+    }
 }
 
 /// A kernel datagram socket: the address it is bound at, and whether it
@@ -852,7 +1007,17 @@ pub(crate) struct KernelUdp {
     // allows fragmenting, while don't-fragment is off, and a size probe, so
     // it never goes out while it is off. Ordinary sends never take it.
     size_sends: parking_lot::Mutex<()>,
+    // The host can send several datagrams in one call on this socket.
+    runs: bool,
+    // Calls for several datagrams that failed, one after another with none
+    // sent between them. At RUN_FAILURES_MOST the socket sends each
+    // datagram alone from then on: a device that cannot take such a send
+    // fails every one of them.
+    run_failures: std::sync::atomic::AtomicU8,
 }
+
+// See `KernelUdp::run_failures`.
+const RUN_FAILURES_MOST: u8 = 8;
 
 impl KernelUdp {
     // `socket`, registered with the runtime entered now.
@@ -867,6 +1032,8 @@ impl KernelUdp {
         socket.set_nonblocking(true)?;
         Ok(KernelUdp {
             local: socket.local_addr()?,
+            runs: crate::udp_options::sends_runs(&socket),
+            run_failures: std::sync::atomic::AtomicU8::new(0),
             socket: std::sync::OnceLock::new(),
             unregistered: parking_lot::Mutex::new(Some(socket)),
             dual_stack,
@@ -938,6 +1105,178 @@ impl KernelUdp {
                 }
             }
         }
+    }
+
+    // How many datagrams one call sends on this socket.
+    fn run_most(&self) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.runs && self.run_failures.load(Relaxed) < RUN_FAILURES_MOST {
+            crate::udp_options::SEND_RUN_DATAGRAMS
+        } else {
+            1
+        }
+    }
+
+    // Datagrams that lie end to end in `bytes`, each `segment` bytes but
+    // the last, sent to `target` in one system call: as many from the
+    // first as one call carries. Ready with how many went.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn send_run(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        segment: usize,
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        use crate::udp_options::{SEND_RUN_BYTES, SEND_RUN_DATAGRAMS};
+
+        let Ok(size) = u16::try_from(segment) else {
+            return Poll::Ready(Err(io::ErrorKind::InvalidInput.into()));
+        };
+        if size == 0 {
+            return Poll::Ready(Err(io::ErrorKind::InvalidInput.into()));
+        }
+        let count = bytes
+            .len()
+            .div_ceil(segment)
+            .min(SEND_RUN_DATAGRAMS)
+            .min((SEND_RUN_BYTES / segment).max(1));
+        let run = &bytes[..bytes.len().min(count * segment)];
+        let target: socket2::SockAddr = self.toward(target).into();
+        let socket = self.io()?;
+        loop {
+            std::task::ready!(socket.poll_send_ready(cx))?;
+            match socket.try_io(tokio::io::Interest::WRITABLE, || {
+                crate::udp_options::send_run(socket, run, size, &target)
+            }) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => {
+                    let failures = self.run_failures.load(Relaxed);
+                    self.run_failures.store(failures.saturating_add(1), Relaxed);
+                    return Poll::Ready(Err(error));
+                }
+                Ok(_) => {
+                    if self.run_failures.load(Relaxed) != 0 {
+                        self.run_failures.store(0, Relaxed);
+                    }
+                    return Poll::Ready(Ok(count));
+                }
+            }
+        }
+    }
+
+    // A host with no call for several datagrams sends the first alone.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn send_run(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        segment: usize,
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        let first = &bytes[..segment.min(bytes.len())];
+        self.io()?
+            .poll_send_to(cx, first, self.toward(target))
+            .map_ok(|_| 1)
+    }
+
+    // `most` where the host has calls for several datagrams, else 1.
+    fn many_most(&self, most: usize) -> usize {
+        if crate::udp_options::TAKES_MANY {
+            most
+        } else {
+            1
+        }
+    }
+
+    // Datagrams that lie end to end in `bytes`, with each one's length and
+    // address in `parts`, sent in one system call: as many from the first
+    // as one call carries. Ready with how many went.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn send_many(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        parts: &[(usize, SocketAddr)],
+    ) -> Poll<io::Result<usize>> {
+        use crate::udp_options::SEND_MANY_DATAGRAMS;
+
+        let count = parts.len().min(SEND_MANY_DATAGRAMS);
+        if count == 0 {
+            return Poll::Ready(Err(io::ErrorKind::InvalidInput.into()));
+        }
+        let mut named = [(0, self.local); SEND_MANY_DATAGRAMS];
+        for (to, (len, target)) in named.iter_mut().zip(&parts[..count]) {
+            *to = (*len, self.toward(*target));
+        }
+        let socket = self.io()?;
+        loop {
+            std::task::ready!(socket.poll_send_ready(cx))?;
+            match socket.try_io(tokio::io::Interest::WRITABLE, || {
+                crate::udp_options::send_many(socket, bytes, &named[..count])
+            }) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                sent => return Poll::Ready(sent),
+            }
+        }
+    }
+
+    // A host with no call for several datagrams sends the first alone.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn send_many(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        parts: &[(usize, SocketAddr)],
+    ) -> Poll<io::Result<usize>> {
+        let Some((len, target)) = parts.first() else {
+            return Poll::Ready(Err(io::ErrorKind::InvalidInput.into()));
+        };
+        self.io()?
+            .poll_send_to(cx, &bytes[..*len], self.toward(*target))
+            .map_ok(|_| 1)
+    }
+
+    // The datagrams that wait, read in one system call into `into`'s
+    // entries from the first on, with `spill` shared among them, each
+    // sender named as `recv_from` names it. Ready with how many: never
+    // none.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn recv_many(
+        &self,
+        cx: &mut Context<'_>,
+        into: &mut [weaver_utp::Received],
+        spill: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let socket = self.io()?;
+        loop {
+            std::task::ready!(socket.poll_recv_ready(cx))?;
+            match socket.try_io(tokio::io::Interest::READABLE, || {
+                crate::udp_options::recv_many(socket, into, spill)
+            }) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => return Poll::Ready(Err(error)),
+                Ok(got) => {
+                    for entry in &mut into[..got] {
+                        entry.from = canonical_socket_addr(entry.from);
+                    }
+                    return Poll::Ready(Ok(got));
+                }
+            }
+        }
+    }
+
+    // A host with no call for several datagrams is never asked for them.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn recv_many(
+        &self,
+        _cx: &mut Context<'_>,
+        _into: &mut [weaver_utp::Received],
+        _spill: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(io::ErrorKind::Unsupported.into()))
     }
 
     // `target` as the socket names it: an IPv4 one by its IPv4-mapped IPv6
@@ -1084,6 +1423,50 @@ impl DatagramSocket for KernelUdp {
                 }
             }
         }
+    }
+
+    fn spreads_streams(&self) -> bool {
+        true
+    }
+
+    fn send_run_most(&self) -> usize {
+        self.run_most()
+    }
+
+    fn send_many_most(&self) -> usize {
+        self.many_most(crate::udp_options::SEND_MANY_DATAGRAMS)
+    }
+
+    fn poll_send_many(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        parts: &[(usize, SocketAddr)],
+    ) -> Poll<io::Result<usize>> {
+        self.send_many(cx, bytes, parts)
+    }
+
+    fn recv_many_most(&self) -> usize {
+        self.many_most(crate::udp_options::RECV_MANY_DATAGRAMS)
+    }
+
+    fn poll_recv_many(
+        &self,
+        cx: &mut Context<'_>,
+        into: &mut [weaver_utp::Received],
+        spill: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        self.recv_many(cx, into, spill)
+    }
+
+    fn poll_send_run(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        segment: usize,
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        self.send_run(cx, bytes, segment, target)
     }
 
     // One datagram from every slice, as the vectored send above, under the
@@ -1398,6 +1781,189 @@ mod pair_tests {
         assert_eq!((&buf[..len], from), (&b"out"[..], paired.v4.bind_addr()));
     }
 
+    // A socket that keeps the trait's own send-run methods takes one
+    // datagram a call: asked for a run, it sends the first alone and says
+    // one went.
+    #[tokio::test]
+    async fn a_socket_with_no_run_call_sends_the_first_datagram_alone() {
+        use std::task::{Context, Poll};
+
+        use std::sync::Arc;
+
+        use super::{BoxFuture, KernelUdp};
+
+        struct Plain(Arc<KernelUdp>);
+        impl DatagramSocket for Plain {
+            fn bind_addr(&self) -> SocketAddr {
+                self.0.bind_addr()
+            }
+            fn recv_from<'a>(
+                &'a self,
+                buf: &'a mut [u8],
+            ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>> {
+                self.0.recv_from(buf)
+            }
+            fn send_to<'a>(
+                &'a self,
+                buf: &'a [u8],
+                target: SocketAddr,
+            ) -> BoxFuture<'a, io::Result<usize>> {
+                self.0.send_to(buf, target)
+            }
+            fn poll_send_to(
+                &self,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+                target: SocketAddr,
+            ) -> Poll<io::Result<usize>> {
+                self.0.poll_send_to(cx, buf, target)
+            }
+        }
+
+        let sockets = KernelSockets::new(None).unwrap();
+        let plain = Plain(
+            sockets
+                .bind_kernel_udp((Ipv4Addr::LOCALHOST, 0).into())
+                .unwrap(),
+        );
+        let peer = sockets
+            .bind_kernel_udp((Ipv4Addr::LOCALHOST, 0).into())
+            .unwrap();
+        let socket: &dyn DatagramSocket = &plain;
+        assert_eq!(socket.send_run_most(), 1);
+        let mut bytes = vec![1u8; 100];
+        bytes.extend_from_slice(&[2u8; 40]);
+        let sent =
+            std::future::poll_fn(|cx| socket.poll_send_run(cx, &bytes, 100, peer.bind_addr()))
+                .await
+                .unwrap();
+        assert_eq!(sent, 1);
+        // The second goes with a call of its own and arrives second: had
+        // the first call carried it too, it would arrive twice.
+        socket.send_to(&[3u8; 7], peer.bind_addr()).await.unwrap();
+        let mut buf = [0u8; 2048];
+        for (byte, len) in [(1u8, 100), (3, 7)] {
+            let (got, _) = peer.recv_from(&mut buf).await.unwrap();
+            assert_eq!(got, len);
+            assert!(buf[..got].iter().all(|b| *b == byte));
+        }
+    }
+
+    // A pair of sockets sends a run on the socket of the target's family.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_paired_socket_sends_a_run_on_the_targets_family() {
+        let sockets = KernelSockets::new(None).unwrap();
+        let paired = PairedUdp {
+            v6: sockets
+                .kernel_udp((Ipv6Addr::LOCALHOST, 0).into(), false)
+                .unwrap(),
+            v4: sockets
+                .kernel_udp((Ipv4Addr::LOCALHOST, 0).into(), false)
+                .unwrap(),
+            v4_first: Default::default(),
+        };
+        assert_eq!(
+            paired.send_run_most(),
+            crate::udp_options::SEND_RUN_DATAGRAMS
+        );
+        let peer = sockets
+            .bind_kernel_udp((Ipv4Addr::LOCALHOST, 0).into())
+            .unwrap();
+        let mapped = SocketAddr::from((
+            Ipv4Addr::LOCALHOST.to_ipv6_mapped(),
+            peer.bind_addr().port(),
+        ));
+        let mut bytes = vec![1u8; 100];
+        bytes.extend_from_slice(&[2u8; 100]);
+        bytes.extend_from_slice(&[3u8; 40]);
+        let sent = std::future::poll_fn(|cx| paired.poll_send_run(cx, &bytes, 100, mapped))
+            .await
+            .unwrap();
+        assert_eq!(sent, 3);
+        let mut buf = [0u8; 2048];
+        for (byte, len) in [(1u8, 100), (2, 100), (3, 40)] {
+            let (got, from) = peer.recv_from(&mut buf).await.unwrap();
+            assert_eq!(from, paired.v4.bind_addr());
+            assert_eq!(got, len);
+            assert!(buf[..got].iter().all(|b| *b == byte));
+        }
+    }
+
+    // One call sends datagrams that lie end to end: the peer receives each
+    // as its own datagram, the short last one too, in order, on both
+    // families of a socket that takes both.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_kernel_socket_sends_a_run_of_datagrams_in_one_call() {
+        let sockets = KernelSockets::new(None).unwrap();
+        for (bind, peer) in [
+            (
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            ),
+            (
+                SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
+                SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
+            ),
+        ] {
+            let sender = sockets.kernel_udp(bind, false).unwrap();
+            assert_eq!(
+                sender.send_run_most(),
+                crate::udp_options::SEND_RUN_DATAGRAMS
+            );
+            let peer = sockets.bind_kernel_udp(peer).unwrap();
+            let mut bytes = Vec::new();
+            for byte in 1..=4u8 {
+                bytes.extend_from_slice(&[byte; 100]);
+            }
+            bytes.extend_from_slice(&[5u8; 40]);
+            let sent =
+                std::future::poll_fn(|cx| sender.poll_send_run(cx, &bytes, 100, peer.bind_addr()))
+                    .await
+                    .unwrap();
+            assert_eq!(sent, 5);
+            let mut buf = [0u8; 2048];
+            for (byte, len) in [(1u8, 100), (2, 100), (3, 100), (4, 100), (5, 40)] {
+                let (got, from) = peer.recv_from(&mut buf).await.unwrap();
+                assert_eq!(from, sender.bind_addr());
+                assert_eq!(got, len);
+                assert!(buf[..got].iter().all(|b| *b == byte));
+            }
+        }
+    }
+
+    // One call carries no more than the kernel takes: a longer run is sent
+    // from the first datagram and the count says how far it went.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_run_longer_than_one_call_carries_is_sent_in_part() {
+        use crate::udp_options::{SEND_RUN_BYTES, SEND_RUN_DATAGRAMS};
+
+        let sockets = KernelSockets::new(None).unwrap();
+        let sender = sockets
+            .kernel_udp((Ipv4Addr::LOCALHOST, 0).into(), false)
+            .unwrap();
+        let peer = sockets
+            .bind_kernel_udp((Ipv4Addr::LOCALHOST, 0).into())
+            .unwrap();
+        let send = |bytes: Vec<u8>, segment| {
+            let (sender, to) = (&sender, peer.bind_addr());
+            async move {
+                std::future::poll_fn(|cx| sender.poll_send_run(cx, &bytes, segment, to))
+                    .await
+                    .unwrap()
+            }
+        };
+        // More datagrams than a call takes.
+        assert_eq!(send(vec![0u8; 20 * 70], 20).await, SEND_RUN_DATAGRAMS);
+        // More bytes than a call takes.
+        assert_eq!(
+            send(vec![0u8; 1400 * 60], 1400).await,
+            SEND_RUN_BYTES / 1400
+        );
+    }
+
     // A kernel socket reads a datagram straight into the two buffers: a
     // short one stays in the first, a long one runs on into the second, and
     // a long DHT message on a shared socket is joined for the DHT. Both
@@ -1469,5 +2035,186 @@ mod pair_tests {
         let mut got = vec![0u8; 4000];
         let (len, from) = dht.recv_from(&mut got).await.unwrap();
         assert_eq!((&got[..len], from), (&message[..], peer4.bind_addr()));
+    }
+
+    // One call reads the datagrams that wait into an entry each, with each
+    // one's sender: one from an IPv4 peer is named by its IPv4 address, and
+    // a DHT message among them goes to the DHT while the rest close up in
+    // their order. The rest of a long datagram is read into the buffer the
+    // entries share, and a long DHT message is joined for the DHT. Of two
+    // long datagrams the last is whole, and the first is whole or reads as
+    // long as the shared buffer.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_kernel_socket_reads_several_datagrams_a_call() {
+        use weaver_utp::{Received, Transport};
+
+        let sockets = KernelSockets::new(None).unwrap();
+        let socket = std::sync::Arc::new(
+            sockets
+                .kernel_udp((Ipv6Addr::UNSPECIFIED, 0).into(), false)
+                .unwrap(),
+        );
+        let port = socket.bind_addr().port();
+        let tap = std::sync::Arc::new(super::DhtTap::default());
+        let share = super::DhtShare {
+            socket: socket.clone(),
+            tap: tap.clone(),
+            shards: None,
+        };
+        let dht = share.dht_socket();
+        let transport = super::DatagramTransport(socket.clone(), Some(tap));
+        assert_eq!(
+            transport.recv_many_most(),
+            crate::udp_options::RECV_MANY_DATAGRAMS
+        );
+        let peer4 = sockets
+            .bind_kernel_udp((Ipv4Addr::LOCALHOST, 0).into())
+            .unwrap();
+        let peer6 = sockets
+            .bind_kernel_udp((Ipv6Addr::LOCALHOST, 0).into())
+            .unwrap();
+        let to4: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+        let to6: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
+
+        let mut into: Vec<Received> = (0..8)
+            .map(|_| Received {
+                head: vec![0u8; 2048].into(),
+                len: 0,
+                from: socket.bind_addr(),
+            })
+            .collect();
+        let mut spill = vec![0u8; usize::from(u16::MAX)];
+        // The next `want` datagrams for uTP: each one's bytes, or none for
+        // one that reads as long as the shared buffer, and its sender.
+        // What is in the shared buffer is read before the next call.
+        async fn read(
+            transport: &impl Transport,
+            into: &mut [Received],
+            spill: &mut [u8],
+            want: usize,
+        ) -> Vec<(Option<Vec<u8>>, SocketAddr)> {
+            let mut got = Vec::new();
+            while got.len() < want {
+                let count = std::future::poll_fn(|cx| transport.poll_recv_many(cx, into, spill))
+                    .await
+                    .unwrap();
+                assert!(count > 0);
+                for entry in &into[..count] {
+                    let bytes = (entry.len < spill.len()).then(|| {
+                        let mut bytes = entry.head[..entry.len.min(2048)].to_vec();
+                        bytes.extend_from_slice(&spill[..entry.len.saturating_sub(2048)]);
+                        bytes
+                    });
+                    got.push((bytes, entry.from));
+                }
+            }
+            got
+        }
+
+        let short = vec![1u8; 100];
+        let long: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        let mut message = vec![b'x'; 3000];
+        message[0] = b'd';
+        message[2999] = b'e';
+        let last = vec![7u8; 20];
+        peer4.send_to(&short, to4).await.unwrap();
+        peer6.send_to(&long, to6).await.unwrap();
+        peer6.send_to(&last, to6).await.unwrap();
+        assert_eq!(
+            read(&transport, &mut into, &mut spill, 3).await,
+            [
+                (Some(short.clone()), peer4.bind_addr()),
+                (Some(long.clone()), peer6.bind_addr()),
+                (Some(last.clone()), peer6.bind_addr()),
+            ]
+        );
+
+        // A long DHT message between two short datagrams.
+        peer6.send_to(&last, to6).await.unwrap();
+        peer4.send_to(&message, to4).await.unwrap();
+        peer4.send_to(&short, to4).await.unwrap();
+        assert_eq!(
+            read(&transport, &mut into, &mut spill, 2).await,
+            [
+                (Some(last), peer6.bind_addr()),
+                (Some(short), peer4.bind_addr()),
+            ]
+        );
+        let mut taken = vec![0u8; 4000];
+        let (len, from) = dht.recv_from(&mut taken).await.unwrap();
+        assert_eq!((&taken[..len], from), (&message[..], peer4.bind_addr()));
+
+        // Two long datagrams.
+        let other: Vec<u8> = (0..4000u32).map(|i| (i % 241) as u8).collect();
+        peer6.send_to(&long, to6).await.unwrap();
+        peer4.send_to(&other, to4).await.unwrap();
+        let got = read(&transport, &mut into, &mut spill, 2).await;
+        assert!(got[0] == (Some(long), peer6.bind_addr()) || got[0] == (None, peer6.bind_addr()));
+        assert_eq!(got[1], (Some(other), peer4.bind_addr()));
+    }
+
+    // One call sends datagrams of several lengths to several addresses, and
+    // each arrives whole at its own. A pair sends the leading datagrams
+    // that go out on one family's socket.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_kernel_socket_sends_datagrams_to_several_addresses_a_call() {
+        let sockets = KernelSockets::new(None).unwrap();
+        let paired = PairedUdp {
+            v6: sockets
+                .kernel_udp((Ipv6Addr::LOCALHOST, 0).into(), false)
+                .unwrap(),
+            v4: sockets
+                .kernel_udp((Ipv4Addr::LOCALHOST, 0).into(), false)
+                .unwrap(),
+            v4_first: Default::default(),
+        };
+        assert_eq!(
+            paired.send_many_most(),
+            crate::udp_options::SEND_MANY_DATAGRAMS
+        );
+        let one = sockets
+            .bind_kernel_udp((Ipv4Addr::LOCALHOST, 0).into())
+            .unwrap();
+        let other = sockets
+            .bind_kernel_udp((Ipv4Addr::LOCALHOST, 0).into())
+            .unwrap();
+        let sixth = sockets
+            .bind_kernel_udp((Ipv6Addr::LOCALHOST, 0).into())
+            .unwrap();
+
+        let mut bytes = vec![1u8; 20];
+        bytes.extend_from_slice(&[2u8; 1400]);
+        bytes.extend_from_slice(&[3u8; 33]);
+        bytes.extend_from_slice(&[4u8; 50]);
+        let parts = [
+            (20, one.bind_addr()),
+            (1400, other.bind_addr()),
+            (33, one.bind_addr()),
+            (50, sixth.bind_addr()),
+        ];
+        let sent = std::future::poll_fn(|cx| paired.poll_send_many(cx, &bytes, &parts))
+            .await
+            .unwrap();
+        assert_eq!(sent, 3);
+        let sent =
+            std::future::poll_fn(|cx| paired.poll_send_many(cx, &bytes[1453..], &parts[3..]))
+                .await
+                .unwrap();
+        assert_eq!(sent, 1);
+
+        let mut buf = vec![0u8; 2000];
+        let (len, from) = one.recv_from(&mut buf).await.unwrap();
+        assert_eq!((&buf[..len], from), (&[1u8; 20][..], paired.v4.bind_addr()));
+        let (len, _) = one.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], &[3u8; 33][..]);
+        let (len, from) = other.recv_from(&mut buf).await.unwrap();
+        assert_eq!(
+            (&buf[..len], from),
+            (&[2u8; 1400][..], paired.v4.bind_addr())
+        );
+        let (len, from) = sixth.recv_from(&mut buf).await.unwrap();
+        assert_eq!((&buf[..len], from), (&[4u8; 50][..], paired.v6.bind_addr()));
     }
 }

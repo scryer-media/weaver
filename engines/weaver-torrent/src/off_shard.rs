@@ -285,6 +285,63 @@ mod tests {
         assert_eq!(rings, 1, "one cross-thread wake for eight reads");
     }
 
+    // Two uTP threads reading through the one disk queue each get their own
+    // reads back, on their own thread and in one wake of it.
+    #[test]
+    fn reads_from_two_threads_come_back_to_their_own() {
+        let session = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let queue: DiskQueue<ReadJob> = DiskQueue::new(session.handle().clone(), 4);
+        let on_thread = |base: usize| {
+            let (go, gate) = std::sync::mpsc::channel::<()>();
+            let gate = std::sync::Arc::new(std::sync::Mutex::new(gate));
+            let (queue, session) = (&queue, &session);
+            shard().block_on(async move {
+                let mut reads: Vec<_> = (0..4)
+                    .map(|i| {
+                        let gate = gate.clone();
+                        read_off_shard(queue, reader_key(), move || {
+                            gate.lock().unwrap().recv().unwrap();
+                            base + i
+                        })
+                    })
+                    .collect();
+                for read in &mut reads {
+                    assert!(futures::poll!(read).is_pending());
+                }
+                for _ in 0..4 {
+                    go.send(()).unwrap();
+                }
+                // Both threads' reads finish while this thread is held.
+                std::thread::scope(|s| {
+                    s.spawn(|| session.block_on(queue.idle())).join().unwrap();
+                });
+                let mut results = Vec::new();
+                for read in reads {
+                    results.push(read.await.unwrap());
+                }
+                let rings = INBOX.with(|inbox| {
+                    let inbox = inbox.borrow();
+                    inbox
+                        .as_ref()
+                        .unwrap()
+                        .rings
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                });
+                (results, rings)
+            })
+        };
+        let (first, second) = std::thread::scope(|s| {
+            let first = s.spawn(|| on_thread(100));
+            let second = s.spawn(|| on_thread(200));
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_eq!(first, (vec![100, 101, 102, 103], 1));
+        assert_eq!(second, (vec![200, 201, 202, 203], 1));
+    }
+
     // A read whose reader is dropped while it runs, as when its peer's
     // connection ends, keeps its disk thread until it ends: the threads bound
     // the reads at work, not the readers waiting on them. The next read

@@ -467,6 +467,25 @@ impl UserRx {
         }
     }
 
+    /// Has the reader wake the stream on its next read while the window
+    /// last announced is too small for a packet of the remote's. Until the
+    /// window is announced again the remote may hold a packet it cannot
+    /// send, and only a read makes the room to announce. A read that came
+    /// since the window was last measured wakes the stream at once.
+    pub fn wake_on_read_below(&mut self, announced: u32, cx: &mut std::task::Context<'_>) {
+        if (announced as usize) >= self.max_incoming_payload.get() {
+            return;
+        }
+        let mut g = self.shared.locked.lock();
+        if g.reader_dropped {
+            return;
+        }
+        if g.queue.window() != self.last_remaining_rx_window {
+            cx.waker().wake_by_ref();
+        }
+        update_optional_waker(&mut g.dispatcher_waker, cx);
+    }
+
     /// Inform the read half that the socket is closed - there will be no more data.
     pub fn mark_vsock_closed(&self) {
         let mut g = self.shared.locked.lock();
@@ -568,10 +587,10 @@ impl UserRx {
         self.ooq.is_empty()
     }
 
-    /// How many packets does ooq have
-    #[cfg(test)]
+    /// How many packets are held past a hole. Packets in order that the
+    /// reader has not been handed yet are not counted.
     pub fn assembler_packets(&self) -> usize {
-        self.ooq.stored_packets()
+        self.ooq.stored_packets() - self.ooq.filled_front
     }
 
     /// The main function for the dispatcher - gets called when new data arrives at a particular offset.
@@ -591,6 +610,13 @@ impl UserRx {
             .saturating_sub(self.ooq.stored_bytes());
         if msg.payload().len() > remaining {
             return Ok(AssemblerAddRemoveResult::Unavailable);
+        }
+        // The remote's packets may be larger than the size this stream
+        // started with.
+        if let Some(len) = NonZeroUsize::new(msg.payload().len())
+            && len > self.max_incoming_payload
+        {
+            self.max_incoming_payload = len;
         }
         match self.ooq.add_remove(msg, offset)? {
             res @ AssemblerAddRemoveResult::Consumed {
@@ -783,7 +809,6 @@ impl OutOfOrderQueue {
         self.filled_front
     }
 
-    #[cfg(test)]
     fn stored_packets(&self) -> usize {
         self.len
     }
@@ -874,7 +899,8 @@ impl OutOfOrderQueue {
             "the SACK read to the queue's end"
         );
 
-        Some(sack)
+        // Empty when every packet held lies past what a SACK can carry.
+        (!sack.is_empty()).then_some(sack)
     }
 
     pub fn add_remove(
@@ -1201,6 +1227,19 @@ mod tests {
         read.read_exact(&mut bytes).await.unwrap();
         assert_eq!(&bytes, b"bc");
         assert_eq!(user_rx.ooq.stored_bytes() + user_rx.len_test(), 0);
+    }
+
+    // Two packets in order wait to be handed to the reader and one is held
+    // past a hole: one packet is past a hole, not three.
+    #[tokio::test]
+    async fn packets_in_order_not_yet_handed_over_are_not_past_a_hole() {
+        let (mut user_rx, _read) = user_rx(100);
+        user_rx.add_remove_test(msg(0, b"a"), 0).await.unwrap();
+        user_rx.add_remove_test(msg(1, b"b"), 0).await.unwrap();
+        user_rx.add_remove_test(msg(3, b"d"), 1).await.unwrap();
+        assert_eq!(user_rx.ooq.stored_packets(), 3);
+        assert_eq!(user_rx.ooq.filled_front(), 2);
+        assert_eq!(user_rx.assembler_packets(), 1);
     }
 
     #[tokio::test]

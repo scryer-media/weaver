@@ -28,7 +28,6 @@ enum Removal {
 async fn transfer_after_removing_a_probe(removal: Removal) {
     let mut t = make_test_vsock(
         SocketOpts {
-            mtu_probe_max_retransmissions: Some(0),
             disable_nagle: true,
             ..Default::default()
         },
@@ -180,7 +179,8 @@ impl DedupPeer {
 }
 
 // The probe reaches the peer, but every ACK of it is lost until the stream
-// gives up on it as too large. The stream then resends the same packet,
+// gives up on it: the timer forgets it, as libtorrent does (v2.0.15
+// utp_stream.cpp:3498). The stream then resends the same packet,
 // whole and under its own sequence number, as ordinary data: the peer drops
 // it as the duplicate it is and acknowledges it, and what follows goes on
 // from the probe's last byte. Cut again, the probe's sequence number would
@@ -217,14 +217,14 @@ async fn a_probe_whose_acks_are_lost_keeps_its_bytes_and_sequence_number() {
     let mut peer = DedupPeer::new(first);
     let mut sent = sent;
     let mut probe_sends = 0;
+    let mut probe_given_up = false;
     loop {
         if let Some(result) = flushing.as_mut().now_or_never() {
             result.unwrap();
             break;
         }
-        // Until the stream lowers its ceiling below the probe, no ACK of
-        // the probe comes back.
-        let probe_given_up = usize::from(t.vsock.segment_sizes.max_ss()) < probe;
+        // Until the stream gives up on the probe, no ACK of it comes back.
+        probe_given_up |= !t.vsock.user_tx_segments.has_live_mtu_probe();
         let mut acked = false;
         for message in sent.drain(..) {
             assert_eq!(message.header.htype, Data);
@@ -255,16 +255,18 @@ async fn a_probe_whose_acks_are_lost_keeps_its_bytes_and_sequence_number() {
         }
     }
     assert_eq!(peer.assembled, payload);
+    assert!(probe_given_up);
     assert!(probe_sends > 1, "the probe was resent");
-    assert!(usize::from(t.vsock.segment_sizes.max_ss()) < probe);
 }
 
-// A path that never delivers the probe. The stream gives up on its size:
-// it lowers its ceiling, so nothing after it is cut as large, and resends
-// the packet as ordinary data, whole, until the ordinary resend limit ends
-// the stream. The packets cut after it reach the peer.
+// A path that never delivers the probe, with a packet sent behind it. The
+// timer forgets the probe, as libtorrent clears m_mtu_seq at a timeout with
+// more than the probe out and leaves the ceiling (v2.0.15
+// utp_stream.cpp:3412-3421, 3498). The packet goes again as ordinary data,
+// whole, until the ordinary resend limit ends the stream (:3522-3545). The
+// packets cut after it reach the peer.
 #[tokio::test]
-async fn a_probe_the_path_always_drops_lowers_the_ceiling_and_ends_the_stream() {
+async fn a_probe_the_path_always_drops_is_forgotten_and_ends_the_stream() {
     setup_test_logging();
     let mut t = make_test_vsock(
         SocketOpts {
@@ -325,7 +327,7 @@ async fn a_probe_the_path_always_drops_lowers_the_ceiling_and_ends_the_stream() 
         matches!(died, Err(Error::MaxRetransmissionsReached)),
         "{died:?}"
     );
-    assert!(usize::from(t.vsock.segment_sizes.max_ss()) < probe);
+    assert!(!t.vsock.user_tx_segments.has_live_mtu_probe());
     assert!(later_packets > 0, "packets were cut after the probe");
     assert_eq!(
         probe_sends, t.vsock.socket_opts.num_resends,

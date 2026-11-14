@@ -34,6 +34,10 @@ pub struct MockInterface {
     pub fragmenting_sends: std::sync::atomic::AtomicUsize,
     // The kind of runtime each transport was registered with.
     pub registered_on: Mutex<Vec<Option<tokio::runtime::RuntimeFlavor>>>,
+    // How many datagrams each call for several addresses was given.
+    pub many_sends: Mutex<Vec<usize>>,
+    // How many datagrams each receive call for several returned.
+    pub many_receives: Mutex<Vec<usize>>,
 }
 
 impl MockInterface {
@@ -45,6 +49,8 @@ impl MockInterface {
             fragmenting_threads: Default::default(),
             fragmenting_sends: Default::default(),
             registered_on: Default::default(),
+            many_sends: Default::default(),
+            many_receives: Default::default(),
         })
     }
 
@@ -90,6 +96,11 @@ pub struct MockUtpTransport {
     spreads: bool,
     // Its registration fails.
     refuses_registration: bool,
+    // How many datagrams one call sends to several addresses, and how many
+    // one call receives.
+    many: usize,
+    // It says it receives several a call and has no call that does.
+    many_unsupported: bool,
 }
 
 impl MockUtpTransport {
@@ -107,7 +118,20 @@ impl MockUtpTransport {
             one_task: false,
             spreads: false,
             refuses_registration: false,
+            many: 1,
+            many_unsupported: false,
         }
+    }
+
+    pub fn taking_many(mut self, most: usize) -> Self {
+        self.many = most;
+        self
+    }
+
+    pub fn claiming_many(mut self, most: usize) -> Self {
+        self.many = most;
+        self.many_unsupported = true;
+        self
     }
 
     pub fn refusing_registration(mut self) -> Self {
@@ -168,6 +192,71 @@ impl Transport for MockUtpTransport {
 
     fn spreads_streams(&self) -> bool {
         self.spreads
+    }
+
+    fn send_many_most(&self) -> usize {
+        self.many
+    }
+
+    fn poll_send_many(
+        &self,
+        _cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+        parts: &[(usize, SocketAddr)],
+    ) -> Poll<std::io::Result<usize>> {
+        self.inner.interface.many_sends.lock().push(parts.len());
+        let mut at = 0;
+        for (sent, (len, target)) in parts.iter().enumerate() {
+            match self.send(&bytes[at..at + len], *target) {
+                Ok(_) => at += len,
+                Err(error) if sent == 0 => return Poll::Ready(Err(error)),
+                Err(_) => return Poll::Ready(Ok(sent)),
+            }
+        }
+        Poll::Ready(Ok(parts.len()))
+    }
+
+    fn recv_many_most(&self) -> usize {
+        self.many
+    }
+
+    fn poll_recv_many(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        into: &mut [crate::Received],
+        spill: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.many_unsupported {
+            return Poll::Ready(Err(std::io::ErrorKind::Unsupported.into()));
+        }
+        let mut locked = self.inner.locked.lock();
+        let mut count = 0;
+        let mut long = None;
+        while count < into.len() {
+            let Poll::Ready(next) = locked.rx.poll_recv(cx) else {
+                break;
+            };
+            let (from, data) = next.unwrap();
+            let first = data.len().min(into[count].head.len());
+            if data.len() > first {
+                // The rest of a long one is written over the rest of the
+                // long one before it in the call.
+                if let Some(before) = long.replace(count) {
+                    into[before].len = spill.len();
+                }
+                spill[..data.len() - first].copy_from_slice(&data[first..]);
+            }
+            let entry = &mut into[count];
+            entry.head[..first].copy_from_slice(&data[..first]);
+            entry.len = data.len();
+            entry.from = from;
+            count += 1;
+        }
+        if count == 0 {
+            return Poll::Pending;
+        }
+        self.inner.interface.many_receives.lock().push(count);
+        Poll::Ready(Ok(count))
     }
 
     async fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
@@ -240,6 +329,8 @@ struct RememberingTransportLocked {
     refused: usize,
     // The socket's streams queue their datagrams for its dispatcher.
     sends_from_one_task: bool,
+    // Sends still taken before the transport refuses them.
+    refuse_after: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -272,6 +363,12 @@ impl RememberingTransport {
         }
     }
 
+    // Takes `sends` more sends, then refuses until told to take them
+    // again.
+    pub fn refuse_after(&self, sends: usize) {
+        self.locked.lock().refuse_after = Some(sends);
+    }
+
     // How many sends the transport refused.
     pub fn refused(&self) -> usize {
         self.locked.lock().refused
@@ -286,6 +383,14 @@ impl RememberingTransport {
     // Refuses a send, keeping the waker it was polled with.
     fn refuse(&self, cx: &std::task::Context<'_>) -> bool {
         let mut g = self.locked.lock();
+        match g.refuse_after {
+            Some(0) => {
+                g.poll_send_pending = true;
+                g.refuse_after = None;
+            }
+            Some(left) => g.refuse_after = Some(left - 1),
+            None => {}
+        }
         if !g.poll_send_pending {
             return false;
         }
