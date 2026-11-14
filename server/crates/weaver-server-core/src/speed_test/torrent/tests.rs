@@ -279,7 +279,9 @@ async fn no_leechers_is_no_demand() {
 }
 
 // A pull counts every block it writes and holds no more verified bytes than
-// it may keep; it tells the tracker `stopped` as it leaves.
+// it may keep; as it leaves, the tracker hears the last announce it is owed:
+// `stopped`, or the `completed` still on its way when the pull stopped,
+// which is owed no `stopped` after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pull_counts_every_block_and_holds_no_more_than_it_keeps() {
     let fixture = TorrentFixture::start(true).await;
@@ -313,9 +315,12 @@ async fn a_pull_counts_every_block_and_holds_no_more_than_it_keeps() {
     let mut announces = fixture.announces();
     announces
         .wait_for(|announces| {
-            announces
-                .iter()
-                .any(|announce| announce.event.as_deref() == Some("stopped"))
+            matches!(
+                announces
+                    .last()
+                    .and_then(|announce| announce.event.as_deref()),
+                Some("stopped" | "completed")
+            )
         })
         .await
         .unwrap();

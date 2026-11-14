@@ -1610,15 +1610,30 @@ async fn a_torrent_run_pulls_from_the_swarm_and_serves_what_it_held() {
         }
         other => panic!("not measured: {other:?}"),
     }
-    // Both the pull and the serve leave the swarm.
+    // Both the pull and the serve leave the swarm. The pull's session has
+    // stopped before the serve's starts, so the tracker hears the pull's
+    // announces first. The pull's last is the last it is owed: `stopped`, or
+    // the `completed` still on its way when it stopped, which is owed no
+    // `stopped` after it. The serve's ends with `stopped`.
     let mut announces = fixture.announces();
     announces
         .wait_for(|announces| {
-            announces
+            let Some(serve) = announces
                 .iter()
-                .filter(|announce| announce.event.as_deref() == Some("stopped"))
-                .count()
-                == 2
+                .skip(1)
+                .position(|announce| {
+                    matches!(announce.event.as_deref(), Some("started" | "paused"))
+                })
+                .map(|at| at + 1)
+            else {
+                return false;
+            };
+            matches!(
+                announces[serve - 1].event.as_deref(),
+                Some("stopped" | "completed")
+            ) && announces[serve + 1..]
+                .iter()
+                .any(|announce| announce.event.as_deref() == Some("stopped"))
         })
         .await
         .unwrap();
