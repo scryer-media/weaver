@@ -1641,6 +1641,44 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
             ("utp", "v6", [0, 0, 0, 0, 0]),
         ],
         dht: Some((150, 20, 6)),
+        disk: {
+            use weaver_server_core::torrents::metrics::{
+                DiskOp, DiskOpSnapshot, DiskStatsSnapshot, SocketSnapshot, Transport,
+            };
+            let mut disk = DiskStatsSnapshot {
+                upload_read_blocks: [64, 32],
+                permit_acquisitions: 50,
+                permit_waits: 7,
+                permit_wait_nanos: 250_000_000,
+                permits_in_use: 3,
+                permits: 8,
+                write_jobs_queued: 4,
+                hash_jobs_queued: 1,
+                read_jobs_queued: 2,
+                queued_write_bytes: 65_536,
+                peers_stopped: 9,
+                peers_resumed: 8,
+                check_waits: 40,
+                check_wait_nanos: 2_000_000_000,
+                read_buffer_growths: 6,
+                batch_buffers: 2,
+                read_seeks: 12,
+                write_seeks: 5,
+                ..Default::default()
+            };
+            disk.ops[DiskOp::PieceWrite.index()] = DiskOpSnapshot {
+                calls: 39,
+                bytes: 4_096_000,
+                nanos: 1_500_000_000,
+                in_flight: 1,
+                most_in_flight: 3,
+            };
+            disk.sockets[Transport::Tcp.index()] = SocketSnapshot {
+                receive_calls: 100,
+                send_calls: 60,
+            };
+            disk
+        },
     };
     let held = SessionSeries {
         route: "ff00ee11dd22cc33".into(),

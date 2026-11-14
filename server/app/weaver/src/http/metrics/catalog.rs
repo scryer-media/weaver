@@ -647,6 +647,48 @@ metric_families! {
         ["route"], "Times a uTP stream owed an ACK at the end of a read while more of its packets were already queued, since the session opened.");
     TORRENT_UTP_MAX_CWND = ("weaver_torrent_utp_max_congestion_window_bytes", Gauge,
         ["route"], "Largest uTP congestion window any stream of the session reached, in bytes.");
+    TORRENT_DISK_CALLS = ("weaver_torrent_disk_calls_total", Counter, ["route", "operation"],
+        "Disk calls of the session's torrents since it opened, by operation: a piece written whole, an upload read for a TCP or a uTP peer, a downloaded piece hashed from memory, a seed-mode check, an initial check.");
+    TORRENT_DISK_BYTES = ("weaver_torrent_disk_bytes_total", Counter, ["route", "operation"],
+        "Bytes the session's disk calls moved since it opened, by operation.");
+    TORRENT_DISK_SECONDS = ("weaver_torrent_disk_seconds_total", Counter, ["route", "operation"],
+        "Time spent inside the session's disk calls since it opened, summed over the calls, by operation: the one place a torrent's disk time is counted.");
+    TORRENT_DISK_IN_FLIGHT = ("weaver_torrent_disk_calls_in_flight", Gauge, ["route", "operation"],
+        "Disk calls of the session running now, by operation.");
+    TORRENT_DISK_IN_FLIGHT_MAX = ("weaver_torrent_disk_calls_in_flight_max", Gauge, ["route", "operation"],
+        "Most disk calls of one operation the session ran at once since it opened.");
+    TORRENT_DISK_UPLOAD_READ_BLOCKS = ("weaver_torrent_disk_upload_read_blocks_total", Counter, ["route", "transport"],
+        "Blocks the session's upload reads read since it opened, by the peer's transport; divide by the upload read calls for blocks per read.");
+    TORRENT_DISK_PERMIT_ACQUISITIONS = ("weaver_torrent_disk_permit_acquisitions_total", Counter, ["route"],
+        "Blocking permits the session's disk work took since it opened.");
+    TORRENT_DISK_PERMIT_WAITS = ("weaver_torrent_disk_permit_waits_total", Counter, ["route"],
+        "Blocking permits that were not free when asked for, since the session opened.");
+    TORRENT_DISK_PERMIT_WAIT_SECONDS = ("weaver_torrent_disk_permit_wait_seconds_total", Counter, ["route"],
+        "Time the session's disk work waited for a blocking permit since it opened, summed.");
+    TORRENT_DISK_PERMITS_IN_USE = ("weaver_torrent_disk_permits_in_use", Gauge, ["route"],
+        "Blocking permits of the session held now.");
+    TORRENT_DISK_PERMITS = ("weaver_torrent_disk_permits", Gauge, ["route"],
+        "Blocking permits the session has.");
+    TORRENT_DISK_READ_JOBS_QUEUED = ("weaver_torrent_disk_read_jobs_queued", Gauge, ["route"],
+        "Upload reads waiting for a disk thread of the session now.");
+    TORRENT_DISK_PIECE_CHECK_WAITS = ("weaver_torrent_disk_piece_check_waits_total", Counter, ["route"],
+        "Times a peer connection waited for the check and write of a piece it completed, since the session opened.");
+    TORRENT_DISK_PIECE_CHECK_WAIT_SECONDS = ("weaver_torrent_disk_piece_check_wait_seconds_total", Counter, ["route"],
+        "Time peer connections waited for the check and write of a piece they completed, since the session opened, summed.");
+    TORRENT_PEER_SOCKET_CALLS = ("weaver_torrent_peer_socket_calls_total", Counter, ["route", "transport", "direction"],
+        "Reads of peer sockets that returned bytes (in) and buffers written to them whole (out), since the session opened, by transport. Encryption handshakes, and the reads behind the last message a connection took, are not counted.");
+    TORRENT_PEER_READ_BUFFER_GROWTHS = ("weaver_torrent_peer_read_buffer_growths_total", Counter, ["route"],
+        "Times a peer connection's read buffer was made larger, since the session opened.");
+    TORRENT_PEER_BATCH_BUFFERS = ("weaver_torrent_peer_batch_buffers", Gauge, ["route"],
+        "Peer connections holding a 512 KiB buffer for runs of uploaded blocks: one is let go when no run was sent for a keep-alive interval.");
+    TORRENT_DISK_FILE_CALLS = ("weaver_torrent_disk_file_calls_total", Counter, ["direction"],
+        "Positional reads and writes of torrents' files since the process started: a write is one file's span of a verified piece. Their bytes and time are in the disk calls by operation.");
+    TORRENT_DISK_FILE_SEEKS = ("weaver_torrent_disk_file_seeks_total", Counter, ["direction"],
+        "Reads and writes of torrents' files that did not start where the last one of the same file ended, since the process started.");
+    TORRENT_DISK_FILE_OPENS = ("weaver_torrent_disk_file_opens_total", Counter, [],
+        "Files of torrents opened because no handle to them was open, since the process started.");
+    TORRENT_DISK_FILE_HANDLES_CLOSED = ("weaver_torrent_disk_file_handles_closed_total", Counter, ["reason"],
+        "Handles to torrents' files the handle pool closed since the process started: to make room for another, or after going unused.");
     TORRENT_SESSION_PEERS = ("weaver_torrent_session_peers", Gauge, ["route", "state"],
         "Peers of every torrent on the session, by state.");
     TORRENT_SESSION_CONNECT_ATTEMPTS = ("weaver_torrent_session_connect_attempts_total", Counter,
