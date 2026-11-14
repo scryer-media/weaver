@@ -30,8 +30,14 @@ fn label_from(mount: Option<String>, path: &Path, device: impl FnOnce() -> Optio
     }
     match device() {
         Some(device) => format!("{} (device {device:x})", root_of(path)),
-        None => format!("{} (device unknown)", root_of(path)),
+        None => unread_label(path),
     }
+}
+
+// The label of a volume whose device is not known: the path's own root,
+// marked so. Made from the path alone; no disk is looked at.
+pub(super) fn unread_label(path: &Path) -> String {
+    format!("{} (device unknown)", root_of(path))
 }
 
 // The root `path` starts from: `/`, or a drive or share with its separator.

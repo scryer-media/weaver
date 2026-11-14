@@ -1368,13 +1368,15 @@ fn lock_paths(cache: &Mutex<PathCache>) -> std::sync::MutexGuard<'_, PathCache> 
 // path. Its device is read first and handed out at once, so an asker of the
 // device never waits on the free space; then the free space. Each part is
 // stored in `cache`, when there is one, as it returns, and handed to every
-// waiter. A look that panics closes the channel, and its waiters are told
-// it was lost.
+// waiter. The device's volume is made known in `volumes`, when given. A
+// look that panics closes the channel, and its waiters are told it was
+// lost.
 fn spawn_look(
     probe: SharedProbeFn,
     clock: Arc<Clock>,
     path: PathBuf,
     cache: Option<Arc<Mutex<PathCache>>>,
+    volumes: Option<Arc<volumes::Volumes>>,
 ) -> LookWatch {
     let (sender, receiver) = tokio::sync::watch::channel(LookProgress::default());
     drop(tokio::task::spawn_blocking(move || {
@@ -1382,6 +1384,11 @@ fn spawn_look(
             device: nearest_device(&path),
             at: clock.now(),
         };
+        // The device's volume is known before the device is: whoever is
+        // answered the device from memory finds its volume there too.
+        if let Some(volumes) = &volumes {
+            volumes.seen(device.device, &path);
+        }
         if let Some(cache) = &cache
             && let Some(entry) = lock_paths(cache).entries.get_mut(&path)
         {
@@ -1612,8 +1619,9 @@ pub struct StorageCapacity {
     readings: Arc<tokio::sync::Notify>,
     // Every other path asked after, looked at on demand.
     paths: Arc<Mutex<PathCache>>,
-    // The volumes asked after, one per device.
-    volumes: volumes::Volumes,
+    // The volumes asked after, one per device. Shared with the threads
+    // that read a device, which make its volume known as they do.
+    volumes: Arc<volumes::Volumes>,
     interval: Duration,
     probe: SharedProbeFn,
     clock: Arc<Clock>,
@@ -1674,6 +1682,7 @@ impl StorageCapacity {
         let readings = Arc::new(tokio::sync::Notify::new());
         // The roots' ledgers count together where they share a filesystem.
         let counts = Arc::new(Counts::default());
+        let volumes = Arc::new(volumes::Volumes::default());
         let slots = StorageRoot::ALL.map(|root| {
             Arc::new_cyclic(|slot: &std::sync::Weak<RootSlot>| {
                 let slot = slot.clone();
@@ -1719,10 +1728,17 @@ impl StorageCapacity {
             let thread_slot = Arc::clone(slot);
             let thread_probe: SharedProbeFn = Arc::clone(&probe);
             let thread_gate = startup_disk_work.clone();
+            let thread_volumes = Arc::clone(&volumes);
             let spawned = std::thread::Builder::new()
                 .name(format!("{SAMPLER_THREAD}{}", slot.root.label()))
                 .spawn(move || {
-                    run_root_sampler(&thread_slot, interval, thread_probe, &thread_gate)
+                    run_root_sampler(
+                        &thread_slot,
+                        interval,
+                        thread_probe,
+                        &thread_gate,
+                        &thread_volumes,
+                    )
                 });
             if let Err(error) = spawned {
                 warn!(
@@ -1736,7 +1752,7 @@ impl StorageCapacity {
             slots,
             readings,
             paths: Arc::default(),
-            volumes: volumes::Volumes::default(),
+            volumes,
             interval,
             probe,
             clock,
@@ -1763,6 +1779,7 @@ impl StorageCapacity {
                     Arc::new(probe_disk_space),
                     Arc::new(Clock::new()),
                     path.clone(),
+                    None,
                     None,
                 )),
             })
@@ -1916,6 +1933,9 @@ impl StorageCapacity {
             Arc::clone(&self.clock),
             path.to_path_buf(),
             Some(Arc::clone(&self.paths)),
+            // A device is asked after for a directory a job will write to;
+            // free space is asked of any folder a user names.
+            matches!(want, Want::Device).then(|| Arc::clone(&self.volumes)),
         );
         entry.flight = Some(flight.clone());
         Ticket::Wait(flight)
@@ -2219,6 +2239,7 @@ fn run_root_sampler(
     interval: Duration,
     probe: SharedProbeFn,
     startup_disk_work: &StartupDiskGate,
+    volumes: &volumes::Volumes,
 ) {
     // Hold the first probe until the startup disk work is done. Stopping the
     // storage meanwhile ends the wait as well.
@@ -2259,6 +2280,11 @@ fn run_root_sampler(
         // The filesystem is found again before each probe, so a root moved
         // to another one counts with its new peers from its next reading.
         let device = nearest_device(&path);
+        // The volume of a root jobs write under is known before the root
+        // holds the device, so a job's directory finds both in memory.
+        if slot.root != StorageRoot::Data {
+            volumes.seen(device, &path);
+        }
         slot.ledger.on_device(device);
         // The kind of storage is read once for each directory the root is
         // pointed at, here, so no one else has to look for it.
