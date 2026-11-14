@@ -208,6 +208,7 @@ impl NamespaceWriter {
                 held_scratch: BTreeMap::new(),
                 settled: self.unsettled(),
                 scratch_later: BTreeMap::new(),
+                unwritten: false,
                 internal: self.working_dir.join(weaver_graph::names::INTERNAL_DIR),
                 members: BTreeMap::new(),
                 usage: RefCell::default(),
@@ -367,6 +368,7 @@ impl NamespaceWriter {
         for ((volume, offset, bytes), provenance) in
             replayed.bytes.slices().zip(&replayed.provenance)
         {
+            self.below_budget();
             let mut effects = Vec::new();
             tree.replay_piece(
                 replayed.node,

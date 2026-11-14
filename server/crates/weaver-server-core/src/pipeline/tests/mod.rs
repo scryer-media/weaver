@@ -569,7 +569,7 @@ async fn new_direct_pipeline_with(
 // The cross-device probe in `direct_store/scenarios/cross_device.rs` hands in two roots on
 // genuinely different mounts.
 #[allow(clippy::too_many_arguments)]
-async fn new_direct_pipeline_at_roots(
+pub(in crate::pipeline) async fn new_direct_pipeline_at_roots(
     data_dir: PathBuf,
     intermediate_dir: PathBuf,
     complete_dir: PathBuf,

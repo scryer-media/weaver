@@ -438,6 +438,15 @@ impl NamespaceWriter {
         self
     }
 
+    // Before the next slice of a repair's or a replay's output is said
+    // again: the loop stands still while a volume the job writes to holds
+    // its budget of bytes (`JobDisk::loop_wait_below`).
+    pub(super) fn below_budget(&self) {
+        if let Some(disk) = &self.disk {
+            disk.loop_wait_below();
+        }
+    }
+
     // The writer of the volume a file under `root` lies on, when the job
     // writes through one.
     pub(super) fn disk_under(
@@ -1692,6 +1701,7 @@ impl NamespaceWriter {
         // One slice per staged piece: no piece is longer than a slice.
         const _: () = assert!(weaver_graph::AGAIN_PIECE <= READ_BACK);
         for ((volume, offset, bytes), provenance) in staged.slices().zip(sources) {
+            self.below_budget();
             let posted = Posted {
                 offset,
                 bytes: bytes?.into(),

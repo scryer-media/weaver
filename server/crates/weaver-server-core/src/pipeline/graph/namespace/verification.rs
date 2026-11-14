@@ -96,6 +96,11 @@ impl Verification {
             // waits for.
             if let Some(settled) = &self.settled {
                 settled.wait_aside();
+                // A write of the file failed: there is nothing to check,
+                // and the failure fails the job.
+                if settled.failed() {
+                    return Ok(None);
+                }
             }
             let file = File::open(&self.path).map_err(io)?;
             let mut bytes = vec![0; READ_BACK as usize];

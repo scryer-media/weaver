@@ -243,7 +243,7 @@ impl Lent {
     // The pipeline began shutting down, or the job's working directory was
     // released: the repair reads and writes nothing more.
     fn stopped(&self) -> bool {
-        self.shutdown.started() || !self.internal.is_dir()
+        self.shutdown.started() || self.unwritten || !self.internal.is_dir()
     }
 
     // The loan's thread begins: it waits for what was still queued for the
@@ -255,6 +255,12 @@ impl Lent {
             return;
         };
         settled.wait_aside();
+        // A write of the job's failed: its files are not as the loop said
+        // them, so the loan reads nothing. The failure fails the job.
+        if settled.failed() {
+            self.unwritten = true;
+            return;
+        }
         for (node, path) in std::mem::take(&mut self.scratch_later) {
             if let Ok(file) = File::open(path) {
                 self.held_scratch.insert(node, file);
@@ -293,6 +299,9 @@ struct Lent {
     // begins, never the loop: the files then lie as the loop said them.
     settled: Option<crate::pipeline::graph::disk::JobBarrier>,
     scratch_later: BTreeMap<NodeId, PathBuf>,
+    // What the loan waited for did not all reach the disk: it reads and
+    // writes nothing, as one stopped.
+    unwritten: bool,
     // The directory the repair's scratch and output lie in, made when the
     // repair is lent. The repair never makes it again: once it is gone, the
     // job's working directory was released under the repair.
@@ -476,6 +485,7 @@ impl NamespaceWriter {
             held_scratch: BTreeMap::new(),
             settled: self.unsettled(),
             scratch_later: BTreeMap::new(),
+                unwritten: false,
             internal: self.working_dir.join(weaver_graph::names::INTERNAL_DIR),
             members: BTreeMap::new(),
             usage: RefCell::default(),

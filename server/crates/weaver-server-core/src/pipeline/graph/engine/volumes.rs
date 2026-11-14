@@ -333,6 +333,11 @@ impl Volumes for RunVolumes {
         // on a thread of its own, which the loop never waits for.
         if let Some(settled) = settled {
             settled.wait_aside();
+            // A write of the volume failed: its file does not hold what
+            // the coverage says, and the failure fails the job.
+            if settled.failed() {
+                return Err(Unreadable::Stopped.into());
+            }
         }
         let len = usize::try_from(len).expect("a read fits the buffer it fills");
         let mut files = self.files.lock().unwrap_or_else(PoisonError::into_inner);

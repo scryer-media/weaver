@@ -30,6 +30,7 @@ pub(crate) fn job_disk(
     key: u64,
     working_dir: &Path,
     output_dir: Option<&Path>,
+    budget: u64,
 ) -> JobDisk {
     let volume = capacity.volume(working_dir);
     probes.first_seen(writers, &volume, working_dir);
@@ -41,7 +42,7 @@ pub(crate) fn job_disk(
             (dir.to_path_buf(), writers.submitter(&other, key))
         })
     });
-    JobDisk::new(working, output)
+    JobDisk::new(working, output).holding(budget)
 }
 
 type Probe = Box<dyn FnOnce() -> std::io::Result<()> + Send>;
@@ -347,11 +348,36 @@ pub(crate) struct JobDisk {
     working: Arc<Submitter>,
     // Where the delivered files lie and their volume, when it is another.
     output: Option<(PathBuf, Arc<Submitter>)>,
+    // How many bytes a volume may hold in memory for its writer before a
+    // thread that produces the job's output waits for it.
+    budget: u64,
 }
 
 impl JobDisk {
     pub(crate) fn new(working: Arc<Submitter>, output: Option<(PathBuf, Arc<Submitter>)>) -> Self {
-        Self { working, output }
+        Self {
+            working,
+            output,
+            budget: u64::MAX,
+        }
+    }
+
+    // The job's disk, its producing threads held to `budget` bytes waiting
+    // on a volume.
+    pub(crate) fn holding(mut self, budget: u64) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    // Stand still until no volume the job writes to holds more than its
+    // budget for its writer: the wait of a thread that produces what the
+    // job writes, an extraction's run, before it hands the loop more.
+    // Never for the loop. Returns at once for a job whose writes failed
+    // or were given up.
+    pub(crate) fn wait_below(&self) {
+        for submitter in self.each() {
+            submitter.wait_below(self.budget);
+        }
     }
 
     // The writer of the volume a file under `root` lies on.
@@ -373,6 +399,30 @@ impl JobDisk {
     // Everything the job submitted so far, on every volume it writes to.
     pub(crate) fn barrier(&self) -> JobBarrier {
         JobBarrier(self.each().map(|submitter| submitter.barrier()).collect())
+    }
+
+    // The loop's own wait on the budget, for the one kind of work in which
+    // the loop itself produces what is written: a repair's or a replay's
+    // output read back from its staging file and said again, slice after
+    // slice, in one step. Before the next slice is queued the loop stands
+    // still while a volume holds its budget, so no more than the budget
+    // and a slice is ever queued. Counted as a loop wait on the volume.
+    // For those applications only: nothing else on the loop may call it.
+    pub(crate) fn loop_wait_below(&self) {
+        use std::sync::atomic::Ordering;
+        for submitter in self.each() {
+            let volume = submitter.volume();
+            if volume.buffered_bytes.load(Ordering::Relaxed) < self.budget {
+                continue;
+            }
+            let started = std::time::Instant::now();
+            submitter.wait_below(self.budget.saturating_sub(1));
+            volume.writer.loop_waits.fetch_add(1, Ordering::Relaxed);
+            volume
+                .writer
+                .loop_wait_nanos
+                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
     }
 
     // Whether a volume the job writes to holds `budget` bytes or more for
@@ -462,6 +512,13 @@ impl JobBarrier {
         for barrier in &self.0 {
             barrier.wait_aside();
         }
+    }
+
+    // An operation of the job failed on a volume, or the job gave its
+    // files up: what was submitted is not all on disk, and nothing may be
+    // read back as if it were.
+    pub(crate) fn failed(&self) -> bool {
+        self.0.iter().any(Barrier::failed)
     }
 
     // Wait until every operation behind it returned, counted against the
