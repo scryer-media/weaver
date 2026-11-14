@@ -156,6 +156,19 @@ pub(crate) fn normalize_checkpoint(
     })
 }
 
+/// Whether the spot check of a piece the resume data names says the files
+/// are not what the resume data says: the piece does not read, or its
+/// bytes do not hash to the torrent's. A piece that cannot be told, a v2
+/// piece whose file's hashes are not held yet, leaves the resume data
+/// trusted: those hashes are kept only once every file's are held, so a
+/// v2 torrent stopped before that has none to check against.
+fn says_files_differ(checked: &anyhow::Result<Verdict>) -> bool {
+    matches!(
+        checked,
+        Ok(Verdict::Failed | Verdict::Inconsistent) | Err(_)
+    )
+}
+
 impl TorrentStateInitializing {
     /// Whether the check reads every piece back and trusts nothing saved.
     pub(crate) fn is_full_check(&self) -> bool {
@@ -328,10 +341,7 @@ impl TorrentStateInitializing {
                     })
                     .enumerate()
                 {
-                    // A piece that does not read, and one whose hash does
-                    // not match, both say the files are not what the
-                    // resume data says.
-                    if !matches!(fo.check_piece_whole(piece_id), Ok(Verdict::Passed)) {
+                    if says_files_differ(&fo.check_piece_whole(piece_id)) {
                         return true;
                     }
 
@@ -1327,6 +1337,17 @@ mod tests {
     // keeping resume data, the session stops, a byte of the first piece
     // changes on disk, and a new session over the same resume data picks
     // the torrent up.
+    #[test]
+    fn a_spot_checked_piece_that_cannot_be_told_leaves_resume_data_trusted() {
+        use super::says_files_differ;
+        use crate::file_ops::Verdict;
+        assert!(!says_files_differ(&Ok(Verdict::Passed)));
+        assert!(!says_files_differ(&Ok(Verdict::Unknown)));
+        assert!(says_files_differ(&Ok(Verdict::Failed)));
+        assert!(says_files_differ(&Ok(Verdict::Inconsistent)));
+        assert!(says_files_differ(&Err(anyhow::anyhow!("no file"))));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn resume_data_naming_a_piece_that_does_not_hash_is_not_trusted() -> anyhow::Result<()> {
         use crate::tests::embedder_util::{TestTorrent, isolated_session_opts};
