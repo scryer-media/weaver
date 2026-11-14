@@ -43,15 +43,21 @@ use crate::jobs::ids::JobId;
 use crate::jobs::model::{FileSummaries, FileSummary, JobArticles, RunState};
 use crate::operations::StorageRoot;
 
-// The wait of the kept history archives: the folder read, the probe count
-// as the wait began, what the folder's disk showed free then, and whether a
-// probe was running then, as a job's hold has them.
+// The wait of the kept history archives: the folder read, how many
+// archives the writer said it keeps, the probe count as the wait began, and
+// the least the folder's disk has shown free since the last attempt.
 pub(crate) struct ArchiveWait {
     dir: PathBuf,
+    pub(in crate::pipeline) kept: usize,
     since: u64,
     mark: Option<u64>,
-    running: bool,
 }
+
+// How much more than its mark the database's disk has to show free for the
+// kept archives to be tried again. A history row is kilobytes: the figure
+// says nothing of what a write needs, and only keeps a retry that was
+// refused from being rung again by the noise of a busy disk.
+pub(in crate::pipeline) const ARCHIVE_RETRY_RISE: u64 = 16 << 20;
 
 // What a job waits for: room made on the disk its write failed on.
 // The disk a held job waits on: a root's, or the disk of a path that lies
@@ -681,57 +687,85 @@ impl Pipeline {
             .unwrap_or_else(|| self.script_data_dir.clone())
     }
 
-    // The writer kept an archive for want of room, or a kept one committed.
-    // While any is kept, each of their rows, retiring and with no runtime
-    // left, says it waits for disk space, and the database's folder is read
-    // as a held path. With none kept the path is let go.
-    pub(in crate::pipeline) fn kept_archives_heard(&mut self) {
-        let kept = self.db.kept_archive_jobs();
-        if kept.is_empty() {
-            if let Some(wait) = self.archive_wait.take() {
-                self.storage_capacity.release_path(&wait.dir);
+    // The writer said something of the archives it keeps, of one job. The
+    // pipeline counts them from what it is told and never reads the
+    // writer's list: each message costs one row looked up by its id.
+    // While it counts any, the database's folder is read as a held path;
+    // the path is let go when the count is back to none.
+    pub(in crate::pipeline) fn archive_news(&mut self, news: crate::persistence::ArchiveNews) {
+        use crate::persistence::ArchiveNews;
+        match news {
+            // The job's row, retiring and with no runtime left, says it
+            // waits for disk space.
+            ArchiveNews::Kept(job_id) => {
+                self.show_archive_wait(job_id, true);
+                if let Some(wait) = &mut self.archive_wait {
+                    wait.kept += 1;
+                    return;
+                }
+                let dir = self.database_dir();
+                let look = self.storage_capacity.hold_path(&dir);
+                warn!(
+                    path = %dir.display(),
+                    "a history write found the database's disk full; it waits for room"
+                );
+                self.archive_wait = Some(ArchiveWait {
+                    dir,
+                    kept: 1,
+                    since: look.begun,
+                    mark: None,
+                });
             }
-            return;
-        }
-        self.shared_state.queue.write(|inner| {
-            let mut shown = false;
-            for job_id in &kept {
-                if let Some(mut row) = inner.job_mut(*job_id)
-                    && row.report.retiring
-                    && row.report.job.download_wait_reason.is_none()
-                {
-                    row.report.job.download_wait_reason =
-                        Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON.into());
-                    shown = true;
+            // Written, the terminal path removes the row. Failed for
+            // another reason, the archive is lost as any that fails so is:
+            // the row stays retiring and says no more that it waits.
+            ArchiveNews::LetGo { job_id, written } => {
+                if !written {
+                    self.show_archive_wait(job_id, false);
+                }
+                let Some(wait) = &mut self.archive_wait else {
+                    return;
+                };
+                wait.kept = wait.kept.saturating_sub(1);
+                if wait.kept == 0 {
+                    self.storage_capacity.release_path(&wait.dir);
+                    self.archive_wait = None;
                 }
             }
-            if shown {
-                crate::pipeline::queue::Change::changed(())
-            } else {
-                crate::pipeline::queue::Change::unchanged(())
+            ArchiveNews::More { from } => {
+                if self.archive_wait.is_some() {
+                    self.db.retry_kept_archives(from);
+                }
             }
-        });
-        if self.archive_wait.is_none() {
-            let dir = self.database_dir();
-            let look = self.storage_capacity.hold_path(&dir);
-            warn!(
-                path = %dir.display(),
-                "a history write found the database's disk full; it waits for room"
-            );
-            self.archive_wait = Some(ArchiveWait {
-                dir,
-                since: look.begun,
-                mark: look.shown,
-                running: look.probe < look.begun,
-            });
         }
     }
 
-    // A reading came while archives are kept. The rule is the one a hold
-    // with no figure has: a good reading whose probe began after the wait
-    // did, showing the reserve more than the mark and more than the reserve
-    // free, rings the writer to try the kept archives, once. The mark moves
-    // to that reading, so an archive refused again waits for a further rise.
+    // Say on the job's retiring row that it waits for disk space, or that
+    // it no longer does.
+    fn show_archive_wait(&self, job_id: JobId, waits: bool) {
+        let reason = waits.then(|| crate::jobs::handle::DISK_SPACE_WAIT_REASON.to_owned());
+        self.shared_state
+            .queue
+            .write(|inner| match inner.job_mut(job_id) {
+                Some(mut row)
+                    if row.report.retiring && row.report.job.download_wait_reason != reason =>
+                {
+                    row.report.job.download_wait_reason = reason;
+                    crate::pipeline::queue::Change::changed(())
+                }
+                _ => crate::pipeline::queue::Change::unchanged(()),
+            });
+    }
+
+    // A reading came while archives are kept. The mark is the least a good
+    // reading, from a probe begun after the wait did, has shown free since
+    // the last attempt. A reading that shows [`ARCHIVE_RETRY_RISE`] more
+    // than the mark rings the writer to try the kept archives, once, and
+    // is the mark from then: an archive refused again waits for a further
+    // rise. The download reserve has no part in it: the database's disk
+    // may be smaller than the reserve. The first good reading of the wait
+    // rings once whatever it shows: room made between the refusal and that
+    // reading would otherwise be the mark and never be seen as a rise.
     pub(in crate::pipeline) fn wake_kept_archives(&mut self) {
         let Some(wait) = &mut self.archive_wait else {
             return;
@@ -739,26 +773,44 @@ impl Pipeline {
         let Some(look) = self.storage_capacity.path_look(&wait.dir) else {
             return;
         };
-        if wait.running && look.probe >= wait.since {
-            if let Some(before) = look.figure_of(wait.since) {
-                wait.mark = Some(before);
-            }
-            wait.running = false;
-        }
         if look.probe > wait.since
             && look.good
             && let Some(shown) = look.shown
         {
-            let reserve = self.extraction_limits.min_free_bytes;
-            match wait.mark {
-                None => wait.mark = Some(shown),
-                Some(mark) if shown >= mark.saturating_add(reserve.max(1)) && shown > reserve => {
-                    wait.mark = Some(shown);
-                    self.db.retry_kept_archives();
-                }
-                Some(_) => {}
+            let first = wait.mark.is_none();
+            let least = wait.mark.map_or(shown, |mark| mark.min(shown));
+            wait.mark = Some(least);
+            if first || shown >= least.saturating_add(ARCHIVE_RETRY_RISE) {
+                wait.mark = Some(shown);
+                self.db.retry_kept_archives(0);
             }
         }
+    }
+
+    // Shutdown does not wait for room. The kept archives are tried once
+    // more, behind the writes already waiting.
+    pub(in crate::pipeline) fn retry_kept_archives_at_drain(&self) {
+        if self.archive_wait.is_some() {
+            self.db.retry_kept_archives(0);
+        }
+    }
+
+    // After the drain's flush: the jobs whose archive is still kept are
+    // named in one warning. Each stays terminal in the active table, and
+    // start-up recovery archives it.
+    pub(in crate::pipeline) fn warn_of_kept_archives(&self) -> Vec<JobId> {
+        if self.archive_wait.is_none() {
+            return Vec::new();
+        }
+        let kept = self.db.kept_archive_jobs();
+        if !kept.is_empty() {
+            warn!(
+                job_ids = ?kept.iter().map(|job_id| job_id.0).collect::<Vec<_>>(),
+                "history writes still wait for room on the database's disk at shutdown; \
+                 the next start archives these jobs"
+            );
+        }
+        kept
     }
 
     // The final moves of the jobs let go start here, at the top of a turn.

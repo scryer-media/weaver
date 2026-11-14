@@ -26,9 +26,8 @@ pub(crate) enum DbReply {
         read: u64,
         lists: Result<crate::pipeline::next_up::HeldLists, String>,
     },
-    // The writer kept a history archive for want of room, or a kept one
-    // committed.
-    KeptArchives,
+    // What the writer says of a history archive it keeps for want of room.
+    Archive(crate::persistence::ArchiveNews),
 }
 
 impl Pipeline {
@@ -52,7 +51,7 @@ impl Pipeline {
                 read,
                 lists,
             } => self.next_up_read(job_id, read, lists),
-            DbReply::KeptArchives => self.kept_archives_heard(),
+            DbReply::Archive(news) => self.archive_news(news),
         }
     }
 

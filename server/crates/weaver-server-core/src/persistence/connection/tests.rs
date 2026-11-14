@@ -2197,22 +2197,34 @@ async fn postgres_job_lane_writes_keep_order_and_archive_last_when_configured() 
     admin_pool.close().await;
 }
 
-// Three archives the database had no room for are kept, in the order they
-// came, with nothing written. One retry tries each once, in that order: the
-// one write refused in that pass is the first archive's, which is kept
-// again, and the other two are written in that same pass. A second retry
-// writes the first. With none kept a retry queues nothing.
+// Five archives the database had no room for are kept, in the order they
+// came, with nothing written, and the listener is told of each job once. A
+// pass tries the test cap of two, in order: the first is refused again and
+// stays first, with nothing said of it; the second is written and let go;
+// and the listener is told where the next pass starts, as more remain and
+// the pass wrote one. In the next pass one fails for another reason and is
+// let go as not written, its sender dropped. A pass that writes none says
+// nothing. The last pass writes the two still kept, in the order they came.
 #[tokio::test]
-async fn kept_archives_are_tried_again_in_order_in_one_pass() {
+async fn kept_archives_are_tried_again_in_order_a_capped_pass_at_a_time() {
+    use super::ArchiveNews::{Kept, LetGo, More};
     use std::sync::atomic::Ordering;
     let no_room = || crate::StateError::OutOfSpace("database or disk is full".into());
+    let refuse = |error| super::ARCHIVE_REFUSED.lock().unwrap().push_back(error);
+    let written = || super::ARCHIVES_WRITTEN.load(Ordering::Relaxed);
     let db = Database::open_in_memory().unwrap();
-    let jobs = [801_u64, 802, 803].map(crate::jobs::ids::JobId);
-    let mut committed = Vec::new();
+    let news = Arc::new(Mutex::new(Vec::new()));
+    db.hear_archive_news({
+        let news = Arc::clone(&news);
+        move |said| news.lock().unwrap().push(said)
+    });
+    let told = || std::mem::take(&mut *news.lock().unwrap());
+    let jobs = [801_u64, 802, 803, 804, 805].map(crate::jobs::ids::JobId);
+    let mut committed = std::collections::VecDeque::new();
     for job_id in jobs {
         db.create_active_job(&postgres_sample_job(job_id)).unwrap();
-        super::ARCHIVE_REFUSED.lock().unwrap().push_back(no_room());
-        committed.push(
+        refuse(no_room());
+        committed.push_back(
             db.try_queue_archive_job_with_terminal_cause(
                 job_id,
                 postgres_sample_history(job_id),
@@ -2224,34 +2236,78 @@ async fn kept_archives_are_tried_again_in_order_in_one_pass() {
     }
     db.flush_write_queue().await.unwrap();
     assert_eq!(db.kept_archive_jobs(), jobs);
-    assert_eq!(*db.kept_archive_count().borrow(), 3);
-    assert_eq!(super::ARCHIVES_WRITTEN.load(Ordering::Relaxed), 0);
+    assert_eq!(told(), jobs.map(Kept));
+    assert_eq!(written(), 0);
     for committed in &mut committed {
         assert!(committed.try_recv().is_err(), "nothing committed");
     }
+    let mut done = |at: usize| committed.remove(at).unwrap();
 
-    super::ARCHIVE_REFUSED.lock().unwrap().push_back(no_room());
-    db.retry_kept_archives();
+    // 801 is refused again, 802 is written; 803 on are past the cap.
+    refuse(no_room());
+    db.retry_kept_archives(0);
     db.flush_write_queue().await.unwrap();
-    assert_eq!(db.kept_archive_jobs(), [jobs[0]]);
-    assert_eq!(*db.kept_archive_count().borrow(), 1);
-    assert_eq!(super::ARCHIVES_WRITTEN.load(Ordering::Relaxed), 2);
-    committed.pop().unwrap().await.unwrap();
-    committed.pop().unwrap().await.unwrap();
-    assert!(db.get_job_history(jobs[0].0).unwrap().is_none());
-    assert!(db.get_job_history(jobs[1].0).unwrap().is_some());
-    assert!(db.get_job_history(jobs[2].0).unwrap().is_some());
+    assert_eq!(db.kept_archive_jobs(), [jobs[0], jobs[2], jobs[3], jobs[4]]);
+    let let_go = |job_id, written| LetGo { job_id, written };
+    assert_eq!(told(), [let_go(jobs[1], true), More { from: 1 }]);
+    assert_eq!(written(), 1);
+    done(1).await.unwrap();
 
-    db.retry_kept_archives();
+    // 803 fails for another reason and is lost; 804 is written.
+    refuse(crate::StateError::Database("the row is malformed".into()));
+    db.retry_kept_archives(1);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(db.kept_archive_jobs(), [jobs[0], jobs[4]]);
+    assert_eq!(
+        told(),
+        [
+            let_go(jobs[2], false),
+            let_go(jobs[3], true),
+            More { from: 1 }
+        ]
+    );
+    assert!(done(1).await.is_err(), "its sender is dropped");
+    done(1).await.unwrap();
+    assert!(db.get_job_history(jobs[2].0).unwrap().is_none());
+
+    // 805 is refused again: the pass wrote none and says nothing.
+    refuse(no_room());
+    db.retry_kept_archives(1);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(db.kept_archive_jobs(), [jobs[0], jobs[4]]);
+    assert_eq!(told(), []);
+    assert_eq!(written(), 2);
+
+    // The next ring starts at the front and writes both.
+    db.retry_kept_archives(0);
     db.flush_write_queue().await.unwrap();
     assert!(db.kept_archive_jobs().is_empty());
-    assert_eq!(*db.kept_archive_count().borrow(), 0);
-    committed.pop().unwrap().await.unwrap();
-    assert!(db.get_job_history(jobs[0].0).unwrap().is_some());
-
-    db.retry_kept_archives();
+    assert_eq!(told(), [let_go(jobs[0], true), let_go(jobs[4], true)]);
+    assert_eq!(written(), 4);
+    done(0).await.unwrap();
+    done(0).await.unwrap();
+    for job_id in [jobs[0], jobs[1], jobs[3], jobs[4]] {
+        assert!(db.get_job_history(job_id.0).unwrap().is_some());
+    }
+    // A pass over an empty list writes nothing and says nothing.
+    db.retry_kept_archives(0);
     db.flush_write_queue().await.unwrap();
-    assert_eq!(super::ARCHIVES_WRITTEN.load(Ordering::Relaxed), 3);
+    assert_eq!((told(), written()), (Vec::new(), 4));
+}
+
+// Only want of room on a SQLite database keeps an archive. A Postgres
+// server's disk cannot be read from here: an archive it refuses with its
+// disk-full state is not kept, and neither is any other failure anywhere.
+#[test]
+fn an_archive_postgres_has_no_room_for_is_not_kept() {
+    let no_room = crate::StateError::OutOfSpace("sqlstate=53100; could not extend file".into());
+    let other = crate::StateError::Database("the row is malformed".into());
+    let postgres = DatabaseTarget::PostgresUrl("postgres://localhost/weaver".into());
+    let sqlite = DatabaseTarget::SqlitePath(PathBuf::from("/config/weaver.db"));
+    assert!(super::keeps_archive(&sqlite, &no_room));
+    assert!(!super::keeps_archive(&postgres, &no_room));
+    assert!(!super::keeps_archive(&sqlite, &other));
+    assert!(!super::keeps_archive(&postgres, &other));
 }
 
 #[tokio::test]

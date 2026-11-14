@@ -3580,14 +3580,61 @@ fn completions(events: &mut tokio::sync::broadcast::Receiver<PipelineEvent>) -> 
     count
 }
 
-// Whether the loop was told of a kept archive, in what it has yet to hear.
-fn told_of_kept_archives(pipeline: &mut Pipeline) -> bool {
-    let mut told = false;
+// Every write queued so far has run, and the loop has heard all the writer
+// said of them: the writer speaks before the flush behind it answers.
+async fn writer_heard(pipeline: &mut Pipeline) {
+    pipeline.db.flush_write_queue().await.unwrap();
     while let Ok(reply) = pipeline.db_reply_rx.try_recv() {
-        told |= matches!(reply, crate::pipeline::db_reply::DbReply::KeptArchives);
+        pipeline.handle_db_reply(reply).await;
     }
-    told
 }
+
+// The job is said to be complete.
+async fn said_complete(events: &mut tokio::sync::broadcast::Receiver<PipelineEvent>) {
+    loop {
+        let event = events.recv().await.expect("the job is said to be complete");
+        if matches!(event, PipelineEvent::JobCompleted { job_id } if job_id == JOB) {
+            return;
+        }
+    }
+}
+
+// How many kept archives the pipeline counts, if it waits for any.
+fn kept_count(pipeline: &Pipeline) -> Option<usize> {
+    pipeline.archive_wait.as_ref().map(|wait| wait.kept)
+}
+
+fn wait_shown(pipeline: &Pipeline) -> Option<String> {
+    pipeline.shared_state.queue.read(|inner| {
+        inner
+            .jobs
+            .iter()
+            .find(|row| row.id == JOB)
+            .and_then(|row| row.report.job.download_wait_reason.clone())
+    })
+}
+
+// The job ends with its archive refused `refused` times for want of room,
+// and the pipeline has heard that the writer keeps it.
+async fn kept_job(
+    room: &Arc<AtomicU64>,
+    refused: usize,
+) -> (
+    tempfile::TempDir,
+    Pipeline,
+    tokio::sync::broadcast::Receiver<PipelineEvent>,
+) {
+    let scenario = one_file(room);
+    let (temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let events = pipeline.event_tx.subscribe();
+    refuse_archives(refused);
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    hears_database(&mut pipeline, |pipeline| pipeline.archive_wait.is_some()).await;
+    assert_eq!(kept_count(&pipeline), Some(1));
+    (temp_dir, pipeline, events)
+}
+
+const RISE: u64 = crate::pipeline::full_disk::ARCHIVE_RETRY_RISE;
 
 fn in_queue(pipeline: &Pipeline) -> bool {
     pipeline
@@ -3644,12 +3691,7 @@ async fn an_archive_the_database_has_no_room_for_waits_and_is_written_when_room_
     assert_eq!(archives_written(), 1);
 
     let room = Arc::new(AtomicU64::new(PLENTY));
-    let scenario = one_file(&room);
-    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
-    let mut events = pipeline.event_tx.subscribe();
-    refuse_archives(2);
-    drive(&mut pipeline, &scenario, JOB, |_| false).await;
-    hears_database(&mut pipeline, |pipeline| pipeline.archive_wait.is_some()).await;
+    let (_temp_dir, mut pipeline, mut events) = kept_job(&room, 3).await;
     let shown = pipeline.shared_state.get_job(JOB).expect("the row stays");
     assert_eq!(shown.status, JobStatus::Complete);
     assert_eq!(shown.download_wait_reason.as_deref(), disk_space);
@@ -3659,40 +3701,234 @@ async fn an_archive_the_database_has_no_room_for_waits_and_is_written_when_room_
     assert_eq!(pipeline.db.kept_archive_jobs(), [JOB]);
     assert!(pipeline.db.get_job_history(JOB.0).unwrap().is_none());
     assert_eq!(completions(&mut events), 0);
-    assert_eq!((archives_yet_to_refuse(), archives_written()), (1, 1));
+    assert_eq!((archives_yet_to_refuse(), archives_written()), (2, 1));
 
-    // No more shows: nothing is tried.
+    // The first good reading of the wait tries once, whatever it shows:
+    // room made since the refusal shows as no rise. Refused, kept again.
     hears(&mut pipeline, &room, StorageRoot::Complete, PLENTY);
-    pipeline.db.flush_write_queue().await.unwrap();
+    writer_heard(&mut pipeline).await;
+    assert_eq!((archives_yet_to_refuse(), archives_written()), (1, 1));
+    assert_eq!(kept_count(&pipeline), Some(1));
+    // That reading is the mark; less than the rise over it tries nothing.
+    hears(
+        &mut pipeline,
+        &room,
+        StorageRoot::Complete,
+        PLENTY + RISE - 1,
+    );
+    writer_heard(&mut pipeline).await;
     assert_eq!((archives_yet_to_refuse(), archives_written()), (1, 1));
 
-    // The reserve more shows: one try, refused, kept again.
-    hears(&mut pipeline, &room, StorageRoot::Complete, 2 * PLENTY);
-    pipeline.db.flush_write_queue().await.unwrap();
+    // The rise shows: one try, refused, kept again, and nothing is told.
+    hears(&mut pipeline, &room, StorageRoot::Complete, PLENTY + RISE);
+    writer_heard(&mut pipeline).await;
     assert_eq!((archives_yet_to_refuse(), archives_written()), (0, 1));
     assert_eq!(pipeline.db.kept_archive_jobs(), [JOB]);
+    assert_eq!(kept_count(&pipeline), Some(1));
+    assert_eq!(wait_shown(&pipeline).as_deref(), disk_space);
+    assert_eq!(pipeline.storage_capacity.waited_paths(), 1);
     // The same reading rings nothing more.
-    hears(&mut pipeline, &room, StorageRoot::Complete, 2 * PLENTY);
-    pipeline.db.flush_write_queue().await.unwrap();
+    hears(&mut pipeline, &room, StorageRoot::Complete, PLENTY + RISE);
+    writer_heard(&mut pipeline).await;
     assert_eq!(archives_written(), 1);
     assert!(retiring(&pipeline));
     assert_eq!(completions(&mut events), 0);
 
     // A further rise: written.
-    hears(&mut pipeline, &room, StorageRoot::Complete, 3 * PLENTY);
-    hears_database(&mut pipeline, |pipeline| pipeline.archive_wait.is_none()).await;
+    hears(
+        &mut pipeline,
+        &room,
+        StorageRoot::Complete,
+        PLENTY + 2 * RISE,
+    );
+    said_complete(&mut events).await;
+    writer_heard(&mut pipeline).await;
     assert_eq!(archives_written(), 2);
-    assert_eq!(completions(&mut events), 1);
+    assert_eq!(completions(&mut events), 0, "said once");
     assert!(!in_queue(&pipeline), "the row left the queue");
     assert!(pipeline.db.kept_archive_jobs().is_empty());
+    assert_eq!(kept_count(&pipeline), None);
     assert_eq!(pipeline.storage_capacity.waited_paths(), 0);
     assert!(!pipeline.waits_for_disk_room());
     let written = pipeline.db.get_job_history(JOB.0).unwrap().unwrap();
     assert_eq!(history_facts(&written), history_facts(&first_time));
     // A reading with nothing kept tries nothing.
     hears(&mut pipeline, &room, StorageRoot::Complete, 8 * PLENTY);
-    pipeline.db.flush_write_queue().await.unwrap();
+    writer_heard(&mut pipeline).await;
     assert_eq!(archives_written(), 2);
+}
+
+// The pipeline counts the kept archives from what the writer says of each
+// job, and never from the writer's list. Two are kept; one is written. Its
+// news is heard while the other is still kept: the count is one, the path
+// is still read, and a later rise still rings the writer. The path is let
+// go only when the last one is.
+#[tokio::test]
+async fn the_database_path_is_held_until_the_last_kept_archive_is_let_go() {
+    use crate::persistence::ArchiveNews;
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let (_temp_dir, mut pipeline, mut events) = kept_job(&room, 1).await;
+    // A second job's archive is kept: the writer says so, of that job.
+    pipeline.archive_news(ArchiveNews::Kept(SECOND));
+    assert_eq!(kept_count(&pipeline), Some(2));
+    assert_eq!(pipeline.storage_capacity.waited_paths(), 1);
+
+    hears(&mut pipeline, &room, StorageRoot::Complete, PLENTY);
+    hears(&mut pipeline, &room, StorageRoot::Complete, PLENTY + RISE);
+    said_complete(&mut events).await;
+    writer_heard(&mut pipeline).await;
+    assert_eq!(archives_written(), 1);
+    assert!(pipeline.db.kept_archive_jobs().is_empty());
+    // The writer's list is empty, as it is in the middle of a pass; the
+    // pipeline's count is not, and the wait stands.
+    assert_eq!(kept_count(&pipeline), Some(1));
+    assert_eq!(pipeline.storage_capacity.waited_paths(), 1);
+    assert!(pipeline.waits_for_disk_room());
+    // A later rise still rings the writer: a refusal waiting is used up
+    // by nothing, since nothing is in the writer's list.
+    hears(
+        &mut pipeline,
+        &room,
+        StorageRoot::Complete,
+        PLENTY + 2 * RISE,
+    );
+    writer_heard(&mut pipeline).await;
+    assert_eq!(kept_count(&pipeline), Some(1));
+
+    pipeline.archive_news(ArchiveNews::LetGo {
+        job_id: SECOND,
+        written: false,
+    });
+    assert_eq!(kept_count(&pipeline), None);
+    assert_eq!(pipeline.storage_capacity.waited_paths(), 0);
+    assert!(!pipeline.waits_for_disk_room());
+}
+
+// The mark follows the least the disk has shown since the last attempt,
+// and the download reserve has no part. The first reading shows much; the
+// disk then fills; a little room made over that low rings the writer,
+// though the disk shows far less than it first did and far less than the
+// reserve, which here no disk could meet.
+#[tokio::test]
+async fn a_kept_archive_is_tried_on_a_small_rise_over_the_lowest_reading() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let (_temp_dir, mut pipeline, mut events) = kept_job(&room, 3).await;
+    Arc::make_mut(&mut pipeline.extraction_limits).min_free_bytes = u64::MAX / 2;
+    assert_eq!((archives_yet_to_refuse(), archives_written()), (2, 0));
+
+    // The first reading tries once and is refused.
+    hears(&mut pipeline, &room, StorageRoot::Complete, 10 * PLENTY);
+    writer_heard(&mut pipeline).await;
+    assert_eq!((archives_yet_to_refuse(), archives_written()), (1, 0));
+    // The disk fills: a lower reading tries nothing and is the mark.
+    hears(&mut pipeline, &room, StorageRoot::Complete, 4 * RISE);
+    writer_heard(&mut pipeline).await;
+    assert_eq!((archives_yet_to_refuse(), archives_written()), (1, 0));
+    // Less than the rise over the low: nothing.
+    hears(&mut pipeline, &room, StorageRoot::Complete, 5 * RISE - 1);
+    writer_heard(&mut pipeline).await;
+    assert_eq!((archives_yet_to_refuse(), archives_written()), (1, 0));
+    // The rise over the low: one try, refused; that reading is the mark.
+    hears(&mut pipeline, &room, StorageRoot::Complete, 5 * RISE);
+    writer_heard(&mut pipeline).await;
+    assert_eq!((archives_yet_to_refuse(), archives_written()), (0, 0));
+    assert_eq!(kept_count(&pipeline), Some(1));
+    // The disk fills again and room is made again: written.
+    hears(&mut pipeline, &room, StorageRoot::Complete, RISE);
+    writer_heard(&mut pipeline).await;
+    assert_eq!(archives_written(), 0);
+    hears(&mut pipeline, &room, StorageRoot::Complete, 2 * RISE);
+    said_complete(&mut events).await;
+    writer_heard(&mut pipeline).await;
+    assert_eq!(archives_written(), 1);
+    assert_eq!(kept_count(&pipeline), None);
+    assert_eq!(pipeline.storage_capacity.waited_paths(), 0);
+}
+
+// A kept archive whose retry fails for another reason is lost as any that
+// fails so is: the row says no more that it waits, the count goes down and
+// the path is let go. The row stays retiring, and nothing is said complete.
+#[tokio::test]
+async fn a_kept_archive_that_fails_otherwise_shows_no_wait() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let (_temp_dir, mut pipeline, mut events) = kept_job(&room, 1).await;
+    assert!(wait_shown(&pipeline).is_some());
+    crate::persistence::connection::ARCHIVE_REFUSED
+        .lock()
+        .unwrap()
+        .push_back(crate::StateError::Database("the row is malformed".into()));
+    hears(&mut pipeline, &room, StorageRoot::Complete, PLENTY);
+    hears(&mut pipeline, &room, StorageRoot::Complete, PLENTY + RISE);
+    writer_heard(&mut pipeline).await;
+    assert_eq!((archives_yet_to_refuse(), archives_written()), (0, 0));
+    assert_eq!(wait_shown(&pipeline), None);
+    assert!(retiring(&pipeline));
+    assert_eq!(kept_count(&pipeline), None);
+    assert!(pipeline.db.kept_archive_jobs().is_empty());
+    assert_eq!(pipeline.storage_capacity.waited_paths(), 0);
+    assert!(!pipeline.waits_for_disk_room());
+    assert!(pipeline.db.get_job_history(JOB.0).unwrap().is_none());
+    assert_eq!(completions(&mut events), 0);
+}
+
+// The thread of a pass over the kept archives fails and takes the archives
+// with it. Each is said to be let go, unwritten: the row shows no wait, the
+// count is back to none and the path is let go.
+#[tokio::test]
+async fn a_pass_whose_thread_fails_lets_its_archives_go() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let (_temp_dir, mut pipeline, mut events) = kept_job(&room, 1).await;
+    crate::persistence::connection::ARCHIVE_PASS_PANICS.store(true, Ordering::Relaxed);
+    hears(&mut pipeline, &room, StorageRoot::Complete, PLENTY);
+    writer_heard(&mut pipeline).await;
+    assert_eq!(archives_written(), 0);
+    assert_eq!(wait_shown(&pipeline), None);
+    assert!(retiring(&pipeline));
+    assert_eq!(kept_count(&pipeline), None);
+    assert!(pipeline.db.kept_archive_jobs().is_empty());
+    assert_eq!(pipeline.storage_capacity.waited_paths(), 0);
+    assert!(!pipeline.waits_for_disk_room());
+    assert_eq!(completions(&mut events), 0);
+}
+
+// At the drain the kept archives are tried once more, with no reading and
+// no wait. One refused again is named in the warning; one written is not.
+#[tokio::test]
+async fn the_drain_tries_kept_archives_once_and_names_those_still_kept() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let (_temp_dir, pipeline, _events) = kept_job(&room, 2).await;
+    pipeline.retry_kept_archives_at_drain();
+    pipeline.db.flush_write_queue().await.unwrap();
+    assert_eq!((archives_yet_to_refuse(), archives_written()), (0, 0));
+    assert_eq!(pipeline.warn_of_kept_archives(), [JOB]);
+
+    pipeline.retry_kept_archives_at_drain();
+    pipeline.db.flush_write_queue().await.unwrap();
+    assert_eq!(archives_written(), 1);
+    assert!(pipeline.warn_of_kept_archives().is_empty());
+    assert!(pipeline.db.get_job_history(JOB.0).unwrap().is_some());
+}
+
+// With more kept than one pass takes, the writer says more remain and the
+// pipeline queues the next pass from where the writer said: every archive
+// is tried on the one ring.
+#[tokio::test]
+async fn a_ring_runs_pass_after_pass_while_each_writes_one() {
+    use crate::persistence::ArchiveNews;
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let (_temp_dir, mut pipeline, mut events) = kept_job(&room, 1).await;
+    // Nothing waits past the pass: more is said only by the writer, and a
+    // pass asked for from past the end tries nothing and says nothing.
+    pipeline.archive_news(ArchiveNews::More { from: 1 });
+    writer_heard(&mut pipeline).await;
+    assert_eq!(archives_written(), 0);
+    assert_eq!(kept_count(&pipeline), Some(1));
+    // A pass asked for from the start writes the one kept.
+    pipeline.archive_news(ArchiveNews::More { from: 0 });
+    said_complete(&mut events).await;
+    writer_heard(&mut pipeline).await;
+    assert_eq!(archives_written(), 1);
+    assert_eq!(kept_count(&pipeline), None);
 }
 
 // An archive that fails for any other reason is lost, as before: nothing is
@@ -3708,18 +3944,18 @@ async fn an_archive_refused_for_another_reason_is_not_kept() {
         .unwrap()
         .push_back(crate::StateError::Database("the row is malformed".into()));
     drive(&mut pipeline, &scenario, JOB, |_| false).await;
-    pipeline.db.flush_write_queue().await.unwrap();
+    // All the writer said of the archive is heard: had it said the archive
+    // is kept, the wait, the path and the row's reason would show it.
+    writer_heard(&mut pipeline).await;
     assert_eq!((archives_yet_to_refuse(), archives_written()), (0, 0));
     assert!(pipeline.db.kept_archive_jobs().is_empty());
     hears(&mut pipeline, &room, StorageRoot::Complete, 4 * PLENTY);
-    pipeline.db.flush_write_queue().await.unwrap();
+    writer_heard(&mut pipeline).await;
     assert_eq!(archives_written(), 0);
-    assert!(pipeline.archive_wait.is_none());
+    assert_eq!(kept_count(&pipeline), None);
     assert_eq!(pipeline.storage_capacity.waited_paths(), 0);
     assert!(!pipeline.waits_for_disk_room());
-    assert!(!told_of_kept_archives(&mut pipeline));
-    let shown = pipeline.shared_state.get_job(JOB).expect("the row stays");
-    assert_eq!(shown.download_wait_reason, None);
+    assert_eq!(wait_shown(&pipeline), None);
     assert!(retiring(&pipeline));
     assert!(pipeline.db.get_job_history(JOB.0).unwrap().is_none());
     assert_eq!(completions(&mut events), 0);
@@ -3735,19 +3971,23 @@ async fn an_archive_written_the_first_time_holds_no_path() {
     let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
     let mut events = pipeline.event_tx.subscribe();
     drive(&mut pipeline, &scenario, JOB, |_| false).await;
-    loop {
-        let event = events.recv().await.expect("the job is said to be complete");
-        if matches!(event, PipelineEvent::JobCompleted { job_id } if job_id == JOB) {
-            break;
-        }
-    }
+    said_complete(&mut events).await;
     assert!(!in_queue(&pipeline), "the row left the queue");
-    assert!(!told_of_kept_archives(&mut pipeline));
-    assert!(pipeline.archive_wait.is_none());
+    // The archive committed, so all the writer said of it is out: nothing
+    // of it reaches the loop.
+    pipeline.db.flush_write_queue().await.unwrap();
+    while let Ok(reply) = pipeline.db_reply_rx.try_recv() {
+        assert!(
+            !matches!(reply, crate::pipeline::db_reply::DbReply::Archive(_)),
+            "a first write tells the loop nothing"
+        );
+        pipeline.handle_db_reply(reply).await;
+    }
+    assert_eq!(kept_count(&pipeline), None);
     assert!(pipeline.db.kept_archive_jobs().is_empty());
     assert_eq!(pipeline.storage_capacity.waited_paths(), 0);
     assert!(!pipeline.waits_for_disk_room());
     hears(&mut pipeline, &room, StorageRoot::Complete, 4 * PLENTY);
-    pipeline.db.flush_write_queue().await.unwrap();
+    writer_heard(&mut pipeline).await;
     assert_eq!(archives_written(), 1);
 }

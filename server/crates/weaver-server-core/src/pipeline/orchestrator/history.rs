@@ -299,34 +299,11 @@ impl Pipeline {
         let event_tx = self.event_tx.clone();
         let queue = self.shared_state.queue.clone();
         // An archive the database has no room for is kept by the writer and
-        // answers once room is made. The pipeline is told each time the
-        // count of kept archives changes while this one is out, and once
-        // more as this one answers, so it shows the wait, reads the
-        // database's folder while any is kept, and stops when none is.
-        let mut kept = self.db.kept_archive_count();
-        let replies = self.db_reply_tx.clone();
+        // answers here once room is made; the writer tells the pipeline of
+        // it, not this task.
         tokio::spawn(async move {
-            let mut archived = archived;
-            // The writer may have kept it before this task began to listen.
-            let mut told = *kept.borrow_and_update() > 0;
-            if told {
-                let _ = replies.send(crate::pipeline::db_reply::DbReply::KeptArchives);
-            }
-            let committed = loop {
-                tokio::select! {
-                    biased;
-                    committed = &mut archived => break committed,
-                    Ok(()) = kept.changed() => {
-                        told = true;
-                        let _ = replies.send(crate::pipeline::db_reply::DbReply::KeptArchives);
-                    }
-                }
-            };
-            if committed.is_err() {
+            if archived.await.is_err() {
                 tracing::error!(job_id = job_id.0, "history archive completion was lost");
-                if told {
-                    let _ = replies.send(crate::pipeline::db_reply::DbReply::KeptArchives);
-                }
                 return;
             }
             queue.write(|inner| {
@@ -347,9 +324,6 @@ impl Pipeline {
                 }
                 crate::pipeline::queue::Change::changed(())
             });
-            if told {
-                let _ = replies.send(crate::pipeline::db_reply::DbReply::KeptArchives);
-            }
         });
     }
 }
