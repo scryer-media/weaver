@@ -16,7 +16,6 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    future::Future,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -24,10 +23,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use tokio::{
-    runtime::Handle,
-    sync::{Notify, OwnedSemaphorePermit, Semaphore},
-};
+use tokio::{runtime::Handle, sync::Notify};
 
 use crate::core::constants::CHUNK_SIZE;
 
@@ -484,12 +480,6 @@ pub(crate) trait DiskJob: Send + 'static + Sized {
 /// Each key has a lane of its own, and the keys with jobs and no thread wait
 /// in turn, so queueing a job and taking a key's jobs cost the same however
 /// many jobs and keys are queued.
-///
-/// A queue made with [`DiskQueue::sharing`] counts its threads against a
-/// bound it shares with other disk work: a thread holds one permit of the
-/// bound while it runs a key's jobs, and between two batches it gives the
-/// permit to whoever waited longest for one, so neither a busy queue nor
-/// the work beside it starves the other.
 pub(crate) struct DiskQueue<J: DiskJob> {
     inner: Arc<QueueInner<J>>,
 }
@@ -506,8 +496,6 @@ struct QueueInner<J> {
     handle: Handle,
     jobs: Mutex<Jobs<J>>,
     threads: usize,
-    // The bound the queue's threads share with other disk work.
-    shared: Option<Arc<Semaphore>>,
     // Rung when the last thread finds the queue empty.
     idle: Notify,
     wakes: AtomicUsize,
@@ -613,17 +601,6 @@ impl<J> Jobs<J> {
 
 impl<J: DiskJob> DiskQueue<J> {
     pub(crate) fn new(handle: Handle, threads: usize) -> Self {
-        Self::with_bound(handle, threads, None)
-    }
-
-    /// A queue whose threads each hold a permit of `shared` while they run
-    /// jobs: with the other holders of its permits, never more at once than
-    /// it has.
-    pub(crate) fn sharing(handle: Handle, threads: usize, shared: Arc<Semaphore>) -> Self {
-        Self::with_bound(handle, threads, Some(shared))
-    }
-
-    fn with_bound(handle: Handle, threads: usize, shared: Option<Arc<Semaphore>>) -> Self {
         DiskQueue {
             inner: Arc::new(QueueInner {
                 handle,
@@ -635,7 +612,6 @@ impl<J: DiskJob> DiskQueue<J> {
                     busy: 0,
                 }),
                 threads: threads.max(1),
-                shared,
                 idle: Notify::new(),
                 wakes: AtomicUsize::new(0),
                 waiting: AtomicUsize::new(0),
@@ -701,13 +677,12 @@ impl<J: DiskJob> DiskQueue<J> {
 // Starts a thread, already counted as running.
 fn spawn_drain<J: DiskJob>(inner: &Arc<QueueInner<J>>) {
     inner.wakes.fetch_add(1, Ordering::Relaxed);
-    Drain {
+    let drain = Drain {
         inner: Some(inner.clone()),
         key: None,
         started: false,
-        permit: None,
-    }
-    .start(inner);
+    };
+    drop(inner.handle.spawn_blocking(move || drain.run()));
 }
 
 // A disk thread's turn.
@@ -727,70 +702,9 @@ struct Drain<J: DiskJob> {
     // The key this thread is on.
     key: Option<usize>,
     started: bool,
-    // The thread's permit of the bound the queue shares.
-    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl<J: DiskJob> Drain<J> {
-    // Runs the turn on a blocking thread: at once, or, when the queue
-    // shares a bound and no permit is free, once one is. The turn is
-    // counted as running while it waits, so one turn waits at most.
-    fn start(mut self, inner: &Arc<QueueInner<J>>) {
-        let handle = &inner.handle;
-        let Some(shared) = &inner.shared else {
-            drop(handle.spawn_blocking(move || self.run()));
-            return;
-        };
-        match Arc::clone(shared).try_acquire_owned() {
-            Ok(permit) => {
-                self.permit = Some(permit);
-                drop(handle.spawn_blocking(move || self.run()));
-            }
-            Err(_) => {
-                // The turn takes its place among those waiting for a permit
-                // here, not when its task first runs: the permits go to the
-                // waiters in the order they asked.
-                let mut permit = Box::pin(Arc::clone(shared).acquire_owned());
-                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-                match permit.as_mut().poll(&mut cx) {
-                    std::task::Poll::Ready(Ok(permit)) => {
-                        self.permit = Some(permit);
-                        drop(handle.spawn_blocking(move || self.run()));
-                    }
-                    std::task::Poll::Ready(Err(_)) => {}
-                    std::task::Poll::Pending => {
-                        let blocking = handle.clone();
-                        // A runtime that shuts down drops the turn where it
-                        // waits, which settles the queued jobs.
-                        drop(handle.spawn(async move {
-                            if let Ok(permit) = permit.await {
-                                self.permit = Some(permit);
-                                drop(blocking.spawn_blocking(move || self.run()));
-                            }
-                        }));
-                    }
-                }
-            }
-        }
-    }
-
-    // Between two batches the permit goes to whoever waited longest for
-    // one. False when someone took it: this thread lets go of its key and,
-    // when a key waits, the turn waits for a permit again.
-    fn keeps_permit(&mut self, inner: &Arc<QueueInner<J>>) -> bool {
-        let Some(shared) = &inner.shared else {
-            return true;
-        };
-        self.permit = None;
-        match Arc::clone(shared).try_acquire_owned() {
-            Ok(permit) => {
-                self.permit = Some(permit);
-                true
-            }
-            Err(_) => false,
-        }
-    }
-
     fn run(mut self) {
         let Some(inner) = self.inner.clone() else {
             return;
@@ -828,26 +742,6 @@ impl<J: DiskJob> Drain<J> {
             }
             J::run_batch(&mut batch);
             debug_assert!(batch.is_empty());
-            if !self.keeps_permit(&inner) {
-                let mut jobs = inner.jobs.lock();
-                if let Some(key) = self.key.take() {
-                    jobs.release(key);
-                }
-                if jobs.ready.is_empty() {
-                    self.inner = None;
-                    jobs.running -= 1;
-                    let idle = jobs.is_idle();
-                    drop(jobs);
-                    if idle {
-                        inner.idle.notify_waiters();
-                    }
-                } else {
-                    drop(jobs);
-                    self.started = false;
-                    self.start(&inner);
-                }
-                return;
-            }
         }
     }
 }
@@ -1331,94 +1225,6 @@ mod tests {
             );
             assert_eq!(queue.wakes(), wakes, "gate {gate}");
         }
-    }
-
-    // Two queues and work in place share a bound of one: a queue's thread
-    // starts only once the permit is free, a busy queue gives the permit up
-    // between batches to the one that waited, and nothing runs beside the
-    // permit's holder.
-    #[test]
-    fn queues_sharing_a_bound_never_run_more_at_once_than_it_has() {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .build()
-            .unwrap();
-        let shared = Arc::new(tokio::sync::Semaphore::new(1));
-        let writes = DiskQueue::sharing(rt.handle().clone(), 4, shared.clone());
-        let reads = DiskQueue::sharing(rt.handle().clone(), 4, shared.clone());
-        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let job = |key, name, entered, release| Gated {
-            key,
-            name,
-            log: log.clone(),
-            entered,
-            release,
-        };
-
-        // Work in place holds the permit: a queued job has a turn waiting,
-        // and does not run.
-        let held = shared.clone().try_acquire_owned().unwrap();
-        let (w_in, w_entered) = std::sync::mpsc::channel();
-        let (w_go, w_release) = std::sync::mpsc::channel();
-        writes.push(job(1, "w1", Some(w_in), Some(w_release)));
-        assert_eq!(writes.at_work(), (1, 1));
-        assert!(log.lock().is_empty());
-        drop(held);
-        w_entered.recv().unwrap();
-        assert_eq!(shared.available_permits(), 0);
-
-        // The write holds it: a read, and a second write of another key,
-        // wait, the read first.
-        let (r_in, r_entered) = std::sync::mpsc::channel();
-        let (r_go, r_release) = std::sync::mpsc::channel();
-        reads.push(job(7, "r1", Some(r_in), Some(r_release)));
-        assert_eq!(reads.at_work(), (1, 1));
-        writes.push(job(1, "w2", None, None));
-        writes.push(job(2, "w3", None, None));
-        w_go.send(()).unwrap();
-
-        // The writes' thread gives the permit up after its batch, with two
-        // more of its own waiting: the read runs before them.
-        r_entered.recv().unwrap();
-        assert_eq!(*log.lock(), ["w1:start", "w1:end", "r1:start"]);
-        r_go.send(()).unwrap();
-        rt.block_on(async {
-            reads.idle().await;
-            writes.idle().await;
-        });
-        let log = log.lock();
-        assert_eq!(log[..4], ["w1:start", "w1:end", "r1:start", "r1:end"]);
-        assert_eq!(log.len(), 8, "{log:?}");
-        assert_eq!(shared.available_permits(), 1);
-    }
-
-    // A turn that waits for a permit when the runtime shuts down is
-    // dropped, and its queued jobs settle.
-    #[test]
-    fn a_turn_dropped_waiting_for_a_permit_drops_the_queued_jobs() {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .build()
-            .unwrap();
-        let shared = Arc::new(tokio::sync::Semaphore::new(1));
-        let queue = DiskQueue::sharing(rt.handle().clone(), 1, shared.clone());
-        let _held = shared.clone().try_acquire_owned().unwrap();
-        let ran = Arc::new(AtomicUsize::new(0));
-        let dropped = Arc::new(AtomicUsize::new(0));
-        for key in [1, 2] {
-            queue.push(Recorded {
-                key,
-                ran: ran.clone(),
-                dropped: dropped.clone(),
-                done: false,
-            });
-        }
-        drop(rt);
-        assert_eq!(
-            (ran.load(Ordering::SeqCst), dropped.load(Ordering::SeqCst)),
-            (0, 2)
-        );
-        assert!(queue.inner.jobs.lock().is_idle());
     }
 
     // A runtime that shuts down before a started thread runs drops the
