@@ -243,6 +243,64 @@ func TestLaterMigrationsReadTheCheckedInManifest(t *testing.T) {
 	if !contains(later.Hooks, "move_nzbs_and_outlines_v85") {
 		t.Fatalf("later hooks = %v, want the NZB move", later.Hooks)
 	}
+	// Every Rust step a rewind replays has a reverse, so a new hook fails
+	// here and not in the restart stage.
+	entries, err := readMigrationManifest(testMigrationsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Version <= graphEngineMigration {
+			continue
+		}
+		for _, step := range entry.Steps {
+			if step.Kind != "rust" {
+				continue
+			}
+			if _, known := rustStepReverses[step.HookID]; !known {
+				t.Fatalf("migration %d: Rust hook %q has no reverse in rustStepReverses", entry.Version, step.HookID)
+			}
+			if !contains(later.Hooks, step.HookID) {
+				t.Fatalf("later hooks = %v, missing %q of migration %d", later.Hooks, step.HookID, entry.Version)
+			}
+		}
+	}
+}
+
+// The reverse of migration 92 passes a list of 50 servers and refuses one
+// past the limit before the rewind changes anything.
+func TestServerTrimReverseRefusesAListPastTheLimit(t *testing.T) {
+	t.Setenv(weaverDatastoreEnv, string(weaverDatastoreSQLite))
+	rewind := schemaRewind{Reverses: []string{"trim_servers_to_limit_v92"}, LedgerFrom: 92}
+	for _, count := range []int{serverLimitV92, serverLimitV92 + 1} {
+		dbPath := filepath.Join(t.TempDir(), "state.db")
+		setup := []string{
+			`CREATE TABLE _sqlx_migrations (version INTEGER PRIMARY KEY, success BOOLEAN NOT NULL)`,
+			`INSERT INTO _sqlx_migrations VALUES (91, 1), (92, 1)`,
+			`CREATE TABLE servers (id INTEGER PRIMARY KEY NOT NULL)`,
+			fmt.Sprintf(`WITH RECURSIVE n(id) AS (SELECT 1 UNION ALL SELECT id + 1 FROM n WHERE id < %d) INSERT INTO servers (id) SELECT id FROM n`, count),
+		}
+		if err := execAll(dbPath, setup); err != nil {
+			t.Fatal(err)
+		}
+		err := applySchemaRewind(dbPath, rewind, nil)
+		versions, readErr := migrationVersions(dbPath)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if count <= serverLimitV92 {
+			if err != nil || !reflect.DeepEqual(versions, map[int]bool{91: true}) {
+				t.Fatalf("%d servers: rewind = %v, ledger %v; want it rewound to 91", count, err, versions)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), "stores 51 servers") {
+			t.Fatalf("%d servers: rewind = %v, want it refused", count, err)
+		}
+		if !reflect.DeepEqual(versions, map[int]bool{91: true, 92: true}) {
+			t.Fatalf("%d servers: ledger %v, want it untouched", count, versions)
+		}
+	}
 }
 
 // The 0.16.5 rewind undoes what came after the graph-engine migration as the
@@ -337,6 +395,11 @@ var testRustSteps = map[string][]string{
 	"fill_history_search_keys_v88": {
 		`UPDATE job_history SET search_key = name`,
 	},
+	"seed_history_retention_v89": {
+		`INSERT INTO settings (key, value) SELECT 'history_retention_days', '0' WHERE EXISTS (SELECT 1 FROM job_history) ON CONFLICT(key) DO NOTHING`,
+	},
+	// The step deletes servers only past 50; these tests hold fewer.
+	"trim_servers_to_limit_v92": nil,
 }
 
 func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
@@ -386,12 +449,16 @@ func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
 	if err := execAll(dbPath, []string{
 		`CREATE TABLE _sqlx_migrations (version INTEGER PRIMARY KEY, success BOOLEAN NOT NULL)`,
 		`INSERT INTO _sqlx_migrations VALUES ` + strings.Join(ledger, ", "),
-		`CREATE TABLE active_jobs (job_id INTEGER PRIMARY KEY, nzb_zstd BLOB)`,
-		`CREATE TABLE job_history (job_id INTEGER PRIMARY KEY, name TEXT, status TEXT, category TEXT, total_bytes INTEGER, health INTEGER, completed_at INTEGER, nzb_zstd BLOB)`,
+		`CREATE TABLE active_jobs (job_id INTEGER PRIMARY KEY, output_dir TEXT, metadata TEXT, password TEXT, password_candidates TEXT, nzb_zstd BLOB)`,
+		`CREATE TABLE job_history (job_id INTEGER PRIMARY KEY, name TEXT, status TEXT, category TEXT, total_bytes INTEGER, health INTEGER, completed_at INTEGER, output_dir TEXT, metadata TEXT, nzb_zstd BLOB)`,
+		`CREATE TABLE async_operation_targets (operation_id INTEGER, job_id INTEGER)`,
+		`CREATE TABLE settings (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)`,
+		`CREATE TABLE servers (id INTEGER PRIMARY KEY NOT NULL)`,
+		`INSERT INTO servers (id) VALUES (1), (2)`,
 		`CREATE TABLE graph_members (job_id INTEGER, member_id INTEGER)`,
 		`CREATE TABLE graph_envelopes (job_id INTEGER, node_id INTEGER)`,
 		`CREATE TABLE graph_holds (job_id INTEGER)`,
-		`INSERT INTO active_jobs VALUES (7, x'0107'), (8, NULL)`,
+		`INSERT INTO active_jobs (job_id, nzb_zstd) VALUES (7, x'0107'), (8, NULL)`,
 		`INSERT INTO job_history (job_id, name, status, nzb_zstd) VALUES (3, 'done', 'complete', x'0203')`,
 	}); err != nil {
 		t.Fatal(err)
@@ -429,6 +496,13 @@ func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
 		if indexes != 0 {
 			t.Fatalf("rewound database keeps %d history indexes", indexes)
 		}
+		var seeded int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM settings WHERE key = 'history_retention_days'`).Scan(&seeded); err != nil {
+			return err
+		}
+		if seeded != 0 {
+			t.Fatalf("rewound database keeps the retention migration 89 seeded")
+		}
 		return nil
 	})
 	if err != nil {
@@ -439,6 +513,19 @@ func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
 	}
 	if got := storedNZBs(t, dbPath, `SELECT job_id, hex(nzb_zstd) AS nzb FROM job_nzbs`); got != "3=0203 7=0107" {
 		t.Fatalf("job_nzbs after the second upgrade = %s", got)
+	}
+	err = withStateDB(dbPath, func(db *stateConn) error {
+		var retention string
+		if err := db.QueryRow(`SELECT value FROM settings WHERE key = 'history_retention_days'`).Scan(&retention); err != nil {
+			return fmt.Errorf("retention after the second upgrade: %w", err)
+		}
+		if retention != "0" {
+			t.Fatalf("retention after the second upgrade = %q, want 0 (history has rows)", retention)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 	versions, err := migrationVersions(dbPath)
 	if err != nil || !reflect.DeepEqual(versions, map[int]bool{73: true}) {

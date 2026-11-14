@@ -95,6 +95,26 @@ func TestFilesystemGateRequiredInFull(t *testing.T) {
 	}
 }
 
+// The filesystem gate, and only it, starts once the Product Behavior Gate
+// has ended; a run with no gate does not hold it back.
+func TestFilesystemGateStartsAfterTheProductGate(t *testing.T) {
+	for _, def := range fullPhaseDefinitions {
+		phase := &fullPhaseContext{Command: def.command}
+		if got, want := fullPhaseWaitsForGate(phase), def.command == "filesystem"; got != want {
+			t.Fatalf("%s waits for the gate = %t, want %t", def.name, got, want)
+		}
+	}
+	gate := newFullGateDone([]*fullPhaseContext{{Command: "release-gate"}, {Command: "filesystem"}})
+	select {
+	case <-gate.done:
+		t.Fatal("the gate is still running, yet its end was signalled")
+	default:
+	}
+	gate.pending.Done()
+	<-gate.done
+	<-newFullGateDone([]*fullPhaseContext{{Command: "filesystem"}}).done
+}
+
 func TestFilesystemGateResultAndCleanup(t *testing.T) {
 	for _, scenario := range []string{"pass", "failed-tests", "still-running", "build", "create", "start", "logs", "inspect", "cancel", "cleanup", "foreign-owner"} {
 		t.Run(scenario, func(t *testing.T) {
