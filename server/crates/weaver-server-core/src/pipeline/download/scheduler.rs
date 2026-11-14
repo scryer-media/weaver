@@ -173,6 +173,19 @@ enum ShareTaken {
     Saturated(SaturationWake),
     // Nothing for this server, refused by these clauses.
     Blocked(BlockedBy),
+    // The job's volume is at its soft line and the lane already holds an
+    // article of the job: the lane's room goes to the jobs after it first,
+    // and the job is asked again only when none of them had work.
+    Later,
+}
+
+// Whether a job at its volume's soft line may pass its turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Turn {
+    // On the walk: a lane that holds one of the job passes it by.
+    MayPass,
+    // After the walk found nothing else: the job answers.
+    Last,
 }
 
 // Which class of handout a counter should record.
@@ -232,31 +245,57 @@ impl Pipeline {
             return Handout::Idle;
         };
 
-        match self.take_lane_share(*hot_job, server_idx, want, lane, pressure) {
+        // A job whose volume is at its soft line is held to one article
+        // on a lane at a time. That limits the job, not the lane: a lane
+        // that already holds its one passes the job by, so the rest of its
+        // room goes to the jobs after it, on volumes that are open. Such a
+        // job is come back to, in the walk's order, when no other job had
+        // work for the lane, and answers then as it always did.
+        let mut passed: Vec<JobId> = Vec::new();
+        match self.take_lane_share(*hot_job, server_idx, want, lane, pressure, Turn::MayPass) {
             ShareTaken::Works(works) => return self.record_handout(HandoutKind::Hot, works),
             ShareTaken::Saturated(wake) => return Handout::Saturated(wake),
             ShareTaken::Blocked(blocked) => self.note_hot_blocked(blocked),
+            ShareTaken::Later => passed.push(*hot_job),
         }
 
         if let Some(in_flight) = spill_in_flight
             && spill_candidates.contains(&in_flight)
         {
-            match self.take_lane_share(in_flight, server_idx, want, lane, pressure) {
+            match self.take_lane_share(in_flight, server_idx, want, lane, pressure, Turn::MayPass)
+            {
                 ShareTaken::Works(works) => {
                     return self.record_handout(HandoutKind::Spill, works);
                 }
                 ShareTaken::Saturated(wake) => return Handout::Saturated(wake),
-                ShareTaken::Blocked(_) => {}
+                ShareTaken::Blocked(_) | ShareTaken::Later => {}
             }
         }
 
         for job_id in spill_candidates {
-            match self.take_lane_share(*job_id, server_idx, want, lane, pressure) {
+            match self.take_lane_share(*job_id, server_idx, want, lane, pressure, Turn::MayPass) {
                 ShareTaken::Works(works) => {
                     return self.record_handout(HandoutKind::Spill, works);
                 }
                 ShareTaken::Saturated(wake) => return Handout::Saturated(wake),
                 ShareTaken::Blocked(_) => {}
+                ShareTaken::Later => passed.push(*job_id),
+            }
+        }
+
+        for job_id in passed {
+            let kind = if job_id == *hot_job {
+                HandoutKind::Hot
+            } else {
+                HandoutKind::Spill
+            };
+            match self.take_lane_share(job_id, server_idx, want, lane, pressure, Turn::Last) {
+                ShareTaken::Works(works) => return self.record_handout(kind, works),
+                ShareTaken::Saturated(wake) => return Handout::Saturated(wake),
+                ShareTaken::Blocked(blocked) if kind == HandoutKind::Hot => {
+                    self.note_hot_blocked(blocked);
+                }
+                ShareTaken::Blocked(_) | ShareTaken::Later => {}
             }
         }
 
@@ -356,15 +395,27 @@ impl Pipeline {
         want: usize,
         lane: Option<LaneShare>,
         pressure: DownloadPressure,
+        turn: Turn,
     ) -> ShareTaken {
         if let Err(blocked) = self.job_articles_built(job_id) {
             return ShareTaken::Blocked(blocked);
         }
         // From a volume's soft limit the lanes fetching for its jobs ask
-        // for one article at a time, as every lane does under soft
+        // for one article of them at a time, as every lane does under soft
         // pressure. At its hard limit the job's queue answers for it.
         let want = match self.volume_intake(job_id) {
-            crate::pipeline::download::volume_pace::VolumeIntake::OneAtATime => want.min(1),
+            crate::pipeline::download::volume_pace::VolumeIntake::OneAtATime => {
+                // A lane that holds its one already has room for other
+                // jobs: this one waits for the walk to try them.
+                if turn == Turn::MayPass
+                    && lane.is_some_and(|lane| {
+                        self.download_lane_holdings_of_job(lane.lane_id, job_id) > 0
+                    })
+                {
+                    return ShareTaken::Later;
+                }
+                want.min(1)
+            }
             _ => want,
         };
         let Some(lane) = lane else {

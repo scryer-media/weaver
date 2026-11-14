@@ -1147,8 +1147,41 @@ async fn a_volume_shares_the_buffer_pool_only_while_a_job_writes_to_it() {
     retire_pipeline_database(pipeline).await;
 }
 
+// One lane asks for work, and holds what it is handed as a dispatch books
+// it. The job of each article handed.
+fn lane_asks(pipeline: &mut Pipeline, lane_id: u64) -> Vec<JobId> {
+    use crate::pipeline::download::scheduler::{Handout, LaneShare};
+    let pressure = pipeline.refresh_download_pressure();
+    let lane_mode = pipeline.download_lane_mode_for_server(0, pressure, true);
+    let want = pipeline.download_refill_want(lane_mode);
+    assert!(want > 1, "{want}");
+    // A pipe as deep as one ask.
+    let lane = LaneShare {
+        lane_id,
+        depth: want,
+    };
+    let spill = pipeline.spill_job_in_flight_on(0);
+    let works = match pipeline.next_works_for_lane(0, want, Some(lane), spill, pressure) {
+        Handout::Works(works) => works,
+        Handout::Idle => panic!("the lane is handed work, and was told there is none"),
+        Handout::Yield(_) => panic!("the lane is handed work, and was told to yield"),
+        Handout::Saturated(wake) => panic!("the lane is handed work, and was held: {wake:?}"),
+    };
+    let jobs = works
+        .iter()
+        .map(|work| work.segment_id.file_id.job_id)
+        .collect();
+    let lease = pipeline
+        .lease_for_handout(lane_id, 0, lane_mode, pressure, works)
+        .expect("the handout is leased");
+    pipeline.activate_download_batch_lease(&lease, &Pipeline::activation_items(&lease), true);
+    jobs
+}
+
 // From a volume's soft limit a lane fetching for its job is handed one
 // article at a time, and a full handout again once the volume is below it.
+// A lane that holds its one and asks again, with no other job to hand from,
+// is handed one more: the job is not passed by for nobody.
 #[tokio::test]
 async fn a_volume_at_its_soft_limit_cuts_a_lanes_ask_to_one_article() {
     use crate::pipeline::download::volume_pace::VolumeIntake;
@@ -1171,12 +1204,98 @@ async fn a_volume_at_its_soft_limit_cuts_a_lanes_ask_to_one_article() {
     assert_eq!(pipeline.volume_intake(job_id), VolumeIntake::OneAtATime);
     let lease = pipeline.lease_for_server_for_test(0).unwrap();
     assert_eq!(lease.works.len(), 1);
+    let lane_id = Pipeline::next_download_lane_id();
+    assert_eq!(lane_asks(&mut pipeline, lane_id), [job_id]);
+    assert_eq!(lane_asks(&mut pipeline, lane_id), [job_id]);
+    assert_eq!(pipeline.download_lane_holdings_of_job(lane_id, job_id), 2);
 
     volume.arrived_bytes.store(soft - 1, Ordering::SeqCst);
     assert_eq!(pipeline.volume_intake(job_id), VolumeIntake::Open);
     let lease = pipeline.lease_for_server_for_test(0).unwrap();
     assert!(lease.works.len() > 1, "{}", lease.works.len());
     volume.arrived_bytes.store(0, Ordering::SeqCst);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A volume's soft line holds its own job to one article on a lane, not the
+// lane: the lane's remaining room goes to the next job, on a volume that is
+// open. The lane is handed one article of the job at the soft line; asked
+// again while it holds that one, it is handed the other job's.
+#[tokio::test]
+async fn a_volume_at_its_soft_limit_leaves_the_lanes_room_to_jobs_on_other_volumes() {
+    use crate::pipeline::download::volume_pace::VolumeIntake;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (intermediate, complete, movies) = (
+        temp_dir.path().join("intermediate"),
+        temp_dir.path().join("complete"),
+        temp_dir.path().join("movies"),
+    );
+    crate::runtime::fs::test_devices::assign(&intermediate, 1);
+    crate::runtime::fs::test_devices::assign(&complete, 2);
+    crate::runtime::fs::test_devices::assign(&movies, 3);
+    let (mut pipeline, _, _) = crate::pipeline::tests::new_direct_pipeline_at_roots(
+        temp_dir.path().join("data"),
+        intermediate,
+        complete,
+        temp_dir.path().join("weaver.db"),
+        16 * 1024 * 1024,
+        8,
+        None,
+    )
+    .await;
+    pipeline.config.write().await.categories = vec![crate::categories::CategoryConfig {
+        id: 0,
+        name: "movies".to_string(),
+        dest_dir: Some(movies.display().to_string()),
+        aliases: String::new(),
+    }];
+    let (slow_job, other_job) = (JobId(92_424), JobId(92_425));
+    let posts = [Post::plain("lantern.bin", payload(8 * ARTICLE, 1))];
+    let mut slow_spec = spec("lantern slow", &posts, ARTICLE);
+    slow_spec.category = Some("movies".to_string());
+    for (job_id, spec) in [
+        (slow_job, slow_spec),
+        (other_job, spec("lantern other", &posts, ARTICLE)),
+    ] {
+        let nzb_zstd = crate::pipeline::tests::nzb_zstd_for(&spec);
+        pipeline
+            .add_job(
+                job_id,
+                spec,
+                PathBuf::from("lantern.nzb"),
+                nzb_zstd,
+                crate::jobs::AddJobOptions::default(),
+            )
+            .await
+            .unwrap();
+        crate::pipeline::tests::activate_job(&mut pipeline, job_id).await;
+    }
+    // The first job in the queue is the one whose own volume is slow.
+    assert_eq!(pipeline.download_scheduler_eligible_jobs(), [slow_job, other_job]);
+    let staging_dir = crate::pipeline::queue::staging_dir_for(&movies, slow_job);
+    let disk = pipeline.graph_jobs[&slow_job].disk().unwrap().clone();
+    let slow = Arc::clone(disk.under(&staging_dir).volume());
+    let shared = Arc::clone(disk.working().volume());
+    assert!(!Arc::ptr_eq(&slow, &shared));
+    let (soft, _) = slow.buffer_limits();
+    slow.arrived_bytes.store(soft, Ordering::SeqCst);
+    assert_eq!(pipeline.volume_intake(slow_job), VolumeIntake::OneAtATime);
+    assert_eq!(pipeline.volume_intake(other_job), VolumeIntake::Open);
+
+    let lane_id = Pipeline::next_download_lane_id();
+    // Holding nothing, the lane is handed one article of the first job.
+    assert_eq!(lane_asks(&mut pipeline, lane_id), [slow_job]);
+    assert_eq!(pipeline.download_lane_holdings_of_job(lane_id, slow_job), 1);
+    // Holding that one, its room goes to the job on the open volume.
+    let rest = lane_asks(&mut pipeline, lane_id);
+    assert!(rest.len() > 1, "{rest:?}");
+    assert!(rest.iter().all(|job_id| *job_id == other_job), "{rest:?}");
+    assert_eq!(pipeline.download_lane_holdings_of_job(lane_id, slow_job), 1);
+    // A lane that holds none of the first job is handed its one.
+    let second = Pipeline::next_download_lane_id();
+    assert_eq!(lane_asks(&mut pipeline, second), [slow_job]);
+
+    slow.arrived_bytes.store(0, Ordering::SeqCst);
     retire_pipeline_database(pipeline).await;
 }
 
