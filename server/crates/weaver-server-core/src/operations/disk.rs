@@ -1585,6 +1585,8 @@ struct HeldPath {
     free: Option<u64>,
     good: bool,
     prior: Option<(u64, u64)>,
+    // The device the path lay on at its latest probe that could read it.
+    device: Option<u64>,
 }
 
 impl HeldPath {
@@ -1656,9 +1658,20 @@ impl HeldPaths {
             })
             .collect();
         for path in paths {
-            let free = probe(&path).ok().map(|space| space.available_bytes);
+            // A path removed while a job waits on it, as a destination
+            // folder its user deleted to make room, is read at the nearest
+            // folder above it that answers: the disk it will be made on
+            // again.
+            let free = probe(&path)
+                .ok()
+                .or_else(|| path.ancestors().skip(1).find_map(|at| probe(at).ok()))
+                .map(|space| space.available_bytes);
+            let device = nearest_device(&path);
             let mut list = self.lock();
             if let Some(held) = list.iter_mut().find(|held| held.path == path) {
+                if device.is_some() {
+                    held.device = device;
+                }
                 held.prior = held.free.map(|figure| (held.published, figure));
                 held.published = held.begun;
                 held.good = free.is_some();
@@ -2297,6 +2310,7 @@ impl StorageCapacity {
                         free: None,
                         good: false,
                         prior: None,
+                        device: None,
                     });
                     self.held.listed.store(list.len(), Ordering::Release);
                     list.len() - 1
@@ -2308,6 +2322,20 @@ impl StorageCapacity {
         };
         self.slot(StorageRoot::Complete).request_refresh();
         look
+    }
+
+    // The device a held path lay on at its latest probe, and the device a
+    // root's directory lay on at its latest look: what is held already,
+    // with no look started. `None` until one could read it.
+    pub(crate) fn held_path_device(&self, path: &Path) -> Option<u64> {
+        let list = self.held.lock();
+        list.iter()
+            .find(|held| held.path == path)
+            .and_then(|held| held.device)
+    }
+
+    pub(crate) fn root_slot_device(&self, root: StorageRoot) -> Option<u64> {
+        self.slot(root).lock().device.flatten()
     }
 
     // What a held path shows now, as `look` tells of a root.
@@ -3405,6 +3433,23 @@ mod tests {
             "shared, not repeated"
         );
         drop(release);
+    }
+
+    // A path a job waits on that cannot be read, as a destination folder
+    // its user removed to make room, shows what the nearest folder above it
+    // that answers shows: the wait is not stuck on a folder that is gone.
+    #[test]
+    fn a_held_path_that_is_gone_is_read_at_the_nearest_folder_above_it() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let probe = counting_probe(calls);
+        let storage = StorageCapacity::with_probe(roots(), NEVER, Arc::clone(&probe));
+        let gone = Path::new("/folders/tv/unmounted");
+        storage.hold_path(gone);
+        let ledger = Arc::clone(&storage.slot(StorageRoot::Complete).ledger);
+        storage.held.sample(&*probe, &ledger);
+        let look = storage.path_look(gone).expect("the path is held");
+        assert!(look.good, "the folder above answered");
+        assert_eq!(look.shown, Some("/folders/tv".len() as u64));
     }
 
     // The paths held are bounded: past the cap, a new path drops the one
