@@ -45,7 +45,9 @@ use weaver_server_core::tags::{TagSnapshot, split_tags};
 use weaver_server_core::torrents::metrics::{Published, SessionSeries};
 use weaver_server_core::torrents::model::{file_priority_number, file_priority_of};
 use weaver_server_core::torrents::service::fingerprint::ViewParts;
-use weaver_server_core::torrents::service::listing::{CategoryPick, FileTotals, Pick, Shown};
+use weaver_server_core::torrents::service::listing::{
+    CategoryPick, FileTotals, Pick, Shown, Window,
+};
 use weaver_server_core::torrents::service::{
     ActionError, AddError, AddRequest, Placement, TorrentService, TorrentSettings, TorrentView,
 };
@@ -262,23 +264,23 @@ impl TorrentFacadeContext {
         let Some(torrents) = &self.inner.torrents else {
             return Vec::new();
         };
-        torrents.picked(pick, |kept| 0..kept, Shown::WHOLE).await
+        torrents.picked(pick, Window::Every, Shown::WHOLE).await
     }
 
-    // The torrents `pick` keeps at the places `page` gives, as a list's rows
-    // read them: with their trackers and tags, and their files' totals in
-    // place of their files unless `files` asks for those too.
+    // The torrents `pick` keeps at `window`'s places, as a list's rows read
+    // them: with their trackers and tags, and their files' totals in place
+    // of their files unless `files` asks for those too.
     async fn rows(
         &self,
         pick: Pick<'_>,
-        page: impl FnOnce(usize) -> std::ops::Range<usize>,
+        window: Window,
         files: bool,
     ) -> Vec<(TorrentView, FileTotals)> {
         let Some(torrents) = &self.inner.torrents else {
             return Vec::new();
         };
         let shown = if files { Shown::WHOLE } else { Shown::LISTED };
-        torrents.picked_rows(pick, page, shown).await
+        torrents.picked_rows(pick, window, shown).await
     }
 
     // Every torrent `pick` keeps, its own fields alone: no files, trackers
@@ -297,7 +299,7 @@ impl TorrentFacadeContext {
         let Some(torrents) = &self.inner.torrents else {
             return Vec::new();
         };
-        torrents.picked(pick, |kept| 0..kept, Shown::BARE).await
+        torrents.picked(pick, Window::Every, Shown::BARE).await
     }
 
     async fn resolve(&self, key: &str) -> Result<CallerScope, StatusCode> {
@@ -1783,16 +1785,12 @@ async fn torrents_info(
         private,
     };
     // A row's files are read only when the answer lists them.
-    let rows = if ask.paged_first() {
-        ctx.rows(
-            pick,
-            |size| info_page(ask.limit, ask.offset, size).unwrap_or(0..size),
-            ask.with_files,
-        )
-        .await
+    let window = if ask.paged_first() {
+        info_window(ask.limit, ask.offset)
     } else {
-        ctx.rows(pick, |kept| 0..kept, ask.with_files).await
+        Window::Every
     };
+    let rows = ctx.rows(pick, window, ask.with_files).await;
     info_list(rows, &ask, scope, ctx.api())
 }
 
@@ -1912,6 +1910,25 @@ fn info_list(
 // The rows of `size` a `torrents/info` page of `limit` after `offset`
 // keeps; `None` keeps them all. A negative offset counts back from the
 // end; a limit of 0 or less is none.
+// The places `info_page` takes, as a window the table can read without a
+// count: only an offset from the end needs how many torrents there are.
+fn info_window(limit: i64, offset: i64) -> Window {
+    if offset < 0 {
+        return Window::Counted(Box::new(move |size| {
+            info_page(limit, offset, size).unwrap_or(0..size)
+        }));
+    }
+    match (usize::try_from(offset), usize::try_from(limit)) {
+        (Ok(0), _) if limit <= 0 => Window::Every,
+        (Ok(offset), Ok(first)) if first > 0 => Window::Page { offset, first },
+        (Ok(offset), _) => Window::Page {
+            offset,
+            first: usize::MAX,
+        },
+        (Err(_), _) => Window::Every,
+    }
+}
+
 fn info_page(limit: i64, mut offset: i64, size: usize) -> Option<std::ops::Range<usize>> {
     let size = i64::try_from(size).unwrap_or(i64::MAX);
     if offset < 0 {
@@ -3634,7 +3651,7 @@ async fn maindata(
         .and_then(|rid| rid.trim().parse::<u64>().ok())
         .unwrap_or(0);
     // Each row reads its files' totals alone, not its files.
-    let rows = ctx.rows(Pick::default(), |kept| 0..kept, false).await;
+    let rows = ctx.rows(Pick::default(), Window::Every, false).await;
     let tags = match tag_snapshot(ctx).await {
         Ok(tags) => tags.made().to_vec(),
         Err(error) => return internal(error),

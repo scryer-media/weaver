@@ -41,7 +41,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 119;
+const CURRENT_SCHEMA_VERSION: i64 = 120;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -1488,7 +1488,7 @@ mod tests {
         run_embedded_migrations_on_path_blocking(&db_path).unwrap();
 
         let pool = open_test_pool(&db_path).await;
-        assert_eq!(CURRENT_SCHEMA_VERSION, 119);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 120);
         assert_eq!(
             max_recorded_migration_version(&pool).await.unwrap(),
             Some(CURRENT_SCHEMA_VERSION)
@@ -2007,6 +2007,92 @@ mod tests {
             .unwrap();
         assert_eq!(hosts, ["tracker.invalid", "xn--bcher-kva.invalid"]);
         pool.close().await;
+    }
+
+    // Migration 120 lets a torrent list read its page in the order the
+    // torrents were added: the existing torrents stay, the two ordered
+    // indexes exist, the category-only index they cover is gone, and a page
+    // of every torrent or of one category walks an index instead of sorting.
+    #[tokio::test]
+    async fn sqlite_migration_120_orders_the_torrent_list_by_an_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("pre-list-order.db");
+        let pool = open_test_pool(&db_path).await;
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(119), true)
+            .await
+            .unwrap();
+        for (job_id, category) in [(7_i64, Some(3_i64)), (8, None), (9, Some(3))] {
+            sqlx::query(
+                "INSERT INTO torrents (job_id, infohash_v1, name, source, added_at_ms, state, category_id)
+                 VALUES (?, ?, 'order', 'magnet', ?, 'queued', ?)",
+            )
+            .bind(job_id)
+            .bind(vec![job_id as u8; 20])
+            .bind(100 - job_id)
+            .bind(category)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'index' AND tbl_name = 'torrents' AND name LIKE 'idx_torrents_%'
+             ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            indexes,
+            ["idx_torrents_added", "idx_torrents_category_added"]
+        );
+        let page: Vec<i64> = sqlx::query_scalar(
+            "SELECT job_id FROM torrents ORDER BY added_at_ms, job_id LIMIT 10 OFFSET 0",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(page, [9, 8, 7]);
+        for (query, index) in [
+            (
+                "SELECT job_id FROM torrents ORDER BY added_at_ms, job_id LIMIT 10 OFFSET 0",
+                "idx_torrents_added",
+            ),
+            (
+                "SELECT job_id FROM torrents WHERE category_id IN (3)
+                 ORDER BY added_at_ms, job_id LIMIT 10 OFFSET 0",
+                "idx_torrents_category_added",
+            ),
+        ] {
+            let plan = explain(&pool, query).await;
+            assert!(
+                plan.iter().any(|step| step.contains(index)),
+                "{query}: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+                "{query}: {plan:?}"
+            );
+        }
+        pool.close().await;
+    }
+
+    async fn explain(pool: &sqlx::SqlitePool, query: &str) -> Vec<String> {
+        use sqlx::Row;
+        sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {query}")))
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect()
     }
 
     // Migration 106 gives each torrent its own upload and download limits: a

@@ -15,8 +15,8 @@ use crate::jobs::types::decode_offset_cursor;
 
 /// The torrents a `torrents` page holds when `first` is not given.
 pub const DEFAULT_TORRENT_PAGE: usize = 100;
-/// The most torrents a `torrents` page holds.
-pub const MAX_TORRENT_PAGE: usize = 500;
+/// The most torrents a `torrents` page holds: the most a queue page holds.
+pub const MAX_TORRENT_PAGE: usize = crate::jobs::paging::MAX_QUEUE_PAGE_SIZE;
 
 #[derive(Default)]
 pub struct TorrentsQuery;
