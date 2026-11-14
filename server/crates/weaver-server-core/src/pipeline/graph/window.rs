@@ -423,6 +423,11 @@ impl Windows {
         })
     }
 
+    // The free space every folder's disk keeps past any window.
+    pub(crate) fn kept_free(&self) -> u64 {
+        self.accountant.budgets().disk_reserve
+    }
+
     // The windows lent now, and their bytes.
     pub(crate) fn live(&self) -> (u64, u64) {
         let lent = self.lock();

@@ -766,9 +766,8 @@ impl Runs {
         // run in RAM is lent nothing, so the scratch cannot refuse it again,
         // and what its decoder refuses from there is weighed as any run's
         // refusal is. Only what its lender heard under this start counts.
-        // Where the policy lets nothing go above the ceiling, the scratch's
-        // refusal stands, with the sizes, as a decoder's refusal over the
-        // ceiling does.
+        // Where the policy lets nothing go above the ceiling, the job waits
+        // for the room the window takes (`window_needs`).
         let refused = self
             .windows
             .as_ref()
@@ -835,6 +834,22 @@ impl Runs {
             .filter(|run| run.lends && grant.over_limit == OverLimit::ScratchThenFail)?;
         let (windows, start) = self.windows.as_ref().zip(run.lent)?;
         windows.refused(node, start).map(|_| grant.held())
+    }
+
+    // What the disk has to show free for the window the scratch refused the
+    // node's run for want of room, under a policy that holds runs to the
+    // ceiling: the widest window the run asked for and the free space the
+    // disk keeps. The job waits for that room; it is not failed.
+    pub(crate) fn window_needs(&self, node: NodeId) -> Option<u64> {
+        let grant = self.hardware.grant();
+        let run = self
+            .runs
+            .get(&node)
+            .filter(|run| run.lends && grant.over_limit == OverLimit::ScratchThenFail)?;
+        let (windows, start) = self.windows.as_ref().zip(run.lent)?;
+        windows
+            .refused(node, start)
+            .map(|widest| widest.saturating_add(windows.kept_free()))
     }
 
     // Whether a refusal stands in the job only because the policy holds runs
