@@ -1426,6 +1426,7 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
         completed_at: 1_700_000_100,
         metadata: Some(metadata),
         server_attribution: None,
+        archived_at: None,
     })
     .unwrap();
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
@@ -1448,6 +1449,7 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
         completed_at: 1_700_000_200,
         metadata: None,
         server_attribution: None,
+        archived_at: None,
     })
     .unwrap();
     let app = nzbget_test_router(
@@ -1521,6 +1523,7 @@ async fn nzbget_history_reports_the_folder_named_after_the_original_title() {
         completed_at: 1_700_000_100,
         metadata: Some(serde_json::to_string(&metadata).unwrap()),
         server_attribution: None,
+        archived_at: None,
     })
     .unwrap();
     let app = nzbget_test_router(
@@ -3019,6 +3022,48 @@ async fn nzbget_log_and_loadlog_expose_job_events() {
 }
 
 #[tokio::test]
+async fn nzbget_log_returns_at_most_its_cap_newest_entries() {
+    let db = Database::open_in_memory().unwrap();
+    let events: Vec<weaver_server_core::history::timeline::JobEvent> = (0..1_005)
+        .map(|n| weaver_server_core::JobEvent {
+            job_id: 42,
+            timestamp: 1_700_000_000 + n,
+            kind: "JobCreated".into(),
+            message: format!("event {n}"),
+            file_id: None,
+        })
+        .collect();
+    db.insert_job_events(&events).unwrap();
+    let job = nzbget_test_job(
+        42,
+        JobStatus::Downloading,
+        weaver_server_core::DownloadState::Downloading,
+        100,
+        10,
+        vec![],
+    );
+    let handle = scheduler_handle_with_jobs(vec![job]).await;
+    let app = nzbget_test_router(db, handle, test_config(), ApiKeyCache::default());
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({"method": "log", "params": [0, 5_000], "id": "log"}),
+        "Bearer session-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = payload["result"].as_array().unwrap();
+    assert_eq!(entries.len(), 1000);
+    assert!(entries[0]["Text"].as_str().unwrap().ends_with("event 5"));
+    assert!(
+        entries[999]["Text"]
+            .as_str()
+            .unwrap()
+            .ends_with("event 1004")
+    );
+}
+
+#[tokio::test]
 async fn nzbget_appendurl_validates_url_and_shape() {
     let db = Database::open_in_memory().unwrap();
     let handle = scheduler_handle_with_jobs(vec![]).await;
@@ -4332,6 +4377,7 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
                 .unwrap(),
             ),
             server_attribution: None,
+            archived_at: None,
         },
     )
     .unwrap();
@@ -4407,6 +4453,7 @@ async fn job_output_file_download_handler_streams_history_file() {
         completed_at: 1_700_000_100,
         metadata: None,
         server_attribution: None,
+        archived_at: None,
     })
     .unwrap();
     let app = job_nzb_test_router(db, handle.handle.clone());
@@ -5768,4 +5815,87 @@ async fn nzbget_lists_every_group_and_the_files_of_a_job_past_the_queue_window()
     let diagnostics = handle.pipeline_diagnostics().await.unwrap();
     assert_eq!(diagnostics.jobs.len(), WINDOW);
     assert!(diagnostics.jobs.iter().all(|job| job.job_id != QUEUED));
+}
+
+// A job's archive password reaches no NZBGet answer: not a queued job's
+// password or its unpack-password parameter in `listgroups`, and not a
+// finished job's sealed password or parameter in `history`.
+#[tokio::test]
+async fn nzbget_listgroups_and_history_never_carry_a_job_password() {
+    let mut job = nzbget_test_job(
+        43,
+        JobStatus::Queued,
+        weaver_server_core::DownloadState::Queued,
+        1_000,
+        0,
+        vec![
+            ("*Unpack:Password".into(), "hunter2-queued".into()),
+            ("source".into(), "api".into()),
+        ],
+    );
+    job.password = Some("hunter2-job".into());
+    let db = Database::open_in_memory().unwrap();
+    let metadata = serde_json::to_string(&vec![
+        (
+            weaver_server_core::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY
+                .to_string(),
+            "sealed-secret".to_string(),
+        ),
+        (
+            "*Unpack:Password".to_string(),
+            "hunter2-history".to_string(),
+        ),
+    ])
+    .unwrap();
+    db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        job_id: 44,
+        job_hash: None,
+        name: "Locked.Release".into(),
+        status: "complete".into(),
+        error_message: None,
+        total_bytes: 123,
+        downloaded_bytes: 123,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: Some("tv".into()),
+        output_dir: Some("/downloads/tv/Locked.Release".into()),
+        nzb_path: None,
+        created_at: 1_700_000_000,
+        completed_at: 1_700_000_100,
+        metadata: Some(metadata),
+        server_attribution: None,
+        archived_at: None,
+        protocol: weaver_server_core::Protocol::Nzb,
+    })
+    .unwrap();
+    let app = nzbget_test_router(
+        db,
+        scheduler_handle_with_jobs(vec![job]).await,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let groups = rpc_result(app.clone(), "listgroups", serde_json::json!([])).await;
+    assert_eq!(groups[0]["NZBID"], 43);
+    let history = rpc_result(app, "history", serde_json::json!([])).await;
+    assert!(
+        history
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["ID"] == 44)
+    );
+    for answer in [groups, history] {
+        let text = answer.to_string();
+        assert!(
+            !text.contains("hunter2") && !text.contains("sealed-secret"),
+            "{text}"
+        );
+        assert!(
+            !text.to_ascii_lowercase().contains("unpack:password"),
+            "{text}"
+        );
+    }
 }

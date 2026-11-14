@@ -67,9 +67,8 @@ struct Bound<'a>(&'a BTreeMap<VolumeIndex, Volume>);
 
 fn held(index: VolumeIndex, volume: &Volume) -> Option<Held<'_>> {
     volume.name.as_ref()?;
-    let facts = volume.stated();
-    (!facts.is_some_and(|facts| misplaced(index, facts))).then_some(Held {
-        facts,
+    (!volume.misplaced(index)).then_some(Held {
+        facts: volume.stated(),
         successor: volume.walk.successor(),
     })
 }
@@ -463,7 +462,7 @@ pub(crate) fn states_position(facts: &RarVolumeFacts) -> bool {
 // own headers say it is not, a name least of all.
 pub(super) fn settled(index: VolumeIndex, volume: &Volume) -> bool {
     let facts = volume.stated();
-    !facts.is_some_and(|facts| misplaced(index, facts))
+    !volume.misplaced(index)
         && (volume.walk.ended
             || facts.is_some_and(states_position)
             || volume
@@ -497,8 +496,13 @@ pub(crate) fn place(facts: &RarVolumeFacts, held: &impl Holds) -> Option<VolumeI
     // A stated position is judged by what the neighbours' headers say, and
     // a neighbour none of whose headers were read yet says nothing against
     // it, on either side. A position with no place after it is none a set
-    // has.
+    // has, and one the volume's own headers rule out places it nowhere, as
+    // they hold it nowhere settled: a first volume that opens on a member
+    // begun before it.
     if let Some(stated) = this.position() {
+        if misplaced(VolumeIndex(stated), facts) {
+            return None;
+        }
         let following = stated.checked_add(1)?;
         let before = stated
             .checked_sub(1)

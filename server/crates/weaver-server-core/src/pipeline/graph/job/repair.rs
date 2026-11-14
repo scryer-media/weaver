@@ -35,6 +35,9 @@ impl GraphJob {
     // the walk waits for it, and again after, for what the walk's rulings
     // made due. Under no slot, as for a job paused, held or retiring,
     // nothing goes out and no work is done: the job lends once it runs.
+    // While the job waits for room on a disk, only what writes nothing goes
+    // out: the reads of recovery a restore asked again, and a check of what
+    // was written. Repairs, replays and the objects' work wait with the job.
     pub(crate) fn lend(&mut self, slots: &mut RepairSlots, limit: usize) -> Result<(), GraphError> {
         if limit > 0 {
             self.lend_rewalks()?;
@@ -62,7 +65,7 @@ impl GraphJob {
     // slot nothing is lent or done.
     pub(crate) fn lend_work(&mut self, limit: usize) -> Result<(), GraphError> {
         let admit = self.works.admit();
-        if limit == 0 || (admit && self.loans.out()) {
+        if limit == 0 || self.writer.disk_held() || (admit && self.loans.out()) {
             return Ok(());
         }
         loop {
@@ -177,6 +180,12 @@ impl GraphJob {
             .loans
             .lending(slots.as_mut().map(|(slots, limit)| (&mut **slots, *limit)));
         if !lending.admit() {
+            return Ok(());
+        }
+        // A replay writes what it reads again, and goes first: while the job
+        // waits for room neither it nor a check behind it goes out. A check
+        // with no replay before it writes nothing, and goes.
+        if self.writer.disk_held() && self.writer.rechecks_waiting() {
             return Ok(());
         }
         if let Some(replay) = self

@@ -67,7 +67,8 @@ impl Replay {
         self.access.shutdown = shutdown.clone();
         let mut provenance = Vec::new();
         let staged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            for &(volume, range) in &self.ranges {
+            // A write the staging refused ends it: nothing more is read.
+            'staging: for &(volume, range) in &self.ranges {
                 let Some(&(_, member)) = self.access.volumes.get(&volume) else {
                     continue;
                 };
@@ -98,6 +99,9 @@ impl Replay {
                             self.access
                                 .repaired
                                 .write(MemberId(volume.0), piece.start, &bytes);
+                            if self.access.repaired.failed.is_some() {
+                                break 'staging;
+                            }
                             provenance.push(source);
                             chunk_read();
                         }
@@ -107,6 +111,7 @@ impl Replay {
         }));
         if staged.is_err() {
             self.access.repaired.failed = Some(LeafError::Io {
+                device: crate::pipeline::graph::limits::Device::Working,
                 path: self.access.repaired.output.path().to_path_buf(),
                 source: std::io::Error::other("posted-input reconstruction worker panicked"),
             });
@@ -200,6 +205,8 @@ impl NamespaceWriter {
                 set: node,
                 recovery: None,
                 defer_holds: true,
+                scratch_read: None,
+                held_scratch: BTreeMap::new(),
                 internal: self.working_dir.join(weaver_graph::names::INTERNAL_DIR),
                 members: BTreeMap::new(),
                 usage: RefCell::default(),
@@ -217,6 +224,7 @@ impl NamespaceWriter {
                 diagnostics: Vec::new(),
                 scratch: None,
                 shutdown: Shutdown::default(),
+                withheld: std::collections::BTreeSet::new(),
             };
             let mut seen = BTreeSet::new();
             for member in volumes.values() {
@@ -248,6 +256,7 @@ impl NamespaceWriter {
         mut replayed: Replayed,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        self.gave_back(&replayed.bytes);
         if let Some(error) = replayed.bytes.failed() {
             let _ = replayed.remove();
             return Err(error.into());

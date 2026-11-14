@@ -252,6 +252,38 @@ fn par2_recovery_dash_format() {
     );
 }
 
+// A volume named by its first block and the one past its last declares the
+// blocks between; a range that does not move forward declares none and is
+// still a volume.
+#[test]
+fn par2_recovery_block_range_format() {
+    for (name, blocks) in [
+        ("fixture.release.vol000-001.par2", 1),
+        ("fixture.release.vol001-003.par2", 2),
+        ("fixture.release.vol063-105.par2", 42),
+        ("fixture.release-sample.vol00-01.par2", 1),
+        ("fixture.release-sample.vol31-58.par2", 27),
+        ("FIXTURE.RELEASE.VOL7-15.PAR2", 8),
+        ("fixture.release.vol15-07.par2", 0),
+    ] {
+        assert_eq!(
+            FileRole::from_filename(name),
+            FileRole::Par2 {
+                is_index: false,
+                recovery_block_count: blocks
+            },
+            "{name}"
+        );
+    }
+    assert_eq!(
+        FileRole::from_filename("fixture.release-sample.par2"),
+        FileRole::Par2 {
+            is_index: true,
+            recovery_block_count: 0
+        }
+    );
+}
+
 #[test]
 fn par2_case_insensitive() {
     assert_eq!(
@@ -655,4 +687,19 @@ fn priority_ordering() {
     assert!(rar_first.download_priority() < standalone.download_priority());
     assert!(standalone.download_priority() < rar_second.download_priority());
     assert!(rar_second.download_priority() < par2_recovery.download_priority());
+}
+
+// A name whose last four bytes begin inside a longer character has no
+// old-style RAR extension, and one that ends in such an extension past a
+// longer character still does.
+#[test]
+fn a_name_ending_inside_a_longer_character_is_classified() {
+    for name in ["éabc", "日本", "aé", "é", "x.r0é"] {
+        assert_eq!(FileRole::from_filename(name), FileRole::Unknown, "{name}");
+    }
+    let role = FileRole::from_filename("é.r00");
+    assert_eq!(role, FileRole::RarVolume { volume_number: 1 });
+    assert_eq!(archive_base_name("é.r00", &role), Some("é".to_string()));
+    let other = FileRole::RarVolume { volume_number: 1 };
+    assert_eq!(archive_base_name("éabc", &other), Some("éabc".to_string()));
 }

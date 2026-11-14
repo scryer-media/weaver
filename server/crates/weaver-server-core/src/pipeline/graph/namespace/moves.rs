@@ -55,7 +55,11 @@ pub(crate) fn restored_at<'a>(
     let exists = |name: &str| {
         let path = Leaf::path_at(working_dir, name);
         path.try_exists()
-            .map_err(|source| super::super::leaf::LeafError::Io { path, source })
+            .map_err(|source| super::super::leaf::LeafError::Io {
+                device: crate::pipeline::graph::limits::Device::Working,
+                path,
+                source,
+            })
     };
     if let Some(sat) = on_disk
         && (exists(sat)? || !exists(output_name)?)
@@ -456,7 +460,11 @@ impl NamespaceWriter {
                 let path = Leaf::path_at(dir, name);
                 if path
                     .try_exists()
-                    .map_err(|source| super::super::leaf::LeafError::Io { path, source })?
+                    .map_err(|source| super::super::leaf::LeafError::Io {
+                        device: crate::pipeline::graph::limits::Device::Working,
+                        path,
+                        source,
+                    })?
                 {
                     return Ok(true);
                 }

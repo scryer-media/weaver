@@ -20,6 +20,7 @@ use weaver_server_core::operations::instrumentation::{
     ServerMetricsSnapshot,
 };
 use weaver_server_core::operations::metrics_store::{JOB_STATUS_KEYS, JobStatusCounts};
+use weaver_server_core::persistence::WalCheckpointMetricsSnapshot;
 use weaver_server_core::post_processing::executor::PostProcessingMetricsSnapshot;
 use weaver_server_core::post_processing::run_metrics::{
     RunStatus, ScriptMetrics, ScriptRunMetricsSnapshot,
@@ -101,12 +102,11 @@ pub(crate) struct PrometheusRenderInput<'a> {
     pub(crate) job_lifecycle: Option<&'a JobLifecycleMetricsSnapshot>,
     pub(crate) pipeline_histograms: Option<&'a PipelineHistogramsSnapshot>,
     pub(crate) db_runtime: Option<&'a DbRuntimeMetricsSnapshot>,
+    // `None` for every engine but a SQLite file database.
+    pub(crate) wal_checkpoint: Option<&'a WalCheckpointMetricsSnapshot>,
     pub(crate) process: Option<&'a ProcessMetricsSnapshot>,
     pub(crate) disk_space: &'a [DiskSpaceSnapshot],
     pub(crate) http_metrics: Option<&'a HttpMetricsSnapshot>,
-    // The article buffer pool's occupancy. Absent in the render tests that
-    // build no pool.
-    pub(crate) buffer_pool: Option<&'a weaver_server_core::runtime::buffers::BufferPoolMetrics>,
 }
 
 impl<'a> PrometheusRenderInput<'a> {
@@ -151,7 +151,7 @@ impl<'a> PrometheusRenderInput<'a> {
             job_lifecycle: None,
             pipeline_histograms: None,
             db_runtime: None,
-            buffer_pool: None,
+            wal_checkpoint: None,
             process: None,
             disk_space: &[],
             http_metrics: None,
@@ -209,10 +209,10 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         job_lifecycle,
         pipeline_histograms,
         db_runtime,
+        wal_checkpoint,
         process,
         disk_space,
         http_metrics,
-        buffer_pool,
     } = *input;
 
     let mut out = Encoder::new();
@@ -285,8 +285,8 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     if let Some(db) = db_runtime {
         render_db_runtime(&mut out, db);
     }
-    if let Some(pool) = buffer_pool {
-        render_buffer_pool(&mut out, pool);
+    if let Some(wal) = wal_checkpoint {
+        render_wal_checkpoint(&mut out, wal);
     }
     if let Some(process) = process {
         render_process(&mut out, process, start_time_seconds);
@@ -309,7 +309,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         render_schedules(&mut out, metrics);
     }
     if let Some(metrics) = network {
-        render_network(&mut out, metrics);
+        render_network(&mut out, metrics, server_health);
     }
     if let Some(metrics) = tunnel {
         render_tunnel(&mut out, metrics);
@@ -437,7 +437,11 @@ fn render_queues(out: &mut Encoder, snapshot: &MetricsSnapshot) {
         &[],
         snapshot.download_queue_depth as u64,
     );
-    out.sample(&f::ACTIVE_DOWNLOADS, &[], snapshot.active_downloads as u64);
+    out.sample(
+        &f::ARTICLES_IN_FLIGHT,
+        &[],
+        snapshot.articles_in_flight as u64,
+    );
     out.sample(&f::ACTIVE_DECODES, &[], snapshot.active_decodes as u64);
     out.sample(&f::DECODE_PENDING, &[], snapshot.decode_pending as u64);
     out.sample(&f::DECODE_PENDING_BYTES, &[], snapshot.decode_pending_bytes);
@@ -1267,10 +1271,12 @@ fn render_server_transfers(
 
     for transfer in server_transfers {
         let server_id = transfer.stable_server_id.0.to_string();
-        let label = labels_by_id
-            .get(server_id.as_str())
-            .copied()
-            .unwrap_or_default();
+        // A server the pool does not run has no `server` label to give and
+        // nothing moving to report: its series are left out, not sent with
+        // an empty label.
+        let Some(&label) = labels_by_id.get(server_id.as_str()) else {
+            continue;
+        };
         let id: &[(&str, &str)] = &[("server_id", server_id.as_str()), ("server", label)];
 
         out.sample(
@@ -1388,10 +1394,10 @@ fn render_server_articles(
 
     for server in server_metrics {
         let server_id = server.stable_server_id.to_string();
-        let label = labels_by_id
-            .get(server_id.as_str())
-            .copied()
-            .unwrap_or_default();
+        // As for transfers: only the servers the pool runs.
+        let Some(&label) = labels_by_id.get(server_id.as_str()) else {
+            continue;
+        };
         let id: &[(&str, &str)] = &[("server_id", server_id.as_str()), ("server", label)];
 
         for attempt in &server.attempts {
@@ -1498,50 +1504,21 @@ fn render_db_runtime(out: &mut Encoder, db: &DbRuntimeMetricsSnapshot) {
     );
 }
 
-// The pre-allocated article buffer pool, in bytes rather than in buffers.
-//
-// Bytes, because the question this answers is how much of the process's
-// resident set the pool accounts for; the tiers have different buffer sizes,
-// so a count of buffers does not add up to anything.
-fn render_buffer_pool(
-    out: &mut Encoder,
-    pool: &weaver_server_core::runtime::buffers::BufferPoolMetrics,
-) {
-    use weaver_server_core::runtime::buffers::BufferTier;
-
-    for (tier, label, in_use, total) in [
-        (
-            BufferTier::Small,
-            "small",
-            pool.small_in_use,
-            pool.small_total,
-        ),
-        (
-            BufferTier::Medium,
-            "medium",
-            pool.medium_in_use,
-            pool.medium_total,
-        ),
-        (
-            BufferTier::Large,
-            "large",
-            pool.large_in_use,
-            pool.large_total,
-        ),
-    ] {
-        let size = tier.size_bytes();
-        out.sample(
-            &f::BUFFER_POOL_IN_USE_BYTES,
-            &[("tier", label)],
-            in_use.saturating_mul(size),
-        );
-        out.sample(
-            &f::BUFFER_POOL_TOTAL_BYTES,
-            &[("tier", label)],
-            total.saturating_mul(size),
-        );
-    }
-    out.sample(&f::BUFFER_POOL_WAITS, &[], pool.wait_count);
+fn render_wal_checkpoint(out: &mut Encoder, wal: &WalCheckpointMetricsSnapshot) {
+    out.sample(&f::DB_WAL_CHECKPOINT_PASSES, &[], wal.passes);
+    out.sample(
+        &f::DB_WAL_CHECKPOINT_PASSES_INCOMPLETE,
+        &[],
+        wal.passes_left_behind,
+    );
+    out.sample(&f::DB_WAL_CHECKPOINT_BUSY, &[], wal.busy_passes);
+    out.sample(&f::DB_WAL_RESTARTS, &[], wal.restarts);
+    render_histogram(out, &f::DB_WAL_CHECKPOINT_DURATION, &[], &wal.duration);
+    out.sample(&f::DB_WAL_LOG_FRAMES, &[], wal.log_frames);
+    out.sample(&f::DB_WAL_CHECKPOINTED_FRAMES, &[], wal.checkpointed_frames);
+    out.sample(&f::DB_WAL_CHECKPOINT_COPIED_FRAMES, &[], wal.copied_frames);
+    out.sample(&f::DB_WAL_BYTES, &[], wal.wal_bytes);
+    render_histogram(out, &f::DB_STATEMENT_DURATION, &[], &wal.statement_duration);
 }
 
 // Standard `process_*` collector series.
@@ -1650,7 +1627,7 @@ fn observed_download_limiter(
     // `idle` — "nothing to do" — when the truth is "nowhere to fetch from",
     // which is the exact state the next check exists to name.
     if required_queue_depth == 0
-        && snapshot.active_downloads == 0
+        && snapshot.articles_in_flight == 0
         && snapshot.parked_infrastructure_work == 0
     {
         return "idle";
@@ -1662,7 +1639,7 @@ fn observed_download_limiter(
     // `dispatch_limited` here would point the operator at the decode/write
     // path or at Weaver's own scheduler, when the problem is upstream of both.
     // It cannot mask an ordinary busy pipeline, which has active downloads.
-    if snapshot.parked_infrastructure_work > 0 && snapshot.active_downloads == 0 {
+    if snapshot.parked_infrastructure_work > 0 && snapshot.articles_in_flight == 0 {
         return "infrastructure_unavailable";
     }
     if snapshot.download_pressure_state != DownloadPressureState::Clear {
@@ -1692,13 +1669,13 @@ fn observed_download_limiter(
         .map(|server| server.connections_available)
         .sum::<usize>();
     if required_queue_depth > 0
-        && snapshot.active_downloads > 0
+        && snapshot.articles_in_flight > 0
         && total_connections > 0
         && available_connections == 0
     {
         return "network_limited";
     }
-    if snapshot.active_downloads > 0 {
+    if snapshot.articles_in_flight > 0 {
         return "active";
     }
     "dispatch_limited"
@@ -1951,10 +1928,25 @@ pub(crate) fn render_schedules(out: &mut Encoder, metrics: &ScheduleMetricsSnaps
 // One per-leg gauge's value, or `None` to leave the leg's series out.
 type LegValue = fn(&LegMetrics) -> Option<f64>;
 
-pub(crate) fn render_network(out: &mut Encoder, metrics: &NetworkMetricsSnapshot) {
+// A leg of a server the pool does not run is left out: no connection is made
+// on it, so its state (`up` until something says otherwise) says nothing.
+pub(crate) fn render_network(
+    out: &mut Encoder,
+    metrics: &NetworkMetricsSnapshot,
+    server_health: &[ServerHealthInfo],
+) {
+    let running: std::collections::HashSet<&str> = server_health
+        .iter()
+        .map(|srv| srv.server_id.as_str())
+        .collect();
     let legs: Vec<(String, String, &LegMetrics)> = metrics
         .legs
         .iter()
+        .filter(|leg| {
+            leg.consumer
+                .strip_prefix("server:")
+                .is_none_or(|id| running.contains(id))
+        })
         .map(|leg| (leg.position.to_string(), leg.egress_id.to_string(), leg))
         .collect();
     for (position, egress, leg) in &legs {

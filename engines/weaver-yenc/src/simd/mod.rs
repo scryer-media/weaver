@@ -790,6 +790,33 @@ mod neon;
 #[cfg(test)]
 mod tests;
 
+// Per-tier entry points for decode-bench only; absent from every other build.
+#[cfg(weaver_yenc_bench)]
+#[doc(hidden)]
+pub mod bench;
+
+// Forced-tier entry points for the fuzz targets (`--cfg fuzzing`) and the
+// crate's own unit tests; absent from every other build.
+#[cfg(any(fuzzing, test))]
+#[doc(hidden)]
+pub mod fuzzing;
+
+// Guard-page bounds and state regressions for every decode tier.
+#[cfg(test)]
+mod bounds_tests;
+
+// Whether the AVX2 raw path runs the frozen `asm!` kernel: the build's
+// `cfg(weaver_yenc_raw_asm)`, which a fuzz or test build can override.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn avx2_raw_asm() -> bool {
+    #[cfg(any(fuzzing, test))]
+    if let Some(on) = fuzzing::avx2_raw_asm_override() {
+        return on;
+    }
+    cfg!(weaver_yenc_raw_asm)
+}
+
 #[cfg(target_arch = "aarch64")]
 use neon::*;
 use scalar::*;

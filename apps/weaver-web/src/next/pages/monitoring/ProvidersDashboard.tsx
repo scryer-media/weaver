@@ -141,7 +141,7 @@ export function ProvidersDashboard() {
                       {totals ? formatSize(totals.range.bytes) : EM_DASH}
                     </span>
                     <span className={cell}>{found === null ? EM_DASH : `${found.toFixed(1)}%`}</span>
-                    <span className={cell}>{provider ? formatLatency(provider.latencyMs) : EM_DASH}</span>
+                    <span className={cell}>{provider ? formatLatency(provider.measuredLatencyMs) : EM_DASH}</span>
                     <span className={cell}>
                       {provider
                         ? `${provider.connectionsActive} / ${provider.connectionsConfigured}`

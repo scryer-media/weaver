@@ -32,25 +32,17 @@ pub(crate) fn waits_its_turn(status: &JobStatus, paused_resume_status: Option<&J
     }
 }
 
-// The row's priority in dispatch order, with an edit not yet applied in force.
-fn row_priority(row: &JobRow, globals: &crate::pipeline::queue::Globals) -> u8 {
-    if row.intents.update.is_some() {
-        crate::pipeline::nzb_admission::metadata_priority(&row.info(globals).metadata)
-    } else {
-        crate::pipeline::nzb_admission::metadata_priority(&row.report.job.metadata)
-    }
-}
-
 // What a window install reads of a job that is not installed: its active row
-// and the files of its stored NZB, as a restart reads it.
+// and its stored NZB outline, as a restart reads it.
 pub(crate) struct ParkedLoads {
     db: crate::Database,
     markers: Vec<(JobId, Result<tokio::sync::oneshot::Receiver<()>, String>)>,
 }
 
 impl ParkedLoads {
-    // Each job read back, in the order named, one parse of each stored NZB,
-    // spread over the cores.
+    // Each job read back, in the order named, from its row and outline,
+    // spread over the cores. A job with no outline yet reads its stored NZB
+    // once for one.
     pub(crate) async fn read(self) -> Vec<(JobId, Result<Option<RestoreJobRequest>, String>)> {
         let Self { db, markers } = self;
         if markers.is_empty() {
@@ -72,10 +64,41 @@ impl ParkedLoads {
         }
         tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
-            ids.into_par_iter()
-                .map(|id| match waited.get(&id) {
+            // The batch's outlines in one read, each handed to its job.
+            let reached: Vec<JobId> = ids
+                .iter()
+                .copied()
+                .filter(|id| !waited.contains_key(id))
+                .collect();
+            let outlines = if reached.is_empty() {
+                Ok(HashMap::new())
+            } else {
+                db.load_job_outlines(Some(&reached))
+                    .map_err(|error| error.to_string())
+            };
+            let mut outlines = match outlines {
+                Ok(outlines) => outlines,
+                Err(error) => {
+                    return ids
+                        .into_iter()
+                        .map(|id| match waited.get(&id) {
+                            Some(waited) => (id, Err(waited.clone())),
+                            None => (id, Err(error.clone())),
+                        })
+                        .collect();
+                }
+            };
+            let jobs: Vec<_> = ids
+                .into_iter()
+                .map(|id| {
+                    let outline = outlines.remove(&id);
+                    (id, outline)
+                })
+                .collect();
+            jobs.into_par_iter()
+                .map(|(id, outline)| match waited.get(&id) {
                     Some(error) => (id, Err(error.clone())),
-                    None => (id, load_parked_job(&db, id)),
+                    None => (id, load_parked_job(&db, id, outline)),
                 })
                 .collect()
         })
@@ -87,6 +110,7 @@ impl ParkedLoads {
 fn load_parked_job(
     db: &crate::Database,
     job_id: JobId,
+    outline: Option<crate::ingest::outline::NzbOutline>,
 ) -> Result<Option<RestoreJobRequest>, String> {
     let Some(recovered) = db
         .load_active_job_row(job_id)
@@ -94,7 +118,7 @@ fn load_parked_job(
     else {
         return Ok(None);
     };
-    let (spec, summaries) = crate::operations::read_stored_files(db, job_id, &recovered)
+    let (spec, summaries) = crate::operations::read_stored_files(db, job_id, &recovered, outline)
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())?;
     let mut request = crate::operations::restore_request(job_id, recovered, spec, summaries);
@@ -114,7 +138,7 @@ impl Pipeline {
     }
 
     // The first jobs in dispatch order, priority then queue position, of the
-    // rows not cancelled, retiring or blocked.
+    // rows not cancelled, retiring, blocked, or paused before they started.
     pub(crate) fn queue_window_ranks(&self, inner: &QueueInner) -> HashSet<JobId> {
         let globals = &inner.globals;
         let size = window_size(
@@ -123,23 +147,37 @@ impl Pipeline {
                 .unwrap_or(crate::settings::model::DEFAULT_MAX_CONCURRENT_NZBS)
                 .get() as usize,
         );
-        let mut ranked: Vec<(u8, usize, JobId)> = inner
-            .jobs
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| {
-                row.intents.cancelled.is_none()
-                    && !row.report.retiring
-                    && !self.blocked_restores.contains_key(&row.id)
-                    && !self.window_unreadable.contains(&row.id)
+        let mut ranked = inner.dispatch_keys(|row| {
+            row.intents.cancelled.is_none()
+                && !row.report.retiring
+                && !self.blocked_restores.contains_key(&row.id)
+                && !self.window_unreadable.contains(&row.id)
+                && !self.paused_unstarted(row)
+        });
+        crate::pipeline::queue::order::keep_first(&mut ranked, size);
+        ranked.into_iter().map(|key| key.job_id()).collect()
+    }
+
+    // A job paused before a byte of it came waits as its row: it takes no
+    // window place from the jobs behind it, and ranks again once resumed.
+    // Paused as the admission pass counts it, so a resume waiting for its
+    // slot ranks at once. A paused job that started keeps its place: one
+    // installed says so itself, and one a restart restored by its checkpoint.
+    pub(in crate::pipeline) fn paused_unstarted(&self, row: &JobRow) -> bool {
+        self.admission_paused(row) && !self.job_started(row)
+    }
+
+    // Whether a byte of the job ever came: a restart found its checkpoint,
+    // its row counts bytes, or, installed, it holds some. A job that started
+    // keeps its window place when paused, and its working directory when the
+    // intermediate folder changes.
+    pub(in crate::pipeline) fn job_started(&self, row: &JobRow) -> bool {
+        row.report.on_disk
+            || row.report.job.downloaded_bytes != 0
+            || row.report.job.failed_bytes != 0
+            || self.jobs.get(&row.id).is_some_and(|state| {
+                Self::effective_downloaded_bytes(state) != 0 || state.failed_bytes != 0
             })
-            .map(|(position, row)| (row_priority(row, globals), position, row.id))
-            .collect();
-        if ranked.len() > size {
-            ranked.select_nth_unstable(size - 1);
-            ranked.truncate(size);
-        }
-        ranked.into_iter().map(|(_, _, id)| id).collect()
     }
 
     // Whether the row's job does something its row cannot carry: it holds a
@@ -319,8 +357,8 @@ impl Pipeline {
         self.update_queue_metrics();
         self.shared_state.queue.write(|inner| {
             for id in &evicted_set {
-                if let Some(row) = inner.job_mut(*id) {
-                    let reason = self.stored_wait_reason(row);
+                if let Some(mut row) = inner.job_mut(*id) {
+                    let reason = self.stored_wait_reason(&row);
                     row.report.job.download_wait_reason = reason.map(str::to_owned);
                 }
             }

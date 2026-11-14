@@ -623,7 +623,13 @@ fn shape(
         .iter()
         .flat_map(|file| file.groups.iter().map(String::as_str))
         .collect();
-    let posters: HashSet<&str> = nzb.files.iter().map(|file| file.poster.as_str()).collect();
+    // A file without a poster names no poster.
+    let posters: HashSet<&str> = nzb
+        .files
+        .iter()
+        .map(|file| file.poster.as_str())
+        .filter(|poster| !poster.is_empty())
+        .collect();
 
     let mut declared = DeclaredBytes {
         files: 0,

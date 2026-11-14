@@ -4,6 +4,9 @@
 mod archive_password;
 pub mod assembly;
 pub mod diagnostic_names;
+pub mod diagnostic_tables;
+pub mod download_summary;
+mod download_summary_persistence;
 pub mod duplicate;
 pub mod duplicate_persistence;
 pub mod error;
@@ -12,6 +15,8 @@ pub(crate) mod graph_checkpoint;
 pub mod handle;
 pub mod ids;
 pub mod model;
+pub(crate) mod nzb_persistence;
+pub(crate) mod outline_persistence;
 pub mod persistence;
 pub mod phase_progress;
 pub mod queries;
@@ -41,11 +46,12 @@ pub use duplicate_persistence::{
 };
 pub use error::SchedulerError;
 pub use handle::{
-    AddJobOptions, CancelJobsOutcome, DownloadBlockKind, DownloadBlockState, EgressQuotaBlock,
-    FINISHED_JOBS_RUNTIME_CAP, HISTORY_DELETE_BATCH_SIZE, HardwareProfileInForce,
-    HistoryDeleteBatchOutcome, HistoryDeleteOutcome, Hold, HoldOrigin, HoldOwner, HoldScope,
-    HoldSet, JobInfo, NntpRuntimeActivation, QueueMoveTarget, RestartRead, RestoreJobRequest,
-    SchedulerHandle, ServerTransportHealth, SharedPipelineState,
+    AddJobOptions, ArchiveHistoryOutcome, ArchiveHistoryResult, CancelJobsOutcome,
+    DownloadBlockKind, DownloadBlockState, EgressQuotaBlock, FINISHED_JOBS_RUNTIME_CAP,
+    HISTORY_DELETE_BATCH_SIZE, HardwareProfileInForce, HistoryDeleteBatchOutcome,
+    HistoryDeleteOutcome, Hold, HoldOrigin, HoldOwner, HoldScope, HoldSet, JobInfo,
+    NntpRuntimeActivation, QueueMoveTarget, RestartRead, RestoreJobRequest, SchedulerHandle,
+    ServerTransportHealth, SharedPipelineState,
 };
 pub use ids::{ConnectionId, JobId, MessageId, NzbFileId, SegmentId, ServerId};
 pub use model::{

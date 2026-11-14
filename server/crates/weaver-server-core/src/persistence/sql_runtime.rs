@@ -530,7 +530,7 @@ impl SqlRuntime {
                     let pool = pool.clone();
                     let op = &op;
                     async move {
-                        let mut tx = SqlTx::Sqlite(pool.begin().await.map_err(db_err)?);
+                        let mut tx = SqlTx::Sqlite(pool.begin().await.map_err(sqlite_write_err)?);
                         let result = {
                             let future = op(&mut tx);
                             future.await?
@@ -576,9 +576,72 @@ impl SqlRuntime {
             }
         }
     }
+
+    // Pure reads that must see one snapshot: one connection, one deferred
+    // transaction, rolled back at the end. It never takes the writer gate, so
+    // a write parked there, or a checkpoint pass a write waits on, does not
+    // hold it up. `op` must not write: on SQLite a write here would meet the
+    // gated writer in the busy handler, and on Postgres the transaction is
+    // read-only and refuses it.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: a read-only snapshot transaction, outside the gate by design"
+    )]
+    pub(crate) async fn run_read_transaction<T, F>(
+        datastore: &StoreDatastore,
+        op_name: &'static str,
+        op: F,
+    ) -> SqlResult<T>
+    where
+        T: Send,
+        F: for<'tx, 'db> Fn(&'tx mut SqlTx<'db>) -> TxFuture<'tx, T> + Send + Sync,
+    {
+        let engine = datastore.engine().as_str();
+        let started = Instant::now();
+        let result = match datastore {
+            StoreDatastore::Sqlite { pool, .. } => {
+                run_with_sqlite_busy_retries(op_name, || {
+                    let pool = pool.clone();
+                    let op = &op;
+                    async move {
+                        let mut tx = SqlTx::Sqlite(pool.begin().await.map_err(db_err)?);
+                        let result = op(&mut tx).await?;
+                        tx.rollback().await?;
+                        Ok(result)
+                    }
+                })
+                .await
+            }
+            StoreDatastore::Postgres { pool } => {
+                run_postgres_transaction_with_retries(op_name, || async {
+                    let before = |e| PostgresTxError::new(TxPhase::BeforeCommit, e);
+                    let mut tx =
+                        SqlTx::Postgres(pool.begin().await.map_err(|e| before(pg_db_err(e)))?);
+                    tx.execute("SET TRANSACTION READ ONLY", &[])
+                        .await
+                        .map_err(before)?;
+                    let result = op(&mut tx).await.map_err(before)?;
+                    tx.rollback().await.map_err(before)?;
+                    Ok(result)
+                })
+                .await
+            }
+        };
+        crate::runtime::perf_probe::record_sql_op(engine, op_name, started.elapsed());
+        result
+    }
 }
 
 impl<'db> SqlTx<'db> {
+    // This transaction's connection, for code that also runs inside a
+    // transaction it does not own.
+    pub(crate) fn conn(&mut self) -> SqlConn<'_> {
+        match self {
+            SqlTx::Sqlite(tx) => SqlConn::Sqlite(tx),
+            SqlTx::Postgres(tx) => SqlConn::Postgres(tx),
+        }
+    }
+
     #[expect(
         clippy::disallowed_methods,
         reason = "writer gate: runs on a transaction run_in_transaction opened under the gate; Postgres has no writer gate"
@@ -589,7 +652,7 @@ impl<'db> SqlTx<'db> {
                 let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
                 let query = bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args);
-                let result = query.execute(&mut **tx).await.map_err(db_err);
+                let result = query.execute(&mut **tx).await.map_err(sqlite_write_err);
                 crate::runtime::perf_probe::record_sql_statement(
                     "sqlite",
                     "tx_execute",
@@ -708,8 +771,15 @@ impl<'db> SqlTx<'db> {
     )]
     pub(crate) async fn commit(self) -> SqlResult<()> {
         match self {
-            SqlTx::Sqlite(tx) => tx.commit().await.map_err(db_err),
+            SqlTx::Sqlite(tx) => tx.commit().await.map_err(sqlite_write_err),
             SqlTx::Postgres(tx) => tx.commit().await.map_err(pg_db_err),
+        }
+    }
+
+    pub(crate) async fn rollback(self) -> SqlResult<()> {
+        match self {
+            SqlTx::Sqlite(tx) => tx.rollback().await.map_err(db_err),
+            SqlTx::Postgres(tx) => tx.rollback().await.map_err(pg_db_err),
         }
     }
 }
@@ -1445,6 +1515,55 @@ pub(crate) fn db_err(error: impl std::fmt::Display) -> StateError {
     StateError::Database(error.to_string())
 }
 
+// SQLite's result code for a write the disk had no room for; an extended
+// code keeps it in its low byte.
+const SQLITE_FULL: u32 = 13;
+// SQLite's I/O error code, and the extended codes of it a disk with no
+// room, or a quota, gives a write. SQLite says SQLITE_FULL only for a write
+// the system refused as a full disk; a write a quota refused is an I/O
+// error on the write. A sync can be where a network or delayed-allocation
+// filesystem first says it has no room, and the shared-memory file is
+// grown by a write that a full disk refuses. A truncate takes no room and
+// is left an error. These codes also carry I/O errors that are not want of
+// room: such a write is held with the others, which loses nothing a
+// failure would have kept.
+const SQLITE_IOERR: u32 = 10;
+const SQLITE_IOERR_WRITE: u32 = SQLITE_IOERR | (3 << 8);
+const SQLITE_IOERR_FSYNC: u32 = SQLITE_IOERR | (4 << 8);
+const SQLITE_IOERR_SHMSIZE: u32 = SQLITE_IOERR | (19 << 8);
+
+// Whether SQLite's result code, extended or not, says the write found no
+// room.
+fn sqlite_code_out_of_space(code: u32) -> bool {
+    code & 0xff == SQLITE_FULL
+        || matches!(
+            code,
+            SQLITE_IOERR_WRITE | SQLITE_IOERR_FSYNC | SQLITE_IOERR_SHMSIZE
+        )
+}
+
+// The SQLSTATE a Postgres server gives a statement its disk had no room
+// for.
+const PG_DISK_FULL: &str = "53100";
+
+// A SQLite write's error, kept apart when the database's disk had no room
+// for it: by SQLite's own code, or by the kind of the I/O error under it.
+pub(crate) fn sqlite_write_err(error: sqlx::Error) -> StateError {
+    let full = match &error {
+        sqlx::Error::Database(database) => database
+            .code()
+            .and_then(|code| code.parse::<u32>().ok())
+            .is_some_and(sqlite_code_out_of_space),
+        sqlx::Error::Io(io) => crate::operations::is_out_of_space(io),
+        _ => false,
+    };
+    if full {
+        StateError::OutOfSpace(error.to_string())
+    } else {
+        db_err(error)
+    }
+}
+
 // Map a Postgres `sqlx::Error` to `StateError`, prefixing the SQLSTATE code as
 // `sqlstate=<code>;` so the transient-retry classifiers can recognize
 // serialization/deadlock/connection failures after the error is stringified.
@@ -1454,6 +1573,10 @@ pub(crate) fn pg_db_err(error: sqlx::Error) -> StateError {
         .and_then(|db| db.code())
         .map(|code| code.into_owned())
     {
+        // The server's disk had no room: kept apart, as SQLite's is.
+        if code == PG_DISK_FULL {
+            return StateError::OutOfSpace(format!("sqlstate={code}; {error}"));
+        }
         return StateError::Database(format!("sqlstate={code}; {error}"));
     }
     // Transport/pool failures carry no SQLSTATE. Crucially, an abruptly dropped
@@ -1480,6 +1603,83 @@ pub(crate) fn pg_db_err(error: sqlx::Error) -> StateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A database error with `code`, as either engine's driver gives one.
+    #[derive(Debug)]
+    struct Coded(&'static str);
+
+    impl std::fmt::Display for Coded {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "coded {}", self.0)
+        }
+    }
+
+    impl std::error::Error for Coded {}
+
+    impl sqlx::error::DatabaseError for Coded {
+        fn message(&self) -> &str {
+            "coded"
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.0.into())
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn coded(code: &'static str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(Coded(code)))
+    }
+
+    // Each code a full disk or a quota gives a SQLite write is kept apart
+    // as want of room, plain or extended; a truncate's, a read's and a
+    // constraint's are not.
+    #[test]
+    fn a_sqlite_write_the_disk_or_a_quota_refused_is_out_of_space() {
+        for code in ["13", "269", "778", "1034", "4874"] {
+            assert!(
+                matches!(sqlite_write_err(coded(code)), StateError::OutOfSpace(_)),
+                "{code}"
+            );
+        }
+        for code in ["10", "266", "1546", "1290", "19", "2067", "5"] {
+            assert!(
+                matches!(sqlite_write_err(coded(code)), StateError::Database(_)),
+                "{code}"
+            );
+        }
+    }
+
+    // A Postgres statement its server's disk had no room for is kept apart
+    // as want of room, with its SQLSTATE; any other keeps its class.
+    #[test]
+    fn a_postgres_statement_the_disk_refused_is_out_of_space() {
+        let StateError::OutOfSpace(message) = pg_db_err(coded("53100")) else {
+            panic!("disk full is want of room");
+        };
+        assert!(message.starts_with("sqlstate=53100;"), "{message}");
+        for code in ["53200", "53300", "40001", "23505"] {
+            assert!(
+                matches!(pg_db_err(coded(code)), StateError::Database(_)),
+                "{code}"
+            );
+        }
+    }
 
     #[test]
     fn transaction_row_sizing_respects_engine_limits_and_boundaries() {

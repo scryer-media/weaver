@@ -65,7 +65,11 @@ fn concurrent_group_discovery_keeps_the_provider_eligible_for_a_grouped_retry() 
     let groups = vec!["alt.test".to_string()];
     // All sessions exist before the first BODY reveals the group requirement.
     let lanes: Vec<_> = (0..LANES)
-        .map(|_| client.try_acquire_blocking_body_lane(&groups, &[]).unwrap())
+        .map(|_| {
+            client
+                .try_acquire_blocking_body_lane(&groups, crate::ServerSet::EMPTY)
+                .unwrap()
+        })
         .collect();
     for mut lane in lanes {
         let trace = lane.fetch_decoded_sequential("<group@test>");
@@ -84,8 +88,10 @@ fn concurrent_group_discovery_keeps_the_provider_eligible_for_a_grouped_retry() 
             .failure_count,
         0
     );
-    assert!(client.has_blocking_body_lane_candidate(&[]));
-    let mut retry = client.try_acquire_blocking_body_lane(&groups, &[]).unwrap();
+    assert!(client.has_blocking_body_lane_candidate(crate::ServerSet::EMPTY));
+    let mut retry = client
+        .try_acquire_blocking_body_lane(&groups, crate::ServerSet::EMPTY)
+        .unwrap();
     let trace = retry.fetch_decoded_sequential("<group@test>");
     assert_eq!(ring_payload(&trace), b"grouped payload");
     client.record_blocking_attempts(&trace.attempts);
@@ -109,6 +115,6 @@ fn concurrent_group_discovery_keeps_the_provider_eligible_for_a_grouped_retry() 
             .failure_count,
         1
     );
-    assert!(client.has_blocking_body_lane_candidate(&[]));
+    assert!(client.has_blocking_body_lane_candidate(crate::ServerSet::EMPTY));
     crate::server_caps::forget("127.0.0.1", port);
 }

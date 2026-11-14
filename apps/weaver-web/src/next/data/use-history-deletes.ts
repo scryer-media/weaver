@@ -8,6 +8,7 @@ import {
   ACCEPT_HISTORY_DELETE_MUTATION,
   HISTORY_DELETE_OPERATIONS_QUERY,
 } from "@/graphql/queries";
+import { useVisibleInterval } from "./timers";
 import {
   deleteProgress,
   settleDeleteLocks,
@@ -81,17 +82,11 @@ export function useHistoryDeletes<T extends { id: number; deleteOperation: RowDe
     }
   }, [awaitingRefresh, fetching]);
 
-  useEffect(() => {
-    if (!active) {
-      return;
+  useVisibleInterval(() => {
+    if (!fetchingRef.current) {
+      pollOperations();
     }
-    const id = window.setInterval(() => {
-      if (!fetchingRef.current) {
-        pollOperations();
-      }
-    }, POLL_MS);
-    return () => window.clearInterval(id);
-  }, [active, pollOperations]);
+  }, active ? POLL_MS : null);
 
   const wasActive = useRef(active);
   useEffect(() => {

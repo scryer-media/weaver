@@ -130,7 +130,7 @@ const TABLE: [ProfileRow; 3] = [
         max_concurrent_extractions: 2,
         par3_memory: MemoryShare {
             divisor: 16,
-            cap_bytes: 256 * MIB,
+            cap_bytes: 128 * MIB,
         },
         direct_store_resident_default_cap_bytes: Some(256 * MIB),
         wireguard_socket_cap: 256,
@@ -147,7 +147,7 @@ const TABLE: [ProfileRow; 3] = [
         max_concurrent_extractions: 4,
         par3_memory: MemoryShare {
             divisor: 8,
-            cap_bytes: GIB,
+            cap_bytes: 512 * MIB,
         },
         direct_store_resident_default_cap_bytes: None,
         wireguard_socket_cap: 512,
@@ -164,7 +164,7 @@ const TABLE: [ProfileRow; 3] = [
         max_concurrent_extractions: 6,
         par3_memory: MemoryShare {
             divisor: 8,
-            cap_bytes: 2 * GIB,
+            cap_bytes: GIB,
         },
         direct_store_resident_default_cap_bytes: None,
         wireguard_socket_cap: 1024,

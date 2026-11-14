@@ -36,8 +36,11 @@ async fn pump_decode_queue_releases_bytes_for_inactive_job() {
             segment_number: 0,
         },
         raw,
-        source_server_idx: None,
-        exclude_servers: Vec::new(),
+        servers: PoolServers::stamped(
+            pipeline.pool_generation,
+            None,
+            weaver_nntp::ServerSet::EMPTY,
+        ),
     });
     pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Failed {
         error: "inactive".to_string(),
@@ -104,8 +107,11 @@ async fn decode_tasks_record_one_wall_duration_each() {
                 segment_number,
             },
             raw,
-            source_server_idx: None,
-            exclude_servers: Vec::new(),
+            servers: PoolServers::stamped(
+                pipeline.pool_generation,
+                None,
+                weaver_nntp::ServerSet::EMPTY,
+            ),
         });
     }
 
@@ -152,8 +158,11 @@ async fn pump_decode_queue_respects_decode_thread_limit() {
                 segment_number: segment_number as u32,
             },
             raw,
-            source_server_idx: None,
-            exclude_servers: Vec::new(),
+            servers: PoolServers::stamped(
+                pipeline.pool_generation,
+                None,
+                weaver_nntp::ServerSet::EMPTY,
+            ),
         });
     }
 
@@ -278,16 +287,7 @@ async fn hard_decode_pressure_latches_until_soft_watermark() {
 #[tokio::test]
 async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 1,
-            medium_count: 1,
-            large_count: 1,
-        },
-        4,
-    )
-    .await;
+    let (mut pipeline, _, _) = new_direct_pipeline_with_backlog(&temp_dir, 5632 * 1024, 4).await;
     let job_id = JobId(20003);
     let files = vec![("broken.bin".to_string(), 64u32)];
     let spec = standalone_job_spec("Decode Failure", &files);
@@ -300,7 +300,7 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
         },
         segment_number: 0,
     };
-    pipeline.active_downloads += 1;
+    pipeline.articles_in_flight += 1;
     let raw = Bytes::from_static(b"not a yenc article");
     let raw_size = raw.len() as u64;
     pipeline
@@ -315,7 +315,7 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -408,7 +408,7 @@ async fn decode_failure_retries_excluding_actual_source_server() {
         },
         segment_number: 0,
     };
-    pipeline.active_downloads += 1;
+    pipeline.articles_in_flight += 1;
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
@@ -423,7 +423,7 @@ async fn decode_failure_retries_excluding_actual_source_server() {
             source_server_idx: Some(0),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -435,16 +435,21 @@ async fn decode_failure_retries_excluding_actual_source_server() {
         .expect("decode channel should stay open");
     let DecodeDone::Failed {
         segment_id: failed_segment,
-        source_server_idx,
-        exclude_servers,
+        servers,
         ..
     } = &done
     else {
         panic!("expected decode failure");
     };
     assert_eq!(*failed_segment, segment_id);
-    assert_eq!(*source_server_idx, Some(0));
-    assert!(exclude_servers.is_empty());
+    assert_eq!(
+        *servers,
+        PoolServers::stamped(
+            pipeline.pool_generation,
+            Some(0),
+            weaver_nntp::ServerSet::EMPTY
+        )
+    );
 
     pipeline.handle_decode_done(done).await;
 
@@ -460,6 +465,123 @@ async fn decode_failure_retries_excluding_actual_source_server() {
         .expect("decode failure should schedule a retry")
         .work;
     assert_eq!(work.exclude_servers, vec![0]);
+}
+
+// A decoded article does not build its job's report: the job is marked, and
+// the snapshot tick publishes the report once. The job's last decode
+// publishes at once.
+#[tokio::test]
+async fn a_decoded_article_leaves_its_jobs_report_to_the_tick_until_the_last() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20031);
+    let files = vec![
+        ("one.bin".to_string(), 64u32),
+        ("two.bin".to_string(), 64u32),
+    ];
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Report Per Tick", &files),
+    )
+    .await;
+
+    for file_index in 0..2 {
+        let segment_id = SegmentId {
+            file_id: NzbFileId { job_id, file_index },
+            segment_number: 0,
+        };
+        pipeline.articles_in_flight += 1;
+        pipeline
+            .handle_download_done(DownloadResult {
+                lane_id: 0,
+                job_id,
+                runtime_generation: 0,
+                segment_id,
+                data: Ok(DownloadPayload::Raw(Bytes::from_static(
+                    b"not a yenc article",
+                ))),
+                attempts: Vec::new(),
+                lane_observation: None,
+                source_server_idx: Some(0),
+                origin: DownloadResultOrigin::NormalPrimary,
+                retry_count: 0,
+                exclude_servers: weaver_nntp::ServerSet::EMPTY,
+                release_connection_slot: true,
+            })
+            .await;
+    }
+    let first = pipeline.decode_done_rx.recv().await.expect("first decode");
+    let last = pipeline.decode_done_rx.recv().await.expect("last decode");
+    let published = |pipeline: &Pipeline| {
+        pipeline.shared_state.queue.read(|inner| {
+            inner
+                .job(job_id)
+                .map(|row| row.report.job.failed_bytes)
+                .expect("the job's row")
+        })
+    };
+
+    pipeline.handle_decode_done(first).await;
+    assert!(pipeline.reports_due.contains(&job_id));
+    // The figure moves; the row says what it said until the tick.
+    let before = published(&pipeline);
+    pipeline.jobs.get_mut(&job_id).unwrap().failed_bytes = before + 7;
+    assert_eq!(published(&pipeline), before);
+    pipeline.refresh_periodic_snapshot();
+    assert!(pipeline.reports_due.is_empty());
+    assert_eq!(published(&pipeline), before + 7);
+
+    pipeline.jobs.get_mut(&job_id).unwrap().failed_bytes = before + 9;
+    pipeline.handle_decode_done(last).await;
+    assert!(pipeline.reports_due.is_empty());
+    assert_eq!(published(&pipeline), before + 9);
+}
+
+// A result or retry that only moves a job's figures leaves its report to the
+// tick; one that moves its stage publishes at once. A job with no report
+// writes nothing.
+#[tokio::test]
+async fn a_report_soon_defers_figures_and_publishes_a_stage_at_once() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20032);
+    let files = vec![("one.bin".to_string(), 64u32)];
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Report Soon", &files),
+    )
+    .await;
+    pipeline.report_job(job_id);
+    let published = |pipeline: &Pipeline| {
+        pipeline.shared_state.queue.read(|inner| {
+            inner
+                .job(job_id)
+                .map(|row| {
+                    (
+                        row.report.job.failed_bytes,
+                        row.report.job.finalizing_download,
+                    )
+                })
+                .expect("the job's row")
+        })
+    };
+    let (before, _) = published(&pipeline);
+
+    pipeline.jobs.get_mut(&job_id).unwrap().failed_bytes = before + 5;
+    pipeline.report_job_soon(job_id);
+    assert!(pipeline.reports_due.contains(&job_id));
+    assert_eq!(published(&pipeline), (before, false));
+
+    pipeline.jobs_finalizing_download.insert(job_id);
+    pipeline.report_job_soon(job_id);
+    assert!(pipeline.reports_due.is_empty());
+    assert_eq!(published(&pipeline), (before + 5, true));
+
+    let revision = pipeline.shared_state.queue.revision();
+    pipeline.report_job(JobId(20033));
+    assert_eq!(pipeline.shared_state.queue.revision(), revision);
 }
 
 #[tokio::test]
@@ -478,7 +600,7 @@ async fn streamed_decode_failure_retries_excluding_actual_source_server() {
         },
         segment_number: 0,
     };
-    pipeline.active_downloads += 1;
+    pipeline.articles_in_flight += 1;
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
@@ -494,7 +616,7 @@ async fn streamed_decode_failure_retries_excluding_actual_source_server() {
             source_server_idx: Some(0),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -556,8 +678,11 @@ async fn queued_yenc_layout_mismatch_retries_before_decode_acceptance() {
                 segments: Vec::new(),
             },
             source: SegmentSource {
-                source_server_idx: Some(1),
-                exclude_servers: vec![2],
+                servers: PoolServers::stamped(
+                    pipeline.pool_generation,
+                    Some(1),
+                    weaver_nntp::ServerSet::from([2]),
+                ),
             },
         })
         .await;
@@ -609,7 +734,7 @@ async fn fused_yenc_layout_mismatch_retries_before_decode_acceptance() {
         segment_number: 0,
     };
     let mut events = pipeline.event_tx.subscribe();
-    pipeline.active_downloads += 1;
+    pipeline.articles_in_flight += 1;
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
@@ -644,7 +769,7 @@ async fn fused_yenc_layout_mismatch_retries_before_decode_acceptance() {
             source_server_idx: Some(2),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: vec![3],
+            exclude_servers: weaver_nntp::ServerSet::from([3]),
             release_connection_slot: true,
         })
         .await;
@@ -679,19 +804,19 @@ async fn fused_yenc_layout_mismatch_retries_before_decode_acceptance() {
 #[test]
 fn decode_retry_exclude_servers_appends_actual_source_server_once() {
     assert_eq!(
-        Pipeline::decode_retry_exclude_servers(&[], Some(1)),
+        Pipeline::decode_retry_exclude_servers(weaver_nntp::ServerSet::EMPTY, Some(1)),
         vec![1]
     );
     assert_eq!(
-        Pipeline::decode_retry_exclude_servers(&[1], Some(1)),
+        Pipeline::decode_retry_exclude_servers(weaver_nntp::ServerSet::from([1]), Some(1)),
         vec![1]
     );
     assert_eq!(
-        Pipeline::decode_retry_exclude_servers(&[1], Some(0)),
+        Pipeline::decode_retry_exclude_servers(weaver_nntp::ServerSet::from([1]), Some(0)),
         vec![1, 0]
     );
     assert_eq!(
-        Pipeline::decode_retry_exclude_servers(&[1, 0], None),
+        Pipeline::decode_retry_exclude_servers(weaver_nntp::ServerSet::from([1, 0]), None),
         vec![1, 0]
     );
 }
@@ -713,7 +838,15 @@ async fn repeated_data_decode_failures_mark_failed_bytes() {
     };
 
     for _ in 0..=MAX_SEGMENT_RETRIES {
-        pipeline.handle_decode_failure(segment_id, "crc mismatch", &[], Some(0));
+        pipeline.handle_decode_failure(
+            segment_id,
+            "crc mismatch",
+            PoolServers::stamped(
+                pipeline.pool_generation,
+                Some(0),
+                weaver_nntp::ServerSet::EMPTY,
+            ),
+        );
     }
 
     assert_eq!(
@@ -741,7 +874,15 @@ async fn single_server_decode_failure_gives_the_article_up_for_repair() {
 
     // The only server produced a bad body: there is nowhere left to retry,
     // so the article fails now instead of queueing work no lane may serve.
-    pipeline.handle_decode_failure(segment_id, "crc mismatch", &[], Some(0));
+    pipeline.handle_decode_failure(
+        segment_id,
+        "crc mismatch",
+        PoolServers::stamped(
+            pipeline.pool_generation,
+            Some(0),
+            weaver_nntp::ServerSet::EMPTY,
+        ),
+    );
 
     assert_eq!(
         pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
@@ -785,7 +926,15 @@ async fn decode_failure_moves_to_the_remaining_server_then_gives_up() {
 
     // Server 0 produced a bad body; server 1 is still untried, so the
     // article moves there.
-    pipeline.handle_decode_failure(segment_id, "crc mismatch", &[], Some(0));
+    pipeline.handle_decode_failure(
+        segment_id,
+        "crc mismatch",
+        PoolServers::stamped(
+            pipeline.pool_generation,
+            Some(0),
+            weaver_nntp::ServerSet::EMPTY,
+        ),
+    );
     let work = pipeline
         .retry_rx
         .recv()
@@ -800,7 +949,11 @@ async fn decode_failure_moves_to_the_remaining_server_then_gives_up() {
 
     // Server 1 produced a bad body too: every server has been tried, so the
     // article fails well inside the retry budget.
-    pipeline.handle_decode_failure(segment_id, "crc mismatch", &work.exclude_servers, Some(1));
+    pipeline.handle_decode_failure(
+        segment_id,
+        "crc mismatch",
+        PoolServers::stamped(pipeline.pool_generation, Some(1), work.exclude_servers),
+    );
     assert_eq!(
         pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
         Some(64)
@@ -812,6 +965,64 @@ async fn decode_failure_moves_to_the_remaining_server_then_gives_up() {
             .segments_failed_permanent
             .load(Ordering::Relaxed),
         1
+    );
+}
+
+// A body fetched under one pool and decoded after a rebuild that reordered
+// the servers and added one: the indices it carries name the old pool's
+// servers and are carried to the new pool by server, so its decode failure
+// is retried on the one server that has not had it, never judged against
+// the old indices. Read as current, "server 1 failed, server 0 excluded"
+// would name the wrong servers; dropped, it would ask both again.
+#[tokio::test]
+async fn a_decode_failure_after_a_rebuild_is_retried_on_the_new_pool() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[0, 0]));
+    let job_id = JobId(20019);
+    let spec = segmented_job_spec("Rebuilt Pool Decode Failure", "broken.bin", &[64, 4096]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+
+    // Fetched from server 1 with server 0 already excluded.
+    let fetched = PoolServers::stamped(
+        pipeline.pool_generation,
+        Some(1),
+        weaver_nntp::ServerSet::from([0]),
+    );
+    // The pool is rebuilt as old 1, old 0, and a new server.
+    let rebuilt_generation = pipeline.pool_generation + 1;
+    pipeline.activate_nntp(hosts_client(&[1, 0, 2]), 4, rebuilt_generation);
+    assert_eq!(
+        fetched.under(&pipeline.pool_layouts, pipeline.pool_generation),
+        (Some(0), weaver_nntp::ServerSet::from([1]))
+    );
+
+    pipeline.handle_decode_failure(segment_id, "crc mismatch", fetched);
+
+    let retry = pipeline
+        .retry_rx
+        .recv()
+        .await
+        .expect("the server that has not had it should draw a retry");
+    assert_eq!(retry.scheduled_pool_generation, rebuilt_generation);
+    assert_eq!(retry.work.exclude_servers, [0, 1]);
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
+        Some(0)
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        0
     );
 }
 
@@ -832,7 +1043,15 @@ async fn recovery_decode_failures_do_not_mark_health_failure() {
     };
 
     for _ in 0..=MAX_SEGMENT_RETRIES {
-        pipeline.handle_decode_failure(segment_id, "crc mismatch", &[], None);
+        pipeline.handle_decode_failure(
+            segment_id,
+            "crc mismatch",
+            PoolServers::stamped(
+                pipeline.pool_generation,
+                None,
+                weaver_nntp::ServerSet::EMPTY,
+            ),
+        );
     }
 
     assert_eq!(
@@ -870,14 +1089,10 @@ fn hdd_profile_allocates_more_write_backlog_than_ssd() {
     };
     let mut hdd_profile = profile.clone();
     hdd_profile.disk.storage_class = StorageClass::Hdd;
-    let buffers = BufferPool::new(BufferPoolConfig {
-        small_count: 64,
-        medium_count: 8,
-        large_count: 2,
-    });
+    let backlog_base_bytes = 48 * 1024 * 1024;
 
-    let ssd_budget = compute_write_backlog_budget_bytes(&profile, &buffers);
-    let hdd_budget = compute_write_backlog_budget_bytes(&hdd_profile, &buffers);
+    let ssd_budget = compute_write_backlog_budget_bytes(&profile, backlog_base_bytes);
+    let hdd_budget = compute_write_backlog_budget_bytes(&hdd_profile, backlog_base_bytes);
 
     assert!(hdd_budget > ssd_budget);
 }
@@ -905,17 +1120,14 @@ fn decode_backlog_budget_is_separate_bounded_raw_article_cache() {
             same_filesystem: true,
         },
     };
-    let buffers = BufferPool::new(BufferPoolConfig {
-        small_count: 192,
-        medium_count: 24,
-        large_count: 6,
-    });
+    let backlog_base_bytes = 144 * 1024 * 1024;
 
-    let write_budget = compute_write_backlog_budget_bytes(&profile, &buffers);
-    let decode_budget = compute_decode_backlog_budget_bytes(&profile, &buffers, write_budget);
+    let write_budget = compute_write_backlog_budget_bytes(&profile, backlog_base_bytes);
+    let decode_budget =
+        compute_decode_backlog_budget_bytes(&profile, backlog_base_bytes, write_budget);
 
     assert!(decode_budget > write_budget);
-    // Memory-scaled: available/12 dominates the buffer-pool term on an 8 GiB
+    // Memory-scaled: available/12 dominates the tier's base term on an 8 GiB
     // machine, bounded by available/8.
     assert_eq!(decode_budget, 8 * 1024 * 1024 * 1024 / 12);
 }
@@ -943,14 +1155,11 @@ fn decode_backlog_budget_respects_effective_memory_cap() {
             same_filesystem: true,
         },
     };
-    let buffers = BufferPool::new(BufferPoolConfig {
-        small_count: 32,
-        medium_count: 4,
-        large_count: 1,
-    });
+    let backlog_base_bytes = 24 * 1024 * 1024;
 
-    let write_budget = compute_write_backlog_budget_bytes(&profile, &buffers);
-    let decode_budget = compute_decode_backlog_budget_bytes(&profile, &buffers, write_budget);
+    let write_budget = compute_write_backlog_budget_bytes(&profile, backlog_base_bytes);
+    let decode_budget =
+        compute_decode_backlog_budget_bytes(&profile, backlog_base_bytes, write_budget);
 
     assert_eq!(decode_budget, 64 * 1024 * 1024);
 }
@@ -983,16 +1192,12 @@ fn backlog_budgets_share_one_memory_ceiling() {
     boxed.memory.cgroup_limit = Some(GIB);
     let mut small_host = host.clone();
     small_host.memory.available_bytes = GIB;
-    // 384 MiB of scratch: above an eighth of the container's limit, well
+    // A 384 MiB base: above an eighth of the container's limit, well
     // below an eighth of the host's memory.
-    let buffers = BufferPool::new(BufferPoolConfig {
-        small_count: 512,
-        medium_count: 64,
-        large_count: 16,
-    });
+    let backlog_base_bytes = 384 * 1024 * 1024;
     let budgets = |profile: &SystemProfile| {
-        let write = compute_write_backlog_budget_bytes(profile, &buffers);
-        let decode = compute_decode_backlog_budget_bytes(profile, &buffers, write);
+        let write = compute_write_backlog_budget_bytes(profile, backlog_base_bytes);
+        let decode = compute_decode_backlog_budget_bytes(profile, backlog_base_bytes, write);
         (write, decode)
     };
 
@@ -1005,6 +1210,146 @@ fn backlog_budgets_share_one_memory_ceiling() {
     // host would have with that much memory.
     assert_eq!(budgets(&boxed), ((GIB / 8) as usize, (GIB / 8) as usize));
     assert_eq!(budgets(&boxed), budgets(&small_host));
+}
+
+// The backlog limits and the pending writes per file come out of the memory
+// tier exactly as they did when the tier sized an article buffer pool and the
+// limits were read off that pool's size. The old arithmetic is copied here as
+// the reference, so any drift in the tier table or the limit formulas fails.
+#[test]
+fn backlog_sizing_matches_the_former_pool_sized_limits_on_every_host() {
+    use crate::runtime::backlog_sizing::BacklogSizing;
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    // The former pool: buffer counts per tier by memory.
+    fn old_counts(available_bytes: u64, cgroup_limit: Option<u64>) -> (usize, usize, usize) {
+        const UNCAPPED_HOST_MEMORY_CAP_BYTES: u64 = (8 * 1024 * 1024 * 1024) - 1;
+        let sizing =
+            cgroup_limit.unwrap_or_else(|| available_bytes.min(UNCAPPED_HOST_MEMORY_CAP_BYTES));
+        let available_mb = (sizing / (1024 * 1024)) as usize;
+        if available_mb < 1024 {
+            (32, 4, 1)
+        } else if available_mb < 2048 {
+            (64, 8, 2)
+        } else if available_mb < 4096 {
+            (128, 16, 4)
+        } else if available_mb < 8192 {
+            (192, 24, 6)
+        } else if available_mb < 16384 {
+            (256, 32, 8)
+        } else if available_mb < 32768 {
+            (384, 48, 12)
+        } else {
+            (512, 64, 16)
+        }
+    }
+    fn old_pool_total_bytes((small, medium, large): (usize, usize, usize)) -> usize {
+        small * 512 * 1024 + medium * 1024 * 1024 + large * 4 * 1024 * 1024
+    }
+    fn old_write_max_pending((small, _, _): (usize, usize, usize)) -> usize {
+        if small <= 64 {
+            4
+        } else if small <= 128 {
+            8
+        } else {
+            16
+        }
+    }
+    fn old_ceiling(profile: &SystemProfile) -> usize {
+        let available_bytes = profile.memory.available_bytes.max(256 * 1024 * 1024);
+        match profile.memory.cgroup_limit {
+            Some(cgroup_limit) => available_bytes.min(cgroup_limit) as usize,
+            None => available_bytes as usize,
+        }
+    }
+    fn old_write_budget(profile: &SystemProfile, scratch_bytes: usize) -> usize {
+        let available_bytes = old_ceiling(profile);
+        let base = scratch_bytes
+            .max(64 * 1024 * 1024)
+            .min((available_bytes / 8).max(64 * 1024 * 1024));
+        match profile.disk.storage_class {
+            StorageClass::Ssd => base,
+            StorageClass::Hdd => (base.saturating_mul(2)).min((available_bytes / 4).max(base)),
+            StorageClass::Network | StorageClass::Unknown => {
+                (base.saturating_mul(3) / 2).min((available_bytes / 5).max(base))
+            }
+        }
+    }
+    fn old_decode_budget(profile: &SystemProfile, scratch_bytes: usize, write: usize) -> usize {
+        let available_bytes = old_ceiling(profile);
+        let scaled = available_bytes / 12;
+        let memory_cap = (available_bytes / 8).max(write).min(4 * 1024 * 1024 * 1024);
+        let target = scratch_bytes.saturating_mul(3).max(scaled).max(write);
+        target.min(memory_cap).max(1)
+    }
+
+    let mut checked = 0;
+    for available in [
+        512 * MIB,
+        GIB,
+        2 * GIB,
+        4 * GIB,
+        8 * GIB,
+        16 * GIB,
+        32 * GIB,
+        64 * GIB,
+    ] {
+        for cgroup_limit in [
+            None,
+            Some(GIB),
+            Some(4 * GIB),
+            Some(16 * GIB),
+            Some(64 * GIB),
+        ] {
+            for storage_class in [StorageClass::Ssd, StorageClass::Hdd, StorageClass::Network] {
+                let profile = SystemProfile {
+                    cpu: CpuProfile {
+                        physical_cores: 4,
+                        logical_cores: 4,
+                        simd: SimdSupport::default(),
+                        cgroup_limit: None,
+                    },
+                    memory: MemoryProfile {
+                        total_bytes: available,
+                        available_bytes: available,
+                        cgroup_limit,
+                        guessed: false,
+                    },
+                    disk: DiskProfile {
+                        storage_class: storage_class.clone(),
+                        filesystem: FilesystemType::Ext4,
+                        sequential_write_mbps: 500.0,
+                        random_read_iops: 10_000.0,
+                        same_filesystem: true,
+                    },
+                };
+                let case = format!("{available} bytes, limit {cgroup_limit:?}, {storage_class:?}");
+
+                let counts = old_counts(available, cgroup_limit);
+                let old_scratch = old_pool_total_bytes(counts);
+                let old_write = old_write_budget(&profile, old_scratch);
+                let old_decode = old_decode_budget(&profile, old_scratch, old_write);
+
+                let sizing = BacklogSizing::for_runtime_memory(available, cgroup_limit);
+                let write = compute_write_backlog_budget_bytes(&profile, sizing.base_bytes);
+                let decode =
+                    compute_decode_backlog_budget_bytes(&profile, sizing.base_bytes, write);
+
+                assert_eq!(sizing.base_bytes, old_scratch, "{case}");
+                assert_eq!(write, old_write, "write backlog limit, {case}");
+                assert_eq!(decode, old_decode, "decode backlog limit, {case}");
+                assert_eq!(
+                    sizing.pending_writes_per_file,
+                    old_write_max_pending(counts),
+                    "pending writes per file, {case}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 8 * 5 * 3);
 }
 
 #[tokio::test]
@@ -1047,28 +1392,30 @@ async fn fail_job_clears_write_backlog_accounting() {
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
     };
     let parked_len = data.len();
-    pipeline
-        .unanchored_parked
-        .entry(file_id)
-        .or_default()
-        .insert(
-            1,
-            crate::pipeline::UnanchoredPart {
-                result: parked,
-                bytes: crate::pipeline::ParkedBytes::Memory(DecodedChunk::from(data)),
-                source: SegmentSource {
-                    source_server_idx: None,
-                    exclude_servers: Vec::new(),
-                },
+    pipeline.unanchored_parked.insert(
+        file_id,
+        1,
+        crate::pipeline::UnanchoredPart {
+            result: parked,
+            bytes: crate::pipeline::ParkedBytes::Memory(DecodedChunk::from(data)),
+            source: SegmentSource {
+                servers: PoolServers::stamped(
+                    pipeline.pool_generation,
+                    None,
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
             },
-        );
+        },
+    );
     pipeline.note_write_buffered(parked_len, 1);
+    assert_eq!(pipeline.unanchored_parked.parts(), 1);
 
     pipeline.fail_job(job_id, "forced failure".to_string());
 
     settle_failed_releases(&mut pipeline).await;
 
     assert!(!pipeline.unanchored_parked.contains_key(&file_id));
+    assert_eq!(pipeline.unanchored_parked.parts(), 0);
     assert_eq!(pipeline.write_buffered_bytes, 0);
     assert_eq!(pipeline.write_buffered_segments, 0);
     assert_eq!(
@@ -1129,8 +1476,11 @@ async fn disk_write_failure_fails_job_before_commit() {
                 checkpoint_plan: weaver_yenc::CheckpointPlan::None,
             },
             SegmentSource {
-                source_server_idx: None,
-                exclude_servers: Vec::new(),
+                servers: PoolServers::stamped(
+                    pipeline.pool_generation,
+                    None,
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
             },
         )
         .await;

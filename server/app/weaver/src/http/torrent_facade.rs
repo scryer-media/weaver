@@ -31,7 +31,7 @@ use weaver_server_core::categories::{
 use weaver_server_core::ingest::{Kind, classify};
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::jobs::{HoldOrigin, HoldOwner, QueueMoveTarget};
-use weaver_server_core::operations::probe_disk_space;
+use weaver_server_core::operations::{OnDemandSpace, Reach, StorageCapacity};
 use weaver_server_core::proxies::{Bandwidth, ResolvedBy, TorrentScope};
 use weaver_server_core::proxies::{DiscoveredInterface, InterfaceSource, SystemInterfaceSource};
 use weaver_server_core::rss::RssService;
@@ -88,6 +88,8 @@ struct Inner {
     security: RuntimeSecurityConfig,
     watch_folder: WatchFolderService,
     torrents: Option<TorrentService>,
+    // The one owner of disk looks; `None` makes each look its own.
+    disk_space: Option<Arc<StorageCapacity>>,
     // Login cookie -> the hash of the API key it was issued for, looked up
     // again on every request so a revoked key ends its sessions.
     sessions: Mutex<SessionTable>,
@@ -145,6 +147,7 @@ impl TorrentFacadeContext {
         torrents: Option<TorrentService>,
         rss: RssService,
         api: Api,
+        disk_space: Option<Arc<StorageCapacity>>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -157,6 +160,7 @@ impl TorrentFacadeContext {
                 security,
                 watch_folder,
                 torrents,
+                disk_space,
                 rss,
                 api,
                 sessions: Mutex::new(SessionTable::default()),
@@ -172,6 +176,21 @@ impl TorrentFacadeContext {
 
     fn api(&self) -> Api {
         self.inner.api
+    }
+
+    // The bytes free on the filesystem holding `path`, -1 where that cannot
+    // be read, as the disk owner answers it.
+    async fn free_bytes(&self, path: PathBuf) -> i64 {
+        let asks = [(path, Reach::Exact)];
+        match StorageCapacity::spaces(self.inner.disk_space.as_deref(), &asks)
+            .await
+            .pop()
+        {
+            Some(OnDemandSpace::Read(space)) => {
+                i64::try_from(space.available_bytes).unwrap_or(i64::MAX)
+            }
+            _ => -1,
+        }
     }
 
     async fn count(&self) -> usize {
@@ -1011,7 +1030,7 @@ async fn app(
         }
         "setPreferences" => set_preferences(ctx, params).await,
         "defaultSavePath" => text(StatusCode::OK, ctx.inner.config.read().await.complete_dir()),
-        "getFreeSpaceAtPath" => free_space(params).await,
+        "getFreeSpaceAtPath" => free_space(ctx, params).await,
         "getDirectoryContent" => directory_content(params).await,
         // Weaver keeps no cookies: a url is fetched with the cookie its add
         // names.
@@ -3627,13 +3646,7 @@ async fn maindata(
     let server_closed = u8::from(download == Some(0)) | u8::from(upload == Some(0)) << 1;
     let mut server_state = transfer(&views, &ctx.published_sessions().sessions, download, upload);
     let save_path = PathBuf::from(config.complete_dir());
-    let free = tokio::task::spawn_blocking(move || probe_disk_space(&save_path))
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .map_or(-1, |space| {
-            i64::try_from(space.available_bytes).unwrap_or(i64::MAX)
-        });
+    let free = ctx.free_bytes(save_path).await;
     // Weaver keeps no totals past its torrents: the all-time figures are
     // those of the torrents it has.
     let downloaded = views.iter().map(|view| view.downloaded_bytes).sum::<u64>();
@@ -3902,18 +3915,12 @@ async fn ban_peers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
 
 // qBittorrent `getFreeSpaceAtPathAction`: the bytes free on the filesystem
 // holding `path`, -1 where that cannot be read.
-async fn free_space(params: &Params) -> Response {
+async fn free_space(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     if let Err(response) = require(params, &["path"]) {
         return *response;
     }
     let path = PathBuf::from(params.get("path").unwrap_or_default());
-    let free = tokio::task::spawn_blocking(move || probe_disk_space(&path))
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .map_or(-1, |space| {
-            i64::try_from(space.available_bytes).unwrap_or(i64::MAX)
-        });
+    let free = ctx.free_bytes(path).await;
     text(StatusCode::OK, free.to_string())
 }
 

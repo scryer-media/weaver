@@ -257,6 +257,7 @@ fn history(db: &Database, job_id: u64) {
         completed_at: 1,
         metadata: None,
         server_attribution: None,
+        archived_at: None,
     })
     .unwrap();
 }
@@ -1045,6 +1046,7 @@ async fn a_mark_raises_the_marked_event_of_its_jobs_kind() {
             metadata: None,
             server_attribution: None,
             protocol,
+            archived_at: None,
         })
         .unwrap();
         crate::post_processing::hooks::mark_history(

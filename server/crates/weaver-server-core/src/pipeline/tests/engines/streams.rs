@@ -332,6 +332,80 @@ async fn a_tar_delivers_its_members() {
     assert_fetched_once(&graph);
 }
 
+// A member whose path no file system takes: 262,000 parts, about 524 KB.
+fn unnamable_path() -> String {
+    let mut path = "a/".repeat(262_000);
+    path.push_str("lantern.mkv");
+    path
+}
+
+// A tar of forty episodes and one member whose name the file system
+// refuses: the one is skipped, which leaves the tar short as a damaged
+// member does, the forty are delivered whole, and the job is partial.
+#[tokio::test]
+async fn a_tar_member_whose_name_the_file_system_refuses_is_skipped() {
+    let episodes: Vec<(String, Vec<u8>)> = (1..=40u8)
+        .map(|number| (format!("episode.{number:02}.mkv"), payload(700, number)))
+        .collect();
+    let path = unnamable_path();
+    let mut members: Vec<(&str, Vec<u8>)> = episodes
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.clone()))
+        .collect();
+    members.insert(20, (path.as_str(), payload(900, 99)));
+    // Articles of a size posts use, so the long name spans one or two.
+    let scenario = Scenario::new(vec![Post::plain("lantern.tar", tar(&members))]).framed(768_000);
+    let (lines, guard) = Lines::capture();
+    let graph = run(&scenario).await;
+    drop(guard);
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
+    let skipped = lines.of("member skipped: the file system refused its name");
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert!(skipped[0].contains("name_bytes=524011"), "{skipped:?}");
+    // The tar, left short, is handed over as it stands beside them.
+    let mut names: Vec<String> = episodes.iter().map(|(name, _)| delivered(name)).collect();
+    names.push(delivered("lantern.tar"));
+    names.sort();
+    assert_eq!(graph.files.keys().cloned().collect::<Vec<_>>(), names);
+    for (name, bytes) in &episodes {
+        assert!(graph.files[&delivered(name)] == *bytes, "{name} bytes");
+    }
+    let delivery = &graph.graph().delivery;
+    assert_eq!(delivery.whole.len(), 40);
+    assert_eq!(delivery.damaged, ["lantern.tar"]);
+}
+
+// A tar whose one member has a name the file system refuses: nothing usable
+// was delivered, so the job fails.
+#[tokio::test]
+async fn a_tar_whose_only_member_has_a_refused_name_fails() {
+    // One part of 300 bytes, past the 255 a part may hold.
+    let name = format!("{}.mkv", "a".repeat(296));
+    let scenario = Scenario::new(vec![Post::plain(
+        "lantern.tar",
+        tar(&[(name.as_str(), payload(900, 98))]),
+    )]);
+    let (lines, guard) = Lines::capture();
+    let graph = run(&scenario).await;
+    drop(guard);
+    let skipped = lines.of("member skipped: the file system refused its name");
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
+    let delivery = &graph.graph().delivery;
+    assert!(delivery.whole.is_empty(), "{delivery:?}");
+    assert_eq!(delivery.damaged.len(), 1, "{delivery:?}");
+}
+
 #[tokio::test]
 async fn a_gzipped_tar_delivers_its_members() {
     let scenario = Scenario::new(vec![Post::plain("lantern.tar.gz", gzip(&tar(&members())))]);

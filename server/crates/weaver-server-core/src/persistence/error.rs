@@ -19,6 +19,11 @@ pub enum StateError {
     #[error("database error: {0}")]
     Database(String),
 
+    // The database's disk, or the quota on it, had no room for the write:
+    // nothing is wrong with the statement or the rows.
+    #[error("database error: {0}")]
+    OutOfSpace(String),
+
     #[error("state conflict: {0}")]
     Conflict(String),
 
@@ -52,5 +57,42 @@ impl StateError {
             Self::Refused(refusal) => Some(refusal),
             _ => None,
         }
+    }
+}
+
+// Why an ordered write did not commit, as its waiter is told: the message,
+// and whether the database's disk had no room for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WriteFailed {
+    pub(crate) message: String,
+    pub(crate) out_of_space: bool,
+}
+
+impl WriteFailed {
+    // A write that failed for a reason other than room.
+    pub(crate) fn other(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            out_of_space: false,
+        }
+    }
+}
+
+impl From<&StateError> for WriteFailed {
+    fn from(error: &StateError) -> Self {
+        Self {
+            message: error.to_string(),
+            out_of_space: match error {
+                StateError::OutOfSpace(_) => true,
+                StateError::Io(error) => crate::operations::is_out_of_space(error),
+                _ => false,
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for WriteFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
     }
 }

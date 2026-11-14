@@ -92,6 +92,7 @@ fn seed_history_job_with_facts(h: &TestHarness, job_id: u64, facts: Option<Strin
             completed_at: 1_767_000_010,
             metadata: None,
             server_attribution: None,
+            archived_at: None,
         },
     )
     .unwrap();
@@ -395,6 +396,7 @@ async fn a_retired_torrent_job_reports_from_its_hash() {
             completed_at: 1_767_000_600,
             metadata: None,
             server_attribution: None,
+            archived_at: None,
         },
     )
     .unwrap();

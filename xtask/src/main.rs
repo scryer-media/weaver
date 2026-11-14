@@ -128,6 +128,11 @@ struct ReleaseArgs {
         help = "Explicitly permit dangerous GraphQL changes; breaking changes still fail patch releases"
     )]
     allow_graphql_dangerous: bool,
+    #[arg(
+        long,
+        help = "Explicitly permit breaking GraphQL changes in a patch release; this permits dangerous changes too"
+    )]
+    allow_graphql_breaking: bool,
     version: Option<String>,
 }
 
@@ -1413,17 +1418,37 @@ fn commit_release_notes_if_changed(
     Ok(true)
 }
 
+// The GraphQL compatibility findings a release was told to let through.
+// Permitting breaking changes permits dangerous ones too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GraphqlOverrides {
+    dangerous: bool,
+    breaking: bool,
+}
+
+impl GraphqlOverrides {
+    fn from_args(args: &ReleaseArgs) -> Self {
+        Self {
+            dangerous: args.allow_graphql_dangerous,
+            breaking: args.allow_graphql_breaking,
+        }
+    }
+}
+
 fn release_args_signature(
     explicit: Option<&Version>,
     bump: VersionBump,
-    allow_graphql_dangerous: bool,
+    graphql: GraphqlOverrides,
 ) -> String {
     let mut signature = explicit.map_or_else(
         || format!("bump:{}", version_bump_label(bump)),
         |version| format!("version:{version}"),
     );
-    if allow_graphql_dangerous {
+    if graphql.dangerous {
         signature.push_str(":allow-graphql-dangerous");
+    }
+    if graphql.breaking {
+        signature.push_str(":allow-graphql-breaking");
     }
     signature
 }
@@ -1951,8 +1976,8 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
         .transpose()?
         .unwrap_or_else(|| Version::new(0, 0, 0));
     let (bump, explicit) = parse_bump(&args)?;
-    let release_args =
-        release_args_signature(explicit.as_ref(), bump, args.allow_graphql_dangerous);
+    let graphql_overrides = GraphqlOverrides::from_args(&args);
+    let release_args = release_args_signature(explicit.as_ref(), bump, graphql_overrides);
     let next_version = explicit.unwrap_or_else(|| next_version(&current_version, bump));
     let tag_name = format!("weaver-v{next_version}");
 
@@ -1963,6 +1988,11 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
     println!("   Next tag   : {tag_name}");
     if args.allow_graphql_dangerous {
         warn("Dangerous GraphQL changes explicitly permitted by --allow-graphql-dangerous");
+    }
+    if args.allow_graphql_breaking {
+        warn(
+            "Breaking and dangerous GraphQL changes explicitly permitted by --allow-graphql-breaking",
+        );
     }
     if args.dry_run {
         println!(
@@ -2041,7 +2071,13 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
 
     if !reused_dry_run_cache {
         step("Running release prep validation");
-        let prep_result = run_weaver_release_prep(ctx, "[prep] ");
+        let prep_result = run_weaver_release_prep(
+            ctx,
+            "[prep] ",
+            latest_tag.as_deref(),
+            &next_version,
+            graphql_overrides,
+        );
         if let Err(error) = &prep_result {
             warn(format!("Release prep validation failed: {error:#}"));
         }
@@ -2051,8 +2087,14 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
             ok("Release prep validation passed");
 
             let prepared_tree = current_tracked_tree(ctx)?;
-            let prep_generated_paths =
-                new_tracked_dirty_paths(ctx, &tracked_dirty_paths_before_validation)?;
+            // The refreshed GraphQL schema artifact is committed with the
+            // version bump, not with the prep changes.
+            let schema_artifact = ctx.path(GRAPHQL_SCHEMA_ARTIFACT);
+            let prep_generated_paths: Vec<_> =
+                new_tracked_dirty_paths(ctx, &tracked_dirty_paths_before_validation)?
+                    .into_iter()
+                    .filter(|path| *path != schema_artifact)
+                    .collect();
 
             if !args.dry_run {
                 step("Committing prep-generated changes");
@@ -2081,7 +2123,7 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
                         {
                             println!("   {YELLOW}Skipping dry-run cache reuse: {reason}{RESET}");
                         } else {
-                            ok("Reused dry-run cache; skipping nextest and ci-clippy");
+                            ok("Reused dry-run cache; skipping clippy and nextest");
                             reused_dry_run_cache = true;
                         }
                     }
@@ -2100,17 +2142,6 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
                 rust_result?;
                 ok("Rust validation passed");
             }
-
-            // Always runs, even when the dry-run cache lets the heavy Rust
-            // validation be skipped: the real release needs the regenerated
-            // artifact in its worktree to commit alongside the version bump.
-            run_weaver_graphql_api_compat_validation(
-                ctx,
-                "[graphql] ",
-                latest_tag.as_deref(),
-                &next_version,
-                args.allow_graphql_dangerous,
-            )?;
 
             Ok::<(Vec<String>, String), anyhow::Error>((
                 vec![
@@ -2244,11 +2275,23 @@ fn sync_release_workspace_lockfile(ctx: &TaskContext) -> Result<()> {
     Ok(())
 }
 
-fn run_weaver_release_prep(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
+// The cheap checks, cheapest first, in the order Scryer's release runs them,
+// so a broken release fails in minutes instead of after the Rust validation.
+fn run_weaver_release_prep(
+    ctx: &TaskContext,
+    prefix: &'static str,
+    latest_tag: Option<&str>,
+    next_version: &Version,
+    graphql: GraphqlOverrides,
+) -> Result<()> {
     run_weaver_release_container_contract_validation(ctx, prefix)?;
-    run_weaver_rust_prep_validation(ctx, prefix)?;
-    run_weaver_web_validation(ctx, prefix)?;
-    run_weaver_release_hygiene_validation(ctx, prefix)
+    run_weaver_web_audit(ctx, prefix)?;
+    run_weaver_rust_audit(ctx, prefix)?;
+    run_weaver_rust_fmt(ctx, prefix)?;
+    run_weaver_web_lint(ctx, prefix)?;
+    run_weaver_graphql_api_compat_validation(ctx, prefix, latest_tag, next_version, graphql)?;
+    run_weaver_release_hygiene_validation(ctx, prefix)?;
+    run_weaver_web_build(ctx, prefix)
 }
 
 fn run_weaver_release_container_contract_validation(
@@ -2282,14 +2325,15 @@ fn run_weaver_release_hygiene_validation(ctx: &TaskContext, prefix: &'static str
 
 // Export the current GraphQL SDL, diff it against the schema shipped by the
 // previous release, and refresh the committed `api/graphql/schema.graphql`
-// artifact. Patch releases reject breaking changes; dangerous changes require
-// an explicit override. A minor or major version increase permits both.
+// artifact. In a patch release dangerous changes require an explicit
+// override, and breaking changes require the breaking override, which covers
+// dangerous ones too. A minor or major version increase permits both.
 fn run_weaver_graphql_api_compat_validation(
     ctx: &TaskContext,
     prefix: &'static str,
     latest_tag: Option<&str>,
     next_version: &Version,
-    allow_graphql_dangerous: bool,
+    graphql: GraphqlOverrides,
 ) -> Result<()> {
     prefixed_step(prefix, "Exporting current GraphQL schema");
     let export_dir = ctx.path(GRAPHQL_SCHEMA_EXPORT_DIR);
@@ -2330,8 +2374,11 @@ fn run_weaver_graphql_api_compat_validation(
             check.arg("scripts/check-graphql-schema-compat.mjs");
             check.arg(&previous_schema_path);
             check.arg(&current_schema_path);
-            if allow_graphql_dangerous {
+            if graphql.dangerous {
                 check.arg("--allow-dangerous");
+            }
+            if graphql.breaking {
+                check.arg("--allow-breaking");
             }
             match run_streaming(&mut check, prefix) {
                 Ok(()) => prefixed_ok(prefix, "GraphQL API compatibility passed"),
@@ -2347,7 +2394,7 @@ fn run_weaver_graphql_api_compat_validation(
                     return Err(error).context(
                         "GraphQL API compatibility failed for a patch release — breaking \
                          schema changes are only permitted when the minor or major version \
-                         increases",
+                         increases, or with --allow-graphql-breaking",
                     );
                 }
             }
@@ -2443,14 +2490,18 @@ fn maybe_add_changed_graphql_schema_artifact(
     Ok(())
 }
 
-fn run_weaver_web_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
+fn run_weaver_web_audit(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
     let web_dir = ctx.path("apps/weaver-web");
     prefixed_step(prefix, "Running npm audit fix");
     let mut audit = ctx.command_in("npm", &web_dir);
     audit.args(["audit", "fix"]);
     run_streaming(&mut audit, prefix)?;
     prefixed_ok(prefix, "npm audit fix complete");
+    Ok(())
+}
 
+fn run_weaver_web_lint(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
+    let web_dir = ctx.path("apps/weaver-web");
     prefixed_step(prefix, "Running TypeScript + ESLint");
     let mut lint = ctx.command_in("npm", &web_dir);
     lint.args(["run", "lint"]);
@@ -2462,7 +2513,11 @@ fn run_weaver_web_validation(ctx: &TaskContext, prefix: &'static str) -> Result<
     graphql_compat_tests.args(["run", "test:graphql-compat"]);
     run_streaming(&mut graphql_compat_tests, prefix)?;
     prefixed_ok(prefix, "GraphQL compatibility checker tests passed");
+    Ok(())
+}
 
+fn run_weaver_web_build(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
+    let web_dir = ctx.path("apps/weaver-web");
     prefixed_step(prefix, "Running web build");
     let mut build = ctx.command_in("npm", &web_dir);
     build.args(["run", "build"]);
@@ -2509,7 +2564,17 @@ fn run_cargo_audit_validation(ctx: &TaskContext, prefix: &'static str) -> Result
     Ok(())
 }
 
-fn run_weaver_rust_prep_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
+fn run_weaver_rust_audit(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
+    prefixed_step(prefix, "Updating workspace packages in Cargo.lock");
+    let mut update = ctx.command_in("cargo", &ctx.repo_root);
+    update.args(["update", "--workspace"]);
+    run_streaming(&mut update, prefix)?;
+    prefixed_ok(prefix, "Cargo.lock updated");
+
+    run_cargo_audit_validation(ctx, prefix)
+}
+
+fn run_weaver_rust_fmt(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
     prefixed_step(prefix, "Running cargo fmt --all");
     let mut fmt_fix = ctx.command_in("cargo", &ctx.repo_root);
     fmt_fix.args(["fmt", "--all"]);
@@ -2521,57 +2586,17 @@ fn run_weaver_rust_prep_validation(ctx: &TaskContext, prefix: &'static str) -> R
     fmt.args(["fmt", "--all", "--check"]);
     run_streaming(&mut fmt, prefix)?;
     prefixed_ok(prefix, "cargo fmt passed");
-
-    prefixed_step(prefix, "Updating workspace packages in Cargo.lock");
-    let mut update = ctx.command_in("cargo", &ctx.repo_root);
-    update.args(["update", "--workspace"]);
-    run_streaming(&mut update, prefix)?;
-    prefixed_ok(prefix, "Cargo.lock updated");
-
-    run_cargo_audit_validation(ctx, prefix)?;
-
     Ok(())
 }
 
+// Clippy, then the test suite: the costliest check runs last, as in Scryer's
+// release.
 fn run_weaver_rust_heavy_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
+    run_weaver_ci_clippy_validation(ctx, "[clippy] ")?;
     ensure_cargo_nextest(ctx, prefix)?;
-
-    prefixed_step(prefix, "Running cargo nextest and ci-clippy in parallel");
-    let nextest_ctx = ctx.clone();
-    let clippy_ctx = ctx.clone();
-    let nextest = thread::spawn(move || run_weaver_nextest_validation(&nextest_ctx, "[nextest] "));
-    let clippy = thread::spawn(move || run_weaver_ci_clippy_validation(&clippy_ctx, "[clippy] "));
-
-    let nextest_result = nextest
-        .join()
-        .map_err(|_| anyhow!("nextest validation thread panicked"))?;
-    let clippy_result = clippy
-        .join()
-        .map_err(|_| anyhow!("ci-clippy validation thread panicked"))?;
-
-    if let Err(error) = &nextest_result {
-        warn(format!("Rust nextest failed: {error:#}"));
-    }
-    if let Err(error) = &clippy_result {
-        warn(format!("Rust ci-clippy failed: {error:#}"));
-    }
-
-    match (nextest_result, clippy_result) {
-        (Ok(()), Ok(())) => {
-            prefixed_ok(prefix, "Parallel nextest + ci-clippy passed");
-            Ok(())
-        }
-        (nextest_result, clippy_result) => {
-            let mut failures = Vec::new();
-            if let Err(error) = nextest_result {
-                failures.push(format!("nextest failed: {error:#}"));
-            }
-            if let Err(error) = clippy_result {
-                failures.push(format!("ci-clippy failed: {error:#}"));
-            }
-            bail!(failures.join("\n"));
-        }
-    }
+    run_weaver_nextest_validation(ctx, "[nextest] ")?;
+    prefixed_ok(prefix, "Clippy and nextest passed");
+    Ok(())
 }
 
 fn ensure_cargo_nextest(ctx: &TaskContext, prefix: &'static str) -> Result<()> {

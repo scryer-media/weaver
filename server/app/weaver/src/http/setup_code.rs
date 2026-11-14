@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use weaver_server_core::auth::service::verify_browser_csrf_token;
 use weaver_server_core::auth::{generate_setup_code, hash_api_key, normalize_setup_code};
+use weaver_server_core::security::canonical_ip;
 
+// Failures one client address may make inside the window.
 const MAX_FAILURES: usize = 5;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
+// Client addresses whose failures are remembered at once. Past this, the
+// address whose last failure is oldest is forgotten first.
+const MAX_TRACKED_CLIENTS: usize = 1024;
 
 // Asks for a setup code even on loopback, to try the flow a container gets.
 const ENV_REQUIRE_SETUP_CODE: &str = "WEAVER_REQUIRE_SETUP_CODE";
@@ -34,8 +39,50 @@ struct State {
     // `None` for a Weaver only this machine can reach, whose setup needs no
     // code: being able to open it at all already proves the operator is here.
     verifier: Option<String>,
-    failures: VecDeque<Instant>,
+    // Recent failures per client address, so one client cannot hold setup
+    // closed for everyone else.
+    failures: HashMap<IpAddr, VecDeque<Instant>>,
     consumed: bool,
+}
+
+impl State {
+    // The failures `client` made inside the window ending at `now`.
+    fn recent_failures(&mut self, client: IpAddr, now: Instant) -> usize {
+        let Some(times) = self.failures.get_mut(&client) else {
+            return 0;
+        };
+        while times
+            .front()
+            .is_some_and(|then| now.duration_since(*then) >= FAILURE_WINDOW)
+        {
+            times.pop_front();
+        }
+        let count = times.len();
+        if count == 0 {
+            self.failures.remove(&client);
+        }
+        count
+    }
+
+    fn record_failure(&mut self, client: IpAddr, now: Instant) {
+        if !self.failures.contains_key(&client) && self.failures.len() >= MAX_TRACKED_CLIENTS {
+            self.failures.retain(|_, times| {
+                times
+                    .back()
+                    .is_some_and(|then| now.duration_since(*then) < FAILURE_WINDOW)
+            });
+            if self.failures.len() >= MAX_TRACKED_CLIENTS
+                && let Some(stalest) = self
+                    .failures
+                    .iter()
+                    .min_by_key(|(_, times)| times.back().copied())
+                    .map(|(ip, _)| *ip)
+            {
+                self.failures.remove(&stalest);
+            }
+        }
+        self.failures.entry(client).or_default().push_back(now);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +102,7 @@ impl SetupChallenge {
         (
             Self(Arc::new(Mutex::new(State {
                 verifier: Some(verifier),
-                failures: VecDeque::new(),
+                failures: HashMap::new(),
                 consumed: false,
             }))),
             code,
@@ -66,7 +113,7 @@ impl SetupChallenge {
     pub(super) fn open() -> Self {
         Self(Arc::new(Mutex::new(State {
             verifier: None,
-            failures: VecDeque::new(),
+            failures: HashMap::new(),
             consumed: false,
         })))
     }
@@ -79,8 +126,10 @@ impl SetupChallenge {
             .is_some()
     }
 
-    pub(super) fn verify(&self, code: Option<&str>) -> Result<(), SetupCodeError> {
-        self.verify_at(code, Instant::now())
+    // Checks `code` for a request attributed to `client`. Wrong and missing
+    // codes count against that client address only.
+    pub(super) fn verify(&self, code: Option<&str>, client: IpAddr) -> Result<(), SetupCodeError> {
+        self.verify_at(code, client, Instant::now())
     }
 
     pub(super) fn is_available(&self) -> bool {
@@ -91,7 +140,13 @@ impl SetupChallenge {
             .consumed
     }
 
-    fn verify_at(&self, code: Option<&str>, now: Instant) -> Result<(), SetupCodeError> {
+    fn verify_at(
+        &self,
+        code: Option<&str>,
+        client: IpAddr,
+        now: Instant,
+    ) -> Result<(), SetupCodeError> {
+        let client = canonical_ip(client);
         let mut state = self.0.lock().expect("setup challenge lock poisoned");
         if state.consumed {
             return Err(SetupCodeError::Consumed);
@@ -99,14 +154,7 @@ impl SetupChallenge {
         let Some(verifier) = state.verifier.clone() else {
             return Ok(());
         };
-        while state
-            .failures
-            .front()
-            .is_some_and(|then| now.duration_since(*then) >= FAILURE_WINDOW)
-        {
-            state.failures.pop_front();
-        }
-        if state.failures.len() >= MAX_FAILURES {
+        if state.recent_failures(client, now) >= MAX_FAILURES {
             return Err(SetupCodeError::RateLimited);
         }
         // Accept the code however it was typed: any case, with or without
@@ -115,11 +163,11 @@ impl SetupChallenge {
             .map(normalize_setup_code)
             .filter(|code| !code.is_empty())
         else {
-            state.failures.push_back(now);
+            state.record_failure(client, now);
             return Err(SetupCodeError::Missing);
         };
         if !verify_browser_csrf_token(&code, &verifier) {
-            state.failures.push_back(now);
+            state.record_failure(client, now);
             return Err(SetupCodeError::Invalid);
         }
         Ok(())
@@ -153,11 +201,14 @@ mod tests {
     fn valid_code_remains_usable_until_commit_consumes_it() {
         let (challenge, code) = SetupChallenge::generate();
         assert!(challenge.is_available());
-        assert_eq!(challenge.verify(Some(&code)), Ok(()));
-        assert_eq!(challenge.verify(Some(&code)), Ok(()));
+        assert_eq!(challenge.verify(Some(&code), CLIENT), Ok(()));
+        assert_eq!(challenge.verify(Some(&code), CLIENT), Ok(()));
         challenge.consume();
         assert!(!challenge.is_available());
-        assert_eq!(challenge.verify(Some(&code)), Err(SetupCodeError::Consumed));
+        assert_eq!(
+            challenge.verify(Some(&code), CLIENT),
+            Err(SetupCodeError::Consumed)
+        );
     }
 
     #[test]
@@ -174,10 +225,13 @@ mod tests {
     fn an_open_challenge_takes_no_code_and_is_still_single_use() {
         let challenge = SetupChallenge::open();
         assert!(!challenge.code_required());
-        assert_eq!(challenge.verify(None), Ok(()));
-        assert_eq!(challenge.verify(Some("anything")), Ok(()));
+        assert_eq!(challenge.verify(None, CLIENT), Ok(()));
+        assert_eq!(challenge.verify(Some("anything"), CLIENT), Ok(()));
         challenge.consume();
-        assert_eq!(challenge.verify(None), Err(SetupCodeError::Consumed));
+        assert_eq!(
+            challenge.verify(None, CLIENT),
+            Err(SetupCodeError::Consumed)
+        );
     }
 
     #[test]
@@ -185,26 +239,31 @@ mod tests {
         let (challenge, code) = SetupChallenge::generate();
         assert!(weaver_server_core::auth::is_setup_code(&code), "{code}");
         assert_eq!(
-            challenge.verify(Some(&format!(" {} ", code.to_ascii_lowercase()))),
+            challenge.verify(Some(&format!(" {} ", code.to_ascii_lowercase())), CLIENT),
             Ok(())
         );
-        assert_eq!(challenge.verify(Some(&code.replace('-', ""))), Ok(()));
+        assert_eq!(
+            challenge.verify(Some(&code.replace('-', "")), CLIENT),
+            Ok(())
+        );
     }
 
+    const CLIENT: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 20));
+
     #[test]
-    fn missing_and_wrong_codes_share_the_global_limit() {
+    fn missing_and_wrong_codes_share_one_client_limit() {
         let (challenge, _) = SetupChallenge::generate();
         for _ in 0..3 {
-            assert_eq!(challenge.verify(None), Err(SetupCodeError::Missing));
+            assert_eq!(challenge.verify(None, CLIENT), Err(SetupCodeError::Missing));
         }
         for _ in 0..2 {
             assert_eq!(
-                challenge.verify(Some("wrong")),
+                challenge.verify(Some("wrong"), CLIENT),
                 Err(SetupCodeError::Invalid)
             );
         }
         assert_eq!(
-            challenge.verify(Some("wrong")),
+            challenge.verify(Some("wrong"), CLIENT),
             Err(SetupCodeError::RateLimited)
         );
     }
@@ -215,17 +274,68 @@ mod tests {
         let now = Instant::now();
         for _ in 0..MAX_FAILURES {
             assert_eq!(
-                challenge.verify_at(Some("wrong"), now),
+                challenge.verify_at(Some("wrong"), CLIENT, now),
                 Err(SetupCodeError::Invalid)
             );
         }
         assert_eq!(
-            challenge.verify_at(Some("wrong"), now),
+            challenge.verify_at(Some("wrong"), CLIENT, now),
             Err(SetupCodeError::RateLimited)
         );
         assert_eq!(
-            challenge.verify_at(Some("wrong"), now + FAILURE_WINDOW),
+            challenge.verify_at(Some("wrong"), CLIENT, now + FAILURE_WINDOW),
             Err(SetupCodeError::Invalid)
+        );
+    }
+
+    #[test]
+    fn one_client_at_its_limit_does_not_lock_out_another() {
+        let (challenge, code) = SetupChallenge::generate();
+        let attacker: IpAddr = "192.168.1.66".parse().unwrap();
+        let now = Instant::now();
+        for _ in 0..MAX_FAILURES {
+            assert_eq!(
+                challenge.verify_at(Some("wrong"), attacker, now),
+                Err(SetupCodeError::Invalid)
+            );
+        }
+        assert_eq!(
+            challenge.verify_at(Some(&code), attacker, now),
+            Err(SetupCodeError::RateLimited)
+        );
+        assert_eq!(challenge.verify_at(Some(&code), CLIENT, now), Ok(()));
+        // The mapped form of an address is the same client.
+        let mapped: IpAddr = "::ffff:192.168.1.66".parse().unwrap();
+        assert_eq!(
+            challenge.verify_at(Some(&code), mapped, now),
+            Err(SetupCodeError::RateLimited)
+        );
+    }
+
+    #[test]
+    fn the_failure_table_stays_bounded() {
+        let (challenge, _) = SetupChallenge::generate();
+        let now = Instant::now();
+        let tracked = |challenge: &SetupChallenge| challenge.0.lock().unwrap().failures.len();
+        for index in 0..(MAX_TRACKED_CLIENTS as u32 * 2) {
+            let client = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + index));
+            assert_eq!(
+                challenge.verify_at(Some("wrong"), client, now),
+                Err(SetupCodeError::Invalid)
+            );
+            assert!(tracked(&challenge) <= MAX_TRACKED_CLIENTS);
+        }
+        assert_eq!(tracked(&challenge), MAX_TRACKED_CLIENTS);
+
+        // Expired entries are dropped before anyone still inside the window.
+        let later = now + FAILURE_WINDOW;
+        for _ in 0..MAX_FAILURES {
+            let _ = challenge.verify_at(Some("wrong"), CLIENT, later);
+        }
+        assert_eq!(tracked(&challenge), 1);
+        assert_eq!(
+            challenge.verify_at(Some("wrong"), CLIENT, later),
+            Err(SetupCodeError::RateLimited)
         );
     }
 }

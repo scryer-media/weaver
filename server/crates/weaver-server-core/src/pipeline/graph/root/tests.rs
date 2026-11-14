@@ -665,6 +665,109 @@ async fn a_window_move_leads_the_ordinary_articles_of_other_files() {
     );
 }
 
+// Moves applied by segment leave both queues as walks of the whole queue
+// leave them: the same items, keys, order and counts. Seeded batches over a
+// job with a parked recovery set, plain files and a set, each batch moving
+// articles to every class, some twice, some not queued at all, with some
+// work taken from the queue between batches as dispatch takes it.
+#[tokio::test]
+async fn moves_by_segment_leave_the_queues_as_walks_of_them_do() {
+    use super::seams::apply_moves_by_walk;
+    let job_id = JobId(91_004);
+    let files = || {
+        let mut files: Vec<(String, FileRole, u32)> = (0..6)
+            .map(|index| (format!("lantern.part{index}.rar"), FileRole::Unknown, 7))
+            .collect();
+        files.push(("lantern.nfo".to_string(), FileRole::Standalone, 2));
+        files.push(("lantern.jpg".to_string(), FileRole::Standalone, 3));
+        files.push(("lantern.par2".to_string(), FileRole::Unknown, 1));
+        files.push(("lantern.vol0+4.par2".to_string(), recovery_role(), 5));
+        files.push(("lantern.vol4+8.par2".to_string(), recovery_role(), 6));
+        files
+    };
+    let classes = |pick: u64| match pick % 7 {
+        0 => Class::Critical,
+        1 => Class::Recovery,
+        2 => Class::FirstArticle,
+        3 => Class::Window((pick / 7 % 5) as u32),
+        4 => Class::Ordinary,
+        _ => Class::Parked,
+    };
+    for seed in 1..=40u64 {
+        let by_segment_dir = tempfile::tempdir().unwrap();
+        let by_walk_dir = tempfile::tempdir().unwrap();
+        let (mut by_segment, _, _) = new_direct_pipeline(&by_segment_dir).await;
+        let (mut by_walk, _, _) = new_direct_pipeline(&by_walk_dir).await;
+        insert_active_job(&mut by_segment, job_id, spec("lantern moves", files())).await;
+        insert_active_job(&mut by_walk, job_id, spec("lantern moves", files())).await;
+        let mut parked = false;
+        let mut random = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut next = move || {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            random
+        };
+        for _ in 0..30 {
+            let moves: Vec<Move> = (0..next() % 24)
+                .map(|_| Move {
+                    // A volume or an ordinal past the post's is no queued item.
+                    volume: VolumeIndex((next() % 12) as u32),
+                    ordinal: (next() % 9) as u32,
+                    class: classes(next()),
+                })
+                .collect();
+            // Each taken item is fetched, or comes back steered off a server.
+            let taken: Vec<bool> = (0..next() % 4).map(|_| next() % 2 == 0).collect();
+            for pipeline in [&mut by_segment, &mut by_walk] {
+                let active = pipeline
+                    .jobs
+                    .get_mut(&job_id)
+                    .unwrap()
+                    .articles
+                    .active_mut()
+                    .unwrap();
+                for steered in &taken {
+                    let Some(mut work) = active.download_queue.pop() else {
+                        continue;
+                    };
+                    if *steered {
+                        work.exclude_servers = weaver_nntp::ServerSet::from([1]);
+                        active.download_queue.push(work);
+                    }
+                }
+            }
+            apply_moves(by_segment.jobs.get_mut(&job_id).unwrap(), &moves);
+            apply_moves_by_walk(by_walk.jobs.get_mut(&job_id).unwrap(), &moves);
+            let segment = by_segment.jobs[&job_id].articles.active().unwrap();
+            let walk = by_walk.jobs[&job_id].articles.active().unwrap();
+            parked |= !walk.recovery_queue.is_empty();
+            for (one, other) in [
+                (&segment.download_queue, &walk.download_queue),
+                (&segment.recovery_queue, &walk.recovery_queue),
+            ] {
+                assert_eq!(one.snapshot(), other.snapshot(), "seed {seed}");
+                assert!(one.counts_match_a_walk(), "seed {seed}");
+                assert_eq!(one.recovery_work_count(), other.recovery_work_count());
+                assert_eq!(one.excluded_work_count(), other.excluded_work_count());
+                for file_index in 0..12 {
+                    let file = crate::jobs::ids::NzbFileId { job_id, file_index };
+                    assert_eq!(
+                        one.queued_count_for_file(file),
+                        other.queued_count_for_file(file)
+                    );
+                }
+                let mut one_first: Vec<_> = one.first_articles().collect();
+                let mut other_first: Vec<_> = other.first_articles().collect();
+                one_first.sort_by_key(|id| (id.file_id.file_index, id.segment_number));
+                other_first.sort_by_key(|id| (id.file_id.file_index, id.segment_number));
+                assert_eq!(one_first, other_first);
+            }
+        }
+        assert!(parked, "seed {seed} parked work in the recovery queue");
+    }
+}
+
 #[tokio::test]
 async fn the_first_article_of_every_member_is_requested_before_ordinary_articles() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -772,6 +875,88 @@ fn a_job_is_queued_in_posted_order_at_one_neutral_priority() {
 }
 
 #[tokio::test]
+async fn retried_articles_of_a_file_share_the_one_group_list_the_queue_holds() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(91_012);
+    let segments = 512;
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        spec(
+            "lantern shared groups",
+            vec![
+                ("lantern.mkv".to_string(), FileRole::Standalone, 4),
+                (
+                    "lantern.vol000+512.par2".to_string(),
+                    FileRole::Par2 {
+                        is_index: false,
+                        recovery_block_count: 512,
+                    },
+                    segments,
+                ),
+            ],
+        ),
+    )
+    .await;
+    let volume = segment_id(job_id, 1, 0).file_id;
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    let active = state.articles.active_mut().unwrap();
+    let shared = Arc::clone(active.download_queue.file_groups(volume).unwrap());
+    while active.download_queue.pop().is_some() {}
+
+    // Every article of the volume fails and is retried: each retry holds the
+    // list the queue built for the file, and none allocates its own.
+    let retries: Vec<_> = (0..segments)
+        .map(|ordinal| {
+            pipeline
+                .download_retry_work(
+                    segment_id(job_id, 1, ordinal),
+                    1,
+                    weaver_nntp::ServerSet::EMPTY,
+                )
+                .unwrap()
+        })
+        .collect();
+    let lists: HashSet<*const [String]> = retries
+        .iter()
+        .map(|work| Arc::as_ptr(&work.groups))
+        .collect();
+    assert_eq!(lists, HashSet::from([Arc::as_ptr(&shared)]));
+    assert_eq!(*shared, ["alt.binaries.test".to_string()]);
+
+    // Back on the queue they still share it, parked or not.
+    for work in retries {
+        pipeline.enqueue_download_work(work);
+    }
+    let active = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap();
+    let mut requeued = 0;
+    while let Some(item) = active
+        .download_queue
+        .pop()
+        .or_else(|| active.recovery_queue.pop())
+    {
+        assert!(Arc::ptr_eq(&item.groups, &shared));
+        requeued += 1;
+    }
+    assert_eq!(requeued, segments);
+}
+
+#[test]
+fn a_file_no_queue_has_held_gets_its_group_list_from_the_post() {
+    let queued = crate::jobs::model::JobArticles::Queued(Default::default());
+    let groups = vec!["alt.binaries.test".to_string()];
+    let list = queued.file_groups(segment_id(JobId(91_013), 0, 0).file_id, &groups);
+    assert_eq!(*list, *groups);
+}
+
+#[tokio::test]
 async fn a_requeued_graph_article_comes_back_at_the_roots_priority_not_its_roles() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -796,7 +981,7 @@ async fn a_requeued_graph_article_comes_back_at_the_roots_priority_not_its_roles
     // retry rebuilt from the post says so; the root holds it ordinary.
     let first_volume = segment_id(job_id, 3, 1);
     let retry = pipeline
-        .download_retry_work(first_volume, 1, Vec::new())
+        .download_retry_work(first_volume, 1, weaver_nntp::ServerSet::EMPTY)
         .unwrap();
     assert_eq!(
         retry.priority,
@@ -1086,8 +1271,11 @@ async fn a_damaged_yenc_article_is_delivered_as_damaged() {
                 segments: Vec::new(),
             },
             SegmentSource {
-                source_server_idx: Some(0),
-                exclude_servers: Vec::new(),
+                servers: crate::pipeline::PoolServers::stamped(
+                    pipeline.pool_generation,
+                    Some(0),
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
             },
         )
         .await;
@@ -2448,4 +2636,38 @@ fn an_unchanged_seek_is_answered_without_mapping_its_range_again() {
     root.map.seek(VolumeIndex(0), whole, critical);
     root.map.seek(VolumeIndex(0), whole, critical);
     assert_eq!(SEEK_MAPPED.with(std::cell::Cell::get), 1);
+}
+
+// A round of seeks over many gaps, asked again with nothing changed, is told
+// the same answers in the same order and maps none of them again. Each memo
+// answer is also checked against a fresh mapping inside `seek`.
+#[test]
+fn a_repeated_round_over_many_gaps_is_answered_from_the_memo() {
+    let mut root = ArticleRoot::new(&[file("volume.vol", &[100; 64])]);
+    for ordinal in (1..64).step_by(2) {
+        root.map.lost(VolumeIndex(0), ordinal);
+    }
+    let asks: Vec<(ByteRange, Option<Class>)> = (1..64u64)
+        .step_by(2)
+        .flat_map(|ordinal| {
+            let gap = ByteRange::new(ordinal * 100, ordinal * 100 + 100);
+            [(gap, None), (gap, Some(Class::Critical))]
+        })
+        .collect();
+    let round = |root: &mut ArticleRoot| -> Vec<Pull> {
+        asks.iter()
+            .map(|(range, class)| root.map.seek(VolumeIndex(0), *range, *class))
+            .collect()
+    };
+    // The first round raises what can still come; the second settles.
+    round(&mut root);
+    let settled = round(&mut root);
+    SEEK_MAPPED.with(|calls| calls.set(0));
+    for _ in 0..3 {
+        assert_eq!(round(&mut root), settled);
+    }
+    assert_eq!(SEEK_MAPPED.with(std::cell::Cell::get), 0);
+    root.map.lost(VolumeIndex(0), 0);
+    round(&mut root);
+    assert!(SEEK_MAPPED.with(std::cell::Cell::get) > 0);
 }

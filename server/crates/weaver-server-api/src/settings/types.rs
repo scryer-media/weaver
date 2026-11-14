@@ -154,6 +154,9 @@ pub struct GeneralSettings {
     pub complete_dir: String,
     pub cleanup_after_extract: bool,
     pub delete_failed_job_files: bool,
+    /// Days a history entry is kept after its job finished; 0 keeps history
+    /// forever.
+    pub history_retention_days: u32,
     pub max_retries: u32,
     pub propagation_delay_secs: u32,
     pub max_concurrent_nzbs: u32,
@@ -173,6 +176,8 @@ pub struct GeneralSettingsInput {
     pub complete_dir: MaybeUndefined<String>,
     pub cleanup_after_extract: Option<bool>,
     pub delete_failed_job_files: Option<bool>,
+    /// Days a history entry is kept, from 0 (forever) to 36500.
+    pub history_retention_days: Option<i32>,
     pub max_retries: Option<u32>,
     pub propagation_delay_secs: Option<u32>,
     #[graphql(validator(minimum = 1, maximum = 2147483647))]
@@ -1858,6 +1863,7 @@ impl From<&weaver_server_core::settings::Config> for GeneralSettings {
             complete_dir: cfg.complete_dir(),
             cleanup_after_extract: cfg.cleanup_after_extract(),
             delete_failed_job_files: cfg.delete_failed_job_files(),
+            history_retention_days: cfg.history_retention_days(),
             propagation_delay_secs: cfg.propagation_delay_secs(),
             max_concurrent_nzbs: cfg.max_concurrent_nzbs(),
             max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),

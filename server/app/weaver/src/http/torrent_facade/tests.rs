@@ -126,7 +126,7 @@ fn config(complete_dir: &std::path::Path) -> SharedConfig {
         intermediate_dir: None,
         complete_dir: Some(complete_dir.to_string_lossy().into_owned()),
         delete_failed_job_files: None,
-        buffer_pool: None,
+        history_retention_days: None,
         servers: vec![],
         categories: vec![],
         retry: None,
@@ -241,6 +241,7 @@ async fn rig_on(
         torrents,
         RssService::new(handle, config.clone(), db.clone()),
         api,
+        None,
     );
     Rig {
         app: build_torrent_facade_routes(context.clone())

@@ -15,7 +15,7 @@
 // Every rapidyenc function starts on a 64-byte boundary. rapidyenc is linked
 // after the code that uses it, so without this its kernels sit wherever the
 // size of that code puts them, and their speed moves with every change to
-// it (Zen 4 AVX2 random-4k: 437 ns or 471 ns for the same rapidyenc). The
+// it, as a loop's offset within a 64-byte line moves with them. The
 // padding sits before each function and never runs. Loops inside a function
 // keep the alignment the compiler gives them, now at a fixed offset.
 #[allow(dead_code)]

@@ -144,7 +144,6 @@ fn config_roundtrip() {
         hardware_profile: None,
         intermediate_dir: Some("/tmp/intermediate".to_string()),
         complete_dir: Some("/tmp/complete".to_string()),
-        buffer_pool: None,
         servers: vec![ServerConfig {
             id: 1,
             host: "news.test.com".to_string(),
@@ -194,6 +193,7 @@ fn config_roundtrip() {
         max_concurrent_nzbs: None,
         cleanup_after_extract: Some(false),
         delete_failed_job_files: None,
+        history_retention_days: None,
         watch_folder: crate::watch_folder::WatchFolderConfig {
             mode: crate::watch_folder::WatchFolderMode::Polling,
             path: Some("/incoming/nzbs".to_string()),

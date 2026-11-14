@@ -103,6 +103,12 @@ pub trait MemberAccess {
     // so the member's coverage says what the object found.
     fn found_damaged(&mut self, _member: MemberId, _range: ByteRange) {}
     fn length(&self, member: MemberId) -> Option<u64>;
+    // Whether the namespace has no room for this member to be rebuilt: the
+    // object writes nothing into it, and a repair that would have rebuilt
+    // it does not say it repaired what it covers.
+    fn withheld(&self, _member: MemberId) -> bool {
+        false
+    }
     // The runs of `range` of the member that arrived, in offset order, each
     // of which reads; the bytes between them never came.
     fn arrived(&self, _member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {
@@ -116,6 +122,16 @@ pub trait MemberAccess {
     fn scratch(&mut self) -> Option<std::path::PathBuf> {
         None
     }
+    // A write the object made in that directory failed. The namespace hears
+    // why, so a disk with no room is not taken for a set that cannot be
+    // repaired.
+    fn scratch_failed(&mut self, _error: std::io::Error) {}
+    // How many bytes this repair writes in all when it runs: every rebuilt
+    // byte it hands to `write_repaired`, and whatever it stages and rebuilds
+    // in its scratch directory. Said before the first write, and said again
+    // it adds. A repair that finds the disk full is run again from its
+    // start, so this is the room it waits for.
+    fn will_write(&mut self, _bytes: u64) {}
 
     // Bytes of the recovery object's own volume, which the namespace kept
     // where the object's inverse map placed them. This is where the
@@ -222,4 +238,12 @@ pub trait Recovery {
     // Each set the object holds, in the order it repairs them. An object
     // with no sets of its own to name says nothing.
     fn sets(&self, _out: &mut Vec<SetRuling>) {}
+
+    // How this object's repair ranks against another's over the same
+    // bytes. A returned repair rewrites bytes an earlier repair wrote only
+    // when its object ranks above every other set of its namespace; between
+    // equals the first repair stands. Most objects rank alike.
+    fn precedence(&self) -> u8 {
+        0
+    }
 }

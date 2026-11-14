@@ -15,8 +15,10 @@ use crate::migration_assets::{
 };
 use crate::persistence::sql_runtime::SqlConn;
 use crate::schema_migrations::{
-    MigrationMode, egress_quotas_v53, networking_bandwidth_v82, proxy_resolver_v64,
-    script_concurrency_v58, script_instances_v55, tracker_hosts_v93, unwanted_extensions_v56,
+    MigrationMode, egress_quotas_v53, history_release_name_v87, history_retention_v89,
+    history_search_key_v88, networking_bandwidth_v94, nzb_tables_v85, proxy_resolver_v64,
+    script_concurrency_v58, script_instances_v55, server_limit_v92, tracker_hosts_v105,
+    unwanted_extensions_v56,
 };
 
 #[derive(Clone, Debug)]
@@ -625,11 +627,27 @@ async fn run_postgres_rust_hook(
         proxy_resolver_v64::HOOK_ID => {
             proxy_resolver_v64::name_proxy_resolvers(&mut SqlConn::Postgres(tx)).await
         }
-        networking_bandwidth_v82::HOOK_ID => {
-            networking_bandwidth_v82::move_bandwidth_to_networking(&mut SqlConn::Postgres(tx)).await
+        nzb_tables_v85::HOOK_ID => {
+            nzb_tables_v85::move_nzbs_and_outlines(&mut SqlConn::Postgres(tx)).await
         }
-        tracker_hosts_v93::HOOK_ID => {
-            tracker_hosts_v93::fill_tracker_hosts(&mut SqlConn::Postgres(tx)).await
+        history_release_name_v87::HOOK_ID => {
+            history_release_name_v87::fill_history_release_names(&mut SqlConn::Postgres(tx)).await
+        }
+        history_search_key_v88::HOOK_ID => {
+            history_search_key_v88::fill_history_search_keys_and_fuzzy(&mut SqlConn::Postgres(tx))
+                .await
+        }
+        history_retention_v89::HOOK_ID => {
+            history_retention_v89::seed_history_retention(&mut SqlConn::Postgres(tx)).await
+        }
+        server_limit_v92::HOOK_ID => {
+            server_limit_v92::trim_servers_to_limit(&mut SqlConn::Postgres(tx)).await
+        }
+        networking_bandwidth_v94::HOOK_ID => {
+            networking_bandwidth_v94::move_bandwidth_to_networking(&mut SqlConn::Postgres(tx)).await
+        }
+        tracker_hosts_v105::HOOK_ID => {
+            tracker_hosts_v105::fill_tracker_hosts(&mut SqlConn::Postgres(tx)).await
         }
         other => Err(StateError::Database(format!(
             "PostgreSQL migration hook '{other}' is not implemented"
@@ -645,8 +663,13 @@ fn implemented_postgres_rust_hooks() -> &'static [&'static str] {
         unwanted_extensions_v56::HOOK_ID,
         script_concurrency_v58::HOOK_ID,
         proxy_resolver_v64::HOOK_ID,
-        networking_bandwidth_v82::HOOK_ID,
-        tracker_hosts_v93::HOOK_ID,
+        nzb_tables_v85::HOOK_ID,
+        history_release_name_v87::HOOK_ID,
+        history_search_key_v88::HOOK_ID,
+        history_retention_v89::HOOK_ID,
+        server_limit_v92::HOOK_ID,
+        networking_bandwidth_v94::HOOK_ID,
+        tracker_hosts_v105::HOOK_ID,
     ]
 }
 

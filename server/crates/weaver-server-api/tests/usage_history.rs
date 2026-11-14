@@ -233,6 +233,7 @@ fn finished_row(id: u64, status: &str, at: i64) -> weaver_server_core::JobHistor
         completed_at: at,
         metadata: None,
         server_attribution: None,
+        archived_at: None,
     }
 }
 

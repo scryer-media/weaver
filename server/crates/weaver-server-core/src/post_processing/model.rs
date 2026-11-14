@@ -1220,6 +1220,12 @@ pub struct PostProcessingFacts {
     // moment the move begins: a resumed move leaves them too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub left_behind: Vec<std::path::PathBuf>,
+    // The working directory the final move delivers from, kept from the
+    // moment the move begins: a restart goes on from it wherever the temp
+    // folder points by then, and takes the move for finished only when it
+    // is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<std::path::PathBuf>,
 }
 
 // How a job that delivered ended, as its graph ruled: whole or in part, the

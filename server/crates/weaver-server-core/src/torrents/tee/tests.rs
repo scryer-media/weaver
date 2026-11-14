@@ -340,7 +340,10 @@ async fn no_checkpoint_is_taken_while_an_object_is_out_for_its_work() {
     let layout =
         Arc::new(PieceLayout::new(1024, vec![file("lantern.zip", archive.len() as u64)]).unwrap());
     let mut storage = storage(dir.path(), &mail, CapacityReader::unknown());
-    storage.passwords = vec![SECRET.to_owned()];
+    storage.passwords = vec![crate::jobs::ArchivePasswordCandidate::new(
+        crate::jobs::ArchivePasswordSource::Tracker,
+        SECRET.to_owned(),
+    )];
     let tee = Tee::fresh(parts(&layout, dir.path(), &mail, Arc::default()), storage);
     tee.with(|job| job.hold_loans());
     // Every piece but the first leaves its step unread: only the job's

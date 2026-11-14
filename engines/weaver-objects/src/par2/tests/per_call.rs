@@ -140,3 +140,23 @@ fn verdicts_and_wants_read_the_order_and_the_damage_the_object_keeps() {
     assert_eq!(asked, later[..1]);
     assert_eq!((orderings, reads), (0, 0), "orderings, slice reads");
 }
+
+// Sets that share a slice size name it once, after what the caller holds.
+#[test]
+fn block_sizes_names_each_size_once() {
+    let one = payload(34, 5000);
+    let two = payload(35, 6000);
+    let three = payload(36, 7000);
+    let mut files = par2_set("first", &[("one.bin", &one)], 1024, 2, 1);
+    files.extend(par2_set("second", &[("two.bin", &two)], BLOCK, 2, 1));
+    files.extend(par2_set("third", &[("three.bin", &three)], 1024, 2, 1));
+    let mut job = job(&files);
+    job.member("one.bin", &one);
+    job.member("two.bin", &two);
+    job.member("three.bin", &three);
+    bind(&mut job);
+    assert_eq!(job.object.slice_sizes().count(), 3);
+    let mut sizes = vec![1024];
+    Recovery::block_sizes(&job.object, &mut sizes);
+    assert_eq!(sizes, [1024, BLOCK, 1024]);
+}

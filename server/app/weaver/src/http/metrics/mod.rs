@@ -163,7 +163,6 @@ pub(crate) struct PrometheusMetricsExporter {
     transfer_policy:
         Arc<weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry>,
     config: SharedConfig,
-    buffers: Arc<weaver_server_core::runtime::buffers::BufferPool>,
     // The configured schedule rules; absent when the exporter is built
     // without a schedule evaluator.
     schedules: Option<weaver_server_core::bandwidth::schedule::SharedSchedules>,
@@ -181,7 +180,6 @@ impl PrometheusMetricsExporter {
             weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry,
         >,
         config: SharedConfig,
-        buffers: Arc<weaver_server_core::runtime::buffers::BufferPool>,
     ) -> Self {
         let build = BuildInfo::new(db.engine_name());
         process_start_epoch_seconds();
@@ -191,7 +189,6 @@ impl PrometheusMetricsExporter {
             nntp_pool,
             transfer_policy,
             config,
-            buffers,
             schedules: None,
             torrents: None,
             build,
@@ -280,6 +277,7 @@ impl PrometheusMetricsExporter {
         let job_lifecycle = self.handle.job_lifecycle_metrics_snapshot();
         let pipeline_histograms = self.handle.pipeline_histograms_snapshot();
         let db_runtime = self.db.runtime_metrics_snapshot();
+        let wal_checkpoint = self.db.wal_checkpoint_metrics_snapshot();
         let process = weaver_server_core::runtime::process_metrics::sample();
         let http_metrics = http_metrics.snapshot();
 
@@ -319,11 +317,10 @@ impl PrometheusMetricsExporter {
         input.job_lifecycle = Some(&job_lifecycle);
         input.pipeline_histograms = Some(&pipeline_histograms);
         input.db_runtime = Some(&db_runtime);
+        input.wal_checkpoint = wal_checkpoint.as_ref();
         input.process = Some(&process);
         input.disk_space = &disk_space;
         input.http_metrics = Some(&http_metrics);
-        let buffer_pool = self.buffers.metrics();
-        input.buffer_pool = Some(&buffer_pool);
         render::render_prometheus_metrics_input(&input)
     }
 }

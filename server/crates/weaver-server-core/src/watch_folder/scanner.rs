@@ -1378,7 +1378,7 @@ mod tests {
                 intermediate_dir: None,
                 complete_dir: None,
                 delete_failed_job_files: None,
-                buffer_pool: None,
+                history_retention_days: None,
                 servers: vec![],
                 categories: vec![tv()],
                 retry: None,

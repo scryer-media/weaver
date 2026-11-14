@@ -222,6 +222,102 @@ type ApplicationUpgradeStatus {
 	latestRun: ApplicationUpgradeRunPayload
 }
 
+"""
+What an archive request answered for one id, before any disk work.
+"""
+enum ArchiveHistoryAcceptOutcome {
+	"""
+	Queued: the entry is archived in the background.
+	"""
+	ACCEPTED
+	"""
+	There is no history entry and no job with this id.
+	"""
+	NOT_FOUND
+	"""
+	Another history operation holds the entry, or the job is in the
+	queue again.
+	"""
+	BUSY
+	"""
+	The job is in the queue and has not finished.
+	"""
+	NOT_FINISHED
+	"""
+	The entry is already archived.
+	"""
+	ALREADY_ARCHIVED
+}
+
+"""
+One id's answer to an archive request.
+"""
+type ArchiveHistoryAcceptResult {
+	id: Int!
+	outcome: ArchiveHistoryAcceptOutcome!
+}
+
+"""
+The answer to an archive request. The accepted ids are archived in the
+background; each entry then shows `archivedAt` once its files are gone,
+or a failed `deleteOperation` with `action: ARCHIVE`.
+"""
+type ArchiveHistoryAcceptance {
+	"""
+	The operation holding the accepted ids; null when none was accepted.
+	"""
+	operationId: Int
+	acceptedIds: [Int!]!
+	totalTargets: Int!
+	"""
+	One result per distinct id, in the order given.
+	"""
+	results: [ArchiveHistoryAcceptResult!]!
+}
+
+"""
+What archiving one history entry did. The entry stays either way.
+"""
+enum ArchiveHistoryOutcome {
+	"""
+	Archived: the folders Weaver manages were removed.
+	"""
+	ARCHIVED
+	"""
+	Archived with nothing on disk to remove, or already archived.
+	"""
+	ALREADY_GONE
+	"""
+	A folder of the job is not one Weaver manages and was left as it is.
+	"""
+	NOT_MANAGED
+	"""
+	The job is in the queue or another history operation holds it.
+	"""
+	BUSY
+	"""
+	There is no history entry with this id.
+	"""
+	NOT_FOUND
+	"""
+	Archiving stopped on an error. Nothing is stamped and a retry is safe.
+	"""
+	FAILED
+}
+
+"""
+Where the password that opened an archive came from. Never the password.
+"""
+enum ArchivePasswordOrigin {
+	EXPLICIT
+	INTEGRATION
+	DNZB_HEADER
+	NZB_META
+	FILENAME_CONVENTION
+	SETTINGS
+	PASSWORD_FILE
+}
+
 type ArchivePasswordSettings {
 	hasPasswords: Boolean!
 	passwordFile: String
@@ -584,6 +680,11 @@ type DownloadBlock {
 	Why a schedule rule is holding new downloads, while one is.
 	"""
 	scheduleHoldReason: String
+	"""
+	When a timed pause lifts by itself, in epoch milliseconds. Absent for
+	a pause that waits to be resumed by hand.
+	"""
+	resumeAtEpochMs: Float
 }
 
 enum DownloadBlockKindGql {
@@ -593,6 +694,62 @@ enum DownloadBlockKindGql {
 	SCHEDULED
 	EGRESS_QUOTA
 	SERVER_QUOTA
+}
+
+enum DownloadLayout {
+	"""
+	Plain files only.
+	"""
+	PLAIN
+	"""
+	Every payload file is part of an archive.
+	"""
+	ARCHIVE
+	"""
+	Archives and plain files side by side.
+	"""
+	MIXED
+}
+
+type DownloadNode {
+	id: Int!
+	"""
+	Null for an archive inside the post itself.
+	"""
+	parentId: Int
+	"""
+	The container's kind, such as `rar_store` or `sevenz_engine`.
+	"""
+	kind: String!
+	name: String
+	volumes: Int!
+	depth: Int!
+	"""
+	Read once its volumes were on disk, rather than as they arrived.
+	"""
+	extracted: Boolean!
+	givenUp: Boolean!
+	"""
+	Why it gave up, such as `encrypted` or `compressed`.
+	"""
+	reason: String
+	encrypted: Boolean!
+	encryptedHeaders: Boolean!
+	passwordNeeded: Boolean!
+	passwordOrigin: ArchivePasswordOrigin
+}
+
+type DownloadPost {
+	files: Int!
+	articles: Int!
+	missingArticles: Int!
+	failedArticles: Int!
+	"""
+	The oldest file date in the NZB, in epoch seconds.
+	"""
+	oldestPost: Int
+	newestPost: Int
+	groups: Int!
 }
 
 enum DownloadPressureReasonGql {
@@ -606,6 +763,53 @@ enum DownloadPressureStateGql {
 	CLEAR
 	SOFT
 	HARD
+}
+
+type DownloadRecovery {
+	nodeId: Int!
+	"""
+	`par2`, `par3`, `sfv`, `rar_recovery` or `rar_record`.
+	"""
+	kind: String!
+	"""
+	`clean`, `repaired`, `impossible`, `waiting` or `unread`.
+	"""
+	outcome: String
+	sets: [DownloadRecoverySet!]!
+	setCount: Int!
+}
+
+type DownloadRecoverySet {
+	blocksReachable: Int!
+	damagedSlices: Int!
+	outcome: String
+	slicesRepaired: Int!
+	readBack: Boolean!
+}
+
+"""
+How a finished job's download went. Built once as the job finished.
+"""
+type DownloadSummary {
+	"""
+	Null when the archive graph did not run for the job.
+	"""
+	layout: DownloadLayout
+	"""
+	The first archive nodes, breadth first from the post: at most 200.
+	"""
+	nodes: [DownloadNode!]!
+	"""
+	Every archive node the job had, however many `nodes` holds.
+	"""
+	nodeCount: Int!
+	"""
+	The deepest an archive sat: 1 for one inside the post.
+	"""
+	maxDepth: Int!
+	recovery: [DownloadRecovery!]!
+	recoveryCount: Int!
+	post: DownloadPost!
 }
 
 enum DuplicateActionGql {
@@ -861,6 +1065,21 @@ type ExtractionTimelineGroup {
 	members: [ExtractionMemberTimeline!]!
 }
 
+type FailureCount {
+	"""
+	`repair`, `password`, `disk_full`, `unpack`, `move`, `health` or
+	`duplicate`; empty when the job's row keeps no cause.
+	"""
+	cause: String!
+	count: Int!
+}
+
+type FinishedJobs {
+	complete: Int!
+	partial: Int!
+	failed: Int!
+}
+
 type FirstRunSetup {
 	"""
 	Whether the browser should walk the operator through first-run setup.
@@ -892,6 +1111,11 @@ type GeneralSettings {
 	completeDir: String!
 	cleanupAfterExtract: Boolean!
 	deleteFailedJobFiles: Boolean!
+	"""
+	Days a history entry is kept after its job finished; 0 keeps history
+	forever.
+	"""
+	historyRetentionDays: Int!
 	maxRetries: Int!
 	propagationDelaySecs: Int!
 	maxConcurrentNzbs: Int!
@@ -911,6 +1135,10 @@ input GeneralSettingsInput {
 	completeDir: String
 	cleanupAfterExtract: Boolean
 	deleteFailedJobFiles: Boolean
+	"""
+	Days a history entry is kept, from 0 (forever) to 36500.
+	"""
+	historyRetentionDays: Int
 	maxRetries: Int
 	propagationDelaySecs: Int
 	maxConcurrentNzbs: Int
@@ -1087,12 +1315,23 @@ enum HistoryDeleteOperationState {
 	COMPLETED_WITH_ERRORS
 }
 
+"""
+The history operation an entry is waiting on, or the last one that
+failed for it. An archive that succeeded shows here no more; the
+entry's `archivedAt` says so instead.
+"""
 type HistoryDeleteRowState {
 	operationId: Int!
 	state: HistoryDeleteRowStateKind!
 	locked: Boolean!
+	action: HistoryOperationAction!
 	deleteFiles: Boolean!
 	errorMessage: String
+	"""
+	How a failed archive ended; null for a delete, and while the
+	archive waits or runs.
+	"""
+	archiveOutcome: ArchiveHistoryOutcome
 }
 
 enum HistoryDeleteRowStateKind {
@@ -1129,6 +1368,15 @@ type HistoryItem {
 	deleteOperation: HistoryDeleteRowState
 	duplicateSummary: DuplicateSummaryInfo
 	"""
+	When the entry was archived: its files removed and the entry kept.
+	Null while it is not archived.
+	"""
+	archivedAt: DateTime
+	"""
+	The job's tags, in tag order.
+	"""
+	tags: [String!]!
+	"""
 	The files Weaver gave a name other than their full one, each with its
 	full name. Empty when every file carries its full name.
 	"""
@@ -1138,6 +1386,20 @@ type HistoryItem {
 	profile's ceiling, so `reprocessJob(noMemoryLimit: true)` may finish it.
 	"""
 	failedForMemory: Boolean!
+}
+
+"""
+What a history operation does with its entries.
+"""
+enum HistoryOperationAction {
+	"""
+	Deletes the entry, with or without its files.
+	"""
+	DELETE
+	"""
+	Archives the entry: removes its files and keeps the entry.
+	"""
+	ARCHIVE
 }
 
 type HistoryPage {
@@ -1177,8 +1439,17 @@ input HistoryPageInput {
 	without a second field.
 	"""
 	categories: [String!]
+	"""
+	Keep only rows whose job carries this tag; the empty string keeps rows
+	whose job carries none.
+	"""
+	tag: String
 	sortField: HistorySortField
 	sortDirection: HistorySortDirection
+	"""
+	Keep only rows that finished at or after this epoch second.
+	"""
+	completedSinceEpochSec: Int
 }
 
 enum HistorySortDirection {
@@ -1279,6 +1550,35 @@ type HttpUploadResult {
 	failure: SpeedTestFailure
 }
 
+type IntegrityHistory {
+	"""
+	This host's local date, `YYYY-MM-DD`.
+	"""
+	today: String!
+	rangeStart: String!
+	rangeEnd: String!
+	"""
+	NZB jobs finished, counted in `events`, under the id `finished`.
+	"""
+	finished: UsageConsumer!
+	"""
+	Of those, the ones a repair was applied to, under the id `repaired`.
+	"""
+	repaired: UsageConsumer!
+	"""
+	Each job stage timed: its runs in `events`, its time in `durationMs`.
+	"""
+	stages: [UsageConsumer!]!
+	"""
+	From the history rows of the NZB jobs that finished in the range.
+	"""
+	recovery: RecoveryTotals!
+	"""
+	From the history rows of the NZB jobs that failed in the range.
+	"""
+	failures: [FailureCount!]!
+}
+
 """
 A scalar that can represent any JSON value.
 """
@@ -1304,12 +1604,19 @@ type Job {
 	metadata: [MetadataEntry!]!
 	outputDir: String
 	createdAt: Float
+	"""
+	The job's tags, in tag order.
+	"""
+	tags: [String!]!
 }
 
 type JobDetailSnapshot {
 	queueItem: QueueItem
 	historyItem: HistoryItem
 	jobTimeline: JobTimeline
+	"""
+	The job's newest events, oldest first: at most 100.
+	"""
 	jobEvents: [JobEvent!]!
 	"""
 	Which servers served this job's articles, highest count first.
@@ -1320,6 +1627,16 @@ type JobDetailSnapshot {
 	that finished before the counters existed.
 	"""
 	serverAttribution: [JobServerContribution!]!
+	"""
+	How many events the job has in all, however many `jobEvents` holds.
+	"""
+	jobEventCount: Int!
+	"""
+	How the download went: its archive tree, recovery and post. Null
+	while the job is queued, and for an entry that finished before
+	Weaver kept it.
+	"""
+	downloadSummary: DownloadSummary
 }
 
 """
@@ -1340,6 +1657,10 @@ type JobEvent {
 	fileId: String
 	message: String!
 	timestamp: Float!
+	"""
+	Pass as `jobEvents(before:)` to read the events older than this one.
+	"""
+	cursor: String
 }
 
 type JobOutputFile {
@@ -1348,10 +1669,32 @@ type JobOutputFile {
 	sizeBytes: Int!
 }
 
+"""
+One page of a job's output files, and the totals of all of them.
+"""
 type JobOutputResult {
 	outputDir: String!
-	files: [JobOutputFile!]!
+	"""
+	The bytes of every file, not only of this page.
+	"""
 	totalBytes: Int!
+	"""
+	How many files there are in all.
+	"""
+	totalCount: Int!
+	"""
+	True when the entry was archived and this is the record kept of its
+	files.
+	"""
+	archived: Boolean!
+	"""
+	The `after` that asks for the next page; null on the last page.
+	"""
+	nextCursor: String
+	"""
+	This page of the files, in file name order.
+	"""
+	files: [JobOutputFile!]!
 }
 
 """
@@ -1394,6 +1737,14 @@ enum JobStatusGql {
 	CHECKING_FILES
 	SEEDING
 	STALLED
+}
+
+"""
+A tag, with how many jobs carry it, queued or in history.
+"""
+type JobTag {
+	name: String!
+	count: Int!
 }
 
 type JobTimeline {
@@ -1613,8 +1964,17 @@ type Metrics {
 	bytesDownloaded: Int!
 	bytesDecoded: Int!
 	bytesCommitted: Int!
+	"""
+	Articles still to fetch across every queued job, recovery articles
+	and jobs outside the queue window included; not connections or jobs.
+	"""
 	downloadQueueDepth: Int!
-	activeDownloads: Int!
+	"""
+	Articles the download lanes hold right now: sent or about to be sent
+	to a server and not yet answered. Roughly busy connections times
+	pipeline depth. Not the number of jobs or files downloading.
+	"""
+	articlesInFlight: Int!
 	activeDecodes: Int!
 	decodePending: Int!
 	decodePendingBytes: Int!
@@ -1659,6 +2019,11 @@ type Metrics {
 	segmentsDownloaded: Int!
 	segmentsDecoded: Int!
 	segmentsCommitted: Int!
+	"""
+	Articles booked missing: every server and every message id was tried
+	and none had it. Per-server refusals are in
+	`downloadFailuresArticleNotFound`.
+	"""
 	articlesNotFound: Int!
 	decodeErrors: Int!
 	verifyActive: Int!
@@ -1666,7 +2031,15 @@ type Metrics {
 	extractActive: Int!
 	diskWriteLatencyUs: Int!
 	segmentsRetried: Int!
+	"""
+	Articles that downloaded but never decoded into place and were left
+	to repair; articles no server had are in `articlesNotFound`.
+	"""
 	segmentsFailedPermanent: Int!
+	"""
+	Article fetches a server answered as not found, one per server asked;
+	an article another server then delivers still counts here.
+	"""
 	downloadFailuresArticleNotFound: Int!
 	downloadFailuresCapacityUnavailable: Int!
 	downloadFailuresTransient: Int!
@@ -1674,6 +2047,10 @@ type Metrics {
 	downloadFailuresPermanent: Int!
 	currentDownloadSpeed: Int!
 	crcErrors: Int!
+	"""
+	Recovery articles still to fetch across the jobs in the queue window;
+	part of `downloadQueueDepth`.
+	"""
 	recoveryQueueDepth: Int!
 	articlesPerSec: Float!
 	decodeRateMbps: Float!
@@ -1864,6 +2241,29 @@ type MutationRoot {
 	Test connectivity to an NNTP server without saving it.
 	"""
 	testConnection(input: ServerInput!): TestConnectionResult!
+	"""
+	Make tags no job carries yet. Answers every tag.
+	"""
+	createTags(tags: [String!]!): [JobTag!]!
+	"""
+	Delete tags, taking them off every job. Answers every tag left.
+	"""
+	deleteTags(tags: [String!]!): [JobTag!]!
+	"""
+	Put tags on jobs, queued or in history, making any tag not made yet.
+	An id of no job is passed over. Answers every tag.
+	"""
+	addJobTags(ids: [Int!]!, tags: [String!]!): [JobTag!]!
+	"""
+	Take tags off jobs; with no tags, take every tag off them. The tags
+	stay made. Answers every tag.
+	"""
+	removeJobTags(ids: [Int!]!, tags: [String!]! = []): [JobTag!]!
+	"""
+	Give jobs exactly these tags, making any not made yet. Answers every
+	tag.
+	"""
+	setJobTags(ids: [Int!]!, tags: [String!]!): [JobTag!]!
 	updateBackupSettings(customBackupPath: String): BackupSettings!
 	updateAutoBackupSettings(input: AutoBackupSettingsInput!): AutoBackupSettings!
 	deleteBackup(filename: String!): Boolean!
@@ -1957,6 +2357,15 @@ type MutationRoot {
 	Returns the remaining history jobs after deletion.
 	"""
 	deleteHistoryBatch(ids: [Int!]!, deleteFiles: Boolean! = false): [HistoryItem!]!
+	"""
+	Archive up to 100 history entries: remove their files and keep the
+	entries and their stored NZBs. Only folders Weaver manages are
+	removed. The request only queues the work and answers one result per
+	distinct id, in the order given; the files go in the background. Each
+	accepted entry then shows `archivedAt`, or a failed `deleteOperation`
+	with `action: ARCHIVE`, its `archiveOutcome` and message.
+	"""
+	archiveHistory(ids: [Int!]!): ArchiveHistoryAcceptance!
 	"""
 	Delete all completed/failed/cancelled jobs from history.
 	Integration (control) scope may also delete completed output with `deleteFiles: true`.
@@ -2617,7 +3026,6 @@ type PeerUploadResult {
 	bytes: Float!
 	elapsedMs: Int!
 	bps: Float!
-	peers: Int!
 	error: String
 }
 
@@ -2646,6 +3054,10 @@ enum PortMapProtocol {
 enum PortMapper {
 	UPNP
 	NAT_PMP
+	"""
+	PCP from a global IPv6 address.
+	"""
+	PCP_IPV_6
 }
 
 type PostProcessingSettingsGql {
@@ -2934,8 +3346,16 @@ type QueryRoot {
 	"""
 	Get the event log for a specific job.
 	"""
-	jobEvents(jobId: Int!): [JobEvent!]!
-	validatedArchivePassword(id: Int!): String
+	jobEvents(		jobId: Int!,
+		"""
+		Events per page: 2000 when absent, at most 2000.
+		"""
+		limit: Int,		offset: Int,
+		"""
+		An event's `cursor`: read only events older than it, so a page holds while new events arrive.
+		"""
+		before: String
+	): [JobEvent!]!
 	"""
 	A report on a queued or finished job's NZB and how the job went, with
 	every name, path, host and password left out so it can be shared.
@@ -2973,11 +3393,11 @@ type QueryRoot {
 	List jobs, optionally filtered by status, category, or metadata key.
 	Supports pagination via `limit` and `offset`.
 	"""
-	jobs(status: [JobStatusGql!], category: String, hasMetadataKey: String, limit: Int, offset: Int): [Job!]!
+	jobs(status: [JobStatusGql!], category: String, hasMetadataKey: String, tag: String, limit: Int, offset: Int): [Job!]!
 	"""
 	Count jobs matching the given filters (same filters as `jobs`).
 	"""
-	jobCount(status: [JobStatusGql!], category: String, hasMetadataKey: String): Int!
+	jobCount(status: [JobStatusGql!], category: String, hasMetadataKey: String, tag: String): Int!
 	"""
 	Get a specific job by ID.
 	"""
@@ -2988,9 +3408,20 @@ type QueryRoot {
 	"""
 	duplicateSnapshot(id: Int!): DuplicateIdentitySnapshotInfo
 	"""
-	List files in a completed job's output directory.
+	List one page of the files in a job's output directory, in file name
+	order, with the totals of all of them. Once the entry was archived,
+	the list is the record kept of its files and `archived` is true.
 	"""
-	jobOutputFiles(jobId: Int!): JobOutputResult
+	jobOutputFiles(		jobId: Int!,
+		"""
+		Files per page: 100 when absent, at most 1000.
+		"""
+		first: Int,
+		"""
+		The `nextCursor` of the page before.
+		"""
+		after: String
+	): JobOutputResult
 	postProcessingSettings: PostProcessingSettingsGql!
 	"""
 	Every saved script job, in run order.
@@ -3122,6 +3553,24 @@ type QueryRoot {
 	Tiered local metrics history for the built-in monitoring UI.
 	"""
 	metricsHistory(range: MetricsHistoryRangeGql!): MetricsHistoryResult!
+	"""
+	Data used per day by each server or category: today, this week (from
+	Monday), this month, this year, all time and the asked range, each
+	date in the range, and the jobs finished today and in the range. All
+	dates are this host's local dates.
+	"""
+	usageHistory(range: UsageRange!, kind: UsageConsumerKind): UsageHistory!
+	"""
+	NZB jobs finished and repaired per day, each stage's runs and time,
+	and, from the history of the jobs that finished in the range, the
+	recovery they posted and fetched and why the failed ones failed.
+	"""
+	integrityHistory(range: UsageRange!): IntegrityHistory!
+	"""
+	Torrent data per day, all together and by tracker: from peers, to
+	peers and seeding time; and the peers connected now.
+	"""
+	torrentHistory(range: UsageRange!): TorrentHistory!
 	browseDirectories(path: String, includeFiles: Boolean): DirectoryBrowseResult!
 	"""
 	How full the disk under a folder is, for a folder that is not saved yet.
@@ -3178,7 +3627,16 @@ type QueryRoot {
 	peers can reach its session.
 	"""
 	torrentRoutes: [TorrentRoute!]!
-	torrents(category: String): [Torrent!]!
+	"""
+	Every torrent, or a category's, in the order they were added: the
+	`first` after the offset cursor `after`, as `queueItems` pages.
+	`first` is 100 when not given, and at most 500.
+	"""
+	torrents(category: String, first: Int, after: String): [Torrent!]!
+	"""
+	Every tag made, in tag order, with how many jobs carry it.
+	"""
+	jobTags: [JobTag!]!
 }
 
 type QueueAttention {
@@ -3348,6 +3806,10 @@ type QueueItem {
 	NZB material and credentials, which remain unavailable to GraphQL.
 	"""
 	duplicateSummary: DuplicateSummaryInfo
+	"""
+	The job's tags, in tag order.
+	"""
+	tags: [String!]!
 }
 
 """
@@ -3428,6 +3890,10 @@ input QueuePageInput {
 	"""
 	categories: [String!]
 	"""
+	Jobs carrying this tag; the empty string names jobs with none.
+	"""
+	tag: String
+	"""
 	Omit both fields to retain the scheduler's hot-download order.
 	"""
 	sortField: QueueSortField
@@ -3502,6 +3968,10 @@ input QueueSelectionInput {
 	"""
 	categories: [String!]
 	"""
+	Jobs carrying this tag; the empty string names jobs with none.
+	"""
+	tag: String
+	"""
 	The whole queue, stated outright. Required when no filter is given.
 	"""
 	all: Boolean
@@ -3557,6 +4027,7 @@ enum QueueWaitReason {
 	REPAIR_CAPACITY
 	EXTRACTION_CAPACITY
 	POST_PROCESSING_CAPACITY
+	DISK_SPACE
 }
 
 type QuotaDirectionUsage {
@@ -3591,6 +4062,17 @@ One setting at one level; `value` is given with `SET` and only then.
 input RatioLeafInput {
 	state: LeafState!
 	value: Float
+}
+
+type RecoveryTotals {
+	"""
+	Recovery the jobs posted.
+	"""
+	availableBytes: Int!
+	"""
+	Of that, what they fetched.
+	"""
+	fetchedBytes: Int!
 }
 
 enum ResolvedBy {
@@ -4257,6 +4739,20 @@ enum ScriptQueueEvent {
 	NZB_NAMED
 	NZB_DOWNLOADED
 	NZB_DELETED
+	SEEDING_FINISHED
+	SEEDING_STOPPED
+	QUOTA_NORMAL
+	QUOTA_TRICKLE
+	QUOTA_STOPPED
+	ROUTE_DOWN
+	TORRENT_MARKED
+	TORRENT_ADDED
+	TORRENT_DOWNLOADED
+	TORRENT_DELETED
+	JOB_ADDED
+	JOB_DOWNLOADED
+	JOB_DELETED
+	ROUTE_UP
 }
 
 type ScriptResultGql {
@@ -4789,7 +5285,8 @@ type ServerHealth {
 	"""
 	label: String!
 	"""
-	"PRIMARY" for the highest-priority server, "BACKUP" otherwise.
+	"PRIMARY" for every fill server on the top priority level, "BACKUP"
+	for every other server (lower levels and backfill servers).
 	"""
 	tier: String!
 	"""
@@ -4840,9 +5337,16 @@ type ServerHealth {
 	"""
 	runtimeGeneration: Int!
 	"""
-	EWMA request latency in milliseconds.
+	EWMA request latency in milliseconds. Reads 50.0, the figure server
+	ranking starts from, until a first request has been timed; use
+	`measuredLatencyMs` to tell a measurement from that start value.
 	"""
 	latencyMs: Float!
+	"""
+	EWMA request latency in milliseconds, absent until a first request
+	to this server has been timed.
+	"""
+	measuredLatencyMs: Float
 	"""
 	EWMA command-to-status-line wait for BODY fetches, in milliseconds.
 	Absent until the download lanes have taken an unbiased sample.
@@ -4858,21 +5362,59 @@ type ServerHealth {
 	"""
 	bodyLatencyBand: String
 	"""
-	BODY pipelining depth the lanes currently run at; 1 is sequential.
+	BODY pipelining depth the lanes currently run at; 1 is sequential,
+	and a server pinned sequential always reads 1.
 	"""
 	bodyPipelineDepth: Int!
 	"""
 	Set once the server has twice failed to answer a pipelined batch
-	cleanly, which holds it sequential for the rest of the process.
+	cleanly, which holds it sequential until Weaver restarts. A reorder
+	or a priority change keeps the hold; a change of host, port or
+	username starts the server afresh.
 	"""
 	bodyPipeliningPinnedSequential: Boolean!
+	"""
+	Requests the connection answered, whatever the answer: a server
+	that says "no such article" is a working connection and counts here.
+	What it had is in `articlesFound` and `articlesNotFound`.
+	"""
 	successCount: Int!
+	"""
+	Requests the connection failed: refused, timed out, dropped or
+	answered out of protocol. A "no such article" answer is not one.
+	"""
 	failureCount: Int!
 	consecutiveFailures: Int!
 	"""
 	Connections that died before reaching a healthy age, recently.
 	"""
 	prematureDeaths: Int!
+	"""
+	Out of use: switched off by a fault, or in a transport cooldown still
+	running. A capacity hold is not down. The data-used ledger counts time
+	down by the same rule.
+	"""
+	down: Boolean!
+	"""
+	The server's saved id, which the data-used ledger counts it under.
+	"""
+	serverId: Int
+	"""
+	When this server was first seen in its current state, in epoch
+	milliseconds. Absent until the data-used ledger has read it once.
+	"""
+	stateSinceEpochMs: Int
+	"""
+	Article requests this server answered with the article, counted
+	since Weaver last started. The count starts again at every start.
+	"""
+	articlesFound: Int!
+	"""
+	Article requests this server answered "no such article", counted
+	since Weaver last started; the article may still have come from
+	another server. The count starts again at every start.
+	"""
+	articlesNotFound: Int!
 	legs: [NetworkLegFlow!]!
 	"""
 	The resolved address new connections to this server dial, once an
@@ -5123,6 +5665,10 @@ input SubmitInput {
 	ignores it.
 	"""
 	unpack: Boolean
+	"""
+	The tags the job is added with.
+	"""
+	tags: [String!]! = []
 }
 
 input SubmitNzbInput {
@@ -5140,6 +5686,10 @@ input SubmitNzbInput {
 	dupeKey: String
 	dupeScore: Int
 	dupeMode: DuplicateMode
+	"""
+	The tags the job is added with.
+	"""
+	tags: [String!]! = []
 }
 
 input SubmitStagedNzbsInput {
@@ -5154,6 +5704,10 @@ input SubmitStagedNzbsInput {
 	dupeScore: Int
 	dupeMode: DuplicateMode
 	paused: Boolean! = false
+	"""
+	The tags each job is added with.
+	"""
+	tags: [String!]! = []
 }
 
 type SubmitStagedNzbsResult {
@@ -5176,6 +5730,10 @@ input SubmitTorrentInput {
 	Whether its archives are extracted; absent inherits.
 	"""
 	unpack: Boolean
+	"""
+	The tags its job is added with.
+	"""
+	tags: [String!]! = []
 }
 
 type SubscriptionRoot {
@@ -5239,11 +5797,13 @@ type SubscriptionRoot {
 	"""
 	systemMetricsUpdates: SystemMetricsSnapshot!
 	"""
-	The torrents as they move: the one `id` names, or every torrent. The
-	first push is the torrents as they are; each later one comes when one
-	of them changes, a tracker's answer as soon as it lands.
+	The torrents as they move: the one `id` names, the ones `ids` names
+	(at most 500), or every torrent. The first push is the torrents as
+	they are, with `fullUpdate`; each later one comes when one of them
+	changes, a tracker's answer as soon as it lands, and carries only the
+	torrents that changed or came and the ids of the ones gone.
 	"""
-	torrentUpdates(id: Int): [Torrent!]!
+	torrentUpdates(id: Int, ids: [Int!]): TorrentChanges!
 }
 
 """
@@ -5423,6 +5983,10 @@ type Torrent {
 	"""
 	routeReason: TorrentRouteReason
 	category: String
+	"""
+	Its job's tags, in tag order.
+	"""
+	tags: [String!]!
 	private: Boolean!
 	forced: Boolean!
 	progress: Float!
@@ -5538,6 +6102,24 @@ type Torrent {
 }
 
 """
+What a `torrentUpdates` push carries.
+"""
+type TorrentChanges {
+	"""
+	The first push: `torrents` is every followed torrent.
+	"""
+	fullUpdate: Boolean!
+	"""
+	The torrents that changed or came.
+	"""
+	torrents: [Torrent!]!
+	"""
+	The ids of the torrents gone since the last push.
+	"""
+	removedIds: [Int!]!
+}
+
+"""
 A client a torrent may name itself as to its peers and trackers.
 """
 enum TorrentClient {
@@ -5604,6 +6186,30 @@ A file's level, by its index in the torrent.
 input TorrentFilePriorityInput {
 	index: Int!
 	priority: TorrentFilePriority!
+}
+
+type TorrentHistory {
+	"""
+	This host's local date, `YYYY-MM-DD`.
+	"""
+	today: String!
+	rangeStart: String!
+	rangeEnd: String!
+	"""
+	Every torrent together: from peers in `bytes`, to peers in
+	`bytesUploaded`, seeding time in `durationMs`.
+	"""
+	total: UsageConsumer!
+	"""
+	Each tracker host, by the torrents that list it; the empty id is
+	the torrents that list none. A torrent counts under each host it
+	lists, so trackers are never added together.
+	"""
+	trackers: [UsageConsumer!]!
+	"""
+	Now, as the torrent client last published its torrents.
+	"""
+	peers: TorrentPeers!
 }
 
 """
@@ -5678,6 +6284,21 @@ enum TorrentPeerProtocol {
 	BOTH
 }
 
+type TorrentPeers {
+	"""
+	Torrents the client holds now.
+	"""
+	torrents: Int!
+	"""
+	Peers connected now, across every torrent.
+	"""
+	connected: Int!
+	"""
+	Of those, the ones that have every piece.
+	"""
+	seeds: Int!
+}
+
 """
 A gateway's last word on one port mapping.
 """
@@ -5749,7 +6370,6 @@ enum TorrentRouteReason {
 	TORRENT_ROUTE_LEGS
 	TORRENT_ROUTE_DIRECT_FALLBACK
 	TORRENT_ROUTE_RUNGS
-	ROUTE_PLAN_FAILED
 	LEG_OPEN_FAILED
 	STATE_DIRECTORY_FAILED
 	LISTEN_PORT_UNAVAILABLE
@@ -5877,6 +6497,8 @@ enum TorrentState {
 	STOPPED
 	MOVING
 	NEEDS_CERTIFICATE
+	CHECKING_RESUME_DATA
+	FILES_MISSING
 }
 
 input TorrentTestInput {
@@ -6163,6 +6785,139 @@ enum UploadOutcome {
 type UploadResult {
 	http: HttpUploadResult
 	peers: PeerUploadResult
+}
+
+type UsageConsumer {
+	kind: String!
+	"""
+	A server's saved id, or a category's name; empty for no category and
+	for the queue-wide total.
+	"""
+	id: String!
+	today: UsageTotals!
+	week: UsageTotals!
+	month: UsageTotals!
+	year: UsageTotals!
+	allTime: UsageTotals!
+	range: UsageTotals!
+	"""
+	Every date of the range in order, days with nothing at zero.
+	"""
+	days: [UsageDay!]!
+	"""
+	For a removed server whose rows are kept until its quota resets: the
+	server's name when it was removed. Absent for every other consumer.
+	"""
+	removedHost: String
+}
+
+enum UsageConsumerKind {
+	SERVER
+	CATEGORY
+	"""
+	NZB jobs finished and repaired.
+	"""
+	JOB
+	"""
+	Job stages, by name.
+	"""
+	STAGE
+	"""
+	Every torrent together.
+	"""
+	TORRENT
+	"""
+	Torrents by the tracker hosts they list.
+	"""
+	TRACKER
+}
+
+type UsageDay {
+	"""
+	`YYYY-MM-DD`.
+	"""
+	day: String!
+	bytes: Int!
+	articlesTried: Int!
+	articlesSucceeded: Int!
+	downSeconds: Int!
+	bytesUploaded: Int!
+	events: Int!
+	durationMs: Int!
+}
+
+type UsageHistory {
+	"""
+	This host's local date, `YYYY-MM-DD`.
+	"""
+	today: String!
+	rangeStart: String!
+	rangeEnd: String!
+	"""
+	The start of today on this host, in epoch seconds.
+	"""
+	todayStartEpochSec: Int!
+	"""
+	The sum over every consumer of the asked kind, servers when none is
+	asked. Servers and categories count the same bytes, so the two are
+	never added together.
+	"""
+	total: UsageConsumer!
+	consumers: [UsageConsumer!]!
+	"""
+	Jobs that finished today, by how they ended.
+	"""
+	finishedToday: FinishedJobs!
+	"""
+	Jobs that finished inside the range, by how they ended.
+	"""
+	finishedInRange: FinishedJobs!
+}
+
+enum UsagePeriod {
+	TODAY
+	"""
+	Monday to today.
+	"""
+	WEEK
+	MONTH
+	YEAR
+	ALL
+	"""
+	`fromDay` to `toDay`, both included.
+	"""
+	CUSTOM
+}
+
+input UsageRange {
+	period: UsagePeriod!
+	"""
+	`YYYY-MM-DD`, for a custom range.
+	"""
+	fromDay: String
+	"""
+	`YYYY-MM-DD`, for a custom range.
+	"""
+	toDay: String
+}
+
+type UsageTotals {
+	bytes: Int!
+	articlesTried: Int!
+	articlesSucceeded: Int!
+	downSeconds: Int!
+	"""
+	Sent to peers, for a torrent or tracker.
+	"""
+	bytesUploaded: Int!
+	"""
+	Jobs for a job row, timed runs for a stage.
+	"""
+	events: Int!
+	"""
+	Stage time, or seeding time, in milliseconds.
+	"""
+	durationMs: Int!
 }
 
 type UsenetResult {

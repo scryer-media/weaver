@@ -77,6 +77,12 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     // come back, so neither do its tags. Every tag made comes back.
     table!("job_tags", Export, RequireEmpty),
     table!("tags", Export, Replace),
+    // The record of the files a history entry's archive took travels with
+    // the entry.
+    table!("job_history_archived_files", Export, RequireEmpty),
+    // Finished jobs' stored NZBs travel with their history; an active job's
+    // goes with the rest of its active rows.
+    table!("job_nzbs", Export, RequireEmpty),
     // Execution queues and output caches cannot be resumed from a logical
     // configuration backup. History keeps its result excerpts.
     table!("script_event_queue", ResetOnRestore, RequireEmpty),
@@ -106,6 +112,7 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("active_extracted", ResetOnRestore, RequireEmpty),
     table!("active_detected_archives", ResetOnRestore, RequireEmpty),
     table!("active_file_identities", ResetOnRestore, RequireEmpty),
+    table!("active_job_outlines", ResetOnRestore, RequireEmpty),
     // Direct-store coverage is claimed against working-directory destination
     // files that a database restore does not restore, so the claim must be
     // discarded with every other `active_*` table. `Export`
@@ -157,9 +164,11 @@ pub(crate) fn export_query(table: &str, columns: &[String]) -> String {
         .join(", ");
     let predicate = match table {
         "settings" => "key <> 'nzbget.scheduled_resume_at'",
-        "job_history_attributes" | "job_events" | "job_tags" => {
-            "job_id IN (SELECT job_id FROM job_history)"
-        }
+        "job_history_attributes"
+        | "job_events"
+        | "job_tags"
+        | "job_nzbs"
+        | "job_history_archived_files" => "job_id IN (SELECT job_id FROM job_history)",
         "duplicate_job_snapshots" => "lifecycle IN ('succeeded', 'failed', 'cancelled')",
         "job_fingerprints" | "duplicate_admission_claims" | "submission_idempotency" => {
             "job_id IN (

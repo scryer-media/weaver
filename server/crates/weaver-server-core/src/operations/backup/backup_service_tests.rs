@@ -147,7 +147,6 @@ fn sample_config() -> Config {
         hardware_profile: None,
         intermediate_dir: Some("/old/data/intermediate".into()),
         complete_dir: Some("/old/data/complete".into()),
-        buffer_pool: None,
         servers: vec![],
         categories: vec![
             CategoryConfig {
@@ -181,6 +180,7 @@ fn sample_config() -> Config {
         max_concurrent_nzbs: None,
         cleanup_after_extract: Some(true),
         delete_failed_job_files: None,
+        history_retention_days: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: None,
@@ -212,6 +212,7 @@ fn populate_source_db(db: &Database) {
         completed_at: 2,
         metadata: None,
         server_attribution: None,
+        archived_at: None,
     })
     .unwrap();
 }
@@ -715,6 +716,7 @@ async fn sqlite_export_snapshot_stays_closed_while_history_grows_concurrently() 
                     completed_at: 2,
                     metadata: None,
                     server_attribution: None,
+                    archived_at: None,
                 })
                 .unwrap();
             writer_db
@@ -1199,7 +1201,6 @@ async fn restore_requires_category_remap_for_external_paths() {
             hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
-            buffer_pool: None,
             servers: vec![],
             categories: vec![],
             retry: None,
@@ -1208,6 +1209,7 @@ async fn restore_requires_category_remap_for_external_paths() {
             max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
             delete_failed_job_files: None,
+            history_retention_days: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: None,
@@ -1227,7 +1229,6 @@ async fn restore_requires_category_remap_for_external_paths() {
             hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
-            buffer_pool: None,
             servers: vec![],
             categories: vec![],
             retry: None,
@@ -1236,6 +1237,7 @@ async fn restore_requires_category_remap_for_external_paths() {
             max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
             delete_failed_job_files: None,
+            history_retention_days: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: None,
@@ -2315,4 +2317,159 @@ async fn failed_automatic_backup_never_prunes_retained_ready_artifacts() {
             BackupArtifactStatus::Ready
         );
     }
+}
+
+fn finished_job(job_id: u64) -> JobHistoryRow {
+    JobHistoryRow {
+        job_id,
+        job_hash: None,
+        name: format!("job-{job_id}"),
+        status: "complete".into(),
+        error_message: None,
+        total_bytes: 10,
+        downloaded_bytes: 10,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: None,
+        nzb_path: Some(format!("/nzbs/job-{job_id}.nzb")),
+        created_at: 1,
+        completed_at: 2,
+        metadata: None,
+        server_attribution: None,
+        archived_at: None,
+        protocol: crate::jobs::Protocol::Nzb,
+    }
+}
+
+// A bundle written before schema 92 never passed through the step that
+// trims a stored server list, so the restore runs it: 53 servers come back
+// as 50, by the upgrade's rule. Server 1 is the primary; of the others, on
+// level 1, the two disabled go first and then the newest. The same bundle
+// written at the current schema is restored as it is.
+#[test]
+fn a_bundle_older_than_the_server_limit_step_restores_within_the_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let source = Database::open(&root.path().join("source.db")).unwrap();
+    for id in 1..=53u32 {
+        let mut server = sample_server(id);
+        server.priority = u32::from(id != 1);
+        server.active = id != 10 && id != 20;
+        source.insert_server_past_limit(&server).unwrap();
+    }
+    let export = source.export_logical_backup().unwrap();
+    let tables = export.staging.path().join("tables");
+    let ids = |db: &Database| {
+        db.list_servers()
+            .unwrap()
+            .into_iter()
+            .map(|server| server.id)
+            .collect::<Vec<_>>()
+    };
+
+    let older = Database::open(&root.path().join("older.db")).unwrap();
+    older
+        .import_logical_backup(&tables, &export.tables, 91)
+        .unwrap();
+    assert_eq!(
+        ids(&older),
+        (1..=52)
+            .filter(|id| ![10, 20].contains(id))
+            .collect::<Vec<_>>()
+    );
+
+    let current = Database::open(&root.path().join("current.db")).unwrap();
+    current
+        .import_logical_backup(&tables, &export.tables, export.schema_version)
+        .unwrap();
+    assert_eq!(ids(&current).len(), 53);
+}
+
+// A finished job's stored NZB travels with its history in a backup, and
+// one in a bundle written while it sat on the history row restores to its
+// own table. An NZB no finished job owns stays out of the bundle.
+#[test]
+fn a_finished_jobs_stored_nzb_travels_with_its_history() {
+    let root = tempfile::tempdir().unwrap();
+    let source = Database::open(&root.path().join("source.db")).unwrap();
+    source.insert_job_history(&finished_job(41)).unwrap();
+    source.insert_job_history(&finished_job(43)).unwrap();
+    execute_sql(
+        &source,
+        vec![
+            "INSERT INTO job_nzbs (job_id, nzb_zstd) VALUES (41, x'0102030405')",
+            "INSERT INTO job_nzbs (job_id, nzb_zstd) VALUES (99, x'09')",
+        ],
+    );
+    let export = source.export_logical_backup().unwrap();
+    let staging = export.staging.path();
+    let exported = logical::read_table_objects(staging, "job_nzbs").unwrap();
+    assert_eq!(exported.len(), 1);
+    assert_eq!(
+        exported[0].get("job_id").and_then(|id| id.as_i64()),
+        Some(41)
+    );
+
+    let restored = Database::open(&root.path().join("restored.db")).unwrap();
+    restored
+        .import_logical_backup(
+            &staging.join("tables"),
+            &export.tables,
+            export.schema_version,
+        )
+        .unwrap();
+    let (_, nzb) = restored
+        .load_history_job_persisted_nzb(41)
+        .unwrap()
+        .unwrap();
+    assert_eq!(nzb, Some(vec![1, 2, 3, 4, 5]));
+    let (_, none) = restored
+        .load_history_job_persisted_nzb(43)
+        .unwrap()
+        .unwrap();
+    assert_eq!(none, None);
+    assert_eq!(query_count(&restored, "job_nzbs"), 1);
+
+    // The same bundle as a build below schema 85 wrote it: the NZB on the
+    // history row, and no table of its own.
+    let tables = staging.join("tables");
+    std::fs::remove_file(tables.join("job_nzbs.ndjson")).unwrap();
+    let mut older = export.tables.clone();
+    older.remove("job_nzbs");
+    let history_path = tables.join("job_history.ndjson");
+    let rows = std::fs::read_to_string(&history_path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut row: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(line).unwrap();
+            let nzb = match row.get("job_id").and_then(|id| id.as_i64()) {
+                Some(41) => serde_json::json!({"__weaver_type": "blob", "base64": "AQIDBAU="}),
+                _ => serde_json::Value::Null,
+            };
+            row.insert("nzb_zstd".into(), nzb);
+            serde_json::to_string(&row).unwrap()
+        })
+        .collect::<Vec<_>>();
+    std::fs::write(&history_path, rows.join("\n") + "\n").unwrap();
+    older
+        .get_mut("job_history")
+        .unwrap()
+        .columns
+        .push("nzb_zstd".into());
+    let restored = Database::open(&root.path().join("older.db")).unwrap();
+    restored.import_logical_backup(&tables, &older, 84).unwrap();
+    let (_, nzb) = restored
+        .load_history_job_persisted_nzb(41)
+        .unwrap()
+        .unwrap();
+    assert_eq!(nzb, Some(vec![1, 2, 3, 4, 5]));
+    let (_, none) = restored
+        .load_history_job_persisted_nzb(43)
+        .unwrap()
+        .unwrap();
+    assert_eq!(none, None);
+    assert_eq!(query_count(&restored, "job_nzbs"), 1);
 }

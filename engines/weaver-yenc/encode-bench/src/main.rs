@@ -9,8 +9,8 @@
 //
 // For every fixture and every rapidyenc kernel this CPU runs, the output of
 // both sides is first checked byte for byte (and length and final column);
-// then both are timed, A,B,A,B..., each sample a calibrated batch of calls.
-// `ratio` is rapidyenc time / weaver time: above 1 means weaver is faster.
+// then both are timed, A,B,B,A,A,B..., each sample a calibrated batch of
+// calls. `ratio` is rapidyenc time / weaver time: above 1 means weaver is faster.
 // A row whose weaver tier is not implemented yet times rapidyenc alone: that
 // is the number the tier has to beat.
 //
@@ -129,7 +129,9 @@ fn parse_args() -> Options {
             }
             "--tier" => opts.tier = Some(args.next().expect("--tier needs a name")),
             "--fixture" => opts.fixture = Some(args.next().expect("--fixture needs a name")),
-            "--perf" => opts.perf = Some(args.next().expect("--perf needs weaver, rapidyenc or none")),
+            "--perf" => {
+                opts.perf = Some(args.next().expect("--perf needs weaver, rapidyenc or none"))
+            }
             "-h" | "--help" => {
                 println!(
                     "usage: encode-bench [--quick] [--tier NAME] [--fixture NAME]\n\
@@ -137,7 +139,7 @@ fn parse_args() -> Options {
                      fixtures: {}",
                     EncoderTier::ALL.map(|t| t.as_str()).join(", "),
                     PAIRS.map(|p| p.1).join(", "),
-                    FIXTURES.map(|f| f.0).into_iter().chain(STREAMS.map(|s| s.0)).collect::<Vec<_>>().join(", ")
+                    FIXTURES.map(|f| f.0).join(", ")
                 );
                 std::process::exit(0);
             }
@@ -162,50 +164,16 @@ fn random(len: usize) -> Vec<u8> {
     (0..len).map(|_| splitmix(&mut state) as u8).collect()
 }
 
-// Every byte encodes to NUL, LF, CR or '=': every byte is escaped.
-fn all_critical(len: usize) -> Vec<u8> {
-    const ALWAYS: [u8; 4] = [214, 224, 227, 19];
-    let mut state = 0xc217;
-    (0..len)
-        .map(|_| ALWAYS[(splitmix(&mut state) >> 8) as usize % 4])
-        .collect()
-}
-
-// Half the bytes encode to TAB, SPACE or '.', which are escaped only at line
-// edges: stresses the line-start and line-end rules.
-fn edge_heavy(len: usize) -> Vec<u8> {
-    const EDGE: [u8; 3] = [223, 246, 4];
-    let mut state = 0xed6e;
-    (0..len)
-        .map(|_| {
-            let r = splitmix(&mut state);
-            if r & 1 == 0 {
-                EDGE[(r >> 8) as usize % 3]
-            } else {
-                (r >> 16) as u8
-            }
-        })
-        .collect()
-}
-
 type Fixture = (&'static str, fn() -> Vec<u8>);
 
-const FIXTURES: [Fixture; 6] = [
-    // rapidyenc tool/bench.cc's shape: 768000 random bytes.
-    ("random", || random(768_000)),
-    ("random-64k", || random(65_536)),
-    ("random-4k", || random(4096)),
-    // Zero encodes to '*': no escapes at all.
-    ("zeros", || vec![0u8; 768_000]),
-    ("all-critical", || all_critical(768_000)),
-    ("edge-heavy", || edge_heavy(768_000)),
-];
+// rapidyenc tool/bench.cc's one shape: 768000 random bytes, encoded again
+// and again from the same buffer.
+const FIXTURES: [Fixture; 1] = [("random", || random(768_000))];
 
-// Non-repeating fixtures: consecutive articles of `len` bytes walking a
-// 256 MiB seeded pool, each article starting on a page boundary, so a timed
-// batch never sees an article twice and nothing repeats for the branch
-// predictor or the caches to learn (real posts never repeat). Pool 0 is
-// random bytes, pool 1 has the `edge-heavy` mix.
+// Not bench rows: the article walks `--verify` checks (verify.rs,
+// `check_streams`), consecutive articles of `len` bytes in a 256 MiB seeded
+// pool, each starting on a page boundary. Pool 0 is random bytes, pool 1
+// mixes in bytes that encode to TAB, SPACE or '.'.
 const STREAMS: [(&str, usize, usize); 4] = [
     ("random-stream", 768_000, 0),
     ("random-stream-64k", 65_536, 0),
@@ -225,8 +193,7 @@ fn stream_pool(kind: usize) -> Paged {
         const EDGE: [u8; 3] = [223, 246, 4];
         let mut state = 0x5eed_57ea_0002;
         for b in pool.bytes() {
-            // Branch-free select (bytes as `edge_heavy`), so building the
-            // pool adds no branch misses to `--perf` counts.
+            // Half the bytes from EDGE, half random, selected branch-free.
             let r = splitmix(&mut state);
             let m = ((r & 1) as u8).wrapping_sub(1);
             *b = (EDGE[(r >> 8) as usize % 3] & m) | ((r >> 16) as u8 & !m);
@@ -425,7 +392,8 @@ fn kernel_name(id: i32) -> String {
         .unwrap_or_else(|| format!("{id:#x}"))
 }
 
-// Interleaved samples, weaver first; rapidyenc alone when weaver has no tier.
+// Interleaved samples, each pair swapping which side runs first; rapidyenc
+// alone when weaver has no tier.
 fn time_sides(
     weaver: bool,
     n_samples: usize,
@@ -438,9 +406,14 @@ fn time_sides(
     let mut w_ns = Vec::with_capacity(n_samples);
     if weaver {
         let w_iters = calibrate(target_ns, &mut *run_w);
-        for _ in 0..n_samples {
-            w_ns.push(sample(w_iters, run_w));
-            r_ns.push(sample(r_iters, run_r));
+        for s in 0..n_samples {
+            if s % 2 == 0 {
+                w_ns.push(sample(w_iters, run_w));
+                r_ns.push(sample(r_iters, run_r));
+            } else {
+                r_ns.push(sample(r_iters, run_r));
+                w_ns.push(sample(w_iters, run_w));
+            }
         }
     } else {
         for _ in 0..n_samples {
@@ -512,32 +485,14 @@ fn main() {
         "TSVHEAD\tarch\tcpu\tfixture\tbytes\tweaver_tier\tweaver_min_ns\tweaver_median_ns\trapidyenc_kernel\trapidyenc_min_ns\trapidyenc_median_ns\tratio_min\tratio_median"
     );
 
-    let names = FIXTURES
-        .iter()
-        .map(|&(n, m)| (n, Some(m), (0, 0)))
-        .chain(STREAMS.iter().map(|&(n, l, k)| (n, None, (l, k))));
-    let mut pool_buf: [Option<Paged>; 2] = [None, None];
-    for (fname, make, (slen, kind)) in names {
+    for (fname, make) in FIXTURES {
         if opts.fixture.as_deref().is_some_and(|f| f != fname) {
             continue;
         }
-        let mut src_buf: Paged;
-        // `n` articles of `len` bytes, `stride` apart; a fixed fixture is one.
-        let (pool, len, stride, n): (&[u8], usize, usize, usize) = match make {
-            Some(make) => {
-                let data = make();
-                src_buf = Paged::new(data.len(), 0);
-                src_buf.bytes().copy_from_slice(&data);
-                (src_buf.bytes(), data.len(), data.len(), 1)
-            }
-            None => {
-                let st = stream_stride(slen);
-                let pool = pool_buf[kind].get_or_insert_with(|| stream_pool(kind));
-                (pool.bytes(), slen, st, STREAM_POOL / st)
-            }
-        };
-        let src: &[u8] = &pool[..len];
-        let art = |k: usize| &pool[k * stride..k * stride + len];
+        let data = make();
+        let mut src_buf = Paged::new(data.len(), 0);
+        src_buf.bytes().copy_from_slice(&data);
+        let src: &[u8] = src_buf.bytes();
         let wcap = encode_max_len(src.len(), LINE_SIZE);
         let mut wdst_buf = Paged::new(wcap, DST_PAGE_OFFSET);
         let wdst = wdst_buf.uninit();
@@ -578,39 +533,27 @@ fn main() {
             // runs the set-up alone, to subtract from the other two.
             if let Some(side) = opts.perf.as_deref() {
                 let iters = (4usize << 30) / src.len();
-                for i in 0..iters {
-                    let a = art(i % n);
+                for _ in 0..iters {
                     if side == "weaver" {
-                        black_box(weaver_once(tier, black_box(a), wdst));
+                        black_box(weaver_once(tier, black_box(src), wdst));
                     } else if side == "rapidyenc" {
-                        black_box(rapidyenc_once(black_box(a), rdst));
+                        black_box(rapidyenc_once(black_box(src), rdst));
                     }
                 }
-                println!("PERF\t{side}\t{fname}\t{}\t{iters}\t{}", tier.as_str(), src.len());
+                println!(
+                    "PERF\t{side}\t{fname}\t{}\t{iters}\t{}",
+                    tier.as_str(),
+                    src.len()
+                );
                 continue;
             }
-            let (w_ns, r_ns) = if n == 1 {
-                let mut run_w = || {
-                    black_box(weaver_once(tier, black_box(src), wdst));
-                };
-                let mut run_r = || {
-                    black_box(rapidyenc_once(black_box(src), rdst));
-                };
-                time_sides(weaver, n_samples, target_ns, &mut run_w, &mut run_r)
-            } else {
-                // Each side walks the stream from article 0, one article per
-                // call, wrapping only after the whole pool.
-                let (mut kw, mut kr) = (0usize, 0usize);
-                let mut run_w = || {
-                    black_box(weaver_once(tier, black_box(art(kw)), wdst));
-                    kw = if kw + 1 == n { 0 } else { kw + 1 };
-                };
-                let mut run_r = || {
-                    black_box(rapidyenc_once(black_box(art(kr)), rdst));
-                    kr = if kr + 1 == n { 0 } else { kr + 1 };
-                };
-                time_sides(weaver, n_samples, target_ns, &mut run_w, &mut run_r)
+            let mut run_w = || {
+                black_box(weaver_once(tier, black_box(src), wdst));
             };
+            let mut run_r = || {
+                black_box(rapidyenc_once(black_box(src), rdst));
+            };
+            let (w_ns, r_ns) = time_sides(weaver, n_samples, target_ns, &mut run_w, &mut run_r);
             let r = stats(r_ns);
             let bytes = src.len();
             if weaver {

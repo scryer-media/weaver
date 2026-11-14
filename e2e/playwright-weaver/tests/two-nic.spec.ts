@@ -139,8 +139,11 @@ test.describe("lane M", () => {
     expect(down.egresses.find(entry => entry.id === wifi.id)?.reason?.trim()).toBeTruthy();
     const atDown = await packetCount(request, "m02", wifiDevice(), tcpTo(stack(), 119));
     expect(await download.release()).toBe("COMPLETED");
+    const dropped = await stopCapture(request);
     const atEnd = await packetCount(request, "m02", wifiDevice(), tcpTo(stack(), 119));
-    await saveEvidence(info, "M02", { down, atDown, atEnd });
+    await saveEvidence(info, "M02", { down, atDown, atEnd, dropped });
+    // A capture that lost packets cannot show that none were sent.
+    expect(dropped, "packets the M02 capture dropped").toBe(0);
     expect(atEnd).toBe(atDown);
   });
 
@@ -248,13 +251,15 @@ test.describe("lane M", () => {
       subscription.close();
     }
     expect(await download.release()).toBe("COMPLETED");
-    await stopCapture(request);
+    const dropped = await stopCapture(request);
     const counts = {
       wifiProxy: await packetCount(request, "m07", laneEgress("wifi").value, tcpTo(stack(), 8101)),
       lanProxy: await packetCount(request, "m07", laneEgress("lan").value, tcpTo(stack(), 8101)),
       lanNntp: await packetCount(request, "m07", laneEgress("lan").value, tcpTo(stack(), 119)),
     };
-    await saveEvidence(info, "M07", counts);
+    await saveEvidence(info, "M07", { ...counts, dropped });
+    // A capture that lost packets cannot show that none went by the LAN.
+    expect(dropped, "packets the M07 capture dropped").toBe(0);
     expect(counts.wifiProxy).toBeGreaterThan(0);
     expect(counts.lanProxy).toBe(0);
     expect(counts.lanNntp).toBeGreaterThan(0);

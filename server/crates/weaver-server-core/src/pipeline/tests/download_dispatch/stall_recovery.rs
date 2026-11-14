@@ -14,16 +14,7 @@ use crate::pipeline::download::{
 // none open, which is the stall's shape. Its pool still has one server to
 // rank, so the stall is not the outage the watchdog leaves alone.
 async fn stalled_pipeline(temp_dir: &tempfile::TempDir) -> Pipeline {
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        0,
-    )
-    .await;
+    let (mut pipeline, _, _) = new_direct_pipeline_with_backlog(temp_dir, 6 * 1024 * 1024, 0).await;
     pipeline.nntp = Arc::new(weaver_nntp::NntpClient::new(
         weaver_nntp::client::NntpClientConfig::single(
             weaver_nntp::ServerConfig {
@@ -47,7 +38,7 @@ async fn stalled_pipeline(temp_dir: &tempfile::TempDir) -> Pipeline {
     assert_eq!(
         pipeline
             .nntp
-            .blocking_body_server_order(&[])
+            .blocking_body_server_order(weaver_nntp::ServerSet::EMPTY)
             .map(|order| order.len()),
         Some(1)
     );
@@ -87,6 +78,7 @@ fn park_indefinite_infrastructure_retry(pipeline: &mut Pipeline, job_id: JobId) 
         .extract_matching(|work| work.segment_id.segment_number == 0)
         .pop()
         .expect("segment 0 is queued");
+    let work = pipeline.dispatched(work);
     pipeline.note_retry_scheduled(work.segment_id);
     let scheduled_pool_generation = pipeline.pool_generation;
     pipeline.schedule_infrastructure_retry(
@@ -236,7 +228,7 @@ async fn an_unexplained_stall_is_kicked_once_at_the_kick_window() {
             .download_queue;
         let mut works = queue.drain_all();
         works[0].avoid_server = Some(0);
-        works[1].exclude_servers = vec![1];
+        works[1].exclude_servers = weaver_nntp::ServerSet::from([1]);
         for work in works {
             queue.push(work);
         }
@@ -426,7 +418,7 @@ async fn a_stall_with_no_server_to_dispatch_to_waits_for_one() {
     assert_eq!(
         pipeline
             .nntp
-            .blocking_body_server_order(&[])
+            .blocking_body_server_order(weaver_nntp::ServerSet::EMPTY)
             .map(|order| order.len()),
         Some(0)
     );
@@ -549,16 +541,7 @@ fn stall_recovery_is_on_unless_the_variable_says_0_false_or_off() {
 // Regression fixtures use real dispatch gates and nonzero capacity. Aging
 // the watch tests the release decision, not elapsed provider retry history.
 async fn verification_pipeline(temp: &tempfile::TempDir, two_servers: bool) -> Pipeline {
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        temp,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        1,
-    )
-    .await;
+    let (mut pipeline, _, _) = new_direct_pipeline_with_backlog(temp, 6 * 1024 * 1024, 1).await;
     let mut config = weaver_nntp::client::NntpClientConfig::single(
         weaver_nntp::ServerConfig {
             host: "127.0.0.1".into(),
@@ -627,7 +610,7 @@ async fn verification_exclude_healthy_and_cool_remaining(pipeline: &mut Pipeline
         .download_queue;
     let mut works = queue.drain_all();
     for work in &mut works {
-        work.exclude_servers = vec![0];
+        work.exclude_servers = weaver_nntp::ServerSet::from([0]);
     }
     for work in works {
         queue.push(work);
@@ -644,7 +627,7 @@ async fn verification_exclude_healthy_and_cool_remaining(pipeline: &mut Pipeline
     assert_eq!(
         pipeline
             .nntp
-            .blocking_body_server_order(&[])
+            .blocking_body_server_order(weaver_nntp::ServerSet::EMPTY)
             .unwrap()
             .iter()
             .map(|id| id.0)
@@ -654,7 +637,7 @@ async fn verification_exclude_healthy_and_cool_remaining(pipeline: &mut Pipeline
     assert!(
         pipeline
             .nntp
-            .blocking_body_server_order(&[0])
+            .blocking_body_server_order(weaver_nntp::ServerSet::from([0]))
             .unwrap()
             .is_empty()
     );
@@ -904,7 +887,7 @@ async fn the_liveness_stall_counts_promoted_recovery_and_not_parked() {
     let _capture = tracing::subscriber::set_default(lines.clone());
     let t0 = Instant::now();
     pipeline.dispatch_downloads_at(t0);
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     let heard = lines.take();
     assert_eq!(heard.len(), 1, "{heard:?}");
     assert_eq!(field(&heard[0], "job_id"), Some("40011"), "{}", heard[0]);
@@ -930,7 +913,7 @@ async fn the_liveness_stall_counts_promoted_recovery_and_not_parked() {
     }
     let t1 = t0 + DOWNLOAD_DISPATCH_STALL_KICK_AFTER;
     pipeline.dispatch_downloads_at(t1);
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     let heard = lines.take();
     assert_eq!(heard.len(), 1, "{heard:?}");
     assert_eq!(field(&heard[0], "job_id"), Some("40010"), "{}", heard[0]);

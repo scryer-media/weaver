@@ -29,8 +29,9 @@ pub fn spawn_maintenance_worker(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         startup_disk_work.wait().await;
-        run_maintenance_pass(db.clone(), complete_dir.clone()).await;
+        run_maintenance_pass(db.clone(), staging_roots(&complete_dir, &config).await).await;
         run_job_files_sweep(&handle, &config).await;
+        run_history_retention(&db, &config).await;
 
         let mut interval = tokio::time::interval_at(
             tokio::time::Instant::now() + MAINTENANCE_INTERVAL,
@@ -40,13 +41,49 @@ pub fn spawn_maintenance_worker(
 
         loop {
             interval.tick().await;
-            run_maintenance_pass(db.clone(), complete_dir.clone()).await;
+            run_maintenance_pass(db.clone(), staging_roots(&complete_dir, &config).await).await;
             run_job_files_sweep(&handle, &config).await;
+            run_history_retention(&db, &config).await;
         }
     })
 }
 
-async fn run_maintenance_pass(db: Database, complete_dir: PathBuf) {
+// History entries older than the retention setting go to the durable delete
+// queue, without their files.
+async fn run_history_retention(db: &Database, config: &SharedConfig) {
+    let days = config.read().await.history_retention_days();
+    if days == 0 {
+        return;
+    }
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64);
+    let db = db.clone();
+    match tokio::task::spawn_blocking(move || db.prune_history_by_age(days, now)).await {
+        Ok(Ok(0)) => {}
+        Ok(Ok(queued)) => {
+            tracing::info!(
+                days,
+                queued,
+                "queued history past its retention for deletion"
+            );
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "history retention pass failed");
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "history retention worker panicked");
+        }
+    }
+}
+
+// Every directory a job stages under: the complete directory and each
+// category's folder.
+async fn staging_roots(complete_dir: &Path, config: &SharedConfig) -> Vec<PathBuf> {
+    crate::pipeline::queue::destination_roots(complete_dir, &config.read().await.categories)
+}
+
+async fn run_maintenance_pass(db: Database, staging_roots: Vec<PathBuf>) {
     match db.datastore().engine() {
         SqlEngine::Sqlite => {
             let sqlite_db = db.clone();
@@ -84,7 +121,7 @@ async fn run_maintenance_pass(db: Database, complete_dir: PathBuf) {
         }
     }
 
-    match tokio::task::spawn_blocking(move || run_staging_cleanup(&db, &complete_dir)).await {
+    match tokio::task::spawn_blocking(move || run_staging_cleanup(&db, &staging_roots)).await {
         Ok(Ok(report)) if report.removed_count > 0 => {
             tracing::info!(
                 staging_dirs_removed = report.removed_count,
@@ -125,10 +162,19 @@ async fn run_job_files_sweep(handle: &SchedulerHandle, config: &SharedConfig) {
     handle.sweep_job_files(failed_finished_by, cutoff).await;
 }
 
-fn run_staging_cleanup(db: &Database, complete_dir: &Path) -> Result<StagingCleanupReport, String> {
+fn run_staging_cleanup(
+    db: &Database,
+    staging_roots: &[PathBuf],
+) -> Result<StagingCleanupReport, String> {
     let recorded_job_ids = db.recorded_job_ids().map_err(|error| error.to_string())?;
-    cleanup_stale_staging_dirs(complete_dir, &recorded_job_ids, STALE_STAGING_TTL)
-        .map_err(|error| error.to_string())
+    let mut report = StagingCleanupReport::default();
+    for root in staging_roots {
+        let one = cleanup_stale_staging_dirs(root, &recorded_job_ids, STALE_STAGING_TTL)
+            .map_err(|error| error.to_string())?;
+        report.removed_count += one.removed_count;
+        report.removed_bytes = report.removed_bytes.saturating_add(one.removed_bytes);
+    }
+    Ok(report)
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]

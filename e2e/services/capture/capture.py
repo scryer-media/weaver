@@ -3,10 +3,14 @@
 
 """Capture control for the advanced-networking e2e flows.
 
-POST /start {"name"}           tcpdump on every non-loopback interface into
+POST /start {"name"[, "filter"]} tcpdump on every non-loopback interface into
                                /artifacts/captures/<name>-<iface>.pcap; answers
-                               once every capture reports it is listening.
-POST /stop                     stop every running capture.
+                               once every capture reports it is listening. A
+                               filter keeps only the packets it matches, so a
+                               busy link cannot crowd the ones a test counts
+                               out of the capture buffer.
+POST /stop                     stop every running capture; answers with how
+                               many packets the kernel dropped from them.
 GET  /count?name&iface[&filter] packets in that capture, optionally filtered.
 GET  /interfaces               `ip -j addr` of the namespace.
 POST /link {"iface", "up"}     `ip link set <iface> up|down`.
@@ -42,12 +46,20 @@ def pcap_path(name, iface):
     return os.path.join(ROOT, "{}-{}.pcap".format(name, iface))
 
 
-def start(name):
+# Only headers are kept, in a large buffer: every count reads addresses, ports
+# and flags, and whole data packets would fill the buffer and push the packets
+# a test counts out of it.
+HEADERS = ["-s", "128", "-B", "16384"]
+DROPPED = re.compile(r"^(\d+) packets dropped by kernel", re.MULTILINE)
+
+
+def start(name, expression=""):
     os.makedirs(ROOT, exist_ok=True)
+    kept = "({}) and {}".format(expression, EXCLUDE) if expression else EXCLUDE
     started = []
     for iface in interfaces():
         process = subprocess.Popen(
-            ["tcpdump", "-i", iface, "-nn", "-U", "-w", pcap_path(name, iface), EXCLUDE],
+            ["tcpdump", "-i", iface, "-nn", "-U", *HEADERS, "-w", pcap_path(name, iface), kept],
             stderr=subprocess.PIPE,
             text=True,
         )
@@ -57,10 +69,13 @@ def start(name):
                 break
         else:
             raise RuntimeError("tcpdump on {} exited: {}".format(iface, process.wait()))
-        threading.Thread(target=process.stderr.read, daemon=True).start()
+        # The rest of stderr ends with tcpdump's own drop count.
+        rest = []
+        reader = threading.Thread(target=lambda out=rest, err=process.stderr: out.append(err.read()), daemon=True)
+        reader.start()
         started.append({"iface": iface, "path": pcap_path(name, iface)})
         with lock:
-            running.append(process)
+            running.append((process, reader, rest))
     return started
 
 
@@ -68,11 +83,14 @@ def stop():
     with lock:
         processes = list(running)
         running.clear()
-    for process in processes:
+    for process, _, _ in processes:
         process.terminate()
-    for process in processes:
+    dropped = 0
+    for process, reader, rest in processes:
         process.wait()
-    return len(processes)
+        reader.join()
+        dropped += sum(int(count) for count in DROPPED.findall("".join(rest)))
+    return {"stopped": len(processes), "dropped": dropped}
 
 
 def count(name, iface, expression):
@@ -125,13 +143,13 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         try:
             if url.path == "/start":
-                name = body.get("name", "")
-                if not NAME.match(name):
-                    return self.reply(400, {"error": "invalid name"})
+                name, expression = body.get("name", ""), body.get("filter", "")
+                if not NAME.match(name) or not isinstance(expression, str) or not FILTER.match(expression):
+                    return self.reply(400, {"error": "invalid name or filter"})
                 stop()
-                return self.reply(200, {"captures": start(name)})
+                return self.reply(200, {"captures": start(name, expression)})
             if url.path == "/stop":
-                return self.reply(200, {"stopped": stop()})
+                return self.reply(200, stop())
             if url.path == "/link":
                 iface, up = body.get("iface", ""), body.get("up")
                 if not IFACE.match(iface) or not isinstance(up, bool):

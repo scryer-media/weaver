@@ -4,8 +4,9 @@
 // A recovery set's repair, lent off the loop. The set's object leaves its
 // node, and the access it repairs through takes along what its reads reach:
 // for every member of the namespaces below the set, as far down as the tree
-// goes, its coverage, the file it is written at and the bytes still held for
-// it; for every data object there, what rebuilds its posted bytes; and the
+// goes, its coverage, the file it is written at and where the bytes still
+// held for it are, read there as the repair asks for them; for every data
+// object there, what rebuilds its posted bytes; and the
 // envelope shelves those objects keep, read as they stand. Nothing the loop
 // changes after the loan reaches it, and what the loop moved that it read is
 // known on its return: a shelf whose generation moved, or a file no longer
@@ -76,9 +77,13 @@ struct Input {
 }
 
 // The held revisions of a member within `range`, as `Holds::revisions`
-// answers them.
+// answers them. `held` is in offset order, the holds never overlapping, as
+// `Holds::revisions` gives them, so only those `range` reaches are visited.
 fn clipped(held: &[(ByteRange, u64)], range: ByteRange) -> Vec<(ByteRange, u64)> {
-    held.iter()
+    let from = held.partition_point(|(held, _)| held.end <= range.start);
+    held[from..]
+        .iter()
+        .take_while(|(held, _)| held.start < range.end)
         .filter_map(|(held, age)| Some((held.intersect(range)?, *age)))
         .collect()
 }
@@ -125,6 +130,12 @@ impl Returned {
 }
 
 impl Loan {
+    // The members the repair is to write nothing into: the disk has no room
+    // for them.
+    pub(super) fn withhold(&mut self, members: BTreeSet<MemberId>) {
+        self.access.withheld = members;
+    }
+
     // Run the repair, where it is not in anyone's way, within `budget`. A
     // repair given after `shutdown` started, or after the job's working
     // directory went, reads nothing, and one going when either happens
@@ -190,9 +201,8 @@ struct Taken {
     revision: Option<(u64, u64)>,
     scratch_revision: Option<(u64, u64)>,
     held_basis: Vec<(ByteRange, u64)>,
-    // The bytes held for it, in offset order.
+    // Where the bytes held for it are, in offset order.
     held: Vec<(ByteRange, Location)>,
-    scratch: Option<File>,
     // Its spill file, for the bytes held past the budgets, and the revision
     // that file stood at when lent.
     spill: Option<File>,
@@ -240,9 +250,20 @@ struct Lent {
     namespace: NodeId,
     set: NodeId,
     recovery: Option<NodeId>,
-    // Replay validates all node revisions on return, so it can defer reads
-    // of reusable scratch spans. Recovery snapshots retain their copies.
+    // Replay validates every node's revisions on return, so it notes
+    // nothing of what it reads.
     defer_holds: bool,
+    // Bytes held on scratch are read in place, through the loan's own
+    // handle on the namespace's scratch file, as the work asks for them. A
+    // span is written again only once every hold on scratch has left, which
+    // the hold revisions show. A repair's return checks the revisions of
+    // what it read. A rewalk's pieces are heard as read, so it notes here
+    // the held ranges each piece found on scratch, and the loop checks
+    // their revisions as it hears the piece (`scratch_stands`).
+    scratch_read: Option<RefCell<Vec<(NodeId, MemberId, ByteRange)>>>,
+    // Each namespace's scratch file, opened when lent for a member that
+    // holds bytes there.
+    held_scratch: BTreeMap<NodeId, File>,
     // The directory the repair's scratch and output lie in, made when the
     // repair is lent. The repair never makes it again: once it is gone, the
     // job's working directory was released under the repair.
@@ -265,6 +286,8 @@ struct Lent {
     scratch: Option<PathBuf>,
     // The pipeline's shutdown: once it starts, no read is answered.
     shutdown: Shutdown,
+    // The members the disk has no room for the repair to rebuild.
+    withheld: BTreeSet<MemberId>,
 }
 
 // What a repair rewrote: runs of members in the order written, each one's
@@ -281,6 +304,13 @@ pub(crate) struct Repaired {
     written: u64,
     // The first write the output refused. Nothing is written after it.
     failed: Option<LeafError>,
+    // What the repair said it writes in all, here and in its scratch
+    // directory, when it runs.
+    writes: u64,
+    // What a repair that failed for want of room needs free to run again:
+    // all it said it writes, since it is run again from its start with its
+    // output and its scratch directory gone. Never what it had written.
+    gave_back: u64,
 }
 
 impl Repaired {
@@ -300,7 +330,14 @@ impl Repaired {
             output: Leaf::at(working_dir, &name),
             written: 0,
             failed: None,
+            writes: 0,
+            gave_back: 0,
         })
+    }
+
+    // The repair says how much it writes in all when it runs.
+    pub(crate) fn will_write(&mut self, bytes: u64) {
+        self.writes = self.writes.saturating_add(bytes);
     }
 
     // What an object asked for again, read back and staged here until the
@@ -310,6 +347,7 @@ impl Repaired {
     pub(crate) fn again(working_dir: &std::path::Path, node: NodeId) -> Result<Self, LeafError> {
         let internal = working_dir.join(weaver_graph::names::INTERNAL_DIR);
         std::fs::create_dir_all(&internal).map_err(|source| LeafError::Io {
+            device: crate::pipeline::graph::limits::Device::Working,
             path: internal.clone(),
             source,
         })?;
@@ -325,6 +363,8 @@ impl Repaired {
             output: Leaf::at(working_dir, &name),
             written: 0,
             failed: None,
+            writes: 0,
+            gave_back: 0,
         })
     }
 
@@ -345,13 +385,55 @@ impl Repaired {
                 self.written = at.end;
                 self.runs.push((member, offset, at));
             }
-            Err(error) => self.failed = Some(error),
+            // Nothing staged is applied once a write is refused, so what
+            // the output holds goes now, not when the return is heard. A
+            // file that will not go is tried again then.
+            Err(error) => {
+                self.output.release_handle();
+                let _ = std::fs::remove_file(self.output.path());
+                self.gave_back = self.writes;
+                self.failed = Some(error);
+            }
         }
+    }
+
+    // The repair's scratch directory, which lies beside the output on the
+    // working disk, refused a write for want of room. The repair failed with
+    // it as it does when the output refuses one: nothing staged is applied.
+    pub(crate) fn refuse(&mut self, path: &std::path::Path, source: std::io::Error) {
+        if self.failed.is_some() {
+            return;
+        }
+        self.gave_back = self.writes;
+        self.output.release_handle();
+        let _ = std::fs::remove_file(self.output.path());
+        self.failed = Some(LeafError::Io {
+            device: crate::pipeline::graph::limits::Device::Working,
+            path: path.to_path_buf(),
+            source,
+        });
     }
 
     // The write the output refused, if one did: the repair failed with it.
     pub(crate) fn failed(&mut self) -> Option<LeafError> {
         self.failed.take()
+    }
+
+    // What a repair that failed needs free to run again; nothing when it
+    // did not say what it writes, and the job then waits for more room than
+    // the disk showed.
+    pub(crate) fn gave_back(&self) -> u64 {
+        self.gave_back
+    }
+
+    // What the repair said it writes in all.
+    pub(crate) fn writes(&self) -> u64 {
+        self.writes
+    }
+
+    // Each run's member and how many bytes it holds, in the order written.
+    pub(crate) fn sizes(&self) -> impl Iterator<Item = (MemberId, u64)> + '_ {
+        self.runs.iter().map(|(member, _, at)| (*member, at.len()))
     }
 
     pub(crate) fn members(&self) -> impl Iterator<Item = MemberId> + '_ {
@@ -406,6 +488,8 @@ impl NamespaceWriter {
             set,
             recovery: Some(set),
             defer_holds: false,
+            scratch_read: None,
+            held_scratch: BTreeMap::new(),
             internal: self.working_dir.join(weaver_graph::names::INTERNAL_DIR),
             members: BTreeMap::new(),
             usage: RefCell::default(),
@@ -420,6 +504,7 @@ impl NamespaceWriter {
             diagnostics: Vec::new(),
             scratch: None,
             shutdown: Shutdown::default(),
+            withheld: BTreeSet::new(),
         };
         let mut seen = BTreeSet::new();
         self.take_namespace(tree, namespace, &mut access, &mut seen);
@@ -451,6 +536,7 @@ impl NamespaceWriter {
         match std::fs::create_dir(&access.internal) {
             Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
                 return Err(LeafError::Io {
+                    device: crate::pipeline::graph::limits::Device::Working,
                     path: access.internal,
                     source: error,
                 });
@@ -550,20 +636,30 @@ impl NamespaceWriter {
             return;
         };
         let files = self.files.get(&node);
-        let held = files
-            .map(|files| {
-                if access.defer_holds {
-                    files
-                        .holds
-                        .peek(held_volume(member), ALL)
-                        .into_iter()
-                        .map(|piece| (piece.range, piece.location))
-                        .collect()
-                } else {
-                    self.held_pieces(files, member)
+        let held = match files {
+            Some(files) => {
+                let held: Vec<(ByteRange, Location)> = files
+                    .holds
+                    .peek(held_volume(member), ALL)
+                    .into_iter()
+                    .map(|piece| (piece.range, piece.location))
+                    .collect();
+                let on_scratch = held
+                    .iter()
+                    .any(|(_, location)| matches!(location, Location::Scratch { .. }));
+                if on_scratch
+                    && !access.held_scratch.contains_key(&node)
+                    && let Some(file) = files
+                        .scratch
+                        .as_ref()
+                        .and_then(|leaf| File::open(leaf.path()).ok())
+                {
+                    access.held_scratch.insert(node, file);
                 }
-            })
-            .unwrap_or_default();
+                held
+            }
+            None => Vec::new(),
+        };
         let bound = tree
             .child_of(node, member)
             .filter(|(child, _)| !tree.recovers(*child));
@@ -585,10 +681,6 @@ impl NamespaceWriter {
                     .map(|files| files.holds.revisions(held_volume(member), ALL))
                     .unwrap_or_default(),
                 held,
-                scratch: files
-                    .and_then(|files| files.scratch.as_ref())
-                    .filter(|_| access.defer_holds)
-                    .and_then(|leaf| File::open(leaf.path()).ok()),
                 spill_revision: files
                     .and_then(|files| files.spills.get(&member))
                     .map(Leaf::revision),
@@ -615,32 +707,43 @@ impl NamespaceWriter {
         self.take_namespace(tree, child, access, seen);
     }
 
-    // What is held for the member: bytes paged to scratch are copied out,
-    // since the scratch span is reused once its hold leaves, and the
-    // budgets bound them. Bytes on file stay there, read through the
-    // loan's own handle on the spill file as the repair asks for them:
-    // nothing bounds how much spilled, so none of it is copied here.
-    fn held_pieces(&self, files: &super::Files, member: MemberId) -> Vec<(ByteRange, Location)> {
-        files
-            .holds
-            .peek(held_volume(member), ALL)
-            .into_iter()
-            .filter_map(|piece| {
-                let location = match piece.location {
-                    Location::Scratch { offset, len } => {
-                        let mut bytes = Vec::new();
-                        files
-                            .scratch
-                            .as_ref()?
-                            .read(offset, index(len), &mut bytes)
-                            .ok()?;
-                        Location::Ram(Bytes::from(bytes))
-                    }
-                    kept @ (Location::Ram(_) | Location::Spilled) => kept,
-                };
-                Some((piece.range, location))
-            })
-            .collect()
+    // Whether every held range a rewalk's piece read on scratch is held
+    // as it was when lent: the same holds, at the same revisions, so the
+    // span the piece read was not written again under it.
+    pub(crate) fn scratch_stands(&self, read: &ScratchRead) -> bool {
+        read.0.iter().all(|(node, member, range, basis)| {
+            self.files
+                .get(node)
+                .is_some_and(|files| files.holds.revisions(held_volume(*member), *range) == *basis)
+        })
+    }
+}
+
+// The held ranges one piece of a rewalk read on scratch, each with the
+// revisions its holds stood at when lent.
+#[derive(Default)]
+pub(crate) struct ScratchRead(Vec<(NodeId, MemberId, ByteRange, Revisions)>);
+
+// Held ranges with the revision each stood at, as `Holds::revisions` gives
+// them.
+type Revisions = Vec<(ByteRange, u64)>;
+
+impl Lent {
+    // What the reads since the last call found on scratch, with the
+    // revisions lent for it.
+    fn scratch_read(&self) -> ScratchRead {
+        let Some(read) = &self.scratch_read else {
+            return ScratchRead::default();
+        };
+        ScratchRead(
+            read.borrow_mut()
+                .drain(..)
+                .filter_map(|(node, member, range)| {
+                    let taken = self.members.get(&(node, member))?;
+                    Some((node, member, range, clipped(&taken.held_basis, range)))
+                })
+                .collect(),
+        )
     }
 }
 
@@ -750,10 +853,15 @@ impl Source for Lent {
                     Location::Ram(bytes) => {
                         Location::Ram(bytes.slice(index(from)..index(from + inside.len())))
                     }
-                    Location::Scratch { offset, .. } => Location::Scratch {
-                        offset: offset + from,
-                        len: inside.len(),
-                    },
+                    Location::Scratch { offset, .. } => {
+                        if let Some(read) = &self.scratch_read {
+                            read.borrow_mut().push((node, member, inside));
+                        }
+                        Location::Scratch {
+                            offset: offset + from,
+                            len: inside.len(),
+                        }
+                    }
                     Location::Spilled => Location::Spilled,
                 };
                 Some((inside, location))
@@ -770,12 +878,14 @@ impl Source for Lent {
         into: &mut Vec<u8>,
     ) -> bool {
         let Some(file) = self
-            .members
-            .get(&(node, member))
-            .and_then(|taken| taken.scratch.as_ref())
+            .held_scratch
+            .get(&node)
+            .filter(|_| self.members.contains_key(&(node, member)))
         else {
             return false;
         };
+        #[cfg(test)]
+        super::tests::SCRATCH_READ_MOST.with(|most| most.set(most.get().max(len)));
         let start = into.len();
         into.resize(start + index(len), 0);
         if read_exact_at(file, offset, &mut into[start..]).is_err() {
@@ -844,6 +954,10 @@ impl MemberAccess for Lent {
         self.members.get(&(self.namespace, member))?.length
     }
 
+    fn withheld(&self, member: MemberId) -> bool {
+        self.withheld.contains(&member)
+    }
+
     fn arrived(&self, member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {
         self.note((self.namespace, member), Some(range));
         let Some(taken) = self.members.get(&(self.namespace, member)) else {
@@ -865,9 +979,28 @@ impl MemberAccess for Lent {
             self.namespace.0, self.set.0
         ));
         super::remove_scratch(&dir);
-        std::fs::create_dir(&dir).ok()?;
+        if let Err(error) = std::fs::create_dir(&dir) {
+            self.scratch_failed(error);
+            return None;
+        }
         self.scratch = Some(dir.clone());
         Some(dir)
+    }
+
+    // Only a disk with no room is the namespace's to wait on. Any other
+    // failure stays the object's, which rules the set as it did before.
+    fn scratch_failed(&mut self, error: std::io::Error) {
+        if crate::operations::is_out_of_space(&error) {
+            let dir = self
+                .scratch
+                .clone()
+                .unwrap_or_else(|| self.internal.clone());
+            self.repaired.refuse(&dir, error);
+        }
+    }
+
+    fn will_write(&mut self, bytes: u64) {
+        self.repaired.will_write(bytes);
     }
 
     // The set's volume is a member of the namespace it was posted in, or a
@@ -892,5 +1025,78 @@ impl MemberAccess for Lent {
             into.truncate(start);
         }
         read
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::graph::job::GraphError;
+    use crate::pipeline::graph::limits::Device;
+    use crate::pipeline::graph::namespace::WriteError;
+
+    // A repair whose output finds the disk full part-way comes back as a
+    // write the working disk had no room for, which holds the job, whatever
+    // kind of recovery wrote it: every kind writes what it rebuilt here.
+    #[test]
+    fn a_repair_whose_output_finds_the_disk_full_comes_back_out_of_space() {
+        use crate::pipeline::graph::leaf::counting::fill_after;
+        let dir = tempfile::tempdir().expect("a working directory");
+        let mut repaired = Repaired::again(dir.path(), NodeId(4)).expect("an output");
+        // A repair that writes 500 MB finds the disk full 14 bytes in.
+        repaired.will_write(500 << 20);
+        fill_after(Some(10));
+        repaired.write(MemberId(0), 0, b"rebuilt");
+        repaired.write(MemberId(0), 7, b"rebuilt");
+        fill_after(None);
+        assert!(!repaired.output.path().exists());
+        // What it needs free to run again: all it writes, not the 14 bytes
+        // it had written when it failed.
+        assert_eq!(repaired.gave_back(), 500 << 20);
+
+        // One that did not say what it writes names no figure.
+        let mut unsaid = Repaired::again(dir.path(), NodeId(5)).expect("an output");
+        fill_after(Some(0));
+        unsaid.write(MemberId(0), 0, b"rebuilt");
+        fill_after(None);
+        assert_eq!(unsaid.gave_back(), 0);
+
+        let error = repaired.failed().expect("the repair failed");
+        let error = GraphError::from(WriteError::from(error));
+        assert_eq!(error.out_of_space(), Some(Device::Working));
+    }
+
+    // A repair whose scratch directory found the disk full comes back as a
+    // write the working disk had no room for, which holds the job: nothing
+    // it staged is applied, and its output is gone.
+    #[test]
+    fn a_repair_whose_scratch_found_the_disk_full_comes_back_out_of_space() {
+        let dir = tempfile::tempdir().expect("a working directory");
+        let mut repaired = Repaired::again(dir.path(), NodeId(3)).expect("an output");
+        // A restore that stages 5 GB and rebuilds 200 MB, which it then
+        // copies into its member.
+        let whole = (5u64 << 30) + 2 * (200 << 20);
+        repaired.will_write(whole);
+        repaired.write(MemberId(0), 0, b"rebuilt");
+        let output = repaired.output.path().to_path_buf();
+        assert!(output.exists());
+
+        let scratch = dir.path().join("scratch");
+        repaired.refuse(
+            &scratch,
+            std::io::Error::from(std::io::ErrorKind::StorageFull),
+        );
+        // A later write is not made, and a second refusal does not replace
+        // the first.
+        repaired.write(MemberId(0), 7, b"more");
+        repaired.refuse(&scratch, std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(!output.exists());
+        // What it needs free to run again: all it stages, rebuilds and
+        // copies, not what it had staged when it failed.
+        assert_eq!(repaired.gave_back(), whole);
+
+        let error = repaired.failed().expect("the repair failed");
+        let error = GraphError::from(WriteError::from(error));
+        assert_eq!(error.out_of_space(), Some(Device::Working));
     }
 }

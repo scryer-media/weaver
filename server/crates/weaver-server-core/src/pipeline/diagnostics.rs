@@ -29,7 +29,7 @@ pub struct PipelineDiagnostics {
     pub pressure: PressureDiagnostics,
     pub global_paused: bool,
     pub scheduled_pause: bool,
-    pub active_downloads: usize,
+    pub articles_in_flight: usize,
     pub active_download_connections: usize,
     pub active_completion_critical_connections: usize,
     pub active_recovery: usize,
@@ -94,7 +94,7 @@ pub struct JobPipelineDiagnostics {
     pub status: JobStatus,
     pub download_queue_len: usize,
     pub recovery_queue_len: usize,
-    pub active_downloads: usize,
+    pub articles_in_flight: usize,
     pub active_download_connections: usize,
     pub active_decodes: usize,
     pub pending_retries: usize,
@@ -166,13 +166,6 @@ pub struct MemoryDiagnostics {
     // Working set on Windows, resident set elsewhere. `None` on a platform
     // that cannot answer cheaply.
     pub process_resident_bytes: Option<u64>,
-    pub buffer_pool_small_in_use_bytes: usize,
-    pub buffer_pool_small_total_bytes: usize,
-    pub buffer_pool_medium_in_use_bytes: usize,
-    pub buffer_pool_medium_total_bytes: usize,
-    pub buffer_pool_large_in_use_bytes: usize,
-    pub buffer_pool_large_total_bytes: usize,
-    pub buffer_pool_waits: usize,
     // Raw article bytes dispatched to lanes and not yet answered.
     pub lane_inflight_bytes: u64,
     pub jobs_eligible: usize,
@@ -196,6 +189,48 @@ pub struct LaneDiagnostics {
     pub yield_after_batch: usize,
     pub parking: usize,
     pub recovering: usize,
+}
+
+// What the queue's shared rows say about the pipeline's work, read without
+// the pipeline answering: one pass over the rows under the queue's lock, the
+// same read the metrics scrape makes for its job counts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueStateCounts {
+    // Queued jobs in each status, in `JOB_STATUS_KEYS` order.
+    pub jobs_by_status: crate::operations::metrics_store::JobStatusCounts,
+    pub jobs: usize,
+    pub max_concurrent_nzbs: usize,
+    // How many queued jobs the pipeline keeps installed for that slot limit.
+    pub queue_window: usize,
+    pub global_paused: bool,
+    pub scheduled_pause: bool,
+}
+
+impl QueueStateCounts {
+    pub(crate) fn read(inner: &crate::pipeline::queue::QueueInner) -> Self {
+        let max_concurrent_nzbs = inner
+            .globals
+            .max_concurrent_nzbs
+            .unwrap_or(crate::settings::model::DEFAULT_MAX_CONCURRENT_NZBS)
+            .get() as usize;
+        Self {
+            jobs_by_status: crate::operations::metrics_store::JobStatusCounts::from_statuses(
+                inner.jobs.iter().map(|row| &row.report.job.status),
+            ),
+            jobs: inner.jobs.len(),
+            max_concurrent_nzbs,
+            queue_window: super::queue_window::window_size(max_concurrent_nzbs),
+            global_paused: inner
+                .globals
+                .holds
+                .stops(crate::jobs::HoldOwner::All, false),
+            scheduled_pause: inner
+                .globals
+                .holds
+                .reason(crate::jobs::HoldOwner::All, false)
+                == Some(crate::jobs::HoldOrigin::Scheduled),
+        }
+    }
 }
 
 impl Pipeline {
@@ -247,8 +282,8 @@ impl Pipeline {
                     retries.get(job_id).copied().unwrap_or_default();
                 let group = next.and_then(|work| {
                     provider_policy.as_ref()?.eligible_group(
-                        &work.exclude_servers,
-                        &self.compute_job_retention_excludes(*job_id),
+                        work.exclude_servers,
+                        self.compute_job_retention_excludes(*job_id),
                         Self::bandwidth_reservation_estimate(work.byte_estimate),
                     )
                 });
@@ -277,8 +312,8 @@ impl Pipeline {
                     status: state.status.clone(),
                     download_queue_len: state.articles.queued_download_len(),
                     recovery_queue_len: state.articles.queued_recovery_len(),
-                    active_downloads: self
-                        .active_downloads_by_job
+                    articles_in_flight: self
+                        .articles_in_flight_by_job
                         .get(job_id)
                         .copied()
                         .unwrap_or(0),
@@ -318,7 +353,7 @@ impl Pipeline {
                     checkpoint_lead_limit_bytes: Some(Self::restart_durable_lead_limit_bytes()),
                     checkpoint_admission: Some(
                         next.map_or("no_queued_primary", |work| {
-                            checkpoint.decision(work, &[]).as_str()
+                            checkpoint.decision(&work, &[]).as_str()
                         })
                         .to_string(),
                     ),
@@ -417,7 +452,7 @@ impl Pipeline {
             },
             global_paused: self.shared_state.is_paused(),
             scheduled_pause: self.global_pause() == Some(crate::jobs::HoldOrigin::Scheduled),
-            active_downloads: self.active_downloads,
+            articles_in_flight: self.articles_in_flight,
             active_download_connections: self.active_download_connections,
             active_completion_critical_connections: self.active_completion_critical_connections,
             active_recovery: self.active_recovery,
@@ -442,36 +477,11 @@ impl Pipeline {
                 parking: metrics.download_lanes_parking_active,
                 recovering: metrics.download_lanes_recovering_active,
             },
-            memory: {
-                use crate::runtime::buffers::BufferTier;
-
-                let pool = self.buffers.metrics();
-                MemoryDiagnostics {
-                    process_resident_bytes: crate::runtime::process_metrics::resident_memory_bytes(
-                    ),
-                    buffer_pool_small_in_use_bytes: pool
-                        .small_in_use
-                        .saturating_mul(BufferTier::Small.size_bytes()),
-                    buffer_pool_small_total_bytes: pool
-                        .small_total
-                        .saturating_mul(BufferTier::Small.size_bytes()),
-                    buffer_pool_medium_in_use_bytes: pool
-                        .medium_in_use
-                        .saturating_mul(BufferTier::Medium.size_bytes()),
-                    buffer_pool_medium_total_bytes: pool
-                        .medium_total
-                        .saturating_mul(BufferTier::Medium.size_bytes()),
-                    buffer_pool_large_in_use_bytes: pool
-                        .large_in_use
-                        .saturating_mul(BufferTier::Large.size_bytes()),
-                    buffer_pool_large_total_bytes: pool
-                        .large_total
-                        .saturating_mul(BufferTier::Large.size_bytes()),
-                    buffer_pool_waits: pool.wait_count,
-                    lane_inflight_bytes: metrics.download_lane_inflight_bytes,
-                    jobs_eligible: metrics.download_jobs_eligible,
-                    jobs_hot: metrics.download_jobs_hot,
-                }
+            memory: MemoryDiagnostics {
+                process_resident_bytes: crate::runtime::process_metrics::resident_memory_bytes(),
+                lane_inflight_bytes: metrics.download_lane_inflight_bytes,
+                jobs_eligible: metrics.download_jobs_eligible,
+                jobs_hot: metrics.download_jobs_hot,
             },
         }
     }

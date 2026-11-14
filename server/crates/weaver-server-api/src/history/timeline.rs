@@ -25,6 +25,39 @@ struct MemberAccumulator {
     interrupted: bool,
 }
 
+// Every event kind `build_job_timeline` acts on. The timeline is built from
+// these alone, so a job's article, segment, file, progress and script events,
+// which outnumber them by far, are never read for it. Leaving the others out
+// changes nothing: the only arm that sees them, in `collect_pause_spans`,
+// clears a pause boundary that a later pause could match only if its
+// timestamp went backwards. A new arm on another kind adds that kind here.
+pub(crate) const TIMELINE_EVENT_KINDS: &[&str] = &[
+    "JobCreated",
+    "JobPaused",
+    "JobResumed",
+    "JobCancelled",
+    "JobCompleted",
+    "JobFailed",
+    "DownloadStarted",
+    "DownloadFinished",
+    "DownloadPipelineDrained",
+    "JobVerificationStarted",
+    "RepairStarted",
+    "RepairComplete",
+    "ExtractionReady",
+    "ExtractionMemberStarted",
+    "ExtractionMemberWaitingStarted",
+    "ExtractionMemberWaitingFinished",
+    "ExtractionMemberAppendStarted",
+    "ExtractionMemberAppendFinished",
+    "ExtractionMemberFinished",
+    "ExtractionMemberFailed",
+    "ExtractionComplete",
+    "ExtractionFailed",
+    "MoveToCompleteStarted",
+    "MoveToCompleteFinished",
+];
+
 pub(crate) fn build_job_timeline(
     job: &JobInfo,
     history: Option<&JobHistoryRow>,

@@ -364,10 +364,26 @@ impl<E: Replicate> ResolutionCache<E> {
             _ => None,
         }
     }
+
+    // Whether an answer is held for `name`, current or not.
+    #[cfg(test)]
+    fn held(&self, name: &str) -> bool {
+        matches!(
+            self.slots
+                .lock()
+                .expect("resolution cache")
+                .names
+                .get(&key(name)),
+            Some(Slot::Held { .. })
+        )
+    }
 }
 
+// A name with a trailing dot is absolute; one without may be completed from
+// the host's search domains, so the two can resolve differently and are held
+// apart.
 fn key(name: &str) -> String {
-    name.trim_end_matches('.').to_ascii_lowercase()
+    name.to_ascii_lowercase()
 }
 
 // A lookup the cache is waiting on. Dropped before it lands, as when the
@@ -455,6 +471,21 @@ pub async fn host_lookup(host: &str) -> io::Result<Vec<IpAddr>> {
         })
         .await,
     )
+}
+
+// Resolves the name of a tunnel's own endpoint with the host's own DNS: the
+// endpoint carries the tunnel, so nothing inside the tunnel can answer it.
+pub struct HostEndpoints;
+
+#[async_trait::async_trait]
+impl crate::endpoint::EndpointResolver for HostEndpoints {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a tunnel's own endpoint is the first hop of the route"
+    )]
+    async fn resolve(&self, host: &str) -> io::Result<Vec<IpAddr>> {
+        host_lookup(host).await
+    }
 }
 
 // `host_lookup` for a thread that may block.

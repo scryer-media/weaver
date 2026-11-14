@@ -21,10 +21,10 @@ const MAX_CONTROL_LINE: usize = 16 * 1024;
 const MAX_TRAILER_JUNK: u64 = 64 * 1024;
 const MAX_ARTICLE_RESERVE: usize = 16 * 1024 * 1024;
 const OUTPUT_BATCH_TARGET: usize = 512 * 1024;
-// Wire bytes handed to the kernel once a sized batch is full. The truthful
-// continuation is the trailer, which produces nothing, so the probe only has
-// to be long enough to reach `=y`; a header that lied fills the probe with
-// data instead and the batch grows from there.
+// Wire bytes handed to the kernel once a sized batch has less room than this.
+// The truthful continuation is the part's last few bytes and the trailer, so
+// the probe only has to be long enough to reach `=y`; a header that lied
+// fills the probe with data instead and the batch grows from there.
 const TAIL_PROBE_INPUT: usize = 256;
 // How many bytes of leading junk may precede `=ybegin` before the article is
 // declared header-less. Bounded so a 222 response whose body never contains a
@@ -260,9 +260,16 @@ pub struct FusedYencArticleDecoder {
     // The batch was sized from a declared length, so a full batch means the
     // trailer is next and the kernel must not grow it to find that out.
     output_sized: bool,
-    // Where a full sized batch's next input decodes; empty for a truthful
-    // header, the lie's first bytes otherwise.
+    // Where a short sized batch's next input decodes: the part's last few
+    // bytes for a truthful header, the lie's first bytes otherwise.
     tail_scratch: Vec<u8>,
+    // Room below which a sized batch decodes through the probe. Tests set it
+    // to one to compare with decoding through the batch until it is full.
+    #[cfg(test)]
+    short_room_limit: usize,
+    // Input length of every body decode call, in order.
+    #[cfg(test)]
+    input_log: Vec<usize>,
     profile_cpu: bool,
     checkpoint_plan: CheckpointPlan,
     stats: FusedYencArticleStats,
@@ -285,6 +292,10 @@ impl FusedYencArticleDecoder {
             batch_target: OUTPUT_BATCH_TARGET,
             output_sized: false,
             tail_scratch: Vec::new(),
+            #[cfg(test)]
+            short_room_limit: TAIL_PROBE_INPUT,
+            #[cfg(test)]
+            input_log: Vec::new(),
             profile_cpu: false,
             checkpoint_plan: CheckpointPlan::None,
             stats: FusedYencArticleStats::default(),
@@ -549,7 +560,9 @@ impl FusedYencArticleDecoder {
         }
 
         self.stats.decode_calls += 1;
-        let progress = if self.sized_batch_is_full() {
+        #[cfg(test)]
+        self.input_log.push(input_len);
+        let progress = if self.sized_batch_is_short() {
             self.decode_body_tail(&src[..input_len])?
         } else {
             let capacity = self.output.capacity();
@@ -858,15 +871,16 @@ impl FusedYencArticleDecoder {
     // was already sized for the whole part, and the doubling lands exactly on
     // the last chunk, whose decoded bytes fit the room that is left. So the
     // input is trimmed to the spare capacity first. Once a
-    // sized batch is full the only truthful continuation is the trailer, so
-    // the input is trimmed to a short probe that decodes through scratch (see
-    // [`Self::decode_body_tail`]) rather than doubling a finished batch to
-    // consume two bytes of line ending. An unreserved batch (no declared
-    // size) has nothing exact to defend and keeps growing amortised as before.
+    // sized batch has less room than the probe, the input is the probe and
+    // it decodes through scratch (see [`Self::decode_body_tail`]): trimming
+    // to a few bytes of room would cost a call per byte of line ending, and
+    // feeding the full batch more would double it to consume the trailer. An
+    // unreserved batch (no declared size) has nothing exact to defend and
+    // keeps growing amortised as before.
     fn next_body_input_len(&self, available: usize) -> usize {
         let batch_room = self.batch_target.saturating_sub(self.output.len());
         let spare = self.output.capacity() - self.output.len();
-        let room = if self.sized_batch_is_full() {
+        let room = if self.sized_batch_is_short() {
             batch_room.min(TAIL_PROBE_INPUT)
         } else if self.output_reserved && spare > 0 {
             spare.min(batch_room)
@@ -876,27 +890,42 @@ impl FusedYencArticleDecoder {
         available.min(room)
     }
 
-    // A batch sized from the header with no room left: the declared bytes are
-    // all decoded, and whatever comes next is either the trailer or a lie.
-    fn sized_batch_is_full(&self) -> bool {
-        self.output_sized && self.output.capacity() == self.output.len()
+    // A batch sized from the header with less room left than the probe: the
+    // declared bytes are all or nearly all decoded, and whatever comes next is
+    // their last few, the trailer, or a lie.
+    fn sized_batch_is_short(&self) -> bool {
+        self.output_sized && self.output.capacity() - self.output.len() < self.short_room_limit()
     }
 
-    // Decode past a full sized batch without growing it.
+    #[cfg(not(test))]
+    fn short_room_limit(&self) -> usize {
+        TAIL_PROBE_INPUT
+    }
+
+    #[cfg(test)]
+    fn short_room_limit(&self) -> usize {
+        self.short_room_limit
+    }
+
+    // Decode the end of a sized batch without growing it.
     //
     // The kernel reserves one output byte per input byte before it looks at
     // the input, so feeding it the trailer through the batch doubles the
     // batch (and a later shrink reallocates it back) to write nothing. The
-    // probe decodes into a small scratch instead; bytes that do come out are
-    // a header that understated the part, and they are appended so the batch
-    // grows amortised exactly as an unreserved one would.
+    // probe decodes into a small scratch instead. Bytes that come out are the
+    // part's last few, which fit the room left, or a header that understated
+    // the part, and those grow the batch amortised exactly as an unreserved
+    // one would.
     fn decode_body_tail(&mut self, input: &[u8]) -> Result<RapidyencDecodeProgress> {
         self.tail_scratch.clear();
         let progress =
             decode_body_chunk_until_control(&mut self.decode_state, input, &mut self.tail_scratch)?;
         if !self.tail_scratch.is_empty() {
-            self.stats.output_grow_events += 1;
+            let capacity = self.output.capacity();
             self.output.extend_from_slice(&self.tail_scratch);
+            if self.output.capacity() != capacity {
+                self.stats.output_grow_events += 1;
+            }
             self.tail_scratch.clear();
         }
         Ok(progress)
@@ -1806,6 +1835,354 @@ mod tests {
             weaver_yenc::CrcVerification::Verified
         );
         assert!(decoder.stats.output_grow_events >= 1);
+    }
+
+    // ── A sized batch with little room left reads probe-sized input ─
+
+    // `=ybegin` of `article` followed by `blank_lines` empty lines, then the
+    // rest of the article.
+    fn pad_after_ybegin(article: &[u8], blank_lines: usize) -> Vec<u8> {
+        let header_end = memchr::memchr(b'\n', article).expect("=ybegin line") + 1;
+        let mut padded = article[..header_end].to_vec();
+        for _ in 0..blank_lines {
+            padded.extend_from_slice(b"\r\n");
+        }
+        padded.extend_from_slice(&article[header_end..]);
+        padded
+    }
+
+    // Line endings decode to nothing, so a batch whose room is smaller than
+    // the probe must not trim each call's input to that room: a one-byte part
+    // padded with blank lines would cost a decode call per wire byte.
+    #[test]
+    fn fused_short_sized_room_takes_probe_sized_input() {
+        const BLANK_LINES: usize = 32 * 1024;
+        let mut article = Vec::new();
+        encode(b"B", &mut article, 128, "one.bin").unwrap();
+        let padded = pad_after_ybegin(&article, BLANK_LINES);
+        let transcript = transcript(&padded, b"223 next\r\n");
+
+        let mut decoder = FusedYencArticleDecoder::new();
+        let mut src = BytesMut::from(transcript.as_slice());
+        let finished = decoder.decode_available(&mut src).unwrap().unwrap();
+
+        assert_eq!(finished.to_data(), b"B");
+        assert_eq!(finished.yenc_result().crc_status, CrcVerification::Verified);
+        assert_eq!(finished.stats.output_grow_events, 0);
+        assert_eq!(&src[..], b"223 next\r\n");
+        let probe_calls = (padded.len() / TAIL_PROBE_INPUT + 2) as u64;
+        assert!(
+            finished.stats.decode_calls <= probe_calls,
+            "{} decode calls for {} body bytes",
+            finished.stats.decode_calls,
+            padded.len()
+        );
+    }
+
+    // The short-room limit under which a sized batch decodes through the
+    // batch until it is full, and only then through the probe.
+    const FULL_BATCH_ONLY: usize = 1;
+
+    // Everything an article's decode delivers, whichever input-length rule
+    // produced it. Decode-call counts and allocation figures are left out.
+    #[derive(Debug, PartialEq, Eq)]
+    struct RuleOutcome {
+        result: String,
+        data: Vec<u8>,
+        batch_lens: Vec<usize>,
+        payload_consumed: u64,
+        leftover: Vec<u8>,
+    }
+
+    fn decode_with_short_room_limit(
+        transcript: &[u8],
+        chunk_len: usize,
+        limit: usize,
+    ) -> (RuleOutcome, Vec<usize>) {
+        let mut decoder = FusedYencArticleDecoder::new();
+        decoder.short_room_limit = limit;
+        let mut src = BytesMut::new();
+        let mut finished = None;
+        for chunk in transcript.chunks(chunk_len.min(transcript.len()).max(1)) {
+            src.extend_from_slice(chunk);
+            match decoder.decode_available(&mut src) {
+                Ok(None) => {}
+                Ok(Some(article)) => {
+                    finished = Some(Ok(article));
+                    break;
+                }
+                Err(err) => {
+                    finished = Some(Err(err));
+                    break;
+                }
+            }
+        }
+        let payload_consumed = decoder.body_payload_bytes_consumed();
+        let (result, batches) = match finished {
+            None => ("unfinished".to_string(), decoder.drain_output_chunks()),
+            Some(Err(err)) => (format!("error {err:?}"), decoder.drain_output_chunks()),
+            Some(Ok(article)) => {
+                let stats = &article.stats;
+                let result = format!(
+                    "{:?} written={} crc={} expected={:?} size={:?}/{}",
+                    article.body,
+                    stats.decoded_bytes_written,
+                    stats.crc_actual,
+                    stats.crc_expected,
+                    stats.yenc_size_expected,
+                    stats.yenc_size_actual
+                );
+                (result, article.chunks)
+            }
+        };
+        let outcome = RuleOutcome {
+            result,
+            data: batches
+                .iter()
+                .flat_map(|batch| batch.iter().copied())
+                .collect(),
+            batch_lens: batches.iter().map(|batch| batch.len()).collect(),
+            payload_consumed,
+            leftover: src.to_vec(),
+        };
+        (outcome, std::mem::take(&mut decoder.input_log))
+    }
+
+    fn redeclare_size(article: &[u8], actual: usize, declared: usize) -> Vec<u8> {
+        let field = format!("size={actual}");
+        let at = article
+            .windows(field.len())
+            .position(|window| window == field.as_bytes())
+            .expect("encoder declared a size");
+        let mut redeclared = article[..at].to_vec();
+        redeclared.extend_from_slice(format!("size={declared}").as_bytes());
+        redeclared.extend_from_slice(&article[at + field.len()..]);
+        redeclared
+    }
+
+    fn pad_before_yend(article: &[u8], blank_lines: usize) -> Vec<u8> {
+        let at = article
+            .windows(b"\r\n=yend".len())
+            .position(|window| window == b"\r\n=yend")
+            .expect("=yend line")
+            + 2;
+        let mut padded = article[..at].to_vec();
+        for _ in 0..blank_lines {
+            padded.extend_from_slice(b"\r\n");
+        }
+        padded.extend_from_slice(&article[at..]);
+        padded
+    }
+
+    fn replace_once(article: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+        let at = article
+            .windows(from.len())
+            .position(|window| window == from)
+            .expect("pattern present");
+        let mut replaced = article[..at].to_vec();
+        replaced.extend_from_slice(to);
+        replaced.extend_from_slice(&article[at + from.len()..]);
+        replaced
+    }
+
+    fn encoded(original: &[u8]) -> Vec<u8> {
+        let mut article = Vec::new();
+        encode(original, &mut article, 128, "rule.bin").unwrap();
+        article
+    }
+
+    fn patterned(size: usize) -> Vec<u8> {
+        (0..size).map(|idx| (idx % 251) as u8).collect()
+    }
+
+    // Every transcript the two input-length rules are compared over.
+    fn short_room_transcripts() -> Vec<(String, Vec<u8>)> {
+        let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut add = |name: String, article: Vec<u8>| {
+            cases.push((
+                name,
+                transcript(&dot_stuff_lines(&article), b"223 next\r\n"),
+            ));
+        };
+
+        for size in [1usize, 37, 255, 256, 257, 4096, 100 * 1024 + 7, 700 * 1024] {
+            add(format!("honest {size}"), encoded(&patterned(size)));
+        }
+        // Lines that open with a dot, and escapes on every line.
+        let dotted: Vec<u8> = (0..4096usize)
+            .map(|idx| {
+                if idx % 128 == 0 {
+                    4
+                } else {
+                    ((idx * 31) % 250 + 5) as u8
+                }
+            })
+            .collect();
+        add("dot-stuffed 4096".to_string(), encoded(&dotted));
+        const ESCAPES: [u8; 7] = [214, 224, 227, 19, b'A', b'B', b'C'];
+        let escapes: Vec<u8> = (0..4096usize).map(|idx| ESCAPES[idx % 7]).collect();
+        add("escape-heavy 4096".to_string(), encoded(&escapes));
+
+        for (actual, declared) in [(5000usize, 4000usize), (5000, 4900), (5000, 4999), (300, 1)] {
+            add(
+                format!("size {declared} below data {actual}"),
+                redeclare_size(&encoded(&patterned(actual)), actual, declared),
+            );
+        }
+        for (actual, declared) in [(5000usize, 5001usize), (5000, 5100), (5000, 9000), (1, 200)] {
+            add(
+                format!("size {declared} above data {actual}"),
+                redeclare_size(&encoded(&patterned(actual)), actual, declared),
+            );
+        }
+
+        add(
+            "size 1, 4096 blank lines first".to_string(),
+            pad_after_ybegin(&encoded(b"B"), 4096),
+        );
+        add(
+            "4096, 300 blank lines first".to_string(),
+            pad_after_ybegin(&encoded(&patterned(4096)), 300),
+        );
+        add(
+            "4096, 300 blank lines before =yend".to_string(),
+            pad_before_yend(&encoded(&patterned(4096)), 300),
+        );
+        add(
+            "size 1, 1000 blank lines before =yend".to_string(),
+            pad_before_yend(&encoded(b"B"), 1000),
+        );
+
+        let mut part = Vec::new();
+        encode_part(
+            &patterned(4096),
+            &mut part,
+            128,
+            "rule.bin",
+            2,
+            3,
+            4097,
+            8192,
+            12288,
+        )
+        .unwrap();
+        add("part 2 of 3".to_string(), part);
+
+        add(
+            "bad trailer".to_string(),
+            replace_once(&encoded(&patterned(4096)), b"=yend", b"=yfoo"),
+        );
+        let honest = encoded(&patterned(4096));
+        let yend_at = honest
+            .windows(b"=yend".len())
+            .position(|window| window == b"=yend")
+            .expect("=yend line");
+        add("no trailer".to_string(), honest[..yend_at].to_vec());
+
+        let mut unterminated = b"222 <test@local> body follows\r\n".to_vec();
+        unterminated.extend_from_slice(&dot_stuff_lines(&encoded(&patterned(4096))));
+        cases.push(("no terminator".to_string(), unterminated));
+        cases
+    }
+
+    // Decoding a sized batch's short room through the probe delivers exactly
+    // what decoding through the batch until it is full delivers: the same
+    // bytes, batches, checksums, ranges, errors and leftover input, however
+    // the wire is split.
+    #[test]
+    fn fused_short_room_probe_matches_full_batch_rule() {
+        let chunkings = [
+            1usize,
+            2,
+            3,
+            7,
+            255,
+            256,
+            257,
+            1024,
+            4096,
+            16 * 1024,
+            64 * 1024,
+            700 * 1024,
+            usize::MAX,
+        ];
+        for (name, transcript) in short_room_transcripts() {
+            for chunk_len in chunkings {
+                // Single-byte chunks cover a large article; the other short
+                // ones only add time there.
+                if transcript.len() > 64 * 1024 && (2..255).contains(&chunk_len) {
+                    continue;
+                }
+                let (old, _) =
+                    decode_with_short_room_limit(&transcript, chunk_len, FULL_BATCH_ONLY);
+                let (new, _) =
+                    decode_with_short_room_limit(&transcript, chunk_len, TAIL_PROBE_INPUT);
+                assert_eq!(old, new, "{name}, chunk {chunk_len}");
+            }
+            if transcript.len() <= 2048 {
+                for split in 0..=transcript.len() {
+                    let decode = |limit| {
+                        let mut decoder = FusedYencArticleDecoder::new();
+                        decoder.short_room_limit = limit;
+                        let mut src = BytesMut::from(&transcript[..split]);
+                        let mut result = decoder
+                            .decode_available(&mut src)
+                            .map(|a| a.map(|a| a.to_data()));
+                        if matches!(result, Ok(None)) {
+                            src.extend_from_slice(&transcript[split..]);
+                            result = decoder
+                                .decode_available(&mut src)
+                                .map(|a| a.map(|a| a.to_data()));
+                        }
+                        (format!("{result:?}"), src.to_vec())
+                    };
+                    assert_eq!(
+                        decode(FULL_BATCH_ONLY),
+                        decode(TAIL_PROBE_INPUT),
+                        "{name}, split {split}"
+                    );
+                }
+            }
+        }
+    }
+
+    // An honest article reads the same input, call for call, under both
+    // rules until its room drops below the probe.
+    #[test]
+    fn fused_honest_article_differs_only_in_its_last_calls() {
+        for size in [4096usize, 700 * 1024] {
+            let transcript = transcript(
+                &dot_stuff_lines(&encoded(&patterned(size))),
+                b"223 next\r\n",
+            );
+            for chunk_len in [16 * 1024usize, 64 * 1024, usize::MAX] {
+                let (_, old) =
+                    decode_with_short_room_limit(&transcript, chunk_len, FULL_BATCH_ONLY);
+                let (_, new) =
+                    decode_with_short_room_limit(&transcript, chunk_len, TAIL_PROBE_INPUT);
+                let shared = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+                eprintln!(
+                    "size {size} chunk {chunk_len}: before {} calls {:?} | after {} calls {:?} | \
+                     {} shared, bytes/call before {} after {}",
+                    old.len(),
+                    &old[shared.saturating_sub(1)..],
+                    new.len(),
+                    &new[shared.saturating_sub(1)..],
+                    shared,
+                    old.iter().sum::<usize>() / old.len(),
+                    new.iter().sum::<usize>() / new.len(),
+                );
+                assert!(new.len() <= old.len(), "size {size} chunk {chunk_len}");
+                // The rules part only once the room is below the probe: the
+                // calls the full-batch rule spends there are each at most a
+                // probe long, and the probe rule spends one.
+                assert!(
+                    new.len() - shared <= 1
+                        && old[shared..].iter().all(|&len| len <= TAIL_PROBE_INPUT),
+                    "size {size} chunk {chunk_len}: before {old:?} after {new:?}"
+                );
+            }
+        }
     }
 
     // ── E12: decoded batches are delivered as they are produced ──────────

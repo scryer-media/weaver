@@ -43,8 +43,29 @@ export function formatSchemaCompatibilityChanges(changes) {
   return sections.join("\n\n");
 }
 
-export function hasSchemaCompatibilityFailure(changes, { allowDangerous = false } = {}) {
-  return changes.breaking.length > 0 || (!allowDangerous && changes.dangerous.length > 0);
+export function hasSchemaCompatibilityFailure(
+  changes,
+  { allowDangerous = false, allowBreaking = false } = {},
+) {
+  // Permitting breaking changes permits dangerous ones too.
+  return (
+    (!allowBreaking && changes.breaking.length > 0) ||
+    (!allowBreaking && !allowDangerous && changes.dangerous.length > 0)
+  );
+}
+
+const OPTIONS = ["--allow-dangerous", "--allow-breaking"];
+
+// The permitting options, each at most once and in any order. Anything else,
+// or a repeat, is null. `--allow-breaking` covers dangerous changes too.
+export function parseSchemaCompatibilityOptions(options) {
+  if (options.some((option) => !OPTIONS.includes(option))) return null;
+  if (new Set(options).size !== options.length) return null;
+  return {
+    allowDangerous:
+      options.includes("--allow-dangerous") || options.includes("--allow-breaking"),
+    allowBreaking: options.includes("--allow-breaking"),
+  };
 }
 
 function formatChangeSection(title, changes) {
@@ -54,22 +75,23 @@ function formatChangeSection(title, changes) {
   ].join("\n");
 }
 
-async function main(args) {
+export async function main(args) {
   const [oldSchemaPath, newSchemaPath, ...options] = args;
-  const allowDangerous = options.length === 1 && options[0] === "--allow-dangerous";
-  if (!oldSchemaPath || !newSchemaPath || (options.length !== 0 && !allowDangerous)) {
+  const permitted = parseSchemaCompatibilityOptions(options);
+  if (!oldSchemaPath || !newSchemaPath || !permitted) {
     console.error(
-      "usage: node scripts/check-graphql-schema-compat.mjs OLD_SCHEMA NEW_SCHEMA [--allow-dangerous]",
+      "usage: node scripts/check-graphql-schema-compat.mjs OLD_SCHEMA NEW_SCHEMA [--allow-dangerous] [--allow-breaking]",
     );
     return 2;
   }
+  const { allowDangerous, allowBreaking } = permitted;
 
   const [oldSdl, newSdl] = await Promise.all([
     readFile(oldSchemaPath, "utf8"),
     readFile(newSchemaPath, "utf8"),
   ]);
   const changes = findSchemaCompatibilityChanges(oldSdl, newSdl);
-  if (hasSchemaCompatibilityFailure(changes, { allowDangerous })) {
+  if (hasSchemaCompatibilityFailure(changes, { allowDangerous, allowBreaking })) {
     console.error("GraphQL API compatibility check failed.");
     console.error(`Old schema: ${oldSchemaPath}`);
     console.error(`New schema: ${newSchemaPath}`);
@@ -77,8 +99,14 @@ async function main(args) {
     return 1;
   }
 
+  if (allowBreaking && changes.breaking.length > 0) {
+    console.warn("GraphQL breaking changes explicitly permitted by --allow-breaking:");
+    console.warn(formatChangeSection("Breaking changes", changes.breaking));
+  }
   if (allowDangerous && changes.dangerous.length > 0) {
-    console.warn("GraphQL dangerous changes explicitly permitted by --allow-dangerous:");
+    console.warn(
+      `GraphQL dangerous changes explicitly permitted by ${allowBreaking ? "--allow-breaking" : "--allow-dangerous"}:`,
+    );
     console.warn(formatChangeSection("Dangerous changes", changes.dangerous));
   }
 

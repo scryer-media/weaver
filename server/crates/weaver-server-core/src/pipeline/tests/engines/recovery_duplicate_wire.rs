@@ -571,8 +571,11 @@ async fn article_copies(
             segment_id: id,
             raw_size: raw.len() as u64,
             error,
-            source_server_idx: Some(0),
-            exclude_servers: Vec::new(),
+            servers: crate::pipeline::PoolServers::stamped(
+                pipeline.pool_generation,
+                Some(0),
+                weaver_nntp::ServerSet::EMPTY,
+            ),
         };
         let done = match decoder.decode_available(&mut bytes::BytesMut::from(raw.as_slice())) {
             Ok(Some(decoded)) => {
@@ -591,8 +594,11 @@ async fn article_copies(
                     Ok(DownloadPayload::Decoded(result)) => DecodeDone::Success {
                         result,
                         source: SegmentSource {
-                            source_server_idx: Some(0),
-                            exclude_servers: Vec::new(),
+                            servers: crate::pipeline::PoolServers::stamped(
+                                pipeline.pool_generation,
+                                Some(0),
+                                weaver_nntp::ServerSet::EMPTY,
+                            ),
                         },
                     },
                     Err(DownloadError::Decode { error, .. }) => failed(error),

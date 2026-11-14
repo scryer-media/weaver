@@ -433,6 +433,12 @@ impl RarStore {
     // the headers it was found under, or nothing when they are open to
     // anyone: the record reads its volume under it and proves no candidate
     // of its own. Only the volumes in `changed` can have one not yet said.
+    //
+    // A volume carries one record, and the record finds itself in the
+    // volume when it rules, so a volume's first recovery header is the one
+    // said: further headers in it would build more records over the same
+    // volume, each ruling alike. A volume said already is passed over
+    // without reading its headers again.
     fn say_recovery(
         &mut self,
         layout: &StoredLayoutBuilder,
@@ -443,6 +449,14 @@ impl RarStore {
             .header_password()
             .map_or_else(Handed::default, Handed::new);
         for volume in changed {
+            let said = self
+                .recovery_said
+                .range((*volume, 0)..=(*volume, u64::MAX))
+                .next()
+                .is_some();
+            if said {
+                continue;
+            }
             let Some(found) = self.volumes.get(volume) else {
                 continue;
             };
@@ -452,16 +466,16 @@ impl RarStore {
             if !layout.has_volume(volume.0) {
                 continue;
             }
-            for service in facts.services.iter().filter(|service| service.name == "RR") {
-                if self.recovery_said.insert((*volume, service.data_offset)) {
-                    out.push(Emit::RecoveryAt {
-                        volume: *volume,
-                        range: ByteRange::at(service.data_offset, service.data_size),
-                        kind: RecoveryKind::Rar,
-                        handed: handed.clone(),
-                    });
-                }
-            }
+            let Some(service) = facts.services.iter().find(|service| service.name == "RR") else {
+                continue;
+            };
+            self.recovery_said.insert((*volume, service.data_offset));
+            out.push(Emit::RecoveryAt {
+                volume: *volume,
+                range: ByteRange::at(service.data_offset, service.data_size),
+                kind: RecoveryKind::Rar,
+                handed: handed.clone(),
+            });
         }
     }
 }

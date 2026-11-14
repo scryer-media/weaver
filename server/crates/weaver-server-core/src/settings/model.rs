@@ -35,8 +35,6 @@ pub struct Config {
     // Defaults to `{data_dir}/complete`.
     pub complete_dir: Option<String>,
     #[serde(default)]
-    pub buffer_pool: Option<BufferPoolOverrides>,
-    #[serde(default)]
     pub servers: Vec<ServerConfig>,
     #[serde(default)]
     pub categories: Vec<CategoryConfig>,
@@ -59,6 +57,11 @@ pub struct Config {
     // and staging directories a day after it failed. Defaults to true.
     #[serde(default)]
     pub delete_failed_job_files: Option<bool>,
+    // How many days a history entry is kept after its job finished, before
+    // housekeeping deletes the entry. Its delivered files stay. 0 keeps
+    // history forever. Defaults to 90.
+    #[serde(default)]
+    pub history_retention_days: Option<u32>,
     // Watched-folder NZB intake settings.
     #[serde(default)]
     pub watch_folder: WatchFolderConfig,
@@ -95,6 +98,11 @@ pub struct Config {
     pub config_path: Option<PathBuf>,
 }
 
+// The history retention, in days, when none is configured.
+pub const DEFAULT_HISTORY_RETENTION_DAYS: u32 = 90;
+// The longest history retention, in days, a setting may ask for.
+pub const MAX_HISTORY_RETENTION_DAYS: u32 = 36_500;
+
 impl Config {
     // Returns the intermediate directory for active downloads.
     // Defaults to `{data_dir}/intermediate`.
@@ -122,6 +130,13 @@ impl Config {
     // when not explicitly configured.
     pub fn delete_failed_job_files(&self) -> bool {
         self.delete_failed_job_files.unwrap_or(true)
+    }
+
+    // How many days history is kept. 0 keeps it forever. Defaults to 90 when
+    // not explicitly configured.
+    pub fn history_retention_days(&self) -> u32 {
+        self.history_retention_days
+            .unwrap_or(DEFAULT_HISTORY_RETENTION_DAYS)
     }
 
     // Whether a finished job may rename a delivered member that still wears an
@@ -274,7 +289,7 @@ pub struct DirectStoreOverrides {
     pub holds_scratch_total_bytes: Option<u64>,
     // Free space the working directory's filesystem must keep, in bytes. A
     // spill that would leave less demotes the set that asked. Defaults to a
-    // twentieth of the filesystem, between 512 MiB and 20 GiB; zero disables
+    // twentieth of the filesystem, between 512 MiB and 5 GiB; zero disables
     // the check.
     pub holds_disk_reserve_bytes: Option<u64>,
 }
@@ -1192,13 +1207,6 @@ impl TorrentEncryption {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BufferPoolOverrides {
-    pub small_count: Option<usize>,
-    pub medium_count: Option<usize>,
-    pub large_count: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryOverrides {
     pub max_retries: Option<u32>,
     pub base_delay_secs: Option<f64>,
@@ -1215,7 +1223,6 @@ mod tests {
             data_dir: "/tmp/weaver".to_string(),
             intermediate_dir: None,
             complete_dir: None,
-            buffer_pool: None,
             servers: vec![ServerConfig {
                 id: 1,
                 host: "news.example.com".to_string(),
@@ -1240,6 +1247,7 @@ mod tests {
             bandwidth: Default::default(),
             cleanup_after_extract: None,
             delete_failed_job_files: None,
+            history_retention_days: None,
             propagation_delay_secs: None,
             max_concurrent_nzbs: None,
             watch_folder: WatchFolderConfig::default(),

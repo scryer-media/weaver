@@ -289,3 +289,39 @@ fn sfv_reports_a_damaged_member_and_never_repairs() {
     );
     assert_eq!(job.store.writes, 0);
 }
+
+// A member past READ_CHUNK, its segments unproven, is read back in
+// several pieces whose CRC32s combine; one changed byte in its last piece
+// is found.
+#[test]
+fn sfv_readback_of_a_member_past_one_read_chunk() {
+    let original = payload(141, 2 * READ_CHUNK as usize + 4097);
+    let mut job = job(&sfv_text(&[("one.bin", crc32(&original))]));
+    let member = job.member("one.bin", &original);
+    bind(&mut job);
+    job.object
+        .feed(member, &segments(0, &original, 1 << 16, 1 << 16, false));
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
+    assert!(job.store.reads >= 3, "{} reads", job.store.reads);
+
+    let mut job = self::job(&sfv_text(&[("one.bin", crc32(&original))]));
+    let mut changed = original;
+    let last = changed.len() - 9;
+    changed[last] ^= 0x10;
+    let member = job.member("one.bin", &changed);
+    bind(&mut job);
+    job.object
+        .feed(member, &segments(0, &changed, 1 << 16, 1 << 16, false));
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Impossible {
+            damaged: 1,
+            reachable: 0
+        }
+    );
+}

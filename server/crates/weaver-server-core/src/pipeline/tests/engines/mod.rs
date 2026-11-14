@@ -66,6 +66,7 @@
 //
 // Files are indexed as the posts are listed; ordinals count from zero.
 
+mod abandon_cost;
 mod accounting;
 mod binding_order;
 mod caps;
@@ -81,8 +82,11 @@ mod dead_posts;
 mod deep;
 mod delivery;
 mod depth;
+mod disk_wait;
+mod download_summary;
 mod embedded;
 mod encrypted_hex;
+mod first_article_sample;
 pub(in crate::pipeline) mod harness;
 mod hold_breach;
 mod lent_handed;
@@ -98,6 +102,7 @@ mod password;
 mod perf;
 mod plain_par2;
 mod post_health_seats;
+mod prefix_sets;
 mod rar;
 mod rar_engine;
 mod rar_rev;
@@ -119,9 +124,11 @@ pub(in crate::pipeline::tests) mod restart;
 mod sealed;
 mod seek;
 mod sets;
+mod settled_rulings;
 mod sevenz;
 mod sevenz_hex;
 mod sfv;
+mod size_bounds;
 mod solid_hex;
 mod spent;
 mod split;
@@ -129,6 +136,7 @@ mod stage_events;
 mod streams;
 mod too_large;
 mod unnamed_index;
+mod volume_order;
 mod withheld_par2;
 mod zip;
 mod zip_par3;

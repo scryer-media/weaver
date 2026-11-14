@@ -34,6 +34,8 @@ pub(crate) struct Options {
     // The item written with a compression method instead of store.
     pub(crate) compressed: Option<usize>,
     pub(crate) recovery: bool,
+    // How many recovery headers each volume carries when it has a record.
+    pub(crate) recovery_headers: usize,
     // RAR5: a password check value, and checksums keyed by the hash key.
     pub(crate) check: bool,
     pub(crate) hash_key: bool,
@@ -49,6 +51,7 @@ impl Options {
             solid: false,
             compressed: None,
             recovery: false,
+            recovery_headers: 1,
             check: true,
             hash_key: false,
         }
@@ -444,10 +447,12 @@ impl Volumes<'_> {
         }
         if self.options.recovery {
             let data = vec![0xa5; 40 + volume];
-            let header = self.layout.recovery(&data);
-            let header = self.seal(header);
-            self.current.extend(header);
-            self.current.extend(data);
+            for _ in 0..self.options.recovery_headers {
+                let header = self.layout.recovery(&data);
+                let header = self.seal(header);
+                self.current.extend(header);
+                self.current.extend(&data);
+            }
         }
         self.used = 0;
     }

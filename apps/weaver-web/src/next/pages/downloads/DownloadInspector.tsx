@@ -7,7 +7,7 @@ import { useMutation, useQuery } from "urql";
 import {
   CANCEL_JOB_MUTATION,
   CANCEL_JOB_POST_PROCESSING_MUTATION,
-  JOB_OUTPUT_FILES_QUERY,
+  JOB_OUTPUT_FILES_INSPECTOR_QUERY,
   PAUSE_JOB_MUTATION,
   RESUME_JOB_MUTATION,
   SET_TORRENT_FORCED_MUTATION,
@@ -21,7 +21,8 @@ import { Eyebrow } from "@/next/components/chrome";
 import { DangerButton, SecondaryButton, Select, Toggle } from "@/next/components/controls";
 import { Icon } from "@/next/components/icons";
 import { PhaseBars, useJobProgress } from "@/next/components/PhaseBars";
-import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
+import { EM_DASH, formatCount, formatRate, formatSize } from "@/next/data/format";
+import { LIST_PAGE_SIZE } from "@/next/data/list-pages";
 import { useNextData } from "@/next/data/next-data";
 import { statusDetail, useStatusLabel } from "@/next/data/status";
 import { SupportReportActions } from "@/next/features/SupportReportActions";
@@ -37,7 +38,7 @@ interface OutputFilesResponse {
   jobOutputFiles: {
     outputDir: string | null;
     files: OutputFile[];
-    totalBytes: number;
+    totalCount: number;
   } | null;
 }
 
@@ -92,9 +93,10 @@ export function DownloadInspector({
   const isTorrent = job.protocol === "TORRENT";
   const t = useTranslate();
   const statusLabel = useStatusLabel();
+  // One page: the job's own screen pages through the rest.
   const [{ data }] = useQuery<OutputFilesResponse>({
-    query: JOB_OUTPUT_FILES_QUERY,
-    variables: { jobId: job.id },
+    query: JOB_OUTPUT_FILES_INSPECTOR_QUERY,
+    variables: { jobId: job.id, first: LIST_PAGE_SIZE },
   });
   const [, pauseJob] = useMutation(PAUSE_JOB_MUTATION);
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
@@ -166,6 +168,7 @@ export function DownloadInspector({
   const token = statusToken(job.status);
   const progress = useJobProgress(job);
   const files = data?.jobOutputFiles?.files ?? [];
+  const fileTotal = data?.jobOutputFiles?.totalCount ?? 0;
   // Only a phase with a bar is one the inspector says the job is in.
   const detail = statusDetail(
     t,
@@ -264,19 +267,33 @@ export function DownloadInspector({
               {t("next.inspector.noFiles")}
             </div>
           ) : (
-            files.map((file) => (
-              <div key={file.path} className="flex items-baseline gap-3">
-                <span
-                  title={file.path}
-                  className="min-w-0 flex-1 truncate text-[12.5px] text-wv-secondary"
+            <>
+              {files.map((file) => (
+                <div key={file.path} className="flex items-baseline gap-3">
+                  <span
+                    title={file.path}
+                    className="min-w-0 flex-1 truncate text-[12.5px] text-wv-secondary"
+                  >
+                    {file.name}
+                  </span>
+                  <span className="flex-none font-wv-mono text-[11.5px] text-wv-muted">
+                    {formatSize(file.sizeBytes)}
+                  </span>
+                </div>
+              ))}
+              {fileTotal > files.length ? (
+                <Link
+                  to={`/jobs/${job.id}`}
+                  title={t("next.inspector.openDetail")}
+                  className="font-wv-mono text-[11.5px] text-wv-accent hover:text-wv-accent-hover"
                 >
-                  {file.name}
-                </span>
-                <span className="flex-none font-wv-mono text-[11.5px] text-wv-muted">
-                  {formatSize(file.sizeBytes)}
-                </span>
-              </div>
-            ))
+                  {t("next.inspector.filesShown", {
+                    shown: formatCount(files.length),
+                    count: formatCount(fileTotal),
+                  })}
+                </Link>
+              ) : null}
+            </>
           )}
         </div>
       </div>

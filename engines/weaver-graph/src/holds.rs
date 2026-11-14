@@ -458,6 +458,94 @@ pub struct HoldLedger {
     // the bytes there, and new bytes would pair them with state they were
     // never part of. Bytes that would spill there stay in RAM instead.
     off_file: BTreeMap<VolumeIndex, u64>,
+    // What each volume holds, and what of that is in RAM, as merged spans:
+    // kept as holds come and go, so asking after them costs the spans, not
+    // the holds.
+    spans: BTreeMap<VolumeIndex, HeldSpans>,
+}
+
+#[derive(Debug, Default)]
+struct HeldSpans {
+    all: Spans,
+    resident: Spans,
+}
+
+// Disjoint byte ranges in offset order, neighbours merged: a file's worth
+// of articles held one after another is one span.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Spans {
+    // Each span's end by its start.
+    spans: BTreeMap<u64, u64>,
+}
+
+impl Spans {
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = ByteRange> + '_ {
+        self.spans
+            .iter()
+            .map(|(&start, &end)| ByteRange::new(start, end))
+    }
+
+    // Whether any byte of `range` is in a span.
+    pub fn overlaps(&self, range: ByteRange) -> bool {
+        !range.is_empty()
+            && self
+                .spans
+                .range(..range.end)
+                .next_back()
+                .is_some_and(|(_, &end)| end > range.start)
+    }
+
+    // Add `range`, merged with every span it touches.
+    pub fn add(&mut self, range: ByteRange) {
+        if range.is_empty() {
+            return;
+        }
+        let (mut start, mut end) = (range.start, range.end);
+        if let Some((&before, &reach)) = self.spans.range(..=start).next_back()
+            && reach >= start
+        {
+            start = before;
+            end = end.max(reach);
+        }
+        while let Some((&next, &reach)) = self.spans.range(start.saturating_add(1)..).next() {
+            if next > end {
+                break;
+            }
+            end = end.max(reach);
+            self.spans.remove(&next);
+        }
+        self.spans.insert(start, end);
+    }
+
+    // Take `range` out of every span it overlaps, the parts outside it kept.
+    pub fn remove(&mut self, range: ByteRange) {
+        if range.is_empty() {
+            return;
+        }
+        if let Some((&before, &reach)) = self.spans.range(..range.start).next_back()
+            && reach > range.start
+        {
+            self.spans.insert(before, range.start);
+            if reach > range.end {
+                self.spans.insert(range.end, reach);
+                return;
+            }
+        }
+        while let Some((&next, &reach)) = self.spans.range(range.start..).next() {
+            if next >= range.end {
+                break;
+            }
+            self.spans.remove(&next);
+            if reach > range.end {
+                self.spans.insert(range.end, reach);
+                break;
+            }
+        }
+    }
 }
 
 impl HoldLedger {
@@ -474,6 +562,7 @@ impl HoldLedger {
             spilled: 0,
             spilled_in: BTreeMap::new(),
             off_file: BTreeMap::new(),
+            spans: BTreeMap::new(),
         }
     }
 
@@ -483,13 +572,22 @@ impl HoldLedger {
 
     // Source-local identities at a worker transition. Cuts and page-outs
     // retain their ages; replacement bytes always get a new age.
+    // Only the holds the range reaches are visited, as `peek` visits them.
     pub fn revisions(&self, volume: VolumeIndex, range: ByteRange) -> Vec<(ByteRange, u64)> {
+        if range.is_empty() {
+            return Vec::new();
+        }
         self.volumes
             .get(&volume)
             .map(|holds| {
+                let start = holds
+                    .range(..=range.start)
+                    .next_back()
+                    .filter(|(_, hold)| hold.range.end > range.start)
+                    .map_or(range.start, |(&start, _)| start);
                 holds
-                    .values()
-                    .filter_map(|hold| Some((hold.range.intersect(range)?, hold.age)))
+                    .range(start..range.end)
+                    .filter_map(|(_, hold)| Some((hold.range.intersect(range)?, hold.age)))
                     .collect()
             })
             .unwrap_or_default()
@@ -673,7 +771,37 @@ impl HoldLedger {
         self.spilled = 0;
         self.spilled_in.clear();
         self.off_file.clear();
+        self.spans.clear();
         self.scratch_end = 0;
+    }
+
+    // What `volume` holds, as merged spans in offset order: one span for
+    // any run of holds that lie end to end, wherever each lives.
+    pub fn held_spans(&self, volume: VolumeIndex) -> impl Iterator<Item = ByteRange> + '_ {
+        self.spans
+            .get(&volume)
+            .into_iter()
+            .flat_map(|held| held.all.iter())
+    }
+
+    // What `volume` holds in RAM, as merged spans in offset order.
+    pub fn resident_spans(&self, volume: VolumeIndex) -> impl Iterator<Item = ByteRange> + '_ {
+        self.spans
+            .get(&volume)
+            .into_iter()
+            .flat_map(|held| held.resident.iter())
+    }
+
+    // Whether any byte of `range` of `volume` is held, wherever it lives.
+    pub fn holds_in(&self, volume: VolumeIndex, range: ByteRange) -> bool {
+        self.spans
+            .get(&volume)
+            .is_some_and(|held| held.all.overlaps(range))
+    }
+
+    // The volumes that hold anything, in volume order.
+    pub fn held_volumes(&self) -> impl Iterator<Item = VolumeIndex> + '_ {
+        self.volumes.keys().copied()
     }
 
     // The held ranges of `volume`, in offset order. Neighbouring holds are
@@ -915,8 +1043,11 @@ impl HoldLedger {
 
     fn place(&mut self, volume: VolumeIndex, hold: Hold) {
         let len = hold.range.len();
+        let spans = self.spans.entry(volume).or_default();
+        spans.all.add(hold.range);
         match hold.location {
             Location::Ram(_) => {
+                spans.resident.add(hold.range);
                 self.resident += len;
                 self.resident_by_age
                     .insert((hold.age, volume, hold.range.start));
@@ -943,6 +1074,15 @@ impl HoldLedger {
             self.volumes.remove(&volume);
         }
         let len = hold.range.len();
+        if let Some(spans) = self.spans.get_mut(&volume) {
+            spans.all.remove(hold.range);
+            if matches!(hold.location, Location::Ram(_)) {
+                spans.resident.remove(hold.range);
+            }
+            if spans.all.is_empty() {
+                self.spans.remove(&volume);
+            }
+        }
         match hold.location {
             Location::Ram(_) => {
                 self.resident -= len;
@@ -963,13 +1103,26 @@ impl HoldLedger {
     }
 
     // Remove `range` from every hold it overlaps, releasing the accounting
-    // of the removed parts and keeping the parts outside it.
+    // of the removed parts and keeping the parts outside it. Holds never
+    // overlap, so the only one that starts before `range` and reaches into
+    // it is the last that starts at or before its start: the holds looked
+    // at are that one and those that start inside it, however many lie
+    // before.
     fn cut(&mut self, volume: VolumeIndex, range: ByteRange) -> Vec<Taken> {
         let Some(holds) = self.volumes.get(&volume) else {
             return Vec::new();
         };
+        let start = holds
+            .range(..=range.start)
+            .next_back()
+            .filter(|(_, hold)| hold.range.end > range.start)
+            .map_or(range.start, |(&start, _)| start);
         let touched: Vec<u64> = holds
-            .range(..range.end)
+            .range(start..range.end.max(start))
+            .inspect(|_| {
+                #[cfg(test)]
+                tests::CUT_LOOKED.with(|looked| looked.set(looked.get() + 1));
+            })
             .filter(|(_, hold)| hold.range.intersect(range).is_some())
             .map(|(&start, _)| start)
             .collect();
@@ -1061,6 +1214,78 @@ impl Drop for HoldLedger {
 mod tests {
     use super::*;
 
+    thread_local! {
+        // How many holds a cut looked at.
+        pub(super) static CUT_LOOKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn spans(of: &Spans) -> Vec<(u64, u64)> {
+        of.iter().map(|range| (range.start, range.end)).collect()
+    }
+
+    // Ranges added end to end or over one another are one span, and a range
+    // taken out of the middle of a span leaves both sides.
+    #[test]
+    fn spans_merge_what_touches_and_split_where_cut() {
+        let mut held = Spans::default();
+        held.add(ByteRange::new(10, 20));
+        held.add(ByteRange::new(30, 40));
+        assert_eq!(spans(&held), vec![(10, 20), (30, 40)]);
+        held.add(ByteRange::new(20, 30));
+        assert_eq!(spans(&held), vec![(10, 40)]);
+        held.add(ByteRange::new(50, 60));
+        held.add(ByteRange::new(5, 55));
+        assert_eq!(spans(&held), vec![(5, 60)]);
+
+        held.remove(ByteRange::new(20, 30));
+        assert_eq!(spans(&held), vec![(5, 20), (30, 60)]);
+        assert!(held.overlaps(ByteRange::new(19, 25)));
+        assert!(!held.overlaps(ByteRange::new(20, 30)));
+        assert!(held.overlaps(ByteRange::new(0, 100)));
+        held.remove(ByteRange::new(0, 10));
+        held.remove(ByteRange::new(15, 35));
+        assert_eq!(spans(&held), vec![(10, 15), (35, 60)]);
+        held.remove(ByteRange::new(0, 100));
+        assert!(held.is_empty());
+    }
+
+    // The spans follow the holds: what is held end to end reads as one
+    // span, what is in RAM is told apart from what is on scratch, and a take
+    // leaves only what is still held.
+    #[test]
+    fn held_spans_follow_holds_page_outs_and_takes() {
+        let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
+            resident_limit: 8,
+            scratch_total: u64::MAX,
+            scratch_ceiling: u64::MAX,
+            disk_reserve: 0,
+        }));
+        let mut ledger = HoldLedger::new(NS, accountant);
+        let volume = VolumeIndex(0);
+        for offset in [0u64, 4, 8] {
+            ledger.hold(volume, offset, Bytes::from_static(b"abcd"), u64::MAX);
+        }
+        let all: Vec<ByteRange> = ledger.held_spans(volume).collect();
+        assert_eq!(all, vec![ByteRange::new(0, 12)]);
+        // The third hold paged the oldest out to make room.
+        let resident: Vec<ByteRange> = ledger.resident_spans(volume).collect();
+        assert_eq!(resident, vec![ByteRange::new(4, 12)]);
+
+        ledger.take(volume, ByteRange::new(2, 6));
+        let all: Vec<ByteRange> = ledger.held_spans(volume).collect();
+        assert_eq!(all, vec![ByteRange::new(0, 2), ByteRange::new(6, 12)]);
+        let resident: Vec<ByteRange> = ledger.resident_spans(volume).collect();
+        assert_eq!(resident, vec![ByteRange::new(6, 12)]);
+
+        assert!(ledger.holds_in(volume, ByteRange::new(1, 3)));
+        assert!(!ledger.holds_in(volume, ByteRange::new(2, 6)));
+        assert!(!ledger.holds_in(VolumeIndex(1), ByteRange::new(0, 12)));
+
+        ledger.take(volume, ByteRange::new(0, 12));
+        assert_eq!(ledger.held_spans(volume).count(), 0);
+        assert_eq!(ledger.held_volumes().count(), 0);
+    }
+
     const NS: HoldsNamespace = HoldsNamespace {
         scope: 1,
         node: NodeId(0),
@@ -1095,6 +1320,75 @@ mod tests {
         );
     }
 
+    // A take hands back what a peek of the same range shows, in the same
+    // order, and leaves held exactly the parts of each hold outside it,
+    // for every range over holds that touch, holds with gaps between and
+    // the space around them.
+    #[test]
+    fn a_take_cuts_exactly_the_holds_the_range_overlaps() {
+        let holds = [(10, 1), (20, 2), (30, 3), (50, 4)];
+        for start in 0..70 {
+            for end in start..70 {
+                let range = ByteRange::new(start, end);
+                let accountant = Arc::new(HoldsAccountant::new(budgets(100)));
+                let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+                for (offset, fill) in holds {
+                    ledger.hold(VolumeIndex(0), offset, bytes(fill, 10), PLENTY);
+                }
+                let before = ledger.held_ranges(VolumeIndex(0));
+                let peeked = ledger.peek(VolumeIndex(0), range);
+                let taken = ledger.take(VolumeIndex(0), range);
+                assert_eq!(taken, peeked, "{range:?}");
+                let left: Vec<ByteRange> = before
+                    .iter()
+                    .flat_map(|hold| match hold.intersect(range) {
+                        Some(inside) => vec![
+                            ByteRange::new(hold.start, inside.start),
+                            ByteRange::new(inside.end, hold.end),
+                        ],
+                        None => vec![*hold],
+                    })
+                    .filter(|piece| !piece.is_empty())
+                    .collect();
+                assert_eq!(ledger.held_ranges(VolumeIndex(0)), left, "{range:?}");
+                let taken_len: u64 = taken.iter().map(|piece| piece.range.len()).sum();
+                assert_eq!(accountant.usage().resident, 40 - taken_len, "{range:?}");
+            }
+        }
+    }
+
+    // A volume held a piece at a time, in order, and taken a piece at a
+    // time behind holds that stay: each hold and each take looks at the
+    // holds it overlaps and the one before, never at every hold before it.
+    #[test]
+    fn holding_and_taking_in_order_looks_at_a_constant_number_of_holds_each() {
+        for pieces in [1_000u64, 4_000] {
+            let accountant = Arc::new(HoldsAccountant::new(budgets(u64::MAX)));
+            let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+            CUT_LOOKED.set(0);
+            for piece in 0..pieces {
+                ledger.hold(VolumeIndex(0), piece * 16, bytes(1, 16), PLENTY);
+            }
+            assert!(
+                CUT_LOOKED.get() as u64 <= pieces,
+                "{pieces}: holding looked at {}",
+                CUT_LOOKED.get()
+            );
+            // The first quarter stays held while the rest is taken.
+            CUT_LOOKED.set(0);
+            for piece in pieces / 4..pieces {
+                let taken = ledger.take(VolumeIndex(0), ByteRange::at(piece * 16, 16));
+                assert_eq!(taken.len(), 1);
+            }
+            assert!(
+                CUT_LOOKED.get() as u64 <= 2 * pieces,
+                "{pieces}: taking looked at {}",
+                CUT_LOOKED.get()
+            );
+            assert_eq!(ledger.held_ranges(VolumeIndex(0)).len() as u64, pieces / 4);
+        }
+    }
+
     #[test]
     fn held_in_is_every_held_range_clipped_to_the_range() {
         let accountant = Arc::new(HoldsAccountant::new(budgets(100)));
@@ -1116,6 +1410,48 @@ mod tests {
         assert!(
             ledger
                 .held_in(VolumeIndex(1), ByteRange::new(0, 100))
+                .is_empty()
+        );
+    }
+
+    // The revisions of a range, visiting only the holds it reaches, are
+    // what a walk over every hold of the volume gives, for every range over
+    // holds that were cut, replaced and left gaps.
+    #[test]
+    fn revisions_of_a_range_match_a_walk_over_every_hold() {
+        let accountant = Arc::new(HoldsAccountant::new(budgets(100)));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        for (offset, fill) in [(10, 1), (30, 2), (50, 3), (70, 4), (75, 5)] {
+            ledger.hold(VolumeIndex(0), offset, bytes(fill, 10), PLENTY);
+        }
+        ledger.hold(VolumeIndex(1), 0, bytes(6, 10), PLENTY);
+        let _ = ledger.take(VolumeIndex(0), ByteRange::new(33, 36));
+        let every = |range: ByteRange| -> Vec<(ByteRange, u64)> {
+            ledger.volumes[&VolumeIndex(0)]
+                .values()
+                .filter_map(|hold| Some((hold.range.intersect(range)?, hold.age)))
+                .collect()
+        };
+        let mut compared = 0;
+        for start in 0..100 {
+            for end in start..100 {
+                let range = ByteRange::new(start, end);
+                assert_eq!(
+                    ledger.revisions(VolumeIndex(0), range),
+                    every(range),
+                    "{range:?}"
+                );
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, 5050);
+        assert_eq!(
+            ledger.revisions(VolumeIndex(0), ByteRange::new(0, u64::MAX)),
+            every(ByteRange::new(0, u64::MAX))
+        );
+        assert!(
+            ledger
+                .revisions(VolumeIndex(2), ByteRange::new(0, 10))
                 .is_empty()
         );
     }

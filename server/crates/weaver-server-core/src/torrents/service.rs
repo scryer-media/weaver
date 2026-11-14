@@ -3339,11 +3339,8 @@ impl TorrentService {
         &self,
         torrent: &Live,
         global: &[ArchivePasswordCandidate],
-    ) -> Vec<String> {
+    ) -> Vec<ArchivePasswordCandidate> {
         torrent_archive_passwords(torrent.rule(&self.rules()), global)
-            .into_iter()
-            .map(|candidate| candidate.value().to_owned())
-            .collect()
     }
 
     // The archive passwords every torrent may try, as the settings give
@@ -3365,7 +3362,7 @@ impl TorrentService {
         work: PathBuf,
         layout: &PieceLayout,
         plan: &Plan,
-        passwords: Vec<String>,
+        passwords: Vec<ArchivePasswordCandidate>,
     ) -> Storage {
         let db = self.inner.db.clone();
         let policy: limits::PolicyRead = Arc::new(move || {
@@ -3522,7 +3519,7 @@ impl TorrentService {
         job_id: JobId,
         layout: &Arc<PieceLayout>,
         plan: Plan,
-        passwords: Vec<String>,
+        passwords: Vec<ArchivePasswordCandidate>,
         hold: Hold<W>,
     ) -> Result<(Arc<Tee>, Option<Note>), Unmade<W>> {
         let work = self.unpacking_dir(job_id);
@@ -8186,7 +8183,7 @@ struct Making {
     files: PathBuf,
     layout: Arc<PieceLayout>,
     tee: bool,
-    passwords: Vec<String>,
+    passwords: Vec<ArchivePasswordCandidate>,
     // In seed mode: its pieces had are unchecked, and go to the tee only
     // as their seed-mode check passes.
     seeded: bool,

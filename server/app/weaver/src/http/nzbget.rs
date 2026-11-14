@@ -1581,7 +1581,7 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         .decode_pending_bytes
         .saturating_add(metrics.decode_active_bytes)
         .saturating_add(metrics.write_buffered_bytes);
-    let thread_count = metrics.active_downloads;
+    let thread_count = metrics.articles_in_flight;
     let (remaining_lo, remaining_hi) = size_parts(remaining);
     let (forced_lo, forced_hi) = size_parts(forced);
     let (downloaded_lo, downloaded_hi) = size_parts(session_downloaded);
@@ -2045,16 +2045,31 @@ fn critical_health_of(total_bytes: u64, optional_recovery_bytes: u64) -> u64 {
 const SUBMITTED_CATEGORY_KEY: &str = "weaver.nzbget.category";
 const SUBMITTED_CATEGORY_FOR_KEY: &str = "weaver.nzbget.category_for";
 
+// Longest submitted label kept, in bytes. `listfiles` repeats the label once
+// per file, so its size multiplies by the job's file count. Real labels such
+// as `tv` or `movies-uhd` are far shorter.
+const MAX_SUBMITTED_CATEGORY_BYTES: usize = 256;
+
 // Replace the submitted-category label in `metadata` for a job whose
 // canonical category is `canonical`. A label equal to the canonical name
-// needs no entry.
+// needs no entry. A longer label is cut to `MAX_SUBMITTED_CATEGORY_BYTES` on a
+// character boundary.
 fn record_submitted_category(
     metadata: &mut Vec<(String, String)>,
     submitted: Option<&str>,
     canonical: Option<&str>,
 ) {
     metadata.retain(|(key, _)| key != SUBMITTED_CATEGORY_KEY && key != SUBMITTED_CATEGORY_FOR_KEY);
-    let submitted = submitted.map(str::trim).filter(|value| !value.is_empty());
+    let submitted = submitted
+        .map(|value| {
+            let value = value.trim();
+            let mut end = value.len().min(MAX_SUBMITTED_CATEGORY_BYTES);
+            while !value.is_char_boundary(end) {
+                end -= 1;
+            }
+            value[..end].trim_end()
+        })
+        .filter(|value| !value.is_empty());
     if let (Some(submitted), Some(canonical)) = (submitted, canonical)
         && submitted != canonical
     {
@@ -2166,19 +2181,13 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
     let is_hidden = |job_id: u64| facade_states.get(&job_id).is_some_and(|state| state.hidden);
     let db = ctx.db.clone();
     let history_job_ids = rows.iter().map(|row| row.job_id).collect::<Vec<_>>();
-    let post_processing_results = tokio::task::spawn_blocking(move || {
-        let mut results = HashMap::new();
-        for job_id in history_job_ids {
-            let scripts = db.job_post_processing_results(job_id)?;
-            if !scripts.is_empty() {
-                results.insert(job_id, scripts);
-            }
-        }
-        Ok::<_, weaver_server_core::StateError>(results)
-    })
-    .await
-    .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?
-    .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?;
+    let post_processing_results =
+        tokio::task::spawn_blocking(move || db.job_post_processing_results_many(&history_job_ids))
+            .await
+            .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?
+            .map_err(|error| {
+                RpcError::invalid_parameter(format!("history unavailable: {error}"))
+            })?;
     let ids: Vec<u64> = terminal_items
         .iter()
         .map(|(item, _, _)| item.id)
@@ -3895,11 +3904,15 @@ fn job_events_to_log_entries(
     entries
 }
 
+// The most entries one `log` call returns.
+const LOG_ENTRIES_MAX_LIMIT: usize = 1000;
+
 // Global message log assembled from the event tails of current queue jobs.
 async fn log_entries(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value, RpcError> {
     let params = positional_params(params)?;
     let id_from = optional_i64_param(&params, 0)?.unwrap_or(0).max(0) as u64;
-    let limit = optional_i64_param(&params, 1)?.unwrap_or(0).max(0) as usize;
+    let limit =
+        (optional_i64_param(&params, 1)?.unwrap_or(0).max(0) as usize).min(LOG_ENTRIES_MAX_LIMIT);
 
     let history = ctx.queue.history_rows();
     let ids: Vec<u64> = ctx.queue.read_queue(|inner| {
@@ -4511,6 +4524,41 @@ mod active_download_state_tests {
         assert!(!nzbget_has_active_download(
             QueueItemState::FinalizingDownload
         ));
+    }
+}
+
+#[cfg(test)]
+mod submitted_category_tests {
+    use super::*;
+
+    fn stored(submitted: &str) -> Option<String> {
+        let mut metadata = Vec::new();
+        record_submitted_category(&mut metadata, Some(submitted), Some("tv"));
+        metadata
+            .into_iter()
+            .find(|(key, _)| key == SUBMITTED_CATEGORY_KEY)
+            .map(|(_, value)| value)
+    }
+
+    #[test]
+    fn short_labels_are_kept_as_submitted() {
+        assert_eq!(stored(" TV-Sonarr ").as_deref(), Some("TV-Sonarr"));
+        assert_eq!(stored("tv"), None);
+        let exact = "a".repeat(MAX_SUBMITTED_CATEGORY_BYTES);
+        assert_eq!(stored(&exact), Some(exact));
+    }
+
+    #[test]
+    fn long_labels_are_cut_on_a_character_boundary() {
+        let long = format!("tv-{}", "x".repeat(1 << 20));
+        let kept = stored(&long).unwrap();
+        assert_eq!(kept.len(), MAX_SUBMITTED_CATEGORY_BYTES);
+        assert!(long.starts_with(&kept));
+
+        // A two-byte character straddling the limit is left out whole.
+        let straddling = format!("{}é", "a".repeat(MAX_SUBMITTED_CATEGORY_BYTES - 1));
+        let kept = stored(&straddling).unwrap();
+        assert_eq!(kept, "a".repeat(MAX_SUBMITTED_CATEGORY_BYTES - 1));
     }
 }
 

@@ -18,6 +18,7 @@ use weaver_graph::{ByteRange, Coverage, MemberId, Sealed, Seek, VolumeIndex, Wei
 use super::facts::Packets;
 use super::repair::SetRepair;
 use super::walker::Walker;
+pub(super) use crate::elimination::Length;
 use crate::lost::Lost;
 use crate::recovery_volume;
 
@@ -185,12 +186,12 @@ impl SetState {
 
     // A verdict was on the members bound then and the unnamed ones it read;
     // others, or the same members bound to other files, void it. Returns
-    // whether it was voided.
+    // the members it was bound to when it was voided.
     pub(super) fn bind(
         &mut self,
         mut members: BTreeMap<FileId, MemberId>,
         unnamed: &[(MemberId, Length)],
-    ) -> bool {
+    ) -> Option<BTreeMap<FileId, MemberId>> {
         // A member bound before that nothing names now, as one a repair
         // knew by its slices, stays that file while no other member is.
         for (file, member) in &self.members {
@@ -214,13 +215,12 @@ impl SetState {
                     && !members.values().any(|bound| bound == member)
             })
             .collect();
-        let changed = members != self.members || unnamed != self.unnamed;
-        if changed {
-            self.members = members;
-            self.unnamed = unnamed;
-            self.last = None;
+        if members == self.members && unnamed == self.unnamed {
+            return None;
         }
-        changed
+        self.unnamed = unnamed;
+        self.last = None;
+        Some(std::mem::replace(&mut self.members, members))
     }
 
     pub(super) fn unnamed(&self) -> &[(MemberId, Length)] {
@@ -446,7 +446,7 @@ impl Front {
     }
 
     // The front a description states for its file.
-    fn described(length: u64, hash_16k: [u8; 16]) -> Self {
+    pub(super) fn described(length: u64, hash_16k: [u8; 16]) -> Self {
         Self {
             window: length.min(HASH_WINDOW),
             md5: hash_16k,
@@ -509,30 +509,5 @@ fn validate_par2_geometry(set: &Par2FileSet, output_limit: u64) -> par2_rs::Resu
 fn par2_resource_error(reason: &str) -> par2_rs::Par2Error {
     par2_rs::Par2Error::ResourceLimitExceeded {
         reason: format!("WEAVER_RESOURCE_LIMIT[par2_metadata]: {reason}"),
-    }
-}
-
-// What is known of an unnamed member's length. A member some byte of which
-// decoded knows its length exactly; one none of whose did is only bounded
-// by its post's encoded size.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Length {
-    Exact(u64),
-    AtMost(u64),
-}
-
-impl Length {
-    // Whether the member could be a described file of `long`.
-    pub(super) fn fits(self, long: u64) -> bool {
-        match self {
-            Self::Exact(length) => length == long,
-            Self::AtMost(bound) => long <= bound,
-        }
-    }
-
-    pub(super) fn bound(self) -> u64 {
-        match self {
-            Self::Exact(length) | Self::AtMost(length) => length,
-        }
     }
 }

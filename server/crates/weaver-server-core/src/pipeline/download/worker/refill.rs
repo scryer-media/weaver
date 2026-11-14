@@ -90,23 +90,23 @@ impl Pipeline {
             .collect();
         owners.sort_unstable();
         owners.dedup();
-        // The owner standing first in the queue, each found by its index.
-        let chosen: Option<(usize, JobId)> = self.shared_state.queue.read(|inner| {
+        // The owner first in dispatch order, ranked as the hot job is, each
+        // found in the queue by its index.
+        self.shared_state.queue.read(|inner| {
             owners
                 .into_iter()
-                .filter(|job_id| self.jobs.contains_key(job_id))
                 .filter_map(|job_id| {
-                    let index = inner.job_position(job_id).or_else(|| {
-                        self.job_order
-                            .iter()
-                            .position(|id| *id == job_id)
-                            .map(|index| inner.jobs.len() + index)
-                    })?;
-                    Some((index, job_id))
+                    let state = self.jobs.get(&job_id)?;
+                    let position = inner.dispatch_position(job_id, &self.job_order)?;
+                    Some(crate::pipeline::queue::order::DispatchKey::new(
+                        Self::job_dispatch_priority(state),
+                        position,
+                        job_id,
+                    ))
                 })
                 .min()
-        });
-        chosen.map(|(_, job_id)| job_id)
+                .map(|key| key.job_id())
+        })
     }
 
     pub(crate) fn handle_download_lane_refill_request(
@@ -384,7 +384,7 @@ impl Pipeline {
         debug_assert!(
             reserved
                 .iter()
-                .all(|work| !work.exclude_servers.contains(&server_idx)),
+                .all(|work| !work.exclude_servers.contains(server_idx)),
             "a lease holds an article already excluded from the server it is pinned to"
         );
         let completion_critical = reserved.iter().any(|work| work.completion_critical);
@@ -399,7 +399,8 @@ impl Pipeline {
             lane_mode,
             server_modes: vec![(server_idx, lane_mode)],
             completion_critical,
-            effective_exclude_servers: self.effective_exclude_servers(job_id, &[]),
+            effective_exclude_servers: self
+                .effective_exclude_servers(job_id, weaver_nntp::ServerSet::EMPTY),
             dial_exclude_servers,
             checkpoint_plan: self
                 .graph_jobs

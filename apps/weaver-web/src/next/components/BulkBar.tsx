@@ -95,6 +95,7 @@ export function BulkButton({
   onClick,
   disabled,
   tone = "default",
+  testId,
 }: {
   children: ReactNode;
   /** A leading icon, named by the action. */
@@ -102,10 +103,12 @@ export function BulkButton({
   onClick: () => void;
   disabled?: boolean;
   tone?: "default" | "danger";
+  testId?: string;
 }) {
   return (
     <button
       type="button"
+      data-testid={testId}
       onClick={onClick}
       disabled={disabled}
       className={bulkButtonClass(tone, disabled)}
