@@ -652,7 +652,10 @@ impl Pipeline {
     // starting for it, so the loop listens for the next reading. The loop
     // reconciles the waits just before it asks.
     pub(in crate::pipeline) fn waits_for_disk_room(&self) -> bool {
-        !self.disk_waiting.is_empty() || self.admission_disk_held || !self.full_disk.is_empty()
+        !self.disk_waiting.is_empty()
+            || self.admission_disk_held
+            || !self.full_disk.is_empty()
+            || self.archive_wait.is_some()
     }
 
     // A turn busy with results, which does not wait on the next event: a
@@ -675,6 +678,7 @@ impl Pipeline {
         self.wake_disk_waiters();
         self.release_admission_disk_hold();
         self.wake_full_disk();
+        self.wake_kept_archives();
     }
 
     // A disk someone waits on has a new reading: each job that waits is

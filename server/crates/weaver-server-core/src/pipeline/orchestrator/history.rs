@@ -298,6 +298,9 @@ impl Pipeline {
     ) {
         let event_tx = self.event_tx.clone();
         let queue = self.shared_state.queue.clone();
+        // An archive the database has no room for is kept by the writer and
+        // answers here once room is made; the writer tells the pipeline of
+        // it, not this task.
         tokio::spawn(async move {
             if archived.await.is_err() {
                 tracing::error!(job_id = job_id.0, "history archive completion was lost");

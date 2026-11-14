@@ -1766,6 +1766,9 @@ pub struct Pipeline {
     // counted against its disk until that step ends, so one reading does
     // not promise the same room to two jobs. Empty unless such a job runs.
     pub(super) full_disk_promised: std::collections::BTreeMap<JobId, full_disk::Promised>,
+    // The wait of the history archives the database had no room for, on the
+    // database's folder. None unless an archive is kept.
+    pub(super) archive_wait: Option<full_disk::ArchiveWait>,
     // The removals of spool files a held job no longer reads, for a test to
     // wait on.
     #[cfg(test)]

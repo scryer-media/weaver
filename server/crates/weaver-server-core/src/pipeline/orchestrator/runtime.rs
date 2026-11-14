@@ -211,6 +211,14 @@ impl Pipeline {
         let (failed_release_tx, failed_release_rx) = mpsc::channel(32);
         let (job_activated_tx, job_activated_rx) = mpsc::channel(32);
         let (db_reply_tx, db_reply_rx) = mpsc::unbounded_channel();
+        // The one listener for the history archives the writer keeps for
+        // want of room: each is told to the loop as a database reply.
+        db.hear_archive_news({
+            let replies = db_reply_tx.clone();
+            move |news| {
+                let _ = replies.send(crate::pipeline::db_reply::DbReply::Archive(news));
+            }
+        });
         let (terminal_post_processing_done_tx, terminal_post_processing_done_rx) =
             mpsc::channel(32);
         let script_effects_rx = db.subscribe_script_effects();
@@ -327,6 +335,7 @@ impl Pipeline {
             full_disk: std::collections::BTreeMap::new(),
             full_disk_moves: Vec::new(),
             full_disk_promised: std::collections::BTreeMap::new(),
+            archive_wait: None,
             #[cfg(test)]
             full_disk_sweeps: Vec::new(),
             nntp_handoff_draining: false,
@@ -1905,6 +1914,7 @@ impl Pipeline {
         // writes such as a proven pipelining depth) so shutdown does not drop
         // them. Bounded so a stuck write cannot hang shutdown forever.
         self.join_fire_and_forget_tasks().await;
+        self.retry_kept_archives_at_drain();
         match tokio::time::timeout(
             Self::FIRE_AND_FORGET_DRAIN_TIMEOUT,
             self.db.flush_write_queue(),
@@ -1915,6 +1925,7 @@ impl Pipeline {
             Ok(Err(error)) => warn!(%error, "failed to flush ordered database writes during drain"),
             Err(_) => warn!("timed out flushing ordered database writes during drain"),
         }
+        self.warn_of_kept_archives();
     }
 
     // A decode running, or an undecoded body queued for one. Only tests
