@@ -596,3 +596,39 @@ fn a_free_name_is_not_one_a_queued_file_will_take() {
     let waits = &disk.working().volume().writer.loop_waits;
     assert_eq!(waits.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
+
+// A handle given back is given back once. A delivery that asks again while
+// it waits for the volume's writer queues nothing behind what it waits for,
+// so the wait ends when the writer has run what was queued. A write after
+// the release opens the file again, and the next release follows it.
+#[test]
+fn a_released_file_is_released_again_only_after_another_operation() {
+    let dir = tempfile::tempdir().unwrap();
+    let through = writers();
+    let hold = through.hold();
+    let to = through.writers.submitter(&through.volume, 1);
+    let mut leaf = Leaf::at(dir.path(), "a.bin").through(Some(&to));
+    leaf.write(0, b"lantern", None).unwrap();
+    leaf.release_handle();
+    let released = to.barrier();
+    leaf.release_handle();
+    leaf.release_handle();
+    // The write and the one release go through; anything queued behind
+    // them is still held.
+    hold.wait_held();
+    hold.release(2);
+    released.wait();
+    assert!(
+        to.barrier().returned(),
+        "nothing was queued behind the release"
+    );
+
+    leaf.write(7, b"light", None).unwrap();
+    leaf.release_handle();
+    let again = to.barrier();
+    assert!(!again.returned(), "the file was opened again and is released");
+    hold.open();
+    again.wait();
+    assert!(again.passed());
+    assert_eq!(std::fs::read(leaf.path()).unwrap(), b"lanternlight");
+}
