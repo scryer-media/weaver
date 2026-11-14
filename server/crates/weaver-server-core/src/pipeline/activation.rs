@@ -240,7 +240,18 @@ impl Pipeline {
                 Ok(mut read) if read.restored.is_none() => {
                     let destination = staging.destination().await;
                     tokio::task::spawn_blocking(move || {
-                        read.staging = Some(staging.choose(job_id, destination));
+                        // This thread may wait on a disk: the volumes of the
+                        // job's directories are read here when memory does
+                        // not cover them, so the loop, which admits the job
+                        // from memory alone, never gives it the volume of an
+                        // unknown device.
+                        let storage = Arc::clone(&staging.storage);
+                        let chosen = staging.choose(job_id, destination);
+                        storage.read_volume(&working_dir);
+                        if let Some(dir) = &chosen {
+                            storage.read_volume(dir);
+                        }
+                        read.staging = Some(chosen);
                         read
                     })
                     .await

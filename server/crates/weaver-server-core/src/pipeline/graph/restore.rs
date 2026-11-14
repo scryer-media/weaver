@@ -270,6 +270,13 @@ impl RestoreSeat {
             sweep_unnamed(output_dir, &snapshot, &rows.held_parts)?;
         }
         let held = held_parts_from_rows(job_id, &self.working_dir, &rows.held_parts);
+        // This thread may wait on a disk: the volumes of the job's
+        // directories are read here when memory does not cover them, so the
+        // job's disk is never given the volume of an unknown device.
+        self.volumes.1.read_volume(&self.working_dir);
+        if let Some((output_dir, _)) = &self.output {
+            self.volumes.1.read_volume(output_dir);
+        }
         let disk = super::disk::job_disk(
             &self.volumes.0,
             &self.volumes.1,
