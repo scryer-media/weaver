@@ -984,4 +984,44 @@ mod tests {
         folding(&mut cut, 3000, bytes(4000, 3));
         assert_eq!(cut.folded(7000, crc), Some(file_crc(&cut, 7000)));
     }
+
+    // Runs either side of 4 GiB, in a sparse file that writes a few
+    // KiB: a write across the line, a rewrite inside it, and a close that
+    // cuts the run just past it each keep the run's digest equal to the
+    // bytes the file holds.
+    #[test]
+    fn a_fold_across_four_gib_keeps_its_digest() {
+        const LINE: u64 = 1 << 32;
+        let dir = tempfile::tempdir().unwrap();
+        let mut leaf = Leaf::at(dir.path(), "lantern.bin");
+        let crc = Algorithm::Crc32;
+        let held = |leaf: &Leaf, from: u64, to: u64| {
+            let mut bytes = Vec::new();
+            leaf.read(from, index(to - from), &mut bytes).unwrap();
+            bytes
+        };
+        let run = |leaf: &Leaf| {
+            assert_eq!(leaf.written.len(), 1, "{:?}", leaf.written);
+            let (start, run) = leaf.written.iter().next().unwrap();
+            (*start, run.end, run.digest.map(|digest| digest.value))
+        };
+        let first = bytes(8192, 5);
+        folding(&mut leaf, LINE - 4096, first.clone());
+        assert_eq!(held(&leaf, LINE - 4096, LINE + 4096), first);
+        let (start, end, digest) = run(&leaf);
+        assert_eq!((start, end), (LINE - 4096, LINE + 4096));
+        assert_eq!(digest, Some(crc.hash(&first).value));
+
+        folding(&mut leaf, LINE - 50, bytes(100, 6));
+        let now = held(&leaf, LINE - 4096, LINE + 4096);
+        assert_eq!(&now[4046..4146], &bytes(100, 6)[..]);
+        assert_eq!(run(&leaf).2, Some(crc.hash(&now).value));
+
+        leaf.close(LINE + 10).unwrap();
+        assert_eq!(leaf.len().unwrap(), LINE + 10);
+        let kept = held(&leaf, LINE - 4096, LINE + 10);
+        let (start, end, digest) = run(&leaf);
+        assert_eq!((start, end), (LINE - 4096, LINE + 10));
+        assert_eq!(digest, Some(crc.hash(&kept).value));
+    }
 }
