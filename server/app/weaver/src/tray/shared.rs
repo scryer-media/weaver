@@ -1389,6 +1389,26 @@ mod tests {
     #[cfg(unix)]
     use super::{RELAUNCH_PENDING_MESSAGE, ServerSupervisor, SupervisedServer};
 
+    // The Windows installer cannot read the constant, so its own wait for the
+    // old processes is held to it here.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn the_installer_waits_as_long_as_the_tray_before_it_kills() {
+        let installer = include_str!("../../../../../packaging/windows/weaver.wxs");
+        let wait = format!(
+            "Wait-Process -Timeout {} ",
+            super::GRACEFUL_STOP_TIMEOUT.as_secs()
+        );
+        assert_eq!(super::GRACEFUL_STOP_TIMEOUT.as_secs(), 60);
+        assert_eq!(installer.matches("Wait-Process -Timeout ").count(), 1);
+        assert_eq!(installer.matches(wait.as_str()).count(), 1);
+        let waits_at = installer.find(wait.as_str()).expect("the installer waits");
+        let kills_at = installer
+            .find("Stop-Process -Force")
+            .expect("the installer kills");
+        assert!(waits_at < kills_at, "the wait comes before the kill");
+    }
+
     #[test]
     fn a_tcp_table_port_is_read_out_of_network_byte_order() {
         // 9090 is 0x2382; the table holds the bytes 0x23 0x82, which a
