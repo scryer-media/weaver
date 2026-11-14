@@ -70,7 +70,50 @@ pub(crate) fn create_sized<M: SparseMarker>(
     marker: &M,
     length: Option<u64>,
 ) -> io::Result<File> {
+    #[cfg(test)]
+    if let Some(sized) = sizing::said() {
+        return create_sized_with(path, marker, length, sized);
+    }
     create_sized_with(path, marker, length, PRESIZES)
+}
+
+// A test that must see one outcome whatever platform it runs on says
+// whether every new file is given its length, for as long as it holds the
+// word. The word is the process's: a test run of its own, as the runner
+// gives each test, is the only one that hears it.
+#[cfg(test)]
+pub(crate) mod sizing {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static SAID: AtomicU8 = AtomicU8::new(0);
+
+    pub(crate) struct Sizing(());
+
+    // Every new file with a declared length is given it.
+    pub(crate) fn always() -> Sizing {
+        SAID.store(1, Ordering::SeqCst);
+        Sizing(())
+    }
+
+    // Every new file grows as it is written.
+    pub(crate) fn never() -> Sizing {
+        SAID.store(2, Ordering::SeqCst);
+        Sizing(())
+    }
+
+    pub(super) fn said() -> Option<bool> {
+        match SAID.load(Ordering::SeqCst) {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        }
+    }
+
+    impl Drop for Sizing {
+        fn drop(&mut self) {
+            SAID.store(0, Ordering::SeqCst);
+        }
+    }
 }
 
 fn create_sized_with<M: SparseMarker>(

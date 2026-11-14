@@ -1,0 +1,25 @@
+{
+  "slug": "adv-rar5-volume-stray-alias",
+  "title": "Amber.Trail.S01E02.Stray.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "direct-store-multivolume's four volumes, plus direct-store-quick-open's second volume posted as archive.part03.rar. Its headers place it second and the volume before it does not carry on into it, so no place in the set is its own: it is a volume of no set, withheld and short. The set's member is delivered with its exact bytes and the job ends partial; the stray set's member is never delivered.",
+  "category": "2000",
+  "expected_outcome": "partial_delivery",
+  "fixtureAssets": [
+    "direct-store-multivolume/archive.part1.rar",
+    "direct-store-multivolume/archive.part2.rar",
+    "direct-store-multivolume/archive.part3.rar",
+    "direct-store-multivolume/archive.part4.rar",
+    "direct-store-quick-open/archive.part2.rar::archive.part03.rar"
+  ],
+  "adversarial": {
+    "group": "default",
+    "outcome": "partial",
+    "minOutputFiles": 1,
+    "forbiddenOutputs": [
+      "cobalt.lantern.s01e07.mkv"
+    ]
+  },
+  "expectedOutputBLAKE3": {
+    "amber.trail.s01e02.mkv": "0f9527235f4aeccd73d0ef80e25572b51b96d4a9dfe96d24a73911590efed9ab"
+  }
+}

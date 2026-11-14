@@ -110,15 +110,21 @@ const TRAY_ICON_ID: u32 = 1;
 const APP_WINDOW_CLASS: &str = "ScryerMedia.Weaver.Desktop.v1.AppWindow";
 // The hover flyout's own class, versioned for the same reason.
 const FLYOUT_WINDOW_CLASS: &str = "ScryerMedia.Weaver.Desktop.v1.Flyout";
-// How long the tray waits for a server that asked to be restarted to
-// actually exit before it stops waiting and kills the child.
-const SERVER_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
-
 // How long the server gets to stop when the session ends, or Restart Manager
 // closes the tray. Shorter than a stop the user asks for: Windows bounds
 // that stop itself, and ends the tray, with a "preventing sign-out" screen,
 // if it waits longer.
 const SESSION_END_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+// How far apart a stop by name looks for the processes it asked to exit, and
+// how many looks fill `shared::GRACEFUL_STOP_TIMEOUT`: a server stopped by
+// name gets the same time to exit as one the tray started.
+const STOP_ASK_INTERVAL: Duration = Duration::from_millis(500);
+const GRACEFUL_STOP_ASK_ATTEMPTS: u32 =
+    (shared::GRACEFUL_STOP_TIMEOUT.as_millis() / STOP_ASK_INTERVAL.as_millis()) as u32;
+
+// How long a terminated server the exiting tray adopted gets to disappear.
+const EXIT_TERMINATE_WAIT: Duration = Duration::from_secs(1);
 
 // `--shutdown` runs before the installer checks for files in use, and the
 // upgrade helper runs it before the installer; both wait on it, so it finishes
@@ -126,27 +132,37 @@ const SESSION_END_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 // the running tray, then `SHUTDOWN_STOP_POLICY`'s budget for whatever is left.
 //
 // The running tray's own exit gives its server the full
-// `shared::GRACEFUL_STOP_TIMEOUT` to stop, then stops an adopted one within
-// `EXIT_STOP_POLICY`'s three seconds. This wait is that minute plus eight
-// seconds, so the sweep below never ends a server the tray is still waiting
-// on.
-const SHUTDOWN_TRAY_EXIT_WAIT: Duration =
-    shared::GRACEFUL_STOP_TIMEOUT.saturating_add(Duration::from_secs(8));
-// Ask whatever is still running from the installation to exit, poll eight
-// times half a second apart, then terminate it and give that two seconds.
+// `shared::GRACEFUL_STOP_TIMEOUT` to stop, then gives an adopted one the
+// same under `EXIT_STOP_POLICY`. This wait is both of those, the adopted
+// server's terminate wait and seven seconds more, so the sweep below never
+// ends a server the tray is still waiting on.
+const SHUTDOWN_TRAY_EXIT_WAIT: Duration = shared::GRACEFUL_STOP_TIMEOUT
+    .saturating_add(shared::GRACEFUL_STOP_TIMEOUT)
+    .saturating_add(EXIT_TERMINATE_WAIT)
+    .saturating_add(Duration::from_secs(7));
+// Ask whatever is still running from the installation to exit, give it
+// `shared::GRACEFUL_STOP_TIMEOUT`, then terminate it and give that two
+// seconds.
 const SHUTDOWN_STOP_POLICY: StopPolicy = StopPolicy {
-    ask_attempts: 8,
-    ask_interval: Duration::from_millis(500),
+    ask_attempts: GRACEFUL_STOP_ASK_ATTEMPTS,
+    ask_interval: STOP_ASK_INTERVAL,
     terminate_wait: Duration::from_secs(2),
 };
 
-// How a tray that is exiting stops the server it adopted rather than started.
-// Short, because it follows the owned server's graceful stop and
-// `--shutdown` may be waiting on this tray while it runs.
+// How a tray that is exiting stops the server it adopted rather than started:
+// the same wait as for one it started.
 const EXIT_STOP_POLICY: StopPolicy = StopPolicy {
+    ask_attempts: GRACEFUL_STOP_ASK_ATTEMPTS,
+    ask_interval: STOP_ASK_INTERVAL,
+    terminate_wait: EXIT_TERMINATE_WAIT,
+};
+
+// The same stop when the session ends: three seconds in all, for the reason
+// `SESSION_END_STOP_TIMEOUT` is short.
+const SESSION_END_EXIT_STOP_POLICY: StopPolicy = StopPolicy {
     ask_attempts: 4,
-    ask_interval: Duration::from_millis(500),
-    terminate_wait: Duration::from_secs(1),
+    ask_interval: STOP_ASK_INTERVAL,
+    terminate_wait: EXIT_TERMINATE_WAIT,
 };
 
 // The argument Windows restarts the tray with after it closed it for an
@@ -907,7 +923,7 @@ impl TrayState {
     // so starting without waiting would silently leave the user with no
     // server at all.
     fn restart_requested_by_server(&mut self) -> Result<(), String> {
-        self.supervisor.wait_for_exit(SERVER_EXIT_TIMEOUT);
+        self.supervisor.wait_for_exit(shared::GRACEFUL_STOP_TIMEOUT);
         self.supervisor.start()?;
         self.supervisor.wait_until_ready()
     }
@@ -1235,12 +1251,13 @@ impl TrayState {
         }
         // SAFETY: The icon belongs to this window and is being removed during teardown.
         unsafe { self.remove_icon(window) };
-        let _ = if self.session_ending {
-            self.supervisor.stop_within(SESSION_END_STOP_TIMEOUT)
+        if self.session_ending {
+            let _ = self.supervisor.stop_within(SESSION_END_STOP_TIMEOUT);
+            self.stop_adopted_server(SESSION_END_EXIT_STOP_POLICY);
         } else {
-            self.supervisor.stop()
-        };
-        self.stop_adopted_server();
+            let _ = self.supervisor.stop();
+            self.stop_adopted_server(EXIT_STOP_POLICY);
+        }
         self.supervisor.shutdown_logging();
     }
 
@@ -1254,7 +1271,7 @@ impl TrayState {
     // upgrade, typically — outlives every exit and holds the installed binary
     // open through the next upgrade. Only this installation's `weaver.exe` is
     // touched; anything else listening on the port is someone else's.
-    fn stop_adopted_server(&self) {
+    fn stop_adopted_server(&self, policy: StopPolicy) {
         let Some(owner) = windows_process::listening_port_owner(self.supervisor.port()) else {
             return;
         };
@@ -1270,7 +1287,7 @@ impl TrayState {
             .into_iter()
             .filter(|&process_id| process_id != owner)
             .collect();
-        let report = stop_product_processes(&names, &install_dir, &others, EXIT_STOP_POLICY);
+        let report = stop_product_processes(&names, &install_dir, &others, policy);
         if !report.all_stopped() {
             eprintln!("Weaver: could not stop the server the tray adopted (pid {owner})");
         }
@@ -2897,6 +2914,26 @@ mod tests {
         MENU_RESTART, MENU_START, MENU_STOP, MENU_TOGGLE_STARTUP, NIN_KEYSELECT, POINT,
         callback_anchor, tray_mutex_name_for_user,
     };
+
+    #[test]
+    fn every_stop_by_name_asks_for_as_long_as_the_tray_gives_its_own_server() {
+        use super::{
+            EXIT_STOP_POLICY, SESSION_END_EXIT_STOP_POLICY, SESSION_END_STOP_TIMEOUT,
+            SHUTDOWN_STOP_POLICY, SHUTDOWN_TRAY_EXIT_WAIT, shared::GRACEFUL_STOP_TIMEOUT,
+        };
+
+        for policy in [EXIT_STOP_POLICY, SHUTDOWN_STOP_POLICY] {
+            assert_eq!(
+                policy.ask_interval * policy.ask_attempts,
+                GRACEFUL_STOP_TIMEOUT
+            );
+        }
+        // `--shutdown` outwaits a tray that stops a server it started and
+        // then one it adopted.
+        assert!(SHUTDOWN_TRAY_EXIT_WAIT > GRACEFUL_STOP_TIMEOUT + EXIT_STOP_POLICY.budget());
+        // The end of a session stays inside the limit Windows puts on it.
+        assert!(SESSION_END_EXIT_STOP_POLICY.budget() <= SESSION_END_STOP_TIMEOUT);
+    }
 
     #[test]
     fn tray_mutex_is_global_but_scoped_to_one_windows_user() {

@@ -28,7 +28,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use weaver_graph::Posted;
-use weaver_graph::holds::{Budget, HoldLedger, HoldsAccountant, HoldsNamespace, Location, Placed};
+use weaver_graph::holds::{
+    Budget, HoldLedger, HoldsAccountant, HoldsNamespace, Location, Placed, Spans,
+};
 use weaver_graph::member::FIRST_BYTES;
 use weaver_graph::{
     Algorithm, Builder, ByteRange, Coverage, Effect, Emit, Evidenced, Kind, Marked, MemberId,
@@ -147,6 +149,10 @@ struct Files {
     // Why a member is a leaf when something refused to own it. Changed only
     // through `refuse` and `unrefuse`, which mark the member.
     refused: BTreeMap<MemberId, Why>,
+    // Inside a restore only: what the checkpoint's hold rows name of each
+    // member. Those bytes were on scratch or in a spill file, never in the
+    // member's own file, whether or not the hold was taken back.
+    recorded: BTreeMap<MemberId, Spans>,
 }
 
 impl Files {
@@ -158,6 +164,7 @@ impl Files {
             spills: BTreeMap::new(),
             spills_empty: BTreeSet::new(),
             refused: BTreeMap::new(),
+            recorded: BTreeMap::new(),
         }
     }
 
@@ -1879,10 +1886,13 @@ impl NamespaceWriter {
     ) -> Result<(), WriteError> {
         let free_disk = self.free_disk_bytes();
         let spilled = bytes.clone();
-        let outcome =
-            self.files_mut(node)
-                .holds
-                .hold(held_volume(member), offset, bytes, free_disk);
+        let files = self.files_mut(node);
+        // Bytes held over ones the member's file already has leave the
+        // tree's coverage as it was, so the hold itself marks the member.
+        files.leaves.mark(member);
+        let outcome = files
+            .holds
+            .hold(held_volume(member), offset, bytes, free_disk);
         for page_out in &outcome.page_outs {
             self.scratch(node)?
                 .write(page_out.scratch_offset, &page_out.bytes, None)?;
@@ -2297,7 +2307,10 @@ impl NamespaceWriter {
         let Some(files) = self.files.get_mut(&node) else {
             return Ok(());
         };
-        files.holds.take(held_volume(member), range);
+        if !files.holds.take(held_volume(member), range).is_empty() {
+            // What a checkpoint says of the member's bytes changed.
+            files.leaves.mark(member);
+        }
         self.release_spill(node, member)
     }
 
@@ -2314,6 +2327,12 @@ impl NamespaceWriter {
             return Ok(Vec::new());
         };
         let taken = files.holds.take(held_volume(member), range);
+        if !taken.is_empty() {
+            // The bytes leave the ledger for the member's file or its
+            // object: a checkpoint left them out of the member's coverage
+            // while they were held, and the next one says them again.
+            files.leaves.mark(member);
+        }
         let mut held = Vec::with_capacity(taken.len());
         for piece in taken {
             let bytes = match piece.location {
@@ -3291,7 +3310,23 @@ impl Source for Probe<'_, '_> {
         else {
             return range.is_empty();
         };
+        // What the checkpoint's hold rows name was never in the file.
+        let recorded = self
+            .0
+            .writer
+            .files
+            .get(&node)
+            .and_then(|files| files.recorded.get(&member))
+            .is_some_and(|recorded| recorded.overlaps(range));
+        let held = self
+            .0
+            .writer
+            .files
+            .get(&node)
+            .is_some_and(|files| files.holds.holds_in(held_volume(member), range));
         written
+            && !recorded
+            && !held
             && leaf.len().is_ok_and(|length| length >= range.end)
             && Self::zeros(into, range.len())
     }
@@ -3378,7 +3413,14 @@ impl Source for Access<'_> {
         else {
             return range.is_empty();
         };
-        written && leaf.read(range.start, index(range.len()), into).is_ok()
+        // What is held for the member is not in its file, whatever length
+        // the file has: the hold gives those bytes, never the file.
+        let held = self
+            .writer
+            .files
+            .get(&node)
+            .is_some_and(|files| files.holds.holds_in(held_volume(member), range));
+        written && !held && leaf.read(range.start, index(range.len()), into).is_ok()
     }
 
     fn held(&self, node: NodeId, member: MemberId, range: ByteRange) -> Vec<(ByteRange, Location)> {

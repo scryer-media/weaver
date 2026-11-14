@@ -1,0 +1,22 @@
+{
+  "slug": "adv-rar5-volume-posted-twice",
+  "title": "Amber.Trail.S01E02.Twice.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "direct-store-multivolume's four volumes, plus its second posted again as archive.part9.rar. The name says ninth, the headers say second, and the headers outrank the name: the copy is placed where the second volume is held and is that volume. The job completes with the member's exact bytes.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "fixtureAssets": [
+    "direct-store-multivolume/archive.part1.rar",
+    "direct-store-multivolume/archive.part2.rar",
+    "direct-store-multivolume/archive.part3.rar",
+    "direct-store-multivolume/archive.part4.rar",
+    "direct-store-multivolume/archive.part2.rar::archive.part9.rar"
+  ],
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "minOutputFiles": 1
+  },
+  "expectedOutputBLAKE3": {
+    "amber.trail.s01e02.mkv": "0f9527235f4aeccd73d0ef80e25572b51b96d4a9dfe96d24a73911590efed9ab"
+  }
+}

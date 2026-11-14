@@ -1,0 +1,18 @@
+{
+  "slug": "adv-par2-many-sets-below-root",
+  "title": "E2E.Adversarial.Par2.Many.Sets.Below.Root.2026-TESTGRP",
+  "description": "A stored zip holding one member, beside a PAR2 file of 1,024 index-only sets that each describe the member under its own slice size. The member's delivery below the root is cut at each distinct slice boundary once, and binding grows with the sets, not their square. The member is delivered with its exact bytes.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "minOutputFiles": 1,
+    "forbiddenOutputs": [
+      "many-sets.zip"
+    ]
+  },
+  "expectedOutputBLAKE3": {
+    "many-sets.mkv": "646a11d7daa62e6c3ae63374af71900b1750d68fd1eb80607a339afc95b2de65"
+  }
+}

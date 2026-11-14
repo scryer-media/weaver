@@ -458,6 +458,94 @@ pub struct HoldLedger {
     // the bytes there, and new bytes would pair them with state they were
     // never part of. Bytes that would spill there stay in RAM instead.
     off_file: BTreeMap<VolumeIndex, u64>,
+    // What each volume holds, and what of that is in RAM, as merged spans:
+    // kept as holds come and go, so asking after them costs the spans, not
+    // the holds.
+    spans: BTreeMap<VolumeIndex, HeldSpans>,
+}
+
+#[derive(Debug, Default)]
+struct HeldSpans {
+    all: Spans,
+    resident: Spans,
+}
+
+// Disjoint byte ranges in offset order, neighbours merged: a file's worth
+// of articles held one after another is one span.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Spans {
+    // Each span's end by its start.
+    spans: BTreeMap<u64, u64>,
+}
+
+impl Spans {
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = ByteRange> + '_ {
+        self.spans
+            .iter()
+            .map(|(&start, &end)| ByteRange::new(start, end))
+    }
+
+    // Whether any byte of `range` is in a span.
+    pub fn overlaps(&self, range: ByteRange) -> bool {
+        !range.is_empty()
+            && self
+                .spans
+                .range(..range.end)
+                .next_back()
+                .is_some_and(|(_, &end)| end > range.start)
+    }
+
+    // Add `range`, merged with every span it touches.
+    pub fn add(&mut self, range: ByteRange) {
+        if range.is_empty() {
+            return;
+        }
+        let (mut start, mut end) = (range.start, range.end);
+        if let Some((&before, &reach)) = self.spans.range(..=start).next_back()
+            && reach >= start
+        {
+            start = before;
+            end = end.max(reach);
+        }
+        while let Some((&next, &reach)) = self.spans.range(start.saturating_add(1)..).next() {
+            if next > end {
+                break;
+            }
+            end = end.max(reach);
+            self.spans.remove(&next);
+        }
+        self.spans.insert(start, end);
+    }
+
+    // Take `range` out of every span it overlaps, the parts outside it kept.
+    pub fn remove(&mut self, range: ByteRange) {
+        if range.is_empty() {
+            return;
+        }
+        if let Some((&before, &reach)) = self.spans.range(..range.start).next_back()
+            && reach > range.start
+        {
+            self.spans.insert(before, range.start);
+            if reach > range.end {
+                self.spans.insert(range.end, reach);
+                return;
+            }
+        }
+        while let Some((&next, &reach)) = self.spans.range(range.start..).next() {
+            if next >= range.end {
+                break;
+            }
+            self.spans.remove(&next);
+            if reach > range.end {
+                self.spans.insert(range.end, reach);
+                break;
+            }
+        }
+    }
 }
 
 impl HoldLedger {
@@ -474,6 +562,7 @@ impl HoldLedger {
             spilled: 0,
             spilled_in: BTreeMap::new(),
             off_file: BTreeMap::new(),
+            spans: BTreeMap::new(),
         }
     }
 
@@ -682,7 +771,37 @@ impl HoldLedger {
         self.spilled = 0;
         self.spilled_in.clear();
         self.off_file.clear();
+        self.spans.clear();
         self.scratch_end = 0;
+    }
+
+    // What `volume` holds, as merged spans in offset order: one span for
+    // any run of holds that lie end to end, wherever each lives.
+    pub fn held_spans(&self, volume: VolumeIndex) -> impl Iterator<Item = ByteRange> + '_ {
+        self.spans
+            .get(&volume)
+            .into_iter()
+            .flat_map(|held| held.all.iter())
+    }
+
+    // What `volume` holds in RAM, as merged spans in offset order.
+    pub fn resident_spans(&self, volume: VolumeIndex) -> impl Iterator<Item = ByteRange> + '_ {
+        self.spans
+            .get(&volume)
+            .into_iter()
+            .flat_map(|held| held.resident.iter())
+    }
+
+    // Whether any byte of `range` of `volume` is held, wherever it lives.
+    pub fn holds_in(&self, volume: VolumeIndex, range: ByteRange) -> bool {
+        self.spans
+            .get(&volume)
+            .is_some_and(|held| held.all.overlaps(range))
+    }
+
+    // The volumes that hold anything, in volume order.
+    pub fn held_volumes(&self) -> impl Iterator<Item = VolumeIndex> + '_ {
+        self.volumes.keys().copied()
     }
 
     // The held ranges of `volume`, in offset order. Neighbouring holds are
@@ -924,8 +1043,11 @@ impl HoldLedger {
 
     fn place(&mut self, volume: VolumeIndex, hold: Hold) {
         let len = hold.range.len();
+        let spans = self.spans.entry(volume).or_default();
+        spans.all.add(hold.range);
         match hold.location {
             Location::Ram(_) => {
+                spans.resident.add(hold.range);
                 self.resident += len;
                 self.resident_by_age
                     .insert((hold.age, volume, hold.range.start));
@@ -952,6 +1074,15 @@ impl HoldLedger {
             self.volumes.remove(&volume);
         }
         let len = hold.range.len();
+        if let Some(spans) = self.spans.get_mut(&volume) {
+            spans.all.remove(hold.range);
+            if matches!(hold.location, Location::Ram(_)) {
+                spans.resident.remove(hold.range);
+            }
+            if spans.all.is_empty() {
+                self.spans.remove(&volume);
+            }
+        }
         match hold.location {
             Location::Ram(_) => {
                 self.resident -= len;
@@ -1086,6 +1217,73 @@ mod tests {
     thread_local! {
         // How many holds a cut looked at.
         pub(super) static CUT_LOOKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn spans(of: &Spans) -> Vec<(u64, u64)> {
+        of.iter().map(|range| (range.start, range.end)).collect()
+    }
+
+    // Ranges added end to end or over one another are one span, and a range
+    // taken out of the middle of a span leaves both sides.
+    #[test]
+    fn spans_merge_what_touches_and_split_where_cut() {
+        let mut held = Spans::default();
+        held.add(ByteRange::new(10, 20));
+        held.add(ByteRange::new(30, 40));
+        assert_eq!(spans(&held), vec![(10, 20), (30, 40)]);
+        held.add(ByteRange::new(20, 30));
+        assert_eq!(spans(&held), vec![(10, 40)]);
+        held.add(ByteRange::new(50, 60));
+        held.add(ByteRange::new(5, 55));
+        assert_eq!(spans(&held), vec![(5, 60)]);
+
+        held.remove(ByteRange::new(20, 30));
+        assert_eq!(spans(&held), vec![(5, 20), (30, 60)]);
+        assert!(held.overlaps(ByteRange::new(19, 25)));
+        assert!(!held.overlaps(ByteRange::new(20, 30)));
+        assert!(held.overlaps(ByteRange::new(0, 100)));
+        held.remove(ByteRange::new(0, 10));
+        held.remove(ByteRange::new(15, 35));
+        assert_eq!(spans(&held), vec![(10, 15), (35, 60)]);
+        held.remove(ByteRange::new(0, 100));
+        assert!(held.is_empty());
+    }
+
+    // The spans follow the holds: what is held end to end reads as one
+    // span, what is in RAM is told apart from what is on scratch, and a take
+    // leaves only what is still held.
+    #[test]
+    fn held_spans_follow_holds_page_outs_and_takes() {
+        let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
+            resident_limit: 8,
+            scratch_total: u64::MAX,
+            scratch_ceiling: u64::MAX,
+            disk_reserve: 0,
+        }));
+        let mut ledger = HoldLedger::new(NS, accountant);
+        let volume = VolumeIndex(0);
+        for offset in [0u64, 4, 8] {
+            ledger.hold(volume, offset, Bytes::from_static(b"abcd"), u64::MAX);
+        }
+        let all: Vec<ByteRange> = ledger.held_spans(volume).collect();
+        assert_eq!(all, vec![ByteRange::new(0, 12)]);
+        // The third hold paged the oldest out to make room.
+        let resident: Vec<ByteRange> = ledger.resident_spans(volume).collect();
+        assert_eq!(resident, vec![ByteRange::new(4, 12)]);
+
+        ledger.take(volume, ByteRange::new(2, 6));
+        let all: Vec<ByteRange> = ledger.held_spans(volume).collect();
+        assert_eq!(all, vec![ByteRange::new(0, 2), ByteRange::new(6, 12)]);
+        let resident: Vec<ByteRange> = ledger.resident_spans(volume).collect();
+        assert_eq!(resident, vec![ByteRange::new(6, 12)]);
+
+        assert!(ledger.holds_in(volume, ByteRange::new(1, 3)));
+        assert!(!ledger.holds_in(volume, ByteRange::new(2, 6)));
+        assert!(!ledger.holds_in(VolumeIndex(1), ByteRange::new(0, 12)));
+
+        ledger.take(volume, ByteRange::new(0, 12));
+        assert_eq!(ledger.held_spans(volume).count(), 0);
+        assert_eq!(ledger.held_volumes().count(), 0);
     }
 
     const NS: HoldsNamespace = HoldsNamespace {
