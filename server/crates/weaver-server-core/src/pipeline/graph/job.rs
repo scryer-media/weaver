@@ -535,6 +535,12 @@ impl GraphJob {
         self.runs.stop(limit);
     }
 
+    // Whether a repair, a replay or a verification of the job is out on its
+    // thread. A repair and a replay write the job's files as they go.
+    pub(in crate::pipeline) fn loan_out(&self) -> bool {
+        self.loans.out()
+    }
+
     // Seam for status: whether a repair of the job is out on a thread.
     pub(crate) fn repair_out(&self) -> bool {
         self.loans.repairing()

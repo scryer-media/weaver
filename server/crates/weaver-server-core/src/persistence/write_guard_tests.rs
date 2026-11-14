@@ -87,7 +87,7 @@ const LIFTED: &[(&str, usize)] = &[
     ),
     (
         "server/crates/weaver-server-core/src/persistence/sql_runtime.rs",
-        6,
+        7,
     ),
     (
         "server/crates/weaver-server-core/src/persistence/sql_services.rs",

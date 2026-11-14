@@ -457,6 +457,11 @@ pub struct BodyLaneTraceMeta {
     pub batch_response_count: u64,
     pub unresolved_count: u64,
     pub connection_discarded: bool,
+    // The server answered a request on this connection while a later one
+    // was already on the wire, since the connection last had nothing
+    // outstanding. A fault without it hit a connection that never showed it
+    // takes pipelined requests: an idle close, a restart, an outage.
+    pub answered_pipelined: bool,
 }
 
 pub struct BodyLaneLease {
@@ -737,6 +742,7 @@ impl BodyLaneLease {
                         batch_response_count: if is_last { stats.completed as u64 } else { 0 },
                         unresolved_count: 0,
                         connection_discarded: stats.connection_discarded,
+                        answered_pipelined: false,
                     },
                 )
                 .await;
@@ -747,6 +753,9 @@ impl BodyLaneLease {
 
         let mut closed_early = false;
         let mut batch_clean_so_far = true;
+        // Every request was written before the first read, so an answer
+        // with a later request still owed was read with that one on the wire.
+        let mut answered_pipelined = false;
         for (response_idx, message_id) in message_ids.iter().take(requested).enumerate() {
             let item_started = Instant::now();
             let mut budget = ActiveTransferBudget::new(self.client.soft_timeout);
@@ -786,7 +795,9 @@ impl BodyLaneLease {
                 )
                 .await;
             stats.completed += 1;
-            batch_clean_so_far &= decoded_result_keeps_connection(&trace.result);
+            let kept = decoded_result_keeps_connection(&trace.result);
+            batch_clean_so_far &= kept;
+            answered_pipelined |= kept && !poisoned && response_idx + 1 < requested;
 
             if poisoned {
                 stats.connection_discarded = true;
@@ -815,6 +826,7 @@ impl BodyLaneLease {
                     0
                 },
                 connection_discarded: stats.connection_discarded,
+                answered_pipelined,
             };
             on_trace(response_idx, trace, meta).await;
 
@@ -845,6 +857,7 @@ impl BodyLaneLease {
                             batch_response_count: 0,
                             unresolved_count: 0,
                             connection_discarded: true,
+                            answered_pipelined,
                         },
                     )
                     .await;
@@ -898,6 +911,7 @@ impl BodyLaneLease {
                         batch_response_count: if batch_complete { requested as u64 } else { 0 },
                         unresolved_count: 0,
                         connection_discarded: stats.connection_discarded,
+                        answered_pipelined,
                     },
                 )
                 .await;

@@ -99,6 +99,11 @@ pub struct QueueInner {
     // held. An admission of one takes it out, so the sweep never acts on a
     // reading older than a retry. Empty except while a page is swept.
     pub(crate) sweep_listed: std::collections::HashSet<JobId>,
+    // The failed jobs whose files a sweep could not remove and has warned
+    // about in this run. Each later sweep still tries, and says so only at
+    // debug; a sweep that removes them, an admission and a history delete
+    // take them out. Bounded by the failed jobs whose files are stuck.
+    pub(crate) sweep_warned: std::collections::HashSet<JobId>,
     pub(crate) pending_cleanup: PendingCleanup,
     pub(crate) nntp: Option<(u64, weaver_nntp::client::NntpClient, usize)>,
     // The endpoint's request count and the pipeline's latest answer, tagged

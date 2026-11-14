@@ -524,12 +524,21 @@ impl Pipeline {
         eligible_count: usize,
     ) {
         if self.articles_in_flight != 0 || self.active_download_connections != 0 {
+            self.download_dispatch_liveness_since = None;
             return;
         }
 
         let dispatchable_queue_depth = self.dispatchable_queue_depth();
         if dispatchable_queue_depth == 0 {
+            self.download_dispatch_liveness_since = None;
             self.last_download_dispatch_stall_log_at = None;
+            return;
+        }
+        // One job ending and the next starting leaves work queued and nothing
+        // in flight for a moment. Only a condition that has held for a whole
+        // interval is reported.
+        let since = *self.download_dispatch_liveness_since.get_or_insert(now);
+        if now.saturating_duration_since(since) < DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL {
             return;
         }
         if self

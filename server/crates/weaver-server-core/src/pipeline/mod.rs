@@ -532,6 +532,13 @@ pub(super) struct DownloadLaneObservation {
     pub(super) batch_clean: bool,
     pub(super) unresolved_count: u64,
     pub(super) connection_discarded: bool,
+    // The server answered a request on this connection while a later one
+    // was already on the wire, since the connection last had nothing
+    // outstanding: it demonstrably took pipelined requests. A fault without
+    // it is how any connection fails (an idle close, a restart, an outage)
+    // and says nothing about pipelining; a clean batch without it ran one
+    // request at a time and proves nothing either.
+    pub(super) answered_pipelined: bool,
 }
 
 pub(super) enum DownloadPayload {
@@ -2046,6 +2053,9 @@ pub struct Pipeline {
     pub(super) login_refusal_sets_examined: std::sync::atomic::AtomicUsize,
     // Last time we logged a queued/no-active-download liveness stall.
     pub(super) last_download_dispatch_stall_log_at: Option<Instant>,
+    // When the dispatch pass first found queued work and nothing in flight,
+    // in the run of such passes going on now; `None` outside one.
+    pub(super) download_dispatch_liveness_since: Option<Instant>,
     // The dispatch stall the watchdog is timing toward a kick or a release.
     pub(super) download_dispatch_stall: Option<download::DispatchStallWatch>,
     // The available fill servers of the dispatch attempt running now, in

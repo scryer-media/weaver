@@ -10,7 +10,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 const QUEUED_EVENTS: usize = 128;
-const MAX_EVENT_BYTES: usize = 16 * 1024;
+// The largest record a sink is handed. A longer one is dropped whole.
+pub const MAX_EVENT_BYTES: usize = 16 * 1024;
 const SHUTDOWN_BOUND: Duration = Duration::from_secs(2);
 
 #[derive(Default)]

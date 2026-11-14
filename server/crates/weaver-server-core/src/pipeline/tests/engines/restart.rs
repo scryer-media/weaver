@@ -723,11 +723,15 @@ pub(in crate::pipeline::tests) async fn run_restarted_while_repairing(
             lent_again = true;
         }
         if repair_out && !restarted {
+            // A repair out writes the job's files: the drain waits for it to
+            // its end rather than for a bound.
+            assert!(pipeline.graph_drain_waits_for_loans());
             pipeline.drain().await;
             assert!(
                 !pipeline.graph_jobs[&JOB].awaits_mail(),
                 "the drain left the job's repair out on its thread"
             );
+            assert!(!pipeline.graph_drain_waits_for_loans());
             drain(&mut sent, &mut events);
             (pipeline, sent) =
                 restart_heard(&temp_dir, pipeline, scenario, &mut in_memory, &mut |_| {}).await;

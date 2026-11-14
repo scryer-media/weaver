@@ -4,7 +4,7 @@
 // Every configured server has a depth explorer before the first lane runs.
 
 use super::*;
-use crate::pipeline::download::transport::DownloadLaneMode;
+use crate::pipeline::download::transport::{DownloadLaneMode, UNCLEAN_BURST_WINDOW};
 
 fn pool_with(servers: Vec<weaver_nntp::pool::ServerPoolConfig>) -> NntpClient {
     NntpClient::new(NntpClientConfig {
@@ -225,7 +225,7 @@ async fn a_pinned_server_stays_sequential_across_a_pool_rebuild() {
         .get_mut(&0)
         .expect("the first server is seeded");
     explorer.note_unclean_batch(now);
-    explorer.note_unclean_batch(now);
+    explorer.note_unclean_batch(now + UNCLEAN_BURST_WINDOW);
     assert!(explorer.pinned_sequential());
 
     // The rebuild swaps the two positions.
@@ -329,7 +329,7 @@ async fn a_pin_follows_its_server_and_not_an_edited_host_or_port() {
         let now = std::time::Instant::now();
         let explorer = pipeline.download_lane_runtime.servers.get_mut(&0).unwrap();
         explorer.note_unclean_batch(now);
-        explorer.note_unclean_batch(now);
+        explorer.note_unclean_batch(now + UNCLEAN_BURST_WINDOW);
         assert!(explorer.pinned_sequential());
 
         pipeline.nntp = std::sync::Arc::new(pool_with(rebuilt));
