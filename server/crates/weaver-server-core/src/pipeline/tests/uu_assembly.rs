@@ -1055,10 +1055,12 @@ fn write_backlog_state(
     )
 }
 
-// A job of 3,000 files is cleaned in one pass over each list. What is left
-// is what a pass per file leaves, on the same seeded state: nothing of the
-// job's files that held a part, everything of the other job, and the
-// ledgers at the other job's share.
+// A job of 3,000 files is cleaned in one pass over each list, and nothing
+// of the job is left in any list: a third of its files hold no part and
+// have only entries for articles sent back for another fetch. The other job
+// is whole and the ledgers are at its share. The pass per file it replaced
+// is compared on the parts both clean, the parks and the ledgers: it left
+// the entries of a file with nothing parked, which is the defect.
 #[tokio::test]
 async fn a_job_of_thousands_of_files_is_cleaned_as_a_pass_per_file_cleans_it() {
     let cleaned = JobId(20181);
@@ -1077,19 +1079,20 @@ async fn a_job_of_thousands_of_files_is_cleaned_as_a_pass_per_file_cleans_it() {
     one_pass.clear_job_write_backlog(cleaned);
     per_file.clear_job_write_backlog_per_file(cleaned);
 
-    let left = write_backlog_state(&one_pass);
-    assert_eq!(left, write_backlog_state(&per_file));
-    let (uu, held, park_requeues, held_requeues, pending, ledgers) = left;
+    let (uu, held, park_requeues, held_requeues, pending, ledgers) = write_backlog_state(&one_pass);
+    let old = write_backlog_state(&per_file);
+    assert_eq!((&uu, &held, &ledgers), (&old.0, &old.1, &old.5));
     assert!(uu.iter().chain(&held).all(|(job, _)| *job == kept.0));
     assert_eq!((uu.len(), held.len()), (1_000, 1_000));
-    // A file that held no part is not one the cleanup knows: its requeue
-    // entries stay, as they did.
-    for list in [&park_requeues, &held_requeues, &pending] {
-        assert_eq!(list.len(), 3_000 + 1_000);
-        assert!(
-            list.iter()
-                .all(|(job, file, _)| *job == kept.0 || file % 3 == 2)
-        );
+    for (list, old) in [
+        (&park_requeues, &old.2),
+        (&held_requeues, &old.3),
+        (&pending, &old.4),
+    ] {
+        assert_eq!(list.len(), 3_000);
+        assert!(list.iter().all(|(job, _, _)| *job == kept.0));
+        // The old pass kept the entries of the files with nothing parked.
+        assert_eq!(old.len(), 3_000 + 1_000);
     }
     assert_eq!(ledgers, [1_000, 1_000 * 8 + 1_000 * 16, 2_000, 1_000]);
 

@@ -103,10 +103,6 @@ impl Pipeline {
             .filter(|file_id| file_id.job_id == job_id)
             .collect();
 
-        if file_ids.is_empty() {
-            return;
-        }
-
         for &file_id in &file_ids {
             // Memory and disk parks use distinct ledgers; each part is let
             // go as any part is, its spool file with it.
@@ -125,13 +121,22 @@ impl Pipeline {
                 self.release_parked_bytes(part.bytes);
             }
         }
-        // One pass over each list for the whole job, not one per file.
-        self.uu_park_requeues
-            .retain(|segment_id, _| !file_ids.contains(&segment_id.file_id));
-        self.unanchored_requeues
-            .retain(|segment_id, _| !file_ids.contains(&segment_id.file_id));
-        self.pending_unanchored_release
-            .retain(|segment_id| !file_ids.contains(&segment_id.file_id));
+        // One pass over each list for the whole job, not one per file, and
+        // by the job, not by the files above: an article sent back for
+        // another fetch because the park had no room leaves an entry for a
+        // file that holds nothing parked. An empty list costs nothing.
+        if !self.uu_park_requeues.is_empty() {
+            self.uu_park_requeues
+                .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+        }
+        if !self.unanchored_requeues.is_empty() {
+            self.unanchored_requeues
+                .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+        }
+        if !self.pending_unanchored_release.is_empty() {
+            self.pending_unanchored_release
+                .retain(|segment_id| segment_id.file_id.job_id != job_id);
+        }
     }
 
     // The cleanup as it was, with a pass over each list per file, kept to
