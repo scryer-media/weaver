@@ -1154,7 +1154,7 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         format!("weaver_torrent_utp_out_of_order_packets_total{{{ROUTE}}} 26"),
         format!("weaver_torrent_utp_streams_given_up_total{{{ROUTE}}} 29"),
         format!("weaver_torrent_utp_receive_drains_total{{{ROUTE}}} 30"),
-        format!("weaver_torrent_utp_stream_switch_marks_total{{{ROUTE}}} 31"),
+        format!("weaver_torrent_utp_streams_marked_total{{{ROUTE}}} 31"),
         format!("weaver_torrent_utp_drain_marks_with_packets_queued_total{{{ROUTE}}} 32"),
         format!("weaver_torrent_utp_max_congestion_window_bytes{{{ROUTE}}} 27"),
         format!(r#"weaver_torrent_session_received_bytes_total{{{ROUTE},kind="payload"}} 5000"#),

@@ -27,7 +27,8 @@ use crate::{
     congestion::{DelaySample, ledbat::Ledbat},
     constants::{
         ACK_DELAY, FAST_RESENDS_PER_ACK, MAX_UDP_PAYLOAD, RECOVERY_TRACING_LOG_LEVEL,
-        RTTE_TRACING_LOG_LEVEL, SEQUENCE_HALF_SPACE, SYNACK_RESEND_INTERNAL, UTP_HEADER,
+        RTTE_TRACING_LOG_LEVEL, SACK_DUP_THRESH, SEQUENCE_HALF_SPACE, SYNACK_RESEND_INTERNAL,
+        UTP_HEADER,
         calc_pipe_expiry,
     },
     delay::DelayTracker,
@@ -244,6 +245,8 @@ struct VirtualSocket<T, Env> {
     ack_deferred: bool,
     // The receive loop drained with an ACK deferred: send it now.
     ack_due: bool,
+    // Packets taken past a hole since the last ACK left.
+    reordered_unacked: u8,
 
     // Incoming queue. The main UDP socket writes here, and we need to consume these
     // as fast as possible.
@@ -371,6 +374,7 @@ macro_rules! on_packet_sent {
         $self.last_sent_window = $header.wnd_size;
         $self.ack_deferred = false;
         $self.ack_due = false;
+        $self.reordered_unacked = 0;
         $self.timers.ack_delay_timer.turn_off("ACK sent");
     }};
 }
@@ -1335,12 +1339,38 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
     // Sends the ACK owed when the receive loop drained: libtorrent's
     // send_deferred_ack (v2.0.15 utp_stream.cpp:252-258).
+    //
+    // A sender resends a lost packet early on a SACK naming more than
+    // SACK_DUP_THRESH packets past it, or on that many ACKs repeating the
+    // cumulative ACK (libtorrent v2.0.15 utp_stream.cpp:1297-1320,
+    // :2723-2728, :2814). While the SACK names no more than the threshold,
+    // one ACK for several packets taken past the hole would count as one
+    // duplicate, and a hole near the end of a burst would wait for the
+    // timer. So each such packet gets its ACK then, as TCP answers every
+    // out-of-order segment (RFC 5681 4.2): the first carries the SACK and
+    // the rest repeat it.
     fn send_due_ack(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<bool> {
+        let repeats = self.duplicate_acks_owed();
         let sent = self.send_ack(cx)?;
         if sent {
             self.socket.stats.immediate_acks.increment(1);
+            for _ in 0..repeats {
+                if !self.send_ack(cx)? {
+                    break;
+                }
+                self.socket.stats.duplicate_acks_sent.increment(1);
+            }
         }
         Ok(sent)
+    }
+
+    // ACKs beyond the first that the packets taken past a hole are owed.
+    fn duplicate_acks_owed(&self) -> u8 {
+        let held = self.user_rx.assembler_packets();
+        if held > SACK_DUP_THRESH as usize {
+            return 0;
+        }
+        self.reordered_unacked.min(held as u8).saturating_sub(1)
     }
 
     fn maybe_send_fin(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<bool> {
@@ -2133,6 +2163,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                             self.socket.stats.consumed_bytes.increment(bytes as u64);
                         } else {
                             self.socket.stats.out_of_order_packets.increment(1);
+                            self.reordered_unacked = self.reordered_unacked.saturating_add(1);
                             debug_every_ms!(500, header=%hdr.short_repr(), offset, ?self.last_consumed_remote_seq_nr, "out of order");
                         }
 
@@ -2846,6 +2877,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             idle_since: None,
             ack_deferred: false,
             ack_due: false,
+            reordered_unacked: 0,
             rx,
             user_tx_segments: Segments::new(seq_nr),
             user_tx,

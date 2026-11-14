@@ -53,9 +53,9 @@ pub struct UtpStats {
     /// Reads of the socket that ended with it empty after taking packets
     /// for a stream, each marking that stream's packets as drained.
     pub receive_drains: AtomicU64,
-    /// Marks made at the end of a read for streams beyond the first that
-    /// took packets in it.
-    pub stream_switch_marks: AtomicU64,
+    /// Streams marked at the ends of reads to send the ACK they owe: each
+    /// stream that took packets in a read, once for that read.
+    pub streams_marked: AtomicU64,
     /// Drain marks a stream reached with more of its packets already
     /// queued behind the mark.
     pub drain_marks_with_packets_queued: AtomicU64,
@@ -86,6 +86,10 @@ pub struct UtpStats {
     pub sack_bits_received: AtomicU64,
     /// Data packets sent that carried a SACK.
     pub data_packets_with_sack: AtomicU64,
+    /// ACKs repeated for packets taken past a hole, one for each such packet beyond the first, while the SACK named too few for the sender to resend on it alone.
+    pub duplicate_acks_sent: AtomicU64,
+    /// Reads of the socket that stopped at the batch limit with datagrams still waiting.
+    pub receive_cuts: AtomicU64,
 }
 
 /// Relaxed counters for a socket, aggregated across its streams.
@@ -113,13 +117,15 @@ pub struct UtpStatsSnapshot {
     pub out_of_order_packets: u64,
     pub streams_given_up: u64,
     pub receive_drains: u64,
-    pub stream_switch_marks: u64,
+    pub streams_marked: u64,
     pub drain_marks_with_packets_queued: u64,
     pub acks_with_sack: u64,
     pub sack_bytes_sent: u64,
     pub sacks_received: u64,
     pub sack_bits_received: u64,
     pub data_packets_with_sack: u64,
+    pub duplicate_acks_sent: u64,
+    pub receive_cuts: u64,
 }
 
 impl UtpStats {
@@ -147,7 +153,7 @@ impl UtpStats {
             out_of_order_packets: self.out_of_order_packets.load(Ordering::Relaxed),
             streams_given_up: self.streams_given_up.load(Ordering::Relaxed),
             receive_drains: self.receive_drains.load(Ordering::Relaxed),
-            stream_switch_marks: self.stream_switch_marks.load(Ordering::Relaxed),
+            streams_marked: self.streams_marked.load(Ordering::Relaxed),
             drain_marks_with_packets_queued: self
                 .drain_marks_with_packets_queued
                 .load(Ordering::Relaxed),
@@ -156,6 +162,8 @@ impl UtpStats {
             sacks_received: self.sacks_received.load(Ordering::Relaxed),
             sack_bits_received: self.sack_bits_received.load(Ordering::Relaxed),
             data_packets_with_sack: self.data_packets_with_sack.load(Ordering::Relaxed),
+            duplicate_acks_sent: self.duplicate_acks_sent.load(Ordering::Relaxed),
+            receive_cuts: self.receive_cuts.load(Ordering::Relaxed),
         }
     }
 }
@@ -210,9 +218,9 @@ impl std::ops::AddAssign for UtpStatsSnapshot {
             .saturating_add(other.out_of_order_packets);
         self.streams_given_up = self.streams_given_up.saturating_add(other.streams_given_up);
         self.receive_drains = self.receive_drains.saturating_add(other.receive_drains);
-        self.stream_switch_marks = self
-            .stream_switch_marks
-            .saturating_add(other.stream_switch_marks);
+        self.streams_marked = self
+            .streams_marked
+            .saturating_add(other.streams_marked);
         self.drain_marks_with_packets_queued = self
             .drain_marks_with_packets_queued
             .saturating_add(other.drain_marks_with_packets_queued);
@@ -221,6 +229,8 @@ impl std::ops::AddAssign for UtpStatsSnapshot {
         self.sacks_received = self.sacks_received.saturating_add(other.sacks_received);
         self.sack_bits_received = self.sack_bits_received.saturating_add(other.sack_bits_received);
         self.data_packets_with_sack = self.data_packets_with_sack.saturating_add(other.data_packets_with_sack);
+        self.duplicate_acks_sent = self.duplicate_acks_sent.saturating_add(other.duplicate_acks_sent);
+        self.receive_cuts = self.receive_cuts.saturating_add(other.receive_cuts);
     }
 }
 

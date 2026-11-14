@@ -1623,7 +1623,7 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
             max_congestion_window_bytes: 27,
             streams_given_up: 29,
             receive_drains: 30,
-            stream_switch_marks: 31,
+            streams_marked: 31,
             drain_marks_with_packets_queued: 32,
             ..Default::default()
         },

@@ -569,7 +569,6 @@ impl UserRx {
     }
 
     /// How many packets does ooq have
-    #[cfg(test)]
     pub fn assembler_packets(&self) -> usize {
         self.ooq.stored_packets()
     }
@@ -783,7 +782,6 @@ impl OutOfOrderQueue {
         self.filled_front
     }
 
-    #[cfg(test)]
     fn stored_packets(&self) -> usize {
         self.len
     }

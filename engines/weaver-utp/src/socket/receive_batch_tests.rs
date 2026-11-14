@@ -119,7 +119,7 @@ async fn one_read_of_one_stream_is_marked_once_at_the_drain() {
     assert_eq!(a.shape(), "PPPPP|");
     assert_eq!(payloads(&mut a), [1, 2, 3, 4, 5]);
     let stats = rig._socket.stats().snapshot();
-    assert_eq!(stats.stream_switch_marks, 0);
+    assert_eq!(stats.streams_marked, 1);
     assert_eq!(stats.receive_drains, 1);
 }
 
@@ -143,9 +143,9 @@ async fn streams_whose_packets_arrive_mixed_are_each_marked_once_a_read() {
     assert_eq!(b.shape(), "PP|");
     assert_eq!(payloads(&mut a), [1, 2, 3, 4]);
     assert_eq!(payloads(&mut b), [1, 2]);
-    // One read, two streams marked: one mark beyond the first.
+    // One read, two streams marked.
     let stats = rig._socket.stats().snapshot();
-    assert_eq!(stats.stream_switch_marks, 1);
+    assert_eq!(stats.streams_marked, 2);
     assert_eq!(stats.receive_drains, 1);
 
     // The next read marks only the stream that took packets in it.
@@ -153,7 +153,7 @@ async fn streams_whose_packets_arrive_mixed_are_each_marked_once_a_read() {
     assert!(!rig.turn().await);
     assert_eq!(a.shape(), "");
     assert_eq!(b.shape(), "P|");
-    assert_eq!(rig._socket.stats().snapshot().stream_switch_marks, 1);
+    assert_eq!(rig._socket.stats().snapshot().streams_marked, 3);
 }
 
 // A stream that ends while a read holds its packets leaves nothing behind:
@@ -190,6 +190,7 @@ async fn a_read_past_the_batch_limit_goes_on_after_a_yield_and_loses_nothing() {
     assert!(rig.turn().await);
     assert_eq!(a.shape(), batch.repeat(2));
     assert_eq!(rig._socket.stats().snapshot().receive_drains, 0);
+    assert_eq!(rig._socket.stats().snapshot().receive_cuts, 2);
     // The last turn reads the rest and finds the socket empty.
     assert!(!rig.turn().await);
     assert_eq!(

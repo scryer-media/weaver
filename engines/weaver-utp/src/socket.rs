@@ -1002,10 +1002,18 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     // when it sends the ACK it owes (session_impl.cpp:2727,
     // utp_socket_manager.cpp:255-261). libtorrent holds one deferred ACK
     // and so sends it as soon as a packet for another stream comes
-    // (utp_socket_manager.cpp:163-172); here each stream's ACK waits for
-    // the end of the read, so streams whose packets arrive mixed send one
-    // ACK a read each, not one a packet. After a read cut at the limit the
-    // read goes on after a yield.
+    // (utp_socket_manager.cpp:163-172), from inside the read; here each
+    // stream's ACK waits for the end of the read, so streams whose packets
+    // arrive mixed send one ACK a read each, not one a packet.
+    //
+    // The mark is made at the limit too, where libtorrent goes on reading
+    // without one (session_impl.cpp:2618, :2673). A socket that packets
+    // reach as fast as they are read never comes up empty, and its streams
+    // would then owe their ACKs to the delayed-ACK timer alone: at 1,400
+    // bytes a packet a sender's window of 1 MiB is 15 reads of 50, so the
+    // sender would stall before the timer. The mark at the limit costs at
+    // most one ACK for 50 datagrams. After a read cut at the limit the read
+    // goes on after a yield.
     async fn read_batch(
         &mut self,
         read_buf: &mut RecvBufs,
@@ -1040,6 +1048,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             }
         }
         self.read_cut = true;
+        self.socket.stats.receive_cuts.increment(1);
         self.flush_unflushed();
         Ok(true)
     }
@@ -1085,11 +1094,8 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     // Marks and wakes each stream holding packets of the current read.
     fn flush_unflushed(&mut self) {
         let streams = self.unflushed.len() as u64;
-        if streams > 1 {
-            self.socket
-                .stats
-                .stream_switch_marks
-                .increment(streams - 1);
+        if streams > 0 {
+            self.socket.stats.streams_marked.increment(streams);
         }
         for queue in self.unflushed.drain(..) {
             queue.flush();

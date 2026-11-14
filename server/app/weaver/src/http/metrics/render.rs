@@ -2809,8 +2809,8 @@ fn render_torrent_sessions(out: &mut Encoder, routes: &[SessionSeries]) {
         (&f::TORRENT_UTP_RECEIVE_DRAINS, |s: &SessionSeries| {
             s.utp.receive_drains
         }),
-        (&f::TORRENT_UTP_STREAM_SWITCH_MARKS, |s: &SessionSeries| {
-            s.utp.stream_switch_marks
+        (&f::TORRENT_UTP_STREAMS_MARKED, |s: &SessionSeries| {
+            s.utp.streams_marked
         }),
         (
             &f::TORRENT_UTP_DRAIN_MARKS_WITH_PACKETS_QUEUED,

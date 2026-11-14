@@ -641,8 +641,8 @@ metric_families! {
         ["route"], "uTP streams ended because their packets went unanswered (resends or timeouts used up, or FIN never acknowledged), since the session opened.");
     TORRENT_UTP_RECEIVE_DRAINS = ("weaver_torrent_utp_receive_drains_total", Counter,
         ["route"], "Reads of the uTP socket that ended with it empty after taking packets for a stream, since the session opened.");
-    TORRENT_UTP_STREAM_SWITCH_MARKS = ("weaver_torrent_utp_stream_switch_marks_total", Counter,
-        ["route"], "uTP packets read for another stream than the packet before, since the session opened.");
+    TORRENT_UTP_STREAMS_MARKED = ("weaver_torrent_utp_streams_marked_total", Counter,
+        ["route"], "uTP streams marked to send the ACK they owe at the end of a socket read, one mark for each stream that took packets in the read, since the session opened.");
     TORRENT_UTP_DRAIN_MARKS_WITH_PACKETS_QUEUED = ("weaver_torrent_utp_drain_marks_with_packets_queued_total", Counter,
         ["route"], "Times a uTP stream owed an ACK at the end of a read while more of its packets were already queued, since the session opened.");
     TORRENT_UTP_MAX_CWND = ("weaver_torrent_utp_max_congestion_window_bytes", Gauge,
