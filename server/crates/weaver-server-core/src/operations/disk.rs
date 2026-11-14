@@ -305,30 +305,50 @@ fn directory_device(path: &Path) -> Option<u64> {
     metadata.is_dir().then(|| metadata.dev())
 }
 
+// The volume a directory lies on is told by the volume's GUID path, the name
+// the OS keeps for it wherever and however often it is mounted: two drive
+// letters or folders that mount one volume give one id, and two volumes
+// never share one, which a volume's serial number does not promise. A
+// network share has no GUID path, and is told by its share root instead.
 #[cfg(windows)]
 fn directory_device(path: &Path) -> Option<u64> {
-    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle,
-    };
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW;
+
     if !std::fs::metadata(path).ok()?.is_dir() {
         return None;
     }
-    let directory = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
-        .ok()?;
-    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
-    // SAFETY: the handle is open for the call and `info` is a valid slot.
-    let result =
-        unsafe { GetFileInformationByHandle(directory.as_raw_handle(), info.as_mut_ptr()) };
-    if result == 0 {
-        return None;
-    }
-    // SAFETY: the call succeeded, so it filled `info`.
-    let info = unsafe { info.assume_init() };
-    Some(u64::from(info.dwVolumeSerialNumber))
+    let root = storage_kind::volume_root(path)?;
+    // A GUID path is 49 units and its NUL.
+    let mut name = [0u16; 50];
+    // SAFETY: `root` holds the NUL-terminated volume path just written, and
+    // `name` is as long as the length passed; the return code is checked
+    // before `name` is read.
+    let found = unsafe {
+        GetVolumeNameForVolumeMountPointW(root.as_ptr(), name.as_mut_ptr(), name.len() as u32)
+    };
+    Some(if found != 0 {
+        volume_identity(&name)
+    } else {
+        volume_identity(&root)
+    })
+}
+
+// The device id of a volume from its name: the units before the first NUL,
+// letters of either case alike, as one stable number. The same name gives
+// the same id in every run.
+#[cfg(any(windows, test))]
+fn volume_identity(name: &[u16]) -> u64 {
+    // FNV-1a over each unit's two bytes.
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    name.iter()
+        .take_while(|unit| **unit != 0)
+        .map(|unit| match *unit {
+            upper @ 0x41..=0x5a => upper + 0x20,
+            unit => unit,
+        })
+        .flat_map(u16::to_le_bytes)
+        .fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -2278,6 +2298,37 @@ fn run_root_sampler(
 
 #[cfg(test)]
 mod tests {
+    // A volume's id comes from its name alone: the same name gives the same
+    // id whatever follows its NUL and whatever the case of its letters, and
+    // another volume's name gives another.
+    #[test]
+    fn a_volume_name_gives_one_id_and_another_name_another() {
+        fn wide(name: &str) -> Vec<u16> {
+            name.encode_utf16().collect()
+        }
+        let guid = r"\\?\Volume{4c1b02c1-d990-11dc-99ae-806e6f6e6963}\";
+        let mut buffered = wide(guid);
+        buffered.extend([0, 0x58, 0x59]);
+        let id = volume_identity(&wide(guid));
+        assert_eq!(id, volume_identity(&buffered));
+        assert_eq!(id, volume_identity(&wide(&guid.to_uppercase())));
+        assert_ne!(
+            id,
+            volume_identity(&wide(r"\\?\Volume{4c1b02c1-d990-11dc-99ae-806e6f6e6964}\"))
+        );
+        // A share is told by its root.
+        assert_eq!(
+            volume_identity(&wide(r"\\NAS\Media\")),
+            volume_identity(&wide(r"\\nas\media\"))
+        );
+        assert_ne!(
+            volume_identity(&wide(r"\\nas\media\")),
+            volume_identity(&wide(r"\\nas\backup\"))
+        );
+        // The id is the same in every run: it is kept beside readings.
+        assert_eq!(volume_identity(&wide("a")), 0x089b_e207_b544_f1e4);
+    }
+
     // Two roots found on one filesystem count together, and go on doing so
     // across a failed look: only a filesystem found otherwise, or a new
     // directory, parts them.
