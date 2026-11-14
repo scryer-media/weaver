@@ -676,7 +676,7 @@ metric_families! {
         "Peer connections that ended since the session opened, by how far they had come (connecting is before the handshake completed) and why. closed is every close of our own, whatever decided it.");
     TORRENT_PEER_BYTES = ("weaver_torrent_peer_bytes_total", Counter,
         ["route", "transport", "direction", "kind"],
-        "Bytes that crossed the session's peer connections after their handshake, since the session opened, by transport, direction and kind: payload is block data, protocol everything else. Handshake bytes are not counted here.");
+        "Bytes that crossed the session's peer connections since the session opened, by transport, direction and kind: payload is block data, protocol everything else, the bytes of the handshakes included. A connection's bytes are counted once its handshake is done, so those of a connection that never completes it are not here.");
     TORRENT_PEER_REQUEST_EVENTS = ("weaver_torrent_peer_request_events_total", Counter,
         ["route", "event"],
         "Block requests that were not simply served, since the session opened: ours timed_out (the peer is snubbed) or asked_already (not sent again); the peer's invalid, while_choked or queue_full (dropped).");
