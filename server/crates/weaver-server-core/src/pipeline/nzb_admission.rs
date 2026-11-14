@@ -451,6 +451,7 @@ impl Pipeline {
         self.nzb_seen.remove(&id);
         self.nzb_pause_releases.remove(&id);
         self.nzb_reprocess_pending.remove(&id);
+        self.resumes_stored.remove(&id);
     }
 
     // The retired ids whose work was in flight: one that came back to the
