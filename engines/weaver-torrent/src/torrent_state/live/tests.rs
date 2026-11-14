@@ -8312,3 +8312,23 @@ async fn a_piece_is_checked_while_another_of_the_torrent_is() {
     spawner.hash().idle().await;
     assert!(h.have(0));
 }
+
+// The checks of the last two pieces end together: both pieces are marked
+// before either is counted into its files. The torrent finished with the
+// second mark, so only that piece's count rings the finish.
+#[tokio::test]
+async fn pieces_that_finish_together_finish_the_torrent_once() {
+    use futures::FutureExt;
+    let h = Harness::build("finish_once", 0x00, 1).await;
+    let first = h.live.lengths.validate_piece_index(0).unwrap();
+    let last = h.live.lengths.validate_piece_index(1).unwrap();
+    assert!(!h.live.mark_piece_had(first).unwrap());
+    assert!(h.live.mark_piece_had(last).unwrap());
+
+    let mut rung = std::pin::pin!(h.live.finished_notify.notified());
+    rung.as_mut().enable();
+    h.live.on_piece_completed(first, false).unwrap();
+    assert!(rung.as_mut().now_or_never().is_none());
+    h.live.on_piece_completed(last, true).unwrap();
+    assert!(rung.now_or_never().is_some());
+}

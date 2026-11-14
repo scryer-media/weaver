@@ -2251,8 +2251,18 @@ impl TorrentStateLive {
     /// files, and each file it made whole is told to the storage once the
     /// lock is let go (libtorrent `torrent::we_have` and
     /// `file_completed_alert`).
-    fn on_piece_completed(&self, id: ValidPieceIndex) -> anyhow::Result<()> {
-        let whole = self.count_piece_had(id)?;
+    /// Marks the checked piece as had. True when nothing selected is
+    /// missing once it is: of pieces whose checks end together, it is true
+    /// for the last one marked only, so what follows the torrent finishing
+    /// follows it once.
+    fn mark_piece_had(&self, id: ValidPieceIndex) -> anyhow::Result<bool> {
+        let mut g = self.lock_write("mark_piece_downloaded");
+        g.get_pieces_mut()?.mark_piece_hash_ok(id);
+        Ok(g.get_chunks()?.is_finished())
+    }
+
+    fn on_piece_completed(&self, id: ValidPieceIndex, finished: bool) -> anyhow::Result<()> {
+        let whole = self.count_piece_had(id, finished)?;
         for file in whole {
             self.files.on_file_completed(file);
         }
@@ -2261,8 +2271,9 @@ impl TorrentStateLive {
 
     /// The piece counted into its files, under the write lock, and what
     /// follows from it. Returns the files it made whole, padding left out;
-    /// empty, and unallocated, when it made none.
-    fn count_piece_had(&self, id: ValidPieceIndex) -> anyhow::Result<Vec<usize>> {
+    /// empty, and unallocated, when it made none. `finished` is what
+    /// [`Self::mark_piece_had`] said of the piece.
+    fn count_piece_had(&self, id: ValidPieceIndex, finished: bool) -> anyhow::Result<Vec<usize>> {
         let mut whole = Vec::new();
         let mut g = self.lock_write("on_piece_completed");
         let locked = &mut **g;
@@ -2284,7 +2295,7 @@ impl TorrentStateLive {
         }
 
         let chunks = locked.get_chunks()?;
-        if chunks.is_finished() {
+        if finished {
             if chunks.get_selected_pieces()[id.get_usize()] {
                 locked.try_flush_bitv(&self.shared, false);
                 info!(id=self.shared.id, info_hash=?self.shared.info_hash, "torrent finished downloading");
@@ -4800,10 +4811,7 @@ fn check_landed_piece(
                 state.handle_disk_error(&e);
                 return state.requeue_piece(piece_index);
             }
-            state
-                .lock_write("mark_piece_downloaded")
-                .get_pieces_mut()?
-                .mark_piece_hash_ok(piece_index);
+            let finished = state.mark_piece_had(piece_index)?;
             // Every peer that sent a block of it earns a point and
             // leaves parole (libtorrent `torrent::piece_passed`).
             for peer in senders.participants() {
@@ -4843,7 +4851,7 @@ fn check_landed_piece(
 
             trace!(piece = index, "successfully downloaded and verified");
 
-            state.on_piece_completed(chunk_info.piece_index)?;
+            state.on_piece_completed(chunk_info.piece_index, finished)?;
 
             state.transmit_haves(chunk_info.piece_index);
             state.update_interest_of_holders(chunk_info.piece_index);
