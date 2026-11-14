@@ -3032,7 +3032,11 @@ impl TorrentService {
                 placed: there.unwrap_or_default(),
             };
         }
-        let removed = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(work)).await;
+        let root = self.inner.env.work.clone();
+        let removed = tokio::task::spawn_blocking(move || {
+            crate::jobs::working_dir::remove_job_working_dir(&root, &work, job_id)
+        })
+        .await;
         if let Ok(Err(error)) = removed
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -3060,9 +3064,15 @@ impl TorrentService {
         }
     }
 
-    // The directory a torrent's unpacking works in.
+    // The directory a torrent's unpacking works in, marked the torrent's
+    // job's as an NZB job's working directory is: `torrent-<id>`, or the
+    // job's own suffixed name when an NZB job's marker holds that one.
     fn unpacking_dir(&self, job_id: JobId) -> PathBuf {
-        self.inner.env.work.join(format!("torrent-{}", job_id.0))
+        crate::jobs::working_dir::own_named_dir(
+            &self.inner.env.work,
+            &format!("torrent-{}", job_id.0),
+            job_id,
+        )
     }
 
     // Where a torrent's side store is: in Weaver's working directory, beside
@@ -3570,7 +3580,10 @@ impl TorrentService {
             mail: env.written.clone(),
         };
         let storage = || self.storage(work.clone(), layout, &plan, passwords.clone());
-        if let Some(rows) = rows {
+        // The directory is claimed the job's before anything reads or writes
+        // in it; one another job's marker holds is never taken.
+        let claimed = crate::jobs::working_dir::claim_named_working_dir(&env.work, &work, job_id);
+        if let (Some(rows), Ok(_)) = (rows, &claimed) {
             match Tee::restore(parts(), storage(), rows) {
                 Ok(tee) => return Ok((tee, None)),
                 // A rebuild that failed writing or stepping is held, as a
@@ -3584,16 +3597,15 @@ impl TorrentService {
             }
         }
         let tee = Tee::fresh(parts(), storage());
-        // Nothing the job wrote before is its now.
-        if let Err(error) = std::fs::remove_dir_all(&work)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
+        // Nothing the job wrote before is its now: its directory goes
+        // through the owner that proved it the job's, and is claimed again.
+        let cleared = claimed.and_then(|_| {
+            crate::jobs::working_dir::remove_job_working_dir(&env.work, &work, job_id)?;
+            crate::jobs::working_dir::claim_named_working_dir(&env.work, &work, job_id)
+        });
+        if let Err(error) = cleared {
             tee.refuse(format!(
-                "could not clear the torrent's unpacking directory: {error}"
-            ));
-        } else if let Err(error) = std::fs::create_dir_all(&work) {
-            tee.refuse(format!(
-                "could not make the torrent's unpacking directory: {error}"
+                "could not claim the torrent's unpacking directory: {error}"
             ));
         }
         Ok((tee, fresh))
@@ -5625,8 +5637,12 @@ impl TorrentService {
             .map(PathBuf::from);
         let mut deletion = deletion(store.files(), &adopted, &outputs, claimed);
         // With or without a tee: one whose unpacked files were not placed
-        // keeps its directory past it.
-        deletion.made.push(self.unpacking_dir(job_id));
+        // keeps its directory past it. It goes only as the torrent's job's.
+        deletion.work = Some((
+            self.inner.env.work.clone(),
+            self.unpacking_dir(job_id),
+            job_id,
+        ));
         deletion
     }
 
@@ -8342,6 +8358,9 @@ pub(super) struct Deletion {
     // The folder claimed for the torrent beside a shared one, to go once
     // empty.
     pub(super) claimed: Option<PathBuf>,
+    // The torrent's unpacking directory, under its root, removed whole only
+    // while its marker names the torrent's job.
+    pub(super) work: Option<(PathBuf, PathBuf, JobId)>,
 }
 
 // What a deletion of the files takes: each listed file not among those
@@ -8370,6 +8389,7 @@ pub(super) fn deletion(
         dir,
         kept_dirs,
         claimed,
+        work: None,
     }
 }
 
@@ -8380,6 +8400,15 @@ pub(super) fn deletion(
 // found where one of the torrent's files was (`delete_one_file` removes a
 // file, never a folder's contents).
 pub(super) fn delete_written(deletion: &Deletion) {
+    if let Some((root, work, job_id)) = &deletion.work {
+        match crate::jobs::working_dir::remove_job_working_dir(root, work, *job_id) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(dir = %work.display(), error = %error, "a torrent's unpacking directory is not its own, or could not go; it stays");
+            }
+        }
+    }
     let mut folders = BTreeSet::new();
     let listed = deletion.paths.iter().map(|path| (path, false));
     let made = deletion.made.iter().map(|path| (path, true));

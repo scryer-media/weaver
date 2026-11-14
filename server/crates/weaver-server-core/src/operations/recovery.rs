@@ -246,7 +246,7 @@ pub async fn recover_server_state(
     // A live job's row may name its destination, not the working directory
     // it is moving out of or that holds what its move left: a directory
     // carrying a live job's marker is that job's all the same.
-    let live_jobs: HashSet<crate::jobs::ids::JobId> = active_jobs.keys().copied().collect();
+    let mut live_jobs: HashSet<crate::jobs::ids::JobId> = active_jobs.keys().copied().collect();
 
     // Split recovered jobs into finished (history) vs in-progress (to restore).
     let mut initial_history = Vec::new();
@@ -342,6 +342,9 @@ pub async fn recover_server_state(
     }
     // The torrents come back too, each with its own job.
     let torrents: HashSet<crate::jobs::ids::JobId> = db.torrent_job_ids()?.into_iter().collect();
+    // A torrent's unpacking directory carries its marker as a job's does:
+    // it is live while the torrent's row is.
+    live_jobs.extend(torrents.iter().copied());
     let restoring: HashSet<crate::jobs::ids::JobId> =
         in_progress.iter().map(|(job_id, _)| *job_id).collect();
     let mut crashed = crate::runtime::panic_trap::boot_marks(data_dir, |job| {

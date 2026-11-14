@@ -302,3 +302,89 @@ async fn a_torrent_whose_history_still_waits_at_a_stop_is_archived_by_the_next_s
     assert!(restarted.torrent(job_id).await.is_none());
     restarted.stop().await;
 }
+
+// A torrent's unpacking folder carries its job's marker, and while the
+// torrent's row stands it is live to every sweep: the start-up sweep of
+// the intermediate folder, the staging sweep's recorded jobs, the failed
+// sweep's page, and a history delete. None of them takes it, though a
+// failed history row for the same job names it.
+#[tokio::test]
+async fn a_live_torrents_unpacking_folder_is_taken_by_no_sweep() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let files: [(&str, &[u8]); 1] = [("ember.mkv", &[0x5a_u8; 300])];
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(metainfo(
+            "ember", &files, 128, false,
+        ))))
+        .await
+        .unwrap();
+    rig.service.stop().await;
+    assert!(rig.db.get_torrent(job_id).unwrap().is_some());
+
+    let work = rig.dir.path().join("work");
+    let unpacking = crate::jobs::working_dir::own_named_dir(
+        &work,
+        &format!("torrent-{}", job_id.0),
+        job_id,
+    );
+    crate::jobs::working_dir::claim_named_working_dir(&work, &unpacking, job_id).unwrap();
+    std::fs::write(unpacking.join("set.part1.rar"), b"held").unwrap();
+    rig.db
+        .insert_job_history(&crate::JobHistoryRow {
+            job_id: job_id.0,
+            job_hash: None,
+            name: "ember".to_owned(),
+            status: "failed".to_owned(),
+            error_message: Some("unpacking failed".to_owned()),
+            total_bytes: 300,
+            downloaded_bytes: 300,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 0,
+            health: 1000,
+            category: None,
+            output_dir: Some(unpacking.display().to_string()),
+            nzb_path: None,
+            created_at: 1,
+            completed_at: 2,
+            metadata: None,
+            server_attribution: None,
+            protocol: crate::jobs::Protocol::Torrent,
+            archived_at: None,
+        })
+        .unwrap();
+
+    assert!(rig.db.recorded_job_ids().unwrap().contains(&job_id.0));
+    assert!(
+        rig.db
+            .failed_job_history_page(i64::MAX, None, 50)
+            .unwrap()
+            .iter()
+            .all(|(_, id, _)| *id != job_id),
+        "the failed sweep passes a live torrent"
+    );
+    let data = rig.dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    crate::operations::recover_server_state(&rig.db, &data, &work)
+        .await
+        .unwrap();
+    assert!(unpacking.join("set.part1.rar").exists(), "the start keeps it");
+
+    let (deleted, outcome) = crate::history::delete_files::delete_history_rows(
+        &rig.db,
+        &work,
+        &[],
+        std::collections::BTreeSet::from([job_id]),
+        true,
+    )
+    .await;
+    outcome.unwrap();
+    assert!(deleted.contains(&job_id), "the history row goes");
+    assert!(
+        unpacking.join("set.part1.rar").exists(),
+        "a history delete keeps it"
+    );
+    assert!(rig.db.get_torrent(job_id).unwrap().is_some());
+}

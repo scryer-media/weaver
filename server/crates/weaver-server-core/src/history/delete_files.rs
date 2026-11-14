@@ -368,15 +368,26 @@ async fn present_staging_dirs(staging_roots: &[PathBuf], job_id: JobId) -> Vec<P
     staged
 }
 
-// The marked working directories of `job_ids` under the intermediate root.
+// The marked working directories of `job_ids` under the intermediate root,
+// and which of them are live torrents. A job whose torrent row stands is
+// live: its folders are the torrent's, never a history row's to take, not
+// those it is marked in nor the one its row records. Which have one is read
+// in one batched lookup, before the scan.
 async fn scan_marked_dirs(
+    db: &crate::Database,
     intermediate_dir: &std::path::Path,
     job_ids: &BTreeSet<JobId>,
-) -> Result<BTreeMap<JobId, Vec<PathBuf>>, crate::SchedulerError> {
+) -> Result<(BTreeMap<JobId, Vec<PathBuf>>, BTreeSet<JobId>), crate::SchedulerError> {
     let root = intermediate_dir.to_path_buf();
-    let owners = job_ids.clone();
+    let mut owners = job_ids.clone();
+    let db = db.clone();
     match tokio::task::spawn_blocking(move || {
-        crate::jobs::working_dir::job_working_dirs(&root, &owners)
+        let ids = owners.iter().copied().collect::<Vec<_>>();
+        let live = db
+            .torrent_job_ids_among(&ids)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        owners.retain(|job_id| !live.contains(job_id));
+        crate::jobs::working_dir::job_working_dirs(&root, &owners).map(|marked| (marked, live))
     })
     .await
     {
@@ -434,15 +445,20 @@ pub(crate) async fn delete_history_rows(
     // still carries its marker: a delivered job's record names where it
     // delivered, and its working directory stays only for what it could not
     // remove.
-    let mut marked = match scan_marked_dirs(intermediate_dir, &job_ids).await {
-        Ok(marked) => marked,
+    let (mut marked, live) = match scan_marked_dirs(db, intermediate_dir, &job_ids).await {
+        Ok(scanned) => scanned,
         Err(error) => return (BTreeSet::new(), Err(error)),
     };
 
     let mut cleanup = BTreeMap::new();
     let mut delete_ids = Vec::with_capacity(job_ids.len());
     for job_id in job_ids {
-        let recorded = rows.get(&job_id).cloned().flatten().map(PathBuf::from);
+        let recorded = rows
+            .get(&job_id)
+            .cloned()
+            .flatten()
+            .filter(|_| !live.contains(&job_id))
+            .map(PathBuf::from);
         let planned = JobCleanupDirs::plan(
             intermediate_dir,
             job_id,
@@ -690,9 +706,10 @@ pub(crate) async fn archive_history(
     }
 
     let pending_ids = pending.keys().copied().collect::<BTreeSet<_>>();
-    let mut marked = scan_marked_dirs(intermediate_dir, &pending_ids).await?;
+    let (mut marked, live) = scan_marked_dirs(db, intermediate_dir, &pending_ids).await?;
     let mut planned = Vec::with_capacity(pending.len());
     for (job_id, recorded) in pending {
+        let recorded = recorded.filter(|_| !live.contains(&job_id));
         match JobCleanupDirs::plan(
             intermediate_dir,
             job_id,

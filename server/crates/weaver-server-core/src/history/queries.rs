@@ -35,13 +35,17 @@ pub(crate) const JOB_HISTORY_SELECTS: [&str; 2] = [JOB_HISTORY_SELECT, JOB_HISTO
 
 // The failed-job sweep's page, first and following. The predicate is spelled
 // out literally so the partial unswept-failed index serves the filter and
-// the sort. The plan test reads these same texts.
+// the sort. A job whose torrent row stands is live, its folders its own,
+// and is passed: the torrent's key answers that for each row. The plan test
+// reads these same texts.
 pub(crate) const FAILED_SWEEP_FIRST_PAGE_SQL: &str = "SELECT job_id, completed_at, output_dir FROM job_history \
      WHERE status = 'failed' AND files_swept_at IS NULL AND completed_at <= {} \
+     AND NOT EXISTS (SELECT 1 FROM torrents WHERE torrents.job_id = job_history.job_id) \
      ORDER BY completed_at DESC, job_id DESC LIMIT {}";
 pub(crate) const FAILED_SWEEP_NEXT_PAGE_SQL: &str = "SELECT job_id, completed_at, output_dir FROM job_history \
      WHERE status = 'failed' AND files_swept_at IS NULL AND completed_at <= {} \
      AND (completed_at < {} OR (completed_at = {} AND job_id < {})) \
+     AND NOT EXISTS (SELECT 1 FROM torrents WHERE torrents.job_id = job_history.job_id) \
      ORDER BY completed_at DESC, job_id DESC LIMIT {}";
 
 impl Database {

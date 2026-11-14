@@ -194,6 +194,37 @@ impl Database {
         })
     }
 
+    // Which of `job_ids` have a torrent row: one statement per bind-sized
+    // chunk, each served by the torrents' key.
+    pub(crate) fn torrent_job_ids_among(
+        &self,
+        job_ids: &[JobId],
+    ) -> Result<std::collections::BTreeSet<JobId>, StateError> {
+        if job_ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let datastore = self.datastore();
+        let ids = job_ids.iter().map(|id| id.0 as i64).collect::<Vec<_>>();
+        self.run_sql_blocking_read(async move {
+            let mut torrents = std::collections::BTreeSet::new();
+            let rows_per = crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 1);
+            for chunk in ids.chunks(rows_per) {
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let args = chunk.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!("SELECT job_id FROM torrents WHERE job_id IN ({placeholders})"),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    torrents.insert(JobId(count(&row, "job_id")?));
+                }
+            }
+            Ok(torrents)
+        })
+    }
+
     // Every torrent, in the order they were added.
     pub fn list_torrents(&self) -> Result<Vec<TorrentRecord>, StateError> {
         self.torrent_read();
