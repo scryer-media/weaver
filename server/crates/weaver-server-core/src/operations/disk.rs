@@ -1331,10 +1331,12 @@ enum Unsettled {
     TimedOut,
 }
 
-// `path` when it exists, else the nearest folder above it that does.
+// `path` when it is a folder that exists, else the nearest folder above it
+// that does. A file on the way is passed over: Windows reads free space only
+// at a folder.
 fn nearest_existing_ancestor(path: &Path) -> PathBuf {
     path.ancestors()
-        .find(|candidate| !candidate.as_os_str().is_empty() && candidate.exists())
+        .find(|candidate| !candidate.as_os_str().is_empty() && candidate.is_dir())
         .unwrap_or(path)
         .to_path_buf()
 }
@@ -3773,7 +3775,12 @@ mod tests {
         std::fs::write(&file, b"x").unwrap();
         let through = file.join("sub");
         let error = probe_disk_space(&through).expect_err("a path through a file");
+        // Unix says a path through a file is no folder; Windows says the
+        // path is not found. Either way the folder above answers.
+        #[cfg(unix)]
         assert!(!error.is_not_found(), "{error}");
+        #[cfg(not(unix))]
+        let _ = error;
         let storage = StorageCapacity::with_probe(roots(), NEVER, Arc::new(probe_disk_space));
         let OnDemandSpace::Read(space) =
             StorageCapacity::path_space(Some(&storage), through.clone()).await

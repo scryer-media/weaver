@@ -59,20 +59,10 @@ impl Database {
                 if statuses.is_empty() {
                     continue;
                 }
-                // Retention clears every row of a status, hidden ones too.
-                let ids = match db.list_job_history_ids_by_status(&statuses) {
-                    Ok(ids) => ids,
-                    Err(error) => {
-                        errors.push(error.to_string());
-                        continue;
-                    }
-                };
-                if !ids.is_empty() {
-                    match db.queue_retention_history_deletes(&ids, delete_files) {
-                        Ok(true) => db.history_delete_wake.notify_one(),
-                        Ok(false) => {}
-                        Err(error) => errors.push(error.to_string()),
-                    }
+                if let Err(error) =
+                    db.prune_history_statuses_paged(&statuses, delete_files, HISTORY_RETENTION_PAGE)
+                {
+                    errors.push(error.to_string());
                 }
             }
             if errors.is_empty() {
@@ -83,6 +73,40 @@ impl Database {
         })
         .await
         .map_err(|error| error.to_string())?
+    }
+
+    // Status retention: every history entry, hidden ones too, whose status
+    // is one of `statuses`, is handed to the durable delete queue with or
+    // without its files, read as ids a page at a time, newest first, one
+    // status after another. Each page is queued as it is read, as age
+    // retention queues its pages. Returns how many pages queued or retried
+    // anything.
+    pub(crate) fn prune_history_statuses_paged(
+        &self,
+        statuses: &[&str],
+        delete_files: bool,
+        page: usize,
+    ) -> Result<usize, crate::StateError> {
+        let mut queued = 0;
+        for status in statuses {
+            let mut after = None;
+            loop {
+                let rows = self.job_history_ids_by_status_page(status, after, page)?;
+                let Some(&last) = rows.last() else {
+                    break;
+                };
+                after = Some(last);
+                let ids = rows.iter().map(|(_, job_id)| *job_id).collect::<Vec<_>>();
+                if self.queue_retention_history_deletes(&ids, delete_files)? {
+                    queued += 1;
+                    self.history_delete_wake.notify_one();
+                }
+                if rows.len() < page {
+                    break;
+                }
+            }
+        }
+        Ok(queued)
     }
 
     // Age retention: every history entry, of any status and hidden ones too,
@@ -315,5 +339,70 @@ mod tests {
         assert_eq!(db.prune_history_by_age_paged(1, NOW, 10).unwrap(), 1);
         assert_eq!(queued_targets(&db), vec![(1, false), (2, false)]);
         assert_eq!(db.list_history_delete_operations(false).unwrap().len(), 2);
+    }
+
+    // Status retention read a page at a time queues the rows the unpaged
+    // read queued, hidden ones too, with and without their files, across
+    // pages whose cursor crosses rows that share a second; rows of other
+    // statuses stay.
+    #[tokio::test]
+    async fn status_pages_queue_what_the_unpaged_read_queued() {
+        let seed = || {
+            let db = Database::open_in_memory().unwrap();
+            for (job_id, status, completed_at) in [
+                (1, "complete", 50),
+                (2, "complete", 50),
+                (3, "complete", 50),
+                (4, "complete", 90),
+                (5, "complete", 10),
+                (6, "failed", 70),
+                (7, "failed", 70),
+                (8, "failed", 5),
+                (9, "partial", 30),
+                (10, "cancelled", 40),
+                (11, "cancelled", 40),
+            ] {
+                db.insert_job_history(&row(job_id, status, completed_at))
+                    .unwrap();
+            }
+            db.set_nzbget_history_hidden(2, true).unwrap();
+            db
+        };
+        let groups: [(&[&str], bool); 2] = [
+            (&["failed", "partial", "complete"], false),
+            (&["cancelled"], true),
+        ];
+        let unpaged = seed();
+        for (statuses, delete_files) in groups {
+            let ids = unpaged.list_job_history_ids_by_status(statuses).unwrap();
+            assert!(
+                unpaged
+                    .queue_retention_history_deletes(&ids, delete_files)
+                    .unwrap()
+            );
+        }
+        let paged = seed();
+        let mut pages = 0;
+        for (statuses, delete_files) in groups {
+            pages += paged
+                .prune_history_statuses_paged(statuses, delete_files, 2)
+                .unwrap();
+        }
+        // Five complete rows take three pages, three failed two, partial and
+        // cancelled one each.
+        assert_eq!(pages, 7);
+        assert!(woken(&paged).await);
+        assert_eq!(queued_targets(&paged), queued_targets(&unpaged));
+        assert_eq!(queued_targets(&paged).len(), 11);
+        // Nothing new is due: a second pass writes and rings nothing.
+        for (statuses, delete_files) in groups {
+            assert_eq!(
+                paged
+                    .prune_history_statuses_paged(statuses, delete_files, 2)
+                    .unwrap(),
+                0
+            );
+        }
+        assert!(!woken(&paged).await);
     }
 }

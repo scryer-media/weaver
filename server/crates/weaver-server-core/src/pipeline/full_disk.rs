@@ -31,7 +31,7 @@
 // Nothing here runs unless a write failed for want of room: every check on
 // a path that runs often is one test of an empty map.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
@@ -62,7 +62,7 @@ pub(in crate::pipeline) const ARCHIVE_RETRY_RISE: u64 = 16 << 20;
 // What a job waits for: room made on the disk its write failed on.
 // The disk a held job waits on: a root's, or the disk of a path that lies
 // on none of theirs.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum Disk {
     Root(StorageRoot),
     Path(PathBuf),
@@ -70,6 +70,7 @@ enum Disk {
 
 // Room promised to a job let go on the figure its step needs: the disk, and
 // how much of what it showed is the job's until its step ends.
+#[derive(Clone)]
 pub(crate) struct Promised {
     disk: Disk,
     bytes: u64,
@@ -97,6 +98,92 @@ impl Promised {
     fn on(&self, disk: &Disk, device: Option<u64>) -> bool {
         self.disk == *disk || (device.is_some() && self.device == device)
     }
+}
+
+// What is promised by disk and by device, built once for a pass over the
+// held jobs and kept up to date as the pass promises or takes room back, so
+// each held job reads its total without walking every promise. A promise
+// counts for a disk when it is on that disk or on the same known device,
+// once when both.
+#[derive(Default)]
+struct PromisedTotals {
+    disk: HashMap<Disk, u128>,
+    device: HashMap<u64, u128>,
+    // Promises on the disk that also know their device: the ones the two
+    // totals above both count.
+    both: HashMap<Disk, HashMap<u64, u128>>,
+}
+
+impl PromisedTotals {
+    fn of<'a>(promises: impl IntoIterator<Item = &'a Promised>) -> Self {
+        let mut totals = Self::default();
+        for promised in promises {
+            totals.add(promised);
+        }
+        totals
+    }
+
+    fn add(&mut self, promised: &Promised) {
+        let bytes = u128::from(promised.bytes);
+        *self.disk.entry(promised.disk.clone()).or_default() += bytes;
+        if let Some(device) = promised.device {
+            *self.device.entry(device).or_default() += bytes;
+            *self
+                .both
+                .entry(promised.disk.clone())
+                .or_default()
+                .entry(device)
+                .or_default() += bytes;
+        }
+    }
+
+    fn remove(&mut self, promised: &Promised) {
+        let bytes = u128::from(promised.bytes);
+        if let Some(total) = self.disk.get_mut(&promised.disk) {
+            *total -= bytes;
+        }
+        if let Some(device) = promised.device {
+            if let Some(total) = self.device.get_mut(&device) {
+                *total -= bytes;
+            }
+            if let Some(total) = self
+                .both
+                .get_mut(&promised.disk)
+                .and_then(|devices| devices.get_mut(&device))
+            {
+                *total -= bytes;
+            }
+        }
+    }
+
+    // What is promised on `disk`, whose device is `device`, held at
+    // `u64::MAX` as a saturating sum is.
+    fn on(&self, disk: &Disk, device: Option<u64>) -> u64 {
+        let mut total = self.disk.get(disk).copied().unwrap_or(0);
+        if let Some(device) = device {
+            total += self.device.get(&device).copied().unwrap_or(0);
+            total -= self
+                .both
+                .get(disk)
+                .and_then(|devices| devices.get(&device))
+                .copied()
+                .unwrap_or(0);
+        }
+        u64::try_from(total).unwrap_or(u64::MAX)
+    }
+}
+
+// The walk the totals replace: every promise, for one disk.
+#[cfg(test)]
+fn promised_on_by_walk<'a>(
+    promises: impl IntoIterator<Item = &'a Promised>,
+    disk: &Disk,
+    device: Option<u64>,
+) -> u64 {
+    promises
+        .into_iter()
+        .filter(|promised| promised.on(disk, device))
+        .fold(0u64, |sum, promised| sum.saturating_add(promised.bytes))
 }
 
 // What the job was doing when its write failed, which is what it goes back
@@ -446,6 +533,7 @@ impl Pipeline {
             self.full_disk_promised
                 .retain(|job_id, _| jobs.contains_key(job_id));
         }
+        let mut promised_totals = PromisedTotals::of(self.full_disk_promised.values());
         for (job_id, hold) in &mut self.full_disk {
             let capacity = &self.storage_capacity;
             // The root waited on was pointed at another directory: the wait
@@ -519,21 +607,20 @@ impl Pipeline {
                         // next held job of this pass is judged against it.
                         (Some((floor, bytes)), _) if !hold.go => {
                             let device = hold.disk.device(capacity);
-                            let promised = self
-                                .full_disk_promised
-                                .values()
-                                .filter(|promised| promised.on(&hold.disk, device))
-                                .fold(0u64, |sum, promised| sum.saturating_add(promised.bytes));
+                            let promised = promised_totals.on(&hold.disk, device);
                             if shown >= floor.saturating_add(promised) && spends {
                                 hold.go = true;
-                                self.full_disk_promised.insert(
-                                    *job_id,
-                                    Promised {
-                                        disk: hold.disk.clone(),
-                                        bytes,
-                                        device,
-                                    },
-                                );
+                                let promise = Promised {
+                                    disk: hold.disk.clone(),
+                                    bytes,
+                                    device,
+                                };
+                                promised_totals.add(&promise);
+                                if let Some(replaced) =
+                                    self.full_disk_promised.insert(*job_id, promise)
+                                {
+                                    promised_totals.remove(&replaced);
+                                }
                             }
                         }
                         (Some(_), _) => {}
@@ -559,7 +646,11 @@ impl Pipeline {
             // its promise up, so the other jobs held on that disk are not
             // judged against room it is not taking: it is judged anew, by a
             // later reading, once it is resumed.
-            if paused && hold.go && self.full_disk_promised.remove(job_id).is_some() {
+            if paused
+                && hold.go
+                && let Some(given_up) = self.full_disk_promised.remove(job_id)
+            {
+                promised_totals.remove(&given_up);
                 hold.go = false;
             }
             let parked = !paused
@@ -1022,5 +1113,176 @@ impl Pipeline {
             Disk::Path(path) => self.storage_capacity.release_path(path),
         }
         Some(hold.stage)
+    }
+}
+
+#[cfg(test)]
+mod promised_totals_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    // A small fixed generator, so every run sees the same seeded promises.
+    struct Seeded(u64);
+
+    impl Seeded {
+        fn next(&mut self, below: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % below
+        }
+    }
+
+    fn disks() -> Vec<Disk> {
+        vec![
+            Disk::Root(StorageRoot::Data),
+            Disk::Root(StorageRoot::Intermediate),
+            Disk::Root(StorageRoot::Complete),
+            Disk::Path(PathBuf::from("/mnt/a")),
+            Disk::Path(PathBuf::from("/mnt/b")),
+        ]
+    }
+
+    const DEVICES: [Option<u64>; 3] = [None, Some(1), Some(2)];
+
+    struct Held {
+        job_id: JobId,
+        disk: Disk,
+        device: Option<u64>,
+        floor: u64,
+        bytes: u64,
+        shown: u64,
+        paused: bool,
+        go: bool,
+    }
+
+    // The let-go part of one pass, in the pass's order: a held job not yet
+    // let go goes when its reading covers its floor on top of what is
+    // promised on its disk, and is promised its figure at once; a paused
+    // job let go gives its promise up. By the walk when `walk`, by the
+    // totals otherwise. Returns the jobs let go.
+    fn pass(held: &mut [Held], promises: &mut BTreeMap<JobId, Promised>, walk: bool) -> Vec<JobId> {
+        let mut totals = PromisedTotals::of(promises.values());
+        let mut woken = Vec::new();
+        for hold in held.iter_mut() {
+            if !hold.go {
+                let promised = if walk {
+                    promised_on_by_walk(promises.values(), &hold.disk, hold.device)
+                } else {
+                    totals.on(&hold.disk, hold.device)
+                };
+                if hold.shown >= hold.floor.saturating_add(promised) {
+                    hold.go = true;
+                    let promise = Promised {
+                        disk: hold.disk.clone(),
+                        bytes: hold.bytes,
+                        device: hold.device,
+                    };
+                    totals.add(&promise);
+                    if let Some(replaced) = promises.insert(hold.job_id, promise) {
+                        totals.remove(&replaced);
+                    }
+                }
+            }
+            if hold.paused
+                && hold.go
+                && let Some(given_up) = promises.remove(&hold.job_id)
+            {
+                totals.remove(&given_up);
+                hold.go = false;
+            }
+            if hold.go {
+                woken.push(hold.job_id);
+            }
+        }
+        woken
+    }
+
+    fn promises_of(promises: &BTreeMap<JobId, Promised>) -> Vec<(JobId, u64)> {
+        promises
+            .iter()
+            .map(|(job_id, promised)| (*job_id, promised.bytes))
+            .collect()
+    }
+
+    // Over seeded holds and promises, on roots and paths that share devices
+    // and ones whose device is not known, the totals give what the walk
+    // over every promise gave: for every disk after each change, and for a
+    // whole pass the same jobs let go in the same order with the same
+    // promises left.
+    #[test]
+    fn promised_totals_match_the_walk_over_every_promise() {
+        let disks = disks();
+        let mut seeded = Seeded(0x9e37_79b9_7f4a_7c15);
+        let mut passes_that_let_go = 0;
+        for _ in 0..200 {
+            let mut promises = BTreeMap::new();
+            for job in 0..seeded.next(40) {
+                let bytes = match seeded.next(10) {
+                    0 => u64::MAX - seeded.next(1_000),
+                    _ => seeded.next(1 << 30),
+                };
+                promises.insert(
+                    JobId(1_000 + job),
+                    Promised {
+                        disk: disks[seeded.next(disks.len() as u64) as usize].clone(),
+                        bytes,
+                        device: DEVICES[seeded.next(3) as usize],
+                    },
+                );
+            }
+            let mut totals = PromisedTotals::of(promises.values());
+            for disk in &disks {
+                for device in DEVICES {
+                    assert_eq!(
+                        totals.on(disk, device),
+                        promised_on_by_walk(promises.values(), disk, device)
+                    );
+                }
+            }
+            // Taking promises back, one at a time.
+            let mut kept = promises.clone();
+            while let Some((&job_id, _)) = kept.iter().next() {
+                let gone = kept.remove(&job_id).unwrap();
+                totals.remove(&gone);
+                for disk in &disks {
+                    for device in DEVICES {
+                        assert_eq!(
+                            totals.on(disk, device),
+                            promised_on_by_walk(kept.values(), disk, device)
+                        );
+                    }
+                }
+            }
+            let held = |seeded: &mut Seeded| -> Vec<Held> {
+                (0..seeded.next(60))
+                    .map(|job| Held {
+                        // Some held jobs already hold a promise.
+                        job_id: JobId(1_000 + seeded.next(80) + job * 100),
+                        disk: disks[seeded.next(disks.len() as u64) as usize].clone(),
+                        device: DEVICES[seeded.next(3) as usize],
+                        floor: seeded.next(1 << 31),
+                        bytes: seeded.next(1 << 30),
+                        shown: seeded.next(1 << 33),
+                        paused: seeded.next(5) == 0,
+                        go: seeded.next(8) == 0,
+                    })
+                    .collect()
+            };
+            let state = seeded.0;
+            let mut by_walk = held(&mut seeded);
+            seeded.0 = state;
+            let mut by_totals = held(&mut seeded);
+            let mut walked = promises.clone();
+            let mut totalled = promises.clone();
+            let woken = pass(&mut by_walk, &mut walked, true);
+            assert_eq!(pass(&mut by_totals, &mut totalled, false), woken);
+            assert_eq!(promises_of(&totalled), promises_of(&walked));
+            if !woken.is_empty() {
+                passes_that_let_go += 1;
+            }
+        }
+        assert!(passes_that_let_go > 50, "{passes_that_let_go}");
     }
 }
