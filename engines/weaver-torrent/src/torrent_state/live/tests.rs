@@ -2280,6 +2280,17 @@ async fn a_peer_that_is_not_interested_is_choked_and_its_slot_handed_on_at_once(
 }
 
 impl Harness {
+    /// The peer takes every piece, in whatever order they are handed out.
+    fn take_every(&self, peer: &PeerHandler) {
+        peer.on_i_am_unchoked();
+        for _ in 0..self.lengths.total_pieces() {
+            peer.acquire_next_piece()
+                .unwrap()
+                .piece()
+                .expect("a piece is not free");
+        }
+    }
+
     /// The peer takes piece `index`, acquiring pieces until it has it.
     fn take(&self, peer: &PeerHandler, index: u32) {
         peer.on_i_am_unchoked();
@@ -8232,15 +8243,26 @@ impl TorrentStorage for GatedStorage {
 }
 
 impl Harness {
-    /// The peer is asked for chunk `chunk` of piece `index`, and it arrives
-    /// in a pool buffer, as a connection receives it, to be queued for the
-    /// disk.
     /// Resolves once no piece waits for its check or for its write.
     async fn settled(&self) {
         let spawner = &self.live.shared.spawner;
         spawner.hash().idle().await;
         spawner.disk().idle().await;
     }
+
+    /// The torrent is paused on a thread of its own, as a pause waits for
+    /// the write and the check under way. Resolves once the run is told to
+    /// end, with the pause to wait for.
+    async fn pausing(&self) -> tokio::task::JoinHandle<TorrentStatePaused> {
+        let live = self.live.clone();
+        let pausing = tokio::task::spawn_blocking(move || live.pause().unwrap());
+        self.live.cancellation_token.cancelled().await;
+        pausing
+    }
+
+    /// The peer is asked for chunk `chunk` of piece `index`, and it arrives
+    /// in a pool buffer, as a connection receives it, to be queued for the
+    /// disk.
 
     async fn send_block(&self, peer: &PeerHandler, (index, chunk): (u32, u32)) {
         let info = self.chunk(index, chunk);
@@ -8322,12 +8344,15 @@ async fn a_pause_with_blocks_queued_writes_none_after_it_and_returns_their_buffe
     h.send_block(&owner, (0, 1)).await;
     assert_eq!(pool.in_use(), 2);
 
-    let _paused = h.live.pause().unwrap();
+    let pausing = h.pausing().await;
+    // The pause waits for the write under way.
+    assert!(!pausing.is_finished());
     let run = h.live.shared.ending_run.lock().clone().unwrap();
     let mut ended = Box::pin(run.wait());
     assert!(futures::poll!(ended.as_mut()).is_pending());
 
     release.send(()).unwrap();
+    let _paused = pausing.await.unwrap();
     ended.await;
     h.live.shared.spawner.disk().idle().await;
     // The held write went through; the queued one never did.
@@ -8485,46 +8510,135 @@ impl TorrentStorage for ReadGatedStorage {
     }
 }
 
-// Every block of piece 0 is written; the last write takes the piece out of
-// flight and queues its check on a hashing thread. The torrent pauses while
-// that check reads the piece back. The paused state lets the piece go, so
-// the check that ends after the pause, which finds the torrent gone, leaves
-// nothing stuck: resumed, the piece is fetched again.
+// Every block of both pieces is written; the last write of each takes the
+// piece out of flight and queues its check on the hashing thread. The
+// torrent pauses while the check of piece 0 reads the piece back, with the
+// check of piece 1 queued behind it. The pause waits for the check under
+// way, whose piece is had in the run that ends; the queued check never
+// reads, and its piece goes back to the queue with no blocks, to be fetched
+// again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_pause_while_a_piece_is_checked_lets_the_piece_go() {
+async fn a_pause_waits_for_the_check_under_way_and_drops_the_one_queued() {
     let storage = ReadGatedStorageFactory::default();
     let h = Harness::build_on(
         "pause_mid_check",
-        0x40,
+        0x00,
         isolated_session_opts(false),
         storage.clone_box(),
     )
     .await;
     let (owner, _owner_rx) = h.peer("127.0.0.1:6881");
-    h.take(&owner, 0);
+    h.take_every(&owner);
     let (mut entered, release) = storage.gate.arm();
     for chunk in 0..CHUNKS_PER_PIECE {
         h.send_block(&owner, (0, chunk)).await;
     }
     // The check of piece 0 is reading it back.
     entered.recv().await.unwrap();
-    let paused = h.live.pause().unwrap();
-    let run = h.live.shared.ending_run.lock().clone().unwrap();
-    release.send(()).unwrap();
-    run.wait().await;
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send_block(&owner, (1, chunk)).await;
+    }
+    // Every block of piece 1 is written and its check waits for the thread.
+    h.live.shared.spawner.disk().idle().await;
+    assert_eq!(h.live.shared.spawner.stats().snapshot().hash_jobs_queued, 1);
 
-    let piece = h.piece(0);
+    let pausing = h.pausing().await;
+    assert!(!pausing.is_finished(), "the pause waits for the check");
+    release.send(()).unwrap();
+    let paused = pausing.await.unwrap();
+    h.live
+        .shared
+        .ending_run
+        .lock()
+        .clone()
+        .unwrap()
+        .wait()
+        .await;
+
     let chunks = &paused.chunk_tracker;
-    assert!(!chunks.is_piece_have(piece), "the check did not pass it");
+    assert!(chunks.is_piece_have(h.piece(0)), "the check under way");
+    assert!(!chunks.is_piece_have(h.piece(1)), "the check never ran");
     assert_eq!(
-        chunks.received_chunks(piece),
+        chunks.received_chunks(h.piece(1)),
         0,
-        "piece 0 kept its blocks as received and is not queued: stuck (queued: {:?})",
+        "piece 1 kept its blocks as received and is not queued: stuck (queued: {:?})",
         chunks
             .iter_queued_pieces()
             .map(|p| p.get())
             .collect::<Vec<_>>()
     );
+}
+
+// The same pause where the storage holds its pieces in memory and keeps
+// their room from one run to the next. The check of piece 0 is under way
+// and ends as the run does: its piece is not written, for the run has ended
+// by its turn of the write threads. The check of piece 1 never runs. Both
+// pieces go back to the queue, and nothing of the run that ended touches the
+// storage once it is handed on: the next run, granted the room again, lands
+// its blocks in it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_that_ends_leaves_the_rooms_of_its_waiting_pieces_to_the_next() {
+    let storage = HeldStorageFactory::default();
+    let h = Harness::build_on(
+        "pause_mid_memory_check",
+        0x00,
+        isolated_session_opts(false),
+        storage.clone_box(),
+    )
+    .await;
+    let (owner, _owner_rx) = h.peer("127.0.0.1:6881");
+    h.take_every(&owner);
+    let (mut entered, release) = storage.gate.arm();
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&owner, (0, chunk), false).await.unwrap();
+    }
+    // The hashing thread holds piece 0's check.
+    entered.recv().await.unwrap();
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&owner, (1, chunk), false).await.unwrap();
+    }
+    assert_eq!(h.live.shared.spawner.stats().snapshot().hash_jobs_queued, 1);
+
+    let pausing = h.pausing().await;
+    assert!(!pausing.is_finished(), "the pause waits for the check");
+    release.send(()).unwrap();
+    let paused = pausing.await.unwrap();
+    // Handed on: the storage is as the run that ended left it.
+    let held = storage.held.lock().clone();
+    assert_eq!(held, [0, 1].into_iter().collect());
+
+    // The next run is handed both pieces and granted room for them.
+    let room = Arc::new(Notify::new());
+    for index in 0..2 {
+        let piece = h.piece(index);
+        assert!(!paused.chunk_tracker.is_piece_have(piece));
+        assert_eq!(paused.chunk_tracker.received_chunks(piece), 0);
+        assert!(paused.files.reserve_piece(piece, &room));
+    }
+    // Every job of the run that ended is over.
+    h.live
+        .shared
+        .ending_run
+        .lock()
+        .clone()
+        .unwrap()
+        .wait()
+        .await;
+    h.settled().await;
+    assert_eq!(storage.checked_on.lock().len(), 1, "the queued check ran");
+    assert_eq!(*storage.held.lock(), held, "a job of the run that ended");
+    // The next run's first block of each piece lands in the room granted.
+    for index in 0..2 {
+        let start = (index * PIECE_LENGTH) as usize;
+        paused
+            .files
+            .pwrite_all(
+                0,
+                start as u64,
+                &h.content[start..start + CHUNK_SIZE as usize],
+            )
+            .expect("the next run's block was refused: its room was taken");
+    }
 }
 
 // The last block of piece 0 lands and takes the piece out of flight. What

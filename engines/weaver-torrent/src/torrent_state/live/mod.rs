@@ -313,6 +313,10 @@ pub struct TorrentStateLive {
     // Whether the run is on the session's rate tick.
     rate_ticked: AtomicBool,
     cancellation_token: CancellationToken,
+    // Held, read, by each write and check of the run while it touches the
+    // storage, and passed once, written, by the run's end: see
+    // `storage_turn`.
+    storage_fence: RwLock<()>,
     // Every task of the run, its connections' among them: once each has
     // ended after the run's end, every byte a closing connection drops has
     // been counted.
@@ -522,6 +526,7 @@ impl TorrentStateLive {
             up_speed_estimator,
             rate_ticked: AtomicBool::new(false),
             cancellation_token,
+            storage_fence: RwLock::new(()),
             tasks: TaskTracker::new(),
             session_stats,
             streams: paused.streams,
@@ -1815,6 +1820,21 @@ impl TorrentStateLive {
         }
     }
 
+    /// The run's turn at its storage, which every write and check it queued
+    /// holds while it touches the storage; none once the run has ended. The
+    /// run's end passes the fence after it is cancelled (`pause`), so it
+    /// waits for the write and the check under way, and those still queued
+    /// find no turn and are dropped: no job of a run touches the storage
+    /// once it is handed on (libtorrent's stop job is such a fence,
+    /// `mmap_disk_io::async_stop_torrent`, mmap_disk_io.cpp:980, v2.0.15).
+    fn storage_turn(&self) -> Option<RwLockReadGuard<'_, ()>> {
+        // Taken again by a check dropped under a turn already held, so the
+        // read never waits behind the run's end; the end cannot starve, as
+        // every turn asked for after it is cancelled is given back at once.
+        let turn = self.storage_fence.read_recursive();
+        (!self.cancellation_token.is_cancelled()).then_some(turn)
+    }
+
     pub fn pause(&self) -> anyhow::Result<TorrentStatePaused> {
         // What a `stopped` announce of this run waits for before it reads
         // the counters, named before anything ends so no announce the end
@@ -1825,6 +1845,11 @@ impl TorrentStateLive {
         self.tasks.close();
         *self.shared.ending_run.lock() = Some(self.tasks.clone());
         self.cancellation_token.cancel();
+        // The write and the check under way end before the storage is handed
+        // on, and none queued begins after: at most one check and one batch
+        // of writes are waited for, before the torrent's lock is taken, as
+        // both take it.
+        drop(self.storage_fence.write());
         // The run ends here: its torrent holds nothing from now on, whatever
         // its closing connections still count.
         self.shared.run.store(None);
@@ -4681,6 +4706,11 @@ fn land_blocks(
     let first = landed.len();
     landed.extend(blocks.iter().map(|_| Ok(None)));
     let landed = &mut landed[first..];
+    // A run that has ended writes nothing more: its blocks are fetched again
+    // in a later run.
+    let Some(_turn) = state.storage_turn() else {
+        return;
+    };
     // Dropped after every lock below, so a panic that unwinds through them
     // finds them free.
     let mut admitted = Admitted {
@@ -5124,7 +5154,14 @@ impl DiskJob for DiskWrite {
                     }
                     WriteJob::run_batch(&mut blocks);
                 }
-                DiskWrite::Piece(PieceWrite(job)) => job.settle(Verdict::Passed),
+                DiskWrite::Piece(PieceWrite(job)) => {
+                    let state = job.state.clone();
+                    // Dropped unwritten once its run has ended: the piece is
+                    // fetched again in a later run.
+                    if let Some(_turn) = state.storage_turn() {
+                        job.settle(Verdict::Passed);
+                    }
+                }
             }
         }
     }
@@ -5145,7 +5182,8 @@ impl WriteJob {
             // A torrent paused or removed writes nothing more: the blocks
             // are fetched again in a later run (libtorrent aborts the jobs
             // of a storage it closes, `peer_connection::on_disk_write_complete`
-            // marks the block cancelled).
+            // marks the block cancelled). `land_blocks` refuses them under
+            // the run's fence; here they are only spared its count.
             if state.cancellation_token.is_cancelled() {
                 drop(jobs);
                 continue;
@@ -5263,7 +5301,10 @@ impl PieceCheck {
 
 impl Drop for PieceCheck {
     fn drop(&mut self) {
+        // A run that has ended has queued its pieces again itself, and its
+        // storage is no longer this check's to tell.
         if let Some(state) = self.state.take()
+            && let Some(_turn) = state.storage_turn()
             && let Err(e) = state.requeue_piece(self.piece)
         {
             debug!(piece = ?self.piece, "a dropped check: {e:#}");
@@ -5286,7 +5327,12 @@ impl DiskJob for HashJob {
     fn run(mut self) {
         let since = std::time::Instant::now();
         self.queued = None;
-        let stats = self.state.shared.spawner.stats().clone();
+        let state = self.state.clone();
+        // A check whose run has ended is dropped unrun.
+        let Some(_turn) = state.storage_turn() else {
+            return;
+        };
+        let stats = state.shared.spawner.stats().clone();
         match hash_landed_piece(&self.state, self.chunk.piece_index) {
             // A piece its storage holds in memory is written whole now: on
             // the torrent's turn of the write threads, in the order the
