@@ -8,10 +8,11 @@
 // The sync here measures a scratch file. Nothing on the download path syncs.
 //
 // Intended call site: where a volume's writer is first made, the caller
-// queues the probe on that writer so it runs on the writer's thread, never
-// on the pipeline loop or the async runtime:
+// leaves the probe with that writer for when it has nothing queued, so it
+// runs on the writer's thread, never on the pipeline loop or the async
+// runtime, and no write stands behind it that was queued before it began:
 //
-//     submitter.run(None, dir.clone(), probe_once(volume, dir, store));
+//     submitter.when_idle(move || { let _ = probe_once(volume, dir, store)(); });
 //
 // and may call `ProbeStore::apply_stored` wherever a volume is first seen,
 // which reads memory only.

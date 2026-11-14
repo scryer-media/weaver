@@ -1041,3 +1041,66 @@ fn a_failure_on_a_volume_with_no_thread_is_reported_before_a_settle_can_end() {
     assert_eq!(*seen.lock().unwrap(), [1]);
     assert!(job.failed());
 }
+
+// The volume's own work waits for the writer to run out of work: writes
+// queued before it and after it are down before it begins, and it runs
+// once nothing is queued. A volume no caller holds runs it at once.
+#[test]
+fn the_volumes_own_work_runs_only_when_nothing_is_queued() {
+    let dir = tempfile::tempdir().unwrap();
+    let (writers, _reports) = writers();
+    let (volume, other) = (volume("one"), volume("two"));
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    let (began, begun) = mpsc::channel();
+    let (go, gone) = mpsc::channel::<()>();
+    let (ended, end) = mpsc::channel();
+    let own = move || {
+        began.send(()).unwrap();
+        // Stands until the test lets it go: a write behind it would too.
+        let _ = gone.recv();
+        ended.send(()).unwrap();
+    };
+
+    // Left with a volume that is held and has written nothing: not run.
+    writers.volume_submitter(&volume).when_idle(own);
+    job.write(1, 0, Bytes::from_static(b"first"), create(&dir.path().join("a")));
+    hold.wait_held();
+    assert!(begun.try_recv().is_err(), "not ahead of the job's first write");
+    job.write(1, 5, Bytes::from_static(b"later"), None);
+    let written = job.barrier();
+    hold.open();
+    // Both writes come down while the volume's own work has yet to end.
+    written.wait();
+    assert!(written.passed());
+    assert_eq!(std::fs::read(dir.path().join("a")).unwrap(), b"firstlater");
+    assert!(end.try_recv().is_err());
+    // A settle does not wait for it either.
+    writers.settle();
+    // Out of work, the writer runs it.
+    begun.recv().unwrap();
+    go.send(()).unwrap();
+    end.recv().unwrap();
+
+    // On a volume no caller holds it runs at once.
+    let (ran, run) = mpsc::channel();
+    writers.volume_submitter(&other).when_idle(move || ran.send(()).unwrap());
+    run.recv().unwrap();
+}
+
+// The volume's own work is dropped unrun once the owner is stopping.
+#[test]
+fn the_volumes_own_work_is_dropped_at_a_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let job = writers.submitter(&volume, 1);
+    let (ran, run) = mpsc::channel::<()>();
+    writers.volume_submitter(&volume).when_idle(move || ran.send(()).unwrap());
+    writers.stop_waits();
+    job.write(1, 0, Bytes::from_static(b"kept"), create(&dir.path().join("a")));
+    job.barrier().wait();
+    drop(job);
+    writers.wait_ended(&volume);
+    assert!(run.recv().is_err(), "dropped, not run");
+}

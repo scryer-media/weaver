@@ -36,14 +36,17 @@ pub(crate) fn job_disk(
 ) -> JobDisk {
     let volume = capacity.volume(working_dir);
     buffers.seen(&volume);
-    probes.first_seen(writers, &volume, working_dir);
+    // The job holds the volume before the probe is queued: a volume held
+    // and not written to yet keeps its probe for later.
     let working = writers.submitter(&volume, key);
+    probes.first_seen(writers, &volume, working_dir);
     let output = output_dir.and_then(|dir| {
         let other = capacity.volume(dir);
         (!Arc::ptr_eq(&other, &volume)).then(|| {
             buffers.seen(&other);
+            let output = writers.submitter(&other, key);
             probes.first_seen(writers, &other, dir);
-            (dir.to_path_buf(), writers.submitter(&other, key))
+            (dir.to_path_buf(), output)
         })
     });
     JobDisk::new(working, output)
@@ -52,9 +55,11 @@ pub(crate) fn job_disk(
 type Probe = Box<dyn FnOnce() -> std::io::Result<()> + Send>;
 
 // What gives each volume its first write rate: the first time a job is
-// given a volume's writer, the volume's probe is queued on that writer,
-// ahead of the job's own writes, and never again for that volume. The
-// probe runs on the volume's thread; nothing here looks at a disk.
+// given a volume's writer, the volume's probe is left with that writer for
+// when it has nothing queued, and never again for that volume: the job's
+// first writes and its first read do not stand behind the probe. It runs
+// the first time the writer runs out of work, on the volume's thread;
+// nothing here looks at a disk.
 pub(crate) struct VolumeProbes {
     // The probe of a volume, given a directory on it that is there.
     probe: Option<Arc<dyn Fn(Arc<Volume>, PathBuf) -> Probe + Send + Sync>>,
@@ -108,14 +113,11 @@ impl VolumeProbes {
         // The job's directory may not be made yet: the probe is given the
         // nearest directory above it that is, found on the volume's thread.
         let (probe, probed, under) = (Arc::clone(probe), Arc::clone(volume), dir.to_path_buf());
-        writers
-            .volume_submitter(volume)
-            .run(None, dir.to_path_buf(), move || {
-                match under.ancestors().find(|dir| dir.is_dir()) {
-                    Some(dir) => probe(probed, dir.to_path_buf())(),
-                    None => Ok(()),
-                }
-            });
+        writers.volume_submitter(volume).when_idle(move || {
+            if let Some(dir) = under.ancestors().find(|dir| dir.is_dir()) {
+                let _ = probe(probed, dir.to_path_buf())();
+            }
+        });
     }
 }
 

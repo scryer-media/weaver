@@ -696,6 +696,19 @@ impl Submitter {
         })
     }
 
+    // Run `run` on the writer thread when the volume has nothing queued:
+    // the first time its writer runs out of work, or at once when no caller
+    // holds the volume. It is no operation of any key: no barrier waits for
+    // it, a settle does not, and nothing queued before or after it stands
+    // behind it. What arrives while it runs waits for it. It is dropped
+    // unrun when the owner is stopping or the volume has no thread.
+    pub(crate) fn when_idle(&self, run: impl FnOnce() + Send + 'static) {
+        let send = self.send.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = send.send(Mail::Idle(Box::new(run)));
+        drop(send);
+        self.lane.run_inline();
+    }
+
     // Stand still until `bytes` or fewer wait in memory for the volume's
     // writer: the wait of a thread that produces what is written, such as
     // an extraction, on the volume's budget. Returns at once when no more
@@ -1160,18 +1173,28 @@ impl Lane {
         let mut inline = inline.lock().unwrap_or_else(PoisonError::into_inner);
         let (thread, queued) = &mut *inline;
         while let Ok(mail) = queued.try_recv() {
-            if let Mail::Op(first) = mail {
-                thread.batch(first, queued);
+            match mail {
+                Mail::Op(first) => {
+                    thread.batch(first, queued);
+                    thread.worked = true;
+                }
+                Mail::Idle(run) => thread.idle.push(run),
+                Mail::Left => {}
             }
         }
+        while thread.run_idle() {}
     }
 }
 
 enum Mail {
     Op(Queued),
+    // Work of the volume's own, for when its writer has nothing queued.
+    Idle(Idle),
     // A caller let the volume go.
     Left,
 }
+
+type Idle = Box<dyn FnOnce() + Send>;
 
 struct Queued {
     seq: u64,
@@ -1341,6 +1364,8 @@ struct Thread {
     turn: u64,
     // A batch ran since the thread last found nothing waiting.
     worked: bool,
+    // The volume's own work, kept for when nothing is queued.
+    idle: Vec<Idle>,
 }
 
 impl Thread {
@@ -1362,6 +1387,7 @@ impl Thread {
             arrived: 0,
             turn: 0,
             worked: false,
+            idle: Vec::new(),
         }
     }
 
@@ -1376,11 +1402,10 @@ impl Thread {
                 Ok(mail) => mail,
                 Err(mpsc::TryRecvError::Disconnected) => return,
                 Err(mpsc::TryRecvError::Empty) => {
-                    if std::mem::take(&mut self.worked) {
-                        self.state
-                            .volume
-                            .idle_turns
-                            .fetch_add(1, Ordering::Relaxed);
+                    // The volume's own work first, then a look at what came
+                    // meanwhile.
+                    if self.run_idle() {
+                        continue;
                     }
                     match self.end(&queued) {
                         Ok(()) => return,
@@ -1392,11 +1417,44 @@ impl Thread {
                     }
                 }
             };
-            if let Mail::Op(first) = mail {
-                self.batch(first, &queued);
-                self.worked = true;
+            match mail {
+                Mail::Op(first) => {
+                    self.batch(first, &queued);
+                    self.worked = true;
+                }
+                Mail::Idle(run) => self.idle.push(run),
+                Mail::Left => {}
             }
         }
+    }
+
+    // Nothing is queued. Count the turn when the thread worked since the
+    // last one, and run one piece of the volume's own work when the writer
+    // has just run out of work or no caller holds the volume: a volume a
+    // job holds and has not written to yet keeps it, so the job's first
+    // writes find the thread free. Whether a piece ran.
+    fn run_idle(&mut self) -> bool {
+        let worked = std::mem::take(&mut self.worked);
+        if worked {
+            self.state
+                .volume
+                .idle_turns
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if self.idle.is_empty() {
+            return false;
+        }
+        if self.state.stopped.load(Ordering::SeqCst) {
+            self.idle.clear();
+            return false;
+        }
+        if !worked && self.state.users.load(Ordering::SeqCst) > 0 {
+            return false;
+        }
+        let run = self.idle.swap_remove(0);
+        // A panic in it must not end the volume's thread.
+        let _ = catch_unwind(AssertUnwindSafe(run));
+        true
     }
 
     // End the thread when no caller holds the volume and nothing is queued:
@@ -1430,8 +1488,10 @@ impl Thread {
     fn batch(&mut self, first: Queued, queued: &mpsc::Receiver<Mail>) {
         self.batch.push(Entry::new(first));
         while let Ok(more) = queued.try_recv() {
-            if let Mail::Op(more) = more {
-                self.batch.push(Entry::new(more));
+            match more {
+                Mail::Op(more) => self.batch.push(Entry::new(more)),
+                Mail::Idle(run) => self.idle.push(run),
+                Mail::Left => {}
             }
         }
         let base = self.arrived;
