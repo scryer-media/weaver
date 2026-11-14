@@ -2297,6 +2297,45 @@ async fn a_temp_folder_changed_during_a_held_move_loses_no_file() {
     move_goes_on(&mut pipeline, &scenario, &complete_dir, &working_dir).await;
 }
 
+// The folder a held move delivers into is removed during the hold, as a
+// user making room does, the five files already moved with it: once room
+// shows, the move goes on, makes the folder again, and delivers each of the
+// seven files still where the job worked, once and whole.
+#[tokio::test]
+async fn a_destination_removed_during_a_held_move_is_made_again() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let (_temp_dir, mut pipeline, complete_dir, working_dir, scenario) =
+        held_after_five(&room, true).await;
+    let moved: Vec<String> = delivered(&complete_dir)
+        .iter()
+        .filter(|(_, bytes)| bytes.len() == ARTICLE)
+        .map(|(name, _)| name.clone())
+        .collect();
+    assert_eq!(moved.len(), 5);
+    for entry in std::fs::read_dir(&complete_dir).unwrap() {
+        std::fs::remove_dir_all(entry.unwrap().path()).unwrap();
+    }
+    assert!(delivered(&complete_dir).is_empty());
+
+    hears(&mut pipeline, &room, StorageRoot::Complete, 2 * PLENTY);
+    assert!(!pipeline.held_for_full_disk(JOB), "the job was let go");
+    pipeline.resume_full_disk_moves().await;
+    assert!(pipeline.inflight_moves.contains(&JOB), "its move goes on");
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    let files = delivered(&complete_dir);
+    assert_eq!(files.len(), 7, "each file left, once: {:?}", files.keys());
+    for (name, body) in twelve() {
+        if !moved.iter().any(|gone| gone.ends_with(&name)) {
+            assert_eq!(file_named(&files, &name), body.as_slice(), "{name}");
+        }
+    }
+    assert!(!working_dir.exists(), "the sources are gone");
+}
+
 // A held move whose working directory carries no ownership marker goes on
 // all the same: the job knows its own directory, and nothing looks for it.
 #[tokio::test]
