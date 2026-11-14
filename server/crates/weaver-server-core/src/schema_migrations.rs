@@ -2023,7 +2023,7 @@ mod tests {
         replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(119), true)
             .await
             .unwrap();
-        for (job_id, category) in [(7_i64, Some(3_i64)), (8, None), (9, Some(3))] {
+        for (job_id, category) in [(7_i64, Some(3_i64)), (8, None), (9, Some(3)), (10, Some(4))] {
             sqlx::query(
                 "INSERT INTO torrents (job_id, infohash_v1, name, source, added_at_ms, state, category_id)
                  VALUES (?, ?, 'order', 'magnet', ?, 'queued', ?)",
@@ -2059,7 +2059,7 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(page, [9, 8, 7]);
+        assert_eq!(page, [10, 9, 8, 7]);
         for (query, index) in [
             (
                 "SELECT job_id FROM torrents ORDER BY added_at_ms, job_id LIMIT 10 OFFSET 0",
@@ -2080,6 +2080,74 @@ mod tests {
                 !plan.iter().any(|step| step.contains("TEMP B-TREE")),
                 "{query}: {plan:?}"
             );
+        }
+
+        // The list's own statements for two categories and more, with and
+        // without the torrents in none: each category walks its index in
+        // the order of adding, and the compound merges them unsorted, to the
+        // rows `IN` keeps, in the same order.
+        use crate::persistence::sql_runtime::{SqlArg, SqlEngine};
+        use crate::torrents::queries::{CategoryIds, TorrentListFilter, list_statements};
+        for (ids, none, kept) in [
+            (vec![3, 4], false, vec![10, 9, 7]),
+            (vec![3, 4, 5], false, vec![10, 9, 7]),
+            (vec![4, 3], true, vec![10, 9, 8, 7]),
+            (vec![3], true, vec![9, 8, 7]),
+        ] {
+            let filter = TorrentListFilter {
+                categories: Some(CategoryIds {
+                    ids: ids.clone(),
+                    none,
+                    known: vec![3, 4, 5],
+                }),
+                hashes: None,
+            };
+            let statements = list_statements(SqlEngine::Sqlite, &filter, 0, Some(10));
+            assert_eq!(statements.len(), 1);
+            let (sql, args) = &statements[0];
+            let sql = sql.replace("{}", "?");
+            let bind = |query: &str| {
+                let mut statement = sqlx::query(sqlx::AssertSqlSafe(query.to_owned()));
+                for arg in args {
+                    let SqlArg::I64(value) = arg else {
+                        panic!("a category list binds integers")
+                    };
+                    statement = statement.bind(*value);
+                }
+                statement
+            };
+            let plan: Vec<String> = {
+                use sqlx::Row;
+                bind(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.get::<String, _>("detail"))
+                    .collect()
+            };
+            assert!(
+                plan.iter()
+                    .filter(|step| step.contains("idx_torrents_category_added"))
+                    .count()
+                    >= ids.len(),
+                "{sql}: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+                "{sql}: {plan:?}"
+            );
+            let rows: Vec<i64> = {
+                use sqlx::Row;
+                bind(&sql)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.get::<i64, _>("job_id"))
+                    .collect()
+            };
+            assert_eq!(rows, kept, "{ids:?}, none {none}");
         }
         pool.close().await;
     }
