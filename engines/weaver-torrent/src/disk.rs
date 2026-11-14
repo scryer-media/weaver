@@ -376,6 +376,12 @@ pub(crate) trait DiskJob: Send + 'static + Sized {
         0
     }
 
+    /// True for jobs that share nothing of their key's: a thread takes one
+    /// of them at a time, and a key with more waiting goes to the back of
+    /// the keys that wait. So the keys are served in turn, and one key's
+    /// jobs run on as many threads as no other key waits for.
+    const SIDE_BY_SIDE: bool = false;
+
     /// Runs every job a thread took in one wake, in order.
     fn run_batch(batch: &mut VecDeque<Self>) {
         for job in batch.drain(..) {
@@ -387,8 +393,9 @@ pub(crate) trait DiskJob: Send + 'static + Sized {
 /// The session's disk work, done on blocking threads off the async runtime.
 /// A thread takes every queued job of one key, runs them, and looks again,
 /// so one wake runs a batch, and it stays on a key while that key has work.
-/// The jobs of one key never run on two threads at once; another thread
-/// starts only for a key no thread is on (libtorrent's `aio_threads` pool,
+/// The jobs of one key never run on two threads at once, unless they are
+/// [`DiskJob::SIDE_BY_SIDE`]; another thread starts only for a key no
+/// thread is on, or one whose jobs run side by side (libtorrent's `aio_threads` pool,
 /// which starts threads as jobs queue, `disk_io_thread_pool::job_queued`).
 /// Each key has a lane of its own, and the keys with jobs and no thread wait
 /// in turn, so queueing a job and taking a key's jobs cost the same however
@@ -428,8 +435,8 @@ struct QueueInner<J> {
 // One key's jobs, in the order queued.
 struct Lane<J> {
     jobs: VecDeque<J>,
-    // A thread is on the key.
-    busy: bool,
+    // Threads on the key.
+    busy: usize,
     // The key waits in `ready`.
     ready: bool,
 }
@@ -452,12 +459,12 @@ impl<J: DiskJob> Jobs<J> {
         let key = job.key();
         let lane = self.lanes.entry(key).or_insert_with(|| Lane {
             jobs: VecDeque::new(),
-            busy: false,
+            busy: 0,
             ready: false,
         });
         lane.jobs.push_back(job);
         self.queued += 1;
-        if lane.busy || lane.ready {
+        if lane.ready || (lane.busy > 0 && !J::SIDE_BY_SIDE) {
             return false;
         }
         lane.ready = true;
@@ -468,13 +475,23 @@ impl<J: DiskJob> Jobs<J> {
 
 impl<J> Jobs<J> {
     // Every queued job of the key that has waited longest with no thread on
-    // it, in order, and that key, now busy.
-    fn take(&mut self, batch: &mut VecDeque<J>) -> Option<usize> {
+    // it, in order, and that key, now busy. Of a key whose jobs run side by
+    // side, the first job only: the key waits again behind the others while
+    // it has more.
+    fn take(&mut self, batch: &mut VecDeque<J>, side_by_side: bool) -> Option<usize> {
         let key = self.ready.pop_front()?;
         let lane = self.lanes.get_mut(&key)?;
-        lane.ready = false;
-        lane.busy = true;
-        std::mem::swap(&mut lane.jobs, batch);
+        lane.busy += 1;
+        if side_by_side {
+            batch.extend(lane.jobs.pop_front());
+            lane.ready = !lane.jobs.is_empty();
+            if lane.ready {
+                self.ready.push_back(key);
+            }
+        } else {
+            lane.ready = false;
+            std::mem::swap(&mut lane.jobs, batch);
+        }
         self.queued -= batch.len();
         self.busy += 1;
         Some(key)
@@ -485,14 +502,16 @@ impl<J> Jobs<J> {
         let Some(lane) = self.lanes.get_mut(&key) else {
             return;
         };
-        if !lane.busy {
+        if lane.busy == 0 {
             return;
         }
-        lane.busy = false;
+        lane.busy -= 1;
         self.busy -= 1;
         if lane.jobs.is_empty() {
-            self.lanes.remove(&key);
-        } else {
+            if lane.busy == 0 {
+                self.lanes.remove(&key);
+            }
+        } else if !lane.ready {
             lane.ready = true;
             self.ready.push_back(key);
         }
@@ -544,8 +563,9 @@ impl<J: DiskJob> DiskQueue<J> {
         self.inner.waiting.fetch_add(1, Ordering::Relaxed);
         let mut jobs = self.inner.jobs.lock();
         // A thread is started when none is looking for work, and this job's
-        // key has no thread on it nor jobs already waiting for one.
-        let start = jobs.push(job) && jobs.wants_thread(self.inner.threads);
+        // key has no thread on it nor jobs already waiting for one, or its
+        // jobs run side by side.
+        let start = (jobs.push(job) || J::SIDE_BY_SIDE) && jobs.wants_thread(self.inner.threads);
         if start {
             jobs.running += 1;
         }
@@ -688,12 +708,12 @@ impl<J: DiskJob> Drain<J> {
         self.started = true;
         let mut batch = VecDeque::new();
         loop {
-            {
+            let beside = {
                 let mut jobs = inner.jobs.lock();
                 if let Some(key) = self.key.take() {
                     jobs.release(key);
                 }
-                self.key = jobs.take(&mut batch);
+                self.key = jobs.take(&mut batch, J::SIDE_BY_SIDE);
                 inner.waiting.fetch_sub(batch.len(), Ordering::Relaxed);
                 if self.key.is_none() {
                     self.inner = None;
@@ -705,6 +725,16 @@ impl<J: DiskJob> Drain<J> {
                     }
                     return;
                 }
+                // A key whose jobs run side by side may wait still, with
+                // this thread on one of its jobs and no other looking.
+                let beside = J::SIDE_BY_SIDE && jobs.wants_thread(inner.threads);
+                if beside {
+                    jobs.running += 1;
+                }
+                beside
+            };
+            if beside {
+                spawn_drain(&inner);
             }
             J::run_batch(&mut batch);
             debug_assert!(batch.is_empty());
@@ -955,6 +985,122 @@ mod tests {
         let at = |e: &str| log.iter().position(|x| x == e).unwrap();
         assert!(at("a1:end") < at("a2:start"), "{log:?}");
         assert_eq!(queue.wakes(), 2, "one thread per key");
+    }
+
+    struct Beside(Gated);
+
+    impl DiskJob for Beside {
+        const SIDE_BY_SIDE: bool = true;
+
+        fn key(&self) -> usize {
+            self.0.key
+        }
+
+        fn run(self) {
+            self.0.run();
+        }
+    }
+
+    // A key whose jobs run side by side takes every thread while no other
+    // key waits, and takes turns with one that does: the other key's job
+    // waits for one job of the busy key, not for all it has queued.
+    #[test]
+    fn side_by_side_jobs_take_every_thread_and_keys_take_turns() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let queue = DiskQueue::new(rt.handle().clone(), 2);
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let job = |key, name, entered, release| {
+            Beside(Gated {
+                key,
+                name,
+                log: log.clone(),
+                entered,
+                release,
+            })
+        };
+        // Two jobs of key 1 hold both threads.
+        let (a1_in, a1_entered) = std::sync::mpsc::channel();
+        let (a1_go, a1_release) = std::sync::mpsc::channel();
+        queue.push(job(1, "a1", Some(a1_in), Some(a1_release)));
+        a1_entered.recv().unwrap();
+        let (a2_in, a2_entered) = std::sync::mpsc::channel();
+        let (a2_go, a2_release) = std::sync::mpsc::channel();
+        queue.push(job(1, "a2", Some(a2_in), Some(a2_release)));
+        a2_entered.recv().unwrap();
+        assert_eq!(queue.wakes(), 2, "one thread for each of the key's jobs");
+
+        // More of key 1 queue, then one of key 2.
+        queue.push(job(1, "a3", None, None));
+        queue.push(job(1, "a4", None, None));
+        queue.push(job(1, "a5", None, None));
+        let (b_in, b_entered) = std::sync::mpsc::channel();
+        queue.push(job(2, "b1", Some(b_in), None));
+        // The thread a1 held runs one job of key 1, then key 2's.
+        a1_go.send(()).unwrap();
+        b_entered.recv().unwrap();
+        a2_go.send(()).unwrap();
+        rt.block_on(queue.idle());
+        let log = log.lock();
+        let at = |e: &str| log.iter().position(|x| x == e).unwrap();
+        assert!(at("a3:start") < at("b1:start"), "{log:?}");
+        assert!(at("b1:start") < at("a4:start"), "{log:?}");
+    }
+
+    // Both threads are held by two other keys while six jobs of key 1
+    // queue, the first of them held, and then one of key 2. Key 2's job
+    // starts on the second thread that comes free: none of key 1's queued
+    // jobs runs ahead of it.
+    #[test]
+    fn a_busy_keys_side_by_side_jobs_do_not_hold_back_another_keys() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let queue = DiskQueue::new(rt.handle().clone(), 2);
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let job = |key, name, entered, release| {
+            Beside(Gated {
+                key,
+                name,
+                log: log.clone(),
+                entered,
+                release,
+            })
+        };
+        let (c_in, c_entered) = std::sync::mpsc::channel();
+        let (c_go, c_release) = std::sync::mpsc::channel();
+        queue.push(job(3, "c", Some(c_in), Some(c_release)));
+        c_entered.recv().unwrap();
+        let (d_in, d_entered) = std::sync::mpsc::channel();
+        let (d_go, d_release) = std::sync::mpsc::channel();
+        queue.push(job(4, "d", Some(d_in), Some(d_release)));
+        d_entered.recv().unwrap();
+
+        let (a0_go, a0_release) = std::sync::mpsc::channel();
+        queue.push(job(1, "a0", None, Some(a0_release)));
+        for name in ["a1", "a2", "a3", "a4", "a5"] {
+            queue.push(job(1, name, None, None));
+        }
+        let (b_in, b_entered) = std::sync::mpsc::channel();
+        queue.push(job(2, "b", Some(b_in), None));
+        c_go.send(()).unwrap();
+        d_go.send(()).unwrap();
+        b_entered.recv().unwrap();
+        a0_go.send(()).unwrap();
+        rt.block_on(queue.idle());
+        let log = log.lock();
+        let b_started = log.iter().position(|e| e == "b:start").unwrap();
+        let ended = |log: &[String]| {
+            log.iter()
+                .filter(|e| e.starts_with('a') && e.ends_with(":end"))
+                .count()
+        };
+        assert_eq!(ended(&log[..b_started]), 0, "{log:?}");
+        assert_eq!(ended(&log), 6, "{log:?}");
+        assert_eq!(queue.wakes(), 2);
     }
 
     struct Panics;

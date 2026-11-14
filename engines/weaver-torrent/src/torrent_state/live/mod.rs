@@ -5115,13 +5115,16 @@ impl Drop for PieceCheck {
 }
 
 impl DiskJob for HashJob {
-    // Each piece is checked by itself, so a torrent whose checks wait takes
-    // every hashing thread: one thread reads back and hashes no faster
-    // than its core does, and a torrent that receives faster than that is
-    // held to it. Two checks share nothing but the torrent's lock, taken
-    // for the verdict.
+    // The checks of one torrent share nothing but its lock, taken for the
+    // verdict, so they run side by side: one thread reads back and hashes
+    // no faster than its core does, and a torrent that receives faster
+    // than that is held to it. The torrent is the key, so torrents are
+    // served in turn, and one whose checks wait takes every hashing thread
+    // only while no other torrent's check waits.
+    const SIDE_BY_SIDE: bool = true;
+
     fn key(&self) -> usize {
-        (Arc::as_ptr(&self.state) as usize).wrapping_add(self.chunk.piece_index.get() as usize)
+        Arc::as_ptr(&self.state) as usize
     }
 
     fn run(self) {
