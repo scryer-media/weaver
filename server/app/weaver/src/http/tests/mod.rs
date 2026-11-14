@@ -1536,6 +1536,16 @@ fn sample_trackers() -> weaver_server_core::torrents::metrics::tracker::TrackerS
     trackers
 }
 
+fn sample_incoming() -> weaver_server_core::torrents::metrics::incoming::IncomingSnapshot {
+    use weaver_server_core::torrents::metrics::incoming::{IncomingEnd, IncomingSnapshot};
+    use weaver_server_core::torrents::metrics::swarm::Transport;
+
+    let mut incoming = IncomingSnapshot::default();
+    incoming.ends[Transport::Tcp as usize][IncomingEnd::Accepted as usize] = 85;
+    incoming.ends[Transport::Utp as usize][IncomingEnd::SessionLimit as usize] = 86;
+    incoming
+}
+
 fn sample_dht_counts() -> weaver_server_core::torrents::metrics::dht::DhtSnapshot {
     use weaver_server_core::torrents::metrics::dht::{
         DhtIgnored, DhtQuery, DhtQueryEnd, DhtSnapshot,
@@ -1700,6 +1710,8 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
         swarm: sample_swarm(),
         trackers: sample_trackers(),
         dht_counts: sample_dht_counts(),
+        incoming: sample_incoming(),
+        unchoke_slots_held: 87,
         connected: weaver_server_core::torrents::metrics::ConnectedPeers {
             tcp: 4,
             utp: 2,

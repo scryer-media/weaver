@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use weaver_torrent::session_stats::dht;
+pub use weaver_torrent::session_stats::incoming;
 pub use weaver_torrent::session_stats::snapshot::UtpStatsSnapshot;
 pub use weaver_torrent::session_stats::swarm;
 pub use weaver_torrent::session_stats::tracker;
@@ -407,6 +408,11 @@ pub struct SessionSeries {
     /// What its DHT node has counted since it started; all zero while it
     /// runs none.
     pub dht_counts: dht::DhtSnapshot,
+    /// How the connections peers opened to it ended their way in, counted
+    /// since it opened.
+    pub incoming: incoming::IncomingSnapshot,
+    /// Upload slots its unchoked peers hold now.
+    pub unchoke_slots_held: u64,
     /// What it asked of its trackers, counted since it opened.
     pub trackers: tracker::TrackerSnapshot,
     /// Its connected peers over TCP, then over uTP, and how many of them
@@ -512,6 +518,8 @@ impl SessionSeries {
             },
             swarm: stats.swarm,
             trackers: stats.trackers,
+            incoming: stats.incoming,
+            unchoke_slots_held: stats.unchoke_slots_held as u64,
             dht_counts: session
                 .get_dht()
                 .map(|dht| dht.counted())

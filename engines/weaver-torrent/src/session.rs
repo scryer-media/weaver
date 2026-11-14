@@ -79,7 +79,7 @@ use crate::{
     },
     read_buf::ReadBuf,
     session_persistence::{SessionPersistenceStore, json::JsonSessionPersistenceStore},
-    session_stats::SessionStats,
+    session_stats::{SessionStats, Transport, incoming::IncomingEnd},
     spawn_utils::BlockingSpawner,
     storage::{
         BoxStorageFactory, StorageFactoryExt, TorrentStorage, filesystem::FilesystemStorageFactory,
@@ -2174,6 +2174,8 @@ impl Session {
         writer: BoxAsyncWrite,
     ) -> anyhow::Result<(Arc<TorrentStateLive>, CheckedIncomingConnection)> {
         let handshake_timeout = self.peer_opts.handshake_timeout();
+        let transport = Transport::of(kind);
+        let refused = |end: IncomingEnd| self.stats.incoming.ended(transport, end);
 
         // The session's one address rule, whichever direction the connection
         // goes (libtorrent `session_impl::incoming_connection` refuses a
@@ -2185,17 +2187,22 @@ impl Session {
                     .counters
                     .blocked_incoming
                     .fetch_add(1, Ordering::Relaxed);
+                refused(IncomingEnd::Filtered);
+            } else {
+                refused(IncomingEnd::Family);
             }
             bail!("incoming connection refused: {} is {why}", addr.ip());
         }
         // An address banned for bad data sent to any torrent is refused
         // before a byte is read, whichever torrent it greets.
         if self.bad_data_bans.contains(addr.ip()) {
+            refused(IncomingEnd::Banned);
             bail!("incoming connection refused: {} is banned", addr.ip());
         }
         // No peer on a privileged port is kept, whichever way it connects
         // (libtorrent `torrent::privileged_port_updated` disconnects one).
         if self.refuses_port(addr.port()) {
+            refused(IncomingEnd::PrivilegedPort);
             bail!("incoming connection refused: {addr} is on a privileged port");
         }
 
@@ -2208,7 +2215,7 @@ impl Session {
         // chain and our identity under it answers. No encryption handshake
         // runs inside it.
         let (encryption, writer, named, skey_named) = if tls {
-            let (r, w, named) = tokio::time::timeout(handshake_timeout, async {
+            let greeted = tokio::time::timeout(handshake_timeout, async {
                 let incoming = crate::ssl::Incoming::start(reader, writer)
                     .await
                     .context("not a TLS connection")?;
@@ -2229,7 +2236,14 @@ impl Session {
                 anyhow::Ok((r, w, id))
             })
             .await
-            .context("TLS handshake timed out")??;
+            .context("TLS handshake timed out");
+            let (r, w, named) = match greeted {
+                Ok(Ok(greeted)) => greeted,
+                Ok(Err(e)) | Err(e) => {
+                    refused(IncomingEnd::Tls);
+                    return Err(e);
+                }
+            };
             reader = r;
             (crate::mse::Encryption::None, w.into(), Some(named), None)
         } else {
@@ -2257,6 +2271,7 @@ impl Session {
                 },
             )
             .await
+            .inspect_err(|_| refused(IncomingEnd::Encryption))
             .context("error in the encryption handshake")?;
             (encryption, writer, None, skey)
         };
@@ -2265,6 +2280,7 @@ impl Session {
         let h = read_buf
             .read_handshake(&mut reader, handshake_timeout)
             .await
+            .inspect_err(|_| refused(IncomingEnd::Handshake))
             .context("error reading handshake")?;
         trace!("received handshake from {addr}: {:?}", h);
 
@@ -2273,7 +2289,8 @@ impl Session {
             .read()
             .by_hash(h.info_hash)
             .map(|(id, t)| (id, t.clone()))
-            .with_context(|| format!("didn't find a matching torrent {:?}", h.info_hash))?;
+            .with_context(|| format!("didn't find a matching torrent {:?}", h.info_hash))
+            .inspect_err(|_| refused(IncomingEnd::UnknownTorrent))?;
         // The encryption handshake keyed the stream to one torrent; the
         // BitTorrent handshake must greet that torrent, by either of a
         // hybrid's ids (libtorrent `bt_peer_connection::on_receive`, "verify
@@ -2281,21 +2298,25 @@ impl Session {
         if let Some(skey) = skey_named
             && !torrent.info_hashes().answers_to(skey)
         {
+            refused(IncomingEnd::Encryption);
             bail!(
                 "the encryption handshake named {skey:?} and the BitTorrent handshake greets torrent {id}"
             );
         }
         if h.peer_id == torrent.shared().peer_id {
+            refused(IncomingEnd::Ourselves);
             bail!("seems like we are connecting to ourselves, ignoring");
         }
         // An SSL torrent takes a connection only through TLS under its own
         // CA, and a TLS connection only greets the torrent it named.
         match named {
             Some(named) if named != id => {
+                refused(IncomingEnd::Tls);
                 bail!("the TLS connection named torrent {named} and greets torrent {id}")
             }
             Some(_) => {}
             None if torrent.is_ssl() => {
+                refused(IncomingEnd::NotAllowed);
                 bail!("torrent {id} is an SSL torrent and takes no plain connection")
             }
             None => {
@@ -2305,6 +2326,7 @@ impl Session {
                     .peer_opts
                     .encryption_under(self.connector.encryption());
                 if !policy.allows(encryption) {
+                    refused(IncomingEnd::NotAllowed);
                     bail!("torrent {id} keeps no {encryption:?} connection under {policy:?}");
                 }
             }
@@ -2313,7 +2335,8 @@ impl Session {
         let live = torrent
             .live_wait_initializing(Duration::from_secs(5))
             .await
-            .with_context(|| format!("torrent {id} is not live, ignoring connection"))?;
+            .with_context(|| format!("torrent {id} is not live, ignoring connection"))
+            .inspect_err(|_| refused(IncomingEnd::NotLive))?;
 
         Ok((
             live,
@@ -2389,6 +2412,7 @@ impl Session {
                             // session's cap and its slack.
                             let Some(slot) = session.connection_slots.try_accept() else {
                                 debug!(%addr, "at the session's connection limit, closing incoming connection");
+                                session.stats.incoming.ended(Transport::of(A::KIND), IncomingEnd::SessionLimit);
                                 continue;
                             };
                             let span = debug_span!(parent: session.rs(), "incoming", addr=%addr);
@@ -2421,9 +2445,14 @@ impl Session {
                 Some(r) = futs.next(), if !futs.is_empty() => {
                     let Ok((live, checked, slot, home)) = r else { continue };
                     let (addr, kind) = (checked.addr, checked.kind);
-                    match live.add_incoming_peer(checked, slot, home) {
+                    let added = live.add_incoming_peer(checked, slot, home);
+                    let session = session.upgrade();
+                    if let Some(session) = &session {
+                        session.stats.incoming.ended(Transport::of(kind), IncomingEnd::of(&added));
+                    }
+                    match added {
                         Ok(AddIncomingPeerResult::Added) => {
-                            if let Some(session) = session.upgrade() {
+                            if let Some(session) = session {
                                 session.settle_over_limit(&live, addr);
                             }
                         }
@@ -8271,6 +8300,9 @@ mod tests {
             "{refusal}"
         );
         assert_eq!(blocked_incoming(&session), 0);
+        use crate::session_stats::{Transport, incoming::IncomingEnd};
+        let ends = session.stats.incoming.snapshot().ends;
+        assert_eq!(ends[Transport::Tcp as usize][IncomingEnd::Family as usize], 1);
 
         assert_eq!(check_once(&session, "192.0.2.1:6881"), None);
         session.stop().await;
@@ -8399,6 +8431,14 @@ mod tests {
         assert!(refusal.contains("privileged port"), "{refusal}");
         assert_eq!(check_once(&session, "10.0.0.2:1024"), None);
         assert_eq!(blocked_incoming(&session), 1);
+        // Each refusal is counted once under its transport and reason, and a
+        // connection still waiting on its handshake under none.
+        use crate::session_stats::{Transport, incoming::IncomingEnd};
+        let ends = session.stats.incoming.snapshot().ends;
+        let tcp = ends[Transport::Tcp as usize];
+        assert_eq!(tcp[IncomingEnd::Filtered as usize], 1);
+        assert_eq!(tcp[IncomingEnd::PrivilegedPort as usize], 1);
+        assert_eq!(ends.as_flattened().iter().sum::<u64>(), 2);
 
         session.set_ip_filter(IpFilter::default());
         assert_eq!(check_once(&session, "10.0.0.1:6881"), None);

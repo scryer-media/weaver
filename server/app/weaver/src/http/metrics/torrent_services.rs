@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // What each open torrent session asked of the services it finds peers
-// through.
+// through, and what became of the connections peers opened to it.
 //
 // Every figure is a count the session keeps and the torrent service read
 // when it last published: rendering reads the published copy, and does the
@@ -11,6 +11,8 @@
 
 use weaver_server_core::torrents::metrics::SessionSeries;
 use weaver_server_core::torrents::metrics::dht::{DhtIgnored, DhtQuery, DhtQueryEnd};
+use weaver_server_core::torrents::metrics::incoming::IncomingEnd;
+use weaver_server_core::torrents::metrics::swarm::Transport;
 use weaver_server_core::torrents::metrics::tracker::{AnnounceEvent, TrackerKind, TrackerResult};
 
 use super::catalog as f;
@@ -84,6 +86,33 @@ pub(super) fn render(out: &mut Encoder, routes: &[SessionSeries]) {
         }
     }
     dht(out, routes);
+    incoming(out, routes);
+}
+
+fn incoming(out: &mut Encoder, routes: &[SessionSeries]) {
+    let open = || routes.iter().filter(|session| session.open);
+    for session in open() {
+        for transport in Transport::ALL {
+            for end in IncomingEnd::ALL {
+                out.sample(
+                    &f::TORRENT_INCOMING_CONNECTIONS,
+                    &[
+                        ("route", session.route.as_str()),
+                        ("transport", transport.as_str()),
+                        ("result", end.as_str()),
+                    ],
+                    session.incoming.ends[*transport as usize][*end as usize],
+                );
+            }
+        }
+    }
+    for session in open() {
+        out.sample(
+            &f::TORRENT_UNCHOKE_SLOTS_HELD,
+            &[("route", session.route.as_str())],
+            session.unchoke_slots_held,
+        );
+    }
 }
 
 fn dht(out: &mut Encoder, routes: &[SessionSeries]) {

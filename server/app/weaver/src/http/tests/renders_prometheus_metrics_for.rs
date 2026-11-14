@@ -1272,6 +1272,13 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
             r#"weaver_torrent_dht_datagrams_ignored_total{{{ROUTE},reason="source_limit"}} 83"#
         ),
         format!("weaver_torrent_dht_peers_found_total{{{ROUTE}}} 84"),
+        format!(
+            r#"weaver_torrent_incoming_connections_total{{{ROUTE},transport="tcp",result="accepted"}} 85"#
+        ),
+        format!(
+            r#"weaver_torrent_incoming_connections_total{{{ROUTE},transport="utp",result="session_limit"}} 86"#
+        ),
+        format!("weaver_torrent_session_unchoke_slots_held{{{ROUTE}}} 87"),
         r#"weaver_torrent_lifecycle_events_total{event="added"} 5"#.to_owned(),
         r#"weaver_torrent_lifecycle_events_total{event="completed"} 3"#.to_owned(),
         r#"weaver_torrent_lifecycle_events_total{event="removed"} 1"#.to_owned(),

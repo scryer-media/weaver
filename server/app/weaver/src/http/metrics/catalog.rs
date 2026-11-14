@@ -730,6 +730,11 @@ metric_families! {
         "Datagrams that reached the DHT node and were not acted on, by reason: malformed, source_limit (the source sends too many), unmatched (a reply to no waiting query) or no_budget (a query that came while the node's send budget was spent).");
     TORRENT_DHT_PEERS_FOUND = ("weaver_torrent_dht_peers_found_total", Counter,
         ["route"], "Peers the replies to the node's searches named since it started, repeats included.");
+    TORRENT_INCOMING_CONNECTIONS = ("weaver_torrent_incoming_connections_total", Counter,
+        ["route", "transport", "result"],
+        "Connections peers opened to the session since it opened, by transport and how each ended its way in: accepted, or the reason it was turned away (session_limit, filtered, family, banned, privileged_port, tls, encryption, handshake, unknown_torrent, ourselves, not_allowed, not_live, already_connected, torrent_limit, not_wanted, error). One still in its handshake is not counted yet.");
+    TORRENT_UNCHOKE_SLOTS_HELD = ("weaver_torrent_session_unchoke_slots_held", Gauge,
+        ["route"], "Upload slots the session's unchoked peers hold now, across every torrent.");
 
     // ---- speed tests -------------------------------------------------------
     SPEED_TEST_RUNS = ("weaver_speed_test_runs_total", Counter, ["kind", "status"],
