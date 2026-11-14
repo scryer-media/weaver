@@ -328,24 +328,12 @@ impl VolumeWriters {
     // Wake whoever hears the reports, once, when the bytes that arrived for
     // `volume` and are not written (`Volume::unwritten_bytes`) are `bytes`
     // or fewer. False when they already are: nothing was asked and no wake
-    // comes. One line is kept per volume; asking again replaces it. The
-    // writer takes the wake as it writes; the loop takes it itself, with
-    // `Volume::take_wake`, as it hands on what was being decoded.
+    // comes. One line is kept per volume, the highest asked
+    // (`Volume::ask_wake`). The writer takes the wake as it writes; the
+    // loop takes it itself, with `Volume::take_wake`, as it hands on what
+    // was being decoded.
     pub(crate) fn wake_below(&self, volume: &Arc<Volume>, bytes: u64) -> bool {
-        let ask = bytes.saturating_add(1);
-        if volume.wake_line.load(Ordering::Relaxed) == ask {
-            return true;
-        }
-        volume.wake_line.store(ask, Ordering::SeqCst);
-        if volume.unwritten_bytes() > bytes {
-            return true;
-        }
-        // Already there. When the writer took the ask first, its wake is on
-        // the way.
-        volume
-            .wake_line
-            .compare_exchange(ask, 0, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
+        volume.ask_wake(bytes)
     }
 
     // Wait until everything submitted to every volume so far has returned,
@@ -843,6 +831,9 @@ impl Submitter {
                 if !self.loop_wait_room(charged) {
                     // The end of a stop passed with the volume still full:
                     // nothing more is queued, and the key says it was left.
+                    // What of the piece the credit paid for is not queued
+                    // either, and no longer counts.
+                    volume.release(piece - charged);
                     return self.key.submitted.load(Ordering::Acquire);
                 }
                 volume.charge(charged);
