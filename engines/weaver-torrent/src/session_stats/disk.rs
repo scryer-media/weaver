@@ -114,6 +114,8 @@ pub struct DiskOpSnapshot {
 struct SocketCounters {
     receive_calls: AtomicU64,
     send_calls: AtomicU64,
+    request_sends: AtomicU64,
+    requests_sent: AtomicU64,
 }
 
 /// The calls the peers' sockets of one transport took.
@@ -125,6 +127,10 @@ pub struct SocketSnapshot {
     /// Buffers handed to the socket to be written whole, after the
     /// handshakes that open a connection.
     pub send_calls: u64,
+    /// Of those, the buffers that carried a request for a block.
+    pub request_sends: u64,
+    /// The requests for a block those buffers carried.
+    pub requests_sent: u64,
 }
 
 /// A session's disk and socket counters.
@@ -250,6 +256,14 @@ impl DiskStats {
             .fetch_add(1, Relaxed);
     }
 
+    /// A buffer written to a peer's socket carried `requests` requests for
+    /// a block.
+    pub fn requests_sent(&self, transport: Transport, requests: u64) {
+        let socket = &self.sockets[transport.index()];
+        socket.request_sends.fetch_add(1, Relaxed);
+        socket.requests_sent.fetch_add(requests, Relaxed);
+    }
+
     /// A blocking permit was taken at once.
     pub fn permit_taken(&self) {
         self.permit_acquisitions.fetch_add(1, Relaxed);
@@ -323,6 +337,8 @@ impl DiskStats {
                 SocketSnapshot {
                     receive_calls: socket.receive_calls.load(Relaxed),
                     send_calls: socket.send_calls.load(Relaxed),
+                    request_sends: socket.request_sends.load(Relaxed),
+                    requests_sent: socket.requests_sent.load(Relaxed),
                 }
             }),
             upload_read_blocks: std::array::from_fn(|i| self.upload_read_blocks[i].load(Relaxed)),

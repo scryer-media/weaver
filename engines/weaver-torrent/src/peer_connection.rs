@@ -1141,6 +1141,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
                 let mut filled = 0;
                 let mut answered = 0;
+                let mut requests = 0u64;
                 let mut ending = None;
                 let mut next = Some(first);
                 while let Some(req) = next.take() {
@@ -1155,6 +1156,9 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     if filled > 0 && buf.len() - filled < needs {
                         carried = Some(req);
                         break;
+                    }
+                    if matches!(req, WriterRequest::Message(Message::Request(_))) {
+                        requests += 1;
                     }
                     let out = &mut buf[filled..];
                     let framed = match req {
@@ -1334,6 +1338,9 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     )
                     .await?;
                     stats.sent(transport);
+                    if requests > 0 {
+                        stats.requests_sent(transport, requests);
+                    }
                 }
                 if let Some(answers) = self.handler.answers() {
                     answers.written(answered);

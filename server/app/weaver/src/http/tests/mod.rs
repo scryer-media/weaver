@@ -1676,6 +1676,8 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
             disk.sockets[Transport::Tcp.index()] = SocketSnapshot {
                 receive_calls: 100,
                 send_calls: 60,
+                request_sends: 12,
+                requests_sent: 96,
             };
             disk
         },

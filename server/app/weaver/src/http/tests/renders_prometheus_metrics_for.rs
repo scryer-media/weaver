@@ -1179,6 +1179,8 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         format!(
             r#"weaver_torrent_peer_socket_calls_total{{{ROUTE},transport="tcp",direction="out"}} 60"#
         ),
+        format!(r#"weaver_torrent_peer_request_writes_total{{{ROUTE},transport="tcp"}} 12"#),
+        format!(r#"weaver_torrent_peer_requests_sent_total{{{ROUTE},transport="tcp"}} 96"#),
         format!("weaver_torrent_peer_read_buffer_growths_total{{{ROUTE}}} 6"),
         format!("weaver_torrent_peer_batch_buffers{{{ROUTE}}} 2"),
         format!(r#"weaver_torrent_session_received_bytes_total{{{ROUTE},kind="payload"}} 5000"#),

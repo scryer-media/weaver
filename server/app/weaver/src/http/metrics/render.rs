@@ -2818,6 +2818,30 @@ fn render_torrent_disk(out: &mut Encoder, routes: &[SessionSeries]) {
         }
     }
     for session in sessions() {
+        for transport in Transport::ALL {
+            out.sample(
+                &f::TORRENT_PEER_REQUEST_WRITES,
+                &[
+                    ("route", session.route.as_str()),
+                    ("transport", transport.as_str()),
+                ],
+                session.disk.sockets[transport.index()].request_sends,
+            );
+        }
+    }
+    for session in sessions() {
+        for transport in Transport::ALL {
+            out.sample(
+                &f::TORRENT_PEER_REQUESTS_SENT,
+                &[
+                    ("route", session.route.as_str()),
+                    ("transport", transport.as_str()),
+                ],
+                session.disk.sockets[transport.index()].requests_sent,
+            );
+        }
+    }
+    for session in sessions() {
         out.sample(
             &f::TORRENT_PEER_READ_BUFFER_GROWTHS,
             &[("route", session.route.as_str())],
