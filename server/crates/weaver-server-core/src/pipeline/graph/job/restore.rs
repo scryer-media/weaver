@@ -70,7 +70,8 @@ impl GraphJob {
         let windows = storage.windows(scope);
         let runs = Runs::new(scope, storage.slots, storage.mail, storage.decode)
             .on(storage.hardware)
-            .lending(windows);
+            .lending(windows)
+            .writing(storage.disk.clone());
         let mut writer = NamespaceWriter::new(
             scope,
             storage.working_dir,

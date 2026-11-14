@@ -37,7 +37,6 @@ use weaver_graph::names::{INTERNAL_DIR, key};
 use weaver_graph::{MemberId, NodeId, Tree};
 
 use super::{NamespaceWriter, WriteError};
-use crate::pipeline::graph::envelope::free_name_through;
 use crate::pipeline::graph::leaf::Leaf;
 
 // Where a restored member's file is: the one name of it the checkpoint
@@ -162,7 +161,7 @@ impl NamespaceWriter {
         }
         #[cfg(test)]
         count(|tally| tally.waiting_opens += 1);
-        let waiting = waiting_name(to.as_ref(), root, node, member, name);
+        let waiting = waiting_name(self.envelopes.given(), to.as_ref(), root, node, member, name);
         let mut leaf = Leaf::at(root, &waiting).through(to.as_ref());
         leaf.intend(name);
         self.moves.push(Waiting {
@@ -534,6 +533,7 @@ fn above(name: &str) -> impl Iterator<Item = String> + '_ {
 // never delivers: a name no file sits at, as one that goes may still sit at
 // the member's last. A directory member waits as a directory.
 fn waiting_name(
+    given: &crate::pipeline::graph::envelope::Given,
     to: Option<&std::sync::Arc<crate::operations::disk::writer::Submitter>>,
     dir: &std::path::Path,
     node: NodeId,
@@ -541,7 +541,7 @@ fn waiting_name(
     name: &str,
 ) -> String {
     let directory = if Leaf::is_directory(name) { "/" } else { "" };
-    let waiting = free_name_through(
+    let waiting = given.free(
         to,
         dir,
         &format!("{INTERNAL_DIR}/graph-waiting-{}-{}", node.0, member.0),

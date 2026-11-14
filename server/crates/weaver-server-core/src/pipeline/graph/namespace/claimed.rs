@@ -10,6 +10,8 @@
 // delivery of its own after that, unless the object is a recovery object,
 // whose volumes live in their files.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use weaver_graph::{ByteRange, Coverage, Effect, MemberId, NodeId, Tree};
 
@@ -158,18 +160,48 @@ impl NamespaceWriter {
         }) else {
             return;
         };
-        // The link is made of the file as it lies, so everything submitted
-        // for the job's files returns first.
-        self.settle_disk();
-        let name = free_name(&self.working_dir, &envelope_name(child, envelope));
+        let Some(disk) = &self.disk else {
+            let name = free_name(&self.working_dir, &envelope_name(child, envelope));
+            let link = self.working_dir.join(&name);
+            let linked = link
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::hard_link(leaf.path(), &link))
+                .is_ok();
+            if linked && !self.envelopes.start_in(child, envelope, &name, true) {
+                let _ = std::fs::remove_file(&link);
+            }
+            return;
+        };
+        // The second name is given by the writer of the working directory's
+        // volume, behind everything submitted for the file, so the loop
+        // never waits for the file to lie as said. Only a file that writer
+        // writes can be given it: one on another volume has no second name
+        // here, and its bytes are written afresh.
+        let to = Arc::clone(disk.working());
+        if !leaf.on_disk() || !Arc::ptr_eq(&to, disk.under(leaf.root())) {
+            return;
+        }
+        let name = self.envelopes.given().free(
+            Some(&to),
+            &self.working_dir,
+            &envelope_name(child, envelope),
+        );
         let link = self.working_dir.join(&name);
-        let linked = link
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::hard_link(leaf.path(), &link))
-            .is_ok();
-        if linked && !self.envelopes.start_in(child, envelope, &name, true) {
-            let _ = std::fs::remove_file(&link);
+        let (from, at) = (leaf.path().to_path_buf(), link.clone());
+        // Where the file system gives a file no second name, the envelope
+        // gets the same bytes as a file of its own.
+        let made = to.run(None, link.clone(), move || {
+            if let Some(parent) = at.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::hard_link(&from, &at).or_else(|_| std::fs::copy(&from, &at).map(|_| ()))
+        });
+        if !self.envelopes.start_after(child, envelope, &name, true, made) {
+            to.run(None, link.clone(), move || match std::fs::remove_file(&link) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+                _ => Ok(()),
+            });
         }
     }
 

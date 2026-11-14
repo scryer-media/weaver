@@ -98,6 +98,7 @@ impl Pipeline {
                 job_id.0,
                 &state.working_dir,
                 state.staging_dir.as_deref(),
+                self.write_backlog_budget_bytes as u64,
             )),
             data_dir: Some(data_dir),
             window_ledger: self.window_ledgers.intermediate.clone(),
