@@ -3632,7 +3632,7 @@ fn index(offset: u64) -> usize {
     usize::try_from(offset).expect("an offset fits the address space")
 }
 
-mod claimed;
+pub(crate) mod claimed;
 mod durable;
 mod loan;
 mod moves;

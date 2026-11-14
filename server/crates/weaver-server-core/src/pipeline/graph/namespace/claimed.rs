@@ -163,11 +163,7 @@ impl NamespaceWriter {
         let Some(disk) = &self.disk else {
             let name = free_name(&self.working_dir, &envelope_name(child, envelope));
             let link = self.working_dir.join(&name);
-            let linked = link
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|()| std::fs::hard_link(leaf.path(), &link))
-                .is_ok();
+            let linked = second_name(leaf.path(), &link);
             if linked && !self.envelopes.start_in(child, envelope, &name, true) {
                 let _ = std::fs::remove_file(&link);
             }
@@ -189,13 +185,13 @@ impl NamespaceWriter {
         );
         let link = self.working_dir.join(&name);
         let (from, at) = (leaf.path().to_path_buf(), link.clone());
-        // Where the file system gives a file no second name, the envelope
-        // gets the same bytes as a file of its own.
+        // Where the file system gives a file no second name, nothing is
+        // made here and nothing fails: the envelope's file is made by the
+        // first of the bytes that go down to it after, which are all of
+        // them, so it is written afresh as any envelope is.
         let made = to.run(None, link.clone(), move || {
-            if let Some(parent) = at.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::hard_link(&from, &at).or_else(|_| std::fs::copy(&from, &at).map(|_| ()))
+            second_name(&from, &at);
+            Ok(())
         });
         if !self.envelopes.start_after(child, envelope, &name, true, made) {
             to.run(None, link.clone(), move || match std::fs::remove_file(&link) {
@@ -225,4 +221,24 @@ impl NamespaceWriter {
         }
         Ok(())
     }
+}
+
+// Give the file at `from` the second name `at`. Whether it has it: a file
+// system that gives a file no second name leaves nothing at `at`.
+fn second_name(from: &std::path::Path, at: &std::path::Path) -> bool {
+    #[cfg(test)]
+    if refused::SECOND_NAMES.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    at.parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::hard_link(from, at))
+        .is_ok()
+}
+
+// A test's file system that gives no file a second name.
+#[cfg(test)]
+pub(crate) mod refused {
+    pub(crate) static SECOND_NAMES: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 }

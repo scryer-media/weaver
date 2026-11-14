@@ -1092,6 +1092,17 @@ fn echoing_scoped(
     pool: Arc<DecodePool>,
     holds: Arc<HoldsAccountant>,
 ) -> Echoing {
+    echoing_through(scope, echoes, pool, holds, None)
+}
+
+// The same, its files written through `disk` when one is given.
+fn echoing_through(
+    scope: u64,
+    echoes: Echoes,
+    pool: Arc<DecodePool>,
+    holds: Arc<HoldsAccountant>,
+    disk: Option<&dyn Fn() -> crate::pipeline::graph::disk::JobDisk>,
+) -> Echoing {
     let count = echoes.volumes;
     let volumes: Vec<Vec<u8>> = (0..count)
         .map(|index| {
@@ -1119,7 +1130,8 @@ fn echoing_scoped(
         dir.path().to_path_buf(),
         Arc::clone(&holds),
         CapacityReader::unknown(),
-    );
+    )
+    .writing_through(disk.map(|disk| disk()));
     let mail = RunMail::default();
     let runs = Runs::new(scope, 1, mail.sender(), Arc::clone(&pool));
     let job = GraphJob::new(&files, Box::new(echoes), writer, runs, u32::MAX);
@@ -1321,6 +1333,55 @@ async fn a_volume_its_engine_takes_from_its_file_is_on_disk_once() {
     for member in 0..2 {
         assert_eq!(echoing.echoed(member), body(member));
     }
+}
+
+// A job that writes through its volume's writer, on a file system that
+// gives a file no second name: the job does not fail and the writer copies
+// nothing. The envelope is a file of its own, made by the bytes that go
+// down to it as every envelope's are.
+#[tokio::test]
+async fn a_volume_whose_file_takes_no_second_name_is_written_afresh() {
+    use crate::operations::disk::volume::Volume;
+    use crate::operations::disk::writer::VolumeWriters;
+    use crate::pipeline::graph::disk::JobDisk;
+    use crate::pipeline::graph::namespace::claimed::refused::SECOND_NAMES;
+    SECOND_NAMES.store(true, std::sync::atomic::Ordering::SeqCst);
+    let writers = VolumeWriters::inline(|_| {});
+    let volume = Arc::new(Volume::new(None, "test".to_owned()));
+    let disk = || JobDisk::new(writers.submitter(&volume, 1), None);
+    let mut echoing = echoing_through(
+        1,
+        Echoes {
+            volumes: 2,
+            ..Echoes::default()
+        },
+        unbounded(),
+        holds(u64::MAX),
+        Some(&disk),
+    );
+    echoing.deliver(1);
+    let posted = echoing.dir.path().join("lantern.part2.rar");
+    assert_eq!(std::fs::read(&posted).unwrap(), echoing.volumes[1]);
+    echoing.deliver(0);
+    let barrier = echoing.job.disk().unwrap().barrier();
+    assert!(barrier.passed(), "nothing of the job failed");
+    let envelope = echoing.dir.path().join(envelope_name(echoing.engine(), 1));
+    assert_eq!(std::fs::read(&envelope).unwrap(), echoing.volumes[1]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(
+            std::fs::metadata(&posted).unwrap().ino(),
+            std::fs::metadata(&envelope).unwrap().ino(),
+            "the envelope is a file of its own"
+        );
+    }
+    while !echoing.hear().await {}
+    for member in 0..2 {
+        assert_eq!(echoing.echoed(member), body(member));
+    }
+    assert_eq!(echoing.job.phase(), RootPhase::Done);
+    assert!(echoing.job.disk().unwrap().barrier().passed());
 }
 
 #[tokio::test]
