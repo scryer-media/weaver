@@ -3876,6 +3876,42 @@ async fn a_full_disk_its_owner_wakes_lasts_until_the_owner_ends_it() {
     assert!(!h.upload_mode());
 }
 
+// A refusal made before its owner left upload mode, and handled after,
+// enters nothing: the wake stands, and the torrent fetches. One made after
+// the leave enters upload mode as any refusal does. The order is driven by
+// hand: the write's count is taken, the owner leaves, then the refusal is
+// handled.
+#[tokio::test]
+async fn a_refusal_made_before_its_owner_left_upload_mode_does_not_enter_it_again() {
+    let storage = RefusingStorageFactory::default();
+    let add = AddTorrentOptions {
+        storage_factory: Some(storage.clone_box()),
+        owner_wakes_full_disk: true,
+        ..Default::default()
+    };
+    let h = Harness::build_added("late_refusal", 3, 0x20, isolated_session_opts(false), add).await;
+    let no_room = || anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::StorageFull));
+
+    // Pieces A and B are written at the same count; A's refusal enters
+    // upload mode.
+    let at = h.upload_epoch();
+    assert!(h.handle_disk_error(&no_room(), at));
+    assert!(h.upload_mode());
+    // Room was made: the owner wakes it.
+    h.leave_upload_mode();
+    assert!(!h.upload_mode());
+    // B's refusal lands now, from before the wake: it is still a refusal,
+    // but it does not undo the wake.
+    assert!(h.handle_disk_error(&no_room(), at));
+    assert!(
+        !h.upload_mode(),
+        "a refusal from before the wake enters nothing"
+    );
+    // A write made after the wake that finds no room enters it again.
+    assert!(h.handle_disk_error(&no_room(), h.upload_epoch()));
+    assert!(h.upload_mode());
+}
+
 // A piece is counted into every file with bytes in it, an empty file among
 // them or not (libtorrent `torrent::we_have` updates every file the piece
 // maps to).

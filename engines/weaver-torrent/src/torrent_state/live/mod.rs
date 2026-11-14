@@ -366,6 +366,11 @@ pub struct TorrentStateLive {
     // found no room, so it fetches nothing and keeps seeding (libtorrent
     // `torrent::m_upload_mode`, `m_upload_mode_time`).
     upload_mode: watch::Sender<Option<UploadMode>>,
+    // How many times upload mode was left. A refused write is read against
+    // the count taken before it was made: one made before a leave enters
+    // nothing after it, so a refusal that lands late cannot undo a wake.
+    // Moved and checked only under the upload mode's own lock.
+    upload_epoch: AtomicU64,
     // How many times the retry task saw an upload mode that waits for its
     // owner and left it be: what a test waits on to know it ran.
     #[cfg(test)]
@@ -565,6 +570,7 @@ impl TorrentStateLive {
             told_upload_only: AtomicBool::new(finished_at_start && !super_seeding),
             last_seen_complete: Mutex::new(None),
             upload_mode: watch::Sender::new(None),
+            upload_epoch: AtomicU64::new(0),
             #[cfg(test)]
             retry_declined: watch::Sender::new(0),
             web_layout: web_seed::Layout::new(&paused.metadata, paused.shared.info_hash),
@@ -2144,6 +2150,14 @@ impl TorrentStateLive {
         let _ = mode.wait_for(|at| at.is_some() == on).await;
     }
 
+    /// Resolves to true once the torrent is in upload mode, or to false
+    /// when its run ends first. It holds nothing of the torrent while it
+    /// waits.
+    pub fn upload_mode_entered(&self) -> impl std::future::Future<Output = bool> + Send + 'static {
+        let mut mode = self.upload_mode.subscribe();
+        async move { mode.wait_for(Option::is_some).await.is_ok() }
+    }
+
     /// Leaves upload mode, as its owner does once room was made for a
     /// torrent added with
     /// [`AddTorrentOptions::owner_wakes_full_disk`](crate::AddTorrentOptions::owner_wakes_full_disk):
@@ -2153,14 +2167,22 @@ impl TorrentStateLive {
         self.set_upload_mode(false);
     }
 
-    /// Enters upload mode, to end by itself once it lasted
-    /// OPTIMISTIC_DISK_RETRY when `retry` holds, else only when its owner
-    /// says. Entered already, it keeps its time, and once it waits for its
-    /// owner it goes on waiting.
-    fn enter_upload_mode(&self, retry: bool) {
+    /// How many times upload mode was left: taken before a write, it is
+    /// what that write's refusal is read against.
+    pub(crate) fn upload_epoch(&self) -> u64 {
+        self.upload_epoch.load(Ordering::Acquire)
+    }
+
+    /// Enters upload mode for a write made at `epoch`, to end by itself
+    /// once it lasted OPTIMISTIC_DISK_RETRY when `retry` holds, else only
+    /// when its owner says. A write made before upload mode was last left
+    /// enters nothing: the leave came after it. Entered already, it keeps
+    /// its time, and once it waits for its owner it goes on waiting.
+    fn enter_upload_mode(&self, retry: bool, epoch: u64) {
         let now = tokio::time::Instant::now();
         let mut entered = false;
         self.upload_mode.send_if_modified(|mode| match mode {
+            _ if self.upload_epoch.load(Ordering::Acquire) != epoch => false,
             Some(mode) if mode.retry && !retry => {
                 mode.retry = false;
                 true
@@ -2181,13 +2203,13 @@ impl TorrentStateLive {
     /// a mode entered here ending by itself.
     fn set_upload_mode(&self, on: bool) {
         if on {
-            self.enter_upload_mode(true);
+            self.enter_upload_mode(true, self.upload_epoch());
             return;
         }
-        if self
-            .upload_mode
-            .send_if_modified(|mode| mode.take().is_some())
-        {
+        if self.upload_mode.send_if_modified(|mode| {
+            self.upload_epoch.fetch_add(1, Ordering::AcqRel);
+            mode.take().is_some()
+        }) {
             self.upload_mode_changed(false);
         }
     }
@@ -2214,10 +2236,11 @@ impl TorrentStateLive {
         self.update_upload_only();
     }
 
-    /// A write failed. One that later writes will likely repeat puts the
-    /// torrent in upload mode; returns whether it was one (libtorrent
+    /// A write made at `epoch` failed. One that later writes will likely
+    /// repeat puts the torrent in upload mode, unless upload mode was left
+    /// since the write was made; returns whether it was one (libtorrent
     /// `torrent::handle_disk_error`).
-    fn handle_disk_error(&self, error: &anyhow::Error) -> bool {
+    fn handle_disk_error(&self, error: &anyhow::Error, epoch: u64) -> bool {
         let refused = crate::storage::write_refused(error);
         if refused {
             warn!(
@@ -2227,7 +2250,7 @@ impl TorrentStateLive {
             );
             // An owner that wakes the torrent decides every refused write:
             // it waits for room, or fails the torrent, with no retry here.
-            self.enter_upload_mode(!self.shared.options.owner_wakes_full_disk);
+            self.enter_upload_mode(!self.shared.options.owner_wakes_full_disk, epoch);
         }
         refused
     }
@@ -5046,13 +5069,14 @@ fn land_blocks(
         // fetched again (libtorrent `peer_connection::on_disk_write_complete`
         // calls `piece_picker::write_failed`, then
         // `torrent::handle_disk_error`).
+        let epoch = state.upload_epoch();
         match state.file_ops().write_chunk(*addr, piece, chunk_info) {
             Ok(()) => written.push(i),
             Err(e) => {
                 admitted
                     .chunks
                     .retain(|c| c.absolute_index != chunk_info.absolute_index);
-                landed[i] = write_failed(state, chunk_info, e);
+                landed[i] = write_failed(state, chunk_info, e, epoch);
             }
         }
     }
@@ -5130,13 +5154,19 @@ impl Drop for Admitted<'_> {
     }
 }
 
-// A block whose write failed: fetched again, and the disk error handled.
-fn write_failed(state: &TorrentStateLive, chunk_info: &ChunkInfo, e: anyhow::Error) -> Landed {
+// A block whose write, made at `epoch`, failed: fetched again, and the
+// disk error handled.
+fn write_failed(
+    state: &TorrentStateLive,
+    chunk_info: &ChunkInfo,
+    e: anyhow::Error,
+    epoch: u64,
+) -> Landed {
     state
         .lock_write("write_failed")
         .get_pieces_mut()?
         .write_failed(chunk_info);
-    if state.handle_disk_error(&e) {
+    if state.handle_disk_error(&e, epoch) {
         return Ok(None);
     }
     error!(
@@ -5215,6 +5245,8 @@ fn settle_landed_piece(
             // A storage that held the piece in memory writes it whole
             // here; one that wrote its blocks as they came has nothing
             // left to write.
+            // Taken before the storage is asked, which may refuse it.
+            let epoch = state.upload_epoch();
             let written = {
                 let _call = from_memory.then(|| {
                     let call = stats.call(DiskOp::PieceWrite);
@@ -5229,7 +5261,7 @@ fn settle_landed_piece(
                     info_hash = ?state.shared.info_hash,
                     "the storage refused piece={index}: {e:#}"
                 );
-                state.handle_disk_error(&e);
+                state.handle_disk_error(&e, epoch);
                 state
                     .session_stats
                     .swarm
