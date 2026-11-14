@@ -83,6 +83,7 @@ impl GraphJob {
         .metered(storage.metrics);
         writer.restore_verifications(&snapshot.root.pending_verifications);
         writer.restore_members(&tree);
+        writer.note_recorded_holds(&tree, &snapshot.holds);
         for ((node, member), state) in &snapshot.files {
             if tree
                 .namespace(*node)
@@ -258,6 +259,7 @@ impl GraphJob {
             }
             refetched.push((volume, ordinal));
         }
+        self.writer.forget_recorded_holds();
         Ok(refetched)
     }
 
