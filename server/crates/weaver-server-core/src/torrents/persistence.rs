@@ -98,6 +98,37 @@ async fn insert_trackers(
     Ok(())
 }
 
+impl crate::persistence::DatabaseWriterExecutor {
+    // A torrent's job's history row, written in one transaction on the
+    // writer's path, which keeps it for want of room as it keeps an NZB
+    // job's archive. When the job `retires` the torrent leaves in the same
+    // write, as `delete_torrent` removes it: no reader finds the job in
+    // neither, so an event raised for it while it was live is still queued
+    // for it after. Otherwise the torrent stays and seeds on.
+    pub(crate) fn write_torrent_history(
+        &self,
+        entry: &JobHistoryRow,
+        retires: bool,
+    ) -> Result<(), StateError> {
+        let id = stored(entry.job_id)?;
+        let datastore = self.datastore();
+        let entry = entry.clone();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "write_torrent_history", |tx| {
+                let entry = entry.clone();
+                Box::pin(async move {
+                    crate::history::persistence::insert_job_history_tx(tx, &entry).await?;
+                    if retires {
+                        delete_torrent_tx(tx, id).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+}
+
 fn stored(value: u64) -> Result<i64, StateError> {
     i64::try_from(value)
         .map_err(|_| StateError::Database(format!("{value} exceeds the database range")))
@@ -549,33 +580,6 @@ impl Database {
             })
             .await
         })
-    }
-
-    // The torrent's job leaves the torrents for history in one write: its
-    // history row is written and the torrent removed as `delete_torrent`
-    // removes it. No reader finds the job in neither, so an event raised
-    // for it while it was live is still queued for it after.
-    pub fn retire_torrent(&self, entry: &JobHistoryRow) -> Result<(), StateError> {
-        let id = stored(entry.job_id)?;
-        let datastore = self.datastore();
-        let cache_entry = entry.clone();
-        let observed_generation = self.job_history_cache_generation();
-        let entry_in_tx = entry.clone();
-        let result = self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "retire_torrent", |tx| {
-                let entry = entry_in_tx.clone();
-                Box::pin(async move {
-                    crate::history::persistence::insert_job_history_tx(tx, &entry).await?;
-                    delete_torrent_tx(tx, id).await?;
-                    Ok(())
-                })
-            })
-            .await
-        });
-        if result.is_ok() {
-            self.cache_job_history_at(cache_entry, observed_generation);
-        }
-        result
     }
 
     // The torrent's category. Returns whether the torrent exists.

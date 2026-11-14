@@ -5361,21 +5361,57 @@ impl TorrentService {
         // Its history row and its removal are one write: the job is never
         // in neither, so an event raised while it was live, still being
         // queued, finds it.
-        if let Err(error) = self.inner.db.retire_torrent(&row) {
-            tracing::warn!(job_id = job_id.0, error = %error, "could not move a torrent to history");
-        }
-        self.finished(report).await;
+        self.write_history(row, true, report).await;
     }
 
     // A torrent's job, finished as `status`: into history and the queue's
     // finished jobs.
     async fn finish(&self, report: JobReport, status: &str, hash: Id20, now: i64) {
-        let job_id = report.job_id;
         let row = report.history_row(status, Some(hash.0.to_vec()), now);
-        if let Err(error) = self.inner.db.insert_job_history(&row) {
-            tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's history");
+        self.write_history(row, false, report).await;
+    }
+
+    // The job's history row goes through the database writer's archives,
+    // as an NZB job's does, with the torrent removed when it `retires`; then
+    // the job goes to the queue's finished jobs. A row the database's disk
+    // has no room for is kept there and written once its folder shows room;
+    // the job reaches the finished jobs then, and this does not wait for
+    // it. A row lost any other way is said, and the job goes on.
+    async fn write_history(&self, row: crate::history::JobHistoryRow, retires: bool, report: JobReport) {
+        let job_id = report.job_id;
+        let (mut written, kept) = match self.inner.db.queue_torrent_history(job_id, row, retires) {
+            Ok(both) => both,
+            Err(error) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's history");
+                return self.finished(report).await;
+            }
+        };
+        let landed = tokio::select! {
+            biased;
+            landed = &mut written => Some(landed.is_ok()),
+            held = kept => match held {
+                Ok(()) => None,
+                Err(_) => Some((&mut written).await.is_ok()),
+            },
+        };
+        match landed {
+            Some(landed) => {
+                if !landed {
+                    tracing::warn!(job_id = job_id.0, "could not record a torrent's history");
+                }
+                self.finished(report).await;
+            }
+            None => {
+                tracing::info!(job_id = job_id.0, "a torrent's history waits for room on the database's disk");
+                let service = self.clone();
+                tokio::spawn(async move {
+                    if written.await.is_err() {
+                        tracing::warn!(job_id = job_id.0, "could not record a torrent's history");
+                    }
+                    service.finished(report).await;
+                });
+            }
         }
-        self.finished(report).await;
     }
 
     // A torrent's job, its history row written: out to the queue's

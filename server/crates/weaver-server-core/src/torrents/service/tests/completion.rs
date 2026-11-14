@@ -132,3 +132,55 @@ fn a_whole_file_of_no_known_type_alone_fails_for_both_kinds() {
     assert_eq!(usenet_status(&files, WHY), failed);
     assert_eq!(torrent_status(&files, WHY), failed);
 }
+
+// A torrent removed while the database's disk has no room for its history
+// row is not lost: its row is kept by the owner that keeps an NZB job's
+// archive, the torrent's row with it, and the job reaches history once a
+// pass writes it, the torrent leaving the torrents in the same write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_history_row_the_disk_has_no_room_for_waits_and_is_written() {
+    use crate::persistence::ArchiveNews;
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (news, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    rig.db.hear_archive_news(move |said| {
+        let _ = news.send(said);
+    });
+    let files: [(&str, &[u8]); 1] = [("ember.mkv", &[0x5a_u8; 300])];
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(metainfo(
+            "ember", &files, 128, false,
+        ))))
+        .await
+        .unwrap();
+    let retired = rig.service.retired();
+    crate::persistence::connection::ARCHIVE_REFUSED
+        .lock()
+        .unwrap()
+        .push_back(crate::StateError::OutOfSpace(
+            "database or disk is full".into(),
+        ));
+    rig.service.remove(job_id, false, false).await.unwrap();
+    assert_eq!(heard.recv().await, Some(ArchiveNews::Kept(job_id)));
+    assert_eq!(rig.db.kept_archive_jobs(), [job_id]);
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+    assert!(rig.db.get_torrent(job_id).unwrap().is_some(), "kept with it");
+    assert_eq!(*retired.borrow(), 0, "not yet in history");
+
+    let mut retired = retired;
+    rig.db.retry_kept_archives(0);
+    assert_eq!(
+        heard.recv().await,
+        Some(ArchiveNews::LetGo {
+            job_id,
+            written: true
+        })
+    );
+    retired.wait_for(|retired| *retired >= 1).await.unwrap();
+    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert_eq!(history.status, "cancelled");
+    assert!(rig.db.get_torrent(job_id).unwrap().is_none());
+    assert!(rig.db.kept_archive_jobs().is_empty());
+    rig.service.stop().await;
+}

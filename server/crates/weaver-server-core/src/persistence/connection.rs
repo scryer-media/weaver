@@ -806,6 +806,16 @@ enum DbWriteCommand {
         failure_kind: Option<crate::history::HistoryFailureKind>,
         committed: oneshot::Sender<BTreeMap<crate::jobs::ids::JobId, String>>,
     },
+    // A torrent's job's history row, kept and tried again for want of room
+    // as an NZB job's archive is. `retires` removes the torrent in the same
+    // transaction. `kept` fires if the row is kept to be tried again.
+    ArchiveTorrent {
+        job_id: crate::jobs::ids::JobId,
+        history: Box<crate::history::JobHistoryRow>,
+        retires: bool,
+        committed: oneshot::Sender<()>,
+        kept: oneshot::Sender<()>,
+    },
     InsertJobEvents {
         events: Vec<crate::history::JobEvent>,
     },
@@ -856,6 +866,15 @@ struct KeptArchive {
     typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
     failure_kind: Option<crate::history::HistoryFailureKind>,
     committed: Option<oneshot::Sender<()>>,
+    of: ArchiveOf,
+}
+
+// What an archive writes: an NZB job's move out of the active tables, or a
+// torrent's job's history row, with the torrent removed when it `retires`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArchiveOf {
+    ActiveJob,
+    Torrent { retires: bool },
 }
 
 // What the writer says of the archives it keeps, one job at a time, so
@@ -940,12 +959,18 @@ pub(crate) static ARCHIVE_PASS_PANICS: std::sync::atomic::AtomicBool =
 // kept in one line.
 fn archive_one(
     writer: &DatabaseWriterExecutor,
-    job_id: crate::jobs::ids::JobId,
-    history: &crate::history::JobHistoryRow,
-    typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
-    failure_kind: Option<crate::history::HistoryFailureKind>,
+    archive: &KeptArchive,
     retry: bool,
 ) -> Result<(), StateError> {
+    let KeptArchive {
+        job_id,
+        history,
+        typed_terminal_cause,
+        failure_kind,
+        of,
+        ..
+    } = archive;
+    let job_id = *job_id;
     #[cfg(test)]
     if let Some(refused) = ARCHIVE_REFUSED.lock().unwrap().pop_front() {
         return Err(refused);
@@ -954,8 +979,18 @@ fn archive_one(
     // history-delete that bumps the generation makes the conditional insert
     // a no-op, rather than resurrecting the just-deleted row.
     let observed_generation = writer.job_history_cache_generation();
-    let archived = writer
-        .archive_job_with_terminal_cause(job_id, history, typed_terminal_cause, failure_kind)
+    let archived = match *of {
+        ArchiveOf::ActiveJob => writer.archive_job_with_terminal_cause(
+            job_id,
+            history,
+            *typed_terminal_cause,
+            *failure_kind,
+        ),
+        ArchiveOf::Torrent { retires } => writer
+            .write_torrent_history(history, retires)
+            .map(|()| Some((**history).clone())),
+    };
+    let archived = archived
         .inspect_err(|error| {
             if retry && matches!(error, StateError::OutOfSpace(_)) {
                 tracing::debug!(
@@ -1004,6 +1039,12 @@ impl DbWriteCommand {
             // every earlier attribution checkpoint, since the archive copies
             // the job's attribution into history.
             Self::ArchiveJob { job_id, .. } => Some((
+                &[WriteLane::Events, WriteLane::ServerAttribution],
+                WriteLane::Job(job_id.0),
+            )),
+            // As an NZB job's archive: its job's events and attribution
+            // land first.
+            Self::ArchiveTorrent { job_id, .. } => Some((
                 &[WriteLane::Events, WriteLane::ServerAttribution],
                 WriteLane::Job(job_id.0),
             )),
@@ -1070,6 +1111,7 @@ async fn execute_write_command(
                     typed_terminal_cause,
                     failure_kind,
                     committed,
+                    of: ArchiveOf::ActiveJob,
                 };
                 archive_kept(&blocking, &failures, &mut archive, false)
                     .err()
@@ -1088,6 +1130,58 @@ async fn execute_write_command(
                 let job_id = archive.job_id;
                 writer_db.kept_archives.list().push_back(archive);
                 writer_db.kept_archives.tell(ArchiveNews::Kept(job_id));
+            }
+        }
+        DbWriteCommand::ArchiveTorrent {
+            job_id,
+            history,
+            retires,
+            committed,
+            kept,
+        } => {
+            // A newer row for the torrent's job takes the place of one kept:
+            // the kept one is let go unwritten, so it is never written over
+            // the newer one when room comes.
+            let superseded: VecDeque<KeptArchive> = {
+                let mut list = writer_db.kept_archives.list();
+                let (gone, stay) = std::mem::take(&mut *list).into_iter().partition(|archive| {
+                    archive.job_id == job_id && matches!(archive.of, ArchiveOf::Torrent { .. })
+                });
+                *list = stay;
+                gone
+            };
+            for archive in superseded {
+                writer_db.kept_archives.tell(ArchiveNews::LetGo {
+                    job_id: archive.job_id,
+                    written: false,
+                });
+            }
+            let blocking = writer.clone();
+            let failures = Arc::clone(&writer_db.checkpoint_failures);
+            let refused = tokio::task::spawn_blocking(move || {
+                let mut archive = KeptArchive {
+                    job_id,
+                    history,
+                    typed_terminal_cause: None,
+                    failure_kind: None,
+                    committed: Some(committed),
+                    of: ArchiveOf::Torrent { retires },
+                };
+                archive_kept(&blocking, &failures, &mut archive, false)
+                    .err()
+                    .map(|error| (archive, error))
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some((archive, error)) = refused
+                && keeps_archive(&writer_db.target, &error)
+            {
+                // Told before its waiter hears it is kept, so whoever counts
+                // the kept archives has counted it by then.
+                writer_db.kept_archives.list().push_back(archive);
+                writer_db.kept_archives.tell(ArchiveNews::Kept(job_id));
+                let _ = kept.send(());
             }
         }
         DbWriteCommand::RetryKeptArchives { from } => {
@@ -1217,14 +1311,7 @@ fn archive_kept(
     archive: &mut KeptArchive,
     retry: bool,
 ) -> Result<(), StateError> {
-    archive_one(
-        writer,
-        archive.job_id,
-        &archive.history,
-        archive.typed_terminal_cause,
-        archive.failure_kind,
-        retry,
-    )?;
+    archive_one(writer, archive, retry)?;
     // An archived job no longer needs its cancelled checkpoint. Keep the
     // failure until this transaction actually succeeds.
     failures.send_modify(|failures| {
@@ -1447,6 +1534,7 @@ impl DbWriteCommand {
     fn label(&self) -> &'static str {
         match self {
             Self::ArchiveJob { .. } => "archive_job",
+            Self::ArchiveTorrent { .. } => "archive_torrent",
             Self::ArchiveJobs { .. } => "archive_jobs",
             Self::InsertJobEvents { .. } => "insert_job_events",
             Self::Write { label, .. } => label,
@@ -1962,6 +2050,32 @@ impl Database {
             "archive",
         )?;
         Ok(committed_rx)
+    }
+
+    // Queue a torrent's job's history row through the writer's archives:
+    // written in its turn, or, refused for want of room, kept and tried
+    // again as an NZB job's archive is. `retires` removes the torrent in the
+    // same transaction. The first receiver fires once the row is written;
+    // the second once it is kept. A row lost any other way drops both.
+    pub(crate) fn queue_torrent_history(
+        &self,
+        job_id: crate::jobs::ids::JobId,
+        history: crate::history::JobHistoryRow,
+        retires: bool,
+    ) -> Result<(oneshot::Receiver<()>, oneshot::Receiver<()>), StateError> {
+        let (committed, written) = oneshot::channel();
+        let (kept, held) = oneshot::channel();
+        self.try_send_with_retry(
+            DbWriteCommand::ArchiveTorrent {
+                job_id,
+                history: Box::new(history),
+                retires,
+                committed,
+                kept,
+            },
+            "archive",
+        )?;
+        Ok((written, held))
     }
 
     // Name the one listener the writer tells of the archives it keeps. It is
