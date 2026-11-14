@@ -12,17 +12,33 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // downloadThenInterrupt stops a single-file download once its checkpoint covers
 // at least `floor` bytes, and returns the job and the ids served before the
-// stop.
-func (ctx *restartCaseContext) downloadThenInterrupt(slug string, floor uint64, extraEnv ...string) (int, restartNntpMetrics, error) {
-	if err := ctx.startWeaverWithOptions("", 8, extraEnv...); err != nil {
+// stop. The news server lets through the bodies that cover `floor` and
+// `slack` more, whichever of them come first, and then holds every body, so
+// the stop comes with the rest of the file still to fetch whatever the
+// machine's speed.
+func (ctx *restartCaseContext) downloadThenInterrupt(slug string, floor, slack uint64, extraEnv ...string) (int, restartNntpMetrics, error) {
+	segments, err := nzbSegments(slug)
+	if err != nil {
 		return 0, restartNntpMetrics{}, err
 	}
-	if err := setNntpChaos("slow_body=1"); err != nil {
+	shapes, err := segmentArticleShapes(nntpHost(), nntpPort(), segments)
+	if err != nil {
+		return 0, restartNntpMetrics{}, err
+	}
+	ids := segmentIDs(segments)
+	need, err := bodiesCovering(shapes, ids, floor+slack)
+	if err != nil {
+		return 0, restartNntpMetrics{}, err
+	}
+	const connections = 8
+	if err := ctx.startWeaverWithOptions("", connections, extraEnv...); err != nil {
+		return 0, restartNntpMetrics{}, err
+	}
+	if _, err := holdAfterBodies(shapes, ids, need, connections); err != nil {
 		return 0, restartNntpMetrics{}, err
 	}
 	jobID, err := ctx.submitSlug(slug)
@@ -30,27 +46,21 @@ func (ctx *restartCaseContext) downloadThenInterrupt(slug string, floor uint64, 
 		return 0, restartNntpMetrics{}, err
 	}
 	dbPath := caseDBPath(ctx)
-	deadline := time.Now().Add(ctx.Timeout)
-	reached := false
-	for time.Now().Before(deadline) && !reached {
-		if status, ok := restartJobStatusFromDB(dbPath, jobID); ok && dbStatusTerminal(normalizeDBStatus(status)) {
-			return 0, restartNntpMetrics{}, fmt.Errorf("job %d ended before its checkpoint covered %d bytes", jobID, floor)
+	if err := ctx.pollJob(fmt.Sprintf("a checkpoint covering %d bytes", floor), dbPath, jobID, func() (bool, error) {
+		rows, err := readJobFileCoverage(dbPath, jobID)
+		if err != nil {
+			return false, nil
 		}
-		if rows, err := readJobFileCoverage(dbPath, jobID); err == nil {
-			for _, row := range rows {
-				if row.Coverage.CoveredBytes() >= floor {
-					reached = true
-				}
+		for _, row := range rows {
+			if row.Coverage.CoveredBytes() >= floor {
+				return true, nil
 			}
 		}
-		if !reached {
-			time.Sleep(chaosPollInterval)
-		}
+		return false, nil
+	}); err != nil {
+		return 0, restartNntpMetrics{}, err
 	}
-	if !reached {
-		return 0, restartNntpMetrics{}, fmt.Errorf("job %d never covered %d bytes", jobID, floor)
-	}
-	if err := ctx.interruptWeaverAndWaitForExit(); err != nil {
+	if err := ctx.interruptHeldWeaverAndWaitForExit(liftPrimaryHold); err != nil {
 		return 0, restartNntpMetrics{}, err
 	}
 	_ = setNntpChaos("off")
@@ -67,7 +77,7 @@ func runPre65CheckpointRowRefused(ctx *restartCaseContext) (restartCaseResult, e
 	const slug = "single-mkv"
 	const checkpointBytes = 4 * 1024 * 1024
 	checkpointEnv := fmt.Sprintf("WEAVER_E2E_DOWNLOAD_RESTART_CHECKPOINT_BYTES=%d", checkpointBytes)
-	jobID, pre, err := ctx.downloadThenInterrupt(slug, 4*checkpointBytes, checkpointEnv)
+	jobID, pre, err := ctx.downloadThenInterrupt(slug, 4*checkpointBytes, 2*checkpointBytes, checkpointEnv)
 	if err != nil {
 		return classifyRestartResult(ctx.Profile, false, "", false, "", err.Error()), nil
 	}
@@ -258,20 +268,24 @@ func runPoisonExtentDoesNotSpread(ctx *restartCaseContext) (restartCaseResult, e
 	if err := ctx.startWeaverWithOptions("", 8); err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := setNntpChaos("slow_body=1"); err != nil {
+	ids := segmentIDs(inFile)
+	// The file's later articles are held at the news server, so the stop
+	// comes mid-file whatever the machine's speed: the first half, the
+	// poisoned article and its neighbours among it, comes through.
+	held := ids[len(ids)/2+1:]
+	if err := setNntpChaosOnServer(nntpHost(), nntpPort(), "hold_ids="+strings.Join(held, ";")); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug(slug)
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	ids := segmentIDs(inFile)
 	if _, started, err := ctx.waitForBodies(jobID, ids, len(ids)/2); err != nil {
 		return restartCaseResult{}, err
 	} else if !started {
 		return classifyRestartResult(ctx.Profile, false, "", false, "", "the job ended before the mid-file stop"), nil
 	}
-	if err := ctx.interruptWeaverAndWaitForExit(); err != nil {
+	if err := ctx.interruptHeldWeaverAndWaitForExit(liftPrimaryHold); err != nil {
 		return restartCaseResult{}, err
 	}
 	_ = setNntpChaos("off")

@@ -98,6 +98,11 @@ pub struct NntpPool {
     // The health tracker's availability, read without its lock.
     availability: Arc<crate::health::AvailabilityBoard>,
     recovery_gates: Vec<Arc<crate::recovery::RecoveryGate>>,
+    // Each server's login identity, as a fingerprint, and configured
+    // backfill flag, as this pool was built; see [`NntpPool::activated`].
+    setups: Vec<(u64, bool)>,
+    // `HealthConfig::auth_give_up_after`, for the line said at the verdict.
+    login_refusal_give_up: Duration,
     // Bumped by every change to any of `recovery_gates`; see
     // [`NntpPool::server_health_changes`].
     health_changed: Arc<tokio::sync::watch::Sender<u64>>,
@@ -411,6 +416,11 @@ impl ServerHealthChanges {
     }
 }
 
+// Fill servers' verdicts of login refusal found untold; see
+// [`NntpPool::login_refusal_verdicts_untold`].
+#[derive(Debug)]
+pub struct UntoldLoginVerdicts(Vec<(usize, crate::recovery::UntoldVerdict)>);
+
 // A recovery probe held out on a server, for tests. Answering it lifts the
 // quarantine; dropping it unanswered gives the probe back.
 #[cfg(any(test, feature = "test-support"))]
@@ -543,6 +553,7 @@ impl NntpPool {
         }
 
         let auth_cooldown = config.health_config.auth_disable_duration;
+        let login_refusal_give_up = config.health_config.auth_give_up_after;
         let mut health =
             HealthTracker::new_with_backfill(server_count, config.health_config, backfill.clone());
         for (idx, control) in transfer_controls.iter().enumerate() {
@@ -550,12 +561,30 @@ impl NntpPool {
                 health.set_recovery_gate(idx, Arc::clone(&control.recovery));
             }
         }
+        // Each server as this pool was built: its login identity, as a
+        // fingerprint, and its configured role.
+        let setups: Vec<(u64, bool)> = config
+            .servers
+            .iter()
+            .map(|spc| {
+                (
+                    crate::transfer::ServerTransferControl::login_fingerprint(
+                        &spc.server.host,
+                        spc.server.port,
+                        spc.server.username.as_deref(),
+                        spc.server.password.as_deref(),
+                    ),
+                    spc.backfill,
+                )
+            })
+            .collect();
         let recovery_gates: Vec<_> = (0..server_count)
             .map(|idx| Arc::clone(&health.server(idx).recovery))
             .collect();
         let health_changed = Arc::new(tokio::sync::watch::channel(0).0);
-        for gate in &recovery_gates {
+        for (gate, (identity, backfill)) in recovery_gates.iter().zip(&setups) {
             gate.add_listener(Arc::downgrade(&health_changed));
+            gate.built(*identity, *backfill);
         }
         let availability = health.availability();
         let health = Arc::new(Mutex::new(health));
@@ -577,6 +606,8 @@ impl NntpPool {
             health,
             availability,
             recovery_gates,
+            setups,
+            login_refusal_give_up,
             health_changed,
             last_connect_failure,
             reconnect_delay: config.reconnect_delay,
@@ -1724,17 +1755,127 @@ impl NntpPool {
     }
 
     // Whether this server refuses this pool's credentials: health disabled it
-    // for `DisableReason::AuthFailure` and that disable still runs. This is
-    // the one answer to "may this server serve an article" beyond the
+    // for `DisableReason::AuthFailure`, that disable still runs, and the
+    // server has refused the login for `HealthConfig::auth_give_up_after`
+    // with no login taken and no change of its login identity or
+    // configured role between ([`Self::activated`]). This
+    // is the one answer to "may this server serve an article" beyond the
     // article's own exclusions and its job's retention: a refusing server
     // serves nothing, so the work it alone could serve is unservable, not
-    // waiting. Every other quarantine (transport, capacity, an outage) is a
-    // wait. Lock-free on a healthy server; reads the recovery gate, which
-    // holds the same deadline the health state does.
+    // waiting. Before the give-up time the
+    // refusal is a wait, as every other quarantine (transport, capacity, an
+    // outage) is. A backfill server's refusal is the answer at once: it never
+    // holds work back. Lock-free on a healthy server; reads the recovery
+    // gate, which holds the same deadline the health state does.
     pub fn refuses_credentials(&self, idx: usize) -> bool {
         self.recovery_gates
             .get(idx)
-            .is_some_and(|gate| gate.refuses_credentials())
+            .is_some_and(|gate| gate.refuses_credentials(self.is_backfill(idx)))
+    }
+
+    // The fill servers whose run of login refusals is still a wait (see
+    // [`Self::refuses_credentials`]): quarantined, of any kind, inside a run
+    // not yet its give-up time old. Empty in the common case; reads one
+    // atomic per server that is not quarantined.
+    pub fn login_refusal_waits(&self) -> crate::ServerSet {
+        self.recovery_gates
+            .iter()
+            .enumerate()
+            .filter(|(idx, gate)| {
+                !self.is_backfill(*idx) && gate.login_refusal_wait_ends().is_some()
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    // This pool is now the one in use. A server whose login identity (host,
+    // port, username, password) or configured role (backfill or fill) is
+    // other than the last pool's ends its run of login refusals, and its
+    // quarantine's probe is due at once. Called once, where the pool is
+    // put in use: a pool built and then dropped, because the rebuild
+    // failed, changes nothing, and the pool still in use while this one
+    // was being built could not spend a probe meant for this one.
+    pub fn activated(&self) {
+        for (gate, (identity, backfill)) in self.recovery_gates.iter().zip(&self.setups) {
+            gate.activated(*identity, *backfill);
+        }
+    }
+
+    // The earliest instant a fill server's run of login refusals is to be
+    // looked at: when it becomes a verdict, the one change to what a server
+    // may serve that no connection outcome announces, or, already past,
+    // when it became one nobody has been told of while the server refuses
+    // now. A caller waits for it, then weighs the waiting work between
+    // [`Self::login_refusal_verdicts_untold`] and
+    // [`Self::mark_login_refusal_verdicts_told`]. None in the common case,
+    // at one atomic read per server that is not quarantined.
+    pub fn next_login_refusal_verdict(&self) -> Option<Instant> {
+        self.recovery_gates
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !self.is_backfill(*idx))
+            .filter_map(|(_, gate)| gate.login_refusal_verdict_due())
+            .min()
+    }
+
+    // The fill servers whose run of login refusals has lasted its give-up
+    // time, untold, and that refuse the login now. None in the common case.
+    // The caller weighs the work that waited on them and then marks the
+    // verdicts told.
+    pub fn login_refusal_verdicts_untold(&self) -> Option<UntoldLoginVerdicts> {
+        let untold: Vec<_> = self
+            .recovery_gates
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !self.is_backfill(*idx))
+            .filter_map(|(idx, gate)| Some((idx, gate.login_refusal_verdict_untold()?)))
+            .collect();
+        (!untold.is_empty()).then_some(UntoldLoginVerdicts(untold))
+    }
+
+    // Marks told, and says the give-up line once for, every verdict of
+    // `untold` whose server has refused the login without a break since it
+    // was found: the work weighed in between was weighed against a server
+    // that refused. Any other stays untold and is found again. Every
+    // watcher of the server's health hears the change. Says whether any
+    // was marked.
+    pub fn mark_login_refusal_verdicts_told(&self, untold: &UntoldLoginVerdicts) -> bool {
+        let mut told = false;
+        for (idx, verdict) in &untold.0 {
+            if self.recovery_gates[*idx].mark_login_refusal_verdict_told(*verdict) {
+                crate::health::warn_login_refusal_gave_up(*idx, self.login_refusal_give_up);
+                told = true;
+            }
+        }
+        told
+    }
+
+    // Server `idx` fails on transport and is quarantined for it, as an
+    // outage quarantines it, whatever it was quarantined for before.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn quarantine_for_transport_for_test(&self, idx: usize) {
+        self.recovery_gates[idx].quarantine(Duration::from_mins(5), None);
+    }
+
+    // Server `idx` refuses the login and is quarantined for it afresh,
+    // whatever it was quarantined for before: the run of refusals goes on,
+    // or begins and becomes the verdict after `give_up`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn refuse_login_for_test(&self, idx: usize, give_up: Duration) {
+        self.recovery_gates[idx].quarantine_for_credentials(Duration::from_mins(5), give_up, None);
+    }
+
+    // Server `idx`'s quarantine reaches its deadline now: its probe is due.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn expire_quarantine_for_test(&self, idx: usize) {
+        self.recovery_gates[idx].expire_now();
+    }
+
+    // Read server `idx`'s run of login refusals against `now` instead of
+    // the clock.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_login_refusal_clock(&self, idx: usize, now: Instant) {
+        self.recovery_gates[idx].set_refusal_clock(now);
     }
 
     // Access the health tracker for observability.

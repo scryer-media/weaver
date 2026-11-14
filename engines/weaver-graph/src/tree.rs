@@ -48,6 +48,28 @@ pub const AGAIN_PIECE: u64 = 1 << 20;
 // What objects parsed of the members they gave back, by namespace and member.
 type Given = BTreeMap<(NodeId, MemberId), Carried>;
 
+// How many members given back a removed node's forgetting read, for the
+// tests that count it.
+#[cfg(test)]
+thread_local! {
+    static GIVEN_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// Every member of `node` given back goes. The node's own range of the map is
+// read, never every member given back, so removing many nodes costs each
+// node its own members.
+fn forget_given<V>(given: &mut BTreeMap<(NodeId, MemberId), V>, node: NodeId) {
+    let members: Vec<(NodeId, MemberId)> = given
+        .range((node, MemberId(0))..=(node, MemberId(u32::MAX)))
+        .map(|(at, _)| *at)
+        .collect();
+    #[cfg(test)]
+    GIVEN_READ.with(|read| read.set(read.get() + members.len()));
+    for at in members {
+        given.remove(&at);
+    }
+}
+
 // How many members a changed front looked at, for the tests that count it.
 #[cfg(test)]
 thread_local! {
@@ -2233,7 +2255,7 @@ impl Tree {
     // moved into its namespace is homed where it was posted again.
     fn remove_node(&mut self, node: NodeId, effects: &mut Vec<Effect>) -> Option<Node> {
         let removed = self.nodes.remove(&node)?;
-        self.given.retain(|(at, _), _| *at != node);
+        forget_given(&mut self.given, node);
         for record in removed.namespace.members() {
             self.release_name((node, record.id), effects);
         }
@@ -5224,6 +5246,37 @@ mod tests {
     const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";
     const HEADER: u64 = 7;
     const VOLUME_LEN: u64 = 100;
+
+    // Over seeded maps of members given back across many nodes, forgetting
+    // a node leaves what a scan of every member keeping the others would,
+    // and reads only that node's members.
+    #[test]
+    fn a_removed_node_forgets_its_members_given_back_alone() {
+        for seed in [1u64, 7, 42, 0x9e37_79b9_7f4a_7c15] {
+            let mut draw = seed;
+            let mut next = |bound: u32| {
+                draw ^= draw << 13;
+                draw ^= draw >> 7;
+                draw ^= draw << 17;
+                (draw % u64::from(bound)) as u32
+            };
+            let mut given = BTreeMap::new();
+            for _ in 0..2_000 {
+                let at = (NodeId(next(64)), MemberId(next(u32::MAX)));
+                given.insert(at, next(1_000));
+            }
+            for node in [0, u32::MAX].into_iter().chain((0..64).map(|_| next(66))) {
+                let node = NodeId(node);
+                let mut scanned = given.clone();
+                scanned.retain(|(at, _), _| *at != node);
+                let own = given.len() - scanned.len();
+                let before = GIVEN_READ.with(std::cell::Cell::get);
+                forget_given(&mut given, node);
+                assert_eq!(given, scanned, "seed {seed} node {node:?}");
+                assert_eq!(GIVEN_READ.with(std::cell::Cell::get) - before, own);
+            }
+        }
+    }
 
     // The root's `copy` folded into `into`, whatever it brought before.
     fn folded(effects: &[Effect], copy: MemberId, into: MemberId) -> bool {

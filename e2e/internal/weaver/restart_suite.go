@@ -34,9 +34,11 @@ const (
 
 const (
 	// An archive's engine still producing members once every volume it reads
-	// is in: the job is extracting, so it cannot terminalize.
-	restartExtractDelayEnv = "WEAVER_E2E_DELAY=status.enter_extracting=20000"
-	restartPar2AliasSet    = "a31f592e0b874d3ea8c44161b77f3049"
+	// is in: the first job to enter extraction parks there until the process
+	// stops, so it is extracting, cannot terminalize, and the job behind it
+	// queues for the extraction.
+	restartExtractHoldEnv = "WEAVER_E2E_HOLD=status.enter_extracting"
+	restartPar2AliasSet   = "a31f592e0b874d3ea8c44161b77f3049"
 )
 
 type restartClassification string
@@ -1474,7 +1476,7 @@ func jobArchived(dbPath string, jobID int) (bool, error) {
 // never resolves.
 func waitForJobArchived(dbPath string, jobID int) error {
 	return awaitJobArchived(func() (bool, error) { return jobArchived(dbPath, jobID) }, func() {
-		time.Sleep(2 * time.Second)
+		time.Sleep(250 * time.Millisecond)
 	})
 }
 
@@ -1928,7 +1930,7 @@ func (ctx *restartCaseContext) waitForAllTerminal(jobIDs []int, timeout time.Dur
 		if complete {
 			return statuses, nil
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(250 * time.Millisecond)
 	}
 	return statuses, fmt.Errorf("timeout waiting for terminal status for jobs %v", jobIDs)
 }
@@ -2575,7 +2577,7 @@ func runQueuedRepairSurvivesAndKeepsPlace(ctx *restartCaseContext) (restartCaseR
 }
 
 func runQueuedExtractSurvivesAndKeepsPlace(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv); err != nil {
+	if err := ctx.startWeaverWithOptions("", 8, restartExtractHoldEnv); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobIDs, err := ctx.submitSlugNTimes("rar5-multi-member", 2)
@@ -2594,7 +2596,9 @@ func runQueuedExtractSurvivesAndKeepsPlace(ctx *restartCaseContext) (restartCase
 		return restartCaseResult{}, err
 	}
 
-	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv); err != nil {
+	// The restarted process holds nothing: what is under test is that both
+	// jobs come back from their durable files and complete.
+	if err := ctx.startWeaverWithOptions("", 8); err != nil {
 		return restartCaseResult{}, err
 	}
 	postDB, err := ctx.waitForDB(2*time.Minute, func(snapshot restartDBSnapshot) bool {

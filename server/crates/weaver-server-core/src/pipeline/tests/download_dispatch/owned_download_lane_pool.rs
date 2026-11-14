@@ -1188,6 +1188,7 @@ async fn generation_wake_requeues_ten_thousand_segments_in_one_batch() {
             reason: "no eligible NNTP server",
             retry_at_epoch_ms: None,
             pending_count: RETRY_COUNT,
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
         },
     );
 
@@ -1384,6 +1385,7 @@ async fn stale_generation_success_does_not_update_new_lane_health() {
             batch_clean: true,
             unresolved_count: 0,
             connection_discarded: false,
+            answered_pipelined: false,
         }),
         source_server_idx: Some(0),
         origin: DownloadResultOrigin::NormalPrimary,
@@ -3555,6 +3557,7 @@ fn unclean_batch_result(job_id: JobId, segment_number: u32) -> DownloadResult {
             batch_clean: false,
             unresolved_count: 1,
             connection_discarded: true,
+            answered_pipelined: true,
         }),
         source_server_idx: Some(0),
         origin: DownloadResultOrigin::NormalPrimary,
@@ -3668,6 +3671,201 @@ async fn a_batch_cut_short_by_cancellation_is_not_an_unclean_batch() {
             .load(Ordering::Relaxed),
         1
     );
+}
+
+// A server whose pin has lapsed into its trial, with a job to fetch for.
+async fn pipeline_on_a_pin_trial(temp_dir: &tempfile::TempDir, job_id: JobId) -> Pipeline {
+    let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        segmented_job_spec("Pin Trial", "payload.bin", &[64; 16]),
+    )
+    .await;
+    pipeline.download_lane_runtime.servers.insert(
+        0,
+        crate::pipeline::download::transport::ServerPipelineExplorer::on_a_lapsed_pin_trial(
+            std::time::Instant::now(),
+        ),
+    );
+    pipeline
+}
+
+// (on trial, the lane running it, the server's depth, pinned).
+fn pin_trial_state(pipeline: &Pipeline) -> (bool, Option<u64>, u8, bool) {
+    let explorer = pipeline.download_lane_runtime.servers.get(&0).unwrap();
+    (
+        explorer.on_pin_trial(),
+        explorer.pin_trial_lane(),
+        explorer.current_depth(),
+        explorer.pinned_sequential(),
+    )
+}
+
+// What the health view shows for server 0: (depth, pinned).
+fn shown_pin(pipeline: &Pipeline) -> (u32, bool) {
+    pipeline.publish_download_transport_health();
+    let shown = pipeline.shared_state.download_transport_health();
+    let entry = shown.iter().find(|entry| entry.server_idx == 0).unwrap();
+    (entry.pipeline_depth, entry.pinned_sequential)
+}
+
+// A complete depth-2 batch from lane 0 that closed clean. `pipelined`: the
+// server answered on it with a later request already on the wire.
+fn clean_batch_result(job_id: JobId, segment_number: u32, pipelined: bool) -> DownloadResult {
+    let mut result = unclean_batch_result(job_id, segment_number);
+    result.data = Ok(DownloadPayload::Raw(Bytes::from_static(b"article")));
+    let observation = result.lane_observation.as_mut().unwrap();
+    observation.payload_bytes = 7;
+    observation.policy_elapsed = Duration::from_millis(25);
+    observation.answered_pipelined = pipelined;
+    observation.batch_clean = true;
+    observation.unresolved_count = 0;
+    observation.connection_discarded = false;
+    result
+}
+
+// The trial a lapsed pin gets runs on one lane: the first lane to ask is
+// handed depth 2 and every other lane stays sequential. A clean batch from
+// that lane counts toward lifting the pin only when the server answered on
+// it with a later request already on the wire. A starved lane closes depth-2
+// windows with one request on the wire at a time; that is sequential
+// fetching and proves nothing about pipelining to the server. A clean trial
+// lifts the pin for every lane.
+#[tokio::test]
+async fn a_pin_trial_runs_on_one_lane_and_counts_only_batches_that_really_pipelined() {
+    use crate::pipeline::download::transport::PIN_TRIAL_CLEAN_BATCHES;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(20033);
+    let mut pipeline = pipeline_on_a_pin_trial(&temp_dir, job_id).await;
+    let pressure = pipeline.refresh_download_pressure();
+    assert_eq!(pin_trial_state(&pipeline), (true, None, 1, false));
+
+    // Lane 0 holds work, asks first and takes the trial. Lanes 9 and 10 are
+    // handed sequential, and so is any caller that names no lane.
+    let mut segment = 0;
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, segment)]);
+    assert_eq!(
+        pipeline.download_lane_mode_for_lane(0, pressure, true, 0),
+        DownloadLaneMode::Pipelined { depth: 2 }
+    );
+    for lane in [9, 10] {
+        assert_eq!(
+            pipeline.download_lane_mode_for_lane(0, pressure, true, lane),
+            DownloadLaneMode::Sequential,
+            "lane {lane}"
+        );
+    }
+    assert_eq!(
+        pipeline.download_lane_mode_for_server(0, pressure, true),
+        DownloadLaneMode::Sequential
+    );
+    assert_eq!(pin_trial_state(&pipeline), (true, Some(0), 1, false));
+    // The pin shows until the trial lifts it.
+    assert_eq!(shown_pin(&pipeline), (1, true));
+
+    let mut release_clean = |pipeline: &mut Pipeline, pipelined: bool| {
+        hold_on_test_lane(pipeline, &[held_segment(job_id, 0, segment)]);
+        pipeline.release_download_result(&clean_batch_result(job_id, segment, pipelined));
+        segment += 1;
+    };
+
+    // More starved batches than a trial needs: none counts.
+    for _ in 0..PIN_TRIAL_CLEAN_BATCHES + 2 {
+        release_clean(&mut pipeline, false);
+    }
+    assert_eq!(pin_trial_state(&pipeline), (true, Some(0), 1, false));
+
+    // Batches that really pipelined do, and the last one lifts the pin.
+    for _ in 0..PIN_TRIAL_CLEAN_BATCHES - 1 {
+        release_clean(&mut pipeline, true);
+    }
+    assert_eq!(pin_trial_state(&pipeline), (true, Some(0), 1, false));
+    release_clean(&mut pipeline, true);
+    assert_eq!(pin_trial_state(&pipeline), (false, None, 2, false));
+    assert_eq!(shown_pin(&pipeline), (2, false));
+    for lane in [0, 9, 10] {
+        assert_eq!(
+            pipeline.download_lane_mode_for_lane(0, pressure, true, lane),
+            DownloadLaneMode::Pipelined { depth: 2 },
+            "lane {lane}"
+        );
+    }
+}
+
+// The trial is not lost with its lane: once the lane that ran it has given
+// up its connection, the next lane to ask takes the trial over. An unclean
+// batch from the trial lane pins the server again; it is the one lane that
+// was pipelining, so it is the one connection lost.
+#[tokio::test]
+async fn a_pin_trial_moves_when_its_lane_goes_and_an_unclean_one_pins_again() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(20034);
+    let mut pipeline = pipeline_on_a_pin_trial(&temp_dir, job_id).await;
+    let pressure = pipeline.refresh_download_pressure();
+
+    // Lane 9 never came to be: it asked, and no lease followed. Lane 0
+    // takes the trial from it.
+    assert_eq!(
+        pipeline.download_lane_mode_for_lane(0, pressure, true, 9),
+        DownloadLaneMode::Pipelined { depth: 2 }
+    );
+    assert_eq!(pin_trial_state(&pipeline), (true, Some(9), 1, false));
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
+    assert_eq!(
+        pipeline.download_lane_mode_for_lane(0, pressure, true, 0),
+        DownloadLaneMode::Pipelined { depth: 2 }
+    );
+    assert_eq!(pin_trial_state(&pipeline), (true, Some(0), 1, false));
+    assert_eq!(
+        pipeline.download_lane_mode_for_lane(0, pressure, true, 9),
+        DownloadLaneMode::Sequential
+    );
+
+    // Lane 0 answers its article and gives up its connection: it is gone,
+    // and lane 9 takes the trial over.
+    pipeline.active_download_connections = 1;
+    let mut last = clean_batch_result(job_id, 0, true);
+    last.release_connection_slot = true;
+    pipeline.release_download_result(&last);
+    assert!(!pipeline.download_lane_owners.contains_key(&0));
+    assert_eq!(pin_trial_state(&pipeline), (true, Some(0), 1, false));
+    assert_eq!(
+        pipeline.download_lane_mode_for_lane(0, pressure, true, 9),
+        DownloadLaneMode::Pipelined { depth: 2 }
+    );
+    assert_eq!(pin_trial_state(&pipeline), (true, Some(9), 1, false));
+
+    // An unclean batch from a lane that is not running the trial changes
+    // nothing.
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 1)]);
+    pipeline.release_download_result(&unclean_batch_result(job_id, 1));
+    assert_eq!(pin_trial_state(&pipeline), (true, Some(9), 1, false));
+
+    // Lane 0 takes the trial back (lane 9 never came to be), and its
+    // unclean batch pins the server again.
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 2)]);
+    assert_eq!(
+        pipeline.download_lane_mode_for_lane(0, pressure, true, 0),
+        DownloadLaneMode::Pipelined { depth: 2 }
+    );
+    // A connection lost before the server answered anything on it with a
+    // later request on the wire is no pipelining fault, however many
+    // requests it lost: an idle close or a restart looks like this.
+    let mut alone = unclean_batch_result(job_id, 2);
+    alone.lane_observation.as_mut().unwrap().answered_pipelined = false;
+    pipeline.release_download_result(&alone);
+    assert_eq!(pin_trial_state(&pipeline), (true, Some(0), 1, false));
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 3)]);
+    pipeline.release_download_result(&unclean_batch_result(job_id, 3));
+    assert_eq!(pin_trial_state(&pipeline), (false, None, 1, true));
+    for lane in [0, 9] {
+        assert_eq!(
+            pipeline.download_lane_mode_for_lane(0, pressure, true, lane),
+            DownloadLaneMode::Sequential
+        );
+    }
 }
 
 // The dispatcher's own gate is the item's wait reason, and a job it holds

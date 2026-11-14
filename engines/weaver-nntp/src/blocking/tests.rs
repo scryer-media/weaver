@@ -2282,6 +2282,80 @@ fn a_drop_mid_drain_poisons_the_connection() {
     );
 }
 
+fn is_connection_closed(trace: &DecodedBodyTrace) -> bool {
+    matches!(
+        trace.result,
+        Err(DecodedBodyError::Nntp(NntpError::ConnectionClosed))
+    )
+}
+
+// A connection the server drops while the lane sits idle between leases, as
+// on an idle timeout or a restart, takes the next lease's requests down
+// unanswered. The ring says the server never answered on it with a later
+// request on the wire, so the fault proves nothing about pipelining, even on
+// a connection whose previous run pipelined cleanly.
+#[test]
+fn a_connection_dropped_between_runs_reports_no_pipelined_answer() {
+    let (port, _, handle) = spawn_reauth_server(
+        vec![
+            Scripted::Body(vec![0x61; 256]),
+            Scripted::Body(vec![0x62; 256]),
+            Scripted::Close,
+        ],
+        vec![b"281 ok\r\n"],
+    );
+    let mut lane = test_body_lane(&reauth_config(port));
+
+    // The first run pipelines two requests cleanly.
+    issue_all(&mut lane, &["<1@t>", "<2@t>"]);
+    let (first, meta) = lane.ring_read_next().unwrap();
+    assert_eq!(ring_payload(&first), vec![0x61; 256]);
+    assert!(meta.answered_pipelined, "answered with <2@t> on the wire");
+    let (second, meta) = lane.ring_read_next().unwrap();
+    assert_eq!(ring_payload(&second), vec![0x62; 256]);
+    assert!(meta.batch_complete && meta.batch_clean);
+    assert!(meta.answered_pipelined, "the run pipelined");
+    assert_eq!(lane.ring_outstanding(), 0);
+
+    // The next run's first request finds the connection gone.
+    issue_all(&mut lane, &["<3@t>", "<4@t>", "<5@t>"]);
+    let (third, meta) = lane.ring_read_next().unwrap();
+    assert!(is_connection_closed(&third), "got {:?}", third.result);
+    assert!(meta.batch_complete && meta.connection_discarded);
+    assert_eq!(meta.unresolved_count, 2);
+    assert!(
+        !meta.answered_pipelined,
+        "nothing was answered on this run, so the drop is no pipelining fault"
+    );
+    assert!(lane.ring_is_closed());
+
+    lane.park();
+    handle.join().unwrap();
+}
+
+// A server that answers a request with later ones on the wire and then drops
+// the connection failed mid-pipeline. The ring says so on the fault.
+#[test]
+fn a_drop_after_a_pipelined_answer_reports_the_pipelined_answer() {
+    let (port, _, handle) = spawn_reauth_server(
+        vec![Scripted::Body(vec![0x71; 256]), Scripted::Close],
+        vec![b"281 ok\r\n"],
+    );
+    let mut lane = test_body_lane(&reauth_config(port));
+    issue_all(&mut lane, &["<1@t>", "<2@t>", "<3@t>"]);
+
+    let (first, _) = lane.ring_read_next().unwrap();
+    assert_eq!(ring_payload(&first), vec![0x71; 256]);
+    let (second, meta) = lane.ring_read_next().unwrap();
+    assert!(is_connection_closed(&second), "got {:?}", second.result);
+    assert!(meta.batch_complete && meta.connection_discarded);
+    assert_eq!(meta.unresolved_count, 1);
+    assert!(meta.answered_pipelined);
+
+    lane.park();
+    handle.join().unwrap();
+}
+
 // A server that refuses the in-place login poisons the connection. The lane
 // says so through its window, the article stays merely unanswered, and the
 // refusal is classified exactly as a dial's login reply is.

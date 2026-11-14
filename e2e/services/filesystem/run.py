@@ -77,15 +77,35 @@ def main():
         if child is not None and child.poll() is None:
             child.terminate()
             child.wait()
+        if child is not None and result:
+            print(f"filesystem-fixture: command exited {result}", file=sys.stderr, flush=True)
+        unmounted = set()
         for target in reversed(mounted):
             unmount = subprocess.run(["fusermount3", "-u", str(target)])
             if unmount.returncode:
+                print(f"filesystem-fixture: unmounting {target} exited {unmount.returncode}", file=sys.stderr, flush=True)
                 result = 1
-        for daemon in daemons:
+            else:
+                unmounted.add(target)
+        for index, daemon in enumerate(daemons):
+            target = Path(args.mount[index])
+            if target in unmounted:
+                # The unmount ends the helper's loop, so it exits by itself,
+                # and 0 is the only clean end: a crash or an error exit fails
+                # the run. The wait has no deadline of its own; a helper that
+                # never ends is a hang the gate's own bound reports.
+                code = daemon.wait()
+                if code != 0:
+                    print(f"filesystem-fixture: helper for {target} exited {code} after its unmount", file=sys.stderr, flush=True)
+                    result = 1
+                continue
+            # The mount never came up, or its unmount failed: nothing will end
+            # the helper's loop, so it is stopped. The run has already failed
+            # for that reason; how the stopped helper exits does not change it.
             if daemon.poll() is None:
                 daemon.terminate()
-            if daemon.wait() not in (0, -signal.SIGTERM):
-                result = 1
+            code = daemon.wait()
+            print(f"filesystem-fixture: helper for {target} was not unmounted and exited {code}", file=sys.stderr, flush=True)
     return result
 
 

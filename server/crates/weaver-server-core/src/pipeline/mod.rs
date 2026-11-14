@@ -495,6 +495,10 @@ pub(super) struct DownloadWaitStatus {
     pub(super) reason: &'static str,
     pub(super) retry_at_epoch_ms: Option<f64>,
     pub(super) pending_count: usize,
+    // The servers the article parked last under this wait excludes, so a
+    // job whose refused article waits out its retry names the servers that
+    // article waits on without walking the retry queue.
+    pub(super) exclude_servers: weaver_nntp::ServerSet,
 }
 
 #[derive(Debug, Clone)]
@@ -530,6 +534,13 @@ pub(super) struct DownloadLaneObservation {
     pub(super) batch_clean: bool,
     pub(super) unresolved_count: u64,
     pub(super) connection_discarded: bool,
+    // The server answered a request on this connection while a later one
+    // was already on the wire, since the connection last had nothing
+    // outstanding: it demonstrably took pipelined requests. A fault without
+    // it is how any connection fails (an idle close, a restart, an outage)
+    // and says nothing about pipelining; a clean batch without it ran one
+    // request at a time and proves nothing either.
+    pub(super) answered_pipelined: bool,
 }
 
 pub(super) enum DownloadPayload {
@@ -582,11 +593,14 @@ impl DownloadFailureKind {
             Self::EstablishedTransport | Self::Unanswered => {
                 Some("NNTP BODY transport unavailable")
             }
-            Self::Auth => Some("NNTP authentication blocked"),
+            Self::Auth => Some(AUTH_WAIT_REASON),
             Self::ArticleNotFound | Self::ContentOrProtocol => None,
         }
     }
 }
+
+// The wait an article refused for the login records for its one-second retry.
+pub(in crate::pipeline) const AUTH_WAIT_REASON: &str = "NNTP authentication blocked";
 
 // What a refusal for want of a selected group (412) says about the article.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2048,8 +2062,14 @@ pub struct Pipeline {
     // Queued articles the dispatch-hold reason has read.
     #[cfg(test)]
     pub(super) dispatch_hold_items_examined: std::sync::atomic::AtomicUsize,
+    // Exclusion sets the login-refusal wait has asked about.
+    #[cfg(test)]
+    pub(super) login_refusal_sets_examined: std::sync::atomic::AtomicUsize,
     // Last time we logged a queued/no-active-download liveness stall.
     pub(super) last_download_dispatch_stall_log_at: Option<Instant>,
+    // When the dispatch pass first found queued work and nothing in flight,
+    // in the run of such passes going on now; `None` outside one.
+    pub(super) download_dispatch_liveness_since: Option<Instant>,
     // The dispatch stall the watchdog is timing toward a kick or a release.
     pub(super) download_dispatch_stall: Option<download::DispatchStallWatch>,
     // The available fill servers of the dispatch attempt running now, in
@@ -2179,8 +2199,10 @@ pub struct Pipeline {
     pub(super) phase_progress: HashMap<(JobId, JobPhase), progress::JobPhaseRuntime>,
     // Cached per-job retention exclusions (pool server indices whose
     // retention window is older than the job). TTL'd; cleared on NNTP
-    // client rebuilds and job removal.
-    pub(super) job_retention_exclude_cache: HashMap<JobId, (Instant, weaver_nntp::ServerSet)>,
+    // client rebuilds and job removal. Behind a lock so a read-only pass
+    // refreshes it in place; only the pipeline's own turn takes it.
+    pub(super) job_retention_exclude_cache:
+        std::sync::Mutex<HashMap<JobId, (Instant, weaver_nntp::ServerSet)>>,
     // Rate limiter, per job, for the "no eligible news server" warning.
     pub(super) no_eligible_server_warn_throttle: download::JobLogThrottle,
     // Rate limiter, per job, for BODY work waiting on local lane capacity.

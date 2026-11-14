@@ -238,10 +238,12 @@ async fn a_recovery_gate_refusal_is_not_capacity_saturation() {
         .expect("a recovered server takes warm dials again");
 }
 
-// A server quarantined because it refused the credentials is a verdict for
-// the work, not a wait: the acquire answers with the refusal, names the
-// server, and does not hand the work back. The same acquire on a server
-// quarantined by transport failures still waits on the recovery gate.
+// A server quarantined because it refused the credentials waits like a
+// server quarantined by transport failures until it has refused the login
+// for its give-up time. From then on the refusal is a verdict for the work,
+// not a wait: the acquire answers with the refusal, names the server, and
+// does not hand the work back. The same acquire on a server quarantined by
+// transport failures still waits on the recovery gate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_credentials_quarantine_refuses_where_a_transport_quarantine_waits() {
     use crate::client::BlockingBodyLaneAcquireError;
@@ -267,6 +269,25 @@ async fn a_credentials_quarantine_refuses_where_a_transport_quarantine_waits() {
 
     let refused = client();
     refused.pool().health.lock().await.record_failure(0, true);
+    // Within the give-up time the refusal waits, as an outage does.
+    assert!(!refused.pool().refuses_credentials(0));
+    assert!(matches!(
+        refused
+            .pool()
+            .try_acquire_blocking_permit_for_work(ServerId(0), true),
+        Err(NntpError::ServerRecovering)
+    ));
+    let Err(waiting) = refused.try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY) else {
+        panic!("a server refusing credentials opened a lane");
+    };
+    assert!(
+        waiting.server().is_none() && waiting.kind() != "credentials_refused",
+        "{waiting:?}"
+    );
+    refused.pool().set_login_refusal_clock(
+        0,
+        std::time::Instant::now() + crate::health::LOGIN_REFUSAL_GIVE_UP,
+    );
     assert!(refused.pool().refuses_credentials(0));
     assert!(matches!(
         refused
@@ -335,6 +356,337 @@ async fn a_credentials_quarantine_refuses_where_a_transport_quarantine_waits() {
         error.server().is_none() && error.kind() != "credentials_refused",
         "{error:?}"
     );
+}
+
+// A backfill server refusing the login holds nothing back: its refusal is the
+// answer at once, with no give-up time, while a fill server refusing the
+// same way is waited for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backfill_server_refusing_the_login_is_answered_at_once() {
+    let server = |port, backfill| ServerPoolConfig {
+        server: ServerConfig {
+            host: "127.0.0.1".into(),
+            port,
+            tls: false,
+            ..Default::default()
+        },
+        stable_id: StableServerId(u32::from(port)),
+        max_connections: 2,
+        backfill,
+        ..Default::default()
+    };
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![server(1, false), server(2, true)],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(1),
+    });
+    let pool = client.pool();
+    {
+        let mut health = pool.health.lock().await;
+        health.record_failure(0, true);
+        health.record_failure(1, true);
+    }
+    assert!(
+        !pool.refuses_credentials(0),
+        "the fill server is waited for"
+    );
+    assert!(pool.refuses_credentials(1), "the backfill server is not");
+}
+
+// A pool rebuilt over the same server (a speed change, a route edit, the
+// active toggle of another server) carries its run of login refusals on with
+// the same verdict instant: the hour is not restarted by rebuilding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rebuilt_pool_keeps_the_login_refusal_run_and_its_verdict_instant() {
+    let registry = ServerTransferRegistry::new();
+    let control = registry.control(StableServerId(7));
+    let client = || {
+        NntpClient::new(NntpClientConfig {
+            servers: vec![ServerPoolConfig {
+                server: ServerConfig {
+                    host: "127.0.0.1".into(),
+                    port: 1,
+                    tls: false,
+                    ..Default::default()
+                },
+                stable_id: StableServerId(7),
+                transfer_control: Some(Arc::clone(&control)),
+                max_connections: 1,
+                ..Default::default()
+            }],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(1),
+        })
+    };
+    let first = client();
+    first.pool().health.lock().await.record_failure(0, true);
+    let verdict_at = control
+        .login_refusal_verdict_at()
+        .expect("the refusal began a run");
+    let rebuilt = client();
+    assert_eq!(control.login_refusal_verdict_at(), Some(verdict_at));
+    assert_eq!(
+        rebuilt.pool().login_refusal_waits(),
+        crate::ServerSet::from_iter([0]),
+        "the rebuilt pool waits on the server"
+    );
+    rebuilt
+        .pool()
+        .set_login_refusal_clock(0, verdict_at - Duration::from_secs(1));
+    assert!(
+        !rebuilt.pool().login_refusal_waits().is_empty(),
+        "up to the same verdict instant"
+    );
+    rebuilt.pool().set_login_refusal_clock(0, verdict_at);
+    assert!(rebuilt.pool().refuses_credentials(0));
+    assert!(rebuilt.pool().login_refusal_waits().is_empty());
+}
+
+// The pool says when a fill server's run of login refusals becomes the
+// verdict, finds it untold at that instant and marks it told once; a
+// backfill server, answered at once, has no such instant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_pool_tells_a_fill_servers_verdict_once_at_its_instant() {
+    let server = |port, backfill| ServerPoolConfig {
+        server: ServerConfig {
+            host: "127.0.0.1".into(),
+            port,
+            tls: false,
+            ..Default::default()
+        },
+        stable_id: StableServerId(u32::from(port)),
+        max_connections: 2,
+        backfill,
+        ..Default::default()
+    };
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![server(1, false), server(2, true)],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(1),
+    });
+    let pool = client.pool();
+    assert_eq!(pool.next_login_refusal_verdict(), None);
+    let start = Instant::now();
+    pool.set_login_refusal_clock(0, start);
+    pool.set_login_refusal_clock(1, start);
+    {
+        let mut health = pool.health.lock().await;
+        health.record_failure(0, true);
+        health.record_failure(1, true);
+    }
+    let verdict_at = start + crate::health::LOGIN_REFUSAL_GIVE_UP;
+    assert_eq!(pool.next_login_refusal_verdict(), Some(verdict_at));
+    assert!(
+        pool.login_refusal_verdicts_untold().is_none(),
+        "the run still waits"
+    );
+    let mut heard = pool.health_changed.subscribe();
+    heard.mark_unchanged();
+    pool.set_login_refusal_clock(0, verdict_at);
+    pool.set_login_refusal_clock(1, verdict_at);
+    let untold = pool
+        .login_refusal_verdicts_untold()
+        .expect("the fill server's verdict");
+    assert_eq!(untold.0.len(), 1, "the backfill server has none");
+    assert!(!heard.has_changed().unwrap());
+    assert!(pool.mark_login_refusal_verdicts_told(&untold));
+    assert!(
+        heard.has_changed().unwrap(),
+        "a watcher of the pool's health hears the verdict"
+    );
+    assert!(pool.refuses_credentials(0));
+    assert!(!pool.mark_login_refusal_verdicts_told(&untold), "told once");
+    assert!(pool.login_refusal_verdicts_untold().is_none());
+    assert_eq!(pool.next_login_refusal_verdict(), None);
+}
+
+// A server's password is edited while the pool built from the old one is
+// still in use and its server quarantined for the refusal. Building the
+// pool from the new password changes nothing: a dispatch on the old pool
+// between then and the new pool coming into use is not handed the probe.
+// The new pool is handed it at once when it is put in use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pool_built_from_an_edited_login_identity_probes_once_it_is_in_use() {
+    let registry = ServerTransferRegistry::new();
+    let control = registry.control(StableServerId(7));
+    let client = |password: &str| {
+        NntpClient::new(NntpClientConfig {
+            servers: vec![ServerPoolConfig {
+                server: ServerConfig {
+                    host: "127.0.0.1".into(),
+                    port: 1,
+                    tls: false,
+                    username: Some("user".into()),
+                    password: Some(password.into()),
+                    ..Default::default()
+                },
+                stable_id: StableServerId(7),
+                transfer_control: Some(Arc::clone(&control)),
+                max_connections: 1,
+                ..Default::default()
+            }],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(1),
+        })
+    };
+    let old = client("old");
+    old.pool().health.lock().await.record_failure(0, true);
+    let verdict_at = control.login_refusal_verdict_at();
+    assert!(verdict_at.is_some());
+    assert!(matches!(
+        old.pool().connection_hold(0, true),
+        Some(crate::recovery::ConnectionHold::Until(_))
+    ));
+
+    let new = client("new");
+    assert_eq!(
+        control.login_refusal_verdict_at(),
+        verdict_at,
+        "building the pool ends nothing: the rebuild may yet fail"
+    );
+    assert!(
+        matches!(
+            old.pool().connection_hold(0, true),
+            Some(crate::recovery::ConnectionHold::Until(_))
+        ),
+        "the old pool is not handed the probe"
+    );
+    assert!(
+        old.pool().recovery_gates[0].admit(true).is_none(),
+        "a dispatch on the old pool opens no connection"
+    );
+
+    new.pool().activated();
+    assert_eq!(control.login_refusal_verdict_at(), None);
+    assert_eq!(
+        new.pool().connection_hold(0, true),
+        Some(crate::recovery::ConnectionHold::Probe)
+    );
+    assert!(new.pool().login_refusal_waits().is_empty());
+}
+
+// A server refusing the login is switched from fill to backfill: the pool
+// put in use with it in its new role ends the run and asks it again at
+// once, where a pool put in use with it in the same role keeps the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pool_put_in_use_with_the_server_switched_to_backfill_ends_its_refusal_run() {
+    let registry = ServerTransferRegistry::new();
+    let control = registry.control(StableServerId(7));
+    let server = |port, backfill, control: Option<&Arc<_>>| ServerPoolConfig {
+        server: ServerConfig {
+            host: "127.0.0.1".into(),
+            port,
+            tls: false,
+            ..Default::default()
+        },
+        stable_id: StableServerId(u32::from(port)),
+        transfer_control: control.map(Arc::clone),
+        max_connections: 1,
+        backfill,
+        ..Default::default()
+    };
+    let client = |backfill| {
+        NntpClient::new(NntpClientConfig {
+            servers: vec![server(7, backfill, Some(&control)), server(8, false, None)],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(1),
+        })
+    };
+    let fill = client(false);
+    fill.pool().health.lock().await.record_failure(0, true);
+    let verdict_at = control.login_refusal_verdict_at();
+    assert!(verdict_at.is_some());
+    let same_role = client(false);
+    same_role.pool().activated();
+    assert_eq!(control.login_refusal_verdict_at(), verdict_at);
+    assert!(matches!(
+        same_role.pool().connection_hold(0, true),
+        Some(crate::recovery::ConnectionHold::Until(_))
+    ));
+    let backfill = client(true);
+    assert_eq!(control.login_refusal_verdict_at(), verdict_at);
+    backfill.pool().activated();
+    assert_eq!(control.login_refusal_verdict_at(), None);
+    assert!(backfill.pool().login_refusal_waits().is_empty());
+    assert_eq!(
+        backfill.pool().connection_hold(0, true),
+        Some(crate::recovery::ConnectionHold::Probe)
+    );
+}
+
+// A server configured as backfill is held as fill in effect while every
+// active server is backfill. Switching the only fill server off, or on
+// again, flips the role in effect without touching the server's own
+// configuration: its run of login refusals goes on to the same verdict
+// instant, so a schedule that switches other servers cannot keep the
+// verdict from arriving. Whether its refusal counts at once follows the
+// role in effect in the pool that is asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_of_the_role_in_effect_alone_keeps_the_refusal_run() {
+    let registry = ServerTransferRegistry::new();
+    let control = registry.control(StableServerId(7));
+    let server = |port, backfill, control: Option<&Arc<_>>| ServerPoolConfig {
+        server: ServerConfig {
+            host: "127.0.0.1".into(),
+            port,
+            tls: false,
+            ..Default::default()
+        },
+        stable_id: StableServerId(u32::from(port)),
+        transfer_control: control.map(Arc::clone),
+        max_connections: 1,
+        backfill,
+        ..Default::default()
+    };
+    let client = |with_fill_server: bool| {
+        let mut servers = vec![server(7, true, Some(&control))];
+        if with_fill_server {
+            servers.push(server(8, false, None));
+        }
+        NntpClient::new(NntpClientConfig {
+            servers,
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(1),
+        })
+    };
+    let as_backfill = client(true);
+    assert!(as_backfill.pool().is_backfill(0));
+    as_backfill
+        .pool()
+        .health
+        .lock()
+        .await
+        .record_failure(0, true);
+    let verdict_at = control.login_refusal_verdict_at();
+    assert!(verdict_at.is_some());
+    assert!(
+        as_backfill.pool().refuses_credentials(0),
+        "a backfill server's refusal counts at once"
+    );
+
+    let as_fill = client(false);
+    as_fill.pool().activated();
+    assert!(!as_fill.pool().is_backfill(0), "fill in effect");
+    assert_eq!(control.login_refusal_verdict_at(), verdict_at);
+    assert!(
+        !as_fill.pool().refuses_credentials(0),
+        "held as fill, its refusal is waited for"
+    );
+    assert_eq!(
+        as_fill.pool().login_refusal_waits(),
+        crate::ServerSet::from_iter([0])
+    );
+
+    let as_backfill_again = client(true);
+    as_backfill_again.pool().activated();
+    assert_eq!(control.login_refusal_verdict_at(), verdict_at);
+    assert!(as_backfill_again.pool().refuses_credentials(0));
 }
 
 // The label the refusal travels under is the whole point of the variant.

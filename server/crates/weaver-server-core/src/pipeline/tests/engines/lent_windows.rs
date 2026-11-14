@@ -608,7 +608,9 @@ async fn held_for_room(
         "{status:?}"
     );
     assert_eq!(
-        pipeline.dispatch_wait_reason(JOB),
+        pipeline
+            .dispatch_wait_reason(JOB, pipeline.login_refusal_view())
+            .as_deref(),
         Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON)
     );
     let needs = pipeline.full_disk_needs(JOB).expect("the window's size");
@@ -693,7 +695,9 @@ async fn a_window_with_no_room_holds_the_job_until_its_folder_shows_the_room() {
             "{status:?}"
         );
         assert_eq!(
-            pipeline.dispatch_wait_reason(JOB),
+            pipeline
+                .dispatch_wait_reason(JOB, pipeline.login_refusal_view())
+                .as_deref(),
             Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON)
         );
         pipeline.held_for_full_disk(JOB)

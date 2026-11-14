@@ -71,7 +71,14 @@ async fn a_job_waiting_for_a_slot_stores_the_reason_the_dispatch_pass_computes()
     pipeline.shared_state.queue.read(|inner| {
         for row in &inner.jobs {
             let stored = row.report.job.download_wait_reason.as_deref();
-            assert_eq!(stored, pipeline.stored_wait_reason(row), "job {}", row.id.0);
+            assert_eq!(
+                stored,
+                pipeline
+                    .stored_wait_reason(row, pipeline.login_refusal_view())
+                    .as_deref(),
+                "job {}",
+                row.id.0
+            );
             if !pipeline.nzb_admitted.contains(&row.id) {
                 assert_eq!(stored, Some(NZB_SLOT_WAIT_REASON), "job {}", row.id.0);
             }

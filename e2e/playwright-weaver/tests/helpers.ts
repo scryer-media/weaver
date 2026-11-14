@@ -280,6 +280,22 @@ export function metricValue(
   return undefined;
 }
 
+// The value of a series the caller needs to be there. A missing series fails
+// with its name and labels instead of reading as 0: some families are left out
+// while their subject is not running, and a 0 standing in for one would let a
+// baseline or a "back to 0" check pass on nothing.
+export function requiredMetricValue(
+  body: string,
+  metric: string,
+  labels: Record<string, string> = {},
+): number {
+  const value = metricValue(body, metric, labels);
+  if (value === undefined) {
+    throw new Error(`metric ${metric} ${JSON.stringify(labels)} is not in the scrape`);
+  }
+  return value;
+}
+
 export async function expectSetting(
   request: APIRequestContext,
   field: string,

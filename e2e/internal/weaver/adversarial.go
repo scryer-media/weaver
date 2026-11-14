@@ -38,7 +38,7 @@ var adversarialListPasswords = []string{"adversarial-list-first", "adversarial-l
 
 // adversarialPollInterval paces the lane's reads of product state. Every wait
 // ends on that state; the interval is only how often it is read.
-const adversarialPollInterval = 500 * time.Millisecond
+const adversarialPollInterval = 50 * time.Millisecond
 
 // adversarialSlack is what a settled job may still hold in scratch beyond what
 // its contract allows: directory entries, markers and the job's own state.
