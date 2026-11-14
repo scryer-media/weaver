@@ -109,15 +109,19 @@ impl crate::persistence::DatabaseWriterExecutor {
         &self,
         entry: &JobHistoryRow,
         retires: bool,
+        files: &[HistoryFile],
     ) -> Result<(), StateError> {
         let id = stored(entry.job_id)?;
         let datastore = self.datastore();
         let entry = entry.clone();
+        let files = files.to_vec();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "write_torrent_history", |tx| {
                 let entry = entry.clone();
+                let files = files.clone();
                 Box::pin(async move {
                     crate::history::persistence::insert_job_history_tx(tx, &entry).await?;
+                    write_history_files_tx(tx, id, &files).await?;
                     if retires {
                         delete_torrent_tx(tx, id).await?;
                     }
@@ -135,10 +139,17 @@ impl crate::persistence::DatabaseWriterExecutor {
     // the next start writes it, as it archives an NZB job left terminal in
     // the active table. The torrent's row goes once the history row is
     // written, and this with it.
-    pub(crate) fn keep_torrent_retiring(&self, entry: &JobHistoryRow) -> Result<(), StateError> {
+    pub(crate) fn keep_torrent_retiring(
+        &self,
+        entry: &JobHistoryRow,
+        files: &[HistoryFile],
+    ) -> Result<(), StateError> {
         let id = stored(entry.job_id)?;
-        let kept = serde_json::to_string(entry)
-            .map_err(|error| StateError::Database(error.to_string()))?;
+        let kept = serde_json::to_string(&Retiring {
+            history: entry.clone(),
+            files: files.to_vec(),
+        })
+        .map_err(|error| StateError::Database(error.to_string()))?;
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "keep_torrent_retiring", |tx| {
@@ -175,13 +186,16 @@ impl Database {
                     let mut written = Vec::with_capacity(rows.len());
                     for row in rows {
                         let id = row.i64("job_id")?;
-                        let entry: JobHistoryRow = serde_json::from_str(&row.text("retiring")?)
-                            .map_err(|error| {
-                                StateError::Database(format!(
-                                    "a torrent's kept history row is not valid: {error}"
-                                ))
-                            })?;
+                        let Retiring {
+                            history: entry,
+                            files,
+                        } = serde_json::from_str(&row.text("retiring")?).map_err(|error| {
+                            StateError::Database(format!(
+                                "a torrent's kept history row is not valid: {error}"
+                            ))
+                        })?;
                         crate::history::persistence::insert_job_history_tx(tx, &entry).await?;
+                        write_history_files_tx(tx, stored(entry.job_id)?, &files).await?;
                         delete_torrent_tx(tx, id).await?;
                         written.push(JobId(entry.job_id));
                     }
@@ -189,6 +203,98 @@ impl Database {
                 })
             })
             .await
+        })
+    }
+}
+
+// A removal's history row kept on the torrent, with the files it lists.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Retiring {
+    history: JobHistoryRow,
+    files: Vec<HistoryFile>,
+}
+
+// A file a torrent's job wrote, as its history row lists it: an absolute
+// path, and whether it goes `whole`, with what is in it (what unpacking
+// placed), or only as a file (the torrent's own).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HistoryFile {
+    pub(crate) path: String,
+    pub(crate) whole: bool,
+}
+
+// The files a torrent's job wrote, listed with its history row in `tx` in
+// place of any list before: an archive from history removes these. In
+// bind-sized chunks, each one statement.
+async fn write_history_files_tx(
+    tx: &mut SqlTx<'_>,
+    job_id: i64,
+    files: &[HistoryFile],
+) -> Result<(), StateError> {
+    tx.execute(
+        "DELETE FROM job_history_files WHERE job_id = {}",
+        &[SqlArg::I64(job_id)],
+    )
+    .await?;
+    // One row a path: one listed twice goes whole if either says so.
+    let mut files: Vec<&HistoryFile> = files.iter().collect();
+    files.sort_unstable_by(|a, b| a.path.cmp(&b.path).then(b.whole.cmp(&a.whole)));
+    files.dedup_by(|later, kept| later.path == kept.path);
+    let rows = crate::persistence::sql_runtime::max_rows_for_tx(tx, 3);
+    for chunk in files.chunks(rows) {
+        let values = vec!["({}, {}, {})"; chunk.len()].join(", ");
+        let mut args = Vec::with_capacity(chunk.len() * 3);
+        for file in chunk {
+            args.push(SqlArg::I64(job_id));
+            args.push(SqlArg::Text(file.path.clone()));
+            args.push(SqlArg::Bool(file.whole));
+        }
+        tx.execute(
+            &format!("INSERT INTO job_history_files (job_id, path, whole) VALUES {values}"),
+            &args,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+// The files a torrent's history row lists, for an archive from history.
+impl Database {
+    pub(crate) fn job_history_files(
+        &self,
+        job_ids: &[JobId],
+    ) -> Result<std::collections::BTreeMap<JobId, Vec<HistoryFile>>, StateError> {
+        if job_ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let datastore = self.datastore();
+        let ids = job_ids.iter().map(|id| id.0 as i64).collect::<Vec<_>>();
+        self.run_sql_blocking_read(async move {
+            let mut files = std::collections::BTreeMap::<JobId, Vec<HistoryFile>>::new();
+            let rows_per =
+                crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 1);
+            for chunk in ids.chunks(rows_per) {
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let args = chunk.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT job_id, path, whole FROM job_history_files WHERE job_id IN ({placeholders})"
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    files
+                        .entry(JobId(count(&row, "job_id")?))
+                        .or_default()
+                        .push(HistoryFile {
+                            path: row.text("path")?,
+                            whole: row.bool("whole")?,
+                        });
+                }
+            }
+            Ok(files)
         })
     }
 }

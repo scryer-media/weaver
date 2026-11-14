@@ -324,11 +324,8 @@ async fn a_live_torrents_unpacking_folder_is_taken_by_no_sweep() {
     assert!(rig.db.get_torrent(job_id).unwrap().is_some());
 
     let work = rig.dir.path().join("work");
-    let unpacking = crate::jobs::working_dir::own_named_dir(
-        &work,
-        &format!("torrent-{}", job_id.0),
-        job_id,
-    );
+    let unpacking =
+        crate::jobs::working_dir::own_named_dir(&work, &format!("torrent-{}", job_id.0), job_id);
     crate::jobs::working_dir::claim_named_working_dir(&work, &unpacking, job_id).unwrap();
     std::fs::write(unpacking.join("set.part1.rar"), b"held").unwrap();
     rig.db
@@ -370,7 +367,10 @@ async fn a_live_torrents_unpacking_folder_is_taken_by_no_sweep() {
     crate::operations::recover_server_state(&rig.db, &data, &work)
         .await
         .unwrap();
-    assert!(unpacking.join("set.part1.rar").exists(), "the start keeps it");
+    assert!(
+        unpacking.join("set.part1.rar").exists(),
+        "the start keeps it"
+    );
 
     let (deleted, outcome) = crate::history::delete_files::delete_history_rows(
         &rig.db,
@@ -387,4 +387,186 @@ async fn a_live_torrents_unpacking_folder_is_taken_by_no_sweep() {
         "a history delete keeps it"
     );
     assert!(rig.db.get_torrent(job_id).unwrap().is_some());
+}
+
+// A torrent removed without its files lists them with its history row, and
+// an archive from history takes exactly those: a file the torrent did not
+// write, in the same folder, stays, and so does the folder its row records.
+// The list goes with the row when the row is deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_of_a_removed_torrent_takes_exactly_the_files_it_listed() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (job_id, dir) = with_every_piece(&rig).await;
+    let mut written = files_under(&dir);
+    written.sort();
+    let mine = dir.join("mine.txt");
+    std::fs::write(&mine, b"not the torrent's").unwrap();
+    rig.service.remove(job_id, false, true).await.unwrap();
+    rig.service.stop().await;
+    assert!(rig.db.get_torrent(job_id).unwrap().is_none());
+
+    let listed = rig.db.job_history_files(&[job_id]).unwrap();
+    let mut paths: Vec<PathBuf> = listed[&job_id]
+        .iter()
+        .inspect(|file| assert!(!file.whole, "{file:?}"))
+        .map(|file| PathBuf::from(&file.path))
+        .collect();
+    paths.sort();
+    assert_eq!(paths, written);
+
+    let work = rig.dir.path().join("work");
+    let archived = crate::history::delete_files::archive_history(
+        &rig.db,
+        &work,
+        &[],
+        std::collections::BTreeSet::from([job_id]),
+        5,
+        50,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        archived[&job_id].outcome,
+        crate::ArchiveHistoryOutcome::Archived,
+        "{:?}",
+        archived[&job_id].message
+    );
+    assert_eq!(files_under(&dir), vec![mine.clone()]);
+    assert!(dir.is_dir(), "the folder its row records stays");
+    assert_eq!(
+        rig.db
+            .get_job_history(job_id.0)
+            .unwrap()
+            .unwrap()
+            .archived_at,
+        Some(5)
+    );
+
+    let (deleted, outcome) = crate::history::delete_files::delete_history_rows(
+        &rig.db,
+        &work,
+        &[],
+        std::collections::BTreeSet::from([job_id]),
+        false,
+    )
+    .await;
+    outcome.unwrap();
+    assert!(deleted.contains(&job_id));
+    assert!(rig.db.job_history_files(&[job_id]).unwrap().is_empty());
+    assert!(mine.exists());
+}
+
+// A history delete with files of a removed torrent takes what it listed,
+// as an archive does, and leaves what it did not write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_history_delete_with_files_of_a_removed_torrent_takes_what_it_listed() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (job_id, dir) = with_every_piece(&rig).await;
+    let mine = dir.join("mine.txt");
+    std::fs::write(&mine, b"not the torrent's").unwrap();
+    rig.service.remove(job_id, false, true).await.unwrap();
+    rig.service.stop().await;
+
+    let (deleted, outcome) = crate::history::delete_files::delete_history_rows(
+        &rig.db,
+        &rig.dir.path().join("work"),
+        &[],
+        std::collections::BTreeSet::from([job_id]),
+        true,
+    )
+    .await;
+    outcome.unwrap();
+    assert!(deleted.contains(&job_id));
+    assert_eq!(files_under(&dir), vec![mine]);
+    assert!(rig.db.job_history_files(&[job_id]).unwrap().is_empty());
+}
+
+// What a history row lists is removed only under the folder the row
+// records: a path elsewhere, one that climbs out of it through `..`, a
+// relative one, and the folder itself are never touched. A listed folder
+// goes whole only when the list says it was made whole.
+#[test]
+fn a_listed_path_outside_its_folder_is_never_removed() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("torrent");
+    std::fs::create_dir_all(dir.join("made/inner")).unwrap();
+    std::fs::create_dir_all(dir.join("own")).unwrap();
+    std::fs::write(dir.join("own/a.bin"), b"a").unwrap();
+    std::fs::write(dir.join("made/inner/b.bin"), b"b").unwrap();
+    std::fs::create_dir_all(dir.join("folder")).unwrap();
+    std::fs::write(dir.join("folder/c.bin"), b"c").unwrap();
+    let outside = root.path().join("outside.bin");
+    std::fs::write(&outside, b"o").unwrap();
+    let listed = |path: &Path, whole: bool| HistoryFile {
+        path: path.to_string_lossy().into_owned(),
+        whole,
+    };
+    let files = [
+        listed(&dir.join("own/a.bin"), false),
+        listed(&dir.join("made"), true),
+        listed(&dir.join("folder"), false),
+        listed(&outside, false),
+        listed(&dir.join("../outside.bin"), false),
+        listed(Path::new("outside.bin"), false),
+        listed(&dir, true),
+    ];
+    let there = remove_history_files(&dir, &files);
+    assert_eq!(there, 3, "the three under it that were there");
+    assert!(!dir.join("own").exists(), "its emptied folder goes with it");
+    assert!(!dir.join("made").exists());
+    assert!(
+        dir.join("folder/c.bin").exists(),
+        "a folder listed as a file stays"
+    );
+    assert!(outside.exists());
+    assert!(dir.is_dir());
+}
+
+// A list past one statement's binds is written whole, in chunks, with its
+// row: none of it is lost and the row is there once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_history_files_list_past_the_bind_limit_is_written_whole() {
+    let rig = rig(set_clock());
+    let job_id = JobId(7);
+    let row = crate::JobHistoryRow {
+        job_id: job_id.0,
+        job_hash: None,
+        name: "many".to_owned(),
+        status: "complete".to_owned(),
+        error_message: None,
+        total_bytes: 1,
+        downloaded_bytes: 1,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: Some("/data/many".to_owned()),
+        nzb_path: None,
+        created_at: 1,
+        completed_at: 2,
+        metadata: None,
+        server_attribution: None,
+        protocol: crate::jobs::Protocol::Torrent,
+        archived_at: None,
+    };
+    let count = 32_766 / 3 + 5;
+    let files: Vec<HistoryFile> = (0..count)
+        .map(|n| HistoryFile {
+            path: format!("/data/many/{n:05}.bin"),
+            whole: false,
+        })
+        .collect();
+    let (written, _) = rig
+        .db
+        .queue_torrent_history(job_id, row, false, files)
+        .unwrap();
+    written.await.unwrap();
+    assert_eq!(
+        rig.db.job_history_files(&[job_id]).unwrap()[&job_id].len(),
+        count
+    );
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_some());
 }

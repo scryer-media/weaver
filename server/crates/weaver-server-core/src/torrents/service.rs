@@ -69,6 +69,7 @@ use crate::torrents::metrics::{
     TorrentSeries,
 };
 use crate::torrents::model::Adopted;
+use crate::torrents::persistence::HistoryFile;
 use crate::torrents::rate::limit_kind;
 use crate::torrents::relocate::{self, Existing, MoveError};
 use crate::torrents::sessions::{
@@ -5367,6 +5368,7 @@ impl TorrentService {
     // of the torrents and into the finished jobs.
     async fn retire(&self, mut torrent: Live, status: &str, error: Option<String>) {
         let job_id = torrent.record.job_id;
+        let files = history_files(&self.written_paths(&torrent));
         self.inner.env.outside.leave(job_id.0);
         // A copy out of the side store under way ends before the store goes.
         if let Some(task) = torrent.leveling.take().and_then(|leveling| leveling.task) {
@@ -5398,18 +5400,25 @@ impl TorrentService {
         // Its history row and its removal are one write: the job is never
         // in neither, so an event raised while it was live, still being
         // queued, finds it.
-        self.write_history(row, true, report).await;
+        self.write_history(row, true, report, files).await;
     }
 
     // A torrent's job, finished as `status`: into history and the queue's
-    // finished jobs.
+    // finished jobs, listing the files it wrote so far.
     async fn finish(&self, report: JobReport, status: &str, hash: Id20, now: i64) {
+        let files = {
+            let live = self.inner.live.lock().await;
+            live.get(&report.job_id)
+                .map(|torrent| history_files(&self.written_paths(torrent)))
+                .unwrap_or_default()
+        };
         let row = report.history_row(status, Some(hash.0.to_vec()), now);
-        self.write_history(row, false, report).await;
+        self.write_history(row, false, report, files).await;
     }
 
     // The job's history row goes through the database writer's archives,
-    // as an NZB job's does, with the torrent removed when it `retires`; then
+    // as an NZB job's does, with the `files` it wrote listed beside it for an
+    // archive from history, and the torrent removed when it `retires`; then
     // the job goes to the queue's finished jobs. A row the database's disk
     // has no room for is kept there and written once its folder shows room;
     // the job reaches the finished jobs then, and this does not wait for
@@ -5419,9 +5428,14 @@ impl TorrentService {
         row: crate::history::JobHistoryRow,
         retires: bool,
         report: JobReport,
+        files: Vec<HistoryFile>,
     ) {
         let job_id = report.job_id;
-        let (mut written, kept) = match self.inner.db.queue_torrent_history(job_id, row, retires) {
+        let queued = self
+            .inner
+            .db
+            .queue_torrent_history(job_id, row, retires, files);
+        let (mut written, kept) = match queued {
             Ok(both) => both,
             Err(error) => {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's history");
@@ -8391,6 +8405,60 @@ pub(super) fn deletion(
         claimed,
         work: None,
     }
+}
+
+// What a history row lists of a deletion: the torrent's own files, each to
+// go only as a file, and what its job made, to go whole.
+fn history_files(deletion: &Deletion) -> Vec<HistoryFile> {
+    let listed = deletion.paths.iter().map(|path| (path, false));
+    let made = deletion.made.iter().map(|path| (path, true));
+    listed
+        .chain(made)
+        .map(|(path, whole)| HistoryFile {
+            path: path.to_string_lossy().into_owned(),
+            whole,
+        })
+        .collect()
+}
+
+// An archive from history, or a delete with files, of a torrent's job whose
+// torrent is gone: the files its row lists go as a removal of the torrent
+// with its files takes them (`delete_written`), each folder above them that
+// this empties with them, up to `dir`, the folder its row records, which
+// stays. A listed path not under `dir`, or one that climbs out of it, is
+// never touched. How many of them were there to remove.
+pub(crate) fn remove_history_files(dir: &Path, files: &[HistoryFile]) -> usize {
+    let inside = |path: &Path| {
+        path.is_absolute()
+            && path != dir
+            && path.starts_with(dir)
+            && path.components().all(|part| {
+                !matches!(
+                    part,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+    };
+    let mut deletion = Deletion {
+        dir: dir.to_path_buf(),
+        ..Deletion::default()
+    };
+    let mut there = 0;
+    for file in files {
+        let path = PathBuf::from(&file.path);
+        if !inside(&path) {
+            tracing::warn!(file = %path.display(), dir = %dir.display(), "a torrent's listed file is not under its folder, and stays");
+            continue;
+        }
+        there += usize::from(std::fs::symlink_metadata(&path).is_ok());
+        if file.whole {
+            deletion.made.push(path);
+        } else {
+            deletion.paths.push(path);
+        }
+    }
+    delete_written(&deletion);
+    there
 }
 
 // libtorrent `storage_utils::delete_files`: the torrent's files go, here

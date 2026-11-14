@@ -3,6 +3,7 @@
 
 use crate::JobId;
 use crate::history::output_files::OutputFileListing;
+use crate::torrents::persistence::HistoryFile;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -399,6 +400,42 @@ async fn scan_marked_dirs(
     }
 }
 
+// The files the history rows of `job_ids` list, the jobs of torrents that
+// are no longer live: a torrent's job lists the files it wrote with its row,
+// as an NZB job marks its folders. One batched lookup, served by the list's
+// key; a job that lists none is absent.
+async fn listed_files(
+    db: &crate::Database,
+    job_ids: Vec<JobId>,
+) -> Result<BTreeMap<JobId, Vec<HistoryFile>>, crate::SchedulerError> {
+    if job_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || db.job_history_files(&job_ids))
+        .await
+        .map_err(|error| {
+            crate::SchedulerError::Internal(format!(
+                "failed to join history files lookup task: {error}"
+            ))
+        })?
+        .map_err(crate::SchedulerError::State)
+}
+
+// Removes the files a torrent's job listed under `dir`, the folder its row
+// records, the way a removal of the torrent with its files takes them; how
+// many were there to remove.
+async fn remove_listed_files(dir: PathBuf, files: Vec<HistoryFile>) -> usize {
+    tokio::task::spawn_blocking(move || {
+        crate::torrents::service::remove_history_files(&dir, &files)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        warn!(%error, "could not remove a torrent's listed files");
+        0
+    })
+}
+
 // History deletion owns persistence and files independently of the pipeline.
 // In order: one read of the
 // batch's history rows, the marker judgement of every directory, one delete
@@ -449,6 +486,21 @@ pub(crate) async fn delete_history_rows(
         Ok(scanned) => scanned,
         Err(error) => return (BTreeSet::new(), Err(error)),
     };
+    // Read before the rows go with them.
+    let mut listed = if delete_files {
+        let ids = job_ids
+            .iter()
+            .filter(|id| !live.contains(id))
+            .copied()
+            .collect();
+        match listed_files(db, ids).await {
+            Ok(listed) => listed,
+            Err(error) => return (BTreeSet::new(), Err(error)),
+        }
+    } else {
+        BTreeMap::new()
+    };
+    let mut listed_dirs = BTreeMap::new();
 
     let mut cleanup = BTreeMap::new();
     let mut delete_ids = Vec::with_capacity(job_ids.len());
@@ -459,6 +511,9 @@ pub(crate) async fn delete_history_rows(
             .flatten()
             .filter(|_| !live.contains(&job_id))
             .map(PathBuf::from);
+        // A job that lists its files is a torrent's: its folder is where its
+        // files are, theirs, and what goes of it is what it lists.
+        let (recorded, files) = take_listed(recorded, listed.remove(&job_id));
         let planned = JobCleanupDirs::plan(
             intermediate_dir,
             job_id,
@@ -481,6 +536,9 @@ pub(crate) async fn delete_history_rows(
             }
         } else {
             output_dirs.remove(&job_id);
+        }
+        if let Some(files) = files {
+            listed_dirs.insert(job_id, files);
         }
         cleanup.insert(job_id, dirs);
         delete_ids.push(job_id);
@@ -552,6 +610,9 @@ pub(crate) async fn delete_history_rows(
                 // directories; the output directory's fate is logged.
                 if let Some(dir) = output_dirs.get(&job_id) {
                     delete_owned_output_dir(dir, job_id, legacy_ok(&shared, dir)).await;
+                }
+                if let Some((dir, files)) = listed_dirs.remove(&job_id) {
+                    remove_listed_files(dir, files).await;
                 }
                 // What the staging directory still holds is the rest of the
                 // delivery the working directory held, and goes the way it
@@ -707,9 +768,20 @@ pub(crate) async fn archive_history(
 
     let pending_ids = pending.keys().copied().collect::<BTreeSet<_>>();
     let (mut marked, live) = scan_marked_dirs(db, intermediate_dir, &pending_ids).await?;
+    let ids = pending_ids
+        .iter()
+        .filter(|id| !live.contains(id))
+        .copied()
+        .collect();
+    let mut listed = listed_files(db, ids).await?;
+    let mut listed_dirs = BTreeMap::new();
     let mut planned = Vec::with_capacity(pending.len());
     for (job_id, recorded) in pending {
         let recorded = recorded.filter(|_| !live.contains(&job_id));
+        let (recorded, files) = take_listed(recorded, listed.remove(&job_id));
+        if let Some(files) = files {
+            listed_dirs.insert(job_id, files);
+        }
         match JobCleanupDirs::plan(
             intermediate_dir,
             job_id,
@@ -868,6 +940,13 @@ pub(crate) async fn archive_history(
             &shared,
         )
         .await;
+        let removal = match (removal, listed_dirs.remove(&job_id)) {
+            (Ok(mut removal), Some((dir, files))) => {
+                removal.removed += remove_listed_files(dir, files).await;
+                Ok(removal)
+            }
+            (removal, _) => removal,
+        };
         let outcome = match removal {
             Err(error) => Archive::new(Outcome::Failed, None, Some(error.to_string())),
             Ok(JobFilesRemoval { not_managed, .. }) if !not_managed.is_empty() => Archive::new(
@@ -933,6 +1012,19 @@ struct JobFilesRemoval {
 // One job's part of an archive, once its directories are proven and
 // its scripts have stopped: its working directories, its recorded output
 // directory when proven the job's, and its staging directories.
+// A job's recorded folder and the files its row lists: with a list, the
+// folder is where those files are, and is no folder of the job's to prove or
+// take; only what the list names under it goes.
+fn take_listed(
+    recorded: Option<PathBuf>,
+    files: Option<Vec<HistoryFile>>,
+) -> (Option<PathBuf>, Option<(PathBuf, Vec<HistoryFile>)>) {
+    match (recorded, files) {
+        (Some(dir), Some(files)) => (None, Some((dir, files))),
+        (recorded, _) => (recorded, None),
+    }
+}
+
 async fn remove_job_files(
     intermediate_dir: &std::path::Path,
     staging_roots: &[PathBuf],

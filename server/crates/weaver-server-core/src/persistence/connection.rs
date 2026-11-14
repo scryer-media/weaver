@@ -813,6 +813,8 @@ enum DbWriteCommand {
         job_id: crate::jobs::ids::JobId,
         history: Box<crate::history::JobHistoryRow>,
         retires: bool,
+        // The files the torrent's job wrote, listed with its row.
+        files: Arc<[crate::torrents::persistence::HistoryFile]>,
         committed: oneshot::Sender<()>,
         kept: oneshot::Sender<()>,
     },
@@ -871,10 +873,15 @@ struct KeptArchive {
 
 // What an archive writes: an NZB job's move out of the active tables, or a
 // torrent's job's history row, with the torrent removed when it `retires`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// A torrent's lists the files its job wrote, which an archive from history
+// removes.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ArchiveOf {
     ActiveJob,
-    Torrent { retires: bool },
+    Torrent {
+        retires: bool,
+        files: Arc<[crate::torrents::persistence::HistoryFile]>,
+    },
 }
 
 // What the writer says of the archives it keeps, one job at a time, so
@@ -979,15 +986,15 @@ fn archive_one(
     // history-delete that bumps the generation makes the conditional insert
     // a no-op, rather than resurrecting the just-deleted row.
     let observed_generation = writer.job_history_cache_generation();
-    let archived = match *of {
+    let archived = match of {
         ArchiveOf::ActiveJob => writer.archive_job_with_terminal_cause(
             job_id,
             history,
             *typed_terminal_cause,
             *failure_kind,
         ),
-        ArchiveOf::Torrent { retires } => writer
-            .write_torrent_history(history, retires)
+        ArchiveOf::Torrent { retires, files } => writer
+            .write_torrent_history(history, *retires, files)
             .map(|()| Some((**history).clone())),
     };
     let archived = archived.inspect_err(|error| {
@@ -1135,6 +1142,7 @@ async fn execute_write_command(
             job_id,
             history,
             retires,
+            files,
             committed,
             kept,
         } => {
@@ -1157,6 +1165,7 @@ async fn execute_write_command(
             }
             let blocking = writer.clone();
             let failures = Arc::clone(&writer_db.checkpoint_failures);
+            let kept_files = Arc::clone(&files);
             let refused = tokio::task::spawn_blocking(move || {
                 let mut archive = KeptArchive {
                     job_id,
@@ -1164,7 +1173,7 @@ async fn execute_write_command(
                     typed_terminal_cause: None,
                     failure_kind: None,
                     committed: Some(committed),
-                    of: ArchiveOf::Torrent { retires },
+                    of: ArchiveOf::Torrent { retires, files },
                 };
                 archive_kept(&blocking, &failures, &mut archive, false)
                     .err()
@@ -1181,9 +1190,10 @@ async fn execute_write_command(
                 if retires {
                     let blocking = writer.clone();
                     let entry = archive.history.clone();
-                    let marked =
-                        tokio::task::spawn_blocking(move || blocking.keep_torrent_retiring(&entry))
-                            .await;
+                    let marked = tokio::task::spawn_blocking(move || {
+                        blocking.keep_torrent_retiring(&entry, &kept_files)
+                    })
+                    .await;
                     if let Ok(Err(error)) = marked {
                         tracing::warn!(
                             job_id = job_id.0,
@@ -2077,6 +2087,7 @@ impl Database {
         job_id: crate::jobs::ids::JobId,
         history: crate::history::JobHistoryRow,
         retires: bool,
+        files: Vec<crate::torrents::persistence::HistoryFile>,
     ) -> Result<(oneshot::Receiver<()>, oneshot::Receiver<()>), StateError> {
         let (committed, written) = oneshot::channel();
         let (kept, held) = oneshot::channel();
@@ -2085,6 +2096,7 @@ impl Database {
                 job_id,
                 history: Box::new(history),
                 retires,
+                files: files.into(),
                 committed,
                 kept,
             },

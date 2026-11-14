@@ -582,6 +582,7 @@ fn classify_sql(template: &str) -> String {
         "job_events",
         "integration_events",
         "job_history_archived_files",
+        "job_history_files",
         "job_history",
         "settings",
         "servers",
