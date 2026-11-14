@@ -48,12 +48,15 @@ impl WireGuardTunnelProvider {
     ) -> Self {
         Self(self.0.with_endpoint_resolver(resolver), self.1)
     }
+    // A tunnel resolves an endpoint written as a name only through the
+    // resolver it is given, or the tunnel beneath it carries the lookup.
+    // Without either it refuses the name: nothing here falls back to the
+    // host's own DNS.
     pub fn new(spec: WireGuardSpec, observer: Arc<dyn TunnelObserver>) -> Self {
         let identity = WireGuardIdentity::of(&spec);
         Self(
             proxy_tunnels::WireGuardTunnelProvider::new(spec, Arc::new(Observer(observer, None)))
-                .with_download_tuning()
-                .with_endpoint_resolver(Arc::new(crate::resolution::HostEndpoints)),
+                .with_download_tuning(),
             identity,
         )
     }

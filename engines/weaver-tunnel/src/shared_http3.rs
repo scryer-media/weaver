@@ -25,10 +25,10 @@ impl Http3TunnelProvider {
     ) -> Self {
         Self(self.0.with_endpoint_resolver(resolver))
     }
+    // A proxy written as a name is resolved only through the resolver it
+    // is given. Without one it refuses the name: nothing here falls back to
+    // the host's own DNS.
     pub fn new(spec: Http3TunnelSpec) -> Result<Self, TunnelError> {
-        Ok(Self(
-            proxy_tunnels::Http3TunnelProvider::new(spec)?
-                .with_endpoint_resolver(std::sync::Arc::new(crate::resolution::HostEndpoints)),
-        ))
+        Ok(Self(proxy_tunnels::Http3TunnelProvider::new(spec)?))
     }
 }
