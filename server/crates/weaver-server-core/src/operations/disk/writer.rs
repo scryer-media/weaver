@@ -640,6 +640,46 @@ impl Submitter {
         })
     }
 
+    // Stand still until `bytes` or fewer wait in memory for the volume's
+    // writer: the wait of a thread that produces what is written, such as
+    // an extraction, on the volume's budget. Returns at once when no more
+    // than that wait, and whatever waits once the key has stopped, by a
+    // failure or by being given up, or the volume has no writer thread:
+    // nothing more of the key will be written then. The writer wakes it
+    // as the bytes fall; nothing is polled.
+    //
+    // Never for the pipeline loop, which must not stand still for a disk:
+    // the loop asks `VolumeWriters::wake_below` and goes on. The wait is
+    // not counted against the loop.
+    pub(crate) fn wait_below(&self, bytes: u64) {
+        let state = &self.lane.state;
+        let over = || {
+            state.volume.buffered_bytes.load(Ordering::SeqCst) > bytes
+                && !self.key.failed.load(Ordering::SeqCst)
+                && !self.key.abandoned.load(Ordering::SeqCst)
+                && self.lane.threadless.is_none()
+        };
+        if !over() {
+            return;
+        }
+        // Counted in before the look that decides to wait, and the look is
+        // made with the lock held: the writer lowers the bytes first and
+        // looks for waiters after, so it either finds this one and wakes
+        // it under the lock, or this look finds the bytes already lowered.
+        state.below_waiters.fetch_add(1, Ordering::SeqCst);
+        let mut held = state
+            .below_waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        #[cfg(test)]
+        state.below.notify_all();
+        while over() {
+            held = state.below.wait(held).unwrap_or_else(PoisonError::into_inner);
+        }
+        state.below_waiters.fetch_sub(1, Ordering::SeqCst);
+        drop(held);
+    }
+
     // Read `len` bytes at `offset` of the file at `path`, after everything
     // the key submitted before. The caller waits for the answer.
     pub(crate) fn read(&self, path: PathBuf, offset: u64, len: usize) -> io::Result<Vec<u8>> {
@@ -698,7 +738,8 @@ impl Submitter {
     // run, and every handle it left open is closed. The barrier taken after
     // this passes once nothing of the key can touch the disk again.
     pub(crate) fn abandon(&self) -> Barrier {
-        self.key.abandoned.store(true, Ordering::Release);
+        self.key.abandoned.store(true, Ordering::SeqCst);
+        self.lane.state.look_below();
         self.submit(Op::Forget);
         self.barrier()
     }
@@ -866,6 +907,10 @@ struct LaneState {
     waiters: AtomicUsize,
     waiting: Mutex<()>,
     woke: Condvar,
+    // Threads standing in `Submitter::wait_below`, and what wakes them.
+    below_waiters: AtomicUsize,
+    below_waiting: Mutex<()>,
+    below: Condvar,
     #[cfg(test)]
     gate: Mutex<Gate>,
     #[cfg(test)]
@@ -880,6 +925,18 @@ impl LaneState {
         counts
             .loop_wait_nanos
             .fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    // Have every thread in `Submitter::wait_below` look again: the bytes
+    // waiting fell, or a key stopped. One load when no thread waits.
+    fn look_below(&self) {
+        if self.below_waiters.load(Ordering::SeqCst) > 0 {
+            let _held = self
+                .below_waiting
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.below.notify_all();
+        }
     }
 
     fn returned(&self, through: u64) {
@@ -902,6 +959,7 @@ fn unbuffer(state: &LaneState, report: &ReportFn, bytes: u64) {
         .buffered_bytes
         .fetch_sub(bytes, Ordering::SeqCst)
         .saturating_sub(bytes);
+    state.look_below();
     let ask = volume.wake_line.load(Ordering::SeqCst);
     if ask != 0
         && left < ask
@@ -939,6 +997,9 @@ impl Lane {
             waiters: AtomicUsize::new(0),
             waiting: Mutex::new(()),
             woke: Condvar::new(),
+            below_waiters: AtomicUsize::new(0),
+            below_waiting: Mutex::new(()),
+            below: Condvar::new(),
             #[cfg(test)]
             gate: Mutex::default(),
             #[cfg(test)]
@@ -1379,7 +1440,7 @@ impl Thread {
                 self.state.done.fetch_add(1, Ordering::Relaxed);
             }
             let key = &entry.key;
-            if !key.failed.swap(true, Ordering::AcqRel) && !key.abandoned.load(Ordering::Acquire) {
+            if !key.failed.swap(true, Ordering::SeqCst) && !key.abandoned.load(Ordering::Acquire) {
                 self.ran.failures.push(Failure {
                     key: key.id,
                     file: None,
@@ -1390,6 +1451,7 @@ impl Thread {
             }
             key.returned(entry.seq);
         }
+        self.state.look_below();
         self.state.returned(base + self.batch.len() as u64);
     }
 
@@ -1655,7 +1717,8 @@ fn perform(
             }
             key.unheard.fetch_add(1, Ordering::AcqRel);
         } else {
-            key.failed.store(true, Ordering::Release);
+            key.failed.store(true, Ordering::SeqCst);
+            state.look_below();
         }
         failures.push(Failure {
             key: key.id,
@@ -1754,6 +1817,19 @@ impl Hold {
     // The next operation let through fails with `error` instead of running.
     pub(crate) fn fail_next(&self, error: io::Error) {
         self.gate().fail_next = Some(error);
+    }
+
+    // Wait until `count` threads stand in `Submitter::wait_below` on the
+    // volume.
+    pub(crate) fn wait_below_waiters(&self, count: usize) {
+        let state = &self.0.state;
+        let mut held = state
+            .below_waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while state.below_waiters.load(Ordering::SeqCst) < count {
+            held = state.below.wait(held).unwrap_or_else(PoisonError::into_inner);
+        }
     }
 
     // Wait until the thread stands before an operation it may not run yet.

@@ -630,6 +630,104 @@ fn a_volume_with_no_thread_is_asked_for_one_again_only_once_it_was_let_go() {
     drop((fourth, fifth));
 }
 
+// A thread that produces what is written waits on the volume's budget: it
+// stands still while more than its line waits for the writer, and goes on
+// as soon as the writer brings the bytes to the line.
+#[test]
+fn a_producer_waits_until_the_bytes_waiting_fall_to_its_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    job.write(1, 0, Bytes::from_static(b"four"), create(&path));
+    job.write(1, 4, Bytes::from_static(b"more"), None);
+    job.write(1, 8, Bytes::from_static(b"last"), None);
+    // Twelve wait: a line of twelve or more is already met.
+    job.wait_below(12);
+    hold.wait_held();
+    let through = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let producer = scope.spawn(|| {
+            job.wait_below(4);
+            through.store(true, Ordering::SeqCst);
+        });
+        hold.wait_below_waiters(1);
+        hold.release(1);
+        hold.wait_held();
+        assert_eq!(count(&volume.buffered_bytes), 8);
+        assert!(!through.load(Ordering::SeqCst), "eight wait, above the line");
+        hold.release(1);
+        producer.join().unwrap();
+    });
+    assert!(through.load(Ordering::SeqCst));
+    assert!(count(&volume.buffered_bytes) <= 4);
+    // The wait was the producer's, not the pipeline loop's.
+    assert_eq!(count(&volume.writer.loop_waits), 0);
+    hold.open();
+    job.barrier().wait_aside();
+    assert_eq!(std::fs::read(&path).unwrap(), b"fourmorelast");
+}
+
+// The wait ends when the key stops, whatever still waits for the writer: by
+// a failure of one of its operations, or by its caller giving it up.
+#[test]
+fn a_producers_wait_ends_when_its_key_fails_or_is_given_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let (failing_path, given_path, other_path) = (
+        dir.path().join("failing"),
+        dir.path().join("given"),
+        dir.path().join("other"),
+    );
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let failing = writers.submitter(&volume, 1);
+    let given_up = writers.submitter(&volume, 2);
+    let other = writers.submitter(&volume, 3);
+    failing.write(1, 0, Bytes::from_static(b"lost"), create(&failing_path));
+    hold.wait_held();
+    given_up.write(1, 0, Bytes::from_static(b"gone"), create(&given_path));
+    other.write(1, 0, Bytes::from_static(b"kept"), create(&other_path));
+    std::thread::scope(|scope| {
+        let after_failure = scope.spawn(|| failing.wait_below(0));
+        let after_giving_up = scope.spawn(|| given_up.wait_below(0));
+        hold.wait_below_waiters(2);
+        // The first write fails. The other keys' bytes still wait.
+        hold.fail_next(io::Error::other("no room"));
+        hold.release(1);
+        after_failure.join().unwrap();
+        hold.wait_held();
+        assert_eq!(count(&volume.buffered_bytes), 8);
+        assert!(failing.barrier().failed());
+        assert!(!given_up.barrier().failed() && !after_giving_up.is_finished());
+        let gone = given_up.abandon();
+        after_giving_up.join().unwrap();
+        assert!(gone.failed());
+    });
+    assert!(!other.barrier().failed());
+    hold.open();
+    other.barrier().wait_aside();
+    assert_eq!(std::fs::read(&other_path).unwrap(), b"kept");
+    assert!(!given_path.exists());
+}
+
+// A volume with no writer thread holds no producer: nothing will be written.
+#[test]
+fn a_producer_does_not_wait_on_a_volume_with_no_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let writers = VolumeWriters::threadless(|_| {});
+    let volume = volume("one");
+    let job = writers.submitter(&volume, 1);
+    // Bytes counted as waiting by something else do not hold it either.
+    volume.buffered_bytes.store(64, Ordering::SeqCst);
+    job.wait_below(0);
+    job.write(1, 0, Bytes::from_static(b"lost"), create(&dir.path().join("a")));
+    job.wait_below(0);
+    assert!(job.barrier().failed());
+}
+
 // A refusal still to be heard is not a failure of the key.
 #[test]
 fn a_refused_name_is_not_a_failed_barrier() {
