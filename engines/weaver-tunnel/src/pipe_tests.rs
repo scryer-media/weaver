@@ -5,9 +5,8 @@ use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn bottom() -> Arc<Egress> {
-    Arc::new(Egress::new(
+    Arc::new(crate::test_support::loopback::egress(
         4,
-        SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()),
         Duration::from_secs(30),
     ))
 }
@@ -147,7 +146,7 @@ async fn connect_proxy(
                 .unwrap()
                 .starts_with(&format!("CONNECT {expected} HTTP/1.1\r\n"))
         );
-        let mut upstream = tokio::net::TcpStream::connect(next).await.unwrap();
+        let mut upstream = crate::test_support::loopback::connect(next).await.unwrap();
         stream
             .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
             .await
@@ -1059,6 +1058,10 @@ async fn a_fallback_rung_whose_proxy_resolves_is_handed_the_name() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "builds egresses only to classify their errors; it never dials or binds"
+)]
 fn unresolved_destination_and_bound_route_failures_have_distinct_evidence() {
     let unresolved = DialError::destination(io::Error::new(
         io::ErrorKind::AddrNotAvailable,
@@ -1445,7 +1448,7 @@ impl Dialer for Mapped {
             .lock()
             .unwrap()
             .push((target.host.clone(), target.port));
-        let stream = tokio::net::TcpStream::connect(self.to)
+        let stream = crate::test_support::loopback::connect(self.to)
             .await
             .map_err(DialError::Destination)?;
         Ok(Dialed {
@@ -2899,4 +2902,40 @@ async fn a_socks5_proxy_silent_at_its_greeting_is_failing() {
     let told = turns.taken();
     assert_eq!(told.len(), 1, "{told:?}");
     assert!(told[0].is_some());
+}
+
+// A direct leg's blocking lookup, the NNTP address plan's, gives what its
+// async lookup gives: the host's own DNS on its one shared cache, in the
+// host's order, kept to the egress's address family. The async lookup hands
+// the same addresses on sorted.
+#[tokio::test]
+async fn a_direct_legs_blocking_lookup_matches_its_async_lookup() {
+    let egress = bottom();
+    let first = Arc::new(record::Recording::default());
+    let blocking = first
+        .scope(async { egress.resolve_blocking("localhost").unwrap() })
+        .await;
+    let noted = first.finish("localhost", 0, None).unwrap();
+    assert_eq!(noted.by, record::ResolvedBy::Host);
+    let host_order: Vec<IpAddr> = noted
+        .addresses
+        .iter()
+        .copied()
+        .filter(IpAddr::is_ipv4)
+        .collect();
+    assert!(!blocking.is_empty());
+    assert_eq!(blocking, host_order);
+
+    let second = Arc::new(record::Recording::default());
+    let Resolution::Addresses(resolved) = second.scope(egress.resolve("localhost")).await.unwrap()
+    else {
+        panic!("a direct leg resolves every name");
+    };
+    let mut sorted = blocking.clone();
+    sorted.sort();
+    assert_eq!(resolved, sorted);
+    assert!(
+        second.finish("localhost", 0, None).unwrap().cached,
+        "the async lookup asks the blocking one's cache"
+    );
 }

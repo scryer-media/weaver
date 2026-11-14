@@ -2671,14 +2671,10 @@ mod tests {
     // Route the first server over a direct leg whose address plan the test
     // reads.
     fn planned_route(config: &mut PoolConfig) -> Arc<crate::route_dialer::AddressPlanned> {
-        let route = Arc::new(crate::route_dialer::AddressPlanned::new(
-            "pool test".into(),
-            Arc::new(weaver_tunnel::pipe::Egress::new(
-                0,
-                crate::egress::SocketEgress::System,
-                Duration::from_secs(30),
-            )),
-        ));
+        let route = crate::route_dialer::AddressPlanned::loopback_for_tests(
+            "pool test",
+            Duration::from_secs(30),
+        );
         config.servers[0].server.dialer = Arc::new(crate::route_dialer::RouteDialer {
             inner: route.clone(),
             plan: Some(route.plan.clone()),

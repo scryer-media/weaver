@@ -11,7 +11,11 @@ async fn idle_inspection_has_a_hard_input_budget_and_restores_normal_reads() {
         let (mut socket, _) = listener.accept().await.unwrap();
         socket.write_all(&vec![7; 128 * 1024]).await.unwrap();
     });
-    let mut route = RouteStream::from(tokio::net::TcpStream::connect(address).await.unwrap());
+    let mut route = RouteStream::from(
+        weaver_tunnel::test_support::loopback::connect(address)
+            .await
+            .unwrap(),
+    );
     server.await.unwrap();
     route.begin_inspection();
     let mut bytes = vec![0; 128 * 1024];

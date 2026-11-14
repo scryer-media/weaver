@@ -265,7 +265,7 @@ async fn serve(
         }
         return Ok(());
     };
-    let mut upstream = TcpStream::connect(addr).await?;
+    let mut upstream = super::loopback::connect(*addr).await?;
     if matches!(kind, TransportKind::HttpConnect) {
         stream.write_all(b"HTTP/1.1 200 Connected\r\n\r\n").await?;
     } else {
@@ -278,8 +278,8 @@ async fn serve(
 // One association: relay datagrams until the control connection ends or
 // the test hangs it up. The relay's sockets close with it.
 async fn associate(mut stream: TcpStream, udp: Arc<UdpRelays>) -> std::io::Result<()> {
-    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
-    let outbound = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let socket = Arc::new(super::loopback::bind_udp((Ipv4Addr::LOCALHOST, 0)).await?);
+    let outbound = Arc::new(super::loopback::bind_udp((Ipv4Addr::LOCALHOST, 0)).await?);
     let mut hang_up = udp.hang_up.subscribe();
     let named = if udp.unspecified {
         Ipv4Addr::UNSPECIFIED

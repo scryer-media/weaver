@@ -1629,7 +1629,7 @@ mod tests {
     #[cfg(not(windows))]
     use tokio::io::AsyncWriteExt;
     #[cfg(not(windows))]
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::TcpListener;
     #[cfg(not(windows))]
     use tokio::sync::oneshot;
     #[cfg(not(windows))]
@@ -2035,7 +2035,9 @@ mod tests {
     async fn s2n_tls_drain_probe() {
         let (server_config, ca_path) = s2n_probe_tls_config();
         let (addr, flushed_rx) = spawn_tls_drain_server(server_config).await;
-        let tcp = TcpStream::connect(addr).await.unwrap();
+        let tcp = weaver_tunnel::test_support::loopback::connect(addr)
+            .await
+            .unwrap();
         let tls_config = build_s2n_tls_config(Some(&ca_path)).expect("s2n TLS config");
         let s2n_tls = connect_s2n_tls(tcp, tls_config, "localhost")
             .await

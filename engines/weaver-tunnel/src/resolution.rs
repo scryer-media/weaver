@@ -460,7 +460,7 @@ static HOST: LazyLock<ResolutionCache<io::Error>> = LazyLock::new(ResolutionCach
 )]
 // The one place a name reaches the host resolver: a leg whose naming is Host.
 #[cfg_attr(dylint_lib = "host_name_lookup", allow(host_name_lookup))]
-pub async fn host_lookup(host: &str) -> io::Result<Vec<IpAddr>> {
+pub(crate) async fn host_lookup(host: &str) -> io::Result<Vec<IpAddr>> {
     asking_host(host);
     noted_by_host(
         host,
@@ -473,21 +473,6 @@ pub async fn host_lookup(host: &str) -> io::Result<Vec<IpAddr>> {
     )
 }
 
-// Resolves the name of a tunnel's own endpoint with the host's own DNS: the
-// endpoint carries the tunnel, so nothing inside the tunnel can answer it.
-pub struct HostEndpoints;
-
-#[async_trait::async_trait]
-impl crate::endpoint::EndpointResolver for HostEndpoints {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a tunnel's own endpoint is the first hop of the route"
-    )]
-    async fn resolve(&self, host: &str) -> io::Result<Vec<IpAddr>> {
-        host_lookup(host).await
-    }
-}
-
 // `host_lookup` for a thread that may block.
 #[expect(
     clippy::disallowed_methods,
@@ -495,7 +480,7 @@ impl crate::endpoint::EndpointResolver for HostEndpoints {
 )]
 // The one place a name reaches the host resolver: a leg whose naming is Host.
 #[cfg_attr(dylint_lib = "host_name_lookup", allow(host_name_lookup))]
-pub fn host_lookup_blocking(host: &str) -> io::Result<Vec<IpAddr>> {
+pub(crate) fn host_lookup_blocking(host: &str) -> io::Result<Vec<IpAddr>> {
     asking_host(host);
     noted_by_host(
         host,

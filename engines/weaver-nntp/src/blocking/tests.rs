@@ -335,7 +335,11 @@ fn spawn_partial_tls_record_proxy(upstream_port: u16) -> (u16, std::thread::Join
     let port = listener.local_addr().unwrap().port();
     let handle = std::thread::spawn(move || {
         let (mut downstream, _) = listener.accept().unwrap();
-        let mut upstream = TcpStream::connect(("127.0.0.1", upstream_port)).unwrap();
+        let mut upstream = weaver_tunnel::test_support::loopback::connect_blocking((
+            [127, 0, 0, 1],
+            upstream_port,
+        ))
+        .unwrap();
         let mut request_reader = downstream.try_clone().unwrap();
         let mut request_writer = upstream.try_clone().unwrap();
         let request_forwarder = std::thread::spawn(move || {
@@ -1540,7 +1544,8 @@ fn spawn_raw_tls_drain_server() -> (u16, std::thread::JoinHandle<()>, std::path:
 #[ignore = "diagnostic read-shape probe; run explicitly with --ignored --nocapture"]
 fn rustls_blocking_drain_probe() {
     let (port, handle, ca_path) = spawn_raw_tls_drain_server();
-    let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let tcp =
+        weaver_tunnel::test_support::loopback::connect_blocking(([127, 0, 0, 1], port)).unwrap();
     let mut stream = BlockingManualTlsStream::connect(
         tcp,
         "localhost",
@@ -1876,7 +1881,7 @@ fn ring_abandon_reports_the_dropped_requests_and_poisons_the_lane() {
 fn tcp_peer_closed_sees_a_server_side_close_on_an_idle_socket() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let client = std::net::TcpStream::connect(addr).unwrap();
+    let client = weaver_tunnel::test_support::loopback::connect_blocking(addr).unwrap();
     let (server, _) = listener.accept().unwrap();
 
     assert!(
@@ -2376,15 +2381,10 @@ fn routed_socket_preserves_implicit_tls_and_starttls_body_delivery() {
             )],
             upgrade,
         );
-        let egress = std::sync::Arc::new(weaver_tunnel::pipe::Egress::new(
-            0,
-            weaver_tunnel::egress::SocketEgress::System,
+        let planned = crate::route_dialer::AddressPlanned::loopback_for_tests(
+            "fixture",
             config.connect_timeout,
-        ));
-        let planned = std::sync::Arc::new(crate::route_dialer::AddressPlanned::new(
-            "fixture".into(),
-            egress,
-        ));
+        );
         config.dialer = std::sync::Arc::new(crate::route_dialer::RouteDialer {
             plan: Some(planned.plan.clone()),
             inner: planned,

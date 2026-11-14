@@ -2,7 +2,6 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
-use crate::egress::SocketEgress;
 use crate::metrics::Resolver;
 use crate::pipe::Egress;
 use crate::resolution::record;
@@ -11,9 +10,8 @@ use crate::{NoopTunnelObserver, TunnelProvider, WireGuardTunnelProvider};
 use std::time::Duration;
 
 fn egress() -> Arc<Egress> {
-    Arc::new(Egress::new(
+    Arc::new(crate::test_support::loopback::egress(
         4,
-        SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()),
         Duration::from_secs(30),
     ))
 }
@@ -98,4 +96,62 @@ async fn a_leg_that_resolves_no_names_refuses_an_endpoint_name() {
     .await
     .unwrap_err();
     assert!(error.to_string().contains("resolves none"), "{error}");
+}
+
+// A shared WireGuard tunnel built without a resolver refuses an endpoint
+// written as a name, and the host's own DNS is never asked for it.
+#[tokio::test]
+async fn a_wireguard_tunnel_without_a_resolver_refuses_an_endpoint_name() {
+    let peer = WireGuardTestPeer::start().await;
+    let mut spec = peer.client_spec("no-resolver");
+    spec.endpoint_host = "vpn.example.test".to_string();
+    let port = spec.endpoint_port;
+    let provider = WireGuardTunnelProvider::new(spec, Arc::new(NoopTunnelObserver));
+
+    let recording = Arc::new(record::Recording::default());
+    let error = recording
+        .scope(provider.dial(&TEST_PEER_ADDRESS.to_string(), TEST_PEER_HTTP_PORT))
+        .await
+        .err()
+        .expect("an endpoint name with no resolver is refused");
+
+    assert!(
+        error.to_string().contains("no resolver was given"),
+        "{error}"
+    );
+    assert!(
+        recording.finish("vpn.example.test", port, None).is_none(),
+        "the endpoint name reached a resolver"
+    );
+}
+
+// A shared HTTP/3 tunnel built without a resolver refuses a proxy written as
+// a name, and the host's own DNS is never asked for it.
+#[tokio::test]
+async fn an_http3_tunnel_without_a_resolver_refuses_a_proxy_name() {
+    let provider = crate::Http3TunnelProvider::new(crate::Http3TunnelSpec {
+        proxy_config_id: "no-resolver".into(),
+        revision: "1".into(),
+        host: "proxy.example.test".into(),
+        port: 443,
+        credentials: None,
+        request_timeout: Duration::from_secs(300),
+    })
+    .unwrap();
+
+    let recording = Arc::new(record::Recording::default());
+    let error = recording
+        .scope(provider.dial("origin.example.test", 80))
+        .await
+        .err()
+        .expect("a proxy name with no resolver is refused");
+
+    assert!(
+        error.to_string().contains("no resolver was given"),
+        "{error}"
+    );
+    assert!(
+        recording.finish("proxy.example.test", 443, None).is_none(),
+        "the proxy name reached a resolver"
+    );
 }

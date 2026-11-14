@@ -89,7 +89,9 @@ fn inspect_fragmented_shutdown(mut inspect: impl FnMut() -> bool, fixture: IdleT
 #[test]
 fn rustls_idle_inspection_preserves_fragments_and_detects_close_notify() {
     let fixture = idle_tls_fixture();
-    let tcp = TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
+    let tcp =
+        weaver_tunnel::test_support::loopback::connect_blocking(([127, 0, 0, 1], fixture.port))
+            .unwrap();
     let stream = BlockingManualTlsStream::connect(
         tcp,
         "localhost",
@@ -108,7 +110,9 @@ fn rustls_idle_inspection_preserves_fragments_and_detects_close_notify() {
 fn s2n_idle_inspection_preserves_fragments_and_detects_close_notify() {
     let _guard = s2n_test_guard();
     let fixture = idle_tls_fixture();
-    let tcp = TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
+    let tcp =
+        weaver_tunnel::test_support::loopback::connect_blocking(([127, 0, 0, 1], fixture.port))
+            .unwrap();
     let stream =
         BlockingS2nStream::connect(tcp, "localhost", Some(&fixture.ca), Duration::from_secs(5))
             .unwrap();
@@ -120,7 +124,7 @@ fn s2n_idle_inspection_preserves_fragments_and_detects_close_notify() {
 async fn async_rustls_idle_inspection_preserves_fragments_and_detects_close_notify() {
     for manual in [true, false] {
         let fixture = idle_tls_fixture();
-        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", fixture.port))
+        let tcp = weaver_tunnel::test_support::loopback::connect(([127, 0, 0, 1], fixture.port))
             .await
             .unwrap();
         let config =
@@ -150,7 +154,7 @@ async fn async_rustls_idle_inspection_preserves_fragments_and_detects_close_noti
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_s2n_idle_inspection_preserves_fragments_and_detects_close_notify() {
     let fixture = idle_tls_fixture();
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", fixture.port))
+    let tcp = weaver_tunnel::test_support::loopback::connect(([127, 0, 0, 1], fixture.port))
         .await
         .unwrap();
     let config = crate::tls::build_s2n_tls_config(Some(&fixture.ca)).unwrap();
@@ -170,7 +174,9 @@ async fn async_s2n_idle_inspection_preserves_fragments_and_detects_close_notify(
 #[test]
 fn rustls_idle_inspection_after_the_read_buffer_is_freed_tells_open_from_closed() {
     let fixture = idle_tls_fixture();
-    let tcp = TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
+    let tcp =
+        weaver_tunnel::test_support::loopback::connect_blocking(([127, 0, 0, 1], fixture.port))
+            .unwrap();
     let mut stream = BlockingManualTlsStream::connect(
         tcp,
         "localhost",

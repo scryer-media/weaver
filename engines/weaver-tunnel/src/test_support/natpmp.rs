@@ -59,7 +59,7 @@ impl NatPmpGateway {
     /// A gateway that forwards, for each internal port asked, the port
     /// `grant` gives for it.
     pub async fn granting(grant: impl Fn(u16) -> u16 + Send + 'static) -> Self {
-        let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        let socket = super::loopback::bind_udp((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind the gateway");
         let address = socket.local_addr().expect("gateway address");

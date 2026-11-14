@@ -513,7 +513,7 @@ mod connect_tests {
             peer.write_all(b"502 Too Many Connections\r\n").unwrap();
         });
         let socket = SocketEgress::System.tcp_socket(target).unwrap();
-        socket.connect(&target.into()).unwrap();
+        crate::test_support::loopback::connect_socket(&socket, target).unwrap();
         server.join().unwrap();
 
         // Inject the connect poll's synthesized hangup after the peer has
@@ -547,7 +547,7 @@ mod connect_tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let target = listener.local_addr().unwrap();
         let socket = SocketEgress::System.tcp_socket(target).unwrap();
-        socket.connect(&target.into()).unwrap();
+        crate::test_support::loopback::connect_socket(&socket, target).unwrap();
         let (_peer, _) = listener.accept().unwrap();
         let error = SocketEgress::finish_blocking_connect(
             socket,

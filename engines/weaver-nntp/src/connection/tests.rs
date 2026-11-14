@@ -112,7 +112,9 @@ async fn connect_tls_drain_client(
     addr: SocketAddr,
     client_config: Arc<ClientConfig>,
 ) -> NntpConnection {
-    let tcp = TcpStream::connect(addr).await.unwrap();
+    let tcp = weaver_tunnel::test_support::loopback::connect(addr)
+        .await
+        .unwrap();
     let remote_addr = tcp.peer_addr().unwrap();
     let connector = TlsConnector::from(client_config);
     let server_name = ServerName::try_from("localhost").unwrap();
@@ -267,7 +269,9 @@ async fn connect_manual_rustls_client(
     addr: SocketAddr,
     client_config: Arc<ClientConfig>,
 ) -> (TcpStream, ClientConnection) {
-    let mut tcp = TcpStream::connect(addr).await.unwrap();
+    let mut tcp = weaver_tunnel::test_support::loopback::connect(addr)
+        .await
+        .unwrap();
     let server_name = ServerName::try_from("localhost").unwrap();
     let mut tls = ClientConnection::new(client_config, server_name).unwrap();
     let mut ciphertext = vec![0u8; 64 * 1024];
@@ -421,7 +425,9 @@ async fn connect_unbuffered_rustls_client(
     UnbufferedRustlsStats,
     UnbufferedInput,
 ) {
-    let mut tcp = TcpStream::connect(addr).await.unwrap();
+    let mut tcp = weaver_tunnel::test_support::loopback::connect(addr)
+        .await
+        .unwrap();
     let server_name = ServerName::try_from("localhost").unwrap();
     let mut tls = UnbufferedClientConnection::new(client_config, server_name).unwrap();
     let mut input = vec![0u8; TLS_TEST_BUFFER_BYTES];
@@ -680,7 +686,9 @@ async fn unbuffered_rustls_first_ready_pass_probe() {
 async fn manual_tls_transport_bulk_drain_probe() {
     let (client_config, server_config) = test_tls_configs();
     let (addr, flushed_rx) = spawn_tls_drain_server(server_config).await;
-    let tcp = TcpStream::connect(addr).await.unwrap();
+    let tcp = weaver_tunnel::test_support::loopback::connect(addr)
+        .await
+        .unwrap();
     let remote_addr = tcp.peer_addr().unwrap();
     let server_name = ServerName::try_from("localhost").unwrap();
     let inner = ManualTlsStream::connect(tcp, client_config, server_name)
@@ -733,7 +741,9 @@ async fn manual_tls_transport_bounds_each_turn_and_preserves_stream() {
         tls.shutdown().await.unwrap();
     });
 
-    let tcp = TcpStream::connect(addr).await.unwrap();
+    let tcp = weaver_tunnel::test_support::loopback::connect(addr)
+        .await
+        .unwrap();
     let remote_addr = tcp.peer_addr().unwrap();
     let server_name = ServerName::try_from("localhost").unwrap();
     let inner = ManualTlsStream::connect(tcp, client_config, server_name)

@@ -1253,3 +1253,23 @@ fn a_kept_pin_that_keeps_refusing_races_once_per_holdoff_not_on_every_connect() 
     settle_all(&dialer);
     assert_eq!(plan.snapshot().races_failed, 2);
 }
+
+// A direct leg's dialer asks its egress for the server's addresses, as the
+// egress's naming says, and gives each one the server's port, in the order
+// the egress gave them.
+#[test]
+fn a_direct_dialer_resolves_through_its_egress() {
+    let egress = Arc::new(weaver_tunnel::test_support::loopback::egress(
+        0,
+        Duration::from_secs(30),
+    ));
+    let dialer = TcpDialer::new("localhost", 119, Duration::from_secs(30), egress.clone());
+    let expected: Vec<SocketAddr> = egress
+        .resolve_blocking("localhost")
+        .unwrap()
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, 119))
+        .collect();
+    assert!(!expected.is_empty());
+    assert_eq!(dialer.resolve().unwrap(), expected);
+}

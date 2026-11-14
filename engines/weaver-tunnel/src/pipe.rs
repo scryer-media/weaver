@@ -243,13 +243,36 @@ fn routed(addresses: Vec<IpAddr>) -> Result<Vec<IpAddr>, DialError> {
 }
 
 // What the host's own DNS resolves `host` to.
-#[expect(clippy::disallowed_methods, reason = "a Host-resolved leg")]
 async fn lookup(host: &str) -> Result<Vec<IpAddr>, DialError> {
-    let mut addresses = crate::resolution::host_lookup(host)
+    let mut addresses = host_dns::lookup(host)
         .await
         .map_err(DialError::Destination)?;
     addresses.sort();
     Ok(addresses)
+}
+
+// The host's own DNS, asked only where a leg's naming is Host: a direct
+// egress leg always, and a proxy hop whose profile says Host. These are the
+// only callers of the host resolver, and nothing outside this module can
+// reach them; every other lookup goes through a leg's naming.
+mod host_dns {
+    use std::{io, net::IpAddr};
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one caller of the host resolver, for a leg whose naming is Host"
+    )]
+    pub(super) async fn lookup(host: &str) -> io::Result<Vec<IpAddr>> {
+        crate::resolution::host_lookup(host).await
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one blocking caller of the host resolver, for a leg whose naming is Host"
+    )]
+    pub(super) fn lookup_blocking(host: &str) -> io::Result<Vec<IpAddr>> {
+        crate::resolution::host_lookup_blocking(host)
+    }
 }
 
 // Whether a dial that resolved `target` itself failed at the destination,
@@ -774,6 +797,15 @@ impl Egress {
         }
         DialError::destination(error)
     }
+    // What the host's own DNS gives for `host` that this egress can reach,
+    // in the order it gives them, for a direct leg's blocking dialer: a
+    // direct leg's naming is always Host.
+    pub fn resolve_blocking(&self, host: &str) -> io::Result<Vec<IpAddr>> {
+        Ok(host_dns::lookup_blocking(host)?
+            .into_iter()
+            .filter(|ip| self.binding.supports_address(*ip))
+            .collect())
+    }
     #[expect(
         clippy::disallowed_methods,
         reason = "an egress leg dials the destination"
@@ -814,15 +846,11 @@ impl UdpSocketFactory for Egress {
 
 #[async_trait::async_trait]
 impl Dialer for Egress {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "an egress leg resolves with the host resolver"
-    )]
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
         let started = tokio::time::Instant::now();
         let attempt = async {
             let peers: Vec<_> = if target.addresses.is_empty() {
-                crate::resolution::host_lookup(&target.host)
+                host_dns::lookup(&target.host)
                     .await
                     .map_err(DialError::Destination)?
             } else {
@@ -874,12 +902,8 @@ impl Dialer for Egress {
             (_, result) => result,
         }
     }
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "an egress leg resolves with the host resolver"
-    )]
     async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
-        let peers = tokio::time::timeout(self.timeout, crate::resolution::host_lookup(host))
+        let peers = tokio::time::timeout(self.timeout, host_dns::lookup(host))
             .await
             .map_err(|_| {
                 DialError::Destination(io::Error::new(

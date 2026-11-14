@@ -111,7 +111,9 @@ mod tests {
             Duration::ZERO,
         )
         .await;
-        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut client = weaver_tunnel::test_support::loopback::connect(([127, 0, 0, 1], port))
+            .await
+            .unwrap();
         client.write_all(b"BO").await.unwrap();
         client.write_all(b"DY <id>\r\n").await.unwrap();
 
@@ -134,7 +136,9 @@ mod tests {
             Duration::ZERO,
         )
         .await;
-        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut client = weaver_tunnel::test_support::loopback::connect(([127, 0, 0, 1], port))
+            .await
+            .unwrap();
         client.write_all(b"BODY <id>\r\n").await.unwrap();
 
         let panic = task.await.expect_err("unexpected command should panic");
