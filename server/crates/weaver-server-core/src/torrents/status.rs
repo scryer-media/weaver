@@ -197,6 +197,9 @@ pub struct Observed {
     /// Not one of the files its pieces are in was there when it was loaded:
     /// it is held stopped until a start, a recheck or a move looks again.
     pub files_missing: bool,
+    /// It waits for room on its disk, as a usenet job held for disk space
+    /// does: in upload mode, seeding, until room is made.
+    pub disk_space: bool,
 }
 
 impl Observed {
@@ -270,6 +273,14 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
     if seen.queued {
         return (TorrentState::Queued, None);
     }
+    // Kept from starting for room on its disk, it waits in the queue and
+    // says so as a usenet job does. Waiting in upload mode is told below.
+    if seen.disk_space && !matches!(seen.engine, Engine::Live { .. }) {
+        return (
+            TorrentState::Queued,
+            detail(crate::jobs::handle::DISK_SPACE_WAIT_REASON),
+        );
+    }
     match &seen.engine {
         // In no session yet: it waits for one to take it.
         Engine::Absent => (TorrentState::Queued, None),
@@ -279,6 +290,13 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
         Engine::Live { .. } | Engine::Paused { .. } if seen.seeding() => {
             (TorrentState::Seeding, seen.failed.clone().map(Why::Said))
         }
+        // Waiting for room, it says so as a usenet job does.
+        Engine::Live {
+            upload_mode: true, ..
+        } if seen.disk_space => (
+            TorrentState::Stalled,
+            detail(crate::jobs::handle::DISK_SPACE_WAIT_REASON),
+        ),
         Engine::Live {
             upload_mode: true, ..
         } => (TorrentState::Stalled, detail(DISK_FULL)),
@@ -669,6 +687,7 @@ mod tests {
             moving: false,
             restore_held: None,
             files_missing: false,
+            disk_space: false,
         }
     }
 
@@ -1013,6 +1032,33 @@ mod tests {
                 upload_mode: true,
             })),
             (TorrentState::Stalled, Some(DISK_FULL.into()))
+        );
+        // Waiting for room on its disk, it says so as a usenet job held for
+        // disk space does.
+        assert_eq!(
+            project(&Observed {
+                disk_space: true,
+                ..seen(Engine::Live {
+                    finished: false,
+                    peers: 3,
+                    upload_mode: true,
+                })
+            }),
+            (
+                TorrentState::Stalled,
+                Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON.into())
+            )
+        );
+        // Kept from starting for room on its disk, it waits in the queue.
+        assert_eq!(
+            project(&Observed {
+                disk_space: true,
+                ..seen(Engine::Paused { finished: false })
+            }),
+            (
+                TorrentState::Queued,
+                Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON.into())
+            )
         );
         assert_eq!(
             project(&Observed {

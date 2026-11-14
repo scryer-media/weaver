@@ -232,6 +232,15 @@ const SNUB_INTERVAL: Duration = Duration::from_secs(1);
 // minutes, read by `torrent::second_tick`).
 const OPTIMISTIC_DISK_RETRY: Duration = Duration::from_secs(600);
 
+// Upload mode as it was entered: when, and whether it ends by itself once
+// it lasted OPTIMISTIC_DISK_RETRY, or only when the torrent's owner says
+// room was made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UploadMode {
+    at: tokio::time::Instant,
+    retry: bool,
+}
+
 pub enum AddIncomingPeerResult {
     Added,
     AlreadyActive,
@@ -356,7 +365,7 @@ pub struct TorrentStateLive {
     // When the torrent entered upload mode, while it is in it: a write
     // found no room, so it fetches nothing and keeps seeding (libtorrent
     // `torrent::m_upload_mode`, `m_upload_mode_time`).
-    upload_mode: watch::Sender<Option<tokio::time::Instant>>,
+    upload_mode: watch::Sender<Option<UploadMode>>,
     // The torrent's files as its web seeds serve them.
     web_layout: web_seed::Layout,
     // Rings once per write that carried block bytes while an
@@ -569,7 +578,9 @@ impl TorrentStateLive {
         state.refilter();
 
         // Upload mode ends once it lasted OPTIMISTIC_DISK_RETRY (libtorrent
-        // `torrent::second_tick`).
+        // `torrent::second_tick`), unless it waits for its owner. Only the
+        // mode slept on ends: one entered again since, or turned over to
+        // the owner, lasts on from then.
         state.spawn(
             debug_span!(parent: state.shared.span.clone(), "upload_mode_retry"),
             format!("[{}]upload_mode_retry", state.shared.id),
@@ -578,15 +589,20 @@ impl TorrentStateLive {
                 let state = Arc::downgrade(&state);
                 async move {
                     loop {
-                        let Ok(Some(at)) = entered.wait_for(Option::is_some).await.map(|at| *at)
+                        let Ok(Some(mode)) = entered
+                            .wait_for(|mode| mode.is_some_and(|mode| mode.retry))
+                            .await
+                            .map(|mode| *mode)
                         else {
                             return Ok(());
                         };
-                        tokio::time::sleep_until(at + OPTIMISTIC_DISK_RETRY).await;
+                        tokio::time::sleep_until(mode.at + OPTIMISTIC_DISK_RETRY).await;
                         let Some(state) = state.upgrade() else {
                             return Ok(());
                         };
-                        state.set_upload_mode(false);
+                        if *state.upload_mode.borrow() == Some(mode) {
+                            state.set_upload_mode(false);
+                        }
                     }
                 }
             },
@@ -2112,24 +2128,61 @@ impl TorrentStateLive {
         let _ = mode.wait_for(|at| at.is_some() == on).await;
     }
 
-    /// Enters or leaves upload mode (libtorrent `torrent::set_upload_mode`).
-    /// Entering, every request outstanding is cancelled and every piece in
-    /// flight goes back to the queue, each under its peer's lock, under
-    /// which a requester picks and asks; leaving, the requesters ask again.
-    /// Either way each requester looks at its interest again, and the peers
-    /// are told whether we only upload.
-    fn set_upload_mode(&self, on: bool) {
+    /// Leaves upload mode, as its owner does once room was made for a
+    /// torrent added with
+    /// [`AddTorrentOptions::owner_wakes_full_disk`](crate::AddTorrentOptions::owner_wakes_full_disk):
+    /// the requesters ask again, and the peers are told we download. Nothing
+    /// happens out of upload mode.
+    pub fn leave_upload_mode(&self) {
+        self.set_upload_mode(false);
+    }
+
+    /// Enters upload mode, to end by itself once it lasted
+    /// OPTIMISTIC_DISK_RETRY when `retry` holds, else only when its owner
+    /// says. Entered already, it keeps its time, and once it waits for its
+    /// owner it goes on waiting.
+    fn enter_upload_mode(&self, retry: bool) {
         let now = tokio::time::Instant::now();
-        let changed = self.upload_mode.send_if_modified(|at| {
-            let changed = at.is_some() != on;
-            if changed {
-                *at = on.then_some(now);
+        let mut entered = false;
+        self.upload_mode.send_if_modified(|mode| match mode {
+            Some(mode) if mode.retry && !retry => {
+                mode.retry = false;
+                true
             }
-            changed
+            Some(_) => false,
+            None => {
+                *mode = Some(UploadMode { at: now, retry });
+                entered = true;
+                true
+            }
         });
-        if !changed {
+        if entered {
+            self.upload_mode_changed(true);
+        }
+    }
+
+    /// Enters or leaves upload mode (libtorrent `torrent::set_upload_mode`),
+    /// a mode entered here ending by itself.
+    fn set_upload_mode(&self, on: bool) {
+        if on {
+            self.enter_upload_mode(true);
             return;
         }
+        if self
+            .upload_mode
+            .send_if_modified(|mode| mode.take().is_some())
+        {
+            self.upload_mode_changed(false);
+        }
+    }
+
+    /// Upload mode was entered or left. Entering, every request outstanding
+    /// is cancelled and every piece in flight goes back to the queue, each
+    /// under its peer's lock, under which a requester picks and asks;
+    /// leaving, the requesters ask again. Either way each requester looks
+    /// at its interest again, and the peers are told whether we only
+    /// upload.
+    fn upload_mode_changed(&self, on: bool) {
         debug!(id = self.shared.id, on, "upload mode");
         if on {
             self.peers.for_each_live_mut(|addr, peer| {
@@ -2156,7 +2209,9 @@ impl TorrentStateLive {
                 info_hash = ?self.shared.info_hash,
                 "a write found no room, only uploading: {error:#}"
             );
-            self.set_upload_mode(true);
+            let owner =
+                self.shared.options.owner_wakes_full_disk && crate::storage::wants_room(error);
+            self.enter_upload_mode(!owner);
         }
         refused
     }

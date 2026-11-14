@@ -738,6 +738,10 @@ struct Counts {
     device: [AtomicU64; LEDGERS],
     // How many times any of the ledgers rang those waiting for room.
     rings: AtomicU64,
+    // Rung with every ring for each listener waiting then: the pipeline
+    // hears `readings`, which keeps one ring for its next turn; a waiter
+    // outside it, such as a torrent waiting for room, listens here.
+    rung: tokio::sync::Notify,
 }
 
 impl fmt::Debug for DiskLedger {
@@ -985,6 +989,7 @@ impl DiskLedger {
         if waited {
             self.counts.rings.fetch_add(1, Ordering::Release);
             self.readings.notify_one();
+            self.counts.rung.notify_waiters();
         }
     }
 
@@ -1710,6 +1715,7 @@ impl HeldPaths {
         }
         ledger.counts.rings.fetch_add(1, Ordering::Release);
         ledger.readings.notify_one();
+        ledger.counts.rung.notify_waiters();
     }
 }
 
@@ -2238,6 +2244,14 @@ impl StorageCapacity {
     // rang since, heard by a turn that does not wait on it.
     pub(crate) fn rings(&self) -> u64 {
         self.slots[0].ledger.counts.rings.load(Ordering::Acquire)
+    }
+
+    // Resolves at the next ring, for a listener outside the pipeline: every
+    // listener waiting hears each ring. A listener enables the future, then
+    // judges what it waits for, then awaits it, so a ring between the two
+    // is not missed.
+    pub(crate) fn rung(&self) -> tokio::sync::futures::Notified<'_> {
+        self.slots[0].ledger.counts.rung.notified()
     }
 
     fn slot(&self, root: StorageRoot) -> &Arc<RootSlot> {

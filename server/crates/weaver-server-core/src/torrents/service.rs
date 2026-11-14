@@ -39,7 +39,8 @@ use crate::jobs::model::{
 };
 use crate::jobs::phase_progress::{JobPhase, JobPhaseProgress};
 use crate::jobs::report::JobReport;
-use crate::operations::disk::CapacityReader;
+use crate::operations::disk::{CapacityReader, StorageCapacity, StorageRoot};
+use crate::operations::room_wait::{Disk, RoomWait, StartCheck, Wants};
 use crate::persistence::Database;
 use crate::pipeline::ExtractionLimits;
 use crate::pipeline::claim_complete_destination_path;
@@ -545,6 +546,11 @@ pub struct TorrentRoute {
 pub struct JobEnv {
     pub(crate) accountant: Arc<HoldsAccountant>,
     pub(crate) free_disk: CapacityReader,
+    // The disks every job's writes are judged on, the pipeline's own: a
+    // torrent whose write found no room waits on them for room as a usenet
+    // job does. None with no pipeline, where a torrent in upload mode
+    // tries again by itself.
+    pub(crate) capacity: Option<Arc<StorageCapacity>>,
     pub(crate) slots: usize,
     pub(crate) limits: Arc<ExtractionLimits>,
     // The decode pool the pipeline's jobs share, and where a decode window
@@ -578,6 +584,7 @@ impl JobEnv {
         Self {
             accountant: budget.accountant,
             free_disk: budget.free_disk,
+            capacity: Some(pipeline.storage_capacity()),
             slots: budget.slots.max(1),
             limits: budget.limits,
             decode: budget.decode,
@@ -615,6 +622,7 @@ impl JobEnv {
                 disk_reserve: 0,
             })),
             free_disk: CapacityReader::unknown(),
+            capacity: None,
             slots: 1,
             limits: Arc::new(ExtractionLimits::unbounded()),
             decode: Arc::new(DecodePool::new(u64::MAX)),
@@ -1333,6 +1341,20 @@ struct Joining {
 }
 
 // What the service keeps of each torrent while it lives.
+// How a torrent waits for room on the complete root's disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskHeld {
+    // A piece found no room: its session is in upload mode, fetching
+    // nothing and seeding, until a reading shows room made or its user
+    // resumes it.
+    Writing,
+    // It has bytes to fetch and its turn came while the disk had no room
+    // over the reserve: it stays paused, as a usenet job is kept from
+    // starting, until a reading shows room. `Inner::start_held` holds the
+    // check's latch.
+    Starting,
+}
+
 struct Live {
     record: TorrentRecord,
     // Who it is to its peers and trackers from its add to its remove, in
@@ -1394,6 +1416,9 @@ struct Live {
     // made: it is in no session, its pieces kept, until a start, a recheck
     // or a move looks again. Found again at each load, never kept.
     files_missing: bool,
+    // Waits for room on the complete root's disk, and how: the service's
+    // wait for it is in `Inner::disk_waits`.
+    disk_held: Option<DiskHeld>,
     queued: bool,
     // Its place among the torrents still downloading, from 1, as the queue
     // was last applied; None while it seeds (qBittorrent
@@ -1562,6 +1587,7 @@ impl Live {
             run_error: None,
             restore_held: None,
             files_missing: false,
+            disk_held: None,
             queued: false,
             queue_rank: None,
             paused_by: None,
@@ -1857,6 +1883,18 @@ impl Live {
     // Everything the state is read from, with the session reporting
     // `engine`.
     fn observed(&self, engine: Engine) -> Observed {
+        // Shown once its session is in upload mode for it.
+        let disk_space = match self.disk_held {
+            Some(DiskHeld::Writing) => matches!(
+                engine,
+                Engine::Live {
+                    upload_mode: true,
+                    ..
+                }
+            ),
+            Some(DiskHeld::Starting) => true,
+            None => false,
+        };
         Observed {
             engine: self
                 .run_error
@@ -1875,6 +1913,7 @@ impl Live {
             moving: self.moving.is_some(),
             restore_held: self.restore_held.clone(),
             files_missing: self.files_missing,
+            disk_space,
         }
     }
 }
@@ -2088,6 +2127,9 @@ pub(super) struct Signal {
     dirty: Mutex<BTreeSet<JobId>>,
     unsaved: Mutex<BTreeMap<JobId, u32>>,
     refused: Mutex<BTreeMap<JobId, String>>,
+    // What the first write that found no room wanted, of the torrents
+    // whose writes found none since the last settle.
+    no_room: Mutex<BTreeMap<JobId, Wants>>,
     // How many files pieces made whole since the last settle.
     whole: Mutex<BTreeMap<JobId, usize>>,
     // A slot or a rank moved where no pass runs: the next settle runs one.
@@ -2127,7 +2169,19 @@ impl Signal {
                 *locked(&self.whole).entry(job_id).or_default() += 1;
                 self.mark(job_id);
             }
+            IntakeHeard::NoRoom(wants) => {
+                locked(&self.no_room).entry(job_id).or_insert(wants);
+                self.mark(job_id);
+            }
         }
+    }
+
+    fn take_no_room(&self, job_id: JobId) -> Option<Wants> {
+        let mut no_room = locked(&self.no_room);
+        if no_room.is_empty() {
+            return None;
+        }
+        no_room.remove(&job_id)
     }
 
     fn take(&self) -> BTreeSet<JobId> {
@@ -2234,6 +2288,14 @@ struct Inner {
     queue_end: Mutex<QueueEnd>,
     // The readings of every torrent's views their followers share.
     readings: updates::Readings,
+    // The torrents waiting for room on the complete root's disk, each by
+    // the wait every kind of job shares, and how many times a wait began
+    // or ended.
+    disk_waits: Mutex<BTreeMap<JobId, RoomWait>>,
+    disk_waits_moved: watch::Sender<u64>,
+    // Torrents with bytes to fetch are kept from starting for the complete
+    // root's disk, by the start check every kind of job shares.
+    start_held: Mutex<bool>,
 }
 
 // A snapshot of the download queue's end from the last pass, extended by
@@ -2295,6 +2357,9 @@ impl TorrentService {
                     last: None,
                 }),
                 readings: updates::Readings::default(),
+                disk_waits: Mutex::default(),
+                disk_waits_moved: watch::channel(0).0,
+                start_held: Mutex::new(false),
             }),
         }
     }
@@ -2741,6 +2806,7 @@ impl TorrentService {
             *locked(&self.inner.hearing) = Some(task);
         }
         self.spawn_settle();
+        self.spawn_follow_disk_room();
         self.spawn_follow_trackers();
         self.spawn_follow_egress_limits();
         self.spawn_follow_interfaces();
@@ -2792,6 +2858,186 @@ impl TorrentService {
         }));
     }
 
+    // A torrent waiting for room is judged at each reading of its disk, as
+    // a usenet job held for a full disk is: a reading that shows room made
+    // lets it fetch again. Nothing runs while none waits, and a pass that
+    // lets none go writes nothing and publishes nothing.
+    fn spawn_follow_disk_room(&self) {
+        let Some(capacity) = self.inner.env.capacity.clone() else {
+            return;
+        };
+        let service = self.clone();
+        let mut moved = self.inner.disk_waits_moved.subscribe();
+        self.keep(tokio::spawn(async move {
+            loop {
+                let rung = capacity.rung();
+                tokio::pin!(rung);
+                rung.as_mut().enable();
+                moved.borrow_and_update();
+                if !locked(&service.inner.disk_waits).is_empty() {
+                    service.wake_disk_waits(&capacity).await;
+                }
+                if service.start_check().is_some_and(|check| {
+                    check.release(&capacity, &mut locked(&service.inner.start_held))
+                }) {
+                    tracing::info!(
+                        "room was made on the disk; torrents with bytes to fetch may start"
+                    );
+                    service.inner.signal.want_pass();
+                }
+                tokio::select! {
+                    () = &mut rung => {}
+                    _ = moved.changed() => {}
+                }
+            }
+        }));
+    }
+
+    // The start check on the complete root's disk, when there are disks to
+    // read.
+    fn start_check(&self) -> Option<StartCheck> {
+        self.inner.env.capacity.as_ref().map(|_| StartCheck {
+            root: StorageRoot::Complete,
+            reserve: self.inner.env.limits.min_free_bytes,
+        })
+    }
+
+    // Whether `torrent`, whose turn lets it run, is kept from starting for
+    // the disk: it has bytes to fetch and the disk has no room over the
+    // reserve, as for a usenet job. A complete one starts and seeds.
+    fn kept_from_starting(&self, torrent: &Live) -> bool {
+        if torrent.seeding() {
+            return false;
+        }
+        let (Some(check), Some(capacity)) = (self.start_check(), &self.inner.env.capacity) else {
+            return false;
+        };
+        let mut held = locked(&self.inner.start_held);
+        let was = *held;
+        let kept = check.hold(capacity, &mut held);
+        drop(held);
+        if kept && !was {
+            tracing::info!(
+                job_id = torrent.record.job_id.0,
+                "the disk has no room over its reserve; torrents with bytes to fetch wait to start"
+            );
+            // The follower reads the latch at its next turn.
+            self.inner.disk_waits_moved.send_modify(|moved| *moved += 1);
+        }
+        kept
+    }
+
+    // A piece of the torrent found no room on the disk: it waits for room
+    // there, by the same wait as a usenet job whose write found its disk
+    // full, while its session keeps it in upload mode, seeding. With no
+    // disks to read, its session tries again by itself.
+    async fn hold_for_room(&self, job_id: JobId, wants: Wants) {
+        let Some(capacity) = &self.inner.env.capacity else {
+            return;
+        };
+        {
+            let mut live = self.inner.live.lock().await;
+            let Some(torrent) = live.get_mut(&job_id) else {
+                return;
+            };
+            if torrent.disk_held.is_some() {
+                return;
+            }
+            let mut waits = locked(&self.inner.disk_waits);
+            if waits.contains_key(&job_id) {
+                return;
+            }
+            let dir = self
+                .inner
+                .env
+                .script_dirs
+                .complete
+                .clone()
+                .unwrap_or_default();
+            waits.insert(
+                job_id,
+                RoomWait::begin(
+                    capacity,
+                    Disk::Root(StorageRoot::Complete),
+                    dir,
+                    wants,
+                    self.inner.env.limits.min_free_bytes,
+                ),
+            );
+            torrent.disk_held = Some(DiskHeld::Writing);
+        }
+        tracing::info!(
+            job_id = job_id.0,
+            "a torrent's write found no room; it seeds and waits for room on the disk"
+        );
+        self.inner.disk_waits_moved.send_modify(|moved| *moved += 1);
+    }
+
+    // The torrent waits for room no longer: room was made, its user
+    // resumed it, its run ended, or it is gone.
+    fn end_disk_wait(&self, job_id: JobId, torrent: Option<&mut Live>) {
+        if let Some(torrent) = torrent {
+            torrent.disk_held = None;
+        }
+        let wait = {
+            let mut waits = locked(&self.inner.disk_waits);
+            if waits.is_empty() {
+                return;
+            }
+            waits.remove(&job_id)
+        };
+        if let (Some(wait), Some(capacity)) = (wait, &self.inner.env.capacity) {
+            wait.end(capacity);
+            self.inner.disk_waits_moved.send_modify(|moved| *moved += 1);
+        }
+    }
+
+    // A reading came: each torrent waiting for room is judged by it. One
+    // whose disk shows room made leaves upload mode and fetches again; one
+    // whose run ended waits no more, its next run fetching again; one
+    // gone ends its wait.
+    async fn wake_disk_waits(&self, capacity: &StorageCapacity) {
+        let reserve = self.inner.env.limits.min_free_bytes;
+        let mut woken = Vec::new();
+        {
+            let mut live = self.inner.live.lock().await;
+            let held: Vec<JobId> = locked(&self.inner.disk_waits).keys().copied().collect();
+            for job_id in held {
+                let Some(torrent) = live.get_mut(&job_id) else {
+                    self.end_disk_wait(job_id, None);
+                    continue;
+                };
+                let Some(run) = torrent
+                    .attached
+                    .as_ref()
+                    .and_then(|attached| attached.handle.live())
+                else {
+                    self.end_disk_wait(job_id, Some(torrent));
+                    woken.push(job_id);
+                    continue;
+                };
+                let room = locked(&self.inner.disk_waits)
+                    .get_mut(&job_id)
+                    .and_then(|wait| wait.judge(capacity, reserve, false, |_, _| 0));
+                // A run not in upload mode yet is about to be: the session
+                // enters it as its write returns. It is let go at a later
+                // reading.
+                if room.is_some() && run.upload_mode() {
+                    tracing::info!(
+                        job_id = job_id.0,
+                        "room was made on the disk; the torrent fetches again"
+                    );
+                    run.leave_upload_mode();
+                    self.end_disk_wait(job_id, Some(torrent));
+                    woken.push(job_id);
+                }
+            }
+        }
+        for job_id in woken {
+            self.publish_job(job_id).await;
+        }
+    }
+
     fn spawn_settle(&self) {
         let service = self.clone();
         self.keep(tokio::spawn(async move {
@@ -2825,6 +3071,9 @@ impl TorrentService {
             if let Some(error) = self.inner.signal.take_refused(job_id) {
                 self.fail(job_id, error).await;
                 continue;
+            }
+            if let Some(wants) = self.inner.signal.take_no_room(job_id) {
+                self.hold_for_room(job_id, wants).await;
             }
             if complete {
                 continue;
@@ -4819,7 +5068,8 @@ impl TorrentService {
     }
 
     // Whether `torrent` joins its session paused: its intent, its turn in
-    // the queue, or a hold over it stops it.
+    // the queue, a hold over it, or a disk too short for it to start stops
+    // it.
     fn held_back(
         &self,
         settings: &TorrentSettings,
@@ -4833,6 +5083,7 @@ impl TorrentService {
                 .holds()
                 .reason_for(queued(settings, rules, torrent, now).target())
                 .is_some()
+            || self.kept_from_starting(torrent)
     }
 
     // What a torrent joins its route's session with, read as it stands, and
@@ -4997,6 +5248,9 @@ impl TorrentService {
         );
         let mut options = AddTorrentOptions {
             paused,
+            // A write that finds no room waits for this service to see room
+            // made, not for a timer.
+            owner_wakes_full_disk: self.inner.env.capacity.is_some(),
             overwrite: true,
             output_folder: Some(dir),
             storage_factory: Some(factory.boxed_factory()),
@@ -5823,6 +6077,19 @@ impl TorrentService {
         self.set_intent(job_id, TorrentIntent::Resumed).await?;
         self.with_torrent(job_id, |torrent| {
             torrent.copy_error = None;
+            // A torrent waiting for room fetches again now, once, whatever
+            // the readings say, as a usenet job held for a full disk does
+            // when resumed. A write that finds no room again holds it again.
+            if torrent.disk_held == Some(DiskHeld::Writing) {
+                if let Some(run) = torrent
+                    .attached
+                    .as_ref()
+                    .and_then(|attached| attached.handle.live())
+                {
+                    run.leave_upload_mode();
+                }
+                self.end_disk_wait(job_id, Some(torrent));
+            }
             Ok(())
         })
         .await?;
@@ -6683,7 +6950,23 @@ impl TorrentService {
         for torrent in live.values_mut() {
             let (queued, turn) = turns[&torrent.record.job_id];
             take_turn(torrent, queued, turn, &holds, now);
-            let run = turn.active && torrent.resumed();
+            let mut run = turn.active && torrent.resumed();
+            // One not running yet whose turn lets it run is kept from
+            // starting while the disk is short; one let go starts.
+            let starting = torrent
+                .attached
+                .as_ref()
+                .is_none_or(|attached| attached.handle.is_paused());
+            if run && (starting || torrent.disk_held == Some(DiskHeld::Starting)) {
+                if self.kept_from_starting(torrent) {
+                    torrent.disk_held = Some(DiskHeld::Starting);
+                    run = false;
+                } else if torrent.disk_held == Some(DiskHeld::Starting) {
+                    torrent.disk_held = None;
+                }
+            } else if !run && torrent.disk_held == Some(DiskHeld::Starting) {
+                torrent.disk_held = None;
+            }
             let Some(attached) = &torrent.attached else {
                 continue;
             };
@@ -6694,6 +6977,11 @@ impl TorrentService {
             } else {
                 continue;
             };
+            // A run that ends or begins is not in upload mode: a wait for
+            // room on it ends.
+            if torrent.disk_held == Some(DiskHeld::Writing) {
+                self.end_disk_wait(torrent.record.job_id, Some(torrent));
+            }
             torrent.ran(result);
         }
     }

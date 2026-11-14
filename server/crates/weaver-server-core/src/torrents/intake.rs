@@ -4,17 +4,19 @@
 // Verified pieces on their way to the store, under the disk budget. A piece
 // the budget refuses, or whose write finds no space, is refused to the
 // session as a write that found no room: the session puts the torrent in
-// upload mode, where it fetches nothing, keeps seeding, and tries again
-// later. Any other write the store could not make fails the torrent.
+// upload mode, where it fetches nothing and keeps seeding, and the owner
+// hears what the write wanted, to wait for room as any job does. Any other
+// write the store could not make fails the torrent.
 
 use std::io;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use weaver_graph::holds::{HoldsAccountant, HoldsNamespace};
-use weaver_torrent::storage::write_refused;
+use weaver_torrent::storage::{wants_room, write_refused};
 
-use crate::operations::disk::{CapacityReader, checked_room};
+use crate::operations::disk::{CapacityReader, checked_room, is_quota_exceeded};
+use crate::operations::room_wait::Wants;
 use crate::pipeline::ExtractionLimits;
 use crate::torrents::storage::Pieces;
 
@@ -71,6 +73,9 @@ pub(crate) enum Heard {
     // The store could not take a piece, and why: the torrent's failure. A
     // write that found no room is not one.
     Refused(String),
+    // A piece found no room on the disk, over the reserve or at all, and
+    // what its write wanted: the torrent waits in upload mode for room.
+    NoRoom(Wants),
     // A piece the session counted made one of the torrent's files whole.
     FileWhole,
 }
@@ -110,6 +115,10 @@ impl Pieces for Intake {
     fn verified(&self, piece: u32, held: &Bytes) -> anyhow::Result<()> {
         let bytes = held.len() as u64;
         if !self.room.admits(bytes) {
+            (self.hear)(Heard::NoRoom(Wants {
+                left: Some(bytes),
+                ..Wants::default()
+            }));
             return Err(
                 anyhow::Error::from(io::Error::from(io::ErrorKind::StorageFull)).context(format!(
                     "{bytes} bytes more would eat into the disk reserve"
@@ -125,6 +134,18 @@ impl Pieces for Intake {
             Ok(()) => {
                 (self.hear)(Heard::Changed);
                 Ok(())
+            }
+            Err(error) if wants_room(&error) => {
+                let quota = error
+                    .chain()
+                    .filter_map(|cause| cause.downcast_ref::<io::Error>())
+                    .any(is_quota_exceeded);
+                (self.hear)(Heard::NoRoom(Wants {
+                    left: Some(bytes),
+                    quota,
+                    needs: None,
+                }));
+                Err(error)
             }
             Err(error) if write_refused(&error) => Err(error),
             Err(error) => {
@@ -287,8 +308,12 @@ mod tests {
         ));
         assert_eq!(*disk.took.lock().unwrap(), [(0, 4), (1, 4)]);
         let said = said.lock().unwrap().clone();
-        assert_eq!(said[..2], [Heard::Changed, Heard::Changed]);
-        assert!(matches!(&said[2..], [Heard::Refused(why)] if why.contains("broken")));
+        let no_room = Heard::NoRoom(Wants {
+            left: Some(4),
+            ..Wants::default()
+        });
+        assert_eq!(said[..3], [Heard::Changed, no_room, Heard::Changed]);
+        assert!(matches!(&said[3..], [Heard::Refused(why)] if why.contains("broken")));
     }
 
     // A piece that failed its hash goes to the store, and its pieces
@@ -382,7 +407,14 @@ mod tests {
         }
         intake.verified(1, &piece(b"bbbb")).unwrap();
         assert_eq!(*disk.took.lock().unwrap(), [(0, 2), (1, 4)]);
-        assert_eq!(*said.lock().unwrap(), [Heard::Changed, Heard::Changed]);
+        let no_room = Heard::NoRoom(Wants {
+            left: Some(4),
+            ..Wants::default()
+        });
+        assert_eq!(
+            *said.lock().unwrap(),
+            [Heard::Changed, no_room, Heard::Changed]
+        );
     }
 
     // Two writers on one volume book on the one ledger: what the first

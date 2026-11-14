@@ -11,6 +11,7 @@ pub mod maintenance;
 pub mod metrics;
 pub mod metrics_store;
 pub mod recovery;
+pub(crate) mod room_wait;
 pub mod usage_history;
 
 pub use async_ops::{

@@ -3750,6 +3750,77 @@ async fn a_block_write_that_finds_no_room_is_fetched_again_after_upload_mode() {
     assert_eq!(h.missing_chunks(0), vec![1, 2, 3]);
 }
 
+// A torrent added with `owner_wakes_full_disk` whose write found no room
+// stays in upload mode past `optimistic_disk_retry`, serving what it has,
+// until its owner says room was made; then it asks again. Weaver's own: its
+// server watches the disk the torrent writes to.
+#[tokio::test]
+async fn a_full_disk_its_owner_wakes_lasts_until_the_owner_ends_it() {
+    let storage = RefusingStorageFactory::default();
+    storage.no_room.store(1, Ordering::SeqCst);
+    let add = AddTorrentOptions {
+        storage_factory: Some(storage.clone_box()),
+        owner_wakes_full_disk: true,
+        ..Default::default()
+    };
+    // Three pieces, the last had.
+    let h = Harness::build_added(
+        "owner_full_disk",
+        3,
+        0x20,
+        isolated_session_opts(false),
+        add,
+    )
+    .await;
+    tokio::time::pause();
+    let (fetcher, _fetcher_rx) = h.peer_with("127.0.0.1:6881", &[0]).await;
+    let (_asked, mut asked_rx) = h.peer_taking_upload_only("127.0.0.2:6881", &[1]).await;
+    let (leecher, mut leecher_rx) = h.peer_with("127.0.0.3:6881", &[]).await;
+    let leecher = &leecher;
+
+    h.take(&fetcher, 0);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&fetcher, (0, chunk), false).await.unwrap();
+    }
+    assert!(h.upload_mode());
+    assert!(matches!(
+        messages_sent(&mut asked_rx).pop(),
+        Some(Message::Extended(ExtendedMessage::UploadOnly(true)))
+    ));
+
+    // Twice the retry passes and it stays in upload mode.
+    tokio::time::advance(OPTIMISTIC_DISK_RETRY * 2).await;
+    tokio::task::yield_now().await;
+    assert!(h.upload_mode());
+    assert!(messages_sent(&mut asked_rx).is_empty());
+
+    // The piece it has is served all the while.
+    leecher
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut leecher_rx).await, Sent::Unchoke);
+    leecher
+        .on_received_message(Message::Request(request(2, 0)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut leecher_rx).await, Sent::Block(2, 0));
+
+    // The owner ends it: the peers are told, and piece 0 is fetched again.
+    h.leave_upload_mode();
+    assert!(!h.upload_mode());
+    assert!(matches!(
+        messages_sent(&mut asked_rx).pop(),
+        Some(Message::Extended(ExtendedMessage::UploadOnly(false)))
+    ));
+    h.take(&fetcher, 0);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&fetcher, (0, chunk), false).await.unwrap();
+    }
+    assert!(h.have(0));
+    assert!(!h.upload_mode());
+}
+
 // A piece is counted into every file with bytes in it, an empty file among
 // them or not (libtorrent `torrent::we_have` updates every file the piece
 // maps to).
