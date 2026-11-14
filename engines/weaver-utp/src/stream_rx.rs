@@ -587,9 +587,10 @@ impl UserRx {
         self.ooq.is_empty()
     }
 
-    /// How many packets does ooq have
+    /// How many packets are held past a hole. Packets in order that the
+    /// reader has not been handed yet are not counted.
     pub fn assembler_packets(&self) -> usize {
-        self.ooq.stored_packets()
+        self.ooq.stored_packets() - self.ooq.filled_front
     }
 
     /// The main function for the dispatcher - gets called when new data arrives at a particular offset.
@@ -1226,6 +1227,19 @@ mod tests {
         read.read_exact(&mut bytes).await.unwrap();
         assert_eq!(&bytes, b"bc");
         assert_eq!(user_rx.ooq.stored_bytes() + user_rx.len_test(), 0);
+    }
+
+    // Two packets in order wait to be handed to the reader and one is held
+    // past a hole: one packet is past a hole, not three.
+    #[tokio::test]
+    async fn packets_in_order_not_yet_handed_over_are_not_past_a_hole() {
+        let (mut user_rx, _read) = user_rx(100);
+        user_rx.add_remove_test(msg(0, b"a"), 0).await.unwrap();
+        user_rx.add_remove_test(msg(1, b"b"), 0).await.unwrap();
+        user_rx.add_remove_test(msg(3, b"d"), 1).await.unwrap();
+        assert_eq!(user_rx.ooq.stored_packets(), 3);
+        assert_eq!(user_rx.ooq.filled_front(), 2);
+        assert_eq!(user_rx.assembler_packets(), 1);
     }
 
     #[tokio::test]
