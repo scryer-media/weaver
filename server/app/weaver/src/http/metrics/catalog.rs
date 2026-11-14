@@ -658,12 +658,24 @@ metric_families! {
         "Times a thread other than the pipeline loop (a check, a repair, a replay) stood until a volume's writer had returned the operations of the file it was to read.");
     VOLUME_ASIDE_WAIT_SECONDS = ("weaver_volume_aside_wait_seconds_total", Counter, ["volume"],
         "Time threads other than the pipeline loop stood waiting for a volume's writer (see `weaver_volume_aside_waits_total`).");
+    VOLUME_WRITER_OPENS = ("weaver_volume_writer_opens_total", Counter, ["volume"],
+        "Files a volume's writer opened, failed opens included.");
+    VOLUME_WRITER_OPEN_SECONDS = ("weaver_volume_writer_open_seconds_total", Counter, ["volume"],
+        "Time a volume's writer spent opening files (see `weaver_volume_writer_opens_total`): the making of the file, its sparse mark and, where files are sized when made, its length.");
+    VOLUME_WRITER_LENGTH_SETS = ("weaver_volume_writer_length_sets_total", Counter, ["volume"],
+        "Lengths a volume's writer set on files, at a close or a truncate.");
+    VOLUME_WRITER_LENGTH_SET_SECONDS = ("weaver_volume_writer_length_set_seconds_total", Counter, ["volume"],
+        "Time a volume's writer spent setting the lengths of files (see `weaver_volume_writer_length_sets_total`).");
+    VOLUME_WRITER_LENGTH_SETS_SKIPPED = ("weaver_volume_writer_length_sets_skipped_total", Counter, ["volume"],
+        "Closes a volume's writer found already at their final length, which set no length.");
+    VOLUME_WRITER_CLOSES = ("weaver_volume_writer_closes_total", Counter, ["volume"],
+        "File handles a volume's writer dropped.");
+    VOLUME_WRITER_CLOSE_SECONDS = ("weaver_volume_writer_close_seconds_total", Counter, ["volume"],
+        "Time a volume's writer spent dropping file handles (see `weaver_volume_writer_closes_total`).");
     VOLUME_WRITER_THREADS = ("weaver_volume_writer_threads_total", Counter, ["volume"],
         "Writer threads started for a volume, one after another: a volume's thread ends when nothing writes to it and starts again at the next write.");
     VOLUME_WRITER_WOKEN = ("weaver_volume_writer_woken_total", Counter, ["volume"],
         "Times a volume's writer woke to new operations after it had run out of them and waited.");
-    VOLUME_WRITER_BUFFERS = ("weaver_volume_writer_buffers_total", Counter, ["volume", "to"],
-        "Written buffers a volume's writer handed back to the pipeline loop to be freed there (`returned`), and those it freed itself because the way back was full (`freed`).");
 
     // ---- PAR3 recovery -----------------------------------------------------------------------------
     // Every series here is fed from `MetricsSnapshot::par3`, which is a plain

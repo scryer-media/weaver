@@ -609,12 +609,17 @@ fn writer_counts(volume: &Volume) -> crate::operations::instrumentation::VolumeW
         loop_read_nanos: counts.loop_read_nanos.load(Ordering::Relaxed),
         aside_waits: counts.aside_waits.load(Ordering::Relaxed),
         aside_wait_nanos: counts.aside_wait_nanos.load(Ordering::Relaxed),
+        opens: counts.opens.load(Ordering::Relaxed),
+        open_nanos: counts.open_nanos.load(Ordering::Relaxed),
+        length_sets: counts.length_sets.load(Ordering::Relaxed),
+        length_set_nanos: counts.length_set_nanos.load(Ordering::Relaxed),
+        length_sets_skipped: counts.length_sets_skipped.load(Ordering::Relaxed),
+        closes: counts.closes.load(Ordering::Relaxed),
+        close_nanos: counts.close_nanos.load(Ordering::Relaxed),
         failed_operations: counts.failed_operations.load(Ordering::Relaxed),
         abandoned_operations: counts.abandoned_operations.load(Ordering::Relaxed),
         threads: counts.threads.load(Ordering::Relaxed),
         woken: counts.woken.load(Ordering::Relaxed),
-        buffers_returned: counts.buffers_returned.load(Ordering::Relaxed),
-        buffers_freed: counts.buffers_freed.load(Ordering::Relaxed),
     }
 }
 

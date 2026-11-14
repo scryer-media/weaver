@@ -18,8 +18,10 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use crate::operations::disk::volume::Volume;
+use crate::operations::disk::volume_rate::WINDOW;
 use crate::runtime::HardwareProfile;
 
 const MIB: u64 = 1024 * 1024;
@@ -61,9 +63,14 @@ const VOLUME_BUFFER_SOFT_PERCENT: u64 = 70;
 // reference load.
 pub(in crate::pipeline) const TYPICAL_ARTICLE_BYTES: u64 = 800_000;
 
-// A volume's measured write rate has changed materially when it moved by
-// this share of the rate its limit was sized on, or more.
-const VOLUME_RATE_CHANGE_PERCENT: u64 = 25;
+// The split takes a volume's live rate in place of the rate it reads only
+// once the live rate has been this many times above it, or below it, at
+// every recompute for a whole window (see `SplitRate`).
+const VOLUME_RATE_SETTLE_RATIO: u64 = 2;
+
+// How long the live rate must stay that far off before the split takes it:
+// the live rate's own window.
+const VOLUME_RATE_SETTLE_WINDOW: Duration = WINDOW;
 
 // The figure: the bytes that may wait for one volume's writer when the
 // volume has a full share (see `volume_limits`).
@@ -165,9 +172,7 @@ pub(in crate::pipeline) fn volume_limits(
             .collect()
     };
 
-    let pool = (u128::from(figure) * u128::from(VOLUME_BUFFER_POOL_FIGURES)).min(u128::from(
-        memory_ceiling_bytes / VOLUME_BUFFER_MEMORY_DIVISOR,
-    ));
+    let pool = pool_bytes(figure, memory_ceiling_bytes);
     if u128::from(figure) * volumes <= pool {
         return all(figure);
     }
@@ -239,6 +244,143 @@ pub(in crate::pipeline) fn volume_limits(
         .collect()
 }
 
+// What every volume's hard limit may add up to: two figures, or an eighth of
+// memory where that is less.
+fn pool_bytes(figure_bytes: u64, memory_ceiling_bytes: u64) -> u128 {
+    (u128::from(figure_bytes.max(1)) * u128::from(VOLUME_BUFFER_POOL_FIGURES)).min(u128::from(
+        memory_ceiling_bytes / VOLUME_BUFFER_MEMORY_DIVISOR,
+    ))
+}
+
+// `volume_limits`, where each volume already holds `held_bytes` (in the same
+// order) counted against its limit. A limit only shrinks into room that is
+// free: a volume whose share is below what it holds keeps what it holds (up
+// to the figure), and the others give that up from their room above what
+// they hold, so the limits still add up to no more than the pool. When they
+// cannot (the figure or memory fell under what is held), the shares stand
+// and a volume over its share stops until it drains.
+//
+// Answers the limits and whether any volume was held above its share: then
+// the split is asked again as volumes drain, until none is.
+pub(in crate::pipeline) fn volume_limits_holding(
+    figure_bytes: u64,
+    memory_ceiling_bytes: u64,
+    rates: &[u64],
+    held_bytes: &[u64],
+) -> (Vec<VolumeLimits>, bool) {
+    let shares = volume_limits(figure_bytes, memory_ceiling_bytes, rates);
+    let pool = pool_bytes(figure_bytes, memory_ceiling_bytes);
+    let most = u64::try_from(pool)
+        .unwrap_or(u64::MAX)
+        .min(figure_bytes.max(1));
+    let floor = |at: usize| held_bytes.get(at).copied().unwrap_or(0).min(most);
+
+    let raised: u128 = shares
+        .iter()
+        .enumerate()
+        .map(|(at, share)| u128::from(floor(at).saturating_sub(share.hard_bytes)))
+        .sum();
+    if raised == 0 {
+        return (shares, false);
+    }
+
+    // The room above what each volume holds, never down to zero.
+    let spare = |at: usize, share: &VolumeLimits| {
+        u128::from(share.hard_bytes.saturating_sub(floor(at).max(1)))
+    };
+    let total: u128 = shares
+        .iter()
+        .map(|share| u128::from(share.hard_bytes))
+        .sum();
+    let need = (total + raised).saturating_sub(pool);
+    let spare_sum: u128 = shares
+        .iter()
+        .enumerate()
+        .map(|(at, share)| spare(at, share))
+        .sum();
+    if need > spare_sum {
+        return (shares, false);
+    }
+
+    // The room needed is taken from each volume in proportion to its room,
+    // rounded up, so at least `need` is taken and no volume gives more than
+    // it has.
+    let limits = shares
+        .iter()
+        .enumerate()
+        .map(|(at, share)| {
+            let held = floor(at);
+            if held > share.hard_bytes {
+                return VolumeLimits::with_hard(held);
+            }
+            let room = spare(at, share);
+            let cut = if spare_sum == 0 {
+                0
+            } else {
+                (need * room).div_ceil(spare_sum).min(room)
+            };
+            VolumeLimits::with_hard(share.hard_bytes - u64::try_from(cut).unwrap_or(0))
+        })
+        .collect();
+    (limits, true)
+}
+
+// The rate the split reads for one volume. The rule: the split keeps the
+// first rate measured for the volume (normally the start-up probe's), and
+// takes the live rate in its place only once the live rate has been at least
+// twice it, or at most half of it, on the same side at every recompute for a
+// whole window. A live gauge that swings with the OS cache never moves it; a
+// drive that really changed speed moves it within one window of the live
+// rate crossing the line, plus one recompute.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SplitRate {
+    // The rate the split reads; zero until the volume is measured.
+    rate: u64,
+    // Since when, and on which side (`true` above), the live rate has been
+    // off by the ratio at every recompute.
+    off_since: Option<(Instant, bool)>,
+}
+
+impl SplitRate {
+    fn new(live: u64) -> Self {
+        Self {
+            rate: live,
+            off_since: None,
+        }
+    }
+
+    // Take the live rate seen at `now`. Whether the rate the split reads
+    // changed. A live rate of zero is no figure and changes nothing.
+    fn follow(&mut self, live: u64, now: Instant) -> bool {
+        if live == 0 {
+            return false;
+        }
+        if self.rate == 0 {
+            *self = Self::new(live);
+            return true;
+        }
+        let above = live >= self.rate.saturating_mul(VOLUME_RATE_SETTLE_RATIO);
+        let below = live.saturating_mul(VOLUME_RATE_SETTLE_RATIO) <= self.rate;
+        if !above && !below {
+            self.off_since = None;
+            return false;
+        }
+        match self.off_since {
+            Some((since, side)) if side == above => {
+                if now.saturating_duration_since(since) < VOLUME_RATE_SETTLE_WINDOW {
+                    return false;
+                }
+                *self = Self::new(live);
+                true
+            }
+            _ => {
+                self.off_since = Some((now, above));
+                false
+            }
+        }
+    }
+}
+
 // What a volume asks of the lanes sending towards it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::pipeline) enum VolumeIntake {
@@ -286,8 +428,9 @@ pub(in crate::pipeline) fn intake_of(volume: &Volume) -> VolumeIntake {
 // the others, whatever it is, the stand-in for an unread device included.
 //
 // Sizing is asked for when a volume gains its first job or loses its last,
-// when the figure changes (the profile in force, the connection count) and
-// when a volume's measured rate has moved. Nothing here runs per article.
+// when the figure changes (the profile in force, the connection count),
+// when the rate the split reads for a volume changed (`SplitRate`) and while
+// a volume is held above its share. Nothing here runs per article.
 pub(crate) struct VolumeBuffers {
     sizing: Mutex<Sizing>,
 }
@@ -300,12 +443,15 @@ struct Sizing {
     // A limit changed as a volume joined or left, and nobody was told yet:
     // the pipeline's next tick hears it from `follow_rates`.
     untold: bool,
+    // A volume was held above its share as the limits were last sized: they
+    // are sized again at every tick until none is.
+    holding: bool,
 }
 
 struct Written {
     volume: Arc<Volume>,
-    // The write rate the volume's limit was sized on.
-    sized_on: u64,
+    // The write rate the split reads for the volume.
+    rate: SplitRate,
     // The jobs writing to the volume now: never zero.
     jobs: usize,
 }
@@ -318,6 +464,7 @@ impl VolumeBuffers {
                 memory_ceiling_bytes,
                 volumes: Vec::new(),
                 untold: false,
+                holding: false,
             }),
         }
     }
@@ -337,7 +484,7 @@ impl VolumeBuffers {
         }
         sizing.volumes.push(Written {
             volume: Arc::clone(volume),
-            sized_on: 0,
+            rate: SplitRate::new(volume.write_rate.load(Ordering::Relaxed)),
             jobs: 1,
         });
         if sizing.size() {
@@ -384,20 +531,23 @@ impl VolumeBuffers {
         sizing.size()
     }
 
-    // Size every limit again when a volume's measured rate has moved
-    // materially from the one its limit was sized on. Whether a limit
-    // changed, here or as a volume joined or left since the last call.
-    // With no rate moved and no such change this reads each volume's rate
-    // and writes nothing.
+    // Size every limit again when the rate the split reads for a volume
+    // changed (`SplitRate`), or while a volume is held above its share.
+    // Whether a limit changed, here or as a volume joined or left since the
+    // last call. With neither, this reads each volume's rate and writes
+    // nothing.
     pub(in crate::pipeline) fn follow_rates(&self) -> bool {
+        self.follow_rates_at(Instant::now())
+    }
+
+    fn follow_rates_at(&self, now: Instant) -> bool {
         let mut sizing = self.lock();
-        let moved = sizing.volumes.iter().any(|written| {
-            rate_moved(
-                written.sized_on,
-                written.volume.write_rate.load(Ordering::Relaxed),
-            )
-        });
-        let sized = moved && sizing.size();
+        let mut moved = false;
+        for written in &mut sizing.volumes {
+            let live = written.volume.write_rate.load(Ordering::Relaxed);
+            moved |= written.rate.follow(live, now);
+        }
+        let sized = (moved || sizing.holding) && sizing.size();
         let untold = sizing.untold;
         if untold {
             sizing.untold = false;
@@ -414,16 +564,27 @@ impl Sizing {
     }
 
     // Put each written volume's limits on it. Whether any changed.
+    // A volume still unmeasured takes its first measured rate here; every
+    // other keeps the rate the split reads for it.
     fn size(&mut self) -> bool {
         for written in &mut self.volumes {
-            written.sized_on = written.volume.write_rate.load(Ordering::Relaxed);
+            if written.rate.rate == 0 {
+                written.rate = SplitRate::new(written.volume.write_rate.load(Ordering::Relaxed));
+            }
         }
         let rates: Vec<u64> = self
             .volumes
             .iter()
-            .map(|written| written.sized_on)
+            .map(|written| written.rate.rate)
             .collect();
-        let limits = volume_limits(self.figure_bytes, self.memory_ceiling_bytes, &rates);
+        let held: Vec<u64> = self
+            .volumes
+            .iter()
+            .map(|written| written.volume.unwritten_bytes())
+            .collect();
+        let (limits, holding) =
+            volume_limits_holding(self.figure_bytes, self.memory_ceiling_bytes, &rates, &held);
+        self.holding = holding;
         let mut changed = false;
         for (Written { volume, .. }, limits) in self.volumes.iter().zip(limits) {
             let now = (limits.soft_bytes, limits.hard_bytes);
@@ -434,16 +595,6 @@ impl Sizing {
         }
         changed
     }
-}
-
-// Whether `now` differs materially from `sized_on`. A rate measured for the
-// first time, or no longer measured, always does.
-fn rate_moved(sized_on: u64, now: u64) -> bool {
-    if sized_on == 0 || now == 0 {
-        return sized_on != now;
-    }
-    u128::from(sized_on.abs_diff(now)) * 100
-        >= u128::from(sized_on) * u128::from(VOLUME_RATE_CHANGE_PERCENT)
 }
 
 #[cfg(test)]
@@ -938,52 +1089,292 @@ mod tests {
         }
     }
 
-    // A rate that moved by less than a quarter leaves every limit alone. One
-    // that moved by a quarter or more, or was measured for the first time,
-    // sizes them all again.
-    #[test]
-    fn volume_buffers_follow_a_rate_that_moved_materially() {
+    // The pipeline's tune tick, and the clock the tests drive it on.
+    const TICK: Duration = Duration::from_secs(5);
+
+    fn hards(volumes: &[&Arc<Volume>]) -> Vec<u64> {
+        volumes.iter().map(|volume| hard(volume)).collect()
+    }
+
+    fn sum_of(volumes: &[&Arc<Volume>]) -> u128 {
+        volumes.iter().map(|volume| u128::from(hard(volume))).sum()
+    }
+
+    // Three volumes joined on their probes, and the limits told once.
+    fn three_joined() -> (VolumeBuffers, [Arc<Volume>; 3], Instant) {
         let buffers = VolumeBuffers::new(FIGURE, ROOMY);
-        let (nvme, sata, unmeasured) = (volume(NVME), volume(SATA), volume(0));
-        for seen in [&nvme, &sata, &unmeasured] {
+        let volumes = [volume(NVME), volume(SATA), volume(HDD)];
+        for seen in &volumes {
             buffers.joined(seen);
         }
-        let sized = |volumes: [&Arc<Volume>; 3]| volumes.map(|volume| hard(volume));
-        let before = sized([&nvme, &sata, &unmeasured]);
-        assert!(
-            buffers.follow_rates(),
-            "the limits the volumes joined on are told"
-        );
-        assert!(!buffers.follow_rates(), "nothing moved");
-
-        sata.write_rate.store(SATA * 110 / 100, Ordering::Relaxed);
-        assert!(!buffers.follow_rates(), "a tenth is not material");
-        assert_eq!(sized([&nvme, &sata, &unmeasured]), before);
-
-        sata.write_rate.store(SATA * 3 / 4, Ordering::Relaxed);
-        assert!(buffers.follow_rates());
-        let slower = sized([&nvme, &sata, &unmeasured]);
-        assert_ne!(slower, before, "the shares follow the new rate");
-        assert!(!buffers.follow_rates(), "sized on the rate it has now");
-
-        // The third volume's probe returns: it is the slowest of the three.
-        unmeasured.write_rate.store(HDD, Ordering::Relaxed);
-        assert!(buffers.follow_rates());
-        assert_eq!(hard(&unmeasured), FIGURE);
-        assert!(hard(&sata) < slower[1]);
+        let start = Instant::now();
+        assert!(buffers.follow_rates_at(start), "the first limits are told");
+        (buffers, volumes, start)
     }
 
     #[test]
-    fn volume_buffers_tell_a_material_change_of_rate() {
-        assert!(!rate_moved(0, 0));
-        assert!(rate_moved(0, 1));
-        assert!(rate_moved(1, 0));
-        assert!(!rate_moved(1000, 1000));
-        assert!(!rate_moved(1000, 1249));
-        assert!(!rate_moved(1000, 751));
-        assert!(rate_moved(1000, 1250));
-        assert!(rate_moved(1000, 750));
-        assert!(rate_moved(u64::MAX, u64::MAX / 2));
+    fn volume_pace_split_rate_takes_a_lasting_change_only() {
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+
+        // Unmeasured: the first figure is taken at once; zero is no figure.
+        let mut rate = SplitRate::new(0);
+        assert!(!rate.follow(0, at(0)));
+        assert!(rate.follow(SATA, at(0)));
+        assert_eq!(rate.rate, SATA);
+        assert!(!rate.follow(0, at(100)));
+        assert_eq!(rate.rate, SATA);
+
+        // Within twice and half it is never off, however long.
+        for tick in 0..100 {
+            let live = if tick % 2 == 0 {
+                SATA * 2 - 1
+            } else {
+                SATA / 2 + 1
+            };
+            assert!(!rate.follow(live, at(tick * 5)));
+        }
+        assert_eq!(rate, SplitRate::new(SATA));
+
+        // Off on one side for less than a window: kept, and a return
+        // inside the line starts the count over.
+        assert!(!rate.follow(SATA * 2, at(1000)));
+        assert!(!rate.follow(SATA * 3, at(1025)));
+        assert!(!rate.follow(SATA, at(1029)));
+        assert!(!rate.follow(SATA * 2, at(1030)));
+        assert!(!rate.follow(SATA * 2, at(1059)));
+        // A turn to the other side starts it over too.
+        assert!(!rate.follow(SATA / 2, at(1060)));
+        assert!(!rate.follow(SATA / 2, at(1089)));
+        assert_eq!(rate.rate, SATA);
+        // A whole window below: taken, as it stands then.
+        assert!(rate.follow(SATA / 3, at(1090)));
+        assert_eq!(rate, SplitRate::new(SATA / 3));
+
+        // No overflow at the ends.
+        let mut rate = SplitRate::new(u64::MAX);
+        assert!(!rate.follow(u64::MAX, at(0)));
+        assert!(!rate.follow(1, at(0)));
+        assert!(rate.follow(1, at(30)));
+        assert_eq!(rate.rate, 1);
+    }
+
+    // (1) Steady rates, with the gauge's ordinary wobble, never change a
+    // limit and never ask for a sizing.
+    #[test]
+    fn volume_buffers_steady_rates_never_change_a_limit() {
+        let (buffers, volumes, start) = three_joined();
+        let [nvme, sata, hdd] = &volumes;
+        let before = hards(&[nvme, sata, hdd]);
+        for tick in 1..=240_u32 {
+            // Up to a fifth either way.
+            let wobble = |rate: u64| rate / 100 * u64::from(80 + (tick * 7) % 41);
+            nvme.write_rate.store(wobble(NVME), Ordering::Relaxed);
+            sata.write_rate.store(wobble(SATA), Ordering::Relaxed);
+            hdd.write_rate.store(wobble(HDD), Ordering::Relaxed);
+            assert!(!buffers.follow_rates_at(start + TICK * tick));
+            assert_eq!(hards(&[nvme, sata, hdd]), before);
+        }
+    }
+
+    // (2) A gauge swinging between x and 4x moves no limit at all: not
+    // every tick, not two ticks each way, not between half and twice the
+    // rate the split reads. The stated fraction is zero.
+    #[test]
+    fn volume_buffers_a_swinging_rate_moves_no_limit() {
+        let patterns: [fn(u32) -> u64; 3] = [
+            |tick| if tick % 2 == 0 { SATA } else { 4 * SATA },
+            |tick| if tick / 2 % 2 == 0 { SATA } else { 4 * SATA },
+            |tick| if tick % 2 == 0 { SATA / 2 } else { 2 * SATA },
+        ];
+        for pattern in patterns {
+            let (buffers, volumes, start) = three_joined();
+            let [nvme, sata, hdd] = &volumes;
+            let before = hards(&[nvme, sata, hdd]);
+            for tick in 1..=240 {
+                sata.write_rate.store(pattern(tick), Ordering::Relaxed);
+                // The fastest drive swings too, a step behind.
+                nvme.write_rate
+                    .store(NVME / SATA * pattern(tick + 1), Ordering::Relaxed);
+                assert!(!buffers.follow_rates_at(start + TICK * tick));
+                assert_eq!(hards(&[nvme, sata, hdd]), before);
+                assert!(sum_of(&[nvme, sata, hdd]) <= 2 * u128::from(FIGURE));
+            }
+        }
+    }
+
+    // (3) A drive that really became four times slower moves the limits,
+    // one window after the gauge first showed it, and not before.
+    #[test]
+    fn volume_buffers_a_lasting_change_moves_the_limits_within_a_window() {
+        let (buffers, volumes, start) = three_joined();
+        let [nvme, sata, hdd] = &volumes;
+        let before = hards(&[nvme, sata, hdd]);
+        sata.write_rate.store(SATA / 4, Ordering::Relaxed);
+        let ticks_in_window = (WINDOW.as_secs() / TICK.as_secs()) as u32;
+        for tick in 1..=ticks_in_window {
+            assert!(!buffers.follow_rates_at(start + TICK * tick));
+            assert_eq!(hards(&[nvme, sata, hdd]), before);
+        }
+        assert!(buffers.follow_rates_at(start + TICK * (ticks_in_window + 1)));
+        let after = hards(&[nvme, sata, hdd]);
+        // The SATA drive now writes as slowly as the hard disk: it takes
+        // more, and the NVMe drive falls to the minimum.
+        assert!(after[1] > before[1], "{before:?} -> {after:?}");
+        assert!(after[0] < before[0], "{before:?} -> {after:?}");
+        assert!(sum_of(&[nvme, sata, hdd]) <= 2 * u128::from(FIGURE));
+        // And it holds there.
+        assert!(!buffers.follow_rates_at(start + TICK * (ticks_in_window + 2)));
+    }
+
+    // (4) One or two volumes have the full figure each, whatever the
+    // gauges do.
+    #[test]
+    fn volume_buffers_one_or_two_volumes_keep_the_full_figure() {
+        let buffers = VolumeBuffers::new(FIGURE, ROOMY);
+        let (first, second) = (volume(SATA), volume(HDD));
+        buffers.joined(&first);
+        let start = Instant::now();
+        for tick in 0..120_u32 {
+            if tick == 10 {
+                buffers.joined(&second);
+            }
+            let live = if tick % 2 == 0 { SATA } else { 4 * SATA };
+            first.write_rate.store(live, Ordering::Relaxed);
+            // A lasting change from tick 40 on.
+            second
+                .write_rate
+                .store(if tick < 40 { HDD } else { HDD / 10 }, Ordering::Relaxed);
+            let _ = buffers.follow_rates_at(start + TICK * tick);
+            assert_eq!(hard(&first), FIGURE);
+            if tick >= 10 {
+                assert_eq!(hard(&second), FIGURE);
+            }
+        }
+    }
+
+    // A volume whose share falls under what it holds keeps what it holds;
+    // the others give it up from their free room, and as it drains its
+    // limit comes down to its share. The pool is never passed.
+    #[test]
+    fn volume_buffers_a_limit_only_shrinks_into_free_room() {
+        let (buffers, volumes, start) = three_joined();
+        let [nvme, sata, hdd] = &volumes;
+        // The SATA drive holds nearly all of its share.
+        let share = hard(sata);
+        sata.count_for_test(share - MIB);
+        // The NVMe drive becomes a crawl for good: it takes the large share
+        // and the SATA drive's falls far below what it holds.
+        nvme.write_rate.store(HDD / 10, Ordering::Relaxed);
+        let mut tick = 1;
+        while !buffers.follow_rates_at(start + TICK * tick) {
+            tick += 1;
+        }
+        assert_eq!(hard(sata), share - MIB, "held, not cut under its bytes");
+        assert_eq!(intake_of(sata), VolumeIntake::Stopped);
+        assert!(sum_of(&[nvme, sata, hdd]) <= 2 * u128::from(FIGURE));
+        assert!(buffers.lock().holding);
+
+        // It drains in steps; at each tick its limit follows it down.
+        let target = volume_limits(FIGURE, ROOMY, &[HDD / 10, SATA, HDD]);
+        for held in [share / 2, share / 4, 0] {
+            sata.count_for_test(held);
+            tick += 1;
+            let _ = buffers.follow_rates_at(start + TICK * tick);
+            assert_eq!(hard(sata), held.max(target[1].hard_bytes));
+            assert!(sum_of(&[nvme, sata, hdd]) <= 2 * u128::from(FIGURE));
+        }
+        assert_eq!(hards(&[nvme, sata, hdd]), hard_bytes(&target));
+        assert!(!buffers.lock().holding);
+        tick += 1;
+        assert!(!buffers.follow_rates_at(start + TICK * tick));
+    }
+
+    // Across a long sequence of swinging and lasting rates, joins, leaves
+    // and held bytes, the limits never add up to more than the pool, and a
+    // volume is never cut under what it holds while the pool has room.
+    #[test]
+    fn volume_buffers_never_pass_the_pool_while_rates_swing() {
+        for memory in [ROOMY, 3 * GIB] {
+            let pool = (2 * u128::from(FIGURE)).min(u128::from(memory / 8));
+            let buffers = VolumeBuffers::new(FIGURE, memory);
+            let volumes: Vec<Arc<Volume>> =
+                [NVME, SATA, HDD, SATA, 0].into_iter().map(volume).collect();
+            let mut next = rate_sequence();
+            let start = Instant::now();
+            let mut joined = [false; 5];
+            for tick in 0..2_000_u32 {
+                let pick = next();
+                let at = (pick % 5) as usize;
+                match pick % 7 {
+                    0 if !joined[at] => {
+                        buffers.joined(&volumes[at]);
+                        joined[at] = true;
+                    }
+                    1 if joined[at] => {
+                        buffers.left(&volumes[at]);
+                        joined[at] = false;
+                    }
+                    _ => {}
+                }
+                for (i, written) in volumes.iter().enumerate() {
+                    // Each gauge swings x to 4x, and the base moves for good
+                    // every 300 ticks.
+                    let base = [NVME, SATA, HDD, SATA, HDD][i] >> ((tick / 300 + i as u32) % 3);
+                    let live = if (tick + i as u32) % 2 == 0 {
+                        base
+                    } else {
+                        4 * base
+                    };
+                    written.write_rate.store(live, Ordering::Relaxed);
+                    let room = hard(written).min(FIGURE);
+                    written.count_for_test(next() % room.max(1));
+                }
+                let _ = buffers.follow_rates_at(start + TICK * tick);
+                let sum: u128 = volumes
+                    .iter()
+                    .zip(joined)
+                    .filter(|(_, joined)| *joined)
+                    .map(|(volume, _)| u128::from(hard(volume)))
+                    .sum();
+                assert!(sum <= pool, "tick {tick}: {sum} over {pool}");
+            }
+        }
+    }
+
+    #[test]
+    fn volume_pace_holding_split_keeps_held_bytes_inside_the_pool() {
+        let mut next = rate_sequence();
+        for count in 1..=8_usize {
+            for _ in 0..200 {
+                let rates: Vec<u64> = (0..count).map(|_| next()).collect();
+                let held: Vec<u64> = (0..count).map(|_| next() % (FIGURE + MIB)).collect();
+                for memory in [GIB, 3 * GIB, ROOMY] {
+                    let pool = (2 * u128::from(FIGURE)).min(u128::from(memory / 8));
+                    let most = FIGURE.min(memory / 8);
+                    let (limits, holding) = volume_limits_holding(FIGURE, memory, &rates, &held);
+                    let plain = volume_limits(FIGURE, memory, &rates);
+                    let context = format!("rates {rates:?}, held {held:?}: {limits:?}");
+                    assert!(hard_sum(&limits) <= pool, "{context}");
+                    let floors: u128 = held.iter().map(|&h| u128::from(h.min(most))).sum();
+                    if floors <= pool / 2 {
+                        // Room enough: nobody is cut under what it holds.
+                        for (limit, &h) in limits.iter().zip(&held) {
+                            assert!(limit.hard_bytes >= h.min(most), "{context}");
+                        }
+                    }
+                    if !holding {
+                        assert_eq!(limits, plain, "{context}");
+                    }
+                    for limit in &limits {
+                        assert!(
+                            limit.hard_bytes >= 1 && limit.hard_bytes <= most,
+                            "{context}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // Another figure sizes every limit again; the same one changes nothing.

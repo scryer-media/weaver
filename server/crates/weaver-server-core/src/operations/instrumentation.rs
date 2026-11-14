@@ -1472,6 +1472,17 @@ pub struct VolumeWriterSnapshot {
     // stood for the writer, and for how long.
     pub aside_waits: u64,
     pub aside_wait_nanos: u64,
+    // Files the writer opened, and the time inside those opens.
+    pub opens: u64,
+    pub open_nanos: u64,
+    // Lengths the writer set, at a close or a truncate, the time inside
+    // those calls, and closes already at their length that set nothing.
+    pub length_sets: u64,
+    pub length_set_nanos: u64,
+    pub length_sets_skipped: u64,
+    // Handles the writer dropped, and the time inside those drops.
+    pub closes: u64,
+    pub close_nanos: u64,
     // Operations that came back with an error.
     pub failed_operations: u64,
     // Operations not run: their caller gave its files up, or an earlier
@@ -1481,10 +1492,6 @@ pub struct VolumeWriterSnapshot {
     pub threads: u64,
     // Times the writer woke to mail after waiting for it.
     pub woken: u64,
-    // Written buffers handed back to the loop, and those freed on the
-    // writer because the way back was full.
-    pub buffers_returned: u64,
-    pub buffers_freed: u64,
 }
 
 #[cfg(test)]

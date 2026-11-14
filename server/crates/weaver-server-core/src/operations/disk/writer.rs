@@ -28,12 +28,21 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-use super::volume::{LoopWait, Volume};
+use super::volume::{LoopWait, Volume, WriterCounts};
 use super::volume_rate::RateSignal;
 
 // How a file that is not open is opened, made when it is not there, at the
 // length it is declared to reach when one is given.
-pub(crate) type OpenFn = fn(&Path, Option<u64>) -> io::Result<File>;
+pub(crate) type OpenFn = fn(&Path, Option<u64>) -> io::Result<Opened>;
+
+// A file an `OpenFn` opened, and the length it left the file at when the
+// opener knows it without another call to the file system; `None` when it
+// does not. The writer keeps that length as it writes, and a close at the
+// length the file already has sets nothing.
+pub(crate) struct Opened {
+    pub(crate) file: File,
+    pub(crate) length: Option<u64>,
+}
 
 // A file to open before an operation that needs it open.
 pub(crate) struct Create {
@@ -195,9 +204,6 @@ struct Registry {
     // Where the loop's own waits end once the owner is stopping. Every
     // lane holds it.
     loop_end: Arc<LoopEnd>,
-    // Written buffers on their way back to the pipeline loop. Every lane
-    // with a thread holds it.
-    returns: Arc<Returns>,
     #[cfg(test)]
     ended: Condvar,
     // Times a thread was asked for.
@@ -208,98 +214,6 @@ struct Registry {
 impl Registry {
     fn lock(&self) -> MutexGuard<'_, Lanes> {
         self.lanes.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-// What the writers may hold of written buffers for the pipeline loop to
-// free: past it a writer frees the buffer itself.
-const RETURN_BYTES: u64 = 32 << 20;
-
-// Buffers the writers have written, held for the pipeline loop to free on
-// its own turn (`VolumeWriters::free_returned`): a decoded article's buffer
-// is freed on the loop's side, as it was before writers had threads, not
-// on a writer. Bounded by `RETURN_BYTES`; a writer never waits on it.
-// While the loop waits with nothing to drive, a writer frees in place
-// (`VolumeWriters::park_returns`): nothing is held for a turn that may not
-// come for a long time.
-struct Returns {
-    held: Mutex<Vec<Bytes>>,
-    bytes: AtomicU64,
-    limit: u64,
-    // Whether the loop waits with nothing to drive.
-    idle: AtomicBool,
-}
-
-impl Default for Returns {
-    fn default() -> Self {
-        Self::new(RETURN_BYTES)
-    }
-}
-
-impl Returns {
-    fn new(limit: u64) -> Self {
-        Self {
-            held: Mutex::default(),
-            bytes: AtomicU64::new(0),
-            limit,
-            idle: AtomicBool::new(false),
-        }
-    }
-
-    // `bytes` were written. The last share of a buffer goes back to the
-    // loop while there is room for it and the loop is not idle, and is
-    // freed here otherwise; dropping any other share frees nothing.
-    fn give(&self, bytes: Bytes, counts: &super::volume::WriterCounts) {
-        if !bytes.is_unique() {
-            return;
-        }
-        let len = bytes.len() as u64;
-        // Checked, then added: writers that check at once may each add past
-        // the limit, by one buffer per writer thread at most, which is fine.
-        if self.idle.load(Ordering::SeqCst)
-            || self.bytes.load(Ordering::Relaxed).saturating_add(len) > self.limit
-        {
-            counts.buffers_freed.fetch_add(1, Ordering::Relaxed);
-            break_span();
-            return;
-        }
-        self.bytes.fetch_add(len, Ordering::Relaxed);
-        self.held
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(bytes);
-        counts.buffers_returned.fetch_add(1, Ordering::Relaxed);
-        // The loop went idle after the check above, and may have freed what
-        // it held before this came: it is freed here instead.
-        if self.idle.load(Ordering::SeqCst) {
-            break_span();
-            self.take_all();
-        }
-    }
-
-    // Free what came back. One load when nothing did.
-    fn free(&self) {
-        if self.bytes.load(Ordering::Relaxed) == 0 {
-            return;
-        }
-        self.take_all();
-    }
-
-    fn take_all(&self) {
-        let held = std::mem::take(&mut *self.held.lock().unwrap_or_else(PoisonError::into_inner));
-        let len = held.iter().map(|bytes| bytes.len() as u64).sum::<u64>();
-        self.bytes.fetch_sub(len, Ordering::Relaxed);
-        drop(held);
-    }
-}
-
-// Held by the pipeline loop while it waits with nothing to drive: the
-// writers free what they write in place until it is dropped.
-pub(crate) struct ParkedReturns(Arc<Returns>);
-
-impl Drop for ParkedReturns {
-    fn drop(&mut self) {
-        self.0.idle.store(false, Ordering::SeqCst);
     }
 }
 
@@ -326,25 +240,6 @@ impl VolumeWriters {
             #[cfg(test)]
             mode: Mode::Threads,
         }
-    }
-
-    // Free the written buffers the writers handed back. Called by the
-    // pipeline loop on each of its turns; one load when none came back.
-    pub(crate) fn free_returned(&self) {
-        self.registry.returns.free();
-    }
-
-    // The pipeline loop is about to wait with nothing to drive: what came
-    // back is freed now, and the writers free in place until the returned
-    // guard is dropped as the wait ends. No wake is rung for it.
-    pub(crate) fn park_returns(&self) -> ParkedReturns {
-        let returns = &self.registry.returns;
-        returns.idle.store(true, Ordering::SeqCst);
-        // Taken under the lock, not after a load: a buffer a writer pushed
-        // before it saw the loop idle is freed here, and one pushed after
-        // is freed by that writer.
-        returns.take_all();
-        ParkedReturns(Arc::clone(returns))
     }
 
     // The same writers, ringing `rates` after every batch that wrote.
@@ -1387,6 +1282,14 @@ impl Barrier {
         self.key.woke.notify_all();
     }
 
+    // Wait until `count` threads stand in a wait on the barrier's key.
+    #[cfg(test)]
+    pub(crate) fn wait_waiters(&self, count: usize) {
+        while self.key.waiters.load(Ordering::SeqCst) < count {
+            std::thread::yield_now();
+        }
+    }
+
     // Whether a test holds the volume's thread.
     #[cfg(test)]
     pub(crate) fn test_held(&self) -> bool {
@@ -1453,9 +1356,6 @@ struct LaneState {
     stopped: Arc<AtomicBool>,
     // Where the loop's own waits end once the owner is stopping.
     loop_end: Arc<LoopEnd>,
-    // Where written buffers go back to the pipeline loop; `None` on a lane
-    // that runs on its callers, which free them where they are.
-    returns: Option<Arc<Returns>>,
     // The keys threads stand in `Barrier::wait_aside` for, so a stop can
     // wake them.
     aside: Mutex<Vec<Arc<Key>>>,
@@ -1536,7 +1436,6 @@ impl Lane {
     ) -> Arc<Self> {
         let stopped = Arc::clone(&registry.stopped);
         let loop_end = Arc::clone(&registry.loop_end);
-        let returns = (!inline).then(|| Arc::clone(&registry.returns));
         let registry = Arc::downgrade(registry);
         let (send, queued) = mpsc::channel();
         let state = Arc::new(LaneState {
@@ -1553,7 +1452,6 @@ impl Lane {
             below: Condvar::new(),
             stopped,
             loop_end,
-            returns,
             aside: Mutex::default(),
             #[cfg(test)]
             gate: Mutex::default(),
@@ -1728,6 +1626,11 @@ struct Open {
     path: PathBuf,
     // Where the last write to it ended; `None` before its first.
     end: Option<u64>,
+    // The file's length as this handle left it: what the opener said, grown
+    // by every write past it and set by every length set. `None` when the
+    // opener did not say, or a write or a length set failed. Only this
+    // writer changes the length of a file while it holds it open.
+    length: Option<u64>,
 }
 
 impl Held {
@@ -1749,6 +1652,7 @@ impl Held {
         file: u64,
         create: Option<&Create>,
         creating: &mut bool,
+        counts: &WriterCounts,
     ) -> io::Result<Option<&mut Open>> {
         if !self.open.contains_key(&file) {
             // The writes of a file whose name was refused are dropped: the
@@ -1764,19 +1668,56 @@ impl Held {
                 ));
             };
             *creating = true;
-            let opened = (create.open)(&create.path, create.length)?;
+            // Timed, failed or not: an open on some systems stands behind
+            // what the file system is writing out.
+            let began = now();
+            let opened = (create.open)(&create.path, create.length);
+            counts.opened(nanos_since(began));
+            break_span();
+            let opened = opened?;
             *creating = false;
             self.open.insert(
                 file,
                 Open {
-                    file: opened,
+                    file: opened.file,
                     path: create.path.clone(),
                     end: None,
+                    length: opened.length,
                 },
             );
         }
         Ok(self.open.get_mut(&file))
     }
+
+    // Drop the handles let go, and `also`, timed for the volume's counts:
+    // on some systems the close of a large file just written is slow.
+    fn drop_let_go(&mut self, also: Option<Open>, counts: &WriterCounts) {
+        let handles = self.letting_go.len() as u64 + u64::from(also.is_some());
+        if handles == 0 {
+            return;
+        }
+        let began = now();
+        drop(also);
+        self.letting_go.clear();
+        counts.closed(handles, nanos_since(began));
+        break_span();
+    }
+}
+
+// Set the length of `open`, timed for the volume's counts, and keep what it
+// left. A length set on some systems stands behind what the file system is
+// writing out of the file.
+fn set_length(open: &mut Open, length: u64, counts: &WriterCounts) -> io::Result<()> {
+    let began = now();
+    let set = open.file.set_len(length);
+    counts.length_set(nanos_since(began));
+    break_span();
+    open.length = set.is_ok().then_some(length);
+    set
+}
+
+fn nanos_since(began: Instant) -> u64 {
+    now().saturating_duration_since(began).as_nanos() as u64
 }
 
 // What a batch has come to so far.
@@ -2214,7 +2155,7 @@ impl Thread {
         #[cfg(test)]
         self.pass_drop_gate();
         let key = &self.batch[entry as usize].key;
-        key.held().letting_go.clear();
+        key.held().drop_let_go(None, &self.state.volume.writer);
         key.letting.store(0, Ordering::Relaxed);
         self.held.remove(&entry);
     }
@@ -2259,6 +2200,8 @@ impl Thread {
         self.files.clear();
         let mut part = 0u32;
         let mut rank = 0u32;
+        // The files of the batch a close ends, by their rank.
+        let mut closing = Vec::new();
         for index in 0..self.batch.len() {
             let at = index as u32;
             let key = &self.batch[index].key;
@@ -2296,6 +2239,9 @@ impl Thread {
             // A write that opens the file runs before the writes after it,
             // which carry no way to open it.
             let alone = !matches!(op, Op::Write { create: None, .. });
+            if matches!(op, Op::Close { .. }) {
+                closing.push(entry.1);
+            }
             let offset = match op {
                 Op::Write { offset, .. } => *offset,
                 _ => 0,
@@ -2316,6 +2262,24 @@ impl Thread {
         }
         if self.order.len() < 2 {
             return;
+        }
+        // Between two operations that may touch more than one file, the files
+        // a close ends run first, each in the order it first came: a reader
+        // of a closed file, a check or a repair, is told its bytes and length
+        // are placed without standing behind another file's open or writes.
+        // The files of one part touch nothing of each other, so any order of
+        // them is as sound as the one they came in.
+        if !closing.is_empty() {
+            const LATER: u32 = 1 << 31;
+            let mut first = vec![false; rank as usize + 1];
+            for rank in closing {
+                first[rank as usize] = true;
+            }
+            for place in &mut self.order {
+                if place.file != 0 && !first[place.file as usize] {
+                    place.file |= LATER;
+                }
+            }
         }
         self.order.sort_unstable();
         let mut start = 0;
@@ -2457,10 +2421,8 @@ fn perform(
         // would have moved or removed, its caller may now move or remove
         // on a thread of its own, so the key's handles are dropped first.
         Op::Run { file, .. } if skip => {
-            if let Some(file) = file {
-                held.open.remove(&file);
-            }
-            held.letting_go.clear();
+            let open = file.and_then(|file| held.open.remove(&file));
+            held.drop_let_go(open, &state.volume.writer);
             *dropped = true;
             Ok(())
         }
@@ -2493,7 +2455,7 @@ fn perform(
             // An open made for this write is not write time: the span
             // starts again after it.
             let was_open = held.open.contains_key(&file);
-            match held.opened(file, create.as_deref(), &mut creating) {
+            match held.opened(file, create.as_deref(), &mut creating, &state.volume.writer) {
                 Ok(Some(open)) => {
                     tally.calls += 1;
                     let seek = open.end.is_some_and(|end| end != offset);
@@ -2528,12 +2490,20 @@ fn perform(
                             .fetch_add(bytes.len() as u64, Ordering::Release);
                     }
                     *wrote_at = Some(returned);
-                    open.end = Some(offset + bytes.len() as u64);
-                    // Its count fell as the call returned (`in_hand`); the
-                    // buffer is freed on the loop's side.
-                    if let Some(returns) = &state.returns {
-                        returns.give(bytes, &volume.writer);
+                    let end = offset + bytes.len() as u64;
+                    open.end = Some(end);
+                    open.length = open
+                        .length
+                        .filter(|_| wrote.is_ok())
+                        .map(|length| length.max(end));
+                    // Its count fell as the call returned (`in_hand`). The
+                    // last share of the buffer is freed here, as soon as it
+                    // is written: the memory goes back while it is still
+                    // warm, and the next article decodes into it.
+                    if bytes.is_unique() {
+                        break_span();
                     }
+                    drop(bytes);
                     wrote
                 }
                 Ok(None) => Ok(()),
@@ -2545,31 +2515,42 @@ fn perform(
             if !held.open.contains_key(&file) && !create.path.try_exists().unwrap_or(true) {
                 Ok(())
             } else {
-                held.opened(file, Some(&create), &mut creating)
-                    .and_then(|open| open.map_or(Ok(()), |open| open.file.set_len(0)))
+                let counts = &state.volume.writer;
+                held.opened(file, Some(&create), &mut creating, counts)
+                    .and_then(|open| open.map_or(Ok(()), |open| set_length(open, 0, counts)))
             }
         }
+        // A file already at its final length, sized when it was made and
+        // written to its end or grown by its writes to it, is not set again:
+        // that is no change, and on some systems the call stands behind
+        // what the file system is writing out of the file.
         Op::Close {
             file,
             length,
             create,
         } => {
             failed_at.clone_from(&create.path);
+            let counts = &state.volume.writer;
             let closed = held
-                .opened(file, Some(&create), &mut creating)
-                .and_then(|open| open.map_or(Ok(()), |open| open.file.set_len(length)));
+                .opened(file, Some(&create), &mut creating, counts)
+                .and_then(|open| match open {
+                    None => Ok(()),
+                    Some(open) if open.length == Some(length) => {
+                        counts.length_sets_skipped.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    }
+                    Some(open) => set_length(open, length, counts),
+                });
             *let_go = held.let_go(file);
             closed
         }
         Op::Run {
             file, path, run, ..
         } => {
-            if let Some(file) = file {
-                held.open.remove(&file);
-            }
             // Its code may move or remove what a handle the key let go
             // still holds open.
-            held.letting_go.clear();
+            let open = file.and_then(|file| held.open.remove(&file));
+            held.drop_let_go(open, &state.volume.writer);
             *dropped = true;
             failed_at = path;
             after = Some(run);
