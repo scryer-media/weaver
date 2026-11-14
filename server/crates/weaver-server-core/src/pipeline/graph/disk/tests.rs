@@ -515,20 +515,31 @@ fn a_free_name_is_not_one_a_queued_file_will_take() {
     let hold = through.hold();
     let disk = through.disk();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("kept");
-    let to = path.clone();
+    let given = crate::pipeline::graph::envelope::Given::default();
+    // The first file's making is queued behind the hold: the disk does not
+    // show it, and nothing waits for it to.
+    let first = given.free(Some(disk.working()), dir.path(), "kept");
+    assert_eq!(first, "kept");
+    let to = dir.path().join(&first);
     disk.working()
-        .run(None, path, move || std::fs::write(&to, b"kept"));
-    let name = std::thread::scope(|scope| {
-        let asked = scope.spawn(|| {
-            crate::pipeline::graph::envelope::free_name_through(
-                Some(disk.working()),
-                dir.path(),
-                "kept",
-            )
-        });
-        hold.open();
-        asked.join().unwrap()
-    });
-    assert_eq!(name, "kept-1");
+        .run(None, to.clone(), move || std::fs::write(&to, b"kept"));
+    assert!(!dir.path().join("kept").exists());
+    assert_eq!(
+        given.free(Some(disk.working()), dir.path(), "kept"),
+        "kept-1"
+    );
+    hold.open();
+    disk.barrier().wait_aside();
+    // The disk says it all again once the writer is idle: the first file
+    // is there, and the second name, which no file was made at, is free.
+    assert_eq!(
+        given.free(Some(disk.working()), dir.path(), "kept"),
+        "kept-1"
+    );
+    assert_eq!(
+        given.free(Some(disk.working()), dir.path(), "other"),
+        "other"
+    );
+    let waits = &disk.working().volume().writer.loop_waits;
+    assert_eq!(waits.load(std::sync::atomic::Ordering::Relaxed), 0);
 }

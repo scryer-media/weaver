@@ -329,9 +329,10 @@ impl Volumes for RunVolumes {
             return Ok(0);
         };
         // The coverage says the bytes were handed to the file; they are
-        // read once the volume's writer has put them there.
+        // read once the volume's writer has put them there. The run reads
+        // on a thread of its own, which the loop never waits for.
         if let Some(settled) = settled {
-            settled.wait();
+            settled.wait_aside();
         }
         let len = usize::try_from(len).expect("a read fits the buffer it fills");
         let mut files = self.files.lock().unwrap_or_else(PoisonError::into_inner);

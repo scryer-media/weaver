@@ -229,6 +229,16 @@ impl Leaf {
         self
     }
 
+    // The file is put at the leaf's path by the operation numbered `made`,
+    // which its writer already has: whoever reads it waits through that
+    // one. Nothing for a leaf that runs its own operations.
+    pub(crate) fn after(mut self, made: u64) -> Self {
+        if let Some(queued) = &mut self.queued {
+            queued.last = queued.last.max(made);
+        }
+        self
+    }
+
     // Everything submitted for the file so far: whoever reads the file by
     // its path waits for this first. `None` for a leaf that runs its own
     // operations, whose file is always as the leaf says.
@@ -251,6 +261,11 @@ impl Leaf {
             length,
             open: open_sized,
         }
+    }
+
+    // The directory the leaf's name is under.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
     }
 
     pub(crate) fn revision(&self) -> (u64, u64) {
@@ -650,7 +665,38 @@ impl Leaf {
         len: usize,
         into: &mut Vec<u8>,
     ) -> Result<(), LeafError> {
-        self.settle();
+        // Through a writer, the read waits only through the last operation
+        // submitted for this file, whatever else its volume has queued.
+        if let Some(queued) = self.queued.as_ref().filter(|queued| queued.last > 0) {
+            let read = queued
+                .to
+                .read_after(queued.last, self.path.clone(), offset, len)
+                .map_err(LeafError::io(&self.path))?;
+            if into.is_empty() {
+                *into = read;
+            } else {
+                into.extend_from_slice(&read);
+            }
+            return Ok(());
+        }
+        self.read_here(offset, len, into)
+    }
+
+    // The same read for a thread the loop does not wait for: a repair or a
+    // replay on a thread of its own.
+    pub(crate) fn read_aside(
+        &self,
+        offset: u64,
+        len: usize,
+        into: &mut Vec<u8>,
+    ) -> Result<(), LeafError> {
+        if let Some(settled) = self.settled() {
+            settled.wait_aside();
+        }
+        self.read_here(offset, len, into)
+    }
+
+    fn read_here(&self, offset: u64, len: usize, into: &mut Vec<u8>) -> Result<(), LeafError> {
         let start = into.len();
         into.resize(start + len, 0);
         let read = match &self.file {

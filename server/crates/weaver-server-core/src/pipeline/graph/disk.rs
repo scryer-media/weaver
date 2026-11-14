@@ -460,8 +460,17 @@ impl JobBarrier {
         self.0.iter().any(Barrier::test_held)
     }
 
-    // Wait until every operation behind it returned. For a thread that may
-    // wait on the disk.
+    // Wait until every operation behind it returned, on a thread the loop
+    // does not wait for: a repair, a check or a replay on its own thread.
+    pub(crate) fn wait_aside(&self) {
+        for barrier in &self.0 {
+            barrier.wait_aside();
+        }
+    }
+
+    // Wait until every operation behind it returned, counted against the
+    // loop.
+    #[cfg(test)]
     pub(crate) fn wait(&self) {
         for barrier in &self.0 {
             barrier.wait();

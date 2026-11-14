@@ -447,12 +447,14 @@ impl NamespaceWriter {
         self.disk.as_ref().map(|disk| Arc::clone(disk.under(root)))
     }
 
-    // Wait until everything the job submitted for its files has returned:
-    // what follows reads or names them where they lie.
-    pub(crate) fn settle_disk(&self) {
-        if let Some(disk) = &self.disk {
-            disk.barrier().wait();
-        }
+    // Everything the job has submitted for its files, when some of it has
+    // yet to return: what a thread of its own waits for before it reads or
+    // opens them where they lie. `None` when the files already lie as said.
+    pub(super) fn unsettled(&self) -> Option<crate::pipeline::graph::disk::JobBarrier> {
+        self.disk
+            .as_ref()
+            .map(|disk| disk.barrier())
+            .filter(|barrier| !barrier.returned())
     }
 
     pub(crate) fn disk(&self) -> Option<&crate::pipeline::graph::disk::JobDisk> {

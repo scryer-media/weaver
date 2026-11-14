@@ -141,7 +141,7 @@ impl Loan {
     // directory went, reads nothing, and one going when either happens
     // reads nothing more: each comes back stopped.
     pub(crate) fn run(mut self, budget: weaver_graph::Budget, shutdown: &Shutdown) -> Returned {
-        self.access.shutdown = shutdown.clone();
+        self.access.begin(shutdown);
         let given = !self.access.stopped();
         let outcome = self
             .object
@@ -206,6 +206,8 @@ struct Taken {
     // Its spill file, for the bytes held past the budgets, and the revision
     // that file stood at when lent.
     spill: Option<File>,
+    // The spill file to open once the loan's thread has waited for it.
+    spill_later: Option<PathBuf>,
     spill_revision: Option<(u64, u64)>,
     bound: Option<(NodeId, VolumeIndex)>,
 }
@@ -243,6 +245,27 @@ impl Lent {
     fn stopped(&self) -> bool {
         self.shutdown.started() || !self.internal.is_dir()
     }
+
+    // The loan's thread begins: it waits for what was still queued for the
+    // job's files when the loan was made, and opens what the loop left for
+    // it to open.
+    fn begin(&mut self, shutdown: &Shutdown) {
+        self.shutdown = shutdown.clone();
+        let Some(settled) = self.settled.take() else {
+            return;
+        };
+        settled.wait_aside();
+        for (node, path) in std::mem::take(&mut self.scratch_later) {
+            if let Ok(file) = File::open(path) {
+                self.held_scratch.insert(node, file);
+            }
+        }
+        for taken in self.members.values_mut() {
+            if let Some(path) = taken.spill_later.take() {
+                taken.spill = File::open(path).ok();
+            }
+        }
+    }
 }
 
 // The owned access a lent repair reads and writes through.
@@ -264,6 +287,12 @@ struct Lent {
     // Each namespace's scratch file, opened when lent for a member that
     // holds bytes there.
     held_scratch: BTreeMap<NodeId, File>,
+    // Everything the job had submitted for its files when the loan was
+    // made, when some of it had yet to return, and the scratch files to
+    // open once it has. The loan waits for it on its own thread as it
+    // begins, never the loop: the files then lie as the loop said them.
+    settled: Option<crate::pipeline::graph::disk::JobBarrier>,
+    scratch_later: BTreeMap<NodeId, PathBuf>,
     // The directory the repair's scratch and output lie in, made when the
     // repair is lent. The repair never makes it again: once it is gone, the
     // job's working directory was released under the repair.
@@ -436,9 +465,8 @@ impl NamespaceWriter {
         namespace: NodeId,
         set: NodeId,
     ) -> Result<Option<Loan>, LeafError> {
-        // The repair opens the job's files where they lie, so everything
-        // submitted for them returns first.
-        self.settle_disk();
+        // The repair opens the job's files where they lie, once everything
+        // submitted for them has returned: it waits for that as it begins.
         let mut access = Lent {
             namespace,
             set,
@@ -446,6 +474,8 @@ impl NamespaceWriter {
             defer_holds: false,
             scratch_read: None,
             held_scratch: BTreeMap::new(),
+            settled: self.unsettled(),
+            scratch_later: BTreeMap::new(),
             internal: self.working_dir.join(weaver_graph::names::INTERNAL_DIR),
             members: BTreeMap::new(),
             usage: RefCell::default(),
@@ -604,12 +634,14 @@ impl NamespaceWriter {
                     .any(|(_, location)| matches!(location, Location::Scratch { .. }));
                 if on_scratch
                     && !access.held_scratch.contains_key(&node)
-                    && let Some(file) = files
-                        .scratch
-                        .as_ref()
-                        .and_then(|leaf| File::open(leaf.path()).ok())
+                    && !access.scratch_later.contains_key(&node)
+                    && let Some(leaf) = files.scratch.as_ref()
                 {
-                    access.held_scratch.insert(node, file);
+                    if access.settled.is_some() {
+                        access.scratch_later.insert(node, leaf.path().to_path_buf());
+                    } else if let Ok(file) = File::open(leaf.path()) {
+                        access.held_scratch.insert(node, file);
+                    }
                 }
                 held
             }
@@ -645,7 +677,12 @@ impl NamespaceWriter {
                 // the ranges it read, a replay's in the file's revision.
                 spill: files
                     .and_then(|files| files.spills.get(&member))
+                    .filter(|_| access.settled.is_none())
                     .and_then(|leaf| File::open(leaf.path()).ok()),
+                spill_later: files
+                    .and_then(|files| files.spills.get(&member))
+                    .filter(|_| access.settled.is_some())
+                    .map(|leaf| leaf.path().to_path_buf()),
                 bound,
             },
         );
@@ -774,7 +811,7 @@ impl Source for Lent {
             self.usage.borrow_mut().shelves.insert(child);
         }
         match self.shelves.get(&child) {
-            Some((shelf, _)) => shelf.read(envelope, range, into),
+            Some((shelf, _)) => shelf.read_aside(envelope, range, into),
             None => range.is_empty(),
         }
     }
