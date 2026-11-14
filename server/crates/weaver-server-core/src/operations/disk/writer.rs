@@ -178,6 +178,17 @@ impl VolumeWriters {
     // A caller's way to write to `volume` under `key`. The volume's thread
     // starts here when it has none; one that has not ended is used again.
     pub(crate) fn submitter(&self, volume: &Arc<Volume>, key: u64) -> Arc<Submitter> {
+        debug_assert_ne!(key, VOLUME_KEY, "the volume's own key is no caller's");
+        self.submitter_under(volume, key)
+    }
+
+    // The way to queue a volume's own work on its writer, such as the probe
+    // of its write rate, under the one key no caller has.
+    pub(crate) fn volume_submitter(&self, volume: &Arc<Volume>) -> Arc<Submitter> {
+        self.submitter_under(volume, VOLUME_KEY)
+    }
+
+    fn submitter_under(&self, volume: &Arc<Volume>, key: u64) -> Arc<Submitter> {
         let lane = self.lane(volume);
         let send = Mutex::new(lane.send.clone());
         Arc::new(Submitter {
@@ -356,6 +367,12 @@ impl VolumeWriters {
         hold
     }
 }
+
+// The key a volume's own work is queued under: reserved here, and handed
+// out only by `volume_submitter`. A caller's key is its own number, for a
+// job its id. Ids are counted up one at a time from ten thousand and kept
+// in signed 64-bit columns, so none reaches this.
+const VOLUME_KEY: u64 = u64::MAX;
 
 // No entry of a batch: the end of a key's chain through it.
 const NONE: u32 = u32::MAX;

@@ -44,10 +44,6 @@ pub(crate) fn job_disk(
     JobDisk::new(working, output)
 }
 
-// The key a volume's probe is queued under. A job's key is its id, which
-// the database numbers from one upwards and never reaches this.
-const PROBE_KEY: u64 = u64::MAX;
-
 type Probe = Box<dyn FnOnce() -> std::io::Result<()> + Send>;
 
 // What gives each volume its first write rate: the first time a job is
@@ -108,7 +104,7 @@ impl VolumeProbes {
         // nearest directory above it that is, found on the volume's thread.
         let (probe, probed, under) = (Arc::clone(probe), Arc::clone(volume), dir.to_path_buf());
         writers
-            .submitter(volume, PROBE_KEY)
+            .volume_submitter(volume)
             .run(None, dir.to_path_buf(), move || {
                 match under.ancestors().find(|dir| dir.is_dir()) {
                     Some(dir) => probe(probed, dir.to_path_buf())(),
