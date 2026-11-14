@@ -257,7 +257,8 @@ impl DiskStats {
     pub fn permit_waited(&self, since: Instant) {
         self.permit_acquisitions.fetch_add(1, Relaxed);
         self.permit_waits.fetch_add(1, Relaxed);
-        self.permit_wait_nanos.fetch_add(nanos_since(since), Relaxed);
+        self.permit_wait_nanos
+            .fetch_add(nanos_since(since), Relaxed);
     }
 
     pub fn peer_stopped(&self) {

@@ -578,7 +578,10 @@ impl<'a> FileOps<'a> {
         let file = self
             .file_infos
             .partition_point(|fi| fi.offset_in_torrent + fi.len <= offset);
-        let start = self.file_infos.get(file).map_or(offset, |fi| fi.offset_in_torrent);
+        let start = self
+            .file_infos
+            .get(file)
+            .map_or(offset, |fi| fi.offset_in_torrent);
         (file, offset - start)
     }
 

@@ -2717,7 +2717,10 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         // failure (libtorrent disconnects with `duplicate_peer_id` at normal
         // severity).
         let supports_dht = handshake.supports_dht();
-        if !self.state.set_peer_live(self.addr, handshake, ckind, &self.upload) {
+        if !self
+            .state
+            .set_peer_live(self.addr, handshake, ckind, &self.upload)
+        {
             return Err(crate::Error::Disconnect.into());
         }
         if supports_dht {

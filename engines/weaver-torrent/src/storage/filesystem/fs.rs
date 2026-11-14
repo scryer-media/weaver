@@ -76,7 +76,10 @@ impl FilesystemStorage {
     }
 
     fn fresh_ends(&self) -> Vec<FileEnds> {
-        self.opened_files.iter().map(|_| FileEnds::default()).collect()
+        self.opened_files
+            .iter()
+            .map(|_| FileEnds::default())
+            .collect()
     }
 
     fn read_at(&self, file_id: usize, offset: u64, len: usize) {
@@ -273,13 +276,13 @@ mod tests {
         let mut bufs: Vec<&mut [u8]> = together.iter_mut().map(Vec::as_mut_slice).collect();
         storage.preadv_exact(0, offset, &mut bufs).unwrap();
 
-        let mut at = offset;
+        let mut at = 5_000usize;
         for (len, read) in lens.iter().zip(&together) {
             let mut alone = vec![0u8; *len];
-            storage.pread_exact(0, at, &mut alone).unwrap();
+            storage.pread_exact(0, at as u64, &mut alone).unwrap();
             assert_eq!(read, &alone, "the buffer at {at}");
-            assert_eq!(alone, payload[at as usize..at as usize + len]);
-            at += *len as u64;
+            assert_eq!(alone, payload[at..at + len]);
+            at += *len;
         }
 
         let mut long = [vec![0u8; 60_000], vec![0u8; 60_000]];
