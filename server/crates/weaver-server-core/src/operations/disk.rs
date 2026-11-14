@@ -1328,10 +1328,13 @@ enum Unsettled {
     TimedOut,
 }
 
-// `path` when it exists, else the nearest folder above it that does.
+// `path` when it exists, else the nearest folder above it that does. On
+// Windows a disk is read only at a folder, so a file there is passed over
+// for the folder that holds it.
 fn nearest_existing_ancestor(path: &Path) -> PathBuf {
+    let reads_a_disk = |at: &Path| if cfg!(windows) { at.is_dir() } else { at.exists() };
     path.ancestors()
-        .find(|candidate| !candidate.as_os_str().is_empty() && candidate.exists())
+        .find(|candidate| !candidate.as_os_str().is_empty() && reads_a_disk(candidate))
         .unwrap_or(path)
         .to_path_buf()
 }
@@ -3478,7 +3481,10 @@ mod tests {
         let file = dir.path().join("file");
         std::fs::write(&file, b"x").unwrap();
         let through = file.join("sub");
-        let error = probe_disk_space(&through).expect_err("a path through a file");
+        probe_disk_space(&through).expect_err("a path through a file");
+        // More than a folder not made yet: the climb over missing folders
+        // ends at the file, and does not answer for the path.
+        let error = probe_nearest_disk_space(&through).expect_err("no folder to climb to");
         assert!(!error.is_not_found(), "{error}");
         let storage = StorageCapacity::with_probe(roots(), NEVER, Arc::new(probe_disk_space));
         let OnDemandSpace::Read(space) =
