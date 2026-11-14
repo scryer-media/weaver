@@ -155,9 +155,24 @@ pub(crate) struct TorrentStateLocked {
     fatal_errors_tx: Option<tokio::sync::oneshot::Sender<anyhow::Error>>,
 
     unflushed_bitv_bytes: u64,
+
+    // Whether the torrent was finished when it was last asked whether it
+    // had turned so (Self::turned_finished).
+    finished: bool,
 }
 
 impl TorrentStateLocked {
+    /// Whether the torrent turned finished since this was last asked, by a
+    /// piece had or by a piece no longer wanted: true once for each time it
+    /// does, so what follows the torrent finishing follows it once. A
+    /// torrent that wants a piece again turns finished again when it has
+    /// it.
+    fn turned_finished(&mut self) -> crate::Result<bool> {
+        let finished = self.get_chunks()?.is_finished();
+        let was = std::mem::replace(&mut self.finished, finished);
+        Ok(finished && !was)
+    }
+
     pub(crate) fn get_chunks(&self) -> crate::Result<&ChunkTracker> {
         self.pieces
             .as_ref()
@@ -482,6 +497,7 @@ impl TorrentStateLive {
             .sharing_session_bans(Arc::clone(&session.bad_data_bans))
             .ordering_connects_by(session.connect_order()),
             _locked: RwLock::new(TorrentStateLocked {
+                finished: paused.chunk_tracker.is_finished(),
                 pieces: Some(PieceTracker::new(paused.chunk_tracker)),
                 fatal_errors_tx: Some(fatal_errors_tx),
                 unflushed_bitv_bytes: 0,
@@ -1870,11 +1886,14 @@ impl TorrentStateLive {
         files: &[FilePriority],
         pieces: &[PiecePriority],
     ) -> anyhow::Result<()> {
-        let hns = self.lock_write("prioritize").get_pieces_mut()?.prioritize(
-            &self.metadata.file_infos,
-            files,
-            pieces,
-        );
+        let hns = {
+            let mut g = self.lock_write("prioritize");
+            let hns = g
+                .get_pieces_mut()?
+                .prioritize(&self.metadata.file_infos, files, pieces);
+            self.settle_finish(g)?;
+            hns
+        };
         // The peers' requesters look again at what they may ask for, and
         // whether we want anything at all (libtorrent
         // `torrent::update_piece_priorities` calls `update_interest` on
@@ -1894,10 +1913,12 @@ impl TorrentStateLive {
         &self,
         priorities: impl IntoIterator<Item = (ValidPieceIndex, PiecePriority)>,
     ) -> anyhow::Result<()> {
-        let hns = self
-            .lock_write("set_piece_priorities")
-            .get_pieces_mut()?
-            .set_piece_priorities(priorities);
+        let hns = {
+            let mut g = self.lock_write("set_piece_priorities");
+            let hns = g.get_pieces_mut()?.set_piece_priorities(priorities);
+            self.settle_finish(g)?;
+            hns
+        };
         // As in prioritize().
         self.new_pieces_notify.notify_waiters();
         // Wanting a skipped piece again may make peers we let go useful. With the
@@ -2247,15 +2268,30 @@ impl TorrentStateLive {
         Ok(())
     }
 
-    /// Marks the checked piece as had and counts it. True when nothing
-    /// selected is missing once it is: of pieces whose checks end together,
-    /// it is true for the last one marked only, so what follows the torrent
-    /// finishing follows it once. The mark and the counts are one hold of
-    /// the lock: whoever sees the torrent finished sees every had piece
-    /// counted.
-    fn mark_piece_had(&self, id: ValidPieceIndex) -> anyhow::Result<bool> {
-        let mut g = self.lock_write("mark_piece_downloaded");
-        g.get_pieces_mut()?.mark_piece_hash_ok(id);
+    /// The checked piece, which the storage took, is had (libtorrent
+    /// `torrent::we_have` and `file_completed_alert`). It is marked, counted
+    /// for the run and into its files, and the finish settled, in one hold
+    /// of the lock: whoever sees the torrent finished sees every had piece
+    /// counted, in the totals and in its files. Each file it made whole is
+    /// told to the storage once the lock is let go, so after the finish
+    /// rings when the piece is the last.
+    fn on_piece_completed(&self, id: ValidPieceIndex) -> anyhow::Result<()> {
+        let whole = self.count_piece_had(id)?;
+        for file in whole {
+            self.files.on_file_completed(file);
+        }
+        Ok(())
+    }
+
+    /// The piece marked had and counted, under the write lock, and what
+    /// follows from it. Returns the files it made whole, padding left out;
+    /// empty, and unallocated, when it made none.
+    fn count_piece_had(&self, id: ValidPieceIndex) -> anyhow::Result<Vec<usize>> {
+        let mut whole = Vec::new();
+        let mut g = self.lock_write("on_piece_completed");
+        let locked = &mut **g;
+        let pieces = locked.get_pieces_mut()?;
+        pieces.mark_piece_hash_ok(id);
         let piece_len = u64::from(self.lengths.piece_length(id));
         self.stats
             .downloaded_and_checked_bytes
@@ -2266,30 +2302,6 @@ impl TorrentStateLive {
         self.stats
             .have_bytes
             .fetch_add(piece_len, Ordering::Relaxed);
-        Ok(g.get_chunks()?.is_finished())
-    }
-
-    /// The piece, which the storage took, is had: it is counted into its
-    /// files, and each file it made whole is told to the storage once the
-    /// lock is let go (libtorrent `torrent::we_have` and
-    /// `file_completed_alert`).
-    fn on_piece_completed(&self, id: ValidPieceIndex, finished: bool) -> anyhow::Result<()> {
-        let whole = self.count_piece_had(id, finished)?;
-        for file in whole {
-            self.files.on_file_completed(file);
-        }
-        Ok(())
-    }
-
-    /// The piece counted into its files, under the write lock, and what
-    /// follows from it. Returns the files it made whole, padding left out;
-    /// empty, and unallocated, when it made none. `finished` is what
-    /// [`Self::mark_piece_had`] said of the piece.
-    fn count_piece_had(&self, id: ValidPieceIndex, finished: bool) -> anyhow::Result<Vec<usize>> {
-        let mut whole = Vec::new();
-        let mut g = self.lock_write("on_piece_completed");
-        let locked = &mut **g;
-        let pieces = locked.get_pieces_mut()?;
         for (idx, file_info) in files_in_piece(&self.metadata.file_infos, id.get()) {
             if pieces.update_file_have_on_piece_completed(id, idx, file_info)
                 && !file_info.attrs.padding
@@ -2301,33 +2313,49 @@ impl TorrentStateLive {
         self.streams
             .wake_streams_on_piece_completed(id, self.metadata.lengths());
 
-        locked.unflushed_bitv_bytes += self.metadata.lengths().piece_length(id) as u64;
+        locked.unflushed_bitv_bytes += piece_len;
         if locked.unflushed_bitv_bytes >= FLUSH_BITV_EVERY_BYTES {
             locked.try_flush_bitv(&self.shared, true)
         }
 
-        let chunks = locked.get_chunks()?;
-        if finished {
-            if chunks.get_selected_pieces()[id.get_usize()] {
-                locked.try_flush_bitv(&self.shared, false);
-                info!(id=self.shared.id, info_hash=?self.shared.info_hash, "torrent finished downloading");
-            }
-            self.finished_notify.notify_waiters();
-
-            if !self.has_active_streams_unfinished_files(locked) {
-                // prevent deadlocks.
-                drop(g);
-                // Each peer's requester, woken by finished_notify, lets a
-                // peer that only uploads go (PeerHandler::request_chunks).
-                // A web seed only uploads too (libtorrent
-                // `torrent::finished`).
-                self.shared.web_seeds.disconnect_all();
-                // The peers left are told we only upload now (libtorrent
-                // `torrent::finished`).
-                self.update_upload_only();
-            }
+        if locked.get_chunks()?.get_selected_pieces()[id.get_usize()]
+            && locked.get_chunks()?.is_finished()
+            && !locked.finished
+        {
+            info!(id=self.shared.id, info_hash=?self.shared.info_hash, "torrent finished downloading");
         }
+        self.settle_finish(g)?;
         Ok(whole)
+    }
+
+    /// What follows the torrent finishing, when it turned finished under
+    /// this hold of the lock, which is let go here: by its last wanted
+    /// piece had, or by the pieces it lacked being wanted no longer
+    /// (libtorrent `torrent::finished`, from `piece_passed` and from
+    /// `update_piece_priorities` alike).
+    fn settle_finish(
+        &self,
+        mut g: TimedExistence<RwLockWriteGuard<'_, TorrentStateLocked>>,
+    ) -> anyhow::Result<()> {
+        if !g.turned_finished()? {
+            return Ok(());
+        }
+        g.try_flush_bitv(&self.shared, false);
+        self.finished_notify.notify_waiters();
+
+        if !self.has_active_streams_unfinished_files(&g) {
+            // prevent deadlocks.
+            drop(g);
+            // Each peer's requester, woken by finished_notify, lets a
+            // peer that only uploads go (PeerHandler::request_chunks).
+            // A web seed only uploads too (libtorrent
+            // `torrent::finished`).
+            self.shared.web_seeds.disconnect_all();
+            // The peers left are told we only upload now (libtorrent
+            // `torrent::finished`).
+            self.update_upload_only();
+        }
+        Ok(())
     }
 
     /// The torrent may want pieces again: the peers let go for being of no
@@ -4823,7 +4851,7 @@ fn check_landed_piece(
                 state.handle_disk_error(&e);
                 return state.requeue_piece(piece_index);
             }
-            let finished = state.mark_piece_had(piece_index)?;
+            state.on_piece_completed(piece_index)?;
             // Every peer that sent a block of it earns a point and
             // leaves parole (libtorrent `torrent::piece_passed`).
             for peer in senders.participants() {
@@ -4845,8 +4873,6 @@ fn check_landed_piece(
             }
 
             trace!(piece = index, "successfully downloaded and verified");
-
-            state.on_piece_completed(chunk_info.piece_index, finished)?;
 
             state.transmit_haves(chunk_info.piece_index);
             state.update_interest_of_holders(chunk_info.piece_index);

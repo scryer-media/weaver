@@ -8313,30 +8313,107 @@ async fn a_piece_is_checked_while_another_of_the_torrent_is() {
     assert!(h.have(0));
 }
 
-// The checks of the last two pieces end together: both pieces are marked
-// before either is counted into its files. The torrent finished with the
-// second mark, so only that piece's count rings the finish.
+// The checks of the last two pieces end together. Each is marked and
+// counted in one hold of the lock, so the torrent finishes with the second
+// and rings once, and whoever sees it finished sees both pieces counted,
+// in the totals and in the files.
 #[tokio::test]
 async fn pieces_that_finish_together_finish_the_torrent_once() {
     use futures::FutureExt;
     let h = Harness::build("finish_once", 0x00, 1).await;
-    let first = h.live.lengths.validate_piece_index(0).unwrap();
-    let last = h.live.lengths.validate_piece_index(1).unwrap();
-    assert!(!h.live.mark_piece_had(first).unwrap());
-    assert!(h.live.mark_piece_had(last).unwrap());
-    // Whoever sees the torrent finished sees both pieces counted, with
-    // neither check having gone further than its mark.
-    let had: u64 = [first, last]
-        .map(|piece| u64::from(h.live.lengths.piece_length(piece)))
+    let mut rung = std::pin::pin!(h.live.finished_notify.notified());
+    rung.as_mut().enable();
+    h.live.on_piece_completed(h.piece(0)).unwrap();
+    assert!(rung.as_mut().now_or_never().is_none());
+    h.live.on_piece_completed(h.piece(1)).unwrap();
+    assert!(rung.now_or_never().is_some());
+
+    let had: u64 = [0, 1]
+        .map(|piece| u64::from(h.live.lengths.piece_length(h.piece(piece))))
         .iter()
         .sum();
     assert_eq!(h.live.get_downloaded_bytes(), had);
     assert_eq!(h.live.stats_snapshot().downloaded_and_checked_pieces, 2);
+    let in_files: u64 = h
+        .lock_read("test")
+        .get_chunks()
+        .unwrap()
+        .per_file_have_bytes()
+        .iter()
+        .sum();
+    assert_eq!(in_files, had);
+}
 
+/// Whether `f` rings the torrent's finish.
+fn rings_the_finish(h: &Harness, f: impl FnOnce()) -> bool {
+    use futures::FutureExt;
     let mut rung = std::pin::pin!(h.live.finished_notify.notified());
     rung.as_mut().enable();
-    h.live.on_piece_completed(first, false).unwrap();
-    assert!(rung.as_mut().now_or_never().is_none());
-    h.live.on_piece_completed(last, true).unwrap();
-    assert!(rung.now_or_never().is_some());
+    f();
+    rung.now_or_never().is_some()
+}
+
+// The one piece the torrent lacks is wanted no longer: that finishes the
+// torrent as its last piece had does, so the finish rings and whoever
+// waits for the torrent to complete is woken.
+#[tokio::test]
+async fn a_skip_that_finishes_the_torrent_rings_the_finish() {
+    use futures::FutureExt;
+    let h = Harness::build("finish_by_skip", 0x00, 1).await;
+    let handle = h.handle();
+    let mut waiter = std::pin::pin!(handle.wait_until_completed());
+    assert!(waiter.as_mut().now_or_never().is_none());
+    assert!(!rings_the_finish(&h, || {
+        h.live.on_piece_completed(h.piece(0)).unwrap()
+    }));
+    assert!(waiter.as_mut().now_or_never().is_none());
+    assert!(rings_the_finish(&h, || {
+        h.set_piece_priorities([(h.piece(1), PiecePriority::Skip)])
+            .unwrap()
+    }));
+    assert!(h.live.is_finished());
+    assert!(waiter.now_or_never().is_some());
+}
+
+// A piece skipped while its check was in flight is had after the torrent
+// finished: the finish, rung by the last wanted piece, is not rung again.
+// The torrent wanting a piece again and then having it finishes again.
+#[tokio::test]
+async fn the_finish_rings_once_for_each_time_the_torrent_finishes() {
+    let h = Harness::build("finish_each_time", 0x00, 1).await;
+    assert!(!rings_the_finish(&h, || {
+        h.set_piece_priorities([(h.piece(1), PiecePriority::Skip)])
+            .unwrap()
+    }));
+    assert!(rings_the_finish(&h, || {
+        h.live.on_piece_completed(h.piece(0)).unwrap()
+    }));
+    assert!(!rings_the_finish(&h, || {
+        h.live.on_piece_completed(h.piece(1)).unwrap()
+    }));
+    // Skipping what is had, or wanting it again, finishes nothing anew.
+    assert!(!rings_the_finish(&h, || {
+        h.set_piece_priorities([(h.piece(1), PiecePriority::Normal)])
+            .unwrap()
+    }));
+}
+
+// A finished torrent that wants a piece again is finished no longer, and
+// rings when that piece is had.
+#[tokio::test]
+async fn a_torrent_that_wants_a_piece_again_finishes_again() {
+    let h = Harness::build("finish_again", 0x00, 1).await;
+    h.set_piece_priorities([(h.piece(1), PiecePriority::Skip)])
+        .unwrap();
+    assert!(rings_the_finish(&h, || {
+        h.live.on_piece_completed(h.piece(0)).unwrap()
+    }));
+    assert!(!rings_the_finish(&h, || {
+        h.set_piece_priorities([(h.piece(1), PiecePriority::Normal)])
+            .unwrap()
+    }));
+    assert!(!h.live.is_finished());
+    assert!(rings_the_finish(&h, || {
+        h.live.on_piece_completed(h.piece(1)).unwrap()
+    }));
 }
