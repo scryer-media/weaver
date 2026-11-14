@@ -8628,7 +8628,14 @@ async fn a_check_that_errors_ends_its_connection_and_the_torrent_in_error() {
         }
     };
     assert!(ended.is_err());
-    assert!(!h.have(0));
+    // No check passed, so piece 0 was never had. Its run's pieces are not
+    // read here: the error stops the torrent on a task of its own, which
+    // may already have ended the run and dropped them.
+    let checks = h.live.session_stats.swarm.snapshot().piece_checks;
+    assert_eq!(
+        checks[crate::session_stats::swarm::PieceCheck::Passed as usize],
+        0
+    );
     let handle = h.handle();
     let error = loop {
         let changed = handle.next_state_change();
