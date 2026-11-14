@@ -69,14 +69,16 @@ pub(crate) fn restored_at<'a>(
     Ok(output_name)
 }
 
-// How many files opened under a waiting name, and how many files moved on
-// disk, on this thread: a job's writer runs on its pipeline's thread, so a
-// test reads its own job's, across every writer a restart makes.
+// How many files opened under a waiting name, how many files moved on
+// disk, and how many files a pass of the moves read to weigh them, on this
+// thread: a job's writer runs on its pipeline's thread, so a test reads its
+// own job's, across every writer a restart makes.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Tally {
     pub(crate) waiting_opens: u64,
     pub(crate) moves: u64,
+    pub(crate) weighed: u64,
 }
 
 #[cfg(test)]
@@ -354,22 +356,39 @@ impl NamespaceWriter {
 
     // Run every waiting move the checkpoints through `committed` record
     // whose name nothing sits at. True when a file moved.
+    //
+    // Where every file sits or waits to move is read once per pass, the
+    // first time a move's name is not shut, and kept as the moves run: a
+    // pass over a long chain of waiting moves costs the files once, never
+    // the files for each move.
     fn run_moves(&mut self, committed: u64) -> Result<bool, WriteError> {
         let mut moved = false;
-        let mut at = 0;
-        while let Some(&waiting) = self.moves.get(at) {
-            let wants = self
+        let mut held: Option<Held> = None;
+        let mut kept = Vec::with_capacity(self.moves.len());
+        let mut pending = std::mem::take(&mut self.moves).into_iter();
+        while let Some(waiting) = pending.next() {
+            let Some(leaf) = self
                 .files
                 .get(&waiting.node)
                 .and_then(|files| files.leaves.get(&waiting.member))
-                .and_then(|leaf| leaf.wants().map(str::to_owned));
-            let Some(wants) = wants else {
-                self.moves.remove(at);
+            else {
+                continue;
+            };
+            let Some(wants) = leaf.wants().map(str::to_owned) else {
                 continue;
             };
             let recorded = waiting.stamp.is_some_and(|stamp| stamp <= committed);
-            if !recorded || !self.free_at(&wants, (waiting.node, waiting.member)) {
-                at += 1;
+            if !recorded || self.name_shut(&wants) {
+                kept.push(waiting);
+                continue;
+            }
+            let free = held.get_or_insert_with(|| Held::of(self)).free(
+                &wants,
+                leaf.name(),
+                Some(wants.as_str()),
+            );
+            if !free {
+                kept.push(waiting);
                 continue;
             }
             let leaf = self
@@ -380,17 +399,44 @@ impl NamespaceWriter {
             if leaf.as_ref().is_some_and(|leaf| leaf.on_disk()) {
                 count(|tally| tally.moves += 1);
             }
-            let left = leaf.map(Leaf::move_on).transpose()?.flatten();
+            let left = match leaf.map(Leaf::move_on).transpose() {
+                Ok(left) => left.flatten(),
+                Err(error) => {
+                    self.moves = restore_moves(kept, waiting, pending);
+                    return Err(error.into());
+                }
+            };
             if let Some(left) = left {
+                if let Some(held) = held.as_mut() {
+                    held.moved(&left);
+                }
                 self.left.insert(key(&left), None);
-                self.remove_emptied(above(left.trim_end_matches('/')).collect())?;
+                if let Err(error) = self.remove_emptied(above(left.trim_end_matches('/')).collect())
+                {
+                    self.moves = restore_moves(kept, waiting, pending);
+                    return Err(error);
+                }
                 moved = true;
                 // Select the actual moved payload, before recording its new location.
                 crate::e2e_failpoint::fire_rename(&wants);
             }
-            self.moves.remove(at);
         }
+        self.moves = kept;
         Ok(moved)
+    }
+
+    // Whether `name`, or a directory it runs through, is shut: a file left
+    // it and the checkpoint that records that has not committed.
+    fn name_shut(&self, name: &str) -> bool {
+        let name = key(name);
+        let committed = self.committed;
+        std::iter::once(name.as_str())
+            .chain(name.match_indices('/').map(|(at, _)| &name[..at]))
+            .any(|path| {
+                self.left
+                    .get(path)
+                    .is_some_and(|left| left.is_none_or(|left| left > committed))
+            })
     }
 
     // The checkpoints through `stamp` have committed: each name they free
@@ -494,20 +540,12 @@ impl NamespaceWriter {
     // file sits at one or waits to move to one. A directory is shared, so
     // two directory members may sit at one name.
     fn free_at(&self, name: &str, mover: (NodeId, MemberId)) -> bool {
+        if self.name_shut(name) {
+            return false;
+        }
         let directory = Leaf::is_directory(name);
         let name = key(name);
         let above: Vec<&str> = name.match_indices('/').map(|(at, _)| &name[..at]).collect();
-        let committed = self.committed;
-        let shut = std::iter::once(name.as_str())
-            .chain(above.iter().copied())
-            .any(|path| {
-                self.left
-                    .get(path)
-                    .is_some_and(|left| left.is_none_or(|left| left > committed))
-            });
-        if shut {
-            return false;
-        }
         // With no file waiting to move, every file sits at the name the
         // ledger gave its member, and the ledger gives a name to one member
         // and never a file a directory's path.
@@ -530,6 +568,103 @@ impl NamespaceWriter {
     }
 }
 
+// The moves a pass had not finished when a move failed, in their order:
+// those it kept, the one that failed, and those it had not reached.
+fn restore_moves(
+    mut kept: Vec<Waiting>,
+    failed: Waiting,
+    rest: impl Iterator<Item = Waiting>,
+) -> Vec<Waiting> {
+    kept.push(failed);
+    kept.extend(rest);
+    kept
+}
+
+// How many times each path is held by the job's files, as a file and as a
+// directory: once for the name each file sits at, and once for the name it
+// waits to move to. One pass of the moves reads it in place of a scan of
+// every file for each move it weighs.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Held(std::collections::HashMap<String, (usize, usize)>);
+
+impl Held {
+    fn of(writer: &NamespaceWriter) -> Self {
+        let mut held = Self::default();
+        for (_, files) in writer.files.iter() {
+            for leaf in files.leaves.values() {
+                #[cfg(test)]
+                count(|tally| tally.weighed += 1);
+                for name in std::iter::once(leaf.name()).chain(leaf.wants()) {
+                    held.add(name, 1);
+                }
+            }
+        }
+        held
+    }
+
+    // A path held `by` more times, or fewer; one held no more is dropped.
+    fn add(&mut self, name: &str, by: isize) {
+        let path = key(name);
+        let held = self.0.entry(path.clone()).or_default();
+        let count = if Leaf::is_directory(name) {
+            &mut held.1
+        } else {
+            &mut held.0
+        };
+        *count = count.checked_add_signed(by).expect("a held path's count");
+        if *held == (0, 0) {
+            self.0.remove(&path);
+        }
+    }
+
+    // How many times `path`, a key, is held as a file and as a directory.
+    fn at(&self, path: &str) -> (usize, usize) {
+        self.0.get(path).copied().unwrap_or_default()
+    }
+
+    // A file that wanted the name it sat at moved off `left`: the name it
+    // waited for is the one it sits at now, held once less.
+    fn moved(&mut self, left: &str) {
+        self.add(left, -1);
+    }
+
+    // Whether no file but the mover's, which sits at `sits` and waits for
+    // `waits`, sits at `name` or waits to move to it, and no file sits at a
+    // directory `name` runs through or waits to move to one. A directory
+    // `name` shares its path with other directories. The same answer as the
+    // scan in `free_at` gives once a move waits and nothing is shut.
+    fn free(&self, name: &str, sits: &str, waits: Option<&str>) -> bool {
+        let directory = Leaf::is_directory(name);
+        let name = key(name);
+        let mover: Vec<(String, bool)> = std::iter::once(sits)
+            .chain(waits)
+            .map(|held| (key(held), !Leaf::is_directory(held)))
+            .collect();
+        // Held at `path` by others than the mover, as a file and as a
+        // directory.
+        let others = |path: &str| {
+            let (mut files, mut dirs) = self.at(path);
+            for (at, file) in &mover {
+                if at == path {
+                    if *file {
+                        files -= 1;
+                    } else {
+                        dirs -= 1;
+                    }
+                }
+            }
+            (files, dirs)
+        };
+        let (files, dirs) = others(&name);
+        if files > 0 || (!directory && dirs > 0) {
+            return false;
+        }
+        !name
+            .match_indices('/')
+            .any(|(at, _)| others(&name[..at]).0 > 0)
+    }
+}
+
 // The directories `name` runs through.
 fn above(name: &str) -> impl Iterator<Item = String> + '_ {
     name.match_indices('/').map(|(at, _)| name[..at].to_owned())
@@ -545,4 +680,126 @@ fn waiting_name(dir: &std::path::Path, node: NodeId, member: MemberId, name: &st
         &format!("{INTERNAL_DIR}/graph-waiting-{}-{}", node.0, member.0),
     );
     format!("{waiting}{directory}")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
+
+    use super::*;
+    use crate::operations::disk::CapacityReader;
+
+    // Names that meet as one path in another case, as a file and a
+    // directory of one path, and as a directory another name runs through.
+    const NAMES: [&str; 14] = [
+        "a.bin",
+        "A.BIN",
+        "a (1).bin",
+        "d",
+        "d/",
+        "D/",
+        "d/a.bin",
+        "D/A.BIN",
+        "d/e/",
+        "d/e/f.bin",
+        "d/e",
+        "e/",
+        "e/a.bin",
+        "f.bin",
+    ];
+
+    // A small deterministic generator, so every seed replays one sequence.
+    struct Draw(u64);
+
+    impl Draw {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound as u64) as usize
+        }
+
+        fn name(&mut self) -> &'static str {
+            NAMES[self.below(NAMES.len())]
+        }
+    }
+
+    fn writer(dir: &Path) -> NamespaceWriter {
+        let budgets = HoldBudgets {
+            resident_limit: u64::MAX,
+            scratch_total: u64::MAX,
+            scratch_ceiling: u64::MAX,
+            disk_reserve: 0,
+        };
+        NamespaceWriter::new(
+            1,
+            dir.to_path_buf(),
+            Arc::new(HoldsAccountant::new(budgets)),
+            CapacityReader::unknown(),
+        )
+    }
+
+    // Over seeded sets of files that sit at and wait for colliding names,
+    // a pass weighs each move as the scan of every file does, and what it
+    // keeps after each move it runs is what a fresh read of the files gives.
+    #[test]
+    fn a_pass_weighs_each_move_as_a_scan_of_every_file_would() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut weighed = [0usize; 2];
+        for seed in [1u64, 7, 42, 1_234_567, 0x9e37_79b9_7f4a_7c15, 31_337] {
+            let mut draw = Draw(seed);
+            let mut writer = writer(dir.path());
+            let mut holders = Vec::new();
+            for _ in 0..12 {
+                let holder = (NodeId(draw.below(3) as u32), MemberId(draw.below(6) as u32));
+                let mut leaf = Leaf::at(dir.path(), draw.name());
+                if draw.below(3) > 0 {
+                    leaf.intend(draw.name());
+                }
+                writer.files_mut(holder.0).leaves.insert(holder.1, leaf);
+                if !holders.contains(&holder) {
+                    holders.push(holder);
+                }
+            }
+            writer.moves.push(Waiting {
+                node: holders[0].0,
+                member: holders[0].1,
+                stamp: None,
+            });
+            let mut held = Held::of(&writer);
+            for _ in 0..400 {
+                let (node, member) = holders[draw.below(holders.len())];
+                let leaf = writer.files_mut(node).leaves.get(&member).unwrap();
+                let (sits, waits) = (leaf.name().to_owned(), leaf.wants().map(str::to_owned));
+                let name = draw.name();
+                let free = held.free(name, &sits, waits.as_deref());
+                assert_eq!(
+                    free,
+                    writer.free_at(name, (node, member)),
+                    "seed {seed} {name}"
+                );
+                weighed[usize::from(free)] += 1;
+                // Now and then a file that waits moves to the name it wants.
+                if draw.below(4) == 0 && waits.is_some() {
+                    let leaf = writer.files_mut(node).leaves.get_mut(&member).unwrap();
+                    let left = leaf.move_on().expect("move").expect("a name it left");
+                    held.moved(&left);
+                    let mut leaf = Leaf::at(dir.path(), &waits.unwrap());
+                    if draw.below(2) == 0 {
+                        leaf.intend(draw.name());
+                    }
+                    // A file named again: what the pass keeps is read again.
+                    if leaf.wants().is_some() {
+                        writer.files_mut(node).leaves.insert(member, leaf);
+                        held = Held::of(&writer);
+                    }
+                }
+                assert_eq!(held, Held::of(&writer), "seed {seed}");
+            }
+        }
+        // Both answers came up many times.
+        assert!(weighed.iter().all(|count| *count > 100), "{weighed:?}");
+    }
 }
