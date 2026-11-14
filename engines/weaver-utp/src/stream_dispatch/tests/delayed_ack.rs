@@ -420,3 +420,46 @@ async fn packets_in_order_in_one_read_get_one_ack() {
         0
     );
 }
+
+// The ACKs owed for packets 3, 4 and 5 past a hole are counted the same
+// whether the socket takes them in one poll or in two: one immediate and
+// two repeats.
+async fn ack_counts_for_three_past_a_hole(refuse: bool) -> (u64, u64) {
+    let mut t = make_test_vsock(Default::default(), false);
+    let ack_nr = t.vsock.seq_nr - 1;
+    t.send_data(1, ack_nr, "a");
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.take_sent().len(), 1);
+    let stats = t._socket.stats();
+    let immediate = stats.immediate_acks.load(Ordering::Relaxed);
+    let duplicate = stats.duplicate_acks_sent.load(Ordering::Relaxed);
+
+    for seq in 3..=5u16 {
+        t.send_data(seq, ack_nr, "x");
+    }
+    if refuse {
+        t.transport.refuse_after(1);
+    }
+    t.poll_once_assert_pending().await;
+    if refuse {
+        assert_eq!(t.transport.refused(), 1);
+        t.transport.set_poll_send_pending(false);
+        t.poll_once_assert_pending().await;
+    }
+    assert_eq!(t.take_sent().len(), 3);
+    let stats = t._socket.stats();
+    (
+        stats.immediate_acks.load(Ordering::Relaxed) - immediate,
+        stats.duplicate_acks_sent.load(Ordering::Relaxed) - duplicate,
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn three_past_a_hole_count_one_immediate_ack_and_two_repeats() {
+    assert_eq!(ack_counts_for_three_past_a_hole(false).await, (1, 2));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_send_does_not_change_the_ack_counts() {
+    assert_eq!(ack_counts_for_three_past_a_hole(true).await, (1, 2));
+}

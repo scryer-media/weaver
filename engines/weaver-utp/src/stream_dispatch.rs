@@ -247,6 +247,9 @@ struct VirtualSocket<T, Env> {
     ack_due: bool,
     // Packets taken past a hole since the last ACK left.
     reordered_unacked: u8,
+    // An ACK went for the packets counted there and more are still owed:
+    // the next that leaves the cumulative ACK where it was is a repeat.
+    ack_repeating: bool,
 
     // Incoming queue. The main UDP socket writes here, and we need to consume these
     // as fast as possible.
@@ -533,6 +536,7 @@ macro_rules! send_data {
             } else {
                 on_packet_sent!($self, $header);
                 $self.reordered_unacked = 0;
+                $self.ack_repeating = false;
             }
 
             if $segment_iter_item.seq_nr().is_after($self.last_sent_seq_nr) {
@@ -1219,6 +1223,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         self.reordered_unacked = self.reordered_unacked.saturating_sub(1);
                     }
                     if self.duplicate_acks_owed() > 0 {
+                        self.ack_repeating = true;
                         self.send_due_ack(cx)?;
                     } else {
                         self.reordered_unacked = 0;
@@ -1394,22 +1399,26 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         while left > 0 {
             if !self.send_ack(cx)? {
                 // The socket took no more: what is left stays owed, and
-                // goes when it is writable again.
+                // goes when it is writable again, counted as the repeats
+                // they are.
                 self.ack_due = true;
                 return Ok(sent);
             }
-            if sent {
+            let moved = std::mem::take(&mut moves_ack);
+            if self.ack_repeating && !moved {
                 self.socket.stats.duplicate_acks_sent.increment(1);
             } else {
                 self.socket.stats.immediate_acks.increment(1);
             }
-            if !std::mem::take(&mut moves_ack) {
+            if !moved {
                 self.reordered_unacked = self.reordered_unacked.saturating_sub(1);
             }
+            self.ack_repeating = true;
             sent = true;
             left -= 1;
         }
         self.reordered_unacked = 0;
+        self.ack_repeating = false;
         Ok(sent)
     }
 
@@ -2931,6 +2940,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             ack_deferred: false,
             ack_due: false,
             reordered_unacked: 0,
+            ack_repeating: false,
             rx,
             user_tx_segments: Segments::new(seq_nr),
             user_tx,
