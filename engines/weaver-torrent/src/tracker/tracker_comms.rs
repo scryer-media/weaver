@@ -2486,8 +2486,9 @@ impl TrackerComms {
     /// and are abandoned past it or when it is zero. Should the session shut
     /// down first, they are dropped then, and each tracker of
     /// [`Stopping::waiting`] whose announce had not finished is sent
-    /// `stopped`, within the same bound. `running` is held until they all
-    /// end.
+    /// `stopped`, within the same bound, beside the others. Each send reads
+    /// the bound as it starts, so none goes once the announces are withheld,
+    /// however late. `running` is held until they all end.
     fn send_stopped(
         self: &Arc<Self>,
         stopping: Stopping,
@@ -2559,27 +2560,34 @@ impl TrackerComms {
                             comms.stats.get()
                         }
                     };
-                    comms.stopped_to(trackers, stats, timeout).await;
+                    comms.stopped_to(trackers, stats).await;
                 };
-                let (cut, ()) = tokio::join!(answers, stopped);
-                if !cut.is_empty() {
-                    // The run ended before the shutdown, so its connections
-                    // have counted what they dropped.
-                    comms.stopped_to(cut, comms.stats.get(), timeout).await;
-                }
+                // The trackers the shutdown cut hear `stopped` as soon as it
+                // does, beside the ones owed it already, so neither waits on
+                // the other and both end within the bound the shutdown waits.
+                let cut = async {
+                    let cut = answers.await;
+                    if !cut.is_empty() {
+                        // The session's connections close with it; the
+                        // counters go as they stand.
+                        comms.stopped_to(cut, comms.stats.get()).await;
+                    }
+                };
+                tokio::join!(stopped, cut);
             }
             .instrument(span),
         );
     }
 
     /// Sends `stopped` to each of `trackers` with `stats`, recorded, within
-    /// `timeout`.
-    async fn stopped_to(
-        self: &Arc<Self>,
-        trackers: StartedTrackers,
-        stats: TrackerCommsStats,
-        timeout: Duration,
-    ) {
+    /// the stopped announces' bound as it is now; none once they are
+    /// withheld, which may have happened since the run stopped.
+    async fn stopped_to(self: &Arc<Self>, trackers: StartedTrackers, stats: TrackerCommsStats) {
+        let timeout = self.stopped.timeout();
+        if timeout.is_zero() {
+            debug!("the stopped announces are withheld: none is sent");
+            return;
+        }
         let announces = trackers.into_iter().map(|(tracker, started)| {
             self.announce_recorded(tracker, Events::stopped(started), stats)
         });
@@ -4938,6 +4946,83 @@ mod tests {
             http[AnnounceEvent::Stopped as usize][TrackerResult::Ok as usize],
             1
         );
+        token.cancel();
+    }
+
+    // A torrent is paused while its `completed` waits for its answer, and its
+    // route then goes down: the session withholds its `stopped` announces
+    // before it shuts down, as `sessions.rs` `hold` does. The `completed` is
+    // cut, and its tracker, though it accepted `started`, hears nothing more:
+    // the address it would go out from no longer carries this session.
+    #[tokio::test]
+    async fn a_completed_left_to_finish_and_cut_once_withheld_leaves_its_tracker_unsent() {
+        let (listener, url) = http_listener().await;
+        let stats = Arc::new(ManualStats {
+            stats: Mutex::new(live(0, 90, false)),
+            completed: tokio::sync::watch::channel(false).0,
+        });
+        let token = CancellationToken::new();
+        let udp_sock = crate::test_support::loopback_udp().await;
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
+        let stopped = StoppedAnnounces::new(DAY);
+        let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity(),
+            op(vec![vec![url.clone()]]),
+            Box::new(stats.clone()),
+            None,
+            tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+            no_vote(),
+            crate::test_support::loopback(),
+            reach_all(),
+            udp_client,
+            stopped.clone(),
+            Default::default(),
+            false,
+            Default::default(),
+        );
+        let q = answer_with_a_peer(
+            &listener,
+            &mut peers,
+            "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe",
+        )
+        .await;
+        assert_eq!(query_param(&q, "event"), Some("started"));
+        *stats.stats.lock() = live(90, 0, true);
+        stats.completed.send_replace(true);
+        let (held, q) = tokio::select! {
+            _ = peers.next() => panic!("a peer came before the tracker was asked"),
+            r = read_announce(&listener) => r,
+        };
+        assert_eq!(query_param(&q, "event"), Some("completed"));
+
+        drop(peers);
+        assert!(
+            row(&status, &url).in_flight,
+            "a pause cut off the completed"
+        );
+        stopped.withhold();
+        stopped.shut_down();
+        closed(held).await;
+        // A `stopped` sent would dial the tracker before the stop could end.
+        tokio::select! {
+            () = stopped.wait_idle() => {}
+            _ = listener.accept() => {
+                panic!("the tracker was dialled after the stopped announces were withheld")
+            }
+        }
+
+        assert!(
+            listener.accept().now_or_never().is_none(),
+            "the tracker was dialled after the stopped announces were withheld"
+        );
+        let counted = status.counted();
+        let stopped_sent: u64 = counted
+            .announces
+            .iter()
+            .flat_map(|kind| kind[AnnounceEvent::Stopped as usize])
+            .sum();
+        assert_eq!(stopped_sent, 0, "a withheld stopped was sent");
         token.cancel();
     }
 
