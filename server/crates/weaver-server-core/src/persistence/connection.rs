@@ -990,22 +990,21 @@ fn archive_one(
             .write_torrent_history(history, retires)
             .map(|()| Some((**history).clone())),
     };
-    let archived = archived
-        .inspect_err(|error| {
-            if retry && matches!(error, StateError::OutOfSpace(_)) {
-                tracing::debug!(
-                    job_id = job_id.0,
-                    error = %error,
-                    "a kept history archive found no room again"
-                );
-            } else {
-                tracing::warn!(
-                    job_id = job_id.0,
-                    error = %error,
-                    "failed to archive job on database writer path"
-                );
-            }
-        })?;
+    let archived = archived.inspect_err(|error| {
+        if retry && matches!(error, StateError::OutOfSpace(_)) {
+            tracing::debug!(
+                job_id = job_id.0,
+                error = %error,
+                "a kept history archive found no room again"
+            );
+        } else {
+            tracing::warn!(
+                job_id = job_id.0,
+                error = %error,
+                "failed to archive job on database writer path"
+            );
+        }
+    })?;
     if let Some(row) = archived {
         writer.cache_job_history_at(row, observed_generation);
     }

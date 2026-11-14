@@ -3155,8 +3155,7 @@ async fn a_torrent_history_row_is_kept_and_written_as_an_nzb_archive_is() {
     refuse(no_room());
     let mut row = postgres_sample_history(torrent);
     row.protocol = crate::jobs::Protocol::Torrent;
-    let (mut torrent_written, torrent_kept) =
-        db.queue_torrent_history(torrent, row, true).unwrap();
+    let (mut torrent_written, torrent_kept) = db.queue_torrent_history(torrent, row, true).unwrap();
     torrent_kept.await.expect("the torrent's row is kept");
     db.flush_write_queue().await.unwrap();
     assert_eq!(db.kept_archive_jobs(), [nzb, torrent]);
@@ -3209,7 +3208,9 @@ async fn a_newer_torrent_history_row_lets_go_the_one_kept() {
     first.protocol = crate::jobs::Protocol::Torrent;
     first.status = "partial".to_string();
     refuse(no_room());
-    let (older, _) = db.queue_torrent_history(torrent, first.clone(), false).unwrap();
+    let (older, _) = db
+        .queue_torrent_history(torrent, first.clone(), false)
+        .unwrap();
     db.flush_write_queue().await.unwrap();
     assert_eq!(told(), [Kept(nzb), Kept(torrent)]);
 

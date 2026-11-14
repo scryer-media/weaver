@@ -47,8 +47,8 @@ use crate::pipeline::graph::engine::{DecodePool, Outside, RunMail, Said};
 use crate::pipeline::graph::job::Storage;
 use crate::pipeline::graph::limits::{self, Caps};
 use crate::pipeline::graph::status::RepairSlots;
-use crate::pipeline::graph::window::ScratchLedger;
 use crate::pipeline::graph::status::{Delivery, Failure};
+use crate::pipeline::graph::window::ScratchLedger;
 use crate::post_processing::model::{QueueEvent, vars};
 use crate::proxies::{
     Consumer, LegTenancy, LegTenant, NetworkRuntime, ResolvedBy, SessionTraffic, TorrentScope,
@@ -5377,7 +5377,12 @@ impl TorrentService {
     // has no room for is kept there and written once its folder shows room;
     // the job reaches the finished jobs then, and this does not wait for
     // it. A row lost any other way is said, and the job goes on.
-    async fn write_history(&self, row: crate::history::JobHistoryRow, retires: bool, report: JobReport) {
+    async fn write_history(
+        &self,
+        row: crate::history::JobHistoryRow,
+        retires: bool,
+        report: JobReport,
+    ) {
         let job_id = report.job_id;
         let (mut written, kept) = match self.inner.db.queue_torrent_history(job_id, row, retires) {
             Ok(both) => both,
@@ -5402,7 +5407,10 @@ impl TorrentService {
                 self.finished(report).await;
             }
             None => {
-                tracing::info!(job_id = job_id.0, "a torrent's history waits for room on the database's disk");
+                tracing::info!(
+                    job_id = job_id.0,
+                    "a torrent's history waits for room on the database's disk"
+                );
                 let service = self.clone();
                 tokio::spawn(async move {
                     if written.await.is_err() {

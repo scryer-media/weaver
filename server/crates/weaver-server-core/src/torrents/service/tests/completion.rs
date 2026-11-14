@@ -33,9 +33,7 @@ fn usenet_status(files: &[(&str, bool)], why: &str) -> JobStatus {
     let piece = |node: NodeId, member: MemberId| {
         tree.namespace(node)
             .and_then(|namespace| namespace.get(member))
-            .is_some_and(|member| {
-                crate::pipeline::post_health::names_a_piece(&member.output_name)
-            })
+            .is_some_and(|member| crate::pipeline::post_health::names_a_piece(&member.output_name))
     };
     let delivery = Delivery::read(
         &tree,
@@ -165,7 +163,10 @@ async fn a_torrent_history_row_the_disk_has_no_room_for_waits_and_is_written() {
     assert_eq!(heard.recv().await, Some(ArchiveNews::Kept(job_id)));
     assert_eq!(rig.db.kept_archive_jobs(), [job_id]);
     assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
-    assert!(rig.db.get_torrent(job_id).unwrap().is_some(), "kept with it");
+    assert!(
+        rig.db.get_torrent(job_id).unwrap().is_some(),
+        "kept with it"
+    );
     assert_eq!(*retired.borrow(), 0, "not yet in history");
 
     let mut retired = retired;
