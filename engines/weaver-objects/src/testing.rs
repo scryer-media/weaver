@@ -299,6 +299,10 @@ pub(crate) struct Store {
     // A directory lent for work on files, as a namespace that keeps them
     // lends one.
     pub(crate) scratch: Option<PathBuf>,
+    // What kind of failure each refused write in that directory was.
+    pub(crate) scratch_failures: Vec<std::io::ErrorKind>,
+    // How many bytes the repairs said they write in all.
+    pub(crate) will_write: u64,
     // Members the namespace has no room to rebuild.
     pub(crate) withheld: BTreeSet<MemberId>,
 }
@@ -329,6 +333,14 @@ impl MemberAccess for Store {
 
     fn scratch(&mut self) -> Option<PathBuf> {
         self.scratch.clone()
+    }
+
+    fn scratch_failed(&mut self, error: std::io::Error) {
+        self.scratch_failures.push(error.kind());
+    }
+
+    fn will_write(&mut self, bytes: u64) {
+        self.will_write += bytes;
     }
 
     fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {

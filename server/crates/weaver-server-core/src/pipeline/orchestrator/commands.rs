@@ -216,6 +216,12 @@ pub(in crate::pipeline) struct CancelledJobCleanup {
     post_processing_done: Option<tokio::sync::watch::Receiver<bool>>,
     working_dir: PathBuf,
     staging_dir: Option<PathBuf>,
+    // The destination folder a final move held for a full disk had claimed
+    // for this job and part filled.
+    destination: Option<PathBuf>,
+    // Whether a script named that folder is not known yet: the cleanup
+    // reads it before it removes the folder, and leaves a named one.
+    destination_unruled: bool,
 }
 
 // A cancel batch's archive outcome, carried back to the actor once the
@@ -346,6 +352,32 @@ impl Pipeline {
         keep_files: bool,
     ) {
         let job_id = cleanup.job_id;
+        // A job held for a full disk in its final move leaves the folder
+        // that move claimed for it, with what it had delivered there. A
+        // folder a script named is not the job's own, and stays.
+        // A job let go whose move had yet to start again leaves it too.
+        let let_go = self
+            .full_disk_moves
+            .iter()
+            .position(|(id, _)| *id == job_id)
+            .map(|at| self.full_disk_moves.swap_remove(at).1);
+        if let Some(crate::pipeline::full_disk::Stage::Moving(dest, _)) =
+            self.drop_full_disk_hold(job_id).or(let_go)
+        {
+            self.reserved_complete_destinations.remove(&job_id);
+            // Nothing is read from the database on this thread: what the
+            // scripts named is asked of memory, and where memory was never
+            // filled the cleanup reads it, off this thread, before it
+            // removes the folder.
+            match self.db.job_script_effects_in_hand(job_id.0) {
+                Some(effects) if effects.final_directory.is_some() => {}
+                Some(_) => cleanup.destination = Some(dest),
+                None => {
+                    cleanup.destination = Some(dest);
+                    cleanup.destination_unruled = true;
+                }
+            }
+        }
         if let Some(state) = self.purge_cancelled_job_runtime(job_id) {
             cleanup.working_dir = state.working_dir;
             cleanup.staging_dir = state.staging_dir;
@@ -541,6 +573,8 @@ impl Pipeline {
                 post_processing_done,
                 working_dir: state.working_dir.clone(),
                 staging_dir: state.staging_dir.clone(),
+                destination: None,
+                destination_unruled: false,
             },
         ))
     }
@@ -603,6 +637,8 @@ impl Pipeline {
                 post_processing_done: None,
                 working_dir,
                 staging_dir: None,
+                destination: None,
+                destination_unruled: false,
             },
         ))
     }
@@ -676,6 +712,19 @@ impl Pipeline {
         .await
         {
             tracing::warn!(job_id = job_id.0, %error, "retaining cancelled job directory while queue scripts are unresolved");
+            return;
+        }
+        let own = !cleanup.destination_unruled || {
+            let db = db.clone();
+            tokio::task::spawn_blocking(move || db.job_script_effects(job_id.0))
+                .await
+                .is_ok_and(|effects| effects.is_ok_and(|effects| effects.final_directory.is_none()))
+        };
+        if let Some(destination) = cleanup.destination.filter(|_| own)
+            && let Err(error) = tokio::fs::remove_dir_all(&destination).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(dir = %destination.display(), %error, "failed to clean up the part-filled destination of a cancelled job");
         }
     }
 }

@@ -304,6 +304,13 @@ pub(crate) struct Repaired {
     written: u64,
     // The first write the output refused. Nothing is written after it.
     failed: Option<LeafError>,
+    // What the repair said it writes in all, here and in its scratch
+    // directory, when it runs.
+    writes: u64,
+    // What a repair that failed for want of room needs free to run again:
+    // all it said it writes, since it is run again from its start with its
+    // output and its scratch directory gone. Never what it had written.
+    gave_back: u64,
 }
 
 impl Repaired {
@@ -323,7 +330,14 @@ impl Repaired {
             output: Leaf::at(working_dir, &name),
             written: 0,
             failed: None,
+            writes: 0,
+            gave_back: 0,
         })
+    }
+
+    // The repair says how much it writes in all when it runs.
+    pub(crate) fn will_write(&mut self, bytes: u64) {
+        self.writes = self.writes.saturating_add(bytes);
     }
 
     // What an object asked for again, read back and staged here until the
@@ -333,6 +347,7 @@ impl Repaired {
     pub(crate) fn again(working_dir: &std::path::Path, node: NodeId) -> Result<Self, LeafError> {
         let internal = working_dir.join(weaver_graph::names::INTERNAL_DIR);
         std::fs::create_dir_all(&internal).map_err(|source| LeafError::Io {
+            device: crate::pipeline::graph::limits::Device::Working,
             path: internal.clone(),
             source,
         })?;
@@ -348,6 +363,8 @@ impl Repaired {
             output: Leaf::at(working_dir, &name),
             written: 0,
             failed: None,
+            writes: 0,
+            gave_back: 0,
         })
     }
 
@@ -374,14 +391,44 @@ impl Repaired {
             Err(error) => {
                 self.output.release_handle();
                 let _ = std::fs::remove_file(self.output.path());
+                self.gave_back = self.writes;
                 self.failed = Some(error);
             }
         }
     }
 
+    // The repair's scratch directory, which lies beside the output on the
+    // working disk, refused a write for want of room. The repair failed with
+    // it as it does when the output refuses one: nothing staged is applied.
+    pub(crate) fn refuse(&mut self, path: &std::path::Path, source: std::io::Error) {
+        if self.failed.is_some() {
+            return;
+        }
+        self.gave_back = self.writes;
+        self.output.release_handle();
+        let _ = std::fs::remove_file(self.output.path());
+        self.failed = Some(LeafError::Io {
+            device: crate::pipeline::graph::limits::Device::Working,
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+
     // The write the output refused, if one did: the repair failed with it.
     pub(crate) fn failed(&mut self) -> Option<LeafError> {
         self.failed.take()
+    }
+
+    // What a repair that failed needs free to run again; nothing when it
+    // did not say what it writes, and the job then waits for more room than
+    // the disk showed.
+    pub(crate) fn gave_back(&self) -> u64 {
+        self.gave_back
+    }
+
+    // What the repair said it writes in all.
+    pub(crate) fn writes(&self) -> u64 {
+        self.writes
     }
 
     // Each run's member and how many bytes it holds, in the order written.
@@ -489,6 +536,7 @@ impl NamespaceWriter {
         match std::fs::create_dir(&access.internal) {
             Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
                 return Err(LeafError::Io {
+                    device: crate::pipeline::graph::limits::Device::Working,
                     path: access.internal,
                     source: error,
                 });
@@ -931,9 +979,28 @@ impl MemberAccess for Lent {
             self.namespace.0, self.set.0
         ));
         super::remove_scratch(&dir);
-        std::fs::create_dir(&dir).ok()?;
+        if let Err(error) = std::fs::create_dir(&dir) {
+            self.scratch_failed(error);
+            return None;
+        }
         self.scratch = Some(dir.clone());
         Some(dir)
+    }
+
+    // Only a disk with no room is the namespace's to wait on. Any other
+    // failure stays the object's, which rules the set as it did before.
+    fn scratch_failed(&mut self, error: std::io::Error) {
+        if crate::operations::is_out_of_space(&error) {
+            let dir = self
+                .scratch
+                .clone()
+                .unwrap_or_else(|| self.internal.clone());
+            self.repaired.refuse(&dir, error);
+        }
+    }
+
+    fn will_write(&mut self, bytes: u64) {
+        self.repaired.will_write(bytes);
     }
 
     // The set's volume is a member of the namespace it was posted in, or a
@@ -958,5 +1025,78 @@ impl MemberAccess for Lent {
             into.truncate(start);
         }
         read
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::graph::job::GraphError;
+    use crate::pipeline::graph::limits::Device;
+    use crate::pipeline::graph::namespace::WriteError;
+
+    // A repair whose output finds the disk full part-way comes back as a
+    // write the working disk had no room for, which holds the job, whatever
+    // kind of recovery wrote it: every kind writes what it rebuilt here.
+    #[test]
+    fn a_repair_whose_output_finds_the_disk_full_comes_back_out_of_space() {
+        use crate::pipeline::graph::leaf::counting::fill_after;
+        let dir = tempfile::tempdir().expect("a working directory");
+        let mut repaired = Repaired::again(dir.path(), NodeId(4)).expect("an output");
+        // A repair that writes 500 MB finds the disk full 14 bytes in.
+        repaired.will_write(500 << 20);
+        fill_after(Some(10));
+        repaired.write(MemberId(0), 0, b"rebuilt");
+        repaired.write(MemberId(0), 7, b"rebuilt");
+        fill_after(None);
+        assert!(!repaired.output.path().exists());
+        // What it needs free to run again: all it writes, not the 14 bytes
+        // it had written when it failed.
+        assert_eq!(repaired.gave_back(), 500 << 20);
+
+        // One that did not say what it writes names no figure.
+        let mut unsaid = Repaired::again(dir.path(), NodeId(5)).expect("an output");
+        fill_after(Some(0));
+        unsaid.write(MemberId(0), 0, b"rebuilt");
+        fill_after(None);
+        assert_eq!(unsaid.gave_back(), 0);
+
+        let error = repaired.failed().expect("the repair failed");
+        let error = GraphError::from(WriteError::from(error));
+        assert_eq!(error.out_of_space(), Some(Device::Working));
+    }
+
+    // A repair whose scratch directory found the disk full comes back as a
+    // write the working disk had no room for, which holds the job: nothing
+    // it staged is applied, and its output is gone.
+    #[test]
+    fn a_repair_whose_scratch_found_the_disk_full_comes_back_out_of_space() {
+        let dir = tempfile::tempdir().expect("a working directory");
+        let mut repaired = Repaired::again(dir.path(), NodeId(3)).expect("an output");
+        // A restore that stages 5 GB and rebuilds 200 MB, which it then
+        // copies into its member.
+        let whole = (5u64 << 30) + 2 * (200 << 20);
+        repaired.will_write(whole);
+        repaired.write(MemberId(0), 0, b"rebuilt");
+        let output = repaired.output.path().to_path_buf();
+        assert!(output.exists());
+
+        let scratch = dir.path().join("scratch");
+        repaired.refuse(
+            &scratch,
+            std::io::Error::from(std::io::ErrorKind::StorageFull),
+        );
+        // A later write is not made, and a second refusal does not replace
+        // the first.
+        repaired.write(MemberId(0), 7, b"more");
+        repaired.refuse(&scratch, std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(!output.exists());
+        // What it needs free to run again: all it stages, rebuilds and
+        // copies, not what it had staged when it failed.
+        assert_eq!(repaired.gave_back(), whole);
+
+        let error = repaired.failed().expect("the repair failed");
+        let error = GraphError::from(WriteError::from(error));
+        assert_eq!(error.out_of_space(), Some(Device::Working));
     }
 }

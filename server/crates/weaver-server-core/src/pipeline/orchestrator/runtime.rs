@@ -324,6 +324,11 @@ impl Pipeline {
             disk_idle: std::collections::BTreeSet::new(),
             admission_disk_held: false,
             disk_unadmitted: std::collections::BTreeSet::new(),
+            full_disk: std::collections::BTreeMap::new(),
+            full_disk_moves: Vec::new(),
+            full_disk_promised: std::collections::BTreeMap::new(),
+            #[cfg(test)]
+            full_disk_sweeps: Vec::new(),
             nntp_handoff_draining: false,
             active_download_passes: HashSet::new(),
             jobs_finalizing_download: HashSet::new(),
@@ -741,6 +746,7 @@ impl Pipeline {
         self.checkpoint_progress_articles.remove(&job_id);
         self.released_remaining.remove(&job_id);
         self.propagation_ready_at.remove(&job_id);
+        self.drop_full_disk_hold(job_id);
     }
 
     pub(crate) fn note_download_activity(&mut self, job_id: JobId) {
@@ -749,6 +755,11 @@ impl Pipeline {
     }
 
     pub(crate) fn emit_download_finished_if_active(&mut self, job_id: JobId) {
+        // A job held for a full disk fetches again what it lost: its
+        // download is not finished while it waits.
+        if self.held_for_full_disk(job_id) {
+            return;
+        }
         if self.active_download_passes.remove(&job_id) {
             self.phase_end(job_id, JobPhase::Downloading);
             let finalization_pending = self.job_has_pending_download_pipeline_work(job_id);
@@ -765,6 +776,9 @@ impl Pipeline {
     }
 
     pub(crate) fn emit_download_pipeline_drained_if_pending(&mut self, job_id: JobId) {
+        if self.held_for_full_disk(job_id) {
+            return;
+        }
         if self.jobs_finalizing_download.remove(&job_id) {
             self.emit_job_event(PipelineEvent::DownloadPipelineDrained { job_id });
         }
@@ -1122,6 +1136,7 @@ impl Pipeline {
                 break;
             }
             self.run_queue_intents().await;
+            self.resume_full_disk_moves().await;
             turn_timer.phase(PipelinePhase::ReadyResults);
             // Whether this turn was woken by, or found, anything other than a
             // periodic tick. Only such a turn can have changed what the job

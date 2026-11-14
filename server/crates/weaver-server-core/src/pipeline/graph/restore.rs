@@ -287,6 +287,7 @@ impl RestoreSeat {
         // The next checkpoint writes only what it changes of these.
         let feed_verdict = rows.feed_verdict.clone();
         job.pending().written(rows);
+        job.pending().stored_settled(&snapshot.root, &refetched);
         if !refetched.is_empty() {
             tracing::info!(
                 job_id = job_id.0,

@@ -123,20 +123,37 @@ async fn without_room(posts: Vec<Post>, more: impl FnOnce(Scenario) -> Scenario)
 #[tokio::test]
 async fn a_rar_whose_dictionary_is_wider_than_the_efficient_window_and_its_scratch_fails_with_the_sizes()
  {
-    let outcome = without_room(vec![Post::plain("silver.rar", wide_rar())], |s| {
-        s.profile(HardwareProfile::Efficient)
-    })
-    .await;
-    failed(
-        &outcome,
-        "silver.rar",
-        Why::TooLarge {
-            needed: Some(4 * GIB),
-            allowed: Some(256 * MIB),
-        },
-        "silver.rar needs 4.0 GiB of decode memory, 256.0 MiB allowed",
-    );
-    assert!(offers_retry(&outcome));
+    // Where windows are mapped, a window no folder has room for holds the
+    // job for a full disk: it waits for the dictionary's size and the free
+    // space its disk keeps, and is not failed.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let needs = super::lent_windows::held_without_room(
+            vec![Post::plain("silver.rar", wide_rar())],
+            |s| s.profile(HardwareProfile::Efficient),
+        )
+        .await;
+        assert_eq!(needs, Some(4 * GIB + super::lent_windows::KEPT_FREE));
+    }
+    // Where none can be mapped the decoder refuses it, and the job fails
+    // with the sizes and offers a retry with no memory limit.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let outcome = without_room(vec![Post::plain("silver.rar", wide_rar())], |s| {
+            s.profile(HardwareProfile::Efficient)
+        })
+        .await;
+        failed(
+            &outcome,
+            "silver.rar",
+            Why::TooLarge {
+                needed: Some(4 * GIB),
+                allowed: Some(256 * MIB),
+            },
+            "silver.rar needs 4.0 GiB of decode memory, 256.0 MiB allowed",
+        );
+        assert!(offers_retry(&outcome));
+    }
 }
 
 // Balanced grants the 4 GiB dictionary above its 1 GiB ceiling once the
@@ -245,6 +262,7 @@ fn wide_ppmd_7z() -> Vec<u8> {
 }
 
 // What a decode of `archive` holds in RAM on one thread, nothing lent.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn in_ram(archive: &[u8]) -> u64 {
     let parsed = sevenz_turbo::Archive::read(
         &mut std::io::Cursor::new(archive),
@@ -280,25 +298,39 @@ async fn a_7z_model_over_the_efficient_memory_without_scratch_fails_with_the_siz
     let post = || vec![Post::plain("lantern.7z", archive.clone())];
     let efficient = |s: Scenario| s.profile(HardwareProfile::Efficient);
 
-    let outcome = without_room(post(), efficient).await;
-    let needed = in_ram(&archive);
-    assert!(needed > 520 * MIB, "{needed}");
-    let error = outcome_error(&outcome);
-    assert!(error.starts_with("lantern.7z needs "), "{error}");
-    assert!(
-        error.ends_with(" of decode memory, 512.0 MiB allowed"),
-        "{error}"
-    );
-    failed(
-        &outcome,
-        "lantern.7z",
-        Why::TooLarge {
-            needed: Some(needed),
-            allowed: Some(512 * MIB),
-        },
-        &error,
-    );
-    assert!(offers_retry(&outcome));
+    // Where windows are mapped, the model no folder has room for holds the
+    // job for a full disk: it waits for that window and the free space its
+    // disk keeps, and is not failed.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let needs = super::lent_windows::held_without_room(post(), efficient).await;
+        assert!(
+            needs.is_some_and(|needs| needs > super::lent_windows::KEPT_FREE),
+            "{needs:?}"
+        );
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let outcome = without_room(post(), efficient).await;
+        let needed = in_ram(&archive);
+        assert!(needed > 520 * MIB, "{needed}");
+        let error = outcome_error(&outcome);
+        assert!(error.starts_with("lantern.7z needs "), "{error}");
+        assert!(
+            error.ends_with(" of decode memory, 512.0 MiB allowed"),
+            "{error}"
+        );
+        failed(
+            &outcome,
+            "lantern.7z",
+            Why::TooLarge {
+                needed: Some(needed),
+                allowed: Some(512 * MIB),
+            },
+            &error,
+        );
+        assert!(offers_retry(&outcome));
+    }
 
     let outcome = without_room(post(), |s| {
         efficient(s).metadata(NO_MEMORY_LIMIT_ATTRIBUTE_KEY, "1")

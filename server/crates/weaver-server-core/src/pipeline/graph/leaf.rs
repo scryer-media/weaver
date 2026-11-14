@@ -22,19 +22,27 @@ use std::path::{Component, Path, PathBuf};
 
 use weaver_graph::{Algorithm, ByteRange, Digest, Evidenced};
 
+use crate::pipeline::graph::limits::Device;
 use crate::pipeline::graph::sparse::{PlatformMarker, create_sized, create_sparse};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LeafError {
     #[error("{}: {source}", path.display())]
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+        // The device the file lies on: the output directory's for a file
+        // the job delivers, else the working directory's.
+        device: Device,
+    },
 }
 
 impl LeafError {
-    fn io(path: &Path) -> impl FnOnce(io::Error) -> LeafError + '_ {
+    fn on(path: &Path, device: Device) -> impl FnOnce(io::Error) -> LeafError + '_ {
         move |source| LeafError::Io {
             path: path.to_path_buf(),
             source,
+            device,
         }
     }
 
@@ -57,6 +65,8 @@ pub(crate) struct Leaf {
     // The directory the leaf's names join under: the job's output root for
     // a member it delivers, its working directory for one it keeps.
     root: PathBuf,
+    // The device that root lies on, for the error a write there ends in.
+    device: Device,
     path: PathBuf,
     // The name the file sits at, as `path` joins it under the directory.
     name: String,
@@ -114,7 +124,10 @@ impl Leaf {
     // name is the leaf's own file.
     pub(crate) fn found(dir: &Path, output_name: &str) -> Result<Self, LeafError> {
         let mut leaf = Self::at(dir, output_name);
-        leaf.on_disk = leaf.path.try_exists().map_err(LeafError::io(&leaf.path))?;
+        leaf.on_disk = leaf
+            .path
+            .try_exists()
+            .map_err(LeafError::on(&leaf.path, leaf.device))?;
         Ok(leaf)
     }
 
@@ -126,6 +139,7 @@ impl Leaf {
             identity: NEXT_LEAF.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             revision: 0,
             root: dir.to_path_buf(),
+            device: Device::Working,
             path: Self::path_at(dir, output_name),
             name: output_name.to_owned(),
             wants: None,
@@ -135,6 +149,12 @@ impl Leaf {
             written: BTreeMap::new(),
             changed: BTreeMap::new(),
         }
+    }
+
+    // The leaf lies on `device`: said by the writer that placed it.
+    pub(crate) fn on(mut self, device: Device) -> Self {
+        self.device = device;
+        self
     }
 
     pub(crate) fn revision(&self) -> (u64, u64) {
@@ -198,9 +218,17 @@ impl Leaf {
     }
 
     pub(crate) fn create_directory(&mut self) -> Result<(), LeafError> {
-        std::fs::create_dir_all(&self.path).map_err(LeafError::io(&self.path))?;
+        std::fs::create_dir_all(&self.path).map_err(LeafError::on(&self.path, self.device))?;
         self.on_disk = true;
         Ok(())
+    }
+
+    // The bytes the leaf holds written, summed over its runs: asked only
+    // when a write failed, never per write.
+    pub(crate) fn written_bytes(&self) -> u64 {
+        self.written.iter().fold(0u64, |sum, (start, run)| {
+            sum.saturating_add(run.end - start)
+        })
     }
 
     // Write `bytes` at `offset`, folding nothing: a file whose bytes no
@@ -247,7 +275,7 @@ impl Leaf {
         }
         let replaced = self.replaced(&overlapped, fold.map(|(algorithm, _)| algorithm))?;
         let file = self.file.as_ref().expect("opened above");
-        write_all_at(file, offset, bytes).map_err(LeafError::io(&self.path))?;
+        write_all_at(file, offset, bytes).map_err(LeafError::on(&self.path, self.device))?;
         self.wrote(span, fold, &overlapped, &replaced);
         Ok(())
     }
@@ -488,8 +516,8 @@ impl Leaf {
     // there: nothing above the file is made. A file already open is kept.
     pub(crate) fn create_within(&mut self) -> Result<(), LeafError> {
         if self.file.is_none() {
-            let file =
-                create_sparse(&self.path, &PlatformMarker).map_err(LeafError::io(&self.path))?;
+            let file = create_sparse(&self.path, &PlatformMarker)
+                .map_err(LeafError::on(&self.path, self.device))?;
             self.file = Some(file);
             self.on_disk = true;
         }
@@ -503,7 +531,7 @@ impl Leaf {
             None => std::fs::metadata(&self.path),
         }
         .map(|metadata| metadata.len())
-        .map_err(LeafError::io(&self.path))
+        .map_err(LeafError::on(&self.path, self.device))
     }
 
     // Fill `into` with `len` bytes from `offset`. The caller only asks for
@@ -524,6 +552,7 @@ impl Leaf {
         read.map_err(|source| {
             into.truncate(start);
             LeafError::Io {
+                device: self.device,
                 path: self.path.clone(),
                 source,
             }
@@ -541,7 +570,8 @@ impl Leaf {
         self.open(Some(length))?;
         self.cut(length)?;
         let file = self.file.as_ref().expect("opened above");
-        file.set_len(length).map_err(LeafError::io(&self.path))?;
+        file.set_len(length)
+            .map_err(LeafError::on(&self.path, self.device))?;
         self.file = None;
         Ok(())
     }
@@ -559,11 +589,17 @@ impl Leaf {
         self.revision += 1;
         self.written.clear();
         self.change(0, u64::MAX);
-        if self.file.is_none() && !self.path.try_exists().map_err(LeafError::io(&self.path))? {
+        if self.file.is_none()
+            && !self
+                .path
+                .try_exists()
+                .map_err(LeafError::on(&self.path, self.device))?
+        {
             return Ok(());
         }
         let file = self.open(None)?;
-        file.set_len(0).map_err(LeafError::io(&self.path))
+        file.set_len(0)
+            .map_err(LeafError::on(&self.path, self.device))
     }
 
     // The member was named again: the file is to follow it, once the
@@ -590,12 +626,12 @@ impl Leaf {
             // A directory is shared and holds no bytes of its own: it is
             // made where it is wanted, whoever else already made it, and
             // the empty one it waited in goes.
-            std::fs::create_dir_all(&path).map_err(LeafError::io(&path))?;
+            std::fs::create_dir_all(&path).map_err(LeafError::on(&path, self.device))?;
             remove_directory(&self.path)?;
         } else if had_file && path != self.path {
-            create_parent(&path)?;
+            create_parent(&path, self.device)?;
             crate::runtime::fs::rename_path_exclusive(&self.path, &path)
-                .map_err(LeafError::io(&self.path))?;
+                .map_err(LeafError::on(&self.path, self.device))?;
         }
         self.path = path;
         self.wants = None;
@@ -614,6 +650,7 @@ impl Leaf {
         }
         match std::fs::remove_file(&self.path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(LeafError::Io {
+                device: self.device,
                 path: self.path,
                 source: error,
             }),
@@ -627,9 +664,9 @@ impl Leaf {
     // final length.
     fn open(&mut self, length: Option<u64>) -> Result<&File, LeafError> {
         if self.file.is_none() {
-            create_parent(&self.path)?;
+            create_parent(&self.path, self.device)?;
             let file = create_sized(&self.path, &PlatformMarker, length)
-                .map_err(LeafError::io(&self.path))?;
+                .map_err(LeafError::on(&self.path, self.device))?;
             self.on_disk = true;
             self.file = Some(file);
         }
@@ -677,6 +714,7 @@ fn remove_directory(path: &Path) -> Result<(), LeafError> {
             ) =>
         {
             Err(LeafError::Io {
+                device: Device::Working,
                 path: path.to_path_buf(),
                 source: error,
             })
@@ -685,9 +723,9 @@ fn remove_directory(path: &Path) -> Result<(), LeafError> {
     }
 }
 
-fn create_parent(path: &Path) -> Result<(), LeafError> {
+fn create_parent(path: &Path, device: Device) -> Result<(), LeafError> {
     match path.parent() {
-        Some(parent) => std::fs::create_dir_all(parent).map_err(LeafError::io(parent)),
+        Some(parent) => std::fs::create_dir_all(parent).map_err(LeafError::on(parent, device)),
         None => Ok(()),
     }
 }
@@ -695,7 +733,7 @@ fn create_parent(path: &Path) -> Result<(), LeafError> {
 fn write_all_at(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
     #[cfg(test)]
     if counting::full(bytes.len()) {
-        return Err(io::Error::from(io::ErrorKind::StorageFull));
+        return Err(io::Error::from(counting::refusal()));
     }
     #[cfg(test)]
     counting::wrote(bytes.len());
@@ -770,6 +808,23 @@ pub(crate) mod counting {
         static WRITTEN: Cell<u64> = const { Cell::new(0) };
         // The bytes this thread may still write before the disk is full.
         static ROOM: Cell<Option<u64>> = const { Cell::new(None) };
+        // Whether a write refused for room is refused by a quota.
+        static QUOTA: Cell<bool> = const { Cell::new(false) };
+    }
+
+    // A write this thread refuses for room is refused by a quota, or by the
+    // disk again.
+    pub(crate) fn refuse_by_quota(quota: bool) {
+        QUOTA.with(|cell| cell.set(quota));
+    }
+
+    // What a write refused for room fails with.
+    pub(super) fn refusal() -> std::io::ErrorKind {
+        if QUOTA.with(Cell::get) {
+            std::io::ErrorKind::QuotaExceeded
+        } else {
+            std::io::ErrorKind::StorageFull
+        }
     }
 
     // The disk fills once this thread has written `room` more bytes, or

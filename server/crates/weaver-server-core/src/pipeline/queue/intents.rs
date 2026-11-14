@@ -65,7 +65,13 @@ impl Queue {
                         let job = &row.report.job;
                         if row.report.retiring {
                             Err(SchedulerError::Conflict("job is being archived".into()))
-                        } else if row.report.moving || job.status == JobStatus::Moving {
+                        } else if row.report.moving
+                            || (job.status == JobStatus::Moving
+                                // A final move held for a full disk is not
+                                // running: the job can be cancelled.
+                                && job.download_wait_reason.as_deref()
+                                    != Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON))
+                        {
                             Err(SchedulerError::Conflict(
                                 "cancel is not supported while the final move is running".into(),
                             ))

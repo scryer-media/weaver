@@ -993,3 +993,27 @@ async fn a_category_change_still_delivers_into_the_new_folder() {
     assert_eq!(dest.parent(), Some(shows.as_path()));
     assert!(!staging.exists());
 }
+
+// A directory whose copy found no room after part of it had moved: the move
+// needs room for what is still under it, not for what already left. An
+// entry refused for any other reason, or with nothing removed by a copy,
+// names no figure.
+#[tokio::test]
+async fn a_part_moved_directory_needs_room_for_what_is_left_of_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("season");
+    std::fs::create_dir_all(dir.join("extras")).unwrap();
+    std::fs::write(dir.join("one.bin"), vec![1u8; 700]).unwrap();
+    std::fs::write(dir.join("two.bin"), vec![2u8; 200]).unwrap();
+    std::fs::write(dir.join("extras").join("three.bin"), vec![3u8; 50]).unwrap();
+    let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
+    assert_eq!(left_to_copy(&dir, &full).await, 950);
+
+    // The first file moved before the disk filled.
+    std::fs::remove_file(dir.join("one.bin")).unwrap();
+    assert_eq!(left_to_copy(&dir, &full).await, 250);
+    assert_eq!(left_to_copy(&dir.join("two.bin"), &full).await, 200);
+
+    let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    assert_eq!(left_to_copy(&dir, &denied).await, 0);
+}

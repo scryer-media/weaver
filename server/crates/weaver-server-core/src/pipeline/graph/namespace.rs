@@ -285,6 +285,12 @@ pub(crate) struct NamespaceWriter {
     // back (true), or the namespace whose members nothing held (false). One
     // archive is one event however many volumes it had.
     given_up: BTreeSet<(NodeId, bool)>,
+    // What a repair or a staging that failed gave back to the disk as it
+    // failed, until the job asks: the room it needs to run again.
+    gave_back: Option<u64>,
+    // What was left to write of the member whose write found no room, by
+    // its declared length, until the job asks.
+    left_to_write: Option<u64>,
     // The budgets each member has spilled past, said once each.
     spills_said: BTreeSet<(NodeId, MemberId, Budget)>,
     // The members whose file the file system refused to create for its
@@ -397,6 +403,8 @@ impl NamespaceWriter {
             refused_in_batch: BTreeSet::new(),
             given_back: Vec::new(),
             given_up: BTreeSet::new(),
+            gave_back: None,
+            left_to_write: None,
             spills_said: BTreeSet::new(),
             unnamable: BTreeSet::new(),
             unnamed_damage: Vec::new(),
@@ -434,6 +442,15 @@ impl NamespaceWriter {
     // member the job delivers, which no object holds, and the working
     // directory for a recovery volume, which stays in its own file for its
     // repair to read and is never delivered.
+    // The device that directory lies on.
+    pub(super) fn device_for(&self, tree: &Tree, node: NodeId, member: MemberId) -> Device {
+        if tree.child_of(node, member).is_none() {
+            Device::Output
+        } else {
+            Device::Working
+        }
+    }
+
     pub(super) fn root_for(&self, tree: &Tree, node: NodeId, member: MemberId) -> &Path {
         if tree.child_of(node, member).is_none() {
             &self.output_dir
@@ -486,8 +503,53 @@ impl NamespaceWriter {
 
     // Whether the job waits for room on a disk, and its place among those
     // that wait.
+    // The reader of the disk `device` is: the one a write there is judged
+    // against, and so the one a job whose write found it full waits on.
+    pub(crate) fn disk(&self, device: Device) -> &CapacityReader {
+        match device {
+            Device::Output => &self.output_free_disk,
+            Device::Working => &self.free_disk,
+        }
+    }
+
     pub(crate) fn disk_held(&self) -> bool {
         self.caps.disk_held()
+    }
+
+    // What the write that just failed gave back to the disk, when it was a
+    // repair's or a staging's, which remove their output as they fail.
+    pub(crate) fn take_gave_back(&mut self) -> Option<u64> {
+        self.gave_back.take()
+    }
+
+    // What was left to write of the member whose write just found no room.
+    pub(crate) fn take_left_to_write(&mut self) -> Option<u64> {
+        self.left_to_write.take()
+    }
+
+    // A decode window of `needs` bytes, the free space its disk keeps
+    // included, found room in no folder: the job waits for that room on the
+    // disk of its working directory, the first folder a window goes in, as
+    // for a write that found that disk full. `quota` when a quota refused
+    // the window's file: the wait is then for the free figure to rise.
+    pub(crate) fn window_found_no_room(&mut self, needs: u64, quota: bool) -> WriteError {
+        self.gave_back = Some(self.gave_back.unwrap_or(0).max(needs));
+        let kind = match quota {
+            true => std::io::ErrorKind::QuotaExceeded,
+            false => std::io::ErrorKind::StorageFull,
+        };
+        WriteError::Leaf(LeafError::Io {
+            path: self.working_dir.clone(),
+            source: std::io::Error::from(kind),
+            device: Device::Working,
+        })
+    }
+
+    fn gave_back(&mut self, staged: &loan::Repaired) {
+        let bytes = staged.gave_back();
+        if bytes > 0 {
+            self.gave_back = Some(self.gave_back.unwrap_or(0).max(bytes));
+        }
     }
 
     pub(crate) fn disk_ticket(&self) -> Option<u64> {
@@ -1610,6 +1672,7 @@ impl NamespaceWriter {
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let mut staged = loan::Repaired::again(&self.working_dir, node)?;
+        staged.will_write(ranges.iter().map(|(_, range)| range.len()).sum());
         let mut sources = Vec::new();
         let serial = tree.again_read(
             node,
@@ -1620,6 +1683,7 @@ impl NamespaceWriter {
                 sources.push(posted.provenance);
             },
         );
+        self.gave_back(&staged);
         let replayed = match staged.failed() {
             Some(error) => Err(WriteError::from(error)),
             None => self.again_staged(
@@ -1693,6 +1757,7 @@ impl NamespaceWriter {
                 sources.push(posted.provenance);
             },
         );
+        self.gave_back(&staged);
         if let Some(error) = staged.failed() {
             tree.again_done();
             let _ = staged.discard();
@@ -1951,7 +2016,16 @@ impl NamespaceWriter {
         offset: u64,
         bytes: &[u8],
     ) -> Result<(), WriteError> {
-        self.spill_file(node, member)?.write(offset, bytes, None)?;
+        if let Err(error) = self.spill_file(node, member)?.write(offset, bytes, None) {
+            // A spill the disk had no room for: the job waits for the room
+            // of what was being spilled.
+            if let LeafError::Io { source, .. } = &error
+                && crate::operations::is_out_of_space(source)
+            {
+                self.left_to_write = Some(bytes.len() as u64);
+            }
+            return Err(error.into());
+        }
         self.files_mut(node).spills_empty.remove(&member);
         Ok(())
     }
@@ -2402,9 +2476,26 @@ impl NamespaceWriter {
             let algorithm = bytes.evidence().first()?.digest.algorithm;
             bytes.proven(algorithm).then_some(algorithm)
         };
-        match record.check().or_else(proven) {
-            Some(algorithm) => leaf.write_folding(offset, bytes, algorithm, record.length)?,
-            None => leaf.write(offset, bytes, record.length)?,
+        let wrote = match record.check().or_else(proven) {
+            Some(algorithm) => leaf.write_folding(offset, bytes, algorithm, record.length),
+            None => leaf.write(offset, bytes, record.length),
+        };
+        if let Err(error) = wrote {
+            // A write the disk had no room for: the job waits for the room
+            // of what the member still has to take, by its declared length
+            // and what the leaf holds of it, and never for less than the
+            // write that was refused.
+            // A member that declares no length waits for the write itself.
+            if let LeafError::Io { source, .. } = &error
+                && crate::operations::is_out_of_space(source)
+            {
+                let left = record
+                    .length
+                    .map_or(0, |length| length.saturating_sub(leaf.written_bytes()))
+                    .max(bytes.len() as u64);
+                self.left_to_write = Some(left);
+            }
+            return Err(error.into());
         }
         let took = started.elapsed();
         // Every byte to its length is in: the file takes that length, or
@@ -2952,7 +3043,10 @@ impl NamespaceWriter {
                 .ok_or(WriteError::UnknownMember { node, member })?;
             let held_off = tree.held_off(node, member);
             let root = self.root_for(tree, node, member).to_path_buf();
-            let leaf = self.new_leaf((node, member), &output_name, held_off, &root);
+            let device = self.device_for(tree, node, member);
+            let leaf = self
+                .new_leaf((node, member), &output_name, held_off, &root)
+                .on(device);
             self.files_mut(node).leaves.insert(member, leaf);
         }
         Ok(self

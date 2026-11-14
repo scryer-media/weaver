@@ -439,6 +439,12 @@ fn a_damaged_member_is_repaired_through_member_access() {
     );
     assert!(job.store.members[&member] == data);
     assert!(job.store.writes > 0 && job.store.volume_reads > 0);
+    // Each slice it writes is counted twice: staged, then placed into the
+    // member while the staged output still stands.
+    let RepairOutcome::Repaired { slices } = outcome else {
+        unreachable!()
+    };
+    assert_eq!(job.store.will_write, 2 * slices * BLOCK);
 }
 
 // A member that arrived with its bytes shifted along by three, so three

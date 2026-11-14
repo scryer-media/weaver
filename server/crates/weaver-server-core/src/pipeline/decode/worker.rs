@@ -28,11 +28,23 @@ enum UuPlacement {
 pub(in crate::pipeline) struct SegmentWriteError {
     file_id: NzbFileId,
     source: io::Error,
+    // The size of the write that was refused, where the site knows it.
+    refused: Option<u64>,
 }
 
 impl SegmentWriteError {
-    fn new(file_id: NzbFileId, source: io::Error) -> Self {
-        Self { file_id, source }
+    pub(in crate::pipeline) fn new(file_id: NzbFileId, source: io::Error) -> Self {
+        Self {
+            file_id,
+            source,
+            refused: None,
+        }
+    }
+
+    // The write that failed was of `bytes`.
+    pub(in crate::pipeline) fn of_bytes(mut self, bytes: usize) -> Self {
+        self.refused = Some(bytes as u64);
+        self
     }
 }
 
@@ -50,10 +62,18 @@ impl std::error::Error for SegmentWriteError {
 
 impl Pipeline {
     // Whether a download or decode result for the job is still taken: the job
-    // is here, has not ended, and is not publishing what it delivered. Once
-    // the final move begins, cleanup has chosen what the delivery holds, and
-    // a late duplicate must not make an input file again.
+    // still downloads, and is not held for a full disk. A held job has no
+    // graph to take a result, and fetches again from its last checkpoint
+    // whatever is still out, so a result that comes back for it is dropped
+    // whole: not placed, and not counted.
     pub(in crate::pipeline) fn job_takes_results(&self, job_id: JobId) -> bool {
+        self.job_downloads(job_id) && !self.held_for_full_disk(job_id)
+    }
+
+    // Whether the job is here, has not ended, and is not publishing what it
+    // delivered. Once the final move begins, cleanup has chosen what the
+    // delivery holds, and a late duplicate must not make an input file again.
+    pub(in crate::pipeline) fn job_downloads(&self, job_id: JobId) -> bool {
         self.jobs.get(&job_id).is_some_and(|state| {
             !is_terminal_status(&state.status)
                 && !matches!(
@@ -862,6 +882,11 @@ impl Pipeline {
                 declared_part_end(expected_layout, yenc_layout),
                 segments,
             );
+            // The write of it found the disk full: the job is held, and the
+            // article is fetched and counted once the job runs on.
+            if self.held_for_full_disk(job_id) {
+                return;
+            }
             if retain_damage && !encoding.is_uu() {
                 // The damaged copy stands. Its extent, and the range its header
                 // named, still say where the part behind it begins.
@@ -1024,7 +1049,7 @@ impl Pipeline {
                 io::Error::other(format!("UU spool task failed: {error}")),
             )
         })?
-        .map_err(|error| SegmentWriteError::new(file_id, error))?;
+        .map_err(|error| SegmentWriteError::new(file_id, error).of_bytes(decoded_bytes))?;
         Ok(entry)
     }
 
@@ -1051,6 +1076,17 @@ impl Pipeline {
             }
             match self.spill_job_parts(job_id).await {
                 Ok(()) => self.park_spilled_job(job_id),
+                // The spool had no room for a part: the job parks without
+                // it, and fetches it again once it resumes.
+                Err(error) if crate::operations::is_out_of_space(&error.source) => {
+                    warn!(
+                        job_id = job_id.0,
+                        file_id = %error.file_id,
+                        error = %error.source,
+                        "held part spool write found no room; the part is fetched again"
+                    );
+                    self.park_spilled_job(job_id);
+                }
                 Err(error) => self.fail_job_for_disk_write(error, "held part spool write failed"),
             }
         }
@@ -1149,6 +1185,18 @@ impl Pipeline {
                 {
                     warn!(path = %path.display(), %error, "could not remove a held part's spool file");
                 }
+            }
+        }
+    }
+
+    // Let a held part go as its job goes back to its checkpoint: its ledger
+    // is released, and a spooled part's file stays, for the checkpoint that
+    // may name it.
+    pub(in crate::pipeline) fn forget_parked_bytes(&mut self, bytes: ParkedBytes) {
+        match bytes {
+            ParkedBytes::Memory(data) => self.release_write_buffered(data.len_bytes(), 1),
+            ParkedBytes::Spilled { decoded_bytes, .. } => {
+                self.release_uu_spooled(decoded_bytes, 1);
             }
         }
     }
@@ -1652,19 +1700,47 @@ impl Pipeline {
     ) {
         let job_id = error.file_id.job_id;
         let out_of_space = crate::operations::is_out_of_space(&error.source);
-        let message = if out_of_space {
-            format!(
-                "{context} for {}: filesystem out of space or over quota ({})",
-                error.file_id, error.source
-            )
-        } else {
-            format!("{context} for {}: {}", error.file_id, error.source)
-        };
+        // A write that found no room holds the job until the disk has room:
+        // what it did not write is fetched again.
+        if out_of_space && self.job_downloads(job_id) {
+            warn!(
+                job_id = job_id.0,
+                file_id = %error.file_id,
+                error = %error.source,
+                context,
+                "disk write found no room; the job waits for room"
+            );
+            // A spool write gives nothing back as it fails: the job waits
+            // for the free figure to rise by the part that was refused.
+            self.hold_job_for_full_disk(
+                job_id,
+                crate::operations::StorageRoot::Intermediate,
+                crate::pipeline::full_disk::Wants {
+                    left: error.refused,
+                    ..crate::pipeline::full_disk::Wants::of(&error.source, None)
+                },
+            );
+            return;
+        }
+        // No room for a part of a job that no longer fetches: it has ended,
+        // or its final move has begun and chosen what it delivers, so the
+        // part is one nothing will read. The write is dropped, and the job
+        // is not failed for it.
+        if out_of_space {
+            warn!(
+                job_id = job_id.0,
+                file_id = %error.file_id,
+                error = %error.source,
+                context,
+                "disk write found no room for a job that no longer fetches; the part is dropped"
+            );
+            return;
+        }
+        let message = format!("{context} for {}: {}", error.file_id, error.source);
         error!(
             job_id = job_id.0,
             file_id = %error.file_id,
             error = %error.source,
-            out_of_space,
             context,
             "disk write failed; failing job"
         );

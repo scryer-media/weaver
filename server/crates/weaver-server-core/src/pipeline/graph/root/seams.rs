@@ -379,6 +379,9 @@ impl Pipeline {
                 if let Some(ticket) = graph.as_mut().and_then(GraphJob::forget_slot) {
                     self.graph_status.repairs.release(ticket);
                 }
+                // A job held for a full disk may go on now its old graph has
+                // nothing out.
+                self.wake_full_disk();
                 match self.pending_graph_terminals.remove(&job_id) {
                     Some(crate::pipeline::health::PendingGraphTerminal::Failed(failure)) => {
                         let cancelling = self.shared_state.queue.read(|inner| {
@@ -531,8 +534,33 @@ impl Pipeline {
             return;
         }
         // A step that failed otherwise fails the job with its error: what
-        // it did not write, nothing after it can read.
+        // it did not write, nothing after it can read. A write that found no
+        // room holds the job until the disk has room instead: what the step
+        // did not write is written again from the job's last checkpoint.
         if let Err(error) = result {
+            if let Some(device) = error.out_of_space() {
+                let root = self.full_disk_root(job_id, device);
+                warn!(job_id = job_id.0, error = %error, "graph job write found no room");
+                // A repair or a staging removes what it wrote as it fails:
+                // the job then waits for the room that takes, not for more
+                // than the disk showed.
+                // A file's own write names what was left of the file. A
+                // write a quota refused says so: the disk shows room the
+                // job cannot use.
+                let (needs, left) = self
+                    .graph_jobs
+                    .get_mut(&job_id)
+                    .map_or((None, None), |graph| {
+                        (graph.take_gave_back(), graph.take_left_to_write())
+                    });
+                let wants = crate::pipeline::full_disk::Wants {
+                    needs,
+                    left,
+                    quota: error.quota(),
+                };
+                self.hold_job_for_full_disk(job_id, root, wants);
+                return;
+            }
             warn!(job_id = job_id.0, error = %error, "graph job step failed");
             self.fail_job_on_extraction_error(job_id, error.to_extraction());
             return;
@@ -624,7 +652,7 @@ impl Pipeline {
     // starting for it, so the loop listens for the next reading. The loop
     // reconciles the waits just before it asks.
     pub(in crate::pipeline) fn waits_for_disk_room(&self) -> bool {
-        !self.disk_waiting.is_empty() || self.admission_disk_held
+        !self.disk_waiting.is_empty() || self.admission_disk_held || !self.full_disk.is_empty()
     }
 
     // A turn busy with results, which does not wait on the next event: a
@@ -646,6 +674,7 @@ impl Pipeline {
         self.reconcile_disk_waits();
         self.wake_disk_waiters();
         self.release_admission_disk_hold();
+        self.wake_full_disk();
     }
 
     // A disk someone waits on has a new reading: each job that waits is

@@ -306,7 +306,10 @@ impl Pipeline {
             .into_iter()
             .filter_map(|(job_id, position)| {
                 let state = self.jobs.get(&job_id)?;
-                if !Self::has_dispatchable_work(state) || self.held_for_added_scripts(job_id) {
+                if !Self::has_dispatchable_work(state)
+                    || self.held_for_added_scripts(job_id)
+                    || self.held_for_full_disk(job_id)
+                {
                     return None;
                 }
                 Some(crate::pipeline::queue::order::DispatchKey::new(

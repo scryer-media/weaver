@@ -825,7 +825,7 @@ enum DbWriteCommand {
         op: WriteOp,
         // Answers with the write's outcome once it has run. A write that
         // never runs drops it, which its receiver reads as a failure.
-        committed: Option<oneshot::Sender<Result<(), String>>>,
+        committed: Option<oneshot::Sender<Result<(), super::error::WriteFailed>>>,
     },
     GraphCheckpoint {
         job_id: crate::jobs::ids::JobId,
@@ -1019,7 +1019,10 @@ async fn execute_write_command(
         } => {
             let writer_db = writer_db.clone();
             tokio::task::spawn_blocking(move || {
-                let outcome = op(&writer_db).map_err(|error| error.to_string());
+                // The waiter is told the kind with the message: a write the
+                // disk had no room for is not a write that went wrong.
+                let outcome =
+                    op(&writer_db).map_err(|error| super::error::WriteFailed::from(&error));
                 if let Err(error) = &outcome {
                     tracing::warn!(label, error = %error, "failed to run ordered database write");
                 }
@@ -1731,7 +1734,7 @@ impl Database {
         job_id: crate::jobs::ids::JobId,
         label: &'static str,
         op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
-    ) -> Result<oneshot::Receiver<Result<(), String>>, StateError> {
+    ) -> Result<oneshot::Receiver<Result<(), super::error::WriteFailed>>, StateError> {
         let (committed, rx) = oneshot::channel();
         self.queue_job_write(job_id, label, op, Some(committed))?;
         Ok(rx)
@@ -1742,7 +1745,7 @@ impl Database {
         job_id: crate::jobs::ids::JobId,
         label: &'static str,
         op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
-        committed: Option<oneshot::Sender<Result<(), String>>>,
+        committed: Option<oneshot::Sender<Result<(), super::error::WriteFailed>>>,
     ) -> Result<(), StateError> {
         let command = DbWriteCommand::Write {
             label,

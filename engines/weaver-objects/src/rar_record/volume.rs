@@ -35,6 +35,10 @@ impl<'a> Volume<'a> {
         self.access.write_repaired(self.member, offset, bytes);
     }
 
+    pub(super) fn will_write(&mut self, bytes: u64) {
+        self.access.will_write(bytes);
+    }
+
     pub(super) fn found_damaged(&mut self, range: ByteRange) {
         self.access.found_damaged(self.member, range);
     }

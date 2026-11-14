@@ -939,6 +939,8 @@ impl Pipeline {
             return;
         }
         self.terminal_post_processing_executor.resume();
+        // A job held in its final move stayed held through the pause.
+        self.wake_full_disk();
         let deferred_moves: Vec<_> = self.deferred_moves.drain().collect();
         for job_id in deferred_moves {
             if self.shared_state.queue.read(|inner| {

@@ -222,6 +222,39 @@ impl GraphJob {
     }
 }
 
+// `coverage`, one member's runs in offset order, without the bytes of
+// `held`, merged spans in offset order: a run a span cuts keeps its parts
+// outside it. The cost is the runs and the spans, never the holds.
+fn leave_out(coverage: Vec<CoverageRecord>, held: &[ByteRange]) -> Vec<CoverageRecord> {
+    if held.is_empty() {
+        return coverage;
+    }
+    let mut out = Vec::with_capacity(coverage.len() + held.len());
+    let mut next = 0;
+    for run in coverage {
+        let mut at = run.start;
+        while next < held.len() && held[next].end <= at {
+            next += 1;
+        }
+        let mut span = next;
+        while at < run.end && span < held.len() && held[span].start < run.end {
+            if held[span].start > at {
+                out.push(CoverageRecord {
+                    start: at,
+                    end: held[span].start,
+                    ..run
+                });
+            }
+            at = at.max(held[span].end);
+            span += 1;
+        }
+        if at < run.end {
+            out.push(CoverageRecord { start: at, ..run });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,40 +334,4 @@ mod tests {
             ]
         );
     }
-}
-
-// `coverage`, one member's runs in offset order, without the bytes of
-// `held`, merged spans in offset order: a run a span cuts keeps its parts
-// outside it. The cost is the runs and the spans, never the holds.
-fn leave_out(coverage: Vec<CoverageRecord>, held: &[ByteRange]) -> Vec<CoverageRecord> {
-    if held.is_empty() {
-        return coverage;
-    }
-    let mut out = Vec::with_capacity(coverage.len() + held.len());
-    let mut next = 0;
-    for run in coverage {
-        let mut at = run.start;
-        while next < held.len() && held[next].end <= at {
-            next += 1;
-        }
-        let mut span = next;
-        while at < run.end && span < held.len() && held[span].start < run.end {
-            if held[span].start > at {
-                out.push(CoverageRecord {
-                    start: at,
-                    end: held[span].start,
-                    ..run
-                });
-            }
-            at = at.max(held[span].end);
-            span += 1;
-        }
-        if at < run.end {
-            out.push(CoverageRecord {
-                start: at,
-                ..run
-            });
-        }
-    }
-    out
 }

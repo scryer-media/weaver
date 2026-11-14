@@ -2516,6 +2516,63 @@ async fn a_run_the_scratch_has_no_room_for_starts_again_in_ram_above_the_ceiling
     assert_eq!(pool.room().above, 0);
 }
 
+// Under the same policy on a machine that could never hold the window in
+// RAM, the run the scratch refused is not started again there, to be
+// refused as beyond the machine: its refusal is the job's to wait on, for
+// the window and the free space its disk keeps, as under the policy that
+// lets nothing go above the ceiling. A machine that could hold it names no
+// such wait.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn a_run_the_scratch_has_no_room_for_that_ram_could_never_hold_waits_for_the_scratch() {
+    for (machine, waits) in [(4u64 << 20, true), (64 << 20, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut envelopes = Envelopes::new(dir.path().join("envelopes"));
+        let windows = scratch_with_room(dir.path(), 0);
+        let pool = profile_pool();
+        let mut mail = RunMail::default();
+        let hardware = crate::pipeline::graph::hardware::Hardware::granting(
+            crate::pipeline::graph::hardware::Grant {
+                run: weaver_graph::Budget {
+                    memory_bytes: Some(CEILING),
+                    window_bytes: Some(CEILING),
+                    threads: 1,
+                    ..weaver_graph::Budget::default()
+                },
+                over_limit: crate::runtime::OverLimit::ScratchThenRam,
+                machine_bytes: Some(machine),
+                ..Default::default()
+            },
+        );
+        let mut runs = Runs::new(1, 1, mail.sender(), Arc::clone(&pool))
+            .on(hardware)
+            .lending(Arc::clone(&windows));
+        let node = NodeId(1);
+        assert_eq!(runs.ask(node, 1), vec![node]);
+        assert_eq!(runs.reserve_for(node, WIDE, LENDS), Reservation::Granted);
+        let (seen, saw) = std::sync::mpsc::channel();
+        runs.start(
+            node,
+            Asks::new(&[WIDE], &windows, &seen),
+            envelopes.shelf(node),
+        );
+        let said = mail.recv().await.unwrap();
+        let found = saw.recv().unwrap();
+        assert_eq!(found.lent, Some(vec![Err(std::io::ErrorKind::StorageFull)]));
+        assert_eq!(runs.window_needs(node), None, "nothing waits before it");
+        assert_eq!(runs.widen(node, Some(WIDE), None), !waits, "{machine}");
+        assert_eq!(runs.rerunning(node), !waits, "{machine}");
+        // One byte is the free space this scratch's disk keeps.
+        assert_eq!(
+            runs.window_needs(node),
+            waits.then_some(WIDE + 1),
+            "{machine}"
+        );
+        runs.ended(node, said.generation, 1);
+        assert_eq!(pool.room().above, 0);
+    }
+}
+
 // A machine of 32 cores and 64 GiB, which every stock profile is offered.
 fn stock_machine() -> crate::runtime::system_profile::SystemProfile {
     use crate::runtime::system_profile::*;

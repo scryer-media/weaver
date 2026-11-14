@@ -126,6 +126,18 @@ pub(super) fn repair_set(
             )
         })
         .collect();
+    // Every slice of a bound member that is not valid is written, copied or
+    // rebuilt, so that many slices is what this repair writes: once into
+    // its staged output, and once more into the member while the staged
+    // output still stands, since a missing slice is a hole in the member.
+    let writes = validity
+        .iter()
+        .filter(|(file, _)| state.members().contains_key(file))
+        .map(|(_, valid)| valid.iter().filter(|valid| !**valid).count() as u64)
+        .sum::<u64>();
+    if writes > 0 {
+        access.will_write(writes.saturating_mul(slice_size).saturating_mul(2));
+    }
     // What the kept slices leave of the limit is the copies' to read in; they
     // are done before par2-rs starts.
     let working = memory_limit.saturating_sub(kept.bytes);

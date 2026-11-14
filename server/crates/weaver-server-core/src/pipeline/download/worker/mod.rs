@@ -817,6 +817,15 @@ impl Pipeline {
                             queue_len = s.articles.queued_download_len(),
                             "dispatch idle: waiting for scripts that run when a job is added"
                         );
+                    } else if self.held_for_full_disk(*jid) {
+                        // A write found the disk full: a reading with room
+                        // releases it.
+                        debug!(
+                            job_id = jid.0,
+                            idx = i,
+                            status = ?s.status,
+                            "dispatch idle: waiting for room after a write found the disk full"
+                        );
                     } else if matches!(
                         s.status,
                         JobStatus::Paused

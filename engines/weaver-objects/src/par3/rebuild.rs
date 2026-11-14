@@ -274,6 +274,29 @@ pub(super) fn repair_set(
             *member = member.filter(|member| !access.withheld(*member));
         }
     }
+    // Every extent not proven of a member that is written is written, copied
+    // or rebuilt, and each rewritten file's inline tails with them.
+    let tails = rewrite
+        .iter()
+        .filter(|file| !withheld.contains(file))
+        .filter(|&&file| member_of(set, bound, file).is_some())
+        .filter_map(|&file| layout.files().get(file))
+        .flat_map(|shape| shape.extents.iter())
+        .map(|extent| match &extent.kind {
+            ExtentKind::Inline(bytes) => bytes.len() as u64,
+            _ => 0,
+        })
+        .sum::<u64>();
+    let writes = unproven
+        .iter()
+        .filter(|(member, _)| member.is_some())
+        .map(|(_, extent)| extent.range.end.saturating_sub(extent.range.start))
+        .fold(tails, u64::saturating_add);
+    // Each is written twice: into the staged output, and into the member
+    // while the staged output still stands.
+    if writes > 0 {
+        access.will_write(writes.saturating_mul(2));
+    }
     let memory = budget.memory_or(super::REPAIR_MEMORY_LIMIT);
     let copied = copy_held(&held, &unproven, memory.max(READ), access);
     proven.retain(|(member, range)| !copied.contains(&(*member, range.start, range.end)));
