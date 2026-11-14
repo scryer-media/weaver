@@ -1676,6 +1676,21 @@ impl Held {
         Some(open)
     }
 
+    // A write, truncate or close of a kept closed file makes it an open
+    // file again: it leaves the closed files, so the bound never lets go of
+    // a file in use, and a close puts it back at the newest end. Whether
+    // the key holds `file` open.
+    fn in_use(&mut self, file: u64) -> bool {
+        let Some(open) = self.open.get_mut(&file) else {
+            return false;
+        };
+        if open.closed {
+            open.closed = false;
+            self.unclose(file);
+        }
+        true
+    }
+
     // `file` leaves the closed files: it is in use again, or let go.
     fn unclose(&mut self, file: u64) {
         if let Some(at) = self.closed.iter().position(|closed| *closed == file) {
@@ -1710,15 +1725,7 @@ impl Held {
         creating: &mut bool,
         counts: &WriterCounts,
     ) -> io::Result<Option<&mut Open>> {
-        // A write, truncate or close of a kept closed file makes it an open
-        // file again: it leaves the closed files, so the bound never lets go
-        // of a file in use, and a close puts it back at the newest end.
-        if let Some(open) = self.open.get_mut(&file) {
-            if open.closed {
-                open.closed = false;
-                self.unclose(file);
-            }
-        } else {
+        if !self.in_use(file) {
             // The writes of a file whose name was refused are dropped: the
             // refusal has said so.
             if self.refused.contains(&file) {
@@ -2319,14 +2326,16 @@ impl Thread {
             if entry.0 != part {
                 rank += 1;
                 *entry = (part, rank, 0);
-                // A write that brings the way to open its file was sent for
-                // a file its caller does not hold open; a truncate or a close
-                // opens one the writer does not hold.
+                // A write that brings the way to open its file, a truncate or
+                // a close opens one the writer does not hold. A kept closed
+                // file the batch uses is in use from here: a close placed
+                // ahead of its use must not let it go at the bound.
                 let opens = match op {
-                    Op::Write { create, .. } => create.is_some(),
-                    Op::Truncate { .. } | Op::Close { .. } => {
-                        !queued.key.held().open.contains_key(&file)
+                    Op::Write { create, .. } => {
+                        let held = queued.key.held().in_use(file);
+                        create.is_some() && !held
                     }
+                    Op::Truncate { .. } | Op::Close { .. } => !queued.key.held().in_use(file),
                     _ => false,
                 };
                 if opens {

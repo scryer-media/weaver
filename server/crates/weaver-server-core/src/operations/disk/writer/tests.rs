@@ -2197,11 +2197,19 @@ fn a_closed_file_written_again_leaves_the_closed_files() {
     for file in 1..=kept {
         close(file);
     }
+    job.barrier().wait();
+    // The thread stands in a batch of its own before what follows comes,
+    // so the write and the two closes after it are one batch, which runs
+    // the closes first.
+    let hold = writers.hold(&volume);
+    job.run(None, dir.path().to_path_buf(), || Ok(()));
+    hold.wait_held();
     job.write(1, 4, Bytes::from_static(b"tail"), create(&path(1)));
     // Two more closed: the first fills the place the written file left,
     // the second passes the bound.
     close(kept + 1);
     close(kept + 2);
+    hold.open();
     job.barrier().wait();
     assert!(job.barrier().passed());
     assert_eq!(
