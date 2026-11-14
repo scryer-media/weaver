@@ -634,6 +634,7 @@ export const nextEs: LocaleDictionary = {
   "next.system.volumeWriting": "escribiendo {{rate}}",
   "next.system.volumeNotWriting": "sin escritura",
   "next.system.volumeBuffered": "{{size}} en búfer",
+  "next.system.volumeBufferedOf": "{{size}} de {{limit}} en búfer",
   "next.system.noVolumes": "Aún no se ha escrito nada.",
   "next.system.configuredStorage": "Almacenamiento configurado",
   "next.system.configuredStorageNote": "las rutas se ocultan en los informes exportados",

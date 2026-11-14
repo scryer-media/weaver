@@ -1268,6 +1268,10 @@ pub struct StorageVolumeWriteRate {
     pub throughput_bytes_per_second: Option<u64>,
     /// Bytes waiting in memory to be written to the volume.
     pub buffered_bytes: u64,
+    /// The most bytes Weaver lets wait in memory for the volume before it
+    /// stops fetching for the jobs that write to it; null until the volume
+    /// has been given a limit.
+    pub buffer_limit_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, SimpleObject)]
@@ -1305,6 +1309,9 @@ impl SystemInfo {
                 write_rate_bytes_per_second: (volume.write_rate > 0).then_some(volume.write_rate),
                 throughput_bytes_per_second: (volume.throughput > 0).then_some(volume.throughput),
                 buffered_bytes: volume.buffered_bytes,
+                // Zero is "not sized yet".
+                buffer_limit_bytes: (volume.buffer_limit_bytes > 0)
+                    .then_some(volume.buffer_limit_bytes),
             })
             .collect())
     }

@@ -1555,6 +1555,15 @@ fn render_volumes(out: &mut Encoder, volumes: &[VolumeSnapshot]) {
             out.sample(&f::VOLUME_WRITE_RATE, labels, volume.write_rate);
         }
         out.sample(&f::VOLUME_BUFFERED_BYTES, labels, volume.buffered_bytes);
+        // Zero is "not sized yet", which is told by the series being absent.
+        if volume.buffer_limit_bytes > 0 {
+            out.sample(&f::VOLUME_BUFFER_LIMIT_BYTES, labels, volume.buffer_limit_bytes);
+            out.sample(
+                &f::VOLUME_BUFFER_SOFT_LIMIT_BYTES,
+                labels,
+                volume.buffer_soft_bytes,
+            );
+        }
         let writer = &volume.writer;
         out.sample(&f::VOLUME_WRITER_BATCHES, labels, writer.batches);
         out.sample(&f::VOLUME_WRITER_OPERATIONS, labels, writer.operations);

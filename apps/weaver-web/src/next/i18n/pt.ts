@@ -634,6 +634,7 @@ export const nextPt: LocaleDictionary = {
   "next.system.volumeWriting": "gravando {{rate}}",
   "next.system.volumeNotWriting": "sem gravação",
   "next.system.volumeBuffered": "{{size}} em buffer",
+  "next.system.volumeBufferedOf": "{{size}} de {{limit}} em buffer",
   "next.system.noVolumes": "Nada foi gravado ainda.",
   "next.system.configuredStorage": "Armazenamento configurado",
   "next.system.configuredStorageNote": "os caminhos ficam ocultos nos relatórios exportados",

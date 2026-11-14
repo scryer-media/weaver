@@ -39,6 +39,8 @@ interface VolumeWriteRate {
   writeRateBytesPerSecond: number | null;
   throughputBytesPerSecond: number | null;
   bufferedBytes: number;
+  /** The most that may wait for the volume; null until the volume has a limit. */
+  bufferLimitBytes: number | null;
 }
 
 type KernelComponent =
@@ -143,7 +145,9 @@ function reportText(info: SystemInfo, cacheBytes: number, cacheLimit: number): s
           volume.throughputBytesPerSecond == null
             ? "not writing"
             : `writing ${formatRate(volume.throughputBytesPerSecond)}`
-        } · ${formatSize(volume.bufferedBytes)} buffered`,
+        } · ${formatSize(volume.bufferedBytes)}${
+          volume.bufferLimitBytes == null ? "" : ` of ${formatSize(volume.bufferLimitBytes)}`
+        } buffered`,
     ),
     ...info.compute.kernels.map((entry) => {
       const pin = entry.pinnedBy ? `, pinned by ${entry.pinnedBy}` : "";
@@ -381,7 +385,12 @@ export function SystemInfoPage() {
                       volume.throughputBytesPerSecond == null
                         ? t("next.system.volumeNotWriting")
                         : t("next.system.volumeWriting", { rate: formatRate(volume.throughputBytesPerSecond) }),
-                      t("next.system.volumeBuffered", { size: formatSize(volume.bufferedBytes) }),
+                      volume.bufferLimitBytes == null
+                        ? t("next.system.volumeBuffered", { size: formatSize(volume.bufferedBytes) })
+                        : t("next.system.volumeBufferedOf", {
+                            size: formatSize(volume.bufferedBytes),
+                            limit: formatSize(volume.bufferLimitBytes),
+                          }),
                     ].join(" · ")}
                   />
                 ))

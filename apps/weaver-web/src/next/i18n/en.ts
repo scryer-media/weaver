@@ -641,6 +641,7 @@ export const nextEn: LocaleDictionary = {
   "next.system.volumeWriting": "writing {{rate}}",
   "next.system.volumeNotWriting": "not writing",
   "next.system.volumeBuffered": "{{size}} buffered",
+  "next.system.volumeBufferedOf": "{{size}} of {{limit}} buffered",
   "next.system.noVolumes": "Nothing has been written yet.",
   "next.system.configuredStorage": "Configured storage",
   "next.system.configuredStorageNote": "paths are hidden in exported reports",

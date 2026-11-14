@@ -1079,7 +1079,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "description": "Bytes waiting in memory for each volume's writer.",
+      "description": "Bytes waiting in memory for each volume's writer, and each volume's limit: fetching stops for its jobs once that many bytes have arrived for it and are not written.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -1110,6 +1110,14 @@
           "legendFormat": "{{volume}}",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "weaver_volume_buffer_limit_bytes{job=\"$job\",instance=~\"$instance\"}",
+          "legendFormat": "{{volume}} limit",
+          "range": true,
+          "refId": "B"
         }
       ],
       "title": "Buffered for the writer",

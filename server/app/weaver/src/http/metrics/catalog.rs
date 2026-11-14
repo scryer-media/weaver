@@ -626,6 +626,10 @@ metric_families! {
         "Bytes per second of wall time written to a volume over the last window, whether or not the volume was the limit. Conditional: emitted only while the volume is being written to.");
     VOLUME_BUFFERED_BYTES = ("weaver_volume_buffered_bytes", Gauge, ["volume"],
         "Bytes waiting in memory for a volume's writer.");
+    VOLUME_BUFFER_LIMIT_BYTES = ("weaver_volume_buffer_limit_bytes", Gauge, ["volume"],
+        "The most bytes that may have arrived for a volume and not be written: at this many, fetching stops for the jobs that write to it. Conditional: emitted only once the volume has been given its limits.");
+    VOLUME_BUFFER_SOFT_LIMIT_BYTES = ("weaver_volume_buffer_soft_limit_bytes", Gauge, ["volume"],
+        "The unwritten bytes of a volume from which the jobs that write to it are fetched for one article at a time. Conditional: emitted only once the volume has been given its limits.");
     VOLUME_WRITER_BATCHES = ("weaver_volume_writer_batches_total", Counter, ["volume"],
         "Batches of queued operations a volume's writer has run.");
     VOLUME_WRITER_OPERATIONS = ("weaver_volume_writer_operations_total", Counter, ["volume"],

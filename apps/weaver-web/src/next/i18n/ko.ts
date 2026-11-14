@@ -634,6 +634,7 @@ export const nextKo: LocaleDictionary = {
   "next.system.volumeWriting": "쓰는 중 {{rate}}",
   "next.system.volumeNotWriting": "쓰기 없음",
   "next.system.volumeBuffered": "버퍼 {{size}}",
+  "next.system.volumeBufferedOf": "버퍼 {{size}} / {{limit}}",
   "next.system.noVolumes": "아직 기록된 내용이 없습니다.",
   "next.system.configuredStorage": "설정된 스토리지",
   "next.system.configuredStorageNote": "내보낸 보고서에서는 경로가 숨겨집니다",

@@ -1426,8 +1426,8 @@ fn sample_volumes() -> Vec<instr::VolumeSnapshot> {
             write_rate: 3_200_000,
             throughput: 1_100_000,
             buffered_bytes: 65_536,
-            buffer_soft_bytes: 0,
-            buffer_limit_bytes: 0,
+            buffer_soft_bytes: 700_000,
+            buffer_limit_bytes: 1_000_000,
             idle_turns: 12,
             writer: instr::VolumeWriterSnapshot {
                 batches: 40,
@@ -1439,7 +1439,8 @@ fn sample_volumes() -> Vec<instr::VolumeSnapshot> {
                 threads: 1,
             },
         },
-        // Seen, never written to: its rate is not measured.
+        // Seen, never written to: its rate is not measured, and it has
+        // no buffer limits yet.
         instr::VolumeSnapshot {
             label: "/mnt/scratch".to_string(),
             kind: "unknown",

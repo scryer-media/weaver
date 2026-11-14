@@ -41,6 +41,7 @@ const SYSTEM_INFO_QUERY: &str = r#"
       writeRateBytesPerSecond
       throughputBytesPerSecond
       bufferedBytes
+      bufferLimitBytes
     }
     configuredStorage {
       labels
@@ -77,6 +78,8 @@ async fn system_info_exposes_safe_runtime_profile_to_read_scope() {
         let throughput = &volume["throughputBytesPerSecond"];
         assert!(throughput.is_null() || throughput.is_u64());
         assert!(volume["bufferedBytes"].is_u64());
+        let limit = &volume["bufferLimitBytes"];
+        assert!(limit.is_null() || limit.as_u64().is_some_and(|limit| limit > 0));
     }
     assert!(matches!(
         info["deployment"].as_str().unwrap(),

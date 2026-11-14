@@ -634,6 +634,7 @@ export const nextZh: LocaleDictionary = {
   "next.system.volumeWriting": "正在写入 {{rate}}",
   "next.system.volumeNotWriting": "未写入",
   "next.system.volumeBuffered": "缓冲 {{size}}",
+  "next.system.volumeBufferedOf": "缓冲 {{size}} / {{limit}}",
   "next.system.noVolumes": "尚未写入任何内容。",
   "next.system.configuredStorage": "已配置的存储",
   "next.system.configuredStorageNote": "导出的报告中会隐藏路径",

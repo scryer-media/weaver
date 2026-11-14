@@ -634,6 +634,7 @@ export const nextJa: LocaleDictionary = {
   "next.system.volumeWriting": "書き込み中 {{rate}}",
   "next.system.volumeNotWriting": "書き込みなし",
   "next.system.volumeBuffered": "バッファ {{size}}",
+  "next.system.volumeBufferedOf": "バッファ {{size}} / {{limit}}",
   "next.system.noVolumes": "まだ何も書き込まれていません。",
   "next.system.configuredStorage": "設定済みストレージ",
   "next.system.configuredStorageNote": "エクスポートしたレポートではパスを伏せます",

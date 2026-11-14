@@ -634,6 +634,7 @@ export const nextFr: LocaleDictionary = {
   "next.system.volumeWriting": "écriture à {{rate}}",
   "next.system.volumeNotWriting": "aucune écriture",
   "next.system.volumeBuffered": "{{size}} en mémoire tampon",
+  "next.system.volumeBufferedOf": "{{size}} sur {{limit}} en mémoire tampon",
   "next.system.noVolumes": "Rien n'a encore été écrit.",
   "next.system.configuredStorage": "Stockage configuré",
   "next.system.configuredStorageNote": "les chemins sont masqués dans les rapports exportés",

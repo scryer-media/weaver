@@ -935,6 +935,13 @@ fn renders_collected_instrumentation_snapshots() {
             .contains("weaver_volume_write_rate_bytes_per_second{volume=\"/mnt/nas\"} 3200000")
     );
     assert!(rendered.contains("weaver_volume_buffered_bytes{volume=\"/mnt/nas\"} 65536"));
+    // A sized volume carries its limits; one not sized yet carries neither.
+    assert!(rendered.contains("weaver_volume_buffer_limit_bytes{volume=\"/mnt/nas\"} 1000000"));
+    assert!(
+        rendered.contains("weaver_volume_buffer_soft_limit_bytes{volume=\"/mnt/nas\"} 700000")
+    );
+    assert!(!rendered.contains("weaver_volume_buffer_limit_bytes{volume=\"/mnt/scratch\"}"));
+    assert!(!rendered.contains("weaver_volume_buffer_soft_limit_bytes{volume=\"/mnt/scratch\"}"));
     assert!(rendered.contains("weaver_volume_write_calls_total{volume=\"/mnt/nas\"} 120"));
     assert!(rendered.contains("weaver_volume_write_seeks_total{volume=\"/mnt/nas\"} 9"));
     assert!(rendered.contains("weaver_volume_write_seeks_total{volume=\"/mnt/scratch\"} 0"));

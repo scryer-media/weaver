@@ -1038,6 +1038,7 @@ export const SYSTEM_INFO_QUERY = gql`
         writeRateBytesPerSecond
         throughputBytesPerSecond
         bufferedBytes
+        bufferLimitBytes
       }
       configuredStorage {
         labels
