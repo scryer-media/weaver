@@ -660,19 +660,34 @@ impl Pipeline {
     // Hold `bytes` that arrived for the job as counted on `volume`, the
     // volume its articles are written to, until the loop has handed them
     // on. The caller counts them on the volume. One map entry per job with
-    // results waiting; nothing is walked.
+    // results waiting; nothing is walked. A job whose bytes now count on
+    // another volume than those it holds, its volume having changed while
+    // they waited, moves those it holds there as well: the entry names the
+    // one volume all of them count on, so each volume gives back only what
+    // it counted.
     pub(in crate::pipeline) fn hold_volume_arrived(
         &mut self,
         job_id: JobId,
         volume: &Arc<crate::operations::disk::volume::Volume>,
         bytes: u64,
     ) {
-        let (_, held) = self
+        let (counted_on, held) = self
             .volume_arrived_by_job
             .entry(job_id)
             .or_insert_with(|| (Arc::clone(volume), 0));
+        let moved = (!Arc::ptr_eq(counted_on, volume))
+            .then(|| (std::mem::replace(counted_on, Arc::clone(volume)), *held));
         *held = held.saturating_add(bytes);
         volume.arrived_bytes.fetch_add(bytes, Ordering::SeqCst);
+        if let Some((before, held)) = moved {
+            before.arrived_bytes.fetch_sub(held, Ordering::SeqCst);
+            before.release(held);
+            volume.arrived_bytes.fetch_add(held, Ordering::SeqCst);
+            volume.charge(held);
+            if before.take_wake() {
+                self.volume_room_changed();
+            }
+        }
     }
 
     // The loop is about to hand on `bytes` of the job that arrived: they

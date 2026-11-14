@@ -306,9 +306,16 @@ impl Volume {
     }
 
     // `bytes` reserved or charged no longer count: an article left its
-    // lane, or the writer wrote them.
+    // lane, or the writer wrote them. The count never goes below zero: a
+    // release of more than it holds is a fault, and wrapping would stop the
+    // volume's leases for good.
     pub(crate) fn release(&self, bytes: u64) {
-        let before = self.counted_bytes.fetch_sub(bytes, Ordering::SeqCst);
+        let before = self
+            .counted_bytes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |counted| {
+                Some(counted.saturating_sub(bytes))
+            })
+            .unwrap_or_else(|counted| counted);
         debug_assert!(before >= bytes, "a volume released more than it counted");
     }
 
@@ -344,15 +351,35 @@ impl Volume {
     // Take the wake someone asked for, when the unwritten bytes have fallen
     // to their line: true once for each ask, to whoever lowered the bytes
     // there, the volume's writer or the pipeline loop. The caller lowers
-    // its count first and asks after.
+    // its count first and asks after. A line raised while it takes is
+    // looked at again, so a wake the count has reached is never missed.
     pub(crate) fn take_wake(&self) -> bool {
-        let ask = self.wake_line.load(Ordering::SeqCst);
-        ask != 0
-            && self.unwritten_bytes() < ask
-            && self
-                .wake_line
-                .compare_exchange(ask, 0, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
+        self.wake_line
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |ask| {
+                (ask != 0 && self.unwritten_bytes() < ask).then_some(0)
+            })
+            .is_ok()
+    }
+
+    // Ask to be woken, once, when the unwritten bytes are `bytes` or
+    // fewer. False when they already are: nothing was asked and no wake
+    // comes. One line is kept, the highest asked, which wakes soonest:
+    // every wake rings dispatch, and whoever it finds still short of room
+    // asks again for its own line, so a lower ask never holds back a
+    // higher one. Only the pipeline loop asks.
+    pub(crate) fn ask_wake(&self, bytes: u64) -> bool {
+        let ask = bytes.saturating_add(1);
+        let before = self.wake_line.fetch_max(ask, Ordering::SeqCst);
+        if before >= ask || self.unwritten_bytes() > bytes {
+            // A line this high or higher is out: whoever brings the count
+            // below it takes the wake.
+            return true;
+        }
+        // Already there: the line asked before goes back, unless a wake
+        // was taken meanwhile, which is then on its way.
+        self.wake_line
+            .compare_exchange(ask, before, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
     }
 }
 
@@ -410,5 +437,45 @@ mod tests {
         assert_eq!(volume.lease_limit(), u64::MAX);
         assert!(volume.reserve(u64::MAX / 2));
         assert!(volume.reserve(1 << 40));
+    }
+
+    // Two asks at different lines keep the higher, whichever came last: the
+    // count reaching it wakes at once, not at the lower line.
+    #[test]
+    fn a_lower_ask_never_holds_back_a_higher_one() {
+        let volume = sized(1600);
+        volume.charge(1000);
+        assert!(volume.ask_wake(800));
+        assert!(volume.ask_wake(400), "a lower line asked after");
+        volume.release(150);
+        assert!(!volume.take_wake(), "850 is above the line at 800");
+        volume.release(100);
+        assert!(volume.take_wake(), "750 has reached the higher line");
+        assert!(!volume.take_wake(), "one wake for the line");
+        // Asked the other way about, the same.
+        assert!(volume.ask_wake(400));
+        assert!(volume.ask_wake(700));
+        volume.release(100);
+        assert!(volume.take_wake(), "650 has reached the higher line");
+        // An ask the count is already under asks nothing and leaves the
+        // line asked before it as it was.
+        assert!(volume.ask_wake(300));
+        assert!(!volume.ask_wake(900), "already under 900");
+        volume.release(400);
+        assert!(volume.take_wake(), "250 has reached the line at 300");
+    }
+
+    // A release past the count is a fault: in a test it is caught, and
+    // outside one the count stops at zero rather than wrapping.
+    #[test]
+    fn a_release_never_takes_the_count_below_zero() {
+        let volume = sized(1600);
+        volume.charge(10);
+        let released = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            volume.release(11);
+        }));
+        assert_eq!(released.is_err(), cfg!(debug_assertions));
+        assert_eq!(volume.unwritten_bytes(), 0);
+        assert!(volume.reserve(1500), "the volume still grants leases");
     }
 }

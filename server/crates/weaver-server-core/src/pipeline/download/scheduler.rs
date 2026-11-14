@@ -404,12 +404,16 @@ impl Pipeline {
 
     // How many of a job's articles one lane may hold for the room the
     // job's volume has left below its lease limit (`Volume::lease_room`),
-    // in articles of the size the lane holds: its part of that room over
-    // every connection, more than it holds now, and never less than a full
-    // pipe, but never more than the room holds either. A lane that holds
-    // nothing is sized by the job's next article. A volume that counts
-    // nothing holds one article whatever its size. `None` when the job
-    // writes to no sized volume: the share stands.
+    // in articles the size of the job's next one: its part of that room
+    // over every connection, more than it holds now, and never less than a
+    // full pipe, but never more than the room holds either. The next
+    // article is the one a lease reserves next and the one the room wake
+    // is asked for (`Self::ask_room_wake`), so a volume that holds room for
+    // it holds room for one more here: what the lane carries of other jobs,
+    // or the larger articles it holds, do not size it. A job with nothing
+    // queued is sized by what the lane holds. A volume that counts nothing
+    // holds one article whatever its size. `None` when the job writes to
+    // no sized volume: the share stands.
     //
     // What the lanes hold is reserved on the volume as it is leased
     // (`Pipeline::reserve_lane_work`), so the room is what is left after
@@ -423,11 +427,12 @@ impl Pipeline {
         full_pipe: usize,
     ) -> Option<VolumeShare> {
         let room = self.volume_room(job_id)?;
-        let (held, held_bytes) = self.download_lane_held_bytes(lane_id);
-        let article = if held == 0 {
-            self.next_article_bytes(job_id)
-        } else {
-            held_bytes / held as u64
+        let article = match self.next_article_bytes(job_id) {
+            0 => {
+                let (held, held_bytes) = self.download_lane_held_bytes(lane_id);
+                held_bytes.checked_div(held as u64).unwrap_or(0)
+            }
+            next => next,
         }
         .max(1);
         let connections = self.tuner.params().max_concurrent_downloads.max(1) as u64;
@@ -517,17 +522,33 @@ impl Pipeline {
             // for every lane held there. Below the line, where the room is
             // short only for the lane's part of it, the lane waits until it
             // has fetched a whole pipe of the job down.
+            //
+            // A share short of a whole pipe here is held by the room itself
+            // (`share` is then what the lane holds: no next article fits),
+            // so the volume is above the line the room wake is asked at,
+            // and the wake is asked. It goes unasked only when the writer
+            // brought the volume to that line between the look at its room
+            // and the ask: the room is there now. The lane is answered again on the
+            // next pass, which this rings, and finds it.
             return match self.job_servable_work_for_server(job_id, server_idx, pressure, true) {
                 Ok(()) if self.ask_room_wake(job_id) => ShareTaken::Saturated(SaturationWake {
                     of: Some(job_id),
                     below: 0,
                     room: true,
                 }),
-                Ok(()) => ShareTaken::Saturated(SaturationWake {
+                Ok(()) if share >= whole => ShareTaken::Saturated(SaturationWake {
                     of: Some(job_id),
                     below: share + 1 - whole,
                     room: false,
                 }),
+                Ok(()) => {
+                    self.download_dispatch_wake = true;
+                    ShareTaken::Saturated(SaturationWake {
+                        of: Some(job_id),
+                        below: holds + 1,
+                        room: false,
+                    })
+                }
                 Err(blocked) => ShareTaken::Blocked(blocked),
             };
         }

@@ -1719,6 +1719,44 @@ fn a_loop_write_takes_its_credit_first_and_goes_in_pieces_past_its_share() {
     assert!(written[10..].iter().all(|byte| *byte == 2));
 }
 
+// A loop write whose wait for room is given up at the end of a stop queues
+// nothing more, and what of it the loop's credit paid for no longer counts:
+// once the writer has written what it holds, the volume counts nothing.
+#[test]
+fn a_loop_write_given_up_at_the_stops_end_leaves_nothing_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    volume.set_buffer_limits(64, 64);
+    assert_eq!(volume.loop_share(), 4);
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    job.write(1, 0, Bytes::from(vec![1u8; 60]), create(&path));
+    assert_eq!(volume.unwritten_bytes(), 60);
+    hold.wait_held();
+    let clock = Arc::new(HandClock::default());
+    let end = Duration::from_secs(30);
+    writers.end_loop_waits_at(Arc::clone(&clock) as Arc<dyn Clock + Send>, end);
+    writers.stop_waits();
+    clock.move_to(end);
+    // An arrived article of two, then eight past it: the first piece is
+    // two of credit and four charged, and four more do not fit.
+    volume.charge(2);
+    volume.loop_credit.store(2, Ordering::Relaxed);
+    job.write(1, 60, Bytes::from(vec![2u8; 10]), None);
+    assert!(job.left());
+    assert_eq!(
+        volume.unwritten_bytes(),
+        60,
+        "the credit's two are given back"
+    );
+    hold.open();
+    writers.settle();
+    assert_eq!(volume.unwritten_bytes(), 0);
+    assert_eq!(std::fs::read(&path).unwrap().len(), 60);
+}
+
 // Opens a new file sized to its declared length, as a file system that makes
 // holes is given it, and says so.
 fn open_sized(path: &Path, length: Option<u64>) -> io::Result<Opened> {

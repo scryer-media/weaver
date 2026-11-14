@@ -443,6 +443,15 @@ impl NamespaceWriter {
         self
     }
 
+    // The job's files are written through `disk` from here, as a job whose
+    // working volume changed.
+    #[cfg(test)]
+    pub(crate) fn move_disk_for_test(&mut self, disk: crate::pipeline::graph::disk::JobDisk) {
+        self.envelopes
+            .write_through(Some(Arc::clone(disk.working())));
+        self.disk = Some(disk);
+    }
+
     // Before the next slice of a repair's or a replay's output is said
     // again: the loop stands still while a volume the job writes to holds
     // its budget of bytes (`JobDisk::loop_wait_below`). An error once the

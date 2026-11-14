@@ -646,6 +646,11 @@ impl GraphJob {
         self.writer.disk()
     }
 
+    #[cfg(test)]
+    pub(crate) fn move_disk_for_test(&mut self, disk: super::disk::JobDisk) {
+        self.writer.move_disk_for_test(disk);
+    }
+
     pub(crate) fn pending(&self) -> &Pending {
         &self.pending
     }

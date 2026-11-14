@@ -448,6 +448,168 @@ async fn an_empty_volume_grants_one_article_larger_than_its_limit() {
     );
 }
 
+// A result released and booked as waiting for the loop, not yet handed on.
+fn release_waiting(pipeline: &mut Pipeline, result: &DownloadResult) {
+    assert!(pipeline.release_download_result(result));
+    pipeline.note_released_download_result_pending(
+        result.job_id,
+        Pipeline::released_download_result_lead_bytes(result),
+    );
+}
+
+// A job's working volume changes while it has bytes counted on the old one,
+// arrived and waiting for the loop, and leases reserved on the new one: each
+// volume gives back what it counted, and both end counting nothing.
+#[tokio::test]
+async fn a_job_whose_volume_changes_gives_each_volume_back_what_it_counted() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(42110);
+    let hard = 64 * u64::from(ARTICLE);
+    let mut pipeline = sized_job(&temp_dir, job_id, 40, hard).await;
+    let first = volume_of(&pipeline, job_id);
+    let lease = book_lease(&mut pipeline).expect("room for a lease");
+    // One article arrives and waits for the loop; the rest come back.
+    let early = arrived(&pipeline, lease.lane_id, &lease.works[0]);
+    release_waiting(&mut pipeline, &early);
+    for work in &lease.works[1..] {
+        pipeline
+            .handle_download_done(failed(
+                lease.lane_id,
+                work,
+                DownloadFailureKind::EstablishedTransport,
+            ))
+            .await;
+    }
+    assert_eq!(first.unwritten_bytes(), u64::from(ARTICLE));
+    assert!(pipeline.volume_reserved_by_job.is_empty());
+
+    // The job's files are written to another volume from here.
+    let second = Arc::new(Volume::new(Some(u64::MAX - 1), "/moved".into()));
+    second.set_buffer_limits(hard, hard);
+    let submitter = pipeline.volume_writers.submitter(&second, job_id.0);
+    pipeline
+        .graph_jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .move_disk_for_test(crate::pipeline::graph::disk::JobDisk::new(submitter, None));
+    let later = book_lease(&mut pipeline).expect("room on the second volume");
+    let leased = later.works.len() as u64 * u64::from(ARTICLE);
+    assert_eq!(second.unwritten_bytes(), leased);
+    // One of them arrives too, and waits with the first: both count on the
+    // second volume now, and the first counts nothing.
+    let next = arrived(&pipeline, later.lane_id, &later.works[0]);
+    release_waiting(&mut pipeline, &next);
+    assert_eq!(first.unwritten_bytes(), 0);
+    assert_eq!(second.unwritten_bytes(), leased + u64::from(ARTICLE));
+
+    pipeline.process_released_download_done(early).await;
+    pipeline.process_released_download_done(next).await;
+    for work in &later.works[1..] {
+        pipeline
+            .handle_download_done(failed(
+                later.lane_id,
+                work,
+                DownloadFailureKind::EstablishedTransport,
+            ))
+            .await;
+    }
+    written(&pipeline, job_id);
+    assert_eq!(first.unwritten_bytes(), 0);
+    assert_eq!(second.unwritten_bytes(), 0);
+    assert!(pipeline.volume_reserved_by_job.is_empty());
+    assert!(pipeline.volume_arrived_by_job.is_empty());
+}
+
+// A lane carrying the tail of another job, of larger articles, asked last
+// for a job whose volume has room for a few of its own smaller ones: it
+// takes those, sized by the job's articles, not by what it carries, and is
+// never held to a line it cannot reach.
+#[tokio::test]
+async fn a_lane_carrying_another_jobs_larger_tail_takes_what_fits_of_the_next() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 16 * 1024 * 1024, 8).await;
+    let tail_job = JobId(42111);
+    insert_active_job(
+        &mut pipeline,
+        tail_job,
+        segmented_job_spec("Budget Tail", "tail.bin", &[4096]),
+    )
+    .await;
+    let hard = 96 * u64::from(ARTICLE);
+    pipeline.volume_buffers.set_figure(hard, u64::MAX);
+    let tail = book_lease(&mut pipeline).expect("room for the tail");
+    assert_eq!(tail.job_id, tail_job);
+    let job_id = JobId(42112);
+    add_job(&mut pipeline, job_id, 40).await;
+    let volume = volume_of(&pipeline, job_id);
+    assert!(Arc::ptr_eq(&volume, &volume_of(&pipeline, tail_job)));
+    // Room below the lease limit for six of the job's articles and none of
+    // the tail's, with the volume at or under its resume line: no room wake
+    // is asked for the job's next article.
+    let room = 6 * u64::from(ARTICLE) + 428;
+    volume.count_for_test(volume.lease_limit() - room);
+    assert!(volume.unwritten_bytes() <= volume.resume_line());
+    let mut answer = ask(&mut pipeline, tail.lane_id);
+    let lease = answer
+        .try_recv()
+        .expect("answered at once")
+        .lease
+        .expect("the lane takes what fits");
+    assert_eq!(lease.job_id, job_id);
+    assert!(!lease.works.is_empty() && lease.works.len() <= 6);
+    assert!(volume.unwritten_bytes() <= volume.lease_limit());
+}
+
+// A volume whose limit holds only a few articles: lanes take what fits until
+// nothing more does, the next lane waits for the volume's room, is not
+// answered while the volume stays full, and is woken and served once the
+// writer has written.
+#[tokio::test]
+async fn lanes_on_a_volume_of_a_few_articles_take_what_fits_then_wait_for_room() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(42113);
+    let hard = 6 * u64::from(ARTICLE);
+    let mut pipeline = sized_job(&temp_dir, job_id, 40, hard).await;
+    let volume = volume_of(&pipeline, job_id);
+    let fits = (volume.lease_limit() / u64::from(ARTICLE)) as usize;
+    let mut leases = Vec::new();
+    let mut waiting = loop {
+        assert!(leases.len() <= fits, "more leases than articles fit");
+        let lane_id = book_lane(&mut pipeline, job_id);
+        let mut answer = ask(&mut pipeline, lane_id);
+        assert!(volume.unwritten_bytes() <= volume.lease_limit());
+        match answer.try_recv() {
+            Ok(response) => leases.push(response.lease.expect("the lane takes what fits")),
+            Err(_) => break answer,
+        }
+    };
+    let taken: usize = leases.iter().map(|lease| lease.works.len()).sum();
+    assert_eq!(taken, fits, "every article that fits was taken");
+    let (holds, wakes) = room_counts(&pipeline);
+    assert_eq!((holds, wakes), (1, 0), "the last lane waits for room");
+    pipeline.service_held_download_refills();
+    assert!(waiting.try_recv().is_err(), "still full: not answered");
+    for lease in &leases {
+        for work in &lease.works {
+            let result = arrived(&pipeline, lease.lane_id, work);
+            hand_in(&mut pipeline, result).await;
+            assert!(volume.unwritten_bytes() <= hard);
+        }
+    }
+    written(&pipeline, job_id);
+    assert_eq!(volume.unwritten_bytes(), 0);
+    pipeline.service_held_download_refills();
+    let woken = waiting
+        .try_recv()
+        .expect("woken once the volume has room")
+        .lease
+        .expect("served from the room");
+    assert!(!woken.works.is_empty() && woken.works.len() <= fits);
+    assert!(volume.unwritten_bytes() <= volume.lease_limit());
+    assert_eq!(room_counts(&pipeline).1, 1);
+}
+
 fn lease_for_test_none(pipeline: &mut Pipeline) -> bool {
     pipeline.lease_for_server_for_test(0).is_none()
 }
