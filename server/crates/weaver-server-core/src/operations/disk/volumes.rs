@@ -291,7 +291,7 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
-    use super::super::{DISK_LOOKS, DiskSpace, StorageRoot};
+    use super::super::{DISK_LOOKS, DiskSpace, Reach, StorageRoot};
     use super::*;
     use crate::runtime::fs::test_devices;
 
@@ -396,6 +396,9 @@ mod tests {
         test_devices::assign(&shows, 9);
         let storage = owner(dir.path());
         assert!(!storage.same_filesystem(&intermediate, &shows).await);
+        // The look reads on after it tells the device, and its free space
+        // comes last: that is waited for before the looks are counted.
+        StorageCapacity::spaces(Some(&storage), &[(shows.clone(), Reach::Exact)]).await;
         let before = looks();
 
         let output = storage.volume(&shows.join(".weaver-staging").join("7"));
