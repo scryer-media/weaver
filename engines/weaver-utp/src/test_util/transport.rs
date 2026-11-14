@@ -240,6 +240,8 @@ struct RememberingTransportLocked {
     refused: usize,
     // The socket's streams queue their datagrams for its dispatcher.
     sends_from_one_task: bool,
+    // Sends still taken before the transport refuses them.
+    refuse_after: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -272,6 +274,12 @@ impl RememberingTransport {
         }
     }
 
+    // Takes `sends` more sends, then refuses until told to take them
+    // again.
+    pub fn refuse_after(&self, sends: usize) {
+        self.locked.lock().refuse_after = Some(sends);
+    }
+
     // How many sends the transport refused.
     pub fn refused(&self) -> usize {
         self.locked.lock().refused
@@ -286,6 +294,14 @@ impl RememberingTransport {
     // Refuses a send, keeping the waker it was polled with.
     fn refuse(&self, cx: &std::task::Context<'_>) -> bool {
         let mut g = self.locked.lock();
+        match g.refuse_after {
+            Some(0) => {
+                g.poll_send_pending = true;
+                g.refuse_after = None;
+            }
+            Some(left) => g.refuse_after = Some(left - 1),
+            None => {}
+        }
         if !g.poll_send_pending {
             return false;
         }

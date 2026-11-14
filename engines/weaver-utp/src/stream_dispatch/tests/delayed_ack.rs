@@ -369,6 +369,42 @@ async fn in_order_and_three_past_a_hole_in_one_read_draw_a_fast_resend() {
     assert_eq!(acks_for_a_tail_hole_reach_a_sender(false).await, (4, true));
 }
 
+// The socket takes the first of three ACKs owed for packets past a hole
+// and refuses the next. The two left stay owed and go once it is writable.
+#[tokio::test(start_paused = true)]
+async fn duplicate_acks_owed_survive_a_refused_send() {
+    let mut t = make_test_vsock(Default::default(), false);
+    let ack_nr = t.vsock.seq_nr - 1;
+    t.send_data(1, ack_nr, "a");
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.take_sent().len(), 1);
+
+    for seq in 3..=5u16 {
+        t.send_data(seq, ack_nr, "x");
+    }
+    t.transport.refuse_after(1);
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.take_sent().len(), 1);
+    assert_eq!(t.transport.refused(), 1);
+
+    t.transport.set_poll_send_pending(false);
+    t.poll_once_assert_pending().await;
+    let sent = t.take_sent();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    for ack in &sent {
+        assert_eq!(ack.header.htype, State);
+        assert_eq!(ack.header.ack_nr, 1.into());
+        assert_eq!(
+            ack.header.extensions.selective_ack.unwrap().as_bytes(),
+            [0b111]
+        );
+    }
+
+    // Nothing more is owed.
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
+}
+
 // Packets that arrive in order owe one ACK a read however many they are.
 #[tokio::test]
 async fn packets_in_order_in_one_read_get_one_ack() {

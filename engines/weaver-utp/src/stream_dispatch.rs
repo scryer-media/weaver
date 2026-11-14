@@ -374,7 +374,6 @@ macro_rules! on_packet_sent {
         $self.last_sent_window = $header.wnd_size;
         $self.ack_deferred = false;
         $self.ack_due = false;
-        $self.reordered_unacked = 0;
         $self.timers.ack_delay_timer.turn_off("ACK sent");
     }};
 }
@@ -533,6 +532,7 @@ macro_rules! send_data {
                 $self.last_sent_window = $header.wnd_size;
             } else {
                 on_packet_sent!($self, $header);
+                $self.reordered_unacked = 0;
             }
 
             if $segment_iter_item.seq_nr().is_after($self.last_sent_seq_nr) {
@@ -1209,9 +1209,20 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if self.timers.ack_delay_timer.expired(self.this_poll.now) {
             if self.ack_deferred {
                 trace!("delayed ack expired, sending ACK");
+                let moves_ack = self.last_consumed_remote_seq_nr != self.last_sent_ack_nr;
                 let sent = self.send_ack(cx)?;
                 if sent {
                     self.socket.stats.delayed_acks.increment(1);
+                    // The duplicates owed for packets past a hole follow
+                    // a delayed ACK as they follow one sent at a drain.
+                    if !moves_ack {
+                        self.reordered_unacked = self.reordered_unacked.saturating_sub(1);
+                    }
+                    if self.duplicate_acks_owed() > 0 {
+                        self.send_due_ack(cx)?;
+                    } else {
+                        self.reordered_unacked = 0;
+                    }
                 }
                 return Ok(sent);
             } else {
@@ -1373,22 +1384,32 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     // follow it.
     fn send_due_ack(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<bool> {
         let duplicates = self.duplicate_acks_owed();
-        let first_moves_ack = self.last_consumed_remote_seq_nr != self.last_sent_ack_nr;
-        let repeats = if first_moves_ack {
-            duplicates
+        let mut moves_ack = self.last_consumed_remote_seq_nr != self.last_sent_ack_nr;
+        let mut left = if moves_ack {
+            duplicates + 1
         } else {
-            duplicates.saturating_sub(1)
+            duplicates.max(1)
         };
-        let sent = self.send_ack(cx)?;
-        if sent {
-            self.socket.stats.immediate_acks.increment(1);
-            for _ in 0..repeats {
-                if !self.send_ack(cx)? {
-                    break;
-                }
-                self.socket.stats.duplicate_acks_sent.increment(1);
+        let mut sent = false;
+        while left > 0 {
+            if !self.send_ack(cx)? {
+                // The socket took no more: what is left stays owed, and
+                // goes when it is writable again.
+                self.ack_due = true;
+                return Ok(sent);
             }
+            if sent {
+                self.socket.stats.duplicate_acks_sent.increment(1);
+            } else {
+                self.socket.stats.immediate_acks.increment(1);
+            }
+            if !std::mem::take(&mut moves_ack) {
+                self.reordered_unacked = self.reordered_unacked.saturating_sub(1);
+            }
+            sent = true;
+            left -= 1;
         }
+        self.reordered_unacked = 0;
         Ok(sent)
     }
 
