@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { expect, metricValue, metrics, test } from "./helpers";
+import { expect, metricValue, metrics, requiredMetricValue, test } from "./helpers";
 import { waitTerminal } from "./support/downloads";
 import {
   type NetworkFlow, type PoolFlow, type ProxyProfile, extended, flowAfter, flowMark, graphqlErrors, ladderLeg, legOn,
@@ -129,7 +129,8 @@ test("P05 a race runs once a server over-limit clears and the pin holds", async 
   const download = await world.pacedDownload("p05-over-limit");
   const before = await pinned(request, view, connect1.id, "connect1 pinned");
   // The held control session takes one slot of max_conns=2, leaving Weaver one.
-  const refusals = async () => metricValue(await metrics(request), "weaver_server_provider_refusals_total", { server_id: String(server) }) ?? 0;
+  // The server is downloading, so its pool reports the counter; a missing one fails rather than reading as a 0 baseline.
+  const refusals = async () => requiredMetricValue(await metrics(request), "weaver_server_provider_refusals_total", { server_id: String(server) });
   const refusalsBefore = await refusals();
   await world.setChaos("slow_body=10,max_conns=2");
   // Admission limits do not evict established sessions. Force fresh admissions
