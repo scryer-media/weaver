@@ -17,7 +17,7 @@
 //
 // Nothing here syncs: an operation has returned when its system call has.
 
-use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -637,11 +637,20 @@ struct Held {
     open: HashMap<u64, Open>,
     // A file whose open was refused: its later writes are dropped.
     refused: HashSet<u64>,
-    // Handles a close, a release or a forget let go in the batch being
-    // run, dropped once the batch runs nothing more of the key, or before
-    // a caller's code of the key runs.
+    // Handles a release, a forget or the bound on closed files let go in the
+    // batch being run, dropped once the batch runs nothing more of the key,
+    // or before a caller's code of the key runs.
     letting_go: Vec<Open>,
+    // Files a close ended whose handles are kept, oldest close first, at
+    // most `KEPT_CLOSED`: a later write, close or truncate of the file uses
+    // the handle instead of opening the file again, which on some systems
+    // stands behind what the file system is writing out of it.
+    closed: VecDeque<u64>,
 }
+
+// The handles a key keeps of files a close ended. Past it the oldest is let
+// go: a file closed longest ago is the one least likely to be written again.
+const KEPT_CLOSED: usize = 64;
 
 impl Key {
     fn new(id: u64) -> Self {
@@ -1600,11 +1609,37 @@ impl Held {
     // Let the handle of `file` go, to be dropped with the key's others.
     // Whether there was one.
     fn let_go(&mut self, file: u64) -> bool {
-        let Some(open) = self.open.remove(&file) else {
+        let Some(open) = self.take(file) else {
             return false;
         };
         self.letting_go.push(open);
         true
+    }
+
+    // The handle of `file`, no longer the key's.
+    fn take(&mut self, file: u64) -> Option<Open> {
+        let open = self.open.remove(&file)?;
+        if let Some(at) = self.closed.iter().position(|closed| *closed == file) {
+            self.closed.remove(at);
+        }
+        Some(open)
+    }
+
+    // A close ended `file`: its handle is kept, and past `KEPT_CLOSED` the
+    // oldest kept is let go. Whether one was.
+    fn keep_closed(&mut self, file: u64) -> bool {
+        if !self.open.contains_key(&file) {
+            return false;
+        }
+        if let Some(at) = self.closed.iter().position(|closed| *closed == file) {
+            self.closed.remove(at);
+        }
+        self.closed.push_back(file);
+        if self.closed.len() <= KEPT_CLOSED {
+            return false;
+        }
+        let oldest = self.closed.pop_front().expect("past the bound");
+        self.let_go(oldest)
     }
 
     // The open handle of `file`, opened through `create` when it is not
@@ -2424,7 +2459,7 @@ fn perform(
         // would have moved or removed, its caller may now move or remove
         // on a thread of its own, so the key's handles are dropped first.
         Op::Run { file, .. } if skip => {
-            let open = file.and_then(|file| held.open.remove(&file));
+            let open = file.and_then(|file| held.take(file));
             held.drop_let_go(open, &state.volume.writer);
             *dropped = true;
             Ok(())
@@ -2544,7 +2579,14 @@ fn perform(
                     }
                     Some(open) => set_length(open, length, counts),
                 });
-            *let_go = held.let_go(file);
+            // The handle stays until something needs it gone: a release, a
+            // move or removal of the file, the key's end, or the bound on
+            // the closed files it keeps. A reader opens a handle of its own.
+            *let_go = if closed.is_ok() {
+                held.keep_closed(file)
+            } else {
+                held.let_go(file)
+            };
             closed
         }
         Op::Run {
@@ -2552,7 +2594,7 @@ fn perform(
         } => {
             // Its code may move or remove what a handle the key let go
             // still holds open.
-            let open = file.and_then(|file| held.open.remove(&file));
+            let open = file.and_then(|file| held.take(file));
             held.drop_let_go(open, &state.volume.writer);
             *dropped = true;
             failed_at = path;

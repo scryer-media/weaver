@@ -916,9 +916,10 @@ impl Leaf {
         self.read(offset, len, into)
     }
 
-    // Every byte is in: the file takes its final length and its handle is
-    // released, so finalize can move it. A directory has no bytes to take:
-    // it is made.
+    // Every byte is in: the file takes its final length. The writer keeps
+    // its handle for a repair's writes and later closes; a move, a removal,
+    // a release at delivery or the job's end lets it go. A directory has no
+    // bytes to take: it is made.
     pub(crate) fn close(&mut self, length: u64) -> Result<(), LeafError> {
         if self.directory {
             return self.create_directory();

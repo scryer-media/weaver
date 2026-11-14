@@ -255,7 +255,7 @@ fn a_close_and_a_move_follow_the_writes_before_them() {
 
 // A reader on a thread of its own, a repair or a check, waits for the bytes
 // and the length of what it reads, not for the writer to drop the handle a
-// close let go: that drop is slow on some systems for a large file just
+// release let go: that drop is slow on some systems for a large file just
 // written, and a reader opens its own handle. The key is still told its
 // operations returned only after the drop, so a settle, a checkpoint and a
 // delivery wait for it as before.
@@ -279,7 +279,8 @@ fn a_reader_does_not_wait_behind_the_drop_of_a_closed_files_handle() {
             open,
         },
     );
-    // The close ran; the writer stands before dropping its handle.
+    job.release(1);
+    // The release ran; the writer stands before dropping its handle.
     hold.wait_dropping();
     let barrier = job.barrier();
     assert!(!barrier.returned() && !barrier.passed());
@@ -305,7 +306,7 @@ fn a_reader_does_not_wait_behind_the_drop_of_a_closed_files_handle() {
     assert_eq!(count(&volume.writer.aside_waits), 0);
 }
 
-// A key that closed a file waits behind its own handle's drop only: once
+// A key that let a file go waits behind its own handle's drop only: once
 // the batch runs nothing more of it, the handle is dropped and the key
 // returned, and the volume's settle has gone past it, while the rest of
 // the batch, another key's writes, is still to run.
@@ -331,14 +332,16 @@ fn a_closed_handle_is_dropped_once_the_batch_runs_nothing_more_of_its_key() {
             open,
         },
     );
+    closing.release(1);
     other.write(1, 0, Bytes::from_static(b"more"), create(&other_path));
     other.write(1, 4, Bytes::from_static(b"tail"), None);
     let state = &writers.lane(&volume).state;
     hold.release(1);
     hold.wait_held();
     assert_eq!(state.returned.load(Ordering::SeqCst), 1);
-    // The closing key's write and close run; the other key's are next.
-    hold.release(2);
+    // The closing key's write, close and release run; the other key's are
+    // next.
+    hold.release(3);
     hold.wait_held();
     let closed = closing.barrier();
     assert!(
@@ -348,7 +351,7 @@ fn a_closed_handle_is_dropped_once_the_batch_runs_nothing_more_of_its_key() {
     assert!(!other.barrier().returned());
     assert_eq!(
         state.returned.load(Ordering::SeqCst),
-        3,
+        4,
         "the settle went past it"
     );
     assert!(closing.barrier().key.held().letting_go.is_empty());
@@ -383,6 +386,7 @@ fn a_stopped_keys_code_is_dropped_after_the_handles_the_key_let_go() {
             open,
         },
     );
+    job.release(1);
     job.write(2, 0, Bytes::from_static(b"lost"), create(&failing_path));
     let ran = Arc::new(AtomicBool::new(false));
     let marked = Arc::clone(&ran);
@@ -392,8 +396,9 @@ fn a_stopped_keys_code_is_dropped_after_the_handles_the_key_let_go() {
     });
     hold.release(1);
     hold.wait_held();
-    // The write and the close run; the next write fails the key.
-    hold.release(2);
+    // The write, the close and the release run; the next write fails the
+    // key.
+    hold.release(3);
     hold.wait_held();
     assert_eq!(job.barrier().key.held().letting_go.len(), 1);
     hold.fail_next(io::Error::other("no room"));
@@ -1691,6 +1696,7 @@ fn a_close_sets_the_length_only_where_the_file_is_not_at_it() {
             Some(made_by(&path, declared, opener)),
         );
         job.close(file, length, made_by(&path, length, opener));
+        job.release(file);
     }
     let barrier = job.barrier();
     barrier.wait();
@@ -1821,6 +1827,8 @@ fn opens_length_sets_and_drops_are_timed() {
         Some(made_by(&second, 4, open_slowly)),
     );
     job.close(2, 4, made_by(&second, 4, open_slowly));
+    job.release(1);
+    job.release(2);
     let barrier = job.barrier();
     hold.open();
     barrier.wait();
@@ -1914,4 +1922,139 @@ fn an_open_files_write_is_placed_before_another_files_make() {
     written.wait();
     assert_eq!(std::fs::read(&made_path).unwrap(), b"more");
     assert_eq!(std::fs::read(&open_path).unwrap(), b"headtail");
+}
+
+// A file is closed when its download ends and again when its tree closes,
+// then written and closed again by a repair: its handle is kept through all
+// of it, and the file is opened once. Only a release lets the handle go.
+#[test]
+fn a_closed_file_written_and_closed_again_is_opened_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let job = writers.submitter(&volume, 1);
+    job.write(1, 0, Bytes::from_static(b"head"), create(&path));
+    job.close(1, 8, made_by(&path, 8, open));
+    job.close(1, 8, made_by(&path, 8, open));
+    job.write(1, 4, Bytes::from_static(b"tail"), create(&path));
+    job.close(1, 8, made_by(&path, 8, open));
+    job.truncate(1, made_by(&path, 0, open));
+    job.write(1, 0, Bytes::from_static(b"lanterns"), create(&path));
+    job.close(1, 8, made_by(&path, 8, open));
+    job.barrier().wait();
+    assert!(job.barrier().passed());
+    assert_eq!(std::fs::read(&path).unwrap(), b"lanterns");
+    assert_eq!(count(&volume.writer.opens), 1);
+    assert_eq!(count(&volume.writer.closes), 0);
+    job.release(1);
+    job.barrier().wait();
+    assert_eq!(count(&volume.writer.closes), 1);
+    assert!(job.barrier().key.held().open.is_empty());
+}
+
+// A caller's code that moves or removes a closed file runs with the file's
+// handle already dropped, and the next write opens the file again.
+#[test]
+fn a_move_and_a_removal_drop_a_closed_files_handle_before_they_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let (from, to) = (dir.path().join("from"), dir.path().join("to"));
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let job = writers.submitter(&volume, 1);
+    job.write(1, 0, Bytes::from_static(b"head"), create(&from));
+    job.close(1, 4, made_by(&from, 4, open));
+    let (seen, moved_from, moved_to) = (Arc::clone(&volume), from.clone(), to.clone());
+    let dropped = Arc::new(AtomicU64::new(u64::MAX));
+    let told = Arc::clone(&dropped);
+    job.run(Some(1), from.clone(), move || {
+        told.store(count(&seen.writer.closes), Ordering::SeqCst);
+        std::fs::rename(&moved_from, &moved_to)
+    });
+    job.barrier().wait();
+    assert!(job.barrier().passed());
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "the move ran on a held handle"
+    );
+    job.write(1, 4, Bytes::from_static(b"tail"), create(&to));
+    job.close(1, 8, made_by(&to, 8, open));
+    let (seen, removed) = (Arc::clone(&volume), to.clone());
+    let told = Arc::clone(&dropped);
+    job.run(Some(1), to.clone(), move || {
+        told.store(count(&seen.writer.closes), Ordering::SeqCst);
+        std::fs::remove_file(&removed)
+    });
+    job.barrier().wait();
+    assert!(job.barrier().passed());
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        2,
+        "the removal ran on a held handle"
+    );
+    assert!(!to.exists());
+    assert_eq!(count(&volume.writer.opens), 2);
+}
+
+// A key's end lets go of every handle it kept.
+#[test]
+fn a_keys_end_drops_its_closed_files_handles() {
+    let dir = tempfile::tempdir().unwrap();
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let job = writers.submitter(&volume, 1);
+    for file in 1..=3u64 {
+        let path = dir.path().join(file.to_string());
+        job.write(file, 0, Bytes::from_static(b"head"), create(&path));
+        job.close(file, 4, made_by(&path, 4, open));
+    }
+    job.barrier().wait();
+    assert_eq!(count(&volume.writer.closes), 0);
+    drop(job);
+    writers.wait_ended(&volume);
+    assert_eq!(count(&volume.writer.closes), 3);
+}
+
+// A key keeps the handles of at most `KEPT_CLOSED` closed files: past it the
+// one closed longest ago is let go, and only that file is opened again by
+// its next write.
+#[test]
+fn a_key_keeps_a_bounded_number_of_closed_files_handles() {
+    let dir = tempfile::tempdir().unwrap();
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let job = writers.submitter(&volume, 1);
+    let kept = super::KEPT_CLOSED as u64;
+    let path = |file: u64| dir.path().join(file.to_string());
+    for file in 1..=kept + 1 {
+        job.write(file, 0, Bytes::from_static(b"head"), create(&path(file)));
+        job.close(file, 4, made_by(&path(file), 4, open));
+    }
+    job.barrier().wait();
+    assert!(job.barrier().passed());
+    assert_eq!(count(&volume.writer.opens), kept + 1);
+    assert_eq!(count(&volume.writer.closes), 1);
+    assert_eq!(job.barrier().key.held().open.len() as u64, kept);
+    assert!(!job.barrier().key.held().open.contains_key(&1));
+    job.write(
+        kept + 1,
+        4,
+        Bytes::from_static(b"tail"),
+        create(&path(kept + 1)),
+    );
+    job.barrier().wait();
+    assert_eq!(
+        count(&volume.writer.opens),
+        kept + 1,
+        "the newest stayed open"
+    );
+    job.write(1, 4, Bytes::from_static(b"tail"), create(&path(1)));
+    job.barrier().wait();
+    assert_eq!(
+        count(&volume.writer.opens),
+        kept + 2,
+        "the oldest was let go"
+    );
+    assert_eq!(std::fs::read(path(1)).unwrap(), b"headtail");
 }
