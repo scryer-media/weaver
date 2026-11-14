@@ -229,11 +229,6 @@ impl Pipeline {
         let whole = completed && shortfall.is_none();
         let typed_terminal_cause = if whole {
             Some(crate::jobs::SemanticTerminalCause::Success)
-        } else if self.login_refusals.contains_key(&job_id) {
-            // Articles a server refusing the login was never asked for: the
-            // refusal is the cause, whatever a later failure recorded.
-            self.semantic_terminal_causes.remove(&job_id);
-            Some(crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage)
         } else {
             self.semantic_terminal_causes.remove(&job_id)
         };

@@ -412,10 +412,9 @@ async fn a_dead_post_past_a_refusing_server_is_given_up_where_a_missing_one_is()
             assert_eq!(refused.unservable, plain.missing);
             assert!(refused.unservable > 0);
             assert_eq!((refused.missing, plain.unservable), (0, 0));
-            assert_eq!(
-                refused.cause,
-                Some(crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage)
-            );
+            // The cause is the missing articles either way: the servers
+            // asked said so, and the job's next duplicate is tried.
+            assert_eq!(refused.cause, plain.cause);
             assert_eq!(
                 plain.cause,
                 Some(crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth)
@@ -1180,7 +1179,7 @@ fn failed_for(pipeline: &Pipeline, job_id: JobId) -> Option<String> {
 
 // An article every server asked said "not found", in a job where another
 // server refuses the login and is never asked, is booked unservable, not
-// missing. The job ends where it would have, and its cause is the refusal,
+// missing. The job ends where it would have, its cause the missing articles,
 // with the refusing server named.
 #[tokio::test]
 async fn a_not_found_walk_past_a_refusing_server_is_booked_unservable_and_names_the_server() {
@@ -1201,28 +1200,97 @@ async fn a_not_found_walk_past_a_refusing_server_is_booked_unservable_and_names_
             (0, 1, SegmentTerminalState::Abandoned)
         ]
     );
-    assert_eq!(
-        pipeline.semantic_terminal_causes.get(&ALPHA),
-        Some(&crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage)
-    );
+    let missing = Some(&crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth);
+    assert_eq!(pipeline.semantic_terminal_causes.get(&ALPHA), missing);
     let words = pipeline.login_refusal_words(ALPHA).unwrap();
     assert!(words.contains("s2.example"), "{words}");
     assert!(!words.contains("s0.example") && !words.contains("s1.example"));
-    // Whatever fails the job, its reason carries those words and its cause
-    // stays the refusal.
-    pipeline.semantic_terminal_causes.insert(
-        ALPHA,
-        crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth,
-    );
-    pipeline.fail_job(ALPHA, "the post cannot complete".into());
+    // Failing for want of articles, its reason carries those words and its
+    // cause stays the missing articles.
+    pipeline.fail_job_on_health(ALPHA, "the post cannot complete".into());
     let reason = failed_for(&pipeline, ALPHA).unwrap();
-    assert!(
-        reason.starts_with("the post cannot complete; ") && reason.ends_with(&words),
-        "{reason}"
+    assert_eq!(reason, format!("the post cannot complete; {words}"));
+    assert_eq!(pipeline.semantic_terminal_causes.get(&ALPHA), missing);
+}
+
+// Failing for any other reason, the same job's reason is its own.
+#[tokio::test]
+async fn a_failure_of_another_kind_past_a_refusing_server_says_nothing_of_it() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _) = walk_alphas_first_article(&temp_dir, Some(2)).await;
+    assert!(pipeline.login_refusal_words(ALPHA).is_some());
+    pipeline.fail_job(ALPHA, "the password is wrong".into());
+    assert_eq!(
+        failed_for(&pipeline, ALPHA).as_deref(),
+        Some("the password is wrong")
     );
     assert_eq!(
         pipeline.semantic_terminal_causes.get(&ALPHA),
-        Some(&crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage)
+        Some(&crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth)
+    );
+}
+
+// The ladder's servers in another order, or fewer of them: server `n` is the
+// same server in every client built here.
+fn ladder_servers(order: &[usize]) -> NntpClient {
+    NntpClient::new(NntpClientConfig {
+        servers: order
+            .iter()
+            .map(|&idx| {
+                let mut config = weaver_nntp::pool::ServerPoolConfig {
+                    max_connections: 100,
+                    stable_id: weaver_nntp::transfer::StableServerId(idx as u32),
+                    ..Default::default()
+                };
+                config.server.host = format!("s{idx}.example");
+                config
+            })
+            .collect(),
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 1,
+        soft_timeout: Duration::from_secs(15),
+    })
+}
+
+// The refusing servers a job holds follow the server list through a change
+// of it: a reordered server is still the one named, a removed one is not
+// named, and with none left there are no words. One server reads as one and
+// several as several.
+#[tokio::test]
+async fn the_refusing_servers_named_follow_a_reordered_and_a_shortened_server_list() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _) = walk_alphas_first_article(&temp_dir, Some(2)).await;
+    let rest = "never asked for the articles no other server had";
+    let one = |name: &str| Some(format!("server {name} refuses the login and was {rest}"));
+    assert_eq!(pipeline.login_refusal_words(ALPHA), one("s2.example:563"));
+
+    // Reordered: what was third is first, and is still the one named.
+    let generation = pipeline.pool_generation;
+    pipeline.activate_nntp(ladder_servers(&[2, 0, 1]), 8, generation + 1);
+    assert_eq!(pipeline.login_refusal_words(ALPHA), one("s2.example:563"));
+
+    // A second server refuses too: s0, now at the second place.
+    pipeline.note_login_refusals(ALPHA, [1usize].into_iter().collect());
+    pipeline.note_login_refusals(ALPHA, [0usize, 1].into_iter().collect());
+    assert_eq!(pipeline.login_refusals[&ALPHA].len(), 2);
+    assert_eq!(
+        pipeline.login_refusal_words(ALPHA),
+        Some(format!(
+            "servers s2.example:563, s0.example:563 refuse the login and were {rest}"
+        ))
+    );
+
+    // s2 leaves the list: only s0 is named.
+    pipeline.activate_nntp(ladder_servers(&[1, 0]), 8, generation + 2);
+    assert_eq!(pipeline.login_refusal_words(ALPHA), one("s0.example:563"));
+
+    // s0 leaves too: no words, and a failure for want of articles adds none.
+    pipeline.activate_nntp(ladder_servers(&[1]), 8, generation + 3);
+    assert_eq!(pipeline.login_refusal_words(ALPHA), None);
+    pipeline.fail_job_on_health(ALPHA, "the post cannot complete".into());
+    assert_eq!(
+        failed_for(&pipeline, ALPHA).as_deref(),
+        Some("the post cannot complete")
     );
 }
 
@@ -1260,7 +1328,8 @@ async fn a_not_found_walk_over_every_server_is_still_booked_missing() {
 // A job with both kinds: six files of four articles, no recovery. The first
 // article to walk out was asked of every server and is missing. Then one
 // server starts refusing the login, and each article that walks out after
-// was never asked of it and is unservable. The job's cause is the refusal.
+// was never asked of it and is unservable. The job's cause is the missing
+// articles, and its words name the refusing server.
 #[tokio::test]
 async fn a_job_with_missing_and_unservable_articles_books_each_as_it_is() {
     let levels = vec![(0, false), (1, false), (2, false)];
@@ -1324,7 +1393,7 @@ async fn a_job_with_missing_and_unservable_articles_books_each_as_it_is() {
     assert!(pipeline.post_probes.dead.contains_key(&job_id));
     assert_eq!(
         pipeline.semantic_terminal_causes.get(&job_id),
-        Some(&crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage)
+        Some(&crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth)
     );
     let words = pipeline.login_refusal_words(job_id).unwrap();
     assert!(words.contains("s2.example"), "{words}");

@@ -1211,11 +1211,7 @@ impl Pipeline {
                         crate::jobs::SemanticTerminalCause::DecodeOrCorruptData
                     }
                 };
-                // A job with articles a refusing server was never asked for
-                // keeps the refusal as its cause.
-                if !self.login_refusals.contains_key(&job_id) {
-                    self.semantic_terminal_causes.insert(job_id, terminal_cause);
-                }
+                self.semantic_terminal_causes.insert(job_id, terminal_cause);
                 match &failure.kind {
                     DownloadFailureKind::ArticleNotFound => self
                         .metrics
@@ -1351,7 +1347,7 @@ impl Pipeline {
                         });
                         // A server that refuses the login was never asked:
                         // the article is unservable, not known to be gone,
-                        // and the refusal is the job's cause.
+                        // and the job keeps which server refused.
                         let refused_by = self.login_refused_unasked(job_id, retry_exclude_servers);
                         let booked = if refused_by.is_empty() {
                             self.book_failed_segment(result.segment_id)

@@ -71,6 +71,16 @@ impl Pipeline {
             crate::post_processing::model::QueueEvent::NzbDeleted,
             Some("HEALTH"),
         );
+        // Only here, where the job fails for want of articles: when a server
+        // refusing the login left articles of it unasked for, the reason
+        // names it. The cause is not touched: the servers asked said the
+        // articles are not there, so it stays a missing-article failure and
+        // the job's next duplicate is tried. Every other way a job fails
+        // keeps its own reason.
+        let error = match self.login_refusal_words(job_id) {
+            Some(words) => format!("{error}; {words}"),
+            None => error,
+        };
         self.fail_job(job_id, error);
     }
 
@@ -85,18 +95,6 @@ impl Pipeline {
         if self.job_failure_started(job_id) {
             return;
         }
-        // A job with articles left unasked for by a server refusing the
-        // login says so, and its cause is the refusal whatever stage failed.
-        let error = match self.login_refusal_words(job_id) {
-            Some(words) => {
-                self.semantic_terminal_causes.insert(
-                    job_id,
-                    crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage,
-                );
-                format!("{error}; {words}")
-            }
-            None => error,
-        };
         tracing::error!(job_id = job_id.0, reason = %error, "job failed");
         let failure_stage = self
             .jobs
