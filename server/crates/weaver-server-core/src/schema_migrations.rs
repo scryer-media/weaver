@@ -1421,6 +1421,144 @@ mod tests {
         assert_eq!(db.list_egress_interfaces().unwrap().len(), 1);
     }
 
+    // A database at 0.16.16's last schema, 92, upgrades to the current one
+    // and keeps what 0.16.16 stored: a finished job with the release name,
+    // search key, archive and sweep 0.16.16's migrations added, its archived
+    // files, a waiting job with its stored NZB, and a server. The finished
+    // job reads as an NZB job.
+    #[tokio::test]
+    async fn the_0_16_16_schema_upgrades_to_current_and_keeps_its_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("v0.16.16.db");
+        let pool = open_test_pool(&db_path).await;
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(92), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            max_recorded_migration_version(&pool).await.unwrap(),
+            Some(92)
+        );
+        sqlx::query(
+            "INSERT INTO active_jobs
+                (job_id, nzb_hash, nzb_path, output_dir, status, error, created_at, category,
+                 metadata, staging_dir, nzb_title)
+             VALUES (101, ?, 'active.nzb', 'active-output', 'queued', NULL, 1, NULL, NULL,
+                     'staging', 'Waiting.Release')",
+        )
+        .bind(vec![1_u8; 32])
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO job_nzbs (job_id, nzb_zstd) VALUES (101, ?)")
+            .bind(vec![7_u8; 16])
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO job_history
+                (job_id, name, status, total_bytes, downloaded_bytes,
+                 optional_recovery_bytes, optional_recovery_downloaded_bytes,
+                 failed_bytes, health, created_at, completed_at,
+                 release_name, search_key, archived_at, archived_file_count,
+                 archived_file_bytes, files_swept_at)
+             VALUES (102, 'history', 'complete', 10, 10, 0, 0, 0, 1000, 1, 2,
+                     'Finished.Release.2026', 'finished release 2026', 3, 1, 10, 4)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO job_history_archived_files (job_id, ordinal, rel_path, size_bytes)
+             VALUES (102, 0, 'Finished.Release.2026.mkv', 10)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO servers (id, host, port, tls, connections, active, priority, backfill)
+             VALUES (1, 'news.example.test', 563, 1, 8, 1, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        assert_eq!(CURRENT_SCHEMA_VERSION, 119);
+        assert_eq!(
+            max_recorded_migration_version(&pool).await.unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+        let version: i64 = sqlx::query_scalar("SELECT version FROM schema_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        let finished: (
+            String,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            String,
+        ) = sqlx::query_as(
+            "SELECT release_name, search_key, archived_at, archived_file_count,
+                        files_swept_at, protocol
+                   FROM job_history WHERE job_id = 102",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            finished,
+            (
+                "Finished.Release.2026".to_string(),
+                "finished release 2026".to_string(),
+                Some(3),
+                Some(1),
+                Some(4),
+                "nzb".to_string()
+            )
+        );
+        let archived: (String, i64) = sqlx::query_as(
+            "SELECT rel_path, size_bytes FROM job_history_archived_files WHERE job_id = 102",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(archived, ("Finished.Release.2026.mkv".to_string(), 10));
+        let waiting: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT staging_dir, nzb_title FROM active_jobs WHERE job_id = 101")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            waiting,
+            (
+                Some("staging".to_string()),
+                Some("Waiting.Release".to_string())
+            )
+        );
+        let nzb: Vec<u8> = sqlx::query_scalar("SELECT nzb_zstd FROM job_nzbs WHERE job_id = 101")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(nzb, vec![7_u8; 16]);
+        let host: String = sqlx::query_scalar("SELECT host FROM servers WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(host, "news.example.test");
+        pool.close().await;
+        let db = crate::Database::open(&db_path).unwrap();
+        db.validate_backup_catalog().unwrap();
+        assert_eq!(db.list_servers().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn fresh_install_runs_remaining_migrations_to_current_schema() {
         let pool = SqlitePoolOptions::new()
