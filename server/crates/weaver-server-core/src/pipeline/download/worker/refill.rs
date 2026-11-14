@@ -384,7 +384,7 @@ impl Pipeline {
         debug_assert!(
             reserved
                 .iter()
-                .all(|work| !work.exclude_servers.contains(&server_idx)),
+                .all(|work| !work.exclude_servers.contains(server_idx)),
             "a lease holds an article already excluded from the server it is pinned to"
         );
         let completion_critical = reserved.iter().any(|work| work.completion_critical);
@@ -399,7 +399,8 @@ impl Pipeline {
             lane_mode,
             server_modes: vec![(server_idx, lane_mode)],
             completion_critical,
-            effective_exclude_servers: self.effective_exclude_servers(job_id, &[]),
+            effective_exclude_servers: self
+                .effective_exclude_servers(job_id, weaver_nntp::ServerSet::EMPTY),
             dial_exclude_servers,
             checkpoint_plan: self
                 .graph_jobs

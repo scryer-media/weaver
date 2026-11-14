@@ -289,7 +289,7 @@ async fn extraction_pause_uses_current_download_activity() {
     state.post_state = crate::jobs::model::PostState::Extracting;
     state.run_state = crate::jobs::model::RunState::Active;
     state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
-    pipeline.active_downloads_by_job.insert(id, 1);
+    pipeline.articles_in_flight_by_job.insert(id, 1);
     pipeline.report_job(id);
     assert_eq!(
         handle.get_job(id).unwrap().download_state,
@@ -307,7 +307,7 @@ async fn extraction_pause_uses_current_download_activity() {
     // back, and the job resumes before a turn parks it: it still holds its
     // articles, with nothing left to fetch.
     assert!(pipeline.jobs[&id].articles.active().is_some());
-    pipeline.active_downloads_by_job.remove(&id);
+    pipeline.articles_in_flight_by_job.remove(&id);
     handle.resume_job(id).await.unwrap();
     pipeline.apply_queue_intents().await;
     let watermark = handle.job_revision();
@@ -443,7 +443,7 @@ async fn pause_refused_after_downloads_drain_clears_the_intent_and_releases_the_
         state.status = JobStatus::Extracting;
         state.download_state = crate::DownloadState::Complete;
         state.post_state = crate::jobs::model::PostState::Extracting;
-        pipeline.active_downloads_by_job.insert(id, 1);
+        pipeline.articles_in_flight_by_job.insert(id, 1);
         pipeline.report_job(id);
         if post_processing_paused {
             handle.pause_post_processing().await.unwrap();
@@ -451,7 +451,7 @@ async fn pause_refused_after_downloads_drain_clears_the_intent_and_releases_the_
             pipeline.start_move_to_complete(id).await.unwrap();
         }
         handle.pause_job(id).await.unwrap();
-        pipeline.active_downloads_by_job.remove(&id);
+        pipeline.articles_in_flight_by_job.remove(&id);
         if post_processing_paused {
             handle.resume_post_processing().await.unwrap();
         } else {

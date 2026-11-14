@@ -78,7 +78,7 @@ struct QueueFacts {
 // The counters the pipeline and its workers publish as they go.
 #[derive(Debug, Serialize)]
 struct WorkFacts {
-    active_downloads: usize,
+    articles_in_flight: usize,
     download_queue_depth: usize,
     recovery_queue_depth: usize,
     download_lanes_active: usize,
@@ -184,7 +184,7 @@ fn unanswered(
             scheduled_pause: queue.scheduled_pause,
         },
         work: WorkFacts {
-            active_downloads: metrics.active_downloads,
+            articles_in_flight: metrics.articles_in_flight,
             download_queue_depth: metrics.download_queue_depth,
             recovery_queue_depth: metrics.recovery_queue_depth,
             download_lanes_active: metrics.download_lanes_active,

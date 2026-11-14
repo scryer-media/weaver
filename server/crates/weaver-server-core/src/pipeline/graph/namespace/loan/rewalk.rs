@@ -62,7 +62,7 @@ impl RewalkLoan {
         shutdown: &Shutdown,
         said: &mut dyn FnMut(VolumeIndex, Result<Posted, ByteRange>, ScratchRead) -> bool,
     ) -> bool {
-        self.access.shutdown = shutdown.clone();
+        self.access.begin(shutdown);
         let access = &self.access;
         let node = self.rewalk.node;
         let mut placed = |volume: VolumeIndex, placement: &Placement, into: &mut Vec<u8>| {
@@ -107,7 +107,6 @@ impl NamespaceWriter {
         tree: &mut Tree,
         node: NodeId,
     ) -> Result<Option<RewalkLoan>, LeafError> {
-        self.settle_disk();
         let Some((parent, volumes)) = tree.volumes(node) else {
             let _ = tree.take_rewalk(node);
             return Ok(None);
@@ -123,6 +122,9 @@ impl NamespaceWriter {
             defer_holds: false,
             scratch_read: Some(RefCell::default()),
             held_scratch: BTreeMap::new(),
+            settled: self.unsettled(),
+            scratch_later: BTreeMap::new(),
+                unwritten: false,
             internal: self.working_dir.join(weaver_graph::names::INTERNAL_DIR),
             members: BTreeMap::new(),
             usage: RefCell::default(),

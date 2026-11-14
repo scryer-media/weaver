@@ -126,6 +126,7 @@ pub(crate) struct RestoreSeat {
         Arc<crate::operations::disk::writer::VolumeWriters>,
         Arc<crate::operations::StorageCapacity>,
         Arc<super::disk::VolumeProbes>,
+        u64,
     ),
 }
 
@@ -162,6 +163,7 @@ impl Pipeline {
                 Arc::clone(&self.volume_writers),
                 Arc::clone(&self.storage_capacity),
                 Arc::clone(&self.volume_probes),
+                self.write_backlog_budget_bytes as u64,
             ),
         }
     }
@@ -210,6 +212,12 @@ impl RestoreSeat {
 
     pub(crate) fn working_dir(&self) -> &Path {
         &self.working_dir
+    }
+
+    // The seat for a job whose working directory moved before it started.
+    pub(crate) fn moved_to(mut self, working_dir: PathBuf) -> Self {
+        self.working_dir = working_dir;
+        self
     }
 
     // Read the job's checkpoint back and rebuild the job from it. A
@@ -268,6 +276,13 @@ impl RestoreSeat {
             sweep_unnamed(output_dir, &snapshot, &rows.held_parts)?;
         }
         let held = held_parts_from_rows(job_id, &self.working_dir, &rows.held_parts);
+        // This thread may wait on a disk: the volumes of the job's
+        // directories are read here when memory does not cover them, so the
+        // job's disk is never given the volume of an unknown device.
+        self.volumes.1.read_volume(&self.working_dir);
+        if let Some((output_dir, _)) = &self.output {
+            self.volumes.1.read_volume(output_dir);
+        }
         let disk = super::disk::job_disk(
             &self.volumes.0,
             &self.volumes.1,
@@ -275,6 +290,7 @@ impl RestoreSeat {
             job_id.0,
             &self.working_dir,
             self.output.as_ref().map(|(dir, _)| dir.as_path()),
+            self.volumes.3,
         );
         let storage = Storage {
             disk: Some(disk),

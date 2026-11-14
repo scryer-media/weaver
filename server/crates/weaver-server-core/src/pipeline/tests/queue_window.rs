@@ -204,6 +204,679 @@ async fn a_restart_installs_only_the_window_and_lists_every_row_in_place() {
     );
 }
 
+// Jobs paused before they started wait as their rows: the window holds the
+// jobs behind them instead, a restart installs none of them, and a resumed
+// one enters on its turn. A paused job that started stays installed.
+#[tokio::test]
+async fn jobs_paused_before_they_start_take_no_window_place() {
+    let paused_ids = || 3..=62u64;
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, handle) = long_queue(&temp, 2).await;
+    // The started job has bytes in hand and a stored checkpoint, as a job
+    // that fetched articles does.
+    let started = JobId(63);
+    activate_job(&mut pipeline, started).await;
+    pipeline.jobs.get_mut(&started).unwrap().downloaded_bytes = 512;
+    pipeline.checkpoint_graph_job(started);
+    pipeline.flush_graph_checkpoint(started);
+    pipeline.db.flush_write_queue().await.unwrap();
+    assert!(pipeline.db.has_graph_checkpoint(started).unwrap());
+    let paused: Vec<JobId> = paused_ids().map(JobId).chain([started]).collect();
+    for outcome in handle.set_jobs_paused(paused, true).await.into_values() {
+        outcome.unwrap();
+    }
+    settle(&mut pipeline).await;
+    // The slot holders, the started job, and the first jobs that are not
+    // paused, a full window of them.
+    let window = |last: u64| -> Vec<JobId> {
+        [1, 2]
+            .into_iter()
+            .chain(63..=last)
+            .map(JobId)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(installed(&pipeline), window(160));
+    assert!(paused_ids().all(|id| pipeline.window_parked(JobId(id))));
+    assert_eq!(rows(&pipeline), QUEUED as usize);
+    assert!(paused_ids().all(|id| {
+        handle
+            .get_job(JobId(id))
+            .is_ok_and(|job| job.status == JobStatus::Paused)
+    }));
+
+    // Resumed, a job enters in its place in the order; the last of the
+    // window leaves.
+    let resumed = JobId(10);
+    for outcome in handle.set_jobs_paused([resumed], false).await.into_values() {
+        outcome.unwrap();
+    }
+    settle(&mut pipeline).await;
+    let mut expected = window(159);
+    expected.insert(2, resumed);
+    assert_eq!(installed(&pipeline), expected);
+    assert!(!pipeline.window_parked(resumed));
+
+    // A restart installs none of the paused jobs either.
+    retire_pipeline_database(pipeline).await;
+    let (mut pipeline, intermediate, _) = new_direct_pipeline(&temp).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    handle
+        .set_max_concurrent_nzbs(std::num::NonZeroU32::new(2).unwrap())
+        .await
+        .unwrap();
+    let recovered = crate::operations::recover_server_state(
+        &pipeline.db,
+        &temp.path().join("data"),
+        &intermediate,
+    )
+    .await
+    .unwrap();
+    for candidate in recovered.to_restore {
+        handle.restore_job(candidate.request).await.unwrap();
+    }
+    settle(&mut pipeline).await;
+    let installed_now = installed(&pipeline);
+    assert!(
+        paused_ids()
+            .filter(|id| *id != resumed.0)
+            .all(|id| !installed_now.contains(&JobId(id))),
+        "a paused job that never started was installed: {installed_now:?}"
+    );
+    // The started job keeps its place in the window across the restart.
+    assert!(
+        installed_now.contains(&started),
+        "the paused job that started lost its place: {installed_now:?}"
+    );
+    assert!(!pipeline.window_parked(started));
+    assert_eq!(rows(&pipeline), QUEUED as usize);
+}
+
+// A paused job that started, moved out of the window and back, is read back
+// with its stored checkpoint: its row says it started, so it keeps the place
+// it was moved to, turn after turn.
+#[tokio::test]
+async fn a_started_paused_job_moved_out_and_back_keeps_its_place() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, handle) = long_queue(&temp, 2).await;
+    let started = JobId(63);
+    activate_job(&mut pipeline, started).await;
+    pipeline.jobs.get_mut(&started).unwrap().downloaded_bytes = 512;
+    pipeline.checkpoint_graph_job(started);
+    pipeline.flush_graph_checkpoint(started);
+    pipeline.db.flush_write_queue().await.unwrap();
+    assert!(pipeline.db.has_graph_checkpoint(started).unwrap());
+    for outcome in handle.set_jobs_paused([started], true).await.into_values() {
+        outcome.unwrap();
+    }
+    settle(&mut pipeline).await;
+    assert!(installed(&pipeline).contains(&started));
+
+    // A restart restores it from its checkpoint, with nothing in hand.
+    retire_pipeline_database(pipeline).await;
+    let (mut pipeline, intermediate, _) = new_direct_pipeline(&temp).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    handle
+        .set_max_concurrent_nzbs(std::num::NonZeroU32::new(2).unwrap())
+        .await
+        .unwrap();
+    let recovered = crate::operations::recover_server_state(
+        &pipeline.db,
+        &temp.path().join("data"),
+        &intermediate,
+    )
+    .await
+    .unwrap();
+    for candidate in recovered.to_restore {
+        handle.restore_job(candidate.request).await.unwrap();
+    }
+    settle(&mut pipeline).await;
+    assert!(installed(&pipeline).contains(&started));
+
+    handle
+        .reorder_jobs(vec![(started, QueueMoveTarget::Bottom)])
+        .await
+        .unwrap();
+    settle(&mut pipeline).await;
+    assert!(
+        pipeline.window_parked(started),
+        "the moved job stayed in the window: {:?}",
+        pipeline
+            .jobs
+            .get(&started)
+            .map(|s| (s.downloaded_bytes, s.status.clone()))
+    );
+
+    handle
+        .reorder_jobs(vec![(started, QueueMoveTarget::Top)])
+        .await
+        .unwrap();
+    settle(&mut pipeline).await;
+    let on_disk = |pipeline: &Pipeline| {
+        pipeline
+            .shared_state
+            .queue
+            .read(|inner| inner.job(started).unwrap().report.on_disk)
+    };
+    assert!(
+        on_disk(&pipeline),
+        "the re-entered row states its checkpoint"
+    );
+    for _ in 0..3 {
+        assert!(installed(&pipeline).contains(&started));
+        assert!(!pipeline.window_parked(started));
+        settle(&mut pipeline).await;
+    }
+    assert_eq!(handle.get_job(started).unwrap().status, JobStatus::Paused);
+}
+
+// The intermediate folder changes with two jobs queued, and Weaver restarts
+// before either runs on. The job that started keeps its working directory;
+// the one that never started works under the new folder as it starts, and
+// leaves nothing behind in the old one. Another restart keeps both answers.
+#[tokio::test]
+async fn an_intermediate_folder_change_moves_only_the_jobs_that_never_started() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, old_root, complete) = new_direct_pipeline(&temp).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let (started, unstarted) = (JobId(1), JobId(2));
+    enqueue(&mut pipeline, started.0).await;
+    enqueue(&mut pipeline, unstarted.0).await;
+    settle(&mut pipeline).await;
+    activate_job(&mut pipeline, started).await;
+    pipeline.jobs.get_mut(&started).unwrap().downloaded_bytes = 512;
+    pipeline.checkpoint_graph_job(started);
+    pipeline.flush_graph_checkpoint(started);
+    pipeline.db.flush_write_queue().await.unwrap();
+    let working = |pipeline: &Pipeline, id: JobId| pipeline.jobs[&id].working_dir.clone();
+    let (started_dir, unstarted_dir) = (working(&pipeline, started), working(&pipeline, unstarted));
+    assert_eq!(started_dir.parent(), Some(old_root.as_path()));
+    assert_eq!(unstarted_dir.parent(), Some(old_root.as_path()));
+    assert!(unstarted_dir.exists());
+
+    // The setting changes: nothing moves yet.
+    let new_root = temp.path().join("moved-intermediate");
+    let data = temp.path().join("data");
+    handle
+        .update_runtime_paths(data.clone(), new_root.clone(), complete.clone())
+        .await
+        .unwrap();
+    settle(&mut pipeline).await;
+    assert_eq!(pipeline.intermediate_dir, new_root);
+    assert_eq!(working(&pipeline, unstarted), unstarted_dir);
+    assert!(unstarted_dir.exists());
+
+    let restart = |pipeline: Pipeline| {
+        let (data, new_root, complete) = (data.clone(), new_root.clone(), complete.clone());
+        let db_path = temp.path().join("weaver.db");
+        async move {
+            retire_pipeline_database(pipeline).await;
+            let (mut pipeline, _, _) = new_direct_pipeline_at_roots(
+                data.clone(),
+                new_root.clone(),
+                complete,
+                db_path,
+                16 * 1024 * 1024,
+                0,
+                None,
+            )
+            .await;
+            let handle =
+                SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+            let recovered = crate::operations::recover_server_state(&pipeline.db, &data, &new_root)
+                .await
+                .unwrap();
+            let mut dirs = std::collections::BTreeMap::new();
+            for candidate in recovered.to_restore {
+                dirs.insert(candidate.job_id, candidate.request.working_dir.clone());
+                handle.restore_job(candidate.request).await.unwrap();
+            }
+            settle(&mut pipeline).await;
+            (pipeline, dirs)
+        }
+    };
+    let (mut pipeline, _) = restart(pipeline).await;
+    // The started job comes back with its checkpoint already built; the
+    // other waits for its first handout.
+    for id in [started, unstarted] {
+        if matches!(
+            pipeline.jobs[&id].articles,
+            crate::jobs::model::JobArticles::Queued(_)
+        ) {
+            activate_job(&mut pipeline, id).await;
+        }
+    }
+    assert!(matches!(
+        pipeline.jobs[&unstarted].articles,
+        crate::jobs::model::JobArticles::Active(_)
+    ));
+    assert_eq!(working(&pipeline, started), started_dir);
+    assert!(started_dir.exists());
+    let moved = working(&pipeline, unstarted);
+    assert_eq!(moved.parent(), Some(new_root.as_path()));
+    assert!(crate::jobs::working_dir::is_job_working_dir(&new_root, &moved, unstarted).unwrap());
+    assert!(!unstarted_dir.exists(), "the old folder is left behind");
+
+    // A second restart reads each job's directory back as it is.
+    let (pipeline, dirs) = restart(pipeline).await;
+    assert_eq!(dirs[&started], started_dir);
+    assert_eq!(dirs[&unstarted], moved);
+    drop(pipeline);
+}
+
+// A job that never started is sent for, let go, and sent for again while the
+// first read is still moving its working directory. The second ask waits
+// for that move to be heard, so the job gets one new directory, not two.
+#[tokio::test]
+async fn a_job_sent_for_twice_moves_its_working_directory_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, old_root, complete) = new_direct_pipeline(&temp).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let id = JobId(1);
+    enqueue(&mut pipeline, id.0).await;
+    settle(&mut pipeline).await;
+    let queued = |pipeline: &Pipeline| {
+        matches!(
+            pipeline.jobs[&id].articles,
+            crate::jobs::model::JobArticles::Queued(_)
+        )
+    };
+    assert!(queued(&pipeline));
+    let old_dir = pipeline.jobs[&id].working_dir.clone();
+    assert_eq!(old_dir.parent(), Some(old_root.as_path()));
+
+    let new_root = temp.path().join("moved-intermediate");
+    handle
+        .update_runtime_paths(temp.path().join("data"), new_root.clone(), complete)
+        .await
+        .unwrap();
+    settle(&mut pipeline).await;
+    assert_eq!(pipeline.intermediate_dir, new_root);
+
+    // The first ask has the move; the job is let go before its reply.
+    pipeline.request_job_activation(id);
+    assert!(pipeline.moving_jobs.contains_key(&id));
+    pipeline.release_job_articles(id);
+    assert!(queued(&pipeline));
+    // The second ask sends nothing while the move is out.
+    pipeline.request_job_activation(id);
+    assert!(queued(&pipeline));
+    assert!(pipeline.awaits_job_articles(id));
+
+    // The first reply is no longer the job's activation, and its move
+    // stands all the same.
+    let done = pipeline.job_activated_rx.recv().await.unwrap();
+    pipeline.handle_job_activated(done);
+    assert!(queued(&pipeline));
+    assert!(pipeline.moving_jobs.is_empty());
+    let moved = pipeline.jobs[&id].working_dir.clone();
+    assert_eq!(moved.parent(), Some(new_root.as_path()));
+    assert!(!old_dir.exists(), "the old folder is left behind");
+    // The stored row named the new directory before the old one went.
+    let stored = |pipeline: &Pipeline| {
+        pipeline
+            .db
+            .load_active_job_row(id)
+            .unwrap()
+            .unwrap()
+            .output_dir
+    };
+    assert_eq!(stored(&pipeline), moved);
+
+    // Sent for again, the job starts in the directory it moved to.
+    activate_job(&mut pipeline, id).await;
+    assert!(matches!(
+        pipeline.jobs[&id].articles,
+        crate::jobs::model::JobArticles::Active(_)
+    ));
+    assert_eq!(pipeline.jobs[&id].working_dir, moved);
+    assert!(pipeline.moving_jobs.is_empty());
+    let dirs = std::fs::read_dir(&new_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(dirs, vec![moved]);
+}
+
+// One queued job that never started, its intermediate folder then changed.
+async fn unstarted_job_with_a_changed_folder(
+    temp: &tempfile::TempDir,
+    id: JobId,
+) -> (Pipeline, PathBuf, PathBuf) {
+    let (mut pipeline, old_root, complete) = new_direct_pipeline(temp).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    enqueue(&mut pipeline, id.0).await;
+    settle(&mut pipeline).await;
+    assert!(matches!(
+        pipeline.jobs[&id].articles,
+        crate::jobs::model::JobArticles::Queued(_)
+    ));
+    let old_dir = pipeline.jobs[&id].working_dir.clone();
+    assert_eq!(old_dir.parent(), Some(old_root.as_path()));
+    let new_root = temp.path().join("moved-intermediate");
+    handle
+        .update_runtime_paths(temp.path().join("data"), new_root.clone(), complete)
+        .await
+        .unwrap();
+    settle(&mut pipeline).await;
+    (pipeline, old_dir, new_root)
+}
+
+// A job that never started is let go while its first read moves its working
+// directory, and leaves the pipeline's installed jobs before the reply: the
+// move is not lost. The stored row and the queue row name the new
+// directory, the old one is gone, and nothing else is left under the root.
+#[tokio::test]
+async fn a_move_heard_after_the_job_was_let_go_is_kept_on_its_row() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = JobId(1);
+    let (mut pipeline, old_dir, new_root) = unstarted_job_with_a_changed_folder(&temp, id).await;
+
+    pipeline.request_job_activation(id);
+    pipeline.release_job_articles(id);
+    let done = pipeline.job_activated_rx.recv().await.unwrap();
+    // The reply finds the job no longer installed, as one paused out of the
+    // window is not.
+    let state = pipeline.jobs.remove(&id).unwrap();
+    pipeline.handle_job_activated(done);
+    assert!(pipeline.moving_jobs.is_empty());
+
+    let stored = pipeline
+        .db
+        .load_active_job_row(id)
+        .unwrap()
+        .unwrap()
+        .output_dir;
+    assert_eq!(stored.parent(), Some(new_root.as_path()));
+    assert!(crate::jobs::working_dir::is_job_working_dir(&new_root, &stored, id).unwrap());
+    assert!(!old_dir.exists(), "the old folder is left behind");
+    let listed = pipeline
+        .shared_state
+        .queue
+        .read(|inner| inner.row(id).unwrap().report.job.output_dir.clone());
+    assert_eq!(listed, Some(stored.display().to_string()));
+    let dirs = std::fs::read_dir(&new_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(dirs, vec![stored]);
+    drop(state);
+}
+
+// A job paused while its first read moves its working directory, then
+// resumed: it starts in the new directory, which its stored row names, and
+// that is the one folder there is.
+#[tokio::test]
+async fn a_job_paused_while_its_move_is_out_resumes_in_the_new_folder() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = JobId(1);
+    let (mut pipeline, old_dir, new_root) = unstarted_job_with_a_changed_folder(&temp, id).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+
+    pipeline.request_job_activation(id);
+    handle.pause_job(id).await.unwrap();
+    settle(&mut pipeline).await;
+    let done = pipeline.job_activated_rx.recv().await.unwrap();
+    pipeline.handle_job_activated(done);
+    assert!(pipeline.moving_jobs.is_empty());
+    let stored = |pipeline: &Pipeline| {
+        pipeline
+            .db
+            .load_active_job_row(id)
+            .unwrap()
+            .unwrap()
+            .output_dir
+    };
+    let moved = stored(&pipeline);
+    assert_eq!(moved.parent(), Some(new_root.as_path()));
+    assert!(!old_dir.exists(), "the old folder is left behind");
+
+    handle.resume_job(id).await.unwrap();
+    settle(&mut pipeline).await;
+    if matches!(
+        pipeline.jobs[&id].articles,
+        crate::jobs::model::JobArticles::Queued(_)
+    ) {
+        activate_job(&mut pipeline, id).await;
+    }
+
+    assert!(matches!(
+        pipeline.jobs[&id].articles,
+        crate::jobs::model::JobArticles::Active(_)
+    ));
+    assert_eq!(pipeline.jobs[&id].working_dir, moved);
+    assert_eq!(stored(&pipeline), moved);
+    let dirs = std::fs::read_dir(&new_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(dirs, vec![moved]);
+}
+
+// A job that never started whose working directory is gone from under the
+// intermediate folder it is still set to is given one there again as it
+// starts; its stored row names it.
+#[tokio::test]
+async fn an_unstarted_job_whose_folder_is_gone_from_the_same_root_claims_one_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, root, _) = new_direct_pipeline(&temp).await;
+    let id = JobId(1);
+    enqueue(&mut pipeline, id.0).await;
+    settle(&mut pipeline).await;
+    let old_dir = pipeline.jobs[&id].working_dir.clone();
+    assert_eq!(old_dir.parent(), Some(root.as_path()));
+    std::fs::remove_dir_all(&old_dir).unwrap();
+
+    activate_job(&mut pipeline, id).await;
+
+    assert!(matches!(
+        pipeline.jobs[&id].articles,
+        crate::jobs::model::JobArticles::Active(_)
+    ));
+    let claimed = pipeline.jobs[&id].working_dir.clone();
+    assert!(crate::jobs::working_dir::is_job_working_dir(&root, &claimed, id).unwrap());
+    let stored = pipeline
+        .db
+        .load_active_job_row(id)
+        .unwrap()
+        .unwrap()
+        .output_dir;
+    assert_eq!(stored, claimed);
+}
+
+// A resume stored for a job that waited for a slot goes with the job when it
+// is cancelled: retried under the same id, paused and resumed while it waits
+// again, its resume is stored again.
+#[tokio::test]
+async fn a_cancelled_job_s_stored_resume_does_not_outlive_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    handle
+        .set_max_concurrent_nzbs(std::num::NonZeroU32::new(1).unwrap())
+        .await
+        .unwrap();
+    enqueue(&mut pipeline, 1).await;
+    enqueue(&mut pipeline, 2).await;
+    settle(&mut pipeline).await;
+    let id = JobId(2);
+    assert!(!pipeline.nzb_admitted.contains(&id));
+
+    handle.pause_job(id).await.unwrap();
+    settle(&mut pipeline).await;
+    handle.resume_job(id).await.unwrap();
+    settle(&mut pipeline).await;
+    assert!(pipeline.resumes_stored.contains(&id));
+
+    let mut events = handle.subscribe_events();
+    handle.cancel_job(id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    assert!(!pipeline.resumes_stored.contains(&id));
+    finish_cancel_jobs(&mut pipeline).await;
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
+    {
+    }
+    handle.redownload_job(id).await.unwrap();
+    settle(&mut pipeline).await;
+    assert!(!pipeline.nzb_admitted.contains(&id));
+
+    handle.pause_job(id).await.unwrap();
+    settle(&mut pipeline).await;
+    assert!(!pipeline.resumes_stored.contains(&id));
+    handle.resume_job(id).await.unwrap();
+    settle(&mut pipeline).await;
+    assert!(pipeline.resumes_stored.contains(&id));
+}
+
+// A job that never started whose working directory is gone, with the folder
+// it stood in, is given a new one under the intermediate folder set now as
+// it starts, and starts.
+#[tokio::test]
+async fn an_unstarted_job_whose_folder_is_gone_claims_a_new_one() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = JobId(1);
+    let (mut pipeline, old_dir, new_root) = unstarted_job_with_a_changed_folder(&temp, id).await;
+    std::fs::remove_dir_all(old_dir.parent().unwrap()).unwrap();
+
+    activate_job(&mut pipeline, id).await;
+
+    assert!(matches!(
+        pipeline.jobs[&id].articles,
+        crate::jobs::model::JobArticles::Active(_)
+    ));
+    let moved = pipeline.jobs[&id].working_dir.clone();
+    assert_eq!(moved.parent(), Some(new_root.as_path()));
+    assert!(crate::jobs::working_dir::is_job_working_dir(&new_root, &moved, id).unwrap());
+    let stored = pipeline
+        .db
+        .load_active_job_row(id)
+        .unwrap()
+        .unwrap()
+        .output_dir;
+    assert_eq!(stored, moved);
+}
+
+// A job deleted, by the real command, while its move was out leaves nothing
+// behind: neither the directory it had nor the one claimed for it.
+#[tokio::test]
+async fn a_job_deleted_while_its_move_is_out_leaves_no_folder() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = JobId(1);
+    let (mut pipeline, old_dir, new_root) = unstarted_job_with_a_changed_folder(&temp, id).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let mut events = handle.subscribe_events();
+
+    pipeline.request_job_activation(id);
+    handle.cancel_job_and_delete_history(id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(&mut pipeline).await;
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
+    {
+    }
+    let done = pipeline.job_activated_rx.recv().await.unwrap();
+    pipeline.handle_job_activated(done);
+    assert!(pipeline.moving_jobs.is_empty());
+
+    // The removals run off the actor: wait for the folders themselves.
+    while old_dir.exists()
+        || std::fs::read_dir(&new_root).is_ok_and(|mut entries| entries.next().is_some())
+    {
+        tokio::task::yield_now().await;
+    }
+    assert!(rows(&pipeline) == 0);
+}
+
+// A job cancelled while its move was out, and retried under the same id
+// before the move is heard: the retry has one folder, the one its row
+// names, and nothing is left of the first run.
+#[tokio::test]
+async fn a_job_cancelled_while_its_move_is_out_and_retried_has_one_folder() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = JobId(1);
+    let (mut pipeline, old_dir, new_root) = unstarted_job_with_a_changed_folder(&temp, id).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let mut events = handle.subscribe_events();
+
+    pipeline.request_job_activation(id);
+    handle.cancel_job(id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(&mut pipeline).await;
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
+    {
+    }
+    handle.redownload_job(id).await.unwrap();
+    let done = pipeline.job_activated_rx.recv().await.unwrap();
+    pipeline.handle_job_activated(done);
+    settle(&mut pipeline).await;
+
+    let retry = pipeline.jobs[&id].working_dir.clone();
+    assert_eq!(retry.parent(), Some(new_root.as_path()));
+    assert!(crate::jobs::working_dir::is_job_working_dir(&new_root, &retry, id).unwrap());
+    let stored = pipeline
+        .db
+        .load_active_job_row(id)
+        .unwrap()
+        .unwrap()
+        .output_dir;
+    assert_eq!(stored, retry);
+    // The removals run off the actor: wait for the folders themselves.
+    while old_dir.exists() || std::fs::read_dir(&new_root).unwrap().count() != 1 {
+        tokio::task::yield_now().await;
+    }
+    assert!(retry.exists());
+}
+
+// A job cancelled while its move was out, its id then being admitted again
+// or held by a history operation when the move is heard: whoever works with
+// the id may have taken the moved directory as its own, so the reply keeps
+// it. With no one working with the id, the same reply lets it go.
+#[tokio::test]
+async fn a_move_heard_while_its_id_is_worked_with_removes_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = JobId(1);
+    let (mut pipeline, _, new_root) = unstarted_job_with_a_changed_folder(&temp, id).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let mut events = handle.subscribe_events();
+
+    // The move is made and waits to be heard; the job is cancelled first.
+    pipeline.request_job_activation(id);
+    let done = pipeline.job_activated_rx.recv().await.unwrap();
+    let moved = done.moved_to.clone().expect("the read moved the job");
+    handle.cancel_job(id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(&mut pipeline).await;
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
+    {
+    }
+    assert_eq!(moved.parent(), Some(new_root.as_path()));
+    let queue = pipeline.shared_state.queue.clone();
+    assert!(queue.read(|inner| inner.row(id).is_none()));
+
+    for held_by_history in [false, true] {
+        queue.write(|inner| {
+            if held_by_history {
+                inner.history_operations.insert(id);
+            } else {
+                inner.admissions.insert(id);
+            }
+            crate::pipeline::queue::Change::unchanged(())
+        });
+        assert!(pipeline.take_moved_dir(id, &done.started_in, &moved));
+        queue.write(|inner| {
+            inner.history_operations.remove(&id);
+            inner.admissions.remove(&id);
+            crate::pipeline::queue::Change::unchanged(())
+        });
+    }
+    assert!(!pipeline.take_moved_dir(id, &done.started_in, &moved));
+
+    // Heard with no one working with the id, the directory goes, off the
+    // actor: wait for the folder itself.
+    pipeline.handle_job_activated(done);
+    while moved.exists() {
+        tokio::task::yield_now().await;
+    }
+}
+
 // A reorder among jobs out of the window changes no installed job, and is
 // stored all the same: a restart before they enter keeps it.
 #[tokio::test]

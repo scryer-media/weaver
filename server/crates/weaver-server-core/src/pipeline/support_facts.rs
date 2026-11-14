@@ -38,7 +38,7 @@ impl Pipeline {
     pub(super) fn note_gap_servers_support_fact(
         &mut self,
         job_id: JobId,
-        server_indices: &[usize],
+        server_indices: weaver_nntp::ServerSet,
     ) {
         if server_indices.is_empty() {
             return;
@@ -48,7 +48,7 @@ impl Pipeline {
             .filter_map(|idx| {
                 self.nntp
                     .pool()
-                    .stable_server_id(weaver_nntp::pool::ServerId(*idx))
+                    .stable_server_id(weaver_nntp::pool::ServerId(idx))
                     .map(|stable| stable.0)
             })
             .collect();

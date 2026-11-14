@@ -5,7 +5,7 @@ use super::*;
 
 impl DownloadPipelineBacklog {
     pub(in crate::pipeline::download::worker) fn has_durable_catch_up_work(self) -> bool {
-        self.active_downloads != 0
+        self.articles_in_flight != 0
             || self.active_decodes != 0
             || self.released_results != 0
             || self.pending_decodes != 0
@@ -79,6 +79,12 @@ impl CheckpointLease {
 }
 
 impl CheckpointAdmission {
+    // Whether the checkpoint refuses no article at all.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn admits_every_article(self) -> bool {
+        !self.enforced || self.limit == 0
+    }
+
     // Whether the checkpoint refuses every payload article of the job, of
     // any size, until its durable floor moves: an article sent to close the
     // gap is still out, or the lead is already past the limit while the
@@ -240,15 +246,6 @@ impl Pipeline {
         self.uu_spool_debits.apply(self.uu_spool_capacity.current())
     }
 
-    pub(in crate::pipeline::download::worker) fn uu_spool_cursor_ordinals(
-        &self,
-    ) -> HashMap<NzbFileId, u32> {
-        self.uu_files
-            .iter()
-            .map(|(file_id, uu)| (*file_id, uu.next_index))
-            .collect()
-    }
-
     pub(in crate::pipeline::download::worker) fn uu_work_closes_cursor(
         cursors: &HashMap<NzbFileId, u32>,
         work: &QueuedWork<'_>,
@@ -315,7 +312,7 @@ impl Pipeline {
         let durable_floor = self.durable_download_floor_bytes_for_job(job_id);
         let accepted_bytes = state.downloaded_bytes.saturating_sub(durable_floor);
         let speculative_active_items = self
-            .active_downloads_by_job
+            .articles_in_flight_by_job
             .get(&job_id)
             .copied()
             .unwrap_or(0)
@@ -349,8 +346,8 @@ impl Pipeline {
         #[cfg(not(test))]
         let pending_decodes = 0;
         DownloadPipelineBacklog {
-            active_downloads: self
-                .active_downloads_by_job
+            articles_in_flight: self
+                .articles_in_flight_by_job
                 .get(&job_id)
                 .copied()
                 .unwrap_or(0),

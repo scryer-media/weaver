@@ -169,7 +169,9 @@ pub(crate) struct ProbeBatch {
     found: Vec<bool>,
     // The servers that have answered for the batch or failed to, each asked
     // once.
-    asked: Vec<usize>,
+    asked: weaver_nntp::ServerSet,
+    // The pool generation `asked` is numbered in.
+    pool_generation: u64,
     // A server could not settle the batch.
     uncertain: bool,
 }
@@ -181,9 +183,30 @@ impl ProbeBatch {
             round,
             found: vec![false; ids.len()],
             ids,
-            asked: Vec::new(),
+            asked: weaver_nntp::ServerSet::EMPTY,
+            pool_generation: 0,
             uncertain: false,
         }
+    }
+
+    // The batch, its servers numbered in pool `generation`.
+    pub(crate) fn in_pool(mut self, generation: u64) -> Self {
+        self.pool_generation = generation;
+        self
+    }
+
+    // Whether whom the batch asked was already numbered in pool
+    // `generation`. A rebuilt pool renumbers its servers, so a batch carried
+    // across the rebuild has whom it asked carried over by server identity:
+    // a server that left the pool, or is no longer the same server, drops
+    // out and is untried. What the batch found is kept.
+    pub(crate) fn rebase(&mut self, layouts: &super::PoolLayouts, generation: u64) -> bool {
+        if self.pool_generation == generation {
+            return true;
+        }
+        self.asked = layouts.set(self.pool_generation, self.asked);
+        self.pool_generation = generation;
+        false
     }
 
     // The articles no server has said it holds yet, in batch order: what the
@@ -198,8 +221,8 @@ impl ProbeBatch {
     }
 
     // The servers this batch has been put to.
-    pub(crate) fn asked(&self) -> &[usize] {
-        &self.asked
+    pub(crate) fn asked(&self) -> weaver_nntp::ServerSet {
+        self.asked
     }
 
     // Whether a server holds every article in the batch.
@@ -212,7 +235,7 @@ impl ProbeBatch {
     // could not settle the batch, or that does not cover it, leaves the batch
     // uncertain.
     pub(crate) fn fold(&mut self, server: usize, result: ProbeBatchResult) {
-        self.asked.push(server);
+        self.asked.insert(server);
         let unfound = self.found.iter().filter(|found| !**found).count();
         if result.inconclusive || result.exists.len() != unfound {
             self.uncertain = true;
@@ -874,7 +897,9 @@ impl Pipeline {
         );
         let batches: Vec<ProbeBatch> = probes
             .chunks(BATCH_SIZE)
-            .map(|batch| ProbeBatch::new(job_id, round, batch.to_vec()))
+            .map(|batch| {
+                ProbeBatch::new(job_id, round, batch.to_vec()).in_pool(self.pool_generation)
+            })
             .collect();
         self.post_probes.lane_rounds.insert(
             job_id,
@@ -899,10 +924,11 @@ impl Pipeline {
     // A lane could not take the batch's seat for a reason that says nothing
     // about the server. Nothing was asked, so the batch waits for a seat as
     // it did before, and the dispatch pass that seats it is woken now.
-    fn post_probe_unseated(&mut self, batch: ProbeBatch) {
+    fn post_probe_unseated(&mut self, mut batch: ProbeBatch) {
         if !self.post_probes.current(&batch) {
             return;
         }
+        batch.rebase(&self.pool_layouts, self.pool_generation);
         self.post_probes.waiting.push_back(batch);
         self.download_dispatch_wake = true;
     }
@@ -919,7 +945,18 @@ impl Pipeline {
         if !self.post_probes.current(&batch) {
             return;
         }
-        batch.fold(server, result);
+        // An answer from a server of a pool since rebuilt names that server
+        // as the old pool numbered it: it is folded in under the server's
+        // current number, or not at all once the server is gone or changed.
+        let asked_under = batch.pool_generation;
+        let server = if batch.rebase(&self.pool_layouts, self.pool_generation) {
+            Some(server)
+        } else {
+            self.pool_layouts.index(asked_under, server)
+        };
+        if let Some(server) = server {
+            batch.fold(server, result);
+        }
         if batch.settled() {
             self.post_probe_batch_done(batch);
             return;
@@ -945,10 +982,11 @@ impl Pipeline {
         let idle_by_server = self.idle_download_lanes_by_server();
         let waiting = std::mem::take(&mut self.post_probes.waiting);
         let mut done = Vec::new();
-        for batch in waiting {
+        for mut batch in waiting {
             if !self.post_probes.current(&batch) {
                 continue;
             }
+            batch.rebase(&self.pool_layouts, self.pool_generation);
             // The selection was contended, which says nothing about the
             // servers; the next pass asks again.
             let Some(order) = self.nntp.blocking_body_server_order(batch.asked()) else {
@@ -1041,7 +1079,7 @@ impl Pipeline {
     fn post_probe_batch_done(&mut self, batch: ProbeBatch) {
         let pool = self.nntp.pool();
         let unasked_could_hold = (0..pool.server_count())
-            .any(|server| !batch.asked().contains(&server) && !pool.refuses_credentials(server));
+            .any(|server| !batch.asked().contains(server) && !pool.refuses_credentials(server));
         let job_id = batch.job_id;
         let Some(lane_round) = self
             .post_probes

@@ -21,7 +21,7 @@ use super::catalog::{
 use crate::persistence::sql_runtime::{SqlConn, StoreDatastore};
 use crate::schema_migrations::{
     egress_quotas_v53, history_retention_v89, history_search_key_v88, proxy_resolver_v64,
-    script_concurrency_v58, script_instances_v55, unwanted_extensions_v56,
+    script_concurrency_v58, script_instances_v55, server_limit_v92, unwanted_extensions_v56,
 };
 use crate::security::RuntimeSecurityConfig;
 use crate::{Database, StateError};
@@ -922,7 +922,8 @@ async fn import_sqlite(
         fill_older_unwanted_extensions(&mut SqlConn::Sqlite(&mut conn), source_schema_version)
             .await?;
         name_older_proxy_resolvers(&mut SqlConn::Sqlite(&mut conn), source_schema_version).await?;
-        name_older_history_releases(&mut SqlConn::Sqlite(&mut conn), source_schema_version).await
+        name_older_history_releases(&mut SqlConn::Sqlite(&mut conn), source_schema_version).await?;
+        trim_older_server_list(&mut SqlConn::Sqlite(&mut conn), source_schema_version).await
     }
     .await;
     match result {
@@ -1022,6 +1023,7 @@ async fn import_postgres(
     fill_older_unwanted_extensions(&mut SqlConn::Postgres(&mut tx), source_schema_version).await?;
     name_older_proxy_resolvers(&mut SqlConn::Postgres(&mut tx), source_schema_version).await?;
     name_older_history_releases(&mut SqlConn::Postgres(&mut tx), source_schema_version).await?;
+    trim_older_server_list(&mut SqlConn::Postgres(&mut tx), source_schema_version).await?;
     tx.commit().await.map_err(db_err)
 }
 
@@ -1103,6 +1105,20 @@ async fn name_older_history_releases(
     // that was never pruned, which keeps all of it as an upgrade does.
     if source_schema_version < history_retention_v89::SCHEMA_VERSION {
         history_retention_v89::seed_history_retention(conn).await?;
+    }
+    Ok(())
+}
+
+// A bundle written before the server limit was enforced on what is stored
+// can carry more servers than Weaver takes. No migration runs over a
+// restore, so the step that trims the list once on an upgrade is run here
+// instead.
+async fn trim_older_server_list(
+    conn: &mut SqlConn<'_>,
+    source_schema_version: i64,
+) -> Result<(), StateError> {
+    if source_schema_version < server_limit_v92::SCHEMA_VERSION {
+        server_limit_v92::trim_servers_to_limit(conn).await?;
     }
     Ok(())
 }

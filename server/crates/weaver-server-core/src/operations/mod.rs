@@ -38,8 +38,9 @@ pub use instrumentation::{
     HistogramSnapshot, HttpMetricsSnapshot, HttpRequestCount, JOB_DURATION_BOUNDS, JobFinishCount,
     JobLifecycleMetrics, JobLifecycleMetricsSnapshot, JobResultKind, JobStageKind,
     JobSubmissionCount, PipelineHistograms, PipelineHistogramsSnapshot, ProcessMetricsSnapshot,
-    STAGE_DURATION_BOUNDS, ServerAttemptCount, ServerAttemptOutcomeKind, ServerCounters,
-    ServerMetricsRegistry, ServerMetricsSnapshot, StageOutcomeKind, VerificationOutcomeKind,
+    STAGE_DURATION_BOUNDS, ServerArticleOutcomes, ServerAttemptCount, ServerAttemptOutcomeKind,
+    ServerCounters, ServerMetricsRegistry, ServerMetricsSnapshot, StageOutcomeKind,
+    VerificationOutcomeKind,
 };
 pub use logs::snapshot_service_logs;
 pub use maintenance::spawn_maintenance_worker;

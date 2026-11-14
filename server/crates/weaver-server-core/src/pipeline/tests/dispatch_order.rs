@@ -127,6 +127,8 @@ fn former_window(pipeline: &Pipeline) -> HashSet<JobId> {
                     && !row.report.retiring
                     && !pipeline.blocked_restores.contains_key(&row.id)
                     && !pipeline.window_unreadable.contains(&row.id)
+                    // A job paused before it started takes no window place.
+                    && !pipeline.paused_unstarted(row)
             })
             .map(|(position, row)| (former_row_priority(row, globals), position, row.id))
             .collect();

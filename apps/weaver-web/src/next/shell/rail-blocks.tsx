@@ -223,7 +223,7 @@ function attentionItems(
     }
     const activity = providerActivityLabel(provider, t, now);
     const consecutive = provider.consecutiveFailures;
-    const failures = `${countLabel(t, "next.attention.consecutiveFailures", consecutive)} · ${formatLatency(provider.latencyMs)}`;
+    const failures = `${countLabel(t, "next.attention.consecutiveFailures", consecutive)} · ${formatLatency(provider.measuredLatencyMs)}`;
     items.push({
       id: `provider:${provider.host}:${provider.port}`,
       text: t("next.attention.providerState", {

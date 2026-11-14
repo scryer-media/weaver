@@ -2713,3 +2713,68 @@ fn the_open_volumes_filed_agree_with_a_walk_of_every_volume() {
     }
     assert!(store.finished());
 }
+
+// A repair inside a run of several MiB cuts it, and what it cut and
+// did not cover is read back from the member past READ_BACK, a MiB at a
+// time. Once with runs as fed, once with runs a restore joined.
+#[test]
+fn a_repair_inside_a_run_past_read_back_refeeds_it_in_pieces() {
+    const MIB: u64 = 1 << 20;
+    for restore in [false, true] {
+        for version in [Version::Rar5, Version::Rar4] {
+            let data = payload(201, 7 * MIB as usize + 13);
+            let mut options = Options::new(version);
+            options.split = Some(3 * MIB as usize);
+            let volumes = write(&[Item::File("alpha.bin", data.clone())], &options);
+            assert_eq!(volumes.len(), 3, "{version:?}");
+            let mut owner = Owner::named(store(), volumes);
+            let length = owner.volumes[0].1.len() as u64;
+            let cut = length / 2;
+            let mut bad = owner.volumes[0].1[cut as usize..cut as usize + 1000].to_vec();
+            bad[17] ^= 0xff;
+            let frame = if restore { 64 * 1024 } else { length };
+            for (start, end) in [(0, cut), (cut + 1000, length)] {
+                let mut at = start;
+                while at < end {
+                    let next = (at + frame).min(end);
+                    owner.deliver(0, ByteRange::new(at, next));
+                    at = next;
+                }
+            }
+            owner.deliver_as(
+                0,
+                ByteRange::new(cut, cut + 1000),
+                Provenance::Damaged,
+                Some(&bad),
+            );
+            for volume in 1..owner.volumes.len() {
+                owner.frames(volume, MIB as usize);
+            }
+            for volume in 0..owner.volumes.len() {
+                owner.close(volume);
+            }
+            assert!(!intact(&owner, 0), "{version:?} the damage holds the gate");
+            if restore {
+                owner.object = super::facts::restored(&owner.object.facts()).expect("restores");
+            }
+            owner.deliver_as(
+                0,
+                ByteRange::new(cut - 500, cut + 1500),
+                Provenance::Repaired,
+                None,
+            );
+            assert!(
+                intact(&owner, 0),
+                "{version:?} restore={restore} {:?}",
+                gates(&owner, 0)
+            );
+            assert!(owner.member("alpha.bin").bytes == data, "{version:?} bytes");
+            for emit in &owner.said {
+                assert!(
+                    !matches!(emit, Emit::Gap { .. } | Emit::Refuse(_) | Emit::Retract(_)),
+                    "{version:?} restore={restore} unexpected {emit:?}"
+                );
+            }
+        }
+    }
+}

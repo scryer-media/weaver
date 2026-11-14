@@ -197,6 +197,7 @@ pub(crate) fn restore_request(
             created_at_epoch_ms: recovered.created_at as f64 * 1000.0,
             reentry: false,
             outline_pending: false,
+            on_disk: false,
         }),
     }
 }
@@ -325,15 +326,19 @@ pub async fn recover_server_state(
         in_progress.iter().map(|(job_id, _)| *job_id).collect();
     let crashed = crate::runtime::panic_trap::boot_marks(data_dir, |job| restoring.contains(&job));
 
-    let mut outlines = if in_progress.is_empty() {
-        HashMap::new()
+    // The checkpoints say which jobs have bytes on disk, in one read.
+    let (mut outlines, on_disk) = if in_progress.is_empty() {
+        (HashMap::new(), HashSet::new())
     } else {
-        db.load_job_outlines(None)?
+        (
+            db.load_job_outlines(None)?,
+            db.jobs_with_graph_checkpoint()?,
+        )
     };
     let mut unread = 0usize;
     for (job_id, recovered) in in_progress {
         let queue_position = recovered.queue_position;
-        let request = match outlines.remove(&job_id) {
+        let mut request = match outlines.remove(&job_id) {
             Some(outline) => {
                 let (spec, summaries) = outline.spec(
                     &recovered.nzb_path,
@@ -357,6 +362,9 @@ pub async fn recover_server_state(
                 request
             }
         };
+        if let Some(read) = request.restart.as_mut() {
+            read.on_disk = on_disk.contains(&job_id);
+        }
         to_restore.push(RestoreCandidate {
             job_id,
             queue_position,
@@ -615,7 +623,7 @@ fn cleanup_unreferenced_intermediate_dirs(
     })?;
     Ok(unclaimed
         .iter()
-        .filter(|(_, path)| remove_unclaimed_working_dir(intermediate_dir, path))
+        .filter(|(owner, path)| remove_unclaimed_working_dir(intermediate_dir, path, *owner))
         .count())
 }
 

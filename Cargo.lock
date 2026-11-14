@@ -3373,9 +3373,9 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6572ee40d3b7dca8bc76bbf9ee58fd60ee293074e2de5f89acaa2729778ea42"
+checksum = "c26ff4dc62c0d93420fe90d87c905c66da3bd13d2a1036a67004a48d00103c8a"
 dependencies = [
  "bytes",
  "cap-std",
@@ -3391,9 +3391,9 @@ dependencies = [
 
 [[package]]
 name = "par3-rs"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65be08f04a17afc247c1fed6c5eee3ce0c20411792f244ce2d1dd13dde4c1ba4"
+checksum = "98d461a83eb5c197f7757b0c9980b64956247544d837da9fb470f52e7b2208ed"
 dependencies = [
  "blake3",
  "cap-std",

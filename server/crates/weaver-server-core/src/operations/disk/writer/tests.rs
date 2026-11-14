@@ -384,7 +384,7 @@ fn a_volume_keeps_one_thread_until_it_ends_and_settle_waits_for_it() {
         clock: Arc::new(Leaping(AtomicU64::new(0))),
         span: Duration::from_secs(30),
     };
-    let left = writers.settle_by(&bound);
+    let left = writers.settle_until(&*bound.clock, bound.end());
     assert_eq!(
         left,
         [Unsettled {
@@ -468,7 +468,7 @@ fn a_panicking_operation_fails_its_key_and_the_thread_goes_on() {
 }
 
 #[test]
-fn a_bounded_settle_gives_up_on_a_volume_that_stands_still_for_the_span() {
+fn a_bounded_settle_gives_up_on_a_volume_that_holds_writes_at_its_end() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a");
     let (writers, _reports) = writers();
@@ -482,15 +482,15 @@ fn a_bounded_settle_gives_up_on_a_volume_that_stands_still_for_the_span() {
     let over = AtomicBool::new(false);
     let left = std::thread::scope(|scope| {
         let settling = scope.spawn(|| {
-            let left = writers.settle_within(span, &clock);
+            let left = writers.settle_until(&clock, span);
             over.store(true, Ordering::SeqCst);
             left
         });
-        // One look as the settle begins and one before it waits.
-        clock.wait_looks(2);
+        // One look before the settle waits.
+        clock.wait_looks(1);
         clock.move_to(Duration::from_secs(29));
         writers.look_again();
-        clock.wait_looks(3);
+        clock.wait_looks(2);
         assert!(!over.load(Ordering::SeqCst), "the span has not passed");
         clock.move_to(span);
         writers.look_again();
@@ -506,8 +506,47 @@ fn a_bounded_settle_gives_up_on_a_volume_that_stands_still_for_the_span() {
     );
     // What was left is still written once the volume moves.
     hold.open();
-    assert!(writers.settle_within(span, &clock).is_empty());
+    writers.settle();
     assert_eq!(std::fs::read(&path).unwrap(), b"stuck");
+}
+
+// Settles given one end share one span. A write that returns just before
+// the end does not move it, and a settle begun after it gives up at once.
+#[test]
+fn settles_that_share_an_end_give_up_at_it_whatever_returned_meanwhile() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    job.write(1, 0, Bytes::from_static(b"first"), create(&a));
+    job.write(2, 0, Bytes::from_static(b"stuck"), create(&b));
+    hold.wait_held();
+    let clock = HandClock::default();
+    let end = Duration::from_secs(30);
+    let left = std::thread::scope(|scope| {
+        let settling = scope.spawn(|| writers.settle_until(&clock, end));
+        // One look before the settle waits.
+        clock.wait_looks(1);
+        // A second before the end one write goes through.
+        clock.move_to(Duration::from_secs(29));
+        hold.release(1);
+        hold.wait_held();
+        clock.move_to(end);
+        writers.look_again();
+        settling.join().unwrap()
+    });
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0].label, "one");
+    assert!(left[0].operations > 0, "{left:?}");
+    // Nothing of the span is left for the settle that follows.
+    assert_eq!(writers.settle_until(&clock, end), left);
+    // What was left is still written once the volume moves.
+    hold.open();
+    writers.settle();
+    assert_eq!(std::fs::read(&a).unwrap(), b"first");
+    assert_eq!(std::fs::read(&b).unwrap(), b"stuck");
 }
 
 #[test]
@@ -610,7 +649,7 @@ fn a_volume_with_no_thread_is_asked_for_one_again_only_once_it_was_let_go() {
     writers.settle();
     assert!(
         writers
-            .settle_within(Duration::from_secs(30), &HandClock::default())
+            .settle_until(&HandClock::default(), Duration::from_secs(30))
             .is_empty()
     );
     assert_eq!(starts(), 1);

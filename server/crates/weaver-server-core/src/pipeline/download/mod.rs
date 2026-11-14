@@ -18,7 +18,8 @@ pub(super) use worker::HeldDownloadRefill;
 #[cfg(test)]
 pub(in crate::pipeline) use worker::{
     DISPATCH_INELIGIBLE_LOG_INTERVAL, DOWNLOAD_DISPATCH_STALL_KICK_AFTER,
-    DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER,
+    DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL, DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER,
+    DOWNLOAD_RETRY_STORM_THRESHOLD,
 };
 pub(crate) use worker::{
     DOWNLOAD_STALL_RECOVERY_ENV, DispatchStallWatch, JobLogThrottle, KeyedLogThrottle,

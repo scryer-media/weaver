@@ -315,7 +315,7 @@ fn queued_work(job_id: JobId) -> DownloadWork {
         retry_count: 0,
         is_recovery: false,
         completion_critical: false,
-        exclude_servers: Vec::new(),
+        exclude_servers: weaver_nntp::ServerSet::EMPTY,
         avoid_server: None,
     }
 }

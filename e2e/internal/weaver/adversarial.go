@@ -50,8 +50,10 @@ type adversarialSpec struct {
 	// adversarialGroups.
 	Group string `json:"group"`
 	// Outcome is success, failed, either (success or failed, the contract of
-	// a lie the product may see through or refuse), or settles (any terminal
-	// status, a failure naming its verdict).
+	// a lie the product may see through or refuse), partial (a hostile piece
+	// beside a whole honest file leaves the job short of that piece, with the
+	// honest file delivered exactly), or settles (any terminal status, a
+	// failure naming its verdict).
 	Outcome string `json:"outcome"`
 	// ErrorContains is a substring of the failed job's history error.
 	ErrorContains string `json:"errorContains,omitempty"`
@@ -115,6 +117,13 @@ func adversarialGroups() []adversarialGroup {
 			}, nil
 		}},
 		{Name: "reserve", Env: adversarialReserveEnv},
+		// The ratio floor lowered to 1 MiB, so a nest of a few MiB is judged
+		// against the ratio of a hundred rather than the 1 GiB floor.
+		{Name: "ratio", Env: func() (map[string]string, error) {
+			return map[string]string{
+				"WEAVER_EXTRACTION_RATIO_FLOOR_BYTES": strconv.Itoa(1 << 20),
+			}, nil
+		}},
 	}
 }
 
@@ -336,14 +345,14 @@ func (spec adversarialSpec) validate() error {
 		known = known || group.Name == spec.Group
 	}
 	if !known {
-		return fmt.Errorf("adversarial group %q is not one of default, tight, reserve", spec.Group)
+		return fmt.Errorf("adversarial group %q is not one of default, tight, reserve, ratio", spec.Group)
 	}
 	switch spec.Outcome {
-	case "success", "failed", "either", "settles":
+	case "success", "failed", "either", "partial", "settles":
 	default:
-		return fmt.Errorf("adversarial outcome %q is not one of success, failed, either, settles", spec.Outcome)
+		return fmt.Errorf("adversarial outcome %q is not one of success, failed, either, partial, settles", spec.Outcome)
 	}
-	if spec.Outcome == "success" && (spec.ErrorContains != "" || spec.FailureKind != "") {
+	if (spec.Outcome == "success" || spec.Outcome == "partial") && (spec.ErrorContains != "" || spec.FailureKind != "") {
 		return errors.New("a success case names no failure")
 	}
 	for _, path := range spec.EscapePaths {

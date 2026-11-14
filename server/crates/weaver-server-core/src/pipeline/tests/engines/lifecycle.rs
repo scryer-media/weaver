@@ -160,7 +160,7 @@ async fn the_last_server_refusing_credentials_fails_the_job() {
     insert_active_job(&mut pipeline, job, spec).await;
     age_job_days(&mut pipeline, job, 10);
     pipeline.clear_job_retention_excludes(job);
-    assert_eq!(pipeline.job_retention_excludes(job).as_slice(), &[0]);
+    assert_eq!(pipeline.job_retention_excludes(job), [0]);
     pipeline
         .nntp
         .pool()
@@ -184,10 +184,10 @@ async fn the_last_server_refusing_credentials_fails_the_job() {
         .unwrap();
     let work = pipeline.dispatched(work);
     pipeline.hold_test_lane_works(vec![work.clone()], false);
-    let effective_exclude_servers = pipeline.effective_exclude_servers(job, &work.exclude_servers);
+    let effective_exclude_servers = pipeline.effective_exclude_servers(job, work.exclude_servers);
     let Err(error) = pipeline
         .nntp
-        .try_acquire_blocking_body_lane(&[], &effective_exclude_servers)
+        .try_acquire_blocking_body_lane(&[], effective_exclude_servers)
     else {
         panic!("a lane opened with no server that may serve the article");
     };
@@ -200,7 +200,7 @@ async fn the_last_server_refusing_credentials_fails_the_job() {
         server_modes: Vec::new(),
         completion_critical: false,
         effective_exclude_servers,
-        dial_exclude_servers: Vec::new(),
+        dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
         works: vec![work],

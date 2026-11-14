@@ -64,7 +64,7 @@ impl Replay {
         shutdown: &Shutdown,
         mut chunk_read: impl FnMut(),
     ) -> Replayed {
-        self.access.shutdown = shutdown.clone();
+        self.access.begin(shutdown);
         let mut provenance = Vec::new();
         let staged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // A write the staging refused ends it: nothing more is read.
@@ -206,6 +206,9 @@ impl NamespaceWriter {
                 defer_holds: true,
                 scratch_read: None,
                 held_scratch: BTreeMap::new(),
+                settled: self.unsettled(),
+                scratch_later: BTreeMap::new(),
+                unwritten: false,
                 internal: self.working_dir.join(weaver_graph::names::INTERNAL_DIR),
                 members: BTreeMap::new(),
                 usage: RefCell::default(),
@@ -365,6 +368,7 @@ impl NamespaceWriter {
         for ((volume, offset, bytes), provenance) in
             replayed.bytes.slices().zip(&replayed.provenance)
         {
+            self.below_budget();
             let mut effects = Vec::new();
             tree.replay_piece(
                 replayed.node,

@@ -70,7 +70,8 @@ impl GraphJob {
         let windows = storage.windows(scope);
         let runs = Runs::new(scope, storage.slots, storage.mail, storage.decode)
             .on(storage.hardware)
-            .lending(windows);
+            .lending(windows)
+            .writing(storage.disk.clone());
         let mut writer = NamespaceWriter::new(
             scope,
             storage.working_dir,
@@ -127,6 +128,8 @@ impl GraphJob {
             notes: Vec::new(),
             fed: super::runs::Fed::default(),
             sealed_at: None,
+            moved: 0,
+            indexes_kept: None,
         };
         for (node, index) in &snapshot.passwords {
             job.offer_again(*node, *index)?;

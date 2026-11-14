@@ -61,7 +61,7 @@ pub(crate) struct Failure {
     pub(crate) creating: bool,
 }
 
-// What a bounded settle left on a volume that stood still.
+// What a bounded settle left on a volume it gave up on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Unsettled {
     pub(crate) label: String,
@@ -95,9 +95,9 @@ impl Clock for WallClock {
     }
 }
 
-// The clock a bounded settle goes by and the span it gives a volume that
-// stands still, chosen by whoever will ask for the settle: the machine's
-// clock outside tests, and in a test one it moves by hand.
+// The clock a bounded settle goes by and the span it has, chosen by
+// whoever will ask for the settle: the machine's clock outside tests, and
+// in a test one it moves by hand.
 #[derive(Clone)]
 pub(crate) struct SettleBound {
     pub(crate) clock: Arc<dyn Clock + Send>,
@@ -105,6 +105,11 @@ pub(crate) struct SettleBound {
 }
 
 impl SettleBound {
+    // What the clock reads when the span, begun now, is over.
+    pub(crate) fn end(&self) -> Duration {
+        self.clock.now().saturating_add(self.span)
+    }
+
     // `span` by the machine's own clock.
     pub(crate) fn wall(span: Duration) -> Self {
         Self {
@@ -279,61 +284,45 @@ impl VolumeWriters {
 
     // Wait until everything submitted to every volume so far has returned,
     // whether or not its caller still holds the volume.
+    #[cfg(test)]
     pub(crate) fn settle(&self) {
         self.settle_each(None);
     }
 
-    // The same wait, given up on a volume once nothing on it has returned
-    // for `span` by `clock`. What each such volume still held comes back;
-    // nothing does when everything returned.
-    pub(crate) fn settle_within(&self, span: Duration, clock: &dyn Clock) -> Vec<Unsettled> {
-        self.settle_each(Some((span, clock)))
-    }
-
-    // The bounded settle, by a clock and span chosen beforehand.
-    pub(crate) fn settle_by(&self, bound: &SettleBound) -> Vec<Unsettled> {
-        self.settle_within(bound.span, &*bound.clock)
+    // The same wait, given up on every volume that has not returned
+    // everything once `clock` reads `end`, however much returned meanwhile.
+    // Settles that share one `end` share one span between them: a later
+    // one has what the earlier ones left of it. What each volume given up
+    // on still held comes back; nothing does when everything returned.
+    pub(crate) fn settle_until(&self, clock: &dyn Clock, end: Duration) -> Vec<Unsettled> {
+        self.settle_each(Some((end, clock)))
     }
 
     fn settle_each(&self, bound: Option<(Duration, &dyn Clock)>) -> Vec<Unsettled> {
-        let began = bound.map(|(_, clock)| clock.now()).unwrap_or_default();
-        // Every volume is measured from the start, so one that stood still
-        // while another was waited for is not given a second span.
-        let lanes: Vec<(Arc<Lane>, u64, u64)> = self
+        let lanes: Vec<(Arc<Lane>, u64)> = self
             .registry
             .lock()
             .iter()
-            .map(|(_, lane)| {
-                (
-                    Arc::clone(lane),
-                    lane.state.sent.load(Ordering::SeqCst),
-                    lane.state.done.load(Ordering::SeqCst),
-                )
-            })
+            .map(|(_, lane)| (Arc::clone(lane), lane.state.sent.load(Ordering::SeqCst)))
             .collect();
         let mut left = Vec::new();
-        for (lane, sent, mut seen) in lanes {
+        for (lane, sent) in lanes {
             let state = &lane.state;
             if state.returned.load(Ordering::SeqCst) >= sent {
                 continue;
             }
             let started = Instant::now();
-            let mut since = began;
             let mut held = state.waiting.lock().unwrap_or_else(PoisonError::into_inner);
             state.waiters.fetch_add(1, Ordering::SeqCst);
             while state.returned.load(Ordering::SeqCst) < sent {
-                let Some((span, clock)) = bound else {
+                let Some((end, clock)) = bound else {
                     held = state.woke.wait(held).unwrap_or_else(PoisonError::into_inner);
                     continue;
                 };
-                let now = clock.now();
-                let done = state.done.load(Ordering::SeqCst);
-                if done != seen {
-                    seen = done;
-                    since = now;
-                }
-                let stood = now.saturating_sub(since);
-                if stood >= span {
+                // How long the volume is still waited for.
+                let more = end.saturating_sub(clock.now());
+                if more.is_zero() {
+                    let done = state.done.load(Ordering::SeqCst);
                     left.push(Unsettled {
                         label: state.volume.label.clone(),
                         operations: state.sent.load(Ordering::SeqCst).saturating_sub(done),
@@ -344,7 +333,7 @@ impl VolumeWriters {
                 held = if clock.runs() {
                     state
                         .woke
-                        .wait_timeout(held, span - stood)
+                        .wait_timeout(held, more)
                         .unwrap_or_else(PoisonError::into_inner)
                         .0
                 } else {

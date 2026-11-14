@@ -1,0 +1,15 @@
+{
+  "slug": "adv-targz-inner-over-member-cap",
+  "title": "E2E.Adversarial.Targz.Inner.Over.Member.Cap.2026-TESTGRP",
+  "description": "A .tar.gz whose 48 MiB tar holds two members of 24 MiB, run with the member cap at 32 MiB. Only delivered files are held to the member cap, so the job completes with both.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "adversarial": {
+    "group": "tight",
+    "outcome": "success",
+    "requiredOutputs": [
+      "reel-a.mkv",
+      "reel-b.mkv"
+    ]
+  }
+}

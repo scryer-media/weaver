@@ -229,6 +229,16 @@ impl Leaf {
         self
     }
 
+    // The file is put at the leaf's path by the operation numbered `made`,
+    // which its writer already has: whoever reads it waits through that
+    // one. Nothing for a leaf that runs its own operations.
+    pub(crate) fn after(mut self, made: u64) -> Self {
+        if let Some(queued) = &mut self.queued {
+            queued.last = queued.last.max(made);
+        }
+        self
+    }
+
     // Everything submitted for the file so far: whoever reads the file by
     // its path waits for this first. `None` for a leaf that runs its own
     // operations, whose file is always as the leaf says.
@@ -251,6 +261,11 @@ impl Leaf {
             length,
             open: open_sized,
         }
+    }
+
+    // The directory the leaf's name is under.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
     }
 
     pub(crate) fn revision(&self) -> (u64, u64) {
@@ -650,7 +665,44 @@ impl Leaf {
         len: usize,
         into: &mut Vec<u8>,
     ) -> Result<(), LeafError> {
-        self.settle();
+        // Through a writer, the read waits only through the last operation
+        // submitted for this file, whatever else its volume has queued.
+        if let Some(queued) = self.queued.as_ref().filter(|queued| queued.last > 0) {
+            let read = queued
+                .to
+                .read_after(queued.last, self.path.clone(), offset, len)
+                .map_err(LeafError::io(&self.path))?;
+            if into.is_empty() {
+                *into = read;
+            } else {
+                into.extend_from_slice(&read);
+            }
+            return Ok(());
+        }
+        self.read_here(offset, len, into)
+    }
+
+    // The same read for a thread the loop does not wait for: a repair or a
+    // replay on a thread of its own.
+    pub(crate) fn read_aside(
+        &self,
+        offset: u64,
+        len: usize,
+        into: &mut Vec<u8>,
+    ) -> Result<(), LeafError> {
+        if let Some(settled) = self.settled() {
+            settled.wait_aside();
+            if settled.failed() {
+                return Err(LeafError::Io {
+                    path: self.path.clone(),
+                    source: io::Error::other("a write of the file failed before it was read"),
+                });
+            }
+        }
+        self.read_here(offset, len, into)
+    }
+
+    fn read_here(&self, offset: u64, len: usize, into: &mut Vec<u8>) -> Result<(), LeafError> {
         let start = into.len();
         into.resize(start + len, 0);
         let read = match &self.file {
@@ -1193,5 +1245,45 @@ mod tests {
         assert_eq!(cut.folded(7000, crc), None);
         folding(&mut cut, 3000, bytes(4000, 3));
         assert_eq!(cut.folded(7000, crc), Some(file_crc(&cut, 7000)));
+    }
+
+    // Runs either side of 4 GiB, in a sparse file that writes a few
+    // KiB: a write across the line, a rewrite inside it, and a close that
+    // cuts the run just past it each keep the run's digest equal to the
+    // bytes the file holds.
+    #[test]
+    fn a_fold_across_four_gib_keeps_its_digest() {
+        const LINE: u64 = 1 << 32;
+        let dir = tempfile::tempdir().unwrap();
+        let mut leaf = Leaf::at(dir.path(), "lantern.bin");
+        let crc = Algorithm::Crc32;
+        let held = |leaf: &Leaf, from: u64, to: u64| {
+            let mut bytes = Vec::new();
+            leaf.read(from, index(to - from), &mut bytes).unwrap();
+            bytes
+        };
+        let run = |leaf: &Leaf| {
+            assert_eq!(leaf.written.len(), 1, "{:?}", leaf.written);
+            let (start, run) = leaf.written.iter().next().unwrap();
+            (*start, run.end, run.digest.map(|digest| digest.value))
+        };
+        let first = bytes(8192, 5);
+        folding(&mut leaf, LINE - 4096, first.clone());
+        assert_eq!(held(&leaf, LINE - 4096, LINE + 4096), first);
+        let (start, end, digest) = run(&leaf);
+        assert_eq!((start, end), (LINE - 4096, LINE + 4096));
+        assert_eq!(digest, Some(crc.hash(&first).value));
+
+        folding(&mut leaf, LINE - 50, bytes(100, 6));
+        let now = held(&leaf, LINE - 4096, LINE + 4096);
+        assert_eq!(&now[4046..4146], &bytes(100, 6)[..]);
+        assert_eq!(run(&leaf).2, Some(crc.hash(&now).value));
+
+        leaf.close(LINE + 10).unwrap();
+        assert_eq!(leaf.len().unwrap(), LINE + 10);
+        let kept = held(&leaf, LINE - 4096, LINE + 10);
+        let (start, end, digest) = run(&leaf);
+        assert_eq!((start, end), (LINE - 4096, LINE + 10));
+        assert_eq!(digest, Some(crc.hash(&kept).value));
     }
 }
