@@ -1661,6 +1661,8 @@ struct Open {
     // opener did not say, or a write or a length set failed. Only this
     // writer changes the length of a file while it holds it open.
     length: Option<u64>,
+    // The file is in the key's closed files, its handle kept since a close.
+    closed: bool,
 }
 
 impl Held {
@@ -1677,21 +1679,28 @@ impl Held {
     // The handle of `file`, no longer the key's.
     fn take(&mut self, file: u64) -> Option<Open> {
         let open = self.open.remove(&file)?;
+        if open.closed {
+            self.unclose(file);
+        }
+        Some(open)
+    }
+
+    // `file` leaves the closed files: it is in use again, or let go.
+    fn unclose(&mut self, file: u64) {
         if let Some(at) = self.closed.iter().position(|closed| *closed == file) {
             self.closed.remove(at);
         }
-        Some(open)
     }
 
     // A close ended `file`: its handle is kept, and past `KEPT_CLOSED` the
     // oldest kept is let go. Whether one was.
     fn keep_closed(&mut self, file: u64) -> bool {
-        if !self.open.contains_key(&file) {
+        let Some(open) = self.open.get_mut(&file) else {
             return false;
-        }
-        if let Some(at) = self.closed.iter().position(|closed| *closed == file) {
-            self.closed.remove(at);
-        }
+        };
+        // A close's own open took it out of the closed files.
+        debug_assert!(!open.closed);
+        open.closed = true;
         self.closed.push_back(file);
         if self.closed.len() <= KEPT_CLOSED {
             return false;
@@ -1710,7 +1719,15 @@ impl Held {
         creating: &mut bool,
         counts: &WriterCounts,
     ) -> io::Result<Option<&mut Open>> {
-        if !self.open.contains_key(&file) {
+        // A write, truncate or close of a kept closed file makes it an open
+        // file again: it leaves the closed files, so the bound never lets go
+        // of a file in use, and a close puts it back at the newest end.
+        if let Some(open) = self.open.get_mut(&file) {
+            if open.closed {
+                open.closed = false;
+                self.unclose(file);
+            }
+        } else {
             // The writes of a file whose name was refused are dropped: the
             // refusal has said so.
             if self.refused.contains(&file) {
@@ -1756,6 +1773,7 @@ impl Held {
                     path: create.path.clone(),
                     end: None,
                     length: opened.length,
+                    closed: false,
                 },
             );
         }

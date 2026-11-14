@@ -2139,3 +2139,54 @@ fn a_key_keeps_a_bounded_number_of_closed_files_handles() {
     );
     assert_eq!(std::fs::read(path(1)).unwrap(), b"headtail");
 }
+
+// A kept closed file written again is in use, not closed: it leaves the
+// closed files, so the bound passes it by and lets go of the next oldest,
+// and the file is not opened again.
+#[test]
+fn a_closed_file_written_again_leaves_the_closed_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let job = writers.submitter(&volume, 1);
+    let kept = super::KEPT_CLOSED as u64;
+    let path = |file: u64| dir.path().join(file.to_string());
+    let close = |file: u64| {
+        job.write(file, 0, Bytes::from_static(b"head"), create(&path(file)));
+        job.close(file, 4, made_by(&path(file), 4, open));
+    };
+    // The closed files are full, and the oldest is written again.
+    for file in 1..=kept {
+        close(file);
+    }
+    job.write(1, 4, Bytes::from_static(b"tail"), create(&path(1)));
+    // Two more closed: the first fills the place the written file left,
+    // the second passes the bound.
+    close(kept + 1);
+    close(kept + 2);
+    job.barrier().wait();
+    assert!(job.barrier().passed());
+    assert_eq!(
+        count(&volume.writer.opens),
+        kept + 2,
+        "the written file stayed open"
+    );
+    assert_eq!(count(&volume.writer.closes), 1);
+    let barrier = job.barrier();
+    let held = barrier.key.held();
+    assert!(held.open.contains_key(&1), "the file in use was let go");
+    assert!(!held.open.contains_key(&2), "the next oldest stayed");
+    assert_eq!(held.closed.len() as u64, kept);
+    assert!(!held.closed.contains(&1));
+    drop(held);
+    // Closed again, it goes in at the newest end.
+    job.close(1, 8, made_by(&path(1), 8, open));
+    job.barrier().wait();
+    assert_eq!(count(&volume.writer.closes), 2);
+    let barrier = job.barrier();
+    let held = barrier.key.held();
+    assert_eq!(held.closed.back(), Some(&1));
+    assert!(!held.open.contains_key(&3), "the oldest closed went");
+    drop(held);
+    assert_eq!(std::fs::read(path(1)).unwrap(), b"headtail");
+}
