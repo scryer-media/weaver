@@ -581,12 +581,19 @@ impl KernelSockets {
     /// address when `reuse`. One at the unspecified IPv6 address takes IPv4
     /// as well, unless it is one of a pair.
     fn kernel_udp(&self, addr: SocketAddr, reuse: bool) -> io::Result<KernelUdp> {
+        let (socket, dual_stack) = self.bound_udp(addr, reuse)?;
+        KernelUdp::registered(socket, dual_stack)
+    }
+
+    // The one bind every datagram socket of the kernel route comes from: a
+    // socket at `addr` from the route's own egress, and whether it takes
+    // both families.
+    fn bound_udp(&self, addr: SocketAddr, reuse: bool) -> io::Result<(std::net::UdpSocket, bool)> {
         #[expect(
             clippy::disallowed_methods,
             reason = "the kernel's own route binds on its device, or the host's"
         )]
-        let (socket, dual_stack) = self.egress.bind_udp_reusing(addr, reuse)?;
-        KernelUdp::registered(socket, dual_stack)
+        self.egress.bind_udp_reusing(addr, reuse)
     }
 
     // A datagram socket at `addr` as `kernel_udp` binds it, set for uTP
@@ -598,11 +605,7 @@ impl KernelSockets {
         reuse: bool,
         receive_buffer: usize,
     ) -> io::Result<KernelUdp> {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the kernel's own route binds on its device, or the host's"
-        )]
-        let (socket, dual_stack) = self.egress.bind_udp_reusing(addr, reuse)?;
+        let (socket, dual_stack) = self.bound_udp(addr, reuse)?;
         crate::udp_options::set_for_utp(&socket, addr, receive_buffer);
         KernelUdp::unregistered(socket, dual_stack)
     }
