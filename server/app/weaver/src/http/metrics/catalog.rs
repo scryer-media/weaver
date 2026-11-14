@@ -633,6 +633,20 @@ metric_families! {
         "Bytes per second of wall time written to a volume over the last window, whether or not the volume was the limit. Conditional: emitted only while the volume is being written to.");
     VOLUME_BUFFERED_BYTES = ("weaver_volume_buffered_bytes", Gauge, ["volume"],
         "Bytes waiting in memory for a volume's writer.");
+    VOLUME_WRITER_BATCHES = ("weaver_volume_writer_batches_total", Counter, ["volume"],
+        "Batches of queued operations a volume's writer has run.");
+    VOLUME_WRITER_OPERATIONS = ("weaver_volume_writer_operations_total", Counter, ["volume"],
+        "Operations a volume's writer has run: writes, closes, renames, removes and the rest.");
+    VOLUME_WRITER_FAILED_OPERATIONS = ("weaver_volume_writer_failed_operations_total", Counter, ["volume"],
+        "Operations a volume's writer ran that came back with an error.");
+    VOLUME_WRITER_ABANDONED_OPERATIONS = ("weaver_volume_writer_abandoned_operations_total", Counter, ["volume"],
+        "Operations queued for a volume's writer and never run: their job gave its files up, or an earlier operation of the same job failed.");
+    VOLUME_LOOP_WAITS = ("weaver_volume_loop_waits_total", Counter, ["volume"],
+        "Times the pipeline loop stood still until a volume's writer had caught up.");
+    VOLUME_LOOP_WAIT_SECONDS = ("weaver_volume_loop_wait_seconds_total", Counter, ["volume"],
+        "Time the pipeline loop has stood still waiting for a volume's writer.");
+    VOLUME_WRITER_THREADS = ("weaver_volume_writer_threads_total", Counter, ["volume"],
+        "Writer threads started for a volume, one after another: a volume's thread ends when nothing writes to it and starts again at the next write.");
 
     // ---- PAR3 recovery -----------------------------------------------------------------------------
     // Every series here is fed from `MetricsSnapshot::par3`, which is a plain

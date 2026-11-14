@@ -1427,6 +1427,15 @@ fn sample_volumes() -> Vec<instr::VolumeSnapshot> {
             write_seeks: 9,
             write_rate: 3_200_000,
             buffered_bytes: 65_536,
+            writer: instr::VolumeWriterSnapshot {
+                batches: 40,
+                operations: 130,
+                loop_waits: 3,
+                loop_wait_nanos: 1_500_000_000,
+                failed_operations: 2,
+                abandoned_operations: 5,
+                threads: 1,
+            },
         },
         // Seen, never written to: its rate is not measured.
         instr::VolumeSnapshot {
@@ -1439,6 +1448,7 @@ fn sample_volumes() -> Vec<instr::VolumeSnapshot> {
             write_seeks: 0,
             write_rate: 0,
             buffered_bytes: 0,
+            writer: Default::default(),
         },
     ]
 }

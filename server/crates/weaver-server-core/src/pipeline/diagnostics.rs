@@ -547,6 +547,7 @@ mod tests {
             write_seeks: 9,
             write_rate: 3_200_000,
             buffered_bytes: 65_536,
+            writer: Default::default(),
         });
         let json = serde_json::to_value(&listed).unwrap();
         assert_eq!(

@@ -506,6 +506,7 @@ impl StorageCapacity {
                 write_seeks: volume.write_seeks.load(Ordering::Relaxed),
                 write_rate: volume.write_rate.load(Ordering::Relaxed),
                 buffered_bytes: volume.buffered_bytes.load(Ordering::Relaxed),
+                writer: writer_counts(volume),
             })
             .collect()
     }
@@ -547,6 +548,20 @@ impl StorageCapacity {
             .filter_map(|entry| entry.space.as_ref().map(|look| look.kind))
             .find(|kind| *kind != StorageKind::Unknown)
             .unwrap_or(StorageKind::Unknown)
+    }
+}
+
+// A volume's writer counts as they stand, each an atomic read.
+fn writer_counts(volume: &Volume) -> crate::operations::instrumentation::VolumeWriterSnapshot {
+    let counts = &volume.writer;
+    crate::operations::instrumentation::VolumeWriterSnapshot {
+        batches: counts.batches.load(Ordering::Relaxed),
+        operations: counts.operations.load(Ordering::Relaxed),
+        loop_waits: counts.loop_waits.load(Ordering::Relaxed),
+        loop_wait_nanos: counts.loop_wait_nanos.load(Ordering::Relaxed),
+        failed_operations: counts.failed_operations.load(Ordering::Relaxed),
+        abandoned_operations: counts.abandoned_operations.load(Ordering::Relaxed),
+        threads: counts.threads.load(Ordering::Relaxed),
     }
 }
 
@@ -1211,6 +1226,7 @@ mod tests {
                     write_seeks: 9,
                     write_rate: 3_200_000,
                     buffered_bytes: 65_536,
+                    writer: Default::default(),
                 },
                 VolumeSnapshot {
                     label: "/mnt/scratch".into(),
@@ -1222,6 +1238,7 @@ mod tests {
                     write_seeks: 0,
                     write_rate: 0,
                     buffered_bytes: 0,
+                    writer: Default::default(),
                 },
             ]
         );

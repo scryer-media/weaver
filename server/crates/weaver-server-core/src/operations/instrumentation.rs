@@ -1390,6 +1390,26 @@ pub struct VolumeSnapshot {
     pub write_rate: u64,
     // Bytes waiting in memory for the volume's writer.
     pub buffered_bytes: u64,
+    // What the volume's writer did and what waiting on it cost.
+    pub writer: VolumeWriterSnapshot,
+}
+
+// One volume's writer counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct VolumeWriterSnapshot {
+    // Batches the writer ran, and the operations in them it ran.
+    pub batches: u64,
+    pub operations: u64,
+    // Times the pipeline loop stood still for the writer, and for how long.
+    pub loop_waits: u64,
+    pub loop_wait_nanos: u64,
+    // Operations that came back with an error.
+    pub failed_operations: u64,
+    // Operations not run: their caller gave its files up, or an earlier
+    // operation of the same caller failed.
+    pub abandoned_operations: u64,
+    // Writer threads started for the volume, one after another.
+    pub threads: u64,
 }
 
 #[cfg(test)]

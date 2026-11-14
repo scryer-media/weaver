@@ -937,6 +937,19 @@ fn renders_collected_instrumentation_snapshots() {
     assert!(rendered.contains("weaver_volume_write_calls_total{volume=\"/mnt/nas\"} 120"));
     assert!(rendered.contains("weaver_volume_write_seeks_total{volume=\"/mnt/nas\"} 9"));
     assert!(rendered.contains("weaver_volume_write_seeks_total{volume=\"/mnt/scratch\"} 0"));
+    for (row, value) in [
+        ("weaver_volume_writer_batches_total", "40"),
+        ("weaver_volume_writer_operations_total", "130"),
+        ("weaver_volume_writer_failed_operations_total", "2"),
+        ("weaver_volume_writer_abandoned_operations_total", "5"),
+        ("weaver_volume_loop_waits_total", "3"),
+        ("weaver_volume_loop_wait_seconds_total", "1.5"),
+        ("weaver_volume_writer_threads_total", "1"),
+    ] {
+        let line = format!("{row}{{volume=\"/mnt/nas\"}} {value}");
+        assert!(rendered.contains(&line), "{line}");
+    }
+    assert!(rendered.contains("weaver_volume_loop_waits_total{volume=\"/mnt/scratch\"} 0"));
     assert!(rendered.contains("weaver_volume_written_bytes_total{volume=\"/mnt/scratch\"} 0"));
     assert!(!rendered.contains("weaver_volume_write_rate_bytes_per_second{volume=\"/mnt/scratch\"}"));
     // What is being written now sits beside what the volume takes, and is

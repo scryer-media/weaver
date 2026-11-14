@@ -1573,6 +1573,26 @@ fn render_volumes(out: &mut Encoder, volumes: &[VolumeSnapshot]) {
             out.sample(&f::VOLUME_WRITE_RATE, labels, volume.write_rate);
         }
         out.sample(&f::VOLUME_BUFFERED_BYTES, labels, volume.buffered_bytes);
+        let writer = &volume.writer;
+        out.sample(&f::VOLUME_WRITER_BATCHES, labels, writer.batches);
+        out.sample(&f::VOLUME_WRITER_OPERATIONS, labels, writer.operations);
+        out.sample(
+            &f::VOLUME_WRITER_FAILED_OPERATIONS,
+            labels,
+            writer.failed_operations,
+        );
+        out.sample(
+            &f::VOLUME_WRITER_ABANDONED_OPERATIONS,
+            labels,
+            writer.abandoned_operations,
+        );
+        out.sample(&f::VOLUME_LOOP_WAITS, labels, writer.loop_waits);
+        out.sample_f64(
+            &f::VOLUME_LOOP_WAIT_SECONDS,
+            labels,
+            writer.loop_wait_nanos as f64 / 1e9,
+        );
+        out.sample(&f::VOLUME_WRITER_THREADS, labels, writer.threads);
     }
 }
 
