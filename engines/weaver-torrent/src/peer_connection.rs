@@ -1062,9 +1062,10 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         };
         let stats = self.spawner.stats().clone();
         let stats = &*stats;
-        // The handshake, and the extended handshake after it, went out
-        // before the transport was known here: one buffer each.
-        stats.sent(transport);
+        // The extended handshake went out before the transport was known
+        // here, in one buffer. The handshakes that open a connection, the
+        // encryption's and BitTorrent's, are counted on neither side: a
+        // connection counts what it reads and writes once it is open.
         if supports_extended {
             stats.sent(transport);
         }
@@ -1867,12 +1868,12 @@ mod tests {
         assert!(meter.sent() > 68 + 9);
         assert_eq!(load(&ledger.paid[1]), meter.sent());
         assert_eq!(load(&ledger.protocol[1]), meter.sent());
-        // Each buffer written whole is one send: the handshake, the
-        // extended handshake and the have.
+        // Each buffer written whole once the connection is open is one
+        // send: the extended handshake and the have, not the handshake.
         let sockets = stats.snapshot().sockets;
         assert_eq!(
             sockets[crate::session_stats::disk::Transport::Tcp.index()].send_calls,
-            3
+            2
         );
         assert_eq!(
             sockets[crate::session_stats::disk::Transport::Utp.index()].send_calls,

@@ -119,9 +119,11 @@ struct SocketCounters {
 /// The calls the peers' sockets of one transport took.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SocketSnapshot {
-    /// Reads that returned bytes.
+    /// Reads that returned bytes, after the handshakes that open a
+    /// connection.
     pub receive_calls: u64,
-    /// Buffers handed to the socket to be written whole.
+    /// Buffers handed to the socket to be written whole, after the
+    /// handshakes that open a connection.
     pub send_calls: u64,
 }
 

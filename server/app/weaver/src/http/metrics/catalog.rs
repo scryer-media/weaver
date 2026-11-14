@@ -676,7 +676,7 @@ metric_families! {
     TORRENT_DISK_PIECE_CHECK_WAIT_SECONDS = ("weaver_torrent_disk_piece_check_wait_seconds_total", Counter, ["route"],
         "Time peer connections waited for the check and write of a piece they completed, since the session opened, summed.");
     TORRENT_PEER_SOCKET_CALLS = ("weaver_torrent_peer_socket_calls_total", Counter, ["route", "transport", "direction"],
-        "Reads of peer sockets that returned bytes (in) and buffers written to them whole (out), since the session opened, by transport. Encryption handshakes, and the reads behind the last message a connection took, are not counted.");
+        "Reads of peer sockets that returned bytes (in) and buffers written to them whole (out), since the session opened, by transport. A connection is counted once it is open: the handshakes that open it, the encryption's and BitTorrent's, either way, and the reads behind the last message it took, are not counted.");
     TORRENT_PEER_READ_BUFFER_GROWTHS = ("weaver_torrent_peer_read_buffer_growths_total", Counter, ["route"],
         "Times a peer connection's read buffer was made larger, since the session opened.");
     TORRENT_PEER_BATCH_BUFFERS = ("weaver_torrent_peer_batch_buffers", Gauge, ["route"],
