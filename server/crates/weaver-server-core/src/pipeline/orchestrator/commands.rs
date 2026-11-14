@@ -385,6 +385,9 @@ impl Pipeline {
             let cleanup_db = self.db.clone();
             let queue = queue.clone();
             tokio::spawn(async move {
+                // A move of the job's folder that is still out ends first:
+                // the folder has one remover at a time.
+                queue.wait_for_moves(job_id).await;
                 Self::cleanup_cancelled_job(cleanup_db, cleanup).await;
                 queue.write(|inner| {
                     inner.pending_cleanup.remove(&job_id);

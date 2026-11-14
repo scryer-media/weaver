@@ -1962,6 +1962,9 @@ pub struct Pipeline {
     // the lane records hold (see `Pipeline::audit_lane_holdings`).
     #[cfg(test)]
     pub(super) audit_lane_holdings: bool,
+    // Where a test stops this pipeline's moves of working folders.
+    #[cfg(test)]
+    pub(super) move_gates: activation::MoveGates,
     // When each deferred job's articles become old enough to fetch.
     //
     // Absent means the question has not been asked yet or was answered

@@ -825,6 +825,148 @@ async fn a_job_cancelled_while_its_move_is_out_and_retried_has_one_folder() {
     assert!(retry.exists());
 }
 
+// Opens its gate when dropped, so a test that fails while a move is held
+// leaves no thread standing at the gate.
+struct OpensOnDrop(Arc<crate::pipeline::activation::MoveGate>);
+
+impl Drop for OpensOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+// Until a retry of `id` either waits with a move out for the job, or goes
+// on to clear the job's folders: how many times it did each.
+async fn retry_waits_or_clears(pipeline: &Pipeline) -> (usize, usize) {
+    let queue = pipeline.shared_state.queue.clone();
+    let mut revision = queue.subscribe();
+    loop {
+        let seen = queue.read(|inner| (inner.waits_on_moves, inner.restarts_clearing));
+        if seen != (0, 0) {
+            return seen;
+        }
+        revision.changed().await.unwrap();
+    }
+}
+
+// The retried job's one folder, under `new_root`, which its stored row
+// names; nothing else is left there or in `old_dir`.
+async fn the_retry_has_one_folder(
+    pipeline: &Pipeline,
+    id: JobId,
+    old_dir: &std::path::Path,
+    new_root: &std::path::Path,
+) {
+    let retry = pipeline.jobs[&id].working_dir.clone();
+    assert_eq!(retry.parent(), Some(new_root));
+    assert!(crate::jobs::working_dir::is_job_working_dir(new_root, &retry, id).unwrap());
+    let stored = pipeline
+        .db
+        .load_active_job_row(id)
+        .unwrap()
+        .unwrap()
+        .output_dir;
+    assert_eq!(stored, retry);
+    // Every removal of the first run's folders is done: none is out.
+    let mut revision = pipeline.shared_state.queue.subscribe();
+    while pipeline
+        .shared_state
+        .queue
+        .read(|inner| inner.moves_out.contains_key(&id) || inner.pending_cleanup.contains(&id))
+    {
+        revision.changed().await.unwrap();
+    }
+    assert!(!old_dir.exists(), "the first run's folder is left");
+    let dirs = std::fs::read_dir(new_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(dirs, vec![retry]);
+}
+
+// A job cancelled while its move was out, and retried while the move's last
+// step on disk is held: the retry waits for that step, and only then clears
+// the job's folders and makes its own. Gone on first, it would look at a
+// folder the move is removing, or make one beside the move's.
+#[tokio::test]
+async fn a_retry_waits_for_the_move_that_is_out() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = JobId(1);
+    let (mut pipeline, old_dir, new_root) = unstarted_job_with_a_changed_folder(&temp, id).await;
+    let gate = Arc::new(crate::pipeline::activation::MoveGate::default());
+    pipeline.move_gates.moving = Some(Arc::clone(&gate));
+    let _opens = OpensOnDrop(Arc::clone(&gate));
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let mut events = handle.subscribe_events();
+
+    pipeline.request_job_activation(id);
+    handle.cancel_job(id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(&mut pipeline).await;
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
+    {
+    }
+    gate.reached().await;
+    let retry = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.redownload_job(id).await }
+    });
+    assert_eq!(
+        retry_waits_or_clears(&pipeline).await,
+        (1, 0),
+        "the retry went on while the move was out"
+    );
+
+    gate.open();
+    retry.await.unwrap().unwrap();
+    let done = pipeline.job_activated_rx.recv().await.unwrap();
+    pipeline.handle_job_activated(done);
+    settle(&mut pipeline).await;
+    the_retry_has_one_folder(&pipeline, id, &old_dir, &new_root).await;
+}
+
+// A move heard after its job was cancelled removes the folder it claimed,
+// which nothing took. A retry that comes while that removal is held waits
+// for it: gone on first, it would make its folder under the same name, for
+// the removal to take.
+#[tokio::test]
+async fn a_retry_waits_for_the_removal_of_the_folder_a_move_claimed() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = JobId(1);
+    let (mut pipeline, old_dir, new_root) = unstarted_job_with_a_changed_folder(&temp, id).await;
+    let gate = Arc::new(crate::pipeline::activation::MoveGate::default());
+    pipeline.move_gates.leaving = Some(Arc::clone(&gate));
+    let _opens = OpensOnDrop(Arc::clone(&gate));
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let mut events = handle.subscribe_events();
+
+    pipeline.request_job_activation(id);
+    let done = pipeline.job_activated_rx.recv().await.unwrap();
+    assert!(done.moved_to.is_some(), "the read moved the job");
+    handle.cancel_job(id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(&mut pipeline).await;
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
+    {
+    }
+    pipeline.handle_job_activated(done);
+    gate.reached().await;
+    let retry = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.redownload_job(id).await }
+    });
+    assert_eq!(
+        retry_waits_or_clears(&pipeline).await,
+        (1, 0),
+        "the retry went on while the removal was out"
+    );
+
+    gate.open();
+    retry.await.unwrap().unwrap();
+    settle(&mut pipeline).await;
+    the_retry_has_one_folder(&pipeline, id, &old_dir, &new_root).await;
+}
+
 // A job cancelled while its move was out, its id then being admitted again
 // or held by a history operation when the move is heard: whoever works with
 // the id may have taken the moved directory as its own, so the reply keeps

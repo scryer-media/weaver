@@ -25,6 +25,57 @@ use crate::pipeline::download::repeated::RepeatedArticles;
 use crate::pipeline::graph::restore::{GraphRestore, GraphRestoreError, RestoreSeat, root_files};
 use crate::pipeline::held::HeldPart;
 
+// A point a move stops at, for a test, until the test opens it.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct MoveGate {
+    // Reached, and opened.
+    state: std::sync::Mutex<(bool, bool)>,
+    moved: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl MoveGate {
+    // On a blocking thread: say it is reached, and wait until it is open.
+    pub(crate) fn pass(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.0 = true;
+        self.moved.notify_all();
+        while !state.1 {
+            state = self.moved.wait(state).unwrap();
+        }
+    }
+
+    pub(crate) fn open(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.moved.notify_all();
+    }
+
+    // Until a move has reached it.
+    pub(crate) async fn reached(self: &Arc<Self>) {
+        let gate = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let mut state = gate.state.lock().unwrap();
+            while !state.0 {
+                state = gate.moved.wait(state).unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+}
+
+// Where a test may stop a move: `moving`, just before the move's last step
+// on disk (leaving the old folder, or giving up the new one), and
+// `leaving`, just before the removal of a folder a move claimed for a job
+// that left.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct MoveGates {
+    pub(crate) moving: Option<Arc<MoveGate>>,
+    pub(crate) leaving: Option<Arc<MoveGate>>,
+}
+
 // What the read of one job's stored NZB produced.
 pub(crate) struct JobActivated {
     pub(crate) job_id: JobId,
@@ -180,6 +231,7 @@ async fn follow_working_dir(
     root: PathBuf,
     current: PathBuf,
     name: String,
+    #[cfg(test)] gate: Option<Arc<MoveGate>>,
 ) -> Option<PathBuf> {
     let from = current.clone();
     let followed = tokio::task::spawn_blocking(move || {
@@ -218,6 +270,10 @@ async fn follow_working_dir(
     // job started in, or has gone, did not move, and the claim is given up.
     let recorded = recorded.is_ok() && moved.load(std::sync::atomic::Ordering::Acquire);
     let _ = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(gate) = gate {
+            gate.pass();
+        }
         if recorded {
             followed.leave_old();
         } else {
@@ -292,9 +348,13 @@ impl Pipeline {
                 .queue
                 .read(|inner| inner.row(job_id).is_none_or(|row| self.job_started(row)))
         });
-        if follow.is_some() {
+        // The move is out from here until its last step on disk returned.
+        let move_out = follow.is_some().then(|| {
             self.moving_jobs.insert(job_id, activation);
-        }
+            crate::pipeline::queue::MoveOut::take(&self.shared_state.queue, job_id)
+        });
+        #[cfg(test)]
+        let gate = self.move_gates.moving.clone();
         let seat = self
             .graph_restore_seat(None, &working_dir)
             .for_job(spec_password, &working_dir, staging_dir.as_deref())
@@ -319,10 +379,20 @@ impl Pipeline {
             let started_in = working_dir.clone();
             let moved_to = match follow {
                 Some((root, name)) => {
-                    follow_working_dir(&db, job_id, root, working_dir, name).await
+                    follow_working_dir(
+                        &db,
+                        job_id,
+                        root,
+                        working_dir,
+                        name,
+                        #[cfg(test)]
+                        gate,
+                    )
+                    .await
                 }
                 None => None,
             };
+            drop(move_out);
             let moved = moved_to.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let seat = match moved {
@@ -382,7 +452,23 @@ impl Pipeline {
     // with the id. An id being admitted, or held by a history operation,
     // may have taken the directory as its own, so it stays, and that job's
     // own cleanup takes any directory that carries its marker.
+    #[cfg(test)]
     pub(crate) fn take_moved_dir(&mut self, job_id: JobId, started_in: &Path, dir: &Path) -> bool {
+        self.take_or_hold_moved_dir(job_id, started_in, dir, false)
+    }
+
+    // `take_moved_dir`; with `hold`, a directory that is to go is counted
+    // as a move out for the job in the same write that judged it, so no one
+    // who starts working with the id after that write removes or makes the
+    // job's folders before the removal returned. The caller then owns that
+    // count, as a `MoveOut`.
+    fn take_or_hold_moved_dir(
+        &mut self,
+        job_id: JobId,
+        started_in: &Path,
+        dir: &Path,
+        hold: bool,
+    ) -> bool {
         let mut kept = false;
         if let Some(state) = self.jobs.get_mut(&job_id) {
             kept |= state.working_dir == dir;
@@ -392,21 +478,30 @@ impl Pipeline {
             }
         }
         let (from, to) = (started_in.display().to_string(), dir.display().to_string());
-        kept | self.shared_state.queue.write(|inner| {
+        self.shared_state.queue.write(|inner| {
             let busy =
                 inner.admissions.contains(&job_id) || inner.history_operations.contains(&job_id);
-            match inner.job_mut(job_id) {
+            let (taken, changed) = match inner.job_mut(job_id) {
                 Some(row)
                     if !row.report.retiring
                         && row.report.job.output_dir.as_deref() == Some(from.as_str()) =>
                 {
                     row.report.job.output_dir = Some(to);
-                    crate::pipeline::queue::Change::changed(true)
+                    (true, true)
                 }
-                Some(row) => crate::pipeline::queue::Change::unchanged(
-                    busy || row.report.job.output_dir.as_deref() == Some(to.as_str()),
+                Some(row) => (
+                    kept || busy || row.report.job.output_dir.as_deref() == Some(to.as_str()),
+                    false,
                 ),
-                None => crate::pipeline::queue::Change::unchanged(busy),
+                None => (kept || busy, false),
+            };
+            if hold && !taken {
+                *inner.moves_out.entry(job_id).or_default() += 1;
+            }
+            if changed {
+                crate::pipeline::queue::Change::changed(taken)
+            } else {
+                crate::pipeline::queue::Change::unchanged(taken)
             }
         })
     }
@@ -438,9 +533,17 @@ impl Pipeline {
         // of a job that left, and goes as that job's own cleanup would have
         // taken it.
         if let Some(dir) = moved_to
-            && !self.take_moved_dir(job_id, &started_in, &dir)
+            && !self.take_or_hold_moved_dir(job_id, &started_in, &dir, true)
         {
+            let out = crate::pipeline::queue::MoveOut::counted(&self.shared_state.queue, job_id);
+            #[cfg(test)]
+            let gate = self.move_gates.leaving.clone();
             tokio::task::spawn_blocking(move || {
+                let _out = out;
+                #[cfg(test)]
+                if let Some(gate) = gate {
+                    gate.pass();
+                }
                 let Some(root) = dir.parent() else {
                     return;
                 };

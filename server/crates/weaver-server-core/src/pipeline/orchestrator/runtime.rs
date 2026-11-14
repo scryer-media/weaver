@@ -493,6 +493,8 @@ impl Pipeline {
             download_lane_owners: HashMap::new(),
             #[cfg(test)]
             audit_lane_holdings: false,
+            #[cfg(test)]
+            move_gates: Default::default(),
             propagation_ready_at: HashMap::new(),
             propagation_delay,
             #[cfg(test)]
