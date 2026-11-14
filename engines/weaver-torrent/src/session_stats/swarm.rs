@@ -559,10 +559,12 @@ mod tests {
 
     impl PeerConnectionHandler for &Counting {
         fn should_send_bitfield(&self) -> bool {
-            false
+            true
         }
-        fn serialize_bitfield_message_to_buf(&self, _: &mut [u8]) -> anyhow::Result<usize> {
-            Ok(0)
+        fn serialize_bitfield_message_to_buf(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
+            // A have-all, in place of the bitfield.
+            buf[..5].copy_from_slice(&[0, 0, 0, 1, 14]);
+            Ok(5)
         }
         fn on_handshake(&self, _: Handshake, _: ConnectionKind, _: bool) -> anyhow::Result<()> {
             Ok(())
@@ -598,6 +600,7 @@ mod tests {
             [1, ..] => MessageKind::Unchoke,
             [4, ..] => MessageKind::Have,
             [7, ..] => MessageKind::Piece,
+            [14, ..] => MessageKind::HaveAll,
             [16, ..] => MessageKind::Reject,
             [20, 0, ..] => MessageKind::ExtendedHandshake,
             [20, id, ..] if Some(*id) == PeerExtendedMessageIds::my().ut_pex => MessageKind::Pex,
@@ -744,6 +747,7 @@ mod tests {
                 ("unchoke", 1),
                 ("have", 3),
                 ("piece", 3),
+                ("have_all", 1),
                 ("reject", 1),
                 ("extended_handshake", 1),
                 ("pex", 1),

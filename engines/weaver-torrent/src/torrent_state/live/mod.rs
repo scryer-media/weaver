@@ -2717,7 +2717,6 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             Message::Bitfield(ByteBuf(have.as_bytes()))
         };
         let len = msg.serialize(buf, &Default::default)?;
-        self.on_wire_messages(Direction::Out, MessageKind::of(&msg), 1);
         trace!("sending: {:?}, length={}", &msg, len);
         Ok(len)
     }

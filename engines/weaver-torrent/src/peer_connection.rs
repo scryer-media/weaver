@@ -589,6 +589,8 @@ struct Framed {
     len: usize,
     chunk: Option<ChunkInfo>,
     read: bool,
+    /// What a frame other than a block is counted as once it is written.
+    kind: Option<MessageKind>,
 }
 
 /// A handler's error as the connection ends in it: one of ours stays as it
@@ -618,6 +620,7 @@ impl Framed {
             len,
             chunk: None,
             read: false,
+            kind: None,
         }
     }
 }
@@ -1028,6 +1031,14 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 )
                 .await?;
                 self.handler.on_protocol_bytes(Channel::Upload, len as u64);
+                // The frame is a bitfield, or under the fast extension a
+                // have-all or have-none, told apart by its message id.
+                let kind = match write_buf.get(4) {
+                    Some(14) => MessageKind::HaveAll,
+                    Some(15) => MessageKind::HaveNone,
+                    _ => MessageKind::Bitfield,
+                };
+                self.handler.on_wire_messages(Direction::Out, kind, 1);
                 trace!("sent bitfield");
             }
 
@@ -1166,6 +1177,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                                     len: needs,
                                     chunk: Some(chunk),
                                     read,
+                                    kind: None,
                                 })
                             }
                         }
@@ -1178,11 +1190,9 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                             break;
                         }
                     };
-                    if let Some(framed) = framed {
-                        if framed.chunk.is_none()
-                            && let Some(kind) = kind
-                        {
-                            self.handler.on_wire_messages(Direction::Out, kind, 1);
+                    if let Some(mut framed) = framed {
+                        if framed.chunk.is_none() {
+                            framed.kind = kind;
                         }
                         filled += framed.len;
                         batch.push(framed);
@@ -1279,6 +1289,9 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     let payload = framed.chunk.map_or(0, |chunk| chunk.size as usize);
                     self.handler
                         .on_protocol_bytes(Channel::Upload, (framed.len - payload) as u64);
+                    if let Some(kind) = framed.kind {
+                        self.handler.on_wire_messages(Direction::Out, kind, 1);
+                    }
                     if let Some(chunk) = framed.chunk {
                         sent_payload += u64::from(chunk.size);
                         self.handler.on_uploaded_bytes(chunk.size);

@@ -20,6 +20,8 @@ use crate::{Session, torrent_state::peers::stats::AggregatePeerStatsAtomic};
 pub mod snapshot;
 pub mod swarm;
 
+pub use swarm::Transport;
+
 gen_stats!(SessionCountersAtomic SessionCountersSnapshot, [
     fetched_bytes u64,
     uploaded_bytes u64,
