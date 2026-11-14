@@ -1703,7 +1703,12 @@ type Metrics {
 	and jobs outside the queue window included; not connections or jobs.
 	"""
 	downloadQueueDepth: Int!
-	activeDownloads: Int!
+	"""
+	Articles the download lanes hold right now: sent or about to be sent
+	to a server and not yet answered. Roughly busy connections times
+	pipeline depth. Not the number of jobs or files downloading.
+	"""
+	articlesInFlight: Int!
 	activeDecodes: Int!
 	decodePending: Int!
 	decodePendingBytes: Int!
@@ -4460,7 +4465,8 @@ type ServerHealth {
 	"""
 	label: String!
 	"""
-	"PRIMARY" for the highest-priority server, "BACKUP" otherwise.
+	"PRIMARY" for every fill server on the top priority level, "BACKUP"
+	for every other server (lower levels and backfill servers).
 	"""
 	tier: String!
 	"""
@@ -4511,9 +4517,16 @@ type ServerHealth {
 	"""
 	runtimeGeneration: Int!
 	"""
-	EWMA request latency in milliseconds.
+	EWMA request latency in milliseconds. Reads 50.0, the figure server
+	ranking starts from, until a first request has been timed; use
+	`measuredLatencyMs` to tell a measurement from that start value.
 	"""
 	latencyMs: Float!
+	"""
+	EWMA request latency in milliseconds, absent until a first request
+	to this server has been timed.
+	"""
+	measuredLatencyMs: Float
 	"""
 	EWMA command-to-status-line wait for BODY fetches, in milliseconds.
 	Absent until the download lanes have taken an unbiased sample.
@@ -4529,21 +4542,44 @@ type ServerHealth {
 	"""
 	bodyLatencyBand: String
 	"""
-	BODY pipelining depth the lanes currently run at; 1 is sequential.
+	BODY pipelining depth the lanes currently run at; 1 is sequential,
+	and a server pinned sequential always reads 1.
 	"""
 	bodyPipelineDepth: Int!
 	"""
 	Set once the server has twice failed to answer a pipelined batch
-	cleanly, which holds it sequential for the rest of the process.
+	cleanly, which holds it sequential until Weaver restarts. A reorder
+	or a priority change keeps the hold; a change of host, port or
+	username starts the server afresh.
 	"""
 	bodyPipeliningPinnedSequential: Boolean!
+	"""
+	Requests the connection answered, whatever the answer: a server
+	that says "no such article" is a working connection and counts here.
+	What it had is in `articlesFound` and `articlesNotFound`.
+	"""
 	successCount: Int!
+	"""
+	Requests the connection failed: refused, timed out, dropped or
+	answered out of protocol. A "no such article" answer is not one.
+	"""
 	failureCount: Int!
 	consecutiveFailures: Int!
 	"""
 	Connections that died before reaching a healthy age, recently.
 	"""
 	prematureDeaths: Int!
+	"""
+	Article requests this server answered with the article, counted
+	since Weaver last started. The count starts again at every start.
+	"""
+	articlesFound: Int!
+	"""
+	Article requests this server answered "no such article", counted
+	since Weaver last started; the article may still have come from
+	another server. The count starts again at every start.
+	"""
+	articlesNotFound: Int!
 	legs: [NetworkLegFlow!]!
 	"""
 	The resolved address new connections to this server dial, once an

@@ -239,11 +239,10 @@ impl Delivery {
     // for fails, and as every failed job publishes nothing, they stay in its
     // working directory.
     pub(crate) fn status(&self, failure: Option<&Failure>) -> JobStatus {
-        let extracted = self.files.iter().any(|file| file.whole && file.depth > 0);
         let short = !(self.damaged.is_empty()
             && self.unrepaired.is_empty()
             && self.withheld.is_empty()
-            && (self.unnamed.is_empty() || extracted));
+            && (self.unnamed.is_empty() || self.extracted()));
         if !self.whole.is_empty() && !short && failure.is_none_or(|failure| failure.from_feed) {
             return JobStatus::Complete;
         }
@@ -275,6 +274,13 @@ impl Delivery {
             }
         };
         JobStatus::Failed { error }
+    }
+
+    // A set below the root extracted a file whole: an unnamed posted file
+    // that never arrived beside it may have been a copy of one of its
+    // volumes, and leaves the delivery no shorter.
+    pub(crate) fn extracted(&self) -> bool {
+        self.files.iter().any(|file| file.whole && file.depth > 0)
     }
 
     // What was withheld, worded by why its object refused it: the names

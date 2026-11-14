@@ -137,7 +137,7 @@ async fn walk(scenario: &Scenario, pause: Option<Pause>) -> Walk {
                     JOB,
                     scenario,
                     article,
-                    &work.exclude_servers,
+                    work.exclude_servers,
                     plan.as_ref(),
                 )
                 .await;

@@ -16,6 +16,22 @@ impl Database {
         server: &ServerConfig,
         routing: Option<&crate::proxies::RoutingPolicy>,
     ) -> Result<(), StateError> {
+        self.insert_server_row(server, routing, true)
+    }
+
+    // A stored list past the limit, as an older version could leave one, so
+    // the upgrade step that trims it can be tested.
+    #[cfg(test)]
+    pub(crate) fn insert_server_past_limit(&self, server: &ServerConfig) -> Result<(), StateError> {
+        self.insert_server_row(server, None, false)
+    }
+
+    fn insert_server_row(
+        &self,
+        server: &ServerConfig,
+        routing: Option<&crate::proxies::RoutingPolicy>,
+        within_limit: bool,
+    ) -> Result<(), StateError> {
         use crate::persistence::encryption::encrypt_secret_for_write;
 
         let datastore = self.datastore();
@@ -29,6 +45,9 @@ impl Database {
             SqlRuntime::run_in_transaction(&datastore, "save_consumer_routing", |tx| {
                 let args = args.clone(); let routing = routing.clone();
                 Box::pin(async move {
+            if within_limit {
+                refuse_past_server_limit(tx).await?;
+            }
             tx.execute(
                 "INSERT INTO servers
                     (id, host, port, tls, username, password, connections, active, supports_pipelining, pipelining_depth, priority, backfill, retention_days, max_download_speed, download_quota_enabled, download_quota_limit_bytes, download_quota_period, download_quota_reset_time_minutes_local, download_quota_weekly_reset_weekday, download_quota_monthly_reset_day, tls_ca_cert, tls_name_mismatch_certificate_der)
@@ -120,25 +139,57 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "delete_routed_consumer", |tx| {
-                Box::pin(async move {
-                    Database::remove_server_schedules(tx, id).await?;
-                    let changed = tx
-                        .execute(
-                            "DELETE FROM servers WHERE id = {}",
-                            &[SqlArg::I64(i64::from(id))],
-                        )
-                        .await?;
-                    tx.execute(
-                        "DELETE FROM proxy_routes WHERE consumer = {}",
-                        &[SqlArg::Text(crate::proxies::Consumer::Server(id).key())],
-                    )
-                    .await?;
-                    Ok(changed > 0)
-                })
+                Box::pin(async move { delete_server_rows(&mut tx.conn(), id).await })
             })
             .await
         })
     }
+}
+
+// Every row a server delete removes: the server's schedule rules, the server,
+// and its proxy route. Runs inside the caller's transaction.
+pub(crate) async fn delete_server_rows(
+    conn: &mut crate::persistence::sql_runtime::SqlConn<'_>,
+    id: u32,
+) -> Result<bool, StateError> {
+    Database::remove_server_schedules(conn, id).await?;
+    let changed = conn
+        .execute(
+            "DELETE FROM servers WHERE id = {}",
+            &[SqlArg::I64(i64::from(id))],
+        )
+        .await?;
+    conn.execute(
+        "DELETE FROM proxy_routes WHERE consumer = {}",
+        &[SqlArg::Text(crate::proxies::Consumer::Server(id).key())],
+    )
+    .await?;
+    Ok(changed > 0)
+}
+
+// Weaver takes at most `MAX_PROVIDERS` news servers, counted active or not:
+// enabling one is an edit, never an insert, so the cap holds there too.
+async fn refuse_past_server_limit(
+    tx: &mut crate::persistence::sql_runtime::SqlTx<'_>,
+) -> Result<(), StateError> {
+    let count = match tx
+        .fetch_optional("SELECT COUNT(*) AS count FROM servers", &[])
+        .await?
+    {
+        Some(row) => row.i64("count")?,
+        None => 0,
+    };
+    let max = weaver_nntp::MAX_PROVIDERS;
+    if count >= max as i64 {
+        let mut params = serde_json::Map::new();
+        params.insert("max".to_string(), serde_json::Value::from(max));
+        return Err(StateError::Refused(crate::persistence::Refusal {
+            code: "SERVER_LIMIT",
+            message: format!("Weaver takes at most {max} servers"),
+            params,
+        }));
+    }
+    Ok(())
 }
 
 pub(crate) fn server_args(
@@ -179,4 +230,34 @@ pub(crate) fn server_args(
         SqlArg::OptText(record.tls_ca_cert),
         SqlArg::OptBytes(record.tls_name_mismatch_certificate_der),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    fn server(id: u32) -> crate::servers::ServerConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "host": format!("news-{id}.example.test"), "port": 119, "tls": false,
+            "connections": 1, "active": id.is_multiple_of(2)
+        }))
+        .unwrap()
+    }
+
+    // Fifty servers are taken, active or not; the fifty-first is refused in
+    // words, and nothing of it is stored.
+    #[test]
+    fn a_fifty_first_server_is_refused() {
+        let db = crate::Database::open_in_memory().unwrap();
+        for id in 1..=50 {
+            db.insert_server(&server(id)).unwrap();
+        }
+        let error = db.insert_server(&server(51)).unwrap_err();
+        assert_eq!(
+            error.refusal().map(|refusal| refusal.code),
+            Some("SERVER_LIMIT")
+        );
+        assert_eq!(error.to_string(), "Weaver takes at most 50 servers");
+        let stored = db.load_config().unwrap().servers;
+        assert_eq!(stored.len(), 50);
+        assert!(stored.iter().all(|server| server.id != 51));
+    }
 }

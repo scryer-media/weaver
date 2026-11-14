@@ -1,0 +1,15 @@
+{
+  "slug": "adv-par2-nested-false-packets",
+  "title": "E2E.Adversarial.Par2.Nested.False.Packets.2026-TESTGRP",
+  "description": "An intact payload and its PAR2 index beside a recovery volume of 8,192 nested false packet headers, none sealed. Each false packet is read again from the volume one replay after another, never one inside the other, and past sixteen volume lengths of re-reading a false packet is read past. The payload is delivered with its exact bytes.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "minOutputFiles": 1
+  },
+  "expectedOutputBLAKE3": {
+    "nested-payload.mkv": "d697b96be7b6ef3024253dfbf684c37f7c0c87eff74d3f4831888ef033fa665e"
+  }
+}

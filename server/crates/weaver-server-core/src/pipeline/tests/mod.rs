@@ -1810,7 +1810,7 @@ pub(in crate::pipeline) async fn insert_delivered_job(
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             release_connection_slot: true,
         })
         .await;
@@ -2030,8 +2030,11 @@ async fn submit_decoded_segment_declaring(
                 segments,
             },
             SegmentSource {
-                source_server_idx: None,
-                exclude_servers: Vec::new(),
+                servers: PoolServers::stamped(
+                    pipeline.pool_generation,
+                    None,
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
             },
         )
         .await;
@@ -2147,6 +2150,27 @@ fn retention_client(retention_days: &[u32]) -> weaver_nntp::client::NntpClient {
         max_idle_age: Duration::from_secs(300),
         max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(1),
+    })
+}
+
+// A client of the `retention_client` servers named by `hosts`, in that
+// order: host `n` is the same server in every client built here.
+fn hosts_client(hosts: &[usize]) -> weaver_nntp::client::NntpClient {
+    weaver_nntp::client::NntpClient::new(weaver_nntp::client::NntpClientConfig {
+        servers: hosts
+            .iter()
+            .map(|host| weaver_nntp::pool::ServerPoolConfig {
+                server: weaver_nntp::ServerConfig {
+                    host: format!("retention-{host}.example.com"),
+                    ..Default::default()
+                },
+                max_connections: 2,
+                ..weaver_nntp::pool::ServerPoolConfig::default()
+            })
+            .collect(),
+        max_idle_age: std::time::Duration::from_secs(300),
+        max_retries_per_server: 1,
+        soft_timeout: std::time::Duration::from_secs(1),
     })
 }
 

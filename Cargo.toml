@@ -117,7 +117,7 @@ windows-sys = { version = "0.61", default-features = false }
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
 # Authenticated recovery scanning and source-change handling.
-par2-rs = { version = "=0.11.0", default-features = false, features = ["crypto-aws-lc"] }
+par2-rs = { version = "=0.12.0", default-features = false, features = ["crypto-aws-lc"] }
 # Native PAR3 verification and repair; shares CPU arithmetic with PAR2.
 # 0.4.1 is a floor, not just a preference: before it, a session alone on the
 # budget that could not fit its own admitted packets was reported as peer
@@ -133,7 +133,7 @@ par2-rs = { version = "=0.11.0", default-features = false, features = ["crypto-a
 # backup, rather than renaming the rebuilt file over it.
 # 0.8 drops RAR PAR-inside (`inside::rar5`, `RarCipher`), which weaver never
 # used; the ZIP and 7z `inside` it does use are unchanged.
-par3-rs = { version = "=0.8.1", default-features = false }
+par3-rs = { version = "=0.8.2", default-features = false }
 # 0.7 is a contract, not just a floor: `RarVolumeFacts::volume_number` is
 # `Option<u32>` there, and volume-facts registration keys on "the header
 # stated a number" versus "the format states none" — a distinction 0.5.x

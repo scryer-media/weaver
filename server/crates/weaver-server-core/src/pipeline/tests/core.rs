@@ -493,7 +493,7 @@ async fn held_off_server_stops_reconnecting_inside_the_holdoff_window() {
     let client = tokio::task::spawn_blocking(move || {
         for _ in 0..CONNECTIONS {
             assert!(matches!(
-                client.try_acquire_blocking_body_lane(&[], &[]),
+                client.try_acquire_blocking_body_lane(&[], weaver_nntp::ServerSet::EMPTY),
                 Err(
                     weaver_nntp::client::BlockingBodyLaneAcquireError::ProviderCapacity(
                         weaver_nntp::NntpError::ServerOverLimit { .. }
@@ -931,9 +931,10 @@ async fn hard_write_pressure_latches_until_soft_watermark() {
 }
 
 #[tokio::test]
-async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
+async fn delayed_retry_carries_exclusions_across_a_pool_rebuild() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(hosts_client(&[0, 1]));
     let job_id = JobId(40041);
     let file_id = NzbFileId {
         job_id,
@@ -977,14 +978,14 @@ async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
         retry_count: 1,
         is_recovery: false,
         completion_critical: false,
-        exclude_servers: vec![0],
+        exclude_servers: weaver_nntp::ServerSet::from([0]),
         avoid_server: None,
     };
 
-    // A rebuild bumped the generation after this retry was scheduled under gen 0:
-    // its exclude index no longer refers to the server it was computed against,
-    // so the guard must drop it (the retry re-tries every server cleanly).
-    pipeline.pool_generation = 1;
+    // A rebuild swapped the two servers after this retry was scheduled under
+    // gen 0: server 0 of that pool is server 1 of the new one, and the retry
+    // keeps it tried under that number.
+    pipeline.activate_nntp(hosts_client(&[1, 0]), 4, 1);
     pipeline.note_retry_scheduled(segment_id);
     pipeline.receive_retry_work(super::RetryWork {
         scheduled_pool_generation: 0,
@@ -1002,10 +1003,31 @@ async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
         .pop()
         .expect("stale retry should still requeue");
     assert_eq!(queued.segment_id, segment_id);
-    assert!(
-        queued.exclude_servers.is_empty(),
-        "stale server exclusions must be dropped after a pool rebuild"
+    assert_eq!(
+        queued.exclude_servers,
+        [1],
+        "server exclusions are carried by server identity across a pool rebuild"
     );
+
+    // Scheduled under a generation no layout is held for: nothing can be
+    // read from its numbers, so the retry tries every server.
+    pipeline.note_retry_scheduled(segment_id);
+    pipeline.receive_retry_work(super::RetryWork {
+        scheduled_pool_generation: 77,
+        infrastructure_retry: false,
+        work: make_work(),
+    });
+    let queued = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .pop()
+        .expect("an unknown-generation retry should still requeue");
+    assert!(queued.exclude_servers.is_empty());
 
     // No rebuild since scheduling: exclusions are still valid and preserved.
     pipeline.note_retry_scheduled(segment_id);
@@ -1498,7 +1520,7 @@ async fn sparse_article_numbers_commit_cleanly_with_dense_ordinals() {
             total_size,
         );
 
-        pipeline.active_downloads += 1;
+        pipeline.articles_in_flight += 1;
         pipeline
             .handle_download_done(DownloadResult {
                 lane_id: 0,
@@ -1511,7 +1533,7 @@ async fn sparse_article_numbers_commit_cleanly_with_dense_ordinals() {
                 source_server_idx: None,
                 origin: DownloadResultOrigin::NormalPrimary,
                 retry_count: 0,
-                exclude_servers: Vec::new(),
+                exclude_servers: weaver_nntp::ServerSet::EMPTY,
                 release_connection_slot: true,
             })
             .await;

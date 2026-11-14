@@ -121,6 +121,64 @@ impl Pipeline {
         output_dir: Option<std::path::PathBuf>,
     ) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
         let values = self.active_runtime_values(job_id)?;
+        self.persist_runtime_values(job_id, values, output_dir)
+    }
+
+    // A paused job's resume that waits for its download slot: its row is
+    // stored as the resume leaves it, so a restart before the slot comes
+    // restores it resumed. The job stays paused here until the slot comes.
+    pub(crate) fn persist_waiting_resume(&self, job_id: JobId) {
+        let Some(mut values) = self.active_runtime_values(job_id) else {
+            return;
+        };
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        if !matches!(state.run_state, crate::jobs::model::RunState::Paused) {
+            return;
+        }
+        let resume_status = state
+            .paused_resume_status
+            .clone()
+            .unwrap_or(JobStatus::Downloading);
+        let (default_download_state, default_post_state, _) =
+            crate::jobs::model::runtime_lanes_from_status_snapshot(&resume_status);
+        let download_state = state
+            .paused_resume_download_state
+            .unwrap_or(default_download_state);
+        let post_state = state.paused_resume_post_state.unwrap_or(default_post_state);
+        let resume_status = crate::jobs::model::derive_legacy_job_status(
+            download_state,
+            post_state,
+            crate::jobs::model::RunState::Active,
+            None,
+        );
+        if matches!(
+            resume_status,
+            JobStatus::Complete
+                | JobStatus::Partial
+                | JobStatus::Failed { .. }
+                | JobStatus::Moving
+                | JobStatus::Paused
+        ) {
+            return;
+        }
+        values.status = Self::persist_active_status_for(&resume_status);
+        values.download_state = Some(download_state.as_str());
+        values.post_state = Some(post_state.as_str());
+        values.run_state = Some(crate::jobs::model::RunState::Active.as_str());
+        values.paused_resume_status = None;
+        values.paused_resume_download_state = None;
+        values.paused_resume_post_state = None;
+        let _ = self.persist_runtime_values(job_id, values, None);
+    }
+
+    fn persist_runtime_values(
+        &self,
+        job_id: JobId,
+        values: ActiveRuntimeValues,
+        output_dir: Option<std::path::PathBuf>,
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
         #[cfg(test)]
         RUNTIME_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let output_dir = output_dir

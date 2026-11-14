@@ -192,7 +192,7 @@ async fn a_probe_waits_for_a_busy_seat_and_rules_the_post_dead_once_it_frees() {
     // off the runtime, so this one does too.
     let nntp = Arc::clone(&pipeline.nntp);
     let busy = std::thread::spawn(move || {
-        nntp.try_acquire_blocking_body_lane_with_estimate(&[], &[], 0)
+        nntp.try_acquire_blocking_body_lane_with_estimate(&[], weaver_nntp::ServerSet::EMPTY, 0)
             .expect("the server seats the busy lane")
     })
     .join()

@@ -145,8 +145,11 @@ async fn deliver_declared(
                 }],
             },
             SegmentSource {
-                source_server_idx,
-                exclude_servers: Vec::new(),
+                servers: PoolServers::stamped(
+                    pipeline.pool_generation,
+                    source_server_idx,
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
             },
         )
         .await;
@@ -316,8 +319,11 @@ async fn deliver_unanchored_status(
                 segments: Vec::new(),
             },
             SegmentSource {
-                source_server_idx: Some(0),
-                exclude_servers: Vec::new(),
+                servers: PoolServers::stamped(
+                    pipeline.pool_generation,
+                    Some(0),
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
             },
         )
         .await;
@@ -798,8 +804,11 @@ async fn deliver_damaged_declaring(
                 segments: Vec::new(),
             },
             SegmentSource {
-                source_server_idx: Some(0),
-                exclude_servers: Vec::new(),
+                servers: PoolServers::stamped(
+                    pipeline.pool_generation,
+                    Some(0),
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
             },
         )
         .await;

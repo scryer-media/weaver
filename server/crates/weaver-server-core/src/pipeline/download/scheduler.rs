@@ -95,11 +95,35 @@
 // connection and lane gauges, download quota reservations, activation of the
 // work it was handed, and returning unused work to the queue.
 
+use super::queue::ScanPoint;
 use super::worker::DownloadPressure;
 use super::worker::{BlockedBy, ServableWork, ServableWorkFilter};
 use super::*;
 use crate::jobs::model::JobArticles;
 use crate::operations::metrics::SchedulerBlockClause;
+
+// Whether a walk may start at a server's floor. Always, except in a test
+// that walks every queue whole to hold the floors' answers to it.
+#[cfg(not(test))]
+fn scan_floors_enabled() -> bool {
+    true
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCAN_FLOORS_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn scan_floors_enabled() -> bool {
+    !SCAN_FLOORS_OFF.with(std::cell::Cell::get)
+}
+
+// Walks every queue whole on this thread while `off` holds.
+#[cfg(test)]
+pub(in crate::pipeline) fn set_scan_floors_off(off: bool) {
+    SCAN_FLOORS_OFF.with(|cell| cell.set(off));
+}
 
 // What a server gets when it asks for work.
 pub(in crate::pipeline) enum Handout {
@@ -312,7 +336,7 @@ impl Pipeline {
             .get(&job_id)
             .map_or(0, |state| state.articles.queued_download_len());
         let out_on_lanes = self
-            .active_downloads_by_job
+            .articles_in_flight_by_job
             .get(&job_id)
             .copied()
             .unwrap_or(0);
@@ -370,7 +394,7 @@ impl Pipeline {
             // Only a job that would actually have served this lane may hold it:
             // one that is blocked here must let the walk go on, or a lane at
             // its share of a job it cannot fetch from would shut out the rest.
-            return match self.job_servable_work_for_server(job_id, server_idx, pressure) {
+            return match self.job_servable_work_for_server(job_id, server_idx, pressure, true) {
                 Ok(()) => ShareTaken::Saturated(wake),
                 Err(blocked) => ShareTaken::Blocked(blocked),
             };
@@ -420,6 +444,18 @@ impl Pipeline {
     // for this call, and names the clauses that refused it. The job's
     // completion-critical heap leads its ordinary one, which is what the
     // queue's own "first matching" scan already does.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn take_servable_works_or_none(
+        &mut self,
+        job_id: JobId,
+        server_idx: usize,
+        want: usize,
+        pressure: DownloadPressure,
+    ) -> Option<Vec<DownloadWork>> {
+        self.take_servable_works(job_id, server_idx, want, pressure)
+            .ok()
+    }
+
     fn take_servable_works(
         &mut self,
         job_id: JobId,
@@ -441,7 +477,7 @@ impl Pipeline {
         let mut filter = match self.servable_work_filter(
             job_id,
             server_idx,
-            bootstrap_files.as_deref(),
+            bootstrap_files.as_ref(),
             uu_cursor_ordinals.as_ref(),
         ) {
             ServableWork::Scan(filter) => filter,
@@ -460,8 +496,11 @@ impl Pipeline {
                 // it as missing now rather than leave the job waiting.
                 let server_count = self.nntp.pool().server_count();
                 let retention = self.job_retention_excludes(job_id);
-                if Self::unavailable_server_count_from_excludes(self.nntp.pool(), &[], &retention)
-                    >= server_count
+                if Self::unavailable_server_count_from_excludes(
+                    self.nntp.pool(),
+                    weaver_nntp::ServerSet::EMPTY,
+                    retention,
+                ) >= server_count
                 {
                     self.retire_unservable_queued_work(job_id);
                 }
@@ -469,31 +508,49 @@ impl Pipeline {
             }
         };
         let mut taken: Vec<DownloadWork> = Vec::new();
-        while taken.len() < want {
-            let Some(state) = self.jobs.get_mut(&job_id) else {
-                break;
+        if let Some(state) = self.jobs.get_mut(&job_id)
+            && let Some(queue) = state.articles.download_queue_mut()
+        {
+            // The walk starts where this server's last one left off while
+            // nothing its refusals rested on has changed, and each article
+            // after the first is looked for past the one before: everything
+            // walked over was refused, and is refused again.
+            let prior = queue
+                .take_scan_floor(server_idx)
+                .filter(|_| scan_floors_enabled());
+            let mut at = match &prior {
+                Some((from, memo)) if filter.resume(memo) => *from,
+                _ => ScanPoint::Head,
             };
-            let popped = state
-                .articles
-                .download_queue_mut()
-                .and_then(|queue| queue.pop_first_matching(|work| filter.allows(work)));
-            let Some(item) = popped else {
-                self.metrics
-                    .download_scheduler_scan_no_match_total
-                    .fetch_add(1, Ordering::Relaxed);
-                break;
-            };
-            let segment_id = item.segment_id;
-            let Some(work) = item.into_work(&state.spec) else {
-                // The job's queue only holds parts of its own article list.
-                error!(
-                    segment = %segment_id,
-                    "queued article is not in its job's article list; dropping it"
-                );
-                continue;
-            };
-            filter.note_taken(&work);
-            taken.push(work);
+            while taken.len() < want {
+                let found = queue.find_from(at, |work| filter.allows(work));
+                let Some(item) = queue.take_at(found) else {
+                    self.metrics
+                        .download_scheduler_scan_no_match_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    at = ScanPoint::End;
+                    break;
+                };
+                at = found;
+                let segment_id = item.segment_id;
+                let Some(work) = item.into_work(&state.spec) else {
+                    // The job's queue only holds parts of its own article list.
+                    error!(
+                        segment = %segment_id,
+                        "queued article is not in its job's article list; dropping it"
+                    );
+                    continue;
+                };
+                filter.note_taken(&work);
+                taken.push(work);
+            }
+            if scan_floors_enabled() && filter.refusals_keep() {
+                queue.set_scan_floor(server_idx, at, filter.memo(prior.map(|(_, memo)| memo)));
+            }
+        } else if want > 0 {
+            self.metrics
+                .download_scheduler_scan_no_match_total
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         self.note_scan_skips(&filter);
@@ -574,9 +631,10 @@ impl Pipeline {
         if !cfg!(debug_assertions) {
             return;
         }
-        let servable = eligible
-            .iter()
-            .any(|job_id| self.job_has_servable_work_for_server(*job_id, server_idx, pressure));
+        // A whole walk, past every floor: the floors are what it checks.
+        let servable = eligible.iter().any(|job_id| {
+            self.job_has_servable_work_for_server(*job_id, server_idx, pressure, false)
+        });
         if servable {
             self.metrics
                 .download_scheduler_idle_with_servable_total
@@ -600,9 +658,9 @@ impl Pipeline {
         (0..server_count)
             .filter(|other| *other != server_idx)
             .any(|other| {
-                eligible
-                    .iter()
-                    .any(|job_id| self.job_has_servable_work_for_server(*job_id, other, pressure))
+                eligible.iter().any(|job_id| {
+                    self.job_has_servable_work_for_server(*job_id, other, pressure, true)
+                })
             })
     }
 
@@ -613,18 +671,22 @@ impl Pipeline {
         job_id: JobId,
         server_idx: usize,
         pressure: DownloadPressure,
+        from_floor: bool,
     ) -> bool {
-        self.job_servable_work_for_server(job_id, server_idx, pressure)
+        self.job_servable_work_for_server(job_id, server_idx, pressure, from_floor)
             .is_ok()
     }
 
     // [`Self::job_has_servable_work_for_server`], naming the clauses that
-    // refused the job when it holds nothing for the server.
+    // refused the job when it holds nothing for the server. `from_floor`
+    // lets the walk start where the server's last one left off; without it
+    // the whole queue is read, as an independent check of those floors is.
     fn job_servable_work_for_server(
         &mut self,
         job_id: JobId,
         server_idx: usize,
         pressure: DownloadPressure,
+        from_floor: bool,
     ) -> Result<(), BlockedBy> {
         if self.propagation_hold_until(job_id).is_some() {
             return Err(BlockedBy::only(SchedulerBlockClause::Propagation));
@@ -634,7 +696,7 @@ impl Pipeline {
         let filter = match self.servable_work_filter(
             job_id,
             server_idx,
-            bootstrap_files.as_deref(),
+            bootstrap_files.as_ref(),
             uu_cursor_ordinals.as_ref(),
         ) {
             ServableWork::Scan(filter) => filter,
@@ -643,15 +705,30 @@ impl Pipeline {
                 return Err(BlockedBy::only(SchedulerBlockClause::Retention));
             }
         };
-        let Some(state) = self.jobs.get(&job_id) else {
+        let Some(state) = self.jobs.get_mut(&job_id) else {
             return Err(BlockedBy::default());
         };
-        let Some(queue) = state.articles.download_queue() else {
+        let Some(queue) = state.articles.download_queue_mut() else {
             return Err(BlockedBy::only(SchedulerBlockClause::Activation));
         };
-        let found = queue
-            .peek_first_matching(|work| filter.allows(work))
-            .is_some();
+        let found = if from_floor {
+            let prior = queue
+                .take_scan_floor(server_idx)
+                .filter(|_| scan_floors_enabled());
+            let from = match &prior {
+                Some((from, memo)) if filter.resume(memo) => *from,
+                _ => ScanPoint::Head,
+            };
+            let at = queue.find_from(from, |work| filter.allows(work));
+            if scan_floors_enabled() && filter.refusals_keep() {
+                queue.set_scan_floor(server_idx, at, filter.memo(prior.map(|(_, memo)| memo)));
+            }
+            at != ScanPoint::End
+        } else {
+            queue
+                .peek_first_matching(|work| filter.allows(work))
+                .is_some()
+        };
         self.note_scan_skips(&filter);
         if found {
             return Ok(());

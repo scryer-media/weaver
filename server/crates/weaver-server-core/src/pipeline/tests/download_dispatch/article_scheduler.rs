@@ -62,7 +62,7 @@ fn lane_holding(pipeline: &mut Pipeline, job_id: JobId, holds: usize, depth: usi
                 retry_count: 0,
                 is_recovery: false,
                 completion_critical: false,
-                exclude_servers: Vec::new(),
+                exclude_servers: weaver_nntp::ServerSet::EMPTY,
                 avoid_server: None,
             };
             (segment_id, work)
@@ -376,9 +376,13 @@ async fn a_retention_excluded_hot_job_is_blocked_on_that_server_alone() {
     let next = JobId(71042);
     add_job(&mut pipeline, hot, "Deep Archive Reel", 200).await;
     add_job(&mut pipeline, next, "Fresh Post Reel", 200).await;
-    pipeline
-        .job_retention_exclude_cache
-        .insert(hot, (std::time::Instant::now(), Arc::new(vec![SERVER_B])));
+    pipeline.job_retention_exclude_cache.insert(
+        hot,
+        (
+            std::time::Instant::now(),
+            weaver_nntp::ServerSet::from([SERVER_B]),
+        ),
+    );
 
     let on_b = taken(ask(&mut pipeline, SERVER_B, 4, None));
     assert_eq!(single_job(&on_b), next);
@@ -506,7 +510,7 @@ async fn soft_pressure_raised_by_a_hot_job_blocked_everywhere_does_not_idle_the_
     }
     // The hot job's remaining articles are refused on both servers.
     rewrite_queue(&mut pipeline, hot, |work| {
-        work.exclude_servers = vec![SERVER_A, SERVER_B];
+        work.exclude_servers = weaver_nntp::ServerSet::from([SERVER_A, SERVER_B]);
     });
     // Its reorder buffers alone put the write backlog at the soft mark.
     let (_, _, write_soft, _) = pipeline.download_pressure_limits();
@@ -657,12 +661,12 @@ async fn per_article_exclusions_decide_which_server_a_job_is_blocked_on() {
     add_job(&mut pipeline, next, "Untouched Reel", 40).await;
     // Both servers are up in this dispatch attempt, so a rotated article
     // has somewhere else to go.
-    pipeline.download_pass_fill_servers = Some(vec![SERVER_A, SERVER_B]);
+    pipeline.download_pass_fill_servers = Some(weaver_nntp::ServerSet::from([SERVER_A, SERVER_B]));
     // Half the hot job's articles failed on this server, the other half were
     // merely rotated away from it: neither may come back to it.
     rewrite_queue(&mut pipeline, hot, |work| {
         if work.segment_id.segment_number % 2 == 0 {
-            work.exclude_servers = vec![SERVER_A];
+            work.exclude_servers = weaver_nntp::ServerSet::from([SERVER_A]);
         } else {
             work.avoid_server = Some(SERVER_A);
         }
@@ -692,7 +696,7 @@ async fn a_rotated_article_returns_to_its_server_while_the_alternative_is_down()
     rewrite_queue(&mut pipeline, job_id, |work| {
         work.avoid_server = Some(SERVER_A);
     });
-    pipeline.download_pass_fill_servers = Some(vec![SERVER_A]);
+    pipeline.download_pass_fill_servers = Some(weaver_nntp::ServerSet::from([SERVER_A]));
 
     let on_a = taken(ask(&mut pipeline, SERVER_A, 8, None));
     assert_eq!(on_a.len(), 4);
@@ -711,7 +715,7 @@ async fn a_rotated_article_goes_to_the_alternative_while_it_is_up() {
     rewrite_queue(&mut pipeline, job_id, |work| {
         work.avoid_server = Some(SERVER_A);
     });
-    pipeline.download_pass_fill_servers = Some(vec![SERVER_A, SERVER_B]);
+    pipeline.download_pass_fill_servers = Some(weaver_nntp::ServerSet::from([SERVER_A, SERVER_B]));
 
     assert!(taken(ask(&mut pipeline, SERVER_A, 8, None)).is_empty());
     assert_eq!(queued(&pipeline, job_id), 4);
@@ -856,7 +860,7 @@ async fn the_guard_counters_account_for_a_shuffled_multi_server_run() {
             2 => {
                 let server = rng.below(2) as usize;
                 rewrite_queue(&mut pipeline, victim, |work| {
-                    work.exclude_servers = vec![server];
+                    work.exclude_servers = weaver_nntp::ServerSet::from([server]);
                 });
             }
             _ => rewrite_queue(&mut pipeline, victim, |work| {
@@ -1040,7 +1044,7 @@ async fn the_share_counts_articles_already_out_on_lanes() {
     add_job(&mut pipeline, hot, "Half Fetched Pack", 10_000).await;
 
     assert_eq!(pipeline.lane_share_of_job(hot, 8), 100);
-    pipeline.active_downloads_by_job.insert(hot, 10_000);
+    pipeline.articles_in_flight_by_job.insert(hot, 10_000);
     assert_eq!(
         pipeline.lane_share_of_job(hot, 8),
         200,
@@ -1077,7 +1081,7 @@ async fn saturation_is_only_charged_by_a_job_that_could_serve_the_lane() {
     add_job(&mut pipeline, hot, "Elsewhere Only Reel", 600).await;
     add_job(&mut pipeline, next, "Here Too Reel", 600).await;
     rewrite_queue(&mut pipeline, hot, |work| {
-        work.exclude_servers = vec![SERVER_A];
+        work.exclude_servers = weaver_nntp::ServerSet::from([SERVER_A]);
     });
 
     let share = pipeline.lane_share_of_job(hot, 8);

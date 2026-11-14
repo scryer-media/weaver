@@ -103,7 +103,7 @@ fn fields(work: &DownloadWork) -> Fields {
         work.retry_count,
         work.is_recovery,
         work.completion_critical,
-        work.exclude_servers.clone(),
+        work.exclude_servers.to_vec(),
         work.avoid_server,
         work.counters.is_some(),
     )
@@ -159,7 +159,7 @@ impl Predicate {
         match self.kind {
             0 => true,
             1 => {
-                !work.exclude_servers.contains(&self.server)
+                !work.exclude_servers.contains(self.server)
                     && work.avoid_server != Some(self.server)
             }
             2 => !work.byte_estimate.is_multiple_of(self.modulus),
@@ -290,7 +290,7 @@ fn run(seed: u64, steps: usize) {
                 retry_count: 0,
                 is_recovery: false,
                 completion_critical: false,
-                exclude_servers: vec![],
+                exclude_servers: weaver_nntp::ServerSet::from([]),
                 avoid_server: None,
             });
         }
@@ -396,7 +396,7 @@ fn run(seed: u64, steps: usize) {
                     work.retry_count += 1;
                 }
                 if rng.chance(30) {
-                    work.exclude_servers.push(rng.below(3) as usize);
+                    work.exclude_servers.insert(rng.below(3) as usize);
                 }
                 if rng.chance(30) {
                     work.avoid_server = Some(rng.below(3) as usize);
@@ -525,8 +525,27 @@ fn run(seed: u64, steps: usize) {
                         pair.reference.clear_rotation_hints()
                     );
                 } else if rng.chance(30) {
-                    pair.new.clear_exclude_servers();
-                    pair.reference.clear_exclude_servers();
+                    // A rebuild: servers 0..3 reordered, one of them
+                    // dropped and a new one added.
+                    let mut layout: Vec<u64> = vec![0, 1, 2];
+                    for slot in (1..layout.len()).rev() {
+                        layout.swap(slot, rng.below(slot as u64 + 1) as usize);
+                    }
+                    if rng.chance(50) {
+                        layout.remove(rng.below(layout.len() as u64) as usize);
+                    }
+                    if rng.chance(50) {
+                        let at = rng.below(layout.len() as u64 + 1) as usize;
+                        layout.insert(at, 3 + step as u64);
+                    }
+                    let remap = weaver_nntp::ServerRemap::between(&[0u64, 1, 2], &layout);
+                    pair.new.remap_servers(&remap);
+                    pair.reference.remap_servers(&remap);
+                    assert_eq!(
+                        pair.new.excluded_work_count(),
+                        pair.reference.excluded_work_count(),
+                        "seed {seed} step {step}"
+                    );
                 }
             }
             17 => {

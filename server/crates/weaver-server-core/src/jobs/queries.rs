@@ -13,6 +13,15 @@ use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 
 type PersistedNzbRecord = (PathBuf, Option<Vec<u8>>);
 
+// What `Database::load_install_row_facts` reads for one job.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct InstallRowFacts {
+    pub(crate) staging_dir: Option<PathBuf>,
+    pub(crate) server_attribution: Option<String>,
+    pub(crate) support_facts: Option<String>,
+    pub(crate) has_checkpoint: bool,
+}
+
 fn md5_from_bytes(bytes: Vec<u8>) -> Result<[u8; 16], StateError> {
     bytes.try_into().map_err(|value: Vec<u8>| {
         StateError::Database(format!("invalid MD5 length: {}", value.len()))
@@ -172,30 +181,79 @@ impl Database {
     // One active job's row, without its stored NZB.
     pub fn load_active_job(&self, job_id: JobId) -> Result<Option<RecoveredJob>, StateError> {
         Ok(self
-            .load_active_jobs_where(Some(job_id), true)?
+            .load_active_jobs_where(Some(&[job_id]), true)?
             .remove(&job_id))
+    }
+
+    // As `load_active_job`, for every job of `job_ids` at once: the same
+    // statements, each over a bind-sized chunk of the ids.
+    pub(crate) fn load_active_jobs_by_id(
+        &self,
+        job_ids: &[JobId],
+    ) -> Result<HashMap<JobId, RecoveredJob>, StateError> {
+        if job_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        self.load_active_jobs_where(Some(job_ids), true)
     }
 
     // One active job's row alone, as `load_active_job_rows` reads each.
     pub fn load_active_job_row(&self, job_id: JobId) -> Result<Option<RecoveredJob>, StateError> {
         Ok(self
-            .load_active_jobs_where(Some(job_id), false)?
+            .load_active_jobs_where(Some(&[job_id]), false)?
             .remove(&job_id))
     }
 
     fn load_active_jobs_where(
         &self,
-        only: Option<JobId>,
+        only: Option<&[JobId]>,
         with_files: bool,
     ) -> Result<HashMap<JobId, RecoveredJob>, StateError> {
         let datastore = self.datastore();
         let key = self.encryption_key().cloned();
+        let chunks: Vec<Vec<SqlArg>> = match only {
+            Some(ids) => ids
+                .chunks(crate::persistence::sql_runtime::max_rows_for_engine(
+                    datastore.engine(),
+                    1,
+                ))
+                .map(|chunk| chunk.iter().map(|id| SqlArg::I64(id.0 as i64)).collect())
+                .collect(),
+            None => vec![Vec::new()],
+        };
+        let filtered = only.is_some();
         self.run_sql_blocking_read(async move {
             let mut jobs = HashMap::new();
-            let (filter, args) = match only {
-                Some(job_id) => (" WHERE job_id = {}", vec![SqlArg::I64(job_id.0 as i64)]),
-                None => ("", Vec::new()),
-            };
+            for args in chunks {
+                let filter = if filtered {
+                    format!(" WHERE job_id IN ({})", vec!["{}"; args.len()].join(", "))
+                } else {
+                    String::new()
+                };
+                Self::read_active_jobs_chunk(
+                    &datastore,
+                    key.as_ref(),
+                    &filter,
+                    &args,
+                    with_files,
+                    &mut jobs,
+                )
+                .await?;
+            }
+            Ok(jobs)
+        })
+    }
+
+    async fn read_active_jobs_chunk(
+        datastore: &crate::persistence::sql_runtime::StoreDatastore,
+        key: Option<&crate::persistence::encryption::EncryptionKey>,
+        filter: &str,
+        args: &[SqlArg],
+        with_files: bool,
+        out: &mut HashMap<JobId, RecoveredJob>,
+    ) -> Result<(), StateError> {
+        {
+            let mut jobs = HashMap::new();
 
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
@@ -208,7 +266,7 @@ impl Database {
                         category, metadata, queue_position, password
                  FROM active_jobs{filter}"
                 ),
-                &args,
+                args,
             )
             .await?;
             for row in rows {
@@ -236,14 +294,15 @@ impl Database {
                     metadata: metadata_from_json(row.opt_text("metadata")?),
                     queue_position: row.opt_i64("queue_position")?,
                     password_override: super::persistence::decrypt_archive_password(
-                        key.as_ref(),
+                        key,
                         row.opt_text("password")?,
                     )?,
                 };
                 jobs.insert(job_id, job);
             }
             if !with_files {
-                return Ok(jobs);
+                out.extend(jobs);
+                return Ok(());
             }
 
             let rows = SqlRuntime::fetch_all(
@@ -254,7 +313,7 @@ impl Database {
                         classification_volume_index, classification_source
                  FROM active_file_identities{filter}"
                 ),
-                &args,
+                args,
             )
             .await?;
             for row in rows {
@@ -291,7 +350,7 @@ impl Database {
                     "SELECT job_id, file_index, kind, set_name, volume_index
                  FROM active_detected_archives{filter}"
                 ),
-                &args,
+                args,
             )
             .await?;
             for row in rows {
@@ -312,7 +371,7 @@ impl Database {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 &format!("SELECT job_id, file_index FROM active_files{filter}"),
-                &args,
+                args,
             )
             .await?;
             for row in rows {
@@ -337,7 +396,8 @@ impl Database {
                         identity.classification = None;
                     }
                 }
-                let discarded_detected = before_detected.saturating_sub(job.detected_archives.len());
+                let discarded_detected =
+                    before_detected.saturating_sub(job.detected_archives.len());
                 if discarded_detected > 0 {
                     tracing::debug!(
                         job_id = job.job_id.0,
@@ -347,12 +407,101 @@ impl Database {
                 }
             }
 
-            Ok(jobs)
+            out.extend(jobs);
+            Ok(())
+        }
+    }
+
+    // What an install reads of each job's row beside its runtime, for every
+    // job of `job_ids` in one statement per bind-sized chunk: the staging
+    // directory, the server attribution and support facts as stored, and
+    // whether a checkpoint is stored. A job with no active row reads its
+    // support facts from its history row, as `load_job_support_facts` does.
+    pub(crate) fn load_install_row_facts(
+        &self,
+        job_ids: &[JobId],
+    ) -> Result<HashMap<JobId, InstallRowFacts>, StateError> {
+        if job_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let datastore = self.datastore();
+        let ids = job_ids.iter().map(|id| id.0 as i64).collect::<Vec<_>>();
+        self.run_sql_blocking_read(async move {
+            let mut facts = HashMap::with_capacity(ids.len());
+            let chunk_len =
+                crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 1);
+            for chunk in ids.chunks(chunk_len) {
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let args = chunk.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT a.job_id, a.staging_dir, a.server_attribution,
+                            COALESCE(a.support_facts,
+                                (SELECT h.support_facts FROM job_history AS h
+                                 WHERE h.job_id = a.job_id)) AS support_facts,
+                            EXISTS (SELECT 1 FROM graph_nodes AS g WHERE g.job_id = a.job_id)
+                                AS has_checkpoint
+                         FROM active_jobs AS a WHERE a.job_id IN ({placeholders})"
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    facts.insert(
+                        JobId(row.i64("job_id")? as u64),
+                        InstallRowFacts {
+                            staging_dir: row
+                                .opt_text("staging_dir")?
+                                .filter(|dir| !dir.is_empty())
+                                .map(PathBuf::from),
+                            server_attribution: row.opt_text("server_attribution")?,
+                            support_facts: row.opt_text("support_facts")?,
+                            has_checkpoint: row.bool("has_checkpoint")?,
+                        },
+                    );
+                }
+                let missing = chunk
+                    .iter()
+                    .copied()
+                    .filter(|id| !facts.contains_key(&JobId(*id as u64)))
+                    .collect::<Vec<_>>();
+                if missing.is_empty() {
+                    continue;
+                }
+                let placeholders = vec!["{}"; missing.len()].join(", ");
+                let args = missing.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT job_id, support_facts FROM job_history WHERE job_id IN ({placeholders})"
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    facts.entry(JobId(row.i64("job_id")? as u64)).or_default().support_facts =
+                        row.opt_text("support_facts")?;
+                }
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT DISTINCT job_id FROM graph_nodes WHERE job_id IN ({placeholders})"
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    facts.entry(JobId(row.i64("job_id")? as u64)).or_default().has_checkpoint = true;
+                }
+            }
+            Ok(facts)
         })
     }
 
     // Where the job's row says it stages the files it delivers: None when
     // the row names no staging directory, or there is no row.
+    #[cfg(test)]
     pub(crate) fn load_active_job_staging_dir(
         &self,
         job_id: JobId,

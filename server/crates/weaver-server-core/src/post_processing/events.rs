@@ -1129,6 +1129,53 @@ impl Database {
         receiver
     }
 
+    // Which of `job_ids` have a script event being admitted, queued, started
+    // or running: what `wait_for_job_events_stopped` would wait on, asked of
+    // a whole list in one statement per bind-sized chunk.
+    pub(crate) fn jobs_with_live_script_events(
+        &self,
+        job_ids: &[u64],
+    ) -> Result<std::collections::HashSet<u64>, StateError> {
+        let mut live = job_ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.has_pending_script_admission(*id)
+                    || self.active_script_run_for_job(*id).is_some()
+            })
+            .collect::<std::collections::HashSet<_>>();
+        if job_ids.is_empty() {
+            return Ok(live);
+        }
+        let datastore = self.datastore();
+        let ids = job_ids.iter().map(|id| *id as i64).collect::<Vec<_>>();
+        let queued = self.run_sql_blocking_read(async move {
+            let mut queued = Vec::new();
+            for chunk in ids.chunks(crate::persistence::sql_runtime::max_rows_for_engine(
+                datastore.engine(),
+                1,
+            )) {
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let args = chunk.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT DISTINCT job_id FROM script_event_queue \
+                         WHERE job_id IN ({placeholders}) AND state IN ('queued', 'started')"
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    queued.push(row.i64("job_id")? as u64);
+                }
+            }
+            Ok(queued)
+        })?;
+        live.extend(queued);
+        Ok(live)
+    }
+
     fn has_pending_script_admission(&self, job_id: u64) -> bool {
         let admissions = self
             .script_runtime

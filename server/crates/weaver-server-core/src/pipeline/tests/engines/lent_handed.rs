@@ -79,7 +79,7 @@ async fn run_settling_while_lent(scenario: &Scenario, held: (u32, u32)) -> Settl
             );
             *asked.entry(article).or_insert(0usize) += 1;
             if article == held && !landed {
-                *pipeline.active_downloads_by_job.entry(JOB).or_insert(0) += 1;
+                *pipeline.articles_in_flight_by_job.entry(JOB).or_insert(0) += 1;
                 kept = Some(work);
                 continue;
             }
@@ -95,7 +95,7 @@ async fn run_settling_while_lent(scenario: &Scenario, held: (u32, u32)) -> Settl
         if kept.is_some() && repair_out(&pipeline) {
             kept = None;
             landed = true;
-            pipeline.active_downloads_by_job.insert(JOB, 0);
+            pipeline.articles_in_flight_by_job.insert(JOB, 0);
             serve(&mut pipeline, scenario, held).await;
             if pipeline.jobs.contains_key(&JOB) && pipeline.job_decode_stage_drained(JOB) {
                 pipeline.maybe_finish_download_pass(JOB);

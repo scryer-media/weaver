@@ -372,7 +372,7 @@ test("Q6 a cancelled job leaves the queue only once its history row says cancell
       attention: { code: "CANCELLED" },
     });
   }
-  await expect.poll(async () => metricValue(await metrics(request), "weaver_pipeline_active_downloads") ?? 0, {
+  await expect.poll(async () => metricValue(await metrics(request), "weaver_pipeline_articles_in_flight") ?? 0, {
     message: "no download stays booked to the cancelled jobs",
     timeout: 0,
   }).toBe(0);

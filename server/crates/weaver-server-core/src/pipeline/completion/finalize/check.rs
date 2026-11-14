@@ -107,7 +107,7 @@ impl Pipeline {
             .unwrap_or(0)
             > 0
             || self
-                .active_downloads_by_job
+                .articles_in_flight_by_job
                 .get(&job_id)
                 .copied()
                 .unwrap_or(0)
@@ -150,7 +150,7 @@ impl Pipeline {
             .get(&job_id)
             .is_some_and(|state| state.articles.has_queued_download_work());
         let has_inflight_downloads = self
-            .active_downloads_by_job
+            .articles_in_flight_by_job
             .get(&job_id)
             .copied()
             .unwrap_or(0)

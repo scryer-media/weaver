@@ -209,7 +209,7 @@ async fn lane_refill_takes_head_work_its_own_server_can_serve() {
         works.pop().unwrap();
         for work in &mut works {
             // Another server failed these; server 0 — this lane — still may.
-            work.exclude_servers = vec![1];
+            work.exclude_servers = weaver_nntp::ServerSet::from([1]);
         }
         for work in works {
             state
@@ -233,7 +233,7 @@ async fn lane_refill_takes_head_work_its_own_server_can_serve() {
         !lease
             .works
             .iter()
-            .any(|work| work.exclude_servers.contains(&0))
+            .any(|work| work.exclude_servers.contains(0))
     );
     assert!(
         lease.effective_exclude_servers.is_empty(),
