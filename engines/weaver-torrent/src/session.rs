@@ -3393,7 +3393,11 @@ impl Session {
                 };
                 let resolved_magnet = self
                     .resolve_magnet(
-                        peer_info_reader::MetadataFetch::new(info_hashes, fetch_dht),
+                        peer_info_reader::MetadataFetch::counted_in(
+                            info_hashes,
+                            fetch_dht,
+                            self.stats.swarm.clone(),
+                        ),
                         &identity,
                         MetadataPeers {
                             list: peer_list,
