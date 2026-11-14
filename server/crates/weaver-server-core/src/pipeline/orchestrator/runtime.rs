@@ -200,11 +200,15 @@ impl Pipeline {
         let volume_writers_of = crate::operations::disk::writer::VolumeWriters::inline;
         #[cfg(not(test))]
         let volume_writers_of = crate::operations::disk::writer::VolumeWriters::new;
+        let volume_rates = storage_capacity.volume_rate_signal();
         let volume_writers = Arc::new(volume_writers_of(
             move |mut report: crate::operations::disk::writer::Report| {
-                // A failure is the job's to hear, with its other mail; the
-                // batch itself only tells the loop the volume moved on. A
+                // A failure is the job's to hear, with its other mail. What
+                // is left tells the loop a volume it stopped dispatch for
+                // fell below its line, or that a failure may have freed
+                // one; a writer with neither to say sends nothing. A
                 // pipeline that has gone hears nothing, and needs to.
+                let wakes = report.below || !report.failures.is_empty();
                 for failure in report.failures.drain(..) {
                     let _ = disk_mail.send(crate::pipeline::graph::engine::Said {
                         scope: failure.key,
@@ -215,9 +219,11 @@ impl Pipeline {
                         )),
                     });
                 }
-                let _ = volume_report_tx.send(report);
+                if wakes {
+                    let _ = volume_report_tx.send(report);
+                }
             },
-        ));
+        ).ringing(volume_rates));
         let extraction_limits = Arc::new(ExtractionLimits::from_env_with_profile_ceiling(
             &complete_dir,
             profile_tuning.extraction_memory_bytes,
@@ -1865,13 +1871,27 @@ impl Pipeline {
             self.handle_failed_job_released(released);
         }
         // Every volume's writer puts down what it holds before the last
-        // checkpoint is taken, so that checkpoint records all of it.
+        // checkpoint is taken, so that checkpoint records all of it. A
+        // volume on which nothing returns for the span is left behind:
+        // what it still holds is in no checkpoint, so it is fetched again.
         let writers = Arc::clone(&self.volume_writers);
-        if tokio::task::spawn_blocking(move || writers.settle())
-            .await
-            .is_err()
+        match tokio::task::spawn_blocking(move || {
+            use crate::operations::disk::writer::WallClock;
+            writers.settle_within(Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT, &WallClock::start())
+        })
+        .await
         {
-            warn!("the volume writers could not be drained at shutdown");
+            Ok(left) => {
+                for volume in left {
+                    warn!(
+                        volume = %volume.label,
+                        operations = volume.operations,
+                        bytes = volume.bytes,
+                        "a volume's writer stood still at shutdown; what it held is left unwritten"
+                    );
+                }
+            }
+            Err(_) => warn!("the volume writers could not be drained at shutdown"),
         }
         self.hear_volume_reports();
         self.checkpoint_graph_holds();

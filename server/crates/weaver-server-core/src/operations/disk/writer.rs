@@ -3,27 +3,33 @@
 
 // One writer thread per volume. A caller hands it file operations and goes
 // on: it never waits for the disk. The thread takes everything queued for
-// its volume, writes one file at a time in offset order, and says once per
-// batch what came back, with the error of anything that failed.
+// its volume and writes one file at a time in offset order. It speaks only
+// when there is something to hear: an operation failed, or the bytes waiting
+// for it fell to a line someone asked to be woken at.
 //
-// A caller writes under a key of its own choosing. Everything it submitted
-// under the key before a given moment is behind a `Barrier`, which passes
-// once every one of those operations has returned. The thread starts with
-// the first caller of its volume and ends when the last one lets go.
+// A caller writes under a key of its own choosing, and its file numbers are
+// its own. Everything it submitted under the key before a given moment is
+// behind a `Barrier`, which passes once every one of those operations has
+// returned, whatever other keys still have queued. The thread starts with
+// the first caller of its volume and ends when the last one has let go and
+// nothing is queued; until it has ended, every caller of the volume gets
+// that same thread.
 //
 // Nothing here syncs: an operation has returned when its system call has.
 
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::File;
 use std::io;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak, mpsc};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak, mpsc};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
 use super::volume::Volume;
+use super::volume_rate::RateSignal;
 
 // How a file that is not open is opened, made when it is not there, at the
 // length it is declared to reach when one is given.
@@ -36,9 +42,12 @@ pub(crate) struct Create {
     pub(crate) open: OpenFn,
 }
 
-// What one batch came to: every operation of it has returned.
+// What a volume's writer has to say. Never sent with nothing in it.
 pub(crate) struct Report {
     pub(crate) failures: Vec<Failure>,
+    // The bytes waiting for the volume fell to the line `wake_below` was
+    // given.
+    pub(crate) below: bool,
 }
 
 // An operation that failed, under the key and for the file it was given.
@@ -52,15 +61,67 @@ pub(crate) struct Failure {
     pub(crate) creating: bool,
 }
 
+// What a bounded settle left on a volume that stood still.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Unsettled {
+    pub(crate) label: String,
+    pub(crate) operations: u64,
+    pub(crate) bytes: u64,
+}
+
+// The time a bounded settle goes by.
+pub(crate) trait Clock: Sync {
+    // How long since a moment that does not move.
+    fn now(&self) -> Duration;
+    // Whether time passes by itself. A clock a test moves by hand does not:
+    // the test wakes the settle after moving it.
+    fn runs(&self) -> bool {
+        true
+    }
+}
+
+// The machine's own clock, from when it was made.
+pub(crate) struct WallClock(Instant);
+
+impl WallClock {
+    pub(crate) fn start() -> Self {
+        Self(Instant::now())
+    }
+}
+
+impl Clock for WallClock {
+    fn now(&self) -> Duration {
+        self.0.elapsed()
+    }
+}
+
 type ReportFn = dyn Fn(Report) + Send + Sync;
 type Then = Box<dyn FnOnce() + Send>;
+type Lanes = Vec<(usize, Arc<Lane>)>;
 
 // The writer threads, one per volume in use.
 pub(crate) struct VolumeWriters {
-    lanes: Mutex<Vec<(usize, Weak<Lane>)>>,
+    registry: Arc<Registry>,
     report: Arc<ReportFn>,
+    // Rung after a batch that wrote, so an idle rate sampler looks again.
+    rates: Option<Arc<RateSignal>>,
     #[cfg(test)]
     mode: Mode,
+}
+
+// Every volume with a writer, by the address of its record. A volume stays
+// here until its thread has ended, whether or not a caller still holds it.
+#[derive(Default)]
+struct Registry {
+    lanes: Mutex<Lanes>,
+    #[cfg(test)]
+    ended: Condvar,
+}
+
+impl Registry {
+    fn lock(&self) -> MutexGuard<'_, Lanes> {
+        self.lanes.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 // How a test's writers run.
@@ -76,14 +137,22 @@ enum Mode {
 }
 
 impl VolumeWriters {
-    // `report` is called on a writer thread once per batch.
+    // `report` is called on a writer thread, or on the submitting thread
+    // for a volume that has none. It must not wait.
     pub(crate) fn new(report: impl Fn(Report) + Send + Sync + 'static) -> Self {
         Self {
-            lanes: Mutex::default(),
+            registry: Arc::default(),
             report: Arc::new(report),
+            rates: None,
             #[cfg(test)]
             mode: Mode::Threads,
         }
+    }
+
+    // The same writers, ringing `rates` after every batch that wrote.
+    pub(crate) fn ringing(mut self, rates: Arc<RateSignal>) -> Self {
+        self.rates = Some(rates);
+        self
     }
 
     // Writers on a machine that will not start another thread.
@@ -107,77 +176,189 @@ impl VolumeWriters {
     }
 
     // A caller's way to write to `volume` under `key`. The volume's thread
-    // starts here when no caller holds it.
+    // starts here when it has none; one that has not ended is used again.
     pub(crate) fn submitter(&self, volume: &Arc<Volume>, key: u64) -> Arc<Submitter> {
+        let lane = self.lane(volume);
+        let send = Mutex::new(lane.send.clone());
         Arc::new(Submitter {
-            lane: self.lane(volume),
-            key: Arc::new(Key {
-                id: key,
-                failed: AtomicBool::new(false),
-                abandoned: AtomicBool::new(false),
-                unheard: AtomicU32::new(0),
-            }),
-            last: AtomicU64::new(0),
+            lane,
+            key: Arc::new(Key::new(key)),
+            send,
         })
     }
 
+    // The volume's lane, held for one more caller.
     fn lane(&self, volume: &Arc<Volume>) -> Arc<Lane> {
         let at = Arc::as_ptr(volume) as usize;
-        let mut lanes = self.lanes.lock().unwrap_or_else(PoisonError::into_inner);
-        lanes.retain(|(_, lane)| lane.strong_count() > 0);
-        lanes
-            .iter()
-            .find(|(volume, _)| *volume == at)
-            .and_then(|(_, lane)| lane.upgrade())
-            .unwrap_or_else(|| {
-                #[cfg(test)]
-                let (inline, threadless) =
-                    (self.mode == Mode::Inline, self.mode == Mode::NoThread);
-                #[cfg(not(test))]
-                let (inline, threadless) = (false, false);
-                let lane = Lane::start(
-                    Arc::clone(volume),
-                    Arc::clone(&self.report),
-                    inline,
-                    threadless,
-                );
-                lanes.push((at, Arc::downgrade(&lane)));
-                lane
-            })
+        // The thread decides to end under this lock, so it cannot go while
+        // a caller is being counted in.
+        let mut lanes = self.registry.lock();
+        if let Some((_, lane)) = lanes.iter().find(|(volume, _)| *volume == at) {
+            lane.state.users.fetch_add(1, Ordering::SeqCst);
+            return Arc::clone(lane);
+        }
+        #[cfg(test)]
+        let (inline, threadless) = (self.mode == Mode::Inline, self.mode == Mode::NoThread);
+        #[cfg(not(test))]
+        let (inline, threadless) = (false, false);
+        let (lane, live) = Lane::start(
+            Arc::clone(volume),
+            Arc::clone(&self.report),
+            self.rates.clone(),
+            Arc::downgrade(&self.registry),
+            inline,
+            threadless,
+        );
+        lane.state.users.fetch_add(1, Ordering::SeqCst);
+        // A lane with no thread is not kept: the next caller tries again.
+        if live {
+            lanes.push((at, Arc::clone(&lane)));
+        }
+        lane
     }
 
-    // Wait until everything submitted to every volume so far has returned.
+    // Wake whoever hears the reports, once, when the bytes waiting for
+    // `volume` are `bytes` or fewer. False when they already are: nothing
+    // was asked and no wake comes. One line is kept per volume; asking again
+    // replaces it.
+    pub(crate) fn wake_below(&self, volume: &Arc<Volume>, bytes: u64) -> bool {
+        let ask = bytes.saturating_add(1);
+        if volume.wake_line.load(Ordering::Relaxed) == ask {
+            return true;
+        }
+        volume.wake_line.store(ask, Ordering::SeqCst);
+        if volume.buffered_bytes.load(Ordering::SeqCst) > bytes {
+            return true;
+        }
+        // Already there. When the writer took the ask first, its wake is on
+        // the way.
+        volume
+            .wake_line
+            .compare_exchange(ask, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+    }
+
+    // Wait until everything submitted to every volume so far has returned,
+    // whether or not its caller still holds the volume.
     pub(crate) fn settle(&self) {
-        let lanes: Vec<Arc<Lane>> = self
-            .lanes
+        self.settle_each(None);
+    }
+
+    // The same wait, given up on a volume once nothing on it has returned
+    // for `span` by `clock`. What each such volume still held comes back;
+    // nothing does when everything returned.
+    pub(crate) fn settle_within(&self, span: Duration, clock: &dyn Clock) -> Vec<Unsettled> {
+        self.settle_each(Some((span, clock)))
+    }
+
+    fn settle_each(&self, bound: Option<(Duration, &dyn Clock)>) -> Vec<Unsettled> {
+        let began = bound.map(|(_, clock)| clock.now()).unwrap_or_default();
+        // Every volume is measured from the start, so one that stood still
+        // while another was waited for is not given a second span.
+        let lanes: Vec<(Arc<Lane>, u64, u64)> = self
+            .registry
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .filter_map(|(_, lane)| lane.upgrade())
+            .map(|(_, lane)| {
+                (
+                    Arc::clone(lane),
+                    lane.state.sent.load(Ordering::SeqCst),
+                    lane.state.done.load(Ordering::SeqCst),
+                )
+            })
             .collect();
-        for lane in lanes {
-            let seq = lane.send.lock().unwrap_or_else(PoisonError::into_inner).0;
-            if lane.state.returned.load(Ordering::SeqCst) >= seq {
+        let mut left = Vec::new();
+        for (lane, sent, mut seen) in lanes {
+            let state = &lane.state;
+            if state.returned.load(Ordering::SeqCst) >= sent {
                 continue;
             }
-            let began = Instant::now();
-            lane.state.wait(seq);
-            lane.state.waited(began);
+            let started = Instant::now();
+            let mut since = began;
+            let mut held = state.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+            state.waiters.fetch_add(1, Ordering::SeqCst);
+            while state.returned.load(Ordering::SeqCst) < sent {
+                let Some((span, clock)) = bound else {
+                    held = state.woke.wait(held).unwrap_or_else(PoisonError::into_inner);
+                    continue;
+                };
+                let now = clock.now();
+                let done = state.done.load(Ordering::SeqCst);
+                if done != seen {
+                    seen = done;
+                    since = now;
+                }
+                let stood = now.saturating_sub(since);
+                if stood >= span {
+                    left.push(Unsettled {
+                        label: state.volume.label.clone(),
+                        operations: state.sent.load(Ordering::SeqCst).saturating_sub(done),
+                        bytes: state.volume.buffered_bytes.load(Ordering::Relaxed),
+                    });
+                    break;
+                }
+                held = if clock.runs() {
+                    state
+                        .woke
+                        .wait_timeout(held, span - stood)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0
+                } else {
+                    state.woke.wait(held).unwrap_or_else(PoisonError::into_inner)
+                };
+            }
+            state.waiters.fetch_sub(1, Ordering::SeqCst);
+            drop(held);
+            state.waited(started);
+        }
+        left
+    }
+
+    // Have a bounded settle look at its clock again, after a test moved it.
+    #[cfg(test)]
+    pub(crate) fn look_again(&self) {
+        let lanes: Vec<Arc<Lane>> = self
+            .registry
+            .lock()
+            .iter()
+            .map(|(_, lane)| Arc::clone(lane))
+            .collect();
+        for lane in lanes {
+            let _held = lane
+                .state
+                .waiting
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            lane.state.woke.notify_all();
+        }
+    }
+
+    // Wait until `volume`'s thread has ended.
+    #[cfg(test)]
+    pub(crate) fn wait_ended(&self, volume: &Arc<Volume>) {
+        let at = Arc::as_ptr(volume) as usize;
+        let mut lanes = self.registry.lock();
+        while lanes.iter().any(|(volume, _)| *volume == at) {
+            lanes = self
+                .registry
+                .ended
+                .wait(lanes)
+                .unwrap_or_else(PoisonError::into_inner);
         }
     }
 
     // Hold `volume`'s thread before each operation until the test lets it
-    // through.
+    // through. The hold keeps the thread as a caller does.
     #[cfg(test)]
     pub(crate) fn hold(&self, volume: &Arc<Volume>) -> Hold {
-        let lane = self.lane(volume);
-        let hold = Hold(Arc::clone(&lane.state), lane);
-        let mut gate = hold.0.gate.lock().unwrap_or_else(PoisonError::into_inner);
-        gate.held = true;
-        drop(gate);
+        let hold = Hold(self.lane(volume));
+        hold.gate().held = true;
         hold
     }
 }
+
+// No entry of a batch: the end of a key's chain through it.
+const NONE: u32 = u32::MAX;
 
 struct Key {
     id: u64,
@@ -188,14 +369,166 @@ struct Key {
     // Refusals the caller has yet to hear and answer; no barrier of the key
     // passes while there are any.
     unheard: AtomicU32,
+    // The number of the last operation submitted under the key, and the
+    // number through which every one of them has returned.
+    submitted: AtomicU64,
+    returned: AtomicU64,
+    waiters: AtomicUsize,
+    waiting: Mutex<()>,
+    woke: Condvar,
+    // What to run once the key's operations through a number have returned,
+    // lowest number first, and that lowest number: `u64::MAX` for none.
+    asked: AtomicU64,
+    then: Mutex<BinaryHeap<Asked>>,
+    // The key's files as its volume's thread holds them. Only that thread
+    // takes this lock.
+    held: Mutex<Held>,
+    // The key's place in the batch being run, kept by the volume's thread
+    // alone: the batch it was last seen in, and the first of its operations
+    // there that has not returned and the last of them.
+    turn: AtomicU64,
+    head: AtomicU32,
+    tail: AtomicU32,
 }
 
-// One caller's key on one volume.
+struct Asked {
+    seq: u64,
+    run: Then,
+}
+
+impl PartialEq for Asked {
+    fn eq(&self, other: &Self) -> bool {
+        self.seq == other.seq
+    }
+}
+
+impl Eq for Asked {}
+
+impl PartialOrd for Asked {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Asked {
+    // The lowest number is the greatest, so the heap gives it first.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.seq.cmp(&self.seq)
+    }
+}
+
+// A key's files on its volume, by the numbers the key gave them.
+#[derive(Default)]
+struct Held {
+    open: HashMap<u64, Open>,
+    // A file whose open was refused: its later writes are dropped.
+    refused: HashSet<u64>,
+}
+
+impl Key {
+    fn new(id: u64) -> Self {
+        Self {
+            id,
+            failed: AtomicBool::new(false),
+            abandoned: AtomicBool::new(false),
+            unheard: AtomicU32::new(0),
+            submitted: AtomicU64::new(0),
+            returned: AtomicU64::new(0),
+            waiters: AtomicUsize::new(0),
+            waiting: Mutex::new(()),
+            woke: Condvar::new(),
+            asked: AtomicU64::new(u64::MAX),
+            then: Mutex::default(),
+            held: Mutex::default(),
+            turn: AtomicU64::new(0),
+            head: AtomicU32::new(NONE),
+            tail: AtomicU32::new(NONE),
+        }
+    }
+
+    fn held(&self) -> MutexGuard<'_, Held> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn has_returned(&self, seq: u64) -> bool {
+        self.returned.load(Ordering::SeqCst) >= seq
+    }
+
+    // Whether the key's operations are no longer run.
+    fn stopped(&self) -> bool {
+        self.abandoned.load(Ordering::Acquire) || self.failed.load(Ordering::Acquire)
+    }
+
+    // Every operation of the key through `seq` has returned.
+    fn returned(&self, seq: u64) {
+        self.returned.fetch_max(seq, Ordering::SeqCst);
+        if self.waiters.load(Ordering::SeqCst) > 0 {
+            let _held = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+            self.woke.notify_all();
+        }
+        if self.asked.load(Ordering::SeqCst) <= seq {
+            self.run_due();
+        }
+    }
+
+    // Run everything asked for whose operations have returned, outside the
+    // lock.
+    fn run_due(&self) {
+        let returned = self.returned.load(Ordering::SeqCst);
+        let mut due = Vec::new();
+        {
+            let mut then = self.then.lock().unwrap_or_else(PoisonError::into_inner);
+            while then.peek().is_some_and(|asked| asked.seq <= returned) {
+                due.extend(then.pop().map(|asked| asked.run));
+            }
+            let next = then.peek().map_or(u64::MAX, |asked| asked.seq);
+            self.asked.store(next, Ordering::SeqCst);
+        }
+        for run in due {
+            // One that panics does not cost the others their turn.
+            let _ = catch_unwind(AssertUnwindSafe(run));
+        }
+    }
+
+    fn then(&self, seq: u64, run: Then) {
+        if self.has_returned(seq) {
+            run();
+            return;
+        }
+        {
+            let mut then = self.then.lock().unwrap_or_else(PoisonError::into_inner);
+            then.push(Asked { seq, run });
+            let next = then.peek().map_or(u64::MAX, |asked| asked.seq);
+            self.asked.store(next, Ordering::SeqCst);
+        }
+        // The operations may have returned between the look and the ask.
+        if self.has_returned(seq) {
+            self.run_due();
+        }
+    }
+
+    fn wait(&self, seq: u64) {
+        if self.has_returned(seq) {
+            return;
+        }
+        let mut held = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        while !self.has_returned(seq) {
+            held = self.woke.wait(held).unwrap_or_else(PoisonError::into_inner);
+        }
+        self.waiters.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+// One caller's key on one volume. Its operations are numbered from one in
+// the order it submits them, and run in that order between themselves.
 pub(crate) struct Submitter {
     lane: Arc<Lane>,
     key: Arc<Key>,
-    // The last operation submitted under the key.
-    last: AtomicU64,
+    // The caller's own way to the thread. Numbering and sending are one
+    // step under it, so the thread sees the key's numbers in order; no
+    // other key takes this lock.
+    send: Mutex<mpsc::Sender<Mail>>,
 }
 
 impl Submitter {
@@ -274,29 +607,39 @@ impl Submitter {
     }
 
     // Read `len` bytes at `offset` of the file at `path`, after everything
-    // submitted before. The caller waits for the answer.
+    // the key submitted before. The caller waits for the answer.
     pub(crate) fn read(&self, path: PathBuf, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        let (reply, answer) = mpsc::sync_channel(1);
-        let began = Instant::now();
-        self.submit(Op::Read {
-            path,
-            offset,
-            len,
-            reply,
-        });
-        let read = answer
-            .recv()
-            .unwrap_or_else(|_| Err(io::Error::other("the volume's writer is gone")));
-        self.lane.state.waited(began);
-        read
+        self.read_after(self.key.submitted.load(Ordering::Acquire), path, offset, len)
+    }
+
+    // The same read, after the key's operations through `seq` only: the
+    // number the last submission for the file returned. The read is made
+    // here, by the caller, as soon as those have returned: it waits for no
+    // other key, queued or running.
+    pub(crate) fn read_after(
+        &self,
+        seq: u64,
+        path: PathBuf,
+        offset: u64,
+        len: usize,
+    ) -> io::Result<Vec<u8>> {
+        if !self.key.has_returned(seq) {
+            let began = Instant::now();
+            self.key.wait(seq);
+            self.lane.state.waited(began);
+        }
+        if self.key.stopped() {
+            return Err(io::Error::other("the file's writes were given up"));
+        }
+        read_at(&path, offset, len)
     }
 
     // Everything submitted under the key so far.
     pub(crate) fn barrier(&self) -> Barrier {
-        self.barrier_at(self.last.load(Ordering::Acquire))
+        self.barrier_at(self.key.submitted.load(Ordering::Acquire))
     }
 
-    // Everything submitted to the volume through the operation `seq`, which
+    // Everything submitted under the key through the operation `seq`, which
     // a submission returned.
     pub(crate) fn barrier_at(&self, seq: u64) -> Barrier {
         Barrier {
@@ -327,34 +670,28 @@ impl Submitter {
     }
 
     fn submit(&self, op: Op) -> u64 {
-        let mut send = self
-            .lane
-            .send
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        send.0 += 1;
-        let seq = send.0;
-        self.last.store(seq, Ordering::Release);
-        let sent = send.1.send(Queued {
+        let state = &self.lane.state;
+        let send = self.send.lock().unwrap_or_else(PoisonError::into_inner);
+        let seq = self.key.submitted.load(Ordering::Relaxed) + 1;
+        self.key.submitted.store(seq, Ordering::Release);
+        state.sent.fetch_add(1, Ordering::Relaxed);
+        let sent = send.send(Mail::Op(Queued {
             seq,
             key: Arc::clone(&self.key),
             op,
-        });
+        }));
         drop(send);
-        if let Err(mpsc::SendError(unsent)) = sent {
-            // The thread is gone, so nothing will be written: the bytes
-            // stop waiting and the barrier does not hold anyone.
+        if let Err(mpsc::SendError(Mail::Op(unsent))) = sent {
+            // The volume has no thread, so nothing will be written: the
+            // bytes stop waiting and the barrier does not hold anyone.
             if let Op::Write { bytes, .. } = &unsent.op {
-                self.lane
-                    .state
-                    .volume
-                    .buffered_bytes
-                    .fetch_sub(bytes.len() as u64, Ordering::Relaxed);
+                unbuffer(state, &*self.lane.report, bytes.len() as u64);
             }
-            let counts = &self.lane.state.volume.writer;
+            state.done.fetch_add(1, Ordering::Relaxed);
+            let counts = &state.volume.writer;
             counts.failed_operations.fetch_add(1, Ordering::Relaxed);
             let first = !self.key.failed.swap(true, Ordering::AcqRel);
-            self.lane.state.returned(seq);
+            self.key.returned(seq);
             // The caller hears of it once, as it hears of any failure.
             if first
                 && !self.key.abandoned.load(Ordering::Acquire)
@@ -368,31 +705,26 @@ impl Submitter {
                         error: io::Error::other("the volume's writer thread is gone"),
                         creating: false,
                     }],
+                    below: false,
                 });
             }
         }
-        if let Some(inline) = &self.lane.inline {
-            let mut inline = inline.lock().unwrap_or_else(PoisonError::into_inner);
-            let (thread, queued) = &mut *inline;
-            while let Ok(first) = queued.try_recv() {
-                thread.batch(first, queued);
-            }
-        }
+        self.lane.run_inline();
         seq
     }
 }
 
 impl Drop for Submitter {
     fn drop(&mut self) {
-        // What is queued under the key still runs; the handles it left
-        // open close behind it.
-        if !self.key.abandoned.load(Ordering::Acquire) {
-            self.submit(Op::Forget);
-        }
+        // What is queued under the key still runs, unless it was given up;
+        // the handles it left open close behind it.
+        self.submit(Op::Forget);
+        self.lane.leave();
     }
 }
 
-// Everything submitted before a moment: passed once all of it has returned.
+// Everything a key submitted before a moment: passed once all of it has
+// returned, whatever other keys still have queued on the volume.
 #[derive(Clone)]
 pub(crate) struct Barrier {
     lane: Arc<LaneState>,
@@ -404,15 +736,14 @@ impl Barrier {
     // Whether everything behind the barrier returned, none of the key's
     // operations failed or was given up, and no refusal waits to be heard.
     pub(crate) fn passed(&self) -> bool {
-        self.lane.returned.load(Ordering::SeqCst) >= self.seq
-            && !self.key.failed.load(Ordering::Acquire)
-            && !self.key.abandoned.load(Ordering::Acquire)
+        self.key.has_returned(self.seq)
+            && !self.key.stopped()
             && self.key.unheard.load(Ordering::Acquire) == 0
     }
 
     // Whether everything behind the barrier returned, failed or not.
     pub(crate) fn returned(&self) -> bool {
-        self.lane.returned.load(Ordering::SeqCst) >= self.seq
+        self.key.has_returned(self.seq)
     }
 
     // Wait until everything behind the barrier has returned, failed or not.
@@ -423,14 +754,14 @@ impl Barrier {
             return;
         }
         let began = Instant::now();
-        self.lane.wait(self.seq);
+        self.key.wait(self.seq);
         self.lane.waited(began);
     }
 
     // The same wait for a thread the loop does not wait for, which is not
     // counted.
     pub(crate) fn wait_aside(&self) {
-        self.lane.wait(self.seq);
+        self.key.wait(self.seq);
     }
 
     // Whether a test holds the volume's thread.
@@ -447,7 +778,7 @@ impl Barrier {
     // not: here and now when it already has, and otherwise on the volume's
     // thread, which it must not hold up.
     pub(crate) fn then(&self, run: impl FnOnce() + Send + 'static) {
-        self.lane.then(self.seq, Box::new(run));
+        self.key.then(self.seq, Box::new(run));
     }
 }
 
@@ -468,26 +799,26 @@ impl std::fmt::Debug for Submitter {
 struct Lane {
     state: Arc<LaneState>,
     report: Arc<ReportFn>,
-    // The number of the last operation sent, and the way to the thread.
-    // Numbering and sending are one step, so the thread sees every number
-    // in order.
-    send: Mutex<(u64, mpsc::Sender<Queued>)>,
+    // The way to the thread; each caller takes a copy of its own.
+    send: mpsc::Sender<Mail>,
     // A lane with no thread: what a thread would hold, run by whoever
     // submits.
-    inline: Option<Mutex<(Thread, mpsc::Receiver<Queued>)>>,
+    inline: Option<Mutex<(Thread, mpsc::Receiver<Mail>)>>,
 }
 
 struct LaneState {
     volume: Arc<Volume>,
-    // Every operation through this number has returned.
+    // Callers that hold the volume. The thread ends only at none.
+    users: AtomicUsize,
+    // Operations submitted to the volume, and operations that returned.
+    sent: AtomicU64,
+    done: AtomicU64,
+    // Of the operations in the order they reached the thread, every one
+    // through this many has returned. Only a settle waits on it.
     returned: AtomicU64,
     waiters: AtomicUsize,
     waiting: Mutex<()>,
     woke: Condvar,
-    // What to run once the operations through a number have returned, and
-    // how many of them there are.
-    asked: AtomicUsize,
-    then: Mutex<Vec<(u64, Then)>>,
     #[cfg(test)]
     gate: Mutex<Gate>,
     #[cfg(test)]
@@ -504,119 +835,125 @@ impl LaneState {
             .fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
-    fn returned(&self, seq: u64) {
-        self.returned.fetch_max(seq, Ordering::SeqCst);
+    fn returned(&self, through: u64) {
+        self.returned.fetch_max(through, Ordering::SeqCst);
         if self.waiters.load(Ordering::SeqCst) > 0 {
             let _held = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
             self.woke.notify_all();
         }
-        if self.asked.load(Ordering::SeqCst) > 0 {
-            self.run_due();
-        }
     }
+}
 
-    // Run everything asked for whose operations have returned, outside the
-    // lock.
-    fn run_due(&self) {
-        let returned = self.returned.load(Ordering::SeqCst);
-        let mut due = Vec::new();
-        {
-            let mut then = self.then.lock().unwrap_or_else(PoisonError::into_inner);
-            let mut at = 0;
-            while at < then.len() {
-                if then[at].0 <= returned {
-                    due.push(then.swap_remove(at).1);
-                } else {
-                    at += 1;
-                }
-            }
-            self.asked.store(then.len(), Ordering::SeqCst);
-        }
-        for run in due {
-            run();
-        }
+// `bytes` no longer wait for the volume's writer. Whoever asked to be woken
+// at a line the count has now reached is woken, once.
+fn unbuffer(state: &LaneState, report: &ReportFn, bytes: u64) {
+    if bytes == 0 {
+        return;
     }
-
-    fn then(&self, seq: u64, run: Then) {
-        if self.returned.load(Ordering::SeqCst) >= seq {
-            run();
-            return;
-        }
-        {
-            let mut then = self.then.lock().unwrap_or_else(PoisonError::into_inner);
-            then.push((seq, run));
-            self.asked.store(then.len(), Ordering::SeqCst);
-        }
-        // The operations may have returned between the look and the ask.
-        if self.returned.load(Ordering::SeqCst) >= seq {
-            self.run_due();
-        }
-    }
-
-    fn wait(&self, seq: u64) {
-        if self.returned.load(Ordering::SeqCst) >= seq {
-            return;
-        }
-        let mut held = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
-        self.waiters.fetch_add(1, Ordering::SeqCst);
-        while self.returned.load(Ordering::SeqCst) < seq {
-            held = self.woke.wait(held).unwrap_or_else(PoisonError::into_inner);
-        }
-        self.waiters.fetch_sub(1, Ordering::SeqCst);
+    let volume = &state.volume;
+    let left = volume
+        .buffered_bytes
+        .fetch_sub(bytes, Ordering::SeqCst)
+        .saturating_sub(bytes);
+    let ask = volume.wake_line.load(Ordering::SeqCst);
+    if ask != 0
+        && left < ask
+        && volume
+            .wake_line
+            .compare_exchange(ask, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    {
+        report(Report {
+            failures: Vec::new(),
+            below: true,
+        });
     }
 }
 
 impl Lane {
+    // The lane, and whether anything will run what is sent to it.
     fn start(
         volume: Arc<Volume>,
         report: Arc<ReportFn>,
+        rates: Option<Arc<RateSignal>>,
+        registry: Weak<Registry>,
         inline: bool,
         threadless: bool,
-    ) -> Arc<Self> {
+    ) -> (Arc<Self>, bool) {
         let (send, queued) = mpsc::channel();
         let state = Arc::new(LaneState {
             volume,
+            users: AtomicUsize::new(0),
+            sent: AtomicU64::new(0),
+            done: AtomicU64::new(0),
             returned: AtomicU64::new(0),
             waiters: AtomicUsize::new(0),
             waiting: Mutex::new(()),
             woke: Condvar::new(),
-            asked: AtomicUsize::new(0),
-            then: Mutex::default(),
             #[cfg(test)]
             gate: Mutex::default(),
             #[cfg(test)]
             gate_moved: Condvar::new(),
         });
+        let thread = Thread::new(Arc::clone(&state), Arc::clone(&report), rates, registry);
         if inline {
-            return Arc::new(Self {
-                state: Arc::clone(&state),
-                report: Arc::clone(&report),
-                send: Mutex::new((0, send)),
-                inline: Some(Mutex::new((Thread::new(state, report), queued))),
+            let lane = Arc::new(Self {
+                state,
+                report,
+                send,
+                inline: Some(Mutex::new((thread, queued))),
             });
+            return (lane, true);
         }
+        let name = format!("volume-writer {}", state.volume.label);
         let lane = Arc::new(Self {
-            state: Arc::clone(&state),
-            report: Arc::clone(&report),
-            send: Mutex::new((0, send)),
+            state,
+            report,
+            send,
             inline: None,
         });
-        let name = format!("volume-writer {}", state.volume.label);
-        let thread_state = Arc::clone(&state);
-        let run = move || Thread::new(thread_state, report).run(queued);
+        let run = move || thread.run(queued);
         let spawned = if threadless {
             drop(run);
             Err(io::Error::other("no thread to be had"))
         } else {
             std::thread::Builder::new().name(name).spawn(run).map(drop)
         };
-        if let Err(error) = spawned {
+        if let Err(error) = &spawned {
             // With no thread the receiver is gone, and every submission
             // fails its key at once instead of waiting forever.
             tracing::error!(%error, "could not start a volume's writer thread");
         }
-        lane
+        (lane, spawned.is_ok())
     }
+
+    // A caller lets the volume go. The thread is woken to see whether it
+    // was the last.
+    fn leave(&self) {
+        self.state.users.fetch_sub(1, Ordering::SeqCst);
+        let _ = self.send.send(Mail::Left);
+        self.run_inline();
+    }
+
+    // On a lane with no thread, run what was sent.
+    fn run_inline(&self) {
+        let Some(inline) = &self.inline else {
+            return;
+        };
+        let mut inline = inline.lock().unwrap_or_else(PoisonError::into_inner);
+        let (thread, queued) = &mut *inline;
+        while let Ok(mail) = queued.try_recv() {
+            if let Mail::Op(first) = mail {
+                thread.batch(first, queued);
+            }
+        }
+    }
+}
+
+enum Mail {
+    Op(Queued),
+    // A caller let the volume go.
+    Left,
 }
 
 struct Queued {
@@ -649,13 +986,7 @@ enum Op {
         path: PathBuf,
         run: Box<dyn FnOnce() -> io::Result<()> + Send>,
     },
-    Read {
-        path: PathBuf,
-        offset: u64,
-        len: usize,
-        reply: mpsc::SyncSender<io::Result<Vec<u8>>>,
-    },
-    // Close every handle the key left open.
+    // Close every handle the key left open and forget its files.
     Forget,
 }
 
@@ -666,7 +997,7 @@ impl Op {
             | Op::Truncate { file, .. }
             | Op::Close { file, .. }
             | Op::Release { file } => Some(*file),
-            Op::Run { .. } | Op::Read { .. } | Op::Forget => None,
+            Op::Run { .. } | Op::Forget => None,
         }
     }
 
@@ -678,7 +1009,7 @@ impl Op {
                 .map(|create| create.path.clone())
                 .unwrap_or_default(),
             Op::Truncate { create, .. } | Op::Close { create, .. } => create.path.clone(),
-            Op::Run { path, .. } | Op::Read { path, .. } => path.clone(),
+            Op::Run { path, .. } => path.clone(),
             Op::Release { .. } | Op::Forget => PathBuf::new(),
         }
     }
@@ -688,9 +1019,49 @@ struct Open {
     file: File,
     // Where it was opened, to name a failure.
     path: PathBuf,
-    key: u64,
     // Where the last write to it ended; `None` before its first.
     end: Option<u64>,
+}
+
+impl Held {
+    // The open handle of `file`, opened through `create` when it is not
+    // open. `None` for a file with no handle and no way to open one.
+    fn opened(
+        &mut self,
+        file: u64,
+        create: Option<&Create>,
+        creating: &mut bool,
+    ) -> io::Result<Option<&mut Open>> {
+        if !self.open.contains_key(&file) {
+            let Some(create) = create else {
+                return Ok(None);
+            };
+            if self.refused.contains(&file) {
+                return Ok(None);
+            }
+            *creating = true;
+            let opened = (create.open)(&create.path, create.length)?;
+            *creating = false;
+            self.open.insert(
+                file,
+                Open {
+                    file: opened,
+                    path: create.path.clone(),
+                    end: None,
+                },
+            );
+        }
+        Ok(self.open.get_mut(&file))
+    }
+}
+
+// What a batch has come to so far.
+#[derive(Default)]
+struct Ran {
+    failures: Vec<Failure>,
+    tally: Tally,
+    // The bytes of the write being made, still counted as waiting.
+    in_hand: u64,
 }
 
 // What one batch adds to its volume's counters.
@@ -717,125 +1088,267 @@ struct Place {
     at: u32,
 }
 
+// One operation of the batch being run.
+struct Entry {
+    seq: u64,
+    key: Arc<Key>,
+    // Taken as the operation runs.
+    op: Option<Op>,
+    done: bool,
+    // The key's next operation in the batch.
+    next: u32,
+}
+
 struct Thread {
     state: Arc<LaneState>,
     report: Arc<ReportFn>,
-    open: HashMap<u64, Open>,
-    // A file whose open was refused: its later writes are dropped.
-    refused: std::collections::HashSet<u64>,
-    batch: Vec<Option<Queued>>,
+    rates: Option<Arc<RateSignal>>,
+    registry: Weak<Registry>,
+    batch: Vec<Entry>,
     order: Vec<Place>,
-    done: Vec<bool>,
-    files: HashMap<u64, (u32, u32, u32)>,
-    // The thread found nothing waiting and has not written since.
-    idle: bool,
+    // Each file of the batch, by its key and the key's number for it.
+    files: HashMap<(usize, u64), (u32, u32, u32)>,
+    ran: Ran,
+    // Operations that reached the thread, and batches it began.
+    arrived: u64,
+    turn: u64,
+    // A batch ran since the thread last found nothing waiting.
+    worked: bool,
 }
 
 impl Thread {
-    fn new(state: Arc<LaneState>, report: Arc<ReportFn>) -> Self {
+    fn new(
+        state: Arc<LaneState>,
+        report: Arc<ReportFn>,
+        rates: Option<Arc<RateSignal>>,
+        registry: Weak<Registry>,
+    ) -> Self {
         Self {
             state,
             report,
-            open: HashMap::new(),
-            refused: Default::default(),
+            rates,
+            registry,
             batch: Vec::new(),
             order: Vec::new(),
-            done: Vec::new(),
             files: HashMap::new(),
-            idle: false,
+            ran: Ran::default(),
+            arrived: 0,
+            turn: 0,
+            worked: false,
         }
     }
 
-    fn run(mut self, queued: mpsc::Receiver<Queued>) {
+    fn run(mut self, queued: mpsc::Receiver<Mail>) {
+        self.state
+            .volume
+            .writer
+            .threads
+            .fetch_add(1, Ordering::Relaxed);
         loop {
-            let first = match queued.try_recv() {
-                Ok(first) => first,
+            let mail = match queued.try_recv() {
+                Ok(mail) => mail,
                 Err(mpsc::TryRecvError::Disconnected) => return,
                 Err(mpsc::TryRecvError::Empty) => {
-                    self.state
-                        .volume
-                        .idle_turns
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.idle = true;
-                    match queued.recv() {
-                        Ok(first) => first,
-                        Err(_) => return,
+                    if std::mem::take(&mut self.worked) {
+                        self.state
+                            .volume
+                            .idle_turns
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    match self.end(&queued) {
+                        Ok(()) => return,
+                        Err(Some(mail)) => mail,
+                        Err(None) => match queued.recv() {
+                            Ok(mail) => mail,
+                            Err(_) => return,
+                        },
                     }
                 }
             };
-            self.batch(first, &queued);
+            if let Mail::Op(first) = mail {
+                self.batch(first, &queued);
+                self.worked = true;
+            }
         }
     }
 
-    // Run `first` and everything queued behind it as one batch.
-    fn batch(&mut self, first: Queued, queued: &mpsc::Receiver<Queued>) {
-        {
-            let base = first.seq;
-            self.batch.push(Some(first));
-            while let Ok(more) = queued.try_recv() {
-                self.batch.push(Some(more));
-            }
-            self.arrange();
-            let mut failures = Vec::new();
-            let mut tally = Tally::default();
-            self.done.clear();
-            self.done.resize(self.batch.len(), false);
-            let mut returned = 0;
-            for index in 0..self.order.len() {
-                let at = self.order[index].at as usize;
-                let queued = self.batch[at].take().expect("each operation runs once");
-                #[cfg(test)]
-                let forced = self.pass_gate();
-                #[cfg(not(test))]
-                let forced = None;
-                self.perform(queued, forced, &mut failures, &mut tally);
-                self.done[at] = true;
-                let before = returned;
-                while returned < self.done.len() && self.done[returned] {
-                    returned += 1;
-                }
-                if returned > before {
-                    self.state.returned(base + returned as u64 - 1);
-                }
-            }
-            self.batch.clear();
-            let volume = &self.state.volume;
-            let counts = &volume.writer;
-            counts.batches.fetch_add(1, Ordering::Relaxed);
-            counts.operations.fetch_add(tally.operations, Ordering::Relaxed);
-            if tally.abandoned > 0 {
-                counts
-                    .abandoned_operations
-                    .fetch_add(tally.abandoned, Ordering::Relaxed);
-            }
-            if !failures.is_empty() {
-                counts
-                    .failed_operations
-                    .fetch_add(failures.len() as u64, Ordering::Relaxed);
-            }
-            if tally.calls > 0 {
-                // The bytes first and the time last, released: whoever
-                // reads the time first never sees time without its bytes.
-                volume.written_bytes.fetch_add(tally.written, Ordering::Relaxed);
-                volume.write_calls.fetch_add(tally.calls, Ordering::Relaxed);
-                volume.write_seeks.fetch_add(tally.seeks, Ordering::Relaxed);
-                volume.write_nanos.fetch_add(tally.nanos, Ordering::Release);
-            }
-            (self.report)(Report { failures });
+    // End the thread when no caller holds the volume and nothing is queued:
+    // the volume leaves the registry as the thread's last act. Decided under
+    // the registry's lock, where a caller takes the volume, so none takes it
+    // as the thread goes. `Err` when the thread stays, with what was queued
+    // in the meantime.
+    fn end(&self, queued: &mpsc::Receiver<Mail>) -> Result<(), Option<Mail>> {
+        if self.state.users.load(Ordering::SeqCst) > 0 {
+            return Err(None);
         }
+        let registry = self.registry.upgrade();
+        let mut lanes = registry.as_ref().map(|registry| registry.lock());
+        if self.state.users.load(Ordering::SeqCst) > 0 {
+            return Err(None);
+        }
+        if let Ok(mail) = queued.try_recv() {
+            return Err(Some(mail));
+        }
+        if let Some(lanes) = &mut lanes {
+            lanes.retain(|(_, lane)| !Arc::ptr_eq(&lane.state, &self.state));
+        }
+        #[cfg(test)]
+        if let Some(registry) = &registry {
+            registry.ended.notify_all();
+        }
+        Ok(())
+    }
+
+    // Run `first` and everything queued behind it as one batch.
+    fn batch(&mut self, first: Queued, queued: &mpsc::Receiver<Mail>) {
+        self.batch.push(Entry::new(first));
+        while let Ok(more) = queued.try_recv() {
+            if let Mail::Op(more) = more {
+                self.batch.push(Entry::new(more));
+            }
+        }
+        let base = self.arrived;
+        self.arrived += self.batch.len() as u64;
+        self.turn += 1;
+        // A panic in one operation must not leave the volume's callers
+        // waiting for a thread that is gone.
+        if catch_unwind(AssertUnwindSafe(|| self.run_batch(base))).is_err() {
+            self.fail_batch(base);
+        }
+        self.batch.clear();
+        let Ran {
+            failures, tally, ..
+        } = std::mem::take(&mut self.ran);
+        let volume = &self.state.volume;
+        let counts = &volume.writer;
+        counts.batches.fetch_add(1, Ordering::Relaxed);
+        counts.operations.fetch_add(tally.operations, Ordering::Relaxed);
+        if tally.abandoned > 0 {
+            counts
+                .abandoned_operations
+                .fetch_add(tally.abandoned, Ordering::Relaxed);
+        }
+        if !failures.is_empty() {
+            counts
+                .failed_operations
+                .fetch_add(failures.len() as u64, Ordering::Relaxed);
+        }
+        if tally.calls > 0 {
+            // The bytes first and the time last, released: whoever
+            // reads the time first never sees time without its bytes.
+            volume.written_bytes.fetch_add(tally.written, Ordering::Relaxed);
+            volume.write_calls.fetch_add(tally.calls, Ordering::Relaxed);
+            volume.write_seeks.fetch_add(tally.seeks, Ordering::Relaxed);
+            volume.write_nanos.fetch_add(tally.nanos, Ordering::Release);
+            // After the counters, so a sampler this wakes finds them moved.
+            if let Some(rates) = &self.rates {
+                rates.wake();
+            }
+        }
+        if !failures.is_empty() {
+            (self.report)(Report {
+                failures,
+                below: false,
+            });
+        }
+    }
+
+    fn run_batch(&mut self, base: u64) {
+        self.arrange();
+        let mut through = 0;
+        for index in 0..self.order.len() {
+            let at = self.order[index].at as usize;
+            #[cfg(test)]
+            let forced = self.pass_gate();
+            #[cfg(not(test))]
+            let forced = None;
+            let op = self.batch[at].op.take().expect("each operation runs once");
+            perform(
+                &self.state,
+                &*self.report,
+                &self.batch[at].key,
+                op,
+                forced,
+                &mut self.ran,
+            );
+            self.batch[at].done = true;
+            self.state.done.fetch_add(1, Ordering::Relaxed);
+            // The key hears of its own operations in the order it submitted
+            // them, whatever order the batch ran them in.
+            let key = &self.batch[at].key;
+            let mut head = key.head.load(Ordering::Relaxed);
+            if head as usize == at {
+                let mut last = 0;
+                while head != NONE && self.batch[head as usize].done {
+                    last = self.batch[head as usize].seq;
+                    head = self.batch[head as usize].next;
+                }
+                key.head.store(head, Ordering::Relaxed);
+                key.returned(last);
+            }
+            let before = through;
+            while through < self.batch.len() && self.batch[through].done {
+                through += 1;
+            }
+            if through > before {
+                self.state.returned(base + through as u64);
+            }
+        }
+    }
+
+    // The batch panicked: every key with an operation in it has failed.
+    // What was not run is not run, all of it counts as returned, and its
+    // bytes stop waiting.
+    fn fail_batch(&mut self, base: u64) {
+        let report = &*self.report;
+        unbuffer(&self.state, report, std::mem::take(&mut self.ran.in_hand));
+        for entry in &mut self.batch {
+            if let Some(Op::Write { bytes, .. }) = entry.op.take() {
+                unbuffer(&self.state, report, bytes.len() as u64);
+            }
+            if !std::mem::replace(&mut entry.done, true) {
+                self.state.done.fetch_add(1, Ordering::Relaxed);
+            }
+            let key = &entry.key;
+            if !key.failed.swap(true, Ordering::AcqRel) && !key.abandoned.load(Ordering::Acquire) {
+                self.ran.failures.push(Failure {
+                    key: key.id,
+                    file: None,
+                    path: PathBuf::new(),
+                    error: io::Error::other("a file operation panicked on the volume's writer"),
+                    creating: false,
+                });
+            }
+            key.returned(entry.seq);
+        }
+        self.state.returned(base + self.batch.len() as u64);
     }
 
     // Order the batch: see `Place`. Overlapping writes of one file between
     // two of its other operations keep the order they were submitted in.
+    // Each key's operations are chained in the order they came.
     fn arrange(&mut self) {
         self.order.clear();
         self.files.clear();
         let mut part = 0u32;
         let mut rank = 0u32;
-        for (at, queued) in self.batch.iter().enumerate() {
-            let queued = queued.as_ref().expect("a batch not yet run");
-            let at = at as u32;
-            let Some(file) = queued.op.file() else {
+        for index in 0..self.batch.len() {
+            let at = index as u32;
+            let key = &self.batch[index].key;
+            let before = if key.turn.load(Ordering::Relaxed) == self.turn {
+                Some(key.tail.swap(at, Ordering::Relaxed))
+            } else {
+                key.turn.store(self.turn, Ordering::Relaxed);
+                key.head.store(at, Ordering::Relaxed);
+                key.tail.store(at, Ordering::Relaxed);
+                None
+            };
+            if let Some(before) = before {
+                self.batch[before as usize].next = at;
+            }
+            let queued = &self.batch[index];
+            let op = queued.op.as_ref().expect("a batch not yet run");
+            let Some(file) = op.file() else {
                 part += 1;
                 self.order.push(Place {
                     part,
@@ -847,15 +1360,16 @@ impl Thread {
                 part += 1;
                 continue;
             };
-            let entry = self.files.entry(file).or_insert((u32::MAX, 0, 0));
+            let of = (Arc::as_ptr(&queued.key) as usize, file);
+            let entry = self.files.entry(of).or_insert((u32::MAX, 0, 0));
             if entry.0 != part {
                 rank += 1;
                 *entry = (part, rank, 0);
             }
             // A write that opens the file runs before the writes after it,
             // which carry no way to open it.
-            let alone = !matches!(&queued.op, Op::Write { create: None, .. });
-            let offset = match &queued.op {
+            let alone = !matches!(op, Op::Write { create: None, .. });
+            let offset = match op {
                 Op::Write { offset, .. } => *offset,
                 _ => 0,
             };
@@ -890,11 +1404,7 @@ impl Thread {
             let mut reached = 0u64;
             let mut overlaps = false;
             for place in &self.order[start..end] {
-                if let Some(Queued {
-                    op: Op::Write { offset, bytes, .. },
-                    ..
-                }) = &self.batch[place.at as usize]
-                {
+                if let Some(Op::Write { offset, bytes, .. }) = &self.batch[place.at as usize].op {
                     overlaps |= *offset < reached;
                     reached = reached.max(offset + bytes.len() as u64);
                 }
@@ -904,185 +1414,6 @@ impl Thread {
             }
             start = end;
         }
-    }
-
-    fn perform(
-        &mut self,
-        queued: Queued,
-        forced: Option<io::Error>,
-        failures: &mut Vec<Failure>,
-        tally: &mut Tally,
-    ) {
-        let Queued { key, op, .. } = queued;
-        let waiting = match &op {
-            Op::Write { bytes, .. } => bytes.len() as u64,
-            _ => 0,
-        };
-        let skip = key.abandoned.load(Ordering::Acquire) || key.failed.load(Ordering::Acquire);
-        let file = op.file();
-        match &op {
-            Op::Forget | Op::Release { .. } => {}
-            Op::Read { .. } if skip => tally.abandoned += 1,
-            Op::Read { .. } => tally.operations += 1,
-            _ if skip => tally.abandoned += 1,
-            _ => tally.operations += 1,
-        }
-        let mut creating = false;
-        let mut failed_at = PathBuf::new();
-        let result = match op {
-            Op::Forget => {
-                self.open.retain(|_, open| open.key != key.id);
-                Ok(())
-            }
-            Op::Release { file } => {
-                self.open.remove(&file);
-                Ok(())
-            }
-            Op::Read {
-                path,
-                offset,
-                len,
-                reply,
-            } => {
-                let read = if skip {
-                    Err(io::Error::other("the file's writes were given up"))
-                } else {
-                    read_at(&path, offset, len)
-                };
-                let _ = reply.send(read);
-                Ok(())
-            }
-            _ if skip => {
-                if let Some(file) = file {
-                    self.open.remove(&file);
-                }
-                Ok(())
-            }
-            _ if forced.is_some() => Err(forced.expect("checked above")),
-            Op::Write {
-                file,
-                offset,
-                bytes,
-                create,
-            } => {
-                if let Some(create) = &create {
-                    failed_at.clone_from(&create.path);
-                }
-                if self.idle {
-                    // SEAM: ring the rate sampler's wake()
-                    self.idle = false;
-                }
-                match self.opened(file, key.id, create.as_deref(), &mut creating) {
-                    Ok(Some(open)) => {
-                        tally.calls += 1;
-                        if open.end.is_some_and(|end| end != offset) {
-                            tally.seeks += 1;
-                        }
-                        let started = Instant::now();
-                        let wrote = write_all_at(&open.file, offset, &bytes);
-                        if wrote.is_err() {
-                            failed_at.clone_from(&open.path);
-                        }
-                        tally.nanos += started.elapsed().as_nanos() as u64;
-                        if wrote.is_ok() {
-                            tally.written += bytes.len() as u64;
-                        }
-                        open.end = Some(offset + bytes.len() as u64);
-                        wrote
-                    }
-                    Ok(None) => Ok(()),
-                    Err(error) => Err(error),
-                }
-            }
-            Op::Truncate { file, create } => {
-                failed_at.clone_from(&create.path);
-                if !self.open.contains_key(&file) && !create.path.try_exists().unwrap_or(true) {
-                    Ok(())
-                } else {
-                    self.opened(file, key.id, Some(&create), &mut creating)
-                        .and_then(|open| open.map_or(Ok(()), |open| open.file.set_len(0)))
-                }
-            }
-            Op::Close {
-                file,
-                length,
-                create,
-            } => {
-                failed_at.clone_from(&create.path);
-                let closed = self
-                    .opened(file, key.id, Some(&create), &mut creating)
-                    .and_then(|open| open.map_or(Ok(()), |open| open.file.set_len(length)));
-                self.open.remove(&file);
-                closed
-            }
-            Op::Run { file, path, run } => {
-                if let Some(file) = file {
-                    self.open.remove(&file);
-                }
-                failed_at = path;
-                run()
-            }
-        };
-        if waiting > 0 {
-            self.state
-                .volume
-                .buffered_bytes
-                .fetch_sub(waiting, Ordering::Relaxed);
-        }
-        if let Err(error) = result {
-            // A name the file system will not take is a refusal of that one
-            // file: the caller decides what follows. Anything else fails
-            // the key, and what is queued behind it under the key is not
-            // run.
-            let refusal = creating && error.kind() == io::ErrorKind::InvalidFilename;
-            if refusal {
-                if let Some(file) = file {
-                    self.refused.insert(file);
-                }
-                key.unheard.fetch_add(1, Ordering::AcqRel);
-            } else {
-                key.failed.store(true, Ordering::Release);
-            }
-            failures.push(Failure {
-                key: key.id,
-                file,
-                path: failed_at,
-                error,
-                creating,
-            });
-        }
-    }
-
-    // The open handle of `file`, opened through `create` when it is not
-    // open. `None` for a file with no handle and no way to open one.
-    fn opened(
-        &mut self,
-        file: u64,
-        key: u64,
-        create: Option<&Create>,
-        creating: &mut bool,
-    ) -> io::Result<Option<&mut Open>> {
-        if !self.open.contains_key(&file) {
-            let Some(create) = create else {
-                return Ok(None);
-            };
-            if self.refused.contains(&file) {
-                return Ok(None);
-            }
-            *creating = true;
-            let opened = (create.open)(&create.path, create.length)?;
-            *creating = false;
-            self.open.insert(
-                file,
-                Open {
-                    file: opened,
-                    path: create.path.clone(),
-                    key,
-                    end: None,
-                },
-            );
-        }
-        Ok(self.open.get_mut(&file))
     }
 
     #[cfg(test)]
@@ -1106,6 +1437,154 @@ impl Thread {
             gate.permits -= 1;
         }
         gate.fail_next.take()
+    }
+}
+
+impl Entry {
+    fn new(queued: Queued) -> Self {
+        Self {
+            seq: queued.seq,
+            key: queued.key,
+            op: Some(queued.op),
+            done: false,
+            next: NONE,
+        }
+    }
+}
+
+// Run one operation of `key` to its end.
+fn perform(
+    state: &LaneState,
+    report: &ReportFn,
+    key: &Key,
+    op: Op,
+    forced: Option<io::Error>,
+    ran: &mut Ran,
+) {
+    let Ran {
+        failures,
+        tally,
+        in_hand,
+    } = ran;
+    *in_hand = match &op {
+        Op::Write { bytes, .. } => bytes.len() as u64,
+        _ => 0,
+    };
+    let skip = key.stopped();
+    let file = op.file();
+    match &op {
+        Op::Forget | Op::Release { .. } => {}
+        _ if skip => tally.abandoned += 1,
+        _ => tally.operations += 1,
+    }
+    let mut creating = false;
+    let mut failed_at = PathBuf::new();
+    // A caller's own code runs with the key's files let go.
+    let mut after = None;
+    let mut held = key.held();
+    let mut result = match op {
+        Op::Forget => {
+            *held = Held::default();
+            Ok(())
+        }
+        Op::Release { file } => {
+            held.open.remove(&file);
+            Ok(())
+        }
+        _ if skip => {
+            if let Some(file) = file {
+                held.open.remove(&file);
+            }
+            Ok(())
+        }
+        _ if forced.is_some() => Err(forced.expect("checked above")),
+        Op::Write {
+            file,
+            offset,
+            bytes,
+            create,
+        } => {
+            if let Some(create) = &create {
+                failed_at.clone_from(&create.path);
+            }
+            match held.opened(file, create.as_deref(), &mut creating) {
+                Ok(Some(open)) => {
+                    tally.calls += 1;
+                    if open.end.is_some_and(|end| end != offset) {
+                        tally.seeks += 1;
+                    }
+                    let started = Instant::now();
+                    let wrote = write_all_at(&open.file, offset, &bytes);
+                    if wrote.is_err() {
+                        failed_at.clone_from(&open.path);
+                    }
+                    tally.nanos += started.elapsed().as_nanos() as u64;
+                    if wrote.is_ok() {
+                        tally.written += bytes.len() as u64;
+                    }
+                    open.end = Some(offset + bytes.len() as u64);
+                    wrote
+                }
+                Ok(None) => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+        Op::Truncate { file, create } => {
+            failed_at.clone_from(&create.path);
+            if !held.open.contains_key(&file) && !create.path.try_exists().unwrap_or(true) {
+                Ok(())
+            } else {
+                held.opened(file, Some(&create), &mut creating)
+                    .and_then(|open| open.map_or(Ok(()), |open| open.file.set_len(0)))
+            }
+        }
+        Op::Close {
+            file,
+            length,
+            create,
+        } => {
+            failed_at.clone_from(&create.path);
+            let closed = held
+                .opened(file, Some(&create), &mut creating)
+                .and_then(|open| open.map_or(Ok(()), |open| open.file.set_len(length)));
+            held.open.remove(&file);
+            closed
+        }
+        Op::Run { file, path, run } => {
+            if let Some(file) = file {
+                held.open.remove(&file);
+            }
+            failed_at = path;
+            after = Some(run);
+            Ok(())
+        }
+    };
+    drop(held);
+    if let Some(run) = after {
+        result = run();
+    }
+    unbuffer(state, report, std::mem::take(in_hand));
+    if let Err(error) = result {
+        // A name the file system will not take is a refusal of that one
+        // file: the caller decides what follows. Anything else fails
+        // the key, and what is queued behind it under the key is not
+        // run.
+        let refusal = creating && error.kind() == io::ErrorKind::InvalidFilename;
+        if refusal {
+            if let Some(file) = file {
+                key.held().refused.insert(file);
+            }
+            key.unheard.fetch_add(1, Ordering::AcqRel);
+        } else {
+            key.failed.store(true, Ordering::Release);
+        }
+        failures.push(Failure {
+            key: key.id,
+            file,
+            path: failed_at,
+            error,
+            creating,
+        });
     }
 }
 
@@ -1169,24 +1648,28 @@ struct Gate {
 
 // A test's hold on a volume's thread.
 #[cfg(test)]
-pub(crate) struct Hold(Arc<LaneState>, #[allow(dead_code)] Arc<Lane>);
+pub(crate) struct Hold(Arc<Lane>);
 
 #[cfg(test)]
 impl Hold {
     fn gate(&self) -> std::sync::MutexGuard<'_, Gate> {
-        self.0.gate.lock().unwrap_or_else(PoisonError::into_inner)
+        self.0
+            .state
+            .gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     // Let the next `count` operations through.
     pub(crate) fn release(&self, count: usize) {
         self.gate().permits += count;
-        self.0.gate_moved.notify_all();
+        self.0.state.gate_moved.notify_all();
     }
 
     // Let everything through from now on.
     pub(crate) fn open(&self) {
         self.gate().held = false;
-        self.0.gate_moved.notify_all();
+        self.0.state.gate_moved.notify_all();
     }
 
     // The next operation let through fails with `error` instead of running.
@@ -1200,10 +1683,18 @@ impl Hold {
         while !(gate.waiting && gate.permits == 0) {
             gate = self
                 .0
+                .state
                 .gate_moved
                 .wait(gate)
                 .unwrap_or_else(PoisonError::into_inner);
         }
+    }
+}
+
+#[cfg(test)]
+impl Drop for Hold {
+    fn drop(&mut self) {
+        self.0.leave();
     }
 }
 

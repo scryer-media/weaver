@@ -473,10 +473,8 @@ impl StorageCapacity {
 
     // What a volume's writer rings after a write, so the sampler leaves its
     // idle wait: `signal.wake()`, one relaxed load while the sampler runs.
-    // SEAM: writer rings wake(). The disk writer takes this once, when it
-    // is made, and calls `wake()` after each write call returns (after its
-    // counters are added); nothing rings it yet, so until the writer lands
-    // an idle sampler is woken by nothing.
+    // The disk writer takes this once, when it is made, and rings it after
+    // each batch that wrote, once its counters are added.
     pub(crate) fn volume_rate_signal(&self) -> Arc<RateSignal> {
         Arc::clone(&self.volume_rates)
     }

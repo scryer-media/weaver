@@ -35,6 +35,56 @@ fn volume(label: &str) -> Arc<Volume> {
     Arc::new(Volume::new(None, label.to_owned()))
 }
 
+fn count(counter: &AtomicU64) -> u64 {
+    counter.load(Ordering::Relaxed)
+}
+
+// A clock that is a minute later each time it is looked at.
+struct Leaping(AtomicU64);
+
+impl Clock for Leaping {
+    fn now(&self) -> Duration {
+        Duration::from_secs(self.0.fetch_add(60, Ordering::Relaxed))
+    }
+
+    fn runs(&self) -> bool {
+        false
+    }
+}
+
+// A clock the test moves by hand, which counts the looks taken at it.
+#[derive(Default)]
+struct HandClock {
+    at: Mutex<(Duration, u32)>,
+    looked: Condvar,
+}
+
+impl HandClock {
+    fn move_to(&self, at: Duration) {
+        self.at.lock().unwrap().0 = at;
+    }
+
+    fn wait_looks(&self, looks: u32) {
+        let mut at = self.at.lock().unwrap();
+        while at.1 < looks {
+            at = self.looked.wait(at).unwrap();
+        }
+    }
+}
+
+impl Clock for HandClock {
+    fn now(&self) -> Duration {
+        let mut at = self.at.lock().unwrap();
+        at.1 += 1;
+        self.looked.notify_all();
+        at.0
+    }
+
+    fn runs(&self) -> bool {
+        false
+    }
+}
+
 #[test]
 fn a_barrier_passes_once_every_write_before_it_returned() {
     let dir = tempfile::tempdir().unwrap();
@@ -59,12 +109,10 @@ fn a_barrier_passes_once_every_write_before_it_returned() {
     assert!(barrier.passed());
     assert_eq!(std::fs::read(&path).unwrap(), b"lantern");
     assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 0);
-    let mut failures = 0;
-    while volume.written_bytes.load(Ordering::Relaxed) < 7 {
-        failures += reports.recv().unwrap().failures.len();
-    }
-    assert_eq!(failures, 0);
+    drop((job, hold));
+    writers.wait_ended(&volume);
     assert_eq!(volume.written_bytes.load(Ordering::Relaxed), 7);
+    assert!(reports.try_recv().is_err(), "a clean batch says nothing");
 }
 
 // The order a held batch ran in, by what each write left in the file's
@@ -230,4 +278,291 @@ fn a_read_follows_the_writes_submitted_before_it() {
     let job = writers.submitter(&volume, 1);
     job.write(1, 0, Bytes::from_static(b"lantern"), create(&path));
     assert_eq!(job.read(path, 3, 4).unwrap(), b"tern");
+}
+
+#[test]
+fn a_keys_barrier_and_read_pass_while_another_keys_operation_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stuck, free) = (dir.path().join("stuck"), dir.path().join("free"));
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let slow = writers.submitter(&volume, 1);
+    let quick = writers.submitter(&volume, 2);
+    quick.write(0, 0, Bytes::from_static(b"lantern"), create(&free));
+    let passed = quick.barrier();
+    hold.wait_held();
+    hold.release(1);
+    slow.write(0, 0, Bytes::from_static(b"stuck"), create(&stuck));
+    let held = slow.barrier();
+    // The thread stands before the other key's write and does not run it.
+    hold.wait_held();
+    assert!(passed.passed());
+    passed.wait();
+    assert_eq!(quick.read(free, 3, 4).unwrap(), b"tern");
+    assert!(!held.returned());
+    assert!(!stuck.exists());
+    hold.open();
+    held.wait();
+    assert_eq!(std::fs::read(&stuck).unwrap(), b"stuck");
+}
+
+#[test]
+fn writes_queued_behind_a_held_volume_run_as_one_batch_by_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+    let (writers, reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    job.run(None, dir.path().to_path_buf(), || Ok(()));
+    hold.wait_held();
+    // Each file is opened by its first four bytes; the rest are submitted
+    // last part first, the two files turn and turn about.
+    job.write(1, 0, Bytes::from(vec![0; 4]), create(&first));
+    job.write(2, 0, Bytes::from(vec![0; 4]), create(&second));
+    for part in (1..32u8).rev() {
+        for file in [1, 2] {
+            job.write(file, u64::from(part) * 4, Bytes::from(vec![part; 4]), None);
+        }
+    }
+    drop(job);
+    hold.open();
+    drop(hold);
+    writers.wait_ended(&volume);
+    let whole: Vec<u8> = (0..32u8).flat_map(|part| [part; 4]).collect();
+    assert_eq!(std::fs::read(&first).unwrap(), whole);
+    assert_eq!(std::fs::read(&second).unwrap(), whole);
+    let counts = &volume.writer;
+    // The held operation, then everything that queued behind it.
+    assert_eq!(count(&counts.batches), 2);
+    assert_eq!(count(&counts.operations), 65);
+    assert_eq!(count(&volume.write_calls), 64);
+    // Each write began where the one before it on its file ended.
+    assert_eq!(count(&volume.write_seeks), 0);
+    assert_eq!(count(&volume.idle_turns), 1);
+    assert_eq!(count(&counts.threads), 1);
+    assert!(reports.try_recv().is_err(), "a clean batch says nothing");
+}
+
+#[test]
+fn a_wake_asked_for_comes_once_when_the_line_is_crossed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    job.write(1, 0, Bytes::from_static(b"four"), create(&path));
+    job.write(1, 4, Bytes::from_static(b"more"), None);
+    job.write(1, 8, Bytes::from_static(b"last"), None);
+    assert!(!writers.wake_below(&volume, 12), "already there: no wake");
+    assert!(writers.wake_below(&volume, 4));
+    assert!(writers.wake_below(&volume, 4), "asked twice, woken once");
+    hold.wait_held();
+    hold.release(1);
+    hold.wait_held();
+    assert_eq!(count(&volume.buffered_bytes), 8);
+    assert!(reports.try_recv().is_err(), "eight wait, above the line");
+    hold.release(1);
+    hold.wait_held();
+    let report = reports.recv().unwrap();
+    assert!(report.below && report.failures.is_empty());
+    hold.open();
+    drop((job, hold));
+    writers.wait_ended(&volume);
+    assert_eq!(count(&volume.buffered_bytes), 0);
+    assert!(reports.try_recv().is_err(), "one wake for one ask");
+}
+
+#[test]
+fn a_volume_keeps_one_thread_until_it_ends_and_settle_waits_for_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (old, new, later) = (
+        dir.path().join("old"),
+        dir.path().join("new"),
+        dir.path().join("later"),
+    );
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let gone = writers.submitter(&volume, 1);
+    gone.write(1, 0, Bytes::from_static(b"old"), create(&old));
+    drop(gone);
+    hold.wait_held();
+    // No caller holds the key, and its write is still seen: a settle that
+    // gives up at once finds it and the close behind it.
+    let left = writers.settle_within(Duration::from_secs(30), &Leaping(AtomicU64::new(0)));
+    assert_eq!(
+        left,
+        [Unsettled {
+            label: "one".to_owned(),
+            operations: 2,
+            bytes: 3,
+        }]
+    );
+    let next = writers.submitter(&volume, 2);
+    next.write(1, 0, Bytes::from_static(b"new"), create(&new));
+    hold.open();
+    writers.settle();
+    assert_eq!(std::fs::read(&old).unwrap(), b"old");
+    assert_eq!(std::fs::read(&new).unwrap(), b"new");
+    drop((next, hold));
+    writers.wait_ended(&volume);
+    assert_eq!(count(&volume.writer.threads), 1);
+    // Only a volume whose thread has ended is given another.
+    let after = writers.submitter(&volume, 3);
+    after.write(1, 0, Bytes::from_static(b"later"), create(&later));
+    after.barrier().wait();
+    assert_eq!(std::fs::read(&later).unwrap(), b"later");
+    assert_eq!(count(&volume.writer.threads), 2);
+}
+
+#[test]
+fn two_keys_number_their_files_apart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let (six, seven) = (writers.submitter(&volume, 6), writers.submitter(&volume, 7));
+    six.run(None, dir.path().to_path_buf(), || Ok(()));
+    hold.wait_held();
+    // One batch holds both keys' file 0.
+    six.write(0, 0, Bytes::from_static(b"AA"), create(&a));
+    seven.write(0, 0, Bytes::from_static(b"BB"), create(&b));
+    six.write(0, 2, Bytes::from_static(b"AA"), None);
+    hold.open();
+    six.barrier().wait();
+    seven.barrier().wait();
+    // And so do two batches.
+    seven.write(0, 2, Bytes::from_static(b"BB"), None);
+    seven.barrier().wait();
+    assert_eq!(std::fs::read(&a).unwrap(), b"AAAA");
+    assert_eq!(std::fs::read(&b).unwrap(), b"BBBB");
+}
+
+#[test]
+fn a_panicking_operation_fails_its_key_and_the_thread_goes_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let (lost, kept) = (dir.path().join("lost"), dir.path().join("kept"));
+    let (writers, reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let broken = writers.submitter(&volume, 1);
+    broken.run(None, dir.path().to_path_buf(), || Ok(()));
+    hold.wait_held();
+    broken.write(1, 0, Bytes::from_static(b"first"), create(&lost));
+    broken.run(None, lost.clone(), || panic!("an operation that panics"));
+    broken.write(1, 5, Bytes::from_static(b"never"), None);
+    let failed = broken.barrier();
+    hold.open();
+    failed.wait();
+    assert!(failed.returned() && !failed.passed());
+    assert!(broken.failed());
+    assert_eq!(count(&volume.buffered_bytes), 0);
+    assert_eq!(std::fs::read(&lost).unwrap(), b"first");
+    let report = reports.recv().unwrap();
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].key, 1);
+    assert_eq!(count(&volume.writer.failed_operations), 1);
+    let healthy = writers.submitter(&volume, 2);
+    healthy.write(1, 0, Bytes::from_static(b"kept"), create(&kept));
+    let kept_barrier = healthy.barrier();
+    kept_barrier.wait();
+    assert!(kept_barrier.passed());
+    assert_eq!(std::fs::read(&kept).unwrap(), b"kept");
+    assert_eq!(count(&volume.writer.threads), 1);
+}
+
+#[test]
+fn a_bounded_settle_gives_up_on_a_volume_that_stands_still_for_the_span() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    job.write(1, 0, Bytes::from_static(b"stuck"), create(&path));
+    hold.wait_held();
+    let clock = HandClock::default();
+    let span = Duration::from_secs(30);
+    let over = AtomicBool::new(false);
+    let left = std::thread::scope(|scope| {
+        let settling = scope.spawn(|| {
+            let left = writers.settle_within(span, &clock);
+            over.store(true, Ordering::SeqCst);
+            left
+        });
+        // One look as the settle begins and one before it waits.
+        clock.wait_looks(2);
+        clock.move_to(Duration::from_secs(29));
+        writers.look_again();
+        clock.wait_looks(3);
+        assert!(!over.load(Ordering::SeqCst), "the span has not passed");
+        clock.move_to(span);
+        writers.look_again();
+        settling.join().unwrap()
+    });
+    assert_eq!(
+        left,
+        [Unsettled {
+            label: "one".to_owned(),
+            operations: 1,
+            bytes: 5,
+        }]
+    );
+    // What was left is still written once the volume moves.
+    hold.open();
+    assert!(writers.settle_within(span, &clock).is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), b"stuck");
+}
+
+#[test]
+fn the_counters_hold_what_a_scripted_run_did() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, x, z) = (dir.path().join("a"), dir.path().join("x"), dir.path().join("z"));
+    let (writers, reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let failing = writers.submitter(&volume, 0);
+    let ordered = writers.submitter(&volume, 1);
+    let seeking = writers.submitter(&volume, 2);
+    let given_up = writers.submitter(&volume, 3);
+    failing.run(None, dir.path().to_path_buf(), || Ok(()));
+    hold.wait_held();
+    hold.fail_next(io::Error::other("no room"));
+    // Three writes that leave no gap once ordered.
+    ordered.write(1, 0, Bytes::from_static(b"aaaa"), create(&a));
+    ordered.write(1, 8, Bytes::from_static(b"cccc"), None);
+    ordered.write(1, 4, Bytes::from_static(b"bbbb"), None);
+    // Two with a gap between them.
+    seeking.write(1, 0, Bytes::from_static(b"xx"), create(&x));
+    seeking.write(1, 10, Bytes::from_static(b"yy"), None);
+    // Two that are given up before they run.
+    given_up.write(1, 0, Bytes::from_static(b"zz"), create(&z));
+    given_up.write(1, 2, Bytes::from_static(b"zz"), None);
+    given_up.abandon();
+    drop((failing, ordered, seeking, given_up));
+    hold.open();
+    drop(hold);
+    writers.wait_ended(&volume);
+    assert_eq!(std::fs::read(&a).unwrap(), b"aaaabbbbcccc");
+    assert_eq!(std::fs::read(&x).unwrap(), b"xx\0\0\0\0\0\0\0\0yy");
+    assert!(!z.exists());
+    let counts = &volume.writer;
+    assert_eq!(count(&counts.batches), 2);
+    assert_eq!(count(&counts.operations), 6);
+    assert_eq!(count(&counts.failed_operations), 1);
+    assert_eq!(count(&counts.abandoned_operations), 2);
+    assert_eq!(count(&volume.write_calls), 5);
+    assert_eq!(count(&volume.write_seeks), 1);
+    assert_eq!(count(&volume.written_bytes), 16);
+    assert_eq!(count(&volume.idle_turns), 1);
+    assert_eq!(count(&counts.threads), 1);
+    assert_eq!(count(&volume.buffered_bytes), 0);
+    let report = reports.recv().unwrap();
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].key, 0);
+    assert!(reports.try_recv().is_err(), "one report, for the one failure");
 }

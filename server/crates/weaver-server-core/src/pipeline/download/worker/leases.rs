@@ -338,8 +338,23 @@ impl Pipeline {
         }
         // A volume the job writes to holds its budget of bytes for its
         // writer: nothing more is fetched for the job until it is below.
+        // Each such volume is asked for one wake, an eighth of the budget
+        // lower so the loop is not woken per write; a volume that fell
+        // there in the meantime holds nothing.
         if self.volume_holds_budget(job_id) {
-            return Err(BlockedBy::only(SchedulerBlockClause::Checkpoint));
+            let budget = self.write_backlog_budget_bytes as u64;
+            let line = budget.saturating_sub((budget / 8).max(1));
+            let mut asked = false;
+            if let Some(disk) = self.graph_jobs.get(&job_id).and_then(|graph| graph.disk()) {
+                for submitter in disk.each() {
+                    let volume = submitter.volume();
+                    asked |= volume.buffered_bytes.load(Ordering::Relaxed) >= budget
+                        && self.volume_writers.wake_below(volume, line);
+                }
+            }
+            if asked {
+                return Err(BlockedBy::only(SchedulerBlockClause::WriteBuffer));
+            }
         }
         let Some(bootstrap_files) = bootstrap_files else {
             return Ok(());

@@ -216,7 +216,7 @@ impl JobDisk {
         &self.working
     }
 
-    fn each(&self) -> impl Iterator<Item = &Arc<Submitter>> {
+    pub(crate) fn each(&self) -> impl Iterator<Item = &Arc<Submitter>> {
         std::iter::once(&self.working).chain(self.output.iter().map(|(_, submitter)| submitter))
     }
 

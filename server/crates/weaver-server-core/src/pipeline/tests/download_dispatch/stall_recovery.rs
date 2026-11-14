@@ -209,6 +209,50 @@ async fn a_stall_behind_a_job_whose_articles_are_being_read_is_never_kicked() {
 }
 
 #[tokio::test]
+async fn a_job_held_by_a_volume_at_its_write_budget_is_never_kicked_or_released() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = stalled_pipeline(&temp_dir).await;
+    let job_id = JobId(40011);
+    insert_stalled_job(&mut pipeline, job_id, 3).await;
+    let budget = pipeline.write_backlog_budget_bytes as u64;
+    let volume = Arc::clone(
+        pipeline.graph_jobs[&job_id]
+            .disk()
+            .expect("the job writes through its volume's writer")
+            .working()
+            .volume(),
+    );
+    let t0 = Instant::now();
+    assert_eq!(pipeline.earliest_explained_dispatch_wait(t0), None);
+
+    // The volume's writer holds the budget: the job waits on the disk.
+    volume.buffered_bytes.store(budget, Ordering::Relaxed);
+    assert_eq!(pipeline.earliest_explained_dispatch_wait(t0), Some(t0));
+    let kick_due = t0 + DOWNLOAD_DISPATCH_STALL_KICK_AFTER;
+    let release_due = kick_due + DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER;
+    let long_after = release_due + DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER;
+    for at in [t0, kick_due, release_due, long_after] {
+        pipeline.dispatch_downloads_at(at);
+        assert_eq!(pipeline.earliest_explained_dispatch_wait(at), Some(at));
+    }
+    assert_eq!(kicks(&pipeline), 0);
+    assert_eq!(releases(&pipeline), 0);
+    assert_eq!(
+        pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        3
+    );
+
+    // Below the budget the disk explains nothing any more.
+    volume.buffered_bytes.store(budget - 1, Ordering::Relaxed);
+    assert_eq!(pipeline.earliest_explained_dispatch_wait(long_after), None);
+}
+
+#[tokio::test]
 async fn an_unexplained_stall_is_kicked_once_at_the_kick_window() {
     let temp_dir = tempfile::tempdir().unwrap();
     let mut pipeline = stalled_pipeline(&temp_dir).await;
