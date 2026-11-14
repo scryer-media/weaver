@@ -814,4 +814,86 @@ mod tests {
         assert_eq!(Direction::In as usize, 0);
         assert_eq!(Direction::Out as usize, 1);
     }
+
+    // Under RC4 the write encrypts the buffer in place, so the kind of the
+    // first frame is taken before the write: a have-all sent on an RC4
+    // connection is counted as one.
+    #[tokio::test(start_paused = true)]
+    async fn a_have_all_sent_under_rc4_is_counted_as_a_have_all() {
+        let counting = Counting::default();
+        let (dialed, _dials) = mpsc::unbounded_channel();
+        let connector = StreamConnector::new(StreamConnectorArgs {
+            enable_tcp: true,
+            ..StreamConnectorArgs::over(Arc::new(Dialed(dialed)))
+        })
+        .await
+        .unwrap();
+        let connection = PeerConnection::new(
+            "127.0.0.1:6881".parse().unwrap(),
+            InfoHashes {
+                v1: Some(Id20::new(HASH)),
+                v2: None,
+            },
+            Id20::new([1; 20]),
+            &counting,
+            Some(PeerConnectionOptions::default()),
+            BlockingSpawner::new(1),
+            Arc::new(connector),
+        );
+        let (ours, mut theirs) = tokio::io::duplex(1 << 16);
+        let (reader, writer) = halves(ours);
+        let (meter, reader, writer) = Meter::wrap(reader, writer);
+        const KEY: &[u8] = b"an rc4 key for the test";
+        let incoming = CheckedIncomingConnection {
+            kind: ConnectionKind::Tcp,
+            addr: "127.0.0.1:6881".parse().unwrap(),
+            reader,
+            writer: crate::mse::Outbound::rc4(writer, crate::mse::Rc4::new(KEY)),
+            read_buf: ReadBuf::new(),
+            handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
+            encryption: crate::mse::Encryption::Rc4,
+            meter,
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut shook = counting.shook.subscribe();
+        let mut saw_have_all = false;
+        let peer = async {
+            let mut decrypt = crate::mse::Rc4::new(KEY);
+            let mut handshake = [0; 68];
+            theirs.read_exact(&mut handshake).await.unwrap();
+            decrypt.apply(&mut handshake);
+            let mut wire = vec![0; 1024];
+            let len = Message::Extended(ExtendedMessage::Handshake(ExtendedHandshake::new()))
+                .serialize(&mut wire, &PeerExtendedMessageIds::my)
+                .unwrap();
+            theirs.write_all(&wire[..len]).await.unwrap();
+            shook.wait_for(|shook| *shook).await.unwrap();
+            tx.send(WriterRequest::Message(Message::Have(9))).unwrap();
+            loop {
+                let mut head = [0u8; 4];
+                theirs.read_exact(&mut head).await.unwrap();
+                decrypt.apply(&mut head);
+                let mut body = vec![0; u32::from_be_bytes(head) as usize];
+                theirs.read_exact(&mut body).await.unwrap();
+                decrypt.apply(&mut body);
+                saw_have_all |= body == [14];
+                // The writer counted the bitfield frame before it framed
+                // this one.
+                if body == [4, 0, 0, 0, 9] {
+                    break;
+                }
+            }
+            drop(tx);
+        };
+        let (_result, ()) = tokio::join!(connection.manage_peer_incoming(rx, incoming), peer);
+        assert!(saw_have_all, "the peer read a have-all off the wire");
+        let snapshot = counting.stats.snapshot();
+        let out: Vec<_> = snapshot
+            .messages()
+            .filter(|(d, _, count)| *d == Direction::Out && *count > 0)
+            .map(|(_, kind, count)| (kind.as_str(), count))
+            .collect();
+        assert!(out.contains(&("have_all", 1)), "{out:?}");
+        assert!(!out.iter().any(|(kind, _)| *kind == "bitfield"), "{out:?}");
+    }
 }

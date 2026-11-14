@@ -1022,6 +1022,15 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     .handler
                     .serialize_bitfield_message_to_buf(&mut write_buf)
                     .map_err(Error::Anyhow)?;
+                // The frame is a bitfield, or under the fast extension a
+                // have-all or have-none, told apart by its message id. It is
+                // read here, as the write may encrypt the buffer in place,
+                // and counted once the write is done.
+                let kind = match write_buf.get(4) {
+                    Some(14) => MessageKind::HaveAll,
+                    Some(15) => MessageKind::HaveNone,
+                    _ => MessageKind::Bitfield,
+                };
                 send(
                     &mut up,
                     &mut write,
@@ -1031,13 +1040,6 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 )
                 .await?;
                 self.handler.on_protocol_bytes(Channel::Upload, len as u64);
-                // The frame is a bitfield, or under the fast extension a
-                // have-all or have-none, told apart by its message id.
-                let kind = match write_buf.get(4) {
-                    Some(14) => MessageKind::HaveAll,
-                    Some(15) => MessageKind::HaveNone,
-                    _ => MessageKind::Bitfield,
-                };
                 self.handler.on_wire_messages(Direction::Out, kind, 1);
                 trace!("sent bitfield");
             }
