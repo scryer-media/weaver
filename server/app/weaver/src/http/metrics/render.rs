@@ -2693,6 +2693,7 @@ pub(crate) fn render_torrents(out: &mut Encoder, metrics: &TorrentMetrics, mode:
             *count,
         );
     }
+    super::torrent_services::render_checks(out, &metrics.check);
 }
 
 // A session's disk calls, blocking permits and peer sockets: every sample

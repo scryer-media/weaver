@@ -184,6 +184,45 @@ pub struct TorrentMetrics {
     pub published: Arc<Published>,
     pub events: Vec<(TorrentEvent, u64)>,
     pub fetches: Vec<(FetchOutcome, u64)>,
+    /// What the piece checks of every session asked of the disk and the
+    /// processor since this process started.
+    pub check: CheckSeries,
+}
+
+/// The process's piece-check counts, as read at one moment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CheckSeries {
+    /// Read calls a check made to a storage, the bytes they read and the
+    /// time spent inside them, in nanoseconds.
+    pub read_calls: u64,
+    pub read_bytes: u64,
+    pub read_nanos: u64,
+    /// Read calls that did not go on from the read before them.
+    pub read_seeks: u64,
+    /// Pieces hashed, and the time spent hashing them, in nanoseconds.
+    pub pieces_hashed: u64,
+    pub hash_nanos: u64,
+    /// Seed-mode pieces whose check was started, and askers that waited
+    /// on a check already running and took its verdict.
+    pub seed_checks_started: u64,
+    pub seed_checks_joined: u64,
+}
+
+impl CheckSeries {
+    /// The counts as they stand: eight relaxed loads.
+    pub fn read() -> Self {
+        let read = weaver_torrent::session_stats::check::CHECK_STATS.snapshot();
+        Self {
+            read_calls: read.read_calls,
+            read_bytes: read.read_bytes,
+            read_nanos: read.read_nanos,
+            read_seeks: read.read_seeks,
+            pieces_hashed: read.pieces_hashed,
+            hash_nanos: read.hash_nanos,
+            seed_checks_started: read.seed_checks_started,
+            seed_checks_joined: read.seed_checks_joined,
+        }
+    }
 }
 
 impl TorrentMetrics {
@@ -192,6 +231,7 @@ impl TorrentMetrics {
             published,
             events: counters.events().to_vec(),
             fetches: counters.fetches().to_vec(),
+            check: CheckSeries::read(),
         }
     }
 }

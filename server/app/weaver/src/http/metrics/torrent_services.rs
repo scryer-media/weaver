@@ -10,13 +10,13 @@
 // same work however many torrents and trackers a session has. No label
 // names a tracker, a peer or a torrent.
 
-use weaver_server_core::torrents::metrics::SessionSeries;
 use weaver_server_core::torrents::metrics::dht::{DhtIgnored, DhtQuery, DhtQueryEnd};
 use weaver_server_core::torrents::metrics::incoming::IncomingEnd;
 use weaver_server_core::torrents::metrics::network::{HolepunchEvent, PortMapResult, PortMapper};
 use weaver_server_core::torrents::metrics::swarm::Transport;
 use weaver_server_core::torrents::metrics::tracker::{AnnounceEvent, TrackerKind, TrackerResult};
 use weaver_server_core::torrents::metrics::web_seed::WebSeedResult;
+use weaver_server_core::torrents::metrics::{CheckSeries, SessionSeries};
 
 use super::catalog as f;
 use super::encode::Encoder;
@@ -92,6 +92,34 @@ pub(super) fn render(out: &mut Encoder, routes: &[SessionSeries]) {
     incoming(out, routes);
     web_seeds(out, routes);
     network(out, routes);
+}
+
+/// The piece checks of the whole process, once and under no route.
+pub(super) fn render_checks(out: &mut Encoder, check: &CheckSeries) {
+    out.sample(&f::TORRENT_CHECK_READ_CALLS, &[], check.read_calls);
+    out.sample(&f::TORRENT_CHECK_READ_BYTES, &[], check.read_bytes);
+    out.sample_f64(
+        &f::TORRENT_CHECK_READ_SECONDS,
+        &[],
+        seconds(check.read_nanos),
+    );
+    out.sample(&f::TORRENT_CHECK_READ_SEEKS, &[], check.read_seeks);
+    out.sample(&f::TORRENT_CHECK_PIECES_HASHED, &[], check.pieces_hashed);
+    out.sample_f64(
+        &f::TORRENT_CHECK_HASH_SECONDS,
+        &[],
+        seconds(check.hash_nanos),
+    );
+    out.sample(
+        &f::TORRENT_SEED_CHECKS_STARTED,
+        &[],
+        check.seed_checks_started,
+    );
+    out.sample(
+        &f::TORRENT_SEED_CHECKS_JOINED,
+        &[],
+        check.seed_checks_joined,
+    );
 }
 
 fn network(out: &mut Encoder, routes: &[SessionSeries]) {

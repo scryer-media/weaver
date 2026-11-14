@@ -829,6 +829,7 @@ fn published_metrics() -> crate::torrents::metrics::TorrentMetrics {
         }),
         events: vec![(TorrentEvent::Added, 2), (TorrentEvent::Failed, 0)],
         fetches: vec![(FetchOutcome::Resolved, 0)],
+        check: Default::default(),
     }
 }
 

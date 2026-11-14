@@ -817,6 +817,22 @@ metric_families! {
         "Requests of peers for bytes to send or receive that were granted only after a wait on a rate limit, the session's or their torrent's, since the session opened. A request granted at once is not counted.");
     TORRENT_RATE_LIMIT_WAIT_SECONDS = ("weaver_torrent_rate_limit_wait_seconds_total", Counter,
         ["route", "direction"], "Time those requests waited in all.");
+    TORRENT_CHECK_READ_CALLS = ("weaver_torrent_check_read_calls_total", Counter, [],
+        "Read calls the piece checks made to storage since this process started: the check of a torrent's files, and the check of a seed-mode piece the first time a peer asks for it. Counted for the whole process, not per session.");
+    TORRENT_CHECK_READ_BYTES = ("weaver_torrent_check_read_bytes_total", Counter, [],
+        "Bytes those read calls read.");
+    TORRENT_CHECK_READ_SECONDS = ("weaver_torrent_check_read_seconds_total", Counter, [],
+        "Time spent inside those read calls.");
+    TORRENT_CHECK_READ_SEEKS = ("weaver_torrent_check_read_seeks_total", Counter, [],
+        "Check read calls that did not start where the read before them on the same file ended. The check of one seed-mode piece counts each read as one unless it starts its file.");
+    TORRENT_CHECK_PIECES_HASHED = ("weaver_torrent_check_pieces_hashed_total", Counter, [],
+        "Pieces the checks hashed since this process started.");
+    TORRENT_CHECK_HASH_SECONDS = ("weaver_torrent_check_hash_seconds_total", Counter, [],
+        "Time spent hashing those pieces.");
+    TORRENT_SEED_CHECKS_STARTED = ("weaver_torrent_seed_mode_checks_started_total", Counter, [],
+        "Seed-mode pieces whose check was started since this process started.");
+    TORRENT_SEED_CHECKS_JOINED = ("weaver_torrent_seed_mode_checks_joined_total", Counter, [],
+        "Askers of a seed-mode piece that waited on a check already running and took its verdict.");
 
     // ---- speed tests -------------------------------------------------------
     SPEED_TEST_RUNS = ("weaver_speed_test_runs_total", Counter, ["kind", "status"],

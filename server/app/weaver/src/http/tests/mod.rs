@@ -1814,6 +1814,16 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
             (FetchOutcome::NoSession, 0),
             (FetchOutcome::Cancelled, 1),
         ],
+        check: weaver_server_core::torrents::metrics::CheckSeries {
+            read_calls: 100,
+            read_bytes: 101,
+            read_nanos: 2_250_000_000,
+            read_seeks: 102,
+            pieces_hashed: 103,
+            hash_nanos: 500_000_000,
+            seed_checks_started: 104,
+            seed_checks_joined: 105,
+        },
     }
 }
 

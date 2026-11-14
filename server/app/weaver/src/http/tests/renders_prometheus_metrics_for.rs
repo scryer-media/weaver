@@ -1433,6 +1433,14 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         r#"weaver_torrent_metadata_fetches_total{outcome="failed"} 1"#.to_owned(),
         r#"weaver_torrent_metadata_fetches_total{outcome="no_session"} 0"#.to_owned(),
         r#"weaver_torrent_metadata_fetches_total{outcome="cancelled"} 1"#.to_owned(),
+        "weaver_torrent_check_read_calls_total 100".to_owned(),
+        "weaver_torrent_check_read_bytes_total 101".to_owned(),
+        "weaver_torrent_check_read_seconds_total 2.25".to_owned(),
+        "weaver_torrent_check_read_seeks_total 102".to_owned(),
+        "weaver_torrent_check_pieces_hashed_total 103".to_owned(),
+        "weaver_torrent_check_hash_seconds_total 0.5".to_owned(),
+        "weaver_torrent_seed_mode_checks_started_total 104".to_owned(),
+        "weaver_torrent_seed_mode_checks_joined_total 105".to_owned(),
     ];
     let lines: std::collections::HashSet<&str> = rendered.lines().collect();
     for line in &expected {
