@@ -832,6 +832,65 @@ async fn a_stop_does_not_wait_for_a_repair_held_by_a_still_volume() {
     stop_past_a_still_volume(&mut pipeline).await;
     assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), queued);
     assert!(!working_dir.join("lantern.bin").exists());
+    // The repair was not taken back: the job stays at its last checkpoint.
+    assert!(pipeline.graph_jobs[&job_id].pending().given_up());
+    assert_ne!(
+        job_status_for_assert(&pipeline, job_id).map(|status| matches!(status, JobStatus::Failed { .. })),
+        Some(true)
+    );
+    retire_pipeline_database(pipeline).await;
+    drop(hold);
+}
+
+// A stop while a repair stands on its own thread for writes its volume has
+// not put down yet, on a volume that does put them down within the stop's
+// span: the repair ends as stopped while the writes are still out, and is
+// taken back once the stop has waited for them. The job is paged out and
+// checkpointed as any other, not left at an older checkpoint.
+#[tokio::test]
+async fn a_stopped_repair_is_taken_back_once_its_volume_has_settled() {
+    use crate::operations::disk::writer::{HandClock, SettleBound};
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_418);
+    let data = payload(4 * ARTICLE, 4);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 2));
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let (volume, hold) = held(&pipeline, job_id);
+    decode(&mut pipeline, job_id, &posts, 0, 0, false).await;
+    for ordinal in 1..4 {
+        decode(&mut pipeline, job_id, &posts, 0, ordinal, true).await;
+    }
+    for index in 1..posts.len() as u32 {
+        decode_all(&mut pipeline, job_id, &posts, index).await;
+    }
+    assert!(pipeline.graph_jobs[&job_id].repair_out());
+    assert!(volume.buffered_bytes.load(Ordering::Relaxed) > 0);
+    // The stop's clock stands still: the settle ends only as the volume's
+    // writes come down. The volume is let go once the settle stands still
+    // for it, which is after the repair came back stopped and was kept.
+    pipeline.shutdown_settle = SettleBound {
+        clock: Arc::new(HandClock::default()),
+        span: std::time::Duration::from_secs(30),
+    };
+    let release = std::thread::spawn(move || {
+        hold.wait_settling();
+        hold.open();
+        hold
+    });
+    let handle =
+        crate::SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    handle.shutdown().await.unwrap();
+    pipeline.run().await;
+    let hold = release.join().unwrap();
+
+    let graph = &pipeline.graph_jobs[&job_id];
+    assert!(!graph.keeps_stopped_repair());
+    assert!(!graph.pending().given_up(), "the job was checkpointed at the stop");
+    assert!(graph.disk().unwrap().quiet());
+    assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 0);
+    assert!(working_dir.join("lantern.bin").exists());
     assert_ne!(
         job_status_for_assert(&pipeline, job_id).map(|status| matches!(status, JobStatus::Failed { .. })),
         Some(true)

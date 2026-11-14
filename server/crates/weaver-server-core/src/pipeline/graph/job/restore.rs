@@ -124,6 +124,7 @@ impl GraphJob {
             reported: snapshot.root.reported,
             pending: Pending::default(),
             mail_owed: None,
+            stopped_repair: None,
             commit_held: None,
             notes: Vec::new(),
             fed: super::runs::Fed::default(),

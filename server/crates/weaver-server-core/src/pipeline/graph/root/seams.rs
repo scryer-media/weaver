@@ -425,6 +425,29 @@ impl Pipeline {
         }
     }
 
+    // Each job that kept a repair the stop ended takes it back when its
+    // writes are down, and is left at its last checkpoint when they are
+    // not. Whether any was taken back.
+    pub(in crate::pipeline) fn take_back_stopped_repairs(&mut self) -> bool {
+        let jobs: Vec<JobId> = self
+            .graph_jobs
+            .iter()
+            .filter(|(_, graph)| graph.keeps_stopped_repair())
+            .map(|(job_id, _)| *job_id)
+            .collect();
+        let mut taken = false;
+        for job_id in jobs {
+            let limit = self.graph_job_slot_limit(job_id);
+            let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
+                continue;
+            };
+            let result = graph.take_back_stopped_repair(&mut self.graph_status.repairs, limit);
+            taken |= matches!(result, Ok(true));
+            self.after_graph_result(job_id, result.map(|_| ()));
+        }
+        taken
+    }
+
     // Everything the runs said since the last turn. A turn hears the mail
     // whole, not one piece of a run's output in a turn's spare moment: a run
     // paced by the pipeline's turns runs as slowly as they are busy.

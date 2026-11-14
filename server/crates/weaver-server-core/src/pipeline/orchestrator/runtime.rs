@@ -1972,6 +1972,20 @@ impl Pipeline {
             .await;
         self.hear_volume_reports();
         self.hear_graph_runs();
+        // A repair the stop ended while its job's volume still held writes
+        // is taken back now that the volume had its time. What taking it
+        // back queued is put down within the same span, so the checkpoint
+        // records it as it does any other job's.
+        if self.take_back_stopped_repairs() {
+            self.drain_graph_runs().await;
+            self.settle_volumes_until(
+                settle_end,
+                "the volume writers could not be drained after a stopped repair was taken back",
+            )
+            .await;
+            self.hear_volume_reports();
+            self.hear_graph_runs();
+        }
         self.checkpoint_graph_holds();
         // What the page-out put on scratch went through the writers too,
         // and the checkpoint that records it waits for those writes: they
@@ -2115,13 +2129,13 @@ impl Pipeline {
             // ended before the volume let go, is left as its last checkpoint
             // has it: reading its files here would wait on that writer,
             // and no checkpoint taken now could be borne out.
-            if self
-                .graph_jobs
-                .get(&job_id)
-                .is_some_and(|graph| {
-                    graph.pending().given_up() || graph.disk().is_some_and(|disk| !disk.quiet())
-                })
-            {
+            // A repair that came back stopped after the writers had their
+            // time is not waited for again: its job is left the same way.
+            let left = self.graph_jobs.get_mut(&job_id).is_some_and(|graph| {
+                graph.leave_stopped_repair();
+                graph.pending().given_up() || graph.disk().is_some_and(|disk| !disk.quiet())
+            });
+            if left {
                 warn!(
                     job_id = job_id.0,
                     "a volume's writer still holds the job's files at shutdown; its holds are not paged out"

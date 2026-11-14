@@ -157,6 +157,9 @@ pub(crate) struct GraphJob {
     // A member's file waits to move on a checkpoint the database has not
     // said it committed, and the run mail will say when it has.
     mail_owed: Option<u64>,
+    // A repair the stop ended while a volume's writer still held operations
+    // of the job, kept until the stop has given that writer its time.
+    stopped_repair: Option<Box<crate::pipeline::graph::namespace::Returned>>,
     // The checkpoints committed through this stamp while a rewalk read its
     // volumes' files where they lay as it was lent: what they move or
     // remove waits for the last piece to be heard.
@@ -274,6 +277,7 @@ impl GraphJob {
             reported: None,
             pending: Pending::default(),
             mail_owed: None,
+            stopped_repair: None,
             commit_held: None,
             notes: Vec::new(),
             fed: runs::Fed::default(),

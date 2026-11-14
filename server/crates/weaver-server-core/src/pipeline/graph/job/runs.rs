@@ -305,15 +305,60 @@ impl GraphJob {
             return Ok(returned.repaired.remove().map_err(WriteError::from)?);
         }
         // A repair the stop ended while a volume's writer still holds
-        // operations of the job is not taken back: taking it back reads the
-        // job's files, and the loop would stand behind that writer, which
-        // may never move. The job is left as its last checkpoint has it,
-        // and no checkpoint is taken of it again.
+        // operations of the job is not taken back yet: taking it back reads
+        // the job's files, and the loop would stand behind that writer,
+        // which may never move. It is kept until the stop has given the
+        // writers their time (`take_back_stopped_repair`).
         if returned.stopped() && self.disk().is_some_and(|disk| !disk.quiet()) {
-            self.pending().left_at_stop();
-            let _ = returned.repaired.remove();
+            self.stopped_repair = Some(Box::new(returned));
             return Ok(());
         }
+        self.take_back(returned, slots, limit)
+    }
+
+    // Whether a repair the stop ended is kept for the writers to settle.
+    pub(in crate::pipeline) fn keeps_stopped_repair(&self) -> bool {
+        self.stopped_repair.is_some()
+    }
+
+    // The stop has given the volumes' writers their time. A repair kept for
+    // them is taken back now when the job's writes are all down, as any
+    // repair is. When a writer still holds some, the job is left as its
+    // last checkpoint has it and no checkpoint is taken of it again: what
+    // it says now could not be borne out. Whether the repair was taken
+    // back.
+    pub(in crate::pipeline) fn take_back_stopped_repair(
+        &mut self,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<bool, GraphError> {
+        let Some(returned) = self.stopped_repair.take() else {
+            return Ok(false);
+        };
+        if self.disk().is_some_and(|disk| !disk.quiet()) {
+            self.pending().left_at_stop();
+            let _ = returned.repaired.remove();
+            return Ok(false);
+        }
+        self.take_back(*returned, slots, limit)?;
+        Ok(true)
+    }
+
+    // A repair still kept is given up with its job's later checkpoints: the
+    // job restarts from the last one written.
+    pub(in crate::pipeline) fn leave_stopped_repair(&mut self) {
+        if let Some(returned) = self.stopped_repair.take() {
+            self.pending().left_at_stop();
+            let _ = returned.repaired.remove();
+        }
+    }
+
+    fn take_back(
+        &mut self,
+        returned: Returned,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<(), GraphError> {
         let mut out = Vec::new();
         let objects = self.runs.hardware();
         let rebuilt = self.writer.returned(

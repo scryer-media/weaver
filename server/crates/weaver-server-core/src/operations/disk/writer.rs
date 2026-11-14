@@ -321,6 +321,9 @@ impl VolumeWriters {
             }
             let mut held = state.waiting.lock().unwrap_or_else(PoisonError::into_inner);
             state.waiters.fetch_add(1, Ordering::SeqCst);
+            // A test that waits for the settle to stand here is told.
+            #[cfg(test)]
+            state.woke.notify_all();
             while state.returned.load(Ordering::SeqCst) < sent {
                 let Some((end, clock)) = bound else {
                     held = state.woke.wait(held).unwrap_or_else(PoisonError::into_inner);
@@ -1929,6 +1932,15 @@ impl Hold {
             .unwrap_or_else(PoisonError::into_inner);
         while state.below_waiters.load(Ordering::SeqCst) < count {
             held = state.below.wait(held).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    // Wait until a settle stands still for the volume.
+    pub(crate) fn wait_settling(&self) {
+        let state = &self.0.state;
+        let mut held = state.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+        while state.waiters.load(Ordering::SeqCst) == 0 {
+            held = state.woke.wait(held).unwrap_or_else(PoisonError::into_inner);
         }
     }
 
