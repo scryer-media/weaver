@@ -2928,6 +2928,9 @@ impl Session {
             ?listen,
             "stopping the session: closing its listeners, DHT and local discovery"
         );
+        // Announces still waiting for their answers are dropped from here
+        // on; the `stopped` announces below still go.
+        self.stopped_announces.shut_down();
         self.swarm.cancel();
         self.swarm_tasks.close();
         self.swarm_tasks.wait().await;
