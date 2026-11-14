@@ -530,7 +530,7 @@ impl SqlRuntime {
                     let pool = pool.clone();
                     let op = &op;
                     async move {
-                        let mut tx = SqlTx::Sqlite(pool.begin().await.map_err(db_err)?);
+                        let mut tx = SqlTx::Sqlite(pool.begin().await.map_err(sqlite_write_err)?);
                         let result = {
                             let future = op(&mut tx);
                             future.await?
@@ -652,7 +652,7 @@ impl<'db> SqlTx<'db> {
                 let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
                 let query = bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args);
-                let result = query.execute(&mut **tx).await.map_err(db_err);
+                let result = query.execute(&mut **tx).await.map_err(sqlite_write_err);
                 crate::runtime::perf_probe::record_sql_statement(
                     "sqlite",
                     "tx_execute",
@@ -771,7 +771,7 @@ impl<'db> SqlTx<'db> {
     )]
     pub(crate) async fn commit(self) -> SqlResult<()> {
         match self {
-            SqlTx::Sqlite(tx) => tx.commit().await.map_err(db_err),
+            SqlTx::Sqlite(tx) => tx.commit().await.map_err(sqlite_write_err),
             SqlTx::Postgres(tx) => tx.commit().await.map_err(pg_db_err),
         }
     }
@@ -1513,6 +1513,28 @@ fn parse_utc_datetime(raw: &str) -> SqlResult<DateTime<Utc>> {
 
 pub(crate) fn db_err(error: impl std::fmt::Display) -> StateError {
     StateError::Database(error.to_string())
+}
+
+// SQLite's result code for a write the disk had no room for; an extended
+// code keeps it in its low byte.
+const SQLITE_FULL: u32 = 13;
+
+// A SQLite write's error, kept apart when the database's disk had no room
+// for it: by SQLite's own code, or by the kind of the I/O error under it.
+pub(crate) fn sqlite_write_err(error: sqlx::Error) -> StateError {
+    let full = match &error {
+        sqlx::Error::Database(database) => database
+            .code()
+            .and_then(|code| code.parse::<u32>().ok())
+            .is_some_and(|code| code & 0xff == SQLITE_FULL),
+        sqlx::Error::Io(io) => crate::operations::is_out_of_space(io),
+        _ => false,
+    };
+    if full {
+        StateError::OutOfSpace(error.to_string())
+    } else {
+        db_err(error)
+    }
 }
 
 // Map a Postgres `sqlx::Error` to `StateError`, prefixing the SQLSTATE code as

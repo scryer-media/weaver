@@ -352,6 +352,18 @@ async fn restart_heard(
     // the coverage a crash loses before the writer's barrier is due.
     pipeline.flush_graph_checkpoint(JOB);
     in_memory.extend(pipeline.graph_jobs[&JOB].in_memory());
+    restart_as_it_stands(temp_dir, pipeline, scenario, inspect).await
+}
+
+// The pipeline dropped as it stands and the next made over the same
+// folders, the job restored from the database's rows: a restart of a job
+// whose graph is not live, as one held for a full disk.
+pub(in crate::pipeline::tests) async fn restart_as_it_stands(
+    temp_dir: &tempfile::TempDir,
+    pipeline: Pipeline,
+    scenario: &Scenario,
+    inspect: Inspect<'_>,
+) -> (Pipeline, tokio::sync::broadcast::Receiver<PipelineEvent>) {
     let working_dir = pipeline.jobs[&JOB].working_dir.clone();
     let db = pipeline.db.clone();
     retire_pipeline_database(pipeline).await;

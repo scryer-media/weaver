@@ -631,17 +631,25 @@ async fn validate_script_move_destination(
 // lane that closed before running it, fails the move before any file has
 // left the working directory, and the still-empty claim is given back.
 async fn moving_row_committed(
-    durable: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    durable: tokio::sync::oneshot::Receiver<Result<(), crate::persistence::error::WriteFailed>>,
     dest: &std::path::Path,
 ) -> Result<(), MoveToCompleteFailure> {
-    let outcome = durable
-        .await
-        .unwrap_or_else(|_| Err("the database writer closed before it ran".into()));
+    let outcome = durable.await.unwrap_or_else(|_| {
+        Err(crate::persistence::error::WriteFailed::other(
+            "the database writer closed before it ran",
+        ))
+    });
     if let Err(error) = outcome {
         let _ = tokio::fs::remove_dir(dest).await;
-        return Err(MoveToCompleteFailure::Operational(format!(
-            "could not record the move before starting it: {error}"
-        )));
+        let message = format!("could not record the move before starting it: {error}");
+        // The database's disk had no room for the row: the job waits for
+        // room there and records the move again. Any other failure of the
+        // write fails the move.
+        return Err(if error.out_of_space {
+            MoveToCompleteFailure::RowFull(message)
+        } else {
+            MoveToCompleteFailure::Operational(message)
+        });
     }
     Ok(())
 }
@@ -716,7 +724,8 @@ struct FinalMove {
     dest: PathBuf,
     // Answers once the moving row has committed. A resumed move has none:
     // its row was already moving when it was read.
-    durable: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+    durable:
+        Option<tokio::sync::oneshot::Receiver<Result<(), crate::persistence::error::WriteFailed>>>,
     // The move goes on after a wait for room, not after a restart: the
     // names whose copy found no room before it.
     held: Option<HashSet<PathBuf>>,
@@ -987,7 +996,6 @@ async fn run_move_to_claimed_destination(
                     Ok(Err((rename_err, copy_err))) => {
                         if entry_found_no_room(&rename_err, &copy_err) {
                             full = true;
-                            quota |= entry_found_quota(&rename_err, &copy_err);
                             quota |= entry_found_quota(&rename_err, &copy_err);
                             needs = needs.saturating_add(left_to_copy(&src, &copy_err).await);
                         }
@@ -1703,16 +1711,14 @@ impl Pipeline {
         }
         // The moving row, naming `dest`, must be durable before the first file
         // leaves the working directory: a restart then finds the delivery and
-        // never fetches the job again. SABnzbd keeps a finished download in
-        // its saved postprocessor queue (sabnzbd/postproc.py:144) and marks it
-        // moving before the first file moves (sabnzbd/postproc.py:517);
-        // NZBGet writes the post stage into its queue file
-        // (daemon/queue/DiskState.cpp:552).
+        // never fetches the job again.
         let durable = self
             .transition_postprocessing_status(job_id, JobStatus::Moving, Some("moving"))
             .unwrap_or_else(|| {
                 let (failed, durable) = tokio::sync::oneshot::channel();
-                let _ = failed.send(Err("the write could not be queued".into()));
+                let _ = failed.send(Err(crate::persistence::error::WriteFailed::other(
+                    "the write could not be queued",
+                )));
                 durable
             });
         self.inflight_moves.insert(job_id);
@@ -2129,6 +2135,33 @@ impl Pipeline {
                 self.fail_delivery_security_check(job_id, error);
             }
             Err(MoveToCompleteFailure::Operational(error)) => self.fail_job(job_id, error),
+            Err(MoveToCompleteFailure::RowFull(message)) => {
+                // Nothing moved and the claim was given back: the job waits
+                // on the data folder's disk, and when let go claims its
+                // destination and records the move again, as a move whose
+                // claim found no room does. The write names no figure: what
+                // the database needs to take a row is its own to know, so
+                // the job waits for the free figure to rise by the reserve.
+                let left_behind = self
+                    .jobs
+                    .get(&job_id)
+                    .map(|state| {
+                        state
+                            .delivery_left_behind
+                            .iter()
+                            .map(|path| state.working_dir.join(path))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let data_dir = self.script_data_dir.clone();
+                self.hold_move_for_full_disk(
+                    job_id,
+                    Stage::Claim(left_behind),
+                    &data_dir,
+                    &message,
+                    Wants::default(),
+                );
+            }
             Err(MoveToCompleteFailure::OutOfSpace {
                 path,
                 message,

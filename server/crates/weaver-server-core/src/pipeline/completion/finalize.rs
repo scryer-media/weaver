@@ -20,6 +20,6 @@ pub(in crate::pipeline) use output::{
 };
 pub(crate) use output::{RestoredPostProcessing, release_failed_delivery};
 mod status;
-#[cfg(test)]
-pub(crate) use status::RUNTIME_WRITES;
 pub(crate) use status::{ActiveRuntimeValues, StoredRuntimeValues};
+#[cfg(test)]
+pub(crate) use status::{MOVING_ROW_REFUSED, MOVING_ROWS_WRITTEN, RUNTIME_WRITES};

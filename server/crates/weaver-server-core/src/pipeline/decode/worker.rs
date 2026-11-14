@@ -28,11 +28,23 @@ enum UuPlacement {
 pub(in crate::pipeline) struct SegmentWriteError {
     file_id: NzbFileId,
     source: io::Error,
+    // The size of the write that was refused, where the site knows it.
+    refused: Option<u64>,
 }
 
 impl SegmentWriteError {
     pub(in crate::pipeline) fn new(file_id: NzbFileId, source: io::Error) -> Self {
-        Self { file_id, source }
+        Self {
+            file_id,
+            source,
+            refused: None,
+        }
+    }
+
+    // The write that failed was of `bytes`.
+    pub(in crate::pipeline) fn of_bytes(mut self, bytes: usize) -> Self {
+        self.refused = Some(bytes as u64);
+        self
     }
 }
 
@@ -1037,7 +1049,7 @@ impl Pipeline {
                 io::Error::other(format!("UU spool task failed: {error}")),
             )
         })?
-        .map_err(|error| SegmentWriteError::new(file_id, error))?;
+        .map_err(|error| SegmentWriteError::new(file_id, error).of_bytes(decoded_bytes))?;
         Ok(entry)
     }
 
@@ -1698,11 +1710,15 @@ impl Pipeline {
                 context,
                 "disk write found no room; the job waits for room"
             );
-            // A spool write gives nothing back as it fails.
+            // A spool write gives nothing back as it fails: the job waits
+            // for the free figure to rise by the part that was refused.
             self.hold_job_for_full_disk(
                 job_id,
                 crate::operations::StorageRoot::Intermediate,
-                crate::pipeline::full_disk::Wants::of(&error.source, None),
+                crate::pipeline::full_disk::Wants {
+                    left: error.refused,
+                    ..crate::pipeline::full_disk::Wants::of(&error.source, None)
+                },
             );
             return;
         }

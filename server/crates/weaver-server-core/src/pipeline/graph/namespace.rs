@@ -530,12 +530,17 @@ impl NamespaceWriter {
     // A decode window of `needs` bytes, the free space its disk keeps
     // included, found room in no folder: the job waits for that room on the
     // disk of its working directory, the first folder a window goes in, as
-    // for a write that found that disk full.
-    pub(crate) fn window_found_no_room(&mut self, needs: u64) -> WriteError {
+    // for a write that found that disk full. `quota` when a quota refused
+    // the window's file: the wait is then for the free figure to rise.
+    pub(crate) fn window_found_no_room(&mut self, needs: u64, quota: bool) -> WriteError {
         self.gave_back = Some(self.gave_back.unwrap_or(0).max(needs));
+        let kind = match quota {
+            true => std::io::ErrorKind::QuotaExceeded,
+            false => std::io::ErrorKind::StorageFull,
+        };
         WriteError::Leaf(LeafError::Io {
             path: self.working_dir.clone(),
-            source: std::io::Error::from(std::io::ErrorKind::StorageFull),
+            source: std::io::Error::from(kind),
             device: Device::Working,
         })
     }
@@ -2011,7 +2016,16 @@ impl NamespaceWriter {
         offset: u64,
         bytes: &[u8],
     ) -> Result<(), WriteError> {
-        self.spill_file(node, member)?.write(offset, bytes, None)?;
+        if let Err(error) = self.spill_file(node, member)?.write(offset, bytes, None) {
+            // A spill the disk had no room for: the job waits for the room
+            // of what was being spilled.
+            if let LeafError::Io { source, .. } = &error
+                && crate::operations::is_out_of_space(source)
+            {
+                self.left_to_write = Some(bytes.len() as u64);
+            }
+            return Err(error.into());
+        }
         self.files_mut(node).spills_empty.remove(&member);
         Ok(())
     }
@@ -2471,11 +2485,13 @@ impl NamespaceWriter {
             // of what the member still has to take, by its declared length
             // and what the leaf holds of it, and never for less than the
             // write that was refused.
-            if let (LeafError::Io { source, .. }, Some(length)) = (&error, record.length)
+            // A member that declares no length waits for the write itself.
+            if let LeafError::Io { source, .. } = &error
                 && crate::operations::is_out_of_space(source)
             {
-                let left = length
-                    .saturating_sub(leaf.written_bytes())
+                let left = record
+                    .length
+                    .map_or(0, |length| length.saturating_sub(leaf.written_bytes()))
                     .max(bytes.len() as u64);
                 self.left_to_write = Some(left);
             }

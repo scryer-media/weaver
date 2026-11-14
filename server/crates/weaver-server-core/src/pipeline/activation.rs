@@ -204,7 +204,7 @@ async fn follow_working_dir(
             Ok(committed) => committed
                 .await
                 .map_err(|error| error.to_string())
-                .and_then(|written| written),
+                .and_then(|written| written.map_err(|error| error.to_string())),
             Err(error) => Err(error.to_string()),
         };
     if let Err(error) = &recorded {

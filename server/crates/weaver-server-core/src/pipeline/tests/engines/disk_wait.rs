@@ -1082,10 +1082,29 @@ async fn a_job_held_for_a_full_disk_keeps_only_the_spooled_parts_its_checkpoint_
     pipeline.pending_unanchored_release.push(part(1));
     assert_eq!(pipeline.uu_spooled_segments, 2);
 
-    pipeline.hold_job_for_full_disk(JOB, StorageRoot::Intermediate, None);
+    // The write that failed had ten bytes left to write.
+    pipeline.hold_job_for_full_disk(
+        JOB,
+        StorageRoot::Intermediate,
+        crate::pipeline::full_disk::Wants {
+            left: Some(10),
+            ..Default::default()
+        },
+    );
     for sweep in pipeline.full_disk_sweeps.drain(..) {
         sweep.await.unwrap();
     }
+    // The five bytes the hold swept show as free at the next reading. They
+    // are not room made: the job fills them again as it fetches that part.
+    // A reading that shows them, or them and nine bytes more, lets nothing
+    // go; one that shows the ten over them does.
+    assert_eq!(pipeline.full_disk_mark(JOB), Some(RESERVE + PLENTY));
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY + 5);
+    assert_eq!(pipeline.full_disk_promised_bytes(), 0);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY + 14);
+    assert_eq!(pipeline.full_disk_promised_bytes(), 0);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY + 15);
+    assert_eq!(pipeline.full_disk_promised_bytes(), 10);
 
     assert!(
         named.exists(),
@@ -2890,6 +2909,54 @@ async fn a_held_download_with_a_reserve_waits_for_the_rise_and_the_reserve() {
     );
 }
 
+// A job a quota holds when the pipeline goes down: the next pipeline, made
+// from the database's rows over the same folders, restores it free, the
+// quota refuses its first write, and it is held again as a quota hold on a
+// mark of this run. With the quota lifted and the figure risen it completes.
+#[tokio::test]
+async fn a_job_a_quota_holds_at_a_restart_is_restored_and_held_by_the_quota_again() {
+    use crate::pipeline::graph::leaf::counting::refuse_by_quota;
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    refuse_by_quota(true);
+    let (temp_dir, mut pipeline, scenario, _complete_dir, _body, left) =
+        held_with_a_file_part_written(&room, RESERVE, 163).await;
+    assert_eq!(pipeline.full_disk_rise(JOB), (Some(left), true));
+
+    pipeline.drain().await;
+    fill_after(Some(0));
+    let (mut pipeline, _) =
+        super::restart::restart_as_it_stands(&temp_dir, pipeline, &scenario, &mut |_| {}).await;
+    assert!(
+        !pipeline.waits_for_disk_room(),
+        "a restored job is not held"
+    );
+    until_full(&mut pipeline, &scenario).await;
+    let (again, quota) = pipeline.full_disk_rise(JOB);
+    assert!(quota, "the restored job's hold is a quota hold");
+    let again = again.expect("the write that failed knew what was left");
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
+    assert_full_disk_held(&pipeline);
+    let mark = pipeline
+        .full_disk_mark(JOB)
+        .expect("a quota hold has a mark");
+
+    fill_after(None);
+    refuse_by_quota(false);
+    room.store(mark - RESERVE + again, Ordering::Release);
+    hears(
+        &mut pipeline,
+        &room,
+        StorageRoot::Intermediate,
+        mark - RESERVE + again,
+    );
+    restarts(&mut pipeline).await;
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+}
+
 // A write a quota refused, on a disk that shows plenty free: the job is
 // held, and no reading of that plenty lets it go. It goes when the figure
 // has risen from the mark by what was left of its file. Let go and refused
@@ -2983,6 +3050,19 @@ async fn a_step_a_quota_refused_waits_for_the_figure_to_rise_by_what_it_needs() 
             held_with_a_file_part_written(&room, RESERVE, 167).await;
         // The same job, held as a step that needs `NEEDS` is held.
         pipeline.drop_full_disk_hold(JOB);
+        // A reading taken while the step's own output was on disk shows
+        // five units less: it is the newest as the step fails, and is not
+        // what a quota hold measures the rise from.
+        if quota {
+            hears(
+                &mut pipeline,
+                &room,
+                StorageRoot::Intermediate,
+                PLENTY - (5 << 20),
+            );
+            // The step gives its output back as it fails.
+            room.store(PLENTY, Ordering::Release);
+        }
         pipeline.hold_job_for_full_disk(
             JOB,
             StorageRoot::Intermediate,
@@ -2998,6 +3078,13 @@ async fn a_step_a_quota_refused_waits_for_the_figure_to_rise_by_what_it_needs() 
         fill_after(None);
         // The disk shows what it showed: a step the disk refused goes on
         // that, one a quota refused does not.
+        if quota {
+            assert_ne!(
+                pipeline.full_disk_mark(JOB),
+                Some(RESERVE + PLENTY - (5 << 20)),
+                "the mark is not the reading from before the step gave its output back"
+            );
+        }
         hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
         if quota {
             assert_eq!(pipeline.full_disk_mark(JOB), Some(RESERVE + PLENTY));
@@ -3034,4 +3121,258 @@ async fn a_step_a_quota_refused_waits_for_the_figure_to_rise_by_what_it_needs() 
             body.as_slice()
         );
     }
+}
+
+// The row that says a move began is refused for want of room on the
+// database's disk: nothing moves, the job is held on the data folder's
+// disk and shown waiting for disk space, not failed. A reading that shows
+// no more keeps it waiting. Once more shows, the row is written, once, and
+// the move delivers every file.
+#[tokio::test]
+async fn a_moving_row_the_database_disk_has_no_room_for_holds_the_job_and_is_written_again() {
+    use crate::pipeline::completion::finalize::{MOVING_ROW_REFUSED, MOVING_ROWS_WRITTEN};
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let posts = twelve()
+        .into_iter()
+        .map(|(name, body)| Post::plain(&name, body))
+        .collect();
+    let scenario = on_disk_posting(&room, posts);
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
+    let working_dir = pipeline.jobs[&JOB].working_dir.clone();
+    crate::jobs::working_dir::stamp_working_dir(&pipeline.intermediate_dir, &working_dir, JOB)
+        .await
+        .unwrap();
+
+    MOVING_ROW_REFUSED
+        .lock()
+        .unwrap()
+        .push_back(crate::StateError::OutOfSpace(
+            "database or disk is full".into(),
+        ));
+    drive(&mut pipeline, &scenario, JOB, |pipeline| {
+        pipeline.held_for_full_disk(JOB)
+    })
+    .await;
+    assert_move_held(&pipeline);
+    // The harness keeps the data folder on the complete root's disk, so
+    // the hold reads that root.
+    assert_eq!(MOVING_ROWS_WRITTEN.load(Ordering::Relaxed), 0);
+    assert!(
+        delivered(&complete_dir).is_empty(),
+        "nothing moved before the row was written"
+    );
+    assert!(working_dir.exists());
+
+    hears(&mut pipeline, &room, StorageRoot::Complete, PLENTY);
+    assert_move_held(&pipeline);
+
+    hears(&mut pipeline, &room, StorageRoot::Complete, 2 * PLENTY);
+    move_goes_on(&mut pipeline, &scenario, &complete_dir, &working_dir).await;
+    assert_eq!(
+        MOVING_ROWS_WRITTEN.load(Ordering::Relaxed),
+        1,
+        "the moving row was written once"
+    );
+}
+
+// A moving row whose write fails for any other reason fails the job, as
+// before.
+#[tokio::test]
+async fn a_moving_row_refused_for_another_reason_fails_the_job() {
+    use crate::pipeline::completion::finalize::MOVING_ROW_REFUSED;
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let posts = twelve()
+        .into_iter()
+        .map(|(name, body)| Post::plain(&name, body))
+        .collect();
+    let scenario = on_disk_posting(&room, posts);
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
+
+    MOVING_ROW_REFUSED
+        .lock()
+        .unwrap()
+        .push_back(crate::StateError::Database("the row is malformed".into()));
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    assert!(!pipeline.held_for_full_disk(JOB));
+    assert!(
+        matches!(
+            job_status_for_assert(&pipeline, JOB),
+            Some(JobStatus::Failed { .. })
+        ),
+        "{:?}",
+        job_status_for_assert(&pipeline, JOB)
+    );
+    assert!(delivered(&complete_dir).is_empty());
+}
+
+// No hold is let go by less than the write that was refused. A spool write
+// that found no room waits for the free figure to rise by the part it could
+// not write. A site with no figure at all, here refused by a quota on a
+// disk that shows plenty free, waits for it to rise by the reserve: a few
+// bytes freed let nothing go.
+#[tokio::test]
+async fn a_hold_with_no_figure_is_not_let_go_by_a_few_bytes() {
+    use crate::jobs::ids::NzbFileId;
+    use crate::pipeline::decode::SegmentWriteError;
+    use crate::pipeline::full_disk::Wants;
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let scenario = on_disk_posting(
+        &room,
+        vec![Post::plain("ember.bin", payload(4 * ARTICLE, 97))],
+    );
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let file_id = NzbFileId {
+        job_id: JOB,
+        file_index: 0,
+    };
+    for (kind, quota) in [
+        (std::io::ErrorKind::StorageFull, false),
+        (std::io::ErrorKind::QuotaExceeded, true),
+    ] {
+        pipeline.fail_job_for_disk_write(
+            SegmentWriteError::new(file_id, std::io::Error::from(kind)).of_bytes(4096),
+            "spooling a part",
+        );
+        assert_eq!(pipeline.full_disk_rise(JOB), (Some(4096), quota));
+        assert_eq!(pipeline.full_disk_mark(JOB), Some(RESERVE + PLENTY));
+        hears(
+            &mut pipeline,
+            &room,
+            StorageRoot::Intermediate,
+            PLENTY + 4095,
+        );
+        assert_eq!(pipeline.full_disk_promised_bytes(), 0);
+        hears(
+            &mut pipeline,
+            &room,
+            StorageRoot::Intermediate,
+            PLENTY + 4096,
+        );
+        assert_eq!(pipeline.full_disk_promised_bytes(), 4096);
+        pipeline.end_full_disk_promise(JOB);
+        assert!(pipeline.drop_full_disk_hold(JOB).is_some());
+        hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
+    }
+
+    pipeline.hold_job_for_full_disk(
+        JOB,
+        StorageRoot::Intermediate,
+        Wants {
+            quota: true,
+            ..Wants::default()
+        },
+    );
+    assert_eq!(pipeline.full_disk_rise(JOB), (Some(RESERVE), true));
+    assert_eq!(pipeline.full_disk_mark(JOB), Some(RESERVE + PLENTY));
+    hears(
+        &mut pipeline,
+        &room,
+        StorageRoot::Intermediate,
+        PLENTY + 4096,
+    );
+    assert_eq!(pipeline.full_disk_promised_bytes(), 0);
+    hears(
+        &mut pipeline,
+        &room,
+        StorageRoot::Intermediate,
+        PLENTY + RESERVE - 1,
+    );
+    assert_eq!(pipeline.full_disk_promised_bytes(), 0);
+    hears(
+        &mut pipeline,
+        &room,
+        StorageRoot::Intermediate,
+        PLENTY + RESERVE,
+    );
+    assert_eq!(pipeline.full_disk_promised_bytes(), RESERVE);
+}
+
+// A job held on a root and a job held on a path below it, on the same
+// device: each waits for 60 of the 100 a reading then shows. One goes, and
+// its 60 count against the other, though one reads the root and the other
+// the path.
+#[tokio::test]
+async fn a_job_held_on_a_root_and_one_on_a_path_of_its_disk_are_promised_the_same_room_once() {
+    use crate::pipeline::full_disk::Stage;
+    const UNIT: u64 = 1 << 20;
+    let room = Arc::new(AtomicU64::new(0));
+    let scenario = on_disk_keeping(
+        &room,
+        vec![Post::plain("harbor.bin", payload(ARTICLE, 7))],
+        KEPT,
+    );
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
+    add_second(&mut pipeline).await;
+    let below = complete_dir.join("ember");
+    crate::runtime::fs::test_devices::assign(&complete_dir, 7);
+    crate::runtime::fs::test_devices::assign(&below, 7);
+    let capacity = Arc::clone(&pipeline.storage_capacity);
+    for root in StorageRoot::ALL {
+        let begun = capacity.probes_begun(root);
+        capacity.request_refresh(root);
+        capacity.wait_for_reading_begun_after(root, begun);
+    }
+    pipeline.hold_move_for_full_disk(
+        JOB,
+        Stage::Claim(Default::default()),
+        &complete_dir,
+        "no room",
+        Some(60 * UNIT),
+    );
+    pipeline.hold_move_for_full_disk(
+        SECOND,
+        Stage::Claim(Default::default()),
+        &below,
+        "no room",
+        Some(60 * UNIT),
+    );
+    assert!(!pipeline.full_disk_on_path(JOB), "one waits on the root");
+    assert!(pipeline.full_disk_on_path(SECOND), "one on the path");
+
+    for _ in 0..2 {
+        hears(&mut pipeline, &room, StorageRoot::Complete, 100 * UNIT);
+        let held = [JOB, SECOND].map(|job| pipeline.held_for_full_disk(job));
+        assert_eq!(
+            held.iter().filter(|held| **held).count(),
+            1,
+            "one goes and one waits: {held:?}"
+        );
+        assert_eq!(pipeline.full_disk_promised_bytes(), 60 * UNIT);
+    }
+    hears(&mut pipeline, &room, StorageRoot::Complete, 120 * UNIT);
+    assert!(!pipeline.held_for_full_disk(JOB) && !pipeline.held_for_full_disk(SECOND));
+    assert_eq!(pipeline.full_disk_promised_bytes(), 120 * UNIT);
+}
+
+// A held job its user paused takes no promise: the room a reading shows
+// goes to the job beside it, which is not judged against room the paused
+// one is not taking.
+#[tokio::test]
+async fn a_paused_held_job_is_promised_nothing() {
+    use crate::pipeline::full_disk::Stage;
+    const UNIT: u64 = 1 << 20;
+    let room = Arc::new(AtomicU64::new(0));
+    let scenario = on_disk_keeping(
+        &room,
+        vec![Post::plain("harbor.bin", payload(ARTICLE, 7))],
+        KEPT,
+    );
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
+    add_second(&mut pipeline).await;
+    for job in [JOB, SECOND] {
+        pipeline.hold_move_for_full_disk(
+            job,
+            Stage::Claim(Default::default()),
+            &complete_dir,
+            "no room",
+            Some(60 * UNIT),
+        );
+    }
+    // The paused one is judged first, by its id.
+    assert!(JOB < SECOND);
+    pipeline.jobs.get_mut(&JOB).unwrap().run_state = RunState::Paused;
+    hears(&mut pipeline, &room, StorageRoot::Complete, 100 * UNIT);
+    assert!(pipeline.held_for_full_disk(JOB), "the paused one waits");
+    assert!(!pipeline.held_for_full_disk(SECOND), "the other goes");
+    assert_eq!(pipeline.full_disk_promised_bytes(), 60 * UNIT);
 }

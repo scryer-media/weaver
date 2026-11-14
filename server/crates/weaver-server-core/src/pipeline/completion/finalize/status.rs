@@ -9,6 +9,16 @@ use super::*;
 pub(crate) static RUNTIME_WRITES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+// What the writer answers the next moving-row writes with in place of
+// running them, first in first out, and how many moving rows it wrote.
+#[cfg(test)]
+pub(crate) static MOVING_ROW_REFUSED: std::sync::Mutex<
+    std::collections::VecDeque<crate::StateError>,
+> = std::sync::Mutex::new(std::collections::VecDeque::new());
+#[cfg(test)]
+pub(crate) static MOVING_ROWS_WRITTEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 // A job's runtime columns in its active row, as the pipeline writes them.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ActiveRuntimeValues {
@@ -119,7 +129,8 @@ impl Pipeline {
         &self,
         job_id: JobId,
         output_dir: Option<std::path::PathBuf>,
-    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), crate::persistence::error::WriteFailed>>>
+    {
         let values = self.active_runtime_values(job_id)?;
         self.persist_runtime_values(job_id, values, output_dir)
     }
@@ -178,7 +189,8 @@ impl Pipeline {
         job_id: JobId,
         values: ActiveRuntimeValues,
         output_dir: Option<std::path::PathBuf>,
-    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), crate::persistence::error::WriteFailed>>>
+    {
         #[cfg(test)]
         RUNTIME_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let output_dir = output_dir
@@ -217,6 +229,16 @@ impl Pipeline {
         match self
             .db
             .try_queue_job_write_committed(job_id, "set_active_job_runtime", move |db| {
+                #[cfg(test)]
+                if status == "moving"
+                    && let Some(refused) = MOVING_ROW_REFUSED.lock().unwrap().pop_front()
+                {
+                    return Err(refused);
+                }
+                #[cfg(test)]
+                if status == "moving" {
+                    MOVING_ROWS_WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 db.set_active_job_runtime_at(
                     job_id,
                     output_dir.as_deref(),
@@ -336,7 +358,8 @@ impl Pipeline {
         new_post_state: crate::jobs::model::PostState,
         new_run_state: crate::jobs::model::RunState,
         persist_status: Option<&'static str>,
-    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), crate::persistence::error::WriteFailed>>>
+    {
         // A moving row is the one durable mark that the delivery has begun:
         // a restart must resume the move into the recorded destination, never
         // fetch the job again.
@@ -656,7 +679,8 @@ impl Pipeline {
         job_id: JobId,
         new_status: JobStatus,
         persist_status: Option<&'static str>,
-    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), crate::persistence::error::WriteFailed>>>
+    {
         let (new_download_state, new_post_state, new_run_state) =
             crate::jobs::model::runtime_lanes_from_status_snapshot(&new_status);
         self.transition_runtime_snapshot(

@@ -844,6 +844,10 @@ pub(super) struct MoveToCompleteResult {
 pub(super) enum MoveToCompleteFailure {
     Security(String),
     Operational(String),
+    // The row that says the move began could not be written for want of
+    // room on the database's disk: nothing moved, and the job waits for
+    // room on the data folder's disk.
+    RowFull(String),
     // An operational failure whose cause is known: the disk `path` lies on
     // had no room for an entry. The job waits for room there.
     // `needs` is what the entries whose copy found no room still have to
@@ -866,6 +870,7 @@ impl std::fmt::Display for MoveToCompleteFailure {
         match self {
             Self::Security(message)
             | Self::Operational(message)
+            | Self::RowFull(message)
             | Self::OutOfSpace { message, .. } => formatter.write_str(message),
         }
     }
