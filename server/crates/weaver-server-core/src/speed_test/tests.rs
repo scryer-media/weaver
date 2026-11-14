@@ -1571,6 +1571,14 @@ async fn a_torrent_run_pulls_from_the_swarm_and_serves_what_it_held() {
         ..Answer::default()
     });
     let rig = torrent_rig(&fixture).await;
+    // Both peers listen on 127.0.0.1. With one connection per address, a
+    // pull that dials the leecher first holds the seeder back until that
+    // connection closes, which the idle leecher leaves to the peer timeout.
+    rig.config
+        .write()
+        .await
+        .torrent
+        .allow_multiple_connections_per_ip = true;
     rig.service
         .peer_upload_budget_for_tests(u64::from(PIECE_LEN));
     let started = rig
