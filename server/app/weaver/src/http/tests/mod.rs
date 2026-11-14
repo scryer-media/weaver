@@ -1686,6 +1686,8 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
             timeouts: 14,
             invalid_packets: 15,
             redundant_packets: 16,
+            syn_flood_dropped: 33,
+            syn_rst: 34,
             immediate_acks: 17,
             delayed_acks: 18,
             window_update_acks: 19,
@@ -1702,7 +1704,6 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
             receive_drains: 30,
             stream_switch_marks: 31,
             drain_marks_with_packets_queued: 32,
-            ..Default::default()
         },
         peers: vec![
             ("established", 6),
