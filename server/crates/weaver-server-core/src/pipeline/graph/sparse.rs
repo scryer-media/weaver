@@ -96,11 +96,23 @@ pub(crate) fn create_sized<M: SparseMarker>(
     marker: &M,
     length: Option<u64>,
 ) -> io::Result<File> {
+    create_sized_known(path, marker, length).map(|(file, _)| file)
+}
+
+// `create_sized`, with the length the file was left at when it is known
+// without another call: the length it was given, or the one the look at it
+// before sizing read. `None` for a file that was not looked at: one with no
+// declared length, or whose mark was refused.
+pub(crate) fn create_sized_known<M: SparseMarker>(
+    path: &Path,
+    marker: &M,
+    length: Option<u64>,
+) -> io::Result<(File, Option<u64>)> {
     #[cfg(test)]
     if let Some(sized) = sizing::said() {
-        return create_sized_with(path, marker, length, |_, _| sized);
+        return create_sized_known_with(path, marker, length, |_, _| sized);
     }
-    create_sized_with(path, marker, length, |file, metadata| {
+    create_sized_known_with(path, marker, length, |file, metadata| {
         SIZES_FILES && holes::makes_holes(file, metadata)
     })
 }
@@ -159,6 +171,15 @@ fn create_sized_with<M: SparseMarker>(
     length: Option<u64>,
     makes_holes: impl FnOnce(&File, &std::fs::Metadata) -> bool,
 ) -> io::Result<File> {
+    create_sized_known_with(path, marker, length, makes_holes).map(|(file, _)| file)
+}
+
+fn create_sized_known_with<M: SparseMarker>(
+    path: &Path,
+    marker: &M,
+    length: Option<u64>,
+    makes_holes: impl FnOnce(&File, &std::fs::Metadata) -> bool,
+) -> io::Result<(File, Option<u64>)> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -170,19 +191,19 @@ fn create_sized_with<M: SparseMarker>(
         crate::runtime::perf_probe::record_value("graph.sparse.mark_failed", 1);
     }
     let Some(length) = length.filter(|length| marked && *length > 0) else {
-        return Ok(file);
+        return Ok((file, None));
     };
     // Sizing is an allocation hint like the mark: a file it fails on stays
     // usable and grows by its writes. The filesystem is asked about last,
     // and only for a file that would be sized.
     let sized = file.metadata().and_then(|metadata| match metadata.len() {
-        0 if makes_holes(&file, &metadata) => file.set_len(length),
-        _ => Ok(()),
+        0 if makes_holes(&file, &metadata) => file.set_len(length).map(|()| length),
+        held => Ok(held),
     });
     if sized.is_err() {
         crate::runtime::perf_probe::record_value("graph.sparse.presize_failed", 1);
     }
-    Ok(file)
+    Ok((file, sized.ok()))
 }
 
 // `FSCTL_SET_SPARSE` with no input buffer, which is the "make it sparse" form

@@ -71,6 +71,19 @@ pub(crate) struct WriterCounts {
     // stood for the writer in `Barrier::wait_aside`, and for how long.
     pub(crate) aside_waits: AtomicU64,
     pub(crate) aside_wait_nanos: AtomicU64,
+    // Files the writer opened, and the time inside those opens: the making
+    // of the file, its sparse mark and its length when it is sized.
+    pub(crate) opens: AtomicU64,
+    pub(crate) open_nanos: AtomicU64,
+    // Lengths the writer set, at a close or a truncate, and the time inside
+    // those calls; and closes it found already at their length, which set
+    // nothing.
+    pub(crate) length_sets: AtomicU64,
+    pub(crate) length_set_nanos: AtomicU64,
+    pub(crate) length_sets_skipped: AtomicU64,
+    // Handles the writer dropped, and the time inside those drops.
+    pub(crate) closes: AtomicU64,
+    pub(crate) close_nanos: AtomicU64,
     // Operations that came back with an error.
     pub(crate) failed_operations: AtomicU64,
     // Operations not run: their caller gave its files up, or an earlier
@@ -120,6 +133,24 @@ impl WriterCounts {
     pub(crate) fn aside_waited(&self, nanos: u64) {
         self.aside_waits.fetch_add(1, Ordering::Relaxed);
         self.aside_wait_nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    // The writer opened a file in `nanos`. Relaxed adds.
+    pub(crate) fn opened(&self, nanos: u64) {
+        self.opens.fetch_add(1, Ordering::Relaxed);
+        self.open_nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    // The writer set a file's length in `nanos`. Relaxed adds.
+    pub(crate) fn length_set(&self, nanos: u64) {
+        self.length_sets.fetch_add(1, Ordering::Relaxed);
+        self.length_set_nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    // The writer dropped `handles` in `nanos`. Relaxed adds.
+    pub(crate) fn closed(&self, handles: u64, nanos: u64) {
+        self.closes.fetch_add(handles, Ordering::Relaxed);
+        self.close_nanos.fetch_add(nanos, Ordering::Relaxed);
     }
 }
 
