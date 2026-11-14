@@ -633,6 +633,10 @@ impl Pipeline {
         self.segment_terminal_states
             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
         self.given_up.remove(&job_id);
+        // A restore keeps the job id: neither the cause nor the refusing
+        // servers of this run may reach the next.
+        self.semantic_terminal_causes.remove(&job_id);
+        self.login_refusals.remove(&job_id);
         self.rate_limit_reservations
             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
         self.job_last_download_activity.remove(&job_id);
