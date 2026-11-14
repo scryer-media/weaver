@@ -1213,11 +1213,11 @@ fn whole(volume: u32, weight: u32) -> Seek {
 async fn the_job_reports_extracting_while_a_run_is_live_and_done_after() {
     let mut echoing = echoing(1);
     echoing.deliver(0);
-    assert_eq!(echoing.job.phase(), RootPhase::Extracting);
+    assert_eq!(echoing.job.checked_phase(), RootPhase::Extracting);
     loop {
         let said = echoing.mail.recv().await.unwrap();
         let ended = matches!(said.heard, Heard::Ended);
-        assert_eq!(echoing.job.phase(), RootPhase::Extracting);
+        assert_eq!(echoing.job.checked_phase(), RootPhase::Extracting);
         echoing
             .job
             .run_said(said, &mut RepairSlots::default(), 1)
@@ -1226,7 +1226,7 @@ async fn the_job_reports_extracting_while_a_run_is_live_and_done_after() {
             break;
         }
     }
-    assert_eq!(echoing.job.phase(), RootPhase::Done);
+    assert_eq!(echoing.job.checked_phase(), RootPhase::Done);
     assert_eq!(echoing.echoed(0), body(0));
 }
 
@@ -1248,7 +1248,7 @@ async fn first_copy_stands(ended: bool) {
     echoing.deliver(0);
     if ended {
         while !echoing.hear().await {}
-        assert_eq!(echoing.job.phase(), RootPhase::Done);
+        assert_eq!(echoing.job.checked_phase(), RootPhase::Done);
     } else {
         echoing.until_closed(0).await;
     }
@@ -1265,7 +1265,7 @@ async fn first_copy_stands(ended: bool) {
     }
     assert!(!echoing.job.runs().live(), "no run reads the second copy");
     assert_eq!(echoing.echoed(0), body(0));
-    assert_eq!(echoing.job.phase(), RootPhase::Done);
+    assert_eq!(echoing.job.checked_phase(), RootPhase::Done);
 }
 
 // Two clean copies of one volume that differ, in either order, in two jobs:
@@ -1287,7 +1287,7 @@ async fn differing_duplicate_copies_give_one_output_in_either_order() {
         echoing.deliver(0);
         while !echoing.hear().await {}
         assert_eq!(echoing.echoed(0), first[HEADER..], "flipped: {flipped}");
-        assert_eq!(echoing.job.phase(), RootPhase::Done);
+        assert_eq!(echoing.job.checked_phase(), RootPhase::Done);
     }
 }
 
@@ -1340,7 +1340,7 @@ async fn the_engine_bids_for_the_volumes_after_the_one_its_run_reached() {
     for member in 0..3 {
         assert_eq!(echoing.echoed(member), body(member));
     }
-    assert_eq!(echoing.job.phase(), RootPhase::Done);
+    assert_eq!(echoing.job.checked_phase(), RootPhase::Done);
 }
 
 // The job reserves the engine's declared window and the overhead before
@@ -1462,7 +1462,7 @@ async fn two_runs_that_do_not_fit_together_run_one_after_the_other() {
     assert_eq!(second.job.runs().reserved(engine), WINDOW + RUN_OVERHEAD);
     while !second.hear().await {}
     assert_eq!(second.echoed(0), body(0));
-    assert_eq!(second.job.phase(), RootPhase::Done);
+    assert_eq!(second.job.checked_phase(), RootPhase::Done);
     assert_eq!(pool.room().reserved, 0);
 }
 
