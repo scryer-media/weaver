@@ -709,6 +709,80 @@ fn a_producer_waits_until_the_bytes_waiting_fall_to_its_line() {
     assert_eq!(std::fs::read(&path).unwrap(), b"fourmorelast");
 }
 
+// Stand until `count` threads wait on the barrier's key.
+fn key_waiters(barrier: &Barrier, count: usize) {
+    while barrier.key.waiters.load(Ordering::SeqCst) < count {
+        std::thread::yield_now();
+    }
+}
+
+// A wait made off the pipeline loop is not a loop wait: neither the wait of
+// a thread of its own on a barrier, nor a settle.
+#[test]
+fn a_wait_off_the_loop_is_not_counted_as_a_loop_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    job.write(1, 0, Bytes::from_static(b"lantern"), create(&path));
+    let barrier = job.barrier();
+    hold.wait_held();
+    std::thread::scope(|scope| {
+        let aside = scope.spawn(|| barrier.wait_aside());
+        let settle = scope.spawn(|| writers.settle());
+        // Both stand on the held write before it is let through.
+        key_waiters(&barrier, 1);
+        while hold.0.state.waiters.load(Ordering::SeqCst) < 1 {
+            std::thread::yield_now();
+        }
+        assert!(!barrier.returned());
+        hold.open();
+        aside.join().unwrap();
+        settle.join().unwrap();
+    });
+    assert!(barrier.passed());
+    assert_eq!(count(&volume.writer.loop_waits), 0);
+    assert_eq!(count(&volume.writer.loop_wait_nanos), 0);
+}
+
+// The loop's own wait on a barrier, and its read behind queued writes, are
+// each one loop wait.
+#[test]
+fn the_loops_wait_and_read_are_each_counted_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    job.write(1, 0, Bytes::from_static(b"lantern"), create(&path));
+    let barrier = job.barrier();
+    hold.wait_held();
+    std::thread::scope(|scope| {
+        let waits = scope.spawn(|| barrier.wait());
+        key_waiters(&barrier, 1);
+        hold.release(1);
+        waits.join().unwrap();
+    });
+    assert_eq!(count(&volume.writer.loop_waits), 1);
+    // A wait that finds everything returned is no wait.
+    barrier.wait();
+    assert_eq!(job.read(path.clone(), 3, 4).unwrap(), b"tern");
+    assert_eq!(count(&volume.writer.loop_waits), 1);
+    job.write(1, 7, Bytes::from_static(b"s"), None);
+    let after = job.barrier();
+    hold.wait_held();
+    std::thread::scope(|scope| {
+        let reads = scope.spawn(|| job.read(path.clone(), 0, 8).unwrap());
+        key_waiters(&after, 1);
+        hold.open();
+        assert_eq!(reads.join().unwrap(), b"lanterns");
+    });
+    assert_eq!(count(&volume.writer.loop_waits), 2);
+}
+
 // The wait ends when the key stops, whatever still waits for the writer: by
 // a failure of one of its operations, or by its caller giving it up.
 #[test]
