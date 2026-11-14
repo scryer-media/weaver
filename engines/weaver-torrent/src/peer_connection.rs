@@ -586,6 +586,8 @@ struct Framed {
     len: usize,
     chunk: Option<ChunkInfo>,
     read: bool,
+    // Whether it is a request for a block.
+    request: bool,
 }
 
 /// A handler's error as the connection ends in it: one of ours stays as it
@@ -615,6 +617,7 @@ impl Framed {
             len,
             chunk: None,
             read: false,
+            request: false,
         }
     }
 }
@@ -1157,9 +1160,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                         carried = Some(req);
                         break;
                     }
-                    if matches!(req, WriterRequest::Message(Message::Request(_))) {
-                        requests += 1;
-                    }
+                    let request = matches!(req, WriterRequest::Message(Message::Request(_)));
                     let out = &mut buf[filled..];
                     let framed = match req {
                         WriterRequest::Message(msg) => addressed(msg.serialize(out, ext_msg_ids))?,
@@ -1234,6 +1235,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                                     len: needs,
                                     chunk: Some(chunk),
                                     read,
+                                    request: false,
                                 })
                             }
                         }
@@ -1246,8 +1248,10 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                             break;
                         }
                     };
-                    if let Some(framed) = framed {
+                    if let Some(mut framed) = framed {
                         filled += framed.len;
+                        framed.request = request;
+                        requests += u64::from(request);
                         batch.push(framed);
                     }
                     next = outgoing_chan.try_recv().ok();
@@ -1320,6 +1324,9 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                         let (i, at) = places[k];
                         batch.truncate(i);
                         filled = at;
+                        // The requests framed behind the block go out no
+                        // more than it does.
+                        requests = batch.iter().filter(|framed| framed.request).count() as u64;
                         failed = Some(Error::ReadChunk(e));
                     }
                 }
@@ -2974,6 +2981,16 @@ mod tests {
         queued: Vec<WriterRequest>,
         until: &[u8],
     ) -> (crate::Result<()>, Vec<u8>, Vec<usize>) {
+        serve_queued_on(recorder, queued, until, BlockingSpawner::new(1)).await
+    }
+
+    /// [`serve_queued`], the connection's disk work and counters on `spawner`.
+    async fn serve_queued_on(
+        recorder: &Recorder,
+        queued: Vec<WriterRequest>,
+        until: &[u8],
+        spawner: BlockingSpawner,
+    ) -> (crate::Result<()>, Vec<u8>, Vec<usize>) {
         use tokio::io::AsyncReadExt;
         let (connection, _dialed) = connection(EncryptionPolicy::Disabled).await;
         let connection = PeerConnection::new(
@@ -2982,7 +2999,7 @@ mod tests {
             connection.peer_id,
             recorder,
             Some(connection.options),
-            BlockingSpawner::new(1),
+            spawner,
             connection.connector,
         );
         let (ours, mut theirs) = tokio::io::duplex(1 << 18);
@@ -3086,6 +3103,43 @@ mod tests {
                 Told::Done(1)
             ]
         );
+    }
+
+    // A request framed behind a block that fails to read is not written, and
+    // is not counted as sent: the one framed before the block is.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_framed_behind_a_block_that_fails_to_read_is_not_counted_sent() {
+        let recorder = Recorder {
+            fails: Some(0),
+            ..Recorder::default()
+        };
+        let block = blocks_of(5);
+        let request = |index| {
+            Message::Request(crate::peer_protocol::Request {
+                index,
+                begin: 0,
+                length: BLOCK,
+            })
+        };
+        let queued = vec![
+            WriterRequest::Message(request(1)),
+            WriterRequest::ReadChunkRequest(block(0)),
+            WriterRequest::Message(request(2)),
+        ];
+        let mut sent = vec![0, 0, 0, 13, 6];
+        for field in [1, 0, BLOCK] {
+            sent.extend_from_slice(&field.to_be_bytes());
+        }
+        let spawner = BlockingSpawner::new(1);
+        let (result, wire, writes) =
+            serve_queued_on(&recorder, queued, &sent, spawner.clone()).await;
+        assert!(matches!(result, Err(Error::ReadChunk(_))), "{result:?}");
+        assert_eq!(writes.last(), Some(&sent.len()), "{writes:?}");
+        assert!(wire.ends_with(&sent));
+
+        let tcp =
+            &spawner.disk_snapshot().sockets[crate::session_stats::disk::Transport::Tcp.index()];
+        assert_eq!((tcp.request_sends, tcp.requests_sent), (1, 1));
     }
 
     // A block that fails to read ends the connection once the frames queued
