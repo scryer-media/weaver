@@ -815,10 +815,8 @@ impl Segments {
 
             if !segment.is_expired && !segment.is_lost {
                 let expires = last_sent + expiry_threshold;
-                recalc_timer = match recalc_timer {
-                    Some(ts) if expires < ts => Some(expires),
-                    _ => Some(expires),
-                }
+                // The earliest expiry among the segments still counted.
+                recalc_timer = Some(recalc_timer.map_or(expires, |ts: Instant| ts.min(expires)));
             }
         }
 
@@ -1537,5 +1535,22 @@ mod pipe_tests {
         segs.remove_up_to_ack(t1 + 110 * MS, &sack(9, 11..=20));
         let pipe = segs.calc_pipe(10.into(), 20.into(), SRTT, t1 + 110 * MS);
         assert_eq!(pipe.reorder_at, Some(t1 + 125 * MS));
+    }
+
+    // Packets 10 to 12 leave at t0 and 10 is sent again 50 ms later. The
+    // pipe is counted again when the first of them expires: 11, at t0 +
+    // 75 ms, not the resent 10 at t0 + 125 ms.
+    #[test]
+    fn the_pipe_timer_is_the_earliest_expiry() {
+        let t0 = Instant::now();
+        let mut segs = queue(10, 12);
+        send(&mut segs, 10..=12, t0);
+        let stats = UtpStats::default();
+        segs.iter_mut_for_sending(None)
+            .next()
+            .unwrap()
+            .on_sent(t0 + 50 * MS, &stats);
+        let pipe = segs.calc_pipe(10.into(), 12.into(), SRTT, t0 + 60 * MS);
+        assert_eq!(pipe.recalc_timer, Some(t0 + 75 * MS));
     }
 }
