@@ -640,22 +640,6 @@ impl Submitter {
         })
     }
 
-    // Move `from` to `to`, where nothing may be, once every earlier
-    // operation has returned.
-    pub(crate) fn rename(&self, file: Option<u64>, from: PathBuf, to: PathBuf) -> u64 {
-        let path = from.clone();
-        self.run(file, path, move || {
-            crate::runtime::fs::rename_path_exclusive(&from, &to)
-        })
-    }
-
-    // Give `from` the second name `to`, once every earlier operation has
-    // returned.
-    pub(crate) fn hard_link(&self, from: PathBuf, to: PathBuf) -> u64 {
-        let path = from.clone();
-        self.run(None, path, move || std::fs::hard_link(&from, &to))
-    }
-
     // Read `len` bytes at `offset` of the file at `path`, after everything
     // the key submitted before. The caller waits for the answer.
     pub(crate) fn read(&self, path: PathBuf, offset: u64, len: usize) -> io::Result<Vec<u8>> {

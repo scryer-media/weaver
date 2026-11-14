@@ -116,7 +116,7 @@ fn a_batch_writes_each_file_by_offset_and_keeps_overlaps_in_order() {
 }
 
 #[test]
-fn a_close_and_a_rename_follow_the_writes_before_them() {
+fn a_close_and_a_move_follow_the_writes_before_them() {
     let dir = tempfile::tempdir().unwrap();
     let (from, to) = (dir.path().join("from"), dir.path().join("to"));
     let (writers, _reports) = writers();
@@ -135,7 +135,10 @@ fn a_close_and_a_rename_follow_the_writes_before_them() {
             open,
         },
     );
-    job.rename(Some(1), from.clone(), to.clone());
+    let (moved_from, moved_to) = (from.clone(), to.clone());
+    job.run(Some(1), from.clone(), move || {
+        std::fs::rename(&moved_from, &moved_to)
+    });
     job.write(1, 0, Bytes::from_static(b"head"), create(&to));
     let barrier = job.barrier();
     hold.open();
@@ -216,7 +219,10 @@ fn nothing_of_an_abandoned_key_is_written_after() {
     let job = writers.submitter(&volume, 1);
     job.write(1, 0, Bytes::from_static(b"one"), create(&path));
     job.write(1, 3, Bytes::from_static(b"two"), None);
-    job.rename(Some(1), path.clone(), dir.path().join("b"));
+    let (moved_from, moved_to) = (path.clone(), dir.path().join("b"));
+    job.run(Some(1), path.clone(), move || {
+        std::fs::rename(&moved_from, &moved_to)
+    });
     hold.wait_held();
     hold.release(1);
     hold.wait_held();
