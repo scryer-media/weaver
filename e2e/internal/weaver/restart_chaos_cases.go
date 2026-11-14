@@ -154,17 +154,25 @@ func runCredentialsRefusedMidJobSettles(ctx *restartCaseContext) (restartCaseRes
 		return restartCaseResult{}, err
 	}
 	ids := segmentIDs(segments)
-	if err := ctx.startWeaverWithOptions("", 8); err != nil {
+	shapes, err := segmentArticleShapes(nntpHost(), nntpPort(), segments)
+	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := setNntpChaos("slow_body=1"); err != nil {
+	const connections = 8
+	if err := ctx.startWeaverWithOptions("", connections); err != nil {
+		return restartCaseResult{}, err
+	}
+	// Ten bodies come through and then every body is held, so the refusal
+	// starts mid-job whatever the machine's speed.
+	const before = 10
+	if _, err := holdAfterBodies(shapes, ids, before, connections); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug(slug)
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	served, started, err := ctx.waitForBodies(jobID, ids, 10)
+	served, started, err := ctx.waitForBodies(jobID, ids, before)
 	if err != nil {
 		return restartCaseResult{}, err
 	}
@@ -173,8 +181,10 @@ func runCredentialsRefusedMidJobSettles(ctx *restartCaseContext) (restartCaseRes
 	}
 	logBefore, _ := os.ReadFile(ctx.caseLogPath)
 	// The refusal also refuses the harness, so the gate is set and cleared
-	// over one control session that authenticated before it.
-	releaseRefusal, err := holdNntpChaosOnServer(nntpHost(), nntpPort(), "slow_body=1,reauth_body=100,reject_auth=100")
+	// over one control session that authenticated before it. It replaces the
+	// hold, so the bodies the hold caught finish and every later BODY is
+	// refused.
+	releaseRefusal, err := holdNntpChaosOnServer(nntpHost(), nntpPort(), "reauth_body=100,reject_auth=100")
 	if err != nil {
 		return restartCaseResult{}, err
 	}
@@ -212,17 +222,26 @@ func runShutdownMidBatchIsNotAnUncleanBatch(ctx *restartCaseContext) (restartCas
 		return restartCaseResult{}, err
 	}
 	ids := segmentIDs(segments)
-	if err := ctx.startWeaverWithOptions("", 8); err != nil {
+	shapes, err := segmentArticleShapes(nntpHost(), nntpPort(), segments)
+	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := setNntpChaos("slow_body=1"); err != nil {
+	const connections = 8
+	if err := ctx.startWeaverWithOptions("", connections); err != nil {
+		return restartCaseResult{}, err
+	}
+	// Thirty bodies come through and then every body is held mid-transfer,
+	// so the Ctrl-C finds pipelined batches in flight whatever the
+	// machine's speed.
+	const before = 30
+	if _, err := holdAfterBodies(shapes, ids, before, connections); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug(slug)
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if _, started, err := ctx.waitForBodies(jobID, ids, 30); err != nil {
+	if _, started, err := ctx.waitForBodies(jobID, ids, before); err != nil {
 		return restartCaseResult{}, err
 	} else if !started {
 		return classifyRestartResult(ctx.Profile, false, "", false, "", "the job ended before the shutdown point"), nil
@@ -232,7 +251,7 @@ func runShutdownMidBatchIsNotAnUncleanBatch(ctx *restartCaseContext) (restartCas
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := ctx.interruptWeaverAndWaitForExit(); err != nil {
+	if err := ctx.interruptHeldWeaverAndWaitForExit(liftPrimaryHold); err != nil {
 		return restartCaseResult{}, err
 	}
 	firstRun, _ := os.ReadFile(ctx.caseLogPath)
