@@ -650,7 +650,7 @@ metric_families! {
     TORRENT_UTP_MAX_CWND = ("weaver_torrent_utp_max_congestion_window_bytes", Gauge,
         ["route"], "Largest uTP congestion window any stream of the session reached, in bytes.");
     TORRENT_DISK_CALLS = ("weaver_torrent_disk_calls_total", Counter, ["route", "operation"],
-        "Disk calls of the session's torrents since it opened, by operation: a piece written whole, an upload read for a TCP or a uTP peer, a downloaded piece hashed from memory, a seed-mode check, an initial check.");
+        "Disk calls of the session's torrents since it opened, by operation: a piece written whole, a batch of received blocks written, an upload read for a TCP or a uTP peer, a downloaded piece hashed from memory or read back from its files, a seed-mode check, an initial check.");
     TORRENT_DISK_BYTES = ("weaver_torrent_disk_bytes_total", Counter, ["route", "operation"],
         "Bytes the session's disk calls moved since it opened, by operation.");
     TORRENT_DISK_SECONDS = ("weaver_torrent_disk_seconds_total", Counter, ["route", "operation"],
