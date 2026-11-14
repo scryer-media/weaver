@@ -11,7 +11,11 @@ use crate::pipeline::queue_window::QUEUE_WINDOW;
 const QUEUED: u64 = 1_000;
 
 async fn enqueue(pipeline: &mut Pipeline, id: u64) {
-    let spec = segmented_job_spec(&format!("Window NZB {id}"), "payload.bin", &[512; 4]);
+    enqueue_named(pipeline, id, &format!("Window NZB {id}")).await;
+}
+
+async fn enqueue_named(pipeline: &mut Pipeline, id: u64, name: &str) {
+    let spec = segmented_job_spec(name, "payload.bin", &[512; 4]);
     let nzb_zstd = nzb_zstd_for(&spec);
     pipeline
         .add_job(
@@ -542,9 +546,17 @@ async fn unstarted_job_with_a_changed_folder(
     temp: &tempfile::TempDir,
     id: JobId,
 ) -> (Pipeline, PathBuf, PathBuf) {
+    unstarted_job_named_with_a_changed_folder(temp, id, &format!("Window NZB {}", id.0)).await
+}
+
+async fn unstarted_job_named_with_a_changed_folder(
+    temp: &tempfile::TempDir,
+    id: JobId,
+    name: &str,
+) -> (Pipeline, PathBuf, PathBuf) {
     let (mut pipeline, old_root, complete) = new_direct_pipeline(temp).await;
     let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
-    enqueue(&mut pipeline, id.0).await;
+    enqueue_named(&mut pipeline, id.0, name).await;
     settle(&mut pipeline).await;
     assert!(matches!(
         pipeline.jobs[&id].articles,
@@ -803,9 +815,14 @@ async fn a_job_cancelled_while_its_move_is_out_and_retried_has_one_folder() {
     while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
     {
     }
-    handle.redownload_job(id).await.unwrap();
+    // The retry waits for the move to be heard.
+    let retried = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.redownload_job(id).await }
+    });
     let done = pipeline.job_activated_rx.recv().await.unwrap();
     pipeline.handle_job_activated(done);
+    retried.await.unwrap().unwrap();
     settle(&mut pipeline).await;
 
     let retry = pipeline.jobs[&id].working_dir.clone();
@@ -823,6 +840,259 @@ async fn a_job_cancelled_while_its_move_is_out_and_retried_has_one_folder() {
         tokio::task::yield_now().await;
     }
     assert!(retry.exists());
+}
+
+// A job that never started is cancelled while its move holds a new folder
+// its row will not take, and is retried at once, after the cancel's own
+// cleanup. Returns the pipeline, the move's seams, the retry, and the new
+// intermediate root. The retry is spawned once the move has claimed.
+async fn retried_while_the_move_holds_a_folder(
+    temp: &tempfile::TempDir,
+    id: JobId,
+    listing: bool,
+) -> (
+    Pipeline,
+    std::sync::Arc<crate::pipeline::activation::move_seams::Seams>,
+    tokio::task::JoinHandle<Result<(), crate::SchedulerError>>,
+    PathBuf,
+) {
+    use crate::pipeline::activation::move_seams;
+    // Named as its NZB file is, so the retry claims the name the move did.
+    let name = format!("window-{}", id.0);
+    let (mut pipeline, _, new_root) =
+        unstarted_job_named_with_a_changed_folder(temp, id, &name).await;
+    let seams = move_seams::arm(
+        &new_root,
+        move_seams::Seams {
+            listing: listing.then(move_seams::Gate::default),
+            ..Default::default()
+        },
+    );
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let mut events = handle.subscribe_events();
+    pipeline.request_job_activation(id);
+    // The move has claimed, and waits at its row write, before the cancel's
+    // cleanup can take the folder it moves from.
+    while !seams.claimed.load(Ordering::Acquire) {
+        tokio::task::yield_now().await;
+    }
+    handle.cancel_job(id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(&mut pipeline).await;
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
+    {
+    }
+    // The cancel's archive has committed: the move's row write takes nothing.
+    seams.row.open();
+    // The cancel's own folders are cleared, so only the move can hold the
+    // retry back.
+    let queue = pipeline.shared_state.queue.clone();
+    while queue.read(|inner| inner.pending_cleanup.folders_held(&id)) {
+        tokio::task::yield_now().await;
+    }
+    let retried = tokio::spawn(async move { handle.redownload_job(id).await });
+    (pipeline, seams, retried, new_root)
+}
+
+// Ordering 1: the retry lists the move's folder, the move gives it up, and
+// the retry's removal finds it gone. The retry waits for the move instead,
+// and goes through.
+#[tokio::test]
+async fn a_retry_waits_for_the_move_to_give_its_folder_up() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = JobId(1);
+    let (mut pipeline, seams, retried, _) =
+        retried_while_the_move_holds_a_folder(&temp, id, true).await;
+    while !seams.listed.load(Ordering::Acquire) && !seams.cleanup_waited.load(Ordering::Acquire) {
+        tokio::task::yield_now().await;
+    }
+    seams.abandon.open();
+    while !seams.abandoned.load(Ordering::Acquire) {
+        tokio::task::yield_now().await;
+    }
+    seams.listing.as_ref().unwrap().open();
+    let done = pipeline.job_activated_rx.recv().await.unwrap();
+    assert!(done.moved_to.is_none(), "the row took nothing");
+    pipeline.handle_job_activated(done);
+    retried.await.unwrap().unwrap();
+    crate::pipeline::activation::move_seams::disarm();
+}
+
+// Ordering 2: the retry clears the move's folder and claims the same name,
+// then the move gives up what is now the retry's folder. The retry waits
+// for the move instead, and keeps the folder its row names.
+#[tokio::test]
+async fn a_retry_keeps_its_folder_when_the_move_gives_its_own_up() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = JobId(1);
+    let (mut pipeline, seams, retried, new_root) =
+        retried_while_the_move_holds_a_folder(&temp, id, false).await;
+    while !retried.is_finished() && !seams.cleanup_waited.load(Ordering::Acquire) {
+        tokio::task::yield_now().await;
+    }
+    seams.abandon.open();
+    while !seams.abandoned.load(Ordering::Acquire) {
+        tokio::task::yield_now().await;
+    }
+    let done = pipeline.job_activated_rx.recv().await.unwrap();
+    pipeline.handle_job_activated(done);
+    retried.await.unwrap().unwrap();
+    settle(&mut pipeline).await;
+    crate::pipeline::activation::move_seams::disarm();
+
+    let retry = pipeline.jobs[&id].working_dir.clone();
+    assert_eq!(retry.parent(), Some(new_root.as_path()));
+    assert!(retry.exists(), "the retry's folder is gone");
+    assert!(crate::jobs::working_dir::is_job_working_dir(&new_root, &retry, id).unwrap());
+}
+
+// A job's read makes it a staging directory on a destination on another
+// device, and the job is cancelled before the reply is heard: the reply
+// removes that directory, and the cancel's hold lasts until it is gone.
+#[tokio::test]
+async fn a_staging_folder_made_for_a_job_cancelled_meanwhile_goes() {
+    let temp = tempfile::tempdir().unwrap();
+    // The roots new_direct_pipeline uses, on two devices before it opens.
+    crate::runtime::fs::test_devices::assign(&temp.path().join("intermediate"), 1);
+    crate::runtime::fs::test_devices::assign(&temp.path().join("complete"), 2);
+    let (mut pipeline, _, complete) = new_direct_pipeline(&temp).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let mut events = handle.subscribe_events();
+    let id = JobId(1);
+    enqueue(&mut pipeline, id.0).await;
+    settle(&mut pipeline).await;
+    assert!(matches!(
+        pipeline.jobs[&id].articles,
+        crate::jobs::model::JobArticles::Queued(_)
+    ));
+
+    pipeline.request_job_activation(id);
+    let done = pipeline.job_activated_rx.recv().await.unwrap();
+    let staging = crate::pipeline::queue::staging_dir_for(&complete, id);
+    assert!(staging.exists(), "the read made no staging directory");
+    handle.cancel_job(id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(&mut pipeline).await;
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
+    {
+    }
+    pipeline.handle_job_activated(done);
+
+    let queue = pipeline.shared_state.queue.clone();
+    while queue.read(|inner| inner.pending_cleanup.contains(&id)) {
+        tokio::task::yield_now().await;
+    }
+    assert!(!staging.exists(), "the staging directory is left behind");
+}
+
+// A job that started, so no move is out, is cancelled before the reply that
+// made it a staging directory is heard. While that directory's removal is
+// held, a restart of the id waits; once the removal ends the restart goes
+// through, and the staging directory the retry makes is there.
+#[tokio::test]
+async fn a_restart_waits_for_the_staging_removal_of_a_job_that_left() {
+    use crate::pipeline::activation::move_seams;
+    let temp = tempfile::tempdir().unwrap();
+    crate::runtime::fs::test_devices::assign(&temp.path().join("intermediate"), 1);
+    crate::runtime::fs::test_devices::assign(&temp.path().join("complete"), 2);
+    let (mut pipeline, _, complete) = new_direct_pipeline(&temp).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let mut events = handle.subscribe_events();
+    let id = JobId(1);
+    enqueue(&mut pipeline, id.0).await;
+    settle(&mut pipeline).await;
+    // Started: its read moves nothing, so no move holds a cancel back.
+    pipeline.jobs.get_mut(&id).unwrap().failed_bytes = 1;
+
+    pipeline.request_job_activation(id);
+    assert!(pipeline.moving_jobs.is_empty());
+    let done = pipeline.job_activated_rx.recv().await.unwrap();
+    let staging = crate::pipeline::queue::staging_dir_for(&complete, id);
+    assert!(staging.exists(), "the read made no staging directory");
+    handle.cancel_job(id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(&mut pipeline).await;
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
+    {
+    }
+    let seams = move_seams::arm(
+        &complete,
+        move_seams::Seams {
+            staging_removal: Some(move_seams::Gate::default()),
+            ..Default::default()
+        },
+    );
+    // The reply's removal is held at its gate.
+    pipeline.handle_job_activated(done);
+    let queue = pipeline.shared_state.queue.clone();
+    while queue.read(|inner| inner.pending_cleanup.folders_held(&id)) {
+        tokio::task::yield_now().await;
+    }
+    let retried = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.redownload_job(id).await }
+    });
+    while !retried.is_finished() && !seams.cleanup_waited.load(Ordering::Acquire) {
+        tokio::task::yield_now().await;
+    }
+    // A retry that did not wait has made its staging directory before the
+    // held removal runs.
+    let waited = !retried.is_finished();
+    let retried = if waited {
+        Some(retried)
+    } else {
+        retried.await.unwrap().unwrap();
+        settle(&mut pipeline).await;
+        activate_job(&mut pipeline, id).await;
+        None
+    };
+    seams.staging_removal.as_ref().unwrap().open();
+    while !seams.staging_removed.load(Ordering::Acquire) {
+        tokio::task::yield_now().await;
+    }
+    if let Some(retried) = retried {
+        retried.await.unwrap().unwrap();
+        settle(&mut pipeline).await;
+        activate_job(&mut pipeline, id).await;
+    }
+    move_seams::disarm();
+
+    assert_eq!(pipeline.jobs[&id].staging_dir.as_ref(), Some(&staging));
+    assert!(staging.exists(), "the retry's staging directory is gone");
+    assert!(waited, "the restart did not wait for the staging removal");
+}
+
+// The cancel clears the staging directory the job's state never named. One
+// the disowned reply names that holds files by then is kept.
+#[tokio::test]
+async fn a_left_job_reply_keeps_a_staging_folder_holding_files() {
+    let temp = tempfile::tempdir().unwrap();
+    crate::runtime::fs::test_devices::assign(&temp.path().join("intermediate"), 1);
+    crate::runtime::fs::test_devices::assign(&temp.path().join("complete"), 2);
+    let (mut pipeline, _, complete) = new_direct_pipeline(&temp).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let id = JobId(1);
+    enqueue(&mut pipeline, id.0).await;
+    settle(&mut pipeline).await;
+    pipeline.request_job_activation(id);
+    let done = pipeline.job_activated_rx.recv().await.unwrap();
+    let staging = crate::pipeline::queue::staging_dir_for(&complete, id);
+    handle.cancel_job(id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(&mut pipeline).await;
+    let queue = pipeline.shared_state.queue.clone();
+    while queue.read(|inner| inner.pending_cleanup.folders_held(&id)) {
+        tokio::task::yield_now().await;
+    }
+    assert!(!staging.exists(), "the cancel left the staging directory");
+
+    crate::jobs::working_dir::make_job_staging_dir(&staging, id).unwrap();
+    std::fs::write(staging.join("payload"), b"keep").unwrap();
+    pipeline.handle_job_activated(done);
+    while queue.read(|inner| inner.pending_cleanup.contains(&id)) {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(std::fs::read(staging.join("payload")).unwrap(), b"keep");
 }
 
 // A job cancelled while its move was out, its id then being admitted again

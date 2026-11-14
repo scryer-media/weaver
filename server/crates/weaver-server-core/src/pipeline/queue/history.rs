@@ -84,6 +84,8 @@ pub(crate) async fn clear_left_working_dirs(
     tokio::task::spawn_blocking(move || {
         let jobs = BTreeSet::from([id]);
         let marked = crate::jobs::working_dir::job_working_dirs(&root, &jobs)?;
+        #[cfg(test)]
+        crate::pipeline::activation::move_seams::after_listing(&root);
         for dir in marked.into_values().flatten().filter(|dir| *dir != keep) {
             crate::jobs::working_dir::remove_job_working_dir(&root, &dir, id)?;
         }
@@ -235,6 +237,8 @@ impl Queue {
     pub(super) async fn wait_for_cleanup(&self, ids: &BTreeSet<JobId>) {
         let mut revision = self.subscribe();
         while self.read(|inner| ids.iter().any(|id| inner.pending_cleanup.contains(id))) {
+            #[cfg(test)]
+            crate::pipeline::activation::move_seams::cleanup_waited();
             if revision.changed().await.is_err() {
                 return;
             }

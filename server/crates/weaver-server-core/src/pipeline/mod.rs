@@ -1618,8 +1618,9 @@ pub struct Pipeline {
     // The jobs whose working directory an activation is moving under the
     // intermediate folder, each with that activation's number. No other
     // activation is sent for one until that reply is heard, so one move at a
-    // time has the directory.
-    pub(super) moving_jobs: HashMap<JobId, u64>,
+    // time has the directory. The watch is shared with the move's guard,
+    // which lets a job cancelled meanwhile go once the move is done.
+    pub(super) moving_jobs: HashMap<JobId, (u64, Arc<activation::MoveWatch>)>,
     // The repair slots graph jobs share, and what each job's recovery
     // objects said when it last advanced.
     pub(super) graph_status: graph::status::GraphStatus,
