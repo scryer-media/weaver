@@ -280,10 +280,15 @@
       "include": [
         "testdata/7z-encrypted/archive.7z",
         "testdata/adv-*/**",
+        "testdata/direct-store-multivolume/archive.part*.rar",
+        "testdata/direct-store-quick-open/archive.part2.rar",
+        "testdata/direct-store-rar4-encrypted/archive.part*.rar",
+        "testdata/direct-store-rar4/archive.part*.rar",
         "testdata/rar5-encrypted/archive.rar",
         "testdata/rar5-single/archive.rar",
         "testdata/single-7z/archive.7z",
         "testdata/single-mkv/**",
+        "testdata/split-7z/archive.7z.00*",
         "testdata/zip-encrypted/archive.zip",
         "testdata/zip-unencrypted/archive.zip"
       ],

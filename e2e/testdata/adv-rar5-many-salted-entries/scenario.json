@@ -1,0 +1,13 @@
+{
+  "slug": "adv-rar5-many-salted-entries",
+  "title": "E2E.Adversarial.Many.Salted.Entries.2026-TESTGRP",
+  "description": "512 stored members in a RAR5 set written with -p across three volumes, each member under its own salt. Every member's key is derived on the pool, not on the pipeline turn, and announcing a member replays no volume. With the right password every member is delivered.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "password": "adversarial-salted-password",
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "minOutputFiles": 512
+  }
+}

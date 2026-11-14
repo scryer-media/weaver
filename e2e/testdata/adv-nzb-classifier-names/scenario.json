@@ -1,0 +1,21 @@
+{
+  "slug": "adv-nzb-classifier-names",
+  "title": "E2E.Adversarial.NZB.Classifier.Names.2026-TESTGRP",
+  "description": "Loose text files posted under names with a multibyte character after a dot, inside a volume suffix, or as the whole name. The file classifier reads every name on the download path; the job completes and delivers each file byte-equal under its own name.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "minOutputFiles": 7
+  },
+  "expectedOutputBLAKE3": {
+    "aé": "7019371ebf68f1c09693198e7be8516c2755960ba8be0a080768c1f7fc422e03",
+    "ordinary-classifier.txt": "4624ee5dbb985989fa6c1e35ab56c0cf5a219f8c07712460a553af38ad5f2bb1",
+    "x.r0é": "432b8b83b4973437661a16350e85db48664fceb9736fd05b2677d8d5b82e382e",
+    "x.€": "fac48bf1ba3dd76ed8d1dee587f03ebdbe5fb476c82d8ecd9f7caf405450f6d8",
+    "é": "fe3dbc08e3c8f3c27d5f0a5b6b59250ff9a19b3732580302a72ca53bb66eefb1",
+    "éabc": "a4cdd5458314121e27040661bdb3a4b595b6e6c08cc21b0d486ad575d632314b",
+    "日本": "e62302d8d38a3e101923d30e1494995f3dbce852b124371f7ba2fce85af78b31"
+  }
+}
