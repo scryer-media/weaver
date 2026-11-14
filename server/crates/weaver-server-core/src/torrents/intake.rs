@@ -8,46 +8,49 @@
 // later. Any other write the store could not make fails the torrent.
 
 use std::io;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use weaver_graph::holds::{HoldsAccountant, HoldsNamespace};
 use weaver_torrent::storage::write_refused;
 
-use crate::operations::disk::{CapacityDebits, CapacityReader};
+use crate::operations::disk::{CapacityReader, checked_room};
 use crate::pipeline::ExtractionLimits;
 use crate::torrents::storage::Pieces;
 
 // The disk budget the pieces are written under: the reserve the job's
-// limits keep free on the volume the reader samples, against what was
-// written since its last reading.
+// limits keep free on the volume the reader samples, booked on the ledger
+// every writer on that volume shares, usenet's included, so two writers
+// never spend the same free space.
 pub(crate) struct Room {
     limits: Arc<ExtractionLimits>,
     free_disk: CapacityReader,
-    debits: Mutex<CapacityDebits>,
 }
 
 impl Room {
     pub(crate) fn new(limits: Arc<ExtractionLimits>, free_disk: CapacityReader) -> Self {
-        Self {
-            limits,
-            free_disk,
-            debits: Mutex::new(CapacityDebits::default()),
-        }
+        Self { limits, free_disk }
     }
 
-    // Whether `bytes` more fit, counted against the reading when they do. A
-    // volume never read is never refused.
+    // Whether `bytes` more fit over the reserve, promised on the ledger when
+    // they do. A volume never read is never refused.
     fn admits(&self, bytes: u64) -> bool {
-        let mut debits = self.debits.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(reading) = debits.apply(self.free_disk.current()).reading() else {
-            return true;
-        };
-        if self.limits.short_of_reserve(&reading, bytes).is_some() {
+        let ledger = self.free_disk.ledger();
+        if bytes > checked_room(ledger, &self.free_disk, self.limits.min_free_bytes) {
             return false;
         }
-        debits.debit(bytes);
+        ledger.promise(bytes);
         true
+    }
+
+    // The promised `bytes` were written.
+    fn landed(&self, bytes: u64) {
+        self.free_disk.ledger().landed(bytes, 0);
+    }
+
+    // The promised `bytes` were not written.
+    fn release(&self, bytes: u64) {
+        self.free_disk.ledger().release(bytes);
     }
 }
 
@@ -113,7 +116,12 @@ impl Pieces for Intake {
                 )),
             );
         }
-        match self.inner.verified(piece, held) {
+        let wrote = self.inner.verified(piece, held);
+        match &wrote {
+            Ok(()) => self.room.landed(bytes),
+            Err(_) => self.room.release(bytes),
+        }
+        match wrote {
             Ok(()) => {
                 (self.hear)(Heard::Changed);
                 Ok(())
@@ -169,6 +177,7 @@ impl Pieces for Intake {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
@@ -374,5 +383,64 @@ mod tests {
         intake.verified(1, &piece(b"bbbb")).unwrap();
         assert_eq!(*disk.took.lock().unwrap(), [(0, 2), (1, 4)]);
         assert_eq!(*said.lock().unwrap(), [Heard::Changed, Heard::Changed]);
+    }
+
+    // Two writers on one volume book on the one ledger: what the first
+    // promised the second cannot spend, a write that failed gives its
+    // promise back, and one that landed counts against the reading.
+    #[test]
+    fn writers_on_one_volume_share_the_ledger() {
+        use crate::operations::disk::{Capacity, CapacityReading};
+
+        let reading = CapacityReading {
+            available_bytes: 110,
+            total_bytes: 1000,
+            sampled_at: std::time::Instant::now(),
+            stale: false,
+        };
+        let reader = CapacityReader::from_fn(move || Capacity::Known(reading));
+        let first = room(reader.clone());
+        let second = room(reader.clone());
+        // Ten bytes over the reserve: six promised to one leave four.
+        assert!(first.admits(6));
+        assert!(!second.admits(5));
+        assert!(second.admits(4));
+        assert_eq!(reader.ledger().promised(), 10);
+        // A write that failed gives its room back for the other.
+        second.release(4);
+        assert_eq!(reader.ledger().promised(), 6);
+        // One that landed is no longer promised but still spent against
+        // the reading it followed.
+        first.landed(6);
+        assert_eq!(reader.ledger().promised(), 0);
+        assert!(!second.admits(5));
+        assert!(second.admits(4));
+    }
+
+    // A piece the store could not write gives back what it was promised.
+    #[test]
+    fn a_refused_write_gives_its_promise_back() {
+        use crate::operations::disk::{Capacity, CapacityReading};
+
+        let reading = CapacityReading {
+            available_bytes: 1000,
+            total_bytes: 1000,
+            sampled_at: std::time::Instant::now(),
+            stale: false,
+        };
+        let reader = CapacityReader::from_fn(move || Capacity::Known(reading));
+        let disk = Arc::new(Disk::default());
+        let (_, hear) = heard();
+        let intake = Intake::new(
+            Arc::clone(&disk) as Arc<dyn Pieces>,
+            room(reader.clone()),
+            hear,
+        );
+        disk.full.store(true, Ordering::SeqCst);
+        assert!(intake.verified(0, &piece(b"aaaa")).is_err());
+        assert_eq!(reader.ledger().promised(), 0);
+        disk.full.store(false, Ordering::SeqCst);
+        intake.verified(0, &piece(b"aaaa")).unwrap();
+        assert_eq!(reader.ledger().promised(), 0);
     }
 }

@@ -1038,6 +1038,17 @@ impl CapacityReader {
     }
 }
 
+// The room above `reserve` a good reading of `reader` leaves on `ledger`:
+// every byte with no reserve, no reading, or a stale one, which checks
+// nothing. The one reserve sum every writer books by, usenet's and
+// torrents' alike.
+pub(crate) fn checked_room(ledger: &DiskLedger, reader: &CapacityReader, reserve: u64) -> u64 {
+    match ledger.free_with(|| reader.current()) {
+        Some(free) if reserve > 0 && !free.stale => free.bytes.saturating_sub(reserve),
+        _ => u64::MAX,
+    }
+}
+
 // Bytes one consumer has admitted against a shared reading since that
 // reading was taken, so a burst of admissions between refreshes cannot each
 // see the same headroom.

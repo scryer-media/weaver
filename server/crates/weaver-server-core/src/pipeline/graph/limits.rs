@@ -15,7 +15,7 @@ use weaver_graph::holds::HoldBudgets;
 use weaver_graph::{MemberId, NodeId, Tree};
 
 use crate::RuntimeTuner;
-use crate::operations::disk::{CapacityReader, DiskLedger};
+use crate::operations::disk::{CapacityReader, DiskLedger, checked_room};
 use crate::pipeline::completion::finalize::MAX_GRAPH_NESTING_DEPTH;
 pub(crate) use crate::pipeline::extraction::ExtractionLimits;
 use crate::pipeline::extraction::{ExtractionFailure, ExtractionRejectionReason};
@@ -366,16 +366,6 @@ struct Extent {
 // ledger is asked, so that most writes touch nothing shared, and how much
 // that was promised may land before the ledger hears of it.
 const SLAB_BYTES: u64 = 64 * 1024 * 1024;
-
-// The room above `reserve` a good reading of `reader` leaves on its
-// ledger: every byte with no reserve, no reading, or a stale one, which
-// checks nothing.
-fn checked_room(ledger: &DiskLedger, reader: &CapacityReader, reserve: u64) -> u64 {
-    match ledger.free_with(|| reader.current()) {
-        Some(free) if reserve > 0 && !free.stale => free.bytes.saturating_sub(reserve),
-        _ => u64::MAX,
-    }
-}
 
 // What the job owes one device: the bytes its members took and have not
 // written yet, and how much of that the device's ledger holds promised for
