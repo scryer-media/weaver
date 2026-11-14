@@ -147,11 +147,8 @@ impl NamespaceWriter {
             // The stop changes which of each member's held bytes a
             // checkpoint says: every member that holds any is told again.
             let files = self.files_mut(node);
-            let holding: Vec<MemberId> = files
-                .holds
-                .held_volumes()
-                .map(super::held_member)
-                .collect();
+            let holding: Vec<MemberId> =
+                files.holds.held_volumes().map(super::held_member).collect();
             for member in holding {
                 files.leaves.mark(member);
             }
