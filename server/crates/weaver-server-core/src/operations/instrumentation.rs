@@ -1474,10 +1474,6 @@ pub struct VolumeWriterSnapshot {
     pub threads: u64,
     // Times the writer woke to mail after waiting for it.
     pub woken: u64,
-    // Written buffers handed back to the loop, and those freed on the
-    // writer because the way back was full.
-    pub buffers_returned: u64,
-    pub buffers_freed: u64,
 }
 
 #[cfg(test)]

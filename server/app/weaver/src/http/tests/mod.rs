@@ -1447,8 +1447,6 @@ fn sample_volumes() -> Vec<instr::VolumeSnapshot> {
                 abandoned_operations: 5,
                 threads: 1,
                 woken: 4,
-                buffers_returned: 30,
-                buffers_freed: 2,
             },
         },
         // Seen, never written to: its rate is not measured, and it has

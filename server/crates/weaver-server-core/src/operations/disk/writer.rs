@@ -195,9 +195,6 @@ struct Registry {
     // Where the loop's own waits end once the owner is stopping. Every
     // lane holds it.
     loop_end: Arc<LoopEnd>,
-    // Written buffers on their way back to the pipeline loop. Every lane
-    // with a thread holds it.
-    returns: Arc<Returns>,
     #[cfg(test)]
     ended: Condvar,
     // Times a thread was asked for.
@@ -208,98 +205,6 @@ struct Registry {
 impl Registry {
     fn lock(&self) -> MutexGuard<'_, Lanes> {
         self.lanes.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-// What the writers may hold of written buffers for the pipeline loop to
-// free: past it a writer frees the buffer itself.
-const RETURN_BYTES: u64 = 32 << 20;
-
-// Buffers the writers have written, held for the pipeline loop to free on
-// its own turn (`VolumeWriters::free_returned`): a decoded article's buffer
-// is freed on the loop's side, as it was before writers had threads, not
-// on a writer. Bounded by `RETURN_BYTES`; a writer never waits on it.
-// While the loop waits with nothing to drive, a writer frees in place
-// (`VolumeWriters::park_returns`): nothing is held for a turn that may not
-// come for a long time.
-struct Returns {
-    held: Mutex<Vec<Bytes>>,
-    bytes: AtomicU64,
-    limit: u64,
-    // Whether the loop waits with nothing to drive.
-    idle: AtomicBool,
-}
-
-impl Default for Returns {
-    fn default() -> Self {
-        Self::new(RETURN_BYTES)
-    }
-}
-
-impl Returns {
-    fn new(limit: u64) -> Self {
-        Self {
-            held: Mutex::default(),
-            bytes: AtomicU64::new(0),
-            limit,
-            idle: AtomicBool::new(false),
-        }
-    }
-
-    // `bytes` were written. The last share of a buffer goes back to the
-    // loop while there is room for it and the loop is not idle, and is
-    // freed here otherwise; dropping any other share frees nothing.
-    fn give(&self, bytes: Bytes, counts: &super::volume::WriterCounts) {
-        if !bytes.is_unique() {
-            return;
-        }
-        let len = bytes.len() as u64;
-        // Checked, then added: writers that check at once may each add past
-        // the limit, by one buffer per writer thread at most, which is fine.
-        if self.idle.load(Ordering::SeqCst)
-            || self.bytes.load(Ordering::Relaxed).saturating_add(len) > self.limit
-        {
-            counts.buffers_freed.fetch_add(1, Ordering::Relaxed);
-            break_span();
-            return;
-        }
-        self.bytes.fetch_add(len, Ordering::Relaxed);
-        self.held
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(bytes);
-        counts.buffers_returned.fetch_add(1, Ordering::Relaxed);
-        // The loop went idle after the check above, and may have freed what
-        // it held before this came: it is freed here instead.
-        if self.idle.load(Ordering::SeqCst) {
-            break_span();
-            self.take_all();
-        }
-    }
-
-    // Free what came back. One load when nothing did.
-    fn free(&self) {
-        if self.bytes.load(Ordering::Relaxed) == 0 {
-            return;
-        }
-        self.take_all();
-    }
-
-    fn take_all(&self) {
-        let held = std::mem::take(&mut *self.held.lock().unwrap_or_else(PoisonError::into_inner));
-        let len = held.iter().map(|bytes| bytes.len() as u64).sum::<u64>();
-        self.bytes.fetch_sub(len, Ordering::Relaxed);
-        drop(held);
-    }
-}
-
-// Held by the pipeline loop while it waits with nothing to drive: the
-// writers free what they write in place until it is dropped.
-pub(crate) struct ParkedReturns(Arc<Returns>);
-
-impl Drop for ParkedReturns {
-    fn drop(&mut self) {
-        self.0.idle.store(false, Ordering::SeqCst);
     }
 }
 
@@ -326,25 +231,6 @@ impl VolumeWriters {
             #[cfg(test)]
             mode: Mode::Threads,
         }
-    }
-
-    // Free the written buffers the writers handed back. Called by the
-    // pipeline loop on each of its turns; one load when none came back.
-    pub(crate) fn free_returned(&self) {
-        self.registry.returns.free();
-    }
-
-    // The pipeline loop is about to wait with nothing to drive: what came
-    // back is freed now, and the writers free in place until the returned
-    // guard is dropped as the wait ends. No wake is rung for it.
-    pub(crate) fn park_returns(&self) -> ParkedReturns {
-        let returns = &self.registry.returns;
-        returns.idle.store(true, Ordering::SeqCst);
-        // Taken under the lock, not after a load: a buffer a writer pushed
-        // before it saw the loop idle is freed here, and one pushed after
-        // is freed by that writer.
-        returns.take_all();
-        ParkedReturns(Arc::clone(returns))
     }
 
     // The same writers, ringing `rates` after every batch that wrote.
@@ -1396,9 +1282,6 @@ struct LaneState {
     stopped: Arc<AtomicBool>,
     // Where the loop's own waits end once the owner is stopping.
     loop_end: Arc<LoopEnd>,
-    // Where written buffers go back to the pipeline loop; `None` on a lane
-    // that runs on its callers, which free them where they are.
-    returns: Option<Arc<Returns>>,
     // The keys threads stand in `Barrier::wait_aside` for, so a stop can
     // wake them.
     aside: Mutex<Vec<Arc<Key>>>,
@@ -1478,7 +1361,6 @@ impl Lane {
     ) -> Arc<Self> {
         let stopped = Arc::clone(&registry.stopped);
         let loop_end = Arc::clone(&registry.loop_end);
-        let returns = (!inline).then(|| Arc::clone(&registry.returns));
         let registry = Arc::downgrade(registry);
         let (send, queued) = mpsc::channel();
         let state = Arc::new(LaneState {
@@ -1495,7 +1377,6 @@ impl Lane {
             below: Condvar::new(),
             stopped,
             loop_end,
-            returns,
             aside: Mutex::default(),
             #[cfg(test)]
             gate: Mutex::default(),
@@ -2471,11 +2352,14 @@ fn perform(
                     }
                     *wrote_at = Some(returned);
                     open.end = Some(offset + bytes.len() as u64);
-                    // Its count fell as the call returned (`in_hand`); the
-                    // buffer is freed on the loop's side.
-                    if let Some(returns) = &state.returns {
-                        returns.give(bytes, &volume.writer);
+                    // Its count fell as the call returned (`in_hand`). The
+                    // last share of the buffer is freed here, as soon as it
+                    // is written: the memory goes back while it is still
+                    // warm, and the next article decodes into it.
+                    if bytes.is_unique() {
+                        break_span();
                     }
+                    drop(bytes);
                     wrote
                 }
                 Ok(None) => Ok(()),

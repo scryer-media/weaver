@@ -81,10 +81,6 @@ pub(crate) struct WriterCounts {
     // Times the writer woke to mail after waiting for it: a send that found
     // it parked.
     pub(crate) woken: AtomicU64,
-    // Written buffers handed back to the pipeline loop to be freed there,
-    // and those the writer freed itself because the way back was full.
-    pub(crate) buffers_returned: AtomicU64,
-    pub(crate) buffers_freed: AtomicU64,
 }
 
 // What the pipeline loop stood still for.
