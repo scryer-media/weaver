@@ -1294,7 +1294,10 @@ impl SystemInfo {
     /// Every volume Weaver writes to, each with what it takes and what is
     /// being written to it. Read
     /// from what the disk owner holds; asks no disk.
-    async fn volumes(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<StorageVolumeWriteRate>> {
+    async fn volumes(
+        &self,
+        ctx: &Context<'_>,
+    ) -> async_graphql::Result<Vec<StorageVolumeWriteRate>> {
         let storage = ctx
             .data::<weaver_server_core::SharedPipelineState>()?
             .storage_capacity();

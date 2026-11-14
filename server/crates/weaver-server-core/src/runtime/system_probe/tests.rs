@@ -359,8 +359,14 @@ fn the_report_names_each_kind_of_storage_the_volumes_read() {
     use crate::operations::disk::StorageKind;
     assert_eq!(storage_class_of(StorageKind::Rotational), StorageClass::Hdd);
     assert_eq!(storage_class_of(StorageKind::Solid), StorageClass::Ssd);
-    assert_eq!(storage_class_of(StorageKind::Network), StorageClass::Network);
-    assert_eq!(storage_class_of(StorageKind::Unknown), StorageClass::Unknown);
+    assert_eq!(
+        storage_class_of(StorageKind::Network),
+        StorageClass::Network
+    );
+    assert_eq!(
+        storage_class_of(StorageKind::Unknown),
+        StorageClass::Unknown
+    );
 }
 
 // The report and the volumes read the same kind of storage.

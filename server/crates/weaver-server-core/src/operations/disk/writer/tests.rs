@@ -122,17 +122,29 @@ fn nothing_is_held_for_a_loop_that_waits_with_nothing_to_drive() {
     assert_eq!(count(&writers.registry.returns.bytes), 7);
 
     let parked = writers.park_returns();
-    assert_eq!(count(&writers.registry.returns.bytes), 0, "freed as the loop parks");
+    assert_eq!(
+        count(&writers.registry.returns.bytes),
+        0,
+        "freed as the loop parks"
+    );
     job.write(1, 7, Bytes::from(b"wick".to_vec()), None);
     job.barrier().wait();
     assert_eq!(count(&writers.registry.returns.bytes), 0);
-    assert_eq!(count(&volume.writer.buffers_freed), 1, "freed by the writer");
+    assert_eq!(
+        count(&volume.writer.buffers_freed),
+        1,
+        "freed by the writer"
+    );
     assert_eq!(count(&volume.writer.buffers_returned), 1);
 
     drop(parked);
     job.write(1, 11, Bytes::from(b"oil".to_vec()), None);
     job.barrier().wait();
-    assert_eq!(count(&writers.registry.returns.bytes), 3, "held for the loop again");
+    assert_eq!(
+        count(&writers.registry.returns.bytes),
+        3,
+        "held for the loop again"
+    );
     assert_eq!(std::fs::read(&path).unwrap(), b"lanternwickoil");
 }
 
@@ -381,9 +393,16 @@ fn a_closed_handle_is_dropped_once_the_batch_runs_nothing_more_of_its_key() {
     hold.release(2);
     hold.wait_held();
     let closed = closing.barrier();
-    assert!(closed.returned() && closed.passed(), "the key waited for the batch");
+    assert!(
+        closed.returned() && closed.passed(),
+        "the key waited for the batch"
+    );
     assert!(!other.barrier().returned());
-    assert_eq!(state.returned.load(Ordering::SeqCst), 3, "the settle went past it");
+    assert_eq!(
+        state.returned.load(Ordering::SeqCst),
+        3,
+        "the settle went past it"
+    );
     assert!(closing.barrier().key.held().letting_go.is_empty());
     hold.open();
     other.barrier().wait();
@@ -503,7 +522,10 @@ fn a_forced_failure_of_a_later_write_names_the_open_file() {
     barrier.wait();
     let report = reports.recv().unwrap();
     assert_eq!(report.failures.len(), 1);
-    assert_eq!((report.failures[0].key, report.failures[0].file), (4, Some(1)));
+    assert_eq!(
+        (report.failures[0].key, report.failures[0].file),
+        (4, Some(1))
+    );
     assert_eq!(report.failures[0].path, path);
     assert_eq!(std::fs::read(&path).unwrap(), b"head");
 }
@@ -878,7 +900,11 @@ fn settles_that_share_an_end_give_up_at_it_whatever_returned_meanwhile() {
 #[test]
 fn the_counters_hold_what_a_scripted_run_did() {
     let dir = tempfile::tempdir().unwrap();
-    let (a, x, z) = (dir.path().join("a"), dir.path().join("x"), dir.path().join("z"));
+    let (a, x, z) = (
+        dir.path().join("a"),
+        dir.path().join("x"),
+        dir.path().join("z"),
+    );
     let (writers, reports) = writers();
     let volume = volume("one");
     let hold = writers.hold(&volume);
@@ -921,7 +947,10 @@ fn the_counters_hold_what_a_scripted_run_did() {
     let report = reports.recv().unwrap();
     assert_eq!(report.failures.len(), 1);
     assert_eq!(report.failures[0].key, 0);
-    assert!(reports.try_recv().is_err(), "one report, for the one failure");
+    assert!(
+        reports.try_recv().is_err(),
+        "one report, for the one failure"
+    );
 }
 
 // A volume no thread can be started for is asked for one once, however many
@@ -1022,7 +1051,10 @@ fn a_producer_waits_until_the_bytes_waiting_fall_to_its_line() {
         hold.release(1);
         hold.wait_held();
         assert_eq!(count(&volume.buffered_bytes), 8);
-        assert!(!through.load(Ordering::SeqCst), "eight wait, above the line");
+        assert!(
+            !through.load(Ordering::SeqCst),
+            "eight wait, above the line"
+        );
         hold.release(1);
         producer.join().unwrap();
     });
@@ -1192,7 +1224,12 @@ fn a_stop_ends_the_waits_of_producers_and_readers_on_a_volume_that_stands_still(
     barrier.wait_aside();
     let later_hold = writers.hold(&later);
     let other = writers.submitter(&later, 2);
-    other.write(1, 0, Bytes::from_static(b"more"), create(&dir.path().join("b")));
+    other.write(
+        1,
+        0,
+        Bytes::from_static(b"more"),
+        create(&dir.path().join("b")),
+    );
     other.wait_below(0);
     other.barrier().wait_aside();
     assert!(!other.barrier().returned());
@@ -1284,7 +1321,11 @@ fn the_loops_read_of_a_stuck_volume_ends_at_the_stops_end() {
     // The wait is counted as a read, the kind the metrics label it.
     let kind = |kind: LoopWait| count(&volume.writer.loop_waits_by_kind[kind as usize]);
     assert_eq!(
-        (kind(LoopWait::Read), kind(LoopWait::Settle), kind(LoopWait::Budget)),
+        (
+            kind(LoopWait::Read),
+            kind(LoopWait::Settle),
+            kind(LoopWait::Budget)
+        ),
         (1, 0, 0)
     );
     assert!(job.left());
@@ -1309,7 +1350,12 @@ fn a_producer_does_not_wait_on_a_volume_with_no_thread() {
     // Bytes counted as waiting by something else do not hold it either.
     volume.buffered_bytes.store(64, Ordering::SeqCst);
     job.wait_below(0);
-    job.write(1, 0, Bytes::from_static(b"lost"), create(&dir.path().join("a")));
+    job.write(
+        1,
+        0,
+        Bytes::from_static(b"lost"),
+        create(&dir.path().join("a")),
+    );
     job.wait_below(0);
     assert!(job.barrier().failed());
 }
@@ -1419,9 +1465,9 @@ fn reporting_what_is_outstanding(
         }
         let lane = at.lock().unwrap();
         let state = &lane.as_ref().expect("the volume is known").state;
-        into.lock().unwrap().push(
-            state.sent.load(Ordering::SeqCst) - state.returned.load(Ordering::SeqCst),
-        );
+        into.lock()
+            .unwrap()
+            .push(state.sent.load(Ordering::SeqCst) - state.returned.load(Ordering::SeqCst));
     }));
     (writers, lane, seen)
 }
@@ -1437,7 +1483,12 @@ fn a_batchs_failures_are_reported_before_a_settle_of_it_can_end() {
     let hold = writers.hold(&volume);
     let job = writers.submitter(&volume, 1);
     *lane.lock().unwrap() = Some(Arc::clone(&job.lane));
-    job.write(1, 0, Bytes::from_static(b"kept"), create(&dir.path().join("a")));
+    job.write(
+        1,
+        0,
+        Bytes::from_static(b"kept"),
+        create(&dir.path().join("a")),
+    );
     job.write(1, 4, Bytes::from_static(b"lost"), None);
     hold.wait_held();
     hold.release(1);
@@ -1462,7 +1513,12 @@ fn a_failure_on_a_volume_with_no_thread_is_reported_before_a_settle_can_end() {
     let job = writers.submitter(&volume, 1);
     *lane.lock().unwrap() = Some(Arc::clone(&job.lane));
 
-    job.write(1, 0, Bytes::from_static(b"lost"), create(&dir.path().join("a")));
+    job.write(
+        1,
+        0,
+        Bytes::from_static(b"lost"),
+        create(&dir.path().join("a")),
+    );
 
     writers.settle();
     assert_eq!(*seen.lock().unwrap(), [1]);
@@ -1501,7 +1557,10 @@ fn the_volumes_own_work_runs_only_when_nothing_is_queued() {
     // has taken the work and the forgetting, and stands: not run.
     writers.volume_submitter(&volume).when_idle(own);
     watch.wait_parked();
-    assert!(begun.try_recv().is_err(), "not ahead of the job's first write");
+    assert!(
+        begun.try_recv().is_err(),
+        "not ahead of the job's first write"
+    );
     // The job's write comes down first. Out of work, the writer runs it.
     job.write(1, 0, Bytes::from_static(b"first"), create(&path));
     assert_eq!(begun.recv().unwrap().as_deref(), Some(&b"first"[..]));
@@ -1527,7 +1586,9 @@ fn the_volumes_own_work_runs_only_when_nothing_is_queued() {
 
     // On a volume no caller holds it runs at once.
     let (ran, run) = mpsc::channel();
-    writers.volume_submitter(&other).when_idle(move || ran.send(()).unwrap());
+    writers
+        .volume_submitter(&other)
+        .when_idle(move || ran.send(()).unwrap());
     run.recv().unwrap();
 }
 
@@ -1541,12 +1602,19 @@ fn the_volumes_own_work_is_dropped_at_a_stop() {
     let volume = volume("one");
     let hold = writers.hold(&volume);
     let job = writers.submitter(&volume, 1);
-    job.write(1, 0, Bytes::from_static(b"kept"), create(&dir.path().join("a")));
+    job.write(
+        1,
+        0,
+        Bytes::from_static(b"kept"),
+        create(&dir.path().join("a")),
+    );
     // The thread stands before the write: nothing after it is looked at
     // until the test lets it through.
     hold.wait_held();
     let (ran, run) = mpsc::channel::<()>();
-    writers.volume_submitter(&volume).when_idle(move || ran.send(()).unwrap());
+    writers
+        .volume_submitter(&volume)
+        .when_idle(move || ran.send(()).unwrap());
     writers.stop_waits();
     hold.open();
     job.barrier().wait();
@@ -1582,7 +1650,11 @@ fn a_write_is_counted_as_its_call_returns_not_at_the_end_of_its_batch() {
     job.barrier().wait();
     assert_eq!(count(&volume.written_bytes), 7);
     assert_eq!(count(&volume.write_calls), 2);
-    assert_eq!(count(&volume.write_seeks), 0, "the second write follows the first");
+    assert_eq!(
+        count(&volume.write_seeks),
+        0,
+        "the second write follows the first"
+    );
     drop((job, hold));
     writers.wait_ended(&volume);
 }

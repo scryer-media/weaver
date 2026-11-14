@@ -87,7 +87,9 @@ fn cached_rotates(disk: Option<String>, ask: impl FnOnce() -> Option<bool>) -> O
     // Asked outside the lock: an answer may take a moment.
     let rotates = ask()?;
     if let Some(disk) = disk {
-        lock().get_or_insert_with(HashMap::new).insert(disk, rotates);
+        lock()
+            .get_or_insert_with(HashMap::new)
+            .insert(disk, rotates);
     }
     Some(rotates)
 }
@@ -265,7 +267,10 @@ fn look(path: &Path) -> Look<impl FnOnce() -> Option<bool>> {
 fn drive_letter(root: &[u16]) -> Option<u16> {
     let verbatim: Vec<u16> = "\\\\?\\".encode_utf16().collect();
     let root = root.strip_prefix(verbatim.as_slice()).unwrap_or(root);
-    let end = root.iter().position(|&unit| unit == 0).unwrap_or(root.len());
+    let end = root
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(root.len());
     match &root[..end] {
         [letter, colon] | [letter, colon, _]
             if *colon == u16::from(b':')
@@ -402,10 +407,7 @@ mod tests {
         let disk = || Some("test:a_disk_that_answered".to_owned());
         assert_eq!(cached_rotates(disk(), || None), None);
         assert_eq!(cached_rotates(disk(), || Some(true)), Some(true));
-        assert_eq!(
-            cached_rotates(disk(), || panic!("asked again")),
-            Some(true)
-        );
+        assert_eq!(cached_rotates(disk(), || panic!("asked again")), Some(true));
         // A disk with no name to keep it by is asked each time.
         assert_eq!(cached_rotates(None, || Some(false)), Some(false));
         assert_eq!(cached_rotates(None, || Some(true)), Some(true));
@@ -422,8 +424,14 @@ mod tests {
             solid_state_said("   Solid State:               No\n"),
             Some(false)
         );
-        assert_eq!(solid_state_said("   Solid State:               Info not available\n"), None);
-        assert_eq!(solid_state_said("   Protocol:                  USB\n"), None);
+        assert_eq!(
+            solid_state_said("   Solid State:               Info not available\n"),
+            None
+        );
+        assert_eq!(
+            solid_state_said("   Protocol:                  USB\n"),
+            None
+        );
     }
 
     #[test]

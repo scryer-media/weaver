@@ -262,7 +262,9 @@ mod tests {
     #[test]
     fn macos_sizes_only_apfs() {
         assert!(apple_makes_holes("apfs"));
-        for filesystem in ["hfs", "smbfs", "nfs", "afpfs", "exfat", "msdos", "macfuse", ""] {
+        for filesystem in [
+            "hfs", "smbfs", "nfs", "afpfs", "exfat", "msdos", "macfuse", "",
+        ] {
             assert!(!apple_makes_holes(filesystem), "{filesystem}");
         }
     }

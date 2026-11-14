@@ -541,7 +541,10 @@ async fn with_recovery_off_a_stall_is_only_logged() {
     assert_eq!(pipeline.last_download_dispatch_stall_log_at, None);
     let logged_at = t0 + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL;
     pipeline.dispatch_downloads_at(logged_at);
-    assert_eq!(pipeline.last_download_dispatch_stall_log_at, Some(logged_at));
+    assert_eq!(
+        pipeline.last_download_dispatch_stall_log_at,
+        Some(logged_at)
+    );
     let kick_window = t0 + DOWNLOAD_DISPATCH_STALL_KICK_AFTER;
     pipeline.dispatch_downloads_at(kick_window);
     let past_release =

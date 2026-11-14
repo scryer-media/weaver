@@ -195,10 +195,15 @@ impl NamespaceWriter {
             second_name_or_empty(&from, &at);
             Ok(())
         });
-        if !self.envelopes.start_after(child, envelope, &name, true, made) {
-            to.run(None, link.clone(), move || match std::fs::remove_file(&link) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
-                _ => Ok(()),
+        if !self
+            .envelopes
+            .start_after(child, envelope, &name, true, made)
+        {
+            to.run(None, link.clone(), move || {
+                match std::fs::remove_file(&link) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+                    _ => Ok(()),
+                }
             });
         }
     }

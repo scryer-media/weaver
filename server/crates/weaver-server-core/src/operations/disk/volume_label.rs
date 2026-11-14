@@ -68,7 +68,10 @@ fn mount_path(existing: &Path) -> Option<String> {
 #[cfg(windows)]
 fn mount_path(existing: &Path) -> Option<String> {
     let root = super::storage_kind::volume_root(existing)?;
-    let length = root.iter().position(|unit| *unit == 0).unwrap_or(root.len());
+    let length = root
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(root.len());
     Some(String::from_utf16_lossy(&root[..length]))
 }
 
@@ -81,9 +84,11 @@ fn mount_path(existing: &Path) -> Option<String> {
     let existing = std::fs::canonicalize(existing).ok()?;
     let device = std::fs::metadata(&existing).ok()?.dev();
     Some(
-        top_on_device(&existing, |at| {
-            std::fs::metadata(at).ok().map(|metadata| metadata.dev())
-        }, device)
+        top_on_device(
+            &existing,
+            |at| std::fs::metadata(at).ok().map(|metadata| metadata.dev()),
+            device,
+        )
         .display()
         .to_string(),
     )
@@ -150,7 +155,10 @@ mod tests {
             top_on_device(Path::new("/mnt/nas/downloads/job"), device_of, 2),
             Path::new("/mnt/nas")
         );
-        assert_eq!(top_on_device(Path::new("/mnt"), device_of, 1), Path::new("/"));
+        assert_eq!(
+            top_on_device(Path::new("/mnt"), device_of, 1),
+            Path::new("/")
+        );
         assert_eq!(
             top_on_device(Path::new("/mnt/nas"), device_of, 2),
             Path::new("/mnt/nas")
@@ -177,7 +185,10 @@ mod tests {
             label_from(Some("/mnt/nas".into()), Path::new("/mnt/nas/job"), unasked),
             "/mnt/nas"
         );
-        assert_eq!(label_from(Some("/".into()), Path::new("/srv/job"), unasked), "/");
+        assert_eq!(
+            label_from(Some("/".into()), Path::new("/srv/job"), unasked),
+            "/"
+        );
     }
 
     // Two volumes whose mounts cannot be read share a root. Neither takes

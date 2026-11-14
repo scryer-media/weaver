@@ -482,7 +482,11 @@ mod tests {
     // An owner whose roots lie under `dir`, each read once and not again.
     fn owner(dir: &Path) -> StorageCapacity {
         let storage = StorageCapacity::with_probe(
-            [dir.join("data"), dir.join("intermediate"), dir.join("complete")],
+            [
+                dir.join("data"),
+                dir.join("intermediate"),
+                dir.join("complete"),
+            ],
             NEVER,
             Arc::new(|_| {
                 Ok(DiskSpace {
@@ -524,7 +528,11 @@ mod tests {
         let meanwhile = storage.volume(&asked);
 
         assert_eq!(meanwhile.device, None);
-        assert!(meanwhile.label.ends_with("(device unknown)"), "{}", meanwhile.label);
+        assert!(
+            meanwhile.label.ends_with("(device unknown)"),
+            "{}",
+            meanwhile.label
+        );
         // The read is out, on another thread, while the asker has its answer.
         assert_eq!(entered.blocking_recv().as_deref(), Some(asked.as_path()));
         // Asked again meanwhile: the same answer, and the path is not
@@ -638,7 +646,10 @@ mod tests {
         assert!(storage.known_volume(&job).is_none());
         assert!(storage.known_volume(&shows).is_none());
         // A directory of the root's beside the folder is still the root's.
-        assert_eq!(storage.volume(&complete.join("films").join("job-2")).device, Some(6));
+        assert_eq!(
+            storage.volume(&complete.join("films").join("job-2")).device,
+            Some(6)
+        );
         drop(release);
         storage.volumes.wait_read();
         let after = looks();
@@ -703,7 +714,11 @@ mod tests {
         }
 
         let known = storage.volumes.lock();
-        assert_eq!(known.by_path.len(), REMEMBERED_PATHS, "one out for each one in");
+        assert_eq!(
+            known.by_path.len(),
+            REMEMBERED_PATHS,
+            "one out for each one in"
+        );
         assert!(known.by_path.contains_key(&live));
         assert!(!known.by_path.contains_key(&under(0)), "the oldest went");
         assert!(known.by_path.contains_key(&under(REMEMBERED_PATHS - 2)));
@@ -733,8 +748,16 @@ mod tests {
         let generation = storage.volumes.generation();
 
         root_volume.write_rate.store(300_000_000, Ordering::Relaxed);
-        assert_eq!(storage.slowest_write_mbps(&roots, &[]), 300.0, "a new sample is read");
-        assert_eq!(storage.volumes.generation(), generation, "no path was looked up again");
+        assert_eq!(
+            storage.slowest_write_mbps(&roots, &[]),
+            300.0,
+            "a new sample is read"
+        );
+        assert_eq!(
+            storage.volumes.generation(),
+            generation,
+            "no path was looked up again"
+        );
 
         let folders = [shows.clone()];
         storage.set_folders(&folders);
@@ -742,10 +765,18 @@ mod tests {
         let shows_volume = storage.volume(&shows);
         assert_eq!(shows_volume.device, Some(8));
         shows_volume.write_rate.store(90_000_000, Ordering::Relaxed);
-        assert_eq!(storage.slowest_write_mbps(&roots, &folders), 90.0, "the folder's volume is found");
+        assert_eq!(
+            storage.slowest_write_mbps(&roots, &folders),
+            90.0,
+            "the folder's volume is found"
+        );
 
         storage.set_folders(&[]);
-        assert_eq!(storage.slowest_write_mbps(&roots, &[]), 300.0, "the folder left");
+        assert_eq!(
+            storage.slowest_write_mbps(&roots, &[]),
+            300.0,
+            "the folder left"
+        );
     }
 
     // A path whose device could not be read keeps that answer for a while,
@@ -770,10 +801,16 @@ mod tests {
         test_devices::assign(&asked, 61);
         let generation = storage.volumes.generation();
         storage.volumes.age_retries();
-        assert!(Arc::ptr_eq(&storage.volume(&asked), &failed), "answered meanwhile");
+        assert!(
+            Arc::ptr_eq(&storage.volume(&asked), &failed),
+            "answered meanwhile"
+        );
         storage.volumes.wait_read();
 
-        assert!(storage.volumes.generation() > generation, "the read that landed moved it");
+        assert!(
+            storage.volumes.generation() > generation,
+            "the read that landed moved it"
+        );
         let read = storage.volume(&asked);
         assert_eq!(read.device, Some(61));
         let after = looks();
@@ -805,7 +842,9 @@ mod tests {
             let mut unread = storage.volumes.unread();
             unread.running = true;
             for index in 0..UNREAD_PATHS {
-                unread.paths.insert(dir.path().join(format!("queued-{index}")));
+                unread
+                    .paths
+                    .insert(dir.path().join(format!("queued-{index}")));
             }
         }
         assert_eq!(storage.slowest_write_mbps(&roots, &[]), 400.0);
@@ -826,7 +865,11 @@ mod tests {
         assert_eq!(read.device, Some(62));
         read.write_rate.store(50_000_000, Ordering::Relaxed);
 
-        assert_eq!(storage.slowest_write_mbps(&roots, &[]), 50.0, "the read volume is found");
+        assert_eq!(
+            storage.slowest_write_mbps(&roots, &[]),
+            50.0,
+            "the read volume is found"
+        );
         let rates = storage.volumes.rate_volumes.lock().unwrap();
         assert!(rates.as_ref().unwrap().settled());
     }

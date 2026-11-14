@@ -21,9 +21,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use weaver_graph::{ByteRange, Coverage, Lost, VolumeIndex, Volumes};
 
+use crate::operations::disk::writer::Barrier;
 use crate::pipeline::graph::decoding::Decoding;
 use crate::pipeline::graph::envelope::{ReadFiles, Shelf, Shelved};
-use crate::operations::disk::writer::Barrier;
 use crate::pipeline::graph::leaf::read_exact_at;
 
 #[derive(Debug, thiserror::Error)]
@@ -211,7 +211,10 @@ impl RunVolumes {
             match kept {
                 Some(kept) if kept.coverage.verified(want) => {
                     kept.reached = kept.reached.max(want.end);
-                    return Ok((want.len(), Some((kept.path().to_path_buf(), kept.settled()))));
+                    return Ok((
+                        want.len(),
+                        Some((kept.path().to_path_buf(), kept.settled())),
+                    ));
                 }
                 Some(kept) if kept.settled => {
                     return match settled(&kept.coverage, want) {

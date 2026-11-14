@@ -161,7 +161,14 @@ impl NamespaceWriter {
         }
         #[cfg(test)]
         count(|tally| tally.waiting_opens += 1);
-        let waiting = waiting_name(self.envelopes.given(), to.as_ref(), root, node, member, name);
+        let waiting = waiting_name(
+            self.envelopes.given(),
+            to.as_ref(),
+            root,
+            node,
+            member,
+            name,
+        );
         let mut leaf = Leaf::at(root, &waiting).through(to.as_ref());
         leaf.intend(name);
         self.moves.push(Waiting {

@@ -273,7 +273,9 @@ impl Pipeline {
     pub(in crate::pipeline) fn download_lane_held_bytes(&self, lane_id: u64) -> (usize, u64) {
         self.download_lane_owners
             .get(&lane_id)
-            .map_or((0, 0), |owner| (owner.outstanding.len(), owner.outstanding_bytes))
+            .map_or((0, 0), |owner| {
+                (owner.outstanding.len(), owner.outstanding_bytes)
+            })
     }
 
     pub(in crate::pipeline) fn download_lane_holdings_of_job(

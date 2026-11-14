@@ -2170,8 +2170,7 @@ pub struct Pipeline {
     // one's report. The mail that says the barrier returned, or the report,
     // starts the delivery again; mail of the job's other file operations
     // does not.
-    pub(super) moves_awaiting_disk:
-        HashMap<JobId, crate::pipeline::graph::disk::JobBarrier>,
+    pub(super) moves_awaiting_disk: HashMap<JobId, crate::pipeline::graph::disk::JobBarrier>,
     // Complete destinations reserved for in-flight moves so concurrent jobs do not collide.
     pub(super) reserved_complete_destinations: HashMap<JobId, PathBuf>,
     // Shared state for control plane reads (API handlers read without channel round-trip).

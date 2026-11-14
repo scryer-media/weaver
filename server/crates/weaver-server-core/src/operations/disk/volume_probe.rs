@@ -286,7 +286,9 @@ mod tests {
     use std::sync::atomic::AtomicU64;
 
     use super::*;
-    use crate::runtime::system_probe::{PROBE_CHUNK_BYTES, probe_file_bytes, probe_file_bytes_until};
+    use crate::runtime::system_probe::{
+        PROBE_CHUNK_BYTES, probe_file_bytes, probe_file_bytes_until,
+    };
 
     const MIB: u64 = 1024 * 1024;
     const DAY: u64 = 24 * 60 * 60;
@@ -426,15 +428,32 @@ mod tests {
         );
         volume.buffered_bytes.store(MIB, Ordering::Relaxed);
         probe_once(Arc::clone(&volume), data.path().to_path_buf(), early)().unwrap();
-        assert_eq!(asked.load(Ordering::Relaxed), 1, "the writes waiting were seen");
-        assert_eq!(rate_of(&volume), 0, "one chunk's figure is not put on the volume");
+        assert_eq!(
+            asked.load(Ordering::Relaxed),
+            1,
+            "the writes waiting were seen"
+        );
+        assert_eq!(
+            rate_of(&volume),
+            0,
+            "one chunk's figure is not put on the volume"
+        );
         assert!(!data.path().join(PROBE_RECORD).exists());
 
         let (reopened, probes) = store(data.path(), 1000, Some(900_000_000));
         let after_restart = self::volume(Some(1), "/");
         assert!(!reopened.apply_stored(&after_restart));
-        probe_once(Arc::clone(&after_restart), data.path().to_path_buf(), reopened)().unwrap();
-        assert_eq!(probes.load(Ordering::Relaxed), 1, "the next start probes again");
+        probe_once(
+            Arc::clone(&after_restart),
+            data.path().to_path_buf(),
+            reopened,
+        )()
+        .unwrap();
+        assert_eq!(
+            probes.load(Ordering::Relaxed),
+            1,
+            "the next start probes again"
+        );
         assert_eq!(rate_of(&after_restart), 900_000_000);
         let (stored, _) = store(data.path(), 1000, None);
         assert!(stored.apply_stored(&self::volume(Some(1), "/")));
@@ -475,7 +494,12 @@ mod tests {
         let (store, probes) = store(data.path(), 1000, Some(50));
 
         std::fs::write(&scratch, b"left behind").unwrap();
-        probe_once(volume(Some(1), "/"), dir.path().to_path_buf(), store.clone())().unwrap();
+        probe_once(
+            volume(Some(1), "/"),
+            dir.path().to_path_buf(),
+            store.clone(),
+        )()
+        .unwrap();
         assert!(!scratch.exists());
 
         std::fs::write(&scratch, b"left behind").unwrap();
@@ -601,7 +625,12 @@ mod tests {
     fn a_volume_whose_identity_changed_is_probed_again() {
         let data = tempfile::tempdir().unwrap();
         let (first, _) = store(data.path(), 1000, Some(180_000_000));
-        probe_once(volume(Some(1), "/mnt/pool"), data.path().to_path_buf(), first)().unwrap();
+        probe_once(
+            volume(Some(1), "/mnt/pool"),
+            data.path().to_path_buf(),
+            first,
+        )()
+        .unwrap();
 
         let (second, probes) = store(data.path(), 1000, Some(60_000_000));
         let replaced = volume(Some(9), "/mnt/pool");
@@ -618,9 +647,18 @@ mod tests {
     fn an_old_figure_is_probed_again_and_old_rows_are_dropped() {
         let data = tempfile::tempdir().unwrap();
         let (first, _) = store(data.path(), 1000, Some(180_000_000));
-        probe_once(volume(Some(1), "/"), data.path().to_path_buf(), Arc::clone(&first))()
-            .unwrap();
-        probe_once(volume(Some(2), "/mnt/gone"), data.path().to_path_buf(), first)().unwrap();
+        probe_once(
+            volume(Some(1), "/"),
+            data.path().to_path_buf(),
+            Arc::clone(&first),
+        )()
+        .unwrap();
+        probe_once(
+            volume(Some(2), "/mnt/gone"),
+            data.path().to_path_buf(),
+            first,
+        )()
+        .unwrap();
 
         let (later, probes) = store(data.path(), 1000 + 7 * DAY, Some(120_000_000));
         let volume = volume(Some(1), "/");

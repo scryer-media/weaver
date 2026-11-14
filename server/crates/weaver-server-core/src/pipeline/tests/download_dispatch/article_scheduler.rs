@@ -958,7 +958,14 @@ async fn a_small_job_is_shared_over_every_connection() {
     assert_eq!(works.len(), 9);
     let held = lane_holding(&mut pipeline, hot, works.len(), lane.depth);
     match ask_as_lane(&mut pipeline, SERVER_A, 18, held) {
-        Handout::Saturated(wake) => assert_eq!(wake, SaturationWake { of: None, below: 9, room: false }),
+        Handout::Saturated(wake) => assert_eq!(
+            wake,
+            SaturationWake {
+                of: None,
+                below: 9,
+                room: false
+            }
+        ),
         other => panic!(
             "a full lane does not open the next job, got {:?}",
             taken(other).len()
@@ -1029,7 +1036,14 @@ async fn a_lane_at_its_share_is_saturated_rather_than_spilled() {
     // and is not opened to it: it waits on its own pipe, not on any share.
     let full_elsewhere = lane_holding(&mut pipeline, next, 17, 8);
     match ask_as_lane(&mut pipeline, SERVER_A, 18, full_elsewhere) {
-        Handout::Saturated(wake) => assert_eq!(wake, SaturationWake { of: None, below: 9, room: false }),
+        Handout::Saturated(wake) => assert_eq!(
+            wake,
+            SaturationWake {
+                of: None,
+                below: 9,
+                room: false
+            }
+        ),
         other => panic!(
             "a full lane does not open another job, got {:?}",
             taken(other).len()
@@ -1094,7 +1108,11 @@ async fn saturation_is_only_charged_by_a_job_that_could_serve_the_lane() {
     match ask_as_lane(&mut pipeline, SERVER_A, 18, lane) {
         Handout::Saturated(wake) => assert_eq!(
             wake,
-            SaturationWake { of: None, below: 9, room: false },
+            SaturationWake {
+                of: None,
+                below: 9,
+                room: false
+            },
             "the walk went on to the next job; only the lane's full pipe holds it"
         ),
         other => panic!(
@@ -1186,9 +1204,7 @@ async fn a_lane_leases_only_its_part_of_the_room_its_jobs_volume_has_left() {
     // and one holding none is handed a whole pipe. Above the volume's
     // resume line the held lane waits for the volume, not for what it
     // holds: it is answered once the volume has fallen to that line.
-    volume
-        .arrived_bytes
-        .store(hard - 4 * 512, Ordering::SeqCst);
+    volume.arrived_bytes.store(hard - 4 * 512, Ordering::SeqCst);
     assert!(volume.unwritten_bytes() > volume.resume_line());
     let short = lane_holding(&mut pipeline, hot, 2, 8);
     assert_eq!(
@@ -1199,7 +1215,10 @@ async fn a_lane_leases_only_its_part_of_the_room_its_jobs_volume_has_left() {
             room: true,
         }
     );
-    assert!(pipeline.ask_room_wake(hot), "the volume holds a wake at its line");
+    assert!(
+        pipeline.ask_room_wake(hot),
+        "the volume holds a wake at its line"
+    );
     let empty = lane_holding(&mut pipeline, hot, 0, 8);
     let works = taken(ask_as_lane(&mut pipeline, SERVER_A, 18, empty));
     assert_eq!(works.len(), 9, "a whole pipe of 9");

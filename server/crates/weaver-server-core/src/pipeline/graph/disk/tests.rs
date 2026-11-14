@@ -513,7 +513,10 @@ fn a_job_on_two_volumes_waits_for_both() {
         disk.under(&path)
             .run(None, path, move || std::fs::write(&to, b"lantern"));
     }
-    assert!(Arc::ptr_eq(disk.under(&output_dir.join("lantern.bin")).volume(), &other));
+    assert!(Arc::ptr_eq(
+        disk.under(&output_dir.join("lantern.bin")).volume(),
+        &other
+    ));
     let barrier = disk.barrier();
     assert!(!disk.quiet());
     hold.open();
@@ -527,7 +530,10 @@ fn a_job_on_two_volumes_waits_for_both() {
     barrier.wait();
     assert!(disk.quiet());
     assert!(barrier.returned());
-    assert!(!barrier.passed(), "a failure on either volume stands against the job");
+    assert!(
+        !barrier.passed(),
+        "a failure on either volume stands against the job"
+    );
     let failures: Vec<_> = through
         .reports
         .iter()
@@ -592,7 +598,10 @@ fn a_job_fails_at_once_where_no_writer_thread_can_start() {
     assert!(barrier.returned());
     assert!(!barrier.passed());
     assert!(disk.failed());
-    let failures: Vec<_> = reports.try_iter().flat_map(|report| report.failures).collect();
+    let failures: Vec<_> = reports
+        .try_iter()
+        .flat_map(|report| report.failures)
+        .collect();
     assert!(!failures.is_empty());
     assert!(failures.iter().all(|failure| failure.key == 1));
     assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 0);
@@ -723,7 +732,10 @@ fn a_released_file_is_released_again_only_after_another_operation() {
     leaf.write(7, b"light", None).unwrap();
     leaf.release_handle();
     let again = to.barrier();
-    assert!(!again.returned(), "the file was opened again and is released");
+    assert!(
+        !again.returned(),
+        "the file was opened again and is released"
+    );
     hold.open();
     again.wait();
     assert!(again.passed());
@@ -756,12 +768,15 @@ fn a_fold_never_waits_for_the_file_s_operations() {
     leaf.fold_read(7, digest);
     assert_eq!(leaf.folded(7, Algorithm::Crc32), Some(digest.value));
     leaf.fold_passed(7, digest);
-    assert_eq!(leaf.folded(7, Algorithm::Crc32), None, "the write is still out");
+    assert_eq!(
+        leaf.folded(7, Algorithm::Crc32),
+        None,
+        "the write is still out"
+    );
     leaf.fold_vouched([(weaver_graph::ByteRange::new(0, 7), digest)]);
     assert_eq!(leaf.folded(7, Algorithm::Crc32), None);
     let waited = || {
-        through.volume.writer.loop_waits_by_kind[LoopWait::Settle as usize]
-            .load(Ordering::Relaxed)
+        through.volume.writer.loop_waits_by_kind[LoopWait::Settle as usize].load(Ordering::Relaxed)
     };
     assert_eq!(waited(), 0, "nothing stood still for the held operation");
 
@@ -779,7 +794,10 @@ fn a_fold_never_waits_for_the_file_s_operations() {
 #[test]
 fn a_checkpoint_s_floor_counts_decoded_bytes() {
     let encoded = PIECE + PIECE / 32;
-    let (mut job, _dir, _) = job_with(&[file("part0.mkv", &[encoded; PIECES as usize])], Vec::new());
+    let (mut job, _dir, _) = job_with(
+        &[file("part0.mkv", &[encoded; PIECES as usize])],
+        Vec::new(),
+    );
     for ordinal in 0..PIECES {
         arrive(&mut job, 0, ordinal);
     }

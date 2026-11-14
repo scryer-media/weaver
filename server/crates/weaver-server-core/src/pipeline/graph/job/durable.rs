@@ -343,10 +343,7 @@ fn leave_out(coverage: Vec<CoverageRecord>, held: &[ByteRange]) -> Vec<CoverageR
             span += 1;
         }
         if at < run.end {
-            out.push(CoverageRecord {
-                start: at,
-                ..run
-            });
+            out.push(CoverageRecord { start: at, ..run });
         }
     }
     out

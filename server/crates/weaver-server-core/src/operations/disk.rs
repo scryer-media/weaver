@@ -18,8 +18,8 @@ pub(crate) mod holes;
 mod storage_kind;
 pub(crate) mod volume;
 pub(crate) mod volume_label;
-pub(crate) mod volume_rate;
 mod volume_probe;
+pub(crate) mod volume_rate;
 mod volume_view;
 mod volumes;
 pub(crate) mod writer;
@@ -347,7 +347,9 @@ fn volume_identity(name: &[u16]) -> u64 {
             unit => unit,
         })
         .flat_map(u16::to_le_bytes)
-        .fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
+        .fold(OFFSET, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+        })
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1343,7 +1345,13 @@ enum Unsettled {
 // Windows a disk is read only at a folder, so a file there is passed over
 // for the folder that holds it.
 fn nearest_existing_ancestor(path: &Path) -> PathBuf {
-    let reads_a_disk = |at: &Path| if cfg!(windows) { at.is_dir() } else { at.exists() };
+    let reads_a_disk = |at: &Path| {
+        if cfg!(windows) {
+            at.is_dir()
+        } else {
+            at.exists()
+        }
+    };
     path.ancestors()
         .find(|candidate| !candidate.as_os_str().is_empty() && reads_a_disk(candidate))
         .unwrap_or(path)
@@ -1787,8 +1795,10 @@ impl StorageCapacity {
     // a test of the limit itself.
     #[cfg(test)]
     fn set_on_demand_timeout(&self, timeout: Duration) {
-        self.on_demand_timeout_nanos
-            .store(timeout.as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
+        self.on_demand_timeout_nanos.store(
+            timeout.as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
     }
 
     // The free space of each asked path, in the order asked: a root's

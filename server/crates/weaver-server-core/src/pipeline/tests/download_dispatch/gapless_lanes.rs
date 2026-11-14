@@ -724,7 +724,7 @@ async fn a_lane_held_for_a_full_volume_is_asked_again_only_once_it_has_room() {
     let refused = |pipeline: &Pipeline| {
         pipeline.metrics.download_scheduler_hot_blocked_total
             [crate::SchedulerBlockClause::WriteBuffer.index()]
-            .load(Ordering::Relaxed)
+        .load(Ordering::Relaxed)
     };
 
     // Two results wait for the loop: the volume holds its limit, and the
@@ -746,7 +746,11 @@ async fn a_lane_held_for_a_full_volume_is_asked_again_only_once_it_has_room() {
     }
     assert!(response_rx.try_recv().is_err());
     assert_eq!(pipeline.held_download_refills.len(), 1);
-    assert_eq!(refused(&pipeline), refused_once, "the job was not asked again");
+    assert_eq!(
+        refused(&pipeline),
+        refused_once,
+        "the job was not asked again"
+    );
 
     // The loop hands both results on: the volume has room, dispatch is
     // woken, and the next pass answers the lane.
@@ -794,15 +798,25 @@ async fn a_lane_held_for_room_is_asked_again_once_its_volume_falls_to_its_resume
     let line = volume.resume_line();
     let counted = |pipeline: &Pipeline| {
         (
-            pipeline.metrics.download_lane_room_held_total.load(Ordering::Relaxed),
-            pipeline.metrics.download_lane_room_woken_total.load(Ordering::Relaxed),
+            pipeline
+                .metrics
+                .download_lane_room_held_total
+                .load(Ordering::Relaxed),
+            pipeline
+                .metrics
+                .download_lane_room_woken_total
+                .load(Ordering::Relaxed),
         )
     };
 
     // With room, the lane is handed a lease.
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(refill_request_on(lane_id, 0, response_tx));
-    response_rx.await.unwrap().lease.expect("a lane with room is served");
+    response_rx
+        .await
+        .unwrap()
+        .lease
+        .expect("a lane with room is served");
     assert!(pipeline.download_lane_holdings(lane_id) > 0);
 
     // One article of room left, above the resume line: the next ask is
@@ -840,7 +854,10 @@ async fn a_lane_held_for_room_is_asked_again_once_its_volume_falls_to_its_resume
     // and the pass answers the lane.
     pipeline.finish_released_download_result_processing(job_id, 512);
     assert!(volume.unwritten_bytes() <= line);
-    assert!(pipeline.download_dispatch_wake, "the crossing wakes dispatch");
+    assert!(
+        pipeline.download_dispatch_wake,
+        "the crossing wakes dispatch"
+    );
     pipeline.service_held_download_refills();
     let lease = response_rx
         .await
@@ -882,7 +899,11 @@ async fn room_held_idle_lane(
     );
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(refill_request_on(lane_id, 0, response_tx));
-    response_rx.await.unwrap().lease.expect("a lane with room is served");
+    response_rx
+        .await
+        .unwrap()
+        .lease
+        .expect("a lane with room is served");
     for _ in 0..63 {
         pipeline.note_released_download_result_pending(job_id, 512);
     }
@@ -972,10 +993,10 @@ async fn a_job_removed_while_its_lane_is_held_for_room_leaves_no_standing_hold()
     let job_id = JobId(41406);
     let (_lane_id, mut response_rx, _volume) = room_held_idle_lane(&mut pipeline, job_id).await;
     pipeline.report_all_for_test();
-    let outcome = pipeline
-        .shared_state
-        .queue
-        .cancel_jobs([job_id].into_iter().collect(), crate::jobs::handle::CancellationOrigin::User);
+    let outcome = pipeline.shared_state.queue.cancel_jobs(
+        [job_id].into_iter().collect(),
+        crate::jobs::handle::CancellationOrigin::User,
+    );
     assert!(outcome.iter().all(|(_, result)| result.is_ok()));
     pipeline.apply_queue_intents().await;
     crate::pipeline::tests::finish_cancel_jobs(&mut pipeline).await;

@@ -3030,8 +3030,13 @@ mod json_log_spellings {
                 format!("INFO weaver: wrote path={LABEL}/Some.Release/file.mkv to {LABEL}.\n"),
             ),
         ];
-        sanitize_package(&mut components, &local, &StoredNames::default(), HashSet::new())
-            .expect("a sanitized package");
+        sanitize_package(
+            &mut components,
+            &local,
+            &StoredNames::default(),
+            HashSet::new(),
+        )
+        .expect("a sanitized package");
 
         let texts: Vec<String> = components
             .iter()
@@ -3077,7 +3082,10 @@ mod json_log_spellings {
         assert_eq!(
             local.volume_stand_ins(),
             vec![
-                ("/srv/weaver-data/SecretPool".to_string(), "<volume-1>".to_string()),
+                (
+                    "/srv/weaver-data/SecretPool".to_string(),
+                    "<volume-1>".to_string()
+                ),
                 ("/mnt/pool".to_string(), "<volume-2>".to_string()),
             ]
         );

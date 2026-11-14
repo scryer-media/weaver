@@ -179,7 +179,9 @@ impl RateWindow {
     fn busy_rate(&self) -> u64 {
         let mut bytes = 0u64;
         let mut wall = Duration::ZERO;
-        for ((began, earlier), (ended, later)) in self.readings.iter().zip(self.readings.iter().skip(1)) {
+        for ((began, earlier), (ended, later)) in
+            self.readings.iter().zip(self.readings.iter().skip(1))
+        {
             if later.busy_since(earlier) {
                 bytes += later.written_bytes - earlier.written_bytes;
                 wall += ended.saturating_sub(*began);
@@ -223,7 +225,9 @@ impl VolumeRates {
                 volume.write_rate.store(rate, Ordering::Relaxed);
             }
             if volume.throughput.load(Ordering::Relaxed) != observed.throughput {
-                volume.throughput.store(observed.throughput, Ordering::Relaxed);
+                volume
+                    .throughput
+                    .store(observed.throughput, Ordering::Relaxed);
             }
             again |= moved || observed.throughput > 0;
         }
@@ -503,23 +507,25 @@ impl StorageCapacity {
                 let sized = |limit: u64| if limit == u64::MAX { 0 } else { limit };
                 (volume, sized(soft), sized(hard))
             })
-            .map(|(volume, buffer_soft_bytes, buffer_limit_bytes)| VolumeSnapshot {
-                buffer_soft_bytes,
-                buffer_limit_bytes,
-                label: volume.label.clone(),
-                kind: self.kind_on_device(volume.device).as_str(),
-                device: volume.device,
-                written_bytes: volume.written_bytes.load(Ordering::Relaxed),
-                write_nanos: volume.write_nanos.load(Ordering::Relaxed),
-                write_calls: volume.write_calls.load(Ordering::Relaxed),
-                write_seeks: volume.write_seeks.load(Ordering::Relaxed),
-                write_rate: volume.write_rate.load(Ordering::Relaxed),
-                throughput: volume.throughput.load(Ordering::Relaxed),
-                buffered_bytes: volume.buffered_bytes.load(Ordering::Relaxed),
-                arrived_bytes: volume.arrived_bytes.load(Ordering::Relaxed),
-                idle_turns: volume.idle_turns.load(Ordering::Relaxed),
-                writer: writer_counts(volume),
-            })
+            .map(
+                |(volume, buffer_soft_bytes, buffer_limit_bytes)| VolumeSnapshot {
+                    buffer_soft_bytes,
+                    buffer_limit_bytes,
+                    label: volume.label.clone(),
+                    kind: self.kind_on_device(volume.device).as_str(),
+                    device: volume.device,
+                    written_bytes: volume.written_bytes.load(Ordering::Relaxed),
+                    write_nanos: volume.write_nanos.load(Ordering::Relaxed),
+                    write_calls: volume.write_calls.load(Ordering::Relaxed),
+                    write_seeks: volume.write_seeks.load(Ordering::Relaxed),
+                    write_rate: volume.write_rate.load(Ordering::Relaxed),
+                    throughput: volume.throughput.load(Ordering::Relaxed),
+                    buffered_bytes: volume.buffered_bytes.load(Ordering::Relaxed),
+                    arrived_bytes: volume.arrived_bytes.load(Ordering::Relaxed),
+                    idle_turns: volume.idle_turns.load(Ordering::Relaxed),
+                    writer: writer_counts(volume),
+                },
+            )
             .collect();
         rows.sort_by(|a, b| a.label.cmp(&b.label));
         rows
@@ -651,7 +657,9 @@ mod tests {
 
     fn wrote(volume: &Volume, mib: u64) {
         volume.written_bytes.fetch_add(mib * MIB, Ordering::Relaxed);
-        volume.write_nanos.fetch_add(mib * 1_000_000, Ordering::Release);
+        volume
+            .write_nanos
+            .fetch_add(mib * 1_000_000, Ordering::Release);
     }
 
     fn waiting(volume: &Volume, bytes: u64) {
@@ -827,13 +835,19 @@ mod tests {
         }
         at += 2;
         written += 20;
-        let mixed = window.observe(secs(at), busy(written, 0)).write_rate.unwrap();
+        let mixed = window
+            .observe(secs(at), busy(written, 0))
+            .write_rate
+            .unwrap();
         assert!(mixed < 100 * MIB && mixed > 10 * MIB, "{mixed}");
         let mut latest = mixed;
         for _ in 0..15 {
             at += 2;
             written += 20;
-            latest = window.observe(secs(at), busy(written, 0)).write_rate.unwrap();
+            latest = window
+                .observe(secs(at), busy(written, 0))
+                .write_rate
+                .unwrap();
         }
         assert_eq!(latest, 10 * MIB);
     }
@@ -854,7 +868,10 @@ mod tests {
     #[test]
     fn a_first_reading_is_a_baseline_and_gives_no_figure() {
         let mut window = RateWindow::default();
-        assert_eq!(window.observe(secs(2), busy(36_000, 0)), Observed::default());
+        assert_eq!(
+            window.observe(secs(2), busy(36_000, 0)),
+            Observed::default()
+        );
         assert_eq!(
             window.observe(secs(4), busy(36_050, 0)),
             Observed {
@@ -1090,14 +1107,19 @@ mod tests {
         let written = Arc::clone(&disk);
         // Reading 1 is the first pass and reading 2 begins the windows
         // again after the ring; reading 3 is the pass after that.
-        let thread = sampler(&signal, Duration::ZERO, &[Arc::clone(&disk)], move |reading| {
-            match reading {
-                3 => wrote(&written, 80),
-                // The writer has caught up: nothing waits any more.
-                4 => waiting(&written, 0),
-                _ => {}
-            }
-        });
+        let thread = sampler(
+            &signal,
+            Duration::ZERO,
+            &[Arc::clone(&disk)],
+            move |reading| {
+                match reading {
+                    3 => wrote(&written, 80),
+                    // The writer has caught up: nothing waits any more.
+                    4 => waiting(&written, 0),
+                    _ => {}
+                }
+            },
+        );
 
         let passes = signal.wait_until_idle_after(1);
         assert_eq!(passes, 1, "an idle sampler makes no pass");

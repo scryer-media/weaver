@@ -367,7 +367,11 @@ mod tests {
     fn the_platform_rule_sizes_a_file_exactly_where_holes_are_made() {
         const LENGTH: u64 = 64 << 20;
         let temp = tempfile::tempdir().unwrap();
-        let expected = if sizes_files_in(temp.path()) { LENGTH } else { 0 };
+        let expected = if sizes_files_in(temp.path()) {
+            LENGTH
+        } else {
+            0
+        };
         let path = temp.path().join("ember.bin");
         let file = create_sized(&path, &PlatformMarker, Some(LENGTH)).unwrap();
         let metadata = file.metadata().unwrap();

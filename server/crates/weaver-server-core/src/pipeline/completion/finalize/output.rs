@@ -1418,13 +1418,15 @@ impl Pipeline {
             && !barrier.passed_or_tell(job_id, &self.graph_runs.written())
         {
             self.moves_awaiting_disk.insert(job_id, barrier);
-            self.shared_state.queue.write(|inner| match inner.job_mut(job_id) {
-                Some(row) => {
-                    row.report.moving = false;
-                    crate::pipeline::queue::Change::changed(())
-                }
-                None => crate::pipeline::queue::Change::unchanged(()),
-            });
+            self.shared_state
+                .queue
+                .write(|inner| match inner.job_mut(job_id) {
+                    Some(row) => {
+                        row.report.moving = false;
+                        crate::pipeline::queue::Change::changed(())
+                    }
+                    None => crate::pipeline::queue::Change::unchanged(()),
+                });
             return Ok(());
         }
         self.moves_awaiting_disk.remove(&job_id);

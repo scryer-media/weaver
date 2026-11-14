@@ -1118,7 +1118,10 @@ async fn a_restored_graph_job_advances_its_durable_floor_with_its_checkpoints() 
     assert_eq!(pipeline.durable_download_floor_bytes_for_job(JOB), restored);
     pipeline.advance_durable_download_floor(JOB);
     let floor = pipeline.durable_download_floor_bytes_for_job(JOB);
-    assert!(floor > restored, "the floor is what the graph checkpoint settles");
+    assert!(
+        floor > restored,
+        "the floor is what the graph checkpoint settles"
+    );
     assert!(floor <= restored + served, "no more than came in");
     // The floor and the downloaded bytes count in the same units, the
     // decoded bytes of what is in hand: with every article checkpointed,
@@ -1170,7 +1173,10 @@ async fn copies_of_an_article_that_arrive_again_are_never_counted_as_not_durable
     }
     let mut in_memory = BTreeSet::new();
     let mut pipeline = restart(&temp_dir, pipeline, &scenario, &mut in_memory, &mut |_| {}).await;
-    assert!(pipeline.jobs[&JOB].restored_download_floor_bytes > 0, "the gate holds a restored job");
+    assert!(
+        pipeline.jobs[&JOB].restored_download_floor_bytes > 0,
+        "the gate holds a restored job"
+    );
 
     // One more article, then three more copies of it.
     let work = next_work(&mut pipeline, &scenario).expect("the post has articles to come");
@@ -1189,7 +1195,11 @@ async fn copies_of_an_article_that_arrive_again_are_never_counted_as_not_durable
     // as not durable: the extra copies were never in hand twice.
     pipeline.advance_durable_download_floor(JOB);
     assert_eq!(pipeline.estimated_undurable_download_bytes_for_job(JOB), 0);
-    assert!(!pipeline.checkpoint_admission(JOB).holds_every_payload_article());
+    assert!(
+        !pipeline
+            .checkpoint_admission(JOB)
+            .holds_every_payload_article()
+    );
     retire_pipeline_database(pipeline).await;
 }
 

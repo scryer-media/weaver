@@ -212,8 +212,8 @@ impl Pipeline {
         #[cfg(not(test))]
         let volume_writers_of = crate::operations::disk::writer::VolumeWriters::new;
         let volume_rates = storage_capacity.volume_rate_signal();
-        let volume_writers = Arc::new(volume_writers_of(
-            move |mut report: crate::operations::disk::writer::Report| {
+        let volume_writers = Arc::new(
+            volume_writers_of(move |mut report: crate::operations::disk::writer::Report| {
                 // A failure is the job's to hear, with its other mail. What
                 // is left tells the loop a volume it stopped dispatch for
                 // fell below its line, or that a failure may have freed
@@ -225,16 +225,15 @@ impl Pipeline {
                         scope: failure.key,
                         node: weaver_graph::NodeId::ROOT,
                         generation: 0,
-                        heard: crate::pipeline::graph::engine::Heard::DiskFailed(Box::new(
-                            failure,
-                        )),
+                        heard: crate::pipeline::graph::engine::Heard::DiskFailed(Box::new(failure)),
                     });
                 }
                 if wakes {
                     let _ = volume_report_tx.send(report);
                 }
-            },
-        ).ringing(volume_rates));
+            })
+            .ringing(volume_rates),
+        );
         // Each volume's first write rate comes from a probe queued on its
         // writer; the figures an earlier run kept are read here, off the
         // runtime. A pipeline under test probes nothing.
@@ -1992,8 +1991,11 @@ impl Pipeline {
             };
             self.handle_failed_job_released(released);
         }
-        self.settle_volumes_until(settle_end, "the volume writers could not be drained at shutdown")
-            .await;
+        self.settle_volumes_until(
+            settle_end,
+            "the volume writers could not be drained at shutdown",
+        )
+        .await;
         self.hear_volume_reports();
         self.hear_graph_runs();
         // A repair the stop ended while its job's volume still held writes

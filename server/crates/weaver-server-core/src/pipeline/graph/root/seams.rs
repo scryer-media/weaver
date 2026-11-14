@@ -46,7 +46,10 @@ impl Pipeline {
     pub(crate) fn admit_graph_job(
         &mut self,
         job_id: JobId,
-        volumes: &[(std::path::PathBuf, Arc<crate::operations::disk::volume::Volume>)],
+        volumes: &[(
+            std::path::PathBuf,
+            Arc<crate::operations::disk::volume::Volume>,
+        )],
     ) {
         // Read before the job is borrowed, in the order they are tried, each
         // with its source for the download summary.

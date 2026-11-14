@@ -16,8 +16,8 @@ use weaver_server_core::bandwidth::schedule_metrics::{
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::operations::instrumentation::{
     DbRuntimeMetricsSnapshot, DiskSpaceSnapshot, HistogramSnapshot, HttpMetricsSnapshot,
-    JobLifecycleMetricsSnapshot, PipelineHistogramsSnapshot, ProcessMetricsSnapshot,
-    LOOP_WAIT_KINDS, ServerMetricsSnapshot, VolumeSnapshot,
+    JobLifecycleMetricsSnapshot, LOOP_WAIT_KINDS, PipelineHistogramsSnapshot,
+    ProcessMetricsSnapshot, ServerMetricsSnapshot, VolumeSnapshot,
 };
 use weaver_server_core::operations::metrics_store::{JOB_STATUS_KEYS, JobStatusCounts};
 use weaver_server_core::persistence::WalCheckpointMetricsSnapshot;
@@ -1564,7 +1564,11 @@ fn render_volumes(out: &mut Encoder, volumes: &[VolumeSnapshot]) {
         out.sample(&f::VOLUME_ARRIVED_BYTES, labels, volume.arrived_bytes);
         // Zero is "not sized yet", which is told by the series being absent.
         if volume.buffer_limit_bytes > 0 {
-            out.sample(&f::VOLUME_BUFFER_LIMIT_BYTES, labels, volume.buffer_limit_bytes);
+            out.sample(
+                &f::VOLUME_BUFFER_LIMIT_BYTES,
+                labels,
+                volume.buffer_limit_bytes,
+            );
             out.sample(
                 &f::VOLUME_BUFFER_SOFT_LIMIT_BYTES,
                 labels,

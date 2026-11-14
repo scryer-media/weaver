@@ -269,8 +269,7 @@ impl Pipeline {
         if let Some(in_flight) = spill_in_flight
             && spill_candidates.contains(&in_flight)
         {
-            match self.take_lane_share(in_flight, server_idx, want, lane, pressure, Turn::MayPass)
-            {
+            match self.take_lane_share(in_flight, server_idx, want, lane, pressure, Turn::MayPass) {
                 ShareTaken::Works(works) => {
                     return self.record_handout(HandoutKind::Spill, works);
                 }
@@ -426,7 +425,11 @@ impl Pipeline {
             self.jobs
                 .get(&job_id)
                 .and_then(|state| state.articles.download_queue())
-                .and_then(|queue| queue.peek_in_class(false).or_else(|| queue.peek_in_class(true)))
+                .and_then(|queue| {
+                    queue
+                        .peek_in_class(false)
+                        .or_else(|| queue.peek_in_class(true))
+                })
                 .map_or(0, |work| u64::from(work.byte_estimate))
         } else {
             held_bytes / held as u64

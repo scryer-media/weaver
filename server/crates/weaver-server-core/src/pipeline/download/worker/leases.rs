@@ -613,7 +613,8 @@ impl Pipeline {
                 continue;
             }
             let line = volume.resume_line();
-            asked |= volume.unwritten_bytes() > line && self.volume_writers.wake_below(volume, line);
+            asked |=
+                volume.unwritten_bytes() > line && self.volume_writers.wake_below(volume, line);
         }
         if asked {
             self.volume_budget_held

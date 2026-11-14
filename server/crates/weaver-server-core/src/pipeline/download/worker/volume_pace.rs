@@ -157,10 +157,16 @@ pub(in crate::pipeline) fn volume_limits(
     let rates = measured_write_bytes_per_sec;
     let volumes = rates.len() as u128;
     let figure = figure_bytes.max(1);
-    let all = |hard: u64| rates.iter().map(|_| VolumeLimits::with_hard(hard)).collect();
+    let all = |hard: u64| {
+        rates
+            .iter()
+            .map(|_| VolumeLimits::with_hard(hard))
+            .collect()
+    };
 
-    let pool = (u128::from(figure) * u128::from(VOLUME_BUFFER_POOL_FIGURES))
-        .min(u128::from(memory_ceiling_bytes / VOLUME_BUFFER_MEMORY_DIVISOR));
+    let pool = (u128::from(figure) * u128::from(VOLUME_BUFFER_POOL_FIGURES)).min(u128::from(
+        memory_ceiling_bytes / VOLUME_BUFFER_MEMORY_DIVISOR,
+    ));
     if u128::from(figure) * volumes <= pool {
         return all(figure);
     }
@@ -383,7 +389,10 @@ impl VolumeBuffers {
     pub(in crate::pipeline) fn follow_rates(&self) -> bool {
         let mut sizing = self.lock();
         let moved = sizing.volumes.iter().any(|written| {
-            rate_moved(written.sized_on, written.volume.write_rate.load(Ordering::Relaxed))
+            rate_moved(
+                written.sized_on,
+                written.volume.write_rate.load(Ordering::Relaxed),
+            )
         });
         let sized = moved && sizing.size();
         let untold = sizing.untold;
@@ -406,7 +415,11 @@ impl Sizing {
         for written in &mut self.volumes {
             written.sized_on = written.volume.write_rate.load(Ordering::Relaxed);
         }
-        let rates: Vec<u64> = self.volumes.iter().map(|written| written.sized_on).collect();
+        let rates: Vec<u64> = self
+            .volumes
+            .iter()
+            .map(|written| written.sized_on)
+            .collect();
         let limits = volume_limits(self.figure_bytes, self.memory_ceiling_bytes, &rates);
         let mut changed = false;
         for (Written { volume, .. }, limits) in self.volumes.iter().zip(limits) {
@@ -642,7 +655,10 @@ mod tests {
     fn volume_pace_unmeasured_volumes_split_evenly() {
         for volumes in [3_usize, 4, 5, 8] {
             let shared = volume_limits(FIGURE, ROOMY, &vec![0; volumes]);
-            assert_eq!(hard_bytes(&shared), vec![2 * FIGURE / volumes as u64; volumes]);
+            assert_eq!(
+                hard_bytes(&shared),
+                vec![2 * FIGURE / volumes as u64; volumes]
+            );
         }
     }
 
@@ -748,8 +764,9 @@ mod tests {
                 for figure in [64, 1_000, 64 * MIB, FIGURE, 4 * GIB, u64::MAX] {
                     for memory in [GIB, 3 * GIB, ROOMY, u64::MAX] {
                         let shared = volume_limits(figure, memory, &rates);
-                        let context =
-                            format!("figure {figure}, memory {memory}, rates {rates:?}: {shared:?}");
+                        let context = format!(
+                            "figure {figure}, memory {memory}, rates {rates:?}: {shared:?}"
+                        );
                         assert_eq!(shared.len(), count, "{context}");
 
                         let pool = (2 * u128::from(figure)).min(u128::from(memory / 8));
@@ -870,7 +887,10 @@ mod tests {
         // One of them is gone: the stand-in is still written to.
         buffers.left(&unread);
         assert!(hard(&nvme) < FIGURE / 4);
-        assert!(!buffers.follow_rates(), "nothing was sized, nothing is told");
+        assert!(
+            !buffers.follow_rates(),
+            "nothing was sized, nothing is told"
+        );
 
         // The last is gone.
         buffers.left(&unread);
@@ -898,7 +918,11 @@ mod tests {
             buffers.joined(seen);
         }
         assert_eq!(hard(&hdd), FIGURE);
-        assert!(hard(&nvme).abs_diff(FIGURE / 11) <= ROUNDING, "{}", hard(&nvme));
+        assert!(
+            hard(&nvme).abs_diff(FIGURE / 11) <= ROUNDING,
+            "{}",
+            hard(&nvme)
+        );
         assert!(
             hard(&sata).abs_diff(FIGURE * 10 / 11) <= ROUNDING,
             "{}",
@@ -923,7 +947,10 @@ mod tests {
         }
         let sized = |volumes: [&Arc<Volume>; 3]| volumes.map(|volume| hard(volume));
         let before = sized([&nvme, &sata, &unmeasured]);
-        assert!(buffers.follow_rates(), "the limits the volumes joined on are told");
+        assert!(
+            buffers.follow_rates(),
+            "the limits the volumes joined on are told"
+        );
         assert!(!buffers.follow_rates(), "nothing moved");
 
         sata.write_rate.store(SATA * 110 / 100, Ordering::Relaxed);

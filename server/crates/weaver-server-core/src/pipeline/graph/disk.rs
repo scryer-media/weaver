@@ -10,17 +10,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::JobId;
+use crate::jobs::model::JobStatus;
 use crate::operations::StorageCapacity;
 use crate::operations::disk::volume::Volume;
 use crate::operations::disk::writer::{Barrier, Failure, Report, Submitter, VolumeWriters};
 use crate::pipeline::Pipeline;
 use crate::pipeline::download::volume_pace::{VolumeBuffers, VolumeIntake, intake_of};
 use crate::pipeline::graph::job::GraphError;
+use crate::pipeline::graph::job::GraphJob;
 use crate::pipeline::graph::leaf::LeafError;
 use crate::pipeline::graph::namespace::WriteError;
-use crate::JobId;
-use crate::jobs::model::JobStatus;
-use crate::pipeline::graph::job::GraphJob;
 
 // The volumes of a job's directories as a thread off the loop read them.
 pub(crate) type ReadVolumes = Vec<(PathBuf, Arc<Volume>)>;
@@ -743,7 +743,9 @@ impl JobBarrier {
             barrier.then(move || {
                 let _ = returned.send(());
             });
-            heard.recv().expect("the volume's thread tells what returned");
+            heard
+                .recv()
+                .expect("the volume's thread tells what returned");
         }
     }
 }

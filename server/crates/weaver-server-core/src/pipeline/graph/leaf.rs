@@ -669,7 +669,10 @@ impl Leaf {
     // Create the file in the directory it lies in, which must already be
     // there: nothing above the file is made. A file already open is kept.
     pub(crate) fn create_within(&mut self) -> Result<(), LeafError> {
-        debug_assert!(self.queued.is_none(), "a queued leaf is made by its first write");
+        debug_assert!(
+            self.queued.is_none(),
+            "a queued leaf is made by its first write"
+        );
         if self.file.is_none() {
             let file =
                 create_sparse(&self.path, &PlatformMarker).map_err(LeafError::io(&self.path))?;
@@ -707,10 +710,7 @@ impl Leaf {
     // submitted for it is still out or did not land, or the OS gave no
     // length.
     fn len_settled(&self) -> Option<u64> {
-        if self
-            .settled()
-            .is_some_and(|settled| settled.unwritten())
-        {
+        if self.settled().is_some_and(|settled| settled.unwritten()) {
             return None;
         }
         match &self.file {
@@ -773,7 +773,9 @@ impl Leaf {
             if settled.unwritten() {
                 return Err(LeafError::Io {
                     path: self.path.clone(),
-                    source: io::Error::other("the writes of the file are not down for it to be read"),
+                    source: io::Error::other(
+                        "the writes of the file are not down for it to be read",
+                    ),
                 });
             }
         }
@@ -891,7 +893,11 @@ impl Leaf {
         // missing owned file must fail the move, and a file this leaf never
         // made must not be taken merely because its old name now exists.
         let had_file = self.on_disk;
-        if let Some(queued) = self.queued.as_mut().filter(|_| had_file && path != self.path) {
+        if let Some(queued) = self
+            .queued
+            .as_mut()
+            .filter(|_| had_file && path != self.path)
+        {
             // The move follows everything submitted for the file, and
             // everything submitted after follows the move.
             let (from, to, directory) = (self.path.clone(), path.clone(), self.directory);

@@ -351,7 +351,8 @@ impl Pipeline {
                         // unknown device.
                         let storage = Arc::clone(&staging.storage);
                         let chosen = staging.choose(job_id, destination);
-                        read.volumes.push((working_dir.clone(), storage.read_volume(&working_dir)));
+                        read.volumes
+                            .push((working_dir.clone(), storage.read_volume(&working_dir)));
                         if let Some(dir) = &chosen {
                             read.volumes.push((dir.clone(), storage.read_volume(dir)));
                         }
@@ -783,8 +784,7 @@ impl Pipeline {
         }
         // A job kept only for its last file operation hears when it returned.
         if let Some(disk) = graph.disk().filter(|disk| !disk.quiet()) {
-            disk.barrier()
-                .then_tell(job_id, &self.graph_runs.written());
+            disk.barrier().then_tell(job_id, &self.graph_runs.written());
         }
         if graph.holds_retirement() {
             self.retiring_graph_jobs.insert(job_id, graph);

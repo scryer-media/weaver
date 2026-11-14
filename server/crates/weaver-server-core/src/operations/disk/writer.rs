@@ -494,7 +494,10 @@ impl VolumeWriters {
             state.woke.notify_all();
             while state.returned.load(Ordering::SeqCst) < sent {
                 let Some((end, clock)) = bound else {
-                    held = state.woke.wait(held).unwrap_or_else(PoisonError::into_inner);
+                    held = state
+                        .woke
+                        .wait(held)
+                        .unwrap_or_else(PoisonError::into_inner);
                     continue;
                 };
                 // How long the volume is still waited for.
@@ -515,7 +518,10 @@ impl VolumeWriters {
                         .unwrap_or_else(PoisonError::into_inner)
                         .0
                 } else {
-                    state.woke.wait(held).unwrap_or_else(PoisonError::into_inner)
+                    state
+                        .woke
+                        .wait(held)
+                        .unwrap_or_else(PoisonError::into_inner)
                 };
             }
             state.waiters.fetch_sub(1, Ordering::SeqCst);
@@ -891,7 +897,13 @@ impl Submitter {
     // file whose name was refused is dropped: the refusal has said so. A
     // write to any other file that is neither open nor given a way to open
     // fails the key.
-    pub(crate) fn write(&self, file: u64, offset: u64, bytes: Bytes, create: Option<Create>) -> u64 {
+    pub(crate) fn write(
+        &self,
+        file: u64,
+        offset: u64,
+        bytes: Bytes,
+        create: Option<Create>,
+    ) -> u64 {
         self.lane
             .state
             .volume
@@ -1009,7 +1021,10 @@ impl Submitter {
         #[cfg(test)]
         state.below.notify_all();
         while over() {
-            held = state.below.wait(held).unwrap_or_else(PoisonError::into_inner);
+            held = state
+                .below
+                .wait(held)
+                .unwrap_or_else(PoisonError::into_inner);
         }
         state.below_waiters.fetch_sub(1, Ordering::SeqCst);
         drop(held);
@@ -1065,7 +1080,12 @@ impl Submitter {
     // `Barrier::wait_aside` and reads the file itself.
     #[cfg(test)]
     pub(crate) fn read(&self, path: PathBuf, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        self.read_after(self.key.submitted.load(Ordering::Acquire), path, offset, len)
+        self.read_after(
+            self.key.submitted.load(Ordering::Acquire),
+            path,
+            offset,
+            len,
+        )
     }
 
     // The same read, after the key's operations through `seq` only: the
@@ -1280,7 +1300,12 @@ impl Barrier {
             return;
         }
         let began = Instant::now();
-        let aside = || self.lane.aside.lock().unwrap_or_else(PoisonError::into_inner);
+        let aside = || {
+            self.lane
+                .aside
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        };
         aside().push(Arc::clone(&self.key));
         self.key.wait_placed(self.seq, Some(&self.lane.stopped));
         let mut aside = aside();
@@ -1300,7 +1325,11 @@ impl Barrier {
     // again, after a test moved it.
     #[cfg(test)]
     pub(crate) fn look_again(&self) {
-        let _held = self.key.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+        let _held = self
+            .key
+            .waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         self.key.woke.notify_all();
     }
 
@@ -1907,10 +1936,7 @@ impl Thread {
     fn run_idle(&mut self) -> bool {
         let worked = std::mem::take(&mut self.worked);
         if worked {
-            self.state
-                .volume
-                .idle_turns
-                .fetch_add(1, Ordering::Relaxed);
+            self.state.volume.idle_turns.fetch_add(1, Ordering::Relaxed);
         }
         if self.idle.is_empty() {
             return false;
@@ -1995,7 +2021,9 @@ impl Thread {
         let volume = &self.state.volume;
         let counts = &volume.writer;
         counts.batches.fetch_add(1, Ordering::Relaxed);
-        counts.operations.fetch_add(tally.operations, Ordering::Relaxed);
+        counts
+            .operations
+            .fetch_add(tally.operations, Ordering::Relaxed);
         if tally.abandoned > 0 {
             counts
                 .abandoned_operations
@@ -2062,14 +2090,16 @@ impl Thread {
             // The first handle the key lets go in the batch holds back what
             // it returns from that operation on, and the settle from that
             // entry on, until the key's handles are dropped.
-            if std::mem::take(&mut self.ran.let_go) && key.letting.load(Ordering::Relaxed) != self.turn
+            if std::mem::take(&mut self.ran.let_go)
+                && key.letting.load(Ordering::Relaxed) != self.turn
             {
                 key.letting.store(self.turn, Ordering::Relaxed);
                 key.held_entry.store(at as u32, Ordering::Relaxed);
                 self.held.insert(at as u32);
             }
             // A caller's code ran with the key's handles dropped.
-            if std::mem::take(&mut self.ran.dropped) && key.letting.load(Ordering::Relaxed) == self.turn
+            if std::mem::take(&mut self.ran.dropped)
+                && key.letting.load(Ordering::Relaxed) == self.turn
             {
                 key.letting.store(0, Ordering::Relaxed);
                 self.held.remove(&key.held_entry.load(Ordering::Relaxed));
@@ -2237,8 +2267,11 @@ impl Thread {
             let head = self.order[start];
             let mut end = start + 1;
             while end < self.order.len()
-                && (self.order[end].part, self.order[end].file, self.order[end].run)
-                    == (head.part, head.file, head.run)
+                && (
+                    self.order[end].part,
+                    self.order[end].file,
+                    self.order[end].run,
+                ) == (head.part, head.file, head.run)
             {
                 end += 1;
             }
@@ -2412,9 +2445,7 @@ fn perform(
                     // the few loads and stores between two calls; work past
                     // that since (`break_span`) restarts it here.
                     let broken = SPAN_BROKEN.replace(false);
-                    let started = since
-                        .filter(|_| was_open && !broken)
-                        .unwrap_or_else(now);
+                    let started = since.filter(|_| was_open && !broken).unwrap_or_else(now);
                     let wrote = write_all_at(&open.file, offset, &bytes);
                     let returned = now();
                     if wrote.is_err() {
@@ -2659,7 +2690,10 @@ impl Hold {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         while state.below_waiters.load(Ordering::SeqCst) < count {
-            held = state.below.wait(held).unwrap_or_else(PoisonError::into_inner);
+            held = state
+                .below
+                .wait(held)
+                .unwrap_or_else(PoisonError::into_inner);
         }
     }
 
@@ -2668,7 +2702,10 @@ impl Hold {
         let state = &self.0.state;
         let mut held = state.waiting.lock().unwrap_or_else(PoisonError::into_inner);
         while state.waiters.load(Ordering::SeqCst) == 0 {
-            held = state.woke.wait(held).unwrap_or_else(PoisonError::into_inner);
+            held = state
+                .woke
+                .wait(held)
+                .unwrap_or_else(PoisonError::into_inner);
         }
     }
 

@@ -714,11 +714,12 @@ impl Pending {
 
     // Every gated change the disk now bears out joins `queued`, in order.
     fn release(slot: &mut Slot) {
-        while slot
-            .gated
-            .front()
-            .is_some_and(|gated| gated.barrier.as_ref().is_some_and(|barrier| barrier.passed()))
-        {
+        while slot.gated.front().is_some_and(|gated| {
+            gated
+                .barrier
+                .as_ref()
+                .is_some_and(|barrier| barrier.passed())
+        }) {
             let gated = slot.gated.pop_front().expect("checked above");
             slot.released = gated.stamp;
             if let Some(held) = slot.held.as_mut() {
