@@ -432,8 +432,9 @@ pub struct SessionSeries {
     /// Pieces its connections took from slower peers.
     pub piece_steals: u64,
     /// Its outgoing handshakes by how each ended: sent plain, or sent
-    /// encrypted and settled on RC4, on header only, or failed.
-    pub outgoing_encryption: [u64; 4],
+    /// encrypted and settled on RC4, on header only, failed, or dropped
+    /// before it ended.
+    pub outgoing_encryption: [u64; 5],
 }
 
 /// A session's connected peers.
@@ -525,6 +526,7 @@ impl SessionSeries {
                     encryption.rc4,
                     encryption.header_only,
                     encryption.failures,
+                    encryption.cancelled,
                 ]
             },
             swarm: stats.swarm,

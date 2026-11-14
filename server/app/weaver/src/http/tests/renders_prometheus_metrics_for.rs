@@ -1340,6 +1340,9 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         format!(
             r#"weaver_torrent_session_outgoing_encryption_total{{{ROUTE},outcome="failed"}} 4"#
         ),
+        format!(
+            r#"weaver_torrent_session_outgoing_encryption_total{{{ROUTE},outcome="cancelled"}} 3"#
+        ),
         format!("weaver_torrent_utp_syn_flood_dropped_total{{{ROUTE}}} 33"),
         format!("weaver_torrent_utp_syn_resets_total{{{ROUTE}}} 34"),
         format!(

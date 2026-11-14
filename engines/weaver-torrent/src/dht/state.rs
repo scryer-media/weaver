@@ -2216,9 +2216,10 @@ impl DhtState {
             // If it's a response to a request we made, find the request task, notify it with the response,
             // and let it handle it.
             MessageKind::Error(_) | MessageKind::Response(_) => {
-                let tid = msg
-                    .get_our_transaction_id()
-                    .ok_or(Error::BadTransactionId)?;
+                let Some(tid) = msg.get_our_transaction_id() else {
+                    self.counts.ignored(DhtIgnored::Malformed);
+                    return Err(Error::BadTransactionId);
+                };
                 let request = match self
                     .inflight_by_transaction_id
                     .remove(&(tid, addr))
@@ -4054,11 +4055,20 @@ mod tests {
         // A datagram that is no message.
         assert!(dht.read_datagram(&[b'x'; 40], addr).is_none());
 
+        // A reply whose transaction id is not one of ours in shape.
+        let reply = dht
+            .read_datagram(b"d1:rd2:id20:abcdefghij0123456789e1:t3:abc1:y1:re", addr)
+            .unwrap();
+        assert!(matches!(
+            dht.on_received_message(reply, addr),
+            Err(crate::dht::Error::BadTransactionId)
+        ));
+
         let mut counted = DhtSnapshot::default();
         counted.sent[DhtQuery::Ping as usize] = 1;
         counted.ended[DhtQuery::Ping as usize][DhtQueryEnd::Timeout as usize] = 1;
         counted.received[DhtQuery::Ping as usize] = 1;
-        counted.ignored[DhtIgnored::Malformed as usize] = 1;
+        counted.ignored[DhtIgnored::Malformed as usize] = 2;
         assert_eq!(dht.counted(), counted);
     }
 

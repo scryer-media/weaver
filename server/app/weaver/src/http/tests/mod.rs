@@ -1748,7 +1748,7 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
             seeders: 3,
         },
         piece_steals: 8,
-        outgoing_encryption: [50, 30, 6, 4],
+        outgoing_encryption: [50, 30, 6, 4, 3],
     };
     let held = SessionSeries {
         route: "ff00ee11dd22cc33".into(),

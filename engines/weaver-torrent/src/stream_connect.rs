@@ -221,14 +221,28 @@ gen_stats!(PerFamilyAtomic PerFamilySnapshot, [], [
 ]);
 // Outgoing handshakes: how many encrypted ones were tried, how many of
 // those ended in a fully encrypted or header-only stream, how many failed,
-// and how many plaintext ones were sent.
+// how many were dropped before they ended, and how many plaintext ones were
+// sent. Every attempt has one of the four ends.
 gen_stats!(EncryptionStatsAtomic EncryptionStatsSnapshot, [
     attempts u64,
     rc4 u64,
     header_only u64,
     failures u64,
+    cancelled u64,
     plaintext u64
 ], []);
+
+// An encrypted handshake under way: counted as cancelled if it is dropped
+// before it ends, as when its torrent is paused or removed.
+struct Unended<'a>(Option<&'a EncryptionStatsAtomic>);
+
+impl Drop for Unended<'_> {
+    fn drop(&mut self) {
+        if let Some(stats) = self.0.take() {
+            stats.cancelled(1);
+        }
+    }
+}
 gen_stats!(ConnectStatsAtomic ConnectStatsSnapshot, [], [
     tcp PerFamilyAtomic PerFamilySnapshot,
     utp PerFamilyAtomic PerFamilySnapshot,
@@ -417,12 +431,14 @@ impl StreamConnector {
         }
 
         stats.attempts(1);
+        let mut unended = Unended(Some(stats));
         let offer = mse::outgoing_offer(policy);
         let established = with_timeout("encryption handshake", rw_timeout, async {
             Ok(mse::initiate(r, w, info_hash, offer, handshake).await?)
         })
-        .await
-        .inspect_err(|e| {
+        .await;
+        unended.0 = None;
+        let established = established.inspect_err(|e| {
             stats.failures(1);
             debug!(?addr, "encrypted handshake failed: {e:#}");
         })?;
@@ -1141,6 +1157,38 @@ mod tests {
         assert_eq!(
             (stats.attempts, stats.failures, stats.plaintext),
             (1, 1, 0),
+            "{stats:?}"
+        );
+    }
+
+    // An encrypted handshake dropped while it waits for the peer's answer
+    // has an end of its own, so the ends sum to the attempts.
+    #[tokio::test(start_paused = true)]
+    async fn an_encrypted_handshake_dropped_before_it_ends_is_counted_cancelled() {
+        use tokio::io::AsyncReadExt;
+        let (connector, mut dialed) = dialing(EncryptionPolicy::Require).await;
+        // The peer reads the first byte of our key and answers nothing.
+        let began = async {
+            let (_, mut theirs) = dialed.recv().await.unwrap();
+            let mut first = [0u8; 1];
+            theirs.read_exact(&mut first).await.unwrap();
+            theirs
+        };
+        tokio::select! {
+            biased;
+            sent = send_handshake(&connector, || true) => panic!("it ended: {sent:?}"),
+            _theirs = began => {}
+        }
+        let stats = connector.stats().encryption.snapshot();
+        assert_eq!(
+            (
+                stats.attempts,
+                stats.cancelled,
+                stats.failures,
+                stats.rc4,
+                stats.header_only
+            ),
+            (1, 1, 0, 0, 0),
             "{stats:?}"
         );
     }

@@ -702,7 +702,7 @@ metric_families! {
         ["route"], "Pieces taken from a slower peer and given to a faster one, since the session opened.");
     TORRENT_SESSION_OUTGOING_ENCRYPTION = ("weaver_torrent_session_outgoing_encryption_total", Counter,
         ["route", "outcome"],
-        "Outgoing peer handshakes since the session opened, by how each ended: plaintext (sent plain), or sent encrypted and settled on rc4, on header_only, or failed. No outcome holds another, so the outcomes sum to the handshakes that ended.");
+        "Outgoing peer handshakes since the session opened, by how each ended: plaintext (sent plain), or sent encrypted and settled on rc4, on header_only, failed, or cancelled (dropped before it ended, as when its torrent is paused or removed). No outcome holds another, so the outcomes sum to the handshakes started but for those under way.");
     TORRENT_UTP_SYN_FLOOD_DROPPED = ("weaver_torrent_utp_syn_flood_dropped_total", Counter,
         ["route"], "Incoming uTP connection requests dropped because too many were waiting, since the session opened.");
     TORRENT_UTP_SYN_RESETS = ("weaver_torrent_utp_syn_resets_total", Counter,
@@ -729,7 +729,7 @@ metric_families! {
         ["route", "type"], "DHT queries from other nodes the session's node answered since it started, by what they ask.");
     TORRENT_DHT_IGNORED = ("weaver_torrent_dht_datagrams_ignored_total", Counter,
         ["route", "reason"],
-        "Datagrams that reached the DHT node and were not acted on, by reason: malformed, source_limit (the source sends too many), unmatched (a reply to no waiting query) or no_budget (a query that came while the node's send budget was spent).");
+        "Datagrams that reached the DHT node and were not acted on, by reason: malformed, source_limit (the source sends too many), unmatched (a reply to no waiting query; one whose transaction id is not ours in shape is malformed) or no_budget (a query that came while the node's send budget was spent).");
     TORRENT_DHT_PEERS_FOUND = ("weaver_torrent_dht_peers_found_total", Counter,
         ["route"], "Peers the replies to the node's searches named since it started, repeats included.");
     TORRENT_INCOMING_CONNECTIONS = ("weaver_torrent_incoming_connections_total", Counter,
