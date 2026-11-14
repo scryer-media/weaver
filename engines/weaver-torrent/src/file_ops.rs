@@ -200,14 +200,30 @@ pub(crate) struct PieceReader<'o, 'a> {
     broken: Vec<u64>,
     // Where the last read of each file ended.
     ends: Vec<u64>,
+    // The offset in the torrent up to which the storage was told what is
+    // about to be read, and how far past a read it is told.
+    told: u64,
+    told_ahead: u64,
 }
 
+/// How far past the byte it reads a check tells the storage what it reads
+/// next ([`TorrentStorage::will_read`]): the system fetches that much of
+/// the files ahead of the one reader, which then waits on the disk for
+/// little of it. Far more than a read, so a device that serves several
+/// requests at once has several; the same bytes in the same order, so one
+/// that serves one still reads front to back.
+pub(crate) const CHECK_TOLD_AHEAD: u64 = 8 << 20;
+
 impl<'o, 'a> PieceReader<'o, 'a> {
-    pub(crate) fn new(ops: &'o FileOps<'a>) -> Self {
+    /// A reader that tells the storage what it reads next `told_ahead`
+    /// bytes ahead; none when that is nothing.
+    pub(crate) fn new(ops: &'o FileOps<'a>, told_ahead: u64) -> Self {
         Self {
             ops,
             broken: vec![u64::MAX; ops.file_infos.len()],
             ends: vec![0; ops.file_infos.len()],
+            told: 0,
+            told_ahead,
         }
     }
 
@@ -224,6 +240,7 @@ impl<'o, 'a> PieceReader<'o, 'a> {
         from: usize,
         into: &mut [u8],
     ) -> anyhow::Result<bool> {
+        self.tell(piece, from);
         let mut filled = 0;
         for span in self.ops.piece_spans(piece, from, into.len()) {
             if span.at >= self.broken[span.file] {
@@ -248,6 +265,39 @@ impl<'o, 'a> PieceReader<'o, 'a> {
         }
         anyhow::ensure!(filled == into.len(), "broken torrent metadata");
         Ok(true)
+    }
+}
+
+impl PieceReader<'_, '_> {
+    // The storage is told what the reads from `from` of `piece` on are
+    // about to read, `told_ahead` bytes of the torrent's files in order,
+    // each time the reader comes within half of that of what it told.
+    fn tell(&mut self, piece: ValidPieceIndex, from: usize) {
+        if self.told_ahead == 0 {
+            return;
+        }
+        let at = self.ops.torrent.lengths().piece_offset(piece) + from as u64;
+        if self.told >= at + self.told_ahead / 2 {
+            return;
+        }
+        let start = self.told.max(at);
+        let end = at + self.told_ahead;
+        let infos = self.ops.file_infos;
+        let first = infos.partition_point(|fi| fi.offset_in_torrent + fi.len <= start);
+        for (file, info) in infos.iter().enumerate().skip(first) {
+            if info.offset_in_torrent >= end {
+                break;
+            }
+            if info.len == 0 || info.attrs.padding {
+                continue;
+            }
+            let from = start.max(info.offset_in_torrent) - info.offset_in_torrent;
+            let to = end.min(info.offset_in_torrent + info.len) - info.offset_in_torrent;
+            if from < self.broken[file] {
+                self.ops.files.will_read(file, from, to - from);
+            }
+        }
+        self.told = end;
     }
 }
 
@@ -733,7 +783,7 @@ impl<'a> FileOps<'a> {
         let _ended = Ended(ahead);
         let memory = ahead.memory;
         let lengths = self.torrent.lengths();
-        let mut reader = PieceReader::new(self);
+        let mut reader = PieceReader::new(self, CHECK_TOLD_AHEAD);
         let mut checked = Vec::new();
         for index in pieces {
             if pause_requested.load(Ordering::Relaxed) || ahead.failed.load(Ordering::Relaxed) {
@@ -2451,6 +2501,8 @@ mod tests {
         // and the torrent's piece length.
         wants_in: Option<(std::ops::Range<u32>, u32)>,
         held: std::sync::Mutex<(usize, usize)>,
+        // What it was told is read next: the file, where, and how much.
+        told: std::sync::Mutex<Vec<(usize, u64, u64)>>,
     }
 
     impl Recording {
@@ -2462,6 +2514,7 @@ mod tests {
                 wants: false,
                 wants_in: None,
                 held: Default::default(),
+                told: Default::default(),
             }
         }
     }
@@ -2473,6 +2526,10 @@ mod tests {
             metadata: &TorrentMetadata,
         ) -> anyhow::Result<()> {
             self.files.init(shared, metadata)
+        }
+
+        fn will_read(&self, file_id: usize, offset: u64, len: u64) {
+            self.told.lock().unwrap().push((file_id, offset, len));
         }
 
         fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
@@ -2602,6 +2659,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A reader tells the storage what it reads next before it reads it:
+    /// each file's bytes once, front to back with no gap, never past the
+    /// file's end, nothing for a file with no bytes, and never further
+    /// past the piece being read than it is set to tell. A check tells the
+    /// storage of every byte it reads the same way.
+    #[test]
+    fn a_check_tells_the_storage_what_it_reads_next() {
+        const PIECE: usize = 16384;
+        const AHEAD: u64 = 40_000;
+        let (metadata, payload) = v1_torrent(
+            &[
+                ("a", 100),
+                ("b", 40_000),
+                ("c", 0),
+                ("d", 16384),
+                ("e", 70_001),
+            ],
+            PIECE,
+        );
+        let lengths = metadata.lengths();
+        let total = lengths.total_length();
+        // Each file's bytes told so far, which must go on where they ended.
+        let told_whole = |storage: &Recording| {
+            let mut ends = vec![0u64; metadata.file_infos.len()];
+            for (file, at, len) in storage.told.lock().unwrap().iter().copied() {
+                assert!(len > 0, "file {file}");
+                assert_eq!(at, ends[file], "file {file}");
+                ends[file] = at + len;
+                assert!(ends[file] <= metadata.file_infos[file].len, "file {file}");
+            }
+            ends
+        };
+
+        let storage = Recording::new(Files::new(&metadata, &payload));
+        let ops = FileOps::new(&metadata, &storage, true);
+        let mut reader = PieceReader::new(&ops, AHEAD);
+        for piece in lengths.iter_piece_infos() {
+            let start = lengths.piece_offset(piece.piece_index);
+            let mut bytes = vec![0u8; piece.len as usize];
+            assert!(reader.read(piece.piece_index, 0, &mut bytes).unwrap());
+            let ends = told_whole(&storage);
+            let told: u64 = ends.iter().sum();
+            assert!(told >= total.min(start + u64::from(piece.len)), "{start}");
+            assert!(told <= start + AHEAD, "{start}");
+            // Nothing was read that the storage was not told of first.
+            for (file, at, len, _) in storage.reads.lock().unwrap().iter() {
+                assert!(at + *len as u64 <= ends[*file], "file {file}");
+            }
+        }
+        let whole: Vec<u64> = metadata.file_infos.iter().map(|fi| fi.len).collect();
+        assert_eq!(told_whole(&storage), whole);
+
+        for threads in [1, 4] {
+            let storage = Recording::new(Files::new(&metadata, &payload));
+            FileOps::new(&metadata, &storage, true)
+                .initial_check(threads, &AtomicU64::new(0), &AtomicBool::new(false))
+                .unwrap();
+            assert_eq!(told_whole(&storage), whole, "{threads}");
+        }
+
+        // A reader set to tell nothing tells nothing.
+        let storage = Recording::new(Files::new(&metadata, &payload));
+        let ops = FileOps::new(&metadata, &storage, true);
+        let mut reader = PieceReader::new(&ops, 0);
+        let first = lengths.iter_piece_infos().next().unwrap();
+        let mut bytes = vec![0u8; first.len as usize];
+        assert!(reader.read(first.piece_index, 0, &mut bytes).unwrap());
+        assert!(storage.told.lock().unwrap().is_empty());
     }
 
     /// The buffers of a check hold no more than its memory allows and one

@@ -54,6 +54,8 @@ pub(crate) trait Pieces: Send + Sync {
     fn hashed(&self, _piece: u32, _held: &Bytes) {}
     // The file's bytes from `offset` as it holds them on disk.
     fn read(&self, file: usize, offset: u64, out: &mut [u8]) -> std::io::Result<()>;
+    // The file's `len` bytes from `offset` are about to be read in order.
+    fn will_read(&self, _file: usize, _offset: u64, _len: u64) {}
     // `outs` filled one after the other from the file's bytes at `offset`
     // as it holds them on disk.
     fn readv(&self, file: usize, mut offset: u64, outs: &mut [&mut [u8]]) -> std::io::Result<()> {
@@ -244,6 +246,10 @@ impl TorrentStorage for PieceStorage {
             .pieces
             .read(file_id, offset, buf)
             .with_context(|| format!("{} bytes at {offset} of file {file_id}", buf.len()))
+    }
+
+    fn will_read(&self, file_id: usize, offset: u64, len: u64) {
+        self.inner.pieces.will_read(file_id, offset, len);
     }
 
     // A run of a file's bytes on disk is read in one go; one with any of

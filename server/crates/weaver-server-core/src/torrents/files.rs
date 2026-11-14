@@ -340,6 +340,20 @@ impl Files {
         read_exact_at(&handle, offset, out)
     }
 
+    // The file's `len` bytes from `offset` are about to be read in order:
+    // the system is told, and reads them ahead. A file not there is left
+    // to the read that follows.
+    pub(crate) fn will_read(&self, file: usize, offset: u64, len: u64) {
+        let Ok(name) = self.name(file) else {
+            return;
+        };
+        let at = self.at();
+        let path = at.dir.join(name);
+        if let Ok(handle) = self.pool.open(at.reads[file], || File::open(&path)) {
+            advise_will_need(&handle, offset, len);
+        }
+    }
+
     // `outs` filled one after the other from the file's bytes at `offset`,
     // in one positional read where the platform has one.
     pub(crate) fn readv(&self, file: usize, offset: u64, outs: &mut [&mut [u8]]) -> io::Result<()> {
@@ -451,6 +465,35 @@ thread_local! {
     pub(crate) static LOOKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+// The system is told the file's `len` bytes from `offset` are about to be
+// read, and starts reading them. Advice only: a refusal changes nothing.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn advise_will_need(file: &File, offset: u64, len: u64) {
+    use std::os::fd::AsRawFd;
+
+    // The system reads ahead no more per call than the device's largest
+    // request, 128 KiB on many, so the range is told in steps of that.
+    const STEP: u64 = 128 << 10;
+    let mut at = offset;
+    let end = offset.saturating_add(len);
+    while at < end {
+        let (Ok(from), Ok(step)) = (
+            libc::off_t::try_from(at),
+            libc::off_t::try_from(STEP.min(end - at)),
+        ) else {
+            return;
+        };
+        // SAFETY: the descriptor is open for as long as `file` is
+        // borrowed, and the call only advises the system about its cache.
+        let _ =
+            unsafe { libc::posix_fadvise(file.as_raw_fd(), from, step, libc::POSIX_FADV_WILLNEED) };
+        at += STEP;
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn advise_will_need(_file: &File, _offset: u64, _len: u64) {}
+
 fn open_for_write(path: &Path) -> io::Result<File> {
     let open = || {
         OpenOptions::new()
@@ -519,6 +562,38 @@ mod tests {
             std::fs::metadata(dir.path().join("c.bin")).unwrap().len(),
             4
         );
+    }
+
+    // Told what is read next, a file is not made, changed or grown: one
+    // not there is still not there, one there reads back the same, past
+    // its end included, and padding is no file to tell of.
+    #[test]
+    fn telling_what_is_read_next_changes_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = Files::in_pool(
+            &layout(&[("a.bin", 8), (".pad/4", 4), ("c.bin", 4)]),
+            dir.path().into(),
+            pool(),
+        )
+        .unwrap();
+        files.write(0, 0, b"abcdwxyz").unwrap();
+        files.will_read(0, 0, 8);
+        files.will_read(0, 4, 1 << 30);
+        files.will_read(1, 0, 4);
+        files.will_read(2, 0, 4);
+        files.will_read(9, 0, 4);
+        let mut out = [0; 8];
+        files.read(0, 0, &mut out).unwrap();
+        assert_eq!(&out, b"abcdwxyz");
+        assert_eq!(
+            std::fs::metadata(dir.path().join("a.bin")).unwrap().len(),
+            8
+        );
+        assert_eq!(
+            files.read(2, 0, &mut out[..4]).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!dir.path().join("c.bin").exists());
     }
 
     // A name that would climb out of the directory, or root itself, is no
