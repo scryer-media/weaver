@@ -20,7 +20,7 @@ use super::source::{Class, Move};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{JobState, JobStatus};
 use crate::pipeline::download::queue::{DownloadWork, QueueItem};
-use crate::pipeline::graph::engine::{Heard, Said};
+use crate::pipeline::graph::engine::{Heard, Hears, Said};
 use crate::pipeline::graph::job::{GraphError, GraphJob, RootFile, Storage};
 use crate::pipeline::graph::limits;
 use crate::pipeline::post_health::GivenUp;
@@ -621,6 +621,14 @@ impl Pipeline {
                 self.report_job(job_id);
             }
         }
+        // A job outside the pipeline, a torrent's unpacking, begins to wait
+        // as one of the pipeline's does: it is heard here once, as its wait
+        // begins, and woken with the pipeline's own by ticket.
+        for scope in self.graph_outside.disk_waits_began() {
+            #[cfg(test)]
+            DISK_WAIT_LOOKS.with(|looks| looks.set(looks.get() + 1));
+            tracing::debug!(job_id = scope, "a job outside the pipeline waits for disk room");
+        }
         if self.disk_idle.is_empty() {
             return;
         }
@@ -661,6 +669,7 @@ impl Pipeline {
     // reconciles the waits just before it asks.
     pub(in crate::pipeline) fn waits_for_disk_room(&self) -> bool {
         !self.disk_waiting.is_empty()
+            || self.graph_outside.waits_for_disk()
             || self.admission_disk_held
             || !self.full_disk.is_empty()
             || self.archive_wait.is_some()
@@ -693,9 +702,11 @@ impl Pipeline {
     // woken, in the order they began to wait, if the disk has room for all
     // it owes beside what those woken before it promised. A job woken goes
     // on; the rest wait for the next reading. A job no longer here is no
-    // longer waited on.
+    // longer waited on. A job outside the pipeline that waits, a torrent's
+    // unpacking, takes its place among them by its ticket from the same
+    // ledger, and goes on through its own task.
     pub(in crate::pipeline) fn wake_disk_waiters(&mut self) {
-        let mut waiting: Vec<(u64, JobId)> = self
+        let mut waiting: Vec<(u64, JobId, Option<Arc<dyn Hears>>)> = self
             .disk_waiting
             .iter()
             .map(|job_id| {
@@ -704,11 +715,23 @@ impl Pipeline {
                     .get(job_id)
                     .and_then(GraphJob::disk_ticket)
                     .unwrap_or(0);
-                (ticket, *job_id)
+                (ticket, *job_id, None)
             })
             .collect();
-        waiting.sort_unstable();
-        for (_, job_id) in waiting {
+        waiting.extend(
+            self.graph_outside
+                .disk_waiters()
+                .into_iter()
+                .map(|(ticket, scope, hears)| (ticket, JobId(scope), Some(hears))),
+        );
+        waiting.sort_unstable_by_key(|(ticket, job_id, outside)| {
+            (*ticket, *job_id, outside.is_some())
+        });
+        for (_, job_id, outside) in waiting {
+            if let Some(hears) = outside {
+                hears.wake_disk();
+                continue;
+            }
             let woke = self
                 .graph_jobs
                 .get_mut(&job_id)

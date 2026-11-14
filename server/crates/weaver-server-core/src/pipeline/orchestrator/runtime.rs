@@ -1286,6 +1286,9 @@ impl Pipeline {
                 // A job that waits for room on a disk wakes on a reading of
                 // a disk someone waits on, never on a timer of its own.
                 let disk_readings = self.storage_capacity.readings();
+                // A job outside the pipeline that begins to wait while the
+                // loop listens for nothing rings it, so it listens.
+                let outside = Arc::clone(&self.graph_outside);
                 self.reconcile_disk_waits();
                 let disk_waiting = self.waits_for_disk_room();
                 turn_timer.pause();
@@ -1338,6 +1341,9 @@ impl Pipeline {
                             _ = disk_readings.notified(), if disk_waiting => {
                                 turn_timer.resume(PipelinePhase::GraphRun);
                                 self.disk_reading();
+                            }
+                            _ = outside.disk_wait_began(), if !disk_waiting => {
+                                turn_timer.resume(PipelinePhase::GraphRun);
                             }
                             Some(result) = self.decode_done_rx.recv() => {
                                 turn_timer.resume(PipelinePhase::DecodeDone);

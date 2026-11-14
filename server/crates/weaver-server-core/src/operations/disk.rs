@@ -935,6 +935,12 @@ impl DiskLedger {
         self.counts.waiters[self.index].load(Ordering::Acquire) > 0
     }
 
+    // How many writers wait for room here.
+    #[cfg(test)]
+    pub(crate) fn waiters(&self) -> u64 {
+        self.counts.waiters[self.index].load(Ordering::Acquire)
+    }
+
     // A reading's key: its `sampled_at` as its distance from `base`, plus
     // one.
     fn key(&self, reading: CapacityReading) -> u64 {
