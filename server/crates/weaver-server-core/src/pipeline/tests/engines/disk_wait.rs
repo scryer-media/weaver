@@ -4094,7 +4094,9 @@ async fn a_job_outside_the_pipeline_and_a_pipeline_job_waiting_wake_in_ticket_or
     );
     assert!(pipeline.waits_for_disk_room());
 
-    room_freed(&mut pipeline, &room).await;
+    // The one reading heard is one begun after the room came, so the pass
+    // it starts finds room for the pipeline's job.
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
     let asked = asked.lock().unwrap().clone();
     assert_eq!(asked.len(), 2, "each asked once: {asked:?}");
     assert_eq!(
