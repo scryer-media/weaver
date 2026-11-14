@@ -72,7 +72,7 @@ test("the add dialog sends a torrent file and a magnet link through submit, read
 
   // The daemon's refusal is shown as it gave it, and the dialog stays open for it.
   await dialog.getByText("This torrent is already in the queue.", { exact: true }).waitFor();
-  const input = { upload: null, category: null, paused: true, password: null, unpack: null };
+  const input = { upload: null, category: null, paused: true, password: null, unpack: null, tags: [] };
   const submitted = (await sent(page)).filter((entry) => entry.name === "Submit").map((entry) => entry.variables);
   assert.deepEqual(submitted, [
     { input: { ...input, text: "magnet:?xt=urn:btih:duplicate" } },
@@ -248,7 +248,8 @@ test("a public torrent announces on the DHT from its trackers, and a private one
 
   const closed = await open("privateTrackers");
   await closed.page.getByTitle("http://a.test/announce", { exact: true }).waitFor();
-  await closed.page.getByRole("button", { name: "Reannounce", exact: true }).waitFor();
+  // The block's own Reannounce comes first, before each tracker's.
+  await closed.page.getByRole("button", { name: "Reannounce", exact: true }).first().waitFor();
   assert.equal(await closed.page.getByRole("button", { name: "DHT announce", exact: true }).count(), 0);
   assert.equal(closed.errors.length, 0, closed.errors.join("\n"));
   await closed.page.close();

@@ -5,6 +5,7 @@ import { useState, type ReactNode } from "react";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { NumberField, Segmented, Toggle, UnitStrip } from "../../components/controls";
 import { LimitControl } from "../../features/networking/limits";
+import { testIds } from "../../testids";
 import type { FieldSpec } from "./framework";
 import { trimNumber } from "./quota";
 
@@ -136,6 +137,7 @@ export function GoalControl({
   suffix,
   precision = 0,
   step = 1,
+  fieldId,
 }: {
   label: string;
   value: number | null;
@@ -147,6 +149,8 @@ export function GoalControl({
   suffix?: string;
   precision?: number;
   step?: number;
+  /** The settings field it draws: the switch takes the field's test ID, the number its value ID. */
+  fieldId?: string;
 }) {
   const [last, setLast] = useState(value ?? fallback);
   return (
@@ -154,6 +158,7 @@ export function GoalControl({
       {value !== null ? (
         <NumberField
           label={label}
+          testId={fieldId === undefined ? undefined : testIds.fieldValue(fieldId)}
           value={value}
           min={0}
           step={step}
@@ -166,7 +171,12 @@ export function GoalControl({
           }}
         />
       ) : null}
-      <Toggle checked={value !== null} label={label} onChange={(on) => onChange(on ? last : null)} />
+      <Toggle
+        checked={value !== null}
+        label={label}
+        onChange={(on) => onChange(on ? last : null)}
+        testId={fieldId === undefined ? undefined : testIds.field(fieldId)}
+      />
       {value === null && offLabel ? <span className="font-wv-mono text-[11.5px] text-wv-muted">{offLabel}</span> : null}
     </div>
   );
@@ -207,6 +217,7 @@ export function DurationGoalControl({
   onChange,
   fallback,
   offLabel,
+  fieldId,
 }: {
   label: string;
   /** Minutes, or null while the goal is off. */
@@ -214,6 +225,8 @@ export function DurationGoalControl({
   onChange: (next: number | null) => void;
   fallback: number;
   offLabel?: string;
+  /** The settings field it draws: the switch takes the field's test ID, the number its value ID. */
+  fieldId?: string;
 }) {
   const t = useTranslate();
   const [last, setLast] = useState(value ?? fallback);
@@ -224,6 +237,7 @@ export function DurationGoalControl({
         <>
           <NumberField
             label={label}
+            testId={fieldId === undefined ? undefined : testIds.fieldValue(fieldId)}
             value={value / UNIT_MINUTES[unit]}
             min={0}
             precision={2}
@@ -240,7 +254,12 @@ export function DurationGoalControl({
           />
         </>
       ) : null}
-      <Toggle checked={value !== null} label={label} onChange={(on) => onChange(on ? last : null)} />
+      <Toggle
+        checked={value !== null}
+        label={label}
+        onChange={(on) => onChange(on ? last : null)}
+        testId={fieldId === undefined ? undefined : testIds.field(fieldId)}
+      />
       {value === null && offLabel ? <span className="font-wv-mono text-[11.5px] text-wv-muted">{offLabel}</span> : null}
     </div>
   );
@@ -275,6 +294,7 @@ export function LeafControl<T>({
   fallback,
   offLabel,
   input,
+  fieldId,
 }: {
   label: string;
   leaf: Leaf<T>;
@@ -284,6 +304,8 @@ export function LeafControl<T>({
   /** What off means here: no goal, unlimited. Null offers no off. */
   offLabel: string | null;
   input: (value: T, onValue: (next: T) => void) => ReactNode;
+  /** The settings field it draws: the state takes the field's test ID. */
+  fieldId?: string;
 }) {
   const t = useTranslate();
   const [last, setLast] = useState<T>(leafValue(leaf) ?? fallback);
@@ -297,6 +319,7 @@ export function LeafControl<T>({
     <div className="flex flex-wrap items-center gap-[10px]">
       <Segmented<LeafState>
         label={label}
+        testId={fieldId === undefined ? undefined : testIds.field(fieldId)}
         value={leaf.state}
         options={states}
         onChange={(state) => onChange(state === "SET" ? leafSet(last) : { state, value: null })}
@@ -312,13 +335,24 @@ export function LeafControl<T>({
 }
 
 /** A duration typed in the unit beside it, kept in minutes. */
-function DurationField({ label, value, onChange }: { label: string; value: number; onChange: (next: number) => void }) {
+function DurationField({
+  label,
+  value,
+  onChange,
+  testId,
+}: {
+  label: string;
+  value: number;
+  onChange: (next: number) => void;
+  testId: string;
+}) {
   const t = useTranslate();
   const [unit, setUnit] = useState<DurationUnit>(() => durationUnit(value));
   return (
     <>
       <NumberField
         label={label}
+        testId={testId}
         value={value / UNIT_MINUTES[unit]}
         min={0}
         precision={2}
@@ -333,12 +367,20 @@ function DurationField({ label, value, onChange }: { label: string; value: numbe
   );
 }
 
-const ratioField = (label: string) => (value: number, onValue: (next: number) => void) => (
-  <NumberField label={label} value={value} min={0} step={0.1} precision={2} onChange={(next) => onValue(Math.max(0, next))} />
+const ratioField = (label: string, fieldId: string) => (value: number, onValue: (next: number) => void) => (
+  <NumberField
+    label={label}
+    testId={testIds.fieldValue(fieldId)}
+    value={value}
+    min={0}
+    step={0.1}
+    precision={2}
+    onChange={(next) => onValue(Math.max(0, next))}
+  />
 );
 
-const durationField = (label: string) => (value: number, onValue: (next: number) => void) => (
-  <DurationField label={label} value={value} onChange={onValue} />
+const durationField = (label: string, fieldId: string) => (value: number, onValue: (next: number) => void) => (
+  <DurationField label={label} testId={testIds.fieldValue(fieldId)} value={value} onChange={onValue} />
 );
 
 /**
@@ -355,8 +397,11 @@ export function seedingFields(
   const prefix = options.idPrefix ?? "seeding";
   const noGoal = t("next.seeding.noGoal");
   const patch = (next: Partial<SeedingPolicy>) => onChange({ ...policy, ...next });
-  const goal = (id: "ratioGoal" | "seedTimeGoalMinutes" | "inactiveGoalMinutes", label: string, control: ReactNode): FieldSpec => ({
-    id: `${prefix}-${id}`,
+  const ratioId = `${prefix}-ratioGoal`;
+  const seedTimeId = `${prefix}-seedTimeGoalMinutes`;
+  const inactiveId = `${prefix}-inactiveGoalMinutes`;
+  const goal = (id: string, label: string, control: ReactNode): FieldSpec => ({
+    id,
     label,
     keywords: "seed seeding goal",
     control: { kind: "custom", control },
@@ -373,20 +418,22 @@ export function seedingFields(
   const fromChoice = <T extends string>(value: string): Leaf<T> => (value === INHERIT_CHOICE ? INHERIT : leafSet(value as T));
   return [
     goal(
-      "ratioGoal",
+      ratioId,
       ratioLabel,
       options.inherits ? (
         <LeafControl
           label={ratioLabel}
+          fieldId={ratioId}
           leaf={policy.ratioGoal}
           offLabel={noGoal}
           fallback={1}
           onChange={(ratioGoal) => patch({ ratioGoal })}
-          input={ratioField(ratioLabel)}
+          input={ratioField(ratioLabel, ratioId)}
         />
       ) : (
         <GoalControl
           label={ratioLabel}
+          fieldId={ratioId}
           value={globalGoal(policy.ratioGoal)}
           offLabel={noGoal}
           onChange={(ratioGoal) => patch({ ratioGoal: fromGlobal(ratioGoal) })}
@@ -397,20 +444,22 @@ export function seedingFields(
       ),
     ),
     goal(
-      "seedTimeGoalMinutes",
+      seedTimeId,
       seedTimeLabel,
       options.inherits ? (
         <LeafControl
           label={seedTimeLabel}
+          fieldId={seedTimeId}
           leaf={policy.seedTimeGoalMinutes}
           offLabel={noGoal}
           fallback={1440}
           onChange={(seedTimeGoalMinutes) => patch({ seedTimeGoalMinutes })}
-          input={durationField(seedTimeLabel)}
+          input={durationField(seedTimeLabel, seedTimeId)}
         />
       ) : (
         <DurationGoalControl
           label={seedTimeLabel}
+          fieldId={seedTimeId}
           value={globalGoal(policy.seedTimeGoalMinutes)}
           offLabel={noGoal}
           onChange={(minutes) => patch({ seedTimeGoalMinutes: fromGlobal(minutes) })}
@@ -419,20 +468,22 @@ export function seedingFields(
       ),
     ),
     goal(
-      "inactiveGoalMinutes",
+      inactiveId,
       inactiveLabel,
       options.inherits ? (
         <LeafControl
           label={inactiveLabel}
+          fieldId={inactiveId}
           leaf={policy.inactiveGoalMinutes}
           offLabel={noGoal}
           fallback={60}
           onChange={(inactiveGoalMinutes) => patch({ inactiveGoalMinutes })}
-          input={durationField(inactiveLabel)}
+          input={durationField(inactiveLabel, inactiveId)}
         />
       ) : (
         <DurationGoalControl
           label={inactiveLabel}
+          fieldId={inactiveId}
           value={globalGoal(policy.inactiveGoalMinutes)}
           offLabel={noGoal}
           onChange={(minutes) => patch({ inactiveGoalMinutes: fromGlobal(minutes) })}

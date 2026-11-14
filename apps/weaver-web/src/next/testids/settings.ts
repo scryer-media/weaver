@@ -28,6 +28,8 @@ export const testIds = {
   sectionNote: (blockId: string) => `note-${blockId}`,
   /** A settings field's help line, by the field id. */
   fieldHelp: (fieldId: string) => `help-${fieldId}`,
+  /** The number of a settings field whose control is a value beside its switch or its state, by the field id. */
+  fieldValue: (fieldId: string) => `field-${fieldId}-value`,
   /** A history row, keyed by the job's id. */
   historyRow: (jobId: string | number) => `history-row-${jobId}`,
   historyRowPrefix: "history-row-",
@@ -198,6 +200,8 @@ export const runtimeIds = {
   /** The tail's state note (following, paused, disconnected). */
   logsTail: (state: "following" | "paused" | "disconnected") => `logs-tail-${state}`,
   analyzerDrop: "analyzer-drop",
+  analyzerMagnet: "analyzer-magnet",
+  analyzerAnalyze: "analyzer-analyze",
   analyzerReport: "analyzer-report",
   analyzerCopyReport: "analyzer-copy-report",
   analyzerDownloadJson: "analyzer-download-json",

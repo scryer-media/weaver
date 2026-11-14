@@ -198,8 +198,9 @@ export function AnalyzerPage() {
               placeholder="magnet:?xt=urn:btih:"
               className="min-w-0 flex-1"
               autoComplete="off"
+              testId={runtimeIds.analyzerMagnet}
             />
-            <PrimaryButton type="submit" disabled={busy || !isMagnet(magnet)}>
+            <PrimaryButton type="submit" disabled={busy || !isMagnet(magnet)} testId={runtimeIds.analyzerAnalyze}>
               {t("next.analyzer.analyze")}
             </PrimaryButton>
           </form>
