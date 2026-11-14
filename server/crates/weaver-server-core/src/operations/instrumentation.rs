@@ -1468,6 +1468,14 @@ pub struct VolumeWriterSnapshot {
     // Files the writer opened, and the time inside those opens.
     pub opens: u64,
     pub open_nanos: u64,
+    // The steps of those opens, each when it ran: create, sparse mark and
+    // length set at creation.
+    pub open_creates: u64,
+    pub open_create_nanos: u64,
+    pub open_marks: u64,
+    pub open_mark_nanos: u64,
+    pub open_sizes: u64,
+    pub open_size_nanos: u64,
     // Lengths the writer set, at a close or a truncate, the time inside
     // those calls, and closes already at their length that set nothing.
     pub length_sets: u64,

@@ -10,6 +10,7 @@ fn open(path: &Path, _length: Option<u64>) -> io::Result<Opened> {
     Ok(Opened {
         file: open_file(path)?,
         length: None,
+        steps: OpenSteps::default(),
     })
 }
 
@@ -1641,6 +1642,7 @@ fn open_sized(path: &Path, length: Option<u64>) -> io::Result<Opened> {
     Ok(Opened {
         file,
         length: Some(length),
+        steps: OpenSteps::default(),
     })
 }
 
@@ -1649,6 +1651,7 @@ fn open_grown(path: &Path, _length: Option<u64>) -> io::Result<Opened> {
     Ok(Opened {
         file: open_file(path)?,
         length: Some(0),
+        steps: OpenSteps::default(),
     })
 }
 
@@ -1734,8 +1737,7 @@ fn a_file_grown_by_its_writes_is_set_at_close_only_when_short() {
 
 fn graphs_opener(path: &Path, length: Option<u64>) -> io::Result<Opened> {
     use crate::pipeline::graph::sparse::{PlatformMarker, create_sized_known};
-    let (file, length) = create_sized_known(path, &PlatformMarker, length)?;
-    Ok(Opened { file, length })
+    create_sized_known(path, &PlatformMarker, length)
 }
 
 // Two files declared at eight bytes: one written whole and closed at eight,
@@ -1877,4 +1879,39 @@ fn a_closed_file_is_placed_before_another_files_open() {
     hold.open();
     other.barrier().wait();
     assert_eq!(std::fs::read(&other_path).unwrap(), b"more");
+}
+
+// A write to a file already open is placed before another key's file in the
+// same batch is made, even when the make came to the writer first.
+#[test]
+fn an_open_files_write_is_placed_before_another_files_make() {
+    let dir = tempfile::tempdir().unwrap();
+    let (open_path, made_path) = (dir.path().join("open"), dir.path().join("made"));
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let writing = writers.submitter(&volume, 1);
+    let making = writers.submitter(&volume, 2);
+    // The file is opened in a batch of its own.
+    writing.write(1, 0, Bytes::from_static(b"head"), create(&open_path));
+    hold.wait_held();
+    hold.release(1);
+    // The thread stands in a batch of its own before what follows comes.
+    making.run(None, dir.path().to_path_buf(), || Ok(()));
+    hold.wait_held();
+    making.write(1, 0, Bytes::from_static(b"more"), create(&made_path));
+    writing.write(1, 4, Bytes::from_static(b"tail"), None);
+    hold.release(1);
+    hold.wait_held();
+    // One operation of the batch runs: the open file's write.
+    hold.release(1);
+    hold.wait_held();
+    let written = writing.barrier();
+    assert!(!written.unwritten(), "the open file's write is placed");
+    assert!(!made_path.exists(), "the other file is not made yet");
+    hold.open();
+    making.barrier().wait();
+    written.wait();
+    assert_eq!(std::fs::read(&made_path).unwrap(), b"more");
+    assert_eq!(std::fs::read(&open_path).unwrap(), b"headtail");
 }

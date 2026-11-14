@@ -275,11 +275,14 @@ fn owned(bytes: &[u8]) -> Bytes {
 // Open the file at `path` for a volume's writer, as a leaf opens its own,
 // with the length it was left at when that is known.
 fn open_sized(path: &Path, length: Option<u64>) -> io::Result<Opened> {
+    let began = std::time::Instant::now();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let (file, length) = create_sized_known(path, &PlatformMarker, length)?;
-    Ok(Opened { file, length })
+    let folders = began.elapsed();
+    let mut opened = create_sized_known(path, &PlatformMarker, length)?;
+    opened.steps.create = opened.steps.create.map(|create| create + folders);
+    Ok(opened)
 }
 
 static NEXT_LEAF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);

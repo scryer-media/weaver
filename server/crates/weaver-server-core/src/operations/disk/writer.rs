@@ -42,7 +42,28 @@ pub(crate) type OpenFn = fn(&Path, Option<u64>) -> io::Result<Opened>;
 pub(crate) struct Opened {
     pub(crate) file: File,
     pub(crate) length: Option<u64>,
+    pub(crate) steps: OpenSteps,
 }
+
+// The time an opener spent in each step of an open, for the steps it ran
+// and timed; `None` for a step it did not run. The create includes the
+// folders made for the file; the size is the look at the file before its
+// length is set at creation, and the set.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct OpenSteps {
+    pub(crate) create: Option<Duration>,
+    pub(crate) mark: Option<Duration>,
+    pub(crate) size: Option<Duration>,
+}
+
+impl OpenSteps {
+    fn nanos(step: Option<Duration>) -> Option<u64> {
+        step.map(|took| took.as_nanos() as u64)
+    }
+}
+
+// An open that took longer than this is logged with its steps.
+const SLOW_OPEN: Duration = Duration::from_millis(100);
 
 // A file to open before an operation that needs it open.
 pub(crate) struct Create {
@@ -1614,9 +1635,26 @@ impl Held {
             // what the file system is writing out.
             let began = now();
             let opened = (create.open)(&create.path, create.length);
-            counts.opened(nanos_since(began));
+            let took = nanos_since(began);
+            counts.opened(took);
             break_span();
             let opened = opened?;
+            let [made, marked, sized] =
+                [opened.steps.create, opened.steps.mark, opened.steps.size].map(OpenSteps::nanos);
+            counts.open_steps(made, marked, sized);
+            if took > SLOW_OPEN.as_nanos() as u64 {
+                let micros = |step: Option<u64>| step.map(|nanos| nanos / 1_000);
+                tracing::warn!(
+                    path = %create.path.display(),
+                    declared_length = ?create.length,
+                    length = ?opened.length,
+                    open_us = took / 1_000,
+                    create_us = ?micros(made),
+                    mark_us = ?micros(marked),
+                    size_us = ?micros(sized),
+                    "the volume's writer took over 100 ms to open a file"
+                );
+            }
             *creating = false;
             self.open.insert(
                 file,
@@ -2142,8 +2180,10 @@ impl Thread {
         self.files.clear();
         let mut part = 0u32;
         let mut rank = 0u32;
-        // The files of the batch a close ends, by their rank.
+        // The files of the batch a close ends, and those its first
+        // operation in their part must open, by their rank.
         let mut closing = Vec::new();
+        let mut opening = Vec::new();
         for index in 0..self.batch.len() {
             let at = index as u32;
             let key = &self.batch[index].key;
@@ -2177,6 +2217,19 @@ impl Thread {
             if entry.0 != part {
                 rank += 1;
                 *entry = (part, rank, 0);
+                // A write that brings the way to open its file was sent for
+                // a file its caller does not hold open; a truncate or a close
+                // opens one the writer does not hold.
+                let opens = match op {
+                    Op::Write { create, .. } => create.is_some(),
+                    Op::Truncate { .. } | Op::Close { .. } => {
+                        !queued.key.held().open.contains_key(&file)
+                    }
+                    _ => false,
+                };
+                if opens {
+                    opening.push(rank);
+                }
             }
             // A write that opens the file runs before the writes after it,
             // which carry no way to open it.
@@ -2206,20 +2259,28 @@ impl Thread {
             return;
         }
         // Between two operations that may touch more than one file, the files
-        // a close ends run first, each in the order it first came: a reader
-        // of a closed file, a check or a repair, is told its bytes and length
-        // are placed without standing behind another file's open or writes.
+        // a close ends run first, then the files already open, then those
+        // that must be opened, each in the order it first came: a reader of
+        // a closed file, a check or a repair, is told its bytes and length
+        // are placed without standing behind another file's open or writes,
+        // and a file already open is not held behind another's open, which
+        // on some systems stands behind what the file system writes out.
         // The files of one part touch nothing of each other, so any order of
-        // them is as sound as the one they came in.
-        if !closing.is_empty() {
-            const LATER: u32 = 1 << 31;
-            let mut first = vec![false; rank as usize + 1];
+        // them is as sound as the one they came in. A key still hears of its
+        // operations in the order it sent them (`run_batch`).
+        if !closing.is_empty() || !opening.is_empty() {
+            const OPEN: u32 = 1 << 30;
+            const OPENING: u32 = 1 << 31;
+            let mut tier = vec![OPEN; rank as usize + 1];
+            for rank in opening {
+                tier[rank as usize] = OPENING;
+            }
             for rank in closing {
-                first[rank as usize] = true;
+                tier[rank as usize] = 0;
             }
             for place in &mut self.order {
-                if place.file != 0 && !first[place.file as usize] {
-                    place.file |= LATER;
+                if place.file != 0 {
+                    place.file |= tier[place.file as usize];
                 }
             }
         }

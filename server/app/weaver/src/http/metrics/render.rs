@@ -1615,6 +1615,29 @@ fn render_volumes(out: &mut Encoder, volumes: &[VolumeSnapshot]) {
             labels,
             writer.open_nanos as f64 / 1e9,
         );
+        for (count, seconds, opens, nanos) in [
+            (
+                &f::VOLUME_WRITER_OPEN_CREATES,
+                &f::VOLUME_WRITER_OPEN_CREATE_SECONDS,
+                writer.open_creates,
+                writer.open_create_nanos,
+            ),
+            (
+                &f::VOLUME_WRITER_OPEN_SPARSE_MARKS,
+                &f::VOLUME_WRITER_OPEN_SPARSE_MARK_SECONDS,
+                writer.open_marks,
+                writer.open_mark_nanos,
+            ),
+            (
+                &f::VOLUME_WRITER_OPEN_LENGTH_SETS,
+                &f::VOLUME_WRITER_OPEN_LENGTH_SET_SECONDS,
+                writer.open_sizes,
+                writer.open_size_nanos,
+            ),
+        ] {
+            out.sample(count, labels, opens);
+            out.sample_f64(seconds, labels, nanos as f64 / 1e9);
+        }
         out.sample(&f::VOLUME_WRITER_LENGTH_SETS, labels, writer.length_sets);
         out.sample_f64(
             &f::VOLUME_WRITER_LENGTH_SET_SECONDS,

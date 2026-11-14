@@ -75,6 +75,15 @@ pub(crate) struct WriterCounts {
     // of the file, its sparse mark and its length when it is sized.
     pub(crate) opens: AtomicU64,
     pub(crate) open_nanos: AtomicU64,
+    // The steps of those opens, each counted when the opener ran and timed
+    // it: the create (with the folders made for it), the sparse mark, and
+    // the length set at creation (with the look at the file before it).
+    pub(crate) open_creates: AtomicU64,
+    pub(crate) open_create_nanos: AtomicU64,
+    pub(crate) open_marks: AtomicU64,
+    pub(crate) open_mark_nanos: AtomicU64,
+    pub(crate) open_sizes: AtomicU64,
+    pub(crate) open_size_nanos: AtomicU64,
     // Lengths the writer set, at a close or a truncate, and the time inside
     // those calls; and closes it found already at their length, which set
     // nothing.
@@ -139,6 +148,20 @@ impl WriterCounts {
     pub(crate) fn opened(&self, nanos: u64) {
         self.opens.fetch_add(1, Ordering::Relaxed);
         self.open_nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    // The steps of an open, in nanoseconds, each when it ran. Relaxed adds.
+    pub(crate) fn open_steps(&self, create: Option<u64>, mark: Option<u64>, size: Option<u64>) {
+        for (step, count, total) in [
+            (create, &self.open_creates, &self.open_create_nanos),
+            (mark, &self.open_marks, &self.open_mark_nanos),
+            (size, &self.open_sizes, &self.open_size_nanos),
+        ] {
+            if let Some(nanos) = step {
+                count.fetch_add(1, Ordering::Relaxed);
+                total.fetch_add(nanos, Ordering::Relaxed);
+            }
+        }
     }
 
     // The writer set a file's length in `nanos`. Relaxed adds.

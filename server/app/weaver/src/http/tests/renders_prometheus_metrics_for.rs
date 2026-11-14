@@ -964,6 +964,18 @@ fn renders_collected_instrumentation_snapshots() {
         ("weaver_volume_aside_wait_seconds_total", "2"),
         ("weaver_volume_writer_opens_total", "11"),
         ("weaver_volume_writer_open_seconds_total", "0.5"),
+        ("weaver_volume_writer_open_creates_total", "11"),
+        ("weaver_volume_writer_open_create_seconds_total", "0.25"),
+        ("weaver_volume_writer_open_sparse_marks_total", "10"),
+        (
+            "weaver_volume_writer_open_sparse_mark_seconds_total",
+            "0.125",
+        ),
+        ("weaver_volume_writer_open_length_sets_total", "4"),
+        (
+            "weaver_volume_writer_open_length_set_seconds_total",
+            "0.075",
+        ),
         ("weaver_volume_writer_length_sets_total", "3"),
         ("weaver_volume_writer_length_set_seconds_total", "1.25"),
         ("weaver_volume_writer_length_sets_skipped_total", "8"),

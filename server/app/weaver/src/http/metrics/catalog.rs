@@ -658,6 +658,18 @@ metric_families! {
         "Files a volume's writer opened, failed opens included.");
     VOLUME_WRITER_OPEN_SECONDS = ("weaver_volume_writer_open_seconds_total", Counter, ["volume"],
         "Time a volume's writer spent opening files (see `weaver_volume_writer_opens_total`): the making of the file, its sparse mark and, where files are sized when made, its length.");
+    VOLUME_WRITER_OPEN_CREATES = ("weaver_volume_writer_open_creates_total", Counter, ["volume"],
+        "Opens of a volume's writer whose create step was timed: the open or making of the file, with the folders made for it.");
+    VOLUME_WRITER_OPEN_CREATE_SECONDS = ("weaver_volume_writer_open_create_seconds_total", Counter, ["volume"],
+        "Time a volume's writer spent in the create step of its opens (see `weaver_volume_writer_open_creates_total`).");
+    VOLUME_WRITER_OPEN_SPARSE_MARKS = ("weaver_volume_writer_open_sparse_marks_total", Counter, ["volume"],
+        "Opens of a volume's writer that marked the file sparse.");
+    VOLUME_WRITER_OPEN_SPARSE_MARK_SECONDS = ("weaver_volume_writer_open_sparse_mark_seconds_total", Counter, ["volume"],
+        "Time a volume's writer spent marking opened files sparse (see `weaver_volume_writer_open_sparse_marks_total`).");
+    VOLUME_WRITER_OPEN_LENGTH_SETS = ("weaver_volume_writer_open_length_sets_total", Counter, ["volume"],
+        "Opens of a volume's writer that looked at the file to size it at creation, sized or not.");
+    VOLUME_WRITER_OPEN_LENGTH_SET_SECONDS = ("weaver_volume_writer_open_length_set_seconds_total", Counter, ["volume"],
+        "Time a volume's writer spent sizing files at creation, the look at the file before it included (see `weaver_volume_writer_open_length_sets_total`).");
     VOLUME_WRITER_LENGTH_SETS = ("weaver_volume_writer_length_sets_total", Counter, ["volume"],
         "Lengths a volume's writer set on files, at a close or a truncate.");
     VOLUME_WRITER_LENGTH_SET_SECONDS = ("weaver_volume_writer_length_set_seconds_total", Counter, ["volume"],
