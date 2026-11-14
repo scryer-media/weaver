@@ -603,6 +603,7 @@ fn rendered_label_sets_cover_every_snapshot_counter() {
             "uu_cursor",
             "checkpoint",
             "activation",
+            "write_buffer",
         ],
     );
     assert_label_set(

@@ -79,10 +79,12 @@ pub enum SchedulerBlockClause {
     ProviderPriority,
     // The job's articles are still being read back from its stored NZB.
     Activation,
+    // A volume the job writes to holds its budget of bytes for its writer.
+    WriteBuffer,
 }
 
 impl SchedulerBlockClause {
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 10;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Propagation,
         Self::Retention,
@@ -93,6 +95,7 @@ impl SchedulerBlockClause {
         Self::Checkpoint,
         Self::ProviderPriority,
         Self::Activation,
+        Self::WriteBuffer,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -106,6 +109,7 @@ impl SchedulerBlockClause {
             Self::Checkpoint => "checkpoint",
             Self::ProviderPriority => "provider_priority",
             Self::Activation => "activation",
+            Self::WriteBuffer => "write_buffer",
         }
     }
 
