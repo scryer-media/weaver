@@ -655,6 +655,22 @@ impl Pipeline {
         self.report_job(job_id);
     }
 
+    // The folder a database write refused for want of room waits on: the
+    // folder of the SQLite file, read like any held path. A Postgres server
+    // has no local folder: its disk cannot be read from here, so the job
+    // waits on the data folder by the reserve rule and tries the write
+    // again when that shows a rise.
+    pub(in crate::pipeline) fn database_dir(&self) -> PathBuf {
+        self.db
+            .database_target()
+            .sqlite_path()
+            .ok()
+            .flatten()
+            .and_then(|file| file.parent().map(std::path::Path::to_path_buf))
+            .filter(|folder| folder.is_absolute())
+            .unwrap_or_else(|| self.script_data_dir.clone())
+    }
+
     // The final moves of the jobs let go start here, at the top of a turn.
     // A move that had claimed its destination goes on into it from the
     // working directory the job has, both as they stood when it stopped. A

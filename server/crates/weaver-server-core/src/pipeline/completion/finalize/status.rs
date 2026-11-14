@@ -601,10 +601,18 @@ impl Pipeline {
                 "placement recovery must succeed before resume".into(),
             ));
         }
-        // A job held for a full disk tries its disk again when resumed.
+        // A job held for a full disk tries its disk again when resumed. One
+        // that is paused is let go by the wake at the end, once it is
+        // active again: a wake now would find it paused and take the
+        // promise this resume just gave it.
         if self.held_for_full_disk(job_id) {
             self.try_full_disk_now(job_id);
-            self.wake_full_disk();
+            let paused = self.jobs.get(&job_id).is_some_and(|state| {
+                matches!(state.run_state, crate::jobs::model::RunState::Paused)
+            });
+            if !paused {
+                self.wake_full_disk();
+            }
         }
         let (resume_status, resume_download_state, resume_post_state) =
             match self.jobs.get_mut(&job_id) {

@@ -2137,7 +2137,7 @@ impl Pipeline {
             Err(MoveToCompleteFailure::Operational(error)) => self.fail_job(job_id, error),
             Err(MoveToCompleteFailure::RowFull(message)) => {
                 // Nothing moved and the claim was given back: the job waits
-                // on the data folder's disk, and when let go claims its
+                // on the database's disk, and when let go claims its
                 // destination and records the move again, as a move whose
                 // claim found no room does. The write names no figure: what
                 // the database needs to take a row is its own to know, so
@@ -2153,7 +2153,7 @@ impl Pipeline {
                             .collect()
                     })
                     .unwrap_or_default();
-                let data_dir = self.script_data_dir.clone();
+                let data_dir = self.database_dir();
                 self.hold_move_for_full_disk(
                     job_id,
                     Stage::Claim(left_behind),
