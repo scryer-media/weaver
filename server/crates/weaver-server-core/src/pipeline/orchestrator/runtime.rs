@@ -521,6 +521,9 @@ impl Pipeline {
             volume_writers,
             volume_reports,
             volume_budget_held: std::sync::atomic::AtomicBool::new(false),
+            shutdown_settle: crate::operations::disk::writer::SettleBound::wall(
+                Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT,
+            ),
             volume_probes,
             window_ledgers: Default::default(),
             extraction_limits,
@@ -1897,12 +1900,8 @@ impl Pipeline {
         // volume on which nothing returns for the span is left behind:
         // what it still holds is in no checkpoint, so it is fetched again.
         let writers = Arc::clone(&self.volume_writers);
-        match tokio::task::spawn_blocking(move || {
-            use crate::operations::disk::writer::WallClock;
-            writers.settle_within(Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT, &WallClock::start())
-        })
-        .await
-        {
+        let bound = self.shutdown_settle.clone();
+        match tokio::task::spawn_blocking(move || writers.settle_by(&bound)).await {
             Ok(left) => {
                 for volume in left {
                     warn!(
@@ -1923,12 +1922,10 @@ impl Pipeline {
         // are put down as the rest was, and the checkpoints they bear out
         // are queued as the jobs hear it.
         let writers = Arc::clone(&self.volume_writers);
-        if tokio::task::spawn_blocking(move || {
-            use crate::operations::disk::writer::WallClock;
-            writers.settle_within(Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT, &WallClock::start())
-        })
-        .await
-        .is_err()
+        let bound = self.shutdown_settle.clone();
+        if tokio::task::spawn_blocking(move || writers.settle_by(&bound))
+            .await
+            .is_err()
         {
             warn!("the volume writers could not be drained after the last checkpoint");
         }

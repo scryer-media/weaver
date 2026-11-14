@@ -95,6 +95,25 @@ impl Clock for WallClock {
     }
 }
 
+// The clock a bounded settle goes by and the span it gives a volume that
+// stands still, chosen by whoever will ask for the settle: the machine's
+// clock outside tests, and in a test one it moves by hand.
+#[derive(Clone)]
+pub(crate) struct SettleBound {
+    pub(crate) clock: Arc<dyn Clock + Send>,
+    pub(crate) span: Duration,
+}
+
+impl SettleBound {
+    // `span` by the machine's own clock.
+    pub(crate) fn wall(span: Duration) -> Self {
+        Self {
+            clock: Arc::new(WallClock::start()),
+            span,
+        }
+    }
+}
+
 type ReportFn = dyn Fn(Report) + Send + Sync;
 type Then = Box<dyn FnOnce() + Send>;
 type Lanes = Vec<(usize, Arc<Lane>)>;
@@ -111,11 +130,16 @@ pub(crate) struct VolumeWriters {
 
 // Every volume with a writer, by the address of its record. A volume stays
 // here until its thread has ended, whether or not a caller still holds it.
+// One whose thread could not be started stays until its last caller has let
+// go: see `VolumeWriters::lane`.
 #[derive(Default)]
 struct Registry {
     lanes: Mutex<Lanes>,
     #[cfg(test)]
     ended: Condvar,
+    // Times a thread was asked for.
+    #[cfg(test)]
+    starts: AtomicU64,
 }
 
 impl Registry {
@@ -178,6 +202,17 @@ impl VolumeWriters {
     // A caller's way to write to `volume` under `key`. The volume's thread
     // starts here when it has none; one that has not ended is used again.
     pub(crate) fn submitter(&self, volume: &Arc<Volume>, key: u64) -> Arc<Submitter> {
+        debug_assert_ne!(key, VOLUME_KEY, "the volume's own key is no caller's");
+        self.submitter_under(volume, key)
+    }
+
+    // The way to queue a volume's own work on its writer, such as the probe
+    // of its write rate, under the one key no caller has.
+    pub(crate) fn volume_submitter(&self, volume: &Arc<Volume>) -> Arc<Submitter> {
+        self.submitter_under(volume, VOLUME_KEY)
+    }
+
+    fn submitter_under(&self, volume: &Arc<Volume>, key: u64) -> Arc<Submitter> {
         let lane = self.lane(volume);
         let send = Mutex::new(lane.send.clone());
         Arc::new(Submitter {
@@ -201,7 +236,9 @@ impl VolumeWriters {
         let (inline, threadless) = (self.mode == Mode::Inline, self.mode == Mode::NoThread);
         #[cfg(not(test))]
         let (inline, threadless) = (false, false);
-        let (lane, live) = Lane::start(
+        #[cfg(test)]
+        self.registry.starts.fetch_add(1, Ordering::Relaxed);
+        let lane = Lane::start(
             Arc::clone(volume),
             Arc::clone(&self.report),
             self.rates.clone(),
@@ -210,10 +247,12 @@ impl VolumeWriters {
             threadless,
         );
         lane.state.users.fetch_add(1, Ordering::SeqCst);
-        // A lane with no thread is not kept: the next caller tries again.
-        if live {
-            lanes.push((at, Arc::clone(&lane)));
-        }
+        // A lane whose thread could not be started is kept as well, so the
+        // callers that come while it is held share it and fail at once: no
+        // thread is asked for again on their behalf. It leaves when the last
+        // of them lets go, and only the caller after that asks for a thread
+        // again: one ask each time the volume has been let go by everyone.
+        lanes.push((at, Arc::clone(&lane)));
         lane
     }
 
@@ -249,6 +288,11 @@ impl VolumeWriters {
     // nothing does when everything returned.
     pub(crate) fn settle_within(&self, span: Duration, clock: &dyn Clock) -> Vec<Unsettled> {
         self.settle_each(Some((span, clock)))
+    }
+
+    // The bounded settle, by a clock and span chosen beforehand.
+    pub(crate) fn settle_by(&self, bound: &SettleBound) -> Vec<Unsettled> {
+        self.settle_within(bound.span, &*bound.clock)
     }
 
     fn settle_each(&self, bound: Option<(Duration, &dyn Clock)>) -> Vec<Unsettled> {
@@ -356,6 +400,12 @@ impl VolumeWriters {
         hold
     }
 }
+
+// The key a volume's own work is queued under: reserved here, and handed
+// out only by `volume_submitter`. A caller's key is its own number, for a
+// job its id. Ids are counted up one at a time from ten thousand and kept
+// in signed 64-bit columns, so none reaches this.
+const VOLUME_KEY: u64 = u64::MAX;
 
 // No entry of a batch: the end of a key's chain through it.
 const NONE: u32 = u32::MAX;
@@ -538,8 +588,9 @@ impl Submitter {
 
     // Write `bytes` at `offset` of `file`, opening it through `create` when
     // it is not open. The bytes are handed over, not copied. A write to a
-    // file that is neither open nor given a way to open is dropped: the
-    // open that failed has said so.
+    // file whose name was refused is dropped: the refusal has said so. A
+    // write to any other file that is neither open nor given a way to open
+    // fails the key.
     pub(crate) fn write(&self, file: u64, offset: u64, bytes: Bytes, create: Option<Create>) -> u64 {
         self.lane
             .state
@@ -590,20 +641,44 @@ impl Submitter {
         })
     }
 
-    // Move `from` to `to`, where nothing may be, once every earlier
-    // operation has returned.
-    pub(crate) fn rename(&self, file: Option<u64>, from: PathBuf, to: PathBuf) -> u64 {
-        let path = from.clone();
-        self.run(file, path, move || {
-            crate::runtime::fs::rename_path_exclusive(&from, &to)
-        })
-    }
-
-    // Give `from` the second name `to`, once every earlier operation has
-    // returned.
-    pub(crate) fn hard_link(&self, from: PathBuf, to: PathBuf) -> u64 {
-        let path = from.clone();
-        self.run(None, path, move || std::fs::hard_link(&from, &to))
+    // Stand still until `bytes` or fewer wait in memory for the volume's
+    // writer: the wait of a thread that produces what is written, such as
+    // an extraction, on the volume's budget. Returns at once when no more
+    // than that wait, and whatever waits once the key has stopped, by a
+    // failure or by being given up, or the volume has no writer thread:
+    // nothing more of the key will be written then. The writer wakes it
+    // as the bytes fall; nothing is polled.
+    //
+    // Never for the pipeline loop, which must not stand still for a disk:
+    // the loop asks `VolumeWriters::wake_below` and goes on. The wait is
+    // not counted against the loop.
+    pub(crate) fn wait_below(&self, bytes: u64) {
+        let state = &self.lane.state;
+        let over = || {
+            state.volume.buffered_bytes.load(Ordering::SeqCst) > bytes
+                && !self.key.failed.load(Ordering::SeqCst)
+                && !self.key.abandoned.load(Ordering::SeqCst)
+                && self.lane.threadless.is_none()
+        };
+        if !over() {
+            return;
+        }
+        // Counted in before the look that decides to wait, and the look is
+        // made with the lock held: the writer lowers the bytes first and
+        // looks for waiters after, so it either finds this one and wakes
+        // it under the lock, or this look finds the bytes already lowered.
+        state.below_waiters.fetch_add(1, Ordering::SeqCst);
+        let mut held = state
+            .below_waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        #[cfg(test)]
+        state.below.notify_all();
+        while over() {
+            held = state.below.wait(held).unwrap_or_else(PoisonError::into_inner);
+        }
+        state.below_waiters.fetch_sub(1, Ordering::SeqCst);
+        drop(held);
     }
 
     // Read `len` bytes at `offset` of the file at `path`, after everything
@@ -664,7 +739,8 @@ impl Submitter {
     // run, and every handle it left open is closed. The barrier taken after
     // this passes once nothing of the key can touch the disk again.
     pub(crate) fn abandon(&self) -> Barrier {
-        self.key.abandoned.store(true, Ordering::Release);
+        self.key.abandoned.store(true, Ordering::SeqCst);
+        self.lane.state.look_below();
         self.submit(Op::Forget);
         self.barrier()
     }
@@ -688,6 +764,9 @@ impl Submitter {
                 unbuffer(state, &*self.lane.report, bytes.len() as u64);
             }
             state.done.fetch_add(1, Ordering::Relaxed);
+            // Nothing sent to the volume will run, so all of it has
+            // returned: a settle does not wait for it.
+            state.returned(state.sent.load(Ordering::SeqCst));
             let counts = &state.volume.writer;
             counts.failed_operations.fetch_add(1, Ordering::Relaxed);
             let first = !self.key.failed.swap(true, Ordering::AcqRel);
@@ -739,6 +818,13 @@ impl Barrier {
         self.key.has_returned(self.seq)
             && !self.key.stopped()
             && self.key.unheard.load(Ordering::Acquire) == 0
+    }
+
+    // Whether an operation of the key failed or the key was given up:
+    // nothing more of it is written. A refusal still to be heard is not a
+    // failure.
+    pub(crate) fn failed(&self) -> bool {
+        self.key.stopped()
     }
 
     // Whether everything behind the barrier returned, failed or not.
@@ -804,6 +890,9 @@ struct Lane {
     // A lane with no thread: what a thread would hold, run by whoever
     // submits.
     inline: Option<Mutex<(Thread, mpsc::Receiver<Mail>)>>,
+    // Set on a lane whose thread could not be started: where it is kept
+    // until its last caller lets go.
+    threadless: Option<Weak<Registry>>,
 }
 
 struct LaneState {
@@ -819,6 +908,10 @@ struct LaneState {
     waiters: AtomicUsize,
     waiting: Mutex<()>,
     woke: Condvar,
+    // Threads standing in `Submitter::wait_below`, and what wakes them.
+    below_waiters: AtomicUsize,
+    below_waiting: Mutex<()>,
+    below: Condvar,
     #[cfg(test)]
     gate: Mutex<Gate>,
     #[cfg(test)]
@@ -833,6 +926,18 @@ impl LaneState {
         counts
             .loop_wait_nanos
             .fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    // Have every thread in `Submitter::wait_below` look again: the bytes
+    // waiting fell, or a key stopped. One load when no thread waits.
+    fn look_below(&self) {
+        if self.below_waiters.load(Ordering::SeqCst) > 0 {
+            let _held = self
+                .below_waiting
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.below.notify_all();
+        }
     }
 
     fn returned(&self, through: u64) {
@@ -855,6 +960,7 @@ fn unbuffer(state: &LaneState, report: &ReportFn, bytes: u64) {
         .buffered_bytes
         .fetch_sub(bytes, Ordering::SeqCst)
         .saturating_sub(bytes);
+    state.look_below();
     let ask = volume.wake_line.load(Ordering::SeqCst);
     if ask != 0
         && left < ask
@@ -871,7 +977,9 @@ fn unbuffer(state: &LaneState, report: &ReportFn, bytes: u64) {
 }
 
 impl Lane {
-    // The lane, and whether anything will run what is sent to it.
+    // The lane, with its thread started. When no thread could be started
+    // nothing will run what is sent to the lane: every submission fails its
+    // key at once.
     fn start(
         volume: Arc<Volume>,
         report: Arc<ReportFn>,
@@ -879,7 +987,7 @@ impl Lane {
         registry: Weak<Registry>,
         inline: bool,
         threadless: bool,
-    ) -> (Arc<Self>, bool) {
+    ) -> Arc<Self> {
         let (send, queued) = mpsc::channel();
         let state = Arc::new(LaneState {
             volume,
@@ -890,28 +998,30 @@ impl Lane {
             waiters: AtomicUsize::new(0),
             waiting: Mutex::new(()),
             woke: Condvar::new(),
+            below_waiters: AtomicUsize::new(0),
+            below_waiting: Mutex::new(()),
+            below: Condvar::new(),
             #[cfg(test)]
             gate: Mutex::default(),
             #[cfg(test)]
             gate_moved: Condvar::new(),
         });
-        let thread = Thread::new(Arc::clone(&state), Arc::clone(&report), rates, registry);
+        let thread = Thread::new(
+            Arc::clone(&state),
+            Arc::clone(&report),
+            rates,
+            registry.clone(),
+        );
         if inline {
-            let lane = Arc::new(Self {
+            return Arc::new(Self {
                 state,
                 report,
                 send,
                 inline: Some(Mutex::new((thread, queued))),
+                threadless: None,
             });
-            return (lane, true);
         }
         let name = format!("volume-writer {}", state.volume.label);
-        let lane = Arc::new(Self {
-            state,
-            report,
-            send,
-            inline: None,
-        });
         let run = move || thread.run(queued);
         let spawned = if threadless {
             drop(run);
@@ -922,17 +1032,38 @@ impl Lane {
         if let Err(error) = &spawned {
             // With no thread the receiver is gone, and every submission
             // fails its key at once instead of waiting forever.
-            tracing::error!(%error, "could not start a volume's writer thread");
+            tracing::error!(
+                %error,
+                volume = %state.volume.label,
+                "could not start a volume's writer thread; what is written to the volume fails until it is let go and asked for again"
+            );
         }
-        (lane, spawned.is_ok())
+        Arc::new(Self {
+            state,
+            report,
+            send,
+            inline: None,
+            threadless: spawned.is_err().then_some(registry),
+        })
     }
 
     // A caller lets the volume go. The thread is woken to see whether it
-    // was the last.
+    // was the last. A lane with no thread leaves the registry with its last
+    // caller, decided under the registry's lock as a thread's end is, so
+    // none takes the lane as it goes.
     fn leave(&self) {
         self.state.users.fetch_sub(1, Ordering::SeqCst);
         let _ = self.send.send(Mail::Left);
         self.run_inline();
+        let Some(registry) = self.threadless.as_ref().and_then(Weak::upgrade) else {
+            return;
+        };
+        let mut lanes = registry.lock();
+        if self.state.users.load(Ordering::SeqCst) == 0 {
+            lanes.retain(|(_, lane)| !Arc::ptr_eq(&lane.state, &self.state));
+            #[cfg(test)]
+            registry.ended.notify_all();
+        }
     }
 
     // On a lane with no thread, run what was sent.
@@ -1025,7 +1156,8 @@ struct Open {
 
 impl Held {
     // The open handle of `file`, opened through `create` when it is not
-    // open. `None` for a file with no handle and no way to open one.
+    // open. `None` for a file whose name was refused; an error for any other
+    // file with no handle and no way to open one.
     fn opened(
         &mut self,
         file: u64,
@@ -1033,12 +1165,18 @@ impl Held {
         creating: &mut bool,
     ) -> io::Result<Option<&mut Open>> {
         if !self.open.contains_key(&file) {
-            let Some(create) = create else {
-                return Ok(None);
-            };
+            // The writes of a file whose name was refused are dropped: the
+            // refusal has said so.
             if self.refused.contains(&file) {
                 return Ok(None);
             }
+            // Any other write to a file that is not open must bring the way
+            // to open it. One that does not would be lost without a word.
+            let Some(create) = create else {
+                return Err(io::Error::other(
+                    "a write reached the volume's writer for a file that is not open, with no way to open it",
+                ));
+            };
             *creating = true;
             let opened = (create.open)(&create.path, create.length)?;
             *creating = false;
@@ -1310,7 +1448,7 @@ impl Thread {
                 self.state.done.fetch_add(1, Ordering::Relaxed);
             }
             let key = &entry.key;
-            if !key.failed.swap(true, Ordering::AcqRel) && !key.abandoned.load(Ordering::Acquire) {
+            if !key.failed.swap(true, Ordering::SeqCst) && !key.abandoned.load(Ordering::Acquire) {
                 self.ran.failures.push(Failure {
                     key: key.id,
                     file: None,
@@ -1321,6 +1459,7 @@ impl Thread {
             }
             key.returned(entry.seq);
         }
+        self.state.look_below();
         self.state.returned(base + self.batch.len() as u64);
     }
 
@@ -1497,7 +1636,17 @@ fn perform(
             }
             Ok(())
         }
-        _ if forced.is_some() => Err(forced.expect("checked above")),
+        // A test's forced failure names the file it stood before: by the
+        // path the operation carries, or the one its file was opened at.
+        _ if forced.is_some() => {
+            failed_at = op.path();
+            if failed_at.as_os_str().is_empty()
+                && let Some(open) = file.and_then(|file| held.open.get(&file))
+            {
+                failed_at.clone_from(&open.path);
+            }
+            Err(forced.expect("checked above"))
+        }
         Op::Write {
             file,
             offset,
@@ -1576,7 +1725,8 @@ fn perform(
             }
             key.unheard.fetch_add(1, Ordering::AcqRel);
         } else {
-            key.failed.store(true, Ordering::Release);
+            key.failed.store(true, Ordering::SeqCst);
+            state.look_below();
         }
         failures.push(Failure {
             key: key.id,
@@ -1677,6 +1827,19 @@ impl Hold {
         self.gate().fail_next = Some(error);
     }
 
+    // Wait until `count` threads stand in `Submitter::wait_below` on the
+    // volume.
+    pub(crate) fn wait_below_waiters(&self, count: usize) {
+        let state = &self.0.state;
+        let mut held = state
+            .below_waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while state.below_waiters.load(Ordering::SeqCst) < count {
+            held = state.below.wait(held).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
     // Wait until the thread stands before an operation it may not run yet.
     pub(crate) fn wait_held(&self) {
         let mut gate = self.gate();
@@ -1695,6 +1858,60 @@ impl Hold {
 impl Drop for Hold {
     fn drop(&mut self) {
         self.0.leave();
+    }
+}
+
+// A clock that is a minute later each time it is looked at.
+#[cfg(test)]
+pub(crate) struct Leaping(pub(crate) AtomicU64);
+
+#[cfg(test)]
+impl Clock for Leaping {
+    fn now(&self) -> Duration {
+        Duration::from_secs(self.0.fetch_add(60, Ordering::Relaxed))
+    }
+
+    fn runs(&self) -> bool {
+        false
+    }
+}
+
+// A clock a test moves by hand, which counts the looks taken at it. A
+// settle that goes by it looks again only when `VolumeWriters::look_again`
+// wakes it, after the test moved the clock.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct HandClock {
+    at: Mutex<(Duration, u32)>,
+    looked: Condvar,
+}
+
+#[cfg(test)]
+impl HandClock {
+    pub(crate) fn move_to(&self, at: Duration) {
+        self.at.lock().unwrap().0 = at;
+    }
+
+    // Wait until the clock has been looked at `looks` times in all.
+    pub(crate) fn wait_looks(&self, looks: u32) {
+        let mut at = self.at.lock().unwrap();
+        while at.1 < looks {
+            at = self.looked.wait(at).unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+impl Clock for HandClock {
+    fn now(&self) -> Duration {
+        let mut at = self.at.lock().unwrap();
+        at.1 += 1;
+        self.looked.notify_all();
+        at.0
+    }
+
+    fn runs(&self) -> bool {
+        false
     }
 }
 
