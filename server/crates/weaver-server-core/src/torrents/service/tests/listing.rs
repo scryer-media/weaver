@@ -5,7 +5,7 @@
 // and paging every torrent's view gives.
 
 use super::*;
-use crate::torrents::service::listing::{CategoryPick, FileTotals, Pick, Shown, page};
+use crate::torrents::service::listing::{CategoryPick, FileTotals, Pick, Shown, Window, page};
 use crate::torrents::service::updates::Follow;
 
 const TORRENTS: usize = 120;
@@ -101,7 +101,8 @@ async fn a_picked_page_is_the_page_of_every_view() {
         let picked = rig
             .service
             .picked(Pick::default(), page(offset, first), Shown::LISTED)
-            .await;
+            .await
+            .unwrap();
         let old: Vec<TorrentView> = every.iter().skip(offset).take(first).cloned().collect();
         assert_eq!(picked, old, "page {offset}+{first}");
     }
@@ -129,7 +130,8 @@ async fn a_picked_page_is_the_page_of_every_view() {
             page(5, 20),
             Shown::LISTED,
         )
-        .await;
+        .await
+        .unwrap();
     assert_eq!(
         picked,
         old.iter().skip(5).take(20).cloned().collect::<Vec<_>>()
@@ -171,10 +173,11 @@ async fn a_picked_page_is_the_page_of_every_view() {
                         category: category.map(CategoryPick::WithSubcategories),
                         private,
                     },
-                    |kept| 0..kept,
+                    Window::Every,
                     Shown::WHOLE,
                 )
-                .await;
+                .await
+                .unwrap();
             assert!(!old.is_empty() || private == Some(true));
             assert_eq!(picked, old, "private {private:?}, category {category:?}");
         }
@@ -183,8 +186,9 @@ async fn a_picked_page_is_the_page_of_every_view() {
     // A view without its trackers and tags is the listed view without them.
     let bare = rig
         .service
-        .picked(Pick::default(), |kept| 0..kept, Shown::BARE)
-        .await;
+        .picked(Pick::default(), Window::Every, Shown::BARE)
+        .await
+        .unwrap();
     assert_eq!(rig.service.job_ids().await, ids(&every));
     let old: Vec<TorrentView> = every
         .iter()
@@ -203,12 +207,79 @@ async fn a_picked_page_is_the_page_of_every_view() {
         assert_eq!(
             rig.service
                 .torrent_by_hash(&format!(" {} ", view.infohash.to_uppercase()))
-                .await,
+                .await
+                .unwrap(),
             rig.service.torrent(view.job_id).await
         );
     }
-    assert_eq!(rig.service.torrent_by_hash("nothex").await, None);
-    assert_eq!(rig.service.torrent_by_hash(&"cd".repeat(20)).await, None);
+    assert_eq!(rig.service.torrent_by_hash("nothex").await.unwrap(), None);
+    assert_eq!(
+        rig.service.torrent_by_hash(&"cd".repeat(20)).await.unwrap(),
+        None
+    );
+    rig.service.stop().await;
+}
+
+// The table cannot be read: a list that reads it fails, never answering an
+// empty list or no torrent, and a list of every torrent, which reads no
+// table, still answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_list_that_cannot_read_the_table_fails() {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(metainfo(
+                "t",
+                &[("t/a.bin", &[7; 3000])],
+                1024,
+                false,
+            )))
+        })
+        .await
+        .unwrap();
+    settled(&rig.service, 1).await;
+    let hash = rig.service.torrent(job_id).await.unwrap().infohash;
+    let datastore = rig.db.datastore();
+    rig.db
+        .run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                "ALTER TABLE torrents RENAME TO torrents_away",
+                &[] as &[SqlArg],
+            )
+            .await?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(
+        rig.service
+            .picked(Pick::default(), page(0, 10), Shown::LISTED)
+            .await
+            .is_err()
+    );
+    let named = [hash.as_str()];
+    let by_hashes = Pick {
+        hashes: Some(&named),
+        ..Pick::default()
+    };
+    assert!(
+        rig.service
+            .picked_rows(by_hashes, Window::Every, Shown::LISTED)
+            .await
+            .is_err()
+    );
+    assert!(rig.service.torrent_by_hash(&hash).await.is_err());
+    let every = rig
+        .service
+        .picked(Pick::default(), Window::Every, Shown::BARE)
+        .await
+        .unwrap();
+    assert_eq!(ids(&every), vec![job_id]);
     rig.service.stop().await;
 }
 
@@ -319,8 +390,9 @@ async fn a_row_reads_the_totals_its_files_give() {
 
     let whole = rig
         .service
-        .picked(Pick::default(), |kept| 0..kept, Shown::WHOLE)
-        .await;
+        .picked(Pick::default(), Window::Every, Shown::WHOLE)
+        .await
+        .unwrap();
     assert_eq!(whole.len(), jobs.len());
     // Every shape is there: one file named as the torrent, one file in a
     // folder, many files, and a file not fetched.
@@ -343,8 +415,9 @@ async fn a_row_reads_the_totals_its_files_give() {
     };
     let rows = rig
         .service
-        .picked_rows(Pick::default(), |kept| 0..kept, Shown::LISTED)
-        .await;
+        .picked_rows(Pick::default(), Window::Every, Shown::LISTED)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), whole.len());
     for ((view, totals), old) in rows.iter().zip(&whole) {
         assert_eq!(*view, without(old));
@@ -354,8 +427,9 @@ async fn a_row_reads_the_totals_its_files_give() {
     // With its files asked for, the row is the whole view.
     let rows = rig
         .service
-        .picked_rows(Pick::default(), |kept| 0..kept, Shown::WHOLE)
-        .await;
+        .picked_rows(Pick::default(), Window::Every, Shown::WHOLE)
+        .await
+        .unwrap();
     assert_eq!(
         rows.iter()
             .map(|(view, _)| view.clone())
@@ -380,11 +454,13 @@ async fn a_row_reads_the_totals_its_files_give() {
             let picked = rig
                 .service
                 .picked(pick, page(offset, first), Shown::WHOLE)
-                .await;
+                .await
+                .unwrap();
             let rows = rig
                 .service
                 .picked_rows(pick, page(offset, first), Shown::LISTED)
-                .await;
+                .await
+                .unwrap();
             assert_eq!(
                 rows,
                 picked
@@ -395,4 +471,151 @@ async fn a_row_reads_the_totals_its_files_give() {
         }
     }
     rig.service.stop().await;
+}
+
+// The table's pick over thousands of torrents gives the ids the walk of
+// every torrent's record gave, in the same order, for every category match,
+// named hashes past one statement's binds, privacy and window. Ties in the
+// time added fall back to the job id; some torrents go by a v2 hash alone,
+// some sit in a category the settings no longer name.
+#[test]
+fn the_tables_pick_is_the_walk_of_every_record() {
+    const SEEDED: u64 = 3000;
+    let db = Database::open_in_memory().unwrap();
+    let category = |id: u32, name: &str| CategoryConfig {
+        upload_cap: Default::default(),
+        id,
+        name: name.into(),
+        dest_dir: None,
+        aliases: String::new(),
+        seeding: None,
+        torrent_route: true,
+        unpack: None,
+    };
+    let settings = TorrentSettings {
+        upload_cap: None,
+        complete_dir: "/complete".into(),
+        // A second category of id 1 is never the one its torrents are in.
+        categories: vec![
+            category(1, "tv"),
+            category(2, "TV/hd"),
+            category(3, "movies"),
+            category(1, "shadowed"),
+            category(4, ""),
+        ],
+        seeding: None,
+        torrent: TorrentConfig::default(),
+    };
+    let mut live = BTreeMap::new();
+    for job_id in 1..=SEEDED {
+        let mut v1 = [0u8; 20];
+        v1[..8].copy_from_slice(&job_id.to_be_bytes());
+        let mut v2 = [0u8; 32];
+        v2[..8].copy_from_slice(&job_id.to_be_bytes());
+        v2[31] = 7;
+        let v2_only = job_id % 7 == 0;
+        let record = TorrentRecord {
+            unpack_in_force: None,
+            job_id: JobId(job_id),
+            infohash_v1: (!v2_only).then_some(v1),
+            infohash_v2: (v2_only || job_id % 5 == 0).then_some(v2),
+            name: format!("t{job_id}"),
+            source: TorrentSource::Magnet,
+            metainfo: None,
+            category_id: [None, Some(1), Some(2), Some(3), Some(9), Some(4)][job_id as usize % 6],
+            // Three at each instant, added out of job order.
+            added_at_ms: EPOCH_MS + ((SEEDED - job_id) / 3) as i64,
+            intent: TorrentIntent::Paused,
+            forced: false,
+            completed_at_ms: None,
+            storage_dir: None,
+            policy_override: None,
+            unpack: None,
+            metadata: Vec::new(),
+            upload_limit: None,
+            download_limit: None,
+            sequential: false,
+            first_last_piece_first: false,
+            save_path: None,
+            content_layout: None,
+            files_dir: None,
+            seed_mode: false,
+            move_to: None,
+            queue_position: job_id as i64,
+            pool_member: None,
+        };
+        db.insert_torrent(&record, &[]).unwrap();
+        let mut torrent = Live::new(
+            record,
+            TorrentCounters::default(),
+            ResumePeers::default(),
+            EPOCH_MS,
+        );
+        torrent.private = job_id % 3 == 0;
+        live.insert(JobId(job_id), torrent);
+    }
+    let hex = |live: &Live| hashes_of(&live.record).best().as_string();
+    let some: Vec<String> = live.values().step_by(11).map(hex).collect();
+    // More hashes than one statement binds: 900 binds hold 300.
+    let many: Vec<String> = live
+        .values()
+        .step_by(2)
+        .map(|torrent| hex(torrent).to_uppercase())
+        .chain(["nothex".to_owned(), String::new(), "ab".repeat(20)])
+        .chain(live.values().take(40).map(hex))
+        .collect();
+    let some: Vec<&str> = some.iter().map(String::as_str).collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    assert!(many.len() > 1000);
+
+    let windows = || -> Vec<(String, Window)> {
+        vec![
+            ("every".into(), Window::Every),
+            ("0+10".into(), page(0, 10)),
+            ("1234+500".into(), page(1234, 500)),
+            ("2990+50".into(), page(2990, 50)),
+            ("5000+5".into(), page(5000, 5)),
+            ("0+0".into(), page(0, 0)),
+            ("0+max".into(), page(0, usize::MAX)),
+            (
+                "last 20".into(),
+                Window::Counted(Box::new(|kept| kept.saturating_sub(20)..kept)),
+            ),
+        ]
+    };
+    let mut compared = 0;
+    let mut nonempty = 0;
+    for hashes in [None, Some(&some[..]), Some(&many[..])] {
+        for category in [
+            None,
+            Some(CategoryPick::Named("TV")),
+            Some(CategoryPick::Named("nothing")),
+            Some(CategoryPick::WithSubcategories("tv")),
+            Some(CategoryPick::WithSubcategories("")),
+            Some(CategoryPick::WithSubcategories("movies")),
+        ] {
+            for private in [None, Some(true), Some(false)] {
+                let pick = Pick {
+                    hashes,
+                    category,
+                    private,
+                };
+                let (old, new) = (windows(), windows());
+                for ((name, old), (_, new)) in old.into_iter().zip(new) {
+                    let old = pick.paged(&settings, &live, old);
+                    let new = pick.picked(&settings, &db, new).unwrap().under(&live);
+                    assert_eq!(
+                        new,
+                        old,
+                        "{name}, hashes {:?}, {category:?}, private {private:?}",
+                        hashes.map(<[&str]>::len)
+                    );
+                    nonempty += usize::from(!old.is_empty());
+                    compared += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(compared, 3 * 6 * 3 * 8);
+    assert!(nonempty > compared / 3, "{nonempty} of {compared}");
 }

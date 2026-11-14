@@ -1670,3 +1670,20 @@ kind = "sql"
 file = "migrations/0119_torrent_adopted/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 120
+description = "a torrent list reads its page in the order torrents were added"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0120_torrent_list_order/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0120_torrent_list_order/postgres.sql"
+engine = "postgres"
+scope = "all"

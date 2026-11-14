@@ -1606,22 +1606,25 @@ async fn a_duplicate_fails_and_a_refusal_conflicts() {
         refused.body
     );
 
+    // A magnet is added whatever its route's state, as qBittorrent adds one
+    // at once (the rig's route is down, so it is held), and the same hash
+    // in base32 is then the duplicate, not a parse error.
     let magnet = rig
         .post(
             "/api/v2/torrents/add",
             "urls=magnet%3A%3Fxt%3Durn%3Abtih%3A0123456789abcdef0123456789abcdef01234567",
         )
         .await;
-    assert_eq!(magnet.status, StatusCode::CONFLICT);
-    // The same hash in base32 reaches the same refusal, not a parse error.
+    assert_eq!(magnet.json()["success_count"], 1, "{}", magnet.body);
     let base32 = rig
         .post(
             "/api/v2/torrents/add",
             "urls=magnet%3A%3Fxt%3Durn%3Abtih%3AAERUKZ4JVPG66AJDIVTYTK6N54ASGRLH",
         )
         .await;
-    assert_eq!((base32.status, &base32.body), (magnet.status, &magnet.body));
-    assert_eq!(rig.torrents().await.len(), 1);
+    assert_eq!(base32.status, StatusCode::CONFLICT);
+    assert!(base32.body.contains("already added"), "{}", base32.body);
+    assert_eq!(rig.torrents().await.len(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1876,7 +1879,14 @@ async fn pausing_all_is_one_hold_over_each_torrents_own_pause() {
             weaver_server_core::torrents::model::TorrentIntent::Resumed,
         ),
     ] {
-        let job_id = rig.context.by_hash(&hash).await.unwrap().job_id;
+        let job_id = rig
+            .context
+            .by_hash(&hash)
+            .await
+            .ok()
+            .flatten()
+            .unwrap()
+            .job_id;
         assert_eq!(rig.db.get_torrent(job_id).unwrap().unwrap().intent, intent);
     }
 }
@@ -1888,7 +1898,14 @@ async fn the_client_deletes_a_private_torrent_short_of_its_goal() {
     let hash = rig.torrents().await[0]["hash"].as_str().unwrap().to_owned();
     // Weaver's own removal still asks for a confirmation.
     let torrents = rig.context.inner.torrents.as_ref().unwrap();
-    let job_id = rig.context.by_hash(&hash).await.unwrap().job_id;
+    let job_id = rig
+        .context
+        .by_hash(&hash)
+        .await
+        .ok()
+        .flatten()
+        .unwrap()
+        .job_id;
     assert!(matches!(
         torrents.remove(job_id, false, false).await,
         Err(ActionError::UnmetGoal(_))

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-//! Which torrents a list shows, picked from their records before any view
-//! is built: a page, a category or a few hashes cost the views they show,
-//! not one view per torrent.
+//! Which torrents a list shows, picked before any view is built: a page, a
+//! category or a few hashes cost the views they show, not one view per
+//! torrent. The table picks them, a page at a time, through the index of
+//! the order they were added in; only privacy, which only a torrent's
+//! metainfo holds, is read from the torrents themselves.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::Range;
@@ -14,6 +16,7 @@ use super::{Live, TorrentService, TorrentSettings, TorrentView, hashes_of};
 use crate::jobs::JobId;
 use crate::torrents::FilePriority;
 use crate::torrents::layout::PieceLayout;
+use crate::torrents::queries::{CategoryIds, TorrentListFilter};
 
 /// What a view carries beside its own fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +107,31 @@ impl FileTotals {
     }
 }
 
+/// The places a list takes among the torrents a pick keeps, in the order
+/// they were added.
+pub enum Window {
+    /// Every one.
+    Every,
+    /// At most `first` after the first `offset`.
+    Page { offset: usize, first: usize },
+    /// The places `places` gives for how many the pick keeps, which are
+    /// counted first.
+    Counted(Box<dyn FnOnce(usize) -> Range<usize> + Send>),
+}
+
+impl Window {
+    // Its places among `kept` torrents.
+    fn places(self, kept: usize) -> Range<usize> {
+        let Range { start, end } = match self {
+            Self::Every => 0..kept,
+            Self::Page { offset, first } => offset..offset.saturating_add(first),
+            Self::Counted(places) => places(kept),
+        };
+        let end = end.min(kept);
+        start.min(end)..end
+    }
+}
+
 /// The category a pick keeps.
 #[derive(Debug, Clone, Copy)]
 pub enum CategoryPick<'a> {
@@ -156,6 +184,36 @@ fn parsed(hashes: &[&str]) -> HashSet<Id20> {
 }
 
 impl Pick<'_> {
+    // What the table is asked for it: the ids of the categories it keeps,
+    // as `CategoryPick::keeps` reads a torrent's category through
+    // `TorrentSettings::category`, and the hashes it names.
+    fn filter(&self, settings: &TorrentSettings) -> TorrentListFilter {
+        TorrentListFilter {
+            categories: self.category.map(|pick| {
+                let mut seen = HashSet::new();
+                let mut categories = CategoryIds {
+                    none: pick.keeps(None),
+                    ..CategoryIds::default()
+                };
+                // The first category of an id is the one a torrent of it is in.
+                for category in &settings.categories {
+                    if seen.insert(category.id) {
+                        categories.known.push(category.id);
+                        if pick.keeps(Some(&category.name)) {
+                            categories.ids.push(category.id);
+                        }
+                    }
+                }
+                categories
+            }),
+            hashes: self.hashes.map(|hashes| {
+                let mut parsed: Vec<[u8; 20]> = parsed(hashes).into_iter().map(|id| id.0).collect();
+                parsed.sort_unstable();
+                parsed
+            }),
+        }
+    }
+
     // The torrents of `live` it keeps, in the order they were added: the
     // order `TorrentService::torrents` lists them in.
     pub(super) fn ids(
@@ -188,18 +246,110 @@ impl Pick<'_> {
         kept.into_iter().map(|(_, job_id)| job_id).collect()
     }
 
-    // Of the torrents it keeps, those at the places `page` gives for how
-    // many it keeps.
-    fn paged(
+    // Of the torrents it keeps, those at `window`'s places, read from the
+    // records of `live`: the reading the table's replaces, kept to prove it
+    // the same.
+    #[cfg(test)]
+    pub(super) fn paged(
         &self,
         settings: &TorrentSettings,
         live: &BTreeMap<JobId, Live>,
-        page: impl FnOnce(usize) -> Range<usize>,
+        window: Window,
     ) -> Vec<JobId> {
         let ids = self.ids(settings, live);
-        let Range { start, end } = page(ids.len());
-        let end = end.min(ids.len());
-        ids.get(start.min(end)..end).unwrap_or_default().to_vec()
+        let places = window.places(ids.len());
+        ids[places].to_vec()
+    }
+
+    // The ids of the torrents it keeps at `window`'s places, in the order
+    // they were added, read from the table with no torrent's lock held: the
+    // page itself, or with a privacy to keep, every torrent the table
+    // keeps, for `Picked::under` to keep those of that privacy and take the
+    // page from them. A pick of every torrent, or of every one of a
+    // privacy, reads no table: `Picked::under` takes them from the live
+    // torrents it walks anyway.
+    pub(super) fn picked(
+        &self,
+        settings: &TorrentSettings,
+        db: &crate::persistence::Database,
+        window: Window,
+    ) -> Result<Picked, crate::StateError> {
+        if self.hashes.is_none() && self.category.is_none() && matches!(window, Window::Every) {
+            return Ok(Picked::Live {
+                private: self.private,
+            });
+        }
+        let filter = self.filter(settings);
+        if let Some(private) = self.private {
+            let kept = db.torrent_list_ids(&filter, 0, None)?;
+            return Ok(Picked::Private {
+                kept,
+                private,
+                window,
+            });
+        }
+        let (offset, limit) = match window {
+            Window::Every => (0, None),
+            Window::Page { offset, first } => (offset, Some(first)),
+            counted @ Window::Counted(_) => {
+                let places = counted.places(db.count_torrent_list(&filter)?);
+                (places.start, Some(places.len()))
+            }
+        };
+        if limit == Some(0) {
+            return Ok(Picked::Page(Vec::new()));
+        }
+        Ok(Picked::Page(db.torrent_list_ids(&filter, offset, limit)?))
+    }
+}
+
+/// The torrents a pick read from the table.
+pub(super) enum Picked {
+    /// The page.
+    Page(Vec<JobId>),
+    /// Every torrent the table keeps, of which those of `private`'s privacy
+    /// give the page at `window`'s places.
+    Private {
+        kept: Vec<JobId>,
+        private: bool,
+        window: Window,
+    },
+    /// Every live torrent, or every one of `private`'s privacy: the table
+    /// was not read.
+    Live { private: Option<bool> },
+}
+
+impl Picked {
+    // The page, among the torrents of `live`: a torrent the table holds
+    // that is not live, being added or removed, is not shown.
+    pub(super) fn under(self, live: &BTreeMap<JobId, Live>) -> Vec<JobId> {
+        match self {
+            Self::Page(page) => page,
+            Self::Private {
+                kept,
+                private,
+                window,
+            } => {
+                let kept: Vec<JobId> = kept
+                    .into_iter()
+                    .filter(|job_id| {
+                        live.get(job_id)
+                            .is_some_and(|torrent| torrent.private == private)
+                    })
+                    .collect();
+                let places = window.places(kept.len());
+                kept[places].to_vec()
+            }
+            Self::Live { private } => {
+                let mut kept: Vec<(i64, JobId)> = live
+                    .values()
+                    .filter(|torrent| private.is_none_or(|private| torrent.private == private))
+                    .map(|torrent| (torrent.record.added_at_ms, torrent.record.job_id))
+                    .collect();
+                kept.sort_unstable();
+                kept.into_iter().map(|(_, job_id)| job_id).collect()
+            }
+        }
     }
 }
 
@@ -215,23 +365,28 @@ impl TorrentService {
         Pick::default().ids(&settings, &*self.inner.live.lock().await)
     }
 
+    // The ids `pick` keeps at `window`'s places, read from the table.
+    fn picked_ids(&self, pick: Pick<'_>, window: Window) -> Result<Picked, crate::StateError> {
+        pick.picked(&self.settings(), &self.inner.db, window)
+    }
+
     /// The torrents `pick` keeps, in the order they were added, and of
-    /// those the ones at the places `page` gives for how many it keeps.
-    /// Only their views are built.
+    /// those the ones at `window`'s places. Only their views are built. An
+    /// error when the table cannot be read, never an empty list.
     pub async fn picked(
         &self,
         pick: Pick<'_>,
-        page: impl FnOnce(usize) -> Range<usize>,
+        window: Window,
         shown: Shown,
-    ) -> Vec<TorrentView> {
+    ) -> Result<Vec<TorrentView>, crate::StateError> {
+        let picked = self.picked_ids(pick, window)?;
         let now = self.inner.clock.now_ms();
-        self.listed_by(shown, false, false, now, |settings, live| {
-            pick.paged(settings, live, page)
-        })
-        .await
-        .into_iter()
-        .map(|(view, ..)| view)
-        .collect()
+        Ok(self
+            .listed_by(shown, false, false, now, move |_, live| picked.under(live))
+            .await
+            .into_iter()
+            .map(|(view, ..)| view)
+            .collect())
     }
 
     /// The torrents `picked` gives, each with the totals of its files: what
@@ -239,17 +394,17 @@ impl TorrentService {
     pub async fn picked_rows(
         &self,
         pick: Pick<'_>,
-        page: impl FnOnce(usize) -> Range<usize>,
+        window: Window,
         shown: Shown,
-    ) -> Vec<(TorrentView, FileTotals)> {
+    ) -> Result<Vec<(TorrentView, FileTotals)>, crate::StateError> {
+        let picked = self.picked_ids(pick, window)?;
         let now = self.inner.clock.now_ms();
-        self.listed_by(shown, false, true, now, |settings, live| {
-            pick.paged(settings, live, page)
-        })
-        .await
-        .into_iter()
-        .map(|(view, _, totals)| (view, totals.expect("asked for")))
-        .collect()
+        Ok(self
+            .listed_by(shown, false, true, now, move |_, live| picked.under(live))
+            .await
+            .into_iter()
+            .map(|(view, _, totals)| (view, totals.expect("asked for")))
+            .collect())
     }
 
     /// The torrents of `ids` there are, as [`TorrentService::torrents`]
@@ -272,23 +427,29 @@ impl TorrentService {
     }
 
     /// The torrent whose `TorrentView::infohash` is `hash`, in any case, as
-    /// [`TorrentService::torrent`] gives it.
-    pub async fn torrent_by_hash(&self, hash: &str) -> Option<TorrentView> {
-        let wanted = *parsed(&[hash]).iter().next()?;
-        let job_id = self
-            .inner
-            .live
-            .lock()
-            .await
-            .values()
-            .find(|torrent| hashes_of(&torrent.record).best() == wanted)?
-            .record
-            .job_id;
-        self.torrent(job_id).await
+    /// [`TorrentService::torrent`] gives it: found through the table's
+    /// index of hashes, not by a walk of every torrent. An error when the
+    /// table cannot be read, never none.
+    pub async fn torrent_by_hash(
+        &self,
+        hash: &str,
+    ) -> Result<Option<TorrentView>, crate::StateError> {
+        let hashes = [hash];
+        let pick = Pick {
+            hashes: Some(&hashes),
+            ..Pick::default()
+        };
+        let Picked::Page(found) = self.picked_ids(pick, page(0, 1))? else {
+            unreachable!("a pick of hashes reads its page from the table")
+        };
+        Ok(match found.first() {
+            Some(job_id) => self.torrent(*job_id).await,
+            None => None,
+        })
     }
 }
 
 /// The places a page of `first` torrents after `offset` takes.
-pub fn page(offset: usize, first: usize) -> impl FnOnce(usize) -> Range<usize> {
-    move |_| offset..offset.saturating_add(first)
+pub fn page(offset: usize, first: usize) -> Window {
+    Window::Page { offset, first }
 }

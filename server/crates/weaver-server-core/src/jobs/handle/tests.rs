@@ -935,3 +935,87 @@ fn a_job_s_debug_text_never_shows_its_password() {
         assert!(text.contains("rss"));
     }
 }
+
+// Each of the other owner's jobs is found at its place as they are added
+// out of order, replaced and removed one at a time, each moving only the
+// positions after it: every position is the one a fresh walk gives.
+#[test]
+fn the_owned_jobs_keep_their_positions_through_each_add_and_removal() {
+    let mut inner = crate::pipeline::queue::QueueInner::default();
+    let held = |inner: &crate::pipeline::queue::QueueInner, gone: &[JobId]| {
+        let jobs = inner.torrents();
+        assert!(jobs.windows(2).all(|pair| {
+            (pair[0].created_at_epoch_ms, pair[0].job_id)
+                <= (pair[1].created_at_epoch_ms, pair[1].job_id)
+        }));
+        for (at, job) in jobs.iter().enumerate() {
+            assert_eq!(inner.torrent_position(job.job_id), Some(at));
+            assert_eq!(inner.torrent(job.job_id), Some(job));
+        }
+        for job_id in gone {
+            assert_eq!(inner.torrent_position(*job_id), None);
+        }
+    };
+    for id in 0..200_u64 {
+        // Three at each instant, added out of the order they sit in.
+        let at = ((id * 37) % 67 / 3) as f64;
+        inner.insert_torrent(owned_job(JobId(id), at));
+        held(&inner, &[]);
+    }
+    assert_eq!(inner.torrents().len(), 200);
+    let mut job = owned_job(
+        JobId(5),
+        inner.torrent(JobId(5)).unwrap().created_at_epoch_ms,
+    );
+    job.name = "renamed".to_owned();
+    let at = inner.torrent_position(JobId(5)).unwrap();
+    inner.set_torrent(at, job);
+    assert_eq!(inner.torrent(JobId(5)).unwrap().name, "renamed");
+    let mut gone = Vec::new();
+    for id in (0..200_u64).step_by(7).chain([199, 0]) {
+        let removed = inner.remove_torrent(JobId(id));
+        assert_eq!(removed.is_some(), !gone.contains(&JobId(id)));
+        gone.push(JobId(id));
+        held(&inner, &gone);
+    }
+    assert_eq!(inner.torrents().len(), 200 - 200_usize.div_ceil(7) - 1);
+    let replaced: Vec<JobInfo> = (300..303).map(|id| owned_job(JobId(id), 1.0)).collect();
+    inner.replace_torrents(replaced);
+    held(&inner, &(0..200).map(JobId).collect::<Vec<_>>());
+}
+
+// Publishing the other owner's jobs as they already stand changes nothing:
+// no reader is woken and no event goes out. A change to one wakes them once.
+#[tokio::test]
+async fn publishing_the_owned_jobs_as_they_stand_wakes_no_reader() {
+    let (handle, _task) = test_scheduler().await;
+    let mut events = handle.subscribe_events();
+    let mut changes = handle.subscribe_job_changes();
+    handle.publish_owned_jobs(vec![owned_job(JobId(2), 0.0), owned_job(JobId(3), 1.0)]);
+    assert!(changes.has_changed().unwrap());
+    changes.borrow_and_update();
+    while events.try_recv().is_ok() {}
+
+    handle.publish_owned_jobs(vec![owned_job(JobId(2), 0.0), owned_job(JobId(3), 1.0)]);
+    handle.publish_owned_job(owned_job(JobId(3), 1.0));
+    assert!(
+        !changes.has_changed().unwrap(),
+        "an idle publish woke a reader"
+    );
+    assert!(events.try_recv().is_err(), "an idle publish sent an event");
+
+    let mut paused = owned_job(JobId(3), 1.0);
+    paused.status = JobStatus::Paused;
+    handle.publish_owned_job(paused);
+    assert!(changes.has_changed().unwrap());
+    assert!(matches!(
+        events.try_recv(),
+        Ok(PipelineEvent::JobPaused { job_id: JobId(3) })
+    ));
+    assert_eq!(
+        handle
+            .state()
+            .read_queue(|inner| inner.torrent(JobId(3)).map(|job| job.status.clone())),
+        Some(JobStatus::Paused)
+    );
+}
