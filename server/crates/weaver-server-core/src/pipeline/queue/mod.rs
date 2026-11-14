@@ -82,6 +82,8 @@ pub struct QueueInner {
     pub globals: Globals,
     // Rows are added, removed and reordered only through `push_job`,
     // `retain_jobs` and `reindex_jobs`, which keep `job_positions` in step.
+    // Every change to a row goes through `RowMut` (`job_mut`, `row_mut_at`),
+    // never `iter_mut`, so the count of jobs with work waiting stays right.
     pub jobs: Vec<JobRow>,
     // Each row's position in `jobs`, so a lookup by id is one probe.
     job_positions: HashMap<JobId, usize>,
