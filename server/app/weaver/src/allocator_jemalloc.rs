@@ -56,10 +56,19 @@ use tikv_jemallocator::Jemalloc;
 pub static malloc_conf: &[u8] =
     b"dirty_decay_ms:3000,muzzy_decay_ms:0,narenas:16,background_thread:true\0";
 
+// Without purge threads, `oversize_threshold:0` is needed as well. By default,
+// when freed buffers merge into a free run of 8 MiB or more, jemalloc
+// gives the whole run back to the system at once, and decay never gets a
+// say. The disk writers free a burst of adjacent article buffers together, so
+// a burst's memory went back as soon as it was written, and the next burst
+// took page faults to get it again. With the threshold off, those pages
+// decay like any other, and the collections below still return them at job
+// end and at idle.
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-pub static malloc_conf: &[u8] = b"dirty_decay_ms:3000,muzzy_decay_ms:0,narenas:16\0";
+pub static malloc_conf: &[u8] =
+    b"dirty_decay_ms:3000,muzzy_decay_ms:0,narenas:16,oversize_threshold:0\0";
 
 // jemalloc, configured by [`malloc_conf`].
 pub(crate) struct ConfiguredJemalloc;
@@ -253,6 +262,10 @@ mod tests {
 
         assert_eq!(opt_ms(c"opt.dirty_decay_ms"), 3000);
         assert_eq!(opt_ms(c"opt.muzzy_decay_ms"), 0);
+        // Off where no purge thread runs: a merged free run of any size
+        // decays instead of going back to the system the moment it forms.
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        assert_eq!(opt_ms(c"opt.oversize_threshold"), 0);
     }
 
     // Reads a boolean `mallctl` value.
