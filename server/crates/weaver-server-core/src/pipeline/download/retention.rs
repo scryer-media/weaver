@@ -247,8 +247,8 @@ impl Pipeline {
     // downloading forever with nothing in flight.
     //
     // When a server refusing this pool's credentials is among those that
-    // would otherwise serve it, the refusal is why: the job's terminal cause
-    // says so, not that the article is missing from Usenet.
+    // would otherwise serve it, the refusal is why: the job keeps which
+    // server refused, and its failure for want of articles says so.
     pub(in crate::pipeline) fn book_unservable_work(&mut self, work: &DownloadWork) {
         self.book_unservable_segment(work.segment_id, work.exclude_servers);
     }
@@ -354,18 +354,25 @@ impl Pipeline {
                 "no server may fetch this article; booking it as missing so repair can proceed"
             );
         }
+        // The job lacks the article whether or not a server refused: its
+        // cause is the missing articles, as when every server asked said
+        // the article is not there, so its next duplicate is tried. The job
+        // keeps which server refused, and a failure for want of articles
+        // names it.
         if !refused_by.is_empty() {
             self.semantic_terminal_causes.insert(
                 job_id,
-                crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage,
+                crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth,
             );
+            self.note_login_refusals(job_id, refused_by);
         }
         self.metrics
             .articles_not_found
             .fetch_add(1, Ordering::Relaxed);
         self.send_segment_event(|| PipelineEvent::ArticleNotFound { segment_id });
         // A server that refuses the credentials never said the article is
-        // gone, so the post's health does not count it.
+        // gone, and the state says so; the post's health counts it missing
+        // all the same, since no server can bring it.
         let state = if refused_by.is_empty() {
             SegmentTerminalState::Missing
         } else {
@@ -397,8 +404,9 @@ impl Pipeline {
             .collect()
     }
 
-    // An article every other server answered not-found for was booked past
-    // `refused_by`: the job keeps which servers refused, by identity (stable
+    // An article was booked past `refused_by`, every other server having
+    // answered not-found for it or being out of the post's retention: the
+    // job keeps which servers refused, by identity (stable
     // id, host, port and account) so the set outlives a change of the server
     // list as the tried servers of an article do. Nothing else changes
     // here: the job's cause is whatever its failures record.

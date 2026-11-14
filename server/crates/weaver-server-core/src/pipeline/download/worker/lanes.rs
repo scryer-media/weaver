@@ -306,6 +306,9 @@ impl Pipeline {
         }
         self.files_counted_missing
             .retain(|file_id| file_id.job_id != job_id);
+        // A job that ends whole keeps the cause an article recorded; a run
+        // under the same id later must not read it back.
+        self.semantic_terminal_causes.remove(&job_id);
         self.login_refusals.remove(&job_id);
     }
 
