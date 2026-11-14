@@ -5314,8 +5314,8 @@ impl Drop for PieceCheck {
 
 impl DiskJob for HashJob {
     // The checks of one torrent share nothing but its lock, taken for the
-    // verdict. The torrent is the key, so the torrents of every session are
-    // served in turn: the hashing thread takes one check of a torrent, and
+    // verdict. The torrent is the key, so the session's torrents are served
+    // in turn: the hashing thread takes one check of a torrent, and
     // a torrent with more waiting goes behind the others that wait, so none
     // holds the thread from another however many pieces it has queued.
     const SIDE_BY_SIDE: bool = true;

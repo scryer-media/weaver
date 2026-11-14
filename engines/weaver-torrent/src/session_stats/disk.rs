@@ -173,9 +173,7 @@ pub struct DiskStatsSnapshot {
     /// Blocking permits held now, and how many there are.
     pub permits_in_use: u64,
     pub permits: u64,
-    /// Jobs waiting for a thread of each disk queue now; of the hashing
-    /// thread, which every session of the process shares, the session's
-    /// own.
+    /// Jobs waiting for a thread of each of the session's disk queues now.
     pub write_jobs_queued: u64,
     pub hash_jobs_queued: u64,
     pub read_jobs_queued: u64,

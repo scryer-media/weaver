@@ -672,13 +672,13 @@ metric_families! {
     TORRENT_DISK_READ_JOBS_QUEUED = ("weaver_torrent_disk_read_jobs_queued", Gauge, ["route"],
         "Upload reads waiting for a disk thread of the session now.");
     TORRENT_DISK_PIECE_CHECK_WAITS = ("weaver_torrent_disk_piece_check_waits_total", Counter, ["route"],
-        "Times a peer connection waited for the hashing thread to check a piece it completed, since the session opened. A piece held in memory until it is checked is not waited for: it is handed to the hashing thread and counted among the pieces waiting.");
+        "Times a peer connection waited for the session's hashing thread to check a piece it completed, since the session opened. A piece held in memory until it is checked is not waited for: it is handed to the hashing thread and counted among the pieces waiting.");
     TORRENT_DISK_PIECE_CHECK_WAIT_SECONDS = ("weaver_torrent_disk_piece_check_wait_seconds_total", Counter, ["route"],
-        "Time peer connections waited for the hashing thread to check a piece they completed, since the session opened, summed.");
+        "Time peer connections waited for the session's hashing thread to check a piece they completed, since the session opened, summed.");
     TORRENT_DISK_HASH_JOBS_QUEUED = ("weaver_torrent_disk_hash_jobs_queued", Gauge, ["route"],
-        "Piece checks of the session waiting for the hashing thread now. The process has one hashing thread, which every session shares.");
+        "Piece checks waiting for the session's hashing thread now. A session has one hashing thread, which checks the pieces of every torrent of it.");
     TORRENT_DISK_HASH_BUSY_SECONDS = ("weaver_torrent_disk_hash_busy_seconds_total", Counter, ["route"],
-        "Time the hashing thread spent on the session's piece checks since the session opened. The process has one hashing thread, which every session shares: the rates of all sessions summed are the share of the thread in use, and at 1 the thread is the bound on what they download.");
+        "Time the session's hashing thread spent on piece checks since the session opened. A session has one hashing thread: the rate is the share of it in use, and at 1 the thread is the bound on what the session downloads.");
     TORRENT_DISK_PIECES_WAITING = ("weaver_torrent_disk_pieces_waiting", Gauge, ["route"],
         "Whole pieces held in memory that wait for their check or their write now.");
     TORRENT_DISK_PIECE_BYTES_WAITING = ("weaver_torrent_disk_piece_bytes_waiting", Gauge, ["route"],

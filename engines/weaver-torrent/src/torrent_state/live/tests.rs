@@ -7657,14 +7657,23 @@ async fn a_connection_receives_the_next_piece_while_the_last_is_being_hashed() {
     assert!(again.now_or_never().is_none());
 }
 
-// Two sessions, a torrent on each: the first's piece comes from a peer over
-// TCP, the second's from a peer over uTP. The process has one hashing
-// thread, which the sessions share: with it held on the first torrent's
-// piece, the second's waits for it, counted among its own session's, and no
-// second thread is started. Released, both are checked on that one thread,
-// written and had.
+// A live peer of `h` over `kind` that has every piece.
+fn peer_with_every_piece(h: &Harness, kind: ConnectionKind) -> (PeerHandler, PeerRx) {
+    let (peer, rx) = h.new_peer_over("127.0.0.1:6881", kind);
+    peer.first_message_received.store(true, Ordering::Relaxed);
+    let mut every_piece = peer::empty_bitfield(h.lengths.total_pieces());
+    every_piece[..h.lengths.total_pieces() as usize].fill(true);
+    peer.on_bitfield(every_piece.as_raw_slice()).unwrap();
+    (peer, rx)
+}
+
+// Two torrents of one session: the first's piece comes from a peer over TCP,
+// the second's from a peer over uTP. The session has one hashing thread:
+// with it held on the first torrent's piece, the second's waits for it, and
+// no second thread is started. Released, both are checked on that one
+// thread, written and had.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_pieces_of_two_sessions_over_tcp_and_utp_are_checked_by_one_thread() {
+async fn the_pieces_of_two_torrents_over_tcp_and_utp_are_checked_by_the_sessions_one_thread() {
     let over_tcp = HeldStorageFactory::default();
     let over_utp = HeldStorageFactory::default();
     let a = Harness::build_on(
@@ -7674,27 +7683,25 @@ async fn the_pieces_of_two_sessions_over_tcp_and_utp_are_checked_by_one_thread()
         over_tcp.clone_box(),
     )
     .await;
-    let b = Harness::build_on(
+    let add = AddTorrentOptions {
+        storage_factory: Some(over_utp.clone_box()),
+        ..Default::default()
+    };
+    let out = TempDir::with_prefix("one_hasher_utp").unwrap();
+    let b = Harness::added_to(
+        a._session.clone(),
+        out,
         "one_hasher_utp",
-        0x00,
-        isolated_session_opts(false),
-        over_utp.clone_box(),
+        PIECES,
+        &[0x00],
+        add,
     )
     .await;
-    let (a_spawner, b_spawner) = (&a.live.shared.spawner, &b.live.shared.spawner);
-    assert!(a_spawner.hash().is(b_spawner.hash()));
-    assert!(!Arc::ptr_eq(a_spawner.stats(), b_spawner.stats()));
+    let spawner = &a.live.shared.spawner;
+    assert!(spawner.hash().is(b.live.shared.spawner.hash()));
 
-    let peer = |h: &Harness, kind| {
-        let (peer, rx) = h.new_peer_over("127.0.0.1:6881", kind);
-        peer.first_message_received.store(true, Ordering::Relaxed);
-        let mut every_piece = peer::empty_bitfield(h.lengths.total_pieces());
-        every_piece[..h.lengths.total_pieces() as usize].fill(true);
-        peer.on_bitfield(every_piece.as_raw_slice()).unwrap();
-        (peer, rx)
-    };
-    let (tcp, _tcp_rx) = peer(&a, ConnectionKind::Tcp);
-    let (utp, _utp_rx) = peer(&b, ConnectionKind::Utp);
+    let (tcp, _tcp_rx) = peer_with_every_piece(&a, ConnectionKind::Tcp);
+    let (utp, _utp_rx) = peer_with_every_piece(&b, ConnectionKind::Utp);
     a.take(&tcp, 0);
     b.take(&utp, 0);
 
@@ -7707,25 +7714,81 @@ async fn the_pieces_of_two_sessions_over_tcp_and_utp_are_checked_by_one_thread()
         b.send(&utp, (0, chunk), false).await.unwrap();
     }
     // The one thread is on the first torrent's piece; the second's waits
-    // for it, and is its own session's to count.
-    assert_eq!(a_spawner.hash().at_work(), (1, 1));
-    assert_eq!(a_spawner.hash().wakes(), 1);
-    assert_eq!(a_spawner.disk_snapshot().hash_jobs_queued, 0);
-    assert_eq!(b_spawner.disk_snapshot().hash_jobs_queued, 1);
+    // for it.
+    assert_eq!(spawner.hash().at_work(), (1, 1));
+    assert_eq!(spawner.hash().wakes(), 1);
+    assert_eq!(spawner.disk_snapshot().hash_jobs_queued, 1);
     assert!(over_utp.checked_on.lock().is_empty());
     assert!(!a.have(0) && !b.have(0));
 
     release.send(()).unwrap();
     a.settled().await;
-    b.settled().await;
     assert!(a.have(0) && b.have(0));
-    assert_eq!(a_spawner.hash().wakes(), 1);
-    assert_eq!(b_spawner.disk_snapshot().hash_jobs_queued, 0);
+    assert_eq!(spawner.hash().wakes(), 1);
+    assert_eq!(spawner.disk_snapshot().hash_jobs_queued, 0);
     let (on_tcp, on_utp) = (over_tcp.checked_on.lock(), over_utp.checked_on.lock());
     assert_eq!((on_tcp.len(), on_utp.len()), (1, 1));
     assert_eq!(on_tcp[0], on_utp[0]);
-    assert!(a_spawner.disk_snapshot().hash_busy_nanos > 0);
-    assert!(b_spawner.disk_snapshot().hash_busy_nanos > 0);
+    assert!(spawner.disk_snapshot().hash_busy_nanos > 0);
+}
+
+// Two sessions, a torrent on each. Each session has a hashing thread of its
+// own: with the first's held on its piece, the second's piece is checked,
+// written and had, on another thread. The first session ends; the second
+// goes on checking its pieces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_session_checks_its_pieces_on_its_own_thread_and_goes_on_when_another_ends() {
+    let first = HeldStorageFactory::default();
+    let second = HeldStorageFactory::default();
+    let a = Harness::build_on(
+        "two_hashers_first",
+        0x00,
+        isolated_session_opts(false),
+        first.clone_box(),
+    )
+    .await;
+    let b = Harness::build_on(
+        "two_hashers_second",
+        0x00,
+        isolated_session_opts(false),
+        second.clone_box(),
+    )
+    .await;
+    let (a_spawner, b_spawner) = (a.live.shared.spawner.clone(), b.live.shared.spawner.clone());
+    assert!(!a_spawner.hash().is(b_spawner.hash()));
+
+    let (a_peer, _a_rx) = a.peer("127.0.0.1:6881");
+    let (b_peer, _b_rx) = b.peer("127.0.0.1:6881");
+    a.take(&a_peer, 0);
+    b.take_every(&b_peer);
+
+    let (mut entered, release) = first.gate.arm();
+    for chunk in 0..CHUNKS_PER_PIECE {
+        a.send(&a_peer, (0, chunk), false).await.unwrap();
+    }
+    entered.recv().await.unwrap();
+    for chunk in 0..CHUNKS_PER_PIECE {
+        b.send(&b_peer, (0, chunk), false).await.unwrap();
+    }
+    // The second session's piece does not wait for the first's thread.
+    b.settled().await;
+    assert!(b.have(0) && !a.have(0));
+    assert_eq!(a_spawner.hash().at_work(), (1, 0));
+    assert_ne!(first.checked_on.lock()[0], second.checked_on.lock()[0]);
+
+    release.send(()).unwrap();
+    a.settled().await;
+    assert!(a.have(0));
+    // The first session ends, its torrent and its queues with it.
+    a._session.stop().await;
+    drop((a_peer, _a_rx, a_spawner, a));
+
+    for chunk in 0..CHUNKS_PER_PIECE {
+        b.send(&b_peer, (1, chunk), false).await.unwrap();
+    }
+    b.settled().await;
+    assert!(b.have(1));
+    assert_eq!(second.checked_on.lock().len(), 2);
 }
 
 // A connection whose whole pieces fill the count of those waiting to its

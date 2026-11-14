@@ -478,20 +478,6 @@ impl<J: DiskJob> Clone for DiskQueue<J> {
     }
 }
 
-/// A queue as those who would share it find it: there while anyone holds
-/// it or a job of its is queued or run, and gone after.
-pub(crate) struct WeakDiskQueue<J: DiskJob>(std::sync::Weak<QueueInner<J>>);
-
-impl<J: DiskJob> WeakDiskQueue<J> {
-    pub(crate) const fn new() -> Self {
-        Self(std::sync::Weak::new())
-    }
-
-    pub(crate) fn upgrade(&self) -> Option<DiskQueue<J>> {
-        self.0.upgrade().map(|inner| DiskQueue { inner })
-    }
-}
-
 struct QueueInner<J> {
     handle: Handle,
     jobs: Mutex<Jobs<J>>,
@@ -647,10 +633,6 @@ impl<J: DiskJob> DiskQueue<J> {
         if start {
             spawn_drain(&self.inner);
         }
-    }
-
-    pub(crate) fn downgrade(&self) -> WeakDiskQueue<J> {
-        WeakDiskQueue(Arc::downgrade(&self.inner))
     }
 
     /// Whether `other` is this queue.

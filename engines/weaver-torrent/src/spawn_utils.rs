@@ -8,37 +8,18 @@
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-use crate::disk::{
-    BlockPool, DiskQueue, MAX_QUEUED_CHECK_BYTES, MAX_QUEUED_DISK_BYTES, WeakDiskQueue,
-};
+use crate::disk::{BlockPool, DiskQueue, MAX_QUEUED_CHECK_BYTES, MAX_QUEUED_DISK_BYTES};
 use crate::session_stats::disk::{DiskStats, DiskStatsSnapshot};
 use crate::torrent_state::{DiskWrite, HashJob};
 
-/// Threads that check pieces: one, libtorrent's default
-/// (`settings_pack::hashing_threads`, settings_pack.cpp:353). One thread
-/// hashes a piece as fast as its core does, and the checks of a torrent end
-/// in the order they were queued, so the pieces a storage holds in memory
-/// reach the write queue, and the files, in that order.
+/// Threads of a session that check pieces: one, libtorrent's default
+/// (`settings_pack::hashing_threads`, settings_pack.cpp:353, its one
+/// session's). The session's one thread checks the pieces of every torrent
+/// of it, from peers over TCP and over uTP alike. One thread hashes a piece
+/// as fast as its core does, and the checks of a torrent end in the order
+/// they were queued, so the pieces a storage holds in memory reach the write
+/// queue, and the files, in that order.
 const HASH_THREADS: usize = 1;
-
-// The hashing queue of the process, there while a session holds it. Every
-// session shares it, so the pieces of every torrent, from peers over TCP
-// and over uTP alike, are checked by the one thread, whatever the number of
-// sessions open (libtorrent's `hashing_threads` are its one session's).
-static HASH: parking_lot::Mutex<WeakDiskQueue<HashJob>> =
-    parking_lot::Mutex::new(WeakDiskQueue::new());
-
-// The process's hashing queue: the one open sessions hold, or a new one on
-// `handle`'s runtime when none does.
-fn hash_queue(handle: &tokio::runtime::Handle) -> DiskQueue<HashJob> {
-    let mut shared = HASH.lock();
-    if let Some(queue) = shared.upgrade() {
-        return queue;
-    }
-    let queue = DiskQueue::new(handle.clone(), HASH_THREADS);
-    *shared = queue.downgrade();
-    queue
-}
 
 /// A piece check counted as waiting for the hashing thread, among its
 /// session's, until the thread takes it or it is dropped.
@@ -84,8 +65,8 @@ pub struct BlockingSpawner {
     // and their write, counted by the marks the blocks are.
     checks: BlockPool,
     disk: DiskQueue<DiskWrite>,
-    // The thread that checks a piece whose last block landed: one for the
-    // process, shared by its sessions.
+    // The thread that checks a piece whose last block landed: the session's
+    // one, on the session's runtime, there while it has a check to run.
     hash: DiskQueue<HashJob>,
     // The threads that read the blocks peers on uTP threads upload.
     reads: DiskQueue<crate::off_shard::ReadJob>,
@@ -139,7 +120,7 @@ impl BlockingSpawner {
             // Checks have a thread of their own, so a write never waits behind
             // one (libtorrent `settings_pack::hashing_threads`, a pool beside
             // `aio_threads`, mmap_disk_io.cpp:1685).
-            hash: hash_queue(&handle),
+            hash: DiskQueue::new(handle.clone(), HASH_THREADS),
             // Uploads are read on threads as many again, or on the same
             // bound when the disk work shares one (libtorrent reads on its
             // `aio_threads` too).
@@ -198,7 +179,7 @@ impl BlockingSpawner {
         &self.disk
     }
 
-    /// The thread that checks pieces, the process's one.
+    /// The thread that checks pieces, the session's one.
     pub(crate) fn hash(&self) -> &DiskQueue<HashJob> {
         &self.hash
     }
