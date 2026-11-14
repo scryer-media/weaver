@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-10.
+// Modified by the Weaver authors, 2026-11-13.
 
 use std::time::Duration;
 
@@ -214,8 +214,9 @@ async fn test_duplicate_ack_counted_only_on_st_state() {
 
 // A packet the retransmission timer resent is not fast-resent after it, as
 // in libtorrent: a SACK that then marks it lost does not send it again, and
-// only the timer does. The window after the expiry is one packet and the
-// resent head fills it, so the packet after it waits for the head's ACK.
+// only the timer does. The packet after it is a fast resend, which does not
+// ask the window (libtorrent v2.0.15 utp_stream.cpp:1990-1997), so it goes
+// on the SACK although the resent head fills the one-packet window.
 #[tokio::test]
 async fn a_packet_the_timer_resent_is_not_fast_resent() {
     setup_test_logging();
@@ -274,7 +275,7 @@ async fn a_packet_the_timer_resent_is_not_fast_resent() {
     );
     t.poll_once_assert_pending().await;
     let resent: Vec<u16> = t.take_sent().iter().map(|p| p.header.seq_nr.0).collect();
-    assert_eq!(resent, Vec::<u16>::new());
+    assert_eq!(resent, vec![102]);
     let head = t
         .vsock
         .user_tx_segments
@@ -284,8 +285,8 @@ async fn a_packet_the_timer_resent_is_not_fast_resent() {
         .send_count();
     assert_eq!(head, 2);
 
-    // The head's resend arrives: 102 is the hole now, with four packets
-    // past it, and goes at once.
+    // The head's resend arrives: 102 is the hole now, and was resent
+    // already, so nothing goes again.
     t.send_msg(
         UtpHeader {
             htype: State,
@@ -302,7 +303,7 @@ async fn a_packet_the_timer_resent_is_not_fast_resent() {
     );
     t.poll_once_assert_pending().await;
     let resent: Vec<u16> = t.take_sent().iter().map(|p| p.header.seq_nr.0).collect();
-    assert_eq!(resent, vec![102]);
+    assert_eq!(resent, Vec::<u16>::new());
 }
 
 // A packet the timer's go-back resent is not fast-resent by the next SACK,
@@ -371,6 +372,78 @@ async fn a_packet_the_go_back_resent_is_not_fast_resent() {
         .max()
         .unwrap();
     assert_eq!(most, 2, "go-back {go_back:?} resent {resent:?}");
+}
+
+// A timer expiry in recovery rewinds the send point to the head. The
+// holes a SACK then shows past it, at or after the fast-resend mark, are
+// fast resends on that SACK, as in libtorrent (v2.0.15
+// utp_stream.cpp:1269, 1352-1355, 1990-1997); the go-back then starts after
+// them and sends none of them again.
+#[tokio::test]
+async fn holes_past_the_timer_resent_head_go_on_the_sack_once() {
+    setup_test_logging();
+    let mut t = make_test_vsock(
+        SocketOpts {
+            link_mtu: Some(calc_mtu_for_mss(5)),
+            ..Default::default()
+        },
+        false,
+    );
+    let rto = Duration::from_secs(1);
+    t.vsock.rtte.force_timeout(rto);
+    let ack = |ack_nr: u16, sacked: &[usize]| UtpHeader {
+        htype: State,
+        seq_nr: 0.into(),
+        ack_nr: ack_nr.into(),
+        wnd_size: 1024,
+        extensions: crate::raw::Extensions {
+            selective_ack: SelectiveAck::new_test(sacked.iter().copied()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    t.send_msg(ack(100, &[]), "");
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(&[b'x'; 5 * 12])
+        .await
+        .unwrap();
+    t.poll_once_assert_pending().await;
+    let first: Vec<u16> = t.take_sent().iter().map(|p| p.header.seq_nr.0).collect();
+    assert_eq!(first, (101..=112).collect::<Vec<u16>>());
+
+    // 102 to 105 arrive: recovery resends 101.
+    t.send_msg(ack(100, &[0, 1, 2, 3]), "");
+    t.poll_once_assert_pending().await;
+    let resent: Vec<u16> = t.take_sent().iter().map(|p| p.header.seq_nr.0).collect();
+    assert_eq!(resent, vec![101]);
+
+    // The timer resends 101 again and rewinds the send point to it.
+    t.env.increment_now(rto);
+    t.poll_once_assert_pending().await;
+    let resent: Vec<u16> = t.take_sent().iter().map(|p| p.header.seq_nr.0).collect();
+    assert_eq!(resent, vec![101]);
+
+    // 109 to 112 arrive too: 106 to 108 each have four packets past them.
+    t.send_msg(ack(100, &[0, 1, 2, 3, 7, 8, 9, 10]), "");
+    t.poll_once_assert_pending().await;
+    let resent: Vec<u16> = t.take_sent().iter().map(|p| p.header.seq_nr.0).collect();
+    assert_eq!(resent, vec![106, 107, 108]);
+
+    // 101 arrives: the go-back has nothing left to send, and no hole goes
+    // a second time on the old evidence.
+    t.send_msg(ack(101, &[0, 1, 2, 6, 7, 8, 9]), "");
+    t.poll_once_assert_pending().await;
+    let resent: Vec<u16> = t.take_sent().iter().map(|p| p.header.seq_nr.0).collect();
+    assert_eq!(resent, Vec::<u16>::new());
+    let sends: Vec<usize> = t
+        .vsock
+        .user_tx_segments
+        .iter_mut_for_sending(None)
+        .map(|s| s.send_count())
+        .collect();
+    assert_eq!(sends, vec![2, 2, 2]);
 }
 
 // One SACK can show many packets lost at once. At most five are resent for

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-12.
+// Modified by the Weaver authors, 2026-11-13.
 
 // uTP doesn't resegment, so we pre-segment TX once.
 // We also store the delivered state of the segments here.
@@ -727,10 +727,17 @@ impl Segments {
 
     // Pipe is the estimate of how much outstanding data is in the network.
     // used during SACK-based recovery not to overwhelm the network.
+    // `high_sent` is the newest packet ever sent. After a timer expiry
+    // rewound `high_data` to the head, the packets past it are marked lost
+    // or not on the SACKs as well, so a hole among them can be resent on
+    // that evidence as libtorrent resends it (v2.0.15 utp_stream.cpp:
+    // 1235-1355, 3550-3551); they are not in the pipe, as libtorrent's
+    // timeout takes them out of its bytes in flight (:3505-3513).
     pub fn calc_pipe(
         &mut self,
         high_rxt: SeqNr,
         high_data: SeqNr,
+        high_sent: SeqNr,
         rtt: Duration,
         now: Instant,
     ) -> Pipe {
@@ -750,6 +757,7 @@ impl Segments {
         // flight size counts the same segments (RFC 6675 section 4,
         // SetPipe, runs from HighACK to HighData).
         let take = self.flight_take(high_data);
+        let marked = self.flight_take(high_sent).max(take);
 
         // After this we don't consider the packet being in the network.
         // rtt/2 might be a bit too aggressive.
@@ -757,7 +765,7 @@ impl Segments {
 
         for (offset, seq_nr, segment, last_sent) in self
             .segments
-            .range_mut(..take)
+            .range_mut(..marked)
             .enumerate()
             .rev()
             .filter_map(|(offset, seg)| {
@@ -776,7 +784,8 @@ impl Segments {
                 continue;
             }
 
-            if seq_nr.is_at_or_before(high_rxt) {
+            let counted = offset < take;
+            if counted && seq_nr.is_at_or_before(high_rxt) {
                 pipe += segment.payload_size;
             }
 
@@ -806,6 +815,9 @@ impl Segments {
                 delivered_segs > SACK_DUP_THRESH as usize
             };
             segment.is_lost = offset <= self.sack_depth + 1 && evidence;
+            if !counted {
+                continue;
+            }
 
             // A segment in flight past the expiry has likely left the
             // network, so it no longer counts against the pipe.
@@ -977,7 +989,7 @@ mod tests {
         }
         segments.remove_up_to_ack(sent, &make_sack_header(9, [0, 1, 2]));
         let rtt = Duration::from_millis(100);
-        let pipe = segments.calc_pipe(9.into(), 17.into(), rtt, sent + rtt * 10);
+        let pipe = segments.calc_pipe(9.into(), 17.into(), 17.into(), rtt, sent + rtt * 10);
         let head = segments.iter_mut_for_sending(None).next().unwrap();
         assert_eq!(head.seq_nr(), 10.into());
         assert!(head.is_expired());
@@ -985,7 +997,7 @@ mod tests {
         assert_eq!(pipe.pipe, 0);
 
         segments.remove_up_to_ack(sent, &make_sack_header(9, [0, 1, 2, 3]));
-        segments.calc_pipe(9.into(), 17.into(), rtt, sent + rtt * 10);
+        segments.calc_pipe(9.into(), 17.into(), 17.into(), rtt, sent + rtt * 10);
         assert!(
             segments
                 .iter_mut_for_sending(None)
@@ -1224,7 +1236,7 @@ mod tests {
         }
         // 11-14 SACKed: 10 is lost and resent.
         ftx.remove_up_to_ack(t0, &make_sack_header(9, [0, 1, 2, 3]));
-        ftx.calc_pipe(9.into(), 15.into(), rtt, t0);
+        ftx.calc_pipe(9.into(), 15.into(), 15.into(), rtt, t0);
         let t1 = t0 + rtt;
         {
             let mut head = ftx.iter_mut_for_sending(None).next().unwrap();
@@ -1234,7 +1246,7 @@ mod tests {
         }
         // The same evidence again, plus 15, sent before the resend.
         ftx.remove_up_to_ack(t1, &make_sack_header(9, [0, 1, 2, 3, 4]));
-        ftx.calc_pipe(10.into(), 15.into(), rtt, t1);
+        ftx.calc_pipe(10.into(), 15.into(), 15.into(), rtt, t1);
         assert!(!ftx.iter_mut_for_sending(None).next().unwrap().is_lost());
 
         // 16-21 go out after the resend; three SACKed are not enough, four
@@ -1244,10 +1256,10 @@ mod tests {
             item.on_sent(t2, &stats);
         }
         ftx.remove_up_to_ack(t2, &make_sack_header(9, [0, 1, 2, 3, 4, 5, 6, 7]));
-        ftx.calc_pipe(10.into(), 21.into(), rtt, t2);
+        ftx.calc_pipe(10.into(), 21.into(), 21.into(), rtt, t2);
         assert!(!ftx.iter_mut_for_sending(None).next().unwrap().is_lost());
         ftx.remove_up_to_ack(t2, &make_sack_header(9, [8]));
-        ftx.calc_pipe(10.into(), 21.into(), rtt, t2);
+        ftx.calc_pipe(10.into(), 21.into(), 21.into(), rtt, t2);
         let head = ftx.iter_mut_for_sending(None).next().unwrap();
         assert_eq!(head.seq_nr(), 10.into());
         assert!(head.is_lost());
@@ -1515,7 +1527,7 @@ mod pipe_tests {
         let mut segs = queue(10, 12);
         send(&mut segs, 10..=12, t0);
         assert_eq!(segs.walk_flight_size_to(12.into()), 3 * SIZE);
-        let pipe = segs.calc_pipe(9.into(), 12.into(), SRTT, t0);
+        let pipe = segs.calc_pipe(9.into(), 12.into(), 12.into(), SRTT, t0);
         assert_eq!(pipe.pipe, 3 * SIZE);
     }
 
@@ -1529,11 +1541,11 @@ mod pipe_tests {
         let mut segs = queue(10, 20);
         send(&mut segs, 10..=19, t0);
         segs.remove_up_to_ack(t1, &sack(9, 11..=15));
-        segs.calc_pipe(9.into(), 19.into(), SRTT, t1);
+        segs.calc_pipe(9.into(), 19.into(), 19.into(), SRTT, t1);
         resend_as_lost(&mut segs, 10, t1);
         send(&mut segs, 20..=20, t1 + 10 * MS);
         segs.remove_up_to_ack(t1 + 110 * MS, &sack(9, 11..=20));
-        let pipe = segs.calc_pipe(10.into(), 20.into(), SRTT, t1 + 110 * MS);
+        let pipe = segs.calc_pipe(10.into(), 20.into(), 20.into(), SRTT, t1 + 110 * MS);
         assert_eq!(pipe.reorder_at, Some(t1 + 125 * MS));
     }
 
@@ -1550,7 +1562,7 @@ mod pipe_tests {
             .next()
             .unwrap()
             .on_sent(t0 + 50 * MS, &stats);
-        let pipe = segs.calc_pipe(10.into(), 12.into(), SRTT, t0 + 60 * MS);
+        let pipe = segs.calc_pipe(10.into(), 12.into(), 12.into(), SRTT, t0 + 60 * MS);
         assert_eq!(pipe.recalc_timer, Some(t0 + 75 * MS));
     }
 }

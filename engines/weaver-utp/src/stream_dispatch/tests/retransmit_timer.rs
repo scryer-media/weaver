@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-03.
+// Modified by the Weaver authors, 2026-11-13.
 
 use std::time::Duration;
 
@@ -720,12 +720,14 @@ async fn fin_retransmit() {
 }
 
 // After a timer expiry the window is one packet: the head goes alone, and
-// nothing more leaves until an ACK comes. ACKs that also report packets
-// delivered before the expiry grow the window one packet each, so the
-// go-back resends leave one more per ACK, not twice as many. A go-back the
-// window does not allow is not a send.
+// nothing more leaves until an ACK comes. Each later SACK shows the next
+// holes lost, with more than three packets past them: the first five are
+// fast resends on it, which do not ask the window (libtorrent v2.0.15
+// utp_stream.cpp:1228-1355, 1990-1997). The go-back then sends only what
+// the window has left beside them. A go-back the window does not allow is
+// not a send.
 #[tokio::test]
-async fn after_a_timer_expiry_one_packet_leaves_and_each_ack_allows_one_more() {
+async fn after_a_timer_expiry_one_packet_leaves_and_each_sack_fast_resends_five() {
     setup_test_logging();
     let mut t = make_test_vsock(
         SocketOpts {
@@ -808,6 +810,8 @@ async fn after_a_timer_expiry_one_packet_leaves_and_each_ack_allows_one_more() {
         per_ack.push(sent.len());
         acked += sent.len() as u16;
     }
-    assert_eq!(per_ack, vec![2, 3, 4, 5, 6]);
-    assert_eq!(t.vsock.totals.packets_sent, 60 + 1 + 20);
+    // Five fast resends a SACK, and the window's room after them.
+    assert_eq!(per_ack, vec![5, 6, 7, 8, 9]);
+    assert_eq!(t.vsock.totals.fast_resends, 25);
+    assert_eq!(t.vsock.totals.packets_sent, 60 + 1 + 35);
 }

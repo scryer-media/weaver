@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-12.
+// Modified by the Weaver authors, 2026-11-13.
 
 #[cfg(test)]
 mod tests;
@@ -28,8 +28,7 @@ use crate::{
     constants::{
         ACK_DELAY, FAST_RESENDS_PER_ACK, MAX_UDP_PAYLOAD, RECOVERY_TRACING_LOG_LEVEL,
         RTTE_TRACING_LOG_LEVEL, SACK_DUP_THRESH, SEQUENCE_HALF_SPACE, SYNACK_RESEND_INTERNAL,
-        UTP_HEADER,
-        calc_pipe_expiry,
+        UTP_HEADER, calc_pipe_expiry,
     },
     delay::DelayTracker,
     ingress::{Event as IngressEvent, Receiver as IngressReceiver, Stop},
@@ -48,10 +47,26 @@ use crate::{
     stream::UtpStream,
     stream_rx::{AssemblerAddRemoveResult, UserRx},
     stream_tx::{UserTx, UtpStreamWriteHalf},
-    stream_tx_segments::{ExpiredProbe, OnAckResult, Segments},
+    stream_tx_segments::{ExpiredProbe, OnAckResult, SegmentForSending, Segments},
     traits::{Transport, UtpEnvironment},
     utils::update_optional_waker,
 };
+
+// After a timer expiry rewound the send point to the head, the packets
+// sent before the expiry and not yet resent lie past it. A SACK walk resends
+// one of them on its evidence as libtorrent does (v2.0.15
+// utp_stream.cpp:1235, 1269, 1352-1355, 3550-3551): lost, at or after the
+// fast-resend mark, and the packet the go-back would send next, so the
+// go-back's point moves past it with the send and does not send it again.
+// Any other packet there ends the walk and waits for the go-back.
+fn stops_short_of_go_back(
+    seg: &SegmentForSending<'_>,
+    last_sent_seq_nr: SeqNr,
+    fast_resend_seq_nr: SeqNr,
+) -> bool {
+    seg.seq_nr().is_after(last_sent_seq_nr)
+        && !(seg.is_lost() && seg.seq_nr().is_at_or_after(fast_resend_seq_nr))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VirtualSocketState {
@@ -892,30 +907,38 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 rec.pipe_estimate = self.user_tx_segments.calc_pipe(
                     rec.high_rxt,
                     self.last_sent_seq_nr,
+                    self.highest_sent_seq_nr,
                     self.rtte.roundtrip_time(),
                     self.this_poll.now,
                 );
                 self.fast_resend_budget = self.fast_resend_budget.max(FAST_RESENDS_PER_ACK);
             }
             let sack_depth = self.user_tx_segments.sack_depth();
-            let last_sent_seq_nr = self.last_sent_seq_nr;
+            let highest_sent_seq_nr = self.highest_sent_seq_nr;
             let fast_resend_seq_nr = self.fast_resend_seq_nr;
             let mut it = self
                 .user_tx_segments
                 .iter_mut_for_sending(None)
                 .take(sack_depth + 1)
-                .take_while(|seg| seg.seq_nr().is_at_or_before(last_sent_seq_nr))
+                .take_while(|seg| seg.seq_nr().is_at_or_before(highest_sent_seq_nr))
                 .filter(|seg| seg.send_count() > 0);
 
             let mut cwnd = rec.cwnd();
             let mut sent = 0;
             let mss = self.segment_sizes.mss() as usize;
             let mut force_head = rec.total_retransmitted_segments() == 0;
-            while (force_head || cwnd > mss) && self.fast_resend_budget > 0 {
+            // A resend on SACK evidence does not ask the window, only the
+            // per-ACK budget bounds it (libtorrent v2.0.15
+            // utp_stream.cpp:1990-1997: the window is checked only when the
+            // resend is not a fast resend).
+            while self.fast_resend_budget > 0 {
                 let mut seg = match it.next() {
                     Some(seg) => seg,
                     None => break,
                 };
+                if stops_short_of_go_back(&seg, self.last_sent_seq_nr, self.fast_resend_seq_nr) {
+                    break;
+                }
 
                 // The first packet recovery resends is the oldest, lost or
                 // not, as the duplicates that began recovery point at it,
@@ -979,7 +1002,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
             if self.fast_resend_budget == 0 {
-                lost_left = it.any(|seg| seg.is_lost());
+                let go_back_at = self.last_sent_seq_nr;
+                lost_left = it
+                    .take_while(|seg| seg.seq_nr().is_at_or_before(go_back_at))
+                    .any(|seg| seg.is_lost());
             }
             if let Some(at) = paced.and_then(|payload| self.pacer.ready_at(payload)) {
                 self.timers.pace.set(at);
@@ -1044,6 +1070,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     .calc_pipe(
                         self.user_tx_segments.acked_seq_nr(),
                         self.last_sent_seq_nr,
+                        self.highest_sent_seq_nr,
                         self.rtte.roundtrip_time(),
                         self.this_poll.now,
                     )
@@ -1051,18 +1078,21 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.fast_resend_budget = self.fast_resend_budget.max(FAST_RESENDS_PER_ACK);
             }
             let sack_depth = self.user_tx_segments.sack_depth();
-            let last_sent_seq_nr = self.last_sent_seq_nr;
+            let highest_sent_seq_nr = self.highest_sent_seq_nr;
             let mut oldest = true;
             let mut it = self
                 .user_tx_segments
                 .iter_mut_for_sending(None)
                 .take(sack_depth + 1)
-                .take_while(|seg| seg.seq_nr().is_at_or_before(last_sent_seq_nr))
+                .take_while(|seg| seg.seq_nr().is_at_or_before(highest_sent_seq_nr))
                 .filter(|seg| seg.send_count() > 0);
             while self.fast_resend_budget > 0
                 && let Some(mut seg) = it.next()
             {
                 let is_oldest = std::mem::take(&mut oldest);
+                if stops_short_of_go_back(&seg, self.last_sent_seq_nr, self.fast_resend_seq_nr) {
+                    break;
+                }
                 if !seg.is_lost() {
                     continue;
                 }
@@ -1102,7 +1132,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.pacer.charge(seg.payload_size());
             }
             if self.fast_resend_budget == 0 {
-                lost_left = it.any(|seg| seg.is_lost());
+                let go_back_at = self.last_sent_seq_nr;
+                lost_left = it
+                    .take_while(|seg| seg.seq_nr().is_at_or_before(go_back_at))
+                    .any(|seg| seg.is_lost());
             }
         }
         self.resend_refused = false;
@@ -1885,6 +1918,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             rec.pipe_estimate = self.user_tx_segments.calc_pipe(
                 rec.high_rxt,
                 self.last_sent_seq_nr,
+                self.highest_sent_seq_nr,
                 self.rtte.roundtrip_time(),
                 self.this_poll.now,
             );
@@ -1898,6 +1932,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .calc_pipe(
                     self.user_tx_segments.acked_seq_nr(),
                     self.last_sent_seq_nr,
+                    self.highest_sent_seq_nr,
                     self.rtte.roundtrip_time(),
                     self.this_poll.now,
                 )
