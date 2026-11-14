@@ -21,6 +21,23 @@ use std::sync::OnceLock;
 
 static IDLE_THREAD_RELEASE: OnceLock<fn()> = OnceLock::new();
 static JOB_COMPLETION_RELEASE: OnceLock<fn()> = OnceLock::new();
+static LANE_THREAD_START: OnceLock<fn()> = OnceLock::new();
+
+// Install what the allocator does as a download lane thread starts: under
+// jemalloc, bind it to the arena the lanes keep their article pages in until
+// one of the releases below. The first installation wins.
+pub fn install_lane_thread_start(hook: fn()) {
+    let _ = LANE_THREAD_START.set(hook);
+}
+
+// Run the allocator's lane start, if a hook is installed. Called once, on
+// the lane thread itself, before it allocates anything for an article.
+#[inline]
+pub fn start_lane_thread() {
+    if let Some(hook) = LANE_THREAD_START.get() {
+        hook();
+    }
+}
 
 // Install the allocator's idle-thread release. The first installation wins;
 // a later one is ignored so a stray second call cannot swap the hook out
