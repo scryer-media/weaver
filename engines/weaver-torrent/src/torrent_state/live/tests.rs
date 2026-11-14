@@ -6,6 +6,7 @@
 
 mod mapped_endpoint_tests;
 mod mapped_filter_tests;
+mod swarm_tests;
 
 use std::{
     collections::BTreeSet,
@@ -242,6 +243,7 @@ impl Harness {
             answers: Default::default(),
             counters,
             first_message_received: AtomicBool::new(false),
+            transport: AtomicU8::new(0),
             disk: Default::default(),
             upload: Default::default(),
             cancel_token: self.live.cancellation_token.child_token(),
@@ -4750,6 +4752,12 @@ async fn a_rendezvous_tells_each_peer_to_connect_to_the_other() {
         holepunch_sent(&mut b_rx),
         [UtHolepunch::Connect(sock("203.0.113.1:6881"))]
     );
+    assert_eq!(holepunches(&h, HolepunchEvent::Introduced), 1);
+}
+
+/// How many holepunch steps of `event` the harness's session has counted.
+fn holepunches(h: &Harness, event: HolepunchEvent) -> u64 {
+    h.live.session_stats.network.snapshot().holepunch[event as usize]
 }
 
 // libtorrent `bt_peer_connection::on_holepunch`, `rendezvous`: not
@@ -4819,6 +4827,8 @@ async fn a_connect_admits_the_peer_only_over_utp_and_a_local_one_only_from_a_loc
     let (from, _rx) = with.holepunch_peer("127.0.0.1:6881", true);
     send_holepunch(&from, UtHolepunch::Connect(target)).await;
     assert!(with.knows(&target.to_string()));
+    assert_eq!(holepunches(&with, HolepunchEvent::ConnectIgnored), 1);
+    assert_eq!(holepunches(&with, HolepunchEvent::Connect), 1);
 }
 
 /// A PEX message naming `addr` with `flags`.
@@ -6492,6 +6502,7 @@ impl Harness {
             answers: Default::default(),
             counters,
             first_message_received: AtomicBool::new(true),
+            transport: AtomicU8::new(0),
             disk: Default::default(),
             upload: Default::default(),
             cancel_token: self.live.cancellation_token.child_token(),

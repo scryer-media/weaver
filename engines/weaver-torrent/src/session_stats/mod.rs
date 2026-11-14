@@ -18,7 +18,15 @@ use tracing::debug_span;
 use crate::{Session, torrent_state::peers::stats::AggregatePeerStatsAtomic};
 
 pub mod check;
+pub mod dht;
+pub mod incoming;
+pub mod network;
 pub mod snapshot;
+pub mod swarm;
+pub mod tracker;
+pub mod web_seed;
+
+pub use swarm::Transport;
 
 gen_stats!(SessionCountersAtomic SessionCountersSnapshot, [
     fetched_bytes u64,
@@ -32,6 +40,11 @@ gen_stats!(SessionCountersAtomic SessionCountersSnapshot, [
 pub struct SessionStats {
     pub counters: SessionCountersAtomic,
     pub peers: Arc<AggregatePeerStatsAtomic>,
+    pub swarm: Arc<swarm::SwarmStats>,
+    pub trackers: Arc<tracker::TrackerStats>,
+    pub incoming: incoming::IncomingStats,
+    pub web_seeds: Arc<web_seed::WebSeedStats>,
+    pub network: network::NetworkStats,
     pub down_speed_estimator: SpeedEstimator,
     pub up_speed_estimator: SpeedEstimator,
     pub startup_time: Instant,
@@ -42,6 +55,11 @@ impl SessionStats {
         SessionStats {
             counters: Default::default(),
             peers: Default::default(),
+            swarm: Default::default(),
+            trackers: Default::default(),
+            incoming: Default::default(),
+            web_seeds: Default::default(),
+            network: Default::default(),
             down_speed_estimator: SpeedEstimator::new(5),
             up_speed_estimator: SpeedEstimator::new(5),
             startup_time: Instant::now(),
@@ -100,6 +118,9 @@ impl Session {
         for socket in &self.utp_sockets {
             snapshot.utp += socket.0.stats().snapshot();
         }
+        snapshot.unchoke_slots_held = self.choker.held();
+        snapshot.lsd = self.lsd.as_ref().map(|lsd| lsd.counted());
+        snapshot.limiter = self.ratelimits.waited();
         snapshot
     }
 }

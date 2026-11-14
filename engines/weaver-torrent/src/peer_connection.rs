@@ -35,6 +35,7 @@ use crate::{
     meter::Meter,
     read_buf::{Incoming, ReadQuota},
     session::CheckedIncomingConnection,
+    session_stats::swarm::{Direction, MessageKind},
     stream_connect::ConnectionKind,
 };
 use futures::TryFutureExt;
@@ -135,6 +136,9 @@ pub trait PeerConnectionHandler {
     /// handshakes and every message but a piece's block (libtorrent
     /// `stat::sent_bytes`, `received_bytes`, the protocol half).
     fn on_protocol_bytes(&self, _channel: Channel, _bytes: u64) {}
+    /// `count` messages of `kind` crossed the connection: read whole from
+    /// the peer, or framed for it.
+    fn on_wire_messages(&self, _direction: Direction, _kind: MessageKind, _count: u64) {}
     /// The connection ended while the peer was sending `block`: the bytes
     /// of it that arrived are dropped. Told once, however the connection
     /// ended.
@@ -585,6 +589,8 @@ struct Framed {
     len: usize,
     chunk: Option<ChunkInfo>,
     read: bool,
+    /// What a frame other than a block is counted as once it is written.
+    kind: Option<MessageKind>,
 }
 
 /// A handler's error as the connection ends in it: one of ours stays as it
@@ -614,6 +620,7 @@ impl Framed {
             len,
             chunk: None,
             read: false,
+            kind: None,
         }
     }
 }
@@ -992,6 +999,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             )
             .await?;
             self.handler.on_protocol_bytes(Channel::Upload, esz as u64);
+            self.handler
+                .on_wire_messages(Direction::Out, MessageKind::ExtendedHandshake, 1);
         }
 
         // A connection on a uTP thread reads the blocks it uploads on the
@@ -1013,6 +1022,15 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     .handler
                     .serialize_bitfield_message_to_buf(&mut write_buf)
                     .map_err(Error::Anyhow)?;
+                // The frame is a bitfield, or under the fast extension a
+                // have-all or have-none, told apart by its message id. It is
+                // read here, as the write may encrypt the buffer in place,
+                // and counted once the write is done.
+                let kind = match write_buf.get(4) {
+                    Some(14) => MessageKind::HaveAll,
+                    Some(15) => MessageKind::HaveNone,
+                    _ => MessageKind::Bitfield,
+                };
                 send(
                     &mut up,
                     &mut write,
@@ -1022,6 +1040,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 )
                 .await?;
                 self.handler.on_protocol_bytes(Channel::Upload, len as u64);
+                self.handler.on_wire_messages(Direction::Out, kind, 1);
                 trace!("sent bitfield");
             }
 
@@ -1086,6 +1105,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                         break;
                     }
                     let out = &mut buf[filled..];
+                    let kind = req.frame_kind();
                     let framed = match req {
                         WriterRequest::Message(msg) => addressed(msg.serialize(out, ext_msg_ids))?,
                         WriterRequest::UtPex(ut_pex) => addressed(
@@ -1159,6 +1179,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                                     len: needs,
                                     chunk: Some(chunk),
                                     read,
+                                    kind: None,
                                 })
                             }
                         }
@@ -1171,7 +1192,10 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                             break;
                         }
                     };
-                    if let Some(framed) = framed {
+                    if let Some(mut framed) = framed {
+                        if framed.chunk.is_none() {
+                            framed.kind = kind;
+                        }
                         filled += framed.len;
                         batch.push(framed);
                     }
@@ -1267,6 +1291,9 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     let payload = framed.chunk.map_or(0, |chunk| chunk.size as usize);
                     self.handler
                         .on_protocol_bytes(Channel::Upload, (framed.len - payload) as u64);
+                    if let Some(kind) = framed.kind {
+                        self.handler.on_wire_messages(Direction::Out, kind, 1);
+                    }
                     if let Some(chunk) = framed.chunk {
                         sent_payload += u64::from(chunk.size);
                         self.handler.on_uploaded_bytes(chunk.size);
@@ -1274,6 +1301,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     }
                 }
                 if !sent.is_empty() {
+                    self.handler.on_wire_messages(
+                        Direction::Out,
+                        MessageKind::Piece,
+                        sent.len() as u64,
+                    );
                     self.handler.uploads_done(&sent);
                     sent.clear();
                 }
@@ -1311,6 +1343,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     Incoming::Block(block) => {
                         trace!("received: {:?}", &block);
                         let payload = block.len() as u64;
+                        self.handler
+                            .on_wire_messages(Direction::In, MessageKind::Piece, 1);
                         tokio::task::coop::consume_budget().await;
                         self.handler
                             .on_received_block(block)
@@ -1324,6 +1358,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     }
                 };
                 trace!("received: {:?}", &message);
+                self.handler
+                    .on_wire_messages(Direction::In, MessageKind::of(&message), 1);
                 let payload = match &message {
                     Message::Piece(piece) => piece.len() as u64,
                     _ => 0,

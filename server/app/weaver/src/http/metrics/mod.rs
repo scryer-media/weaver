@@ -19,6 +19,8 @@
 pub(super) mod catalog;
 pub(super) mod encode;
 mod render;
+mod torrent_services;
+mod torrent_swarm;
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -624,17 +626,37 @@ async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealthInfo> {
         .collect()
 }
 
-// Which torrents earn their own `weaver_torrent_*` series under the
-// configured mode: a stopped torrent's job is complete or failed, which
-// `job_is_exported` drops under `Active` the same way.
+// Which torrents earn their own `weaver_torrent_*` series, and their
+// trackers', under the configured mode. `Active` is a torrent at work on its
+// own data: downloading, checking its files, fetching its metadata or moving.
+// One that seeds, waits or is held has none, so the scrape does not grow
+// with the torrents kept; `weaver_torrents` counts every one by state.
 pub(super) fn torrent_is_exported(
     state: weaver_server_core::torrents::TorrentState,
     mode: PerJobSeries,
 ) -> bool {
+    use weaver_server_core::torrents::TorrentState;
     match mode {
         PerJobSeries::Off => false,
         PerJobSeries::All => true,
-        PerJobSeries::Active => state != weaver_server_core::torrents::TorrentState::Stopped,
+        PerJobSeries::Active => match state {
+            TorrentState::Downloading
+            | TorrentState::CheckingFiles
+            | TorrentState::FetchingMetadata
+            | TorrentState::Moving => true,
+            // A download with no peer, or with a full disk: it holds a
+            // download's turn and is watched as one.
+            TorrentState::Stalled => true,
+            // Every torrent passes through this at each start, the seeding
+            // ones included; it reads what was saved and moves no figure.
+            TorrentState::CheckingResumeData => false,
+            TorrentState::Queued
+            | TorrentState::Seeding
+            | TorrentState::Paused
+            | TorrentState::Stopped
+            | TorrentState::NeedsCertificate
+            | TorrentState::FilesMissing => false,
+        },
     }
 }
 

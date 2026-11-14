@@ -309,16 +309,21 @@ pub struct MetricsConfig {
 }
 
 // Which jobs get their own `weaver_job_*` series, and which torrents their
-// own `weaver_torrent_*` ones (a stopped torrent is a finished job).
+// own `weaver_torrent_*` ones, their trackers' included.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PerJobSeries {
     // Only jobs the pipeline is working on: those holding an NZB slot and
     // those past their download, until they finish. Jobs waiting their turn
-    // get none.
+    // get none. A torrent has its series only while it downloads (stalled
+    // included), checks its files, fetches its metadata or moves; one that
+    // seeds, is queued, paused, stopped or otherwise held has none, and is
+    // still counted in `weaver_torrents{route,state}` and its route's
+    // session series.
     #[default]
     Active,
-    // Every job the runtime still remembers, finished ones included.
+    // Every job the runtime still remembers, finished ones included, and
+    // every torrent.
     All,
     // No per-job series at all; `weaver_pipeline_jobs{status}` still reports
     // the aggregate queue mix.

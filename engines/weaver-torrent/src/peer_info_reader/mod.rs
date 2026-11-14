@@ -8,7 +8,10 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Duration,
 };
 
@@ -40,6 +43,9 @@ use crate::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
     },
     session::FetchPhase,
+    session_stats::swarm::{
+        self, ByteKind, ClosePhase, CloseReason, Direction, MessageKind, SwarmStats, Transport,
+    },
     spawn_utils::BlockingSpawner,
     stream_connect::{ConnectionKind, StreamConnector},
     torrent_state::live::peers::PeerStates,
@@ -85,10 +91,17 @@ pub(crate) async fn read_metainfo_from_peer(
     let requests = Arc::new(Requests::new());
     let request_tx = writer_tx.clone();
     let info_hashes = fetch.info_hashes;
+    let transport = Arc::new(AtomicU8::new(0));
+    let mut closing = Closing {
+        swarm: fetch.swarm.clone(),
+        transport: transport.clone(),
+        reason: CloseReason::Closed,
+    };
     let handler = Handler {
         addr,
         peers,
         fetch,
+        transport,
         writer_tx,
         result_tx: Mutex::new(Some(result_tx)),
         requests: requests.clone(),
@@ -112,9 +125,36 @@ pub(crate) async fn read_metainfo_from_peer(
         result = result_reader => Ok(result??),
         whatever = connection_runner => match whatever {
             Ok(_) => anyhow::bail!("connection runner completed first"),
-            Err(e) => Err(e.into())
+            Err(e) => {
+                closing.reason = CloseReason::of(Some(&e));
+                Err(e.into())
+            }
         },
-        e = requests.send(&request_tx) => Err(e),
+        e = requests.send(&request_tx) => {
+            closing.reason = CloseReason::Timeout;
+            Err(e)
+        }
+    }
+}
+
+// Counts the connection's end when the fetch lets go of it, however that
+// comes: with the metadata, with an error, or dropped because another peer
+// answered first. An end nothing else names is a close of our own.
+struct Closing {
+    swarm: Arc<SwarmStats>,
+    // What carries the connection, once its handshake says: a
+    // `swarm::Transport` and one, none before.
+    transport: Arc<AtomicU8>,
+    reason: CloseReason,
+}
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        let phase = match self.transport.load(Ordering::Relaxed) {
+            0 => ClosePhase::Connecting,
+            _ => ClosePhase::Live,
+        };
+        self.swarm.closed(phase, self.reason);
     }
 }
 
@@ -151,6 +191,9 @@ pub(crate) struct MetadataFetch {
     set: Arc<Mutex<PieceSet>>,
     /// The DHT the fetch looks for peers on, when it may.
     dht: Option<FetchDht>,
+    /// The session's connection counts, which the fetch's connections are
+    /// counted in.
+    swarm: Arc<SwarmStats>,
 }
 
 /// The session's DHT, for a magnet whose metadata fetch may use it, and
@@ -171,11 +214,23 @@ impl FetchDht {
 }
 
 impl MetadataFetch {
+    /// A fetch whose connections are counted nowhere a session reads.
+    #[cfg(test)]
     pub(crate) fn new(info_hashes: InfoHashes, dht: Option<FetchDht>) -> Arc<Self> {
+        Self::counted_in(info_hashes, dht, Arc::default())
+    }
+
+    /// A fetch whose connections are counted in `swarm`.
+    pub(crate) fn counted_in(
+        info_hashes: InfoHashes,
+        dht: Option<FetchDht>,
+        swarm: Arc<SwarmStats>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             info_hashes,
             set: Arc::new(Mutex::new(PieceSet::new())),
             dht,
+            swarm,
         })
     }
 
@@ -526,6 +581,9 @@ struct Handler {
     /// The list the peer is on.
     peers: Arc<PeerStates>,
     fetch: Arc<MetadataFetch>,
+    /// What carries the connection, once its handshake says: a
+    /// `swarm::Transport` and one, none before.
+    transport: Arc<AtomicU8>,
     writer_tx: UnboundedSender<WriterRequest>,
     result_tx: Mutex<
         Option<
@@ -543,6 +601,11 @@ struct Handler {
 }
 
 impl Handler {
+    fn transport(&self) -> Option<Transport> {
+        let at = usize::from(self.transport.load(Ordering::Relaxed)).checked_sub(1)?;
+        Transport::ALL.get(at).copied()
+    }
+
     /// A peer named its DHT node: the DHT pings it and adds it on reply
     /// (libtorrent `peer_connection::incoming_dht_port`), once for each
     /// port the connection names, as on a live connection. Nothing goes
@@ -574,13 +637,20 @@ impl PeerConnectionHandler for Handler {
     }
 
     fn on_handshake_encryption(&self, encryption: crate::mse::Encryption) {
+        if let Some(transport) = self.transport() {
+            self.fetch.swarm.handshake(
+                transport,
+                Direction::Out,
+                swarm::Encryption::of(encryption),
+            );
+        }
         self.peers.handshake_encryption(self.addr, encryption);
     }
 
     fn on_handshake(
         &self,
         handshake: Handshake,
-        _kind: ConnectionKind,
+        kind: ConnectionKind,
         _speaks_v2: bool,
     ) -> anyhow::Result<()> {
         if !handshake.supports_extended() {
@@ -588,7 +658,25 @@ impl PeerConnectionHandler for Handler {
                 "this peer does not support extended handshaking, which is a prerequisite to download metadata"
             )
         }
+        self.transport
+            .store(Transport::of(kind) as u8 + 1, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn on_protocol_bytes(&self, channel: crate::limits::Channel, bytes: u64) {
+        let direction = match channel {
+            crate::limits::Channel::Download => Direction::In,
+            crate::limits::Channel::Upload => Direction::Out,
+        };
+        if let Some(transport) = self.transport() {
+            self.fetch
+                .swarm
+                .bytes(transport, direction, ByteKind::Protocol, bytes);
+        }
+    }
+
+    fn on_wire_messages(&self, direction: Direction, kind: MessageKind, count: u64) {
+        self.fetch.swarm.messages(direction, kind, count);
     }
 
     async fn on_received_message(&self, msg: Message<'_>) -> anyhow::Result<()> {

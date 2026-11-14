@@ -65,7 +65,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -112,7 +112,11 @@ use crate::{
     piece_priority::{FilePriority, PiecePriority},
     piece_tracker::{AcquireRequest, AcquireResult, Arrival, PickOptions, PieceTracker},
     session::CheckedIncomingConnection,
-    session_stats::SessionStats,
+    session_stats::{
+        SessionStats,
+        network::HolepunchEvent,
+        swarm::{self, Direction, MessageKind},
+    },
     stream_connect::ConnectionKind,
     torrent_state::utils::atomic_inc,
     type_aliases::{FileStorage, PeerHandle, PeerSourceFlag},
@@ -768,6 +772,7 @@ impl TorrentStateLive {
             answers: AnswerBacklog::default(),
             counters,
             first_message_received: AtomicBool::new(false),
+            transport: AtomicU8::new(0),
             disk: Default::default(),
             upload: Default::default(),
             cancel_token: self.cancellation_token.child_token(),
@@ -786,6 +791,7 @@ impl TorrentStateLive {
             .session
             .upgrade()
             .is_some_and(|session| session.allow_idna);
+        let counts = &self.session_stats.web_seeds;
         let connection = WebSeedConnection::new(
             clients,
             resolver,
@@ -794,7 +800,8 @@ impl TorrentStateLive {
             &link,
             &self.shared.user_agent,
         )
-        .allowing_idna(allow_idna);
+        .allowing_idna(allow_idna)
+        .counting(counts.clone());
         let res = tokio::select! {
             r = handler.task_peer_chunk_requester() => r,
             r = connection.run(&*handler, rx) => r,
@@ -803,6 +810,7 @@ impl TorrentStateLive {
             Ok(()) => handler.on_peer_died(None)?,
             Err(e) => {
                 debug!("web seed connection failed: {e:#}");
+                counts.failed();
                 link.failed();
                 handler.on_peer_died(Some(e))?;
             }
@@ -945,6 +953,7 @@ impl TorrentStateLive {
             answers: AnswerBacklog::default(),
             counters,
             first_message_received: AtomicBool::new(false),
+            transport: AtomicU8::new(0),
             disk: Default::default(),
             upload: Default::default(),
             cancel_token: self.cancellation_token.child_token(),
@@ -1066,6 +1075,7 @@ impl TorrentStateLive {
             answers: AnswerBacklog::default(),
             counters,
             first_message_received: AtomicBool::new(false),
+            transport: AtomicU8::new(0),
             disk: Default::default(),
             upload: Default::default(),
             cancel_token: state.cancellation_token.child_token(),
@@ -1654,6 +1664,7 @@ impl TorrentStateLive {
     /// libtorrent's `torrent::pause` closes each connection, and counts what
     /// it drops, before the torrent stops (`peer_connection::disconnect`).
     fn add_closing_redundant_bytes(&self, len: u64) {
+        self.session_stats.swarm.wasted(swarm::Waste::CutShort, len);
         let mut moved = self.shared.moved.lock();
         if self.run_counted.load(Ordering::Relaxed) {
             moved.redundant_bytes += len;
@@ -1770,6 +1781,9 @@ impl TorrentStateLive {
     /// address names its IPv4 peer, so one peer has one entry.
     pub(crate) fn add_peer(&self, addr: SocketAddr, source: PeerSourceFlag) {
         let addr = crate::network::canonical_socket_addr(addr);
+        self.session_stats
+            .swarm
+            .peer_named(swarm::PeerSource::of(source));
         if self.may_connect_to(addr) {
             self.peers.add_peer(addr, source);
         }
@@ -2578,6 +2592,10 @@ struct PeerHandler {
 
     first_message_received: AtomicBool,
 
+    // What carries the connection, once its handshake says: a
+    // `swarm::Transport` and one, none before.
+    transport: AtomicU8,
+
     cancel_token: CancellationToken,
 
     client_name_and_version: String,
@@ -2642,6 +2660,15 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     }
 
     fn on_handshake_encryption(&self, encryption: crate::mse::Encryption) {
+        if let Some(transport) = self.transport() {
+            let direction = if self.incoming {
+                Direction::In
+            } else {
+                Direction::Out
+            };
+            let encryption = swarm::Encryption::of(encryption);
+            self.swarm().handshake(transport, direction, encryption);
+        }
         self.state.peers.handshake_encryption(self.addr, encryption);
     }
 
@@ -2800,6 +2827,8 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         speaks_v2: bool,
     ) -> anyhow::Result<()> {
         self.speaks_v2.store(speaks_v2, Ordering::Relaxed);
+        self.transport
+            .store(swarm::Transport::of(ckind) as u8 + 1, Ordering::Relaxed);
         // A connection closed for its peer id is closed by us, which is no
         // failure (libtorrent disconnects with `duplicate_peer_id` at normal
         // severity).
@@ -2842,6 +2871,13 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         self.state.give_back_bandwidth(channel, bytes);
     }
 
+    fn on_wire_messages(&self, direction: Direction, kind: MessageKind, count: u64) {
+        self.state
+            .session_stats
+            .swarm
+            .messages(direction, kind, count);
+    }
+
     fn on_protocol_bytes(&self, channel: Channel, bytes: u64) {
         let (peer, torrent, session) = match channel {
             Channel::Download => (
@@ -2858,6 +2894,11 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         for counter in [peer, torrent, session] {
             counter.fetch_add(bytes, Ordering::Relaxed);
         }
+        let direction = match channel {
+            Channel::Download => Direction::In,
+            Channel::Upload => Direction::Out,
+        };
+        self.count_bytes(direction, swarm::ByteKind::Protocol, bytes);
     }
 
     /// The part of a block of the torrent that arrived is not used.
@@ -2889,6 +2930,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             .counters
             .uploaded_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.count_bytes(Direction::Out, swarm::ByteKind::Payload, bytes.into());
     }
 
     // The torrent's count moves once per write, after its stamp: whoever
@@ -3159,6 +3201,26 @@ impl PeerConnectionHandler for &'_ PeerHandler {
 }
 
 impl PeerHandler {
+    fn swarm(&self) -> &swarm::SwarmStats {
+        &self.state.session_stats.swarm
+    }
+
+    /// What carries the connection, once its handshake is done.
+    fn transport(&self) -> Option<swarm::Transport> {
+        let transport = self.transport.load(Ordering::Relaxed);
+        swarm::Transport::ALL
+            .get(usize::from(transport).wrapping_sub(1))
+            .copied()
+    }
+
+    /// Bytes of the connection that crossed after its handshake.
+    #[inline]
+    fn count_bytes(&self, direction: Direction, kind: swarm::ByteKind, bytes: u64) {
+        if let Some(transport) = self.transport() {
+            self.swarm().bytes(transport, direction, kind, bytes);
+        }
+    }
+
     // The peer's send buffer, once the peer is live.
     fn upload_ledger(&self) -> Option<&Arc<UploadLedger>> {
         if let Some(upload) = self.upload.get() {
@@ -3253,6 +3315,7 @@ impl PeerHandler {
                 ?msg,
                 "holepunch message from a peer that did not advertise it, ignoring"
             );
+            self.count_holepunch(HolepunchEvent::Unoffered);
             return;
         }
         match msg {
@@ -3260,10 +3323,14 @@ impl PeerHandler {
             // A local address is taken only from a local peer.
             UtHolepunch::Connect(addr) => {
                 if !is_local(addr.ip()) || is_local(self.addr.ip()) {
+                    self.count_holepunch(HolepunchEvent::Connect);
                     self.state.holepunch(addr);
+                } else {
+                    self.count_holepunch(HolepunchEvent::ConnectIgnored);
                 }
             }
             UtHolepunch::Error(addr, code) => {
+                self.count_holepunch(HolepunchEvent::Failed);
                 debug!(?addr, code, "the peer could not introduce us");
             }
         }
@@ -3274,6 +3341,10 @@ impl PeerHandler {
     /// connect to the other; else the peer is told why not. A local peer and
     /// one that is not are never introduced (libtorrent
     /// `bt_peer_connection::on_holepunch`, `rendezvous`).
+    fn count_holepunch(&self, event: HolepunchEvent) {
+        self.state.session_stats.network.holepunch(event);
+    }
+
     fn on_rendezvous(&self, target: SocketAddr) {
         let send = |tx: &PeerTx, msg: UtHolepunch| {
             let _ = tx.send(WriterRequest::Message(Message::Extended(
@@ -3291,14 +3362,17 @@ impl PeerHandler {
             Some(_) => None,
         };
         if let Some(code) = refused {
+            self.count_holepunch(HolepunchEvent::Refused);
             send(&self.tx, UtHolepunch::Error(target, code));
             return;
         }
         if is_local(target.ip()) != is_local(self.addr.ip()) {
+            self.count_holepunch(HolepunchEvent::Refused);
             debug!(?target, "not introducing a local peer to one that is not");
             return;
         }
         if let Some((_, target_tx)) = found {
+            self.count_holepunch(HolepunchEvent::Introduced);
             send(&self.tx, UtHolepunch::Connect(target));
             send(&target_tx, UtHolepunch::Connect(self.addr));
         }
@@ -3341,6 +3415,13 @@ impl PeerHandler {
             peers,
         );
         let prev = pe.value_mut().take_state(peers);
+        self.swarm().closed(
+            match prev {
+                PeerState::Live(_) => swarm::ClosePhase::Live,
+                _ => swarm::ClosePhase::Connecting,
+            },
+            swarm::CloseReason::of(error.as_ref()),
+        );
         self.state.layer_fetch.forget(handle);
 
         // Whether the connection held an upload slot, when it was live. The
@@ -3422,6 +3503,7 @@ impl PeerHandler {
         // once a tracker answered.
         peers.untracked_closed(handle);
         if rendezvous && let Some(introducer) = peers.introducer(handle) {
+            self.count_holepunch(HolepunchEvent::Asked);
             let _ = introducer.send(WriterRequest::Message(Message::Extended(
                 ExtendedMessage::UtHolepunch(UtHolepunch::Rendezvous(handle)),
             )));
@@ -3545,21 +3627,30 @@ impl PeerHandler {
 
                 match result {
                     AcquireResult::Reserved(piece) => {
+                        self.swarm().piece_pick(swarm::PiecePick::Reserved);
                         trace!("reserved piece {}", piece);
                         Ok(Pick::Piece(piece))
                     }
                     AcquireResult::Stolen { piece, from_peer } => {
+                        self.swarm().piece_pick(swarm::PiecePick::Stolen);
                         debug!("stole piece {} from {}", piece, from_peer);
                         // Store steal info to process after releasing peer lock to avoid deadlock
                         steal_info = Some((from_peer, piece));
                         Ok(Pick::Piece(piece))
                     }
                     AcquireResult::EndGame { piece, chunk } => {
+                        self.swarm().piece_pick(swarm::PiecePick::EndGame);
                         debug!("end game: asking for {chunk:?}, asked of another peer too");
                         Ok(Pick::Piece(piece))
                     }
-                    AcquireResult::NoneAvailable => Ok(Pick::Nothing),
-                    AcquireResult::NoRoom => Ok(Pick::NoRoom),
+                    AcquireResult::NoneAvailable => {
+                        self.swarm().piece_pick(swarm::PiecePick::Nothing);
+                        Ok(Pick::Nothing)
+                    }
+                    AcquireResult::NoRoom => {
+                        self.swarm().piece_pick(swarm::PiecePick::NoRoom);
+                        Ok(Pick::NoRoom)
+                    }
                 }
             })
             .transpose()
@@ -3644,6 +3735,7 @@ impl PeerHandler {
                 if since > CHOKED_REQUEST_GRACE {
                     anyhow::bail!("received {request:?} {since:?} after we choked the peer");
                 }
+                self.swarm().request_event(swarm::RequestEvent::WhileChoked);
                 trace!(?request, "ignoring a request from a peer we choke");
                 Ok(())
             }
@@ -3651,6 +3743,7 @@ impl PeerHandler {
                 "received {request:?} while choked, past three times the blocks of the piece"
             ),
             Err(Refused::QueueFull) => {
+                self.swarm().request_event(swarm::RequestEvent::QueueFull);
                 trace!(?request, "ignoring a request past the peer's request queue");
                 Ok(())
             }
@@ -3662,6 +3755,7 @@ impl PeerHandler {
     /// a Reject on a fast connection; a plain one has no word for it
     /// (libtorrent `peer_connection::incoming_request`).
     fn on_invalid_request(&self, request: Request) -> anyhow::Result<()> {
+        self.swarm().request_event(swarm::RequestEvent::Invalid);
         let peer_chokes_us = self.choked_by_peer();
         let keep = self
             .state
@@ -4014,6 +4108,7 @@ impl PeerHandler {
     /// only pieces no one else had started (`snub_peer` returns early on
     /// parole).
     fn on_requests_timed_out(&self) -> crate::Result<()> {
+        self.swarm().request_event(swarm::RequestEvent::TimedOut);
         let on_parole = self
             .state
             .peers
@@ -4201,6 +4296,8 @@ impl PeerHandler {
                             .stats
                             .asked_already
                             .fetch_add(1, Ordering::Relaxed);
+                        self.swarm()
+                            .request_event(swarm::RequestEvent::AskedAlready);
                         debug!(?chunk, "asked of the peer already");
                         continue;
                     }
@@ -4358,11 +4455,15 @@ impl PeerHandler {
             .peers
             .with_live_mut(self.addr, "inflight_requests.remove", |h| {
                 match h.remove_inflight_request(&chunk_info) {
-                    RemoveInflightRequestResult::Expected => {}
+                    RemoveInflightRequestResult::Expected => {
+                        self.swarm().block(swarm::BlockArrival::Requested);
+                    }
                     RemoveInflightRequestResult::LateCanceled => {
+                        self.swarm().block(swarm::BlockArrival::Cancelled);
                         trace!(?chunk_info, "peer sent a block after we cancelled it");
                     }
                     RemoveInflightRequestResult::Unexpected => {
+                        self.swarm().block(swarm::BlockArrival::Unrequested);
                         debug!(
                             ?chunk_info,
                             inflight = ?h.inflight_requests_debug(),
@@ -4383,6 +4484,7 @@ impl PeerHandler {
             .counters
             .fetched_bytes
             .fetch_add(len as u64, Ordering::Relaxed);
+        self.count_bytes(Direction::In, swarm::ByteKind::Payload, len as u64);
 
         Ok(chunk_info)
     }
@@ -4675,6 +4777,10 @@ fn land_blocks(
                 }
                 Arrival::Discard => {
                     state.add_redundant_bytes(piece.len() as u64);
+                    state
+                        .session_stats
+                        .swarm
+                        .wasted(swarm::Waste::Redundant, piece.len() as u64);
                     debug!(
                         "{chunk_info:?} is had, arrived from another first, or has no room, ignoring"
                     );
@@ -4823,6 +4929,10 @@ fn check_landed_piece(
         .with_context(|| format!("error checking piece={index}"))?
     {
         Verdict::Inconsistent => {
+            state
+                .session_stats
+                .swarm
+                .piece_check(swarm::PieceCheck::Inconsistent);
             return state.on_fatal_error(inconsistent_hashes(chunk_info.piece_index));
         }
         Verdict::Passed => {
@@ -4849,8 +4959,16 @@ fn check_landed_piece(
                     "the storage refused piece={index}: {e:#}"
                 );
                 state.handle_disk_error(&e);
+                state
+                    .session_stats
+                    .swarm
+                    .piece_check(swarm::PieceCheck::StorageRefused);
                 return state.requeue_piece(piece_index);
             }
+            state
+                .session_stats
+                .swarm
+                .piece_check(swarm::PieceCheck::Passed);
             state
                 .lock_write("mark_piece_downloaded")
                 .get_pieces_mut()?
@@ -4913,6 +5031,12 @@ fn check_landed_piece(
                 u64::from(state.lengths.piece_length(piece_index)),
                 Ordering::Relaxed,
             );
+            let checks = &state.session_stats.swarm;
+            checks.piece_check(swarm::PieceCheck::Failed);
+            checks.wasted(
+                swarm::Waste::HashFailed,
+                u64::from(state.lengths.piece_length(piece_index)),
+            );
             // Before the storage lets go of the failed bytes.
             let blocks = smart_ban::read_back(&state.lengths, piece_index, &senders, read_block);
             for liar in state.peers.piece_failed(piece_index, blocks) {
@@ -4956,7 +5080,13 @@ fn check_landed_piece(
         // No hash to check the piece against: nobody is to blame
         // (libtorrent `torrent::on_piece_verified` neither passes nor
         // fails it).
-        Verdict::Unknown => state.requeue_piece(piece_index)?,
+        Verdict::Unknown => {
+            state
+                .session_stats
+                .swarm
+                .piece_check(swarm::PieceCheck::Unknown);
+            state.requeue_piece(piece_index)?
+        }
     };
     Ok(())
 }

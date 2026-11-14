@@ -584,6 +584,8 @@ metric_families! {
     TORRENT_TRACKER_FAILURES = ("weaver_torrent_tracker_consecutive_failures", Gauge,
         ["job_id", "category", "route", "tracker"],
         "Announces to the tracker that failed in a row since it last answered.");
+    TORRENTS = ("weaver_torrents", Gauge, ["route", "state"],
+        "Torrents by the route they run on and their state, every torrent counted once whatever metrics.per_job_series says. The route is empty for a torrent that has none yet.");
     TORRENT_SESSION_OPEN = ("weaver_torrent_session_open", Gauge, ["route"],
         "Whether the torrent session of each route that has one runs; 0 while the route is held.");
     TORRENT_SESSION_LISTENING = ("weaver_torrent_session_listening", Gauge, ["route"],
@@ -663,6 +665,104 @@ metric_families! {
         "Torrents added, completed, removed or failed since this process started. Every event is emitted, so the series pre-exist at zero.");
     TORRENT_METADATA_FETCHES = ("weaver_torrent_metadata_fetches_total", Counter, ["outcome"],
         "Magnet metadata fetches that ended since this process started, by outcome. Every outcome is emitted, so the series pre-exist at zero.");
+    TORRENT_PEER_MESSAGES = ("weaver_torrent_peer_messages_total", Counter,
+        ["route", "direction", "type"],
+        "Peer wire messages that crossed the session's connections since it opened, by direction and message type. A message we send is counted once its write is done. Every type is emitted, so the series pre-exist at zero.");
+    TORRENT_PEER_HANDSHAKES = ("weaver_torrent_peer_handshakes_total", Counter,
+        ["route", "transport", "direction", "encryption"],
+        "Peer connections that completed their handshake since the session opened, by transport, direction (in is a connection the peer opened) and encryption: plaintext, header_only (encrypted handshake, plain stream) or rc4.");
+    TORRENT_PEER_DISCONNECTS = ("weaver_torrent_peer_disconnects_total", Counter,
+        ["route", "phase", "reason"],
+        "Peer connections that ended since the session opened, by how far they had come (connecting is before the handshake completed) and why. closed is every close of our own, whatever decided it.");
+    TORRENT_PEER_BYTES = ("weaver_torrent_peer_bytes_total", Counter,
+        ["route", "transport", "direction", "kind"],
+        "Bytes that crossed the session's peer connections since the session opened, by transport, direction and kind: payload is block data, protocol everything else, the bytes of the handshakes included. A connection's bytes are counted once its handshake is done, so those of a connection that never completes it are not here.");
+    TORRENT_PEER_REQUEST_EVENTS = ("weaver_torrent_peer_request_events_total", Counter,
+        ["route", "event"],
+        "Block requests that were not simply served, since the session opened: ours timed_out (the peer is snubbed) or asked_already (not sent again); the peer's invalid, while_choked or queue_full (dropped).");
+    TORRENT_PEER_BLOCKS_RECEIVED = ("weaver_torrent_peer_blocks_received_total", Counter,
+        ["route", "request"],
+        "Blocks peers sent since the session opened, by the request they answer: requested, cancelled (it came after we cancelled) or unrequested.");
+    TORRENT_PIECE_CHECKS = ("weaver_torrent_piece_checks_total", Counter, ["route", "result"],
+        "Downloaded pieces hash-checked since the session opened, by result: passed, failed, inconsistent (the torrent's own hashes disagree), unknown (no hash yet) or storage_refused (passed, and the storage would not take it).");
+    TORRENT_PIECE_PICKS = ("weaver_torrent_piece_picks_total", Counter, ["route", "result"],
+        "Times a connection asked for its next piece since the session opened, by what it got: reserved, stolen (from a slower peer), end_game (a block asked of another peer too), nothing or no_room (the storage is full).");
+    TORRENT_SESSION_WASTED = ("weaver_torrent_session_wasted_bytes_total", Counter,
+        ["route", "reason"],
+        "Bytes the session received and did not use since it opened, by reason: hash_failed (the whole failed piece), redundant (a block already had or that came twice) or cut_short (the part of a block that arrived before its connection closed). The reasons do not overlap.");
+    TORRENT_SESSION_PEERS_NAMED = ("weaver_torrent_session_peers_named_total", Counter,
+        ["route", "source"],
+        "Times a source named a peer address to a running torrent since the session opened, by source; an address named again counts again. A magnet's metadata fetch is not counted.");
+    TORRENT_SESSION_CONNECTED_PEERS = ("weaver_torrent_session_connected_peers", Gauge,
+        ["route", "transport"],
+        "Peers of every torrent on the session with a live connection, by transport.");
+    TORRENT_SESSION_CONNECTED_SEEDERS = ("weaver_torrent_session_connected_seeders", Gauge,
+        ["route"], "Connected peers of the session that have every piece of their torrent.");
+    TORRENT_SESSION_PIECE_STEALS = ("weaver_torrent_session_piece_steals_total", Counter,
+        ["route"], "Pieces taken from a slower peer and given to a faster one, since the session opened.");
+    TORRENT_SESSION_OUTGOING_ENCRYPTION = ("weaver_torrent_session_outgoing_encryption_total", Counter,
+        ["route", "outcome"],
+        "Outgoing peer handshakes since the session opened, by how each ended: plaintext (sent plain), or sent encrypted and settled on rc4, on header_only, failed, or cancelled (dropped before it ended, as when its torrent is paused or removed). No outcome holds another, so the outcomes sum to the handshakes started but for those under way.");
+    TORRENT_UTP_SYN_FLOOD_DROPPED = ("weaver_torrent_utp_syn_flood_dropped_total", Counter,
+        ["route"], "Incoming uTP connection requests dropped because too many were waiting, since the session opened.");
+    TORRENT_UTP_SYN_RESETS = ("weaver_torrent_utp_syn_resets_total", Counter,
+        ["route"], "Incoming uTP connection requests answered with a reset, since the session opened.");
+    TORRENT_TRACKER_ANNOUNCES = ("weaver_torrent_session_tracker_announces_total", Counter,
+        ["route", "kind", "event", "result"],
+        "Announces to a tracker that ended since the session opened, by how the tracker is spoken to, the event carried and how it ended: ok, timeout, refused (the tracker's own failure), bad_reply (an answer that does not parse), skipped (no address of a family the session connects over, nothing sent) or error (anything else). An announce over both address families counts once. Every combination is emitted, so the series pre-exist at zero.");
+    TORRENT_TRACKER_ANNOUNCE_SECONDS = ("weaver_torrent_session_tracker_announce_seconds_total", Counter,
+        ["route", "kind"],
+        "Time the announces that ended took in all, since the session opened; divided by the announces it gives their mean. The wait for a turn among HTTP announces is not in it.");
+    TORRENT_TRACKER_PEERS = ("weaver_torrent_session_tracker_peers_total", Counter,
+        ["route", "kind"], "Peers the accepted announces named, since the session opened, known already or not.");
+    TORRENT_TRACKER_SCRAPES = ("weaver_torrent_session_tracker_scrapes_total", Counter,
+        ["route", "kind", "result"],
+        "Scrapes of a tracker that ended since the session opened, one per hash asked about, by how the tracker is spoken to and how it ended. A tracker that offers no scrape counts as error. Every combination is emitted, so the series pre-exist at zero.");
+    TORRENT_TRACKER_SCRAPE_SECONDS = ("weaver_torrent_session_tracker_scrape_seconds_total", Counter,
+        ["route", "kind"], "Time the scrapes that ended took in all, since the session opened.");
+    TORRENT_DHT_QUERIES_SENT = ("weaver_torrent_dht_queries_sent_total", Counter,
+        ["route", "type"], "DHT queries the session's node sent since it started, by what they ask. Absent while the session runs no DHT.");
+    TORRENT_DHT_QUERY_RESULTS = ("weaver_torrent_dht_query_results_total", Counter,
+        ["route", "type", "result"],
+        "DHT queries the node sent that ended, by what they ask and how they ended: reply, error (the node's own error reply) or timeout. A query withdrawn before either is not counted, so sent less results is not the number waiting.");
+    TORRENT_DHT_QUERIES_RECEIVED = ("weaver_torrent_dht_queries_received_total", Counter,
+        ["route", "type"], "DHT queries from other nodes the session's node answered since it started, by what they ask.");
+    TORRENT_DHT_IGNORED = ("weaver_torrent_dht_datagrams_ignored_total", Counter,
+        ["route", "reason"],
+        "Datagrams that reached the DHT node and were not acted on, by reason: malformed, source_limit (the source sends too many), unmatched (a reply to no waiting query; one whose transaction id is not ours in shape is malformed) or no_budget (a query that came while the node's send budget was spent).");
+    TORRENT_DHT_PEERS_FOUND = ("weaver_torrent_dht_peers_found_total", Counter,
+        ["route"], "Peers the replies to the node's searches named since it started, repeats included.");
+    TORRENT_INCOMING_CONNECTIONS = ("weaver_torrent_incoming_connections_total", Counter,
+        ["route", "transport", "result"],
+        "Connections peers opened to the session since it opened, by transport and how each ended its way in: accepted, or the reason it was turned away (session_limit, filtered, family, banned, privileged_port, tls, encryption, handshake, unknown_torrent, ourselves, not_allowed, not_live, already_connected, torrent_limit, not_wanted, error). One still in its handshake is not counted yet.");
+    TORRENT_UNCHOKE_SLOTS_HELD = ("weaver_torrent_session_unchoke_slots_held", Gauge,
+        ["route"], "Upload slots the session's unchoked peers hold now, across every torrent.");
+    TORRENT_WEB_SEED_REQUESTS = ("weaver_torrent_web_seed_requests_total", Counter,
+        ["route", "result"],
+        "HTTP requests the session sent to web seeds since it opened, by how each ended: ok (200 or 206), redirect (followed by a request of its own), unavailable (503), rejected (any other status), timeout or failed (not sent, or no answer read).");
+    TORRENT_WEB_SEED_BYTES = ("weaver_torrent_web_seed_received_bytes_total", Counter,
+        ["route"], "Body bytes web seeds sent the session since it opened. The same bytes are also in the session's received payload bytes once they are whole blocks.");
+    TORRENT_WEB_SEED_WAITS = ("weaver_torrent_web_seed_retry_waits_total", Counter,
+        ["route"], "Times a web seed was left to wait before being asked again since the session opened: its name did not resolve, it lacked a file, or it said it was unavailable.");
+    TORRENT_WEB_SEED_FAILED = ("weaver_torrent_web_seed_connections_failed_total", Counter,
+        ["route"], "Web seed connections that ended in failure since the session opened.");
+    TORRENT_PORT_MAPPING_REPORTS = ("weaver_torrent_port_mapping_reports_total", Counter,
+        ["route", "mapper", "result"],
+        "Reports the session's port mappers made since it opened, by mapper (natpmp, upnp, pcp_ipv6) and what each said: mapped, failed or removed. A mapping kept alive is reported again at each renewal.");
+    TORRENT_HOLEPUNCH_EVENTS = ("weaver_torrent_holepunch_events_total", Counter,
+        ["route", "event"],
+        "Holepunch steps since the session opened: asked (we asked a peer for an introduction), introduced and refused (a peer asked us for one), connect and connect_ignored (a peer told us to connect to another), failed (the peer we asked could not), unoffered (a message from a peer that did not offer the extension).");
+    TORRENT_LSD_SENT = ("weaver_torrent_lsd_announces_sent_total", Counter,
+        ["route"], "Announces the session sent to the local network since it started, one per torrent each time. Absent while the session runs no local discovery.");
+    TORRENT_LSD_RECEIVED = ("weaver_torrent_lsd_announces_received_total", Counter,
+        ["route"], "Announces of other hosts on the local network the session read since it started.");
+    TORRENT_LSD_PEERS_FOUND = ("weaver_torrent_lsd_peers_found_total", Counter,
+        ["route"], "Peers the local network's announces named for a torrent the session announces there, repeats included.");
+    TORRENT_RATE_LIMIT_WAITS = ("weaver_torrent_rate_limit_waits_total", Counter,
+        ["route", "direction"],
+        "Requests of peers for bytes to send or receive that were granted only after a wait on a rate limit, the session's or their torrent's, since the session opened. A request granted at once is not counted.");
+    TORRENT_RATE_LIMIT_WAIT_SECONDS = ("weaver_torrent_rate_limit_wait_seconds_total", Counter,
+        ["route", "direction"], "Time those requests waited in all.");
 
     // ---- speed tests -------------------------------------------------------
     SPEED_TEST_RUNS = ("weaver_speed_test_runs_total", Counter, ["kind", "status"],

@@ -1002,9 +1002,11 @@ fn absent_instrumentation_omits_its_families() {
     assert!(partial.contains("process_start_time_seconds 1700000000"));
 }
 
-// Each torrent's series follow the per-job knob as a job's do: `Active`
-// drops a stopped torrent, whose job is complete or failed, with its
-// trackers; the session series go under every setting.
+// Each torrent's series follow the per-job knob: `Active` gives them to a
+// torrent at work and to no seeding or stopped one, `All` to every torrent,
+// `Off` to none. The trackers' series go with their torrent's. What carries
+// no job is the same under every setting, and the count by state is of
+// every torrent.
 #[test]
 fn per_job_series_knob_controls_torrent_cardinality() {
     use weaver_server_core::settings::PerJobSeries;
@@ -1012,52 +1014,148 @@ fn per_job_series_knob_controls_torrent_cardinality() {
 
     let mut torrents = sample_torrent_metrics();
     let published = std::sync::Arc::make_mut(&mut torrents.published);
+    assert_eq!(published.torrents[0].state, TorrentState::Seeding);
+    assert!(!published.torrents[0].trackers.is_empty());
     let mut stopped = published.torrents[0].clone();
     stopped.job_id = JobId(9);
     stopped.state = TorrentState::Stopped;
     published.torrents.push(stopped);
+    let mut downloading = published.torrents[0].clone();
+    downloading.job_id = JobId(10);
+    downloading.state = TorrentState::Downloading;
+    published.torrents.push(downloading);
+    let count = published.torrents.len() as u64;
     let render_with = |mode| {
         let mut encoder = metrics::Encoder::new();
         metrics::render_torrents(&mut encoder, &torrents, mode);
         encoder.finish()
     };
+    let jobs = |rendered: &str, family: &str| rendered_label_values(rendered, family, "job_id");
 
+    // 7 seeds, 8 fetches its metadata and has no tracker yet, 9 is stopped,
+    // 10 downloads.
     let active = render_with(PerJobSeries::Active);
     assert_valid_prometheus_exposition(&active);
-    for family in ["weaver_torrent_state", "weaver_torrent_tracker_status"] {
-        assert!(
-            !rendered_label_values(&active, family, "job_id").contains(&"9".to_owned()),
-            "{family}: active mode must drop a stopped torrent"
-        );
-    }
+    assert_eq!(jobs(&active, "weaver_torrent_state"), ["8", "10"]);
     assert_eq!(
-        rendered_label_values(&active, "weaver_torrent_state", "job_id"),
-        ["7", "8"]
+        jobs(&active, "weaver_torrent_uploaded_bytes_total"),
+        ["8", "10"]
+    );
+    assert_eq!(jobs(&active, "weaver_torrent_tracker_status"), ["10"]);
+    assert!(
+        !active.contains(r#"job_id="7""#),
+        "a seeding torrent has no series"
+    );
+    assert!(
+        !active.contains(r#"job_id="9""#),
+        "a stopped torrent has no series"
     );
 
     let all = render_with(PerJobSeries::All);
     assert_valid_prometheus_exposition(&all);
+    assert_eq!(jobs(&all, "weaver_torrent_state"), ["7", "8", "9", "10"]);
     assert_eq!(
-        rendered_label_values(&all, "weaver_torrent_state", "job_id"),
-        ["7", "8", "9"]
-    );
-    assert!(
-        rendered_label_values(&all, "weaver_torrent_tracker_status", "job_id")
-            .contains(&"9".to_owned())
+        jobs(&all, "weaver_torrent_tracker_status"),
+        ["7", "9", "10"]
     );
 
     let off = render_with(PerJobSeries::Off);
     assert_valid_prometheus_exposition(&off);
-    assert!(rendered_label_values(&off, "weaver_torrent_state", "job_id").is_empty());
-    assert!(rendered_label_values(&off, "weaver_torrent_tracker_status", "job_id").is_empty());
-    let sessions = |rendered: &str| {
+    assert!(!off.contains("job_id="));
+
+    // The route's totals, the count by state and the event counters: the
+    // same lines under every setting.
+    let jobless = |rendered: &str| -> Vec<String> {
         rendered
             .lines()
             .filter(|line| !line.starts_with('#') && !line.contains("job_id="))
-            .count()
+            .map(str::to_owned)
+            .collect()
     };
-    assert_eq!(sessions(&off), sessions(&all));
-    assert!(sessions(&off) > 0);
+    assert!(
+        jobless(&off)
+            .iter()
+            .any(|line| line.starts_with("weaver_torrent_session_"))
+    );
+    assert_eq!(jobless(&active), jobless(&off));
+    assert_eq!(jobless(&all), jobless(&off));
+
+    for rendered in [&active, &all, &off] {
+        let by_state: Vec<u64> = rendered
+            .lines()
+            .filter(|line| line.starts_with("weaver_torrents{"))
+            .map(|line| line.rsplit(' ').next().unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(by_state.iter().sum::<u64>(), count);
+        // Every state of every route, the held route's zeros included.
+        assert_eq!(
+            by_state.len(),
+            published_routes(&torrents)
+                * weaver_server_core::torrents::metrics::TORRENT_STATES.len()
+        );
+    }
+    for (state, expected) in [
+        ("seeding", 1),
+        ("fetching_metadata", 1),
+        ("stopped", 1),
+        ("downloading", 1),
+        ("paused", 0),
+    ] {
+        let line =
+            format!(r#"weaver_torrents{{route="00aa11bb22cc33dd",state="{state}"}} {expected}"#);
+        assert!(off.lines().any(|rendered| rendered == line), "{line}");
+    }
+}
+
+fn published_routes(torrents: &weaver_server_core::torrents::metrics::TorrentMetrics) -> usize {
+    torrents.published.sessions.len()
+}
+
+// Under `Active` a torrent has series of its own in exactly the states in
+// which it works on its own data.
+#[test]
+fn active_gives_series_only_to_torrents_at_work() {
+    use weaver_server_core::settings::PerJobSeries;
+    use weaver_server_core::torrents::TorrentState;
+    use weaver_server_core::torrents::metrics::TORRENT_STATES;
+
+    let mut torrents = sample_torrent_metrics();
+    let published = std::sync::Arc::make_mut(&mut torrents.published);
+    let seed = published.torrents[0].clone();
+    published.torrents = TORRENT_STATES
+        .iter()
+        .enumerate()
+        .map(|(at, state)| {
+            let mut torrent = seed.clone();
+            torrent.job_id = JobId(100 + at as u64);
+            torrent.state = *state;
+            torrent
+        })
+        .collect();
+    let mut encoder = metrics::Encoder::new();
+    metrics::render_torrents(&mut encoder, &torrents, PerJobSeries::Active);
+    let rendered = encoder.finish();
+
+    let at_work = [
+        TorrentState::FetchingMetadata,
+        TorrentState::CheckingFiles,
+        TorrentState::Downloading,
+        TorrentState::Stalled,
+        TorrentState::Moving,
+    ];
+    let expected: Vec<String> = TORRENT_STATES
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| at_work.contains(state))
+        .map(|(at, _)| (100 + at).to_string())
+        .collect();
+    for family in ["weaver_torrent_state", "weaver_torrent_tracker_status"] {
+        assert_eq!(
+            rendered_label_values(&rendered, family, "job_id"),
+            expected,
+            "{family}"
+        );
+    }
 }
 
 #[test]
@@ -1068,7 +1166,7 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         metrics::render_torrents(
             &mut encoder,
             &torrents,
-            weaver_server_core::settings::PerJobSeries::Active,
+            weaver_server_core::settings::PerJobSeries::All,
         );
         encoder.finish()
     };
@@ -1191,6 +1289,112 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         format!(r#"weaver_torrent_dht_nodes{{{ROUTE},family="v4"}} 150"#),
         format!(r#"weaver_torrent_dht_nodes{{{ROUTE},family="v6"}} 20"#),
         format!("weaver_torrent_dht_outstanding_requests{{{ROUTE}}} 6"),
+        format!(r#"weaver_torrent_peer_messages_total{{{ROUTE},direction="in",type="have"}} 410"#),
+        format!(
+            r#"weaver_torrent_peer_messages_total{{{ROUTE},direction="in",type="piece"}} 4100"#
+        ),
+        format!(
+            r#"weaver_torrent_peer_messages_total{{{ROUTE},direction="out",type="request"}} 4200"#
+        ),
+        format!(r#"weaver_torrent_peer_messages_total{{{ROUTE},direction="out",type="pex"}} 7"#),
+        format!(
+            r#"weaver_torrent_peer_messages_total{{{ROUTE},direction="out",type="keep_alive"}} 0"#
+        ),
+        format!(
+            r#"weaver_torrent_peer_handshakes_total{{{ROUTE},transport="utp",direction="in",encryption="rc4"}} 51"#
+        ),
+        format!(
+            r#"weaver_torrent_peer_handshakes_total{{{ROUTE},transport="tcp",direction="out",encryption="plaintext"}} 0"#
+        ),
+        format!(
+            r#"weaver_torrent_peer_disconnects_total{{{ROUTE},phase="live",reason="peer_closed"}} 52"#
+        ),
+        format!(
+            r#"weaver_torrent_peer_disconnects_total{{{ROUTE},phase="connecting",reason="timeout"}} 53"#
+        ),
+        format!(
+            r#"weaver_torrent_peer_bytes_total{{{ROUTE},transport="tcp",direction="in",kind="payload"}} 5400"#
+        ),
+        format!(
+            r#"weaver_torrent_peer_bytes_total{{{ROUTE},transport="utp",direction="out",kind="protocol"}} 55"#
+        ),
+        format!(r#"weaver_torrent_peer_request_events_total{{{ROUTE},event="timed_out"}} 56"#),
+        format!(r#"weaver_torrent_peer_request_events_total{{{ROUTE},event="invalid"}} 0"#),
+        format!(r#"weaver_torrent_peer_blocks_received_total{{{ROUTE},request="unrequested"}} 57"#),
+        format!(r#"weaver_torrent_piece_checks_total{{{ROUTE},result="failed"}} 58"#),
+        format!(r#"weaver_torrent_piece_checks_total{{{ROUTE},result="passed"}} 0"#),
+        format!(r#"weaver_torrent_piece_picks_total{{{ROUTE},result="end_game"}} 59"#),
+        format!(r#"weaver_torrent_session_wasted_bytes_total{{{ROUTE},reason="cut_short"}} 60"#),
+        format!(r#"weaver_torrent_session_peers_named_total{{{ROUTE},source="dht"}} 61"#),
+        format!(r#"weaver_torrent_session_connected_peers{{{ROUTE},transport="tcp"}} 4"#),
+        format!(r#"weaver_torrent_session_connected_peers{{{ROUTE},transport="utp"}} 2"#),
+        format!("weaver_torrent_session_connected_seeders{{{ROUTE}}} 3"),
+        format!("weaver_torrent_session_piece_steals_total{{{ROUTE}}} 8"),
+        format!(
+            r#"weaver_torrent_session_outgoing_encryption_total{{{ROUTE},outcome="plaintext"}} 50"#
+        ),
+        format!(r#"weaver_torrent_session_outgoing_encryption_total{{{ROUTE},outcome="rc4"}} 30"#),
+        format!(
+            r#"weaver_torrent_session_outgoing_encryption_total{{{ROUTE},outcome="header_only"}} 6"#
+        ),
+        format!(
+            r#"weaver_torrent_session_outgoing_encryption_total{{{ROUTE},outcome="failed"}} 4"#
+        ),
+        format!(
+            r#"weaver_torrent_session_outgoing_encryption_total{{{ROUTE},outcome="cancelled"}} 3"#
+        ),
+        format!("weaver_torrent_utp_syn_flood_dropped_total{{{ROUTE}}} 33"),
+        format!("weaver_torrent_utp_syn_resets_total{{{ROUTE}}} 34"),
+        format!(
+            r#"weaver_torrent_session_tracker_announces_total{{{ROUTE},kind="http",event="started",result="ok"}} 70"#
+        ),
+        format!(
+            r#"weaver_torrent_session_tracker_announces_total{{{ROUTE},kind="udp",event="periodic",result="timeout"}} 71"#
+        ),
+        format!(
+            r#"weaver_torrent_session_tracker_announce_seconds_total{{{ROUTE},kind="http"}} 2.5"#
+        ),
+        format!(
+            r#"weaver_torrent_session_tracker_announce_seconds_total{{{ROUTE},kind="udp"}} 30"#
+        ),
+        format!(r#"weaver_torrent_session_tracker_peers_total{{{ROUTE},kind="udp"}} 73"#),
+        format!(
+            r#"weaver_torrent_session_tracker_scrapes_total{{{ROUTE},kind="http",result="bad_reply"}} 74"#
+        ),
+        format!(
+            r#"weaver_torrent_session_tracker_scrape_seconds_total{{{ROUTE},kind="http"}} 0.25"#
+        ),
+        format!(r#"weaver_torrent_dht_queries_sent_total{{{ROUTE},type="get_peers"}} 80"#),
+        format!(
+            r#"weaver_torrent_dht_query_results_total{{{ROUTE},type="get_peers",result="timeout"}} 81"#
+        ),
+        format!(r#"weaver_torrent_dht_queries_received_total{{{ROUTE},type="find_node"}} 82"#),
+        format!(
+            r#"weaver_torrent_dht_datagrams_ignored_total{{{ROUTE},reason="source_limit"}} 83"#
+        ),
+        format!("weaver_torrent_dht_peers_found_total{{{ROUTE}}} 84"),
+        format!(
+            r#"weaver_torrent_incoming_connections_total{{{ROUTE},transport="tcp",result="accepted"}} 85"#
+        ),
+        format!(
+            r#"weaver_torrent_incoming_connections_total{{{ROUTE},transport="utp",result="session_limit"}} 86"#
+        ),
+        format!("weaver_torrent_session_unchoke_slots_held{{{ROUTE}}} 87"),
+        format!(r#"weaver_torrent_web_seed_requests_total{{{ROUTE},result="ok"}} 88"#),
+        format!(r#"weaver_torrent_web_seed_requests_total{{{ROUTE},result="rejected"}} 89"#),
+        format!("weaver_torrent_web_seed_received_bytes_total{{{ROUTE}}} 90"),
+        format!("weaver_torrent_web_seed_retry_waits_total{{{ROUTE}}} 91"),
+        format!("weaver_torrent_web_seed_connections_failed_total{{{ROUTE}}} 92"),
+        format!(
+            r#"weaver_torrent_port_mapping_reports_total{{{ROUTE},mapper="upnp",result="mapped"}} 93"#
+        ),
+        format!(r#"weaver_torrent_holepunch_events_total{{{ROUTE},event="introduced"}} 94"#),
+        format!("weaver_torrent_lsd_announces_sent_total{{{ROUTE}}} 95"),
+        format!("weaver_torrent_lsd_announces_received_total{{{ROUTE}}} 96"),
+        format!("weaver_torrent_lsd_peers_found_total{{{ROUTE}}} 97"),
+        format!(r#"weaver_torrent_rate_limit_waits_total{{{ROUTE},direction="down"}} 98"#),
+        format!(r#"weaver_torrent_rate_limit_waits_total{{{ROUTE},direction="up"}} 99"#),
+        format!(r#"weaver_torrent_rate_limit_wait_seconds_total{{{ROUTE},direction="down"}} 1.5"#),
         r#"weaver_torrent_lifecycle_events_total{event="added"} 5"#.to_owned(),
         r#"weaver_torrent_lifecycle_events_total{event="completed"} 3"#.to_owned(),
         r#"weaver_torrent_lifecycle_events_total{event="removed"} 1"#.to_owned(),
@@ -1220,6 +1424,9 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         format!("weaver_torrent_utp_packets_lost_total{{{HELD}}}"),
         format!("weaver_torrent_dht_nodes{{{HELD}"),
         format!("weaver_torrent_dht_outstanding_requests{{{HELD}}}"),
+        format!("weaver_torrent_peer_messages_total{{{HELD}"),
+        format!("weaver_torrent_peer_disconnects_total{{{HELD}"),
+        format!("weaver_torrent_session_connected_seeders{{{HELD}}}"),
         format!("weaver_torrent_tracker_last_announce_timestamp_seconds{{{BACKUP}}}"),
         format!("weaver_torrent_tracker_announce_interval_seconds{{{BACKUP}}}"),
         format!("weaver_torrent_tracker_swarm_peers{{{BACKUP}"),
@@ -1231,11 +1438,14 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         );
     }
 
-    // A held route says it holds no session, and nothing else.
-    let held: Vec<&str> = rendered
+    // A held route says it holds no session and counts its torrents, here
+    // none, and nothing else.
+    let (held_torrents, held): (Vec<&str>, Vec<&str>) = rendered
         .lines()
         .filter(|line| line.contains(HELD))
-        .collect();
+        .partition(|line| line.starts_with("weaver_torrents{"));
+    assert_eq!(held_torrents.len(), 12, "{rendered}");
+    assert!(held_torrents.iter().all(|line| line.ends_with(" 0")));
     assert_eq!(
         held,
         [format!("weaver_torrent_session_open{{{HELD}}} 0")],

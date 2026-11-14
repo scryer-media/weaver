@@ -11,10 +11,17 @@
 //! engine nothing. The few events counted here are relaxed atomic adds where
 //! they happen, none of them on a peer, piece or socket path.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use weaver_torrent::session_stats::dht;
+pub use weaver_torrent::session_stats::incoming;
+pub use weaver_torrent::session_stats::network;
 pub use weaver_torrent::session_stats::snapshot::UtpStatsSnapshot;
+pub use weaver_torrent::session_stats::swarm;
+pub use weaver_torrent::session_stats::tracker;
+pub use weaver_torrent::session_stats::web_seed;
 use weaver_torrent::{FetchPhase, Session};
 
 use crate::jobs::JobId;
@@ -333,17 +340,24 @@ pub fn trackers(
     trackers: &[TorrentTracker],
     announces: &[weaver_torrent::TrackerAnnounce],
 ) -> Vec<TrackerSeries> {
+    // Each URL's first announce, and the hosts kept so far, found without
+    // a walk per tracker.
+    let mut announce_of: HashMap<&str, &weaver_torrent::TrackerAnnounce> =
+        HashMap::with_capacity(announces.len());
+    for announce in announces {
+        announce_of.entry(announce.url.as_str()).or_insert(announce);
+    }
+    let mut kept: HashSet<String> = HashSet::with_capacity(trackers.len());
     let mut series: Vec<TrackerSeries> = Vec::with_capacity(trackers.len());
     for tracker in trackers {
         let Some(host) = tracker_host(&tracker.url) else {
             continue;
         };
-        if series.iter().any(|kept| kept.host == host) {
+        if !kept.insert(host.clone()) {
             continue;
         }
-        let interval_seconds = announces
-            .iter()
-            .find(|announce| announce.url == tracker.url)
+        let interval_seconds = announce_of
+            .get(tracker.url.as_str())
             .and_then(|announce| announce.last.as_ref())
             .and_then(|last| last.result.as_ref().ok())
             .map(|accepted| accepted.interval.as_secs());
@@ -391,6 +405,44 @@ pub struct SessionSeries {
     /// Its DHT, while it runs one: nodes in the v4 and v6 routing tables,
     /// and requests waiting for an answer.
     pub dht: Option<(usize, usize, usize)>,
+    /// What its peer connections did, counted since it opened.
+    pub swarm: swarm::SwarmSnapshot,
+    /// What its DHT node has counted since it started; all zero while it
+    /// runs none.
+    pub dht_counts: dht::DhtSnapshot,
+    /// How the connections peers opened to it ended their way in, counted
+    /// since it opened.
+    pub incoming: incoming::IncomingSnapshot,
+    /// Upload slots its unchoked peers hold now.
+    pub unchoke_slots_held: u64,
+    /// What it asked of its torrents' web seeds, counted since it opened.
+    pub web_seeds: web_seed::WebSeedSnapshot,
+    /// Its port mapping reports and holepunch steps, counted since it
+    /// opened.
+    pub network: network::NetworkSnapshot,
+    /// What its local service discovery has counted, while it runs one.
+    pub lsd: Option<network::LsdSnapshot>,
+    /// What waited on a rate limit, the session's or a torrent's.
+    pub limiter: network::LimiterSnapshot,
+    /// What it asked of its trackers, counted since it opened.
+    pub trackers: tracker::TrackerSnapshot,
+    /// Its connected peers over TCP, then over uTP, and how many of them
+    /// are seeds.
+    pub connected: ConnectedPeers,
+    /// Pieces its connections took from slower peers.
+    pub piece_steals: u64,
+    /// Its outgoing handshakes by how each ended: sent plain, or sent
+    /// encrypted and settled on RC4, on header only, failed, or dropped
+    /// before it ended.
+    pub outgoing_encryption: [u64; 5],
+}
+
+/// A session's connected peers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConnectedPeers {
+    pub tcp: u32,
+    pub utp: u32,
+    pub seeders: u32,
 }
 
 /// The states a session's peers are counted in.
@@ -461,6 +513,182 @@ impl SessionSeries {
                     dht.outstanding_requests,
                 )
             }),
+            connected: ConnectedPeers {
+                tcp: peers.live_tcp,
+                utp: peers.live_utp,
+                seeders: peers.live_seeders,
+            },
+            piece_steals: peers.steals.into(),
+            outgoing_encryption: {
+                let encryption = &connections.encryption;
+                [
+                    encryption.plaintext,
+                    encryption.rc4,
+                    encryption.header_only,
+                    encryption.failures,
+                    encryption.cancelled,
+                ]
+            },
+            swarm: stats.swarm,
+            trackers: stats.trackers,
+            incoming: stats.incoming,
+            web_seeds: stats.web_seeds,
+            network: stats.network,
+            lsd: stats.lsd,
+            limiter: stats.limiter,
+            unchoke_slots_held: stats.unchoke_slots_held as u64,
+            dht_counts: session
+                .get_dht()
+                .map(|dht| dht.counted())
+                .unwrap_or_default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use weaver_torrent::{AnnounceOk, LastAnnounce, TrackerAnnounce};
+
+    use super::{TrackerSeries, trackers};
+    use crate::settings::model::tracker_host;
+    use crate::torrents::{NamedBy, TorrentTracker, TrackerStatus};
+
+    /// The series as they were built before: a walk of the kept series and
+    /// of the announces for every tracker.
+    fn trackers_by_walking(
+        trackers: &[TorrentTracker],
+        announces: &[TrackerAnnounce],
+    ) -> Vec<TrackerSeries> {
+        let mut series: Vec<TrackerSeries> = Vec::with_capacity(trackers.len());
+        for tracker in trackers {
+            let Some(host) = tracker_host(&tracker.url) else {
+                continue;
+            };
+            if series.iter().any(|kept| kept.host == host) {
+                continue;
+            }
+            let interval_seconds = announces
+                .iter()
+                .find(|announce| announce.url == tracker.url)
+                .and_then(|announce| announce.last.as_ref())
+                .and_then(|last| last.result.as_ref().ok())
+                .map(|accepted| accepted.interval.as_secs());
+            series.push(TrackerSeries {
+                host,
+                status: tracker.status,
+                last_announce_ms: tracker.last_announce_ms,
+                next_announce_ms: tracker.next_announce_ms,
+                interval_seconds,
+                seeders: tracker.seeders,
+                leechers: tracker.leechers,
+                completed: tracker.downloaded,
+                fails: tracker.fails,
+            });
+        }
+        series
+    }
+
+    /// A step of a fixed sequence, so the data is the same every run.
+    fn next(seed: &mut u64) -> u64 {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *seed >> 33
+    }
+
+    /// A torrent's `count` trackers and the announces of its run. Hosts and
+    /// whole URLs repeat, some URLs have no host, some trackers have no
+    /// announce, some announces were refused, and a URL may have two
+    /// announces with different intervals.
+    fn torrent(seed: &mut u64, count: usize) -> (Vec<TorrentTracker>, Vec<TrackerAnnounce>) {
+        const STATUSES: [TrackerStatus; 4] = [
+            TrackerStatus::NotContacted,
+            TrackerStatus::Working,
+            TrackerStatus::NotWorking,
+            TrackerStatus::TrackerError,
+        ];
+        let hosts = (count / 2).max(1) as u64;
+        let mut trackers = Vec::new();
+        let mut announces = Vec::new();
+        for at in 0..count {
+            let url = match next(seed) % 10 {
+                0 => format!("not a url {at}"),
+                1..=3 => format!("http://tracker{}.invalid/announce", next(seed) % hosts),
+                _ => format!(
+                    "udp://tracker{}.invalid:{}/announce",
+                    next(seed) % hosts,
+                    6969 + next(seed) % 3
+                ),
+            };
+            let some =
+                |seed: &mut u64| (!next(seed).is_multiple_of(3)).then(|| (next(seed) % 500) as u32);
+            trackers.push(TorrentTracker {
+                tier: at as u32,
+                url: url.clone(),
+                named_by: NamedBy::Torrent,
+                status: STATUSES[(next(seed) % 4) as usize],
+                updating: next(seed).is_multiple_of(2),
+                last_announce_ms: some(seed).map(i64::from),
+                next_announce_ms: some(seed).map(i64::from),
+                min_announce_ms: None,
+                message: None,
+                seeders: some(seed),
+                leechers: some(seed),
+                downloaded: some(seed),
+                peers: some(seed),
+                fails: (next(seed) % 4) as u32,
+                resolved_by: None,
+            });
+            for _ in 0..next(seed) % 3 {
+                let last = match next(seed) % 3 {
+                    0 => None,
+                    _ => Some(LastAnnounce {
+                        at: SystemTime::UNIX_EPOCH,
+                        result: Ok(AnnounceOk {
+                            interval: Duration::from_secs(60 + next(seed) % 3600),
+                            min_interval: Duration::from_secs(30),
+                            seeders: None,
+                            leechers: None,
+                            downloaded: None,
+                            peers: Vec::new(),
+                            warning: None,
+                        }),
+                    }),
+                };
+                announces.push(TrackerAnnounce {
+                    url: url.clone(),
+                    last,
+                    ..TrackerAnnounce::default()
+                });
+            }
+        }
+        (trackers, announces)
+    }
+
+    // The series built with one pass and two tables are the series the
+    // walks built: the same trackers, in the same order, with the same
+    // figures, for torrents of no, one, five and fifty trackers.
+    #[test]
+    fn the_tracker_series_are_those_the_walks_built() {
+        let mut seed = 0x5eed;
+        let mut kept_fewer = 0;
+        let mut with_interval = 0;
+        for count in [0, 1, 5, 50] {
+            for _ in 0..40 {
+                let (listed, announces) = torrent(&mut seed, count);
+                let built = trackers(&listed, &announces);
+                assert_eq!(built, trackers_by_walking(&listed, &announces));
+                kept_fewer += usize::from(built.len() < listed.len());
+                with_interval += built
+                    .iter()
+                    .filter(|series| series.interval_seconds.is_some())
+                    .count();
+            }
+        }
+        // The data did repeat hosts and did carry intervals.
+        assert!(kept_fewer > 40, "{kept_fewer}");
+        assert!(with_interval > 40, "{with_interval}");
     }
 }

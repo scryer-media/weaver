@@ -10,11 +10,15 @@ use std::{
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     str::from_utf8,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
 use crate::core::{Id20, spawn_utils::spawn_with_cancel};
+use crate::session_stats::network::LsdSnapshot;
 use anyhow::Context;
 use futures::{Stream, future::BoxFuture};
 use parking_lot::{Mutex, RwLock};
@@ -268,6 +272,11 @@ struct LocalServiceDiscoveryInner {
     registry: Mutex<Registry>,
     /// Wakes the schedule when it moves earlier.
     reschedule: Notify,
+    /// Announces sent, announces of other hosts read, and peers they named
+    /// for a torrent announced here.
+    sent: AtomicU64,
+    received: AtomicU64,
+    peers_found: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -336,6 +345,9 @@ impl LocalServiceDiscovery {
                 cookie,
                 registry: Mutex::new(Registry::new()),
                 reschedule: Notify::new(),
+                sent: AtomicU64::new(0),
+                received: AtomicU64::new(0),
+                peers_found: AtomicU64::new(0),
             }),
         };
 
@@ -456,11 +468,13 @@ cookie: {cookie}\r
             return Ok(());
         }
 
+        self.inner.received.fetch_add(1, Ordering::Relaxed);
         let mut addr = addr;
         addr.set_port(bts.port);
         let registry = self.inner.registry.lock();
         for hash in bts.hashes {
             if let Some(announce) = registry.receivers.get(&hash) {
+                self.inner.peers_found.fetch_add(1, Ordering::Relaxed);
                 let _ = announce.tx.send(addr);
             }
         }
@@ -501,10 +515,20 @@ cookie: {cookie}\r
                 // A socket, once in place, is only ever replaced.
                 let Some(socket) = self.socket() else { break };
                 trace!(?info_hash, port, "announcing");
+                self.inner.sent.fetch_add(1, Ordering::Relaxed);
                 socket
                     .send_everywhere(&|is_v6| self.gen_announce_msg(info_hash, port, is_v6))
                     .await;
             }
+        }
+    }
+
+    /// What the LSD has counted since it started.
+    pub fn counted(&self) -> LsdSnapshot {
+        LsdSnapshot {
+            sent: self.inner.sent.load(Ordering::Relaxed),
+            received: self.inner.received.load(Ordering::Relaxed),
+            peers_found: self.inner.peers_found.load(Ordering::Relaxed),
         }
     }
 
@@ -1032,6 +1056,7 @@ mod tests {
             [(a, 0), (a, 2), (a, 6), (a, 300)],
             "sends at 0, 2 and 6 s, the next announce at 300 s",
         );
+        assert_eq!(h.lsd.counted().sent, 4);
     }
 
     // The announce belongs to the stream: once dropped, not even the
@@ -1225,6 +1250,8 @@ mod tests {
         let peer: SocketAddr = "10.0.0.7:7001".parse().unwrap();
         assert_eq!(peers_a.next().await, Some(peer));
         assert_eq!(peers_b.next().await, Some(peer));
+        // One peer named for each of the two torrents announced here.
+        assert_eq!(h.lsd.counted().peers_found, 2);
 
         let mut headers = [httparse::EMPTY_HEADER; 16];
         let packet = format!(
