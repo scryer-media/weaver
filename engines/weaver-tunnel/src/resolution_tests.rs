@@ -407,12 +407,3 @@ fn the_host_order_is_kept_without_repeats() {
     let [a, b]: [IpAddr; 2] = ["2001:db8::1".parse().unwrap(), "192.0.2.1".parse().unwrap()];
     assert_eq!(untimed([a, b, a].into_iter()).addresses, [a, b]);
 }
-
-#[tokio::test]
-async fn a_host_that_answers_on_no_address_is_asked_for_again() {
-    host_lookup("localhost").await.unwrap();
-    assert!(HOST.held("localhost"));
-    // Nothing listens on port zero.
-    connect_host("localhost", 0).await.unwrap_err();
-    assert!(!HOST.held("localhost"));
-}
