@@ -92,11 +92,13 @@ def build_and_run():
                   and item.get("profile", {}).get("test") and item.get("executable"))
     failed = False
     for profile in ("unraid", "portable"):
-        for command in ([sys.executable, "/fs-fixture/smoke.py", "/fs"], [sys.executable, __file__, "--run", binary]):
+        for name, command in (("smoke", [sys.executable, "/fs-fixture/smoke.py", "/fs"]),
+                              ("regressions", [sys.executable, __file__, "--run", binary])):
             result = subprocess.run(
                 [sys.executable, "/fs-fixture/run.py", "--mount", "/fs", "--", *command],
                 env=dict(os.environ, WEAVER_FS_PROFILE=profile),
             )
+            print(f"filesystem-gate: {profile} {name} exited {result.returncode}", flush=True)
             failed |= result.returncode != 0
     return failed
 

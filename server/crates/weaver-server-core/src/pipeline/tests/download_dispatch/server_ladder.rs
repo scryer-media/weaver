@@ -137,13 +137,7 @@ async fn run_ladder(levels: &[(u32, bool)], refusing: &[usize]) -> (Vec<usize>, 
     let temp_dir = tempfile::tempdir().unwrap();
     let mut pipeline = ladder_pipeline(&temp_dir, levels).await;
     for server in refusing {
-        pipeline
-            .nntp
-            .pool()
-            .health()
-            .lock()
-            .await
-            .record_failure(*server, true);
+        refuse_login_past_give_up(&pipeline, *server).await;
     }
     let job_id = JobId(42001);
     insert_active_job(
@@ -269,13 +263,7 @@ async fn run_dead_post_refused(
     let temp_dir = tempfile::tempdir().unwrap();
     let mut pipeline = ladder_pipeline(&temp_dir, levels).await;
     for &server in refusing {
-        pipeline
-            .nntp
-            .pool()
-            .health()
-            .lock()
-            .await
-            .record_failure(server, true);
+        refuse_login_past_give_up(&pipeline, server).await;
     }
     // A fill server that refuses keeps backfill shut, so the walk is the
     // fill servers left; a backfill server that refuses is only passed.
@@ -811,13 +799,7 @@ async fn the_scan_floors_hand_out_what_a_whole_walk_does() {
                 }
                 // Halfway, a fill server starts refusing its credentials.
                 3 if step >= 450 && changes[3] == 0 => {
-                    pipeline
-                        .nntp
-                        .pool()
-                        .health()
-                        .lock()
-                        .await
-                        .record_failure(REFUSES_LATER, true);
+                    refuse_login_past_give_up(&pipeline, REFUSES_LATER).await;
                     changes[3] += 1;
                 }
                 _ => {}
@@ -1115,14 +1097,9 @@ fn rewrite_queue(pipeline: &mut Pipeline, job_id: JobId, mut edit: impl FnMut(&m
 
 const ALPHA: JobId = JobId(42005);
 
+// The server has refused the login for its whole give-up time.
 async fn refuse_login(pipeline: &Pipeline, server: usize) {
-    pipeline
-        .nntp
-        .pool()
-        .health()
-        .lock()
-        .await
-        .record_failure(server, true);
+    refuse_login_past_give_up(pipeline, server).await;
 }
 
 // Job "Alpha": one file of two articles and no recovery, on three fill

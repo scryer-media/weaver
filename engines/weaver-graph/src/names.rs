@@ -62,6 +62,32 @@ struct Entry {
     waits: Option<PathId>,
 }
 
+// The forms of one wanted name, from the first, that seats read past: each
+// was shut to every file, or held by a file. A seat that ranks above every
+// file they hold, and holds or leaves none of them, would read past each of
+// them again, so it starts after them. Each form is known only until
+// something changes at its path or the rank of its file changes, when the
+// run is cut back to the forms before it. Every spelling of a name with one
+// key has forms at the same paths ("Movie (2).mkv" and "MOVIE (2).MKV"), so
+// the run is kept by the key and shared by them all.
+#[derive(Debug)]
+struct Run {
+    path: String,
+    forms: Vec<Form>,
+    // How many of its forms each holder's file holds or leaves.
+    holders: HashMap<Holder, usize>,
+}
+
+#[derive(Debug)]
+struct Form {
+    at: PathId,
+    file: Option<Holder>,
+    leaving: Option<Holder>,
+    // The rank of the file that ranks last of those this form and the forms
+    // before it hold.
+    lowest: Option<(Position, Holder)>,
+}
+
 // A path on disk the ledger holds something at, in `Paths`.
 type PathId = u32;
 
@@ -222,6 +248,24 @@ pub struct NameLedger {
     // A path on disk to the rank of every holder waiting for it, highest
     // first: the first takes the path when it comes free.
     wanting: HashMap<PathId, BTreeSet<(Position, Holder)>>,
+    // What the forms of a wanted name that seats read past hold, by the
+    // name's key, so a long chain of members that want one name reads only the
+    // forms past those known instead of every form from the first (`Run`).
+    runs: HashMap<u64, Run>,
+    run_of: HashMap<String, u64>,
+    next_run: u64,
+    // Each path a known form is at, and each file a known form held: a
+    // change there cuts each run back to the forms before that one.
+    forms_at: HashMap<PathId, Vec<(u64, usize)>>,
+    forms_held: HashMap<Holder, Vec<(u64, usize)>>,
+    // How many forms seats read and started past, and whether a seat is
+    // not held to a read of every form from the first.
+    #[cfg(test)]
+    read: usize,
+    #[cfg(test)]
+    passed: usize,
+    #[cfg(test)]
+    unchecked: bool,
     // How many holders a free name was offered to.
     #[cfg(test)]
     offered: usize,
@@ -335,6 +379,7 @@ impl NameLedger {
         for name in &freed {
             if let Some(at) = self.paths.find(name) {
                 self.leaving.remove(&at);
+                self.changed(at);
                 self.prune(at);
             }
         }
@@ -445,12 +490,17 @@ impl NameLedger {
         self.left_by.clear();
         self.entries.clear();
         self.wanting.clear();
+        self.runs.clear();
+        self.run_of.clear();
+        self.forms_at.clear();
+        self.forms_held.clear();
     }
 
     // `holder` takes the path `path`, a key, as its file's.
     fn take(&mut self, path: &str, holder: Holder) {
         let at = self.paths.insert(path);
         self.taken.insert(at, holder);
+        self.changed(at);
     }
 
     // No file holds the path `path`, a key, any more.
@@ -458,6 +508,7 @@ impl NameLedger {
         if let Some(at) = self.paths.find(path)
             && self.taken.remove(&at).is_some()
         {
+            self.changed(at);
             self.prune(at);
         }
     }
@@ -477,6 +528,7 @@ impl NameLedger {
             {
                 return;
             }
+            self.changed(at);
             at = self.paths.remove(at);
         }
     }
@@ -500,6 +552,7 @@ impl NameLedger {
                 waits,
             },
         );
+        self.rank_changed(holder);
     }
 
     // `holder` holds nothing and waits for nothing any more.
@@ -523,6 +576,7 @@ impl NameLedger {
         if let Some(before) = self.leaving.insert(at, holder) {
             self.forget_left(before, &name);
         }
+        self.changed(at);
         self.left_by.entry(holder).or_default().insert(name);
     }
 
@@ -531,6 +585,7 @@ impl NameLedger {
     fn unleave(&mut self, name: &str) -> Option<Holder> {
         let at = self.paths.find(name)?;
         let holder = self.leaving.remove(&at)?;
+        self.changed(at);
         self.prune(at);
         self.forget_left(holder, name);
         Some(holder)
@@ -564,7 +619,8 @@ impl NameLedger {
     }
 
     // `holder` takes the name `place` gives it; the member it outranks
-    // there, if any, is returned to be moved on.
+    // there, if any, is returned to be moved on. The forms known to be shut
+    // to it are not read again (`Run`).
     fn seat(
         &mut self,
         holder: Holder,
@@ -574,6 +630,191 @@ impl NameLedger {
         if is_directory(wanted) {
             return (wanted.to_owned(), None);
         }
+        #[cfg(test)]
+        let scanned = (!self.unchecked).then(|| self.seat_by_scan(holder, rank, wanted));
+        let (stem, extension) = split_extension(wanted);
+        let path = key(wanted);
+        let first = self.first_unknown(&path, holder, rank);
+        #[cfg(test)]
+        {
+            self.passed += first;
+        }
+        for n in first.. {
+            #[cfg(test)]
+            {
+                self.read += 1;
+            }
+            let candidate = match n {
+                0 => wanted.to_owned(),
+                n => format!("{stem} ({n}){extension}"),
+            };
+            let key = key(&candidate);
+            let at = self.paths.find(&key);
+            if let Some(at) = at {
+                if self.paths.dirs(at) > 0 {
+                    self.known(&path, n, at);
+                    continue;
+                }
+                match self.leaving.get(&at) {
+                    Some(leaving) if *leaving != holder => {
+                        self.known(&path, n, at);
+                        continue;
+                    }
+                    Some(_) => {
+                        self.unleave(&key);
+                    }
+                    None => {}
+                }
+            }
+            // A path the unleave let go is held by no file either.
+            let file = at.and_then(|at| Some((at, *self.taken.get(&at)?)));
+            let outranked = match file {
+                None => None,
+                Some((_, other)) if other == holder => None,
+                Some((at, other)) => match self.entries.get(&other) {
+                    Some(entry) if *rank < entry.rank => Some(other),
+                    _ => {
+                        self.known(&path, n, at);
+                        continue;
+                    }
+                },
+            };
+            #[cfg(test)]
+            if let Some(scanned) = scanned {
+                assert_eq!(scanned, (candidate.clone(), outranked), "{wanted}");
+            }
+            self.take(&key, holder);
+            return (candidate, outranked);
+        }
+        unreachable!("an unbounded counter finds a free name")
+    }
+
+    // The first form of the name with key `path` a seat for `holder` at
+    // `rank` reads: the one past every known form, when it ranks above every
+    // file they hold and holds or leaves none of them, since it would read
+    // past each of them; otherwise the first.
+    fn first_unknown(&self, path: &str, holder: Holder, rank: &(Position, Holder)) -> usize {
+        let Some(run) = self.run_of.get(path).and_then(|id| self.runs.get(id)) else {
+            return 0;
+        };
+        let past = !run.holders.contains_key(&holder)
+            && run
+                .forms
+                .last()
+                .is_some_and(|last| last.lowest.as_ref().is_none_or(|lowest| lowest < rank));
+        if past { run.forms.len() } else { 0 }
+    }
+
+    // A seat read past the form `n` of the name with key `path`, at `at`:
+    // it is known from here when the forms before it are.
+    fn known(&mut self, path: &str, n: usize, at: PathId) {
+        let id = match self.run_of.get(path) {
+            Some(id) => *id,
+            None if n == 0 => {
+                let id = self.next_run;
+                self.next_run += 1;
+                self.run_of.insert(path.to_owned(), id);
+                self.runs.insert(
+                    id,
+                    Run {
+                        path: path.to_owned(),
+                        forms: Vec::new(),
+                        holders: HashMap::new(),
+                    },
+                );
+                id
+            }
+            None => return,
+        };
+        let run = self.runs.get_mut(&id).expect("a listed run");
+        if run.forms.len() != n {
+            return;
+        }
+        let file = self.taken.get(&at).copied();
+        let leaving = self.leaving.get(&at).copied();
+        let rank = file
+            .and_then(|file| self.entries.get(&file))
+            .map(|entry| entry.rank.clone());
+        let lowest = run
+            .forms
+            .last()
+            .and_then(|last| last.lowest.clone())
+            .max(rank);
+        for holder in file.iter().chain(&leaving) {
+            *run.holders.entry(*holder).or_default() += 1;
+        }
+        run.forms.push(Form {
+            at,
+            file,
+            leaving,
+            lowest,
+        });
+        self.forms_at.entry(at).or_default().push((id, n));
+        if let Some(file) = file {
+            self.forms_held.entry(file).or_default().push((id, n));
+        }
+    }
+
+    // Something changed at `at`: each run with a form there is cut back to
+    // the forms before it.
+    fn changed(&mut self, at: PathId) {
+        if self.forms_at.is_empty() {
+            return;
+        }
+        for (id, n) in self.forms_at.remove(&at).unwrap_or_default() {
+            self.cut(id, n);
+        }
+    }
+
+    // The rank of `holder` changed: each run with a form its file held is
+    // cut back to the forms before it.
+    fn rank_changed(&mut self, holder: Holder) {
+        if self.forms_held.is_empty() {
+            return;
+        }
+        for (id, n) in self.forms_held.remove(&holder).unwrap_or_default() {
+            self.cut(id, n);
+        }
+    }
+
+    // The run `id` keeps its first `n` forms; one left with none goes.
+    fn cut(&mut self, id: u64, n: usize) {
+        let Some(run) = self.runs.get_mut(&id) else {
+            return;
+        };
+        while run.forms.len() > n {
+            let form = run.forms.pop().expect("a form past n");
+            let entry = (id, run.forms.len());
+            forget(&mut self.forms_at, &form.at, entry);
+            if let Some(file) = form.file {
+                forget(&mut self.forms_held, &file, entry);
+            }
+            for holder in form.file.iter().chain(&form.leaving) {
+                if let Some(count) = run.holders.get_mut(holder) {
+                    *count -= 1;
+                    if *count == 0 {
+                        run.holders.remove(holder);
+                    }
+                }
+            }
+        }
+        if run.forms.is_empty()
+            && let Some(run) = self.runs.remove(&id)
+        {
+            self.run_of.remove(&run.path);
+        }
+    }
+
+    // The seat as it was before runs were kept: a read of every form from
+    // the first. Tests hold every seat to it. The holder's own form it is
+    // leaving is read as free of it, as the seat lets it go there.
+    #[cfg(test)]
+    fn seat_by_scan(
+        &self,
+        holder: Holder,
+        rank: &(Position, Holder),
+        wanted: &str,
+    ) -> (String, Option<Holder>) {
         let (stem, extension) = split_extension(wanted);
         for n in 0u32.. {
             let candidate = match n {
@@ -588,13 +829,9 @@ impl NameLedger {
                 }
                 match self.leaving.get(&at) {
                     Some(leaving) if *leaving != holder => continue,
-                    Some(_) => {
-                        self.unleave(&key);
-                    }
-                    None => {}
+                    Some(_) | None => {}
                 }
             }
-            // A path the unleave let go is held by no file either.
             let outranked = match at.and_then(|at| self.taken.get(&at)) {
                 None => None,
                 Some(other) if *other == holder => None,
@@ -603,7 +840,6 @@ impl NameLedger {
                     _ => continue,
                 },
             };
-            self.take(&key, holder);
             return (candidate, outranked);
         }
         unreachable!("an unbounded counter finds a free name")
@@ -702,6 +938,7 @@ impl NameLedger {
                         .paths
                         .child_or_insert(walk.at, &walk.path[part], &mut probe);
                     self.paths.node_mut(walk.at).dirs += 1;
+                    self.changed(walk.at);
                     if let Some(file) = self
                         .taken
                         .get(&walk.at)
@@ -727,7 +964,9 @@ impl NameLedger {
                         continue;
                     }
                     node.dirs -= 1;
-                    if node.dirs == 0 && !self.leaving.contains_key(&next) {
+                    let emptied = node.dirs == 0;
+                    self.changed(next);
+                    if emptied && !self.leaving.contains_key(&next) {
                         steps.push(Step::Unclaim(walk));
                         steps.push(Step::TakeWanted(next));
                         return;
@@ -750,6 +989,7 @@ impl NameLedger {
                 }
                 // Held from here, the path stays while the holder stops waiting.
                 self.taken.insert(name, holder);
+                self.changed(name);
                 let entry = self.exit(holder).expect("a waiting holder has an entry");
                 let old = entry.name;
                 let wanted = entry.wanted;
@@ -837,6 +1077,20 @@ impl Walk {
         let part = self.from..stop;
         self.from = stop + 1;
         Some(part)
+    }
+}
+
+// The form `form` of a run leaves the list under `at`; a list left empty goes.
+fn forget<K: std::hash::Hash + Eq>(
+    lists: &mut HashMap<K, Vec<(u64, usize)>>,
+    at: &K,
+    form: (u64, usize),
+) {
+    if let Some(list) = lists.get_mut(at) {
+        list.retain(|other| *other != form);
+        if list.is_empty() {
+            lists.remove(at);
+        }
     }
 }
 
@@ -1549,8 +1803,8 @@ mod tests {
         assert_eq!(ledger.offered, 0);
         assert!(ledger.entries.is_empty() && ledger.wanting.is_empty());
 
-        // Fewer here: giving one name to every member probes each suffix
-        // the ones before it took.
+        // Fewer here: each seat of one name is held to a read of every
+        // suffix the ones before it took.
         const SAME: u32 = 300;
         let mut ledger = NameLedger::new();
         for member in 0..SAME {
@@ -1963,6 +2217,32 @@ mod tests {
             }
         }
         assert_eq!(paths.ids.len(), paths.held().count());
+        // Every known form is the path of its form of the wanted name, and
+        // holds what it was known to: what a seat would read there.
+        let mut forms = 0;
+        for (id, run) in &ledger.runs {
+            assert_eq!(ledger.run_of.get(&run.path), Some(id));
+            let (stem, extension) = split_extension(&run.path);
+            for (n, form) in run.forms.iter().enumerate() {
+                let candidate = match n {
+                    0 => run.path.clone(),
+                    n => format!("{stem} ({n}){extension}"),
+                };
+                assert_eq!(paths.path(form.at), key(&candidate));
+                assert_eq!(ledger.taken.get(&form.at).copied(), form.file);
+                assert_eq!(ledger.leaving.get(&form.at).copied(), form.leaving);
+                if let Some(entry) = form.file.and_then(|file| ledger.entries.get(&file)) {
+                    assert!(Some(&entry.rank) <= form.lowest.as_ref());
+                }
+                assert!(ledger.forms_at[&form.at].contains(&(*id, n)));
+                if let Some(file) = form.file {
+                    assert!(ledger.forms_held[&file].contains(&(*id, n)));
+                }
+            }
+            forms += run.forms.len();
+        }
+        assert_eq!(ledger.run_of.len(), ledger.runs.len());
+        assert_eq!(ledger.forms_at.values().map(Vec::len).sum::<usize>(), forms);
     }
 
     // A small deterministic generator, so every seed replays one sequence.
@@ -2060,12 +2340,14 @@ mod tests {
 
     // The most members one change moved on, how many changes moved a file
     // off a directory's path and that file moved another on, and the most
-    // steps that ran at once, over every seed.
+    // steps that ran at once, over every seed, and how many forms seats
+    // started past.
     #[derive(Default)]
     struct Chains {
         longest: usize,
         through_directory: usize,
         deepest: usize,
+        passed: usize,
     }
 
     fn answers_as_the_reference_among(names: &[&str], members: u32) -> Chains {
@@ -2152,6 +2434,7 @@ mod tests {
             chains.longest = chains.longest.max(ledger.longest);
             chains.through_directory += ledger.through_directory;
             chains.deepest = chains.deepest.max(ledger.deepest);
+            chains.passed += ledger.passed;
         }
         chains
     }
@@ -2194,6 +2477,158 @@ mod tests {
         assert!(chains.longest >= 4, "{}", chains.longest);
         assert!(chains.through_directory > 0);
         assert_eq!(chains.deepest, 1);
+    }
+
+    // Names many members want at once, so the suffixed forms of each run
+    // long: spelled in other cases and normalisations, with other
+    // extensions and none, as files and directories at the forms' paths,
+    // and wanted as forms themselves.
+    const RUN_NAMES: [&str; 24] = [
+        "r.bin",
+        "r.bin",
+        "r.bin",
+        "R.BIN",
+        "r (1).bin",
+        "r (2).bin/",
+        "r (3).bin",
+        "r (1) (1).bin",
+        "r (10).bin",
+        "r",
+        "r",
+        "R",
+        "r (1)",
+        "r (2)/x",
+        "r/",
+        "r.tar.gz",
+        "R.TAR.GZ",
+        "r.tar (1).gz",
+        "Caf\u{e9}.bin",
+        "Cafe\u{301}.bin",
+        "caf\u{e9} (1).bin",
+        ".r",
+        ".r (1)",
+        "r (4)",
+    ];
+
+    // Every seat, in a ledger driven through seeded sequences of seats,
+    // releases, seats again and moves, is held to a read of every form from
+    // the first (`seat_by_scan`), and every answer to the reference's.
+    #[test]
+    fn a_seat_answers_as_a_read_of_every_form_would() {
+        let chains = answers_as_the_reference_among(&RUN_NAMES, 24);
+        // Seats started past known forms, and chains of moves ran.
+        assert!(chains.passed > 0);
+        assert!(chains.longest >= 4, "{}", chains.longest);
+    }
+
+    // A chain of members that want one name, each ranking below the one
+    // before it, then a member that outranks them all: each seat reads a
+    // bounded number of forms, never every form the ones before it took.
+    #[test]
+    fn a_chain_of_one_name_reads_each_form_a_bounded_number_of_times() {
+        const N: usize = 20_000;
+        let mut ledger = NameLedger {
+            unchecked: true,
+            ..NameLedger::default()
+        };
+        let moved = run_chain(&mut ledger, Chain::OneName, N);
+        assert_chain(&ledger, Chain::OneName, &moved, N);
+        assert!(ledger.read <= 4 * (N + 1), "{} forms read", ledger.read);
+        // Released, the members leave no known form behind.
+        for k in 0..N {
+            ledger.release(link(k).0, &mut Vec::new());
+        }
+        ledger.release(TOP_MEMBER, &mut Vec::new());
+        assert!(ledger.runs.is_empty() && ledger.run_of.is_empty());
+        assert!(ledger.forms_at.is_empty() && ledger.forms_held.is_empty());
+    }
+
+    // Spellings of a name with one key have every form at one path, so one
+    // run serves them all: case folds a character to one character and
+    // never to or from a dot or a slash, and composing never makes, takes
+    // or reaches across one, nor across the " (n)" a form puts before the
+    // extension.
+    #[test]
+    fn spellings_with_one_key_have_their_forms_at_one_path() {
+        let spellings: [&[&str]; 6] = [
+            &["Movie.mkv", "movie.mkv", "MOVIE.MKV", "mOvIe.MkV"],
+            &[
+                "Caf\u{e9}.bin",
+                "Cafe\u{301}.bin",
+                "CAF\u{c9}.BIN",
+                "CAFE\u{301}.BIN",
+            ],
+            &["\u{1e9e}.bin", "\u{df}.bin"],
+            &["Dir.D/Movie.MKV", "dir.d/movie.mkv"],
+            &["x\u{301}.Tar.GZ", "X\u{301}.tar.gz"],
+            &["a.\u{301}b", "A.\u{301}B"],
+        ];
+        for group in spellings {
+            for spelling in group {
+                assert_eq!(key(spelling), key(group[0]), "{spelling}");
+                let ((stem, extension), (first_stem, first_extension)) =
+                    (split_extension(spelling), split_extension(group[0]));
+                for n in 1..12 {
+                    assert_eq!(
+                        key(&format!("{stem} ({n}){extension}")),
+                        key(&format!("{first_stem} ({n}){first_extension}")),
+                        "{spelling} {n}"
+                    );
+                }
+            }
+        }
+    }
+
+    // A chain of members that each want another spelling of one name, in
+    // case and in composition: they share one run, so each seat still reads
+    // a bounded number of forms and the ledger knows each form once.
+    #[test]
+    fn a_chain_of_spellings_of_one_name_keeps_one_run() {
+        const N: usize = 20_000;
+        let mut ledger = NameLedger {
+            unchecked: true,
+            ..NameLedger::default()
+        };
+        // Fifteen letters cased by the bits of `k`, then "é" composed or
+        // not by the next bit: every member's spelling is its own.
+        let spelling = |k: usize| {
+            let mut name: String = "abcdefghijklmno"
+                .chars()
+                .enumerate()
+                .map(|(bit, c)| {
+                    if k >> bit & 1 == 1 {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            name.push_str(if k >> 15 & 1 == 1 {
+                "e\u{301}"
+            } else {
+                "\u{e9}"
+            });
+            name + ".bin"
+        };
+        let mut moved = Vec::new();
+        for k in 0..N {
+            let (holder, position) = link(k);
+            let wanted = spelling(k);
+            let name = ledger.allocate(holder, position, &wanted, &mut moved);
+            let (stem, extension) = split_extension(&wanted);
+            let form = match k {
+                0 => wanted.clone(),
+                k => format!("{stem} ({k}){extension}"),
+            };
+            assert_eq!(name, form);
+        }
+        assert_eq!(moved, Vec::new());
+        assert!(ledger.read <= 4 * N, "{} forms read", ledger.read);
+        assert_eq!(ledger.runs.len(), 1);
+        let forms: usize = ledger.runs.values().map(|run| run.forms.len()).sum();
+        assert!(forms < N, "{forms} forms known");
+        assert!(ledger.forms_at.values().map(Vec::len).sum::<usize>() < N);
+        assert!(ledger.forms_held.values().map(Vec::len).sum::<usize>() < N);
     }
 
     // A directory takes the path of a file, which moves on to its first
@@ -2407,9 +2842,10 @@ mod tests {
     }
 
     // A chain far longer than any stack could hold a call per member of
-    // moves every member on in one pass at one depth. Every member wanting
-    // one name probes each suffix the ones before it hold, so that chain
-    // stays at the size above.
+    // moves every member on in one pass at one depth. A chain of members
+    // that want one name is held here to a read of every suffix the ones
+    // before it hold at each seat, so it runs long in the test of the forms
+    // it reads instead.
     #[test]
     fn a_long_chain_of_members_moved_on_runs_at_one_depth() {
         const N: usize = 100_000;

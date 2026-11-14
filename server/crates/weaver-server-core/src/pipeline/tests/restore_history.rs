@@ -634,6 +634,52 @@ async fn a_job_sent_for_again_while_its_page_is_swept_keeps_its_new_folder() {
     retire_pipeline_database(pipeline).await;
 }
 
+// A failed job whose files will not go is tried on every sweep and stays
+// unstamped, but is warned about once in a run. The sweep that removes them
+// hands the job back to be stamped and forgets the warning, so a failure
+// after that warns again.
+#[tokio::test]
+async fn a_failed_job_whose_files_will_not_go_is_warned_about_once_and_tried_every_sweep() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let queue = pipeline.shared_state.queue.clone();
+    let resources = queue.resources.get().cloned().unwrap();
+    let id = JobId(30099);
+    // A regular file where the staging folder belongs: every removal of the
+    // job's staging fails.
+    let staging_root = temp_dir.path().join("stuck-staging-root");
+    std::fs::create_dir_all(&staging_root).unwrap();
+    let blocker = staging_root.join(crate::jobs::working_dir::STAGING_DIR_NAME);
+    std::fs::write(&blocker, b"not a folder").unwrap();
+    let roots = [staging_root.clone()];
+    let (queue_ref, resources_ref, roots_ref) = (&queue, &resources, &roots);
+    let sweep = || async move {
+        queue_ref.write(|inner| {
+            inner.sweep_listed.insert(id);
+            crate::pipeline::queue::Change::unchanged(())
+        });
+        queue_ref
+            .sweep_failed_job(resources_ref, roots_ref, id, None, Vec::new())
+            .await
+    };
+    let warned = || queue.read(|inner| inner.sweep_warned.contains(&id));
+
+    assert_eq!(sweep().await, None, "the files are still there");
+    assert!(warned());
+    assert_eq!(sweep().await, None, "every sweep tries again");
+    assert!(warned());
+    assert_eq!(queue.read(|inner| inner.sweep_warned.len()), 1);
+
+    std::fs::remove_file(&blocker).unwrap();
+    assert_eq!(
+        sweep().await,
+        Some(id),
+        "the sweep that removes them stamps it"
+    );
+    assert!(!warned());
+    retire_pipeline_database(pipeline).await;
+}
+
 // One page of the sweep works from the reading of the intermediate root it
 // is given, and reads no root of its own: a job the reading names gives up
 // its folder and is stamped, and a job whose marked folder the reading does
@@ -1652,6 +1698,56 @@ async fn job_failed_event_publishes_after_history_archive_commits() {
         .list_job_history(&crate::HistoryFilter::default(), crate::HistoryRows::All)
         .unwrap();
     assert!(listed.iter().any(|row| row.job_id == job_id.0));
+}
+
+// Shutdown waits for a failed job's folder release however long it takes,
+// and the job's history row is written when it reports. Left behind at the
+// bound, the job would stay an active row with its folder perhaps already
+// gone, and the next start would download it again. The clock is paused:
+// the release reports an hour of virtual time after shutdown began.
+#[tokio::test(start_paused = true)]
+async fn a_failed_job_whose_folder_release_outlasts_the_shutdown_bound_is_still_recorded() {
+    use crate::runtime::shutdown_steps::SHUTDOWN_STEP_BOUND;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30042);
+    let spec = standalone_job_spec(
+        "Slow Release Failure",
+        &[("slow-release.mkv".to_string(), 123)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    pipeline.fail_job(job_id, "too many articles are missing".to_string());
+    // The release ran; its report is handed back to the actor only long
+    // after the bound on a step that writes nothing.
+    let released = pipeline
+        .failed_release_rx
+        .recv()
+        .await
+        .expect("the release reports");
+    assert_eq!(released.job_id, job_id);
+    assert!(pipeline.releasing_failed_jobs.contains(&job_id));
+    let late = pipeline.failed_release_tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(SHUTDOWN_STEP_BOUND * 360).await;
+        let _ = late.send(released).await;
+    });
+    let started = tokio::time::Instant::now();
+
+    pipeline.drain().await;
+
+    assert!(started.elapsed() >= SHUTDOWN_STEP_BOUND * 360);
+    assert!(!pipeline.releasing_failed_jobs.contains(&job_id));
+    assert_eq!(
+        pipeline
+            .db
+            .get_job_history(job_id.0)
+            .unwrap()
+            .map(|row| row.status),
+        Some("failed".to_string()),
+        "the failure is recorded before the pipeline is down"
+    );
 }
 
 // A failed job's working directory is what the history lists as its

@@ -9,6 +9,7 @@ import {
   nntpBodyMetrics,
   nntpConnectionMetrics,
   postMultipartProbeArticle,
+  requiredMetricValue,
   resetNntpMetrics,
   setNntpChaos,
   submitProbeNzb,
@@ -67,13 +68,13 @@ async function configureAndProveHoldoff(
   // Keep the admitted lanes occupied so the surplus attempts all meet the
   // provider ceiling instead of racing each other for the same free slot.
   await setNntpChaos(`max_conns=${providerConnectionLimit},slow_body=5`);
-  const lifetimeBefore = await serverLifetimeBytes(request);
   await updateConfiguredServer(request, "nntp", {
     active: true,
     connections: 12,
     maxDownloadSpeed: 0,
     downloadQuota: unlimitedQuota,
   });
+  const lifetimeBefore = await runningServerLifetimeBytes(request);
   expect(
     await submitProbeNzb(
       request,
@@ -115,13 +116,13 @@ async function provePersistedConfigurationAndHoldoff(
   });
   const articles = await createProbeArticles("weaver-provider-cap-restart");
   await resetNntpMetrics();
-  const lifetimeBefore = await serverLifetimeBytes(request);
   await updateConfiguredServer(request, "nntp", {
     active: true,
     connections: 12,
     maxDownloadSpeed: 0,
     downloadQuota: unlimitedQuota,
   });
+  const lifetimeBefore = await runningServerLifetimeBytes(request);
   expect(
     await submitProbeNzb(
       request,
@@ -250,16 +251,37 @@ async function expectProbeTransfers(count: number) {
     .toBe(count);
 }
 
+// The server's lifetime body bytes. The series is there only while the pool
+// runs the server, so a missing series fails here instead of reading as 0.
 async function serverLifetimeBytes(
   request: Parameters<typeof metrics>[0],
 ): Promise<number> {
   const server = await configuredServer(request, "nntp");
-  const body = await metrics(request);
-  return metricValue(
-    body,
+  return requiredMetricValue(
+    await metrics(request),
     "weaver_server_download_lifetime_bytes",
     { server_id: String(server.id) },
-  ) ?? 0;
+  );
+}
+
+// The baseline for a probe: the server was just switched on, so wait until
+// the pool runs it and reports its series, then read it. No job is queued yet,
+// so nothing moves between this read and the submission; the value already
+// holds every byte persisted before, so only the probe's bytes can lift it.
+async function runningServerLifetimeBytes(
+  request: Parameters<typeof metrics>[0],
+): Promise<number> {
+  const server = await configuredServer(request, "nntp");
+  await expect
+    .poll(
+      async () =>
+        metricValue(await metrics(request), "weaver_server_download_lifetime_bytes", {
+          server_id: String(server.id),
+        }) !== undefined,
+      { message: `server ${server.id} reports its lifetime bytes once the pool runs it` },
+    )
+    .toBe(true);
+  return serverLifetimeBytes(request);
 }
 
 async function expectWeaverProbeBytes(

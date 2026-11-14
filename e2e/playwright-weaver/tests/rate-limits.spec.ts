@@ -7,6 +7,7 @@ import {
   expectSetting,
   graphql,
   metricValue,
+  requiredMetricValue,
   metrics,
   nntpBodyMetrics,
   postProbeArticle,
@@ -94,14 +95,14 @@ test(`global, scheduled, and per-server limits: ${stage}`, async ({ request }) =
     }),
   ).toBe(throttleBeforeGlobal);
   expect(
-    metricValue(body, "weaver_server_download_throttle_seconds_total", {
+    requiredMetricValue(body, "weaver_server_download_throttle_seconds_total", {
       server_id: String(server.id),
-    }) ?? 0,
+    }),
   ).toBeGreaterThan(0);
   expect(
-    metricValue(body, "weaver_server_download_lifetime_bytes", {
+    requiredMetricValue(body, "weaver_server_download_lifetime_bytes", {
       server_id: String(server.id),
-    }) ?? 0,
+    }),
   ).toBeGreaterThan(0);
 
   // Leave the full precedence chain configured so the harness restart proves

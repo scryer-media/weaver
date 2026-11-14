@@ -125,6 +125,7 @@ impl Queue {
                 return Change::unchanged(Err(SchedulerError::JobExists(id)));
             }
             inner.sweep_listed.remove(&id);
+            inner.sweep_warned.remove(&id);
             Change::unchanged(Ok(()))
         })?;
         let reservation = Reservation {

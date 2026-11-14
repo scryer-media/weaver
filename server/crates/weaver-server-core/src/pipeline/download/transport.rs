@@ -66,6 +66,40 @@ const RUNG_THROUGHPUT_NOISE_RATIO: f64 = 1.05;
 // How long a server is left alone after a revert or an unclean batch.
 const RUNG_HOLD: Duration = Duration::from_secs(10 * 60);
 
+// Unclean batches on one server that come this soon after the one that cost
+// a rung are the same event and count once. A burst of connection resets
+// tears down every lane of the server within a second or two, and each lane
+// reports its own unclean batch.
+pub(crate) const UNCLEAN_BURST_WINDOW: Duration = Duration::from_secs(30);
+
+// How long a server stays pinned to sequential before it is given one trial
+// at depth 2. Each unclean trial pins it again for twice as long, up to
+// `PIN_HOLD_MAX`.
+pub(crate) const PIN_HOLD: Duration = RUNG_HOLD;
+pub(crate) const PIN_HOLD_MAX: Duration = Duration::from_secs(2 * 60 * 60);
+
+// Clean, complete pipelined batches at depth 2 that end a lapsed pin's
+// trial and lift the pin. Counted per batch, not per rung window, so a
+// server that gets only a few articles a job still finishes its trial.
+pub(crate) const PIN_TRIAL_CLEAN_BATCHES: u8 = 4;
+
+// The depth the one trial lane runs at: the shallowest pipelined rung.
+const PIN_TRIAL_DEPTH: u8 = RUNGS[1];
+
+// A server that goes this long after its pin was lifted without being
+// pinned again starts the back-off over at `PIN_HOLD`: it has run clean for
+// as long as the longest pin would have held it. Until then the lift is
+// provisional, and an unclean batch pins it again at the next step.
+pub(crate) const PIN_BACKOFF_RESET_AFTER: Duration = PIN_HOLD_MAX;
+
+// The hold of the pin that follows `strikes` earlier ones in the same
+// back-off.
+fn pin_hold(strikes: u32) -> Duration {
+    PIN_HOLD
+        .saturating_mul(1u32 << strikes.min(16))
+        .min(PIN_HOLD_MAX)
+}
+
 // Body sizes kept for the median the depth formula divides by.
 //
 // A median, not a mean: a file's last article is a fraction of the others and
@@ -219,8 +253,11 @@ pub(crate) enum RungChange {
     Reverted { from: u8, to: u8 },
     // An unclean pipelined batch cost a rung.
     Dropped { from: u8, to: u8 },
-    // A second unclean batch inside the hold: this server does not pipeline.
-    PinnedSequential,
+    // A second unclean batch inside the hold, or an unclean trial after a
+    // pin lapsed: the server is sequential for `hold`.
+    PinnedSequential { hold: Duration },
+    // A clean trial after a pin lapsed: the server pipelines again.
+    PinLifted { depth: u8 },
 }
 
 impl RungChange {
@@ -230,7 +267,9 @@ impl RungChange {
     // settles it, and a restart would resume at a depth nothing has yet paid
     // for. Every other outcome is a settled verdict, including the ones that
     // lower the rung — a persisted depth that over-promises is the one worth
-    // correcting.
+    // correcting. A pin is one of those: it writes depth 1, so a restart
+    // opens the server at the shallowest pipelined rung and not at the rung
+    // that just failed twice.
     pub(crate) fn settles_the_rung(self) -> bool {
         !matches!(self, Self::Stepped { from, to } if to > from)
     }
@@ -333,7 +372,30 @@ pub(crate) struct ServerPipelineExplorer {
     // window close and blended across windows. The depth formula's divisor.
     modelled_transfer: Option<Duration>,
     hold_until: Option<Instant>,
+    // The last unclean batch that counted toward a pin: the one that cost a
+    // held rung or pinned. A second one inside `RUNG_HOLD` of it pins.
     last_unclean_at: Option<Instant>,
+    // The last unclean batch acted on in any way, a guessed rung's drop
+    // included. Batches inside `UNCLEAN_BURST_WINDOW` after it do not count.
+    unclean_burst_at: Option<Instant>,
+    // When the current pin lapses into a trial. Kept through the trial, so a
+    // pool rebuilt during one carries a pin that is already due.
+    pinned_until: Option<Instant>,
+    // Pins in the current back-off; the next pin holds `pin_hold(strikes)`.
+    pin_strikes: u32,
+    // The server is on the one trial a lapsed pin gets: one lane runs at
+    // depth 2 and every other lane stays sequential, so `current_depth`
+    // stays 1 until the trial is judged.
+    pin_trial: bool,
+    // The lane running the trial. `None` until a lane asks for its mode
+    // after the lapse, and taken over by the next lane to ask once this one
+    // is gone.
+    pin_trial_lane: Option<u64>,
+    // Clean batches at depth 2 counted toward `PIN_TRIAL_CLEAN_BATCHES` on
+    // the current trial.
+    pin_trial_clean_batches: u8,
+    // When a clean trial last lifted a pin.
+    pin_lifted_at: Option<Instant>,
     // Depth the servers table already holds, so a kept rung only writes once.
     persisted_depth: Option<u8>,
 }
@@ -370,6 +432,13 @@ impl Default for ServerPipelineExplorer {
             modelled_transfer: None,
             hold_until: None,
             last_unclean_at: None,
+            unclean_burst_at: None,
+            pinned_until: None,
+            pin_strikes: 0,
+            pin_trial: false,
+            pin_trial_lane: None,
+            pin_trial_clean_batches: 0,
+            pin_lifted_at: None,
             persisted_depth: None,
         }
     }
@@ -417,14 +486,21 @@ impl ServerPipelineExplorer {
 
     // Carry what `prior`, this server's explorer in the pool this one
     // replaces, had ruled about pipelining: a server pinned sequential stays
-    // pinned and at depth 1, and a hold after an unclean batch keeps running,
-    // so a rebuilt pool neither pipelines to a server that failed it twice
-    // nor shows a depth the lanes are held off.
+    // pinned and at depth 1 until the same lapse, with the same back-off, and
+    // a hold after an unclean batch keeps running, so a rebuilt pool neither
+    // pipelines to a server that failed it twice nor shows a depth the lanes
+    // are held off. A server on its trial is carried pinned with its lapse
+    // already due, so its next response starts the trial again, on whichever
+    // lane of the new pool asks first.
     pub(super) fn carry_pipelining_verdict(&mut self, prior: &Self) {
         self.last_unclean_at = prior.last_unclean_at;
+        self.unclean_burst_at = prior.unclean_burst_at;
         self.hold_until = prior.hold_until;
-        if prior.pinned_sequential {
+        self.pin_strikes = prior.pin_strikes;
+        self.pin_lifted_at = prior.pin_lifted_at;
+        if prior.pinned_sequential || prior.pin_trial {
             self.pinned_sequential = true;
+            self.pinned_until = prior.pinned_until;
             self.current_depth = 1;
         }
     }
@@ -443,6 +519,28 @@ impl ServerPipelineExplorer {
         self.current_depth
     }
 
+    // The server is on the one trial a lapsed pin gets.
+    #[cfg(test)]
+    pub(crate) fn on_pin_trial(&self) -> bool {
+        self.pin_trial
+    }
+
+    // The lane running the trial, if one has taken it.
+    #[cfg(test)]
+    pub(crate) fn pin_trial_lane(&self) -> Option<u64> {
+        self.pin_trial_lane
+    }
+
+    // A pipelining server whose pin has lapsed into its trial.
+    #[cfg(test)]
+    pub(crate) fn on_a_lapsed_pin_trial(now: Instant) -> Self {
+        let mut explorer = Self::seeded(Some(2), None, None);
+        explorer.note_supports_pipelining(true);
+        explorer.pin(now);
+        explorer.begin_pin_trial();
+        explorer
+    }
+
     pub(crate) fn latency(&self) -> Option<Duration> {
         self.latency
     }
@@ -455,8 +553,15 @@ impl ServerPipelineExplorer {
         self.latency.map(LatencyBand::from_latency)
     }
 
+    #[cfg(test)]
     pub(crate) fn pinned_sequential(&self) -> bool {
         self.pinned_sequential
+    }
+
+    // What the health view reports as the pin: held until a clean trial
+    // lifts it, so a server on its trial still reads pinned.
+    pub(crate) fn pin_held(&self) -> bool {
+        self.pinned_sequential || self.pin_trial
     }
 
     #[cfg(test)]
@@ -609,6 +714,30 @@ impl ServerPipelineExplorer {
         DownloadLaneMode::from_depth(self.current_depth)
     }
 
+    // The mode for `lane_id`'s next lease. The same as `choose_mode` except
+    // on the trial a lapsed pin gets: then exactly one lane runs at depth 2
+    // and the rest stay sequential, so an unclean trial costs one connection
+    // and not every lane of the server. The first lane to ask takes the
+    // trial and keeps it for as long as `lane_is_live` says it exists; once
+    // it is gone the next lane to ask takes the trial over, with the clean
+    // batches already counted.
+    pub(super) fn choose_mode_for_lane(
+        &mut self,
+        pressure_clear: bool,
+        lane_id: u64,
+        lane_is_live: impl FnOnce(u64) -> bool,
+    ) -> DownloadLaneMode {
+        if !self.pin_trial || !pressure_clear || !self.supports_pipelining {
+            return self.choose_mode(pressure_clear);
+        }
+        match self.pin_trial_lane {
+            Some(holder) if holder == lane_id => {}
+            Some(holder) if lane_is_live(holder) => return DownloadLaneMode::Sequential,
+            _ => self.pin_trial_lane = Some(lane_id),
+        }
+        DownloadLaneMode::from_depth(PIN_TRIAL_DEPTH)
+    }
+
     // Fold one clean response into the current window and, once the window is
     // full, decide whether the rung stays, reverts, or advances. `fed` says
     // the response's lane held a full rung of articles when it was read.
@@ -623,9 +752,19 @@ impl ServerPipelineExplorer {
         cold: bool,
         fed: bool,
     ) -> Option<RungChange> {
-        // A pinned server is out of the exploration entirely: nothing it does
-        // afterwards may walk its depth back up.
+        // A pinned server is out of the exploration until its pin lapses:
+        // nothing it does before then may walk its depth back up. The first
+        // response after the lapse puts it on its one trial at depth 2.
         if self.pinned_sequential {
+            if self.pinned_until.is_some_and(|until| now >= until) {
+                self.begin_pin_trial();
+            }
+            return None;
+        }
+        // The trial a lapsed pin gets is judged by its lane's batches, in
+        // `note_clean_batch`. One lane at depth 2 beside sequential ones
+        // measures neither rung, so the windows wait for the verdict.
+        if self.pin_trial {
             return None;
         }
         // Pressure forces sequential and distorts throughput; such a sample
@@ -858,15 +997,119 @@ impl ServerPipelineExplorer {
         }
     }
 
-    // An unclean pipelined batch: one rung off, and hands off this server for
-    // ten minutes. A second one inside that window settles the question.
+    // A clean, complete pipelined batch `lane_id` issued at `depth`. On the
+    // trial a lapsed pin gets, `PIN_TRIAL_CLEAN_BATCHES` of them from the
+    // trial's lane lift the pin for every lane, and the explorer goes on
+    // from depth 2 as after any kept trial. Anywhere else it changes nothing.
+    //
+    // `pipelined` says the server answered on the batch's connection with a
+    // later request already on the wire. A batch that ran with one request
+    // at a time on the wire was sequential in all but name and proves
+    // nothing about the server, so it does not count.
+    pub(in crate::pipeline) fn note_clean_batch(
+        &mut self,
+        now: Instant,
+        depth: u8,
+        pipelined: bool,
+        lane_id: u64,
+    ) -> Option<RungChange> {
+        if !self.pin_trial
+            || !pipelined
+            || depth != PIN_TRIAL_DEPTH
+            || self.pin_trial_lane != Some(lane_id)
+        {
+            return None;
+        }
+        self.pin_trial_clean_batches = self.pin_trial_clean_batches.saturating_add(1);
+        if self.pin_trial_clean_batches < PIN_TRIAL_CLEAN_BATCHES {
+            return None;
+        }
+        self.pin_trial = false;
+        self.pin_trial_lane = None;
+        self.pin_trial_clean_batches = 0;
+        self.on_trial = false;
+        self.pinned_until = None;
+        self.pin_lifted_at = Some(now);
+        self.current_depth = PIN_TRIAL_DEPTH;
+        self.baseline_depth = Some(self.current_depth);
+        self.baseline_throughput_bps = None;
+        self.reset_window();
+        Some(RungChange::PinLifted {
+            depth: self.current_depth,
+        })
+    }
+
+    // The same, from lane 0 at the explorer's current rung, or at the
+    // trial's on a trial.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn note_unclean_batch(&mut self, now: Instant) -> Option<RungChange> {
+        let depth = if self.pin_trial {
+            PIN_TRIAL_DEPTH
+        } else {
+            self.current_depth
+        };
+        self.note_unclean_batch_at(now, depth, true, 0)
+    }
+
+    // An unclean pipelined batch issued at `depth`, `pipelined` when the
+    // server had answered on its connection with a later request already on
+    // the wire before the fault: one rung off, and hands
+    // off this server for ten minutes. A second one inside that window pins
+    // the server to sequential for `pin_hold`. Unclean batches inside
+    // `UNCLEAN_BURST_WINDOW` of the last one acted on are the same event and
+    // change nothing, and so does one issued deeper than the current rung:
+    // the rung it failed at is already given up. On the trial after a pin
+    // lapsed only the trial lane's batch counts: it pins again at the next
+    // step of the back-off, and that lane's connection is the only one lost.
+    // So does one at the trial's rung or below before a lifted pin has run
+    // clean for `PIN_BACKOFF_RESET_AFTER`: the trial's own proof has failed.
+    // A fault at a deeper rung in that time says only that the deeper rung
+    // is too deep, and takes the ordinary drop and hold.
     //
     // A rung opened on the probe's guess and not yet measured is the
     // exception: it drops a rung with no hold and is not counted toward the
     // pin, and the first climb back is judged by a trial.
-    pub(in crate::pipeline) fn note_unclean_batch(&mut self, now: Instant) -> Option<RungChange> {
-        if self.pinned_sequential {
+    pub(in crate::pipeline) fn note_unclean_batch_at(
+        &mut self,
+        now: Instant,
+        depth: u8,
+        pipelined: bool,
+        lane_id: u64,
+    ) -> Option<RungChange> {
+        // A connection lost before the server answered anything on it with
+        // a later request on the wire failed the way a sequential one does,
+        // however many requests it had written: an outage, a server restart,
+        // an idle drop. That says nothing about pipelining and is no strike.
+        if self.pinned_sequential || !pipelined {
             return None;
+        }
+        if self.pin_trial {
+            // Any other lane's unclean batch was issued before the pin.
+            if self.pin_trial_lane != Some(lane_id) || depth != PIN_TRIAL_DEPTH {
+                return None;
+            }
+            self.unclean_burst_at = Some(now);
+            self.last_unclean_at = Some(now);
+            self.reset_window();
+            return Some(self.pin(now));
+        }
+        if depth > self.current_depth {
+            return None;
+        }
+        if self
+            .unclean_burst_at
+            .is_some_and(|at| now.saturating_duration_since(at) < UNCLEAN_BURST_WINDOW)
+        {
+            return None;
+        }
+        self.unclean_burst_at = Some(now);
+        let lift_is_provisional = self
+            .pin_lifted_at
+            .is_some_and(|at| now.saturating_duration_since(at) < PIN_BACKOFF_RESET_AFTER);
+        if lift_is_provisional && depth <= PIN_TRIAL_DEPTH {
+            self.reset_window();
+            self.last_unclean_at = Some(now);
+            return Some(self.pin(now));
         }
         self.reset_window();
         self.on_trial = false;
@@ -888,9 +1131,7 @@ impl ServerPipelineExplorer {
             .is_some_and(|at| now.saturating_duration_since(at) < RUNG_HOLD);
         self.last_unclean_at = Some(now);
         if within_hold {
-            self.pinned_sequential = true;
-            self.current_depth = 1;
-            return Some(RungChange::PinnedSequential);
+            return Some(self.pin(now));
         }
 
         self.hold_until = Some(now + RUNG_HOLD);
@@ -901,6 +1142,50 @@ impl ServerPipelineExplorer {
             return None;
         }
         Some(RungChange::Dropped { from, to })
+    }
+
+    // Pin the server to sequential until `pinned_until`. The hold doubles
+    // with each pin of the back-off; a server that ran clean for
+    // `PIN_BACKOFF_RESET_AFTER` since its last pin was lifted starts over.
+    fn pin(&mut self, now: Instant) -> RungChange {
+        if self
+            .pin_lifted_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= PIN_BACKOFF_RESET_AFTER)
+        {
+            self.pin_strikes = 0;
+        }
+        self.pin_lifted_at = None;
+        let hold = pin_hold(self.pin_strikes);
+        self.pin_strikes = self.pin_strikes.saturating_add(1);
+        self.pinned_sequential = true;
+        self.pin_trial = false;
+        self.pin_trial_lane = None;
+        self.pin_trial_clean_batches = 0;
+        self.on_trial = false;
+        self.pinned_until = Some(now + hold);
+        self.current_depth = 1;
+        RungChange::PinnedSequential { hold }
+    }
+
+    // The pin has lapsed: one trial, on one lane at depth 2, ended by
+    // `PIN_TRIAL_CLEAN_BATCHES` clean batches from that lane or by an
+    // unclean one. Every other lane stays sequential, so the depth stays 1.
+    fn begin_pin_trial(&mut self) {
+        self.pinned_sequential = false;
+        self.pin_trial = true;
+        self.pin_trial_lane = None;
+        self.pin_trial_clean_batches = 0;
+        self.on_trial = false;
+        self.settle_pending = false;
+        // Every later move is a single step: the first climb is long past.
+        self.first_climb_pending = false;
+        // A pin can come before the opening window closed; what follows the
+        // trial is not an opening window.
+        self.warmup_windows_left = self.warmup_windows_left.min(RUNG_WARMUP_WINDOWS - 1);
+        self.baseline_depth = None;
+        self.baseline_throughput_bps = None;
+        self.current_depth = 1;
+        self.reset_window();
     }
 
     fn step_toward(&self, target: u8) -> u8 {
@@ -1733,23 +2018,560 @@ mod tests {
         // The rung the first climb was waiting to settle is gone.
         assert!(!explorer.settle_pending);
 
+        let pinned_at = now + Duration::from_secs(60);
         assert_eq!(
-            explorer.note_unclean_batch(now + Duration::from_secs(60)),
-            Some(RungChange::PinnedSequential)
+            explorer.note_unclean_batch(pinned_at),
+            Some(RungChange::PinnedSequential { hold: PIN_HOLD })
         );
         assert!(explorer.pinned_sequential());
         assert_eq!(explorer.choose_mode(true), DownloadLaneMode::Sequential);
+        assert_eq!(explorer.pinned_until, Some(pinned_at + PIN_HOLD));
 
-        // The pin outlives the hold: it is for the rest of the process, and a
-        // full window of clean responses does not lift it.
-        let later = now + RUNG_HOLD * 3;
+        // Until the pin lapses a full window of clean responses does not
+        // lift it.
+        let inside = pinned_at + PIN_HOLD - Duration::from_secs(1);
         assert_eq!(
-            run_window(&mut explorer, later, 100_000, Duration::from_millis(100)),
+            run_window(&mut explorer, inside, 100_000, Duration::from_millis(100)),
             None
         );
+        assert!(explorer.pinned_sequential());
         assert_eq!(explorer.choose_mode(true), DownloadLaneMode::Sequential);
         // A third unclean batch is a no-op rather than a second warning.
-        assert_eq!(explorer.note_unclean_batch(later), None);
+        assert_eq!(explorer.note_unclean_batch(inside), None);
+    }
+
+    // A server pinned at `now + UNCLEAN_BURST_WINDOW`, from a first climb to
+    // 8 and two counted unclean batches.
+    fn pinned(now: Instant) -> (ServerPipelineExplorer, Instant) {
+        let mut explorer = explorer(300, 50);
+        run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
+        assert_eq!(
+            explorer.note_unclean_batch(now),
+            Some(RungChange::Dropped { from: 8, to: 4 })
+        );
+        let pinned_at = now + UNCLEAN_BURST_WINDOW;
+        assert!(matches!(
+            explorer.note_unclean_batch(pinned_at),
+            Some(RungChange::PinnedSequential { .. })
+        ));
+        (explorer, pinned_at)
+    }
+
+    // One sequential response after the lapse starts the trial, and lane 0
+    // takes it.
+    fn lapse(explorer: &mut ServerPipelineExplorer, at: Instant) {
+        assert_eq!(
+            explorer.note_response(
+                at,
+                1,
+                100_000,
+                Duration::from_millis(100),
+                true,
+                false,
+                true
+            ),
+            None
+        );
+        assert!(!explorer.pinned_sequential());
+        assert!(explorer.pin_trial);
+        // The server's depth stays 1; lane 0 asks first and takes the trial.
+        assert_eq!(explorer.current_depth(), 1);
+        assert_eq!(explorer.choose_mode(true), DownloadLaneMode::Sequential);
+        assert_eq!(
+            explorer.choose_mode_for_lane(true, 0, |_| true),
+            DownloadLaneMode::Pipelined { depth: 2 }
+        );
+    }
+
+    // Clean batches at the trial's rung, all at `at`.
+    fn clean_batches(
+        explorer: &mut ServerPipelineExplorer,
+        at: Instant,
+        count: u8,
+    ) -> Option<RungChange> {
+        let mut change = None;
+        for _ in 0..count {
+            change = explorer.note_clean_batch(at, 2, true, 0).or(change);
+        }
+        change
+    }
+
+    // A burst of resets makes every lane of the server report an unclean
+    // batch within a second. That is one event: it costs one rung and
+    // starts one hold, and does not pin. The lanes whose batches were issued
+    // at the rung just given up are ignored for that alone; the rest by the
+    // burst window.
+    #[test]
+    fn a_burst_of_unclean_batches_costs_one_rung_and_does_not_pin() {
+        let mut explorer = explorer(300, 50);
+        let now = Instant::now();
+        run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
+        assert_eq!(explorer.current_depth(), 8);
+
+        assert_eq!(
+            explorer.note_unclean_batch_at(now, 8, true, 0),
+            Some(RungChange::Dropped { from: 8, to: 4 })
+        );
+        for lane in 1..40u64 {
+            let at = now + Duration::from_millis(25 * lane);
+            let depth = if lane % 2 == 0 { 8 } else { 4 };
+            assert_eq!(
+                explorer.note_unclean_batch_at(at, depth, true, 0),
+                None,
+                "lane {lane}"
+            );
+        }
+        // Issued at the rung already given up, it is ignored past the
+        // burst window too.
+        assert_eq!(
+            explorer.note_unclean_batch_at(now + UNCLEAN_BURST_WINDOW * 2, 8, true, 0),
+            None
+        );
+        assert!(!explorer.pinned_sequential());
+        assert_eq!(explorer.current_depth(), 4);
+        assert_eq!(explorer.hold_until, Some(now + RUNG_HOLD));
+        assert_eq!(explorer.last_unclean_at, Some(now));
+
+        // Just inside the burst window still changes nothing; the first one
+        // past it, inside the hold, pins.
+        let edge = now + UNCLEAN_BURST_WINDOW - Duration::from_millis(1);
+        assert_eq!(explorer.note_unclean_batch(edge), None);
+        assert_eq!(
+            explorer.note_unclean_batch(now + UNCLEAN_BURST_WINDOW),
+            Some(RungChange::PinnedSequential { hold: PIN_HOLD })
+        );
+    }
+
+    // A pin lapses into one trial at depth 2. `PIN_TRIAL_CLEAN_BATCHES`
+    // clean batches there lift it, and the explorer goes on from that rung.
+    #[test]
+    fn a_lapsed_pin_gets_one_trial_at_depth_two_and_a_clean_one_lifts_it() {
+        let now = Instant::now();
+        let (mut explorer, pinned_at) = pinned(now);
+        let due = pinned_at + PIN_HOLD;
+        // Just before the lapse a response leaves the pin alone.
+        assert_eq!(
+            explorer.note_response(
+                due - Duration::from_secs(1),
+                1,
+                100_000,
+                Duration::from_millis(100),
+                true,
+                false,
+                true
+            ),
+            None
+        );
+        assert!(explorer.pinned_sequential());
+
+        lapse(&mut explorer, due);
+        // A full, fed window at the trial's rung does not judge it, and a
+        // clean batch issued at another depth does not count.
+        assert_eq!(
+            run_window(&mut explorer, due, 100_000, Duration::from_millis(100)),
+            None
+        );
+        assert_eq!(explorer.note_clean_batch(due, 4, true, 0), None);
+        assert_eq!(
+            clean_batches(&mut explorer, due, PIN_TRIAL_CLEAN_BATCHES - 1),
+            None
+        );
+        assert!(explorer.pin_trial);
+        // Neither does one that closed with a single request on the wire.
+        assert_eq!(explorer.note_clean_batch(due, 2, false, 0), None);
+        assert!(explorer.pin_trial);
+        assert_eq!(
+            explorer.note_clean_batch(due, 2, true, 0),
+            Some(RungChange::PinLifted { depth: 2 })
+        );
+        assert!(!explorer.pin_trial);
+        assert!(!explorer.on_trial);
+        assert_eq!(explorer.pinned_until, None);
+        assert_eq!(explorer.pin_lifted_at, Some(due));
+        assert_eq!(
+            explorer.choose_mode(true),
+            DownloadLaneMode::Pipelined { depth: 2 }
+        );
+        // From here it explores as after any kept trial: a rung at a time.
+        assert_eq!(
+            run_window(&mut explorer, due, 100_000, Duration::from_millis(100)),
+            Some(RungChange::Stepped { from: 2, to: 4 })
+        );
+    }
+
+    // A server that gets a few articles a job never closes a rung window,
+    // and its trial still ends: on its batches. An unclean batch before the
+    // last clean one needed pins it again.
+    #[test]
+    fn a_starved_trial_lifts_on_its_clean_batches_and_an_unclean_one_before_then_pins() {
+        let now = Instant::now();
+        let (mut explorer, pinned_at) = pinned(now);
+        let due = pinned_at + PIN_HOLD;
+        lapse(&mut explorer, due);
+        let mut unclean = explorer.clone();
+
+        // Batches hours apart, with no window anywhere near full.
+        let mut at = due;
+        for _ in 0..PIN_TRIAL_CLEAN_BATCHES - 1 {
+            at += Duration::from_secs(60 * 60);
+            assert_eq!(explorer.note_clean_batch(at, 2, true, 0), None);
+        }
+        assert!(explorer.window_rung_responses < explorer.window_target_responses());
+        at += Duration::from_secs(60 * 60);
+        assert_eq!(
+            explorer.note_clean_batch(at, 2, true, 0),
+            Some(RungChange::PinLifted { depth: 2 })
+        );
+        assert_eq!(explorer.pin_lifted_at, Some(at));
+
+        clean_batches(&mut unclean, due, PIN_TRIAL_CLEAN_BATCHES - 1);
+        assert_eq!(
+            unclean.note_unclean_batch(due + Duration::from_secs(60)),
+            Some(RungChange::PinnedSequential { hold: PIN_HOLD * 2 })
+        );
+        // The next trial counts its clean batches from nothing.
+        let again = due + Duration::from_secs(60) + PIN_HOLD * 2;
+        lapse(&mut unclean, again);
+        assert_eq!(unclean.pin_trial_clean_batches, 0);
+    }
+
+    // A lift is provisional until the server has run clean for
+    // `PIN_BACKOFF_RESET_AFTER`. An unclean batch an hour after it pins again
+    // at the next step; one after that time is an ordinary first strike.
+    #[test]
+    fn an_unclean_batch_soon_after_a_lift_pins_again_for_twice_as_long() {
+        let now = Instant::now();
+        let (mut explorer, pinned_at) = pinned(now);
+        let due = pinned_at + PIN_HOLD;
+        lapse(&mut explorer, due);
+        clean_batches(&mut explorer, due, PIN_TRIAL_CLEAN_BATCHES);
+        assert_eq!(explorer.pin_lifted_at, Some(due));
+        let lifted = explorer.clone();
+
+        assert_eq!(
+            explorer.note_unclean_batch(due + Duration::from_secs(60 * 60)),
+            Some(RungChange::PinnedSequential { hold: PIN_HOLD * 2 })
+        );
+        assert!(explorer.pinned_sequential());
+
+        let mut explorer = lifted;
+        let strike = due + PIN_BACKOFF_RESET_AFTER;
+        assert_eq!(
+            explorer.note_unclean_batch(strike),
+            Some(RungChange::Dropped { from: 2, to: 1 })
+        );
+        assert!(!explorer.pinned_sequential());
+        assert_eq!(explorer.hold_until, Some(strike + RUNG_HOLD));
+    }
+
+    // An unclean trial pins again for twice as long, up to the cap.
+    #[test]
+    fn an_unclean_trial_pins_again_for_twice_as_long_up_to_the_cap() {
+        let now = Instant::now();
+        let (mut explorer, pinned_at) = pinned(now);
+        let mut due = pinned_at + PIN_HOLD;
+        let mut holds = Vec::new();
+        for _ in 0..6 {
+            lapse(&mut explorer, due);
+            let Some(RungChange::PinnedSequential { hold }) = explorer.note_unclean_batch(due)
+            else {
+                panic!("an unclean trial pins");
+            };
+            assert!(explorer.pinned_sequential());
+            assert_eq!(explorer.current_depth(), 1);
+            assert_eq!(explorer.pinned_until, Some(due + hold));
+            holds.push(hold.as_secs() / 60);
+            due += hold;
+        }
+        assert_eq!(holds, vec![20, 40, 80, 120, 120, 120]);
+    }
+
+    // The back-off starts over once the server has run as long as the
+    // longest pin since a clean trial lifted its last one.
+    #[test]
+    fn a_clean_stretch_after_a_lifted_pin_resets_the_back_off() {
+        let now = Instant::now();
+        let (mut explorer, pinned_at) = pinned(now);
+        let mut due = pinned_at + PIN_HOLD;
+        lapse(&mut explorer, due);
+        assert!(matches!(
+            explorer.note_unclean_batch(due),
+            Some(RungChange::PinnedSequential { hold }) if hold == PIN_HOLD * 2
+        ));
+        due += PIN_HOLD * 2;
+        lapse(&mut explorer, due);
+        clean_batches(&mut explorer, due, PIN_TRIAL_CLEAN_BATCHES);
+        assert_eq!(explorer.pin_lifted_at, Some(due));
+
+        // Pinned again before the stretch: the back-off goes on.
+        let mut soon = explorer.clone();
+        assert_eq!(
+            soon.note_unclean_batch(due + Duration::from_secs(60)),
+            Some(RungChange::PinnedSequential { hold: PIN_HOLD * 4 })
+        );
+
+        // Pinned again after it: back to the first hold.
+        let strike = due + PIN_BACKOFF_RESET_AFTER;
+        explorer.note_unclean_batch(strike);
+        assert_eq!(
+            explorer.note_unclean_batch(strike + UNCLEAN_BURST_WINDOW),
+            Some(RungChange::PinnedSequential { hold: PIN_HOLD })
+        );
+    }
+
+    // A pool rebuild carries the pin, when it lapses and how far its
+    // back-off has gone. A server rebuilt during its trial is carried
+    // pinned with the lapse already due, so its trial starts again.
+    #[test]
+    fn a_rebuild_carries_the_pin_its_lapse_and_its_back_off() {
+        let now = Instant::now();
+        let (mut prior, pinned_at) = pinned(now);
+        let due = pinned_at + PIN_HOLD;
+        lapse(&mut prior, due);
+        prior.note_unclean_batch(due);
+        assert_eq!(prior.pin_strikes, 2);
+
+        let mut rebuilt = ServerPipelineExplorer::seeded(Some(4), None, None);
+        rebuilt.note_supports_pipelining(true);
+        rebuilt.carry_pipelining_verdict(&prior);
+        assert!(rebuilt.pinned_sequential());
+        assert_eq!(rebuilt.current_depth(), 1);
+        assert_eq!(rebuilt.pinned_until, prior.pinned_until);
+        assert_eq!(rebuilt.pin_strikes, 2);
+        assert_eq!(rebuilt.last_unclean_at, prior.last_unclean_at);
+
+        // Rebuilt on the trial.
+        let again = due + PIN_HOLD * 2;
+        lapse(&mut prior, again);
+        let mut rebuilt = ServerPipelineExplorer::seeded(Some(4), None, None);
+        rebuilt.note_supports_pipelining(true);
+        rebuilt.carry_pipelining_verdict(&prior);
+        assert!(rebuilt.pinned_sequential());
+        assert_eq!(rebuilt.pinned_until, Some(again));
+        lapse(&mut rebuilt, again);
+        assert_eq!(
+            rebuilt.note_unclean_batch(again),
+            Some(RungChange::PinnedSequential { hold: PIN_HOLD * 4 })
+        );
+    }
+
+    // An outage takes every connection down, and takes down each one the
+    // lanes open for as long as it lasts. The lanes that were mid-pipeline
+    // when it began lose connections the server had been answering with
+    // later requests on the wire: one event, one strike. Every connection
+    // opened during the outage dies before the server answers anything on
+    // it, however many requests the lane wrote first, and is no strike, so
+    // a 90 second outage does not pin the server. A fault mid-pipeline after
+    // it is a strike as any other.
+    #[test]
+    fn an_outage_of_dead_connections_is_no_strike_and_a_fault_mid_pipeline_is() {
+        let now = Instant::now();
+        let mut explorer = ServerPipelineExplorer::seeded(Some(4), None, None);
+        explorer.note_supports_pipelining(true);
+
+        // Every lane was mid-pipeline when the server went away.
+        let mut strikes = Vec::new();
+        for lane in 0..8u64 {
+            let at = now + Duration::from_millis(50 * lane);
+            if let Some(change) = explorer.note_unclean_batch_at(at, 4, true, lane) {
+                strikes.push(change);
+            }
+        }
+        assert_eq!(strikes, vec![RungChange::Dropped { from: 4, to: 2 }]);
+
+        // For the rest of the outage each connection the lanes open dies
+        // before it answers anything.
+        for step in 1..=18u64 {
+            let at = now + Duration::from_secs(5 * step);
+            let depth = explorer.current_depth();
+            for lane in 0..8u64 {
+                assert_eq!(
+                    explorer.note_unclean_batch_at(at, depth, false, lane),
+                    None,
+                    "{}s lane {lane}",
+                    5 * step
+                );
+            }
+        }
+        assert!(!explorer.pinned_sequential());
+        assert_eq!(explorer.current_depth(), 2);
+        assert_eq!(explorer.last_unclean_at, Some(now));
+        assert_eq!(explorer.hold_until, Some(now + RUNG_HOLD));
+
+        // Back up, a connection that pipelined and then failed mid-pipeline
+        // inside the hold is the second strike, and pins.
+        let fault = now + Duration::from_secs(120);
+        assert_eq!(
+            explorer.note_unclean_batch_at(fault, 2, true, 0),
+            Some(RungChange::PinnedSequential { hold: PIN_HOLD })
+        );
+    }
+
+    // A trial runs on one lane. The first lane to ask after the lapse is
+    // handed depth 2; every other lane is handed sequential for as long as
+    // that lane lives, and its batches alone are counted.
+    #[test]
+    fn a_pin_trial_runs_on_one_lane_and_the_rest_stay_sequential() {
+        let now = Instant::now();
+        let (mut explorer, pinned_at) = pinned(now);
+        let due = pinned_at + PIN_HOLD;
+        lapse(&mut explorer, due);
+        assert_eq!(explorer.pin_trial_lane, Some(0));
+
+        for lane in 1..8 {
+            assert_eq!(
+                explorer.choose_mode_for_lane(true, lane, |holder| holder == 0),
+                DownloadLaneMode::Sequential,
+                "lane {lane}"
+            );
+        }
+        assert_eq!(
+            explorer.choose_mode_for_lane(true, 0, |_| panic!("the holder is not looked up")),
+            DownloadLaneMode::Pipelined { depth: 2 }
+        );
+        // Pressure holds the trial lane sequential too, and it keeps the trial.
+        assert_eq!(
+            explorer.choose_mode_for_lane(false, 0, |_| true),
+            DownloadLaneMode::Sequential
+        );
+        assert_eq!(explorer.pin_trial_lane, Some(0));
+        assert_eq!(explorer.current_depth(), 1);
+
+        // Another lane's batches, clean or not, are not the trial's: they
+        // were issued before the pin.
+        for _ in 0..PIN_TRIAL_CLEAN_BATCHES * 2 {
+            assert_eq!(explorer.note_clean_batch(due, 2, true, 3), None);
+        }
+        assert_eq!(explorer.note_unclean_batch_at(due, 2, true, 3), None);
+        assert_eq!(explorer.note_unclean_batch_at(due, 4, true, 0), None);
+        assert!(explorer.pin_trial);
+        assert_eq!(explorer.pin_trial_clean_batches, 0);
+
+        // The trial lane's unclean batch pins the server again.
+        assert_eq!(
+            explorer.note_unclean_batch_at(due, 2, true, 0),
+            Some(RungChange::PinnedSequential { hold: PIN_HOLD * 2 })
+        );
+        assert_eq!(explorer.pin_trial_lane, None);
+    }
+
+    // The trial is not lost with its lane. Once the lane is gone the next
+    // lane to ask takes the trial over, with the clean batches already
+    // counted, and no second lane runs it while the first lives.
+    #[test]
+    fn a_pin_trial_moves_to_another_lane_when_its_lane_goes() {
+        let now = Instant::now();
+        let (mut explorer, pinned_at) = pinned(now);
+        let due = pinned_at + PIN_HOLD;
+        lapse(&mut explorer, due);
+        clean_batches(&mut explorer, due, PIN_TRIAL_CLEAN_BATCHES - 2);
+
+        // Lane 0 lives: lane 5 is refused.
+        assert_eq!(
+            explorer.choose_mode_for_lane(true, 5, |_| true),
+            DownloadLaneMode::Sequential
+        );
+        assert_eq!(explorer.pin_trial_lane, Some(0));
+        // Lane 0 is gone: lane 5 takes the trial, and lane 6 is refused.
+        assert_eq!(
+            explorer.choose_mode_for_lane(true, 5, |_| false),
+            DownloadLaneMode::Pipelined { depth: 2 }
+        );
+        assert_eq!(explorer.pin_trial_lane, Some(5));
+        assert_eq!(
+            explorer.choose_mode_for_lane(true, 6, |holder| holder == 5),
+            DownloadLaneMode::Sequential
+        );
+        assert!(explorer.pin_trial);
+
+        // A late batch from the lane that went no longer counts.
+        assert_eq!(explorer.note_clean_batch(due, 2, true, 0), None);
+        assert_eq!(explorer.note_clean_batch(due, 2, true, 5), None);
+        assert_eq!(
+            explorer.note_clean_batch(due, 2, true, 5),
+            Some(RungChange::PinLifted { depth: 2 })
+        );
+        // Lifted for every lane.
+        assert_eq!(
+            explorer.choose_mode_for_lane(true, 6, |_| panic!("no trial, no holder")),
+            DownloadLaneMode::Pipelined { depth: 2 }
+        );
+    }
+
+    // A pin writes depth 1 through to the servers table, so a restart opens
+    // the server at the shallowest pipelined rung and not at the rung that
+    // just failed. The trial moves nothing on disk until it is judged, and a
+    // lift writes the rung it proved.
+    #[test]
+    fn a_pin_saves_depth_one_and_a_restart_opens_at_the_shallowest_rung() {
+        let mut explorer = ServerPipelineExplorer::seeded(Some(8), None, None);
+        explorer.note_supports_pipelining(true);
+        let now = Instant::now();
+        let dropped = explorer.note_unclean_batch(now).expect("dropped");
+        assert_eq!(dropped, RungChange::Dropped { from: 8, to: 4 });
+        assert!(dropped.settles_the_rung());
+        assert_eq!(explorer.take_persist_request(), Some(4));
+
+        let pinned_at = now + UNCLEAN_BURST_WINDOW;
+        let pinned = explorer.note_unclean_batch(pinned_at).expect("pinned");
+        assert_eq!(pinned, RungChange::PinnedSequential { hold: PIN_HOLD });
+        assert!(pinned.settles_the_rung());
+        assert_eq!(explorer.take_persist_request(), Some(1));
+        assert_eq!(explorer.take_persist_request(), None);
+
+        // A restart seeds from the saved depth.
+        let mut restarted = ServerPipelineExplorer::seeded(Some(1), None, None);
+        restarted.note_supports_pipelining(true);
+        assert_eq!(restarted.current_depth(), 2);
+        assert!(!restarted.pinned_sequential());
+        assert_eq!(
+            restarted.choose_mode(true),
+            DownloadLaneMode::Pipelined { depth: 2 }
+        );
+
+        // A clean trial writes the rung it proved.
+        let due = pinned_at + PIN_HOLD;
+        lapse(&mut explorer, due);
+        let lifted = clean_batches(&mut explorer, due, PIN_TRIAL_CLEAN_BATCHES).expect("lifted");
+        assert_eq!(lifted, RungChange::PinLifted { depth: 2 });
+        assert!(lifted.settles_the_rung());
+        assert_eq!(explorer.take_persist_request(), Some(2));
+    }
+
+    // A clean trial proved depth 2 and nothing deeper. A fault at the next
+    // rung up while the lift is still provisional gives that rung up and
+    // holds, as any unclean batch does; it does not pin. A fault back at the
+    // proven rung in that time does.
+    #[test]
+    fn a_fault_above_the_trial_rung_after_a_lift_drops_and_holds_without_pinning() {
+        let now = Instant::now();
+        let (mut explorer, pinned_at) = pinned(now);
+        let due = pinned_at + PIN_HOLD;
+        lapse(&mut explorer, due);
+        clean_batches(&mut explorer, due, PIN_TRIAL_CLEAN_BATCHES);
+        assert_eq!(
+            run_window(&mut explorer, due, 100_000, Duration::from_millis(100)),
+            Some(RungChange::Stepped { from: 2, to: 4 })
+        );
+
+        let fault = due + Duration::from_secs(60);
+        assert_eq!(
+            explorer.note_unclean_batch_at(fault, 4, true, 0),
+            Some(RungChange::Dropped { from: 4, to: 2 })
+        );
+        assert!(!explorer.pinned_sequential());
+        assert_eq!(explorer.hold_until, Some(fault + RUNG_HOLD));
+        assert_eq!(explorer.pin_strikes, 1);
+        assert_eq!(
+            explorer.choose_mode(true),
+            DownloadLaneMode::Pipelined { depth: 2 }
+        );
+
+        // The proven rung failing too is the trial's verdict undone.
+        assert_eq!(
+            explorer.note_unclean_batch_at(fault + UNCLEAN_BURST_WINDOW, 2, true, 0),
+            Some(RungChange::PinnedSequential { hold: PIN_HOLD * 2 })
+        );
     }
 
     #[test]
@@ -2038,17 +2860,34 @@ mod tests {
         assert!(!explorer.settle_pending);
     }
 
-    // The unclean batch after a dropped guess is the first one counted: it
-    // drops and holds as any other, and only the one after that pins.
+    // A burst at a guessed rung costs that one rung and nothing more: the
+    // other lanes' batches, whether issued at the dropped rung or at the
+    // rung below it, change nothing, and no depth is left to write through.
+    // The first unclean batch past the burst window is the first one
+    // counted: it drops and holds as any other, and only one after that
+    // pins.
     #[test]
     fn a_second_unclean_batch_after_a_dropped_guess_does_not_pin() {
         let mut explorer = guessed_from_probe(100);
         let now = Instant::now();
         assert_eq!(
-            explorer.note_unclean_batch(now),
+            explorer.note_unclean_batch_at(now, 4, true, 0),
             Some(RungChange::Dropped { from: 4, to: 2 })
         );
-        let next = now + Duration::from_secs(1);
+        for lane in 1..16u64 {
+            let at = now + Duration::from_millis(100 * lane);
+            let depth = if lane % 2 == 0 { 4 } else { 2 };
+            assert_eq!(
+                explorer.note_unclean_batch_at(at, depth, true, 0),
+                None,
+                "lane {lane}"
+            );
+        }
+        assert_eq!(explorer.current_depth(), 2);
+        assert_eq!(explorer.hold_until, None);
+        assert_eq!(explorer.last_unclean_at, None);
+
+        let next = now + UNCLEAN_BURST_WINDOW;
         assert_eq!(
             explorer.note_unclean_batch(next),
             Some(RungChange::Dropped { from: 2, to: 1 })
@@ -2056,10 +2895,9 @@ mod tests {
         assert!(!explorer.pinned_sequential());
         assert_eq!(explorer.hold_until, Some(next + RUNG_HOLD));
         assert_eq!(explorer.last_unclean_at, Some(next));
-
         assert_eq!(
-            explorer.note_unclean_batch(next + Duration::from_secs(1)),
-            Some(RungChange::PinnedSequential)
+            explorer.note_unclean_batch(next + UNCLEAN_BURST_WINDOW),
+            Some(RungChange::PinnedSequential { hold: PIN_HOLD })
         );
     }
 

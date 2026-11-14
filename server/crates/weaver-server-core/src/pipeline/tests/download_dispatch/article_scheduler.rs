@@ -376,13 +376,17 @@ async fn a_retention_excluded_hot_job_is_blocked_on_that_server_alone() {
     let next = JobId(71042);
     add_job(&mut pipeline, hot, "Deep Archive Reel", 200).await;
     add_job(&mut pipeline, next, "Fresh Post Reel", 200).await;
-    pipeline.job_retention_exclude_cache.insert(
-        hot,
-        (
-            std::time::Instant::now(),
-            weaver_nntp::ServerSet::from([SERVER_B]),
-        ),
-    );
+    pipeline
+        .job_retention_exclude_cache
+        .get_mut()
+        .unwrap()
+        .insert(
+            hot,
+            (
+                std::time::Instant::now(),
+                weaver_nntp::ServerSet::from([SERVER_B]),
+            ),
+        );
 
     let on_b = taken(ask(&mut pipeline, SERVER_B, 4, None));
     assert_eq!(single_job(&on_b), next);

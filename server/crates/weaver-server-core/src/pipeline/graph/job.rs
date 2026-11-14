@@ -552,7 +552,13 @@ impl GraphJob {
 
     // Whether a run or a repair of the job is still out on its thread.
     pub(crate) fn workers_out(&self) -> bool {
-        self.runs.in_flight() || self.loans.out()
+        self.runs.in_flight() || self.loan_out()
+    }
+
+    // Whether a repair, a replay or a verification of the job is out on its
+    // thread. A repair and a replay write the job's files as they go.
+    pub(in crate::pipeline) fn loan_out(&self) -> bool {
+        self.loans.out()
     }
 
     // Seam for status: whether a repair of the job is out on a thread.

@@ -523,11 +523,12 @@ impl Pipeline {
 
     // Restate the wait reason the rows of the jobs named store.
     fn restate_wait_reasons(&self, ids: impl Iterator<Item = JobId>) {
+        let login_refusals = self.login_refusal_view();
         self.shared_state.queue.write(|inner| {
             for id in ids {
                 if let Some(mut row) = inner.job_mut(id) {
-                    let reason = self.stored_wait_reason(&row);
-                    row.report.job.download_wait_reason = reason.map(str::to_owned);
+                    let reason = self.stored_wait_reason(&row, login_refusals);
+                    row.report.job.download_wait_reason = reason.map(std::borrow::Cow::into_owned);
                 }
             }
             Change::changed(())

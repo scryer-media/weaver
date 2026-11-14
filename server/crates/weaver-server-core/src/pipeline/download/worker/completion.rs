@@ -23,6 +23,7 @@ impl Pipeline {
         job_id: JobId,
         kind: DownloadFailureKind,
         delay: Option<std::time::Duration>,
+        exclude_servers: weaver_nntp::ServerSet,
     ) {
         let Some(reason) = kind.infrastructure_wait_reason() else {
             return;
@@ -42,8 +43,10 @@ impl Pipeline {
                 reason,
                 retry_at_epoch_ms,
                 pending_count: 0,
+                exclude_servers,
             });
         wait.reason = reason;
+        wait.exclude_servers = exclude_servers;
         wait.retry_at_epoch_ms = match (wait.retry_at_epoch_ms, retry_at_epoch_ms) {
             (Some(current), Some(next)) => Some(current.min(next)),
             (Some(current), None) => Some(current),
@@ -302,7 +305,12 @@ impl Pipeline {
         };
         self.note_retry_scheduled(segment_id);
         let scheduled_pool_generation = self.pool_generation;
-        self.note_infrastructure_retry_scheduled(segment_id.file_id.job_id, failure_kind, delay);
+        self.note_infrastructure_retry_scheduled(
+            segment_id.file_id.job_id,
+            failure_kind,
+            delay,
+            exclude_servers,
+        );
         self.schedule_infrastructure_retry(
             delay,
             RetryWork {
@@ -1378,6 +1386,10 @@ impl Pipeline {
                     // in this pass, not leased one batch at a time to be
                     // refused again.
                     self.retire_unservable_queued_work(job_id);
+                    // A login refused past the give-up time is the verdict
+                    // for every job that waited on the server, not this
+                    // one alone.
+                    self.tell_login_refusal_verdicts();
                 } else {
                     let seg_id = result.segment_id;
                     let completion_critical = self.segment_is_completion_critical(seg_id);
@@ -1481,6 +1493,7 @@ impl Pipeline {
                                     job_id,
                                     failure.kind,
                                     Some(delay),
+                                    retry_exclude_servers,
                                 );
                             }
                             debug!(
