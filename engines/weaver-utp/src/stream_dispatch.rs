@@ -2612,6 +2612,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 continue;
             }
 
+            if !self.state.is_remote_fin_or_later() {
+                self.user_rx.wake_on_read_below(self.last_sent_window, cx);
+            }
             self.update_tail_probe_timer();
             self.arm_next_poll(cx);
 

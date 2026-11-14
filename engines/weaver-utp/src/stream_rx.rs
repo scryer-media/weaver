@@ -467,6 +467,25 @@ impl UserRx {
         }
     }
 
+    /// Has the reader wake the stream on its next read while the window
+    /// last announced is too small for a packet of the remote's. Until the
+    /// window is announced again the remote may hold a packet it cannot
+    /// send, and only a read makes the room to announce. A read that came
+    /// since the window was last measured wakes the stream at once.
+    pub fn wake_on_read_below(&mut self, announced: u32, cx: &mut std::task::Context<'_>) {
+        if (announced as usize) >= self.max_incoming_payload.get() {
+            return;
+        }
+        let mut g = self.shared.locked.lock();
+        if g.reader_dropped {
+            return;
+        }
+        if g.queue.window() != self.last_remaining_rx_window {
+            cx.waker().wake_by_ref();
+        }
+        update_optional_waker(&mut g.dispatcher_waker, cx);
+    }
+
     /// Inform the read half that the socket is closed - there will be no more data.
     pub fn mark_vsock_closed(&self) {
         let mut g = self.shared.locked.lock();
@@ -590,6 +609,13 @@ impl UserRx {
             .saturating_sub(self.ooq.stored_bytes());
         if msg.payload().len() > remaining {
             return Ok(AssemblerAddRemoveResult::Unavailable);
+        }
+        // The remote's packets may be larger than the size this stream
+        // started with.
+        if let Some(len) = NonZeroUsize::new(msg.payload().len())
+            && len > self.max_incoming_payload
+        {
+            self.max_incoming_payload = len;
         }
         match self.ooq.add_remove(msg, offset)? {
             res @ AssemblerAddRemoveResult::Consumed {

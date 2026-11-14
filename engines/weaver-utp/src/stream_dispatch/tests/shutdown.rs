@@ -946,6 +946,88 @@ async fn test_read_gets_eof_on_fin_real_world_packets() {
     shutdown.await.unwrap();
 }
 
+// A window announced smaller than a packet, but not zero, reopens over
+// reads that are each smaller than a packet. The remote holds a packet it
+// cannot send until the window is announced again, so each read wakes the
+// stream until it is.
+#[tokio::test]
+async fn a_small_window_is_announced_again_once_reads_make_room_for_a_packet() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::task::{Context, Wake, Waker};
+
+    #[derive(Default)]
+    struct Woken(AtomicBool);
+    impl Wake for Woken {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    setup_test_logging();
+
+    const MSS: usize = 5;
+    let opts = SocketOpts {
+        vsock_rx_bufsize_bytes: Some(non_zero_const!(MSS * 2 + 2)),
+        link_mtu: Some(calc_mtu_for_mss(MSS)),
+        ..Default::default()
+    };
+    let mut t = make_test_vsock(opts, true);
+    let woken = Arc::new(Woken::default());
+    let waker = Waker::from(woken.clone());
+    // Polls until the stream stops asking for another pass.
+    let poll = |t: &mut super::TestVsock| {
+        t.tx.flush();
+        loop {
+            let polled = t.vsock.poll_unpin(&mut Context::from_waker(&waker));
+            assert!(polled.is_pending());
+            if !woken.0.swap(false, Ordering::SeqCst) {
+                break t.take_sent();
+            }
+        }
+    };
+    assert_eq!(
+        poll(&mut t),
+        vec![cmphead!(State, seq_nr = 101, ack_nr = 0)]
+    );
+
+    // Two packets leave two bytes of window: less than a packet.
+    t.send_data(1, 100, "aaaaa");
+    t.send_data(2, 100, "bbbbb");
+    assert_eq!(
+        poll(&mut t),
+        vec![cmphead!(State, seq_nr = 101, ack_nr = 2, wnd_size = 2u32)]
+    );
+
+    // Three bytes read: the window is a packet wide, but grew by less than
+    // one since it was announced, so nothing is sent.
+    let mut stream = t.stream.take().unwrap();
+    let mut buf = [0u8; 3];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert!(woken.0.swap(false, Ordering::SeqCst));
+    assert!(poll(&mut t).is_empty());
+
+    // Two more: it grew by a packet. The read wakes the stream, which
+    // announces the window.
+    let mut buf = [0u8; 2];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert!(
+        woken.0.swap(false, Ordering::SeqCst),
+        "the read that made room for a packet did not wake the stream"
+    );
+    assert_eq!(
+        poll(&mut t),
+        vec![cmphead!(State, seq_nr = 101, ack_nr = 2, wnd_size = 7u32)]
+    );
+
+    // The remote can send again: later reads wake nobody.
+    let mut buf = [0u8; 5];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert!(!woken.0.load(Ordering::SeqCst));
+}
+
 #[tokio::test]
 async fn test_window_update_ack_after_read_with_waking() {
     setup_test_logging();
