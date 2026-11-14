@@ -21,12 +21,13 @@ pub(crate) mod egress_quotas_v53;
 pub(crate) mod history_release_name_v87;
 pub(crate) mod history_retention_v89;
 pub(crate) mod history_search_key_v88;
+mod history_swept_v91;
 pub(crate) mod nzb_tables_v85;
 pub(crate) mod proxy_resolver_v64;
 mod schedule_tracks_v55;
 pub(crate) mod script_concurrency_v58;
 pub(crate) mod script_instances_v55;
-pub(crate) mod server_limit_v91;
+pub(crate) mod server_limit_v92;
 pub(crate) mod unwanted_extensions_v56;
 
 const EMBEDDED_MIGRATION_CATALOG: &[u8] =
@@ -38,7 +39,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 91;
+const CURRENT_SCHEMA_VERSION: i64 = 92;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -893,8 +894,8 @@ async fn run_rust_hook(
         history_retention_v89::HOOK_ID => {
             history_retention_v89::seed_history_retention(&mut SqlConn::Sqlite(tx)).await
         }
-        server_limit_v91::HOOK_ID => {
-            server_limit_v91::trim_servers_to_limit(&mut SqlConn::Sqlite(tx)).await
+        server_limit_v92::HOOK_ID => {
+            server_limit_v92::trim_servers_to_limit(&mut SqlConn::Sqlite(tx)).await
         }
         other => Err(StateError::Database(format!(
             "unknown migration hook id '{other}'"

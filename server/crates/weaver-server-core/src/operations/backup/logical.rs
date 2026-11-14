@@ -21,7 +21,7 @@ use super::catalog::{
 use crate::persistence::sql_runtime::{SqlConn, StoreDatastore};
 use crate::schema_migrations::{
     egress_quotas_v53, history_retention_v89, history_search_key_v88, proxy_resolver_v64,
-    script_concurrency_v58, script_instances_v55, server_limit_v91, unwanted_extensions_v56,
+    script_concurrency_v58, script_instances_v55, server_limit_v92, unwanted_extensions_v56,
 };
 use crate::security::RuntimeSecurityConfig;
 use crate::{Database, StateError};
@@ -1117,8 +1117,8 @@ async fn trim_older_server_list(
     conn: &mut SqlConn<'_>,
     source_schema_version: i64,
 ) -> Result<(), StateError> {
-    if source_schema_version < server_limit_v91::SCHEMA_VERSION {
-        server_limit_v91::trim_servers_to_limit(conn).await?;
+    if source_schema_version < server_limit_v92::SCHEMA_VERSION {
+        server_limit_v92::trim_servers_to_limit(conn).await?;
     }
     Ok(())
 }

@@ -38,16 +38,17 @@ async fn admission_and_intents_answer_without_a_running_pipeline() {
     assert_eq!(handle.get_job(id).unwrap().status, JobStatus::Paused);
     assert!(!pipeline.jobs.contains_key(&id));
     pipeline.apply_queue_intents().await;
-    assert_eq!(handle.get_job(id).unwrap().status, JobStatus::Paused);
-    assert_eq!(pipeline.jobs[&id].status, JobStatus::Paused);
-    let path = pipeline.jobs[&id].working_dir.clone();
+    // Paused before a byte of it came, the job waits as its row.
+    let info = handle.get_job(id).unwrap();
+    assert_eq!(info.status, JobStatus::Paused);
+    assert!(!pipeline.jobs.contains_key(&id));
+    let path = std::path::PathBuf::from(info.output_dir.unwrap());
     let watermark = handle.job_revision();
     handle.cancel_job(id).await.unwrap();
     assert!(handle.job_revision() > watermark);
     // Still listed: the job leaves the queue only once its history row commits.
     assert_eq!(handle.get_job(id).unwrap().status, JobStatus::Paused);
     assert!(path.exists());
-    assert!(pipeline.jobs.contains_key(&id));
 }
 
 #[tokio::test]

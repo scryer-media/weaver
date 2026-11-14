@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use super::{ids::JobId, server_attribution::JobServerAttribution};
+use super::ids::JobId;
+#[cfg(test)]
+use super::server_attribution::JobServerAttribution;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::{Database, StateError};
 
@@ -30,6 +32,7 @@ impl Database {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn load_active_server_attribution(
         &self,
         job_id: JobId,

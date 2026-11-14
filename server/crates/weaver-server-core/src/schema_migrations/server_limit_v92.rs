@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Migration 91, upgrade step: a server list an older version stored past the
+// Migration 92, upgrade step: a server list an older version stored past the
 // server limit is brought down to it, once.
 //
 // Weaver takes at most 50 servers. One pass deletes servers until 50 remain:
@@ -20,8 +20,8 @@ use crate::StateError;
 use crate::persistence::sql_runtime::SqlConn;
 use crate::servers::persistence::delete_server_rows;
 
-pub(crate) const HOOK_ID: &str = "trim_servers_to_limit_v91";
-pub(crate) const SCHEMA_VERSION: i64 = 91;
+pub(crate) const HOOK_ID: &str = "trim_servers_to_limit_v92";
+pub(crate) const SCHEMA_VERSION: i64 = 92;
 
 struct Stored {
     id: u32,
@@ -128,12 +128,22 @@ mod tests {
         .unwrap();
     }
 
-    // The real catalog, replayed to 90 with 53 servers stored and upgraded
-    // to 91: the manifest entry reaches the step, and the step deletes on
+    // The real catalog, replayed to 91 with 53 servers stored and upgraded
+    // to 92: the manifest entry reaches the step, and the step deletes on
     // the migration's own connection, a deleted server's route with it.
     // Server 1 is the primary; the others are enabled, on level 1.
     #[tokio::test]
+    async fn the_upgrade_from_91_trims_a_stored_list_to_the_limit() {
+        upgrade_trims_from(SCHEMA_VERSION - 1).await;
+    }
+
+    // The same from 90: the step runs after migration 91 in one upgrade.
+    #[tokio::test]
     async fn the_upgrade_from_90_trims_a_stored_list_to_the_limit() {
+        upgrade_trims_from(SCHEMA_VERSION - 2).await;
+    }
+
+    async fn upgrade_trims_from(from: i64) {
         use super::super::{
             apply_version_range, embedded_catalog, embedded_payload_bytes,
             replay_catalog_into_fresh_db,
@@ -147,7 +157,7 @@ mod tests {
             .unwrap();
         let catalog = embedded_catalog().unwrap();
         let payload = embedded_payload_bytes().unwrap();
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(SCHEMA_VERSION - 1), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(from), true)
             .await
             .unwrap();
         for id in 1..=53i64 {
@@ -172,7 +182,7 @@ mod tests {
             &catalog,
             &payload,
             MigrationInstallKind::Upgrade,
-            SCHEMA_VERSION,
+            from + 1,
             SCHEMA_VERSION,
         )
         .await

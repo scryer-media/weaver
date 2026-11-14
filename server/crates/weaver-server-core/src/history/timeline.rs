@@ -406,6 +406,67 @@ impl Database {
         })
     }
 
+    // As `get_last_job_event_of_kinds`, for every job of `job_ids`: one
+    // statement per bind-sized chunk, served by the (job_id, kind) index. A
+    // job with no such event is absent from the map.
+    pub(crate) fn get_last_job_events_of_kinds(
+        &self,
+        job_ids: &[u64],
+        kinds: &[&str],
+        download_finished_file_id: &str,
+    ) -> Result<std::collections::HashMap<u64, JobEvent>, StateError> {
+        if kinds.is_empty() || job_ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let fixed = kinds
+            .iter()
+            .map(|kind| SqlArg::Text((*kind).to_string()))
+            .chain(std::iter::once(SqlArg::Text(
+                download_finished_file_id.to_string(),
+            )))
+            .collect::<Vec<_>>();
+        let kind_placeholders = vec!["{}"; kinds.len()].join(", ");
+        let ids = job_ids.iter().map(|id| *id as i64).collect::<Vec<_>>();
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let mut events = std::collections::HashMap::new();
+            let chunk_len =
+                crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 1)
+                    .saturating_sub(fixed.len())
+                    .max(1);
+            for chunk in ids.chunks(chunk_len) {
+                let sql = format!(
+                    "SELECT e.job_id, e.timestamp, e.kind, e.message, e.file_id
+                       FROM job_events AS e
+                      WHERE e.id IN (
+                        SELECT MAX(x.id) FROM job_events AS x
+                         WHERE x.job_id IN ({})
+                           AND x.kind IN ({kind_placeholders})
+                           AND (x.kind <> 'DownloadFinished' OR x.file_id = {{}})
+                         GROUP BY x.job_id)",
+                    vec!["{}"; chunk.len()].join(", ")
+                );
+                let args = chunk
+                    .iter()
+                    .copied()
+                    .map(SqlArg::I64)
+                    .chain(fixed.iter().cloned())
+                    .collect::<Vec<_>>();
+                for row in SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await? {
+                    let event = JobEvent {
+                        job_id: row.i64("job_id")? as u64,
+                        timestamp: row.i64("timestamp")?,
+                        kind: row.text("kind")?,
+                        message: row.text("message")?,
+                        file_id: row.opt_text("file_id")?,
+                    };
+                    events.insert(event.job_id, event);
+                }
+            }
+            Ok(events)
+        })
+    }
+
     // How many events of each kind a job has, with the id of the newest of
     // each, ordered by that id.
     pub fn get_job_event_kind_counts(

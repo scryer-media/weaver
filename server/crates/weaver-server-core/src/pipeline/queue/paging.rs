@@ -86,6 +86,7 @@ impl JobRow {
                 seen_intent_seq: self.report.seen_intent_seq,
                 retiring: self.report.retiring,
                 restoring: self.report.restoring,
+                on_disk: self.report.on_disk,
                 post_processing_cancellable: self.report.post_processing_cancellable,
                 moving: self.report.moving,
                 download_active: self.report.download_active,

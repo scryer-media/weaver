@@ -177,15 +177,17 @@ fn cleanupable_history_output_dir(
 }
 
 // The recorded folder as the job's working directory: a direct child of the
-// intermediate root that is not a delivery folder, one whose parent is a
-// destination root (as when the complete folder is the intermediate one).
+// intermediate root that is neither a destination root nor a delivery
+// folder, one whose parent is a destination root (as when the complete
+// folder is the intermediate one).
 pub(crate) fn working_dir_on_record(
     intermediate_dir: &std::path::Path,
     recorded: &std::path::Path,
     destinations: &[PathBuf],
 ) -> Option<PathBuf> {
-    cleanupable_history_output_dir(intermediate_dir, recorded)
-        .filter(|dir| !is_delivery_dir(dir, destinations))
+    cleanupable_history_output_dir(intermediate_dir, recorded).filter(|dir| {
+        !destinations.iter().any(|root| root == dir) && !is_delivery_dir(dir, destinations)
+    })
 }
 
 // Whether `dir` sits directly in one of `destinations`, where jobs deliver.
@@ -556,41 +558,27 @@ pub(crate) async fn delete_history_rows(
     )
 }
 
-// Housekeeping for a failed job: once its scripts have stopped, every
-// working directory carrying its marker and its staging directory go the
-// way a history delete takes them, and its record stays. `marked` is what a
-// marker scan found for the job; the directory its record names is among
-// them when it still carries the job's marker, and is left, and said,
-// when it does not.
+// Housekeeping for a failed job whose scripts have stopped: the working
+// directories that carry its marker, `marked`, as a scan of the intermediate
+// root found them, and its staging directory go, and its record stays. The
+// folder its record names goes only as one of those: unmarked, another
+// job's, or a delivery folder, it is not housekeeping's to remove and stays,
+// said once. Returns whether housekeeping has done all it ever will for the
+// job; false when its recorded folder carries its marker and is still there,
+// which the next sweep's scan finds.
 pub(crate) async fn sweep_failed_job_files(
-    db: &crate::Database,
     intermediate_dir: &std::path::Path,
     staging_roots: &[PathBuf],
     job_id: JobId,
     recorded: Option<PathBuf>,
     marked: Vec<PathBuf>,
-) -> Result<(), crate::SchedulerError> {
-    retry_script_stop_wait(job_id, || {
-        crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0)
-    })
-    .await
-    .map_err(crate::SchedulerError::State)?;
-    if let Some(recorded) = recorded
-        .as_deref()
-        .and_then(|dir| working_dir_on_record(intermediate_dir, dir, staging_roots))
-        .filter(|dir| !marked.contains(dir))
-        && tokio::fs::symlink_metadata(&recorded).await.is_ok()
-    {
-        warn!(
-            job_id = job_id.0,
-            dir = %recorded.display(),
-            "a failed job's working directory has no ownership marker of the job; housekeeping leaves it"
-        );
-    }
-    let dirs = JobCleanupDirs::plan(intermediate_dir, job_id, None, marked, &[])
-        .await
-        .map_err(|(_, error)| error)?;
-    for dir in dirs.remove(intermediate_dir, job_id).await?.left_in_place {
+) -> Result<bool, crate::SchedulerError> {
+    let dirs = JobCleanupDirs {
+        owned: marked.into_iter().collect(),
+        left_in_place: Vec::new(),
+    };
+    let left_in_place = dirs.remove(intermediate_dir, job_id).await?.left_in_place;
+    for dir in &left_in_place {
         warn!(
             job_id = job_id.0,
             dir = %dir.display(),
@@ -602,7 +590,40 @@ pub(crate) async fn sweep_failed_job_files(
     for staging in staged {
         info!(dir = %staging.display(), "removed a failed job's staging directory");
     }
-    Ok(())
+    let Some(recorded) = recorded else {
+        return Ok(true);
+    };
+    let (root, destinations) = (intermediate_dir.to_path_buf(), staging_roots.to_vec());
+    tokio::task::spawn_blocking(move || {
+        match std::fs::symlink_metadata(&recorded) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+        // Still there. A delivery folder, or one outside the intermediate
+        // root, was never a working directory housekeeping takes.
+        let Some(dir) = working_dir_on_record(&root, &recorded, &destinations) else {
+            return Ok(true);
+        };
+        match crate::jobs::working_dir::working_dir_owner(&root, &dir)? {
+            Some(owner) if owner == job_id => return Ok(false),
+            Some(owner) => debug!(
+                job_id = job_id.0,
+                owner = owner.0,
+                dir = %dir.display(),
+                "a failed job's recorded folder belongs to another job; housekeeping leaves it"
+            ),
+            None => warn!(
+                job_id = job_id.0,
+                dir = %dir.display(),
+                "a failed job's recorded folder does not carry its marker; housekeeping leaves it, and removing the entry's files takes it"
+            ),
+        }
+        Ok(true)
+    })
+    .await
+    .map_err(|error| crate::SchedulerError::Io(std::io::Error::other(error)))?
+    .map_err(crate::SchedulerError::Io)
 }
 
 // Archiving history entries: their files are removed while the entries, and
@@ -943,6 +964,29 @@ async fn remove_job_files(
 mod tests {
     use super::*;
     use tokio::sync::oneshot;
+
+    // A recorded folder is the job's working directory only as a plain child
+    // of the intermediate root: never a destination root that sits there,
+    // nor a folder delivered into one.
+    #[test]
+    fn a_recorded_destination_root_is_never_a_working_dir() {
+        let intermediate = std::path::Path::new("/data/intermediate");
+        let complete = intermediate.join("complete");
+        let destinations = [complete.clone()];
+        assert_eq!(
+            working_dir_on_record(intermediate, &complete, &destinations),
+            None
+        );
+        assert_eq!(
+            working_dir_on_record(intermediate, &complete.join("show"), &destinations),
+            None
+        );
+        let working = intermediate.join("show.42");
+        assert_eq!(
+            working_dir_on_record(intermediate, &working, &destinations),
+            Some(working)
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn history_cleanup_surfaces_persistent_failure_after_bounded_backoff() {

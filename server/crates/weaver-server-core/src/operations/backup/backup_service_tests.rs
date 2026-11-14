@@ -2257,7 +2257,7 @@ fn finished_job(job_id: u64) -> JobHistoryRow {
     }
 }
 
-// A bundle written before schema 91 never passed through the step that
+// A bundle written before schema 92 never passed through the step that
 // trims a stored server list, so the restore runs it: 53 servers come back
 // as 50, by the upgrade's rule. Server 1 is the primary; of the others, on
 // level 1, the two disabled go first and then the newest. The same bundle
@@ -2284,7 +2284,7 @@ fn a_bundle_older_than_the_server_limit_step_restores_within_the_limit() {
 
     let older = Database::open(&root.path().join("older.db")).unwrap();
     older
-        .import_logical_backup(&tables, &export.tables, 90)
+        .import_logical_backup(&tables, &export.tables, 91)
         .unwrap();
     assert_eq!(
         ids(&older),

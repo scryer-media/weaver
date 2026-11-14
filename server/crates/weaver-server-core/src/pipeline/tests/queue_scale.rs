@@ -102,7 +102,7 @@ async fn a_turn_with_no_new_intent_walks_no_queue_row() {
     handle.pause_job(in_window).await.unwrap();
     pipeline.apply_queue_intents().await;
     assert!(row_walks() > settled);
-    assert_eq!(pipeline.jobs[&in_window].run_state, crate::RunState::Paused);
+    assert_eq!(row_run_state(&pipeline, in_window), crate::RunState::Paused);
     let acted = row_walks();
     pipeline.apply_queue_intents().await;
     assert_eq!(row_walks(), acted);
@@ -1141,25 +1141,35 @@ async fn the_jobs_next_up_hold_their_lists_read_ahead() {
 }
 
 // A job stored before outlines were restores with no NZB read before the
-// server answers. Each such job installs, wherever it stands, reading its NZB
-// once and storing the outline it reads; the jobs out of the window leave it
-// again. Each job then holds the summaries it held before the restart, and
-// the next restart reads no NZB.
+// server answers. Each such job reads its NZB once, wherever it stands, and
+// stores the outline it reads: a job in the window installs, and one out of
+// it reads its outline alone and waits as its row, which states its files.
+// Each job then holds the summaries it held before the restart, and the next
+// restart reads no NZB.
 #[tokio::test]
 async fn a_restart_fills_the_outlines_of_jobs_stored_without_one() {
+    use crate::jobs::service::OUTLINE_ONLY_READS;
     let temp = tempfile::tempdir().unwrap();
     let Restarted {
         mut pipeline,
-        handle: _handle,
+        handle,
         order,
         summaries: expected,
         recovery_parses,
     } = restarted_long_queue_with(&temp, true).await;
     assert_eq!(recovery_parses, 0);
     let parses = nzb_parses();
+    let outline_only = OUTLINE_ONLY_READS.load(Ordering::Relaxed);
     settle_window(&mut pipeline).await;
     assert_eq!(nzb_parses() - parses, QUEUED);
     assert_eq!(pipeline.jobs.len(), QUEUE_WINDOW + 1);
+    // Only the window and the late slot holder were installed.
+    assert_eq!(
+        OUTLINE_ONLY_READS.load(Ordering::Relaxed) - outline_only,
+        QUEUED - (QUEUE_WINDOW as u64 + 1)
+    );
+    let parked = order[QUEUE_WINDOW];
+    assert!(pipeline.window_parked(parked));
     assert!(
         order[..QUEUE_WINDOW]
             .iter()
@@ -1176,6 +1186,33 @@ async fn a_restart_fills_the_outlines_of_jobs_stored_without_one() {
     pipeline.db.flush_write_queue().await.unwrap();
     let outlines = pipeline.db.load_job_outlines(None).unwrap();
     assert_eq!(outlines.len(), QUEUED as usize);
+    // A job that waits as its row states the files its outline read.
+    let row = handle.get_job(parked).unwrap();
+    assert_eq!(row.total_files as usize, outlines[&parked].files.len());
+    assert_eq!(
+        row.total_bytes,
+        outlines[&parked]
+            .files
+            .iter()
+            .map(|file| file.bytes)
+            .sum::<u64>()
+    );
+    assert!(row.total_bytes > 0);
+    // Its wanted and remaining bytes are what the job states once it
+    // installs.
+    let parked_figures = (row.wanted_bytes, row.remaining_bytes);
+    assert!(parked_figures.0 > 0);
+    handle
+        .reorder_jobs(vec![(parked, QueueMoveTarget::Top)])
+        .await
+        .unwrap();
+    settle_window(&mut pipeline).await;
+    assert!(pipeline.jobs.contains_key(&parked));
+    let installed = handle.get_job(parked).unwrap();
+    assert_eq!(
+        (installed.wanted_bytes, installed.remaining_bytes),
+        parked_figures
+    );
     // Every job installed before the restart holds the same files.
     for (id, summaries) in &expected {
         let files: Vec<(u32, u64)> = outlines[id]
