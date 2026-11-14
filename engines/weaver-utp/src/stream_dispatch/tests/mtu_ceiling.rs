@@ -11,6 +11,7 @@ use tokio::io::AsyncWriteExt;
 use crate::{
     Error, SocketOpts,
     raw::{Type::*, UtpHeader},
+    seq_nr::SeqNr,
     stream_dispatch::{
         StreamArgs, UtpStreamStarter,
         tests::{make_test_vsock, make_test_vsock_on, test_stream_args},
@@ -64,10 +65,10 @@ const PATH_DELAY_US: u32 = 10_000;
 
 // A stream sending 512 KiB over a path that carries payloads of up to
 // `passes` bytes and drops larger ones whole, unless the send allowed them
-// to be fragmented: those arrive. The peer acks, 10 ms after each send,
-// everything before the first packet the path dropped; when nothing new
-// arrived, the clock steps a millisecond, the pacer's tick. The payloads
-// sent, in order.
+// to be fragmented: those arrive. The peer holds what arrives and acks, 10
+// ms after each send that brought something, every packet it holds in
+// order; when nothing new arrived, the clock steps a millisecond, the
+// pacer's tick. The payloads sent, in order.
 async fn over_a_path(passes: usize) -> (super::TestVsock, Vec<usize>) {
     let env = MockUtpEnvironment::new();
     let args = test_stream_args(&env, false);
@@ -90,6 +91,9 @@ async fn over_a_path(passes: usize) -> (super::TestVsock, Vec<usize>) {
         .await
         .unwrap();
     let mut sizes = Vec::new();
+    // The packets held past a hole, and the first the peer has not got.
+    let mut held = std::collections::BTreeSet::new();
+    let mut next: Option<SeqNr> = None;
     for _ in 0..20_000 {
         // Each round runs on a fresh task budget: past tokio's 128 receives
         // in one task poll, the stream's inbox reads as empty.
@@ -98,13 +102,20 @@ async fn over_a_path(passes: usize) -> (super::TestVsock, Vec<usize>) {
         let sent = t.take_sent_fragmenting();
         let data = sent.iter().filter(|(msg, _)| msg.header.get_type() == Data);
         sizes.extend(data.clone().map(|(msg, _)| msg.payload().len()));
-        let arrived = data
-            .take_while(|(msg, fragmenting)| {
-                msg.payload().len() <= passes || *fragmenting == Some(crate::Fragmenting::Allowed)
-            })
-            .last()
-            .map(|(msg, _)| msg.header.seq_nr);
-        match arrived {
+        let mut arrived = false;
+        for (msg, fragmenting) in data {
+            let next = next.get_or_insert(msg.header.seq_nr);
+            if (msg.payload().len() <= passes || *fragmenting == Some(crate::Fragmenting::Allowed))
+                && msg.header.seq_nr.is_at_or_after(*next)
+            {
+                held.insert(msg.header.seq_nr.0);
+                arrived = true;
+            }
+            while held.remove(&next.0) {
+                *next += 1;
+            }
+        }
+        match next.filter(|_| arrived).map(|next| next - 1) {
             Some(ack_nr) => {
                 t.env.increment_now(Duration::from_millis(10));
                 let timestamp_microseconds = t.vsock.timestamp_microseconds();
@@ -272,6 +283,93 @@ impl Peer {
             t.env.increment_now(Duration::from_millis(1));
         }
     }
+}
+
+// The payload of a packet `mtu` bytes long on IPv4.
+fn payload_of(mtu: usize) -> usize {
+    mtu - 48
+}
+
+// The probes a stream sent forbidding fragmentation, each once, in the
+// order first tried, with whether the path took it.
+fn probes_tried(peer: &Peer) -> Vec<(u16, usize, bool)> {
+    let mut seen = std::collections::HashSet::new();
+    peer.tried
+        .iter()
+        .zip(&peer.fragmenting)
+        .filter(|(_, fragmenting)| **fragmenting == Some(crate::Fragmenting::Never))
+        .map(|(tried, _)| *tried)
+        .filter(|&(seq_nr, len, _)| seen.insert((seq_nr, len)))
+        .collect()
+}
+
+// A path that drops every packet larger than 1280 bytes sent forbidding
+// fragmentation. Each probe tries halfway between the largest size proven
+// and the smallest lost, so the stream finds the path's size in ten probes,
+// and sends the floor's packets behind each probe while it is out
+// (libtorrent v2.0.15 utp_stream.cpp:1528-1532). Every byte arrives.
+#[tokio::test]
+async fn a_stream_finds_the_paths_size_by_halving() {
+    setup_test_logging();
+    let transport = RememberingTransport::new(ADDR_1);
+    transport.set_controls_fragmenting();
+    let (mut t, written) = writing(transport).await;
+    let mut peer = Peer::new();
+    peer.passes = payload_of(1280);
+    while t.vsock.segment_sizes.is_probing() || peer.received.len() < written.len() {
+        peer.round(&mut t).await;
+    }
+    assert!(peer.received == written, "every byte arrived, in order");
+    assert_eq!(usize::from(t.vsock.segment_sizes.mss()), payload_of(1280));
+    let sizes: Vec<usize> = probes_tried(&peer).iter().map(|p| p.1).collect();
+    let expected: Vec<usize> = [1039, 1270, 1386, 1328, 1299, 1285, 1278, 1282, 1280, 1281]
+        .into_iter()
+        .map(payload_of)
+        .collect();
+    assert_eq!(sizes, expected);
+}
+
+// A host whose path carries 1000-byte packets refuses a larger one when it
+// is sent. A refused probe is cut again smaller at once, under the same
+// sequence number, before anything after it goes, and the stream finds the
+// path's size. Every byte arrives.
+#[tokio::test]
+async fn a_refused_probe_is_cut_again_smaller_at_once() {
+    setup_test_logging();
+    let (mut t, written) = writing(RememberingTransport::new(ADDR_1)).await;
+    let mut peer = Peer::new();
+    peer.set_mtu(&mut t, 1000);
+    while t.vsock.segment_sizes.is_probing() || peer.received.len() < written.len() {
+        peer.round(&mut t).await;
+    }
+    assert!(peer.received == written, "every byte arrived, in order");
+    assert_eq!(usize::from(t.vsock.segment_sizes.mss()), payload_of(1000));
+    // Each refused send is followed at once by a smaller try of the same
+    // sequence number.
+    for pair in peer.tried.windows(2) {
+        let ((seq_nr, len, taken), (next_seq_nr, next_len, _)) = (pair[0], pair[1]);
+        if !taken {
+            assert!(len > payload_of(1000), "{seq_nr}: {len} bytes lost");
+            assert_eq!(next_seq_nr, seq_nr, "{seq_nr} cut again at once");
+            assert!(next_len < len, "{seq_nr}: {next_len} after {len}");
+        }
+    }
+    // A probe is a send larger than any the path took before it.
+    let mut proven = payload_of(576);
+    let mut sizes = Vec::new();
+    for &(_, len, taken) in &peer.tried {
+        if len > proven {
+            sizes.push(len);
+        }
+        if taken {
+            proven = proven.max(len);
+        }
+    }
+    let expected: Vec<usize> = [1039, 808, 924, 982, 1011, 997, 1004, 1001, 999, 1000]
+        .into_iter()
+        .map(payload_of)
+        .collect();
+    assert_eq!(sizes, expected);
 }
 
 // A stream with 1 MiB written, of bytes that each say where they belong,

@@ -838,9 +838,8 @@ async fn the_default_send_buffer_grows_to_the_window() {
 }
 
 // A peer writes each block as a 13-byte message header and then 16 KiB of
-// data, or in many small writes. Every data packet but the last carries a
-// full packet's payload: a part-filled one waits for more while data is in
-// flight.
+// data, or in many small writes. No data packet is part-filled for want of
+// written data: a part-filled one waits for more while data is in flight.
 #[tokio::test(start_paused = true)]
 async fn a_writer_in_pieces_fills_every_packet() {
     const BYTES: usize = 16 * 1024 * 1024;
@@ -892,10 +891,13 @@ async fn a_writer_in_pieces_fills_every_packet() {
         // that frees buffer sends nothing of its own: the ACKs the data
         // draws carry the window.
         assert_eq!(counters.window_updates, 0, "{case}: {counters:?}");
-        // Short packets are the probes that find the path's size and the
-        // last tail: one in a hundred at most.
+        // Short packets are the probes that find the path's size, the
+        // packets sent while a probe is out, which take the size proven so
+        // far as libtorrent's do (utp_stream.cpp v2.0.15:1528-1532), and the
+        // last tail: the payload sent comes within one in a hundred of full
+        // packets.
         assert!(
-            counters.short_data * 100 <= counters.data_sent,
+            counters.data_payload * 100 >= counters.data_sent * PACKET_PAYLOAD as u64 * 99,
             "{case}: {counters:?}"
         );
     }

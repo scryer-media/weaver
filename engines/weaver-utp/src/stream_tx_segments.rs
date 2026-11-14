@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-13.
+// Modified by the Weaver authors, 2026-11-14.
 
 // uTP doesn't resegment, so we pre-segment TX once.
 // We also store the delivered state of the segments here.
@@ -139,6 +139,12 @@ pub struct Segments {
 
     // The payload of segments a SACK reported delivered and still queued.
     delivered_bytes: usize,
+
+    // The sequence number of the last MTU probe cut. It is the live probe
+    // while that segment is queued, still a probe and not delivered; data
+    // cut after it may sit behind it, as libtorrent sends floor packets
+    // behind its probe (utp_stream.cpp v2.0.15:1528-1532).
+    probe_seq_nr: Option<SeqNr>,
 }
 
 pub struct SegmentForSending<'a> {
@@ -199,6 +205,18 @@ impl SegmentForSending<'_> {
     // A probe given up on as too large, resent as ordinary data.
     pub fn size_given_up(&self) -> bool {
         self.segment.size_given_up
+    }
+
+    pub fn retransmit_count(&self) -> usize {
+        self.segment.retransmit_count()
+    }
+
+    // Gives up on this probe as too large: it goes again whole as ordinary
+    // data, and its delivery proves no size. Returns its payload size.
+    pub fn give_up_probe(&mut self) -> usize {
+        self.segment.is_mtu_probe = false;
+        self.segment.size_given_up = true;
+        self.segment.payload_size
     }
 
     pub fn is_delivered(&self) -> bool {
@@ -322,6 +340,7 @@ impl Segments {
             flight_end: 0,
             flight_bytes: 0,
             delivered_bytes: 0,
+            probe_seq_nr: None,
         }
     }
 
@@ -491,6 +510,9 @@ impl Segments {
         if self.segments.len() >= MAX_RESERVED_DATA_PACKETS {
             return false;
         }
+        if is_mtu_probe {
+            self.probe_seq_nr = Some(self.next_seq_nr());
+        }
         self.segments.push_back(Segment {
             payload_size: payload_len,
             payload_offset_absolute: self.offset,
@@ -508,23 +530,48 @@ impl Segments {
         true
     }
 
-    pub fn pop_mtu_probe(&mut self, seq_nr: SeqNr) -> bool {
-        let last_segment_seq_nr = self.snd_una + self.segments.len() as u16 - 1;
-        match self.segments.back() {
-            Some(s) if last_segment_seq_nr == seq_nr && s.is_mtu_probe && !s.is_delivered => {
-                self.uncount_back();
-                let s = self.segments.pop_back().unwrap();
-                self.len_bytes -= s.payload_size;
-                self.offset = s.payload_offset_absolute;
-                self.check_running_totals();
-                true
-            }
-            _ => false,
-        }
+    // The index of the live MTU probe: queued, a probe and not delivered.
+    fn live_probe_index(&self) -> Option<usize> {
+        let index = usize::from(self.probe_seq_nr?.forward_distance_from(self.snd_una));
+        self.segments
+            .get(index)
+            .is_some_and(|s| s.is_mtu_probe && !s.is_delivered)
+            .then_some(index)
     }
 
-    /// Gives up on the MTU probe at the back once its timer has expired
-    /// often enough. A probe that was sent keeps its bytes and its sequence
+    // Whether an MTU probe is out and unanswered: no other is cut meanwhile.
+    pub fn has_live_mtu_probe(&self) -> bool {
+        self.live_probe_index().is_some()
+    }
+
+    // Drops the live probe at `seq_nr` the host refused, and the segments
+    // cut after it, when none of those was ever sent: they are cut again
+    // at the lowered size.
+    pub fn pop_mtu_probe(&mut self, seq_nr: SeqNr) -> bool {
+        let Some(index) = self.live_probe_index() else {
+            return false;
+        };
+        if self.snd_una + index as u16 != seq_nr
+            || self
+                .segments
+                .iter()
+                .skip(index + 1)
+                .any(|s| s.send_count() > 0)
+        {
+            return false;
+        }
+        while self.segments.len() > index {
+            self.uncount_back();
+            let s = self.segments.pop_back().unwrap();
+            self.len_bytes -= s.payload_size;
+            self.offset = s.payload_offset_absolute;
+        }
+        self.check_running_totals();
+        true
+    }
+
+    /// Gives up on the live MTU probe once its timer has expired often
+    /// enough. A probe that was sent keeps its bytes and its sequence
     /// number: the peer may hold it, and drops by sequence number alone
     /// anything sent again under it. It stays as ordinary data, to be resent
     /// whole, as libtorrent resends a timed-out probe (utp_stream.cpp
@@ -534,21 +581,20 @@ impl Segments {
         retransmit_timed_out: bool,
         max_probe_retransmissions: usize,
     ) -> ExpiredProbe {
-        let seq_nr = self.next_seq_nr() - 1;
-        match self.segments.back_mut() {
-            Some(s) if s.is_delivered || !s.is_mtu_probe => ExpiredProbe::Empty,
-            Some(s)
-                if retransmit_timed_out && s.retransmit_count() >= max_probe_retransmissions =>
-            {
-                s.is_mtu_probe = false;
-                s.size_given_up = true;
-                ExpiredProbe::Expired {
-                    payload_size: s.payload_size,
-                    rewind_to: seq_nr - 1,
-                }
+        let Some(index) = self.live_probe_index() else {
+            return ExpiredProbe::Empty;
+        };
+        let seq_nr = self.snd_una + index as u16;
+        let s = &mut self.segments[index];
+        if retransmit_timed_out && s.retransmit_count() >= max_probe_retransmissions {
+            s.is_mtu_probe = false;
+            s.size_given_up = true;
+            ExpiredProbe::Expired {
+                payload_size: s.payload_size,
+                rewind_to: seq_nr - 1,
             }
-            Some(_) => ExpiredProbe::NotExpired,
-            None => ExpiredProbe::Empty,
+        } else {
+            ExpiredProbe::NotExpired
         }
     }
 

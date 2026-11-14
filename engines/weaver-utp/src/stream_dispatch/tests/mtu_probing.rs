@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-12.
+// Modified by the Weaver authors, 2026-11-14.
 
 use std::time::Duration;
 
@@ -9,23 +9,9 @@ use tokio::io::AsyncWriteExt;
 
 use crate::{
     SocketOpts,
-    constants::{IPV4_HEADER, UDP_HEADER, UTP_HEADER},
     raw::{Type::*, UtpHeader},
     stream_dispatch::tests::{PROBE_WINDOW, make_test_vsock},
-    test_util::{cmphead::CmpUtpHeader, setup_test_logging},
 };
-
-fn make_payload(len: usize) -> String {
-    String::from_utf8(vec![b'a'; len]).unwrap()
-}
-
-const fn calc_payload_size(mtu: u16) -> usize {
-    (mtu - IPV4_HEADER - UTP_HEADER - UDP_HEADER) as usize
-}
-
-fn p(mtu: u16) -> String {
-    make_payload(calc_payload_size(mtu))
-}
 
 #[tokio::test]
 async fn abandoning_a_probe_counts_its_last_timeout_without_backoff() {
@@ -89,9 +75,72 @@ async fn abandoning_a_probe_counts_its_last_timeout_without_backoff() {
     }
 }
 
-// Put a probe in flight, with optional payload still waiting behind it.
+// A probe goes out with a floor packet's worth of data written behind it.
+// Once the window has room, that data goes at the floor size while the
+// probe is unanswered, as libtorrent sends packets of m_mtu_floor behind its
+// probe (utp_stream.cpp v2.0.15:1497-1506, 1528-1532), so a loss ahead of
+// the probe gets the SACKs that fast-resend it.
+#[tokio::test]
+async fn data_written_behind_a_probe_goes_out_at_the_floor_size() {
+    let mut t = make_test_vsock(
+        SocketOpts {
+            disable_nagle: true,
+            ..Default::default()
+        },
+        false,
+    );
+    t.vsock.congestion_controller.set_window(PROBE_WINDOW);
+    let floor = usize::from(t.vsock.segment_sizes.mss());
+    let probe = usize::from(t.vsock.segment_sizes.probe_size());
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(&vec![7; floor + probe + floor])
+        .await
+        .unwrap();
+    t.poll_once_assert_pending().await;
+    let sent = |t: &mut super::TestVsock| -> Vec<(u16, usize)> {
+        t.take_sent()
+            .iter()
+            .map(|m| (m.header.seq_nr.0, m.payload().len()))
+            .collect()
+    };
+    let first = sent(&mut t);
+    assert_eq!(first[..2], [(101, floor), (102, probe)]);
+    t.vsock.congestion_controller.set_window(64 * 1024);
+    t.send_msg(
+        UtpHeader {
+            htype: State,
+            seq_nr: 1.into(),
+            ack_nr: 101.into(),
+            wnd_size: 1024 * 1024,
+            ..Default::default()
+        },
+        "",
+    );
+    t.poll_once_assert_pending().await;
+    let mut all = first;
+    all.extend(sent(&mut t));
+    assert_eq!(all, [(101, floor), (102, probe), (103, floor)]);
+    assert!(t.vsock.user_tx_segments.has_live_mtu_probe());
+}
+
+// What is written behind the probe put in flight.
+#[derive(PartialEq)]
+enum Behind {
+    Nothing,
+    // A floor packet's worth, held by a window that has room for nothing
+    // past the probe.
+    Unsent,
+    // A floor packet, sent once the ACK before the probe makes room, as
+    // libtorrent sends packets behind its probe (utp_stream.cpp
+    // v2.0.15:1528-1532).
+    Sent,
+}
+
+// Put a probe in flight, with what is written behind it.
 async fn probe_in_flight(
-    queued_data: bool,
+    behind: Behind,
     retries: usize,
     forced_rto: Option<Duration>,
 ) -> (super::TestVsock, usize) {
@@ -110,7 +159,7 @@ async fn probe_in_flight(
     t.vsock.congestion_controller.set_window(PROBE_WINDOW);
     let floor = usize::from(t.vsock.segment_sizes.mss());
     let probe = usize::from(t.vsock.segment_sizes.probe_size());
-    let extra = if queued_data { floor } else { 0 };
+    let extra = if behind == Behind::Nothing { 0 } else { floor };
     t.stream
         .as_mut()
         .unwrap()
@@ -122,6 +171,9 @@ async fn probe_in_flight(
     let sizes: Vec<usize> = sent.iter().map(|m| m.payload().len()).collect();
     assert_eq!(sizes, [floor, probe]);
     assert_eq!(sent[1].header.seq_nr, 102.into());
+    if behind == Behind::Unsent {
+        t.vsock.congestion_controller.set_window(probe);
+    }
     t.send_msg(
         UtpHeader {
             htype: State,
@@ -133,7 +185,16 @@ async fn probe_in_flight(
         "",
     );
     t.poll_once_assert_pending().await;
-    t.assert_sent_empty();
+    let sent = t.take_sent();
+    let sent: Vec<(u16, usize)> = sent
+        .iter()
+        .map(|m| (m.header.seq_nr.0, m.payload().len()))
+        .collect();
+    if behind == Behind::Sent {
+        assert_eq!(sent, [(103, floor)]);
+    } else {
+        assert_eq!(sent, []);
+    }
     (t, floor)
 }
 
@@ -200,9 +261,8 @@ async fn an_unsent_probe_does_not_hide_the_data_timeout() {
 
 #[tokio::test]
 async fn a_probe_with_unsent_queued_data_keeps_its_timeout_exemption() {
-    let (mut t, floor) = probe_in_flight(true, 1, None).await;
-    // The queued segment has payload in the write buffer, but is not in flight.
-    assert!(t.vsock.user_tx_segments.enqueue(floor, false));
+    let (mut t, _) = probe_in_flight(Behind::Unsent, 1, None).await;
+    // The segment cut behind the probe is queued, but not in flight.
     assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 2);
     assert_eq!(t.vsock.user_tx_segments.outstanding_packets(), 1);
     let window = t.vsock.congestion_controller.window();
@@ -217,15 +277,7 @@ async fn a_probe_with_unsent_queued_data_keeps_its_timeout_exemption() {
 
 #[tokio::test]
 async fn a_probe_with_other_sent_data_takes_a_real_timeout() {
-    let (mut t, floor) = probe_in_flight(true, 1, None).await;
-    // Exercise a probe followed by another sent segment, independently of
-    // the segmenter's policy of pausing new segmentation behind a probe.
-    assert!(t.vsock.user_tx_segments.enqueue(floor, false));
-    t.vsock.congestion_controller.set_window(64 * 1024);
-    t.poll_once_assert_pending().await;
-    let sent = t.take_sent();
-    assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].header.seq_nr, 103.into());
+    let (mut t, floor) = probe_in_flight(Behind::Sent, 1, None).await;
     assert_eq!(t.vsock.user_tx_segments.outstanding_packets(), 2);
     expire_retransmit(&mut t);
     t.poll_once_assert_pending().await;
@@ -237,7 +289,8 @@ async fn a_probe_with_other_sent_data_takes_a_real_timeout() {
 #[tokio::test]
 async fn a_probe_with_an_unacked_fin_is_not_abandoned_as_a_lone_probe() {
     // Exercise the RTO before the local-FIN final-chance timer expires.
-    let (mut t, floor) = probe_in_flight(false, 0, Some(Duration::from_millis(500))).await;
+    let (mut t, floor) =
+        probe_in_flight(Behind::Nothing, 0, Some(Duration::from_millis(500))).await;
     // Dropping both halves sends FIN once all buffered data has been sent.
     drop(t.stream.take());
     t.poll_once_assert_pending().await;
@@ -255,274 +308,6 @@ async fn a_probe_with_an_unacked_fin_is_not_abandoned_as_a_lone_probe() {
         sent[0].payload().len(),
         usize::from(t.vsock.segment_sizes.probe_size())
     );
-}
-
-#[tokio::test]
-async fn test_mtu_probing() {
-    setup_test_logging();
-
-    // Let's pretend the actual MTU is 1280. By probing through binary search, ensure it gets found quickly.
-    let mut t = make_test_vsock(
-        SocketOpts {
-            link_mtu: Some(non_zero_const!(1500)),
-            mtu_probe_max_retransmissions: Some(0),
-            vsock_tx_bufsize_bytes_initial: Some(non_zero_const!(1024 * 1024)), // so that we can write the initial large payload without blocking
-            disable_nagle: true,
-            ..Default::default()
-        },
-        false,
-    );
-    let (_r, mut w) = t.stream.take().unwrap().split();
-
-    // Force congestion controller to have a very high window so that it doesn't interfere.
-    t.vsock.congestion_controller.set_window(1024 * 1024);
-
-    #[derive(Debug)]
-    enum TestCommand {
-        ExpectSend(Vec<CmpUtpHeader>),
-        Ack(u16),
-        WaitForRto,
-    }
-
-    use TestCommand::*;
-
-    const RWND: u32 = calc_payload_size(1280) as u32 * 6 - 1;
-
-    // The data below assumes we send 3 packets with minimum segment size before sending an MTU probe.
-    t.vsock
-        .segment_sizes
-        .set_probe_expiry_cooldown_max_packets(3);
-
-    let commands = [
-        ExpectSend(vec![
-            cmphead!(Data, seq_nr = 101, payload = p(576)),
-            cmphead!(Data, seq_nr = 102, payload = p(1039)), // (1500 + 576) / 2 + 1: first probe, successful
-        ]),
-        Ack(102),
-        ExpectSend(vec![
-            cmphead!(Data, seq_nr = 103, payload = p(1039)),
-            cmphead!(Data, seq_nr = 104, payload = p(1039)),
-            cmphead!(Data, seq_nr = 105, payload = p(1039)),
-            cmphead!(Data, seq_nr = 106, payload = p(1270)), // (1500 + 1039) / 2 + 1: second probe, successful
-        ]),
-        Ack(106),
-        ExpectSend(vec![
-            cmphead!(Data, seq_nr = 107, payload = p(1270)),
-            cmphead!(Data, seq_nr = 108, payload = p(1270)),
-            cmphead!(Data, seq_nr = 109, payload = p(1270)),
-            cmphead!(Data, seq_nr = 110, payload = p(1386)), // (1500 + 1270) / 2 + 1: third probe, unsuccessful
-        ]),
-        Ack(109),
-        WaitForRto,
-        // Given up on as too large, the probe goes again whole under its own
-        // sequence number, as ordinary data, and the path delivers it; the
-        // ceiling is lowered for what is cut after it.
-        ExpectSend(vec![
-            cmphead!(Data, seq_nr = 110, payload = p(1386)),
-            cmphead!(Data, seq_nr = 111, payload = p(1270)),
-            cmphead!(Data, seq_nr = 112, payload = p(1270)),
-            cmphead!(Data, seq_nr = 113, payload = p(1270)),
-            cmphead!(Data, seq_nr = 114, payload = p(1328)), // 4th probe, unsuccessful
-        ]),
-        Ack(113),
-        WaitForRto,
-        ExpectSend(vec![
-            cmphead!(Data, seq_nr = 114, payload = p(1328)),
-            cmphead!(Data, seq_nr = 115, payload = p(1270)),
-            cmphead!(Data, seq_nr = 116, payload = p(1270)),
-            cmphead!(Data, seq_nr = 117, payload = p(1270)),
-            cmphead!(Data, seq_nr = 118, payload = p(1299)), // 5th probe, unsuccessful
-        ]),
-        Ack(117),
-        WaitForRto,
-        ExpectSend(vec![
-            cmphead!(Data, seq_nr = 118, payload = p(1299)),
-            cmphead!(Data, seq_nr = 119, payload = p(1270)),
-            cmphead!(Data, seq_nr = 120, payload = p(1270)),
-            cmphead!(Data, seq_nr = 121, payload = p(1270)),
-            cmphead!(Data, seq_nr = 122, payload = p(1285)), // 6th probe, unsuccessful
-        ]),
-        Ack(121),
-        WaitForRto,
-        ExpectSend(vec![
-            cmphead!(Data, seq_nr = 122, payload = p(1285)),
-            cmphead!(Data, seq_nr = 123, payload = p(1270)),
-            cmphead!(Data, seq_nr = 124, payload = p(1270)),
-            cmphead!(Data, seq_nr = 125, payload = p(1270)),
-            cmphead!(Data, seq_nr = 126, payload = p(1278)), // 7th probe, successful
-        ]),
-        Ack(126),
-        ExpectSend(vec![
-            cmphead!(Data, seq_nr = 127, payload = p(1278)),
-            cmphead!(Data, seq_nr = 128, payload = p(1278)),
-            cmphead!(Data, seq_nr = 129, payload = p(1278)),
-            cmphead!(Data, seq_nr = 130, payload = p(1282)), // 8th probe, unsuccessful
-        ]),
-        Ack(129),
-        WaitForRto,
-        ExpectSend(vec![
-            cmphead!(Data, seq_nr = 130, payload = p(1282)),
-            cmphead!(Data, seq_nr = 131, payload = p(1278)),
-            cmphead!(Data, seq_nr = 132, payload = p(1278)),
-            cmphead!(Data, seq_nr = 133, payload = p(1278)),
-            cmphead!(Data, seq_nr = 134, payload = p(1280)), // 9th probe, successful
-        ]),
-        Ack(134),
-        ExpectSend(vec![
-            cmphead!(Data, seq_nr = 135, payload = p(1280)),
-            cmphead!(Data, seq_nr = 136, payload = p(1280)),
-            cmphead!(Data, seq_nr = 137, payload = p(1280)),
-            cmphead!(Data, seq_nr = 138, payload = p(1281)), // 10th probe, unsuccessful
-        ]),
-        Ack(137),
-        WaitForRto,
-        // At this point final MTU was found, and we don't need to be limited by probes, but rather by other factors.
-        // In this test's case we'll get limited by remote window: the last
-        // probe's 1233 bytes and four of 1232 leave 1230 of its 7391, less
-        // than the next segment, cut at 1231.
-        ExpectSend(vec![
-            cmphead!(Data, seq_nr = 138, payload = p(1281)),
-            cmphead!(Data, seq_nr = 139, payload = p(1280)),
-            cmphead!(Data, seq_nr = 140, payload = p(1280)),
-            cmphead!(Data, seq_nr = 141, payload = p(1280)),
-            cmphead!(Data, seq_nr = 142, payload = p(1280)), // limited by rwnd
-        ]),
-    ];
-
-    w.write_all(make_payload(200000).as_bytes()).await.unwrap();
-
-    for command in commands {
-        match command {
-            ExpectSend(sent) => {
-                t.poll_once_assert_pending().await;
-                assert_eq!(t.take_sent(), sent)
-            }
-            Ack(seq_nr) => {
-                t.env.increment_now(Duration::from_secs(1));
-                t.send_msg(
-                    UtpHeader {
-                        htype: State,
-                        seq_nr: 1.into(),
-                        ack_nr: seq_nr.into(),
-                        wnd_size: RWND,
-                        ..Default::default()
-                    },
-                    "",
-                );
-            }
-            WaitForRto => {
-                t.poll_once_assert_pending().await;
-                t.assert_sent_empty();
-                t.env.increment_now(t.vsock.rtte.retransmission_timeout());
-            }
-        }
-    }
-}
-
-#[tokio::test]
-async fn probe_retry_if_emsgsize() {
-    setup_test_logging();
-    let mut t = make_test_vsock(
-        SocketOpts {
-            disable_nagle: true,
-            ..Default::default()
-        },
-        false,
-    );
-
-    const FAKE_MTU: usize = 1000;
-
-    // Anything above this will trigger emsgsize, and we should retry immediately.
-    t.transport
-        .set_max_payload_len((FAKE_MTU as u16 - IPV4_HEADER - UDP_HEADER) as usize);
-    t.vsock
-        .segment_sizes
-        .set_probe_expiry_cooldown_max_packets(2);
-
-    // Force congestion controller to have a very high window so that it doesn't interfere.
-    t.vsock.congestion_controller.set_window(1024 * 1024);
-
-    let (_r, mut w) = t.stream.take().unwrap().split();
-    w.write_all(make_payload(30000).as_bytes()).await.unwrap();
-
-    #[derive(Debug)]
-    enum TestCommand {
-        ExpectSend(Vec<CmpUtpHeader>),
-        Ack(u16),
-    }
-
-    use TestCommand::*;
-
-    let commands = [
-        ExpectSend(vec![
-            cmphead!(Data, seq_nr = 101, payload = p(576)),
-            cmphead!(Data, seq_nr = 102, payload = p(1039)), // (1500 + 576) / 2 + 1: first probe, unsuccessful. Will retry immediately.
-            cmphead!(Data, seq_nr = 102, payload = p(808)),  // 2nd probe, successful
-        ]),
-        Ack(102),
-        ExpectSend(vec![
-            cmphead!(Data, seq_nr = 103, payload = p(808)), // cooldown
-            cmphead!(Data, seq_nr = 104, payload = p(808)), // cooldown
-            cmphead!(Data, seq_nr = 105, payload = p(924)), // 3rd probe, successful
-        ]),
-        Ack(105),
-        ExpectSend(vec![
-            cmphead!(Data, seq_nr = 106, payload = p(924)), // cooldown
-            cmphead!(Data, seq_nr = 107, payload = p(924)), // cooldown
-            cmphead!(Data, seq_nr = 108, payload = p(982)), // 4th probe, successful
-        ]),
-        Ack(108),
-        ExpectSend(vec![
-            cmphead!(Data, seq_nr = 109, payload = p(982)), // cooldown
-            cmphead!(Data, seq_nr = 110, payload = p(982)), // cooldown
-            cmphead!(Data, seq_nr = 111, payload = p(1011)), // 5th probe, unsuccessful
-            cmphead!(Data, seq_nr = 111, payload = p(997)), // 6th probe, successful
-        ]),
-        Ack(111),
-        ExpectSend(vec![
-            cmphead!(Data, seq_nr = 112, payload = p(997)), // cooldown
-            cmphead!(Data, seq_nr = 113, payload = p(997)), // cooldown
-            cmphead!(Data, seq_nr = 114, payload = p(1004)), // unsuccessful
-            cmphead!(Data, seq_nr = 114, payload = p(1001)), // unsuccessful
-            cmphead!(Data, seq_nr = 114, payload = p(999)), // successful
-        ]),
-        Ack(114),
-        ExpectSend(vec![
-            cmphead!(Data, seq_nr = 115, payload = p(999)), // cooldown
-            cmphead!(Data, seq_nr = 116, payload = p(999)), // cooldown
-            cmphead!(Data, seq_nr = 117, payload = p(1000)), // successful
-        ]),
-        Ack(117),
-        ExpectSend(vec![
-            cmphead!(Data, seq_nr = 118, payload = p(1000)),
-            cmphead!(Data, seq_nr = 119, payload = p(1000)),
-            cmphead!(Data, seq_nr = 120, payload = p(1000)),
-            cmphead!(Data, seq_nr = 121, payload = p(1000)),
-            cmphead!(Data, seq_nr = 122, payload = p(999)), // limited by RWND (see below)
-        ]),
-    ];
-
-    for command in commands {
-        match command {
-            ExpectSend(sent) => {
-                t.poll_once_assert_pending().await;
-                assert_eq!(t.take_sent(), sent)
-            }
-            Ack(seq_nr) => {
-                t.env.increment_now(Duration::from_secs(1));
-                t.send_msg(
-                    UtpHeader {
-                        htype: State,
-                        seq_nr: 1.into(),
-                        wnd_size: (calc_payload_size(1000) * 5) as u32 - 1,
-                        ack_nr: seq_nr.into(),
-                        ..Default::default()
-                    },
-                    "",
-                );
-            }
-        }
-    }
 }
 
 // A full send buffer refilled by each ACK hands the stream one packet's

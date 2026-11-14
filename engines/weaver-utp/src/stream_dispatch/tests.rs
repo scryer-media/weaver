@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-12.
+// Modified by the Weaver authors, 2026-11-14.
 
 mod arrival_time;
 mod basics;
@@ -23,6 +23,7 @@ mod pacing;
 mod packet_validation;
 mod probe_payload;
 mod refused_sends;
+mod resend_after_timeout;
 mod retransmit_timer;
 mod rtte;
 mod sack_on_data;
