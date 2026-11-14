@@ -1616,28 +1616,51 @@ impl NntpPool {
         );
     }
 
-    // Every server's standing for article eligibility, as of now. Takes no
-    // lock: health availability comes from the tracker's published board,
-    // and credentials, routes and quotas are lock-free reads of their own,
-    // so a sample never waits and never fails for contention.
+    // Every server's standing for article eligibility, as of now. Health
+    // availability comes from the tracker's published board, and credentials
+    // and routes are lock-free reads of their own. Only a server with a
+    // quota takes its transfer state's lock, briefly, to read what is left;
+    // one without a quota is known from a lock-free read to have no limit.
     pub fn provider_policy(&self) -> crate::provider_policy::ProviderPolicy {
+        self.provider_policy_with(|control| {
+            if control.quota_configured() {
+                Self::quota_left(control)
+            } else {
+                u64::MAX
+            }
+        })
+    }
+
+    // The policy with every server's quota read from a snapshot, as it once
+    // was, for the tests that hold the lock-free read to it.
+    #[cfg(test)]
+    pub(crate) fn provider_policy_by_snapshot(&self) -> crate::provider_policy::ProviderPolicy {
+        self.provider_policy_with(Self::quota_left)
+    }
+
+    // What the quota leaves before local reservations; no limit without one.
+    fn quota_left(control: &crate::transfer::ServerTransferControl) -> u64 {
+        let quota = control.snapshot();
+        if quota.quota_enabled {
+            quota
+                .quota_limit_bytes
+                .saturating_sub(quota.quota_used_bytes)
+        } else {
+            u64::MAX
+        }
+    }
+
+    fn provider_policy_with(
+        &self,
+        quota_left: impl Fn(&crate::transfer::ServerTransferControl) -> u64,
+    ) -> crate::provider_policy::ProviderPolicy {
         use crate::provider_policy::{ProviderGroup, ProviderPolicy, ProviderState};
         ProviderPolicy::sampled(
             (0..self.configs.len())
                 .map(|idx| {
-                    let quota_remaining =
-                        self.transfer_controls[idx]
-                            .as_ref()
-                            .map_or(u64::MAX, |control| {
-                                let quota = control.snapshot();
-                                if quota.quota_enabled {
-                                    quota
-                                        .quota_limit_bytes
-                                        .saturating_sub(quota.quota_used_bytes)
-                                } else {
-                                    u64::MAX
-                                }
-                            });
+                    let quota_remaining = self.transfer_controls[idx]
+                        .as_deref()
+                        .map_or(u64::MAX, &quota_left);
                     ProviderState {
                         group: ProviderGroup {
                             backfill: self.backfill[idx],
