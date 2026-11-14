@@ -36,9 +36,9 @@ use crate::pipeline::extraction::ExtractionFailure;
 #[cfg(test)]
 pub(crate) use claims::Claim;
 pub(crate) use claims::Delivered;
-pub(crate) use claims::{Delivery, Unarrived};
 #[cfg(test)]
 pub(crate) use claims::root_furniture;
+pub(crate) use claims::{Delivery, Unarrived};
 pub(in crate::pipeline) use seams::advance;
 pub(crate) use slots::RepairSlots;
 pub(crate) use summary::{RecoverySummary, SetSummary};
