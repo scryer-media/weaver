@@ -1420,12 +1420,100 @@ impl TorrentStateLive {
     // is served; the connection stays either way, and the check of every
     // piece closes it as ours, as `torrent::force_recheck` does
     // (`disconnect_all`).
+    //
+    // A piece is checked once however many ask for it meanwhile: the first
+    // to ask checks it and the rest wait for what that check finds
+    // (libtorrent skips a request whose piece is `verifying_piece`,
+    // peer_connection.cpp:5316, v2.0.15). The wait here blocks its thread.
     pub(crate) fn check_seeded(&self, piece: ValidPieceIndex) -> anyhow::Result<bool> {
+        use crate::torrent_state::seed_mode::Claim;
+        let seed = &self.shared.options.seed;
+        loop {
+            if !seed.unchecked(piece) {
+                return Ok(true);
+            }
+            match seed.claim(piece) {
+                Claim::Check(checking) => return self.check_claimed(piece, checking),
+                Claim::Wait(mut found) => {
+                    crate::session_stats::check::CHECK_STATS.seed_checks_joined(1);
+                    // A check that ended in an error told nothing: the
+                    // piece is claimed again.
+                    if let Ok(served) = found.blocking_recv() {
+                        return Ok(served);
+                    }
+                }
+            }
+        }
+    }
+
+    // A peer's request for a block of `piece` waits here while the torrent
+    // is in seed mode and the piece is not yet checked. The check runs on a
+    // blocking thread of the session and holds one of the session's
+    // blocking permits, those the reads of blocks and the checks of
+    // downloaded pieces share: as many seed-mode pieces are read at once as
+    // the session has permits (`SessionOptions::runtime_worker_threads`, 8
+    // by default), however many peers ask. libtorrent runs these hashes on
+    // its `aio_threads` (10) and allows each peer three
+    // (peer_connection.cpp:5318-5319, v2.0.15). Waiting for another's check
+    // holds neither a thread nor a permit.
+    pub(crate) async fn serve_seeded(
+        self: &Arc<Self>,
+        piece: ValidPieceIndex,
+    ) -> anyhow::Result<bool> {
+        use crate::torrent_state::seed_mode::Claim;
+        let seed = &self.shared.options.seed;
+        loop {
+            if !seed.unchecked(piece) {
+                return Ok(true);
+            }
+            match seed.claim(piece) {
+                Claim::Check(checking) => {
+                    let permit = self.shared.spawner.semaphore().acquire_owned().await?;
+                    let state = Arc::clone(self);
+                    // On the session's pool: a uTP thread's runtime has a
+                    // pool of its own, which nothing bounds.
+                    return self
+                        .shared
+                        .spawner
+                        .spawn_blocking(move || {
+                            let _permit = permit;
+                            state.check_claimed(piece, checking)
+                        })
+                        .await?;
+                }
+                Claim::Wait(mut found) => {
+                    crate::session_stats::check::CHECK_STATS.seed_checks_joined(1);
+                    if let Ok(served) = found.recv().await {
+                        return Ok(served);
+                    }
+                }
+            }
+        }
+    }
+
+    // The check of a seed-mode piece by the one that claimed it. Those
+    // that wait on the claim hear what it found; an error tells them
+    // nothing and lets go of the claim.
+    fn check_claimed(
+        &self,
+        piece: ValidPieceIndex,
+        checking: crate::torrent_state::seed_mode::Checking,
+    ) -> anyhow::Result<bool> {
+        let served = self.check_unchecked(piece)?;
+        checking.found(served);
+        Ok(served)
+    }
+
+    fn check_unchecked(&self, piece: ValidPieceIndex) -> anyhow::Result<bool> {
         let seed = &self.shared.options.seed;
         if !seed.unchecked(piece) {
             return Ok(true);
         }
-        if matches!(self.file_ops().check_piece(piece), Ok(Verdict::Passed)) {
+        crate::session_stats::check::CHECK_STATS.seed_checks_started(1);
+        if matches!(
+            self.file_ops().check_piece_whole(piece),
+            Ok(Verdict::Passed)
+        ) {
             self.files.on_piece_checked(piece)?;
             if seed.checked(piece) {
                 debug!("every piece passed its check: seed mode ends");
@@ -2851,21 +2939,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     // A seed-mode piece is checked on a blocking thread, and the peer's
     // writer waits for it (libtorrent `peer_connection::fill_send_buffer`
     // queues `disk_interface::async_hash` and keeps the request until
-    // `on_seed_mode_hashed`): the hash holds none of the permits the reads
-    // of blocks share.
+    // `on_seed_mode_hashed`).
     async fn serves(&self, chunk: &ChunkInfo) -> anyhow::Result<bool> {
-        let piece = chunk.piece_index;
-        if !self.state.shared.options.seed.unchecked(piece) {
-            return Ok(true);
-        }
-        let state = Arc::clone(&self.state);
-        // On the session's pool: a uTP thread's runtime has a pool of its
-        // own, which nothing bounds.
-        self.state
-            .shared
-            .spawner
-            .spawn_blocking(move || state.check_seeded(piece))
-            .await?
+        self.state.serve_seeded(chunk.piece_index).await
     }
 
     fn read_chunk(&self, chunk: &ChunkInfo, buf: &mut [u8]) -> anyhow::Result<()> {
