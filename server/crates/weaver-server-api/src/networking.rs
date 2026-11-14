@@ -758,6 +758,8 @@ pub enum LookupErrorCode {
     TimedOut,
     ServerFailure,
     NoReply,
+    NotAuthenticated,
+    TlsFailed,
     Other,
 }
 impl From<core::LookupFailure> for LookupErrorCode {
@@ -768,6 +770,8 @@ impl From<core::LookupFailure> for LookupErrorCode {
             core::LookupFailure::TimedOut => Self::TimedOut,
             core::LookupFailure::ServerFailure => Self::ServerFailure,
             core::LookupFailure::NoReply => Self::NoReply,
+            core::LookupFailure::NotAuthenticated => Self::NotAuthenticated,
+            core::LookupFailure::TlsFailed => Self::TlsFailed,
             core::LookupFailure::Other => Self::Other,
         }
     }

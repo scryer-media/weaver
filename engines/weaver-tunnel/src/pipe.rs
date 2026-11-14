@@ -42,6 +42,7 @@ use tokio::{
 use crate::{
     TunnelError, TunnelProvider, TunnelStream,
     bridge::ConnectionOutcome,
+    dns::{DnsServer, Trust},
     egress::SocketEgress,
     endpoint::{DatagramTransport, EndpointStream, EndpointTransport, UdpSocketFactory},
     fault::{self, ProxyFault},
@@ -116,32 +117,38 @@ pub struct Target {
 pub enum Naming {
     // Weaver resolves the name with the host's own DNS.
     Host,
-    // Weaver asks these servers in order, from the route's egress.
+    // Weaver asks these servers in order, from the route's egress, and
+    // judges their answers by `trust`.
     Servers {
-        servers: Vec<IpAddr>,
+        servers: Vec<DnsServer>,
+        trust: Trust,
         egress: Arc<dyn Dialer>,
         answers: Arc<ResolutionCache<DialError>>,
     },
     // The proxy is handed the name and resolves it.
     Proxy,
-    // These servers are asked in order, through the proxy.
+    // These servers are asked in order, through the proxy, and their
+    // answers judged by `trust`.
     ProxyServers {
-        servers: Vec<IpAddr>,
+        servers: Vec<DnsServer>,
+        trust: Trust,
         answers: Arc<ResolutionCache<DialError>>,
     },
 }
 
 impl Naming {
-    pub fn servers(servers: Vec<IpAddr>, egress: Arc<dyn Dialer>) -> Self {
+    pub fn servers(servers: Vec<DnsServer>, trust: Trust, egress: Arc<dyn Dialer>) -> Self {
         Self::Servers {
             servers,
+            trust,
             egress,
             answers: Default::default(),
         }
     }
-    pub fn proxy_servers(servers: Vec<IpAddr>) -> Self {
+    pub fn proxy_servers(servers: Vec<DnsServer>, trust: Trust) -> Self {
         Self::ProxyServers {
             servers,
+            trust,
             answers: Default::default(),
         }
     }
@@ -167,28 +174,39 @@ impl Naming {
         }
         record::asking(host, || match self {
             Self::Host => Asker::host(),
-            Self::Servers { servers, .. } => Asker::servers(servers),
+            Self::Servers { servers, trust, .. } => Asker::servers(servers, *trust),
             Self::Proxy => Asker::proxy(proxy),
-            Self::ProxyServers { servers, .. } => Asker::proxy_servers(proxy, servers),
+            Self::ProxyServers { servers, trust, .. } => {
+                Asker::proxy_servers(proxy, servers, *trust)
+            }
         });
+        // Each naming value holds its own answers, and its trust never
+        // changes, so every answer held under `RequireAd` was authenticated
+        // when it was stored. A lookup that was refused is an error, which
+        // the cache never holds.
         let resolving = async {
             match self {
                 Self::Proxy => Ok(None),
                 Self::Host => lookup(host).await.map(Some),
                 Self::Servers {
                     servers,
+                    trust,
                     egress,
                     answers,
                 } => answers
                     .resolve(Resolver::Routed, host, || {
-                        crate::dns::resolve_through(egress.as_ref(), servers, host)
+                        crate::dns::resolve_through(egress.as_ref(), servers, *trust, host)
                     })
                     .await
                     .and_then(routed)
                     .map(Some),
-                Self::ProxyServers { servers, answers } => answers
+                Self::ProxyServers {
+                    servers,
+                    trust,
+                    answers,
+                } => answers
                     .resolve(Resolver::Routed, host, || {
-                        crate::dns::resolve_through(hop, servers, host)
+                        crate::dns::resolve_through(hop, servers, *trust, host)
                     })
                     .await
                     .and_then(routed)
@@ -240,6 +258,17 @@ fn routed(addresses: Vec<IpAddr>) -> Result<Vec<IpAddr>, DialError> {
         return Err(crate::dns::unresolved());
     }
     Ok(addresses)
+}
+
+// Whether a WireGuard tunnel's own resolver can serve servers asked by
+// `trust`. It speaks only plain DNS to port 53 of the servers the tunnel
+// was built with, and passes on no AD bit, so any other wire, port or
+// trust is asked by Weaver's own client through the hop instead.
+fn tunnel_resolver_serves(servers: &[DnsServer], trust: Trust) -> bool {
+    trust == Trust::AsSent
+        && servers
+            .iter()
+            .all(|server| *server == DnsServer::plain(server.address.ip()))
 }
 
 // What the host's own DNS resolves `host` to.
@@ -1513,14 +1542,24 @@ impl Dialer for SessionHop {
     async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
         // A WireGuard tunnel asks its DNS servers from inside the tunnel. It
         // was built with the same servers this naming lists, so it asks
-        // them itself.
-        let (Naming::ProxyServers { servers, answers }, Some(provider)) =
-            (&self.naming, &self.resolver)
+        // them itself when it can serve the naming; otherwise Weaver's own
+        // client asks them through this hop.
+        let (
+            Naming::ProxyServers {
+                servers,
+                trust,
+                answers,
+            },
+            Some(provider),
+        ) = (&self.naming, &self.resolver)
         else {
             return self.naming.resolve(self, self.id, host, self.timeout).await;
         };
+        if !tunnel_resolver_serves(servers, *trust) {
+            return self.naming.resolve(self, self.id, host, self.timeout).await;
+        }
         if host.parse::<IpAddr>().is_err() {
-            record::asking(host, || Asker::proxy_servers(self.id, servers));
+            record::asking(host, || Asker::proxy_servers(self.id, servers, *trust));
         }
         answers
             .resolve(Resolver::WireGuard, host, || async {

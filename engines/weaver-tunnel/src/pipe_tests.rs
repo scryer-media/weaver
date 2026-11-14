@@ -1195,7 +1195,10 @@ async fn a_wireguard_session_carries_another_and_stays_up_while_it_rides() {
             },
             endpoint: Some(endpoint),
             timeout: Duration::from_secs(30),
-            naming: Naming::proxy_servers(vec!["10.0.0.2".parse().unwrap()]),
+            naming: Naming::proxy_servers(
+                vec![DnsServer::plain("10.0.0.2".parse().unwrap())],
+                Trust::AsSent,
+            ),
             resolver: Some(provider),
             forwarding: Default::default(),
             failure: Default::default(),
@@ -1325,7 +1328,10 @@ fn wireguard_session(
         },
         endpoint: None,
         timeout: Duration::from_secs(30),
-        naming: Naming::proxy_servers(vec!["10.0.0.2".parse().unwrap()]),
+        naming: Naming::proxy_servers(
+            vec![DnsServer::plain("10.0.0.2".parse().unwrap())],
+            Trust::AsSent,
+        ),
         resolver: Some(resolver),
         forwarding: Default::default(),
         failure: Default::default(),
@@ -1553,7 +1559,10 @@ async fn each_hop_of_a_chain_resolves_the_next_with_its_own_setting() {
             7,
             &first.addr.ip().to_string(),
             first.addr.port(),
-            Naming::proxy_servers(vec![ROUTED_DNS.parse().unwrap()]),
+            Naming::proxy_servers(
+                vec![DnsServer::plain(ROUTED_DNS.parse().unwrap())],
+                Trust::AsSent,
+            ),
             bottom(),
         ),
     );
@@ -1617,7 +1626,11 @@ async fn a_mid_chain_hop_resolved_by_weaver_has_weaver_resolve_the_next_hop() {
             8,
             "second.invalid",
             second.addr.port(),
-            Naming::servers(vec![ROUTED_DNS.parse().unwrap()], egress.clone()),
+            Naming::servers(
+                vec![DnsServer::plain(ROUTED_DNS.parse().unwrap())],
+                Trust::AsSent,
+                egress.clone(),
+            ),
             named_hop(
                 7,
                 &first.addr.ip().to_string(),
@@ -1671,7 +1684,11 @@ async fn a_hop_resolved_by_weavers_servers_asks_them_from_the_egress() {
         7,
         &proxy.addr.ip().to_string(),
         proxy.addr.port(),
-        Naming::servers(vec![ROUTED_DNS.parse().unwrap()], egress.clone()),
+        Naming::servers(
+            vec![DnsServer::plain(ROUTED_DNS.parse().unwrap())],
+            Trust::AsSent,
+            egress.clone(),
+        ),
         bottom(),
     );
 
@@ -1706,7 +1723,11 @@ async fn a_recorded_dial_says_weavers_servers_resolved_the_name() {
         7,
         &proxy.addr.ip().to_string(),
         proxy.addr.port(),
-        Naming::servers(vec![ROUTED_DNS.parse().unwrap()], egress),
+        Naming::servers(
+            vec![DnsServer::plain(ROUTED_DNS.parse().unwrap())],
+            Trust::AsSent,
+            egress,
+        ),
         bottom(),
     );
 
@@ -1723,6 +1744,8 @@ async fn a_recorded_dial_says_weavers_servers_resolved_the_name() {
             by: ResolvedBy::Servers,
             proxy: None,
             servers: vec![ROUTED_DNS.parse().unwrap()],
+            wire: Some(crate::dns::WireKind::Plain),
+            trust: Some(crate::resolution::record::TrustOutcome::AsSent),
             addresses: vec![PUBLIC.parse().unwrap()],
             cached: false,
             connected: Some(PUBLIC.parse().unwrap()),
@@ -1778,7 +1801,11 @@ async fn a_hop_holds_its_servers_answer_for_its_ttl() {
             7,
             &proxy.addr.ip().to_string(),
             proxy.addr.port(),
-            Naming::servers(vec![ROUTED_DNS.parse().unwrap()], egress),
+            Naming::servers(
+                vec![DnsServer::plain(ROUTED_DNS.parse().unwrap())],
+                Trust::AsSent,
+                egress,
+            ),
             bottom(),
         );
 
@@ -1811,7 +1838,11 @@ async fn a_hop_forgets_an_answer_its_proxy_could_not_reach() {
         7,
         &proxy.addr.ip().to_string(),
         proxy.addr.port(),
-        Naming::servers(vec![ROUTED_DNS.parse().unwrap()], egress),
+        Naming::servers(
+            vec![DnsServer::plain(ROUTED_DNS.parse().unwrap())],
+            Trust::AsSent,
+            egress,
+        ),
         bottom(),
     );
 
@@ -1897,7 +1928,10 @@ async fn servers_asked_through_an_unreachable_hop_fail_as_the_path() {
         7,
         "192.0.2.1",
         8080,
-        Naming::proxy_servers(vec![ROUTED_DNS.parse().unwrap()]),
+        Naming::proxy_servers(
+            vec![DnsServer::plain(ROUTED_DNS.parse().unwrap())],
+            Trust::AsSent,
+        ),
         inner,
     );
     let Err(error) = pipe.dial(&named("news.invalid", 119)).await else {
@@ -1994,7 +2028,8 @@ async fn a_slow_lookup_leaves_the_hop_its_whole_connect_window() {
         "192.0.2.1",
         8080,
         Naming::servers(
-            vec![ROUTED_DNS.parse().unwrap()],
+            vec![DnsServer::plain(ROUTED_DNS.parse().unwrap())],
+            Trust::AsSent,
             Arc::new(SlowDns {
                 delay: Duration::from_secs(4),
             }),
@@ -2938,4 +2973,95 @@ async fn a_direct_legs_blocking_lookup_matches_its_async_lookup() {
         second.finish("localhost", 0, None).unwrap().cached,
         "the async lookup asks the blocking one's cache"
     );
+}
+
+#[test]
+fn a_tunnel_resolver_serves_only_plain_servers_on_port_53_taken_as_sent() {
+    let ip: IpAddr = "10.0.0.2".parse().unwrap();
+    let plain = DnsServer::plain(ip);
+    assert!(tunnel_resolver_serves(&[], Trust::AsSent));
+    assert!(tunnel_resolver_serves(
+        std::slice::from_ref(&plain),
+        Trust::AsSent
+    ));
+    assert!(!tunnel_resolver_serves(
+        std::slice::from_ref(&plain),
+        Trust::RequireAd
+    ));
+    let off_port = DnsServer {
+        address: SocketAddr::new(ip, 5353),
+        wire: crate::dns::Wire::Plain,
+    };
+    assert!(!tunnel_resolver_serves(
+        &[plain.clone(), off_port],
+        Trust::AsSent
+    ));
+    let tls = DnsServer {
+        address: SocketAddr::new(ip, 53),
+        wire: crate::dns::Wire::Tls { name: None },
+    };
+    assert!(!tunnel_resolver_serves(
+        &[plain.clone(), tls],
+        Trust::AsSent
+    ));
+    let https = DnsServer {
+        address: SocketAddr::new(ip, 443),
+        wire: crate::dns::Wire::Https {
+            path: "/dns-query".into(),
+        },
+    };
+    assert!(!tunnel_resolver_serves(&[https], Trust::AsSent));
+}
+
+// A WireGuard hop whose naming its tunnel's own resolver cannot serve asks
+// the servers with Weaver's client, dialled through the hop.
+#[tokio::test]
+async fn a_wireguard_hop_asks_servers_its_tunnel_cannot_serve_through_itself() {
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<(String, u16)>>);
+    #[async_trait::async_trait]
+    impl TunnelProvider for Recorder {
+        async fn prepare(&self) -> Result<(), TunnelError> {
+            Ok(())
+        }
+        async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
+            self.0.lock().unwrap().push((host.to_owned(), port));
+            Err(TunnelError::Engine(
+                "the fixture refuses every stream".into(),
+            ))
+        }
+        fn describe(&self) -> String {
+            "recording fixture".into()
+        }
+    }
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let ip: IpAddr = "10.0.0.2".parse().unwrap();
+    for (server, trust) in [
+        (
+            DnsServer {
+                address: SocketAddr::new(ip, 853),
+                wire: crate::dns::Wire::Tls { name: None },
+            },
+            Trust::AsSent,
+        ),
+        (DnsServer::plain(ip), Trust::RequireAd),
+    ] {
+        let resolver = Arc::new(crate::WireGuardTunnelProvider::new(
+            near.client_spec("1"),
+            Arc::new(crate::NoopTunnelObserver),
+        ));
+        let recorder = Arc::new(Recorder::default());
+        let hop = wireguard_session(1, recorder.clone(), resolver, bottom(), vec![], 1);
+        let mut hop = Arc::try_unwrap(hop).ok().expect("one owner");
+        hop.naming = Naming::proxy_servers(vec![server.clone()], trust);
+        let hop = Arc::new(hop);
+        hop.resolve("origin.tunnel.test")
+            .await
+            .expect_err("the fixture refuses the stream");
+        assert_eq!(
+            *recorder.0.lock().unwrap(),
+            [("10.0.0.2".to_owned(), server.address.port())],
+            "{server}, {trust:?}"
+        );
+    }
 }

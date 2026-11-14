@@ -3,6 +3,7 @@
 
 use super::*;
 use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct Resolver {
     failed_family: u16,
@@ -13,7 +14,7 @@ struct Resolver {
 
 #[async_trait::async_trait]
 impl Carrier for Resolver {
-    async fn open(&self, server: IpAddr) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
+    async fn open(&self, server: &DnsServer) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
         assert_eq!(server.to_string(), "192.0.2.53");
         let (client, mut server) = tokio::io::duplex(1024);
         let failed_family = self.failed_family;
@@ -69,7 +70,7 @@ async fn one_family_survives_peer_protocol_or_transport_failure() {
             };
             let addresses = resolve_name(
                 &resolver,
-                &["192.0.2.53".parse().unwrap()],
+                &[DnsServer::plain("192.0.2.53".parse().unwrap())],
                 "fixture.invalid",
             )
             .await
@@ -92,7 +93,7 @@ async fn both_family_failures_remain_an_error() {
     };
     let unanswered = resolve_name(
         &resolver,
-        &["192.0.2.53".parse().unwrap()],
+        &[DnsServer::plain("192.0.2.53".parse().unwrap())],
         "fixture.invalid",
     )
     .await
@@ -114,7 +115,7 @@ async fn a_silent_family_does_not_consume_the_outer_request_deadline() {
             std::time::Duration::from_secs(10),
             resolve_name(
                 &resolver,
-                &["192.0.2.53".parse().unwrap()],
+                &[DnsServer::plain("192.0.2.53".parse().unwrap())],
                 "fixture.invalid",
             ),
         )
@@ -138,7 +139,7 @@ async fn both_successful_families_are_retained() {
     };
     let result = resolve_name(
         &resolver,
-        &["192.0.2.53".parse().unwrap()],
+        &[DnsServer::plain("192.0.2.53".parse().unwrap())],
         "fixture.invalid",
     )
     .await
@@ -158,7 +159,7 @@ struct DeadRoute {
 
 #[async_trait::async_trait]
 impl Carrier for DeadRoute {
-    async fn open(&self, server: IpAddr) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
+    async fn open(&self, server: &DnsServer) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
         self.dials.lock().unwrap().push(server.to_string());
         if self.hang {
             std::future::pending::<()>().await;
@@ -177,7 +178,10 @@ async fn a_dead_route_is_dialled_once_per_server_not_once_per_family() {
         let started = tokio::time::Instant::now();
         let result = resolve_name(
             &route,
-            &["192.0.2.53".parse().unwrap(), "192.0.2.54".parse().unwrap()],
+            &[
+                DnsServer::plain("192.0.2.53".parse().unwrap()),
+                DnsServer::plain("192.0.2.54".parse().unwrap()),
+            ],
             "fixture.invalid",
         )
         .await;

@@ -466,6 +466,8 @@ async fn a_proxy_test_with_a_target_says_who_resolved_it() {
             by: ResolvedBy::ProxyServers,
             proxy: Some(1),
             servers: vec![ip(ROUTED_DNS)],
+            wire: Some(weaver_tunnel::dns::WireKind::Plain),
+            trust: Some(weaver_tunnel::resolution::record::TrustOutcome::AsSent),
             addresses: vec![ip(NAMED)],
             cached: false,
             connected: Some(ip(NAMED)),

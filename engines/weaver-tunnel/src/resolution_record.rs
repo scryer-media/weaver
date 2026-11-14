@@ -14,6 +14,7 @@
 // caches, the DNS client, and the tunnel engines' callbacks. A lookup made
 // in another task does not reach it; the paths a test dials make theirs in
 // the task that dials.
+use crate::dns::{DnsServer, Trust, WireKind};
 use std::{
     collections::HashMap,
     future::Future,
@@ -54,6 +55,11 @@ pub enum LookupFailure {
     ServerFailure,
     // No server answered at all.
     NoReply,
+    // The server answered without marking the answer authenticated, and the
+    // naming requires it.
+    NotAuthenticated,
+    // The TLS handshake or certificate check with the server failed.
+    TlsFailed,
     Other,
 }
 
@@ -65,6 +71,8 @@ impl LookupFailure {
             Self::TimedOut => "TIMED_OUT",
             Self::ServerFailure => "SERVER_FAILURE",
             Self::NoReply => "NO_REPLY",
+            Self::NotAuthenticated => "NOT_AUTHENTICATED",
+            Self::TlsFailed => "TLS_FAILED",
             Self::Other => "OTHER",
         }
     }
@@ -77,6 +85,29 @@ pub struct LookupError {
     pub detail: String,
 }
 
+// How the answer from listed servers was judged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TrustOutcome {
+    // Taken as the server sent it.
+    AsSent,
+    // The server marked it authenticated.
+    Authenticated,
+    // Refused, as the server did not mark it authenticated.
+    Refused,
+}
+
+impl TrustOutcome {
+    pub const ALL: [Self; 3] = [Self::AsSent, Self::Authenticated, Self::Refused];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AsSent => "as_sent",
+            Self::Authenticated => "authenticated",
+            Self::Refused => "refused",
+        }
+    }
+}
+
 // How the name a dial ended at was resolved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostResolution {
@@ -87,6 +118,12 @@ pub struct HostResolution {
     pub proxy: Option<u32>,
     // The DNS servers asked.
     pub servers: Vec<IpAddr>,
+    // The wire of the server that answered, or when that is not known the
+    // first listed server's. None when no servers were asked.
+    pub wire: Option<WireKind>,
+    // How the servers' answer was judged. None when no servers were asked,
+    // or when the servers must authenticate and no answer came to judge.
+    pub trust: Option<TrustOutcome>,
     // What the name resolved to; none when a proxy resolved it.
     pub addresses: Vec<IpAddr>,
     // Whether the answer was one Weaver held from an earlier lookup.
@@ -102,36 +139,32 @@ pub(crate) struct Asker {
     by: ResolvedBy,
     proxy: Option<u32>,
     servers: Vec<IpAddr>,
+    wire: Option<WireKind>,
+    // None when no servers are asked.
+    trust: Option<Trust>,
 }
 
 impl Asker {
-    pub(crate) fn host() -> Self {
+    fn asking(by: ResolvedBy, proxy: Option<u32>, servers: &[DnsServer], trust: Trust) -> Self {
         Self {
-            by: ResolvedBy::Host,
-            proxy: None,
-            servers: Vec::new(),
+            by,
+            proxy,
+            servers: servers.iter().map(|server| server.address.ip()).collect(),
+            wire: servers.first().map(|server| server.wire.kind()),
+            trust: servers.first().map(|_| trust),
         }
     }
-    pub(crate) fn servers(servers: &[IpAddr]) -> Self {
-        Self {
-            by: ResolvedBy::Servers,
-            proxy: None,
-            servers: servers.to_vec(),
-        }
+    pub(crate) fn host() -> Self {
+        Self::asking(ResolvedBy::Host, None, &[], Trust::AsSent)
+    }
+    pub(crate) fn servers(servers: &[DnsServer], trust: Trust) -> Self {
+        Self::asking(ResolvedBy::Servers, None, servers, trust)
     }
     pub(crate) fn proxy(proxy: u32) -> Self {
-        Self {
-            by: ResolvedBy::Proxy,
-            proxy: Some(proxy),
-            servers: Vec::new(),
-        }
+        Self::asking(ResolvedBy::Proxy, Some(proxy), &[], Trust::AsSent)
     }
-    pub(crate) fn proxy_servers(proxy: u32, servers: &[IpAddr]) -> Self {
-        Self {
-            by: ResolvedBy::ProxyServers,
-            proxy: Some(proxy),
-            servers: servers.to_vec(),
-        }
+    pub(crate) fn proxy_servers(proxy: u32, servers: &[DnsServer], trust: Trust) -> Self {
+        Self::asking(ResolvedBy::ProxyServers, Some(proxy), servers, trust)
     }
 }
 
@@ -143,6 +176,10 @@ struct Entry {
     cached: Option<bool>,
     answer: Option<Result<Vec<IpAddr>, LookupError>>,
     connected: Option<IpAddr>,
+    // The wire of the server whose answer was used.
+    wire: Option<WireKind>,
+    // How the servers' answer was judged, by the lookup that asked them.
+    judged: Option<TrustOutcome>,
 }
 
 // A datagram socket a tunnel engine bound to reach its peer.
@@ -191,6 +228,8 @@ impl Recording {
                 entry.answer = note.answer;
             }
             entry.connected = entry.connected.or(note.connected);
+            entry.wire = entry.wire.or(note.wire);
+            entry.judged = entry.judged.or(note.judged);
         }
         let taken = std::mem::take(&mut *other.bound.lock().expect("resolution recording"));
         self.bound
@@ -222,6 +261,8 @@ impl Recording {
                 by: ResolvedBy::Literal,
                 proxy: None,
                 servers: Vec::new(),
+                wire: None,
+                trust: None,
                 addresses: vec![ip],
                 cached: false,
                 connected,
@@ -250,11 +291,23 @@ impl Recording {
                     .find(|bound| bound.peer.port() == port && addresses.contains(&bound.peer.ip()))
                     .map(|bound| bound.peer.ip())
             });
+            let trust = asker.trust.and_then(|trust| match trust {
+                Trust::AsSent => Some(TrustOutcome::AsSent),
+                // An answer that came through the cache without a lookup of
+                // this dial's was authenticated when it was stored: a
+                // naming's cache holds only answers judged by its own trust,
+                // which never changes.
+                Trust::RequireAd => entry
+                    .judged
+                    .or(entry.cached.map(|_| TrustOutcome::Authenticated)),
+            });
             return Some(HostResolution {
                 host: host.to_owned(),
                 by: asker.by,
                 proxy: asker.proxy,
                 servers: asker.servers.clone(),
+                wire: entry.wire.or(asker.wire),
+                trust,
                 addresses,
                 cached: entry.cached.unwrap_or(false),
                 connected,
@@ -274,6 +327,8 @@ impl Recording {
                 by: ResolvedBy::Host,
                 proxy: None,
                 servers: Vec::new(),
+                wire: None,
+                trust: None,
                 addresses: vec![bound.peer.ip()],
                 cached: false,
                 connected: Some(bound.peer.ip()),
@@ -286,6 +341,8 @@ impl Recording {
             by: ResolvedBy::Host,
             proxy: None,
             servers: Vec::new(),
+            wire: None,
+            trust: None,
             addresses: Vec::new(),
             cached: false,
             connected: None,
@@ -385,6 +442,15 @@ pub(crate) fn asking(host: &str, asker: impl FnOnce() -> Asker) {
 pub(crate) fn cached(host: &str, held: bool) {
     note(host, |entry| {
         entry.cached.get_or_insert(held);
+    });
+}
+
+// The servers asked for `host` came to an answer judged `trust`, from a
+// server on `wire` when one answered.
+pub(crate) fn answered(host: &str, wire: Option<WireKind>, trust: TrustOutcome) {
+    note(host, |entry| {
+        entry.wire = entry.wire.or(wire);
+        entry.judged.get_or_insert(trust);
     });
 }
 

@@ -8,13 +8,105 @@ use crate::{
     pipe::{DialError, Dialer, Purpose, Target},
     resolution::{
         Lookup, Ttl,
-        record::{self, LookupFailure},
+        record::{self, LookupFailure, TrustOutcome},
     },
 };
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU16, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use wire::{Session, WIRES, Wires};
+
+mod https;
+mod wire;
+
+// One DNS server Weaver asks, and how it is asked.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DnsServer {
+    pub address: SocketAddr,
+    pub wire: Wire,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Wire {
+    // DNS over TCP, in the clear. Port 53 by default.
+    Plain,
+    // DNS over TLS (RFC 7858). Port 853 by default. The certificate is
+    // checked against the server's address, or against `name` when one is
+    // given.
+    Tls { name: Option<String> },
+    // DNS over HTTPS (RFC 8484), POST to `path` (starts with '/') at the
+    // server's address. Port 443 by default.
+    Https { path: String },
+}
+
+// Which wire a server is asked over, without its settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WireKind {
+    Plain,
+    Tls,
+    Https,
+}
+
+impl Wire {
+    pub fn kind(&self) -> WireKind {
+        match self {
+            Self::Plain => WireKind::Plain,
+            Self::Tls { .. } => WireKind::Tls,
+            Self::Https { .. } => WireKind::Https,
+        }
+    }
+}
+
+impl WireKind {
+    pub const ALL: [Self; 3] = [Self::Plain, Self::Tls, Self::Https];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Tls => "tls",
+            Self::Https => "https",
+        }
+    }
+
+    // The port a server on this wire listens on unless told otherwise.
+    pub fn default_port(self) -> u16 {
+        match self {
+            Self::Plain => 53,
+            Self::Tls => 853,
+            Self::Https => 443,
+        }
+    }
+}
+
+impl DnsServer {
+    // A plain server on port 53.
+    pub fn plain(ip: IpAddr) -> Self {
+        Self {
+            address: SocketAddr::new(ip, WireKind::Plain.default_port()),
+            wire: Wire::Plain,
+        }
+    }
+}
+
+// The server's address, without the port when it is the wire's default.
+impl std::fmt::Display for DnsServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.address.port() == self.wire.kind().default_port() {
+            write!(f, "{}", self.address.ip())
+        } else {
+            write!(f, "{}", self.address)
+        }
+    }
+}
+
+// How answers from listed servers are judged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Trust {
+    #[default]
+    AsSent,
+    // Refuse an answer the server did not mark authenticated (the AD bit).
+    RequireAd,
+}
 
 // What routed DNS says when it fails, and `fault` reads back.
 pub(crate) const INVALID: &str = "routed DNS returned an invalid response";
@@ -31,7 +123,7 @@ const FAMILY_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 // What a query is asked over.
 #[async_trait::async_trait]
 trait Carrier: Send + Sync {
-    async fn open(&self, server: IpAddr) -> Result<Box<dyn TunnelStream>, TunnelError>;
+    async fn open(&self, server: &DnsServer) -> Result<Box<dyn TunnelStream>, TunnelError>;
 }
 
 // Why no server gave an answer. `reached` says whether any server could be
@@ -51,12 +143,13 @@ struct Stage<'a> {
 
 #[async_trait::async_trait]
 impl Carrier for Stage<'_> {
-    async fn open(&self, server: IpAddr) -> Result<Box<dyn TunnelStream>, TunnelError> {
+    async fn open(&self, server: &DnsServer) -> Result<Box<dyn TunnelStream>, TunnelError> {
+        let ip = server.address.ip();
         let target = Target {
-            host: server.to_string(),
-            port: 53,
+            host: ip.to_string(),
+            port: server.address.port(),
             purpose: Purpose::Dns,
-            addresses: vec![server],
+            addresses: vec![ip],
         };
         match self.dialer.dial(&target).await {
             Ok(dialed) => Ok(dialed.into_observed_stream()),
@@ -80,10 +173,11 @@ pub fn unresolved() -> DialError {
 // server could be reached at all, the error is the stage's own, so a dead
 // path counts against the path and not against the name. Every server
 // saying the name has no address is a negative answer: no addresses, with
-// how long that holds.
+// how long that holds. `trust` is how the answers are to be judged.
 pub async fn resolve_through(
     dialer: &dyn Dialer,
-    servers: &[IpAddr],
+    servers: &[DnsServer],
+    trust: Trust,
     host: &str,
 ) -> Result<Lookup, DialError> {
     if let Ok(ip) = host.parse() {
@@ -97,7 +191,7 @@ pub async fn resolve_through(
         dialer,
         failure: Mutex::new(None),
     };
-    let resolved = resolve_name(&stage, servers, host).await;
+    let resolved = resolve(&stage, &WIRES, servers, trust, host).await;
     crate::metrics::record_resolution(
         crate::metrics::Resolver::Routed,
         resolved
@@ -132,6 +226,12 @@ enum Failed {
     // The server answered with this error code instead of an answer.
     Rcode(u16),
     Invalid,
+    // The naming requires the AD bit and the reply did not carry it.
+    NotAuthenticated,
+    // The TLS handshake or certificate check failed, saying this.
+    Tls(String),
+    // The HTTPS server answered with this status instead of 200.
+    Http(u16),
 }
 
 // Why a lookup found nothing, from what each server it asked said: the
@@ -142,11 +242,13 @@ struct Why(Option<(LookupFailure, String)>);
 impl Why {
     fn rank(failure: LookupFailure) -> u8 {
         match failure {
-            LookupFailure::NoSuchName => 5,
-            LookupFailure::NoAddress => 4,
-            LookupFailure::ServerFailure => 3,
-            LookupFailure::TimedOut => 2,
-            LookupFailure::Other => 1,
+            LookupFailure::NotAuthenticated => 7,
+            LookupFailure::NoSuchName => 6,
+            LookupFailure::NoAddress => 5,
+            LookupFailure::ServerFailure => 4,
+            LookupFailure::TimedOut => 3,
+            LookupFailure::Other => 2,
+            LookupFailure::TlsFailed => 1,
             LookupFailure::NoReply => 0,
         }
     }
@@ -160,7 +262,7 @@ impl Why {
         }
     }
     // What one family's query came to at `server`.
-    fn query(&mut self, server: IpAddr, answered: &Result<Result<Found, Failed>, impl Sized>) {
+    fn query(&mut self, server: &DnsServer, answered: &Result<Result<Found, Failed>, impl Sized>) {
         match answered {
             Ok(Ok(found)) if found.addresses.is_empty() && found.nonexistent => {
                 self.consider(LookupFailure::NoSuchName, || format!("{server}: NXDOMAIN"))
@@ -190,6 +292,16 @@ impl Why {
             Ok(Err(Failed::Invalid)) => {
                 self.consider(LookupFailure::Other, || format!("{server}: {INVALID}"))
             }
+            Ok(Err(Failed::NotAuthenticated)) => self
+                .consider(LookupFailure::NotAuthenticated, || {
+                    format!("{server}: the answer was not marked authenticated")
+                }),
+            Ok(Err(Failed::Tls(reason))) => self.consider(LookupFailure::TlsFailed, || {
+                format!("{server}: TLS failed: {reason}")
+            }),
+            Ok(Err(Failed::Http(status))) => self.consider(LookupFailure::ServerFailure, || {
+                format!("{server}: HTTP {status}")
+            }),
             Err(_) => self.consider(LookupFailure::TimedOut, || {
                 format!(
                     "{server}: no answer within {}s",
@@ -207,9 +319,37 @@ impl Why {
     }
 }
 
+// Every server plain and every answer taken as sent, as most tests ask.
+#[cfg(test)]
 async fn resolve_name(
     provider: &dyn Carrier,
-    servers: &[IpAddr],
+    servers: &[DnsServer],
+    host: &str,
+) -> Result<Lookup, Unanswered> {
+    resolve(provider, &WIRES, servers, Trust::AsSent, host).await
+}
+
+// How an answer the lookup used is judged.
+fn judged(trust: Trust) -> TrustOutcome {
+    match trust {
+        Trust::AsSent => TrustOutcome::AsSent,
+        Trust::RequireAd => TrustOutcome::Authenticated,
+    }
+}
+
+// A lookup that came to an answer, positive or negative: the wire of the
+// server it came from, and how it was judged.
+fn settled(host: &str, wire: WireKind, trust: Trust) {
+    record::answered(host, Some(wire), judged(trust));
+    crate::metrics::record_dns_wire(wire);
+    crate::metrics::record_dns_trust(judged(trust));
+}
+
+async fn resolve(
+    provider: &dyn Carrier,
+    wires: &Wires,
+    servers: &[DnsServer],
+    trust: Trust,
     host: &str,
 ) -> Result<Lookup, Unanswered> {
     if servers.is_empty() {
@@ -227,6 +367,9 @@ async fn resolve_name(
     // asked has said so for both families.
     let mut negative = Some(u32::MAX);
     for server in servers {
+        // An encrypted wire keeps one connection to the server for both
+        // families and every alias followed.
+        let mut session = Session::new(provider, wires, server);
         let mut addresses = Vec::new();
         // The shortest TTL either family's answer gave.
         let mut ttl: Option<u32> = None;
@@ -245,11 +388,11 @@ async fn resolve_name(
             let mut reached = false;
             let answered = tokio::time::timeout(
                 FAMILY_QUERY_TIMEOUT,
-                query(provider, *server, host, qtype, &mut reached),
+                query(&mut session, host, qtype, trust, &mut reached),
             )
             .await;
             reached_any |= reached;
-            why.query(*server, &answered);
+            why.query(server, &answered);
             match answered {
                 Ok(Ok(found)) => {
                     if let Some(held) = found.ttl {
@@ -259,12 +402,15 @@ async fn resolve_name(
                     addresses.extend(found.addresses);
                 }
                 _ if !reached => break,
+                // The other family would only fail the same handshake.
+                Ok(Err(Failed::Tls(_))) => break,
                 _ => {}
             }
         }
         if !addresses.is_empty() {
             addresses.sort();
             addresses.dedup();
+            settled(host, server.wire.kind(), trust);
             return Ok(Lookup {
                 addresses,
                 ttl: ttl.map_or(Ttl::Unknown, Ttl::Seconds),
@@ -277,34 +423,64 @@ async fn resolve_name(
             .map(|(negative, ttl)| negative.min(ttl));
     }
     let nonexistent = matches!(why.0, Some((LookupFailure::NoSuchName, _)));
+    let refused = matches!(why.0, Some((LookupFailure::NotAuthenticated, _)));
     why.note(host);
     match negative {
-        Some(ttl) => Ok(Lookup {
-            addresses: Vec::new(),
-            ttl: Ttl::Seconds(ttl),
-            nonexistent,
-        }),
-        None => Err(Unanswered {
-            error: TunnelError::Engine(UNRESOLVED.into()),
-            reached: reached_any,
-        }),
+        // Every server said so; the first is named as the one that answered.
+        Some(ttl) => {
+            settled(host, servers[0].wire.kind(), trust);
+            Ok(Lookup {
+                addresses: Vec::new(),
+                ttl: Ttl::Seconds(ttl),
+                nonexistent,
+            })
+        }
+        None => {
+            // A lookup with no authenticated answer fails. It is never a
+            // negative answer, so nothing holds it.
+            if refused {
+                record::answered(host, None, TrustOutcome::Refused);
+                crate::metrics::record_dns_trust(TrustOutcome::Refused);
+            }
+            Err(Unanswered {
+                error: TunnelError::Engine(UNRESOLVED.into()),
+                reached: reached_any,
+            })
+        }
     }
 }
 
+// Whether a reply carries the AD bit: the server says it validated the
+// answer (RFC 4035 §3.2.3).
+fn authenticated(bytes: &[u8]) -> bool {
+    u16_at(bytes, 2).is_ok_and(|flags| flags & 0x0020 != 0)
+}
+
 async fn query(
-    provider: &dyn Carrier,
-    server: IpAddr,
+    session: &mut Session<'_>,
     host: &str,
     qtype: u16,
+    trust: Trust,
     reached: &mut bool,
 ) -> Result<Found, Failed> {
     let mut name = host.trim_end_matches('.').to_ascii_lowercase();
     // The shortest TTL of the aliases followed so far.
     let mut ttl = u32::MAX;
     for _ in 0..8 {
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        // DNS over HTTPS sends id 0, so a cache between can serve it (RFC
+        // 8484 §4.1).
+        let id = match session.server().wire {
+            Wire::Https { .. } => 0,
+            Wire::Plain | Wire::Tls { .. } => NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        };
         let mut packet = Vec::from(id.to_be_bytes());
-        packet.extend_from_slice(&[1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+        // Recursion desired, and under `RequireAd` the AD bit, which asks
+        // the server to say whether it validated the answer (RFC 6840 §5.7).
+        let ad = match trust {
+            Trust::AsSent => 0,
+            Trust::RequireAd => 0x20,
+        };
+        packet.extend_from_slice(&[1, ad, 0, 1, 0, 0, 0, 0, 0, 0]);
         if name.is_empty() || name.len() > 253 {
             return Err(Failed::Invalid);
         }
@@ -318,27 +494,14 @@ async fn query(
         packet.push(0);
         packet.extend_from_slice(&qtype.to_be_bytes());
         packet.extend_from_slice(&[0, 1]);
-        let mut stream = provider.open(server).await.map_err(Failed::Unreached)?;
-        *reached = true;
-        stream
-            .write_u16(packet.len() as u16)
-            .await
-            .map_err(|_| Failed::Closed)?;
-        stream
-            .write_all(&packet)
-            .await
-            .map_err(|_| Failed::Closed)?;
-        let size = stream.read_u16().await.map_err(|_| Failed::Closed)? as usize;
-        if !(12..=16384).contains(&size) {
-            return Err(Failed::Invalid);
-        }
-        let mut bytes = vec![0; size];
-        stream
-            .read_exact(&mut bytes)
-            .await
-            .map_err(|_| Failed::Closed)?;
+        let bytes = session.ask(&packet, reached).await?;
         let reply = parse_response(&bytes, id, &name, qtype)
             .map_err(|_| refusal(&bytes, id).map_or(Failed::Invalid, Failed::Rcode))?;
+        // Under `RequireAd` every reply the answer rests on must carry the
+        // AD bit: each alias step, and a reply saying there is no address.
+        if trust == Trust::RequireAd && !authenticated(&bytes) {
+            return Err(Failed::NotAuthenticated);
+        }
         ttl = ttl.min(reply.ttl);
         if !reply.addresses.is_empty() {
             return Ok(Found {
@@ -606,7 +769,9 @@ fn negative_ttl(bytes: &[u8], mut at: usize, count: usize) -> Option<u32> {
 mod tests {
     use super::*;
     mod families;
+    mod trust;
     mod ttl;
+    mod wires;
     #[test]
     fn compression_cycles_and_truncation_are_rejected() {
         assert!(read_name(&[0xc0, 0], &mut 0).is_err());

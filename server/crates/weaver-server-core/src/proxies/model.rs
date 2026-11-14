@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, net::IpAddr, sync::Arc, time::Duration};
 use weaver_tunnel::{
     Http3ProxyCredentials, Http3TunnelProvider, Http3TunnelSpec, TunnelError, TunnelSpec,
-    WireGuardSpec, parse_key,
+    WireGuardSpec,
+    dns::{DnsServer, Trust},
+    parse_key,
     pipe::{Egress, Naming, PortForwarding, gateway_of},
 };
 
@@ -101,11 +103,18 @@ impl ProxyProfile {
     // How a hop through this proxy resolves names, Weaver's servers asked
     // from `egress`.
     pub fn naming(&self, egress: Arc<Egress>) -> Naming {
+        let servers = || {
+            self.dns_servers
+                .iter()
+                .copied()
+                .map(DnsServer::plain)
+                .collect()
+        };
         match (self.resolver, self.dns_servers.is_empty()) {
             (Resolver::Weaver, true) => Naming::Host,
-            (Resolver::Weaver, false) => Naming::servers(self.dns_servers.clone(), egress),
+            (Resolver::Weaver, false) => Naming::servers(servers(), Trust::AsSent, egress),
             (Resolver::Proxy, true) => Naming::Proxy,
-            (Resolver::Proxy, false) => Naming::proxy_servers(self.dns_servers.clone()),
+            (Resolver::Proxy, false) => Naming::proxy_servers(servers(), Trust::AsSent),
         }
     }
     // Who resolves a destination's name dialled through this proxy as the

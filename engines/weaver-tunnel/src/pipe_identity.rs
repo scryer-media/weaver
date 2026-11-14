@@ -407,7 +407,7 @@ mod tests {
             },
             endpoint: None,
             timeout: Duration::from_secs(30),
-            naming: Naming::proxy_servers(Vec::new()),
+            naming: Naming::proxy_servers(Vec::new(), crate::dns::Trust::AsSent),
             resolver: Some(resolver),
             forwarding: Default::default(),
             failure: Default::default(),

@@ -6529,6 +6529,7 @@ dependencies = [
  "h3",
  "h3-quinn",
  "http",
+ "httparse",
  "if-addrs",
  "libc",
  "proxy-tunnels",
@@ -6540,6 +6541,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "webpki-roots",
  "windows-sys 0.61.2",
 ]
 

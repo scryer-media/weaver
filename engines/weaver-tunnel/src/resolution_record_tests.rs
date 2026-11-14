@@ -65,7 +65,9 @@ async fn the_first_note_of_each_kind_stands() {
     let recording = Arc::new(Recording::default());
     recording
         .scope(async {
-            asking("Name.Test.", || Asker::servers(&[ip("192.0.2.53")]));
+            asking("Name.Test.", || {
+                Asker::servers(&[DnsServer::plain(ip("192.0.2.53"))], Trust::AsSent)
+            });
             asking("name.test", Asker::host);
             cached("name.test", false);
             cached("name.test", true);
@@ -81,6 +83,8 @@ async fn the_first_note_of_each_kind_stands() {
             by: ResolvedBy::Servers,
             proxy: None,
             servers: vec![ip("192.0.2.53")],
+            wire: Some(WireKind::Plain),
+            trust: Some(TrustOutcome::AsSent),
             addresses: vec![ip("192.0.2.1"), ip("192.0.2.2")],
             cached: false,
             connected: Some(ip("192.0.2.2")),
@@ -113,6 +117,8 @@ async fn a_recording_is_carried_and_adopts_notes_without_overriding_its_own() {
             by: ResolvedBy::Proxy,
             proxy: Some(7),
             servers: Vec::new(),
+            wire: None,
+            trust: None,
             addresses: Vec::new(),
             cached: true,
             connected: Some(ip("192.0.2.7")),
@@ -132,7 +138,11 @@ async fn a_recording_is_carried_and_adopts_notes_without_overriding_its_own() {
 async fn a_lookup_still_out_when_the_dial_ended_ran_out_of_time() {
     let recording = Arc::new(Recording::default());
     recording
-        .scope(async { asking("slow.test", || Asker::proxy_servers(4, &[ip("192.0.2.53")])) })
+        .scope(async {
+            asking("slow.test", || {
+                Asker::proxy_servers(4, &[DnsServer::plain(ip("192.0.2.53"))], Trust::AsSent)
+            })
+        })
         .await;
     let resolution = recording.finish("slow.test", 80, None).unwrap();
     assert_eq!(resolution.by, ResolvedBy::ProxyServers);
@@ -220,7 +230,9 @@ async fn a_held_answer_is_noted_as_held_and_a_held_negative_says_what_kind() {
     let second = Arc::new(Recording::default());
     second
         .scope(async {
-            asking("gone.test", || Asker::servers(&[ip("192.0.2.53")]));
+            asking("gone.test", || {
+                Asker::servers(&[DnsServer::plain(ip("192.0.2.53"))], Trust::AsSent)
+            });
             cache
                 .resolve(Resolver::Routed, "gone.test", negative)
                 .await

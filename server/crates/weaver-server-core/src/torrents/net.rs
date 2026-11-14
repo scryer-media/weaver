@@ -2109,9 +2109,12 @@ mod tests {
             },
             endpoint: None,
             timeout: std::time::Duration::from_secs(30),
-            naming: weaver_tunnel::pipe::Naming::proxy_servers(vec![
-                weaver_tunnel::test_support::TEST_PEER_ADDRESS.into(),
-            ]),
+            naming: weaver_tunnel::pipe::Naming::proxy_servers(
+                vec![weaver_tunnel::dns::DnsServer::plain(
+                    weaver_tunnel::test_support::TEST_PEER_ADDRESS.into(),
+                )],
+                weaver_tunnel::dns::Trust::AsSent,
+            ),
             resolver: Some(provider),
             forwarding,
             failure: Default::default(),

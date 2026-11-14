@@ -8,7 +8,7 @@ license-file = "LICENSE"
 default = []
 # In-process tunnel, DNS and proxy fixtures for consumer integration tests.
 # Never enabled in a product build.
-test-support = ["proxy-tunnels/test-support", "dep:bytes", "dep:http", "dep:h3", "dep:h3-quinn", "dep:quinn", "dep:tokio-rustls", "dep:rcgen", "dep:reqwest"]
+test-support = ["proxy-tunnels/test-support", "dep:bytes", "dep:http", "dep:h3", "dep:h3-quinn", "dep:quinn", "dep:rcgen", "dep:reqwest"]
 
 [dependencies]
 # Shared protocols pinned to an immutable signed version tag.
@@ -21,6 +21,10 @@ tracing = { workspace = true }
 socket2 = { workspace = true }
 libc = { workspace = true }
 if-addrs = "0.15.0"
+# DNS over TLS and over HTTPS, on the stream the routing layer dials.
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+httparse = { version = "1", default-features = false, features = ["std"] }
 
 # Reuse the approved HTTP/3 stack for local fixtures; absent from product builds.
 bytes = { workspace = true, optional = true }
@@ -28,7 +32,6 @@ http = { workspace = true, optional = true }
 h3 = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.5.0", optional = true }
 h3-quinn = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.5.0", optional = true }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"], optional = true }
-tokio-rustls = { workspace = true, optional = true }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"], optional = true }
 # Finished HTTP clients for consumers' tests.
 reqwest = { workspace = true, optional = true }
@@ -39,6 +42,7 @@ windows-sys = { workspace = true, features = ["Win32_NetworkManagement_IpHelper"
 [dev-dependencies]
 proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.5.0", features = ["http3", "test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 
 # The host name lookup lint names itself in `cfg(dylint_lib)` when it runs.
 [lints.rust]

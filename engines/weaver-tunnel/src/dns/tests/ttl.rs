@@ -4,28 +4,32 @@
 use super::*;
 use crate::resolution::record::{LookupError, Recording};
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-type Answer = dyn Fn(IpAddr, u16, &[u8]) -> Vec<u8> + Send + Sync;
+pub(super) type Answer = dyn Fn(IpAddr, u16, &[u8]) -> Vec<u8> + Send + Sync;
 
 // Servers that answer each query as the test says.
-struct Zone(Arc<Answer>);
+pub(super) struct Zone(Arc<Answer>);
 
 impl Zone {
-    fn new(answer: impl Fn(IpAddr, u16, &[u8]) -> Vec<u8> + Send + Sync + 'static) -> Self {
+    pub(super) fn new(
+        answer: impl Fn(IpAddr, u16, &[u8]) -> Vec<u8> + Send + Sync + 'static,
+    ) -> Self {
         Self(Arc::new(answer))
     }
 }
 
 #[async_trait::async_trait]
 impl Carrier for Zone {
-    async fn open(&self, server: IpAddr) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
+    async fn open(&self, server: &DnsServer) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
         let (client, mut stream) = tokio::io::duplex(4096);
         let answer = self.0.clone();
+        let asked = server.address.ip();
         tokio::spawn(async move {
             let size = stream.read_u16().await.unwrap() as usize;
             let mut query = vec![0; size];
             stream.read_exact(&mut query).await.unwrap();
-            let reply = answer(server, u16_at(&query, size - 4).unwrap(), &query);
+            let reply = answer(asked, u16_at(&query, size - 4).unwrap(), &query);
             stream.write_u16(reply.len() as u16).await.unwrap();
             stream.write_all(&reply).await.unwrap();
         });
@@ -34,9 +38,9 @@ impl Carrier for Zone {
 }
 
 // The name asked, by pointer to the question.
-const ASKED: [u8; 2] = [0xc0, 0x0c];
+pub(super) const ASKED: [u8; 2] = [0xc0, 0x0c];
 
-fn wire(name: &str) -> Vec<u8> {
+pub(super) fn wire(name: &str) -> Vec<u8> {
     let mut wire = Vec::new();
     for label in name.split('.') {
         wire.push(label.len() as u8);
@@ -46,7 +50,7 @@ fn wire(name: &str) -> Vec<u8> {
     wire
 }
 
-fn rr(owner: &[u8], kind: u16, ttl: u32, data: &[u8]) -> Vec<u8> {
+pub(super) fn rr(owner: &[u8], kind: u16, ttl: u32, data: &[u8]) -> Vec<u8> {
     let mut record = owner.to_vec();
     record.extend_from_slice(&kind.to_be_bytes());
     record.extend_from_slice(&[0, 1]);
@@ -56,7 +60,7 @@ fn rr(owner: &[u8], kind: u16, ttl: u32, data: &[u8]) -> Vec<u8> {
     record
 }
 
-fn soa(ttl: u32, minimum: u32) -> Vec<u8> {
+pub(super) fn soa(ttl: u32, minimum: u32) -> Vec<u8> {
     let mut data = wire("ns.test");
     data.extend(wire("hostmaster.test"));
     for field in [1u32, 7200, 900, 1_209_600, minimum] {
@@ -65,7 +69,12 @@ fn soa(ttl: u32, minimum: u32) -> Vec<u8> {
     rr(&wire("test"), 6, ttl, &data)
 }
 
-fn respond(query: &[u8], rcode: u8, answers: &[Vec<u8>], authority: &[Vec<u8>]) -> Vec<u8> {
+pub(super) fn respond(
+    query: &[u8],
+    rcode: u8,
+    answers: &[Vec<u8>],
+    authority: &[Vec<u8>],
+) -> Vec<u8> {
     let mut reply = query.to_vec();
     reply[2] = 0x81;
     reply[3] = 0x80 | rcode;
@@ -77,12 +86,12 @@ fn respond(query: &[u8], rcode: u8, answers: &[Vec<u8>], authority: &[Vec<u8>]) 
     reply
 }
 
-fn v4(query: &[u8], ttl: u32) -> Vec<u8> {
+pub(super) fn v4(query: &[u8], ttl: u32) -> Vec<u8> {
     respond(query, 0, &[rr(&ASKED, 1, ttl, &[192, 0, 2, 7])], &[])
 }
 
-fn server() -> IpAddr {
-    "192.0.2.53".parse().unwrap()
+pub(super) fn server() -> DnsServer {
+    DnsServer::plain("192.0.2.53".parse().unwrap())
 }
 
 #[tokio::test]
@@ -181,12 +190,12 @@ async fn a_negative_answer_needs_every_server_asked_to_give_one() {
             respond(query, 3, &[], &[soa(900, 120)])
         }
     });
-    let unanswered = resolve_name(&zone, &[server(), other], "missing.test")
+    let unanswered = resolve_name(&zone, &[server(), DnsServer::plain(other)], "missing.test")
         .await
         .unwrap_err();
     assert!(unanswered.reached);
     let zone = Zone::new(|_, _, query| respond(query, 3, &[], &[soa(900, 120)]));
-    let both = [server(), other];
+    let both = [server(), DnsServer::plain(other)];
     let lookup = resolve_name(&zone, &both, "missing.test").await.unwrap();
     assert_eq!(lookup.ttl, Ttl::Seconds(120));
 }
@@ -208,11 +217,11 @@ fn a_ttl_with_the_top_bit_set_is_read_as_zero() {
 
 // What a test recording says of a lookup through `carrier` that found
 // nothing.
-async fn why(carrier: &dyn Carrier, servers: &[IpAddr], host: &str) -> LookupError {
+async fn why(carrier: &dyn Carrier, servers: &[DnsServer], host: &str) -> LookupError {
     let recording = Arc::new(Recording::default());
     recording
         .scope(async {
-            record::asking(host, || record::Asker::servers(servers));
+            record::asking(host, || record::Asker::servers(servers, Trust::AsSent));
             let _ = resolve_name(carrier, servers, host).await;
         })
         .await;
@@ -222,7 +231,7 @@ async fn why(carrier: &dyn Carrier, servers: &[IpAddr], host: &str) -> LookupErr
         .expect("a failed lookup")
 }
 
-fn failure(failure: LookupFailure, detail: &str) -> LookupError {
+pub(super) fn failure(failure: LookupFailure, detail: &str) -> LookupError {
     LookupError {
         failure,
         detail: detail.into(),
@@ -253,18 +262,18 @@ async fn a_lookup_says_which_answer_told_it_most() {
         respond(query, if asked == other { 3 } else { 5 }, &[], &[])
     });
     assert_eq!(
-        why(&zone, &[server(), other], "missing.test").await,
+        why(&zone, &[server(), DnsServer::plain(other)], "missing.test").await,
         failure(LookupFailure::NoSuchName, "192.0.2.54: NXDOMAIN")
     );
 }
 
 // Servers that can be dialled and never answer.
 #[derive(Default)]
-struct Silent(std::sync::Mutex<Vec<tokio::io::DuplexStream>>);
+pub(super) struct Silent(std::sync::Mutex<Vec<tokio::io::DuplexStream>>);
 
 #[async_trait::async_trait]
 impl Carrier for Silent {
-    async fn open(&self, _: IpAddr) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
+    async fn open(&self, _: &DnsServer) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
         let (client, server) = tokio::io::duplex(4096);
         self.0.lock().unwrap().push(server);
         Ok(Box::new(client))
@@ -276,7 +285,7 @@ struct Unreachable;
 
 #[async_trait::async_trait]
 impl Carrier for Unreachable {
-    async fn open(&self, _: IpAddr) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
+    async fn open(&self, _: &DnsServer) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
         Err(TunnelError::Engine(
             "egress connection failed: no route".into(),
         ))
@@ -293,4 +302,31 @@ async fn a_server_that_never_answers_runs_out_of_time_and_one_never_reached_give
         why(&Unreachable, &[server()], "fixture.test").await,
         failure(LookupFailure::NoReply, "egress connection failed: no route")
     );
+}
+
+#[tokio::test]
+async fn a_plain_server_off_port_53_is_dialled_there_and_named_with_its_port() {
+    let ports = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = ports.clone();
+    struct Port(Zone, Arc<std::sync::Mutex<Vec<u16>>>);
+    #[async_trait::async_trait]
+    impl Carrier for Port {
+        async fn open(
+            &self,
+            server: &DnsServer,
+        ) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
+            self.1.lock().unwrap().push(server.address.port());
+            self.0.open(server).await
+        }
+    }
+    let zone = Port(Zone::new(|_, _, query| respond(query, 2, &[], &[])), seen);
+    let server = DnsServer {
+        address: "192.0.2.53:5353".parse().unwrap(),
+        wire: Wire::Plain,
+    };
+    assert_eq!(
+        why(&zone, &[server], "fixture.test").await,
+        failure(LookupFailure::ServerFailure, "192.0.2.53:5353: SERVFAIL")
+    );
+    assert_eq!(*ports.lock().unwrap(), [5353, 5353]);
 }
