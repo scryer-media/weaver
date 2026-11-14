@@ -85,7 +85,7 @@ impl Drop for Checking {
 pub(crate) fn blocking_permit(
     spawner: &crate::spawn_utils::BlockingSpawner,
 ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-    futures::executor::block_on(spawner.semaphore().acquire_owned()).ok()
+    futures::executor::block_on(spawner.owned_permit()).ok()
 }
 
 impl SeedMode {

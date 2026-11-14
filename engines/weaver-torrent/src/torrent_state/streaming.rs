@@ -360,7 +360,7 @@ impl ManagedTorrent {
             &metadata,
         )?;
         let streams = self.streams()?;
-        let blocking_permit = self.shared().spawner.semaphore().acquire_owned().await?;
+        let blocking_permit = self.shared().spawner.owned_permit().await?;
         let s = FileStream {
             stream_id: streams.next_id(),
             streams: streams.clone(),

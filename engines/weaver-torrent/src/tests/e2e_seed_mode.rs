@@ -646,3 +646,55 @@ async fn test_paused_seed_check_waits_for_its_permit_without_the_state_lock() ->
     assert_eq!(gate.counts().0, 1);
     Ok(())
 }
+
+// Every blocking permit a torrent's own calls take moves the session's
+// permit counters: the add, a seed-mode check that no peer's request runs,
+// and a file stream each count the one permit they take. The start from
+// the seed-mode checkpoint, done before the torrent is initialized, takes
+// one more.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_permits_taken_by_an_add_a_seed_check_and_a_stream_are_counted() -> anyhow::Result<()>
+{
+    setup_test_logging();
+    let t = TestTorrent::new(
+        "test_permits_counted",
+        PIECES * PIECE_LENGTH as usize,
+        PIECE_LENGTH,
+    )
+    .await?;
+    let dir = TempDir::with_prefix("test_permits_counted_out")?;
+    let held = MemoryStorageFactory::holding(vec![t.content.clone()]);
+    let session =
+        Session::new_with_opts(dir.path().join("seed"), isolated_session_opts(false)).await?;
+    let taken = || session.spawner.disk_snapshot().permit_acquisitions;
+    assert_eq!(taken(), 0);
+
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(held.clone_box()),
+                seed_mode: true,
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    handle.wait_until_initialized().await?;
+    assert_eq!(taken(), 2, "the add and its start");
+
+    let piece = piece_of(2)?;
+    let checked = tokio::task::spawn_blocking({
+        let handle = handle.clone();
+        move || handle.check_seeded(piece.get())
+    })
+    .await?;
+    assert_eq!(checked.transpose()?, Some(true));
+    assert_eq!(taken(), 3, "the seed-mode check");
+
+    let stream = handle.clone().stream(0).await?;
+    assert_eq!(taken(), 4, "the stream");
+    drop(stream);
+    Ok(())
+}

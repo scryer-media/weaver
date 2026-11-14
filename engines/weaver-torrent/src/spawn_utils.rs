@@ -215,6 +215,23 @@ impl BlockingSpawner {
         self.concurrent_block_in_place_semaphore.clone()
     }
 
+    /// One of the session's blocking permits, held for as long as it is
+    /// kept, counted as every permit is: its wait timed only when it has to
+    /// wait. An error once the permits are closed.
+    pub(crate) async fn owned_permit(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        let semaphore = &self.concurrent_block_in_place_semaphore;
+        if let Ok(permit) = Arc::clone(semaphore).try_acquire_owned() {
+            self.stats.permit_taken();
+            return Ok(permit);
+        }
+        let since = std::time::Instant::now();
+        let permit = Arc::clone(semaphore).acquire_owned().await?;
+        self.stats.permit_waited(since);
+        Ok(permit)
+    }
+
     /// Runs `f` on one of the session's blocking threads once it holds a
     /// blocking permit, from any thread, a uTP thread too: the work runs on
     /// the session's pool, never on the calling runtime's own, and disk
@@ -227,19 +244,7 @@ impl BlockingSpawner {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        let semaphore = &self.concurrent_block_in_place_semaphore;
-        let permit = match Arc::clone(semaphore).try_acquire_owned() {
-            Ok(permit) => {
-                self.stats.permit_taken();
-                permit
-            }
-            Err(_) => {
-                let since = std::time::Instant::now();
-                let permit = Arc::clone(semaphore).acquire_owned().await?;
-                self.stats.permit_waited(since);
-                permit
-            }
-        };
+        let permit = self.owned_permit().await?;
         Ok(self
             .handle
             .spawn_blocking(move || {
@@ -406,6 +411,24 @@ mod tests {
         assert_eq!(third.await.unwrap().unwrap(), 3);
         assert_eq!(started_rx.try_recv(), Ok(3));
         assert_eq!(spawner.semaphore().available_permits(), 2);
+    }
+
+    // An owned permit counts as every permit does: one taken free is a
+    // taking, one that had to wait is a taking and a wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_owned_permit_moves_the_permit_counters() {
+        let spawner = BlockingSpawner::new(1);
+        let free = spawner.owned_permit().await.unwrap();
+        let counted = spawner.disk_snapshot();
+        assert_eq!((counted.permit_acquisitions, counted.permit_waits), (1, 0));
+
+        let mut waiting = std::pin::pin!(spawner.owned_permit());
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        drop(free);
+        drop(waiting.await.unwrap());
+        let counted = spawner.disk_snapshot();
+        assert_eq!((counted.permit_acquisitions, counted.permit_waits), (2, 1));
+        assert_eq!(spawner.semaphore().available_permits(), 1);
     }
 
     // Says, when dropped, whether it was dropped on a uTP thread.

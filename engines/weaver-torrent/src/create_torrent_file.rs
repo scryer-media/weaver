@@ -115,7 +115,7 @@ async fn create_torrent_raw<'a>(
     const READ_SIZE: u32 = 8192; // todo: twea
     let mut read_buf = vec![0; READ_SIZE as usize];
 
-    let _permit = spawner.semaphore().acquire_owned().await?;
+    let _permit = spawner.owned_permit().await?;
 
     let mut length = 0;
     let mut remaining_piece_length = piece_length;
@@ -298,6 +298,21 @@ mod tests {
 
         let deserialized = torrent_from_bytes(&bytes).unwrap();
         assert_eq!(torrent.info_hash(), deserialized.info_hash);
+    }
+
+    // Making a torrent takes one blocking permit for its reads, and the
+    // permit counters see it.
+    #[tokio::test]
+    async fn the_permit_a_torrent_is_made_with_is_counted() {
+        let dir = tempfile::TempDir::with_prefix("create_torrent_permit").unwrap();
+        let file = dir.path().join("one.data");
+        std::fs::write(&file, vec![7u8; 4096]).unwrap();
+        let spawner = BlockingSpawner::new(1);
+        create_torrent(&file, Default::default(), &spawner)
+            .await
+            .unwrap();
+        assert_eq!(spawner.disk_snapshot().permit_acquisitions, 1);
+        assert_eq!(spawner.semaphore().available_permits(), 1);
     }
 
     // A directory's files are listed in name order, byte by byte and one

@@ -3566,7 +3566,7 @@ impl Session {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         };
 
-        let _permit = self.spawner.semaphore().acquire_owned().await?;
+        let _permit = self.spawner.owned_permit().await?;
 
         let (managed_torrent, metadata) = {
             let mut g = self.db.write();
