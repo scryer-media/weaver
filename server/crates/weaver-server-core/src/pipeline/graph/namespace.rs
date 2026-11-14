@@ -2594,6 +2594,19 @@ impl NamespaceWriter {
         result: Result<(), WriteError>,
     ) -> Result<(), WriteError> {
         let Err(WriteError::Leaf(error)) = &result else {
+            // A member renamed since its name was refused, and now written
+            // under the new one, has a file: it is no longer marked. A close
+            // with nothing written leaves the mark.
+            if result.is_ok()
+                && !self.unnamable.is_empty()
+                && self
+                    .files
+                    .get(&node)
+                    .and_then(|files| files.leaves.get(&member))
+                    .is_some_and(Leaf::on_disk)
+            {
+                self.unnamable.remove(&(node, member));
+            }
             return result;
         };
         let creating = self
@@ -2924,6 +2937,7 @@ impl NamespaceWriter {
             self.discard(leaf)?;
         }
         self.caps.forget(tree, node, member);
+        self.unnamable.remove(&(node, member));
         Ok(())
     }
 
