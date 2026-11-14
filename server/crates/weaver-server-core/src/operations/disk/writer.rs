@@ -778,6 +778,13 @@ impl Barrier {
             && self.key.unheard.load(Ordering::Acquire) == 0
     }
 
+    // Whether an operation of the key failed or the key was given up:
+    // nothing more of it is written. A refusal still to be heard is not a
+    // failure.
+    pub(crate) fn failed(&self) -> bool {
+        self.key.stopped()
+    }
+
     // Whether everything behind the barrier returned, failed or not.
     pub(crate) fn returned(&self) -> bool {
         self.key.has_returned(self.seq)

@@ -629,3 +629,37 @@ fn a_volume_with_no_thread_is_asked_for_one_again_only_once_it_was_let_go() {
     assert_eq!(starts(), 2);
     drop((fourth, fifth));
 }
+
+// A refusal still to be heard is not a failure of the key.
+#[test]
+fn a_refused_name_is_not_a_failed_barrier() {
+    fn refuse(_: &Path, _: Option<u64>) -> io::Result<File> {
+        Err(io::ErrorKind::InvalidFilename.into())
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, reports) = writers();
+    let volume = volume("one");
+    let job = writers.submitter(&volume, 1);
+    job.write(
+        1,
+        0,
+        Bytes::from_static(b"name"),
+        Some(Create {
+            path: path.clone(),
+            length: None,
+            open: refuse,
+        }),
+    );
+    // The later writes of the refused file are dropped without a word.
+    job.write(1, 4, Bytes::from_static(b"more"), None);
+    let barrier = job.barrier();
+    barrier.wait_aside();
+    assert!(!barrier.failed() && !barrier.passed());
+    let report = reports.recv().unwrap();
+    assert_eq!(report.failures.len(), 1);
+    assert!(report.failures[0].creating);
+    job.heard_refusal();
+    assert!(barrier.passed());
+    assert!(reports.try_recv().is_err(), "the refusal was the only word");
+}
