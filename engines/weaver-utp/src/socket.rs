@@ -537,26 +537,25 @@ impl RecvBufs {
     }
 
     // Buffers for a transport that returns at most `most` datagrams a
-    // call. Each entry has a spill buffer of its own, as any datagram of a
-    // call may be a long one: RECEIVE_BATCH of them at most, for the
-    // socket's life.
+    // call: RECEIVE_BATCH entries at most, each a pooled buffer, for the
+    // socket's life. A pooled buffer holds any datagram a path of a common
+    // MTU delivers, and the entries share the one spill buffer for a
+    // longer one, so only a long datagram followed by another in one call
+    // is lost. libtorrent reads every datagram into 1500 bytes and loses
+    // the rest of a longer one (udp_socket.hpp v2.0.15:159,
+    // udp_socket.cpp:206).
     fn receiving(most: usize) -> Self {
-        let spill = || vec![0; u16::MAX as usize].into_boxed_slice();
-        let many = if most > 1 {
-            (0..most.min(RECEIVE_BATCH))
-                .map(|_| crate::Received {
-                    head: crate::rx_buf::take(),
-                    spill: spill(),
-                    len: 0,
-                    from: SocketAddr::from(([0, 0, 0, 0], 0)),
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let mut many = Vec::new();
+        if most > 1 {
+            many.extend((0..most.min(RECEIVE_BATCH)).map(|_| crate::Received {
+                head: crate::rx_buf::take(),
+                len: 0,
+                from: SocketAddr::from(([0, 0, 0, 0], 0)),
+            }));
+        }
         Self {
             head: crate::rx_buf::take(),
-            spill: spill(),
+            spill: vec![0; u16::MAX as usize].into_boxed_slice(),
             many,
         }
     }
@@ -572,18 +571,26 @@ impl RecvBufs {
             return Ok(Got::One(len, from));
         }
         let most = most.clamp(1, self.many.len());
-        poll_fn(|cx| transport.poll_recv_many(cx, &mut self.many[..most]))
-            .await
-            .map(Got::Many)
+        let many = &mut self.many[..most];
+        let spill = &mut self.spill;
+        match poll_fn(|cx| transport.poll_recv_many(cx, many, spill)).await {
+            // A transport that says it receives several and does not is
+            // read one datagram a call from here on.
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                self.many = Vec::new();
+                let (len, from) = self.recv(transport).await?;
+                Ok(Got::One(len, from))
+            }
+            got => got.map(Got::Many),
+        }
     }
 
-    // The buffers of the `index`th datagram of the last call change places
-    // with `head` and `spill`: once to handle it there, and once more to
-    // give the entry buffers for the next call.
+    // The buffer of the `index`th datagram of the last call changes places
+    // with `head`: once to handle it there, and once more to give the
+    // entry a buffer for the next call.
     fn swap(&mut self, index: usize) -> (usize, SocketAddr) {
         let entry = &mut self.many[index];
         std::mem::swap(&mut self.head, &mut entry.head);
-        std::mem::swap(&mut self.spill, &mut entry.spill);
         (entry.len, entry.from)
     }
 
@@ -750,8 +757,10 @@ fn poll_outgoing<T: Transport, E: UtpEnvironment>(
                 let stamp = ((now - socket.created).as_micros() as u32).to_be_bytes();
                 let mut at = 0;
                 for (len, _) in &parts[..count] {
-                    if let Some(timestamp) = bytes.get_mut(at + 4..at + 8) {
-                        timestamp.copy_from_slice(&stamp);
+                    // Within the datagram: one too short for a header has
+                    // no timestamp.
+                    if *len >= 8 {
+                        bytes[at + 4..at + 8].copy_from_slice(&stamp);
                     }
                     at += len;
                 }
@@ -761,15 +770,21 @@ fn poll_outgoing<T: Transport, E: UtpEnvironment>(
                 match sent {
                     Some(Poll::Ready(Ok(taken))) if taken > 0 => {
                         let taken = taken.min(count);
-                        socket.stats.send_batches.increment(1);
-                        socket.stats.send_batch_datagrams.increment(taken as u64);
+                        // A call that took one datagram sent nothing
+                        // together.
+                        if taken > 1 {
+                            socket.stats.send_batches.increment(1);
+                            socket.stats.send_batch_datagrams.increment(taken as u64);
+                        }
                         outgoing.batch.advance_run(taken, now);
                         outgoing.sent += taken as u64;
                         continue;
                     }
                     // The first could not be sent: it goes alone below,
                     // which names the failure for its stream.
-                    Some(Poll::Ready(_)) => {}
+                    Some(Poll::Ready(_)) => {
+                        socket.stats.send_batch_errors.increment(1);
+                    }
                     Some(Poll::Pending) if !tokio::task::coop::has_budget_remaining() => {
                         break 'batches;
                     }
@@ -1283,6 +1298,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         };
         if len >= read_buf.capacity() {
             self.socket.stats.invalid_packets.increment(1);
+            self.socket.stats.datagrams_too_long.increment(1);
             trace!(len, ?addr, "dropping datagram at receive buffer limit");
             return Ok(());
         }

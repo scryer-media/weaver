@@ -166,15 +166,18 @@ pub trait DatagramSocket: Send + Sync + 'static {
     }
 
     /// Receives the datagrams that wait, at most `into.len()` of them, in
-    /// the order they came, each into the buffers of its own entry from the
-    /// first on, as [`Self::poll_recv_from_split`] reads one. Ready with
-    /// how many: never none.
+    /// the order they came, each into its own entry from the first on,
+    /// with `spill` shared among them as
+    /// [`weaver_utp::Transport::poll_recv_many`] has it. Ready with how
+    /// many: never none. A socket that does not receive several fails as
+    /// unsupported, and is then read one datagram a call.
     fn poll_recv_many(
         &self,
         cx: &mut Context<'_>,
         into: &mut [weaver_utp::Received],
+        spill: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        let _ = (cx, into);
+        let _ = (cx, into, spill);
         Poll::Ready(Err(io::ErrorKind::Unsupported.into()))
     }
 

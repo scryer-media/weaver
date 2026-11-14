@@ -267,14 +267,18 @@ pub(crate) const TAKES_MANY: bool = cfg!(any(target_os = "linux", target_os = "a
 
 /// Receives the datagrams that wait on `socket` in one system call, at
 /// most `into.len()` and [`RECV_MANY_DATAGRAMS`] of them, each into its
-/// entry's two buffers, with its length and sender: at most `spill.len()`
-/// bytes of each, and one cut short reads as that many. How many came.
+/// entry's buffer, with its length and sender. What of a datagram does not
+/// fit its entry's buffer is read into `spill`, which the entries share:
+/// at most `spill.len()` bytes of a datagram are read in all, and the last
+/// long datagram of a call is whole. One before it in the call, and one
+/// cut short, read as `spill.len()` bytes. How many came.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn recv_many(
     socket: &impl AsSocket,
     into: &mut [weaver_utp::Received],
+    spill: &mut [u8],
 ) -> io::Result<usize> {
-    many::recv(socket.as_raw_fd(), into)
+    many::recv(socket.as_raw_fd(), into, spill)
 }
 
 /// Sends datagrams that lie end to end in `bytes` in one system call:
@@ -361,23 +365,30 @@ mod many {
         }
     }
 
-    pub(super) fn recv(fd: RawFd, into: &mut [weaver_utp::Received]) -> io::Result<usize> {
+    pub(super) fn recv(
+        fd: RawFd,
+        into: &mut [weaver_utp::Received],
+        spill: &mut [u8],
+    ) -> io::Result<usize> {
         let most = into.len().min(RECV_MANY_DATAGRAMS);
         // SAFETY: message headers, buffer descriptions and addresses are
         // plain data for which all zeroes is a valid value.
         let mut names: [Name; RECV_MANY_DATAGRAMS] = unsafe { mem::zeroed() };
         let mut bufs: [[libc::iovec; 2]; RECV_MANY_DATAGRAMS] = unsafe { mem::zeroed() };
         let mut msgs: [libc::mmsghdr; RECV_MANY_DATAGRAMS] = unsafe { mem::zeroed() };
+        let spill_at = spill.as_mut_ptr();
         for (i, entry) in into[..most].iter_mut().enumerate() {
-            let tail = entry.spill.len().saturating_sub(entry.head.len());
             bufs[i] = [
                 libc::iovec {
                     iov_base: entry.head.as_mut_ptr().cast(),
                     iov_len: entry.head.len(),
                 },
+                // Every datagram's second buffer is the one `spill`: the
+                // host fills the datagrams in order, so a long one's rest
+                // stays there unless a later long one follows it.
                 libc::iovec {
-                    iov_base: entry.spill.as_mut_ptr().cast(),
-                    iov_len: tail,
+                    iov_base: spill_at.cast(),
+                    iov_len: spill.len().saturating_sub(entry.head.len()),
                 },
             ];
             let msg = &mut msgs[i].msg_hdr;
@@ -388,9 +399,10 @@ mod many {
         }
         // SAFETY: the first `most` headers each name an address and two
         // buffers that are valid for writes of the lengths given and
-        // outlive the call: the arrays above and the entries' buffers,
-        // which `into` borrows exclusively. `fd` is an open socket for the
-        // call, which does not wait.
+        // outlive the call: the arrays above, the entries' buffers, which
+        // `into` borrows exclusively, and `spill`, borrowed exclusively
+        // and named by every header, which the host only writes bytes to.
+        // `fd` is an open socket for the call, which does not wait.
         let got = unsafe {
             libc::recvmmsg(
                 fd,
@@ -404,14 +416,18 @@ mod many {
             return Err(io::Error::last_os_error());
         }
         let got = got as usize;
-        for (i, entry) in into[..got].iter_mut().enumerate() {
+        // The rest of a long datagram is whole only for the last long one.
+        let mut long_after = false;
+        for (i, entry) in into[..got].iter_mut().enumerate().rev() {
             let cut = msgs[i].msg_hdr.msg_flags & libc::MSG_TRUNC != 0;
+            let len = msgs[i].msg_len as usize;
+            let long = len > entry.head.len();
             match named(&names[i]) {
                 Some(from) => {
-                    entry.len = if cut {
-                        entry.spill.len()
+                    entry.len = if cut || (long && long_after) {
+                        spill.len()
                     } else {
-                        msgs[i].msg_len as usize
+                        len
                     };
                     entry.from = from;
                 }
@@ -419,6 +435,7 @@ mod many {
                 // which is no packet.
                 None => entry.len = 0,
             }
+            long_after |= long;
         }
         Ok(got)
     }

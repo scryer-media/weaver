@@ -50,6 +50,15 @@ impl Rig {
         if most > 1 {
             transport = transport.taking_many(most).sending_from_one_task();
         }
+        Self::over(transport, wire)
+    }
+
+    // A socket over `transport`, whose datagrams arrive from `wire`.
+    fn over(
+        transport: MockUtpTransport,
+        wire: tokio::sync::mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>,
+    ) -> Self {
+        let most = transport.recv_many_most();
         let (socket, dispatcher) = UtpSocket::new_with_opts_and_dispatcher(
             transport,
             MockUtpEnvironment::new(),
@@ -352,6 +361,7 @@ async fn a_read_takes_several_datagrams_a_call() {
     assert_eq!(stats.receive_calls, 1);
     assert_eq!(stats.receive_call_datagrams, 6);
     assert_eq!(stats.invalid_packets, 1);
+    assert_eq!(stats.datagrams_too_long, 0);
     assert_eq!(stats.streams_marked, 2);
     assert_eq!(stats.receive_drains, 1);
 
@@ -372,6 +382,60 @@ async fn a_read_takes_several_datagrams_a_call() {
     assert_eq!(stats.receive_calls, 6);
     assert_eq!(stats.receive_call_datagrams, 6 + arrived as u64);
     assert_eq!(stats.receive_cuts, 1);
+}
+
+// The datagrams of a call share one buffer for what does not fit a pooled
+// one. Two long datagrams in one call: the first, whose rest the second
+// wrote over, is dropped and counted, the second and the short ones
+// around them are handled, and the first is taken whole when it comes
+// again.
+#[tokio::test(start_paused = true)]
+async fn the_first_of_two_long_datagrams_in_a_call_is_dropped_and_counted() {
+    let interface = MockInterface::new();
+    let mut rig = Rig::taking_many(8, interface.clone());
+    let mut a = rig.stream(ID_A);
+    rig.arrive(ID_A, 1);
+    rig.arrive_long(ID_A, 2, 3000, 9);
+    rig.arrive(ID_A, 3);
+    rig.arrive_long(ID_A, 4, 2500, 7);
+    rig.arrive(ID_A, 5);
+    assert!(!rig.turn().await);
+    assert_eq!(*interface.many_receives.lock(), [5]);
+    let lens = |rx: &mut Receiver| {
+        let mut seen = Vec::new();
+        while let Some(event) = rx.try_recv() {
+            let payload = event.message.payload();
+            seen.push((payload.len(), payload[payload.len() - 1]));
+        }
+        seen
+    };
+    assert_eq!(lens(&mut a), [(2, 1), (2, 3), (2500, 7), (2, 5)]);
+    let stats = rig._socket.stats().snapshot();
+    assert_eq!(stats.datagrams_too_long, 1);
+    assert_eq!(stats.invalid_packets, 1);
+
+    rig.arrive_long(ID_A, 2, 3000, 9);
+    assert!(!rig.turn().await);
+    assert_eq!(lens(&mut a), [(3000, 9)]);
+    assert_eq!(rig._socket.stats().snapshot().datagrams_too_long, 1);
+}
+
+// A transport that says it receives several datagrams a call and has no
+// call that does is read one datagram a call.
+#[tokio::test(start_paused = true)]
+async fn a_transport_with_no_call_for_several_is_read_one_a_call() {
+    let (wire, rx) = unbounded_channel();
+    let transport = MockUtpTransport::new(ADDR_1, rx, MockInterface::new()).claiming_many(8);
+    let mut rig = Rig::over(transport, wire);
+    let mut a = rig.stream(ID_A);
+    for seq_nr in 1..=3 {
+        rig.arrive(ID_A, seq_nr);
+    }
+    assert!(!rig.turn().await);
+    assert_eq!(payloads(&mut a), [1, 2, 3]);
+    let stats = rig._socket.stats().snapshot();
+    assert_eq!(stats.receive_calls, 3);
+    assert_eq!(stats.receive_call_datagrams, 3);
 }
 
 // A transport that receives one datagram a call counts one a call.
@@ -455,7 +519,22 @@ async fn datagrams_queued_for_several_addresses_leave_in_one_call() {
     );
     assert_eq!(stats.send_batches, 2);
     assert_eq!(stats.send_batch_datagrams, 4);
+    assert_eq!(stats.send_batch_errors, 1);
     for ((_, peer), fill) in peers.iter().zip([4u8, 5]) {
+        let mut buf = [0u8; 64];
+        let (len, _) = peer.recv_from(&mut buf).await.unwrap();
+        assert_eq!(buf[len - 1], fill);
+    }
+
+    // A call the transport cut after one datagram sent nothing together.
+    queue(&rig, ADDR_2, 6);
+    queue(&rig, nowhere, 7);
+    queue(&rig, ADDR_3, 8);
+    rig.dispatcher.send_outgoing().await.unwrap();
+    let stats = rig._socket.stats().snapshot();
+    assert_eq!(stats.send_batches, 2);
+    assert_eq!(stats.send_batch_datagrams, 4);
+    for ((_, peer), fill) in peers.iter().zip([6u8, 8]) {
         let mut buf = [0u8; 64];
         let (len, _) = peer.recv_from(&mut buf).await.unwrap();
         assert_eq!(buf[len - 1], fill);

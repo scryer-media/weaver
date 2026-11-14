@@ -35,12 +35,12 @@ pub enum Fragmenting {
     Allowed,
 }
 
-/// One datagram of a [`Transport::poll_recv_many`], and the two buffers it
-/// was read into: its first `head.len()` bytes are in `head` and the rest
-/// at the start of `spill`. One cut short reads as `spill.len()` bytes.
+/// One datagram of a [`Transport::poll_recv_many`], and the buffer of its
+/// own it was read into: its first `head.len()` bytes are in `head`. The
+/// rest of one longer than that is at the start of the call's one spill
+/// buffer.
 pub struct Received {
     pub head: Box<[u8]>,
-    pub spill: Box<[u8]>,
     pub len: usize,
     pub from: SocketAddr,
 }
@@ -151,14 +151,24 @@ pub trait Transport: PollSendToVectored + Send + Sync + Unpin + 'static {
     }
 
     /// Receives the datagrams that wait, at most `into.len()` of them, in
-    /// the order they came, each into the buffers of its own entry from the
-    /// first on. Ready with how many: never none.
+    /// the order they came, each into its own entry from the first on.
+    /// Ready with how many: never none.
+    ///
+    /// The entries share `spill`, as [`Transport::recv_from_split`] has
+    /// it, for what of a datagram does not fit its entry's `head`: the
+    /// last such datagram of a call is whole. One before it in the same
+    /// call, whose rest the later one wrote over, and one cut short, read
+    /// as `spill.len()` bytes, which is the length of no whole datagram.
+    ///
+    /// A transport that does not receive several fails as unsupported, and
+    /// is then read one datagram a call.
     fn poll_recv_many(
         &self,
         cx: &mut Context<'_>,
         into: &mut [Received],
+        spill: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
-        let _ = (cx, into);
+        let _ = (cx, into, spill);
         Poll::Ready(Err(std::io::ErrorKind::Unsupported.into()))
     }
 

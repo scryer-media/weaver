@@ -2830,6 +2830,8 @@ fn render_torrent_sessions(out: &mut Encoder, routes: &[SessionSeries]) {
         (&f::TORRENT_UTP_RECEIVE_CALL_DATAGRAMS, |s: &SessionSeries| s.utp.receive_call_datagrams),
         (&f::TORRENT_UTP_SEND_BATCHES, |s: &SessionSeries| s.utp.send_batches),
         (&f::TORRENT_UTP_SEND_BATCH_DATAGRAMS, |s: &SessionSeries| s.utp.send_batch_datagrams),
+        (&f::TORRENT_UTP_DATAGRAMS_TOO_LONG, |s: &SessionSeries| s.utp.datagrams_too_long),
+        (&f::TORRENT_UTP_SEND_BATCH_ERRORS, |s: &SessionSeries| s.utp.send_batch_errors),
         (&f::TORRENT_UTP_MAX_CWND, |s: &SessionSeries| {
             s.utp.max_congestion_window_bytes
         }),

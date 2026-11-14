@@ -1170,6 +1170,8 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         format!("weaver_torrent_utp_receive_call_datagrams_total{{{ROUTE}}} 44"),
         format!("weaver_torrent_utp_send_batches_total{{{ROUTE}}} 45"),
         format!("weaver_torrent_utp_send_batch_datagrams_total{{{ROUTE}}} 46"),
+        format!("weaver_torrent_utp_datagrams_too_long_total{{{ROUTE}}} 47"),
+        format!("weaver_torrent_utp_send_batch_errors_total{{{ROUTE}}} 48"),
         format!("weaver_torrent_utp_max_congestion_window_bytes{{{ROUTE}}} 27"),
         format!(r#"weaver_torrent_session_received_bytes_total{{{ROUTE},kind="payload"}} 5000"#),
         format!(r#"weaver_torrent_session_received_bytes_total{{{ROUTE},kind="protocol"}} 700"#),

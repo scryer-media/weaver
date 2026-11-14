@@ -666,13 +666,17 @@ metric_families! {
     TORRENT_UTP_SEND_RUN_ERRORS = ("weaver_torrent_utp_send_run_errors_total", Counter,
         ["route"], "Calls for more than one uTP datagram that failed as a whole, after which the datagrams went one at a time, since the session opened.");
     TORRENT_UTP_RECEIVE_CALLS = ("weaver_torrent_utp_receive_calls_total", Counter,
-        ["route"], "Total uTP socket receive calls that returned datagrams");
+        ["route"], "Total uTP socket receive calls that returned datagrams for uTP; a call that returned only DHT messages is not counted");
     TORRENT_UTP_RECEIVE_CALL_DATAGRAMS = ("weaver_torrent_utp_receive_call_datagrams_total", Counter,
-        ["route"], "Total datagrams uTP socket receive calls returned");
+        ["route"], "Total datagrams uTP socket receive calls returned for uTP; DHT messages on a shared socket are not counted");
     TORRENT_UTP_SEND_BATCHES = ("weaver_torrent_utp_send_batches_total", Counter,
-        ["route"], "Total uTP sends of datagrams for several addresses in one system call");
+        ["route"], "Total uTP system calls that sent two or more datagrams for several addresses");
     TORRENT_UTP_SEND_BATCH_DATAGRAMS = ("weaver_torrent_utp_send_batch_datagrams_total", Counter,
-        ["route"], "Total uTP datagrams sent for several addresses in one system call");
+        ["route"], "Total uTP datagrams sent by system calls that sent two or more for several addresses");
+    TORRENT_UTP_DATAGRAMS_TOO_LONG = ("weaver_torrent_utp_datagrams_too_long_total", Counter,
+        ["route"], "Total datagrams a uTP socket dropped as longer than its receive buffers");
+    TORRENT_UTP_SEND_BATCH_ERRORS = ("weaver_torrent_utp_send_batch_errors_total", Counter,
+        ["route"], "Total uTP sends for several addresses in one system call that failed");
     TORRENT_UTP_MAX_CWND = ("weaver_torrent_utp_max_congestion_window_bytes", Gauge,
         ["route"], "Largest uTP congestion window any stream of the session reached, in bytes.");
     TORRENT_SESSION_PEERS = ("weaver_torrent_session_peers", Gauge, ["route", "state"],

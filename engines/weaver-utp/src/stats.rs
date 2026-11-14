@@ -96,14 +96,18 @@ pub struct UtpStats {
     pub send_run_datagrams: AtomicU64,
     /// Calls for more than one datagram that failed as a whole; their datagrams then went one at a time.
     pub send_run_errors: AtomicU64,
-    /// Reads of the socket that returned datagrams.
+    /// Reads of the socket that returned datagrams for uTP; DHT messages a transport takes are not counted.
     pub receive_calls: AtomicU64,
     /// Datagrams those reads returned: several a read where the host has a call for it.
     pub receive_call_datagrams: AtomicU64,
-    /// Sends that carried datagrams for several addresses in one call.
+    /// Calls that sent two or more datagrams for several addresses.
     pub send_batches: AtomicU64,
     /// Datagrams those sends carried.
     pub send_batch_datagrams: AtomicU64,
+    /// Datagrams dropped as longer than the buffers they were read into.
+    pub datagrams_too_long: AtomicU64,
+    /// Sends of datagrams for several addresses in one call that failed; the first then went alone.
+    pub send_batch_errors: AtomicU64,
 }
 
 /// Relaxed counters for a socket, aggregated across its streams.
@@ -147,6 +151,8 @@ pub struct UtpStatsSnapshot {
     pub receive_call_datagrams: u64,
     pub send_batches: u64,
     pub send_batch_datagrams: u64,
+    pub datagrams_too_long: u64,
+    pub send_batch_errors: u64,
 }
 
 impl UtpStats {
@@ -192,6 +198,8 @@ impl UtpStats {
             receive_call_datagrams: self.receive_call_datagrams.load(Ordering::Relaxed),
             send_batches: self.send_batches.load(Ordering::Relaxed),
             send_batch_datagrams: self.send_batch_datagrams.load(Ordering::Relaxed),
+            datagrams_too_long: self.datagrams_too_long.load(Ordering::Relaxed),
+            send_batch_errors: self.send_batch_errors.load(Ordering::Relaxed),
         }
     }
 }
@@ -266,6 +274,8 @@ impl std::ops::AddAssign for UtpStatsSnapshot {
         self.receive_call_datagrams = self.receive_call_datagrams.saturating_add(other.receive_call_datagrams);
         self.send_batches = self.send_batches.saturating_add(other.send_batches);
         self.send_batch_datagrams = self.send_batch_datagrams.saturating_add(other.send_batch_datagrams);
+        self.datagrams_too_long = self.datagrams_too_long.saturating_add(other.datagrams_too_long);
+        self.send_batch_errors = self.send_batch_errors.saturating_add(other.send_batch_errors);
     }
 }
 

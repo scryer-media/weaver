@@ -99,6 +99,8 @@ pub struct MockUtpTransport {
     // How many datagrams one call sends to several addresses, and how many
     // one call receives.
     many: usize,
+    // It says it receives several a call and has no call that does.
+    many_unsupported: bool,
 }
 
 impl MockUtpTransport {
@@ -117,11 +119,18 @@ impl MockUtpTransport {
             spreads: false,
             refuses_registration: false,
             many: 1,
+            many_unsupported: false,
         }
     }
 
     pub fn taking_many(mut self, most: usize) -> Self {
         self.many = most;
+        self
+    }
+
+    pub fn claiming_many(mut self, most: usize) -> Self {
+        self.many = most;
+        self.many_unsupported = true;
         self
     }
 
@@ -215,18 +224,30 @@ impl Transport for MockUtpTransport {
         &self,
         cx: &mut std::task::Context<'_>,
         into: &mut [crate::Received],
+        spill: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
+        if self.many_unsupported {
+            return Poll::Ready(Err(std::io::ErrorKind::Unsupported.into()));
+        }
         let mut locked = self.inner.locked.lock();
         let mut count = 0;
+        let mut long = None;
         while count < into.len() {
             let Poll::Ready(next) = locked.rx.poll_recv(cx) else {
                 break;
             };
             let (from, data) = next.unwrap();
+            let first = data.len().min(into[count].head.len());
+            if data.len() > first {
+                // The rest of a long one is written over the rest of the
+                // long one before it in the call.
+                if let Some(before) = long.replace(count) {
+                    into[before].len = spill.len();
+                }
+                spill[..data.len() - first].copy_from_slice(&data[first..]);
+            }
             let entry = &mut into[count];
-            let first = data.len().min(entry.head.len());
             entry.head[..first].copy_from_slice(&data[..first]);
-            entry.spill[..data.len() - first].copy_from_slice(&data[first..]);
             entry.len = data.len();
             entry.from = from;
             count += 1;

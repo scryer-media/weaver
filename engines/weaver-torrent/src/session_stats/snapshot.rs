@@ -83,4 +83,6 @@ struct SerializedUtpStatsSnapshot {
     receive_call_datagrams: u64,
     send_batches: u64,
     send_batch_datagrams: u64,
+    datagrams_too_long: u64,
+    send_batch_errors: u64,
 }
