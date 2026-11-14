@@ -24,7 +24,7 @@ function provider(overrides: Partial<ProviderHealth> = {}): ProviderHealth {
     connectionsMax: 100,
     connectionsConfigured: 100,
     capacityPenaltyUntilEpochMs: null,
-    latencyMs: 0,
+    measuredLatencyMs: null,
     bodyLatencyMs: null,
     bodyLatencyBand: null,
     successCount: 0,

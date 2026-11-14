@@ -69,7 +69,7 @@ impl Pipeline {
                                     .uu_files
                                     .get(&work.segment_id.file_id)
                                     .is_none_or(|uu| {
-                                        uu.next_index == work.segment_id.segment_number
+                                        uu.next_index.get() == work.segment_id.segment_number
                                     }))
                     })
                     .is_some();
@@ -91,7 +91,7 @@ impl Pipeline {
                     .peek_next_matching(|work| {
                         self.uu_files
                             .get(&work.segment_id.file_id)
-                            .is_none_or(|uu| uu.next_index == work.segment_id.segment_number)
+                            .is_none_or(|uu| uu.next_index.get() == work.segment_id.segment_number)
                     })
                     .is_some()
         })
@@ -190,7 +190,7 @@ impl Pipeline {
             .iter()
             .chain(self.download_wait_by_job.keys())
             .chain(self.active_download_connections_by_job.keys())
-            .chain(self.active_downloads_by_job.keys())
+            .chain(self.articles_in_flight_by_job.keys())
             .chain(self.active_decodes_by_job.jobs())
             .chain(self.pending_released_download_results_by_job.keys())
             .copied()

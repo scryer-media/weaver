@@ -192,7 +192,7 @@ struct CachedFailure {
     generation: u64,
     source: Option<usize>,
     groups: Arc<[String]>,
-    requested_excludes: Vec<usize>,
+    requested_excludes: weaver_nntp::ServerSet,
     expires: Option<Instant>,
     _memory: Option<ProcessMemoryPermit>,
 }
@@ -214,7 +214,7 @@ struct Reply {
     data: Result<DownloadPayload, DownloadError>,
     attempts: Vec<weaver_nntp::client::FetchAttemptTrace>,
     source: Option<usize>,
-    excludes: Vec<usize>,
+    excludes: weaver_nntp::ServerSet,
 }
 
 impl RepeatedArticles {
@@ -290,7 +290,7 @@ impl RepeatedArticles {
     async fn fetch(
         self: &Arc<Self>,
         work: &DownloadWork,
-        excludes: &[usize],
+        excludes: weaver_nntp::ServerSet,
         nntp: &NntpClient,
         generation: u64,
     ) -> Reply {
@@ -301,7 +301,7 @@ impl RepeatedArticles {
     async fn fetch_guarded(
         self: &Arc<Self>,
         work: &DownloadWork,
-        excludes: &[usize],
+        excludes: weaver_nntp::ServerSet,
         nntp: &NntpClient,
         generation: u64,
         ready: impl Fn() -> bool,
@@ -313,7 +313,7 @@ impl RepeatedArticles {
             ))),
             attempts: Vec::new(),
             source: None,
-            excludes: work.exclude_servers.clone(),
+            excludes: work.exclude_servers,
         };
         if !ready() {
             return obsolete();
@@ -330,11 +330,11 @@ impl RepeatedArticles {
                 if body.generation == generation
                     && body
                         .source
-                        .is_none_or(|source| !work.exclude_servers.contains(&source)) =>
+                        .is_none_or(|source| !work.exclude_servers.contains(source)) =>
             {
                 let memory = self.memory.clone();
                 let id = work.segment_id;
-                let excludes = work.exclude_servers.clone();
+                let excludes = work.exclude_servers;
                 return tokio::task::spawn_blocking(move || {
                     let Some(Entry::Body(body)) = state.as_mut() else {
                         unreachable!()
@@ -346,7 +346,7 @@ impl RepeatedArticles {
                             .map_err(DownloadError::local),
                         attempts: Vec::new(),
                         source: body.source,
-                        excludes: excludes.to_vec(),
+                        excludes,
                     }
                 })
                 .await
@@ -356,7 +356,7 @@ impl RepeatedArticles {
                     ))),
                     attempts: Vec::new(),
                     source: None,
-                    excludes: Vec::new(),
+                    excludes: weaver_nntp::ServerSet::EMPTY,
                 });
             }
             Some(Entry::Failure(failure))
@@ -375,7 +375,7 @@ impl RepeatedArticles {
                     data: Err(failure.error.clone()),
                     attempts: Vec::new(),
                     source: failure.source,
-                    excludes: work.exclude_servers.clone(),
+                    excludes: work.exclude_servers,
                 };
             }
             Some(Entry::Fatal(error)) => {
@@ -383,7 +383,7 @@ impl RepeatedArticles {
                     data: Err(DownloadError::local(error.clone())),
                     attempts: Vec::new(),
                     source: None,
-                    excludes: work.exclude_servers.clone(),
+                    excludes: work.exclude_servers,
                 };
             }
             _ => {}
@@ -451,7 +451,7 @@ impl RepeatedArticles {
                     generation,
                     source: reply.source,
                     groups: work.groups.clone(),
-                    requested_excludes: excludes.to_vec(),
+                    requested_excludes: excludes,
                     expires,
                     _memory: Some(reservation),
                 }));
@@ -472,7 +472,11 @@ impl RepeatedArticles {
     // evidence, so the work requeues without spending the segment's retry
     // budget and the short-lived cached failure expires on its own. No
     // article is lost; the duplicates simply wait for a lane to free up.
-    async fn fetch_uncached(work: &DownloadWork, excludes: &[usize], nntp: &NntpClient) -> Reply {
+    async fn fetch_uncached(
+        work: &DownloadWork,
+        excludes: weaver_nntp::ServerSet,
+        nntp: &NntpClient,
+    ) -> Reply {
         let trace = nntp
             .fetch_body_decoded_with_groups_excluding_traced(
                 &work.message_id.wire_form(),
@@ -495,7 +499,7 @@ impl RepeatedArticles {
             data,
             attempts,
             source,
-            excludes: work.exclude_servers.clone(),
+            excludes: work.exclude_servers,
         }
     }
 }
@@ -518,15 +522,11 @@ impl Pipeline {
                 // from the work: fetching on the lease's set alone re-asks a
                 // server this article has already been refused by, and the
                 // result then reports a set that never grows.
-                let article_excludes = Pipeline::union_exclude_servers(
-                    &work.exclude_servers,
-                    &lease.effective_exclude_servers,
-                );
-                let excludes =
-                    Pipeline::union_exclude_servers(&article_excludes, &lease.dial_exclude_servers);
+                let article_excludes = work.exclude_servers.union(lease.effective_exclude_servers);
+                let excludes = article_excludes.union(lease.dial_exclude_servers);
                 let guard_state = state.clone();
                 let guard_pool = Arc::clone(nntp.pool());
-                let guard_excludes = article_excludes.clone();
+                let guard_excludes = article_excludes;
                 let job_id = lease.job_id;
                 let generation = lease.runtime_generation;
                 let estimate = Pipeline::bandwidth_reservation_estimate(work.byte_estimate);
@@ -535,37 +535,30 @@ impl Pipeline {
                         && matches!(
                             guard_pool.provider_policy().eligibility(
                                 server.0,
-                                &guard_excludes,
-                                &[],
+                                guard_excludes,
+                                weaver_nntp::ServerSet::EMPTY,
                                 estimate
                             ),
                             weaver_nntp::provider_policy::ArticleEligibility::Eligible(_)
                         )
                 });
                 let reply = cache
-                    .fetch_guarded(&work, &excludes, &guarded, lease.runtime_generation, || {
+                    .fetch_guarded(&work, excludes, &guarded, lease.runtime_generation, || {
                         super::owned_lane::job_work_is_current(
                             &state,
                             lease.job_id,
                             lease.runtime_generation,
                         ) && {
-                            let policy = nntp.pool().provider_policy();
-                            (0..nntp.pool().server_count()).any(|server| {
-                                !lease.dial_exclude_servers.contains(&server)
-                                    && matches!(
-                                        policy.eligibility(
-                                            server,
-                                            &article_excludes,
-                                            &[],
-                                            Pipeline::bandwidth_reservation_estimate(
-                                                work.byte_estimate
-                                            )
-                                        ),
-                                        weaver_nntp::provider_policy::ArticleEligibility::Eligible(
-                                            _
-                                        )
-                                    )
-                            })
+                            !nntp
+                                .pool()
+                                .provider_policy()
+                                .eligible_servers(
+                                    article_excludes,
+                                    weaver_nntp::ServerSet::EMPTY,
+                                    Pipeline::bandwidth_reservation_estimate(work.byte_estimate),
+                                )
+                                .difference(lease.dial_exclude_servers)
+                                .is_empty()
                         }
                     })
                     .await;
@@ -584,10 +577,7 @@ impl Pipeline {
                             work.completion_critical,
                         ),
                         retry_count: work.retry_count,
-                        exclude_servers: Pipeline::union_exclude_servers(
-                            &reply.excludes,
-                            &lease.effective_exclude_servers,
-                        ),
+                        exclude_servers: reply.excludes.union(lease.effective_exclude_servers),
                         release_connection_slot: false,
                     })
                     .await;
@@ -651,7 +641,7 @@ mod tests {
             retry_count: 0,
             is_recovery: false,
             completion_critical: false,
-            exclude_servers: Vec::new(),
+            exclude_servers: weaver_nntp::ServerSet::EMPTY,
             avoid_server: None,
         }
     }
@@ -768,7 +758,7 @@ mod tests {
             generation: 7,
             source: Some(0),
             groups: work.groups.clone(),
-            requested_excludes: Vec::new(),
+            requested_excludes: weaver_nntp::ServerSet::EMPTY,
             expires: None,
             _memory: None,
         };
@@ -787,7 +777,9 @@ mod tests {
             max_retries_per_server: 1,
             soft_timeout: Duration::from_secs(1),
         });
-        let reply = cache.fetch(&work, &[], &client, 7).await;
+        let reply = cache
+            .fetch(&work, weaver_nntp::ServerSet::EMPTY, &client, 7)
+            .await;
         assert!(matches!(
             reply.data,
             Err(DownloadError::Fetch(DownloadFailure {
@@ -807,16 +799,20 @@ mod tests {
             let Some(Entry::Failure(failure)) = state.as_mut() else {
                 panic!("cached failure")
             };
-            failure.requested_excludes = vec![1];
+            failure.requested_excludes = weaver_nntp::ServerSet::from([1]);
         }
-        let reply = cache.fetch(&work, &[1], &client, 7).await;
+        let reply = cache
+            .fetch(&work, weaver_nntp::ServerSet::from([1]), &client, 7)
+            .await;
         assert_eq!(
             reply.excludes,
             Vec::<usize>::new(),
             "a transport avoidance hint is not a missing-article proof"
         );
         assert_eq!(reply.source, Some(0));
-        let reply = cache.fetch(&work, &[], &client, 8).await;
+        let reply = cache
+            .fetch(&work, weaver_nntp::ServerSet::EMPTY, &client, 8)
+            .await;
         assert!(matches!(
             reply.data,
             Err(DownloadError::Fetch(DownloadFailure {
@@ -840,7 +836,7 @@ mod tests {
             generation: 7,
             source: None,
             groups: work.groups.clone(),
-            requested_excludes: Vec::new(),
+            requested_excludes: weaver_nntp::ServerSet::EMPTY,
             expires: Some(Instant::now() - Duration::from_millis(1)),
             _memory: None,
         };
@@ -861,7 +857,9 @@ mod tests {
         });
         // The expired entry is discarded rather than replayed, so this reply
         // is the fresh refusal from the fetch path.
-        let reply = cache.fetch(&work, &[], &client, 7).await;
+        let reply = cache
+            .fetch(&work, weaver_nntp::ServerSet::EMPTY, &client, 7)
+            .await;
         let Err(DownloadError::Fetch(failure)) = &reply.data else {
             panic!("the expired entry must be refetched into a capacity refusal")
         };

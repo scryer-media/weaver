@@ -600,8 +600,11 @@ async fn a_decode_done_during_a_restart_is_heard_between_batches() {
             },
             raw_size: 0,
             error: "synthetic decode failure".to_string(),
-            source_server_idx: None,
-            exclude_servers: Vec::new(),
+            servers: PoolServers::stamped(
+                pipeline.pool_generation,
+                None,
+                weaver_nntp::ServerSet::EMPTY,
+            ),
         })
         .await
         .unwrap();
@@ -1043,7 +1046,7 @@ async fn a_result_turn_and_a_refill_turn_walk_no_row_and_ask_no_database_on_a_lo
                 source_server_idx: None,
                 origin: DownloadResultOrigin::NormalPrimary,
                 retry_count: 0,
-                exclude_servers: Vec::new(),
+                exclude_servers: weaver_nntp::ServerSet::EMPTY,
                 release_connection_slot: true,
             })
             .await;

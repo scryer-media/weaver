@@ -16,7 +16,7 @@ export interface MetricsSnapshot {
   bytesDecoded: number;
   bytesCommitted: number;
   downloadQueueDepth: number;
-  activeDownloads: number;
+  articlesInFlight: number;
   activeDecodes: number;
   decodePending: number;
   decodePendingBytes: number;
@@ -182,7 +182,7 @@ export const COUNTER_HISTORY_METRIC_NAMES = [
 export const GAUGE_HISTORY_METRIC_NAMES = [
   "weaver_pipeline_current_download_speed_bytes_per_second",
   "weaver_pipeline_download_queue_depth",
-  "weaver_pipeline_active_downloads",
+  "weaver_pipeline_articles_in_flight",
   "weaver_pipeline_active_decodes",
   "weaver_pipeline_decode_pending",
   "weaver_pipeline_decode_pending_bytes",
@@ -247,7 +247,7 @@ export const PROM_METRIC_TO_SNAPSHOT_FIELD: Record<
   weaver_pipeline_download_pressure_stalls_total: "downloadPressureStallsTotal",
   weaver_pipeline_current_download_speed_bytes_per_second: "currentDownloadSpeed",
   weaver_pipeline_download_queue_depth: "downloadQueueDepth",
-  weaver_pipeline_active_downloads: "activeDownloads",
+  weaver_pipeline_articles_in_flight: "articlesInFlight",
   weaver_pipeline_active_decodes: "activeDecodes",
   weaver_pipeline_decode_pending: "decodePending",
   weaver_pipeline_decode_pending_bytes: "decodePendingBytes",

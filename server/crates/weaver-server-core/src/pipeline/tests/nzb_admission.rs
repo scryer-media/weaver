@@ -245,7 +245,7 @@ async fn twenty_four_providers_cannot_admit_more_than_ten_of_124_nzbs() {
                 source_server_idx: None,
                 origin: DownloadResultOrigin::NormalPrimary,
                 retry_count: 0,
-                exclude_servers: Vec::new(),
+                exclude_servers: weaver_nntp::ServerSet::EMPTY,
                 release_connection_slot: true,
             })
             .await;

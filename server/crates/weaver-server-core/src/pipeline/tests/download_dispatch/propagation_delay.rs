@@ -37,8 +37,8 @@ async fn owned_download_lane_capacity_failure_requeues_without_failing_the_artic
         lane_mode: DownloadLaneMode::Sequential,
         server_modes: Vec::new(),
         completion_critical: false,
-        effective_exclude_servers: Vec::new(),
-        dial_exclude_servers: Vec::new(),
+        effective_exclude_servers: weaver_nntp::ServerSet::EMPTY,
+        dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
         works: vec![work],
@@ -60,15 +60,15 @@ async fn owned_download_lane_capacity_failure_requeues_without_failing_the_artic
     );
 
     assert!(pending.is_empty());
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     assert_eq!(pipeline.active_download_connections, 0);
-    assert_eq!(pipeline.active_downloads_by_job.get(&job_id), None);
+    assert_eq!(pipeline.articles_in_flight_by_job.get(&job_id), None);
     assert_eq!(
         pipeline.active_download_connections_by_job.get(&job_id),
         None
     );
     assert_eq!(
-        pipeline.active_downloads_by_file.get(&segment_id.file_id),
+        pipeline.articles_in_flight_by_file.get(&segment_id.file_id),
         None
     );
     assert_eq!(
@@ -126,8 +126,8 @@ async fn owned_download_lane_selection_contention_requeues_without_failing_the_a
         lane_mode: DownloadLaneMode::Sequential,
         server_modes: Vec::new(),
         completion_critical: false,
-        effective_exclude_servers: Vec::new(),
-        dial_exclude_servers: Vec::new(),
+        effective_exclude_servers: weaver_nntp::ServerSet::EMPTY,
+        dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
         works: vec![work],
@@ -152,15 +152,15 @@ async fn owned_download_lane_selection_contention_requeues_without_failing_the_a
         pending.is_empty(),
         "contention must not resolve any of the leased articles"
     );
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     assert_eq!(pipeline.active_download_connections, 0);
-    assert_eq!(pipeline.active_downloads_by_job.get(&job_id), None);
+    assert_eq!(pipeline.articles_in_flight_by_job.get(&job_id), None);
     assert_eq!(
         pipeline.active_download_connections_by_job.get(&job_id),
         None
     );
     assert_eq!(
-        pipeline.active_downloads_by_file.get(&segment_id.file_id),
+        pipeline.articles_in_flight_by_file.get(&segment_id.file_id),
         None
     );
     assert_eq!(
@@ -223,7 +223,7 @@ async fn dispatch_downloads_shares_a_small_hot_job_across_both_lanes_before_the_
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 3);
+    assert_eq!(pipeline.articles_in_flight, 3);
     assert_eq!(pipeline.active_download_connections, 2);
     // The hot job's three articles are two lanes' share, not one handout: the
     // second lane takes what the first left rather than opening the next
@@ -253,9 +253,12 @@ async fn dispatch_downloads_shares_a_small_hot_job_across_both_lanes_before_the_
             .len(),
         1
     );
-    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&3));
     assert_eq!(
-        pipeline.active_downloads_by_job.get(&secondary_job_id),
+        pipeline.articles_in_flight_by_job.get(&hot_job_id),
+        Some(&3)
+    );
+    assert_eq!(
+        pipeline.articles_in_flight_by_job.get(&secondary_job_id),
         None
     );
 }
@@ -306,12 +309,15 @@ async fn dispatch_downloads_throttles_hot_job_under_soft_byte_pressure() {
     let first_pass_started = Instant::now();
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 1);
+    assert_eq!(pipeline.articles_in_flight, 1);
     assert_eq!(pipeline.active_download_connections, 1);
-    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&1));
+    assert_eq!(
+        pipeline.articles_in_flight_by_job.get(&hot_job_id),
+        Some(&1)
+    );
     assert!(
         !pipeline
-            .active_downloads_by_job
+            .articles_in_flight_by_job
             .contains_key(&secondary_job_id)
     );
     assert_eq!(
@@ -358,7 +364,7 @@ async fn dispatch_downloads_throttles_hot_job_under_soft_byte_pressure() {
     pipeline.download_pressure_soft_dispatch_after =
         Some(Instant::now() + Duration::from_secs(3600));
     pipeline.dispatch_downloads();
-    assert_eq!(pipeline.active_downloads, 1);
+    assert_eq!(pipeline.articles_in_flight, 1);
     assert_eq!(pipeline.active_download_connections, 1);
     assert_eq!(
         pipeline
@@ -376,9 +382,12 @@ async fn dispatch_downloads_throttles_hot_job_under_soft_byte_pressure() {
     pipeline.download_pressure_soft_dispatch_after =
         Some(Instant::now() - Duration::from_millis(1));
     pipeline.dispatch_downloads();
-    assert_eq!(pipeline.active_downloads, 2);
+    assert_eq!(pipeline.articles_in_flight, 2);
     assert_eq!(pipeline.active_download_connections, 2);
-    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&2));
+    assert_eq!(
+        pipeline.articles_in_flight_by_job.get(&hot_job_id),
+        Some(&2)
+    );
     assert_eq!(
         pipeline
             .jobs
@@ -431,11 +440,14 @@ async fn dispatch_downloads_suppresses_the_spill_under_soft_byte_pressure() {
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 1);
-    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&1));
+    assert_eq!(pipeline.articles_in_flight, 1);
+    assert_eq!(
+        pipeline.articles_in_flight_by_job.get(&hot_job_id),
+        Some(&1)
+    );
     assert!(
         !pipeline
-            .active_downloads_by_job
+            .articles_in_flight_by_job
             .contains_key(&secondary_job_id)
     );
     assert_eq!(
@@ -631,7 +643,7 @@ async fn list_jobs_projects_downloading_while_extracting_with_active_download_wo
     );
     assert_eq!(info.post_state, crate::jobs::model::PostState::Extracting);
 
-    pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline.articles_in_flight_by_job.insert(job_id, 1);
     let active_info = pipeline
         .list_jobs()
         .into_iter()
@@ -668,7 +680,7 @@ async fn lane_less_download_stays_downloading_and_resumes_on_the_gauge_window() 
             .clone()
     });
     let now = std::time::Instant::now();
-    pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline.articles_in_flight_by_job.insert(job_id, 1);
     pipeline.report_job(job_id);
     pipeline
         .shared_state
@@ -691,7 +703,7 @@ async fn lane_less_download_stays_downloading_and_resumes_on_the_gauge_window() 
             .is_some()
     );
 
-    pipeline.active_downloads_by_job.remove(&job_id);
+    pipeline.articles_in_flight_by_job.remove(&job_id);
     pipeline.report_job(job_id);
     pipeline.shared_state.queue.sample_counters(
         &pipeline.metrics,
@@ -705,7 +717,7 @@ async fn lane_less_download_stays_downloading_and_resumes_on_the_gauge_window() 
     assert_eq!(inactive.download_state, crate::DownloadState::Queued);
     assert!(inactive.phase_progress.is_empty());
 
-    pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline.articles_in_flight_by_job.insert(job_id, 1);
     pipeline.report_job(job_id);
     pipeline.shared_state.queue.sample_counters(
         &pipeline.metrics,
@@ -751,7 +763,7 @@ async fn a_started_download_with_only_queued_work_lists_as_downloading() {
             .active_download_connections_by_job
             .contains_key(&job_id)
     );
-    assert!(!pipeline.active_downloads_by_job.contains_key(&job_id));
+    assert!(!pipeline.articles_in_flight_by_job.contains_key(&job_id));
     assert!(!pipeline.active_decodes_by_job.contains_key(&job_id));
     assert!(!pipeline.job_has_current_download_activity(job_id));
 
@@ -788,7 +800,7 @@ async fn download_phase_rate_matches_the_global_speed_gauge() {
         ),
     )
     .await;
-    pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline.articles_in_flight_by_job.insert(job_id, 1);
     pipeline.report_job(job_id);
     pipeline.phase_begin(job_id, JobPhase::Downloading, Some(1_024));
     let counters = pipeline.shared_state.queue.read(|inner| {
@@ -884,7 +896,7 @@ fn start_rate_sum_download(
     pipeline: &mut Pipeline,
     job_id: JobId,
 ) -> Arc<crate::pipeline::queue::JobCounters> {
-    pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline.articles_in_flight_by_job.insert(job_id, 1);
     pipeline.report_job(job_id);
     pipeline.phase_begin(job_id, JobPhase::Downloading, Some(1 << 40));
     let counters = pipeline.shared_state.queue.job_counters(job_id).unwrap();
@@ -973,7 +985,7 @@ async fn downloading_rows_rates_sum_to_the_global_speed_gauge() {
 
     // Between lanes the second job shows no rate; once a lane holds it again
     // its rate resumes on the same window, with no warm-up of its own.
-    pipeline.active_downloads_by_job.remove(&second);
+    pipeline.articles_in_flight_by_job.remove(&second);
     pipeline.report_job(second);
     for tick in 40..44 {
         land_rate_sum_article(&first_counters, 250_000);
@@ -983,7 +995,7 @@ async fn downloading_rows_rates_sum_to_the_global_speed_gauge() {
             vec![first]
         );
     }
-    pipeline.active_downloads_by_job.insert(second, 1);
+    pipeline.articles_in_flight_by_job.insert(second, 1);
     pipeline.report_job(second);
     for tick in 44..60 {
         land_rate_sum_article(&first_counters, 250_000);
@@ -1208,7 +1220,7 @@ async fn server_quota_ui_state_does_not_globally_stop_unrelated_dispatch() {
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 1);
+    assert_eq!(pipeline.articles_in_flight, 1);
     assert_eq!(
         pipeline
             .jobs
@@ -1737,7 +1749,7 @@ async fn active_rate_limit_does_not_prelease_multiple_bodies() {
     pipeline.rate_limiter.set_rate(128 * 1024);
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 1);
+    assert_eq!(pipeline.articles_in_flight, 1);
     assert_eq!(
         pipeline
             .jobs
@@ -1782,7 +1794,7 @@ async fn download_done_refunds_rate_limit_estimate_to_actual_raw_bytes() {
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: vec![],
+            exclude_servers: weaver_nntp::ServerSet::from([]),
             release_connection_slot: true,
         })
         .await;
@@ -1821,7 +1833,7 @@ async fn download_done_charges_rate_limit_for_raw_bytes_above_estimate() {
             source_server_idx: None,
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: vec![],
+            exclude_servers: weaver_nntp::ServerSet::from([]),
             release_connection_slot: true,
         })
         .await;
@@ -1847,9 +1859,9 @@ async fn auto_pause_stalled_download_releases_blocking_runtime() {
         job_id,
         minimal_job_state(job_id, "stalled-job", temp_dir.path().join("stalled-job")),
     );
-    pipeline.active_downloads = 1;
+    pipeline.articles_in_flight = 1;
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline.articles_in_flight_by_job.insert(job_id, 1);
     pipeline.rate_limit_reservations.insert(segment_id, 256);
     let lane_id = Pipeline::next_download_lane_id();
     pipeline.download_lane_owners.insert(
@@ -1873,7 +1885,7 @@ async fn auto_pause_stalled_download_releases_blocking_runtime() {
                     retry_count: 0,
                     is_recovery: false,
                     completion_critical: false,
-                    exclude_servers: vec![],
+                    exclude_servers: weaver_nntp::ServerSet::from([]),
                     avoid_server: None,
                 },
             )]),
@@ -1897,9 +1909,9 @@ async fn auto_pause_stalled_download_releases_blocking_runtime() {
             .and_then(|state| state.paused_resume_status.clone()),
         Some(JobStatus::Downloading)
     );
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     assert!(!pipeline.active_download_passes.contains(&job_id));
-    assert!(!pipeline.active_downloads_by_job.contains_key(&job_id));
+    assert!(!pipeline.articles_in_flight_by_job.contains_key(&job_id));
     assert!(pipeline.rate_limit_reservations.is_empty());
 }
 
@@ -1942,7 +1954,7 @@ async fn body_activity_keeps_only_its_current_job_alive_without_article_results(
             job,
             minimal_job_state(job, "paced", temp_dir.path().join(job.0.to_string())),
         );
-        pipeline.active_downloads_by_job.insert(job, 1);
+        pipeline.articles_in_flight_by_job.insert(job, 1);
     }
     pipeline.download_lane_owners.insert(
         Pipeline::next_download_lane_id(),
@@ -1988,7 +2000,7 @@ async fn body_activity_keeps_only_its_current_job_alive_without_article_results(
     // Resuming the same ID need not replace the pool. A retired lease can
     // still return bytes, but only leases admitted after retirement count.
     pipeline.resume_job_runtime(live).unwrap();
-    pipeline.active_downloads_by_job.insert(live, 1);
+    pipeline.articles_in_flight_by_job.insert(live, 1);
     pipeline.job_last_download_activity.insert(
         live,
         std::time::Instant::now() - STALLED_DOWNLOAD_IDLE_THRESHOLD - Duration::from_secs(1),
@@ -2061,9 +2073,9 @@ async fn pause_allows_extracting_status_with_runtime_download_work() {
     state.post_state = crate::jobs::model::PostState::Extracting;
     state.refresh_legacy_status();
     pipeline.jobs.insert(job_id, state);
-    pipeline.active_downloads = 1;
+    pipeline.articles_in_flight = 1;
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline.articles_in_flight_by_job.insert(job_id, 1);
 
     pipeline.pause_job_runtime(job_id).unwrap();
 
@@ -2190,7 +2202,7 @@ async fn changing_propagation_delay_updates_the_hold_and_zero_dispatches_immedia
         pipeline.propagation_ready_at[&job_id], initial_hold,
         "saving unchanged settings must preserve the timer"
     );
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     let drain_wait_updates = |events: &mut broadcast::Receiver<PipelineEvent>| {
         let mut count = 0;
         while let Ok(event) = events.try_recv() {
@@ -2221,7 +2233,7 @@ async fn changing_propagation_delay_updates_the_hold_and_zero_dispatches_immedia
     pipeline.dispatch_downloads();
     let held = pipeline.shared_state.get_job(job_id).unwrap();
     assert!(held.download_retry_at_epoch_ms.unwrap() > initial_deadline + 500_000.0);
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     assert_eq!(drain_wait_updates(&mut events), 1);
 
     set_job_status_for_test(&mut pipeline, job_id, JobStatus::Paused);
@@ -2247,7 +2259,7 @@ async fn changing_propagation_delay_updates_the_hold_and_zero_dispatches_immedia
         .unwrap();
     pipeline.apply_queue_intents().await;
     pipeline.dispatch_downloads();
-    assert_eq!(pipeline.active_downloads, 1);
+    assert_eq!(pipeline.articles_in_flight, 1);
     assert!(pipeline.propagation_ready_at.is_empty());
     assert!(pipeline.next_propagation_delay().is_none());
     let released = pipeline.shared_state.get_job(job_id).unwrap();
@@ -2316,7 +2328,7 @@ async fn a_deferred_job_issues_nothing_until_it_is_eligible() {
     pipeline.dispatch_downloads();
 
     assert_eq!(
-        pipeline.active_downloads, 0,
+        pipeline.articles_in_flight, 0,
         "a deferred job must not put an article on the wire"
     );
     assert_eq!(
@@ -2343,7 +2355,7 @@ async fn a_deferred_job_issues_nothing_until_it_is_eligible() {
     pipeline.dispatch_downloads();
 
     assert_eq!(
-        pipeline.active_downloads, 1,
+        pipeline.articles_in_flight, 1,
         "once the post has propagated the same pass dispatches it"
     );
     assert_eq!(

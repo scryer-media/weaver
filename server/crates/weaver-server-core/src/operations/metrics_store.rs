@@ -46,7 +46,7 @@ pub const COUNTER_METRIC_KEYS: [&str; NUM_COUNTER_METRICS] = [
 pub const GAUGE_METRIC_KEYS: [&str; NUM_GAUGE_METRICS] = [
     "weaver_pipeline_current_download_speed_bytes_per_second",
     "weaver_pipeline_download_queue_depth",
-    "weaver_pipeline_active_downloads",
+    "weaver_pipeline_articles_in_flight",
     "weaver_pipeline_active_decodes",
     "weaver_pipeline_decode_pending",
     "weaver_pipeline_decode_pending_bytes",
@@ -275,7 +275,7 @@ impl RawMetricsHistoryPoint {
             gauge_values: [
                 snapshot.current_download_speed as f64,
                 snapshot.download_queue_depth as f64,
-                snapshot.active_downloads as f64,
+                snapshot.articles_in_flight as f64,
                 snapshot.active_decodes as f64,
                 snapshot.decode_pending as f64,
                 snapshot.decode_pending_bytes as f64,

@@ -192,3 +192,152 @@ async fn reseeding_carries_a_surviving_servers_measurements_across() {
         "the newcomer has measured nothing and starts at the shallowest rung"
     );
 }
+
+// A server pinned to sequential fetch stays pinned through a pool rebuild.
+//
+// The rebuild used to seed a fresh explorer for every server, so a server
+// that had twice failed a pipelined batch came back at depth 2 and unpinned:
+// the lanes pipelined to it again, and its health card showed a depth the
+// log had just said was given up.
+#[tokio::test]
+async fn a_pinned_server_stays_sequential_across_a_pool_rebuild() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let with_id = |host: &str, id: u32| {
+        let mut config = server(
+            host,
+            weaver_nntp::PipeliningCapability::Known(true),
+            Some(4),
+        );
+        config.stable_id = weaver_nntp::transfer::StableServerId(id);
+        config
+    };
+
+    pipeline.nntp = std::sync::Arc::new(pool_with(vec![
+        with_id("pinned.example.invalid", 7),
+        with_id("clean.example.invalid", 8),
+    ]));
+    pipeline.seed_download_lane_explorers();
+    let now = std::time::Instant::now();
+    let explorer = pipeline
+        .download_lane_runtime
+        .servers
+        .get_mut(&0)
+        .expect("the first server is seeded");
+    explorer.note_unclean_batch(now);
+    explorer.note_unclean_batch(now);
+    assert!(explorer.pinned_sequential());
+
+    // The rebuild swaps the two positions.
+    pipeline.nntp = std::sync::Arc::new(pool_with(vec![
+        with_id("clean.example.invalid", 8),
+        with_id("pinned.example.invalid", 7),
+    ]));
+    pipeline.seed_download_lane_explorers();
+    let pressure = pipeline.refresh_download_pressure();
+
+    assert_eq!(
+        pipeline.download_lane_mode_for_server(1, pressure, true),
+        DownloadLaneMode::Sequential
+    );
+    assert_eq!(
+        pipeline.download_lane_mode_for_server(0, pressure, true),
+        DownloadLaneMode::Pipelined { depth: 4 }
+    );
+    pipeline.publish_download_transport_health();
+    let shown = pipeline.shared_state.download_transport_health();
+    assert_eq!(
+        shown
+            .iter()
+            .map(|entry| (
+                entry.server_idx,
+                entry.pipeline_depth,
+                entry.pinned_sequential
+            ))
+            .collect::<Vec<_>>(),
+        vec![(0, 4, false), (1, 1, true)]
+    );
+}
+
+// The pin belongs to the server that earned it: the same stable id, host,
+// port and username, as a rebuild knows a server. A reorder or a priority
+// change keeps it. An edit that points the entry at another host or port
+// starts it unpinned: that backend never failed a pipelined batch.
+#[tokio::test]
+async fn a_pin_follows_its_server_and_not_an_edited_host_or_port() {
+    let entry = |host: &str, port: u16, group: u32, id: u32| {
+        let mut config = server(
+            host,
+            weaver_nntp::PipeliningCapability::Known(true),
+            Some(4),
+        );
+        config.server.port = port;
+        config.group = group;
+        config.stable_id = weaver_nntp::transfer::StableServerId(id);
+        config
+    };
+    let other = |group: u32| entry("clean.example.invalid", 119, group, 8);
+    // Each case rebuilds the pool from a pinned "nova" at position 0, and
+    // names where the entry is afterwards and whether it is still pinned.
+    let cases = [
+        (
+            "reordered",
+            vec![other(0), entry("nova.example.invalid", 119, 0, 7)],
+            1,
+            true,
+        ),
+        (
+            "moved to another level",
+            vec![entry("nova.example.invalid", 119, 3, 7), other(0)],
+            0,
+            true,
+        ),
+        (
+            "pointed at another port",
+            vec![entry("nova.example.invalid", 563, 0, 7), other(0)],
+            0,
+            false,
+        ),
+        (
+            "pointed at another host",
+            vec![entry("vega.example.invalid", 119, 0, 7), other(0)],
+            0,
+            false,
+        ),
+        (
+            "given another username",
+            vec![
+                {
+                    let mut renamed = entry("nova.example.invalid", 119, 0, 7);
+                    renamed.server.username = Some("another-account".to_string());
+                    renamed
+                },
+                other(0),
+            ],
+            0,
+            false,
+        ),
+    ];
+    for (case, rebuilt, position, pinned) in cases {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        pipeline.nntp = std::sync::Arc::new(pool_with(vec![
+            entry("nova.example.invalid", 119, 0, 7),
+            other(0),
+        ]));
+        pipeline.seed_download_lane_explorers();
+        let now = std::time::Instant::now();
+        let explorer = pipeline.download_lane_runtime.servers.get_mut(&0).unwrap();
+        explorer.note_unclean_batch(now);
+        explorer.note_unclean_batch(now);
+        assert!(explorer.pinned_sequential());
+
+        pipeline.nntp = std::sync::Arc::new(pool_with(rebuilt));
+        pipeline.seed_download_lane_explorers();
+        assert_eq!(
+            pipeline.download_lane_runtime.servers[&position].pinned_sequential(),
+            pinned,
+            "{case}"
+        );
+    }
+}

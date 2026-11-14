@@ -184,7 +184,7 @@ async fn obsolete_work_leaves_no_attempt_and_no_health_mark() {
         .fetch_body_with_groups_prefer_excluding_traced(
             "<obsolete@example.invalid>",
             &["alt.binaries.test".to_string()],
-            &[],
+            crate::ServerSet::EMPTY,
         )
         .await;
     assert!(
@@ -391,7 +391,7 @@ async fn queued_probe_guard_rechecks_recovery_before_using_a_cached_fallback() {
         .client
         .confirm_exists_for_probe_using(
             &["<queued-probe@example.invalid>"],
-            &[],
+            crate::ServerSet::EMPTY,
             |server, batch, guard| {
                 let pool = Arc::clone(&pool);
                 async move {

@@ -1192,3 +1192,13 @@ kind = "sql"
 file = "migrations/0091_history_swept/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 92
+description = "a server list stored past the server limit is trimmed to it"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "trim_servers_to_limit_v92"
+scope = "all"

@@ -50,7 +50,7 @@ type realUsenetProgress struct {
 }
 
 type realUsenetPipeline struct {
-	ActiveDownloads                   uint32 `json:"activeDownloads"`
+	ArticlesInFlight                  uint32 `json:"articlesInFlight"`
 	DecodePendingBytes                uint64 `json:"decodePendingBytes"`
 	WriteBufferedBytes                uint64 `json:"writeBufferedBytes"`
 	DownloadPressureState             string `json:"downloadPressureState"`
@@ -139,7 +139,7 @@ func (perf *realUsenetPerf) observe(api realUsenetAPI, jobID int) error {
 			State string
 		}
 	}
-	if err := api.query("query($id:Int!) {metrics {bytesDownloaded currentDownloadSpeed activeDownloads decodePendingBytes writeBufferedBytes downloadPressureState downloadPressureReason downloadPressureStallsTotal downloadPressureStallDurationMs downloadPipelineTrialFailureTotal downloadPipelineReplayItemsTotal decodeErrors} queueItem(id:$id) {id state}}", map[string]any{"id": jobID}, &snapshot); err != nil {
+	if err := api.query("query($id:Int!) {metrics {bytesDownloaded currentDownloadSpeed articlesInFlight decodePendingBytes writeBufferedBytes downloadPressureState downloadPressureReason downloadPressureStallsTotal downloadPressureStallDurationMs downloadPipelineTrialFailureTotal downloadPipelineReplayItemsTotal decodeErrors} queueItem(id:$id) {id state}}", map[string]any{"id": jobID}, &snapshot); err != nil {
 		return err
 	}
 	state := "ARCHIVING"

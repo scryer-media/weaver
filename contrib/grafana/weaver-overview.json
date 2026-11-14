@@ -136,8 +136,8 @@
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
           "editorMode": "code",
-          "expr": "weaver_pipeline_active_downloads{job=\"$job\",instance=~\"$instance\"}",
-          "legendFormat": "active downloads",
+          "expr": "weaver_pipeline_articles_in_flight{job=\"$job\",instance=~\"$instance\"}",
+          "legendFormat": "articles in flight",
           "range": true,
           "refId": "B"
         }

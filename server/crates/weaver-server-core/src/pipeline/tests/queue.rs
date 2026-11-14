@@ -203,7 +203,7 @@ async fn rename_waits_for_job_quiescence_and_preserves_written_payload() {
     pipeline.apply_queue_intents().await;
     let old = pipeline.jobs[&id].working_dir.clone();
     std::fs::write(old.join("payload.bin"), b"partial payload").unwrap();
-    pipeline.active_downloads_by_job.insert(id, 1);
+    pipeline.articles_in_flight_by_job.insert(id, 1);
     let watermark = handle.job_revision();
     handle
         .update_job(
@@ -229,7 +229,7 @@ async fn rename_waits_for_job_quiescence_and_preserves_written_payload() {
         )
         .await
         .unwrap();
-    pipeline.active_downloads_by_job.remove(&id);
+    pipeline.articles_in_flight_by_job.remove(&id);
     pipeline.active_decodes_by_job.insert(id, 1);
     pipeline.apply_queue_intents().await;
     assert_eq!(pipeline.jobs[&id].working_dir, old);
