@@ -79,7 +79,16 @@ pub struct TrackerComms {
     grow: tokio::sync::mpsc::UnboundedSender<Arc<TrackerComms>>,
     /// Where the session counts its announces.
     counts: Arc<TrackerStats>,
+    /// The announces waiting for their answers. The run drives them; when
+    /// it stops they are left to finish within the stop's bound (see
+    /// [`StopOnDrop`]).
+    in_flight: Mutex<FuturesUnordered<InFlightAnnounce>>,
 }
+
+/// An announce of the run, abortable when its tracker is removed: the
+/// tracker it went to and the peers its answer named.
+type InFlightAnnounce =
+    BoxFuture<'static, Result<(SupportedTracker, Vec<SocketAddr>), futures::future::Aborted>>;
 
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrackerCommsStatsState {
@@ -1840,7 +1849,7 @@ impl TrackerTask {
         }
         let tiers = supported_tiers(tiers);
         for (comms, gone) in self.status.replace_tiers(&tiers) {
-            comms.send_stopped(gone, comms.stopped.register());
+            comms.send_stopped(gone, FuturesUnordered::new(), comms.stopped.register());
         }
         if let Some(first) = runs.first() {
             for info_hash in info_hashes.ids20() {
@@ -2064,6 +2073,15 @@ impl Drop for RunningGuard {
 /// the stopped announces may take no time at all: then none is sent
 /// (libtorrent `torrent::announce_with_tracker` with
 /// `stop_tracker_timeout <= 0`).
+///
+/// An announce still waiting for its answer is not cut off: it finishes,
+/// and is recorded, within the same bound, as libtorrent's
+/// `torrent::stop_announcing` leaves a request already sent to finish
+/// (torrent.cpp:10815-10826; only `session_impl::abort` and `pause`,
+/// through `tracker_manager::abort_all_requests`, abort one). So a
+/// `completed` on its way when the run stops still reaches its tracker. A
+/// run whose announces a route move handed over, or one with no time left
+/// for its stop, abandons them.
 struct StopOnDrop {
     comms: Arc<TrackerComms>,
     running: Option<RunningGuard>,
@@ -2078,10 +2096,18 @@ impl StopOnDrop {
 
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
-        let trackers = self.comms.list.lock().stop();
+        let (trackers, handed_over) = {
+            let mut list = self.comms.list.lock();
+            (list.stop(), list.handed_over)
+        };
+        let in_flight = std::mem::take(&mut *self.comms.in_flight.lock());
         self.comms.publish(Instant::now(), SystemTime::now());
         if let Some(running) = self.running.take() {
-            self.comms.send_stopped(trackers, running);
+            let in_flight = match handed_over {
+                true => FuturesUnordered::new(),
+                false => in_flight,
+            };
+            self.comms.send_stopped(trackers, in_flight, running);
         }
     }
 }
@@ -2301,6 +2327,7 @@ impl TrackerComms {
                     http_announces: http_announces.clone(),
                     grow: grow.clone(),
                     counts: counts.clone(),
+                    in_flight: Default::default(),
                 })
             })
             .collect::<Vec<_>>();
@@ -2386,6 +2413,7 @@ impl TrackerComms {
             http_announces: self.http_announces.clone(),
             grow: self.grow.clone(),
             counts: self.counts.clone(),
+            in_flight: Default::default(),
         });
         if self.grow.send(comms.clone()).is_err() {
             return;
@@ -2399,10 +2427,17 @@ impl TrackerComms {
     /// closed, each recorded in the table as any announce is, within the
     /// stopped announces' bound; none when that bound is zero. The wait for
     /// the connections has its own bound, so a run slow to end still leaves
-    /// the announces theirs whole. `running` is held until they end.
-    fn send_stopped(self: &Arc<Self>, trackers: StartedTrackers, running: RunningGuard) {
+    /// the announces theirs whole. The run's announces `in_flight` finish
+    /// meanwhile, within the same bound whole, and are abandoned past it or
+    /// when it is zero. `running` is held until they all end.
+    fn send_stopped(
+        self: &Arc<Self>,
+        trackers: StartedTrackers,
+        mut in_flight: FuturesUnordered<InFlightAnnounce>,
+        running: RunningGuard,
+    ) {
         let timeout = self.stopped.timeout();
-        if timeout.is_zero() || trackers.is_empty() {
+        if timeout.is_zero() || (trackers.is_empty() && in_flight.is_empty()) {
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -2411,29 +2446,46 @@ impl TrackerComms {
         };
         let comms = self.clone();
         let run_end = self.stopped.run_end;
-        let ended = comms.stats.run_ended();
+        let whole = run_end + timeout;
+        let ended = (!trackers.is_empty()).then(|| comms.stats.run_ended());
         let span = debug_span!(parent: None, "tracker_stopped", info_hash = ?comms.info_hash);
         runtime.spawn(
             async move {
                 let _running = running;
-                // The counters once the run's connections have counted what
-                // they dropped; within their bound, as they are if not.
-                let stats = match tokio::time::timeout(run_end, ended).await {
-                    Ok(stats) => stats,
-                    Err(_) => {
-                        debug!(?run_end, "the run's connections did not close in time");
-                        comms.stats.get()
+                let answers = async {
+                    let all = async { while in_flight.next().await.is_some() {} };
+                    if tokio::time::timeout(whole, all).await.is_err() {
+                        debug!(
+                            ?whole,
+                            "an announce in flight at the stop did not finish in time"
+                        );
                     }
                 };
-                let announces = trackers.into_iter().map(|(tracker, started)| {
-                    comms.announce_recorded(tracker, Events::stopped(started), stats)
-                });
-                if tokio::time::timeout(timeout, futures::future::join_all(announces))
-                    .await
-                    .is_err()
-                {
-                    debug!(?timeout, "stopped announce timed out");
-                }
+                let stopped = async {
+                    let Some(ended) = ended else {
+                        return;
+                    };
+                    // The counters once the run's connections have counted
+                    // what they dropped; within their bound, as they are if
+                    // not.
+                    let stats = match tokio::time::timeout(run_end, ended).await {
+                        Ok(stats) => stats,
+                        Err(_) => {
+                            debug!(?run_end, "the run's connections did not close in time");
+                            comms.stats.get()
+                        }
+                    };
+                    let announces = trackers.into_iter().map(|(tracker, started)| {
+                        comms.announce_recorded(tracker, Events::stopped(started), stats)
+                    });
+                    if tokio::time::timeout(timeout, futures::future::join_all(announces))
+                        .await
+                        .is_err()
+                    {
+                        debug!(?timeout, "stopped announce timed out");
+                    }
+                };
+                tokio::join!(answers, stopped);
             }
             .instrument(span),
         );
@@ -2465,8 +2517,7 @@ impl TrackerComms {
     /// Announces under this hash until dropped: whatever the tracker list
     /// says is due, then waits for an answer, for the next tracker to come
     /// due, or for the torrent to become a seed.
-    async fn run(&self) -> anyhow::Result<()> {
-        let mut in_flight = FuturesUnordered::new();
+    async fn run(self: &Arc<Self>) -> anyhow::Result<()> {
         // The torrent became a seed during this run and the list was told
         // (libtorrent `torrent::completed`, once per transition).
         let mut completion_seen = false;
@@ -2497,14 +2548,17 @@ impl TrackerComms {
             let current = *port.borrow_and_update();
             let due = self.list.lock().start_due(Instant::now(), current, &stats);
             for (tracker, events) in due {
-                let (announce, abort) = futures::future::abortable(self.announce_recorded(
-                    tracker.clone(),
-                    events,
-                    stats,
-                ));
+                // Owned, so that it may outlive the run (see `StopOnDrop`).
+                let comms = self.clone();
+                let announced = tracker.clone();
+                let (announce, abort) = futures::future::abortable(
+                    async move { comms.announce_recorded(announced, events, stats).await }
+                        .in_current_span(),
+                );
                 aborts.insert(tracker, abort);
-                in_flight.push(announce);
+                self.in_flight.lock().push(announce.boxed());
             }
+            let answered = futures::future::poll_fn(|cx| self.in_flight.lock().poll_next_unpin(cx));
             let next_due = self.list.lock().next_due();
             let next_due = async {
                 match next_due {
@@ -2513,7 +2567,7 @@ impl TrackerComms {
                 }
             };
             tokio::select! {
-                Some(answer) = in_flight.next() => {
+                Some(answer) = answered => {
                     if let Ok((tracker, peers)) = answer {
                         aborts.remove(&tracker);
                         for peer in peers {
@@ -4441,6 +4495,88 @@ mod tests {
         token.cancel();
     }
 
+    // The run stops while its `completed` waits for the answer: the tracker
+    // is owed no `stopped` (see
+    // `stopped_passes_over_a_tracker_whose_announce_waits_for_its_answer`),
+    // but the `completed` already sent is not cut off. It is answered after
+    // the stop, within the stop's bound, and counted as sent (libtorrent
+    // `torrent::stop_announcing` aborts no request already out).
+    #[tokio::test]
+    async fn a_completed_in_flight_when_the_run_stops_still_reaches_its_tracker() {
+        let (listener, url) = http_listener().await;
+        let stats = Arc::new(ManualStats {
+            stats: Mutex::new(live(0, 90, false)),
+            completed: tokio::sync::watch::channel(false).0,
+        });
+        let token = CancellationToken::new();
+        let udp_sock = crate::test_support::loopback_udp().await;
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
+        // A bound no run reaches: the answer below ends the wait.
+        let stopped = StoppedAnnounces::new(DAY);
+        let identity = identity();
+        let completion = identity.completion.clone();
+        let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity,
+            op(vec![vec![url.clone()]]),
+            Box::new(stats.clone()),
+            None,
+            tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+            no_vote(),
+            crate::test_support::loopback(),
+            reach_all(),
+            udp_client,
+            stopped.clone(),
+            Default::default(),
+            false,
+            Default::default(),
+        );
+        let q = answer_with_a_peer(
+            &listener,
+            &mut peers,
+            "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe",
+        )
+        .await;
+        assert_eq!(query_param(&q, "event"), Some("started"));
+
+        *stats.stats.lock() = live(90, 0, true);
+        stats.completed.send_replace(true);
+        let (conn, q) = tokio::select! {
+            _ = peers.next() => panic!("a peer came before the tracker was asked"),
+            r = read_announce(&listener) => r,
+        };
+        assert_eq!(query_param(&q, "event"), Some("completed"));
+        assert!(status.announces()[0].in_flight);
+
+        // Stopped while the tracker has not answered.
+        drop(peers);
+        assert!(status.announces()[0].in_flight, "the announce was cut off");
+        respond(conn, "d8:completei4e8:intervali1800e5:peers0:e").await;
+        stopped.wait_idle().await;
+
+        let row = status.announces()[0].clone();
+        assert!(!row.in_flight);
+        assert_eq!(row.next_announce, None);
+        assert_eq!(
+            row.last.unwrap().result.map(|a| a.seeders),
+            Ok(Some(4)),
+            "the row holds the completed answer"
+        );
+        assert!(completion.is_sent(), "the completed counts as sent");
+        let counted = status.counted();
+        let http = &counted.announces[TrackerKind::Http as usize];
+        assert_eq!(
+            http[AnnounceEvent::Completed as usize][TrackerResult::Ok as usize],
+            1
+        );
+        assert_eq!(
+            http[AnnounceEvent::Stopped as usize].iter().sum::<u64>(),
+            0,
+            "a tracker whose announce waited for its answer is owed no stopped"
+        );
+        token.cancel();
+    }
+
     #[tokio::test]
     async fn a_zero_stopped_timeout_sends_no_stopped_announce() {
         // libtorrent torrent::announce_with_tracker: with
@@ -5150,7 +5286,10 @@ mod tests {
     #[tokio::test]
     async fn test_announce_abandoned_in_flight_leaves_no_outcome() {
         let (listener, url) = http_listener().await;
-        let stopped = StoppedAnnounces::default();
+        // A stop with no time for its announces abandons the one in flight;
+        // with time, it finishes (see
+        // `a_completed_in_flight_when_the_run_stops_still_reaches_its_tracker`).
+        let stopped = StoppedAnnounces::new(Duration::ZERO);
         let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
         let TrackerTask { mut peers, status } = task;
 
