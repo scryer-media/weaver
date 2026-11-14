@@ -622,11 +622,62 @@ fn poll_outgoing<T: Transport, E: UtpEnvironment>(
         return Poll::Pending;
     };
     let start = outgoing.sent;
+    let run_most = transport.send_run_most();
     'batches: loop {
         if outgoing.batch.is_drained() && !outbox.take(&mut outgoing.batch, cx.waker()) {
             break;
         }
-        while let Some((buf, queued)) = outgoing.batch.front() {
+        while !outgoing.batch.is_drained() {
+            // Datagrams for one address that lie together leave in one
+            // call where the transport has one, each stamped with the
+            // time of that call.
+            if run_most > 1
+                && let Some((bytes, segment, count, addr)) = outgoing.batch.front_run(run_most)
+            {
+                let now = env.now();
+                let stamp = ((now - socket.created).as_micros() as u32).to_be_bytes();
+                for datagram in bytes.chunks_mut(segment) {
+                    if let Some(timestamp) = datagram.get_mut(4..8) {
+                        timestamp.copy_from_slice(&stamp);
+                    }
+                }
+                let sent = socket.poll_send_gated(&mut outgoing.gate, cx, true, |cx| {
+                    transport.poll_send_run(cx, bytes, segment, addr)
+                });
+                match sent {
+                    Some(Poll::Ready(Ok(taken))) if taken > 0 => {
+                        let taken = taken.min(count);
+                        socket.stats.send_runs.increment(1);
+                        socket.stats.send_run_datagrams.increment(taken as u64);
+                        outgoing.batch.advance_run(taken, now);
+                        outgoing.sent += taken as u64;
+                        continue;
+                    }
+                    // The run failed as a whole: its first datagram goes
+                    // alone below, which names the failure for its stream.
+                    Some(Poll::Ready(_)) => {
+                        socket.stats.send_run_errors.increment(1);
+                    }
+                    Some(Poll::Pending) if !tokio::task::coop::has_budget_remaining() => {
+                        break 'batches;
+                    }
+                    None | Some(Poll::Pending) => {
+                        if sent.is_some() {
+                            socket.stats.send_poll_pending.increment(1);
+                        }
+                        outbox.stall();
+                        outbox.set_sent(outgoing.sent);
+                        return if outgoing.sent == start {
+                            Poll::Pending
+                        } else {
+                            Poll::Ready(())
+                        };
+                    }
+                }
+            }
+            let Some((buf, queued)) = outgoing.batch.front() else {
+                break;
+            };
             let now = env.now();
             let stamp = (now - socket.created).as_micros() as u32;
             if let Some(timestamp) = buf.get_mut(4..8) {

@@ -160,6 +160,102 @@ pub(crate) fn send_fragmenting(
     sent
 }
 
+/// The most datagrams one [`send_run`] carries, and the most bytes: Linux
+/// takes 64 segments in a call (UDP_MAX_SEGMENTS, include/linux/udp.h) and
+/// their sum must fit one UDP datagram's length.
+pub(crate) const SEND_RUN_DATAGRAMS: usize = 64;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) const SEND_RUN_BYTES: usize = 65_000;
+
+/// Whether one system call can send several datagrams on `socket`: Linux
+/// with UDP segmentation (4.18 and later). No other host has a public call
+/// for it.
+pub(crate) fn sends_runs(socket: &impl AsSocket) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        runs::supported(socket.as_raw_fd())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = socket;
+        false
+    }
+}
+
+/// Sends `bytes` to `target` in one system call as datagrams of `segment`
+/// bytes each, the last one shorter when `bytes` does not divide. The
+/// kernel takes all of them or none.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn send_run(
+    socket: &impl AsSocket,
+    bytes: &[u8],
+    segment: u16,
+    target: &socket2::SockAddr,
+) -> io::Result<usize> {
+    runs::send(socket.as_raw_fd(), bytes, segment, target)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod runs {
+    use std::{io, mem, os::fd::RawFd};
+
+    use nix::libc;
+
+    pub(super) fn supported(fd: RawFd) -> bool {
+        super::unix::get_int(fd, libc::SOL_UDP, libc::UDP_SEGMENT).is_ok()
+    }
+
+    pub(super) fn send(
+        fd: RawFd,
+        bytes: &[u8],
+        segment: u16,
+        target: &socket2::SockAddr,
+    ) -> io::Result<usize> {
+        // Room for one control message that holds the segment size, kept
+        // at the alignment a control message header needs.
+        let mut control = [0u64; 4];
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: bytes.len(),
+        };
+        // SAFETY: a message header is plain data for which all zeroes is a
+        // valid value.
+        let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+        msg.msg_name = target.as_ptr().cast_mut().cast();
+        msg.msg_namelen = target.len();
+        msg.msg_iov = &raw mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        // SAFETY: CMSG_SPACE and CMSG_LEN only compute sizes.
+        let (space, len) = unsafe {
+            (
+                libc::CMSG_SPACE(mem::size_of::<u16>() as u32),
+                libc::CMSG_LEN(mem::size_of::<u16>() as u32),
+            )
+        };
+        debug_assert!(space as usize <= mem::size_of_val(&control));
+        msg.msg_controllen = space as _;
+        // SAFETY: `msg` names `control`, which is aligned for a control
+        // message header and has room for the one message of `space`
+        // bytes, so the first header and its data lie inside it. `bytes`,
+        // `target` and `control` outlive the call, which only reads them,
+        // and `fd` is an open socket for the call.
+        let sent = unsafe {
+            let header = libc::CMSG_FIRSTHDR(&raw const msg);
+            (*header).cmsg_level = libc::SOL_UDP;
+            (*header).cmsg_type = libc::UDP_SEGMENT;
+            (*header).cmsg_len = len as _;
+            libc::CMSG_DATA(header).cast::<u16>().write_unaligned(segment);
+            libc::sendmsg(fd, &raw const msg, 0)
+        };
+        if sent < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(sent as usize)
+        }
+    }
+}
+
 // Linux asks for path-MTU discovery that never fragments.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod sys {

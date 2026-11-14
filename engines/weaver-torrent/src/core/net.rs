@@ -116,6 +116,27 @@ pub trait DatagramSocket: Send + Sync + 'static {
         self.poll_send_to_vectored(cx, bufs, target)
     }
 
+    /// How many datagrams one [`DatagramSocket::poll_send_run`] may take: 1
+    /// for a socket that sends each datagram with a call of its own.
+    fn send_run_most(&self) -> usize {
+        1
+    }
+
+    /// Sends datagrams that lie end to end in `bytes`, all to `target`:
+    /// each is `segment` bytes long but the last, which may be shorter.
+    /// Ready with how many were sent, counted from the first. A socket with
+    /// no call for several datagrams sends the first alone.
+    fn poll_send_run(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        segment: usize,
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        let first = &bytes[..segment.min(bytes.len())];
+        self.poll_send_to(cx, first, target).map_ok(|_| 1)
+    }
+
     /// The largest IP packet the socket's route carries, where it knows
     /// it, such as a tunnel's MTU; uTP sends nothing larger.
     fn link_mtu(&self) -> Option<u16> {

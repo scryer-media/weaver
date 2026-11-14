@@ -71,10 +71,15 @@ struct Recorded {
 
 impl Departures {
     pub(crate) fn push(&self, at: Option<Instant>) {
+        self.push_run(at, 1);
+    }
+
+    /// Records `count` departures at once, all at `at`.
+    pub(crate) fn push_run(&self, at: Option<Instant>, count: usize) {
         let waker = {
             let mut recorded = self.recorded.lock();
             let first = recorded.left.is_empty();
-            recorded.left.push_back(at);
+            recorded.left.extend(std::iter::repeat_n(at, count));
             self.any.store(true, Ordering::Release);
             if first { recorded.waker.take() } else { None }
         };
@@ -163,6 +168,61 @@ impl Batch {
 
     pub(crate) fn advance(&mut self) {
         self.next += 1;
+    }
+
+    /// The datagrams from the front that one call can send, when they are
+    /// more than one: all to one address, none marked for a send of its
+    /// own, each as long as the first but the last, which may be shorter,
+    /// and at most `most` of them. Their bytes, which lie end to end, the
+    /// first's length, their count and the address.
+    pub(crate) fn front_run(&mut self, most: usize) -> Option<(&mut [u8], usize, usize, SocketAddr)> {
+        let first = self.packets.get(self.next)?;
+        if first.fragmenting.is_some() || first.len == 0 {
+            return None;
+        }
+        let (addr, segment) = (first.addr, first.len);
+        let start = first.start as usize;
+        let mut count = 1;
+        let mut end = start + segment as usize;
+        for queued in self.packets[self.next + 1..].iter().take(most.saturating_sub(1)) {
+            if queued.addr != addr
+                || queued.fragmenting.is_some()
+                || queued.len > segment
+                || queued.len == 0
+            {
+                break;
+            }
+            count += 1;
+            end += queued.len as usize;
+            if queued.len < segment {
+                break;
+            }
+        }
+        (count > 1).then(|| (&mut self.bytes[start..end], segment as usize, count, addr))
+    }
+
+    /// The first `count` datagrams left at `at`: each one's stream is
+    /// told, the datagrams of one stream that lie together at once.
+    pub(crate) fn advance_run(&mut self, count: usize, at: Instant) {
+        let run = &self.packets[self.next..self.next + count];
+        let mut i = 0;
+        while i < run.len() {
+            let Some(departures) = &run[i].departures else {
+                i += 1;
+                continue;
+            };
+            let mut same = 1;
+            while run
+                .get(i + same)
+                .and_then(|queued| queued.departures.as_ref())
+                .is_some_and(|other| Arc::ptr_eq(other, departures))
+            {
+                same += 1;
+            }
+            departures.push_run(Some(at), same);
+            i += same;
+        }
+        self.next += count;
     }
 
     fn clear(&mut self) {
@@ -348,5 +408,75 @@ mod tests {
         drained.advance();
         assert!(!outbox.take(&mut drained, Waker::noop()));
         assert_eq!(queue(&outbox, 0, 20), Some(2));
+    }
+
+    // A run is the datagrams from the front that go to one address and are
+    // as long as the first, with at most one shorter one to end it.
+    #[test]
+    fn a_run_is_datagrams_of_one_length_for_one_address() {
+        const OTHER: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 2);
+        let outbox = Outbox::new();
+        let departures = Arc::new(Departures::default());
+        let to = |byte: u8, len: usize, addr, departures: Option<&Arc<Departures>>| {
+            let payload = vec![byte; len];
+            outbox
+                .try_queue(&[IoSlice::new(&payload)], addr, 7, departures)
+                .unwrap();
+        };
+        // Three of 30 bytes and a shorter one, then a longer one, then two
+        // for another address, then one alone.
+        to(1, 30, ADDR, Some(&departures));
+        to(2, 30, ADDR, Some(&departures));
+        to(3, 30, ADDR, None);
+        to(4, 10, ADDR, Some(&departures));
+        to(5, 40, ADDR, None);
+        to(6, 40, OTHER, None);
+        to(7, 40, OTHER, None);
+        to(8, 40, ADDR, None);
+        let mut batch = Batch::default();
+        assert!(outbox.take(&mut batch, Waker::noop()));
+
+        // No more than asked for.
+        let (bytes, segment, count, addr) = batch.front_run(2).unwrap();
+        assert_eq!((bytes.len(), segment, count, addr), (60, 30, 2, ADDR));
+
+        let (bytes, segment, count, addr) = batch.front_run(64).unwrap();
+        assert_eq!((segment, count, addr), (30, 4, ADDR));
+        assert_eq!(bytes.len(), 100);
+        assert_eq!([bytes[0], bytes[30], bytes[60], bytes[90]], [1, 2, 3, 4]);
+        let at = Instant::now();
+        batch.advance_run(4, at);
+        let mut left = VecDeque::new();
+        departures.take(&mut left);
+        assert_eq!(left, [Some(at); 3]);
+
+        // The longer datagram is followed by another address: no run.
+        assert!(batch.front_run(64).is_none());
+        assert_eq!(batch.front().unwrap().0[0], 5);
+        batch.advance();
+        let (bytes, segment, count, addr) = batch.front_run(64).unwrap();
+        assert_eq!((bytes.len(), segment, count, addr), (80, 40, 2, OTHER));
+        batch.advance_run(2, at);
+        assert!(batch.front_run(64).is_none());
+        batch.advance();
+        assert!(batch.is_drained());
+        assert!(batch.front_run(64).is_none());
+    }
+
+    // A datagram marked for a send of its own never rides in a run.
+    #[test]
+    fn a_datagram_sent_allowing_fragments_ends_a_run() {
+        let outbox = Outbox::new();
+        for byte in 0..3 {
+            assert!(queue(&outbox, byte, 30).is_some());
+        }
+        let mut batch = Batch::default();
+        assert!(outbox.take(&mut batch, Waker::noop()));
+        batch.packets[2].fragmenting = Some(crate::Fragmenting::Allowed);
+        let (_, _, count, _) = batch.front_run(64).unwrap();
+        assert_eq!(count, 2);
+        batch.advance_run(2, Instant::now());
+        assert!(batch.front_run(64).is_none());
+        assert!(batch.front().is_some());
     }
 }

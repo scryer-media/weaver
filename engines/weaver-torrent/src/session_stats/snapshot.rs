@@ -76,4 +76,7 @@ struct SerializedUtpStatsSnapshot {
     data_packets_with_sack: u64,
     duplicate_acks_sent: u64,
     receive_cuts: u64,
+    send_runs: u64,
+    send_run_datagrams: u64,
+    send_run_errors: u64,
 }

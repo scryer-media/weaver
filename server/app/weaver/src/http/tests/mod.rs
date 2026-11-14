@@ -1625,6 +1625,16 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
             receive_drains: 30,
             streams_marked: 31,
             drain_marks_with_packets_queued: 32,
+            acks_with_sack: 33,
+            data_packets_with_sack: 34,
+            sack_bytes_sent: 35,
+            sacks_received: 36,
+            sack_bits_received: 37,
+            duplicate_acks_sent: 38,
+            receive_cuts: 39,
+            send_runs: 40,
+            send_run_datagrams: 41,
+            send_run_errors: 42,
             ..Default::default()
         },
         peers: vec![

@@ -90,6 +90,12 @@ pub struct UtpStats {
     pub duplicate_acks_sent: AtomicU64,
     /// Reads of the socket that stopped at the batch limit with datagrams still waiting.
     pub receive_cuts: AtomicU64,
+    /// Calls that sent more than one queued datagram at once.
+    pub send_runs: AtomicU64,
+    /// Datagrams sent by the calls that take more than one.
+    pub send_run_datagrams: AtomicU64,
+    /// Calls for more than one datagram that failed as a whole; their datagrams then went one at a time.
+    pub send_run_errors: AtomicU64,
 }
 
 /// Relaxed counters for a socket, aggregated across its streams.
@@ -126,6 +132,9 @@ pub struct UtpStatsSnapshot {
     pub data_packets_with_sack: u64,
     pub duplicate_acks_sent: u64,
     pub receive_cuts: u64,
+    pub send_runs: u64,
+    pub send_run_datagrams: u64,
+    pub send_run_errors: u64,
 }
 
 impl UtpStats {
@@ -164,6 +173,9 @@ impl UtpStats {
             data_packets_with_sack: self.data_packets_with_sack.load(Ordering::Relaxed),
             duplicate_acks_sent: self.duplicate_acks_sent.load(Ordering::Relaxed),
             receive_cuts: self.receive_cuts.load(Ordering::Relaxed),
+            send_runs: self.send_runs.load(Ordering::Relaxed),
+            send_run_datagrams: self.send_run_datagrams.load(Ordering::Relaxed),
+            send_run_errors: self.send_run_errors.load(Ordering::Relaxed),
         }
     }
 }
@@ -231,6 +243,9 @@ impl std::ops::AddAssign for UtpStatsSnapshot {
         self.data_packets_with_sack = self.data_packets_with_sack.saturating_add(other.data_packets_with_sack);
         self.duplicate_acks_sent = self.duplicate_acks_sent.saturating_add(other.duplicate_acks_sent);
         self.receive_cuts = self.receive_cuts.saturating_add(other.receive_cuts);
+        self.send_runs = self.send_runs.saturating_add(other.send_runs);
+        self.send_run_datagrams = self.send_run_datagrams.saturating_add(other.send_run_datagrams);
+        self.send_run_errors = self.send_run_errors.saturating_add(other.send_run_errors);
     }
 }
 

@@ -66,6 +66,10 @@ pub(crate) struct LinkEnd {
     pub(crate) acks: AtomicU64,
     pub(crate) data: AtomicU64,
     forced_timeout: Mutex<Option<ForcedTimeout>>,
+    // How many datagrams this end takes in one call, and the calls that
+    // took more than one.
+    run_most: AtomicU64,
+    runs: AtomicU64,
 }
 
 // With `one_way` set, each direction holds every datagram that long on the
@@ -90,6 +94,8 @@ pub(crate) fn link(
         acks: AtomicU64::new(0),
         data: AtomicU64::new(0),
         forced_timeout: Mutex::new(None),
+        run_most: AtomicU64::new(1),
+        runs: AtomicU64::new(0),
     };
     (end(a, b_tx, a_rx), end(b, a_tx, b_rx))
 }
@@ -198,6 +204,26 @@ impl Transport for LinkEnd {
         _target: SocketAddr,
     ) -> Poll<std::io::Result<usize>> {
         Poll::Ready(self.send(buf))
+    }
+
+    fn send_run_most(&self) -> usize {
+        self.run_most.load(Ordering::Relaxed) as usize
+    }
+
+    fn poll_send_run(
+        &self,
+        _cx: &mut Context<'_>,
+        bytes: &[u8],
+        segment: usize,
+        _target: SocketAddr,
+    ) -> Poll<std::io::Result<usize>> {
+        self.runs.fetch_add(1, Ordering::Relaxed);
+        let mut sent = 0;
+        for datagram in bytes.chunks(segment) {
+            self.send(datagram)?;
+            sent += 1;
+        }
+        Poll::Ready(Ok(sent))
     }
 
     fn bind_addr(&self) -> SocketAddr {
@@ -388,6 +414,16 @@ async fn delivery_time_is_stamped_before_the_forwarder_runs() {
 }
 
 async fn delayed_transfer(drop_every: u64) -> crate::UtpStatsSnapshot {
+    delayed_transfer_in_runs(drop_every, 1).await.0
+}
+
+// The transfer with the sending end taking up to `run_most` datagrams in
+// one call; the sender's counters and the calls its link end took that
+// carried more than one datagram.
+async fn delayed_transfer_in_runs(
+    drop_every: u64,
+    run_most: u64,
+) -> (crate::UtpStatsSnapshot, u64) {
     const TOTAL: usize = 2 << 20;
     let token = tokio_util::sync::CancellationToken::new();
     let (server, client) = sockets(
@@ -400,6 +436,8 @@ async fn delayed_transfer(drop_every: u64) -> crate::UtpStatsSnapshot {
             ..Default::default()
         },
     );
+    let link = link_transport(&client);
+    link.run_most.store(run_most, Ordering::Relaxed);
     let serve = async {
         let (mut reader, writer) = server.accept().await.unwrap().split();
         let mut buf = vec![0u8; 1 << 16];
@@ -432,7 +470,32 @@ async fn delayed_transfer(drop_every: u64) -> crate::UtpStatsSnapshot {
     let (_server_halves, _client_halves) = tokio::join!(serve, dial);
     let stats = client.stats().snapshot();
     token.cancel();
-    stats
+    (stats, link.runs.load(Ordering::Relaxed))
+}
+
+// A sender whose transport takes several datagrams in a call hands it the
+// packets queued together for the peer: the data arrives whole and in
+// order, the counters agree with the calls the transport saw, and nothing
+// is resent on a link that loses nothing.
+#[tokio::test(start_paused = true)]
+async fn packets_queued_together_leave_in_one_call() {
+    let (stats, runs) = delayed_transfer_in_runs(0, 16).await;
+    assert!(runs > 0);
+    assert_eq!(stats.send_runs, runs);
+    assert!(stats.send_run_datagrams >= 2 * runs);
+    assert!(stats.send_run_datagrams <= 16 * runs);
+    assert_eq!(stats.send_run_errors, 0);
+    assert_eq!(stats.data_retransmissions, 0);
+    assert_eq!(stats.timeouts, 0);
+}
+
+// The same over a link that loses one datagram in twenty: the losses are
+// repaired and the transfer completes.
+#[tokio::test(start_paused = true)]
+async fn a_lossy_transfer_sent_in_runs_completes() {
+    let (stats, runs) = delayed_transfer_in_runs(20, 16).await;
+    assert!(runs > 0);
+    assert!(stats.packets_lost > 0);
 }
 
 #[tokio::test(start_paused = true)]

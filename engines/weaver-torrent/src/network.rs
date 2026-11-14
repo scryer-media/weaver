@@ -326,6 +326,20 @@ impl DatagramSocket for SharedDhtSocket {
     fn link_mtu(&self) -> Option<u16> {
         self.socket.link_mtu()
     }
+
+    fn send_run_most(&self) -> usize {
+        self.socket.send_run_most()
+    }
+
+    fn poll_send_run(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        segment: usize,
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        self.socket.poll_send_run(cx, bytes, segment, target)
+    }
 }
 
 impl PollSendToVectored for DatagramTransport {
@@ -436,6 +450,20 @@ impl Transport for DatagramTransport {
 
     fn link_mtu(&self) -> Option<u16> {
         self.0.link_mtu()
+    }
+
+    fn send_run_most(&self) -> usize {
+        self.0.send_run_most()
+    }
+
+    fn poll_send_run(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        segment: usize,
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        self.0.poll_send_run(cx, bytes, segment, target)
     }
 }
 
@@ -836,6 +864,27 @@ impl DatagramSocket for PairedUdp {
         let (socket, target) = self.toward(target);
         socket.poll_send_to_vectored_fragmenting(cx, bufs, target, fragmenting)
     }
+
+    // The larger of the two families' answers: a run toward the family
+    // whose socket sends one datagram a call goes out one at a time below.
+    fn send_run_most(&self) -> usize {
+        self.v6.run_most().max(self.v4.run_most())
+    }
+
+    fn poll_send_run(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        segment: usize,
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        let (socket, target) = self.toward(target);
+        if socket.run_most() == 1 {
+            let first = &bytes[..segment.min(bytes.len())];
+            return socket.poll_send_to(cx, first, target).map_ok(|_| 1);
+        }
+        socket.send_run(cx, bytes, segment, target)
+    }
 }
 
 /// A kernel datagram socket: the address it is bound at, and whether it
@@ -852,7 +901,17 @@ pub(crate) struct KernelUdp {
     // allows fragmenting, while don't-fragment is off, and a size probe, so
     // it never goes out while it is off. Ordinary sends never take it.
     size_sends: parking_lot::Mutex<()>,
+    // The host can send several datagrams in one call on this socket.
+    runs: bool,
+    // Calls for several datagrams that failed, one after another with none
+    // sent between them. At RUN_FAILURES_MOST the socket sends each
+    // datagram alone from then on: a device that cannot take such a send
+    // fails every one of them.
+    run_failures: std::sync::atomic::AtomicU8,
 }
+
+// See `KernelUdp::run_failures`.
+const RUN_FAILURES_MOST: u8 = 8;
 
 impl KernelUdp {
     // `socket`, registered with the runtime entered now.
@@ -867,6 +926,8 @@ impl KernelUdp {
         socket.set_nonblocking(true)?;
         Ok(KernelUdp {
             local: socket.local_addr()?,
+            runs: crate::udp_options::sends_runs(&socket),
+            run_failures: std::sync::atomic::AtomicU8::new(0),
             socket: std::sync::OnceLock::new(),
             unregistered: parking_lot::Mutex::new(Some(socket)),
             dual_stack,
@@ -938,6 +999,81 @@ impl KernelUdp {
                 }
             }
         }
+    }
+
+    // How many datagrams one call sends on this socket.
+    fn run_most(&self) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.runs && self.run_failures.load(Relaxed) < RUN_FAILURES_MOST {
+            crate::udp_options::SEND_RUN_DATAGRAMS
+        } else {
+            1
+        }
+    }
+
+    // Datagrams that lie end to end in `bytes`, each `segment` bytes but
+    // the last, sent to `target` in one system call: as many from the
+    // first as one call carries. Ready with how many went.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn send_run(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        segment: usize,
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        use crate::udp_options::{SEND_RUN_BYTES, SEND_RUN_DATAGRAMS};
+
+        let Ok(size) = u16::try_from(segment) else {
+            return Poll::Ready(Err(io::ErrorKind::InvalidInput.into()));
+        };
+        if size == 0 {
+            return Poll::Ready(Err(io::ErrorKind::InvalidInput.into()));
+        }
+        let count = bytes
+            .len()
+            .div_ceil(segment)
+            .min(SEND_RUN_DATAGRAMS)
+            .min((SEND_RUN_BYTES / segment).max(1));
+        let run = &bytes[..bytes.len().min(count * segment)];
+        let target: socket2::SockAddr = self.toward(target).into();
+        let socket = self.io()?;
+        loop {
+            std::task::ready!(socket.poll_send_ready(cx))?;
+            match socket.try_io(tokio::io::Interest::WRITABLE, || {
+                crate::udp_options::send_run(socket, run, size, &target)
+            }) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => {
+                    let failures = self.run_failures.load(Relaxed);
+                    self.run_failures.store(failures.saturating_add(1), Relaxed);
+                    return Poll::Ready(Err(error));
+                }
+                Ok(_) => {
+                    if self.run_failures.load(Relaxed) != 0 {
+                        self.run_failures.store(0, Relaxed);
+                    }
+                    return Poll::Ready(Ok(count));
+                }
+            }
+        }
+    }
+
+    // A host with no call for several datagrams sends the first alone.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn send_run(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        segment: usize,
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        let first = &bytes[..segment.min(bytes.len())];
+        self.io()?
+            .poll_send_to(cx, first, self.toward(target))
+            .map_ok(|_| 1)
     }
 
     // `target` as the socket names it: an IPv4 one by its IPv4-mapped IPv6
@@ -1084,6 +1220,20 @@ impl DatagramSocket for KernelUdp {
                 }
             }
         }
+    }
+
+    fn send_run_most(&self) -> usize {
+        self.run_most()
+    }
+
+    fn poll_send_run(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        segment: usize,
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        self.send_run(cx, bytes, segment, target)
     }
 
     // One datagram from every slice, as the vectored send above, under the
@@ -1396,6 +1546,184 @@ mod pair_tests {
         let mut buf = [0u8; 8];
         let (len, from) = peer.recv_from(&mut buf).await.unwrap();
         assert_eq!((&buf[..len], from), (&b"out"[..], paired.v4.bind_addr()));
+    }
+
+    // A socket that keeps the trait's own send-run methods takes one
+    // datagram a call: asked for a run, it sends the first alone and says
+    // one went.
+    #[tokio::test]
+    async fn a_socket_with_no_run_call_sends_the_first_datagram_alone() {
+        use std::task::{Context, Poll};
+
+        use std::sync::Arc;
+
+        use super::{BoxFuture, KernelUdp};
+
+        struct Plain(Arc<KernelUdp>);
+        impl DatagramSocket for Plain {
+            fn bind_addr(&self) -> SocketAddr {
+                self.0.bind_addr()
+            }
+            fn recv_from<'a>(
+                &'a self,
+                buf: &'a mut [u8],
+            ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>> {
+                self.0.recv_from(buf)
+            }
+            fn send_to<'a>(
+                &'a self,
+                buf: &'a [u8],
+                target: SocketAddr,
+            ) -> BoxFuture<'a, io::Result<usize>> {
+                self.0.send_to(buf, target)
+            }
+            fn poll_send_to(
+                &self,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+                target: SocketAddr,
+            ) -> Poll<io::Result<usize>> {
+                self.0.poll_send_to(cx, buf, target)
+            }
+        }
+
+        let sockets = KernelSockets::new(None).unwrap();
+        let plain = Plain(
+            sockets
+                .bind_kernel_udp((Ipv4Addr::LOCALHOST, 0).into())
+                .unwrap(),
+        );
+        let peer = sockets
+            .bind_kernel_udp((Ipv4Addr::LOCALHOST, 0).into())
+            .unwrap();
+        let socket: &dyn DatagramSocket = &plain;
+        assert_eq!(socket.send_run_most(), 1);
+        let mut bytes = vec![1u8; 100];
+        bytes.extend_from_slice(&[2u8; 40]);
+        let sent =
+            std::future::poll_fn(|cx| socket.poll_send_run(cx, &bytes, 100, peer.bind_addr()))
+                .await
+                .unwrap();
+        assert_eq!(sent, 1);
+        // The second goes with a call of its own and arrives second: had
+        // the first call carried it too, it would arrive twice.
+        socket.send_to(&[3u8; 7], peer.bind_addr()).await.unwrap();
+        let mut buf = [0u8; 2048];
+        for (byte, len) in [(1u8, 100), (3, 7)] {
+            let (got, _) = peer.recv_from(&mut buf).await.unwrap();
+            assert_eq!(got, len);
+            assert!(buf[..got].iter().all(|b| *b == byte));
+        }
+    }
+
+    // A pair of sockets sends a run on the socket of the target's family.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_paired_socket_sends_a_run_on_the_targets_family() {
+        let sockets = KernelSockets::new(None).unwrap();
+        let paired = PairedUdp {
+            v6: sockets
+                .kernel_udp((Ipv6Addr::LOCALHOST, 0).into(), false)
+                .unwrap(),
+            v4: sockets
+                .kernel_udp((Ipv4Addr::LOCALHOST, 0).into(), false)
+                .unwrap(),
+            v4_first: Default::default(),
+        };
+        assert_eq!(
+            paired.send_run_most(),
+            crate::udp_options::SEND_RUN_DATAGRAMS
+        );
+        let peer = sockets
+            .bind_kernel_udp((Ipv4Addr::LOCALHOST, 0).into())
+            .unwrap();
+        let mapped = SocketAddr::from((
+            Ipv4Addr::LOCALHOST.to_ipv6_mapped(),
+            peer.bind_addr().port(),
+        ));
+        let mut bytes = vec![1u8; 100];
+        bytes.extend_from_slice(&[2u8; 100]);
+        bytes.extend_from_slice(&[3u8; 40]);
+        let sent = std::future::poll_fn(|cx| paired.poll_send_run(cx, &bytes, 100, mapped))
+            .await
+            .unwrap();
+        assert_eq!(sent, 3);
+        let mut buf = [0u8; 2048];
+        for (byte, len) in [(1u8, 100), (2, 100), (3, 40)] {
+            let (got, from) = peer.recv_from(&mut buf).await.unwrap();
+            assert_eq!(from, paired.v4.bind_addr());
+            assert_eq!(got, len);
+            assert!(buf[..got].iter().all(|b| *b == byte));
+        }
+    }
+
+    // One call sends datagrams that lie end to end: the peer receives each
+    // as its own datagram, the short last one too, in order, on both
+    // families of a socket that takes both.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_kernel_socket_sends_a_run_of_datagrams_in_one_call() {
+        let sockets = KernelSockets::new(None).unwrap();
+        for (bind, peer) in [
+            (
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            ),
+            (
+                SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
+                SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
+            ),
+        ] {
+            let sender = sockets.kernel_udp(bind, false).unwrap();
+            assert_eq!(sender.send_run_most(), crate::udp_options::SEND_RUN_DATAGRAMS);
+            let peer = sockets.bind_kernel_udp(peer).unwrap();
+            let mut bytes = Vec::new();
+            for byte in 1..=4u8 {
+                bytes.extend_from_slice(&[byte; 100]);
+            }
+            bytes.extend_from_slice(&[5u8; 40]);
+            let sent = std::future::poll_fn(|cx| {
+                sender.poll_send_run(cx, &bytes, 100, peer.bind_addr())
+            })
+            .await
+            .unwrap();
+            assert_eq!(sent, 5);
+            let mut buf = [0u8; 2048];
+            for (byte, len) in [(1u8, 100), (2, 100), (3, 100), (4, 100), (5, 40)] {
+                let (got, from) = peer.recv_from(&mut buf).await.unwrap();
+                assert_eq!(from, sender.bind_addr());
+                assert_eq!(got, len);
+                assert!(buf[..got].iter().all(|b| *b == byte));
+            }
+        }
+    }
+
+    // One call carries no more than the kernel takes: a longer run is sent
+    // from the first datagram and the count says how far it went.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_run_longer_than_one_call_carries_is_sent_in_part() {
+        use crate::udp_options::{SEND_RUN_BYTES, SEND_RUN_DATAGRAMS};
+
+        let sockets = KernelSockets::new(None).unwrap();
+        let sender = sockets
+            .kernel_udp((Ipv4Addr::LOCALHOST, 0).into(), false)
+            .unwrap();
+        let peer = sockets
+            .bind_kernel_udp((Ipv4Addr::LOCALHOST, 0).into())
+            .unwrap();
+        let send = |bytes: Vec<u8>, segment| {
+            let (sender, to) = (&sender, peer.bind_addr());
+            async move {
+                std::future::poll_fn(|cx| sender.poll_send_run(cx, &bytes, segment, to))
+                    .await
+                    .unwrap()
+            }
+        };
+        // More datagrams than a call takes.
+        assert_eq!(send(vec![0u8; 20 * 70], 20).await, SEND_RUN_DATAGRAMS);
+        // More bytes than a call takes.
+        assert_eq!(send(vec![0u8; 1400 * 60], 1400).await, SEND_RUN_BYTES / 1400);
     }
 
     // A kernel socket reads a datagram straight into the two buffers: a

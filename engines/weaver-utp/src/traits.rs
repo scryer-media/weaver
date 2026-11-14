@@ -87,6 +87,29 @@ pub trait Transport: PollSendToVectored + Send + Sync + Unpin + 'static {
         false
     }
 
+    /// How many datagrams one [`Transport::poll_send_run`] may take: 1 for
+    /// a transport that sends each datagram with a call of its own.
+    fn send_run_most(&self) -> usize {
+        1
+    }
+
+    /// Sends datagrams that lie end to end in `bytes`, all to `target`:
+    /// each is `segment` bytes long but the last, which may be shorter.
+    /// Ready with how many were sent, counted from the first: all of them
+    /// or fewer, never none. Called only with more than one datagram, and
+    /// with no more than [`Transport::send_run_most`]. A run the transport
+    /// fails as a whole is sent again one datagram at a time.
+    fn poll_send_run(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        segment: usize,
+        target: SocketAddr,
+    ) -> Poll<std::io::Result<usize>> {
+        let first = &bytes[..segment.min(bytes.len())];
+        self.poll_send_to(cx, first, target).map_ok(|_| 1)
+    }
+
     /// Whether the socket's streams may run on uTP threads other than the
     /// one its I/O task runs on. Only a transport whose every datagram the
     /// I/O task sends ([`Transport::sends_from_one_task`]) and that keeps
