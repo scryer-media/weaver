@@ -2247,20 +2247,32 @@ impl TorrentStateLive {
         Ok(())
     }
 
+    /// Marks the checked piece as had and counts it. True when nothing
+    /// selected is missing once it is: of pieces whose checks end together,
+    /// it is true for the last one marked only, so what follows the torrent
+    /// finishing follows it once. The mark and the counts are one hold of
+    /// the lock: whoever sees the torrent finished sees every had piece
+    /// counted.
+    fn mark_piece_had(&self, id: ValidPieceIndex) -> anyhow::Result<bool> {
+        let mut g = self.lock_write("mark_piece_downloaded");
+        g.get_pieces_mut()?.mark_piece_hash_ok(id);
+        let piece_len = u64::from(self.lengths.piece_length(id));
+        self.stats
+            .downloaded_and_checked_bytes
+            .fetch_add(piece_len, Ordering::Release);
+        self.stats
+            .downloaded_and_checked_pieces
+            .fetch_add(1, Ordering::Release);
+        self.stats
+            .have_bytes
+            .fetch_add(piece_len, Ordering::Relaxed);
+        Ok(g.get_chunks()?.is_finished())
+    }
+
     /// The piece, which the storage took, is had: it is counted into its
     /// files, and each file it made whole is told to the storage once the
     /// lock is let go (libtorrent `torrent::we_have` and
     /// `file_completed_alert`).
-    /// Marks the checked piece as had. True when nothing selected is
-    /// missing once it is: of pieces whose checks end together, it is true
-    /// for the last one marked only, so what follows the torrent finishing
-    /// follows it once.
-    fn mark_piece_had(&self, id: ValidPieceIndex) -> anyhow::Result<bool> {
-        let mut g = self.lock_write("mark_piece_downloaded");
-        g.get_pieces_mut()?.mark_piece_hash_ok(id);
-        Ok(g.get_chunks()?.is_finished())
-    }
-
     fn on_piece_completed(&self, id: ValidPieceIndex, finished: bool) -> anyhow::Result<()> {
         let whole = self.count_piece_had(id, finished)?;
         for file in whole {
@@ -4820,24 +4832,7 @@ fn check_landed_piece(
                     .with_peer_mut(peer, "piece_passed", |p| p.piece_passed(&state.peers));
             }
 
-            // Global piece counters.
             let piece_len = state.lengths.piece_length(chunk_info.piece_index) as u64;
-            state
-                .stats
-                .downloaded_and_checked_bytes
-                // This counter is used to compute "is_finished", so using
-                // stronger ordering.
-                .fetch_add(piece_len, Ordering::Release);
-            state
-                .stats
-                .downloaded_and_checked_pieces
-                // This counter is used to compute "is_finished", so using
-                // stronger ordering.
-                .fetch_add(1, Ordering::Release);
-            state
-                .stats
-                .have_bytes
-                .fetch_add(piece_len, Ordering::Relaxed);
             if let Some(time) = full_piece_download_time {
                 #[allow(clippy::cast_possible_truncation)]
                 state

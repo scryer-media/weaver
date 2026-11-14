@@ -8324,6 +8324,14 @@ async fn pieces_that_finish_together_finish_the_torrent_once() {
     let last = h.live.lengths.validate_piece_index(1).unwrap();
     assert!(!h.live.mark_piece_had(first).unwrap());
     assert!(h.live.mark_piece_had(last).unwrap());
+    // Whoever sees the torrent finished sees both pieces counted, with
+    // neither check having gone further than its mark.
+    let had: u64 = [first, last]
+        .map(|piece| u64::from(h.live.lengths.piece_length(piece)))
+        .iter()
+        .sum();
+    assert_eq!(h.live.get_downloaded_bytes(), had);
+    assert_eq!(h.live.stats_snapshot().downloaded_and_checked_pieces, 2);
 
     let mut rung = std::pin::pin!(h.live.finished_notify.notified());
     rung.as_mut().enable();
