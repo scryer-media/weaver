@@ -1497,7 +1497,17 @@ fn perform(
             }
             Ok(())
         }
-        _ if forced.is_some() => Err(forced.expect("checked above")),
+        // A test's forced failure names the file it stood before: by the
+        // path the operation carries, or the one its file was opened at.
+        _ if forced.is_some() => {
+            failed_at = op.path();
+            if failed_at.as_os_str().is_empty()
+                && let Some(open) = file.and_then(|file| held.open.get(&file))
+            {
+                failed_at.clone_from(&open.path);
+            }
+            Err(forced.expect("checked above"))
+        }
         Op::Write {
             file,
             offset,

@@ -217,12 +217,39 @@ fn a_failed_write_comes_back_with_its_batch_and_stops_its_key_only() {
     }
     assert_eq!(failures.len(), 1);
     assert_eq!((failures[0].key, failures[0].file), (1, Some(1)));
+    assert_eq!(failures[0].path, bad, "the failure names its file");
     assert!(failing.failed() && !healthy.failed());
     assert!(failed.returned() && !failed.passed());
     assert!(kept.passed());
     assert!(!good.exists(), "nothing of a failed key is written after");
     assert_eq!(std::fs::read(&other).unwrap(), b"kept");
     assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 0);
+}
+
+// A forced failure of a write to a file already open, which carries no
+// path of its own, names the path the file was opened at.
+#[test]
+fn a_forced_failure_of_a_later_write_names_the_open_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 4);
+    job.write(1, 0, Bytes::from_static(b"head"), create(&path));
+    job.write(1, 4, Bytes::from_static(b"tail"), None);
+    let barrier = job.barrier();
+    hold.wait_held();
+    hold.release(1);
+    hold.wait_held();
+    hold.fail_next(io::Error::other("no room"));
+    hold.open();
+    barrier.wait();
+    let report = reports.recv().unwrap();
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!((report.failures[0].key, report.failures[0].file), (4, Some(1)));
+    assert_eq!(report.failures[0].path, path);
+    assert_eq!(std::fs::read(&path).unwrap(), b"head");
 }
 
 #[test]
