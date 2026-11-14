@@ -886,6 +886,9 @@ async fn a_stopped_repair_is_taken_back_once_its_volume_has_settled() {
     let hold = release.join().unwrap();
 
     let graph = &pipeline.graph_jobs[&job_id];
+    // The repair did not end by itself: the stop ended it, the job kept it,
+    // and the stop took it back after the settle.
+    assert_eq!(graph.stopped_repairs_taken_back(), 1);
     assert!(!graph.keeps_stopped_repair());
     assert!(!graph.pending().given_up(), "the job was checkpointed at the stop");
     assert!(graph.disk().unwrap().quiet());

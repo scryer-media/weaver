@@ -917,6 +917,50 @@ fn the_loops_wait_on_a_limit_outlasts_the_stop_and_ends_at_the_stops_end() {
     assert!(job.loop_wait_below(0));
 }
 
+// The loop's read of a file whose writes sit on a stuck volume does not
+// stand for good once the owner is stopping: it ends at the end the stop
+// gives its volumes, with an error and the key left, and nothing of the key
+// failed. A later wait of the loop on the same writes does not stand at
+// all, and says they are unwritten. The bytes are written when the volume
+// gets to them.
+#[test]
+fn the_loops_read_of_a_stuck_volume_ends_at_the_stops_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let job = writers.submitter(&volume, 1);
+    let wrote = job.write(1, 0, Bytes::from_static(b"held"), create(&path));
+    hold.wait_held();
+    let barrier = job.barrier_at(wrote);
+    let clock = Arc::new(HandClock::default());
+    let end = Duration::from_secs(30);
+    writers.end_loop_waits_at(Arc::clone(&clock) as Arc<dyn Clock + Send>, end);
+    std::thread::scope(|scope| {
+        let read = scope.spawn(|| job.read_after(wrote, path.clone(), 0, 4));
+        // The read looked at the clock once, short of the end, and stands
+        // under the key's lock, which the wake below takes.
+        clock.wait_looks(1);
+        // The stop that sends producers on is not what ends it.
+        writers.stop_waits();
+        clock.move_to(end);
+        barrier.look_again();
+        let error = read.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("still out"), "{error}");
+    });
+    assert!(job.left());
+    assert!(!barrier.failed(), "nothing of the key failed");
+    // Past the end the loop does not stand again.
+    barrier.wait();
+    assert!(barrier.unwritten());
+    assert!(job.read_after(wrote, path.clone(), 0, 4).is_err());
+    hold.open();
+    writers.settle();
+    assert_eq!(std::fs::read(&path).unwrap(), b"held");
+    assert!(!barrier.unwritten());
+}
+
 // A volume with no writer thread holds no producer: nothing will be written.
 #[test]
 fn a_producer_does_not_wait_on_a_volume_with_no_thread() {

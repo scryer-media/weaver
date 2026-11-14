@@ -1101,6 +1101,14 @@ impl Barrier {
         }
     }
 
+    // Have a wait of the loop on the barrier's key look at its clock
+    // again, after a test moved it.
+    #[cfg(test)]
+    pub(crate) fn look_again(&self) {
+        let _held = self.key.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+        self.key.woke.notify_all();
+    }
+
     // Whether a test holds the volume's thread.
     #[cfg(test)]
     pub(crate) fn test_held(&self) -> bool {

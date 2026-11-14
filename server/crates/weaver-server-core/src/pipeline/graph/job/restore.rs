@@ -125,6 +125,8 @@ impl GraphJob {
             pending: Pending::default(),
             mail_owed: None,
             stopped_repair: None,
+            #[cfg(test)]
+            stopped_repairs_taken_back: 0,
             commit_held: None,
             notes: Vec::new(),
             fed: super::runs::Fed::default(),

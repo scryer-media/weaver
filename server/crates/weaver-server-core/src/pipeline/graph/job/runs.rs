@@ -341,7 +341,16 @@ impl GraphJob {
             return Ok(false);
         }
         self.take_back(*returned, slots, limit)?;
+        #[cfg(test)]
+        {
+            self.stopped_repairs_taken_back += 1;
+        }
         Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(in crate::pipeline) fn stopped_repairs_taken_back(&self) -> u32 {
+        self.stopped_repairs_taken_back
     }
 
     // A repair still kept is given up with its job's later checkpoints: the

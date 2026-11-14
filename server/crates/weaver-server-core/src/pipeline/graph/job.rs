@@ -161,6 +161,9 @@ pub(crate) struct GraphJob {
     // A repair the stop ended while a volume's writer still held operations
     // of the job, kept until the stop has given that writer its time.
     stopped_repair: Option<Box<crate::pipeline::graph::namespace::Returned>>,
+    // How many repairs the stop ended were kept and then taken back.
+    #[cfg(test)]
+    stopped_repairs_taken_back: u32,
     // The checkpoints committed through this stamp while a rewalk read its
     // volumes' files where they lay as it was lent: what they move or
     // remove waits for the last piece to be heard.
@@ -279,6 +282,8 @@ impl GraphJob {
             pending: Pending::default(),
             mail_owed: None,
             stopped_repair: None,
+            #[cfg(test)]
+            stopped_repairs_taken_back: 0,
             commit_held: None,
             notes: Vec::new(),
             fed: runs::Fed::default(),

@@ -185,12 +185,14 @@ impl NamespaceWriter {
         );
         let link = self.working_dir.join(&name);
         let (from, at) = (leaf.path().to_path_buf(), link.clone());
-        // Where the file system gives a file no second name, nothing is
-        // made here and nothing fails: the envelope's file is made by the
-        // first of the bytes that go down to it after, which are all of
-        // them, so it is written afresh as any envelope is.
+        // Where the file system gives a file no second name, an empty file
+        // is made at the name and nothing fails: the bytes that go down to
+        // the envelope after, which are all of them, are written afresh as
+        // any envelope's are. The envelope's leaf is told its file is there,
+        // and it is either way, so a move, a length read or a removal that
+        // comes before the first of those bytes finds a file.
         let made = to.run(None, link.clone(), move || {
-            second_name(&from, &at);
+            second_name_or_empty(&from, &at);
             Ok(())
         });
         if !self.envelopes.start_after(child, envelope, &name, true, made) {
@@ -236,9 +238,75 @@ fn second_name(from: &std::path::Path, at: &std::path::Path) -> bool {
         .is_ok()
 }
 
+// As `second_name`, for a name that must be a file after: where the file
+// system gives no second name, an empty file is made there. A disk that
+// cannot make even that says so on the first write to the file.
+fn second_name_or_empty(from: &std::path::Path, at: &std::path::Path) {
+    if second_name(from, at) {
+        return;
+    }
+    let _ = at
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(at)
+        });
+}
+
 // A test's file system that gives no file a second name.
 #[cfg(test)]
 pub(crate) mod refused {
     pub(crate) static SECOND_NAMES: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::graph::leaf::Leaf;
+
+    // A file system that gives no second name leaves a file at the name all
+    // the same, so the leaf that is told its file is there can be moved and
+    // measured before a byte is written to it.
+    #[test]
+    fn a_refused_second_name_still_leaves_a_file_the_leaf_can_move() {
+        refused::SECOND_NAMES.store(true, std::sync::atomic::Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("lantern.part2.rar");
+        std::fs::write(&from, b"volume").unwrap();
+        let at = dir.path().join("kept").join("envelope-1");
+
+        second_name_or_empty(&from, &at);
+
+        let mut leaf = Leaf::over(dir.path(), "kept/envelope-1", true);
+        assert_eq!(leaf.len().unwrap(), 0, "nothing was copied");
+        leaf.intend("kept/moved");
+        assert_eq!(leaf.move_on().unwrap().as_deref(), Some("kept/envelope-1"));
+        assert!(dir.path().join("kept").join("moved").is_file());
+        assert!(!at.exists());
+        assert_eq!(std::fs::read(&from).unwrap(), b"volume");
+    }
+
+    // Where the second name is given, it is the file itself and nothing
+    // else is made.
+    #[cfg(unix)]
+    #[test]
+    fn a_given_second_name_is_the_file_itself() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("lantern.part2.rar");
+        std::fs::write(&from, b"volume").unwrap();
+        let at = dir.path().join("envelope-1");
+
+        second_name_or_empty(&from, &at);
+
+        assert_eq!(
+            std::fs::metadata(&from).unwrap().ino(),
+            std::fs::metadata(&at).unwrap().ino()
+        );
+    }
 }
