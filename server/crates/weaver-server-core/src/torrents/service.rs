@@ -2271,6 +2271,12 @@ impl Signal {
         }
     }
 
+    // A refusal heard again: a run that entered upload mode for it.
+    fn hold_again(&self, job_id: JobId, no_room: NoRoom) {
+        locked(&self.no_room).entry(job_id).or_insert(no_room);
+        self.mark(job_id);
+    }
+
     fn take_no_room(&self, job_id: JobId) -> Option<NoRoom> {
         let mut no_room = locked(&self.no_room);
         if no_room.is_empty() {
@@ -2414,6 +2420,11 @@ struct Inner {
     // ledger is waited on for while any is listed. A torrent leaves at that
     // reading, or when it is gone; at most one entry per live torrent.
     relook: Mutex<Relook>,
+    // The refusals heard while their run was not in upload mode, heard
+    // again once it is: one task per torrent's run waits for that.
+    entering: Mutex<BTreeMap<JobId, (RunMark, NoRoom)>>,
+    // The service stops: a look its stop ended waits for no reading.
+    stopping: AtomicBool,
     // How many settles ran: what a test waits on to know one consumed
     // what the intakes said before it.
     #[cfg(test)]
@@ -2461,7 +2472,11 @@ impl Drop for PlaceLook {
             self.service.inner.signal.want_pass();
         } else {
             self.intake.room().end_placing();
-            self.service.place_later(self.job_id, self.again);
+            // A look the stop ended is looked again by no one: no reading
+            // is waited for after the stop.
+            if !self.service.inner.stopping.load(Ordering::Acquire) {
+                self.service.place_later(self.job_id, self.again);
+            }
         }
         self.service
             .inner
@@ -2535,6 +2550,8 @@ impl TorrentService {
                 settled: watch::channel(0).0,
                 start_held: Mutex::new([false; 3]),
                 relook: Mutex::default(),
+                entering: Mutex::default(),
+                stopping: AtomicBool::new(false),
             }),
         }
     }
@@ -2823,6 +2840,7 @@ impl TorrentService {
 
     /// Stop the tick and the job tasks, and close every session.
     pub async fn stop(&self) {
+        self.inner.stopping.store(true, Ordering::Release);
         let tasks = std::mem::take(
             &mut *self
                 .inner
@@ -3293,6 +3311,20 @@ impl TorrentService {
             else {
                 return;
             };
+            // A run out of upload mode installs no wait: nothing could end
+            // it, since a wake reads the run in upload mode. A refusal from
+            // before a wake enters nothing in the run, and is spent; one
+            // made since enters upload mode as its write returns, and is
+            // heard again then.
+            if !run.upload_mode() {
+                self.hold_in_upload_mode(
+                    job_id,
+                    RunMark::of(&run),
+                    run.upload_mode_entered(),
+                    no_room,
+                );
+                return;
+            }
             let dir = files_dir(torrent);
             let place = torrent
                 .intake
@@ -3348,13 +3380,6 @@ impl TorrentService {
             if let Some(intake) = &torrent.intake {
                 intake.room().give_back();
             }
-            if !run.upload_mode() {
-                let mark = RunMark::of(&run);
-                let run = Arc::clone(&run);
-                self.wake_in_upload_mode(job_id, mark, async move {
-                    run.wait_for_upload_mode(true).await;
-                });
-            }
         }
         self.end_room_promise(job_id);
         tracing::info!(
@@ -3364,29 +3389,45 @@ impl TorrentService {
         self.inner.disk_waits_moved.send_modify(|moved| *moved += 1);
     }
 
-    // The run enters upload mode as its refused write returns, which may
-    // be after this wait was first judged: the wake judges it again once
-    // it has, so a wait whose room shows before then is still let go. The
-    // watch ends with the wait.
-    fn wake_in_upload_mode(
+    // A refusal heard while its run is not in upload mode is heard again
+    // once the run enters it: its write returns after the refusal is said.
+    // One the run never enters for, made before a wake, is heard only if a
+    // later refusal enters it, and is dropped as the run ends. The task
+    // holds nothing of the run while it waits.
+    fn hold_in_upload_mode(
         &self,
         job_id: JobId,
         run: RunMark,
-        entered: impl std::future::Future<Output = ()> + Send + 'static,
+        entered: impl std::future::Future<Output = bool> + Send + 'static,
+        no_room: NoRoom,
     ) {
+        let mine = RunMark(run.0.clone());
+        {
+            let mut entering = locked(&self.inner.entering);
+            if let Some((waiting, held)) = entering.get_mut(&job_id)
+                && waiting.same(&run)
+            {
+                *held = no_room;
+                return;
+            }
+            // One left from a run that ended is replaced: its task finds
+            // the entry another run's and leaves it.
+            entering.insert(job_id, (run, no_room));
+        }
         let service = self.clone();
         self.keep(tokio::spawn(async move {
-            let mut moved = service.inner.disk_waits_moved.subscribe();
-            let gone = |_: &u64| {
-                locked(&service.inner.disk_waits)
-                    .get(&job_id)
-                    .is_none_or(|wait| !wait.run.same(&run))
-            };
-            tokio::select! {
-                () = entered => {
-                    service.inner.disk_waits_moved.send_modify(|moved| *moved += 1);
+            let entered = entered.await;
+            let no_room = {
+                let mut entering = locked(&service.inner.entering);
+                match entering.get(&job_id) {
+                    Some((waiting, _)) if waiting.same(&mine) => {
+                        entering.remove(&job_id).map(|(_, no_room)| no_room)
+                    }
+                    _ => None,
                 }
-                _ = moved.wait_for(gone) => {}
+            };
+            if let Some(no_room) = no_room.filter(|_| entered) {
+                service.inner.signal.hold_again(job_id, no_room);
             }
         }));
     }
@@ -5948,6 +5989,23 @@ impl TorrentService {
                         Arc::clone(&self.inner.signal),
                         session.cancellation_token().clone().cancelled_owned(),
                     );
+                }
+                // Nothing is said as the run's start from what was saved
+                // ends: the torrent is shown once it has, not at the next
+                // tick. A run removed from its session ends the start, and
+                // a session that stops ends the wait.
+                {
+                    let started = Arc::clone(&handle);
+                    let stopping = session.cancellation_token().clone().cancelled_owned();
+                    let service = self.clone();
+                    self.keep(tokio::spawn(async move {
+                        tokio::select! {
+                            _ = started.wait_until_initialized() => {}
+                            () = stopping => return,
+                        }
+                        drop(started);
+                        service.publish_job(job_id).await;
+                    }));
                 }
                 torrent.attached = Some(Attached {
                     session,

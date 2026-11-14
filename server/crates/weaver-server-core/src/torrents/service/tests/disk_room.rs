@@ -392,12 +392,42 @@ async fn a_torrent_held_by_promises_wakes_when_they_are_released() {
     let run = held(&disk).await.live().unwrap();
     assert_eq!(ledger_wait(service, disk.job_id), Some(16_384));
 
+    // The wake ends upload mode. A refusal heard once it has, from a write
+    // the run made before the wake, installs no wait: nothing could end
+    // one while the run is out of upload mode. It is heard again only if
+    // the run enters upload mode, which a refusal from before the wake
+    // cannot make it do. The seeder goes first, so no piece written after
+    // the wake can be refused and enter upload mode on its own.
+    disk.seeding.stop().await;
     ledger.release(60 << 10);
+    run.wait_for_upload_mode(false).await;
     waits_for_room(service, disk.job_id, false).await;
+    let intake = service.inner.live.lock().await[&disk.job_id]
+        .intake
+        .clone()
+        .unwrap();
+    // What the wake handed the torrent goes back, and the room is promised
+    // elsewhere: the piece below books on the ledger and is refused.
+    intake.room().give_back();
+    ledger.promise(1 << 40);
+    let piece = bytes::Bytes::from(vec![0u8; 16_384]);
+    assert!(weaver_torrent::storage::write_refused(
+        &intake.verified(0, &piece).unwrap_err()
+    ));
+    service
+        .inner
+        .settled
+        .subscribe()
+        .wait_for(|_| locked(&service.inner.entering).contains_key(&disk.job_id))
+        .await
+        .unwrap();
     assert!(!run.upload_mode());
+    assert!(!locked(&service.inner.disk_waits).contains_key(&disk.job_id));
+    let view = service.torrent(disk.job_id).await.unwrap();
+    assert_ne!(view.detail.as_deref(), Some(DISK_SPACE_WAIT_REASON));
+    ledger.release(1 << 40);
     assert!(!ledger.waited_on());
     service.stop().await;
-    disk.seeding.stop().await;
 }
 
 // `on_disk`, with `promised` of the room promised on the complete root's
@@ -604,7 +634,9 @@ async fn a_restarted_torrent_that_downloaded_books_its_pieces_on_its_disk() {
 
 // A torrent that joins its session again, after a pause, keeps the disk
 // found for its folder: a piece of its new run books there, refused on
-// that disk's ledger with no room over the reserve, with no new look.
+// that disk's ledger with no room over the reserve, with no new look. The
+// run is not in upload mode for this refusal, so it is kept to be heard
+// once it is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_torrent_that_joins_again_books_on_the_disk_it_kept() {
     let room = Arc::new(AtomicU64::new(1));
@@ -631,8 +663,19 @@ async fn a_torrent_that_joins_again_books_on_the_disk_it_kept() {
     assert!(weaver_torrent::storage::write_refused(
         &intake.verified(0, &piece).unwrap_err()
     ));
-    waits_for_room(service, job_id, true).await;
-    assert_eq!(ledger_wait(service, job_id), Some(16_384));
+    let entering = |_: &u64| {
+        locked(&service.inner.entering)
+            .get(&job_id)
+            .map(|(_, no_room)| *no_room)
+    };
+    service
+        .inner
+        .settled
+        .subscribe()
+        .wait_for(|seen| entering(seen).is_some())
+        .await
+        .unwrap();
+    assert_eq!(entering(&0), Some(NoRoom::Ledger(16_384)));
     let kept = placed(service, job_id).await;
     assert_eq!((kept.disk, kept.dir), (place.disk, place.dir));
     assert_eq!(disk.capacity.root_looks(), looks);
