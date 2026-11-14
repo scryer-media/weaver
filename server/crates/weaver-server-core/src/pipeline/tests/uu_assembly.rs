@@ -1049,7 +1049,7 @@ fn write_backlog_state(
         [
             pipeline.unanchored_parked.parts(),
             pipeline.write_buffered_bytes,
-            pipeline.write_buffered_segments as usize,
+            pipeline.write_buffered_segments,
             pipeline.uu_parked_segments,
         ],
     )
