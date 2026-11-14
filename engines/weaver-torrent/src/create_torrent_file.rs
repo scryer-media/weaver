@@ -31,9 +31,13 @@ pub struct CreateTorrentOptions<'a> {
     pub ssl_cert: Option<&'a [u8]>,
 }
 
+// The files of a directory in name order, compared byte by byte one path
+// component at a time: the same folder makes the same torrent on every
+// filesystem, whatever order the filesystem lists its entries in.
 fn walk_dir_find_paths(dir: &Path, out: &mut Vec<Cow<'_, Path>>) -> anyhow::Result<()> {
     out.extend(
         walkdir::WalkDir::new(dir)
+            .sort_by_file_name()
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
@@ -294,5 +298,53 @@ mod tests {
 
         let deserialized = torrent_from_bytes(&bytes).unwrap();
         assert_eq!(torrent.info_hash(), deserialized.info_hash);
+    }
+
+    // A directory's files are listed in name order, byte by byte and one
+    // path component at a time, whatever order they were made in: created
+    // neither ascending nor descending, with an upper-case name and a
+    // subdirectory between the files, they come out sorted.
+    #[tokio::test]
+    async fn a_created_torrent_lists_a_directorys_files_in_name_order() {
+        let dir = tempfile::TempDir::with_prefix("create_torrent_order").unwrap();
+        let content = dir.path().join("content");
+        std::fs::create_dir_all(content.join("b")).unwrap();
+        for name in [
+            "c.data", "a.data", "b/z.data", "B.data", "b/a.data", "d.data",
+        ] {
+            std::fs::write(content.join(name), name.repeat(64)).unwrap();
+        }
+        let made = create_torrent(
+            &content,
+            crate::CreateTorrentOptions {
+                piece_length: Some(1024),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap();
+        let files: Vec<String> = made
+            .meta
+            .info
+            .data
+            .files
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                f.path
+                    .iter()
+                    .map(|part| String::from_utf8_lossy(part.as_ref()).into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .collect();
+        assert_eq!(
+            files,
+            [
+                "B.data", "a.data", "b/a.data", "b/z.data", "c.data", "d.data"
+            ]
+        );
     }
 }
