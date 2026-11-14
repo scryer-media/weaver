@@ -418,8 +418,24 @@ macro_rules! send_data {
                     .checked_sub($segment_iter_item.payload_size() + SACK_EXTENSION_HEADER)?;
                 sack.truncated(room)
             });
-            // A hole this packet could not report still owes its ACK.
-            let sack_unsent = held.is_some() && sack.is_none();
+            // A hole this packet could not report, or reported only in
+            // part with its SACK cut to the room left, still owes its ACK.
+            // So does a hole with no more than SACK_DUP_THRESH packets held
+            // past it, though this packet reports it: a sender counts
+            // neither a data packet nor so short a SACK toward a resend
+            // (libtorrent v2.0.15 utp_stream.cpp:2723-2728, ST_STATE only;
+            // :1306-1320), so only the ACKs owed for the packets taken out
+            // of order tell it, and a data packet does not pay them.
+            let duplicates_owed = {
+                let past_hole = $self.user_rx.assembler_packets();
+                $self.reordered_unacked > 0
+                    && past_hole > 0
+                    && past_hole <= SACK_DUP_THRESH as usize
+            };
+            let sack_cut = held.is_some_and(|held| {
+                sack.is_none_or(|sack| sack.len() < held.len())
+            });
+            let sack_unsent = sack_cut || duplicates_owed;
             // The long buffer is zeroed only for a packet with a SACK.
             let mut bare = [0u8; UTP_HEADER as usize];
             let mut with_sack;
@@ -1365,6 +1381,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     // ACKs beyond the first that the packets taken past a hole are owed.
+    // A data packet sent meanwhile leaves the count as it is.
     fn duplicate_acks_owed(&self) -> u8 {
         let held = self.user_rx.assembler_packets();
         if held > SACK_DUP_THRESH as usize {

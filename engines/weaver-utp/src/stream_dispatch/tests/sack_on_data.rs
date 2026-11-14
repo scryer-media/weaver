@@ -57,6 +57,63 @@ async fn a_pass_that_sends_data_still_reports_the_sack() {
     );
 }
 
+// A hole with exactly three packets past it, in a pass that also sends
+// data. The data packet carries the SACK, but a sender counts neither a
+// data packet nor a SACK of three toward an early resend, so the three
+// packets still get their three ACKs. Without them the hole would wait for
+// the sender's timer.
+#[tokio::test(start_paused = true)]
+async fn a_pass_that_sends_data_still_sends_the_duplicate_acks_owed() {
+    let mut t = make_test_vsock(Default::default(), false);
+    let ack_nr = t.vsock.seq_nr - 1;
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(b"request")
+        .await
+        .unwrap();
+    // 2 is lost; 3, 4 and 5 arrive past the hole.
+    t.send_data(1, ack_nr, "a");
+    for seq in 3..=5u16 {
+        t.send_data(seq, ack_nr, "x");
+    }
+    t.poll_once_assert_pending().await;
+    t.send_queued().await;
+    let sent = t.take_sent();
+    let data: Vec<_> = sent.iter().filter(|m| m.header.htype == Data).collect();
+    assert_eq!(data.len(), 1, "{sent:?}");
+    assert_eq!(
+        data[0].header.extensions.selective_ack.unwrap().as_bytes(),
+        [0b111]
+    );
+    let acks: Vec<_> = sent.iter().filter(|m| m.header.htype == State).collect();
+    assert_eq!(acks.len(), 3, "{sent:?}");
+    for ack in &acks {
+        assert_eq!(ack.header.ack_nr, 1.into());
+        assert_eq!(
+            ack.header.extensions.selective_ack.unwrap().as_bytes(),
+            [0b111]
+        );
+    }
+
+    // Nothing more is owed: a later pass with nothing new sends nothing.
+    t.poll_once_assert_pending().await;
+    t.send_queued().await;
+    assert!(t.take_sent().is_empty());
+
+    // A fourth packet past the hole makes the SACK enough by itself: one
+    // packet carries it and nothing is repeated.
+    t.send_data(6, ack_nr, "x");
+    t.poll_once_assert_pending().await;
+    t.send_queued().await;
+    let sent = t.take_sent();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        sent[0].header.extensions.selective_ack.unwrap().as_bytes(),
+        [0b1111]
+    );
+}
+
 // Data written once a hole is known is cut short by the SACK, so the packet
 // with the SACK is no larger than a full packet without one, and each
 // carries the SACK.
