@@ -328,12 +328,17 @@ async fn _test_e2e_download(mode: ListenerMode, drop_checks: &DropChecks) {
                 );
             }
             // A kernel socket's streams, and so their connections, run past
-            // the first uTP thread, which is left to the sockets.
-            assert_eq!(
-                crate::peer_connection::ON_UTP_IO_THREAD.load(std::sync::atomic::Ordering::Relaxed),
-                0,
-                "a connection ran on the thread that reads and sends"
-            );
+            // the first uTP thread, which is left to the sockets. A host
+            // with one core gives a session one uTP thread, and everything
+            // runs on it.
+            if weaver_utp::Shards::new("count", crate::session::UTP_THREADS).threads() > 1 {
+                assert_eq!(
+                    crate::peer_connection::ON_UTP_IO_THREAD
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    0,
+                    "a connection ran on the thread that reads and sends"
+                );
+            }
         }
         tokio::time::timeout(Duration::from_secs(5), session.delete(id.into(), false))
             .await

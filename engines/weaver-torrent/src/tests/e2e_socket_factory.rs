@@ -332,7 +332,8 @@ async fn test_e2e_socket_factory_utp() -> anyhow::Result<()> {
 
 // A peer over a socket that does not spread its streams, as a tunnel's,
 // runs where its stream does: on the session's first uTP thread, the one
-// that reads and sends on the socket.
+// that reads and sends on the socket. On a host with one core the session
+// has that thread alone, and the test shows only that the peers ran on it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_peer_over_a_tunnel_socket_runs_on_the_thread_that_reads_and_sends() -> anyhow::Result<()>
 {

@@ -72,6 +72,12 @@ impl Shards {
         }))
     }
 
+    /// The threads these shards run on once started: the count asked for,
+    /// held to the machine's cores.
+    pub fn threads(&self) -> usize {
+        self.0.count
+    }
+
     fn shards(&self) -> Option<&[Shard]> {
         self.0
             .started

@@ -4550,12 +4550,12 @@ fn session_utp_opts(
 // not a torrent's or a socket's, and an idle one is parked, so the count
 // does not grow with the torrents held. A tunnel's streams stay on the
 // first.
-const UTP_THREADS: usize = 2;
+pub(crate) const UTP_THREADS: usize = 2;
 
-// The session's uTP threads, when the runtime has threads to spare for
-// them, named apart from other sessions' within the 15 bytes Linux keeps of
-// a thread's name (`utp{session}-{index}`). None start until a uTP socket
-// places a task.
+// The session's uTP threads, when it runs on a multi-threaded runtime:
+// `UTP_THREADS`, held to the machine's cores, named apart from other
+// sessions' within the 15 bytes Linux keeps of a thread's name
+// (`utp{session}-{index}`). None start until a uTP socket places a task.
 fn utp_shards() -> Option<weaver_utp::Shards> {
     static SESSIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     if tokio::runtime::Handle::current().runtime_flavor()
