@@ -201,10 +201,10 @@ struct Slot {
     // `None` until a checkpoint is written or read: what the database holds
     // of the job is not known, so the next change is the whole job.
     held: Option<Held>,
-    // What the stored checkpoint a restore read says is in hand, by volume:
-    // decoded when a job is held before this run's first checkpoint, never
-    // at the restore, and gone once the root is encoded, which then says it.
-    restored: Option<std::collections::HashMap<usize, std::collections::HashSet<u32>>>,
+    // What the stored checkpoint a restore read says is in hand, the
+    // ordinals of each volume: left by the restore, and gone once the root
+    // is encoded, which then says it.
+    restored: Option<Vec<Vec<u32>>>,
     feed_verdict: Option<crate::jobs::feed_verdict::FeedVerdict>,
     // The change waiting for its barrier or for a queued write to take it.
     queued: Option<Delta>,
@@ -849,38 +849,23 @@ impl Pending {
     }
 
     // What the stored checkpoint a restore read says is not fetched again,
-    // by volume, decoded from the root row and parts the restore left here.
-    // Asked for only when a job is held before this run's first checkpoint,
-    // and then once.
-    fn stored_settled(
-        slot: &Slot,
-    ) -> Option<std::collections::HashMap<usize, std::collections::HashSet<u32>>> {
-        let root = slot.held.as_ref()?.root.as_ref()?;
-        let parts: Vec<Part> = slot
-            .root_parts
+    // by volume: taken by the restore, off the pipeline's thread, from the
+    // root facts it had already decoded, and kept until this run's first
+    // checkpoint says it instead.
+    pub(crate) fn stored_settled(&self, root: &RootFacts) {
+        let settled = root
+            .volumes
             .iter()
-            .map(|(part, bytes)| Part {
-                key: *part as u64,
-                bytes: Arc::clone(bytes),
+            .map(|facts| {
+                facts
+                    .articles
+                    .iter()
+                    .filter(|(_, article)| *article != facts::ArticleFacts::Waiting)
+                    .map(|(ordinal, _)| *ordinal)
+                    .collect()
             })
             .collect();
-        let facts = facts::decode(version(root).ok()?, &root.facts, &parts).ok()?;
-        Some(
-            facts
-                .volumes
-                .iter()
-                .enumerate()
-                .map(|(volume, facts)| {
-                    let settled = facts
-                        .articles
-                        .iter()
-                        .filter(|(_, article)| *article != facts::ArticleFacts::Waiting)
-                        .map(|(ordinal, _)| *ordinal)
-                        .collect();
-                    (volume, settled)
-                })
-                .collect(),
-        )
+        self.slot().restored = Some(settled);
     }
 
     // The ordinals of `volume`'s articles the last checkpoint taken from
@@ -892,17 +877,17 @@ impl Pending {
         &self,
         volume: usize,
     ) -> std::collections::HashSet<u32> {
-        let mut slot = self.slot();
-        let Some(held) = &slot.held else {
+        let slot = self.slot();
+        if slot.held.is_none() {
             return std::collections::HashSet::new();
-        };
-        // The rows are a restore's, and no checkpoint was taken since: what
-        // they say is decoded now, once, and kept until one is.
-        if slot.restored.is_none() && held.read.is_none() {
-            slot.restored = Self::stored_settled(&slot);
         }
+        // The rows are a restore's, and no checkpoint was taken since: what
+        // the restore took from them stands.
         if let Some(restored) = &slot.restored {
-            return restored.get(&volume).cloned().unwrap_or_default();
+            return restored
+                .get(volume)
+                .map(|settled| settled.iter().copied().collect())
+                .unwrap_or_default();
         }
         slot.root.settled(volume)
     }
