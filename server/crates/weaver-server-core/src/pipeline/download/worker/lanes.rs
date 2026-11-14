@@ -460,12 +460,29 @@ impl Pipeline {
         }
 
         if observation.mode != DownloadLaneMode::Sequential && observation.batch_complete {
+            let depth = observation.mode.depth();
             if observation.batch_clean {
+                // The server answered with a later request on the wire, so
+                // the batch really ran pipelined.
+                change = explorer
+                    .note_clean_batch(now, depth, observation.answered_pipelined, result.lane_id)
+                    .or(change);
                 self.metrics
                     .download_pipeline_trial_success_total
                     .fetch_add(1, Ordering::Relaxed);
             } else if unclean_server_fault {
-                change = explorer.note_unclean_batch(now).or(change);
+                change = explorer
+                    .note_unclean_batch_at(
+                        now,
+                        depth,
+                        // The server had taken pipelined requests on this
+                        // connection before it failed. A connection that
+                        // died before answering anything (an idle close, a
+                        // restart, an outage) is no strike.
+                        observation.answered_pipelined,
+                        result.lane_id,
+                    )
+                    .or(change);
                 self.metrics
                     .download_pipeline_trial_failure_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -519,13 +536,24 @@ impl Pipeline {
                     from, to, "download pipeline batch was unclean; depth dropped"
                 );
             }
-            RungChange::PinnedSequential => {
+            RungChange::PinnedSequential { hold } => {
                 self.metrics
                     .download_pipeline_cooldown_total
                     .fetch_add(1, Ordering::Relaxed);
                 warn!(
                     server = server_idx,
-                    "second unclean pipelined batch; server pinned to sequential BODY fetches"
+                    hold_mins = hold.as_secs() / 60,
+                    "unclean pipelined batch inside the hold; server pinned to sequential BODY \
+                     fetches until a trial at depth 2"
+                );
+            }
+            RungChange::PinLifted { depth } => {
+                self.metrics
+                    .download_pipeline_proof_pass_total
+                    .fetch_add(1, Ordering::Relaxed);
+                info!(
+                    server = server_idx,
+                    depth, "download pipeline trial was clean; sequential pin lifted"
                 );
             }
         }
@@ -568,7 +596,7 @@ impl Pipeline {
                     .map(|transfer| transfer.as_secs_f64() * 1000.0),
                 latency_band: explorer.latency_band().map(|band| band.label().to_string()),
                 pipeline_depth: u32::from(explorer.current_depth()),
-                pinned_sequential: explorer.pinned_sequential(),
+                pinned_sequential: explorer.pin_held(),
             })
             .collect();
         health.sort_unstable_by_key(|entry| entry.server_idx);
@@ -891,6 +919,7 @@ impl Pipeline {
                             batch_clean: policy_outcome,
                             unresolved_count: u64::from(!policy_outcome),
                             connection_discarded: false,
+                            answered_pipelined: false,
                         }),
                         source_server_idx,
                         origin: DownloadResultOrigin::from_work(

@@ -611,7 +611,8 @@ pub struct ServerTransportHealth {
     pub latency_band: Option<String>,
     // BODY pipelining depth in use, where 1 means sequential.
     pub pipeline_depth: u32,
-    // Set once a server has proved twice that it cannot pipeline cleanly.
+    // Set while a server is held sequential after twice failing a pipelined
+    // batch; cleared by a clean trial once the hold lapses.
     pub pinned_sequential: bool,
 }
 

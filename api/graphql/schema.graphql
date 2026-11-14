@@ -4547,10 +4547,12 @@ type ServerHealth {
 	"""
 	bodyPipelineDepth: Int!
 	"""
-	Set once the server has twice failed to answer a pipelined batch
-	cleanly, which holds it sequential until Weaver restarts. A reorder
-	or a priority change keeps the hold; a change of host, port or
-	username starts the server afresh.
+	Set while the server is held sequential after twice failing to answer
+	a pipelined batch cleanly. The hold ends in a trial at depth 2: a
+	clean trial clears this, an unclean one holds the server again for
+	twice as long, up to two hours. A reorder or a priority change keeps
+	the hold; a change of host, port or username, or a restart, starts
+	the server afresh.
 	"""
 	bodyPipeliningPinnedSequential: Boolean!
 	"""

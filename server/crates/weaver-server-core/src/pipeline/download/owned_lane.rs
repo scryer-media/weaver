@@ -1769,6 +1769,9 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                     batch_clean: !discarded,
                     unresolved_count: 0,
                     connection_discarded: discarded,
+                    // The requests still on the ring report the fault as
+                    // they are read, with the ring's own verdict.
+                    answered_pipelined: false,
                 },
                 work_context.retention_excludes,
                 group_selected,
@@ -1933,6 +1936,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 batch_clean: meta.batch_clean,
                 unresolved_count: meta.unresolved_count,
                 connection_discarded: meta.connection_discarded,
+                answered_pipelined: meta.answered_pipelined,
             },
             work_context.retention_excludes,
             group_selected,
@@ -1974,6 +1978,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                     lane.transfer_ewma(),
                     work_context.pressure_clear,
                     unresolved_count,
+                    meta.answered_pipelined,
                     work_context.retention_excludes,
                     "lane pipeline faulted before this article's response",
                 );
@@ -2283,6 +2288,7 @@ fn unresolved_result(
     transfer: Option<std::time::Duration>,
     pressure_clear: bool,
     unresolved_count: u64,
+    answered_pipelined: bool,
     retention_excludes: weaver_nntp::ServerSet,
     message: &'static str,
 ) -> DownloadResult {
@@ -2314,6 +2320,7 @@ fn unresolved_result(
             batch_clean: false,
             unresolved_count,
             connection_discarded: true,
+            answered_pipelined,
         }),
         source_server_idx: None,
         origin: DownloadResultOrigin::from_work(is_recovery, completion_critical),
@@ -2477,6 +2484,7 @@ mod tests {
             batch_clean: true,
             unresolved_count: 0,
             connection_discarded: false,
+            answered_pipelined: false,
         };
         let straggler = result_from_trace(
             tail_work(1, 0),
@@ -2557,6 +2565,7 @@ mod tests {
                 batch_clean: true,
                 unresolved_count: 0,
                 connection_discarded: false,
+                answered_pipelined: false,
             },
             context.retention_excludes,
             false,
@@ -2586,6 +2595,7 @@ mod tests {
                 None,
                 true,
                 1,
+                false,
                 retention,
                 "test",
             )
@@ -2645,6 +2655,7 @@ mod tests {
             None,
             true,
             3,
+            false,
             weaver_nntp::ServerSet::EMPTY,
             "lane pipeline faulted before this article's response",
         );
@@ -2679,6 +2690,7 @@ mod tests {
                     None,
                     true,
                     0,
+                    false,
                     weaver_nntp::ServerSet::EMPTY,
                     "streamed",
                 );
@@ -2890,6 +2902,7 @@ mod tests {
                 batch_clean: true,
                 unresolved_count: 0,
                 connection_discarded: false,
+                answered_pipelined: false,
             },
             weaver_nntp::ServerSet::EMPTY,
             false,
@@ -2992,6 +3005,7 @@ mod tests {
                 batch_clean: true,
                 unresolved_count: 0,
                 connection_discarded: false,
+                answered_pipelined: false,
             },
             weaver_nntp::ServerSet::EMPTY,
             false,
@@ -3037,6 +3051,7 @@ mod tests {
                 batch_clean: true,
                 unresolved_count: 0,
                 connection_discarded: false,
+                answered_pipelined: false,
             },
             weaver_nntp::ServerSet::EMPTY,
             group_selected,
