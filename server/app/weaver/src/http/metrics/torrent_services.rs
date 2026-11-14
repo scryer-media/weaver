@@ -10,6 +10,7 @@
 // names a tracker, a peer or a torrent.
 
 use weaver_server_core::torrents::metrics::SessionSeries;
+use weaver_server_core::torrents::metrics::dht::{DhtIgnored, DhtQuery, DhtQueryEnd};
 use weaver_server_core::torrents::metrics::tracker::{AnnounceEvent, TrackerKind, TrackerResult};
 
 use super::catalog as f;
@@ -81,5 +82,63 @@ pub(super) fn render(out: &mut Encoder, routes: &[SessionSeries]) {
                 seconds(session.trackers.scrape_nanos[*kind as usize]),
             );
         }
+    }
+    dht(out, routes);
+}
+
+fn dht(out: &mut Encoder, routes: &[SessionSeries]) {
+    let running = || {
+        routes
+            .iter()
+            .filter(|session| session.open && session.dht.is_some())
+    };
+    for session in running() {
+        for query in DhtQuery::ALL {
+            out.sample(
+                &f::TORRENT_DHT_QUERIES_SENT,
+                &[("route", session.route.as_str()), ("type", query.as_str())],
+                session.dht_counts.sent[*query as usize],
+            );
+        }
+    }
+    for session in running() {
+        for query in DhtQuery::ALL {
+            for end in DhtQueryEnd::ALL {
+                out.sample(
+                    &f::TORRENT_DHT_QUERY_RESULTS,
+                    &[
+                        ("route", session.route.as_str()),
+                        ("type", query.as_str()),
+                        ("result", end.as_str()),
+                    ],
+                    session.dht_counts.ended[*query as usize][*end as usize],
+                );
+            }
+        }
+    }
+    for session in running() {
+        for query in DhtQuery::ALL {
+            out.sample(
+                &f::TORRENT_DHT_QUERIES_RECEIVED,
+                &[("route", session.route.as_str()), ("type", query.as_str())],
+                session.dht_counts.received[*query as usize],
+            );
+        }
+    }
+    for session in running() {
+        for why in DhtIgnored::ALL {
+            out.sample(
+                &f::TORRENT_DHT_IGNORED,
+                &[("route", session.route.as_str()), ("reason", why.as_str())],
+                session.dht_counts.ignored[*why as usize],
+            );
+        }
+    }
+    for session in running() {
+        out.sample(
+            &f::TORRENT_DHT_PEERS_FOUND,
+            &[("route", session.route.as_str())],
+            session.dht_counts.peers_found,
+        );
     }
 }

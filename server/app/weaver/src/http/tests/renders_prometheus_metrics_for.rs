@@ -1263,6 +1263,15 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         format!(
             r#"weaver_torrent_session_tracker_scrape_seconds_total{{{ROUTE},kind="http"}} 0.25"#
         ),
+        format!(r#"weaver_torrent_dht_queries_sent_total{{{ROUTE},type="get_peers"}} 80"#),
+        format!(
+            r#"weaver_torrent_dht_query_results_total{{{ROUTE},type="get_peers",result="timeout"}} 81"#
+        ),
+        format!(r#"weaver_torrent_dht_queries_received_total{{{ROUTE},type="find_node"}} 82"#),
+        format!(
+            r#"weaver_torrent_dht_datagrams_ignored_total{{{ROUTE},reason="source_limit"}} 83"#
+        ),
+        format!("weaver_torrent_dht_peers_found_total{{{ROUTE}}} 84"),
         r#"weaver_torrent_lifecycle_events_total{event="added"} 5"#.to_owned(),
         r#"weaver_torrent_lifecycle_events_total{event="completed"} 3"#.to_owned(),
         r#"weaver_torrent_lifecycle_events_total{event="removed"} 1"#.to_owned(),

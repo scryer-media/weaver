@@ -56,6 +56,8 @@ use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender, channel, unb
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{Instrument, debug, debug_span, info, trace, warn};
 
+use crate::session_stats::dht::{DhtCounts, DhtIgnored, DhtQuery, DhtQueryEnd, DhtSnapshot};
+
 fn now() -> Instant {
     Instant::now()
 }
@@ -1055,9 +1057,12 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
             // A search that wants no peers (a bootstrap or a refresh) has no
             // receiver: a node that names peers anyway is still walked past,
             // never the end of the search.
+            let mut named = 0;
             for peer in response.values.iter().flatten() {
                 let _ = self.peer_tx.send(peer.0);
+                named += 1;
             }
+            self.dht.counts.peers_found(named);
             // The nodes named are heard of (libtorrent
             // traversal_algorithm.cpp:317, v2.0.15).
             let mut table = self.dht.table(addr.is_ipv4()).write();
@@ -1486,6 +1491,9 @@ pub struct DhtState {
     // room (see `admit_walk`), so a session that starts ten thousand
     // torrents does not walk for all of them in its first seconds.
     walk_admission: WalkAdmission,
+
+    // What the node sent, was sent and found.
+    counts: DhtCounts,
 }
 
 impl DhtState {
@@ -1526,6 +1534,7 @@ impl DhtState {
             cancellation_token,
             client_version,
             walk_admission: WalkAdmission::new(),
+            counts: DhtCounts::default(),
         }
     }
 
@@ -2009,6 +2018,7 @@ impl DhtState {
         // from the moment it is sent. It is outstanding until then, and
         // withdrawn at its deadline or when whoever issued it drops it, so a
         // request never outlives the search that wanted it.
+        let query = request.counted_as();
         let (tid, message) = self.create_request(request, addr);
         let (_outstanding, answer) = Outstanding::register(self, (tid, addr));
         self.take_budget().await;
@@ -2021,12 +2031,20 @@ impl DhtState {
             },
             Some(slot),
         )?;
+        self.counts.sent(query);
         let sent_at = tokio::time::Instant::now();
         sent(sent_at);
         let response = tokio::time::timeout_at(sent_at + RESPONSE_TIMEOUT, answer)
             .await
             .unwrap_or(Ok(Err(Error::ResponseTimeout(RESPONSE_TIMEOUT))))
-            .map_err(|_| Error::DhtDead)??;
+            .map_err(|_| Error::DhtDead)?;
+        match &response {
+            Ok(ResponseOrError::Response(_)) => self.counts.ended(query, DhtQueryEnd::Reply),
+            Ok(ResponseOrError::Error(_)) => self.counts.ended(query, DhtQueryEnd::Error),
+            Err(Error::ResponseTimeout(_)) => self.counts.ended(query, DhtQueryEnd::Timeout),
+            Err(_) => {}
+        }
+        let response = response?;
         trace!("received {response:?}");
         Ok(response)
     }
@@ -2167,6 +2185,7 @@ impl DhtState {
     /// to our own queries too, before a byte of it is parsed.
     fn read_datagram(&self, buf: &[u8], addr: SocketAddr) -> Option<Message<ByteBufOwned>> {
         if buf.len() <= 20 || buf.first() != Some(&b'd') || buf.last() != Some(&b'e') {
+            self.counts.ignored(DhtIgnored::Malformed);
             return None;
         }
         if !self
@@ -2175,12 +2194,14 @@ impl DhtState {
             .admit(addr.ip(), tokio::time::Instant::now())
         {
             trace!("ignoring a datagram from {addr}: it sends too many");
+            self.counts.ignored(DhtIgnored::SourceLimit);
             return None;
         }
         match bprotocol::deserialize_message::<ByteBufOwned>(buf) {
             Ok(message) => Some(message),
             Err(e) => {
                 trace!("{addr}: error deserializing incoming message: {e:#}");
+                self.counts.ignored(DhtIgnored::Malformed);
                 None
             }
         }
@@ -2206,6 +2227,7 @@ impl DhtState {
                     Some(req) => req,
                     None => {
                         trace!(?msg, "outstanding request not found");
+                        self.counts.ignored(DhtIgnored::Unmatched);
                         return Err(Error::RequestNotFound);
                     }
                 };
@@ -2236,6 +2258,7 @@ impl DhtState {
             .has_quota(tokio::time::Instant::now())
         {
             trace!("dropping a query from {addr}: the DHT's send budget is spent");
+            self.counts.ignored(DhtIgnored::NoBudget);
             return Ok(());
         }
 
@@ -2244,6 +2267,7 @@ impl DhtState {
         match &msg.kind {
             // Otherwise, respond to a query.
             MessageKind::PingRequest(req) => {
+                self.counts.received(DhtQuery::Ping);
                 let message = Message {
                     transaction_id: msg.transaction_id,
                     version: None,
@@ -2265,6 +2289,7 @@ impl DhtState {
                 Ok(())
             }
             MessageKind::AnnouncePeer(ann) => {
+                self.counts.received(DhtQuery::AnnouncePeer);
                 self.queried_by(ann.id, addr);
                 let added = self.peer_store.store_peer(ann, addr);
                 trace!("{addr}: added_peer={added}, announce={ann:?}");
@@ -2288,6 +2313,7 @@ impl DhtState {
                 Ok(())
             }
             MessageKind::GetPeersRequest(req) => {
+                self.counts.received(DhtQuery::GetPeers);
                 let want = req
                     .want
                     .unwrap_or(if addr.is_ipv6() { Want::V6 } else { Want::V4 });
@@ -2319,6 +2345,7 @@ impl DhtState {
                 Ok(())
             }
             MessageKind::FindNodeRequest(req) => {
+                self.counts.received(DhtQuery::FindNode);
                 let want = req
                     .want
                     .unwrap_or(if addr.is_ipv6() { Want::V6 } else { Want::V4 });
@@ -2369,6 +2396,17 @@ enum Request {
         port: u16,
     },
     Ping,
+}
+
+impl Request {
+    fn counted_as(&self) -> DhtQuery {
+        match self {
+            Self::GetPeers(_) => DhtQuery::GetPeers,
+            Self::FindNode(_) => DhtQuery::FindNode,
+            Self::Announce { .. } => DhtQuery::AnnouncePeer,
+            Self::Ping => DhtQuery::Ping,
+        }
+    }
 }
 
 enum ResponseOrError {
@@ -2890,6 +2928,11 @@ impl DhtState {
 
     pub fn stats(&self) -> DhtStats {
         self.get_stats()
+    }
+
+    /// What the node has counted since it started.
+    pub fn counted(&self) -> DhtSnapshot {
+        self.counts.snapshot()
     }
 
     pub fn with_routing_tables<R, F: FnOnce(&RoutingTable, &RoutingTable) -> R>(&self, f: F) -> R {
@@ -3971,6 +4014,52 @@ mod tests {
         ));
         assert_eq!(tokio::time::Instant::now() - start, held + RESPONSE_TIMEOUT);
         assert_eq!(dht.get_stats().outstanding_requests, 0);
+    }
+
+    // A query of ours is counted as it goes out and as it ends; a node's
+    // query is counted by what it asks; a datagram that is no message is
+    // counted as ignored.
+    #[tokio::test(start_paused = true)]
+    async fn test_the_node_counts_its_queries_those_it_answers_and_what_it_ignores() {
+        use crate::session_stats::dht::{DhtIgnored, DhtQuery, DhtQueryEnd, DhtSnapshot};
+
+        let (state, mut sent) = fixture_state();
+        let dht = Arc::new(state);
+        assert_eq!(dht.counted(), DhtSnapshot::default());
+        let addr = SocketAddr::from(([10, 0, 1, 1], 6881));
+
+        // Our ping goes out and is never answered.
+        let ask = tokio::spawn({
+            let dht = dht.clone();
+            async move { dht.request(super::Request::Ping, addr).await }
+        });
+        let ping = sent.recv().await.unwrap();
+        assert!(matches!(ping.message.kind, MessageKind::PingRequest(_)));
+        assert!(matches!(
+            ask.await.unwrap(),
+            Err(crate::dht::Error::ResponseTimeout(_))
+        ));
+
+        // A node pings us, and is answered.
+        let query = dht
+            .read_datagram(
+                b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe",
+                addr,
+            )
+            .unwrap();
+        dht.on_received_message(query, addr).unwrap();
+        let answer = sent.recv().await.unwrap();
+        assert!(matches!(answer.message.kind, MessageKind::Response(_)));
+
+        // A datagram that is no message.
+        assert!(dht.read_datagram(&[b'x'; 40], addr).is_none());
+
+        let mut counted = DhtSnapshot::default();
+        counted.sent[DhtQuery::Ping as usize] = 1;
+        counted.ended[DhtQuery::Ping as usize][DhtQueryEnd::Timeout as usize] = 1;
+        counted.received[DhtQuery::Ping as usize] = 1;
+        counted.ignored[DhtIgnored::Malformed as usize] = 1;
+        assert_eq!(dht.counted(), counted);
     }
 
     fn errors_of(dht: &DhtState, id: crate::core::hash_id::Id20) -> usize {

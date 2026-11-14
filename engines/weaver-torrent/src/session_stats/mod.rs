@@ -17,6 +17,7 @@ use tracing::debug_span;
 
 use crate::{Session, torrent_state::peers::stats::AggregatePeerStatsAtomic};
 
+pub mod dht;
 pub mod snapshot;
 pub mod swarm;
 pub mod tracker;

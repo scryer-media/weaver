@@ -718,6 +718,18 @@ metric_families! {
         "Scrapes of a tracker that ended since the session opened, one per hash asked about, by how the tracker is spoken to and how it ended. A tracker that offers no scrape counts as error. Every combination is emitted, so the series pre-exist at zero.");
     TORRENT_TRACKER_SCRAPE_SECONDS = ("weaver_torrent_session_tracker_scrape_seconds_total", Counter,
         ["route", "kind"], "Time the scrapes that ended took in all, since the session opened.");
+    TORRENT_DHT_QUERIES_SENT = ("weaver_torrent_dht_queries_sent_total", Counter,
+        ["route", "type"], "DHT queries the session's node sent since it started, by what they ask. Absent while the session runs no DHT.");
+    TORRENT_DHT_QUERY_RESULTS = ("weaver_torrent_dht_query_results_total", Counter,
+        ["route", "type", "result"],
+        "DHT queries the node sent that ended, by what they ask and how they ended: reply, error (the node's own error reply) or timeout. A query withdrawn before either is not counted, so sent less results is not the number waiting.");
+    TORRENT_DHT_QUERIES_RECEIVED = ("weaver_torrent_dht_queries_received_total", Counter,
+        ["route", "type"], "DHT queries from other nodes the session's node answered since it started, by what they ask.");
+    TORRENT_DHT_IGNORED = ("weaver_torrent_dht_datagrams_ignored_total", Counter,
+        ["route", "reason"],
+        "Datagrams that reached the DHT node and were not acted on, by reason: malformed, source_limit (the source sends too many), unmatched (a reply to no waiting query) or no_budget (a query that came while the node's send budget was spent).");
+    TORRENT_DHT_PEERS_FOUND = ("weaver_torrent_dht_peers_found_total", Counter,
+        ["route"], "Peers the replies to the node's searches named since it started, repeats included.");
 
     // ---- speed tests -------------------------------------------------------
     SPEED_TEST_RUNS = ("weaver_speed_test_runs_total", Counter, ["kind", "status"],

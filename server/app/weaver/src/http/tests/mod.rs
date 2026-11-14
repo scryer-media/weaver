@@ -1536,6 +1536,20 @@ fn sample_trackers() -> weaver_server_core::torrents::metrics::tracker::TrackerS
     trackers
 }
 
+fn sample_dht_counts() -> weaver_server_core::torrents::metrics::dht::DhtSnapshot {
+    use weaver_server_core::torrents::metrics::dht::{
+        DhtIgnored, DhtQuery, DhtQueryEnd, DhtSnapshot,
+    };
+
+    let mut dht = DhtSnapshot::default();
+    dht.sent[DhtQuery::GetPeers as usize] = 80;
+    dht.ended[DhtQuery::GetPeers as usize][DhtQueryEnd::Timeout as usize] = 81;
+    dht.received[DhtQuery::FindNode as usize] = 82;
+    dht.ignored[DhtIgnored::SourceLimit as usize] = 83;
+    dht.peers_found = 84;
+    dht
+}
+
 fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMetrics {
     use weaver_server_core::torrents::metrics::{
         FetchOutcome, Published, SeedingGoal, SeedingSeries, SessionSeries, TorrentEvent,
@@ -1685,6 +1699,7 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
         dht: Some((150, 20, 6)),
         swarm: sample_swarm(),
         trackers: sample_trackers(),
+        dht_counts: sample_dht_counts(),
         connected: weaver_server_core::torrents::metrics::ConnectedPeers {
             tcp: 4,
             utp: 2,

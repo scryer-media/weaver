@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use weaver_torrent::session_stats::dht;
 pub use weaver_torrent::session_stats::snapshot::UtpStatsSnapshot;
 pub use weaver_torrent::session_stats::swarm;
 pub use weaver_torrent::session_stats::tracker;
@@ -403,6 +404,9 @@ pub struct SessionSeries {
     pub dht: Option<(usize, usize, usize)>,
     /// What its peer connections did, counted since it opened.
     pub swarm: swarm::SwarmSnapshot,
+    /// What its DHT node has counted since it started; all zero while it
+    /// runs none.
+    pub dht_counts: dht::DhtSnapshot,
     /// What it asked of its trackers, counted since it opened.
     pub trackers: tracker::TrackerSnapshot,
     /// Its connected peers over TCP, then over uTP, and how many of them
@@ -508,6 +512,10 @@ impl SessionSeries {
             },
             swarm: stats.swarm,
             trackers: stats.trackers,
+            dht_counts: session
+                .get_dht()
+                .map(|dht| dht.counted())
+                .unwrap_or_default(),
         }
     }
 }
