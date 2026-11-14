@@ -552,6 +552,28 @@ impl JobDisk {
     }
 }
 
+// What a test runs between the two looks `JobBarrier::passed_or_tell` takes
+// at a barrier, on the thread that takes them: once, then it is gone.
+#[cfg(test)]
+pub(crate) mod between_looks {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static RUN: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set(run: impl FnOnce() + 'static) {
+        RUN.with(|slot| *slot.borrow_mut() = Some(Box::new(run)));
+    }
+
+    pub(super) fn run() {
+        let run = RUN.with(|slot| slot.borrow_mut().take());
+        if let Some(run) = run {
+            run();
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct JobBarrier(Vec<Barrier>);
 
@@ -587,6 +609,32 @@ impl JobBarrier {
                 heard: crate::pipeline::graph::engine::Heard::DiskReturned,
             });
         });
+    }
+
+    // Whether the barrier has passed, for a job that steps back when it has
+    // not and starts again on its mail: when it has not, the job hears
+    // `DiskReturned` once the operations behind it returned, unless they
+    // already had, failed or refused, which their own report says. Whether
+    // they returned is looked at once, before whether the barrier passed:
+    // operations that return on a volume's thread between the two looks
+    // then either pass the barrier here or are told of. Looked at the other
+    // way round, they left a barrier that had not passed and asked for no
+    // mail, and the job waited for a mail that never came.
+    pub(crate) fn passed_or_tell(
+        &self,
+        job_id: JobId,
+        mail: &tokio::sync::mpsc::UnboundedSender<crate::pipeline::graph::engine::Said>,
+    ) -> bool {
+        let returned = self.returned();
+        #[cfg(test)]
+        between_looks::run();
+        if self.passed() {
+            return true;
+        }
+        if !returned {
+            self.then_tell(job_id, mail);
+        }
+        false
     }
 
     // As `then_tell`, asking only the volumes whose operations are still

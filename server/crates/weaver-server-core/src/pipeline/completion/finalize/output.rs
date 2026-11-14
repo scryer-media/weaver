@@ -1415,11 +1415,8 @@ impl Pipeline {
             .graph_jobs
             .get(&job_id)
             .and_then(|graph| graph.disk_barrier())
-            .filter(|barrier| !barrier.passed())
+            && !barrier.passed_or_tell(job_id, &self.graph_runs.written())
         {
-            if !barrier.returned() {
-                barrier.then_tell(job_id, &self.graph_runs.written());
-            }
             self.moves_awaiting_disk.insert(job_id);
             self.shared_state.queue.write(|inner| match inner.job_mut(job_id) {
                 Some(row) => {

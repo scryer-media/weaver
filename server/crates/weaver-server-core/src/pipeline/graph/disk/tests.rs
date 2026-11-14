@@ -596,3 +596,59 @@ fn a_free_name_is_not_one_a_queued_file_will_take() {
     let waits = &disk.working().volume().writer.loop_waits;
     assert_eq!(waits.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
+
+// A delivery looks at its barrier twice: whether the operations behind it
+// returned, and whether it passed. Operations that return on the volume's
+// thread between the two looks leave the barrier passed or the job told:
+// the delivery is never left stepped back with no mail asked for.
+#[test]
+fn operations_that_return_between_a_deliverys_two_looks_do_not_strand_it() {
+    let through = writers();
+    let hold = through.hold();
+    let disk = through.disk();
+    let (mut job, _dir, _) = job_through(&files(), Vec::new(), |_| Some(disk.clone()));
+    for (volume, ordinal) in seeded() {
+        arrive(&mut job, volume, ordinal);
+    }
+    let barrier = disk.barrier();
+    assert!(!barrier.returned());
+    let (mail, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    let returning = barrier.clone();
+    super::between_looks::set(move || {
+        hold.open();
+        returning.wait();
+    });
+    let passed = barrier.passed_or_tell(crate::JobId(1), &mail);
+    assert!(barrier.passed());
+    assert!(
+        passed || heard.try_recv().is_ok(),
+        "the delivery stepped back and no mail will start it again"
+    );
+}
+
+// A delivery whose operations are still out steps back and hears once they
+// returned; one whose operations all returned goes on and hears nothing.
+#[test]
+fn a_delivery_behind_held_operations_is_told_when_they_return() {
+    let through = writers();
+    let hold = through.hold();
+    let disk = through.disk();
+    let (mut job, _dir, _) = job_through(&files(), Vec::new(), |_| Some(disk.clone()));
+    for (volume, ordinal) in seeded() {
+        arrive(&mut job, volume, ordinal);
+    }
+    let barrier = disk.barrier();
+    let (mail, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    assert!(!barrier.passed_or_tell(crate::JobId(1), &mail));
+    assert!(heard.try_recv().is_err());
+    hold.open();
+    barrier.wait();
+    let said = heard.blocking_recv().expect("the job is told");
+    assert_eq!(said.scope, 1);
+    assert!(matches!(
+        said.heard,
+        crate::pipeline::graph::engine::Heard::DiskReturned
+    ));
+    assert!(barrier.passed_or_tell(crate::JobId(1), &mail));
+    assert!(heard.try_recv().is_err());
+}
