@@ -705,6 +705,19 @@ metric_families! {
         ["route"], "Incoming uTP connection requests dropped because too many were waiting, since the session opened.");
     TORRENT_UTP_SYN_RESETS = ("weaver_torrent_utp_syn_resets_total", Counter,
         ["route"], "Incoming uTP connection requests answered with a reset, since the session opened.");
+    TORRENT_TRACKER_ANNOUNCES = ("weaver_torrent_session_tracker_announces_total", Counter,
+        ["route", "kind", "event", "result"],
+        "Announces to a tracker that ended since the session opened, by how the tracker is spoken to, the event carried and how it ended: ok, timeout, refused (the tracker's own failure), bad_reply (an answer that does not parse), skipped (no address of a family the session connects over, nothing sent) or error (anything else). An announce over both address families counts once. Every combination is emitted, so the series pre-exist at zero.");
+    TORRENT_TRACKER_ANNOUNCE_SECONDS = ("weaver_torrent_session_tracker_announce_seconds_total", Counter,
+        ["route", "kind"],
+        "Time the announces that ended took in all, since the session opened; divided by the announces it gives their mean. The wait for a turn among HTTP announces is not in it.");
+    TORRENT_TRACKER_PEERS = ("weaver_torrent_session_tracker_peers_total", Counter,
+        ["route", "kind"], "Peers the accepted announces named, since the session opened, known already or not.");
+    TORRENT_TRACKER_SCRAPES = ("weaver_torrent_session_tracker_scrapes_total", Counter,
+        ["route", "kind", "result"],
+        "Scrapes of a tracker that ended since the session opened, one per hash asked about, by how the tracker is spoken to and how it ended. A tracker that offers no scrape counts as error. Every combination is emitted, so the series pre-exist at zero.");
+    TORRENT_TRACKER_SCRAPE_SECONDS = ("weaver_torrent_session_tracker_scrape_seconds_total", Counter,
+        ["route", "kind"], "Time the scrapes that ended took in all, since the session opened.");
 
     // ---- speed tests -------------------------------------------------------
     SPEED_TEST_RUNS = ("weaver_speed_test_runs_total", Counter, ["kind", "status"],

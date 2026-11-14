@@ -27,6 +27,7 @@ pub struct SessionStatsSnapshot {
     #[serde(with = "SerializedUtpStatsSnapshot")]
     pub utp: UtpStatsSnapshot,
     pub swarm: super::swarm::SwarmSnapshot,
+    pub trackers: super::tracker::TrackerSnapshot,
 }
 
 impl From<(&SessionStats, ConnectStatsSnapshot)> for SessionStatsSnapshot {
@@ -40,6 +41,7 @@ impl From<(&SessionStats, ConnectStatsSnapshot)> for SessionStatsSnapshot {
             connections: c,
             utp: Default::default(),
             swarm: s.swarm.snapshot(),
+            trackers: s.trackers.snapshot(),
         }
     }
 }

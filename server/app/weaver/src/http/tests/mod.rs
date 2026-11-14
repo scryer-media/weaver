@@ -1520,6 +1520,22 @@ fn sample_swarm() -> weaver_server_core::torrents::metrics::swarm::SwarmSnapshot
     swarm
 }
 
+fn sample_trackers() -> weaver_server_core::torrents::metrics::tracker::TrackerSnapshot {
+    use weaver_server_core::torrents::metrics::tracker::{
+        AnnounceEvent, TrackerKind, TrackerResult, TrackerSnapshot,
+    };
+
+    let mut trackers = TrackerSnapshot::default();
+    let (http, udp) = (TrackerKind::Http as usize, TrackerKind::Udp as usize);
+    trackers.announces[http][AnnounceEvent::Started as usize][TrackerResult::Ok as usize] = 70;
+    trackers.announces[udp][AnnounceEvent::Periodic as usize][TrackerResult::Timeout as usize] = 71;
+    trackers.announce_nanos = [2_500_000_000, 30_000_000_000];
+    trackers.peers = [72, 73];
+    trackers.scrapes[http][TrackerResult::BadReply as usize] = 74;
+    trackers.scrape_nanos = [250_000_000, 0];
+    trackers
+}
+
 fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMetrics {
     use weaver_server_core::torrents::metrics::{
         FetchOutcome, Published, SeedingGoal, SeedingSeries, SessionSeries, TorrentEvent,
@@ -1668,6 +1684,7 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
         ],
         dht: Some((150, 20, 6)),
         swarm: sample_swarm(),
+        trackers: sample_trackers(),
         connected: weaver_server_core::torrents::metrics::ConnectedPeers {
             tcp: 4,
             utp: 2,

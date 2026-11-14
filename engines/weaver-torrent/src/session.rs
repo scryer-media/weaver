@@ -3874,6 +3874,7 @@ impl Session {
             self.stopped_announces.clone(),
             self.http_announces.clone(),
             self.allow_idna,
+            self.stats.trackers.clone(),
         );
         // The table rings the session's watcher at each change, until the
         // table is gone.

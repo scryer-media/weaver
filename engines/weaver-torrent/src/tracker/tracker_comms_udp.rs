@@ -349,6 +349,26 @@ struct ClientShared {
     locked: RwLock<ClientLocked>,
 }
 
+/// A tracker's reply that is no answer to the request.
+#[derive(Debug)]
+pub(crate) enum NoAnswer {
+    /// The tracker's error message (BEP 15 action 3).
+    Errored(String),
+    /// A reply of no known action.
+    Unparsed,
+}
+
+impl std::fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Errored(e) => write!(f, "remote errored: {e}"),
+            Self::Unparsed => f.write_str("remote replied with something we could not parse"),
+        }
+    }
+}
+
+impl std::error::Error for NoAnswer {}
+
 #[derive(Clone)]
 pub struct UdpTrackerClient {
     state: Arc<ClientShared>,
@@ -509,11 +529,9 @@ impl UdpTrackerClient {
         trace!(tid = tid_g.tid, ?response, ?addr, "parsed");
         match &response {
             Response::Error(e) => {
-                anyhow::bail!("remote errored: {e}")
+                return Err(NoAnswer::Errored(e.to_string()).into());
             }
-            Response::Unknown => {
-                anyhow::bail!("remote replied with something we could not parse")
-            }
+            Response::Unknown => return Err(NoAnswer::Unparsed.into()),
             _ => {}
         }
         Ok(response)

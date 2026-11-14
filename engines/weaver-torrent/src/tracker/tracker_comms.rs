@@ -34,6 +34,7 @@ use url::Url;
 use crate::Identity;
 use crate::core::hash_id::{Id20, InfoHashes};
 use crate::core::net::{Egress, HttpClients, NamedBy, Resolved, Resolver, is_idna, is_public};
+use crate::session_stats::tracker::{AnnounceEvent, TrackerKind, TrackerResult, TrackerStats};
 use crate::tracker::Tracker;
 use crate::tracker::shape::AnnounceShape;
 use crate::tracker::tracker_comms_http;
@@ -76,6 +77,8 @@ pub struct TrackerComms {
     /// Hands the task an announce loop for another hash the torrent goes by
     /// (see [`TrackerTask::take_over`]).
     grow: tokio::sync::mpsc::UnboundedSender<Arc<TrackerComms>>,
+    /// Where the session counts its announces.
+    counts: Arc<TrackerStats>,
 }
 
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
@@ -467,6 +470,22 @@ impl Events {
     /// Some leg carries an event.
     fn any(&self) -> bool {
         self.after_start.is_some() || self.unstarted.flatten().is_some()
+    }
+
+    /// The event the announce is counted under: that of the legs that
+    /// answered `started` when there are any, else that of the others.
+    fn counted_as(&self) -> AnnounceEvent {
+        let event = match self.started.any() {
+            true => self.after_start,
+            false => self.unstarted.flatten(),
+        };
+        match event {
+            None => AnnounceEvent::Periodic,
+            Some(TrackerRequestEvent::Started) => AnnounceEvent::Started,
+            Some(TrackerRequestEvent::Completed) => AnnounceEvent::Completed,
+            Some(TrackerRequestEvent::Stopped) => AnnounceEvent::Stopped,
+            Some(TrackerRequestEvent::Paused) => AnnounceEvent::Paused,
+        }
     }
 }
 
@@ -1030,7 +1049,49 @@ async fn within_completion_timeout<T>(
 ) -> anyhow::Result<T> {
     tokio::time::timeout(COMPLETION_TIMEOUT, request)
         .await
-        .map_err(|_| anyhow::anyhow!("the tracker did not answer within {COMPLETION_TIMEOUT:?}"))?
+        .map_err(|_| anyhow::Error::new(Unanswered))?
+}
+
+/// A request to a tracker that was given up after [`COMPLETION_TIMEOUT`].
+#[derive(Debug)]
+struct Unanswered;
+
+impl std::fmt::Display for Unanswered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the tracker did not answer within {COMPLETION_TIMEOUT:?}"
+        )
+    }
+}
+
+impl std::error::Error for Unanswered {}
+
+/// What a request to a tracker is counted as having ended in.
+fn counted_result<T>(result: &anyhow::Result<T>) -> TrackerResult {
+    let Err(e) = result else {
+        return TrackerResult::Ok;
+    };
+    for cause in e.chain() {
+        if cause.is::<Unanswered>() || cause.is::<tokio::time::error::Elapsed>() {
+            return TrackerResult::Timeout;
+        }
+        if let Some(refused) = cause.downcast_ref::<Refused>() {
+            return match refused.failure {
+                true => TrackerResult::Refused,
+                false => TrackerResult::BadReply,
+            };
+        }
+        match cause.downcast_ref::<tracker_comms_udp::NoAnswer>() {
+            Some(tracker_comms_udp::NoAnswer::Errored(_)) => return TrackerResult::Refused,
+            Some(tracker_comms_udp::NoAnswer::Unparsed) => return TrackerResult::BadReply,
+            None => {}
+        }
+        if cause.downcast_ref::<Unreachable>() == Some(&Unreachable::Family) {
+            return TrackerResult::Skipped;
+        }
+    }
+    TrackerResult::Error
 }
 
 /// How long to wait before the next announce.
@@ -1240,6 +1301,7 @@ struct Scraper {
     reachable: Reachable,
     udp_client: UdpTrackerClient,
     allow_idna: bool,
+    counts: Arc<TrackerStats>,
 }
 
 impl Scraper {
@@ -1264,7 +1326,8 @@ impl Scraper {
         tracker: &SupportedTracker,
         info_hash: Id20,
     ) -> anyhow::Result<ScrapeOk> {
-        within_completion_timeout(async {
+        let asked = Instant::now();
+        let result = within_completion_timeout(async {
             if tracker.udp {
                 self.scrape_udp(tracker, info_hash)
                     .instrument(trace_span!("udp_scrape", ?tracker))
@@ -1275,8 +1338,13 @@ impl Scraper {
                     .await
             }
         })
-        .await
-        .map_err(without_url)
+        .await;
+        self.counts.scraped(
+            TrackerKind::of(tracker.udp),
+            counted_result(&result),
+            asked.elapsed(),
+        );
+        result.map_err(without_url)
     }
 
     async fn scrape_http(
@@ -1387,6 +1455,7 @@ impl std::fmt::Debug for TrackerStatus {
 }
 
 impl TrackerStatus {
+    #[allow(clippy::too_many_arguments)]
     fn new<'a>(
         trackers: impl IntoIterator<Item = &'a SupportedTracker>,
         info_hashes: Vec<Id20>,
@@ -1395,6 +1464,7 @@ impl TrackerStatus {
         reachable: Reachable,
         udp_client: UdpTrackerClient,
         allow_idna: bool,
+        counts: Arc<TrackerStats>,
     ) -> Self {
         let unique = unique(trackers);
         let announces = unique
@@ -1423,9 +1493,16 @@ impl TrackerStatus {
                 reachable,
                 udp_client,
                 allow_idna,
+                counts,
             },
             runs: Default::default(),
         }))
+    }
+
+    /// What the session has counted of its trackers.
+    #[cfg(test)]
+    fn counted(&self) -> crate::session_stats::tracker::TrackerSnapshot {
+        self.0.scraper.counts.snapshot()
     }
 
     /// A route move takes the torrent to another session, where its
@@ -2168,6 +2245,7 @@ impl TrackerComms {
         stopped: StoppedAnnounces,
         http_announces: HttpAnnounces,
         allow_idna: bool,
+        counts: Arc<TrackerStats>,
     ) -> TrackerTask {
         let mut tiers = supported_tiers(tiers);
         for trackers in &mut tiers {
@@ -2183,6 +2261,7 @@ impl TrackerComms {
             reachable.clone(),
             udp_client.clone(),
             allow_idna,
+            counts.clone(),
         );
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<SocketAddr>(16);
@@ -2221,6 +2300,7 @@ impl TrackerComms {
                     stopped: stopped.clone(),
                     http_announces: http_announces.clone(),
                     grow: grow.clone(),
+                    counts: counts.clone(),
                 })
             })
             .collect::<Vec<_>>();
@@ -2305,6 +2385,7 @@ impl TrackerComms {
             stopped: self.stopped.clone(),
             http_announces: self.http_announces.clone(),
             grow: self.grow.clone(),
+            counts: self.counts.clone(),
         });
         if self.grow.send(comms.clone()).is_err() {
             return;
@@ -2530,7 +2611,8 @@ impl TrackerComms {
             true => None,
             false => Some(self.http_announces.take(events.any()).await),
         };
-        within_completion_timeout(async {
+        let asked = Instant::now();
+        let result = within_completion_timeout(async {
             if tracker.udp {
                 self.announce_udp(tracker, events, stats)
                     .instrument(trace_span!("udp_tracker", ?tracker))
@@ -2541,8 +2623,15 @@ impl TrackerComms {
                     .await
             }
         })
-        .await
-        .map_err(without_url)
+        .await;
+        self.counts.announced(
+            TrackerKind::of(tracker.udp),
+            events.counted_as(),
+            counted_result(&result),
+            asked.elapsed(),
+            result.as_ref().map_or(0, |announced| announced.peers.len()),
+        );
+        result.map_err(without_url)
     }
 
     /// The corrupt and redundant bytes counted since `tracker` last heard
@@ -2841,6 +2930,7 @@ mod tests {
         TrackerTask, UdpTrackerResolveResult, Unreachable, may_complete, read_answer, retry_delay,
         udp_tracker_to_socket_addrs,
     };
+    use super::{AnnounceEvent, TrackerKind, TrackerResult};
     use super::{Entry, unique};
     use crate::Identity;
     use crate::tracker::tracker_comms_http::{MAX_INTERVAL, TrackerRequestEvent};
@@ -3742,6 +3832,7 @@ mod tests {
             stopped.clone(),
             Default::default(),
             false,
+            Default::default(),
         )
         .peers;
         let mut announced = Vec::new();
@@ -3798,6 +3889,7 @@ mod tests {
             stopped.clone(),
             Default::default(),
             false,
+            Default::default(),
         );
         let (conn, started) = tokio::select! {
             _ = peers.next() => panic!("the tracker sent peers"),
@@ -3879,6 +3971,7 @@ mod tests {
             stopped.clone(),
             Default::default(),
             false,
+            Default::default(),
         );
         let (conn, started) = tokio::select! {
             _ = peers.next() => panic!("the tracker sent peers"),
@@ -3985,6 +4078,7 @@ mod tests {
             stopped.clone(),
             Default::default(),
             false,
+            Default::default(),
         )
         .peers;
         let q = answer_with_a_peer(
@@ -4049,6 +4143,7 @@ mod tests {
             stopped.clone(),
             Default::default(),
             false,
+            Default::default(),
         )
         .peers;
         let q = answer_with_a_peer(
@@ -4185,6 +4280,7 @@ mod tests {
             StoppedAnnounces::default(),
             Default::default(),
             false,
+            Default::default(),
         )
         .peers;
         let first = tokio::select! {
@@ -4236,6 +4332,7 @@ mod tests {
             StoppedAnnounces::default(),
             Default::default(),
             false,
+            Default::default(),
         )
         .peers;
         let first = tokio::select! {
@@ -4294,6 +4391,7 @@ mod tests {
             stopped.clone(),
             Default::default(),
             false,
+            Default::default(),
         )
         .peers;
 
@@ -4366,6 +4464,7 @@ mod tests {
             stopped.clone(),
             Default::default(),
             false,
+            Default::default(),
         )
         .peers;
 
@@ -4412,6 +4511,7 @@ mod tests {
             stopped.clone(),
             Default::default(),
             false,
+            Default::default(),
         )
         .peers;
 
@@ -4472,6 +4572,7 @@ mod tests {
             stopped.clone(),
             Default::default(),
             false,
+            Default::default(),
         )
         .peers;
 
@@ -4613,6 +4714,7 @@ mod tests {
             stopped.clone(),
             Default::default(),
             false,
+            Default::default(),
         )
         .peers;
         drop(peers);
@@ -4686,6 +4788,7 @@ mod tests {
             stopped.clone(),
             Default::default(),
             false,
+            Default::default(),
         );
         (task, token)
     }
@@ -4907,6 +5010,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn each_announce_is_counted_under_its_event_and_how_it_ended() {
+        let (listener, url) = http_listener().await;
+        let stopped = StoppedAnnounces::default();
+        let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+        let mut rx = status.subscribe();
+        assert_eq!(status.counted(), Default::default());
+
+        // `started` is accepted, with one peer.
+        let (named, ()) = tokio::join!(peers.next(), async {
+            let (conn, q) = read_announce(&listener).await;
+            assert_eq!(query_param(&q, "event"), Some("started"));
+            respond(conn, b"d8:intervali1800e5:peers6:\x0a\x00\x00\x01\x1a\xe1e").await;
+        });
+        assert_eq!(named, Some("10.0.0.1:6881".parse().unwrap()));
+        tokio::select! {
+            _ = peers.next() => panic!("the tracker sent one peer"),
+            r = rx.wait_for(|a| a[0].last.is_some() && !a[0].in_flight) => { r.unwrap(); }
+        }
+        // `stopped` is refused.
+        drop(peers);
+        let (conn, q) = read_announce(&listener).await;
+        assert_eq!(query_param(&q, "event"), Some("stopped"));
+        respond(conn, "d14:failure reason4:nopee").await;
+        stopped.wait_idle().await;
+
+        let counted = status.counted();
+        let http = &counted.announces[TrackerKind::Http as usize];
+        assert_eq!(
+            http[AnnounceEvent::Started as usize][TrackerResult::Ok as usize],
+            1
+        );
+        assert_eq!(
+            http[AnnounceEvent::Stopped as usize][TrackerResult::Refused as usize],
+            1
+        );
+        // Nothing else was counted, and the peer was.
+        assert_eq!(
+            counted
+                .announces
+                .as_flattened()
+                .as_flattened()
+                .iter()
+                .sum::<u64>(),
+            2
+        );
+        assert_eq!(counted.peers, [1, 0]);
+        token.cancel();
+    }
+
+    #[tokio::test]
     async fn a_zero_stopped_timeout_still_leaves_no_announce_due() {
         let (listener, url) = http_listener().await;
         let stopped = StoppedAnnounces::new(Duration::ZERO);
@@ -4952,6 +5106,7 @@ mod tests {
             stopped.clone(),
             Default::default(),
             false,
+            Default::default(),
         )
         .peers;
 
@@ -5108,6 +5263,13 @@ mod tests {
             .clone()
             .unwrap();
         assert_eq!((accepted.seeders, accepted.leechers), (Some(7), Some(1)));
+        // One scrape, of an HTTP tracker, answered.
+        let counted = status.counted();
+        assert_eq!(
+            counted.scrapes[TrackerKind::Http as usize][TrackerResult::Ok as usize],
+            1
+        );
+        assert_eq!(counted.scrapes.as_flattened().iter().sum::<u64>(), 1);
         token.cancel();
     }
 
@@ -5240,6 +5402,7 @@ mod tests {
             stopped.clone(),
             Default::default(),
             false,
+            Default::default(),
         );
 
         for url in &forged {
@@ -5375,6 +5538,7 @@ mod tests {
             StoppedAnnounces::default(),
             Default::default(),
             false,
+            Default::default(),
         )
         .peers;
 
@@ -5506,6 +5670,7 @@ mod tests {
             stopped.clone(),
             Default::default(),
             false,
+            Default::default(),
         )
     }
 
@@ -6158,6 +6323,7 @@ mod tests {
             stopped.clone(),
             Default::default(),
             false,
+            Default::default(),
         );
 
         for (url, why) in &refused {
@@ -6215,6 +6381,7 @@ mod tests {
             stopped.clone(),
             Default::default(),
             false,
+            Default::default(),
         );
 
         let serve = async {

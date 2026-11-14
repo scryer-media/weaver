@@ -19,6 +19,7 @@ use crate::{Session, torrent_state::peers::stats::AggregatePeerStatsAtomic};
 
 pub mod snapshot;
 pub mod swarm;
+pub mod tracker;
 
 pub use swarm::Transport;
 
@@ -35,6 +36,7 @@ pub struct SessionStats {
     pub counters: SessionCountersAtomic,
     pub peers: Arc<AggregatePeerStatsAtomic>,
     pub swarm: Arc<swarm::SwarmStats>,
+    pub trackers: Arc<tracker::TrackerStats>,
     pub down_speed_estimator: SpeedEstimator,
     pub up_speed_estimator: SpeedEstimator,
     pub startup_time: Instant,
@@ -46,6 +48,7 @@ impl SessionStats {
             counters: Default::default(),
             peers: Default::default(),
             swarm: Default::default(),
+            trackers: Default::default(),
             down_speed_estimator: SpeedEstimator::new(5),
             up_speed_estimator: SpeedEstimator::new(5),
             startup_time: Instant::now(),

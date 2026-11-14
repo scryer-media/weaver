@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use weaver_torrent::session_stats::snapshot::UtpStatsSnapshot;
 pub use weaver_torrent::session_stats::swarm;
+pub use weaver_torrent::session_stats::tracker;
 use weaver_torrent::{FetchPhase, Session};
 
 use crate::jobs::JobId;
@@ -402,6 +403,8 @@ pub struct SessionSeries {
     pub dht: Option<(usize, usize, usize)>,
     /// What its peer connections did, counted since it opened.
     pub swarm: swarm::SwarmSnapshot,
+    /// What it asked of its trackers, counted since it opened.
+    pub trackers: tracker::TrackerSnapshot,
     /// Its connected peers over TCP, then over uTP, and how many of them
     /// are seeds.
     pub connected: ConnectedPeers,
@@ -504,6 +507,7 @@ impl SessionSeries {
                 ]
             },
             swarm: stats.swarm,
+            trackers: stats.trackers,
         }
     }
 }

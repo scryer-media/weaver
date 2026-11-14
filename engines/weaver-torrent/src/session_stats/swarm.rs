@@ -43,6 +43,7 @@ macro_rules! counted {
         }
     };
 }
+pub(super) use counted;
 
 counted! {
     /// Which way something crossed a connection.
@@ -368,14 +369,14 @@ impl PeerSource {
     }
 }
 
-type Tally<const N: usize> = [AtomicU64; N];
+pub(super) type Tally<const N: usize> = [AtomicU64; N];
 
 #[inline]
-fn add<const N: usize>(tally: &Tally<N>, kind: usize, count: u64) {
+pub(super) fn add<const N: usize>(tally: &Tally<N>, kind: usize, count: u64) {
     tally[kind].fetch_add(count, Ordering::Relaxed);
 }
 
-fn read<const N: usize>(tally: &Tally<N>) -> [u64; N] {
+pub(super) fn read<const N: usize>(tally: &Tally<N>) -> [u64; N] {
     std::array::from_fn(|kind| tally[kind].load(Ordering::Relaxed))
 }
 
