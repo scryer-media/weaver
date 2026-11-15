@@ -20,7 +20,7 @@ use super::source::{Class, Move};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::JobState;
 use crate::pipeline::download::queue::{DownloadWork, QueueItem};
-use crate::pipeline::graph::engine::{Heard, Said};
+use crate::pipeline::graph::engine::{Heard, Hears, Said};
 use crate::pipeline::graph::job::{GraphError, GraphJob, RootFile, Storage};
 use crate::pipeline::graph::limits;
 use crate::pipeline::post_health::GivenUp;
@@ -658,6 +658,17 @@ impl Pipeline {
                 self.report_job(job_id);
             }
         }
+        // A job outside the pipeline, a torrent's unpacking, begins to wait
+        // as one of the pipeline's does: it is heard here once, as its wait
+        // begins, and woken with the pipeline's own by ticket.
+        for scope in self.graph_outside.disk_waits_began() {
+            #[cfg(test)]
+            DISK_WAIT_LOOKS.with(|looks| looks.set(looks.get() + 1));
+            // Said once, as the wait begins, as the pipeline's own is.
+            if let Some((wait, dir)) = self.graph_outside.disk_wait_of(scope) {
+                self.say_disk_wait(JobId(scope), &wait, &dir);
+            }
+        }
         if self.disk_idle.is_empty() {
             return;
         }
@@ -692,17 +703,16 @@ impl Pipeline {
         use crate::support::human_bytes;
         #[cfg(test)]
         DISK_WAITS_SAID.with(|said| said.set(said.get() + 1));
-        let name = self
-            .jobs
-            .get(&job_id)
-            .map_or("", |state| state.spec.name.as_str());
+        // A job outside the pipeline has no name here: its line leaves the
+        // field out (`Option` records nothing when `None`).
+        let name = self.jobs.get(&job_id).map(|state| state.spec.name.as_str());
         let disk = match wait.device {
             limits::Device::Output => "output",
             limits::Device::Working => "working",
         };
         warn!(
             job_id = job_id.0,
-            job = %name,
+            job = name,
             disk,
             folder = %dir.display(),
             owes = %human_bytes(wait.owes),
@@ -726,6 +736,7 @@ impl Pipeline {
     // reconciles the waits just before it asks.
     pub(in crate::pipeline) fn waits_for_disk_room(&self) -> bool {
         !self.disk_waiting.is_empty()
+            || self.graph_outside.waits_for_disk()
             || self.admission_disk_held
             || !self.full_disk.is_empty()
             || self.archive_wait.is_some()
@@ -758,9 +769,13 @@ impl Pipeline {
     // woken, in the order they began to wait, if the disk has room for all
     // it owes beside what those woken before it promised. A job woken goes
     // on; the rest wait for the next reading. A job no longer here is no
-    // longer waited on.
+    // longer waited on. A job outside the pipeline that waits, a torrent's
+    // unpacking, takes its place among them by its ticket from the same
+    // ledger, and goes on through its own task.
     pub(in crate::pipeline) fn wake_disk_waiters(&mut self) {
-        let mut waiting: Vec<(u64, JobId)> = self
+        // Each waiter's ticket and job, and how to wake it when it is outside.
+        type Waiter = (u64, JobId, Option<Arc<dyn Hears>>);
+        let mut waiting: Vec<Waiter> = self
             .disk_waiting
             .iter()
             .map(|job_id| {
@@ -769,11 +784,23 @@ impl Pipeline {
                     .get(job_id)
                     .and_then(GraphJob::disk_ticket)
                     .unwrap_or(0);
-                (ticket, *job_id)
+                (ticket, *job_id, None)
             })
             .collect();
-        waiting.sort_unstable();
-        for (_, job_id) in waiting {
+        waiting.extend(
+            self.graph_outside
+                .disk_waiters()
+                .into_iter()
+                .map(|(ticket, scope, hears)| (ticket, JobId(scope), Some(hears))),
+        );
+        waiting.sort_unstable_by_key(|(ticket, job_id, outside)| {
+            (*ticket, *job_id, outside.is_some())
+        });
+        for (_, job_id, outside) in waiting {
+            if let Some(hears) = outside {
+                hears.wake_disk();
+                continue;
+            }
             let woke = self
                 .graph_jobs
                 .get_mut(&job_id)

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use std::path::PathBuf;
+
 use crate::StateError;
 use crate::history::record::JobHistoryRow;
 use crate::jobs::ids::JobId;
@@ -98,6 +100,802 @@ async fn insert_trackers(
     Ok(())
 }
 
+impl crate::persistence::DatabaseWriterExecutor {
+    // A torrent's job's history row, written in one transaction on the
+    // writer's path, which keeps it for want of room as it keeps an NZB
+    // job's archive. When the job `retires` the torrent leaves in the same
+    // write, as `delete_torrent` removes it: no reader finds the job in
+    // neither, so an event raised for it while it was live is still queued
+    // for it after. Otherwise the torrent stays and seeds on.
+    pub(crate) fn write_torrent_history(
+        &self,
+        entry: &JobHistoryRow,
+        retires: bool,
+        files: &[HistoryFile],
+    ) -> Result<(), StateError> {
+        let id = stored(entry.job_id)?;
+        let datastore = self.datastore();
+        let entry = entry.clone();
+        let files = files.to_vec();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "write_torrent_history", |tx| {
+                let entry = entry.clone();
+                let files = files.clone();
+                Box::pin(async move {
+                    crate::history::persistence::insert_job_history_tx(tx, &entry).await?;
+                    write_history_files_tx(tx, id, &files).await?;
+                    if retires {
+                        delete_torrent_tx(tx, id).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+}
+
+impl Database {
+    // A removal's mark, before anything of the torrent goes: the flag that
+    // it is leaving, and whether its files go with it (`delete_files`). A
+    // stop from then on brings it back retiring, never live, and the next
+    // start finishes the removal from its row. One small UPDATE.
+    pub(crate) fn mark_torrent_retiring(
+        &self,
+        job_id: JobId,
+        delete_files: bool,
+    ) -> Result<(), StateError> {
+        #[cfg(test)]
+        match MARK_REFUSED.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => return Err(StateError::OutOfSpace("database or disk is full".into())),
+            2 => return Err(StateError::Database("the mark was refused".into())),
+            _ => {}
+        }
+        let args = vec![
+            SqlArg::Text(
+                if delete_files {
+                    RETIRING_DELETED
+                } else {
+                    RETIRING_KEPT
+                }
+                .to_owned(),
+            ),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE torrents SET retiring = {} WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    // Whether a removal has marked the torrent of `job_id` (`retiring`): an
+    // add of the same torrent is refused as still being removed, not as a
+    // duplicate. One read by key, only when an add finds the torrent.
+    pub(crate) fn torrent_is_retiring(&self, job_id: JobId) -> Result<bool, StateError> {
+        let id = stored(job_id.0)?;
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT retiring FROM torrents WHERE job_id = {}",
+                &[SqlArg::I64(id)],
+            )
+            .await?;
+            Ok(row
+                .map(|row| row.opt_text("retiring"))
+                .transpose()?
+                .flatten()
+                .is_some())
+        })
+    }
+
+    // Every torrent a removal left retiring, with what of its row finishing
+    // the removal takes, and the history row its job has, if any. One
+    // statement, served by the retiring index.
+    pub(crate) fn retiring_torrents(&self) -> Result<Vec<RetiringRow>, StateError> {
+        #[cfg(test)]
+        if RETIRING_READ_FAILS.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(StateError::Database(
+                "the retiring torrents do not read".into(),
+            ));
+        }
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT t.job_id, t.retiring, t.name, t.infohash_v1, t.infohash_v2, t.metainfo, \
+                        t.storage_dir, t.files_dir, t.outputs, t.adopted, t.added_at_ms, \
+                        t.completed_at_ms, h.status AS had_status, \
+                        h.error_message AS had_error, h.total_bytes AS had_total, \
+                        h.downloaded_bytes AS had_downloaded, h.category AS had_category, \
+                        h.metadata AS had_metadata \
+                   FROM torrents t LEFT JOIN job_history h ON h.job_id = t.job_id \
+                  WHERE t.retiring IS NOT NULL",
+                &[],
+            )
+            .await?;
+            rows.iter().map(retiring_row).collect()
+        })
+    }
+
+    // Each of `rows`, a retiring torrent's history row and the files it
+    // lists, to history and out of the torrents: all in one transaction,
+    // and when that fails, each in its own, so one row that cannot be
+    // written holds back none of the others. A row left retiring never
+    // loads as a live torrent; the service shows it and writes it through
+    // the kept archives (`TorrentService::retry_retiring`).
+    pub(crate) fn archive_retiring_torrents(
+        &self,
+        rows: Vec<(JobId, JobHistoryRow, Vec<HistoryFile>)>,
+    ) -> RetiringArchived {
+        let mut archived = RetiringArchived::default();
+        if rows.is_empty() {
+            return archived;
+        }
+        match self.write_retiring(&rows) {
+            Ok(written) => archived.written = written,
+            Err(error) => {
+                tracing::warn!(error = %error, "could not archive the retiring torrents at once; each goes on its own");
+                for row in rows {
+                    let job_id = row.0;
+                    match self.write_retiring(std::slice::from_ref(&row)) {
+                        Ok(one) => archived.written.extend(one),
+                        Err(error) => {
+                            tracing::warn!(job_id = job_id.0, error = %error, "could not archive a retiring torrent; it stays retiring and is retried");
+                            archived.left.push(job_id);
+                        }
+                    }
+                }
+            }
+        }
+        archived
+    }
+
+    // `rows` to history, out of the torrents, in one transaction.
+    fn write_retiring(
+        &self,
+        rows: &[(JobId, JobHistoryRow, Vec<HistoryFile>)],
+    ) -> Result<Vec<JobId>, StateError> {
+        #[cfg(test)]
+        if let Some((job_id, ..)) = rows
+            .iter()
+            .find(|(job_id, ..)| RETIRING_REFUSED.lock().unwrap().contains(job_id))
+        {
+            return Err(StateError::Database(format!(
+                "refused the retiring torrent {}",
+                job_id.0
+            )));
+        }
+        let rows = rows.to_vec();
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "archive_retiring_torrents", |tx| {
+                let rows = rows.clone();
+                Box::pin(async move {
+                    let mut written = Vec::with_capacity(rows.len());
+                    for (job_id, entry, files) in &rows {
+                        let id = stored(job_id.0)?;
+                        crate::history::persistence::insert_job_history_tx(tx, entry).await?;
+                        write_history_files_tx(tx, id, files).await?;
+                        delete_torrent_tx(tx, id).await?;
+                        written.push(*job_id);
+                    }
+                    Ok(written)
+                })
+            })
+            .await
+        })
+    }
+}
+
+// Test seam: the retiring torrents a start's archive refuses to write, in
+// a batch or alone.
+#[cfg(test)]
+pub(crate) static RETIRING_REFUSED: std::sync::Mutex<Vec<JobId>> =
+    std::sync::Mutex::new(Vec::new());
+
+// Test seam: a removal's mark is refused, 1 for want of room, 2 otherwise.
+#[cfg(test)]
+pub(crate) static MARK_REFUSED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+// Test seam: the retiring torrents do not read.
+#[cfg(test)]
+pub(crate) static RETIRING_READ_FAILS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// What a start's archive of the retiring torrents came to: the jobs written
+// to history, and those left retiring, never live, for the service to retry.
+#[derive(Debug, Default)]
+pub(crate) struct RetiringArchived {
+    pub(crate) written: Vec<JobId>,
+    pub(crate) left: Vec<JobId>,
+}
+
+// The marks a removal leaves on a torrent's row: its files kept, or asked
+// to go with it.
+pub(crate) const RETIRING_KEPT: &str = "kept";
+pub(crate) const RETIRING_DELETED: &str = "deleted";
+
+// A retiring torrent's row, as finishing its removal at a start reads it.
+#[derive(Debug)]
+pub(crate) struct RetiringRow {
+    pub(crate) job_id: JobId,
+    // Whether its removal asked for its files.
+    pub(crate) delete_files: bool,
+    pub(crate) metainfo: Option<Vec<u8>>,
+    pub(crate) storage_dir: Option<String>,
+    pub(crate) files_dir: Option<String>,
+    // None when it does not read.
+    pub(crate) outputs: Option<Vec<String>>,
+    pub(crate) adopted: Option<super::model::Adopted>,
+    // Its history row as its torrents row gives it, kept from the one its
+    // job has where there is one (a failed finish's status and why).
+    pub(crate) history: JobHistoryRow,
+}
+
+fn retiring_row(row: &crate::persistence::sql_runtime::SqlRow) -> Result<RetiringRow, StateError> {
+    let job_id = JobId(count(row, "job_id")?);
+    let completed = row.opt_i64("completed_at_ms")?;
+    let added = row.i64("added_at_ms")?;
+    let hash = row
+        .opt_bytes("infohash_v1")?
+        .or(row.opt_bytes("infohash_v2")?);
+    let had = row.opt_text("had_status")?;
+    let status = had.clone().unwrap_or_else(|| {
+        if completed.is_some() {
+            "complete"
+        } else {
+            "cancelled"
+        }
+        .to_owned()
+    });
+    let storage_dir = row.opt_text("storage_dir")?;
+    let history = JobHistoryRow {
+        job_id: job_id.0,
+        job_hash: hash,
+        name: row.text("name")?,
+        status,
+        error_message: if had.is_some() {
+            row.opt_text("had_error")?
+        } else {
+            None
+        },
+        total_bytes: row
+            .opt_i64("had_total")?
+            .map_or(0, |bytes| bytes.max(0) as u64),
+        downloaded_bytes: row
+            .opt_i64("had_downloaded")?
+            .map_or(0, |bytes| bytes.max(0) as u64),
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: row.opt_text("had_category")?,
+        output_dir: storage_dir.clone(),
+        nzb_path: None,
+        created_at: added / 1000,
+        completed_at: completed.unwrap_or(added) / 1000,
+        metadata: row.opt_text("had_metadata")?,
+        server_attribution: None,
+        protocol: crate::jobs::Protocol::Torrent,
+        archived_at: None,
+    };
+    Ok(RetiringRow {
+        job_id,
+        delete_files: row.text("retiring")? == RETIRING_DELETED,
+        metainfo: row.opt_bytes("metainfo")?,
+        storage_dir,
+        files_dir: row.opt_text("files_dir")?,
+        outputs: match row.opt_text("outputs")? {
+            Some(text) => serde_json::from_str(&text).ok(),
+            None => Some(Vec::new()),
+        },
+        // Never written: what was there before is not known, and the
+        // start's delete takes none of the torrent's files.
+        adopted: match row.opt_text("adopted")? {
+            Some(text) => serde_json::from_str(&text).ok(),
+            None => None,
+        },
+        history,
+    })
+}
+
+// A file a torrent's job wrote, as its history row lists it: an absolute
+// path, and whether it goes `whole`, with what is in it (what unpacking
+// placed), or only as a file (the torrent's own).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HistoryFile {
+    pub(crate) path: String,
+    pub(crate) whole: bool,
+}
+
+// The files a torrent's job wrote, listed with its history row in `tx` in
+// place of any list before: an archive from history removes these. In
+// bind-sized chunks, each one statement.
+async fn write_history_files_tx(
+    tx: &mut SqlTx<'_>,
+    job_id: i64,
+    files: &[HistoryFile],
+) -> Result<(), StateError> {
+    tx.execute(
+        "DELETE FROM job_history_files WHERE job_id = {}",
+        &[SqlArg::I64(job_id)],
+    )
+    .await?;
+    // One row a path: one listed twice goes whole if either says so.
+    let mut files: Vec<&HistoryFile> = files.iter().collect();
+    files.sort_unstable_by(|a, b| a.path.cmp(&b.path).then(b.whole.cmp(&a.whole)));
+    files.dedup_by(|later, kept| later.path == kept.path);
+    let rows = crate::persistence::sql_runtime::max_rows_for_tx(tx, 3);
+    for chunk in files.chunks(rows) {
+        let values = vec!["({}, {}, {})"; chunk.len()].join(", ");
+        let mut args = Vec::with_capacity(chunk.len() * 3);
+        for file in chunk {
+            args.push(SqlArg::I64(job_id));
+            args.push(SqlArg::Text(file.path.clone()));
+            args.push(SqlArg::Bool(file.whole));
+        }
+        tx.execute(
+            &format!("INSERT INTO job_history_files (job_id, path, whole) VALUES {values}"),
+            &args,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+// The files a torrent's history row lists, for an archive from history.
+impl Database {
+    pub(crate) fn job_history_files(
+        &self,
+        job_ids: &[JobId],
+    ) -> Result<std::collections::BTreeMap<JobId, Vec<HistoryFile>>, StateError> {
+        if job_ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let datastore = self.datastore();
+        let ids = job_ids.iter().map(|id| id.0 as i64).collect::<Vec<_>>();
+        self.run_sql_blocking_read(async move {
+            let mut files = std::collections::BTreeMap::<JobId, Vec<HistoryFile>>::new();
+            let rows_per =
+                crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 1);
+            for chunk in ids.chunks(rows_per) {
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let args = chunk.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT job_id, path, whole FROM job_history_files WHERE job_id IN ({placeholders})"
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    files
+                        .entry(JobId(count(&row, "job_id")?))
+                        .or_default()
+                        .push(HistoryFile {
+                            path: row.text("path")?,
+                            whole: row.bool("whole")?,
+                        });
+                }
+            }
+            Ok(files)
+        })
+    }
+}
+
+impl Database {
+    // The list of every torrent job's history row among `job_ids`, empty for
+    // one that lists nothing: a torrent's job is removed from by its list
+    // alone, never as an NZB job's output folder is, whatever it lists. One
+    // batched read of the lists and one of which rows are torrents', each
+    // served by its key.
+    pub(crate) fn torrent_history_lists(
+        &self,
+        job_ids: &[JobId],
+    ) -> Result<std::collections::BTreeMap<JobId, Vec<HistoryFile>>, StateError> {
+        let mut lists = self.job_history_files(job_ids)?;
+        if job_ids.is_empty() {
+            return Ok(lists);
+        }
+        let datastore = self.datastore();
+        let ids = job_ids.iter().map(|id| id.0 as i64).collect::<Vec<_>>();
+        let torrents = self.run_sql_blocking_read(async move {
+            let mut torrents = Vec::new();
+            let rows_per =
+                crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 1);
+            for chunk in ids.chunks(rows_per) {
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let mut args = vec![SqlArg::Text(
+                    crate::jobs::Protocol::Torrent.as_str().to_owned(),
+                )];
+                args.extend(chunk.iter().copied().map(SqlArg::I64));
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT job_id FROM job_history WHERE protocol = {{}} AND job_id IN ({placeholders})"
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    torrents.push(JobId(count(&row, "job_id")?));
+                }
+            }
+            Ok(torrents)
+        })?;
+        for job_id in torrents {
+            lists.entry(job_id).or_default();
+        }
+        Ok(lists)
+    }
+
+    // Whether `job_id` is a torrent's job in history: one read of its
+    // protocol by the history key.
+    pub(crate) fn history_job_is_torrent(&self, job_id: JobId) -> Result<bool, StateError> {
+        let id = stored(job_id.0)?;
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT 1 AS found FROM job_history WHERE job_id = {} AND protocol = {}",
+                &[
+                    SqlArg::I64(id),
+                    SqlArg::Text(crate::jobs::Protocol::Torrent.as_str().to_owned()),
+                ],
+            )
+            .await?;
+            Ok(row.is_some())
+        })
+    }
+
+    // Which of `dirs`, each with the job whose marker it carries, that job's
+    // history row lists: a torrent's kept unpacking folder, recorded as an
+    // NZB job's working folder is, which a start-up sweep leaves for an
+    // archive to take. One statement per bind-sized chunk, each served by
+    // the list's key.
+    pub(crate) fn listed_history_dirs(
+        &self,
+        dirs: &[(JobId, PathBuf)],
+    ) -> Result<std::collections::HashSet<PathBuf>, StateError> {
+        if dirs.is_empty() {
+            return Ok(Default::default());
+        }
+        let pairs = dirs
+            .iter()
+            .map(|(job_id, dir)| Ok((stored(job_id.0)?, dir.to_string_lossy().into_owned())))
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let mut listed = std::collections::HashSet::new();
+            let rows_per =
+                crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 2);
+            for chunk in pairs.chunks(rows_per) {
+                let filters = vec!["(job_id = {} AND path = {})"; chunk.len()].join(" OR ");
+                let args = chunk
+                    .iter()
+                    .flat_map(|(job_id, path)| [SqlArg::I64(*job_id), SqlArg::Text(path.clone())])
+                    .collect::<Vec<_>>();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!("SELECT path FROM job_history_files WHERE {filters}"),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    listed.insert(PathBuf::from(row.text("path")?));
+                }
+            }
+            Ok(listed)
+        })
+    }
+}
+
+impl Database {
+    // The paths live torrents hold (`torrent_held_paths`), never one a
+    // removal left retiring, that are one of `keys`, lie under one, or are
+    // above one, each key spelled as the filesystem spells it. Served by
+    // the path index: one statement for the paths under each bind-sized
+    // chunk of `keys`, and one for each chunk of the folders above them.
+    // What comes back is bounded by what live torrents hold there, never by
+    // how many share a folder above it.
+    pub(crate) fn live_held_paths(
+        &self,
+        keys: &[PathBuf],
+    ) -> Result<std::collections::BTreeSet<PathBuf>, StateError> {
+        use crate::persistence::sql_runtime::SqlEngine;
+        if keys.is_empty() {
+            return Ok(Default::default());
+        }
+        let separator = std::path::MAIN_SEPARATOR;
+        let after = char::from_u32(u32::from(separator) + 1).unwrap_or(separator);
+        let under: Vec<(String, String, String)> = keys
+            .iter()
+            .map(|key| {
+                let key = key.to_string_lossy().trim_end_matches(separator).to_owned();
+                (
+                    key.clone(),
+                    format!("{key}{separator}"),
+                    format!("{key}{after}"),
+                )
+            })
+            .collect();
+        let above: Vec<String> = keys
+            .iter()
+            .flat_map(|key| key.ancestors().skip(1))
+            .map(|key| key.to_string_lossy().into_owned())
+            .filter(|key| !key.is_empty())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            // Ordered by bytes on both engines, so a range over a folder's
+            // path is the paths under it.
+            let path = match datastore.engine() {
+                SqlEngine::Sqlite => "h.path".to_owned(),
+                SqlEngine::Postgres => "h.path COLLATE \"C\"".to_owned(),
+            };
+            let select = "SELECT DISTINCT h.path FROM torrent_held_paths h \
+                          JOIN torrents t ON t.job_id = h.job_id \
+                          WHERE t.retiring IS NULL AND";
+            let mut found = std::collections::BTreeSet::new();
+            let rows_per =
+                crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 3);
+            for chunk in under.chunks(rows_per) {
+                let filters = vec![
+                    format!("{path} = {{}} OR ({path} >= {{}} AND {path} < {{}})");
+                    chunk.len()
+                ]
+                .join(" OR ");
+                let args = chunk
+                    .iter()
+                    .flat_map(|(key, from, to)| {
+                        [
+                            SqlArg::Text(key.clone()),
+                            SqlArg::Text(from.clone()),
+                            SqlArg::Text(to.clone()),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!("{select} ({filters})"),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    found.insert(PathBuf::from(row.text("path")?));
+                }
+            }
+            let rows_per =
+                crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 1);
+            for chunk in above.chunks(rows_per) {
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let args: Vec<SqlArg> = chunk.iter().cloned().map(SqlArg::Text).collect();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!("{select} {path} IN ({placeholders})"),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    found.insert(PathBuf::from(row.text("path")?));
+                }
+            }
+            Ok(found)
+        })
+    }
+
+    // What each of `torrents` holds, in place of what it held, in one
+    // transaction: its rows are its own from now on.
+    pub(crate) fn set_torrents_held(
+        &self,
+        torrents: &[(JobId, Vec<String>)],
+    ) -> Result<(), StateError> {
+        if torrents.is_empty() {
+            return Ok(());
+        }
+        let torrents = torrents
+            .iter()
+            .map(|(job_id, held)| Ok((stored(job_id.0)?, held.clone())))
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_torrents_held", |tx| {
+                let torrents = torrents.clone();
+                Box::pin(async move {
+                    for (id, held) in &torrents {
+                        tx.execute(
+                            "DELETE FROM torrent_held_paths WHERE job_id = {}",
+                            &[SqlArg::I64(*id)],
+                        )
+                        .await?;
+                        insert_held_tx(tx, *id, held).await?;
+                        tx.execute(
+                            "UPDATE torrents SET held_set = {} WHERE job_id = {}",
+                            &[SqlArg::Bool(true), SqlArg::I64(*id)],
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    // `held` added to what the torrent holds, before its files move there,
+    // and what it holds marked to be written again, in one transaction: a
+    // file that reaches the new folder is held from the moment it does, and
+    // a move that never ends leaves the next start to write what it holds.
+    pub(crate) fn add_torrent_held(
+        &self,
+        job_id: JobId,
+        held: &[String],
+    ) -> Result<(), StateError> {
+        let id = stored(job_id.0)?;
+        let held = held.to_vec();
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "add_torrent_held", |tx| {
+                let held = held.clone();
+                Box::pin(async move {
+                    insert_held_tx(tx, id, &held).await?;
+                    tx.execute(
+                        "UPDATE torrents SET held_set = {} WHERE job_id = {}",
+                        &[SqlArg::Bool(false), SqlArg::I64(id)],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    // What the torrents not leaving hold, each row as written, or only the
+    // rows of `job_id`. One statement: by the table's key for one torrent,
+    // and every row once at a start, as the restore reads its torrents.
+    pub(crate) fn held_rows(
+        &self,
+        job_id: Option<JobId>,
+    ) -> Result<Vec<(JobId, String)>, StateError> {
+        let only = job_id.map(|job_id| stored(job_id.0)).transpose()?;
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let select = "SELECT h.job_id, h.path FROM torrent_held_paths h \
+                          JOIN torrents t ON t.job_id = h.job_id \
+                          WHERE t.retiring IS NULL";
+            let rows = match only {
+                Some(id) => {
+                    SqlRuntime::fetch_all(
+                        datastore.read_exec(),
+                        &format!("{select} AND h.job_id = {{}}"),
+                        &[SqlArg::I64(id)],
+                    )
+                    .await?
+                }
+                None => SqlRuntime::fetch_all(datastore.read_exec(), select, &[]).await?,
+            };
+            rows.into_iter()
+                .map(|row| {
+                    let id = u64::try_from(row.i64("job_id")?)
+                        .map_err(|error| StateError::Database(error.to_string()))?;
+                    Ok((JobId(id), row.text("path")?))
+                })
+                .collect()
+        })
+    }
+
+    // Each `(job, was, now)` row of what a torrent holds spelled `now` in
+    // place of `was`, in one transaction: a row that is gone by then, as a
+    // move or a removal took it, stays gone. Two statements per chunk,
+    // whatever the number of torrents.
+    pub(crate) fn respell_held(&self, rows: &[(JobId, String, String)]) -> Result<(), StateError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let rows = rows
+            .iter()
+            .map(|(job_id, was, now)| Ok((stored(job_id.0)?, was.clone(), now.clone())))
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let datastore = self.datastore();
+        let rows_per = crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 3);
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "respell_held", |tx| {
+                let rows = rows.clone();
+                Box::pin(async move {
+                    for chunk in rows.chunks(rows_per) {
+                        let values = vec!["({}, {}, {})"; chunk.len()].join(", ");
+                        let args = chunk
+                            .iter()
+                            .flat_map(|(id, was, now)| {
+                                [
+                                    SqlArg::I64(*id),
+                                    SqlArg::Text(was.clone()),
+                                    SqlArg::Text(now.clone()),
+                                ]
+                            })
+                            .collect::<Vec<_>>();
+                        tx.execute(
+                            &format!(
+                                "WITH v (job_id, was, now) AS (VALUES {values}) \
+                                 INSERT INTO torrent_held_paths (job_id, path) \
+                                 SELECT v.job_id, v.now FROM v WHERE EXISTS \
+                                 (SELECT 1 FROM torrent_held_paths h \
+                                   WHERE h.job_id = v.job_id AND h.path = v.was) \
+                                 ON CONFLICT (job_id, path) DO NOTHING"
+                            ),
+                            &args,
+                        )
+                        .await?;
+                        let filters = vec!["(job_id = {} AND path = {})"; chunk.len()].join(" OR ");
+                        let args = chunk
+                            .iter()
+                            .flat_map(|(id, was, _)| [SqlArg::I64(*id), SqlArg::Text(was.clone())])
+                            .collect::<Vec<_>>();
+                        tx.execute(
+                            &format!("DELETE FROM torrent_held_paths WHERE {filters}"),
+                            &args,
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    // One torrent's [`Self::set_torrents_held`].
+    pub(crate) fn set_torrent_held(
+        &self,
+        job_id: JobId,
+        held: Vec<String>,
+    ) -> Result<(), StateError> {
+        self.set_torrents_held(&[(job_id, held)])
+    }
+}
+
+// `held` added to what torrent `id` holds, in `tx`, a bind-sized chunk per
+// statement; a path it holds already stays one row.
+async fn insert_held_tx(tx: &mut SqlTx<'_>, id: i64, held: &[String]) -> Result<(), StateError> {
+    let held: Vec<&String> = held
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let engine = match tx {
+        SqlTx::Sqlite(_) => crate::persistence::sql_runtime::SqlEngine::Sqlite,
+        SqlTx::Postgres(_) => crate::persistence::sql_runtime::SqlEngine::Postgres,
+    };
+    let rows_per = crate::persistence::sql_runtime::max_rows_for_engine(engine, 2);
+    for chunk in held.chunks(rows_per) {
+        let values = vec!["({}, {})"; chunk.len()].join(", ");
+        let args = chunk
+            .iter()
+            .flat_map(|path| [SqlArg::I64(id), SqlArg::Text((*path).clone())])
+            .collect::<Vec<_>>();
+        tx.execute(
+            &format!(
+                "INSERT INTO torrent_held_paths (job_id, path) VALUES {values} \
+                 ON CONFLICT (job_id, path) DO NOTHING"
+            ),
+            &args,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 fn stored(value: u64) -> Result<i64, StateError> {
     i64::try_from(value)
         .map_err(|_| StateError::Database(format!("{value} exceeds the database range")))
@@ -110,6 +908,11 @@ async fn delete_torrent_tx(tx: &mut SqlTx<'_>, id: i64) -> Result<bool, StateErr
     let changed = tx
         .execute("DELETE FROM torrents WHERE job_id = {}", &[SqlArg::I64(id)])
         .await?;
+    tx.execute(
+        "DELETE FROM torrent_held_paths WHERE job_id = {}",
+        &[SqlArg::I64(id)],
+    )
+    .await?;
     for table in crate::jobs::graph_checkpoint::TABLES {
         tx.execute(
             &format!("DELETE FROM {table} WHERE job_id = {{}}"),
@@ -120,9 +923,11 @@ async fn delete_torrent_tx(tx: &mut SqlTx<'_>, id: i64) -> Result<bool, StateErr
     Ok(changed > 0)
 }
 
+// What was there before, written even when nothing was: a row whose
+// `adopted` was never written (a row from before it was kept) reads as not
+// known, never as nothing there (`retiring_row`).
 fn adopted_text(adopted: &super::model::Adopted) -> Result<Option<String>, StateError> {
-    (!adopted.is_empty())
-        .then(|| serde_json::to_string(adopted))
+    Some(serde_json::to_string(adopted))
         .transpose()
         .map_err(|error| StateError::Database(error.to_string()))
 }
@@ -200,7 +1005,7 @@ impl Database {
         torrent: &TorrentRecord,
         trackers: &[TrackerEntry],
     ) -> Result<TorrentInsert, StateError> {
-        self.insert_placed_torrent(torrent, trackers, &super::model::Adopted::default())
+        self.insert_placed_torrent(torrent, trackers, &super::model::Adopted::default(), None)
     }
 
     // [`Self::insert_torrent`], with what was already on disk where its
@@ -210,8 +1015,21 @@ impl Database {
         torrent: &TorrentRecord,
         trackers: &[TrackerEntry],
         adopted: &super::model::Adopted,
+        held: Option<&[String]>,
     ) -> Result<TorrentInsert, StateError> {
         let adopted = adopted_text(adopted)?;
+        // What it holds, or, not known, its whole folder as spelled, until
+        // its rows are written.
+        let held_set = held.is_some();
+        let held: Vec<String> = match held {
+            Some(held) => held.to_vec(),
+            None => torrent
+                .files_dir
+                .clone()
+                .or_else(|| torrent.storage_dir.clone())
+                .into_iter()
+                .collect(),
+        };
         let infohashes = torrent.infohashes();
         if infohashes.is_empty() {
             return Err(StateError::Database(
@@ -229,6 +1047,7 @@ impl Database {
                 let torrent_args = torrent_args.clone();
                 let trackers = trackers.clone();
                 let adopted = adopted.clone();
+                let held = held.clone();
                 Box::pin(async move {
                     if let Some(existing) = torrent_by_infohash_tx(tx, &infohashes).await? {
                         return Ok(TorrentInsert::Duplicate(existing.job_id));
@@ -242,6 +1061,14 @@ impl Database {
                     )
                     .await?;
                     insert_trackers(tx, id, &trackers).await?;
+                    insert_held_tx(tx, id, &held).await?;
+                    if held_set {
+                        tx.execute(
+                            "UPDATE torrents SET held_set = {} WHERE job_id = {}",
+                            &[SqlArg::Bool(true), SqlArg::I64(id)],
+                        )
+                        .await?;
+                    }
                     if let Some(adopted) = adopted.clone() {
                         tx.execute(
                             "UPDATE torrents SET adopted = {} WHERE job_id = {}",
@@ -435,22 +1262,32 @@ impl Database {
     // The files unpacking is about to place beside the torrent's own, kept
     // on its row with those it kept before: a crash before
     // [`Self::finish_torrent_unpack`] leaves none its delete does not know.
+    // `held` joins what the torrent holds in the same transaction, so a
+    // history archive leaves them from the moment they are placed.
     pub(crate) fn keep_torrent_outputs(
         &self,
         job_id: JobId,
         outputs: &[String],
+        held: &[String],
     ) -> Result<(), StateError> {
         let id = stored(job_id.0)?;
         let outputs = self.outputs_with(job_id, outputs, &[])?;
+        let held = held.to_vec();
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            SqlRuntime::execute(
-                datastore.write_exec(),
-                "UPDATE torrents SET outputs = {} WHERE job_id = {}",
-                &[SqlArg::OptText(outputs), SqlArg::I64(id)],
-            )
-            .await?;
-            Ok(())
+            SqlRuntime::run_in_transaction(&datastore, "keep_torrent_outputs", |tx| {
+                let (outputs, held) = (outputs.clone(), held.clone());
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE torrents SET outputs = {} WHERE job_id = {}",
+                        &[SqlArg::OptText(outputs), SqlArg::I64(id)],
+                    )
+                    .await?;
+                    insert_held_tx(tx, id, &held).await?;
+                    Ok(())
+                })
+            })
+            .await
         })
     }
 
@@ -502,6 +1339,7 @@ impl Database {
 
     // What was on disk where the torrent's files go before Weaver wrote
     // them; nothing kept is nothing adopted.
+    #[cfg(test)]
     pub(crate) fn set_torrent_adopted(
         &self,
         job_id: JobId,
@@ -514,11 +1352,20 @@ impl Database {
         self.set_torrent_column("adopted", args)
     }
 
-    // What [`Self::set_torrent_adopted`] kept.
+    // A row from before what was there was kept: `adopted` never written.
+    #[cfg(test)]
+    pub(crate) fn forget_torrent_adopted(&self, job_id: JobId) -> Result<bool, StateError> {
+        let args = vec![SqlArg::OptText(None), SqlArg::I64(stored(job_id.0)?)];
+        self.set_torrent_column("adopted", args)
+    }
+
+    // What was on disk where the torrent's files go before Weaver wrote
+    // them; None when that was never written (a row from before it was
+    // kept), which is not known and takes no file.
     pub(crate) fn torrent_adopted(
         &self,
         job_id: JobId,
-    ) -> Result<super::model::Adopted, StateError> {
+    ) -> Result<Option<super::model::Adopted>, StateError> {
         let id = stored(job_id.0)?;
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
@@ -533,9 +1380,11 @@ impl Database {
                 .transpose()?
                 .flatten()
             else {
-                return Ok(super::model::Adopted::default());
+                return Ok(None);
             };
-            serde_json::from_str(&text).map_err(|error| StateError::Database(error.to_string()))
+            serde_json::from_str(&text)
+                .map(Some)
+                .map_err(|error| StateError::Database(error.to_string()))
         })
     }
 
@@ -549,33 +1398,6 @@ impl Database {
             })
             .await
         })
-    }
-
-    // The torrent's job leaves the torrents for history in one write: its
-    // history row is written and the torrent removed as `delete_torrent`
-    // removes it. No reader finds the job in neither, so an event raised
-    // for it while it was live is still queued for it after.
-    pub fn retire_torrent(&self, entry: &JobHistoryRow) -> Result<(), StateError> {
-        let id = stored(entry.job_id)?;
-        let datastore = self.datastore();
-        let cache_entry = entry.clone();
-        let observed_generation = self.job_history_cache_generation();
-        let entry_in_tx = entry.clone();
-        let result = self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "retire_torrent", |tx| {
-                let entry = entry_in_tx.clone();
-                Box::pin(async move {
-                    crate::history::persistence::insert_job_history_tx(tx, &entry).await?;
-                    delete_torrent_tx(tx, id).await?;
-                    Ok(())
-                })
-            })
-            .await
-        });
-        if result.is_ok() {
-            self.cache_job_history_at(cache_entry, observed_generation);
-        }
-        result
     }
 
     // The torrent's category. Returns whether the torrent exists.
@@ -674,8 +1496,12 @@ impl Database {
     }
 
     // A magnet's metainfo once its peers sent it: the hashes and name it
-    // carries, the file, the directory its files go to, and the files and
-    // trackers it lists. Returns whether the torrent exists.
+    // carries, the file, the directory its files go to and the folder they
+    // sit in when that is not it, the files and trackers it lists, and what
+    // it holds there (`torrent_held_paths`), all in one transaction: a crash
+    // leaves the torrent holding its whole folder as a magnet does, or what
+    // its files are, never a row with the files known and the paths not.
+    // Returns whether the torrent exists.
     #[allow(clippy::too_many_arguments)]
     pub fn set_torrent_metainfo(
         &self,
@@ -685,28 +1511,37 @@ impl Database {
         name: &str,
         metainfo: &[u8],
         storage_dir: &str,
+        files_dir: Option<&str>,
         trackers: &[TrackerEntry],
+        held: &[String],
+        adopted: &super::model::Adopted,
     ) -> Result<bool, StateError> {
         let id = stored(job_id.0)?;
+        let adopted = adopted_text(adopted)?;
         let head = vec![
             SqlArg::OptBytes(infohash_v1.map(|hash| hash.to_vec())),
             SqlArg::OptBytes(infohash_v2.map(|hash| hash.to_vec())),
             SqlArg::Text(name.to_owned()),
             SqlArg::Bytes(metainfo.to_vec()),
             SqlArg::Text(storage_dir.to_owned()),
+            SqlArg::OptText(files_dir.map(str::to_owned)),
+            SqlArg::Bool(true),
+            SqlArg::OptText(adopted),
             SqlArg::I64(id),
         ];
         let trackers = trackers.to_vec();
+        let held = held.to_vec();
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "set_torrent_metainfo", |tx| {
                 let head = head.clone();
                 let trackers = trackers.clone();
+                let held = held.clone();
                 Box::pin(async move {
                     let changed = tx
                         .execute(
                             "UPDATE torrents SET infohash_v1 = {}, infohash_v2 = {}, name = {}, metainfo = {},
-                                     storage_dir = {}
+                                     storage_dir = {}, files_dir = {}, held_set = {}, adopted = {}
                               WHERE job_id = {}",
                             &head,
                         )
@@ -720,6 +1555,12 @@ impl Database {
                     )
                     .await?;
                     insert_trackers(tx, id, &trackers).await?;
+                    tx.execute(
+                        "DELETE FROM torrent_held_paths WHERE job_id = {}",
+                        &[SqlArg::I64(id)],
+                    )
+                    .await?;
+                    insert_held_tx(tx, id, &held).await?;
                     Ok(true)
                 })
             })
@@ -727,15 +1568,17 @@ impl Database {
         })
     }
 
-    // The directory a torrent's files now live under. Returns whether the
-    // torrent exists.
+    // The directory a torrent's files now live under. What it holds is
+    // marked to be written again in the same statement, so a crash before
+    // that write leaves the next start to write it (`held_set`). Returns
+    // whether the torrent exists.
     pub fn set_torrent_storage_dir(&self, job_id: JobId, dir: &str) -> Result<bool, StateError> {
         let args = vec![SqlArg::Text(dir.to_owned()), SqlArg::I64(stored(job_id.0)?)];
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
                 datastore.write_exec(),
-                "UPDATE torrents SET storage_dir = {} WHERE job_id = {}",
+                "UPDATE torrents SET storage_dir = {}, held_set = FALSE WHERE job_id = {}",
                 &args,
             )
             .await?;
@@ -805,7 +1648,9 @@ impl Database {
         self.set_torrent_column("first_last_piece_first", args)
     }
 
-    // Where the torrent's files sit when not in its storage directory.
+    // Where the torrent's files sit when not in its storage directory,
+    // what it holds marked to be written again as `set_torrent_storage_dir`
+    // marks it.
     pub fn set_torrent_files_dir(
         &self,
         job_id: JobId,
@@ -815,7 +1660,16 @@ impl Database {
             SqlArg::OptText(dir.map(str::to_owned)),
             SqlArg::I64(stored(job_id.0)?),
         ];
-        self.set_torrent_column("files_dir", args)
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE torrents SET files_dir = {}, held_set = FALSE WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
     }
 
     // The directory the torrent's files go under, as asked or as it moved.

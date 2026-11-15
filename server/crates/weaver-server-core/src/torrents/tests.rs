@@ -114,22 +114,30 @@ fn what_was_on_disk_before_a_torrent_is_kept_with_it() {
         files: vec!["kept/a.bin".to_owned()],
         dirs: vec![String::new(), "kept".to_owned()],
     };
-    db.insert_placed_torrent(&torrent(5, Some([5; 20]), None), &[], &found)
+    db.insert_placed_torrent(&torrent(5, Some([5; 20]), None), &[], &found, None)
         .unwrap();
-    assert_eq!(db.torrent_adopted(JobId(5)).unwrap(), found);
+    assert_eq!(db.torrent_adopted(JobId(5)).unwrap(), Some(found));
 
     db.insert_torrent(&torrent(6, Some([6; 20]), None), &[])
         .unwrap();
-    assert_eq!(db.torrent_adopted(JobId(6)).unwrap(), Adopted::default());
+    assert_eq!(
+        db.torrent_adopted(JobId(6)).unwrap(),
+        Some(Adopted::default())
+    );
     let all = Adopted {
         all_files: true,
         ..Adopted::default()
     };
     db.set_torrent_adopted(JobId(6), &all).unwrap();
-    assert_eq!(db.torrent_adopted(JobId(6)).unwrap(), all);
+    assert_eq!(db.torrent_adopted(JobId(6)).unwrap(), Some(all));
     db.set_torrent_adopted(JobId(6), &Adopted::default())
         .unwrap();
-    assert_eq!(db.torrent_adopted(JobId(6)).unwrap(), Adopted::default());
+    assert_eq!(
+        db.torrent_adopted(JobId(6)).unwrap(),
+        Some(Adopted::default())
+    );
+    db.forget_torrent_adopted(JobId(6)).unwrap();
+    assert_eq!(db.torrent_adopted(JobId(6)).unwrap(), None, "never written");
 }
 
 #[test]
@@ -324,7 +332,10 @@ fn the_hosts_a_torrent_announces_to_outlive_it() {
             "torrent 5",
             b"d4:infodee",
             "/data/t5",
-            &more
+            None,
+            &more,
+            &[],
+            &crate::torrents::model::Adopted::default()
         )
         .unwrap()
     );

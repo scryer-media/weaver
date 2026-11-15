@@ -503,3 +503,94 @@ async fn a_panic_taking_a_word_leaves_the_torrents_marker() {
     }
     assert_eq!(marked(dir.path()).message, "the disk could not be read");
 }
+
+// A torrent's unpacking that finds no room over the reserve waits as a job
+// of the pipeline's does: it takes a ticket from the disk's ledger and is
+// listed among the jobs outside the pipeline that wait, which the
+// pipeline's reading wakes in ticket order. While the disk reads no room it
+// stays waiting; once a reading shows room it no longer waits, its runs go
+// on, and it unpacks whole.
+#[tokio::test]
+async fn a_torrent_unpack_held_for_room_is_woken_when_room_returns() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut mail = RunMail::default();
+    let layout = Arc::new(PieceLayout::new(64, vec![file("set.rar", LZ.len() as u64)]).unwrap());
+    let room = Arc::new(AtomicU64::new(0));
+    let reader = {
+        let room = Arc::clone(&room);
+        CapacityReader::from_fn(move || {
+            crate::operations::disk::Capacity::Known(crate::operations::disk::CapacityReading {
+                available_bytes: 1 + room.load(Ordering::Acquire),
+                total_bytes: 1 << 40,
+                sampled_at: std::time::Instant::now(),
+                stale: false,
+            })
+        })
+    };
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let mut storage = storage(&work, &mail, reader);
+    let mut limits = crate::pipeline::ExtractionLimits::unbounded();
+    limits.min_free_bytes = 1;
+    storage.caps = Caps::new(
+        Arc::new(limits),
+        crate::pipeline::graph::limits::known_policy(
+            crate::post_processing::model::PostProcessingSettings {
+                unacceptable_extensions: Vec::new(),
+                ..Default::default()
+            },
+        ),
+        Vec::new(),
+    );
+    let tee = Tee::fresh(parts(&layout, &work, &mail, Arc::default()), storage);
+    let outside = Arc::clone(&tee.outside);
+    assert!(!outside.waits_for_disk());
+
+    for index in 0..layout.piece_count() {
+        tee.deliver(index, &piece(&layout, LZ, index));
+    }
+    while !tee.with(|job| job.disk_held()) {
+        let said = mail.recv().await.unwrap();
+        tee.take(super::Word::Said(said, 1), (false, false));
+    }
+    assert!(outside.waits_for_disk(), "the job waits for room");
+    assert_eq!(
+        outside.disk_waits_began(),
+        vec![1],
+        "heard once, as it began"
+    );
+    assert!(outside.disk_waits_began().is_empty());
+    let waiters = outside.disk_waiters();
+    assert_eq!(waiters.len(), 1);
+    let (ticket, scope, hears) = &waiters[0];
+    assert_eq!(*scope, 1);
+    assert_eq!(Some(*ticket), tee.with(|job| job.disk_ticket()));
+    // The pipeline is given its wait and folder, as its own job's, to say
+    // as the wait begins.
+    let wait = outside
+        .disk_wait_of(1)
+        .expect("the waiting job gives its wait");
+    assert_eq!(Some(wait.clone()), tee.with(|job| job.disk_wait()));
+    assert_eq!(wait.0.reserve, 1);
+    assert_eq!(hears.disk_wait(), Some(wait));
+
+    // A reading with no room keeps it waiting.
+    assert!(!hears.wake_disk());
+    assert!(outside.waits_for_disk());
+
+    // Room returns: the reading wakes it, and its runs go on.
+    room.store(1 << 30, Ordering::Release);
+    assert!(hears.wake_disk(), "a reading with room wakes it");
+    assert!(!outside.waits_for_disk());
+    assert!(outside.disk_waiters().is_empty());
+    assert_eq!(hears.disk_wait(), None, "woken, it waits for nothing");
+    assert!(!tee.with(|job| job.disk_held()));
+    while !tee.done() {
+        let said = mail.recv().await.unwrap();
+        tee.take(super::Word::Said(said, 1), (false, false));
+    }
+    assert!(!outside.waits_for_disk());
+    tee.forget();
+}

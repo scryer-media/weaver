@@ -302,6 +302,9 @@ impl RssService {
         match torrents.add(request).await {
             Ok(job_id) => Ok(job_id.0),
             Err(AddError::Duplicate(_)) => Err(NotAdded::Ignored("already added".into())),
+            Err(AddError::Refused(crate::torrents::admission::Refusal::Removing(_))) => Err(
+                NotAdded::Ignored("the torrent is still being removed".into()),
+            ),
             Err(error) => Err(error.to_string().into()),
         }
     }

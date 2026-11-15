@@ -143,6 +143,13 @@ pub(crate) struct Tee {
     owes_lend: std::sync::atomic::AtomicBool,
     // The torrent is paused on its own: the job takes no slot.
     paused: std::sync::atomic::AtomicBool,
+    // The ticket the job took from the disk ledger as it began to wait for
+    // room, `NO_TICKET` while it does not wait: the pipeline orders it by
+    // this among the jobs it wakes, without the job's lock.
+    disk_ticket: std::sync::atomic::AtomicU64,
+    // What the job waits for room for, and the folder it waits on, kept as
+    // its wait begins: the pipeline says it then, without the job's lock.
+    disk_wait: Mutex<Option<DiskWaitOf>>,
     // Counts the checkpoints asked of the job, each before it waits on the
     // job's lock.
     #[cfg(test)]
@@ -159,7 +166,18 @@ enum Word {
     Said(Said, usize),
     Clock(bool),
     Own(bool),
+    // A disk the job waits on had a reading while the job was busy: it is
+    // asked for room again on its own task.
+    WakeDisk,
+    // The job has room again: its runs and repairs go on.
+    DiskWoke,
 }
+
+// The job waits for no room.
+const NO_TICKET: u64 = u64::MAX;
+
+// What a job waits for room for, and the folder it waits on.
+type DiskWaitOf = (crate::pipeline::graph::limits::DiskWait, PathBuf);
 
 // One share of a piece that the job has yet to take.
 struct Share {
@@ -261,14 +279,21 @@ impl Tee {
             heard: tokio::sync::watch::Sender::new(0),
             owes_lend: std::sync::atomic::AtomicBool::new(false),
             paused: std::sync::atomic::AtomicBool::new(false),
+            disk_ticket: std::sync::atomic::AtomicU64::new(NO_TICKET),
+            disk_wait: Mutex::new(None),
             #[cfg(test)]
             asked: tokio::sync::watch::Sender::new(0),
             #[cfg(test)]
             clocked: tokio::sync::watch::Sender::new(0),
         });
         tokio::spawn(hear(Arc::downgrade(&tee), heard_words));
-        tee.outside
-            .join(parts.job_id.0, Arc::new(Hearer { mail: words }));
+        tee.outside.join(
+            parts.job_id.0,
+            Arc::new(Hearer {
+                mail: words,
+                tee: Arc::downgrade(&tee),
+            }),
+        );
         tee
     }
 
@@ -312,7 +337,106 @@ impl Tee {
                 self.held_clock((all, paused));
                 (all, paused)
             }
+            Word::WakeDisk => {
+                let mut job = self.locked();
+                if self.wake_disk_locked(&mut job) {
+                    drop(job);
+                    self.disk_woke();
+                }
+                self.heard.send_modify(|heard| *heard += 1);
+                (all, own)
+            }
+            Word::DiskWoke => {
+                self.disk_woke();
+                self.heard.send_modify(|heard| *heard += 1);
+                (all, own)
+            }
         }
+    }
+
+    // A disk the job waits on had a reading, asked from the pipeline's
+    // loop, which never waits on the job's lock: an intake writing to disk
+    // may hold it. Held, the job is asked on its own task instead, and
+    // keeps its place among the waiters until then. Woken, its runs go on
+    // on its own task.
+    fn wake_disk_now(&self) -> bool {
+        let job = match self.job.try_lock() {
+            Ok(job) => job,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let _ = self.words.send(Word::WakeDisk);
+                return false;
+            }
+        };
+        let mut job = Held { tee: self, job };
+        if !self.wake_disk_locked(&mut job) {
+            return false;
+        }
+        drop(job);
+        let _ = self.words.send(Word::DiskWoke);
+        true
+    }
+
+    // Whether the job has room again, as a job of the pipeline's is asked
+    // (`GraphJob::wake_disk`): woken, it no longer waits.
+    fn wake_disk_locked(&self, job: &mut GraphJob) -> bool {
+        if job.disk_held() && !job.wake_disk() {
+            return false;
+        }
+        self.disk_unheld();
+        true
+    }
+
+    // The job woke from its wait for room: its runs start again and its
+    // repairs are lent, as `disk_woke` does for a job of the pipeline's.
+    fn disk_woke(&self) {
+        if let Err(error) = self.resume() {
+            tracing::warn!(job_id = self.job_id.0, error = %error, "a torrent's unpacking step failed");
+        }
+        self.signal.mark(self.job_id);
+    }
+
+    // The job waits for room on a disk after a step, or no longer does. It
+    // begins to wait as a job of the pipeline's does, by a ticket from the
+    // ledger of the disk, and the pipeline wakes it with its own, in ticket
+    // order. One that waits owing nothing, its last write landed, wakes at
+    // once, as the pipeline wakes its own.
+    fn note_disk(&self, job: &mut GraphJob) {
+        if !job.disk_held() {
+            self.disk_unheld();
+            return;
+        }
+        if job.disk_idle() && job.wake_disk() {
+            self.disk_unheld();
+            let _ = self.words.send(Word::DiskWoke);
+            return;
+        }
+        let ticket = job.disk_ticket().unwrap_or(0);
+        let was = self
+            .disk_ticket
+            .swap(ticket, std::sync::atomic::Ordering::AcqRel);
+        if was == NO_TICKET {
+            // Kept before the pipeline hears the wait begin, which reads it.
+            *self.disk_wait_slot() = job.disk_wait();
+            self.outside.disk_held(self.job_id.0);
+            self.signal.mark(self.job_id);
+        }
+    }
+
+    fn disk_unheld(&self) {
+        let was = self
+            .disk_ticket
+            .swap(NO_TICKET, std::sync::atomic::Ordering::AcqRel);
+        if was != NO_TICKET {
+            self.outside.disk_unheld(self.job_id.0);
+            *self.disk_wait_slot() = None;
+        }
+    }
+
+    fn disk_wait_slot(&self) -> std::sync::MutexGuard<'_, Option<DiskWaitOf>> {
+        self.disk_wait
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     // The count of the words for the job taken so far, which moves with
@@ -426,6 +550,7 @@ impl Tee {
         if job.pending().control().cancelled() {
             return;
         }
+        self.note_disk(job);
         if job.awaits_commit()
             || job.owes_checkpoint()
             || job.pending().stepped(self.job_id, &self.mail)
@@ -823,6 +948,7 @@ fn retry_from_top(offered: &mut std::collections::BTreeMap<weaver_graph::NodeId,
 // which an intake writing to disk may hold.
 struct Hearer {
     mail: tokio::sync::mpsc::UnboundedSender<Word>,
+    tee: std::sync::Weak<Tee>,
 }
 
 impl Hears for Hearer {
@@ -832,6 +958,22 @@ impl Hears for Hearer {
 
     fn hold_clock(&self, paused: bool) {
         let _ = self.mail.send(Word::Clock(paused));
+    }
+
+    fn disk_ticket(&self) -> Option<u64> {
+        let tee = self.tee.upgrade()?;
+        let ticket = tee.disk_ticket.load(std::sync::atomic::Ordering::Acquire);
+        (ticket != NO_TICKET).then_some(ticket)
+    }
+
+    // A tee gone waits for nothing.
+    fn wake_disk(&self) -> bool {
+        self.tee.upgrade().is_none_or(|tee| tee.wake_disk_now())
+    }
+
+    fn disk_wait(&self) -> Option<DiskWaitOf> {
+        let tee = self.tee.upgrade()?;
+        tee.disk_wait_slot().clone()
     }
 }
 

@@ -112,6 +112,25 @@ pub fn claim_named_working_dir(root: &Path, path: &Path, job_id: JobId) -> std::
     Ok(existed)
 }
 
+// The directory under `root` a job names for itself, as a torrent's
+// unpacking does: the one already carrying its marker, the suffixed name
+// first, as a claim falls back to it; else `name`, unless another job's
+// marker holds it, and then the suffixed name. Asked again, it names the
+// same directory while that one is there, whatever became of the other: at
+// most two marker reads, no scan of the root.
+pub(crate) fn own_named_dir(root: &Path, name: &str, job_id: JobId) -> PathBuf {
+    let dir_name = sanitize_dirname(name);
+    let suffixed = suffixed_working_dir(root, &dir_name, job_id);
+    if matches!(working_dir_owner(root, &suffixed), Ok(Some(owner)) if owner == job_id) {
+        return suffixed;
+    }
+    let plain = root.join(&dir_name);
+    match working_dir_owner(root, &plain) {
+        Ok(Some(owner)) if owner != job_id => suffixed,
+        _ => plain,
+    }
+}
+
 fn create_working_dir(
     intermediate_dir: &Path,
     job_id: JobId,
@@ -1260,6 +1279,27 @@ pub(crate) fn mark_legacy_output_dir(dir: &Path) -> std::io::Result<()> {
     )
 }
 
+// Removes `dir` once it holds nothing but, at most, the marker naming
+// `job_id`: the folder a torrent's job made for its files, which goes once
+// they have, as an empty one did before it was marked. One holding anything
+// else, or another job's marker, stays. Whether it went.
+pub(crate) fn remove_emptied_output_dir(dir: &Path, job_id: JobId) -> std::io::Result<bool> {
+    let mut marker = false;
+    for entry in std::fs::read_dir(dir)? {
+        if entry?.file_name() != OUTPUT_DIR_MARKER || marker {
+            return Ok(false);
+        }
+        marker = true;
+    }
+    if marker {
+        if output_dir_owner(dir) != Some(OutputDirOwner::Job(job_id)) {
+            return Ok(false);
+        }
+        std::fs::remove_file(dir.join(OUTPUT_DIR_MARKER))?;
+    }
+    std::fs::remove_dir(dir).map(|()| true)
+}
+
 // Removes an output directory its marker proved Weaver's, the marker last:
 // everything else in it first, then the marker, then the directory. A
 // removal that fails part way leaves the marker, so a retry still proves the
@@ -2005,5 +2045,64 @@ mod tests {
         assert!(!claim_named_working_dir(&root, &path, JobId(6)).unwrap());
         assert!(is_job_working_dir(&root, &path, JobId(6)).unwrap());
         assert!(claim_named_working_dir(&root, &path, JobId(6)).unwrap());
+    }
+
+    // An NZB job named "torrent-7" and torrent 7's unpacking each keep a
+    // folder of their own, whichever claims first, and neither's removal
+    // takes the other's.
+    #[test]
+    fn an_nzb_job_named_as_a_torrents_unpacking_and_the_torrent_keep_their_own_folders() {
+        let (nzb, torrent) = (JobId(9), JobId(7));
+        for nzb_first in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("intermediate");
+            let (nzb_dir, torrent_dir) = if nzb_first {
+                let nzb_dir = claim_working_dir(&root, nzb, "torrent-7").unwrap().path;
+                let torrent_dir = own_named_dir(&root, "torrent-7", torrent);
+                claim_named_working_dir(&root, &torrent_dir, torrent).unwrap();
+                (nzb_dir, torrent_dir)
+            } else {
+                let torrent_dir = own_named_dir(&root, "torrent-7", torrent);
+                claim_named_working_dir(&root, &torrent_dir, torrent).unwrap();
+                let nzb_dir = claim_working_dir(&root, nzb, "torrent-7").unwrap().path;
+                (nzb_dir, torrent_dir)
+            };
+            assert_ne!(nzb_dir, torrent_dir, "nzb first: {nzb_first}");
+            assert_eq!(
+                own_named_dir(&root, "torrent-7", torrent),
+                torrent_dir,
+                "asked again, the torrent names the same folder"
+            );
+            assert!(is_job_working_dir(&root, &nzb_dir, nzb).unwrap());
+            assert!(is_job_working_dir(&root, &torrent_dir, torrent).unwrap());
+            std::fs::write(nzb_dir.join("nzb.bin"), b"n").unwrap();
+            std::fs::write(torrent_dir.join("torrent.bin"), b"t").unwrap();
+
+            assert!(remove_job_working_dir(&root, &nzb_dir, torrent).is_err());
+            assert!(remove_job_working_dir(&root, &torrent_dir, nzb).is_err());
+            assert_eq!(
+                remove_job_working_dir(&root, &torrent_dir, torrent).unwrap(),
+                HistoryWorkingDir::Owned
+            );
+            assert!(!torrent_dir.exists());
+            assert!(nzb_dir.join("nzb.bin").exists(), "the NZB job's stays");
+        }
+    }
+
+    // A torrent's unpacking that took its suffixed folder because an NZB
+    // job held the plain name keeps naming that folder once the NZB job's
+    // is gone: the name is the one its marker is in, never recomputed back.
+    #[test]
+    fn a_torrents_suffixed_unpacking_folder_keeps_its_name_once_the_plain_one_is_free() {
+        let (nzb, torrent) = (JobId(9), JobId(7));
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("intermediate");
+        let nzb_dir = claim_working_dir(&root, nzb, "torrent-7").unwrap().path;
+        let torrent_dir = own_named_dir(&root, "torrent-7", torrent);
+        assert_ne!(torrent_dir, nzb_dir);
+        claim_named_working_dir(&root, &torrent_dir, torrent).unwrap();
+        remove_job_working_dir(&root, &nzb_dir, nzb).unwrap();
+        assert!(!nzb_dir.exists());
+        assert_eq!(own_named_dir(&root, "torrent-7", torrent), torrent_dir);
     }
 }

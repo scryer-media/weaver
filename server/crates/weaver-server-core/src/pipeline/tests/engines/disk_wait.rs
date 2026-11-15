@@ -4178,3 +4178,126 @@ async fn an_archive_written_the_first_time_holds_no_path() {
     writer_heard(&mut pipeline).await;
     assert_eq!(archives_written(), 1);
 }
+
+// A job outside the pipeline, as a torrent's unpacking, that waits for room
+// on a disk the pipeline's job waits on too. One reading wakes them all in
+// the order they took their tickets from the disk's ledger: one that began
+// to wait before the pipeline's job is asked while all three wait, and one
+// that began after is asked once the pipeline's job no longer waits, alone.
+// A job outside that begins to wait rings the pipeline's loop.
+#[tokio::test]
+async fn a_job_outside_the_pipeline_and_a_pipeline_job_waiting_wake_in_ticket_order() {
+    use crate::pipeline::graph::engine::{Hears, Outside};
+
+    struct Waits {
+        scope: u64,
+        ticket: u64,
+        ledger: Arc<DiskLedger>,
+        outside: std::sync::Weak<Outside>,
+        asked: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+    }
+    impl Hears for Waits {
+        fn said(&self, _said: crate::pipeline::graph::engine::Said, _slots: usize) {}
+
+        fn hold_clock(&self, _paused: bool) {}
+
+        fn disk_ticket(&self) -> Option<u64> {
+            Some(self.ticket)
+        }
+
+        fn wake_disk(&self) -> bool {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((self.scope, self.ledger.waiters()));
+            if let Some(outside) = self.outside.upgrade() {
+                outside.disk_unheld(self.scope);
+            }
+            self.ledger.unwait();
+            true
+        }
+
+        fn disk_wait(
+            &self,
+        ) -> Option<(crate::pipeline::graph::limits::DiskWait, std::path::PathBuf)> {
+            Some((
+                crate::pipeline::graph::limits::DiskWait {
+                    device: crate::pipeline::graph::limits::Device::Working,
+                    owes: self.ticket,
+                    free: Some(0),
+                    reserve: 1,
+                },
+                std::path::PathBuf::from(format!("/waits/{}", self.scope)),
+            ))
+        }
+    }
+
+    let said = || crate::pipeline::graph::root::DISK_WAITS_SAID.with(std::cell::Cell::get);
+    let room = Arc::new(AtomicU64::new(0));
+    let scenario = on_disk(&room);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let ledger = working(&pipeline);
+    // One outside waiter takes its ticket before the pipeline's job, one
+    // after.
+    let early = ledger.wait();
+    until_waiting(&mut pipeline, &scenario).await;
+    let ticket = pipeline.graph_jobs[&JOB]
+        .disk_ticket()
+        .expect("the job took a ticket");
+    let late = ledger.wait();
+    assert!(early < ticket && ticket < late);
+    assert_eq!(ledger.waiters(), 3);
+
+    let outside = Arc::clone(&pipeline.graph_outside);
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (before, after) = (92_201, 92_202);
+    for (scope, ticket) in [(after, late), (before, early)] {
+        outside.join(
+            scope,
+            Arc::new(Waits {
+                scope,
+                ticket,
+                ledger: Arc::clone(&ledger),
+                outside: Arc::downgrade(&outside),
+                asked: Arc::clone(&asked),
+            }),
+        );
+    }
+    let began = outside.disk_wait_began();
+    outside.disk_held(after);
+    outside.disk_held(before);
+    began.await;
+    let before_said = said();
+    pipeline.reconcile_disk_waits();
+    assert!(
+        outside.disk_waits_began().is_empty(),
+        "the pipeline heard both begin"
+    );
+    assert_eq!(
+        said(),
+        before_said + 2,
+        "each wait said once, as the pipeline's own"
+    );
+    pipeline.reconcile_disk_waits();
+    assert_eq!(said(), before_said + 2, "a wait is said only as it begins");
+    assert!(pipeline.waits_for_disk_room());
+
+    // The one reading heard is one begun after the room came, so the pass
+    // it starts finds room for the pipeline's job.
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
+    let asked = asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 2, "each asked once: {asked:?}");
+    assert_eq!(
+        asked[0],
+        (before, 3),
+        "asked first, while the pipeline's job still waits"
+    );
+    assert_eq!(
+        asked[1],
+        (after, 1),
+        "asked after the pipeline's job no longer waits"
+    );
+    assert!(!pipeline.graph_disk_held(JOB), "the pipeline's job goes on");
+    assert!(!outside.waits_for_disk());
+    assert!(!pipeline.waits_for_disk_room());
+}

@@ -869,13 +869,238 @@ mod tests {
 
         let separator = if base_url.contains('?') { '&' } else { '?' };
         let target_url = format!("{base_url}{separator}options=-csearch_path%3D{schema}");
-        let scoped_pool = sqlx::postgres::PgPoolOptions::new()
+        let scoped_pool = match sqlx::postgres::PgPoolOptions::new()
             .max_connections(2)
             .connect(&target_url)
             .await
-            .unwrap();
+        {
+            Ok(pool) => pool,
+            Err(error) => {
+                drop_schema(&admin_pool, &schema).await;
+                panic!("could not connect to the test schema: {error}");
+            }
+        };
 
         Some((admin_pool, schema, scoped_pool))
+    }
+
+    async fn drop_schema(admin_pool: &PgPool, schema: &str) {
+        sqlx::query(AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(admin_pool)
+            .await
+            .unwrap();
+        admin_pool.close().await;
+    }
+
+    // Runs `body` over a schema of its own and drops the schema after it,
+    // whether the body passed or panicked; a panic then goes on. Skips, as
+    // `create_scoped_pool` does, when no server is named.
+    async fn in_scoped_schema<F, Fut>(body: F)
+    where
+        F: FnOnce(PgPool) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let Some((admin_pool, schema, pool)) = create_scoped_pool().await else {
+            return;
+        };
+        let ran = tokio::spawn(body(pool.clone())).await;
+        pool.close().await;
+        // The drop runs on its own task too, so a panic in it cannot hide
+        // the body's: the body's panic goes on first.
+        let dropped = tokio::spawn(async move { drop_schema(&admin_pool, &schema).await }).await;
+        if let Err(error) = ran {
+            match error.try_into_panic() {
+                Ok(panic) => std::panic::resume_unwind(panic),
+                Err(error) => panic!("the test body did not finish: {error}"),
+            }
+        }
+        // The body passed: a drop that failed fails the test.
+        if let Err(error) = dropped {
+            match error.try_into_panic() {
+                Ok(panic) => std::panic::resume_unwind(panic),
+                Err(error) => panic!("the schema drop did not finish: {error}"),
+            }
+        }
+    }
+
+    // A schema stamped through `version`, upgraded from there to the
+    // current one after `seed` writes its rows at that version.
+    async fn upgrade_from<F, Fut>(pool: &PgPool, version: i64, seed: F)
+    where
+        F: FnOnce(PgPool) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let catalog = crate::schema_migrations::embedded_catalog().unwrap();
+        let payload = crate::schema_migrations::embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(pool, &catalog, &payload, Some(version))
+            .await
+            .unwrap();
+        let stamped: i64 =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = TRUE")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(stamped, version, "the fixture starts at {version}");
+        seed(pool.clone()).await;
+        run_migrations(pool, MigrationMode::Apply)
+            .await
+            .expect("the upgrade applies");
+        let current: i64 = sqlx::query_scalar("SELECT version FROM schema_version")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(current, catalog.max_version());
+    }
+
+    // Each index of `table` in the test schema, by name, with its definition.
+    async fn indexes_of(pool: &PgPool, table: &str) -> std::collections::BTreeMap<String, String> {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT indexname, indexdef FROM pg_indexes
+              WHERE schemaname = current_schema() AND tablename = $1",
+        )
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect()
+    }
+
+    async fn insert_kept_torrent(
+        pool: &PgPool,
+        job_id: i64,
+        files_dir: Option<&str>,
+        storage_dir: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO torrents
+                (job_id, infohash_v1, name, source, added_at_ms, state, files_dir, storage_dir)
+             VALUES ($1, $2, $3, 'magnet', $1, 'downloading', $4, $5)",
+        )
+        .bind(job_id)
+        .bind(vec![u8::try_from(job_id).unwrap(); 20])
+        .bind(format!("torrent-{job_id}"))
+        .bind(files_dir)
+        .bind(storage_dir)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    // 0120: a torrent list's page is served in added order, the whole list's
+    // and a category's, and the category index it supersedes is gone.
+    #[tokio::test]
+    async fn postgres_0120_orders_torrents_by_added_when_configured() {
+        in_scoped_schema(|pool| async move {
+            upgrade_from(&pool, 119, |_| async {}).await;
+            let indexes = indexes_of(&pool, "torrents").await;
+            assert!(
+                indexes["idx_torrents_added"].ends_with("(added_at_ms, job_id)"),
+                "{indexes:?}"
+            );
+            assert!(
+                indexes["idx_torrents_category_added"]
+                    .ends_with("(category_id, added_at_ms, job_id)"),
+                "{indexes:?}"
+            );
+            assert!(
+                !indexes.contains_key("idx_torrents_category"),
+                "{indexes:?}"
+            );
+        })
+        .await;
+    }
+
+    // 0121: a torrent row carries its removal, NULL unless one is under
+    // way, and the torrents being removed are found by a partial index.
+    #[tokio::test]
+    async fn postgres_0121_adds_torrent_retiring_when_configured() {
+        in_scoped_schema(|pool| async move {
+            upgrade_from(&pool, 120, |pool| async move {
+                insert_kept_torrent(&pool, 1, None, Some("/save/a")).await;
+            })
+            .await;
+            let (kind, nullable): (String, String) = sqlx::query_as(
+                "SELECT data_type, is_nullable FROM information_schema.columns
+                  WHERE table_schema = current_schema()
+                    AND table_name = 'torrents' AND column_name = 'retiring'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!((kind.as_str(), nullable.as_str()), ("text", "YES"));
+            let retiring: Option<String> =
+                sqlx::query_scalar("SELECT retiring FROM torrents WHERE job_id = 1")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                retiring, None,
+                "a torrent kept before it is not being removed"
+            );
+            let indexes = indexes_of(&pool, "torrents").await;
+            let partial = &indexes["idx_torrents_retiring"];
+            assert!(partial.contains("(job_id)"), "{partial}");
+            assert!(
+                partial.contains("WHERE (retiring IS NOT NULL)"),
+                "{partial}"
+            );
+        })
+        .await;
+    }
+
+    // 0122: a history row's files have a table of their own, and each
+    // torrent kept before it holds its whole folder, as spelled, its files'
+    // folder before its storage folder, until its next start writes its own.
+    #[tokio::test]
+    async fn postgres_0122_holds_each_kept_torrents_folder_when_configured() {
+        in_scoped_schema(|pool| async move {
+            upgrade_from(&pool, 121, |pool| async move {
+                insert_kept_torrent(&pool, 1, Some("/files/a"), Some("/save/a")).await;
+                insert_kept_torrent(&pool, 2, None, Some("/save/b")).await;
+                insert_kept_torrent(&pool, 3, None, None).await;
+            })
+            .await;
+            let held: Vec<(i64, String)> =
+                sqlx::query_as("SELECT job_id, path FROM torrent_held_paths ORDER BY job_id, path")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                held,
+                vec![(1, "/files/a".to_string()), (2, "/save/b".to_string())]
+            );
+            let set: Vec<bool> =
+                sqlx::query_scalar("SELECT held_set FROM torrents ORDER BY job_id")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                set,
+                vec![false, false, false],
+                "no torrent's rows are its own yet"
+            );
+            let by_path =
+                &indexes_of(&pool, "torrent_held_paths").await["idx_torrent_held_paths_path"];
+            assert!(by_path.contains(r#"(path COLLATE "C")"#), "{by_path}");
+
+            let files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_history_files")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(files, 0, "no history row lists files before it");
+            sqlx::query("INSERT INTO job_history_files (job_id, path) VALUES (1, '/files/a/x')")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let whole: bool =
+                sqlx::query_scalar("SELECT whole FROM job_history_files WHERE job_id = 1")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert!(!whole, "a listed file is a file unless it is said whole");
+        })
+        .await;
     }
 
     async fn insert_v26_history_row(pool: &PgPool, job_id: i64, metadata: Option<&str>) {

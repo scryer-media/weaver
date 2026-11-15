@@ -32,6 +32,7 @@ mod manifest;
 mod pending;
 mod permissions;
 mod restore;
+pub(crate) use restore::job_info_from_history;
 mod service;
 mod stored;
 mod upgrade;

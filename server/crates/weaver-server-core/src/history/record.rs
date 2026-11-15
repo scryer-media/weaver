@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-#[derive(Debug, Clone)]
+// Serialized only to keep a torrent's row a removal could not write for want
+// of room on the torrent itself, which a start then writes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct JobHistoryRow {
     pub job_id: u64,
     pub job_hash: Option<Vec<u8>>,

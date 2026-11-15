@@ -23,6 +23,10 @@ pub enum Refusal {
     Executable(String),
     #[error("the torrent has no name")]
     Unnamed,
+    /// The same torrent is still being removed, as this job: it may be
+    /// added again once that removal ends.
+    #[error("the torrent is still being removed as job {}; add it again once its removal ends", .0.0)]
+    Removing(crate::jobs::ids::JobId),
 }
 
 fn extension(name: &str) -> Option<&str> {

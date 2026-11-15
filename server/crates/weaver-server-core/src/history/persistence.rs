@@ -656,6 +656,7 @@ pub(crate) async fn delete_job_history_bundles_tx(
             "job_events",
             "job_history_attributes",
             "job_history_archived_files",
+            "job_history_files",
         ] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE job_id IN ({placeholders})"),
