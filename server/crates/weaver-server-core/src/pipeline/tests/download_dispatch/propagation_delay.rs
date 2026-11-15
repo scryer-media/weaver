@@ -41,6 +41,7 @@ async fn owned_download_lane_capacity_failure_requeues_without_failing_the_artic
         dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
+        repeated: None,
         works: vec![work],
     };
     pipeline.active_download_connections = 1;
@@ -130,6 +131,7 @@ async fn owned_download_lane_selection_contention_requeues_without_failing_the_a
         dial_exclude_servers: weaver_nntp::ServerSet::EMPTY,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
+        repeated: None,
         works: vec![work],
     };
     pipeline.active_download_connections = 1;
