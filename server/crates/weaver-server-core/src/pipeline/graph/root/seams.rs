@@ -664,10 +664,10 @@ impl Pipeline {
         for scope in self.graph_outside.disk_waits_began() {
             #[cfg(test)]
             DISK_WAIT_LOOKS.with(|looks| looks.set(looks.get() + 1));
-            tracing::debug!(
-                job_id = scope,
-                "a job outside the pipeline waits for disk room"
-            );
+            // Said once, as the wait begins, as the pipeline's own is.
+            if let Some((wait, dir)) = self.graph_outside.disk_wait_of(scope) {
+                self.say_disk_wait(JobId(scope), &wait, &dir);
+            }
         }
         if self.disk_idle.is_empty() {
             return;
@@ -703,17 +703,16 @@ impl Pipeline {
         use crate::support::human_bytes;
         #[cfg(test)]
         DISK_WAITS_SAID.with(|said| said.set(said.get() + 1));
-        let name = self
-            .jobs
-            .get(&job_id)
-            .map_or("", |state| state.spec.name.as_str());
+        // A job outside the pipeline has no name here: its line leaves the
+        // field out (`Option` records nothing when `None`).
+        let name = self.jobs.get(&job_id).map(|state| state.spec.name.as_str());
         let disk = match wait.device {
             limits::Device::Output => "output",
             limits::Device::Working => "working",
         };
         warn!(
             job_id = job_id.0,
-            job = %name,
+            job = name,
             disk,
             folder = %dir.display(),
             owes = %human_bytes(wait.owes),

@@ -4216,8 +4216,23 @@ async fn a_job_outside_the_pipeline_and_a_pipeline_job_waiting_wake_in_ticket_or
             self.ledger.unwait();
             true
         }
+
+        fn disk_wait(
+            &self,
+        ) -> Option<(crate::pipeline::graph::limits::DiskWait, std::path::PathBuf)> {
+            Some((
+                crate::pipeline::graph::limits::DiskWait {
+                    device: crate::pipeline::graph::limits::Device::Working,
+                    owes: self.ticket,
+                    free: Some(0),
+                    reserve: 1,
+                },
+                std::path::PathBuf::from(format!("/waits/{}", self.scope)),
+            ))
+        }
     }
 
+    let said = || crate::pipeline::graph::root::DISK_WAITS_SAID.with(std::cell::Cell::get);
     let room = Arc::new(AtomicU64::new(0));
     let scenario = on_disk(&room);
     let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
@@ -4252,11 +4267,19 @@ async fn a_job_outside_the_pipeline_and_a_pipeline_job_waiting_wake_in_ticket_or
     outside.disk_held(after);
     outside.disk_held(before);
     began.await;
+    let before_said = said();
     pipeline.reconcile_disk_waits();
     assert!(
         outside.disk_waits_began().is_empty(),
         "the pipeline heard both begin"
     );
+    assert_eq!(
+        said(),
+        before_said + 2,
+        "each wait said once, as the pipeline's own"
+    );
+    pipeline.reconcile_disk_waits();
+    assert_eq!(said(), before_said + 2, "a wait is said only as it begins");
     assert!(pipeline.waits_for_disk_room());
 
     // The one reading heard is one begun after the room came, so the pass

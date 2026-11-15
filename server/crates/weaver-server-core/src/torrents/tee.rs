@@ -147,6 +147,9 @@ pub(crate) struct Tee {
     // room, `NO_TICKET` while it does not wait: the pipeline orders it by
     // this among the jobs it wakes, without the job's lock.
     disk_ticket: std::sync::atomic::AtomicU64,
+    // What the job waits for room for, and the folder it waits on, kept as
+    // its wait begins: the pipeline says it then, without the job's lock.
+    disk_wait: Mutex<Option<DiskWaitOf>>,
     // Counts the checkpoints asked of the job, each before it waits on the
     // job's lock.
     #[cfg(test)]
@@ -172,6 +175,9 @@ enum Word {
 
 // The job waits for no room.
 const NO_TICKET: u64 = u64::MAX;
+
+// What a job waits for room for, and the folder it waits on.
+type DiskWaitOf = (crate::pipeline::graph::limits::DiskWait, PathBuf);
 
 // One share of a piece that the job has yet to take.
 struct Share {
@@ -274,6 +280,7 @@ impl Tee {
             owes_lend: std::sync::atomic::AtomicBool::new(false),
             paused: std::sync::atomic::AtomicBool::new(false),
             disk_ticket: std::sync::atomic::AtomicU64::new(NO_TICKET),
+            disk_wait: Mutex::new(None),
             #[cfg(test)]
             asked: tokio::sync::watch::Sender::new(0),
             #[cfg(test)]
@@ -409,6 +416,8 @@ impl Tee {
             .disk_ticket
             .swap(ticket, std::sync::atomic::Ordering::AcqRel);
         if was == NO_TICKET {
+            // Kept before the pipeline hears the wait begin, which reads it.
+            *self.disk_wait_slot() = job.disk_wait();
             self.outside.disk_held(self.job_id.0);
             self.signal.mark(self.job_id);
         }
@@ -420,7 +429,14 @@ impl Tee {
             .swap(NO_TICKET, std::sync::atomic::Ordering::AcqRel);
         if was != NO_TICKET {
             self.outside.disk_unheld(self.job_id.0);
+            *self.disk_wait_slot() = None;
         }
+    }
+
+    fn disk_wait_slot(&self) -> std::sync::MutexGuard<'_, Option<DiskWaitOf>> {
+        self.disk_wait
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     // The count of the words for the job taken so far, which moves with
@@ -953,6 +969,11 @@ impl Hears for Hearer {
     // A tee gone waits for nothing.
     fn wake_disk(&self) -> bool {
         self.tee.upgrade().is_none_or(|tee| tee.wake_disk_now())
+    }
+
+    fn disk_wait(&self) -> Option<DiskWaitOf> {
+        let tee = self.tee.upgrade()?;
+        tee.disk_wait_slot().clone()
     }
 }
 

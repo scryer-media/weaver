@@ -2200,6 +2200,71 @@ async fn a_removal_whose_request_is_dropped_at_its_mark_still_ends() {
     rig.service.stop().await;
 }
 
+// A move whose request is dropped while the torrent shows moving goes on
+// all the same: once let go, its files are at the destination and the
+// queue no longer shows it moving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_move_whose_request_is_dropped_while_moving_still_ends() {
+    let rig = rig(set_clock());
+    let queue = queue();
+    let state = queue.state().clone();
+    rig.service.publish_to(queue);
+    rig.service.open().await.unwrap();
+    let (job_id, dir) = with_every_piece(&rig).await;
+    let files = files_under(&dir);
+    let elsewhere = rig.dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let moving = || {
+        state
+            .list_jobs()
+            .iter()
+            .find(|job| job.job_id == job_id)
+            .map(|job| job.status == crate::jobs::JobStatus::Moving)
+    };
+    let (reached, at) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *locked(&MOVE_HOLD) = Some((reached, released));
+    let mut asked = Box::pin(
+        rig.service
+            .set_location(job_id, elsewhere.to_string_lossy().into_owned()),
+    );
+    tokio::select! {
+        biased;
+        _ = at => {}
+        ended = &mut asked => panic!("the move ended before it held: {ended:?}"),
+    }
+    assert_eq!(moving(), Some(true), "the queue shows it moving");
+    let mut changes = state.subscribe_job_changes();
+    drop(asked);
+
+    release.send(()).unwrap();
+    while moving() != Some(false) {
+        changes.changed().await.unwrap();
+    }
+    let there = PathBuf::from(
+        rig.service
+            .torrent(job_id)
+            .await
+            .unwrap()
+            .storage_dir
+            .unwrap(),
+    );
+    assert_eq!(there.parent(), Some(elsewhere.as_path()));
+    let relative = |under: &Path, found: Vec<PathBuf>| -> Vec<PathBuf> {
+        found
+            .iter()
+            .map(|file| file.strip_prefix(under).unwrap().to_path_buf())
+            .collect()
+    };
+    assert_eq!(
+        relative(&there, files_under(&there)),
+        relative(&dir, files),
+        "its files are at the destination"
+    );
+    assert!(files_under(&dir).is_empty(), "none is left where they were");
+    rig.service.stop().await;
+}
+
 // A failure while a removal writes its mark, and then the mark refused:
 // the removal does not go ahead, and the failure it held fails the
 // torrent, which goes to history as failed with that error.

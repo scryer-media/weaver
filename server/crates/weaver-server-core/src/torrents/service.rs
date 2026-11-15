@@ -3819,6 +3819,9 @@ impl TorrentService {
         if !matches!(claimed, Ok(true)) {
             return Placing::Waits;
         }
+        // The queue shows the torrent moving while its outputs move, and
+        // the settle that placed them shows where they ended.
+        self.publish_job(job_id).await;
         let releasing = Arc::clone(tee);
         let spent = match tokio::task::spawn_blocking(move || releasing.spent()).await {
             Ok(Ok(spent)) => spent,
@@ -5231,10 +5234,10 @@ impl TorrentService {
         let foldered = layout
             .unwrap_or(ContentLayout::Original)
             .foldered(manifest.single_file);
-        let made = |dir: &Path| {
-            std::fs::create_dir_all(dir).map_err(|error| {
-                AddError::State(format!("could not make the torrent's directory: {error}"))
-            })
+        // Made off the async runtime: on the blocking pool where the folder
+        // is marked with it, through `tokio::fs` where it is made alone.
+        let unmade = |error: std::io::Error| {
+            AddError::State(format!("could not make the torrent's directory: {error}"))
         };
         match parent {
             Some(parent) if foldered => {
@@ -5244,7 +5247,7 @@ impl TorrentService {
                 let marked = dir.clone();
                 tokio::task::spawn_blocking(move || {
                     let existed = std::fs::symlink_metadata(&marked).is_ok();
-                    made(&marked)?;
+                    std::fs::create_dir_all(&marked).map_err(unmade)?;
                     mark_storage(&db, &marked, job_id, existed);
                     Ok::<_, AddError>(())
                 })
@@ -5254,7 +5257,7 @@ impl TorrentService {
             }
             Some(parent) => {
                 let adopted = found(parent.clone()).await?;
-                made(&parent)?;
+                tokio::fs::create_dir_all(&parent).await.map_err(unmade)?;
                 let dir = self.claim_dir(settings, category, manifest, job_id).await?;
                 Ok((dir, Some(parent.to_string_lossy().into_owned()), adopted))
             }
@@ -5266,7 +5269,7 @@ impl TorrentService {
             None => {
                 let parent = category_parent()?;
                 let adopted = found(parent.clone()).await?;
-                made(&parent)?;
+                tokio::fs::create_dir_all(&parent).await.map_err(unmade)?;
                 let dir = self.claim_dir(settings, category, manifest, job_id).await?;
                 Ok((dir, Some(parent.to_string_lossy().into_owned()), adopted))
             }
@@ -6822,6 +6825,13 @@ impl TorrentService {
         job_id: JobId,
         to: (Option<String>, Option<String>),
     ) -> Result<(), StateError> {
+        #[cfg(test)]
+        let held = locked(&MOVE_HOLD).take();
+        #[cfg(test)]
+        if let Some((reached, release)) = held {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
         self.write_held(job_id, Some(to)).await
     }
 
@@ -7334,6 +7344,23 @@ impl TorrentService {
         parent: String,
         existing: Existing,
     ) -> Result<(), ActionError> {
+        // The move runs on its own task: a request dropped part way, as a
+        // client that goes away drops it, cannot leave the torrent shown
+        // moving. Once begun, the move ends there, as a removal does
+        // (`remove_as`).
+        let service = self.clone();
+        tokio::spawn(async move { service.move_storage_now(job_id, parent, existing).await })
+            .await
+            .map_err(|error| ActionError::State(format!("the move did not finish: {error}")))?
+    }
+
+    // `move_storage`, on a task of its own.
+    async fn move_storage_now(
+        &self,
+        job_id: JobId,
+        parent: String,
+        existing: Existing,
+    ) -> Result<(), ActionError> {
         let parent = PathBuf::from(parent.trim());
         if !parent.is_absolute() {
             return Err(ActionError::Invalid(
@@ -7409,6 +7436,9 @@ impl TorrentService {
             give_back(&to.to_string_lossy(), job_id).await;
             return Err(error);
         }
+        // The queue shows the torrent moving (qBittorrent's `moving` state)
+        // until `moved` or `move_refused` ends it and the job shows again.
+        self.publish_job(job_id).await;
         let destination = (Some(to.to_string_lossy().into_owned()), None);
         if let Err(error) = self.hold_destination(job_id, destination).await {
             self.move_refused(job_id).await;
@@ -7542,6 +7572,8 @@ impl TorrentService {
                 Ok(torrent.record.storage_dir.clone())
             })
             .await?;
+        // Shown moving until the move ends, as a move of its directory is.
+        self.publish_job(job_id).await;
         let destination = (storage, Some(to.to_string_lossy().into_owned()));
         if let Err(error) = self.hold_destination(job_id, destination).await {
             self.move_refused(job_id).await;
@@ -7629,6 +7661,8 @@ impl TorrentService {
             })
             .await;
         self.inner.signal.mark(job_id);
+        // It no longer shows moving.
+        self.publish_job(job_id).await;
     }
 
     // The torrent's files moved, or could not: the record follows a move,
@@ -10115,6 +10149,17 @@ async fn held_at(record: &TorrentRecord, tops: Option<BTreeSet<String>>) -> Vec<
 // saying first that it has reached that point.
 #[cfg(test)]
 pub(crate) static MARK_HOLD: Mutex<
+    Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+> = Mutex::new(None);
+
+// Test seam: a move, shown moving, waits once before it holds its
+// destination, until the test lets it go, saying first that it has reached
+// that point.
+#[cfg(test)]
+pub(crate) static MOVE_HOLD: Mutex<
     Option<(
         tokio::sync::oneshot::Sender<()>,
         tokio::sync::oneshot::Receiver<()>,

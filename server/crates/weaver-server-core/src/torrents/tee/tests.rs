@@ -567,6 +567,14 @@ async fn a_torrent_unpack_held_for_room_is_woken_when_room_returns() {
     let (ticket, scope, hears) = &waiters[0];
     assert_eq!(*scope, 1);
     assert_eq!(Some(*ticket), tee.with(|job| job.disk_ticket()));
+    // The pipeline is given its wait and folder, as its own job's, to say
+    // as the wait begins.
+    let wait = outside
+        .disk_wait_of(1)
+        .expect("the waiting job gives its wait");
+    assert_eq!(Some(wait.clone()), tee.with(|job| job.disk_wait()));
+    assert_eq!(wait.0.reserve, 1);
+    assert_eq!(hears.disk_wait(), Some(wait));
 
     // A reading with no room keeps it waiting.
     assert!(!hears.wake_disk());
@@ -577,6 +585,7 @@ async fn a_torrent_unpack_held_for_room_is_woken_when_room_returns() {
     assert!(hears.wake_disk(), "a reading with room wakes it");
     assert!(!outside.waits_for_disk());
     assert!(outside.disk_waiters().is_empty());
+    assert_eq!(hears.disk_wait(), None, "woken, it waits for nothing");
     assert!(!tee.with(|job| job.disk_held()));
     while !tee.done() {
         let said = mail.recv().await.unwrap();

@@ -188,6 +188,13 @@ pub(crate) trait Hears: Send + Sync {
     fn wake_disk(&self) -> bool {
         true
     }
+    // What the job waits for room for, and the folder it waits on, as
+    // `GraphJob::disk_wait` says for a job of the pipeline's: read as its
+    // wait begins, so the pipeline says it once, as it says its own. A job
+    // that does not wait, or never waits for room, has none.
+    fn disk_wait(&self) -> Option<(super::limits::DiskWait, std::path::PathBuf)> {
+        None
+    }
 }
 
 // The jobs outside the pipeline whose runs speak on its mail, by scope,
@@ -271,6 +278,16 @@ impl Outside {
     // The jobs that began to wait since the last look, still waiting.
     pub(crate) fn disk_waits_began(&self) -> Vec<u64> {
         std::mem::take(&mut self.disk_scopes().1)
+    }
+
+    // What the job `scope` waits for room for, and the folder it waits on,
+    // if it is here and waits.
+    pub(crate) fn disk_wait_of(
+        &self,
+        scope: u64,
+    ) -> Option<(super::limits::DiskWait, std::path::PathBuf)> {
+        let hears = self.jobs().get(&scope).cloned()?;
+        hears.disk_wait()
     }
 
     // Rung once a job begins to wait while none of the pipeline's loop's
