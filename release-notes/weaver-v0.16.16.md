@@ -128,6 +128,9 @@ Everything below is new since 0.16.15.
   an outage, before the articles only it could bring are booked missing.
   The job's failure then names that server, and its next duplicate is
   tried.
+- **A server with no login that answers a download with 480 counts as
+  refusing the login.** It was asked again without end, so the jobs
+  waiting on it kept their slots and the rest of the queue did not start.
 - **A held server recovers.** Its recovery probe carries real work and is
   never left unanswered, so jobs no longer stall after body timeouts or a
   refused login.
@@ -225,3 +228,5 @@ This release changes the GraphQL API in ways that can break a client.
 - **Rows past the size limits** that the small test rows never cross.
 - **End-to-end waits follow state,** not fixed sleeps, and a missing
   metric series fails a spec instead of reading 0.
+- **A second end-to-end full run refuses to start** while one is in
+  process on the same machine.
