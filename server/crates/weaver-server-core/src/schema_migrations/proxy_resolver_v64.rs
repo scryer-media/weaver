@@ -168,12 +168,18 @@ mod tests {
         assert_eq!(profile(&pool, 3).await[RESOLVER], "Weaver");
         assert_eq!(profile(&pool, 4).await[RESOLVER], "Proxy");
 
-        // What this step names, the later shape reads.
-        let mut conn = pool.acquire().await.unwrap();
-        super::super::proxy_dns_v121::spell_out_proxy_dns(&mut SqlConn::Sqlite(&mut conn))
-            .await
-            .unwrap();
-        drop(conn);
+        // What this step names, the later shape reads once the upgrade to
+        // DNS profiles has run over it.
+        apply_version_range(
+            &pool,
+            &embedded_catalog().unwrap(),
+            &embedded_payload_bytes().unwrap(),
+            MigrationInstallKind::Upgrade,
+            SCHEMA_VERSION + 1,
+            super::super::proxy_dns_v121::SCHEMA_VERSION,
+        )
+        .await
+        .unwrap();
         for id in 1..=4 {
             let read: crate::proxies::ProxyProfile =
                 serde_json::from_str(&saved(&pool, id).await).unwrap();

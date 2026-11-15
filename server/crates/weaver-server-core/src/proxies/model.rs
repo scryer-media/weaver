@@ -2,18 +2,13 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashSet,
-    net::{IpAddr, SocketAddr},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, net::IpAddr, time::Duration};
 use weaver_tunnel::{
     Http3ProxyCredentials, Http3TunnelProvider, Http3TunnelSpec, TunnelError, TunnelSpec,
     WireGuardSpec,
-    dns::{DnsServer, Trust, Wire},
+    dns::DnsServer,
     parse_key,
-    pipe::{Egress, Naming, PortForwarding, gateway_of},
+    pipe::{PortForwarding, gateway_of},
 };
 // Which wire a server is asked over, as a lookup's record names it.
 pub use weaver_tunnel::dns::WireKind;
@@ -27,300 +22,8 @@ pub enum ProxyKind {
     WireGuard,
 }
 
-// How a name dialled through a proxy is resolved: the next hop's endpoint,
-// or the destination when the proxy is the last hop.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProxyDns {
-    pub who: DnsWho,
-    // Where the listed servers are asked from. Only Servers asks them.
-    pub path: DnsPath,
-    // Asked in order. Only Servers has any.
-    pub servers: Vec<ProxyDnsServer>,
-    // How the listed servers' answers are judged. Only Servers asks them.
-    pub trust: DnsTrust,
-}
-
-// Who answers: the host's own DNS, the proxy, or the listed servers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DnsWho {
-    Host,
-    Proxy,
-    Servers,
-}
-
-// Where the listed servers are asked from: the route's egress, or through
-// the proxy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DnsPath {
-    Direct,
-    ThroughProxy,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DnsTrust {
-    AsSent,
-    // An answer the server did not mark authenticated is refused.
-    RequireAd,
-    // Weaver checks the DNSSEC signatures itself: an unsigned name resolves,
-    // one that fails the check does not.
-    Validate,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProxyDnsServer {
-    pub address: SocketAddr,
-    pub wire: ProxyDnsWire,
-}
-
-// How a server is asked: in the clear, over TLS (its certificate checked
-// against `name`, or its address without one), or over HTTPS at `path`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ProxyDnsWire {
-    Plain,
-    Tls { name: Option<String> },
-    Https { path: String },
-}
-
-// The most servers one DNS setting lists: a proxy's, or an egress's.
-pub const MAX_DNS_SERVERS: usize = 10;
 // The most tunnel addresses a WireGuard proxy takes.
 pub const MAX_TUNNEL_ADDRESSES: usize = 8;
-const MAX_TLS_NAME_BYTES: usize = 253;
-const MAX_HTTPS_PATH_BYTES: usize = 2048;
-
-// How a name dialled straight out of an egress, with no proxy above it, is
-// resolved: by the host's own DNS, or by the listed servers asked from the
-// egress. Every direct leg, direct fallback and first proxy endpoint on the
-// egress resolves this way.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EgressDns {
-    pub who: DnsWho,
-    // Asked in order. Only Servers has any.
-    pub servers: Vec<ProxyDnsServer>,
-    // How the listed servers' answers are judged. Only Servers asks them.
-    pub trust: DnsTrust,
-}
-
-impl Default for EgressDns {
-    fn default() -> Self {
-        Self::host()
-    }
-}
-
-impl EgressDns {
-    // The host answers.
-    pub fn host() -> Self {
-        Self {
-            who: DnsWho::Host,
-            servers: Vec::new(),
-            trust: DnsTrust::AsSent,
-        }
-    }
-    pub fn is_host(&self) -> bool {
-        self.who == DnsWho::Host
-    }
-    // The setting as it is saved: what only listed servers use is dropped
-    // when the host answers, so two settings that behave the same are stored
-    // the same.
-    pub fn normal(self) -> Self {
-        match self.who {
-            DnsWho::Host => Self::host(),
-            DnsWho::Proxy | DnsWho::Servers => self,
-        }
-    }
-    pub fn validate(&self) -> Result<(), super::NetworkRefusal> {
-        match self.who {
-            DnsWho::Host => Ok(()),
-            // No proxy sits above a direct dial to hand the name to.
-            DnsWho::Proxy => Err(super::NetworkRefusal::EgressDnsWhoInvalid),
-            DnsWho::Servers => validate_servers(&self.servers),
-        }
-    }
-    // The listed servers in the engine's terms, and how their answers are
-    // judged; None when the host answers.
-    pub fn engine(&self) -> Option<(Vec<DnsServer>, Trust)> {
-        (self.who == DnsWho::Servers).then(|| {
-            (
-                self.servers.iter().map(ProxyDnsServer::engine).collect(),
-                self.trust.engine(),
-            )
-        })
-    }
-    // Who resolves a name dialled straight out of the egress.
-    pub fn resolved_by(&self) -> super::ResolvedBy {
-        match self.who {
-            DnsWho::Servers => super::ResolvedBy::Servers,
-            DnsWho::Host | DnsWho::Proxy => super::ResolvedBy::Host,
-        }
-    }
-}
-
-impl DnsTrust {
-    pub fn engine(self) -> Trust {
-        match self {
-            Self::AsSent => Trust::AsSent,
-            Self::RequireAd => Trust::RequireAd,
-            Self::Validate => Trust::Validate,
-        }
-    }
-}
-
-// What every DNS setting checks of the servers it lists: at least one, at
-// most `MAX_DNS_SERVERS`, no plain server after an encrypted one, and each
-// server well formed.
-fn validate_servers(servers: &[ProxyDnsServer]) -> Result<(), super::NetworkRefusal> {
-    use super::NetworkRefusal as Refusal;
-    if servers.is_empty() {
-        return Err(Refusal::ProxyDnsServersRequired);
-    }
-    if servers.len() > MAX_DNS_SERVERS {
-        return Err(Refusal::ProxyDnsServerCount);
-    }
-    // A name asked of an encrypted server that failed must not then go out
-    // in clear: a plain server may only come first.
-    let first_encrypted = servers
-        .iter()
-        .position(|server| server.wire != ProxyDnsWire::Plain);
-    if let Some(first) = first_encrypted
-        && servers[first..]
-            .iter()
-            .any(|server| server.wire == ProxyDnsWire::Plain)
-    {
-        return Err(Refusal::ProxyDnsPlainAfterEncrypted);
-    }
-    servers.iter().try_for_each(ProxyDnsServer::validate)?;
-    // The same address, port and wire, with the same TLS name or HTTPS path,
-    // is one server; asking it twice only repeats a failure. The list holds
-    // at most ten, so comparing every pair costs nothing.
-    if servers
-        .iter()
-        .enumerate()
-        .any(|(at, server)| servers[..at].contains(server))
-    {
-        return Err(Refusal::ProxyDnsServerDuplicate);
-    }
-    Ok(())
-}
-
-impl ProxyDns {
-    // The host answers.
-    pub fn host() -> Self {
-        Self {
-            who: DnsWho::Host,
-            path: DnsPath::ThroughProxy,
-            servers: Vec::new(),
-            trust: DnsTrust::AsSent,
-        }
-    }
-    // The proxy is handed the name.
-    pub fn proxy() -> Self {
-        Self {
-            who: DnsWho::Proxy,
-            ..Self::host()
-        }
-    }
-    // These servers, asked plain on port 53 from `path`, their answers taken
-    // as sent.
-    pub fn plain(path: DnsPath, ips: impl IntoIterator<Item = IpAddr>) -> Self {
-        Self {
-            who: DnsWho::Servers,
-            path,
-            servers: ips
-                .into_iter()
-                .map(|ip| ProxyDnsServer {
-                    address: SocketAddr::new(ip, WireKind::Plain.default_port()),
-                    wire: ProxyDnsWire::Plain,
-                })
-                .collect(),
-            trust: DnsTrust::AsSent,
-        }
-    }
-    // The settings as they are saved: what only listed servers use is
-    // dropped when no servers answer, so two settings that behave the same
-    // are stored the same.
-    pub fn normal(self) -> Self {
-        match self.who {
-            DnsWho::Host => Self::host(),
-            DnsWho::Proxy => Self::proxy(),
-            DnsWho::Servers => self,
-        }
-    }
-    fn engine_servers(&self) -> Vec<DnsServer> {
-        self.servers.iter().map(ProxyDnsServer::engine).collect()
-    }
-    fn engine_trust(&self) -> Trust {
-        self.trust.engine()
-    }
-    fn validate(&self, kind: ProxyKind) -> Result<(), super::NetworkRefusal> {
-        use super::NetworkRefusal as Refusal;
-        match self.who {
-            // A WireGuard peer is handed packets, never a name.
-            DnsWho::Proxy if kind == ProxyKind::WireGuard => {
-                Err(Refusal::ProxyWireGuardNeedsDnsServers)
-            }
-            DnsWho::Host | DnsWho::Proxy => Ok(()),
-            DnsWho::Servers => validate_servers(&self.servers),
-        }
-    }
-}
-
-impl ProxyDnsServer {
-    pub fn engine(&self) -> DnsServer {
-        DnsServer {
-            address: self.address,
-            wire: match &self.wire {
-                ProxyDnsWire::Plain => Wire::Plain,
-                ProxyDnsWire::Tls { name } => Wire::Tls { name: name.clone() },
-                ProxyDnsWire::Https { path } => Wire::Https { path: path.clone() },
-            },
-        }
-    }
-    fn validate(&self) -> Result<(), super::NetworkRefusal> {
-        use super::NetworkRefusal as Refusal;
-        if self.address.port() == 0 {
-            return Err(Refusal::ProxyDnsServerInvalid);
-        }
-        match &self.wire {
-            ProxyDnsWire::Plain | ProxyDnsWire::Tls { name: None } => Ok(()),
-            ProxyDnsWire::Tls { name: Some(name) } if is_tls_name(name) => Ok(()),
-            ProxyDnsWire::Tls { .. } => Err(Refusal::ProxyDnsTlsNameInvalid),
-            ProxyDnsWire::Https { path } if is_https_path(path) => Ok(()),
-            ProxyDnsWire::Https { .. } => Err(Refusal::ProxyDnsUrlInvalid),
-        }
-    }
-}
-
-// A name a certificate is issued for: labels of letters, digits, hyphens
-// and underscores, at most 63 bytes each and not starting or ending with a
-// hyphen, with one optional trailing dot, 253 bytes in all.
-pub fn is_tls_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > MAX_TLS_NAME_BYTES {
-        return false;
-    }
-    let name = name.strip_suffix('.').unwrap_or(name);
-    !name.is_empty()
-        && name.split('.').all(|label| {
-            let bytes = label.as_bytes();
-            (1..=63).contains(&bytes.len())
-                && bytes
-                    .iter()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-                && bytes.first() != Some(&b'-')
-                && bytes.last() != Some(&b'-')
-        })
-}
-
-// The path a DNS over HTTPS query is posted to, its query string included:
-// from a leading '/', only letters, digits and the characters a URI path or
-// query carries as written (unreserved, sub-delims, ':', '@', '/', '%' and
-// '?'), 2048 bytes at most. A request can always be built for it.
-pub fn is_https_path(path: &str) -> bool {
-    path.starts_with('/')
-        && path.len() <= MAX_HTTPS_PATH_BYTES
-        && path
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/%?".contains(&b))
-}
 
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProxySecrets {
@@ -344,7 +47,11 @@ pub struct ProxyProfile {
     pub enabled: bool,
     pub host: String,
     pub port: u16,
-    pub dns: ProxyDns,
+    // WireGuard: the DNS servers the tunnel's configuration lists. A route
+    // whose DNS profile has the proxy answer asks them through the tunnel.
+    // Other kinds keep none.
+    #[serde(default)]
+    pub dns_servers: Vec<IpAddr>,
     pub tunnel_addresses: Vec<String>,
     pub peer_public_key: Option<String>,
     pub mtu: u16,
@@ -360,6 +67,13 @@ pub struct ProxyProfile {
     // same one. Unused with NAT-PMP.
     #[serde(default)]
     pub forwarded_port: Option<u16>,
+    // The DNS profile that finds this proxy's own address when it is a
+    // name: System, or a proxy name profile. Stored in its own column, so it
+    // is no part of the settings a revision covers: pointing a proxy at
+    // another profile rebuilds nothing, and the next lookup of its address
+    // uses the new profile.
+    #[serde(skip)]
+    pub dns_profile_id: u32,
     #[serde(skip)]
     pub secrets: ProxySecrets,
 }
@@ -391,65 +105,17 @@ impl ProxyProfile {
     pub fn timeout(&self) -> Duration {
         Duration::from_secs(u64::from(self.timeout_seconds))
     }
-    // How a hop through this proxy resolves names, Weaver's servers asked
-    // from `egress`. The host answering means the egress's own naming: on an
-    // egress that lists servers those servers answer, sent on its binding,
-    // from the one naming the egress holds; on any other, the host's DNS.
-    pub fn naming(&self, egress: Arc<Egress>) -> Naming {
-        let dns = &self.dns;
-        match (dns.who, dns.path) {
-            (DnsWho::Host, _) => egress.naming().cloned().unwrap_or(Naming::Host),
-            (DnsWho::Proxy, _) => Naming::Proxy,
-            (DnsWho::Servers, DnsPath::Direct) => {
-                Naming::servers(dns.engine_servers(), dns.engine_trust(), egress)
-            }
-            (DnsWho::Servers, DnsPath::ThroughProxy) => {
-                Naming::proxy_servers(dns.engine_servers(), dns.engine_trust())
-            }
-        }
-    }
-    // Who resolves a destination's name dialled through this proxy as the
-    // last hop on an egress whose DNS is `egress`, as `naming` resolves it:
-    // the host answering is the egress's servers when it lists them.
-    pub fn resolved_on(&self, egress: &EgressDns) -> super::ResolvedBy {
-        match self.resolved_by() {
-            super::ResolvedBy::Host => egress.resolved_by(),
-            by => by,
-        }
-    }
-    // Who resolves a destination's name dialled through this proxy as the
-    // last hop on an egress that asks the host, as `naming` resolves it.
-    pub fn resolved_by(&self) -> super::ResolvedBy {
-        use super::ResolvedBy;
-        match (self.dns.who, self.dns.path) {
-            (DnsWho::Host, _) => ResolvedBy::Host,
-            (DnsWho::Proxy, _) => ResolvedBy::Proxy,
-            (DnsWho::Servers, DnsPath::Direct) => ResolvedBy::Servers,
-            (DnsWho::Servers, DnsPath::ThroughProxy) => ResolvedBy::ProxyServers,
-        }
-    }
-    // The DNS servers asked through the proxy itself.
-    pub fn proxy_dns_servers(&self) -> &[ProxyDnsServer] {
-        match (self.dns.who, self.dns.path) {
-            (DnsWho::Servers, DnsPath::ThroughProxy) => &self.dns.servers,
-            _ => &[],
-        }
-    }
-    // The servers the WireGuard tunnel's own resolver may ask, plain on port
-    // 53 from inside it. Only a list that asks nothing more of its servers
-    // qualifies: one encrypted server, another port or an answer that must be
-    // authenticated or validated here leaves the tunnel resolver with no server at all, so no
-    // name can reach a listed server in clear by that path.
-    fn wireguard_resolver_ips(&self) -> Vec<IpAddr> {
-        let servers = self.proxy_dns_servers();
-        let plain_only = self.dns.trust == DnsTrust::AsSent
-            && servers
-                .iter()
-                .all(|server| server.engine() == DnsServer::plain(server.address.ip()));
-        if !plain_only {
+    // The tunnel's DNS servers in the engine's terms: each asked in plain
+    // on port 53 from inside the tunnel.
+    pub fn tunnel_dns(&self) -> Vec<DnsServer> {
+        if self.kind != ProxyKind::WireGuard {
             return Vec::new();
         }
-        servers.iter().map(|server| server.address.ip()).collect()
+        self.dns_servers
+            .iter()
+            .copied()
+            .map(DnsServer::plain)
+            .collect()
     }
     // What a save checks of the profile's own settings, apart from its
     // secrets: what can be judged of a profile whose secrets are not in hand.
@@ -473,7 +139,21 @@ impl ProxyProfile {
         if self.tunnel_addresses.len() > MAX_TUNNEL_ADDRESSES {
             return Err(Refusal::ProxyAddressCount);
         }
-        self.dns.validate(self.kind)
+        if self.dns_servers.len() > super::MAX_DNS_SERVERS {
+            return Err(Refusal::ProxyDnsServerCount);
+        }
+        if self
+            .dns_servers
+            .iter()
+            .enumerate()
+            .any(|(at, ip)| self.dns_servers[..at].contains(ip))
+        {
+            return Err(Refusal::ProxyDnsServerDuplicate);
+        }
+        if self.kind != ProxyKind::WireGuard && !self.dns_servers.is_empty() {
+            return Err(Refusal::ProxyDnsServerInvalid);
+        }
+        Ok(())
     }
     // Everything a save checks: the profile's own settings, then those that
     // need its secrets, such as a WireGuard or SSH key.
@@ -636,7 +316,13 @@ impl ProxyProfile {
                 .iter()
                 .map(|s| s.parse())
                 .collect::<Result<_, _>>()?,
-            dns_servers: self.wireguard_resolver_ips(),
+            // The tunnel's own resolver asks only the first server it is
+            // given, so it is given one only when the tunnel lists exactly
+            // one; a longer list is asked by Weaver's own client in turn.
+            dns_servers: match self.dns_servers.as_slice() {
+                [only] => vec![*only],
+                _ => Vec::new(),
+            },
             mtu: self.mtu,
             persistent_keepalive: self.keepalive_seconds.filter(|v| *v != 0),
             request_timeout: self.timeout(),
@@ -656,6 +342,11 @@ pub struct RoutingPolicy {
     pub legs: Vec<super::RouteLeg>,
     #[serde(default)]
     pub failover: super::Failover,
+    // The DNS profile the route's names follow, stored in its own column
+    // beside the policy. None on a save keeps the stored profile, or takes
+    // the System profile for a new route; a loaded route always has one.
+    #[serde(skip)]
+    pub dns_profile_id: Option<u32>,
 }
 impl Default for RoutingPolicy {
     fn default() -> Self {
@@ -664,10 +355,15 @@ impl Default for RoutingPolicy {
             allow_direct: true,
             legs: Vec::new(),
             failover: super::Failover::Redistribute,
+            dns_profile_id: None,
         }
     }
 }
 impl RoutingPolicy {
+    // The DNS profile the route's names follow.
+    pub fn dns_profile(&self) -> u32 {
+        self.dns_profile_id.unwrap_or(super::SYSTEM_DNS_PROFILE_ID)
+    }
     pub fn route(&self) -> super::Route {
         if self.legs.is_empty() {
             super::Route::from_legacy(self)
@@ -710,6 +406,7 @@ impl RoutingPolicy {
             allow_direct,
             legs: route.legs,
             failover: route.failover,
+            dns_profile_id: None,
         }
     }
 
@@ -815,475 +512,5 @@ impl Default for RoutingStatus {
             selected_proxy_id: None,
             failures: Vec::new(),
         }
-    }
-}
-
-#[cfg(test)]
-mod dns_tests {
-    use super::*;
-    use crate::proxies::NetworkRefusal as R;
-
-    fn socks(dns: ProxyDns) -> ProxyProfile {
-        ProxyProfile {
-            id: 1,
-            name: "proxy".into(),
-            kind: ProxyKind::Socks5,
-            enabled: true,
-            host: "192.0.2.1".into(),
-            port: 1080,
-            dns,
-            tunnel_addresses: vec![],
-            peer_public_key: None,
-            mtu: 1420,
-            keepalive_seconds: None,
-            timeout_seconds: 30,
-            host_key_fingerprint: None,
-            revision: 0,
-            natpmp: false,
-            forwarded_port: None,
-            secrets: ProxySecrets::default(),
-        }
-    }
-
-    fn servers(path: DnsPath, trust: DnsTrust, wires: Vec<ProxyDnsWire>) -> ProxyDns {
-        ProxyDns {
-            who: DnsWho::Servers,
-            path,
-            servers: wires
-                .into_iter()
-                .enumerate()
-                .map(|(index, wire)| ProxyDnsServer {
-                    address: SocketAddr::new([192, 0, 2, 53 + index as u8].into(), 853),
-                    wire,
-                })
-                .collect(),
-            trust,
-        }
-    }
-
-    fn plain() -> ProxyDnsWire {
-        ProxyDnsWire::Plain
-    }
-
-    fn tls() -> ProxyDnsWire {
-        ProxyDnsWire::Tls {
-            name: Some("dns.example".into()),
-        }
-    }
-
-    fn https() -> ProxyDnsWire {
-        ProxyDnsWire::Https {
-            path: "/dns-query".into(),
-        }
-    }
-
-    fn checked(wires: Vec<ProxyDnsWire>) -> Result<(), R> {
-        socks(servers(DnsPath::ThroughProxy, DnsTrust::AsSent, wires)).validate()
-    }
-
-    // A lookup never goes out in clear once an encrypted server failed it.
-    #[test]
-    fn a_plain_server_may_lead_but_never_follow_an_encrypted_one() {
-        assert_eq!(
-            checked(vec![tls(), plain()]),
-            Err(R::ProxyDnsPlainAfterEncrypted)
-        );
-        assert_eq!(
-            checked(vec![https(), plain()]),
-            Err(R::ProxyDnsPlainAfterEncrypted)
-        );
-        assert_eq!(
-            checked(vec![plain(), tls(), plain()]),
-            Err(R::ProxyDnsPlainAfterEncrypted)
-        );
-        assert_eq!(checked(vec![plain(), tls()]), Ok(()));
-        assert_eq!(checked(vec![plain(), plain()]), Ok(()));
-        assert_eq!(checked(vec![tls(), https()]), Ok(()));
-    }
-
-    #[test]
-    fn a_server_list_is_bounded_and_each_server_well_formed() {
-        assert_eq!(checked(vec![]), Err(R::ProxyDnsServersRequired));
-        assert_eq!(checked(vec![plain(); MAX_DNS_SERVERS]), Ok(()));
-        assert_eq!(checked(vec![plain(); 10]), Ok(()));
-        assert_eq!(checked(vec![plain(); 11]), Err(R::ProxyDnsServerCount));
-        // Ten encrypted servers after a plain one are eleven.
-        let mut wires = vec![plain()];
-        wires.extend(vec![tls(); 10]);
-        assert_eq!(checked(wires), Err(R::ProxyDnsServerCount));
-
-        let mut zero = servers(DnsPath::ThroughProxy, DnsTrust::AsSent, vec![plain()]);
-        zero.servers[0].address.set_port(0);
-        assert_eq!(socks(zero).validate(), Err(R::ProxyDnsServerInvalid));
-
-        let tls_named = |name: &str| ProxyDnsWire::Tls {
-            name: Some(name.into()),
-        };
-        assert_eq!(checked(vec![ProxyDnsWire::Tls { name: None }]), Ok(()));
-        assert_eq!(checked(vec![tls_named("dns.example.")]), Ok(()));
-        for bad in [
-            "",
-            "not a name",
-            "-dns.example",
-            "dns..example",
-            "dns\u{e9}.example",
-        ] {
-            assert_eq!(
-                checked(vec![tls_named(bad)]),
-                Err(R::ProxyDnsTlsNameInvalid),
-                "{bad:?}"
-            );
-        }
-        assert_eq!(checked(vec![tls_named(&["a"; 127].join("."))]), Ok(()));
-        assert_eq!(
-            checked(vec![tls_named(&["a"; 128].join("."))]),
-            Err(R::ProxyDnsTlsNameInvalid)
-        );
-
-        let path = |path: &str| ProxyDnsWire::Https { path: path.into() };
-        assert_eq!(checked(vec![path("/dns-query?ct=1")]), Ok(()));
-        assert_eq!(
-            checked(vec![path(&format!("/{}", "a".repeat(2047)))]),
-            Ok(())
-        );
-        for bad in [
-            String::new(),
-            "dns-query".into(),
-            "/dns query".into(),
-            "/dns\tquery".into(),
-            "/dns-query#top".into(),
-            "/d\u{e9}".into(),
-            format!("/{}", "a".repeat(2048)),
-        ] {
-            assert_eq!(
-                checked(vec![path(&bad)]),
-                Err(R::ProxyDnsUrlInvalid),
-                "{bad:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn who_answers_decides_what_a_wireguard_proxy_may_save() {
-        let wireguard = |dns: &ProxyDns| dns.validate(ProxyKind::WireGuard);
-        assert_eq!(
-            wireguard(&ProxyDns::proxy()),
-            Err(R::ProxyWireGuardNeedsDnsServers)
-        );
-        assert_eq!(wireguard(&ProxyDns::host()), Ok(()));
-        // Servers asked from the egress are taken from a WireGuard proxy, and
-        // a plain server asked there may still require authenticated answers.
-        let direct = servers(DnsPath::Direct, DnsTrust::RequireAd, vec![plain()]);
-        assert_eq!(wireguard(&direct), Ok(()));
-        assert_eq!(socks(direct).validate(), Ok(()));
-    }
-
-    #[test]
-    fn a_saved_dns_says_who_resolves_and_what_the_tunnel_asks() {
-        let through = servers(DnsPath::ThroughProxy, DnsTrust::AsSent, vec![plain()]);
-        let direct = servers(DnsPath::Direct, DnsTrust::AsSent, vec![plain()]);
-        assert_eq!(
-            socks(ProxyDns::host()).resolved_by(),
-            super::super::ResolvedBy::Host
-        );
-        assert_eq!(
-            socks(ProxyDns::proxy()).resolved_by(),
-            super::super::ResolvedBy::Proxy
-        );
-        assert_eq!(
-            socks(direct.clone()).resolved_by(),
-            super::super::ResolvedBy::Servers
-        );
-        assert_eq!(
-            socks(through.clone()).resolved_by(),
-            super::super::ResolvedBy::ProxyServers
-        );
-        assert_eq!(
-            socks(through.clone()).proxy_dns_servers(),
-            &through.servers[..]
-        );
-        assert!(socks(direct).proxy_dns_servers().is_empty());
-    }
-
-    #[test]
-    fn a_dns_that_names_no_servers_is_stored_in_one_form() {
-        let loose = ProxyDns {
-            who: DnsWho::Host,
-            path: DnsPath::Direct,
-            servers: vec![ProxyDnsServer {
-                address: "192.0.2.53:53".parse().unwrap(),
-                wire: plain(),
-            }],
-            trust: DnsTrust::RequireAd,
-        };
-        assert_eq!(loose.clone().normal(), ProxyDns::host());
-        let kept = servers(DnsPath::Direct, DnsTrust::RequireAd, vec![tls()]);
-        assert_eq!(kept.clone().normal(), kept);
-        let validated = ProxyDns {
-            trust: DnsTrust::Validate,
-            ..loose
-        };
-        assert_eq!(validated.normal(), ProxyDns::host());
-        let kept = servers(DnsPath::ThroughProxy, DnsTrust::Validate, vec![plain()]);
-        assert_eq!(kept.clone().normal(), kept);
-    }
-
-    // Validating here asks listed servers like the other trusts do: it needs
-    // one, and the engine is told to validate.
-    #[test]
-    fn validating_here_needs_listed_servers_and_reaches_the_engine() {
-        let none = servers(DnsPath::Direct, DnsTrust::Validate, Vec::new());
-        assert_eq!(
-            none.validate(ProxyKind::Socks5),
-            Err(R::ProxyDnsServersRequired)
-        );
-        let listed = servers(DnsPath::Direct, DnsTrust::Validate, vec![plain()]);
-        assert_eq!(listed.validate(ProxyKind::Socks5), Ok(()));
-        assert_eq!(listed.validate(ProxyKind::WireGuard), Ok(()));
-        assert_eq!(listed.engine_trust(), Trust::Validate);
-        let stored = serde_json::to_value(&listed).unwrap();
-        assert_eq!(stored["trust"], "Validate");
-        assert_eq!(serde_json::from_value::<ProxyDns>(stored).unwrap(), listed);
-    }
-
-    // A WireGuard profile whose DNS servers are `listed`, each at its own
-    // address and port, asked through the tunnel with `trust`.
-    fn wireguard(trust: DnsTrust, listed: Vec<(u16, ProxyDnsWire)>) -> ProxyProfile {
-        let mut profile = socks(ProxyDns {
-            who: DnsWho::Servers,
-            path: DnsPath::ThroughProxy,
-            servers: listed
-                .into_iter()
-                .enumerate()
-                .map(|(index, (port, wire))| ProxyDnsServer {
-                    address: SocketAddr::new([10, 64, 0, 1 + index as u8].into(), port),
-                    wire,
-                })
-                .collect(),
-            trust,
-        });
-        profile.kind = ProxyKind::WireGuard;
-        profile.port = 51820;
-        profile.tunnel_addresses = vec!["10.63.0.2/32".into()];
-        profile.peer_public_key = Some("AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=".into());
-        profile.secrets.private_key = Some("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".into());
-        profile
-    }
-
-    fn tunnel_resolver(profile: &ProxyProfile) -> Vec<IpAddr> {
-        profile.validate().unwrap();
-        profile.wireguard_spec_capped(8).unwrap().dns_servers
-    }
-
-    #[test]
-    fn the_tunnel_resolver_gets_a_list_only_of_plain_servers_on_port_53() {
-        let plain = wireguard(DnsTrust::AsSent, vec![(53, plain()), (53, plain())]);
-        assert_eq!(
-            tunnel_resolver(&plain),
-            vec![IpAddr::from([10, 64, 0, 1]), IpAddr::from([10, 64, 0, 2])]
-        );
-    }
-
-    #[test]
-    fn the_tunnel_resolver_gets_no_server_a_name_could_reach_in_clear() {
-        let cases = [
-            ("tls", wireguard(DnsTrust::AsSent, vec![(853, tls())])),
-            ("https", wireguard(DnsTrust::AsSent, vec![(443, https())])),
-            ("tls on 53", wireguard(DnsTrust::AsSent, vec![(53, tls())])),
-            (
-                "plain then tls",
-                wireguard(DnsTrust::AsSent, vec![(53, plain()), (853, tls())]),
-            ),
-            (
-                "plain then https",
-                wireguard(DnsTrust::AsSent, vec![(53, plain()), (443, https())]),
-            ),
-            (
-                "plain off 53",
-                wireguard(DnsTrust::AsSent, vec![(5353, plain())]),
-            ),
-            (
-                "plain, one off 53",
-                wireguard(DnsTrust::AsSent, vec![(53, plain()), (5353, plain())]),
-            ),
-            (
-                "require ad",
-                wireguard(DnsTrust::RequireAd, vec![(53, plain())]),
-            ),
-            (
-                "validate",
-                wireguard(DnsTrust::Validate, vec![(53, plain()), (53, plain())]),
-            ),
-        ];
-        for (case, profile) in cases {
-            assert!(tunnel_resolver(&profile).is_empty(), "{case}");
-        }
-    }
-
-    // A DoH path is one the request can be built with: every path the check
-    // accepts is an HTTP path and query, and every character a URI refuses
-    // there is refused here.
-    #[test]
-    fn a_doh_path_holds_only_what_an_http_request_carries() {
-        let every: String = (b'!'..=b'~').map(char::from).collect();
-        let allowed: String = every
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || "-._~!$&'()*+,;=:@/%?".contains(*c))
-            .collect();
-        for accepted in [
-            "/".to_owned(),
-            "/dns-query".to_owned(),
-            "/dns-query?ct=application/dns-message&x=1".to_owned(),
-            format!("/{allowed}"),
-            format!("/{}", "a".repeat(MAX_HTTPS_PATH_BYTES - 1)),
-        ] {
-            assert!(is_https_path(&accepted), "{accepted}");
-            let uri: http::Uri = accepted.parse().unwrap();
-            assert_eq!(uri.path_and_query().unwrap().as_str(), accepted);
-        }
-        for refused in "<>`\"{}|\\^[] #".chars() {
-            let path = format!("/a{refused}b");
-            assert!(!is_https_path(&path), "{path}");
-        }
-        for byte in every.chars().filter(|c| !allowed.contains(*c)) {
-            let path = format!("/a{byte}b");
-            assert!(!is_https_path(&path), "{path}");
-        }
-        assert!(!is_https_path("dns-query"));
-        assert!(!is_https_path(""));
-        assert!(!is_https_path(&format!(
-            "/{}",
-            "a".repeat(MAX_HTTPS_PATH_BYTES)
-        )));
-        assert!(!is_https_path("/a\u{e9}"));
-    }
-
-    fn egress_servers(trust: DnsTrust, wires: Vec<ProxyDnsWire>) -> EgressDns {
-        let ProxyDns { servers, .. } = servers(DnsPath::Direct, trust, wires);
-        EgressDns {
-            who: DnsWho::Servers,
-            servers,
-            trust,
-        }
-    }
-
-    // An egress's DNS keeps every rule a proxy's listed servers keep, and
-    // has no proxy to hand a name to.
-    #[test]
-    fn an_egress_dns_keeps_the_server_rules_and_has_no_proxy() {
-        assert_eq!(EgressDns::host().validate(), Ok(()));
-        assert_eq!(EgressDns::default(), EgressDns::host());
-        let proxy = EgressDns {
-            who: DnsWho::Proxy,
-            ..EgressDns::host()
-        };
-        assert_eq!(proxy.validate(), Err(R::EgressDnsWhoInvalid));
-        let checked = |wires| egress_servers(DnsTrust::AsSent, wires).validate();
-        assert_eq!(checked(vec![]), Err(R::ProxyDnsServersRequired));
-        assert_eq!(checked(vec![plain(); 10]), Ok(()));
-        assert_eq!(checked(vec![plain(); 11]), Err(R::ProxyDnsServerCount));
-        assert_eq!(
-            checked(vec![tls(), plain()]),
-            Err(R::ProxyDnsPlainAfterEncrypted)
-        );
-        assert_eq!(checked(vec![plain(), tls(), https()]), Ok(()));
-        let mut zero = egress_servers(DnsTrust::AsSent, vec![plain()]);
-        zero.servers[0].address.set_port(0);
-        assert_eq!(zero.validate(), Err(R::ProxyDnsServerInvalid));
-        assert_eq!(
-            checked(vec![ProxyDnsWire::Tls {
-                name: Some("not a name".into())
-            }]),
-            Err(R::ProxyDnsTlsNameInvalid)
-        );
-        assert_eq!(
-            checked(vec![ProxyDnsWire::Https {
-                path: "dns-query".into()
-            }]),
-            Err(R::ProxyDnsUrlInvalid)
-        );
-    }
-
-    // One address, port and wire, with one TLS name or HTTPS path, is one
-    // server, and a proxy or an egress lists it once. The same address over
-    // another wire, port, name or path is another server.
-    #[test]
-    fn a_server_is_listed_once_and_another_wire_is_another_server() {
-        let at = |port, wire| ProxyDnsServer {
-            address: SocketAddr::new([192, 0, 2, 53].into(), port),
-            wire,
-        };
-        let name = |name: &str| ProxyDnsWire::Tls {
-            name: Some(name.into()),
-        };
-        let path = |path: &str| ProxyDnsWire::Https { path: path.into() };
-        let proxy = |list: Vec<ProxyDnsServer>| {
-            socks(ProxyDns {
-                servers: list,
-                ..servers(DnsPath::ThroughProxy, DnsTrust::AsSent, vec![])
-            })
-            .validate()
-        };
-        let egress = |list: Vec<ProxyDnsServer>| {
-            EgressDns {
-                servers: list,
-                ..egress_servers(DnsTrust::AsSent, vec![])
-            }
-            .validate()
-        };
-        let repeated = [
-            vec![at(53, plain()), at(53, plain())],
-            vec![at(53, plain()), at(853, tls()), at(853, tls())],
-            vec![at(853, tls()), at(443, https()), at(853, tls())],
-            vec![at(443, https()), at(443, https())],
-        ];
-        for list in repeated {
-            assert_eq!(proxy(list.clone()), Err(R::ProxyDnsServerDuplicate));
-            assert_eq!(egress(list), Err(R::ProxyDnsServerDuplicate));
-        }
-        let distinct = [
-            vec![at(53, plain()), at(53, tls())],
-            vec![at(53, plain()), at(5353, plain())],
-            vec![at(853, name("a.example")), at(853, name("b.example"))],
-            vec![
-                at(853, ProxyDnsWire::Tls { name: None }),
-                at(853, name("a.example")),
-            ],
-            vec![at(443, path("/dns-query")), at(443, path("/other"))],
-        ];
-        for list in distinct {
-            assert_eq!(proxy(list.clone()), Ok(()));
-            assert_eq!(egress(list), Ok(()));
-        }
-    }
-
-    #[test]
-    fn an_egress_dns_that_names_no_servers_is_stored_as_the_host() {
-        let loose = EgressDns {
-            who: DnsWho::Host,
-            ..egress_servers(DnsTrust::Validate, vec![tls()])
-        };
-        assert_eq!(loose.clone().normal(), EgressDns::host());
-        assert!(loose.normal().is_host());
-        let kept = egress_servers(DnsTrust::RequireAd, vec![plain(), https()]);
-        assert_eq!(kept.clone().normal(), kept);
-        assert_eq!(kept.resolved_by(), super::super::ResolvedBy::Servers);
-        assert_eq!(
-            EgressDns::host().resolved_by(),
-            super::super::ResolvedBy::Host
-        );
-        let (servers, trust) = kept.engine().unwrap();
-        assert_eq!(trust, Trust::RequireAd);
-        assert_eq!(servers.len(), 2);
-        assert_eq!(
-            servers[1].wire,
-            Wire::Https {
-                path: "/dns-query".into()
-            }
-        );
-        assert!(EgressDns::host().engine().is_none());
-        // The stored form reads back as written.
-        let json = serde_json::to_string(&kept).unwrap();
-        assert_eq!(serde_json::from_str::<EgressDns>(&json).unwrap(), kept);
     }
 }

@@ -2062,17 +2062,10 @@ fn networking_renders_leg_egress_pool_and_tunnel_families() {
         &rendered,
         "weaver_network_dns_trust_total",
         "outcome",
-        &[
-            "as_sent",
-            "authenticated",
-            "bogus",
-            "refused",
-            "unsigned",
-            "validated",
-        ],
+        &["as_sent", "bogus", "unsigned", "validated"],
     );
     assert!(rendered.contains("weaver_network_dns_answers_total{wire=\"tls\"} 5"));
-    assert!(rendered.contains("weaver_network_dns_trust_total{outcome=\"refused\"} 2"));
+    assert!(rendered.contains("weaver_network_dns_trust_total{outcome=\"as_sent\"} 9"));
     assert!(rendered.contains("weaver_network_dns_trust_total{outcome=\"validated\"} 6"));
     assert!(rendered.contains("weaver_network_dns_trust_total{outcome=\"unsigned\"} 8"));
     assert!(rendered.contains("weaver_network_dns_trust_total{outcome=\"bogus\"} 1"));

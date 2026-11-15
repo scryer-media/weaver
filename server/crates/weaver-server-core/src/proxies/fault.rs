@@ -88,16 +88,14 @@ mod tests {
         let private = STANDARD.encode([7u8; 32]);
         let preshared = STANDARD.encode([5u8; 32]);
         let profile = ProxyProfile {
+            dns_profile_id: 0,
             id: 1,
             name: "Frankfurt".into(),
             kind: ProxyKind::WireGuard,
             enabled: true,
             host: "fra.vpn.example".into(),
             port: 51820,
-            dns: crate::proxies::ProxyDns::plain(
-                crate::proxies::DnsPath::ThroughProxy,
-                ["10.2.0.1".parse().unwrap()],
-            ),
+            dns_servers: vec!["10.2.0.1".parse().unwrap()],
             tunnel_addresses: vec!["10.2.0.2/32".into()],
             peer_public_key: Some(STANDARD.encode([9u8; 32])),
             mtu: 1420,
@@ -134,8 +132,10 @@ mod tests {
             refused(&|p| p.secrets.preshared_key = Some(format!("{preshared}x"))),
             refused(&|p| p.secrets.preshared_key = Some(preshared[..40].to_string())),
             refused(&|p| p.peer_public_key = Some(own_key.clone())),
-            refused(&|p| p.dns = crate::proxies::ProxyDns::proxy()),
-            refused(&|p| p.dns.servers.clear()),
+            refused(&|p| p.dns_servers.push("10.2.0.1".parse().unwrap())),
+            refused(&|p| {
+                p.dns_servers = (1..=11).map(|n| [10, 2, 0, n].into()).collect();
+            }),
         ];
         for refusal in &refusals {
             texts.push(format!("{refusal} {refusal:?}"));

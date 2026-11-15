@@ -12,8 +12,9 @@ use weaver_tunnel::{
     Http3TunnelProvider, SshTunnelProvider, TunnelProvider, WireGuardTunnelProvider,
     egress::SocketEgress,
     pipe::{
-        DialError, DialPath, Dialed, Dialer, Egress, Fallback, InnerTransport, Naming, Revocable,
-        SessionHop, SessionSockets, SocketShares, Target, TransportHop,
+        DialError, DialPath, Dialed, Dialer, DnsChoice, Egress, Fallback, InnerTransport, Names,
+        NamesSlot, Naming, Revocable, SessionHop, SessionSockets, SocketShares, Target,
+        TransportHop,
     },
     transport::{TransportKind, TransportProxy},
 };
@@ -35,16 +36,21 @@ pub use torrent::{
 #[path = "network_test_via.rs"]
 mod test_via;
 pub use test_via::{
-    HostResolution, LookupError, LookupFailure, MAX_TEST_PATHS, P2pTest, PathTest, ResolvedBy,
-    TestSubject, TrustOutcome,
+    DnsProbed, DnsServerProbe, DnsServerTest, HostResolution, LookupError, LookupFailure,
+    MAX_TEST_PATHS, P2pTest, PathTest, ResolvedBy, TestSubject, TrustOutcome,
 };
 
 // The health reason of an egress whose download quota is used up.
 pub const QUOTA_REACHED: &str = "Quota reached";
 
-// How long an egress's listed DNS server is given to accept a connection.
-// The lookup as a whole stays inside the dial or resolve that asked for it.
-const EGRESS_DNS_DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+// How long a listed DNS server is given to accept a connection. The lookup
+// as a whole stays inside the dial or resolve that asked for it.
+const DNS_SERVER_DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+// What a stage resolves when no route's DNS profile is in scope. Every dial
+// of a route carries its profile, so nothing reaches this but a mistake, and
+// a mistake fails rather than asking the host.
+const UNSCOPED_NAMES: &str = "no route's DNS profile is in scope for this lookup";
 
 #[derive(Clone)]
 struct Configuration {
@@ -59,19 +65,12 @@ struct Configuration {
     socket_cap: usize,
     // How the routes share each WireGuard session's sockets.
     socket_ledger: HashMap<SessionPath, TunnelSockets>,
-    // The naming of each egress whose names go to listed servers, shared by
-    // every leg and hop on it: its answers, TLS sessions and DNSSEC state
-    // belong to that egress's setting and to no other.
-    namings: HashMap<u32, Naming>,
+    // The saved DNS server lists and profiles.
+    dns: Arc<StoredDns>,
 }
 impl Configuration {
     fn load(db: &Database) -> Result<Self, String> {
-        // An egress whose stored DNS cannot be read is left out: its legs are
-        // down, as a missing egress's are, and never resolve by the host.
-        let (egresses, unreadable) = db.load_egress_interfaces().map_err(|e| e.to_string())?;
-        let unreadable: HashMap<u32, String> = unreadable.into_iter().collect();
         let mut configuration = Self {
-            namings: HashMap::new(),
             warnings: HashMap::new(),
             socket_cap: super::wireguard_socket_cap(),
             socket_ledger: HashMap::new(),
@@ -81,7 +80,12 @@ impl Configuration {
                 .into_iter()
                 .map(Consumer::key)
                 .collect(),
-            egresses: egresses.into_iter().map(|e| (e.id, e)).collect(),
+            egresses: db
+                .list_egress_interfaces()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|e| (e.id, e))
+                .collect(),
             profiles: db
                 .list_proxy_profiles()
                 .map_err(|e| e.to_string())?
@@ -99,6 +103,7 @@ impl Configuration {
                 .map_err(|e| e.to_string())?
                 .into_iter()
                 .collect(),
+            dns: Arc::new(db.load_dns().map_err(|e| e.to_string())?),
         };
         let connections: HashMap<u32, u16> = db
             .list_servers()
@@ -108,19 +113,25 @@ impl Configuration {
             .map(|server| (server.id, server.connections))
             .collect();
         configuration.socket_ledger = configuration.ledger(&connections);
-        configuration.name_egresses();
         let mut missing = Vec::new();
         for (consumer, policy) in &configuration.policies {
+            // A route whose DNS profile cannot be used resolves nothing, and
+            // each of its legs says why.
+            let dns = match configuration.dns_choice(policy.dns_profile()) {
+                DnsChoice::Refused(reason) => Some(reason),
+                _ => None,
+            };
             for (position, leg) in policy.legs.iter().enumerate() {
-                if let Some(fault) = unreadable.get(&leg.egress_id) {
-                    missing.push((
-                        (consumer.clone(), position),
-                        format!("Egress {}'s stored DNS setting cannot be read ({fault}); this leg is Down until its egress is repaired.", leg.egress_id),
-                    ));
-                } else if !configuration.egresses.contains_key(&leg.egress_id) {
+                if !configuration.egresses.contains_key(&leg.egress_id) {
                     missing.push((
                         (consumer.clone(), position),
                         format!("Restored egress {} is missing; this leg is Down until its egress is repaired.", leg.egress_id),
+                    ));
+                }
+                if let Some(reason) = &dns {
+                    missing.push((
+                        (consumer.clone(), position),
+                        format!("The route's DNS cannot be used: {reason}. Nothing this leg dials by name is resolved until it is repaired."),
                     ));
                 }
             }
@@ -132,42 +143,47 @@ impl Configuration {
         configuration.warn_peer_clamps(db.torrent_peer_limit().map_err(|e| e.to_string())?);
         Ok(configuration)
     }
-    // A fresh naming for every egress whose names go to listed servers.
-    fn name_egresses(&mut self) {
-        self.namings = self
-            .egresses
-            .values()
-            .filter_map(|egress| {
-                let (servers, trust) = egress.dns.engine()?;
-                let carrier = NetworkRuntime::socket_egress(egress, EGRESS_DNS_DIAL_TIMEOUT, None);
-                Some((egress.id, carrier.servers_naming(servers, trust)))
+    // Profile `id`, refused as a route's save refuses it unless a route may
+    // name by it.
+    pub(super) fn route_profile(&self, id: u32) -> Result<super::DnsProfile, NetworkRefusal> {
+        let profile = self
+            .dns
+            .profile(id)
+            .ok_or(NetworkRefusal::DnsProfileNotFound)?;
+        profile.select_as(super::DnsProfileKind::Route)?;
+        Ok(profile)
+    }
+    // The DNS profile `consumer`'s route names.
+    fn dns_profile_of(&self, consumer: &str) -> u32 {
+        self.policies
+            .get(consumer)
+            .map_or(super::SYSTEM_DNS_PROFILE_ID, RoutingPolicy::dns_profile)
+    }
+    // The DNS profile a torrent leg on egress `egress_id` and `path` names
+    // its session's own lookups by: that of the first torrent route on it by
+    // consumer key, System when none stored is on it.
+    fn torrent_leg_profile(&self, egress_id: u32, path: &LegPath) -> u32 {
+        self.policies
+            .iter()
+            .filter(|(key, _)| key.starts_with("torrent:"))
+            .filter(|(_, policy)| {
+                policy
+                    .route()
+                    .legs
+                    .first()
+                    .is_some_and(|leg| leg.egress_id == egress_id && leg.path == *path)
             })
-            .collect();
+            .min_by(|(a, _), (b, _)| a.cmp(b))
+            .map_or(super::SYSTEM_DNS_PROFILE_ID, |(_, policy)| {
+                policy.dns_profile()
+            })
     }
-    // What a leg or session on egress `id` adds to its signature for the
-    // egress's DNS: nothing when the host resolves, so every leg saved
-    // before the setting keeps its signature.
-    fn dns_signature(&self, id: u32) -> Result<Option<String>, String> {
-        match self.egresses.get(&id).map(|egress| &egress.dns) {
-            Some(dns) if !dns.is_host() => serde_json::to_string(dns)
-                .map(|json| Some(format!(":dns={json}")))
-                .map_err(|e| e.to_string()),
-            _ => Ok(None),
-        }
-    }
-    // Keeps `prior`'s naming for each egress saved with the same binding
-    // and DNS, so a save that does not touch an egress's DNS keeps what its
-    // servers answered and the sessions open to them.
-    fn keep_namings(&mut self, prior: &Self) {
-        for (id, naming) in &mut self.namings {
-            let unchanged = matches!(
-                (self.egresses.get(id), prior.egresses.get(id)),
-                (Some(next), Some(old)) if next.binding == old.binding && next.dns == old.dns
-            );
-            if let Some(kept) = prior.namings.get(id).filter(|_| unchanged) {
-                *naming = kept.clone();
-            }
-        }
+    // Who answers the names a route on DNS profile `id` dials. A profile
+    // that is gone, or whose server list cannot be read, answers nothing.
+    fn dns_choice(&self, id: u32) -> DnsChoice {
+        self.dns
+            .choice(id)
+            .unwrap_or_else(|| DnsChoice::Refused(format!("DNS profile {id} does not exist")))
     }
     // Hand route health the routes of every consumer that still exists.
     fn configure_health(&self, health: &RouteHealth) {
@@ -391,13 +407,128 @@ pub struct LiveNetworkRoute {
     timeout: Duration,
 }
 
-type StagedPoolMembers = HashMap<(u32, u32), Vec<(u32, Arc<dyn Dialer>)>>;
+type StagedPoolMembers = HashMap<PoolKey, Vec<(u32, Arc<dyn Dialer>)>>;
 // The pools running now, by pool and egress.
 // A WireGuard session's path, the cap its tunnel was built to, and its
 // socket shares.
 pub(super) type SessionSocketMap =
     Arc<Mutex<HashMap<String, (SessionPath, usize, Arc<SessionSockets>)>>>;
-pub(super) type RunningPools = Arc<Mutex<HashMap<(u32, u32), Arc<PoolStage>>>>;
+// Running pools by pool and egress.
+pub(super) type PoolKey = (u32, u32);
+pub(super) type RunningPools = Arc<Mutex<HashMap<PoolKey, Arc<PoolStage>>>>;
+
+// The owner of the slot a proxy's hop looks its own address up with: this
+// and the proxy's id. The slot holds the names of the DNS profile the proxy
+// selects, never a route's.
+const PROXY_NAME_OWNER: &str = "proxy-name:";
+
+fn proxy_name_owner(proxy: u32) -> String {
+    format!("{PROXY_NAME_OWNER}{proxy}")
+}
+
+// The owner of the slot a torrent leg dials with: this and the leg's path.
+const TORRENT_LEG_OWNER: &str = "torrent-leg:";
+
+// The names of one DNS profile on one egress, and the setting they answer
+// for. They hold that setting's answers and DNSSEC state.
+#[derive(Clone)]
+struct NamedEgress {
+    choice: DnsChoice,
+    binding: EgressBinding,
+    names: Names,
+}
+
+// The names every route dials with, kept across reloads: a save that leaves
+// a profile and its egress alone keeps what was answered, and one that
+// changes either puts fresh names in the slots, which every leg and session
+// built on them reads at its next dial. Nothing is rebuilt for it.
+#[derive(Default)]
+pub(super) struct RouteNames {
+    // By DNS profile and egress.
+    named: HashMap<(u32, u32), NamedEgress>,
+    // The slot the legs of a route on an egress dial with, by owner and
+    // egress. A route's own legs are owned by the route. A torrent leg is
+    // shared by every torrent route on it, whatever its profile, and is
+    // owned by its path: it names as the first of those routes by key does.
+    // Each torrent route's own lookups name by a slot the route owns.
+    slots: HashMap<(String, u32), Arc<NamesSlot>>,
+}
+pub(super) type SharedRouteNames = Arc<Mutex<RouteNames>>;
+
+impl RouteNames {
+    // The names of profile `profile` on `egress` as `config` sets them: the
+    // ones held when the setting and the egress's binding are unchanged,
+    // otherwise fresh ones, which hold no answer.
+    fn names(&mut self, config: &Configuration, profile: u32, egress: &EgressInterface) -> Names {
+        let choice = config.dns_choice(profile);
+        match self.named.get(&(profile, egress.id)) {
+            Some(held) if held.choice == choice && held.binding == egress.binding => {
+                held.names.clone()
+            }
+            _ => {
+                let carrier: Arc<dyn Dialer> = Arc::new(NetworkRuntime::socket_egress(
+                    egress,
+                    DNS_SERVER_DIAL_TIMEOUT,
+                ));
+                let names = Names::new(choice.clone(), Some(carrier));
+                self.named.insert(
+                    (profile, egress.id),
+                    NamedEgress {
+                        choice,
+                        binding: egress.binding.clone(),
+                        names: names.clone(),
+                    },
+                );
+                names
+            }
+        }
+    }
+    // The owner of the slot `consumer`'s leg on `path` dials with.
+    fn owner(consumer: Consumer, path: &LegPath) -> String {
+        if consumer.shares_legs() {
+            format!(
+                "{TORRENT_LEG_OWNER}{}",
+                serde_json::to_string(path).unwrap_or_default()
+            )
+        } else {
+            consumer.key()
+        }
+    }
+    // Puts in every slot still held the names `config` gives it, and lets go
+    // of what nothing holds. Names that did not change stay as they are.
+    fn refresh(&mut self, config: &Configuration) {
+        self.slots.retain(|_, slot| Arc::strong_count(slot) > 1);
+        let slots: Vec<_> = self
+            .slots
+            .iter()
+            .map(|((owner, egress), slot)| (owner.clone(), *egress, slot.clone()))
+            .collect();
+        let mut used = HashSet::new();
+        for (owner, egress, slot) in slots {
+            let Some(egress) = config.egresses.get(&egress) else {
+                continue;
+            };
+            let profile = if let Some(path) = owner.strip_prefix(TORRENT_LEG_OWNER) {
+                match serde_json::from_str(path) {
+                    Ok(path) => config.torrent_leg_profile(egress.id, &path),
+                    Err(_) => continue,
+                }
+            } else if let Some(id) = owner.strip_prefix(PROXY_NAME_OWNER) {
+                // A proxy that is gone leaves its slot as it is: nothing
+                // builds a hop on it again.
+                match id.parse().ok().and_then(|id| config.profiles.get(&id)) {
+                    Some(proxy) => proxy.dns_profile_id,
+                    None => continue,
+                }
+            } else {
+                config.dns_profile_of(&owner)
+            };
+            used.insert((profile, egress.id));
+            slot.set(self.names(config, profile, egress));
+        }
+        self.named.retain(|key, _| used.contains(key));
+    }
+}
 
 pub struct NetworkRuntime {
     pub egress_controls: Arc<weaver_nntp::transfer::ServerTransferRegistry>,
@@ -447,6 +578,9 @@ pub struct NetworkRuntime {
     // Counts the reloads that took a saved configuration, so whoever waits
     // on a route to come up tries it again at once.
     reloads: tokio::sync::watch::Sender<u64>,
+    // The names the routes dial with. Shared with the staging runtime, which
+    // adds the slots of new legs; a reload's commit refreshes them all.
+    route_names: SharedRouteNames,
 }
 
 impl NetworkRuntime {
@@ -512,6 +646,7 @@ impl NetworkRuntime {
             route_health: Some(route_health),
             probing: false,
             reloads: tokio::sync::watch::Sender::new(0),
+            route_names: Arc::default(),
         });
         let weak = Arc::downgrade(&runtime);
         *runtime.poll.lock().expect("network health task") = Some(handle.spawn(async move {
@@ -635,21 +770,108 @@ impl NetworkRuntime {
             .get(&id)
             .cloned()
     }
-    /// Who resolves a destination's name dialled through proxy `id` as the
-    /// last hop above egress `egress_id`, when the proxy is configured.
-    pub fn resolved_by(&self, id: u32, egress_id: u32) -> Option<ResolvedBy> {
+    /// Who resolves a destination's name `consumer`'s route dials through
+    /// proxy `id` as the last hop, or straight out of its egress with none,
+    /// when the proxy is configured.
+    pub fn resolved_by(&self, consumer: Consumer, id: Option<u32>) -> Option<ResolvedBy> {
         let config = self.configuration.read().expect("network configuration");
-        let profile = config.profiles.get(&id)?;
-        Some(match config.egresses.get(&egress_id) {
-            Some(egress) => profile.resolved_on(&egress.dns),
-            None => profile.resolved_by(),
-        })
+        let exit = match id {
+            Some(id) => Some(config.profiles.get(&id)?),
+            None => None,
+        };
+        let profile = config.dns.profile(config.dns_profile_of(&consumer.key()))?;
+        profile.resolved_by(
+            exit.map(|proxy| proxy.kind),
+            exit.is_some_and(|proxy| !proxy.dns_servers.is_empty()),
+        )
     }
-    /// Egress `id` alone, with no proxy above it: what a direct leg's own
-    /// sockets dial out of, and how they look names up.
-    pub fn egress_dialer(&self, id: u32, timeout: Duration) -> Result<Arc<dyn Dialer>, String> {
+    /// The DNS profile `consumer`'s route names.
+    pub fn dns_profile_of(&self, consumer: Consumer) -> u32 {
+        self.configuration
+            .read()
+            .expect("network configuration")
+            .dns_profile_of(&consumer.key())
+    }
+    /// Egress `id` alone, with no proxy above it: what a direct leg of
+    /// `consumer`'s route dials out of with its own sockets, looking names up
+    /// the way the route's DNS profile says.
+    pub fn egress_dialer(
+        &self,
+        consumer: Consumer,
+        id: u32,
+        timeout: Duration,
+    ) -> Result<Arc<dyn Dialer>, String> {
         let config = self.configuration.read().expect("network configuration");
-        Ok(Self::bottom(&config, id, timeout)? as Arc<dyn Dialer>)
+        let bottom = Self::bottom(&config, id, timeout)?;
+        let names = self.leg_names(&config, consumer, id, &LegPath::Direct, None);
+        Ok(Arc::new(Revocable::named(bottom, names)))
+    }
+    // The slot `consumer`'s leg on egress `egress_id` and `path` dials with:
+    // the names of the route's DNS profile there, or of `profile` when one is
+    // given. A torrent leg names as its owner route does.
+    fn leg_names(
+        &self,
+        config: &Configuration,
+        consumer: Consumer,
+        egress_id: u32,
+        path: &LegPath,
+        profile: Option<u32>,
+    ) -> Arc<NamesSlot> {
+        let profile = profile.unwrap_or_else(|| {
+            if consumer.shares_legs() {
+                config.torrent_leg_profile(egress_id, path)
+            } else {
+                config.dns_profile_of(&consumer.key())
+            }
+        });
+        self.names_slot(
+            config,
+            RouteNames::owner(consumer, path),
+            profile,
+            egress_id,
+        )
+    }
+    /// The slot a torrent route's own lookups on egress `egress_id` name
+    /// by: its trackers' and web seeds'. It holds the names of the route's
+    /// DNS profile there, and a save puts the new ones in it.
+    pub fn torrent_names(&self, scope: TorrentScope, egress_id: u32) -> Arc<NamesSlot> {
+        let config = self.configuration.read().expect("network configuration");
+        let consumer = Consumer::Torrent(scope).key();
+        let profile = config.dns_profile_of(&consumer);
+        self.names_slot(&config, consumer, profile, egress_id)
+    }
+    // The slot `owner`'s dials on egress `egress_id` use, holding the names
+    // of DNS profile `profile` there.
+    fn names_slot(
+        &self,
+        config: &Configuration,
+        owner: String,
+        profile: u32,
+        egress_id: u32,
+    ) -> Arc<NamesSlot> {
+        let mut held = self.route_names.lock().expect("route names");
+        let Some(egress) = config.egresses.get(&egress_id) else {
+            return Arc::new(NamesSlot::new(Names::new(
+                DnsChoice::Refused(format!("egress {egress_id} does not exist")),
+                None,
+            )));
+        };
+        let names = held.names(config, profile, egress);
+        let key = (owner, egress_id);
+        match held.slots.get(&key) {
+            Some(slot) => {
+                // A reload's commit puts the new names in every slot at once.
+                if !self.compiling {
+                    slot.set(names);
+                }
+                slot.clone()
+            }
+            None => {
+                let slot = Arc::new(NamesSlot::new(names));
+                held.slots.insert(key, slot.clone());
+                slot
+            }
+        }
     }
     pub fn configuration_snapshot(
         &self,
@@ -789,23 +1011,15 @@ impl NetworkRuntime {
             }
         }
     }
-    // Egress `id` as a route dials out of it, naming what it dials the way
-    // the egress's DNS says.
+    // Egress `id` as a route dials out of it. It names what it dials by the
+    // DNS profile of the route dialling.
     fn bottom(config: &Configuration, id: u32, timeout: Duration) -> Result<Arc<Egress>, String> {
         let egress = config.egresses.get(&id).ok_or("egress does not exist")?;
-        Ok(Arc::new(Self::socket_egress(
-            egress,
-            timeout,
-            config.namings.get(&id).cloned(),
-        )))
+        Ok(Arc::new(Self::socket_egress(egress, timeout)))
     }
-    // The saved egress's sockets, naming what they dial with `naming`, or
-    // with the host's DNS when there is none.
-    fn socket_egress(
-        egress: &EgressInterface,
-        timeout: Duration,
-        naming: Option<Naming>,
-    ) -> Egress {
+    // The saved egress's sockets, naming what they dial by the DNS profile
+    // of the route dialling, and nothing outside one.
+    fn socket_egress(egress: &EgressInterface, timeout: Duration) -> Egress {
         let binding = match &egress.binding {
             EgressBinding::System => SocketEgress::System,
             EgressBinding::Interface { name } => SocketEgress::Interface(name.clone()),
@@ -816,11 +1030,12 @@ impl NetworkRuntime {
             reason = "the runtime builds a route's egress from the saved egress"
         )]
         let socket = Egress::new(egress.id, binding, timeout);
-        match naming {
-            Some(naming) => socket.with_naming(naming),
-            None => socket,
-        }
+        socket.with_naming(Naming::Refused(UNSCOPED_NAMES.into()))
     }
+    // Proxy `id` above `inner`, for a route on DNS profile `dns`. A session
+    // it opens names its own endpoint, when it looks one up, by the names of
+    // the route dialling it, and from its own tasks by that profile's names,
+    // which a reload swaps in place.
     fn hop(
         &self,
         config: &Configuration,
@@ -834,16 +1049,13 @@ impl NetworkRuntime {
             return Ok(Arc::new(Unavailable(format!("proxy {id} is disabled"))));
         }
         // A canonical hop has the profile's timeout, independent of its first
-        // consumer, and names its endpoint the way the egress's DNS says.
+        // consumer, and names what it dials by the route dialling.
         #[expect(
             clippy::disallowed_methods,
             reason = "a hop's egress is the leg's, with the profile's timeout"
         )]
         let socket = Egress::new(bottom.id(), bottom.binding().clone(), profile.timeout());
-        let bottom = Arc::new(match config.namings.get(&bottom.id()) {
-            Some(naming) => socket.with_naming(naming.clone()),
-            None => socket,
-        });
+        let bottom = Arc::new(socket.with_naming(Naming::Refused(UNSCOPED_NAMES.into())));
         let inner: Arc<dyn Dialer> = if prefix.is_empty() {
             bottom.clone()
         } else {
@@ -858,11 +1070,6 @@ impl NetworkRuntime {
             .map(|id| (*id, config.profiles.get(id).map(|p| p.revision)))
             .collect();
         let mut key = format!("{}:{:?}:{revisions:?}", bottom.id(), bottom.binding());
-        // A session whose endpoint the egress's own DNS servers name is
-        // rebuilt when that DNS changes; one the host names keeps its key.
-        if let Some(dns) = config.dns_signature(bottom.id())? {
-            key.push_str(&dns);
-        }
         // A WireGuard tunnel is built to the socket cap, so a new cap
         // rebuilds every session with a WireGuard hop up to it.
         if config.carries_wireguard(&ids) {
@@ -880,6 +1087,16 @@ impl NetworkRuntime {
             id,
             revision: profile.revision,
         });
+        // One session serves every route that rides it. Its own address is
+        // looked up with the DNS profile the proxy selects, from a slot of
+        // its own that a save swaps in place, so pointing the proxy at
+        // another profile or editing that profile rebuilds nothing.
+        let names = self.names_slot(
+            config,
+            proxy_name_owner(id),
+            profile.dns_profile_id,
+            bottom.id(),
+        );
         let mut transport = None;
         let mut resolver = None;
         // The hop tells the saved route's health how its dials go, as one
@@ -909,7 +1126,8 @@ impl NetworkRuntime {
                 },
                 inner,
                 timeout: profile.timeout(),
-                naming: profile.naming(bottom.clone()),
+                naming: Naming::Refused(UNSCOPED_NAMES.into()),
+                endpoint_names: names.clone(),
                 failure: failure(),
             }),
             _ => {
@@ -919,6 +1137,7 @@ impl NetworkRuntime {
                             inner: inner.clone(),
                             proxy: id,
                             connected: Mutex::new(None),
+                            names: names.clone(),
                         });
                         transport = Some(input.clone());
                         Arc::new(
@@ -937,7 +1156,10 @@ impl NetworkRuntime {
                         let provider = match prefix.last() {
                             None => provider
                                 .with_udp_factory(bottom.clone())
-                                .with_endpoint_resolver(Arc::new(EndpointNames(bottom.clone()))),
+                                .with_endpoint_resolver(Arc::new(EndpointNames(
+                                    bottom.clone(),
+                                    names.clone(),
+                                ))),
                             // A WireGuard tunnel rides only on another
                             // WireGuard tunnel.
                             Some(beneath) => {
@@ -952,7 +1174,14 @@ impl NetworkRuntime {
                                         inner.describe()
                                     ))));
                                 };
-                                provider.with_datagram_transport(carrier)
+                                // Its endpoint is asked through the tunnel
+                                // beneath, with the proxy's own names.
+                                provider.with_datagram_transport(Arc::new(
+                                    weaver_tunnel::endpoint_names::EndpointDatagrams(
+                                        carrier,
+                                        names.clone(),
+                                    ),
+                                ))
                             }
                         };
                         let provider = Arc::new(provider);
@@ -969,7 +1198,10 @@ impl NetworkRuntime {
                             )
                             .map_err(|e| e.to_string())?
                             .with_udp_factory(bottom.clone())
-                            .with_endpoint_resolver(Arc::new(EndpointNames(bottom.clone()))),
+                            .with_endpoint_resolver(Arc::new(EndpointNames(
+                                bottom.clone(),
+                                names.clone(),
+                            ))),
                         )
                     }
                     _ => unreachable!(),
@@ -1022,7 +1254,8 @@ impl NetworkRuntime {
                         .ok()
                         .map(|ip| std::net::SocketAddr::new(ip, profile.port)),
                     timeout: profile.timeout(),
-                    naming: profile.naming(bottom.clone()),
+                    naming: Naming::Refused(UNSCOPED_NAMES.into()),
+                    tunnel_dns: profile.tunnel_dns(),
                     resolver,
                     forwarding: profile.port_forwarding(),
                     failure: failure(),
@@ -1032,8 +1265,8 @@ impl NetworkRuntime {
         sessions.insert(key, stage.clone());
         Ok(stage)
     }
-    // Pool `id` on `bottom`'s egress, marked as one a consumer dials whole
-    // when `whole` is: only such a pool opens its members ahead of a dial.
+    // Pool `id` on `bottom`'s egress, marked as one a consumer dials whole when `whole` is: only such a pool
+    // opens its members ahead of a dial.
     fn pool(
         &self,
         config: &Configuration,
@@ -1042,18 +1275,14 @@ impl NetworkRuntime {
         whole: bool,
     ) -> Result<Arc<dyn Dialer>, String> {
         let pool = config.pools.get(&id).ok_or("proxy pool does not exist")?;
+        let key = (id, bottom.id());
         if !pool.enabled {
-            if let Some(stage) = self
-                .pools
-                .lock()
-                .expect("network pools")
-                .get(&(id, bottom.id()))
-            {
+            if let Some(stage) = self.pools.lock().expect("network pools").get(&key) {
                 if self.compiling {
                     self.pool_updates
                         .lock()
                         .expect("staged pools")
-                        .insert((id, bottom.id()), Vec::new());
+                        .insert(key, Vec::new());
                 } else {
                     stage.set_members(Vec::new());
                 }
@@ -1072,7 +1301,7 @@ impl NetworkRuntime {
             })
             .collect::<Result<Vec<_>, String>>()?;
         let mut pools = self.pools.lock().expect("network pools");
-        let stage = if let Some(stage) = pools.get(&(id, bottom.id())) {
+        let stage = if let Some(stage) = pools.get(&key) {
             if whole {
                 stage.serve_whole();
             }
@@ -1080,7 +1309,7 @@ impl NetworkRuntime {
                 self.pool_updates
                     .lock()
                     .expect("staged pools")
-                    .insert((id, bottom.id()), members);
+                    .insert(key, members);
             } else {
                 let revision = stage.revision();
                 stage.set_members(members);
@@ -1094,7 +1323,7 @@ impl NetworkRuntime {
             if whole {
                 stage.serve_whole();
             }
-            pools.insert((id, bottom.id()), stage.clone());
+            pools.insert(key, stage.clone());
             if !self.compiling {
                 stage.prewarm();
             }
@@ -1102,6 +1331,8 @@ impl NetworkRuntime {
         };
         Ok(stage)
     }
+    // Leg `position` of `consumer`'s route, naming what it dials by DNS
+    // profile `profile` when one is given, else as its route does.
     fn leg(
         &self,
         config: &Configuration,
@@ -1109,6 +1340,7 @@ impl NetworkRuntime {
         position: usize,
         leg: &RouteLeg,
         timeout: Duration,
+        profile: Option<u32>,
     ) -> Result<LiveLeg, String> {
         if !config.egresses.contains_key(&leg.egress_id) {
             let warning = config.missing_egress_warning(&consumer.key(), position, leg.egress_id);
@@ -1122,6 +1354,7 @@ impl NetworkRuntime {
             });
         }
         let bottom = Self::bottom(config, leg.egress_id, timeout)?;
+        let names = self.leg_names(config, consumer, leg.egress_id, &leg.path, profile);
         let mut address_plan = None;
         let mut ladder = None;
         let mut versions = Vec::new();
@@ -1200,15 +1433,13 @@ impl NetworkRuntime {
         if config.carries_wireguard(&hops) {
             signature.push_str(&format!(":sockets={}", config.socket_cap));
         }
-        // A save of the egress's DNS rebuilds every leg on it, and ends the
-        // connections opened with what the old setting named.
-        if let Some(dns) = config.dns_signature(leg.egress_id)? {
-            signature.push_str(&dns);
-        }
+        // A DNS change rebuilds no leg: the leg reads its names from the slot
+        // at each dial, and a torrent leg is shared whatever its routes'
+        // profiles.
         Ok(LiveLeg {
             definition: leg.clone(),
             warning: config.warnings.get(&(consumer.key(), position)).cloned(),
-            stage: Arc::new(Revocable::new(stage)),
+            stage: Arc::new(Revocable::named(stage, names)),
             address_plan,
             ladder,
             signature,
@@ -1244,7 +1475,7 @@ impl NetworkRuntime {
             .legs
             .iter()
             .enumerate()
-            .map(|(position, leg)| self.leg(&config, consumer, position, leg, timeout))
+            .map(|(position, leg)| self.leg(&config, consumer, position, leg, timeout, None))
             .collect::<Result<Vec<_>, _>>()?;
         if consumer.shares_legs() {
             let live: Vec<_> = routes.values().cloned().collect();
@@ -1357,10 +1588,9 @@ impl NetworkRuntime {
                 })
             })
     }
-    fn apply_configuration(&self, mut next: Configuration) -> Result<(), String> {
+    fn apply_configuration(&self, next: Configuration) -> Result<(), String> {
         // Route lookups must see configuration and compiled paths from the same reload.
         let mut configuration = self.configuration.write().expect("network configuration");
-        next.keep_namings(&configuration);
         let mut staging = Self {
             db: self.db.clone(),
             handle: self.handle.clone(),
@@ -1383,6 +1613,7 @@ impl NetworkRuntime {
             route_health: self.route_health.clone(),
             probing: self.probing,
             reloads: tokio::sync::watch::Sender::new(0),
+            route_names: self.route_names.clone(),
             egress_controls: self.egress_controls.clone(),
             quota_policy: None,
             #[cfg(test)]
@@ -1417,7 +1648,7 @@ impl NetworkRuntime {
                 .iter()
                 .enumerate()
                 .map(|(position, leg)| {
-                    staging.leg(&next, route.consumer, position, leg, route.timeout)
+                    staging.leg(&next, route.consumer, position, leg, route.timeout, None)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             {
@@ -1453,7 +1684,7 @@ impl NetworkRuntime {
         }
         // Everything below commits already validated objects; preparation above never
         // changes live membership, allocations, sessions, or revocation state.
-        let prior_revisions: HashMap<(u32, u32), u64> = self
+        let prior_revisions: HashMap<PoolKey, u64> = self
             .pools
             .lock()
             .expect("network pools")
@@ -1560,6 +1791,11 @@ impl NetworkRuntime {
         if let Some(health) = &self.route_health {
             next.configure_health(health);
         }
+        // Every leg kept, and every session on it, names by its route's DNS
+        // profile as saved now. A profile, list or route change only swaps
+        // the names in the slots; what was answered under a setting that
+        // changed goes with the names it was held in.
+        self.route_names.lock().expect("route names").refresh(&next);
         *configuration = next;
         // Only new or re-membered pools warm up, and a pool first dialled
         // whole; an unchanged idle member must not handshake again on every
@@ -1689,12 +1925,12 @@ fn shared_leg(routes: &[Arc<LiveNetworkRoute>], signature: &str) -> Option<LiveL
         })
 }
 // The running pools `leg` dials through, by pool and egress.
-fn pool_keys(leg: &RouteLeg) -> impl Iterator<Item = (u32, u32)> + '_ {
+fn pool_keys(leg: &RouteLeg) -> impl Iterator<Item = PoolKey> + '_ {
     let rungs = match &leg.path {
         LegPath::Ladder { rungs, .. } => rungs.as_slice(),
         LegPath::Direct => &[],
     };
-    rungs.iter().filter_map(|rung| match rung {
+    rungs.iter().filter_map(move |rung| match rung {
         Rung::Pool { id } => Some((*id, leg.egress_id)),
         _ => None,
     })

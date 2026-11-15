@@ -86,7 +86,7 @@ impl FetchPath for FetchAttempt {
         if self.guard.is_revoked() {
             return Err(DialError::Skipped("leg revoked".into()));
         }
-        self.stage.resolve(host).await
+        weaver_tunnel::pipe::Names::scope(self.guard.names(), self.stage.resolve(host)).await
     }
     // Pins the checked addresses a direct dial of `host` uses.
     fn pin(&self, host: &str, addresses: Vec<IpAddr>) {
@@ -355,7 +355,8 @@ impl NetworkRuntime {
                         // A fetch leases any member: it dials the pool whole.
                         self.pool(&config, id, bottom.clone(), true)?;
                         let pools = self.pools.lock().expect("network pools");
-                        let Some(pool) = pools.get(&(id, bottom.id())) else {
+                        let key = (id, bottom.id());
+                        let Some(pool) = pools.get(&key) else {
                             continue;
                         };
                         pool.lease_members()

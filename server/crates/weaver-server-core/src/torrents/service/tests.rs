@@ -1374,7 +1374,6 @@ async fn routes_are_planned_from_the_runtime_not_the_route_rows() {
             download_bps: None,
             upload_bps: None,
             quota: Default::default(),
-            dns: Default::default(),
         })
         .unwrap();
     db.save_proxy_routing_policy(
@@ -1564,7 +1563,6 @@ async fn url_route(category: Option<&str>, matched: bool) {
             download_bps: None,
             upload_bps: None,
             quota: Default::default(),
-            dns: Default::default(),
         })
         .unwrap();
     db.save_proxy_routing_policy(
@@ -12537,10 +12535,7 @@ async fn a_new_peer_limit_is_told_on_the_torrent_leg() {
             kind: crate::proxies::ProxyKind::WireGuard,
             host: "192.0.2.1".into(),
             port: 51820,
-            dns: crate::proxies::ProxyDns::plain(
-                crate::proxies::DnsPath::ThroughProxy,
-                ["10.64.0.1".parse().unwrap()],
-            ),
+            dns_servers: vec!["10.64.0.1".parse().unwrap()],
             tunnel_addresses: vec!["10.64.0.2/32".into()],
             peer_public_key: Some(key(2)),
             secrets: crate::proxies::ProxySecrets {

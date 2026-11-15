@@ -27,8 +27,6 @@ pub enum NetworkRefusal {
     EgressGone,
     EgressNotFound,
     EgressSystemUndeletable,
-    // An egress's names are resolved by the host or by listed servers.
-    EgressDnsWhoInvalid,
     // Each in-use refusal names the route that holds the item.
     EgressInUse(Consumer),
 
@@ -93,7 +91,6 @@ pub enum NetworkRefusal {
     // More servers than a DNS setting lists.
     ProxyDnsServerCount,
     ProxyDnsServerInvalid,
-    ProxyWireGuardNeedsDnsServers,
     ProxyDnsServersRequired,
     ProxyDnsTlsNameInvalid,
     ProxyDnsUrlInvalid,
@@ -122,6 +119,54 @@ pub enum NetworkRefusal {
     },
     ProxyInUse(Consumer),
     ProxyHostKeyNotSsh,
+
+    // DNS server lists and DNS profiles. Each in-use refusal names what
+    // holds the list or profile.
+    DnsListNameLength,
+    DnsListNotFound,
+    DnsListLimitReached,
+    DnsListInUse {
+        profiles: Vec<String>,
+    },
+    DnsProfileNameLength,
+    DnsProfileNotFound,
+    DnsProfileLimitReached,
+    DnsProfileBuiltIn,
+    // The stored route keys as they are, a key that cannot be read included,
+    // and the proxies whose address it names.
+    DnsProfileInUse {
+        routes: Vec<String>,
+        proxies: Vec<u32>,
+    },
+    // A route selected a profile that is not a route profile, or a proxy one
+    // that is not a proxy name profile; System is either.
+    DnsProfileKind {
+        expected: super::DnsProfileKind,
+    },
+    // A proxy name profile has the proxy answer, or its servers asked
+    // through a proxy.
+    DnsProfileProxyNameInvalid,
+    // A save changes what a profile answers for.
+    DnsProfileKindImmutable,
+    // A new profile names no kind.
+    DnsProfileKindRequired,
+    DnsProfileListRequired,
+    DnsProfileTrustInvalid,
+    // The proxy answers, and a leg or rung of these routes has no proxy.
+    DnsProfileNeedsProxy {
+        routes: Vec<Consumer>,
+    },
+    // Weaver validates what the proxy answers, which only a WireGuard
+    // tunnel's own servers allow, and these routes reach another kind.
+    DnsProfileNeedsWireGuard {
+        routes: Vec<Consumer>,
+    },
+    // The proxy answers, and these WireGuard proxies at the end of a rung of
+    // these routes list no DNS servers of the tunnel's own.
+    DnsProfileNeedsTunnelDns {
+        proxies: Vec<u32>,
+        routes: Vec<Consumer>,
+    },
 
     // Speed tests.
     SpeedTestAlreadyRunning {
@@ -231,7 +276,6 @@ impl NetworkRefusal {
             Self::BandwidthSplitRange => "BANDWIDTH_SPLIT_RANGE",
             Self::EgressGone | Self::EgressNotFound => "EGRESS_NOT_FOUND",
             Self::EgressSystemUndeletable => "EGRESS_SYSTEM_UNDELETABLE",
-            Self::EgressDnsWhoInvalid => "EGRESS_DNS_WHO_INVALID",
             Self::EgressInUse(_) => "EGRESS_IN_USE",
 
             Self::PoolNameLength => "POOL_NAME_LENGTH",
@@ -273,7 +317,6 @@ impl NetworkRefusal {
             Self::ProxyAddressCount => "PROXY_ADDRESS_COUNT",
             Self::ProxyDnsServerCount => "PROXY_DNS_SERVER_COUNT",
             Self::ProxyDnsServerInvalid => "PROXY_DNS_SERVER_INVALID",
-            Self::ProxyWireGuardNeedsDnsServers => "PROXY_WIREGUARD_NEEDS_DNS_SERVERS",
             Self::ProxyDnsServersRequired => "PROXY_DNS_SERVERS_REQUIRED",
             Self::ProxyDnsTlsNameInvalid => "PROXY_DNS_TLS_NAME_INVALID",
             Self::ProxyDnsUrlInvalid => "PROXY_DNS_URL_INVALID",
@@ -297,6 +340,25 @@ impl NetworkRefusal {
             Self::ProxyInPool { .. } => "PROXY_IN_POOL",
             Self::ProxyInUse(_) => "PROXY_IN_USE",
             Self::ProxyHostKeyNotSsh => "PROXY_HOST_KEY_NOT_SSH",
+
+            Self::DnsListNameLength => "DNS_LIST_NAME_LENGTH",
+            Self::DnsListNotFound => "DNS_LIST_NOT_FOUND",
+            Self::DnsListLimitReached => "DNS_LIST_LIMIT_REACHED",
+            Self::DnsListInUse { .. } => "DNS_LIST_IN_USE",
+            Self::DnsProfileNameLength => "DNS_PROFILE_NAME_LENGTH",
+            Self::DnsProfileNotFound => "DNS_PROFILE_NOT_FOUND",
+            Self::DnsProfileLimitReached => "DNS_PROFILE_LIMIT_REACHED",
+            Self::DnsProfileBuiltIn => "DNS_PROFILE_BUILT_IN",
+            Self::DnsProfileInUse { .. } => "DNS_PROFILE_IN_USE",
+            Self::DnsProfileListRequired => "DNS_PROFILE_LIST_REQUIRED",
+            Self::DnsProfileTrustInvalid => "DNS_PROFILE_TRUST_INVALID",
+            Self::DnsProfileNeedsProxy { .. } => "DNS_PROFILE_NEEDS_PROXY",
+            Self::DnsProfileNeedsWireGuard { .. } => "DNS_PROFILE_NEEDS_WIREGUARD",
+            Self::DnsProfileNeedsTunnelDns { .. } => "DNS_PROFILE_NEEDS_TUNNEL_DNS",
+            Self::DnsProfileKind { .. } => "DNS_PROFILE_KIND",
+            Self::DnsProfileProxyNameInvalid => "DNS_PROFILE_PROXY_NAME_INVALID",
+            Self::DnsProfileKindImmutable => "DNS_PROFILE_KIND_IMMUTABLE",
+            Self::DnsProfileKindRequired => "DNS_PROFILE_KIND_REQUIRED",
 
             Self::SpeedTestAlreadyRunning { .. } => "SPEED_TEST_ALREADY_RUNNING",
             Self::SpeedTestQueueBusy => "SPEED_TEST_QUEUE_BUSY",
@@ -363,6 +425,25 @@ impl NetworkRefusal {
             | Self::PoolInUseEmpty(holder)
             | Self::ProxyInUse(holder) => serde_json::json!({ "consumer": holder.key() }),
             Self::ProxyInPool { pool } => serde_json::json!({ "poolId": pool }),
+            Self::DnsListInUse { profiles } => serde_json::json!({ "profiles": profiles }),
+            Self::DnsProfileInUse { routes, proxies } => {
+                serde_json::json!({ "routes": routes, "proxies": proxies })
+            }
+            Self::DnsProfileKind { expected } => serde_json::json!({
+                "expected": match expected {
+                    super::DnsProfileKind::Route => "ROUTE",
+                    super::DnsProfileKind::ProxyName => "PROXY_NAME",
+                },
+            }),
+            Self::DnsProfileNeedsProxy { routes } | Self::DnsProfileNeedsWireGuard { routes } => {
+                serde_json::json!({
+                    "routes": routes.iter().map(|route| route.key()).collect::<Vec<_>>(),
+                })
+            }
+            Self::DnsProfileNeedsTunnelDns { proxies, routes } => serde_json::json!({
+                "proxies": proxies,
+                "routes": routes.iter().map(|route| route.key()).collect::<Vec<_>>(),
+            }),
             _ => return serde_json::Map::new(),
         };
         match value {
@@ -397,9 +478,6 @@ impl std::fmt::Display for NetworkRefusal {
             Self::EgressGone => "egress no longer exists",
             Self::EgressNotFound => "egress not found",
             Self::EgressSystemUndeletable => "the System egress cannot be deleted",
-            Self::EgressDnsWhoInvalid => {
-                "names dialled straight out of an egress are resolved by the host or by listed DNS servers"
-            }
             Self::EgressInUse(holder) => {
                 return write!(f, "egress is used by {}", RouteHolder(*holder));
             }
@@ -508,17 +586,12 @@ impl std::fmt::Display for NetworkRefusal {
             Self::ProxyDnsServerCount => {
                 return write!(
                     f,
-                    "a DNS setting lists at most {} servers",
+                    "a DNS server list holds at most {} servers",
                     super::MAX_DNS_SERVERS
                 );
             }
             Self::ProxyDnsServerInvalid => "DNS servers must be IP addresses",
-            Self::ProxyWireGuardNeedsDnsServers => {
-                "a WireGuard proxy resolves names only through DNS servers"
-            }
-            Self::ProxyDnsServersRequired => {
-                "a DNS setting whose listed servers answer needs at least one"
-            }
+            Self::ProxyDnsServersRequired => "a DNS server list needs at least one server",
             Self::ProxyDnsTlsNameInvalid => "a DNS server's TLS name must be a valid host name",
             Self::ProxyDnsUrlInvalid => {
                 "a DNS over HTTPS server needs an https URL with an IP address and a path"
@@ -559,6 +632,90 @@ impl std::fmt::Display for NetworkRefusal {
                 return write!(f, "proxy is used by {}", RouteHolder(*holder));
             }
             Self::ProxyHostKeyNotSsh => "only SSH profiles have host-key trust",
+
+            Self::DnsListNameLength => "DNS server list name must contain 1–128 characters",
+            Self::DnsListNotFound => "DNS server list not found",
+            Self::DnsListLimitReached => {
+                return write!(
+                    f,
+                    "at most {} DNS server lists are supported",
+                    super::MAX_DNS_LISTS
+                );
+            }
+            Self::DnsListInUse { profiles } => {
+                return write!(
+                    f,
+                    "DNS server list is used by {}",
+                    profiles
+                        .iter()
+                        .map(|name| format!("DNS profile {name}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            Self::DnsProfileNameLength => "DNS profile name must contain 1–128 characters",
+            Self::DnsProfileNotFound => "DNS profile not found",
+            Self::DnsProfileLimitReached => {
+                return write!(
+                    f,
+                    "at most {} DNS profiles are supported",
+                    super::MAX_DNS_PROFILES
+                );
+            }
+            Self::DnsProfileBuiltIn => "the System DNS profile cannot be changed or deleted",
+            Self::DnsProfileInUse { routes, proxies } => {
+                let mut users: Vec<String> = Vec::new();
+                if !routes.is_empty() {
+                    users.push(StoredRouteHolders(routes).to_string());
+                }
+                users.extend(proxies.iter().map(|id| format!("proxy {id}")));
+                return write!(f, "DNS profile is used by {}", users.join(", "));
+            }
+            Self::DnsProfileKind {
+                expected: super::DnsProfileKind::Route,
+            } => "a route selects a route DNS profile or System",
+            Self::DnsProfileKind {
+                expected: super::DnsProfileKind::ProxyName,
+            } => "a proxy selects a proxy name DNS profile or System",
+            Self::DnsProfileProxyNameInvalid => {
+                "a proxy name DNS profile is answered by the system or by listed servers asked from the egress"
+            }
+            Self::DnsProfileKindImmutable => {
+                "what a DNS profile answers for cannot be changed after it is created"
+            }
+            Self::DnsProfileKindRequired => {
+                "a new DNS profile says whether routes or proxies select it"
+            }
+            Self::DnsProfileListRequired => {
+                "a DNS profile where Weaver answers needs a server list"
+            }
+            Self::DnsProfileTrustInvalid => {
+                "the system takes answers as sent, and the proxy's answers are taken as sent or validated here"
+            }
+            Self::DnsProfileNeedsProxy { routes } => {
+                return write!(
+                    f,
+                    "the proxy cannot answer for {}, which has a leg or rung with no proxy",
+                    RouteHolders(routes)
+                );
+            }
+            Self::DnsProfileNeedsWireGuard { routes } => {
+                return write!(
+                    f,
+                    "only a WireGuard proxy's answers can be validated here, and {} reaches another kind",
+                    RouteHolders(routes)
+                );
+            }
+            Self::DnsProfileNeedsTunnelDns { proxies, routes } => {
+                let proxies: Vec<String> = proxies.iter().map(|id| format!("proxy {id}")).collect();
+                let lists = if proxies.len() == 1 { "lists" } else { "list" };
+                return write!(
+                    f,
+                    "{} {lists} no DNS servers of its tunnel, and {} needs them to answer names",
+                    proxies.join(", "),
+                    RouteHolders(routes)
+                );
+            }
 
             Self::SpeedTestAlreadyRunning { run } => {
                 return write!(
@@ -630,6 +787,40 @@ impl std::fmt::Display for RouteHolder {
                 write!(f, "the torrent route of tracker rule {id}")
             }
         }
+    }
+}
+
+// The owners of several routes, as a refusal names them.
+struct RouteHolders<'a>(&'a [Consumer]);
+
+impl std::fmt::Display for RouteHolders<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, holder) in self.0.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{}", RouteHolder(*holder))?;
+        }
+        Ok(())
+    }
+}
+
+// Stored route keys, each named as its owner when the key can be read, and
+// as stored when it cannot.
+struct StoredRouteHolders<'a>(&'a [String]);
+
+impl std::fmt::Display for StoredRouteHolders<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, key) in self.0.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            match Consumer::from_key(key) {
+                Some(holder) => write!(f, "{}", RouteHolder(holder))?,
+                None => write!(f, "route {key}")?,
+            }
+        }
+        Ok(())
     }
 }
 

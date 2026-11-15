@@ -42,7 +42,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 122;
+const CURRENT_SCHEMA_VERSION: i64 = 121;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -916,7 +916,7 @@ async fn run_rust_hook(
             tracker_hosts_v105::fill_tracker_hosts(&mut SqlConn::Sqlite(tx)).await
         }
         proxy_dns_v121::HOOK_ID => {
-            proxy_dns_v121::spell_out_proxy_dns(&mut SqlConn::Sqlite(tx)).await
+            proxy_dns_v121::dns_profiles_from_proxies(&mut SqlConn::Sqlite(tx)).await
         }
         other => Err(StateError::Database(format!(
             "unknown migration hook id '{other}'"
@@ -1492,7 +1492,7 @@ mod tests {
         run_embedded_migrations_on_path_blocking(&db_path).unwrap();
 
         let pool = open_test_pool(&db_path).await;
-        assert_eq!(CURRENT_SCHEMA_VERSION, 122);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 121);
         assert_eq!(
             max_recorded_migration_version(&pool).await.unwrap(),
             Some(CURRENT_SCHEMA_VERSION)
@@ -2154,39 +2154,6 @@ mod tests {
             assert_eq!(rows, kept, "{ids:?}, none {none}");
         }
         pool.close().await;
-    }
-
-    // Migration 122 gives an egress its own DNS. Every egress saved before
-    // it, the System one and one bound to an interface, reads back
-    // resolving by the host, as it did.
-    #[tokio::test]
-    async fn sqlite_migration_122_leaves_every_egress_on_the_host() {
-        let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("pre-egress-dns.db");
-        let pool = open_test_pool(&db_path).await;
-        let catalog = embedded_catalog().unwrap();
-        let payload = embedded_payload_bytes().unwrap();
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(121), true)
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO egress_interfaces (id, name, binding_kind, binding_value, enabled, created_at, updated_at)
-             VALUES (1, 'wired', 'interface', 'en7', TRUE, 0, 0)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        pool.close().await;
-
-        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
-
-        let db = crate::Database::open(&db_path).unwrap();
-        let egresses = db.list_egress_interfaces().unwrap();
-        assert_eq!(
-            egresses.iter().map(|egress| egress.id).collect::<Vec<_>>(),
-            [0, 1]
-        );
-        assert!(egresses.iter().all(|egress| egress.dns.is_host()));
     }
 
     async fn explain(pool: &sqlx::SqlitePool, query: &str) -> Vec<String> {

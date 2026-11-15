@@ -17,19 +17,19 @@ fn interface(id: u32) -> EgressInterface {
         download_bps: None,
         upload_bps: None,
         quota: Default::default(),
-        dns: Default::default(),
     }
 }
 
 fn wireguard(id: u32, revision: u64) -> ProxyProfile {
     ProxyProfile {
+        dns_profile_id: 0,
         id,
         name: format!("wg-{id}"),
         kind: ProxyKind::WireGuard,
         enabled: true,
         host: "vpn.invalid".into(),
         port: 51820,
-        dns: crate::proxies::ProxyDns::host(),
+        dns_servers: vec![],
         tunnel_addresses: vec![],
         peer_public_key: None,
         mtu: 1420,
@@ -557,6 +557,9 @@ impl Hop {
             inner: stage.clone(),
             timeout: Duration::from_secs(5),
             naming: weaver_tunnel::pipe::Naming::Proxy,
+            endpoint_names: std::sync::Arc::new(weaver_tunnel::pipe::NamesSlot::new(
+                weaver_tunnel::pipe::Names::new(weaver_tunnel::pipe::DnsChoice::System, None),
+            )),
             failure: weaver_tunnel::pipe::HopFailure::watched(health.watcher(3, beneath, proxy, 1)),
         };
         Self { stage, hop }

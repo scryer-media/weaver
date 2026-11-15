@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+mod dns;
+mod dns_persistence;
+pub(crate) use dns_persistence::validate_restored_dns;
+pub use dns_persistence::{StoredDns, UnreadableDnsList};
 mod fault;
 mod interfaces;
 mod model;
 mod network;
 pub mod network_metrics;
 mod network_persistence;
-pub(crate) use network_persistence::{
-    SocketAsks, dns_arg, lock_network_asks, stored_dns, validate_stored_sockets,
-};
+pub(crate) use network_persistence::{SocketAsks, lock_network_asks, validate_stored_sockets};
 mod network_runtime;
 pub(crate) mod persistence;
 mod pool_stage;
@@ -21,6 +23,7 @@ mod routed_http;
 mod runtime;
 mod socket_ledger;
 mod weighted;
+pub use dns::*;
 pub use fault::{ProxyFault, ProxyTestPass, fault_params};
 pub use interfaces::*;
 pub use model::*;

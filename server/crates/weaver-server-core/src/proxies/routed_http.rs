@@ -118,6 +118,9 @@ pub(crate) fn start_bridge(path: Arc<dyn FetchPath>) -> Result<Arc<Bridge>, Stri
 pub struct PathBridge {
     pub bridge: Arc<Bridge>,
     pub path: Arc<dyn FetchPath>,
+    // What keeps the bridge up: every client built on it holds this, so a
+    // bridge that is let go once nothing holds it outlives its clients.
+    pub keep: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl PathBridge {
@@ -125,6 +128,7 @@ impl PathBridge {
         Ok(Self {
             bridge: start_bridge(path.clone())?,
             path,
+            keep: None,
         })
     }
     pub async fn revoke(&self) {
@@ -528,13 +532,14 @@ pub(crate) fn direct_runtime() -> Arc<ProxyRuntime> {
 pub(crate) fn outbound_only_through(kind: super::ProxyKind, port: u16) -> Arc<ProxyRuntime> {
     let db = crate::Database::open_in_memory().unwrap();
     db.save_proxy_profile(&super::ProxyProfile {
+        dns_profile_id: 0,
         id: 1,
         name: "outbound".into(),
         kind,
         enabled: true,
         host: "127.0.0.1".into(),
         port,
-        dns: crate::proxies::ProxyDns::proxy(),
+        dns_servers: vec![],
         tunnel_addresses: vec![],
         peer_public_key: None,
         mtu: 1280,
@@ -547,11 +552,27 @@ pub(crate) fn outbound_only_through(kind: super::ProxyKind, port: u16) -> Arc<Pr
         secrets: super::ProxySecrets::default(),
     })
     .unwrap();
+    let dns = db
+        .save_dns_profile(
+            super::DnsProfile {
+                kind: crate::proxies::DnsProfileKind::Route,
+                id: 0,
+                name: "Proxy".into(),
+                who: super::DnsWho::Proxy,
+                transit: None,
+                trust: super::DnsTrust::AsSent,
+                server_list_id: None,
+                system_fallback: false,
+            },
+            true,
+        )
+        .unwrap();
     db.save_proxy_routing_policy(
         Consumer::Outbound,
         &super::RoutingPolicy {
             proxy_ids: vec![1],
             allow_direct: false,
+            dns_profile_id: Some(dns.id),
             ..Default::default()
         },
     )

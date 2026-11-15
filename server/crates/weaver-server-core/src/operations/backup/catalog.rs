@@ -51,6 +51,9 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("egress_download_usage", Export, Replace),
     table!("network_bandwidth", Export, Replace),
     table!("proxy_pools", Export, RequireEmpty),
+    // The DNS presets the routes name, restored with them.
+    table!("dns_server_lists", Export, RequireEmpty),
+    table!("dns_profiles", Export, RequireEmpty),
     table!("server_download_usage", Export, RequireZeroUsage),
     table!("server_tls_diagnostics", Export, Replace),
     // Data used per day is history a person keeps across a move.

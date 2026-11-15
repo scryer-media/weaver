@@ -650,7 +650,7 @@ async fn run_postgres_rust_hook(
             tracker_hosts_v105::fill_tracker_hosts(&mut SqlConn::Postgres(tx)).await
         }
         proxy_dns_v121::HOOK_ID => {
-            proxy_dns_v121::spell_out_proxy_dns(&mut SqlConn::Postgres(tx)).await
+            proxy_dns_v121::dns_profiles_from_proxies(&mut SqlConn::Postgres(tx)).await
         }
         other => Err(StateError::Database(format!(
             "PostgreSQL migration hook '{other}' is not implemented"

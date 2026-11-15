@@ -6,13 +6,14 @@ use weaver_tunnel::{TunnelProvider, pipe::Purpose};
 
 fn proxy() -> ProxyProfile {
     ProxyProfile {
+        dns_profile_id: 0,
         id: 1,
         name: "fixture".into(),
         kind: ProxyKind::Socks5,
         enabled: true,
         host: "proxy.invalid".into(),
         port: 1080,
-        dns: crate::proxies::ProxyDns::proxy(),
+        dns_servers: vec![],
         tunnel_addresses: vec![],
         peer_public_key: None,
         mtu: 1420,
@@ -155,6 +156,7 @@ fn first_stage(route: &LiveNetworkRoute) -> Arc<Revocable> {
     route.legs.read().unwrap()[0].stage.clone()
 }
 
+// Pool 7 running on the System egress.
 fn running_pool(runtime: &NetworkRuntime) -> Arc<PoolStage> {
     runtime.pools.lock().unwrap()[&(7, 0)].clone()
 }
@@ -729,7 +731,7 @@ async fn dial_every_member(runtime: &NetworkRuntime, legacy: &Arc<ConsumerRoute>
     runtime
         .fetch_attempts(Consumer::Rss(1), legacy.clone())
         .unwrap();
-    let pool = runtime.pools.lock().unwrap()[&(7, 0)].clone();
+    let pool = running_pool(runtime);
     let target = Target {
         host: "feed.invalid".into(),
         port: 443,
@@ -896,7 +898,6 @@ fn metered_egress(limit_bytes: u64) -> EgressInterface {
             address: "127.0.0.1".parse().unwrap(),
         },
         enabled: true,
-        dns: Default::default(),
         download_bps: None,
         upload_bps: None,
         quota: crate::proxies::EgressQuota {
@@ -1194,7 +1195,6 @@ async fn a_route_seen_up_and_then_down_raises_route_down_once() {
         download_bps: None,
         upload_bps: None,
         quota: Default::default(),
-        dns: Default::default(),
     };
     config.egresses.insert(link.id, link);
     runtime.apply_configuration(config.clone()).unwrap();
@@ -1422,6 +1422,7 @@ async fn a_wireguard_chain_rides_one_tunnel_inside_another() {
     config
         .profiles
         .insert(2, wireguard(2, &far, "far.vpn.test".into(), FAR_PORT));
+    store_tunnel_dns(&mut config);
     config.policies.insert(
         consumer.key(),
         RoutingPolicy {
@@ -1433,6 +1434,7 @@ async fn a_wireguard_chain_rides_one_tunnel_inside_another() {
                     direct_fallback: false,
                 },
             }],
+            dns_profile_id: Some(TUNNEL_DNS),
             ..Default::default()
         },
     );
@@ -1514,10 +1516,7 @@ fn wireguard_profile(
         kind: ProxyKind::WireGuard,
         host,
         port,
-        dns: crate::proxies::ProxyDns::plain(
-            crate::proxies::DnsPath::ThroughProxy,
-            spec.dns_servers.clone(),
-        ),
+        dns_servers: spec.dns_servers.clone(),
         tunnel_addresses: vec![format!(
             "{}/32",
             weaver_tunnel::test_support::TEST_CLIENT_ADDRESS
@@ -1560,6 +1559,37 @@ async fn stacked_peers() -> (
     })
     .await;
     (near, far)
+}
+
+// The DNS profile on which the proxies a route dials through answer its
+// names: a WireGuard tunnel answers by its own servers.
+const TUNNEL_DNS: u32 = 1;
+
+// `config` with profile `TUNNEL_DNS` stored.
+fn store_tunnel_dns(config: &mut Configuration) {
+    let mut dns = (*config.dns).clone();
+    dns.profiles.insert(
+        TUNNEL_DNS,
+        crate::proxies::DnsProfile {
+            kind: crate::proxies::DnsProfileKind::Route,
+            id: TUNNEL_DNS,
+            name: "Tunnel".into(),
+            who: crate::proxies::DnsWho::Proxy,
+            transit: None,
+            trust: crate::proxies::DnsTrust::AsSent,
+            server_list_id: None,
+            system_fallback: false,
+        },
+    );
+    config.dns = Arc::new(dns);
+}
+
+// `policy` naming by profile `TUNNEL_DNS`.
+fn on_tunnel_dns(policy: RoutingPolicy) -> RoutingPolicy {
+    RoutingPolicy {
+        dns_profile_id: Some(TUNNEL_DNS),
+        ..policy
+    }
 }
 
 fn wireguard_ladder(rung: Rung) -> RoutingPolicy {
@@ -1719,9 +1749,10 @@ async fn a_wireguard_chain_downloads_four_concurrent_bulk_streams() {
     );
     assert_eq!(config.profiles[&1].mtu, 1280);
     assert_eq!(config.profiles[&2].mtu, 1280);
+    store_tunnel_dns(&mut config);
     config.policies.insert(
         consumer.key(),
-        wireguard_ladder(Rung::Chain { ids: vec![1, 2] }),
+        on_tunnel_dns(wireguard_ladder(Rung::Chain { ids: vec![1, 2] })),
     );
     // The server's connections are its share of the far tunnel's sockets.
     config.socket_ledger = config.ledger(&HashMap::from([(1, STREAMS as u16)]));
@@ -1821,9 +1852,10 @@ async fn a_three_hop_wireguard_chain_sizes_each_tunnel_from_its_carrier() {
         3,
         wireguard_profile(3, &far, "far.vpn.test".into(), FAR_PORT),
     );
+    store_tunnel_dns(&mut config);
     config.policies.insert(
         consumer.key(),
-        wireguard_ladder(Rung::Chain { ids: vec![1, 2, 3] }),
+        on_tunnel_dns(wireguard_ladder(Rung::Chain { ids: vec![1, 2, 3] })),
     );
     runtime.apply_configuration(config.clone()).unwrap();
     let route = runtime
@@ -1892,9 +1924,11 @@ async fn stacking_on_a_wireguard_session_preserves_its_capacity_and_identity() {
         assert_eq!(config.profiles[&1].mtu, 1280);
         config.profiles.get_mut(&1).unwrap().mtu = lower_mtu;
         config.profiles.get_mut(&2).unwrap().mtu = upper_mtu;
-        config
-            .policies
-            .insert(direct.key(), wireguard_ladder(Rung::Proxy { id: 1 }));
+        store_tunnel_dns(&mut config);
+        config.policies.insert(
+            direct.key(),
+            on_tunnel_dns(wireguard_ladder(Rung::Proxy { id: 1 })),
+        );
         runtime.apply_configuration(config.clone()).unwrap();
         let route = runtime.route(direct, 1, Duration::from_secs(300)).unwrap();
         // The session the live route uses, as the runtime holds it.
@@ -1921,7 +1955,7 @@ async fn stacking_on_a_wireguard_session_preserves_its_capacity_and_identity() {
         config.consumers.insert(stacked.key());
         config.policies.insert(
             stacked.key(),
-            wireguard_ladder(Rung::Chain { ids: vec![1, 2] }),
+            on_tunnel_dns(wireguard_ladder(Rung::Chain { ids: vec![1, 2] })),
         );
         runtime.apply_configuration(config.clone()).unwrap();
         runtime.retire_unused_sessions().await;
@@ -2088,10 +2122,7 @@ fn idle_wireguard_profile(id: u32) -> ProxyProfile {
         kind: ProxyKind::WireGuard,
         host: "192.0.2.1".into(),
         port: 51820,
-        dns: crate::proxies::ProxyDns::plain(
-            crate::proxies::DnsPath::ThroughProxy,
-            ["10.64.0.1".parse().unwrap()],
-        ),
+        dns_servers: vec!["10.64.0.1".parse().unwrap()],
         tunnel_addresses: vec!["10.64.0.2/32".into()],
         peer_public_key: Some(key(2)),
         secrets: ProxySecrets {
@@ -2399,10 +2430,7 @@ fn same_identity_runtime() -> (Arc<NetworkRuntime>, Configuration, Arc<Mutex<Vec
                 host: "127.0.0.1".into(),
                 port: 9,
                 tunnel_addresses: vec!["10.0.0.2/32".into()],
-                dns: crate::proxies::ProxyDns::plain(
-                    crate::proxies::DnsPath::ThroughProxy,
-                    [[10, 0, 0, 1].into()],
-                ),
+                dns_servers: vec![[10, 0, 0, 1].into()],
                 peer_public_key: Some(key(2)),
                 secrets: ProxySecrets {
                     private_key: Some(key(1)),
@@ -2455,7 +2483,12 @@ async fn a_test_button_probe_asks_through_the_live_session_with_its_identity() {
         failover: Failover::default(),
     };
     let tests = runtime
-        .test_via(&route, TestSubject::Proxy(2), Some(("127.0.0.1".into(), 9)))
+        .test_via(
+            &route,
+            SYSTEM_DNS_PROFILE_ID,
+            TestSubject::Proxy(2),
+            Some(("127.0.0.1".into(), 9)),
+        )
         .await
         .unwrap();
     assert_eq!(tests.len(), 1);
@@ -2703,57 +2736,64 @@ async fn a_server_test_takes_probe_room_beside_servers_holding_all_of_usenet() {
     runtime.shutdown().await;
 }
 
-// One egress whose stored DNS cannot be read is left out of the routing
-// configuration: its legs are down, saying why, the other egresses load,
-// and nothing on it resolves by the host. A read of the egress itself still
-// fails, so the fault is not hidden.
+// A DNS server list whose stored servers cannot be read answers nothing:
+// each leg of a route on a profile that asks it says why, and nothing the
+// route dials by name is resolved, by the host or anyone else. A read of
+// the list itself gives it no servers, so the fault is not hidden.
 #[tokio::test]
-async fn an_egress_whose_stored_dns_cannot_be_read_is_left_out_and_its_legs_are_down() {
+async fn a_list_whose_stored_servers_cannot_be_read_resolves_nothing_and_says_why() {
     use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
     let db = Database::open_in_memory().unwrap();
-    let egress = db
-        .create_egress_interface(&EgressInterface {
-            id: 0,
-            name: "WAN B".into(),
-            binding: EgressBinding::SourceAddress {
-                address: "192.0.2.2".parse().unwrap(),
+    let list = db
+        .save_dns_server_list(
+            DnsServerList {
+                id: 0,
+                name: "Listed".into(),
+                servers: vec![ListedServer {
+                    address: "192.0.2.53:53".parse().unwrap(),
+                    wire: ListedWire::Plain,
+                }],
             },
-            enabled: true,
-            download_bps: None,
-            upload_bps: None,
-            quota: Default::default(),
-            dns: Default::default(),
-        })
+            true,
+        )
         .unwrap();
-    let consumer = Consumer::Server(1);
-    let route = Route {
-        legs: vec![RouteLeg {
-            egress_id: egress.id,
-            weight: 100,
-            path: LegPath::Direct,
-        }],
-        failover: Failover::default(),
-    };
+    let profile = db
+        .save_dns_profile(
+            DnsProfile {
+                kind: crate::proxies::DnsProfileKind::Route,
+                id: 0,
+                name: "Listed".into(),
+                who: DnsWho::Weaver,
+                transit: Some(DnsTransit::Egress),
+                trust: DnsTrust::AsSent,
+                server_list_id: Some(list.id),
+                system_fallback: false,
+            },
+            true,
+        )
+        .unwrap();
+    let consumer = Consumer::Outbound;
+    db.save_proxy_routing_policy(
+        consumer,
+        &RoutingPolicy {
+            legs: vec![RouteLeg {
+                egress_id: SYSTEM_EGRESS_ID,
+                weight: 100,
+                path: LegPath::Direct,
+            }],
+            dns_profile_id: Some(profile.id),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let store = db.datastore();
-    let id = egress.id;
+    let id = list.id;
     db.run_sql_blocking(async move {
-        SqlRuntime::run_in_transaction(&store, "unreadable_egress_dns", |tx| {
-            let route = route.clone();
+        SqlRuntime::run_in_transaction(&store, "unreadable_dns_list", |tx| {
             Box::pin(async move {
                 tx.execute(
-                    "INSERT INTO proxy_routes (consumer, policy) VALUES ({}, {})",
-                    &[
-                        SqlArg::Text(consumer.key()),
-                        SqlArg::Text(serde_json::to_string(&route).unwrap()),
-                    ],
-                )
-                .await?;
-                tx.execute(
-                    "UPDATE egress_interfaces SET dns = {} WHERE id = {}",
-                    &[
-                        SqlArg::Text("{\"who\":\"Proxy\"".into()),
-                        SqlArg::I64(i64::from(id)),
-                    ],
+                    "UPDATE dns_server_lists SET servers = {} WHERE id = {}",
+                    &[SqlArg::Text("{\"v\":1".into()), SqlArg::I64(i64::from(id))],
                 )
                 .await?;
                 Ok(())
@@ -2763,20 +2803,268 @@ async fn an_egress_whose_stored_dns_cannot_be_read_is_left_out_and_its_legs_are_
     })
     .unwrap();
 
-    assert!(db.list_egress_interfaces().is_err());
+    assert!(db.list_dns_server_lists().unwrap()[0].servers.is_empty());
     let runtime = NetworkRuntime::new(db, tokio::runtime::Handle::current()).unwrap();
     {
         let config = runtime.configuration.read().unwrap();
-        assert!(config.egresses.contains_key(&SYSTEM_EGRESS_ID));
-        assert!(!config.egresses.contains_key(&id));
         let warning = config.warnings.get(&(consumer.key(), 0)).unwrap();
         assert!(
-            warning.starts_with(&format!(
-                "Egress {id}'s stored DNS setting cannot be read ("
+            warning.contains(&format!(
+                "the stored servers of DNS server list {id} cannot be read ("
             )),
             "{warning}"
         );
     }
-    assert!(runtime.egress_dialer(id, Duration::from_secs(1)).is_err());
+    let route = runtime.route(consumer, 1, Duration::from_secs(1)).unwrap();
+    let stage = first_stage(&route);
+    let dialed = stage
+        .dial(&Target {
+            host: "localhost".into(),
+            port: 9,
+            purpose: Purpose::Probe,
+            addresses: Vec::new(),
+        })
+        .await;
+    let error = match dialed {
+        Ok(_) => panic!("a name was resolved on a list that cannot be read"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("cannot be read"), "{error}");
+    runtime.shutdown().await;
+}
+
+// A WireGuard proxy whose endpoint is a name, never dialled here.
+fn named_wireguard(id: u32) -> ProxyProfile {
+    ProxyProfile {
+        host: "vpn.example".into(),
+        ..idle_wireguard_profile(id)
+    }
+}
+
+// `config` with profile `LISTED` stored: Weaver asks one listed server from
+// the egress.
+const LISTED: u32 = 2;
+fn store_listed_dns(config: &mut Configuration) {
+    let mut dns = (*config.dns).clone();
+    dns.lists.insert(
+        4,
+        crate::proxies::DnsServerList {
+            id: 4,
+            name: "Listed".into(),
+            servers: vec![crate::proxies::ListedServer {
+                address: "192.0.2.53:53".parse().unwrap(),
+                wire: crate::proxies::ListedWire::Plain,
+            }],
+        },
+    );
+    dns.profiles.insert(
+        LISTED,
+        crate::proxies::DnsProfile {
+            kind: crate::proxies::DnsProfileKind::Route,
+            id: LISTED,
+            name: "Listed".into(),
+            who: crate::proxies::DnsWho::Weaver,
+            transit: Some(crate::proxies::DnsTransit::Egress),
+            trust: crate::proxies::DnsTrust::AsSent,
+            server_list_id: Some(4),
+            system_fallback: false,
+        },
+    );
+    config.dns = Arc::new(dns);
+}
+
+// `config` with profile `NAME` stored: a proxy name profile on which Weaver
+// asks one listed server, apart from `LISTED`'s, from the egress.
+const NAME: u32 = 3;
+fn store_name_dns(config: &mut Configuration) {
+    let mut dns = (*config.dns).clone();
+    dns.lists.insert(
+        5,
+        crate::proxies::DnsServerList {
+            id: 5,
+            name: "Proxy address".into(),
+            servers: vec![crate::proxies::ListedServer {
+                address: "192.0.2.99:53".parse().unwrap(),
+                wire: crate::proxies::ListedWire::Plain,
+            }],
+        },
+    );
+    dns.profiles.insert(
+        NAME,
+        crate::proxies::DnsProfile {
+            kind: crate::proxies::DnsProfileKind::ProxyName,
+            id: NAME,
+            name: "Proxy address".into(),
+            who: crate::proxies::DnsWho::Weaver,
+            transit: Some(crate::proxies::DnsTransit::Egress),
+            trust: crate::proxies::DnsTrust::AsSent,
+            server_list_id: Some(5),
+            system_fallback: false,
+        },
+    );
+    config.dns = Arc::new(dns);
+}
+
+// The servers a names slot's Weaver choice asks, or None for any other.
+fn listed_servers(slot: &NamesSlot) -> Option<Vec<std::net::SocketAddr>> {
+    match slot.get()?.choice() {
+        weaver_tunnel::pipe::DnsChoice::Weaver { servers, .. } => {
+            Some(servers.iter().map(|server| server.address).collect())
+        }
+        _ => None,
+    }
+}
+
+// The names slot proxy `proxy`'s own address is looked up with.
+fn proxy_name_slots(runtime: &NetworkRuntime, proxy: u32) -> Vec<Arc<NamesSlot>> {
+    runtime
+        .route_names
+        .lock()
+        .unwrap()
+        .slots
+        .iter()
+        .filter(|((owner, _), _)| *owner == proxy_name_owner(proxy))
+        .map(|(_, slot)| slot.clone())
+        .collect()
+}
+
+// Two routes on different route profiles through one WireGuard proxy whose
+// endpoint is a name ride one session, and the endpoint is looked up by the
+// proxy's own name profile, not by either route's.
+#[tokio::test]
+async fn routes_on_different_profiles_share_a_session_named_by_the_proxys_profile() {
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let mut config = runtime.configuration.read().unwrap().clone();
+    config.profiles.insert(
+        1,
+        ProxyProfile {
+            dns_profile_id: NAME,
+            ..named_wireguard(1)
+        },
+    );
+    store_listed_dns(&mut config);
+    store_name_dns(&mut config);
+    let mut listed = wireguard_ladder(Rung::Proxy { id: 1 });
+    listed.dns_profile_id = Some(LISTED);
+    for (server, policy) in [(1, wireguard_ladder(Rung::Proxy { id: 1 })), (2, listed)] {
+        config.consumers.insert(Consumer::Server(server).key());
+        config
+            .policies
+            .insert(Consumer::Server(server).key(), policy);
+    }
+    runtime.apply_configuration(config).unwrap();
+    for server in [1, 2] {
+        runtime
+            .route(Consumer::Server(server), 5, Duration::from_secs(1))
+            .unwrap();
+    }
+    assert_eq!(runtime.sessions.lock().unwrap().len(), 1);
+    let slots = proxy_name_slots(&runtime, 1);
+    assert_eq!(slots.len(), 1);
+    assert_eq!(
+        listed_servers(&slots[0]),
+        Some(vec!["192.0.2.99:53".parse().unwrap()])
+    );
+    runtime.shutdown().await;
+}
+
+// A proxy pointed from System at a proxy name profile keeps its session and
+// every leg on it: only the slot its address is looked up with is swapped,
+// so its next endpoint lookup asks the listed servers, not the host.
+#[tokio::test]
+async fn a_proxy_moved_to_a_name_profile_keeps_its_session_and_stops_asking_the_host() {
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let mut config = runtime.configuration.read().unwrap().clone();
+    config.profiles.insert(1, named_wireguard(1));
+    store_name_dns(&mut config);
+    config.consumers.insert(Consumer::Server(1).key());
+    config.policies.insert(
+        Consumer::Server(1).key(),
+        wireguard_ladder(Rung::Proxy { id: 1 }),
+    );
+    runtime.apply_configuration(config.clone()).unwrap();
+    let route = server_route(&runtime);
+    let stage = first_stage(&route);
+    let session = runtime
+        .sessions
+        .lock()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    let slot = proxy_name_slots(&runtime, 1).pop().unwrap();
+    assert_eq!(
+        *slot.get().unwrap().choice(),
+        weaver_tunnel::pipe::DnsChoice::System
+    );
+
+    config.profiles.get_mut(&1).unwrap().dns_profile_id = NAME;
+    runtime.apply_configuration(config).unwrap();
+
+    assert!(!stage.is_revoked());
+    assert!(Arc::ptr_eq(&stage, &first_stage(&server_route(&runtime))));
+    let sessions = runtime.sessions.lock().unwrap().clone();
+    assert_eq!(sessions.len(), 1);
+    assert!(Arc::ptr_eq(&session, sessions.values().next().unwrap()));
+    // The same slot, now holding the name profile's servers.
+    let held = proxy_name_slots(&runtime, 1);
+    assert_eq!(held.len(), 1);
+    assert!(Arc::ptr_eq(&slot, &held[0]));
+    assert_eq!(
+        listed_servers(&slot),
+        Some(vec!["192.0.2.99:53".parse().unwrap()])
+    );
+    runtime.shutdown().await;
+}
+
+// Each hop of a chain looks its own address up with its own proxy's name
+// profile: the second hop's slot holds its profile, the first's System.
+#[tokio::test]
+async fn each_hop_of_a_chain_names_its_address_by_its_own_proxy() {
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let mut config = runtime.configuration.read().unwrap().clone();
+    config.profiles.insert(1, named_wireguard(1));
+    config.profiles.insert(
+        2,
+        ProxyProfile {
+            dns_profile_id: NAME,
+            ..named_wireguard(2)
+        },
+    );
+    store_name_dns(&mut config);
+    config.consumers.insert(Consumer::Server(1).key());
+    config.policies.insert(
+        Consumer::Server(1).key(),
+        wireguard_ladder(Rung::Chain { ids: vec![1, 2] }),
+    );
+    runtime.apply_configuration(config).unwrap();
+    runtime
+        .route(Consumer::Server(1), 5, Duration::from_secs(1))
+        .unwrap();
+    let first = proxy_name_slots(&runtime, 1);
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        *first[0].get().unwrap().choice(),
+        weaver_tunnel::pipe::DnsChoice::System
+    );
+    let second = proxy_name_slots(&runtime, 2);
+    assert_eq!(second.len(), 1);
+    assert_eq!(
+        listed_servers(&second[0]),
+        Some(vec!["192.0.2.99:53".parse().unwrap()])
+    );
     runtime.shutdown().await;
 }

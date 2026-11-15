@@ -24,22 +24,19 @@ fn egress() -> EgressInterface {
         download_bps: Some(1_000_000),
         upload_bps: None,
         quota: Default::default(),
-        dns: Default::default(),
     }
 }
 
 fn profile(id: u32) -> ProxyProfile {
     ProxyProfile {
+        dns_profile_id: 0,
         id,
         name: format!("proxy-{id}"),
         kind: ProxyKind::Socks5,
         enabled: true,
         host: "proxy.example".into(),
         port: 1080,
-        dns: crate::proxies::ProxyDns::plain(
-            crate::proxies::DnsPath::ThroughProxy,
-            ["192.0.2.53".parse().unwrap()],
-        ),
+        dns_servers: vec![],
         tunnel_addresses: vec![],
         peer_public_key: None,
         mtu: 1280,
@@ -597,6 +594,8 @@ fn a_route_may_stack_wireguard_only_on_wireguard() {
             kind: ProxyKind::WireGuard,
             host: "wg.example".into(),
             port: 51820,
+            // Its tunnel's servers find the address of the hop it carries.
+            dns_servers: vec!["10.63.0.1".parse().unwrap()],
             tunnel_addresses: vec!["10.63.0.2/32".into()],
             peer_public_key: Some(key(id as u8 + 10)),
             secrets: ProxySecrets {
@@ -637,6 +636,7 @@ fn a_route_may_stack_wireguard_only_on_wireguard() {
         .find(|p| p.id == 2)
         .unwrap();
     changed.kind = ProxyKind::Socks5;
+    changed.dns_servers.clear();
     changed.revision += 1;
     assert_eq!(
         refused(db.save_proxy_profile(&changed)),
@@ -654,6 +654,8 @@ fn a_wireguard_proxy_is_saved_on_only_one_path_per_egress() {
             kind: ProxyKind::WireGuard,
             host: "wg.example".into(),
             port: 51820,
+            // Its tunnel's servers find the address of the hop it carries.
+            dns_servers: vec!["10.63.0.1".parse().unwrap()],
             tunnel_addresses: vec!["10.63.0.2/32".into()],
             peer_public_key: Some(key(id as u8 + 10)),
             secrets: ProxySecrets {

@@ -24,19 +24,20 @@ use weaver_torrent::{
     ListenerMode, ListenerOptions, PeerConnectionOptions, Session, SessionLimits, SessionOptions,
     SharedLimits, SocketFactory,
 };
-use weaver_tunnel::pipe::Dialer;
+use weaver_tunnel::pipe::{Dialer, NamesSlot};
 
 use crate::StateError;
 use crate::bandwidth::TorrentRates;
 use crate::persistence::Database;
 use crate::proxies::{
-    Consumer, EgressBinding, EgressDns, EgressHealth, EgressInterface, EgressLimitChanges,
-    FetchOptions, LegPath, LegTenancy, MulticastInterfaces, NetworkRuntime, ProxyRuntime,
-    ResolvedBy, Route, RoutingPolicy, Rung, SYSTEM_EGRESS_ID, SessionOpening, TorrentLeg,
-    TorrentScope, pool_of, routed_fetch,
+    Consumer, EgressBinding, EgressHealth, EgressInterface, EgressLimitChanges, FetchOptions,
+    LegPath, LegTenancy, MulticastInterfaces, NetworkRuntime, ProxyRuntime, ResolvedBy, Route,
+    RoutingPolicy, Rung, SYSTEM_EGRESS_ID, SessionOpening, TorrentLeg, TorrentScope, pool_of,
+    routed_fetch,
 };
 use crate::settings::{BlocklistSource, TorrentConfig, TorrentEncryption, TorrentLimit};
 use crate::torrents::identity::IDENTITY;
+use crate::torrents::naming::{LegNaming, ScopeNaming, TorrentNames};
 use crate::torrents::net::{Exposure, LegKind, LegNames, LegSockets, Shape, tracker_client};
 use crate::torrents::rate::SessionRates;
 
@@ -154,39 +155,6 @@ impl RouteKey {
         Self(hex::encode(&Sha1::digest(&encoded)[..8]))
     }
 
-    /// [`of`](Self::of) for a leg on an egress whose names go to listed
-    /// DNS servers: a save of that DNS opens a new session. An egress the
-    /// host names keeps the key it always had.
-    pub fn of_named(
-        egress_id: u32,
-        binding: &EgressBinding,
-        path: &LegPath,
-        dns: &EgressDns,
-    ) -> Self {
-        if dns.is_host() {
-            return Self::of(egress_id, binding, path);
-        }
-        let encoded =
-            serde_json::to_vec(&(egress_id, binding, path, dns)).expect("route legs always encode");
-        Self(hex::encode(&Sha1::digest(&encoded)[..8]))
-    }
-
-    /// [`member`](Self::member) on an egress whose names go to listed DNS
-    /// servers.
-    pub fn member_named(
-        egress_id: u32,
-        binding: &EgressBinding,
-        member: u32,
-        dns: &EgressDns,
-    ) -> Self {
-        if dns.is_host() {
-            return Self::member(egress_id, binding, member);
-        }
-        let encoded = serde_json::to_vec(&("member", egress_id, binding, member, dns))
-            .expect("route legs always encode");
-        Self(hex::encode(&Sha1::digest(&encoded)[..8]))
-    }
-
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -220,31 +188,31 @@ pub fn leg_unavailable(network: &NetworkRuntime, egress_id: u32) -> Option<Route
     }
 }
 
-/// Who resolves the names a session on `path` through `egress_id` looks up:
-/// the egress's DNS on a direct leg, the exit proxy's naming on a ladder, none
-/// on a pool exit, whose sessions each name through their own member, or a
-/// proxy that is not configured.
-pub fn names_on(network: &NetworkRuntime, egress_id: u32, path: &LegPath) -> Option<ResolvedBy> {
+/// Who resolves the names a session of `consumer`'s route on `path` looks
+/// up, as the route's DNS profile says: through the exit proxy on a ladder,
+/// out of the egress on a direct leg. None on a pool exit, whose sessions
+/// each name through their own member, or a proxy that is not configured.
+pub fn names_on(
+    network: &NetworkRuntime,
+    consumer: Consumer,
+    path: &LegPath,
+) -> Option<ResolvedBy> {
     let exit = match path {
-        LegPath::Direct => {
-            return Some(
-                leg_egress(network, egress_id)
-                    .map_or(ResolvedBy::Host, |egress| egress.dns.resolved_by()),
-            );
-        }
-        LegPath::Ladder { rungs, .. } => match rungs.last()? {
+        LegPath::Direct => None,
+        LegPath::Ladder { rungs, .. } => Some(match rungs.last()? {
             Rung::Proxy { id } => *id,
             Rung::Chain { ids } => *ids.last()?,
             Rung::Pool { .. } => return None,
-        },
+        }),
     };
-    network.resolved_by(exit, egress_id)
+    network.resolved_by(consumer, exit)
 }
 
-/// The key of the session a route through `egress_id` and `path` opens.
+/// The key of the session a route through `egress_id` and `path` opens,
+/// whatever DNS profile it names by: each torrent on it names by its own.
 pub fn leg_key(network: &NetworkRuntime, egress_id: u32, path: &LegPath) -> RouteKey {
     match leg_egress(network, egress_id) {
-        Some(egress) => RouteKey::of_named(egress.id, &egress.binding, path, &egress.dns),
+        Some(egress) => RouteKey::of(egress.id, &egress.binding, path),
         None => RouteKey::of(egress_id, &EgressBinding::System, path),
     }
 }
@@ -253,7 +221,7 @@ pub fn leg_key(network: &NetworkRuntime, egress_id: u32, path: &LegPath) -> Rout
 /// `member`.
 pub fn member_key(network: &NetworkRuntime, egress_id: u32, member: u32) -> RouteKey {
     match leg_egress(network, egress_id) {
-        Some(egress) => RouteKey::member_named(egress.id, &egress.binding, member, &egress.dns),
+        Some(egress) => RouteKey::member(egress.id, &egress.binding, member),
         None => RouteKey::member(egress_id, &EgressBinding::System, member),
     }
 }
@@ -375,6 +343,8 @@ pub struct OpenLeg {
     /// The route's leg the factory dials through, kept while the session
     /// lives.
     pub leg: Option<Arc<TorrentLeg>>,
+    /// How each torrent on the session names: by its own route's profile.
+    pub naming: Arc<LegNaming>,
 }
 
 impl OpenLeg {
@@ -394,11 +364,20 @@ impl OpenLeg {
         } else {
             Arc::new(LegSockets::new(Arc::clone(&dialer), &kind))
         };
+        let http = tracker_client(&kind, Arc::clone(&dialer), bridge)?;
+        let names: Arc<dyn Resolver> = Arc::new(LegNames(Arc::clone(&dialer)));
         Ok(Self {
             shape: kind.shape(Some(&dialer)),
             factory,
-            http: tracker_client(&kind, Arc::clone(&dialer), bridge)?,
-            names: Arc::new(LegNames(dialer)),
+            naming: Arc::new(LegNaming::new(
+                kind.clone(),
+                Arc::clone(&dialer),
+                leg.clone(),
+                Arc::clone(&names),
+                Arc::clone(&http),
+            )),
+            http,
+            names,
             kind,
             leg,
         })
@@ -422,6 +401,11 @@ pub trait Routes: Send + Sync {
     /// returned lives: the leg reads as opening meanwhile. Nothing to hold
     /// by default.
     fn opening(&self, _plan: &RoutePlan) -> Option<Arc<LegTenancy>> {
+        None
+    }
+    /// The slot the lookups of `plan`'s torrents name by on its leg; none
+    /// when they name as the leg does.
+    fn scope_names(&self, _plan: &RoutePlan) -> Option<Arc<NamesSlot>> {
         None
     }
     /// The blocklist at `url`, which every route's session shares.
@@ -502,7 +486,9 @@ impl Routes for NetworkRoutes {
                                 down: unavailable.clone().or_else(|| {
                                     members_down.remove(&id).map(RouteFailure::leg_down)
                                 }),
-                                names: self.network().resolved_by(id, leg.egress_id),
+                                names: self
+                                    .network()
+                                    .resolved_by(Consumer::Torrent(scope), Some(id)),
                             })
                             .collect();
                         // Down while no member is up: for the first member's
@@ -527,12 +513,16 @@ impl Routes for NetworkRoutes {
             egress_id,
             kind: leg_kind(self.network(), leg.egress_id, &leg.path),
             key,
-            names: names_on(self.network(), leg.egress_id, &leg.path),
+            names: names_on(self.network(), Consumer::Torrent(scope), &leg.path),
             policy,
             down,
             members,
             member: None,
         }
+    }
+
+    fn scope_names(&self, plan: &RoutePlan) -> Option<Arc<NamesSlot>> {
+        Some(self.network().torrent_names(plan.scope, plan.egress_id))
     }
 
     // A pool member's session may be another scope's too: whether its
@@ -543,7 +533,11 @@ impl Routes for NetworkRoutes {
 
     async fn open(&self, plan: &RoutePlan, peers: usize) -> Result<OpenLeg, String> {
         if plan.kind.own_sockets() {
-            let egress = self.network().egress_dialer(plan.egress_id, self.timeout)?;
+            let egress = self.network().egress_dialer(
+                Consumer::Torrent(plan.scope),
+                plan.egress_id,
+                self.timeout,
+            )?;
             return OpenLeg::on(plan.kind.clone(), egress, None, None);
         }
         let peers = u16::try_from(peers).unwrap_or(u16::MAX);
@@ -943,6 +937,8 @@ enum Slot {
     Open {
         session: Arc<Session>,
         leg: Option<Arc<TorrentLeg>>,
+        // How each torrent on the session names.
+        naming: Arc<LegNaming>,
         port: u16,
         // The external port its session asks a gateway to map, when it maps.
         maps: Option<u16>,
@@ -1403,6 +1399,35 @@ impl Sessions {
         Some(running)
     }
 
+    /// How a torrent of `plan`'s scope names on `session`: by its route's
+    /// profile, through the session's leg. A session no longer open as
+    /// `plan`'s route, or a naming that cannot be built, looks nothing up.
+    pub async fn scope_naming(&self, plan: &RoutePlan, session: &Arc<Session>) -> ScopeNaming {
+        let naming = match self.slots.lock().await.get(&plan.key) {
+            Some(Slot::Open {
+                session: open,
+                naming,
+                ..
+            }) if Arc::ptr_eq(open, session) => Arc::clone(naming),
+            _ => return ScopeNaming::refused("the torrent's session is gone"),
+        };
+        naming
+            .of(plan.scope, self.routes.scope_names(plan))
+            .unwrap_or_else(|error| {
+                tracing::warn!(route = plan.key.as_str(), %error, "a torrent route's naming could not be built");
+                ScopeNaming::refused("the torrent route's naming could not be built")
+            })
+    }
+
+    /// A torrent's naming on `session` as `plan`'s scope names.
+    pub async fn torrent_names(
+        &self,
+        plan: &RoutePlan,
+        session: &Arc<Session>,
+    ) -> Arc<TorrentNames> {
+        TorrentNames::new(self.scope_naming(plan, session).await)
+    }
+
     /// The open session of `plan`'s route, built when it is not open yet. A
     /// route that is down holds closed. A session built here names itself as
     /// the client of `opener`, the torrent that opens it, wherever it names a
@@ -1506,13 +1531,13 @@ impl Sessions {
             let now = self
                 .off()
                 .or_else(|| slots.get(&plan.key).and_then(Slot::held));
-            if let Ok((session, leg, _, maps, _)) = built {
+            if let Ok((session, leg, _, maps, _, _)) = built {
                 self.closing.close(&plan.key, session, leg, maps);
             }
             return Err(SessionError::RouteDown(now.unwrap_or(REVOKED)));
         }
         match built {
-            Ok((session, leg, port, maps, opening)) => {
+            Ok((session, leg, port, maps, opening, naming)) => {
                 self.rates.add(
                     &session,
                     plan.egress_id,
@@ -1539,6 +1564,7 @@ impl Sessions {
                     Slot::Open {
                         session: Arc::clone(&session),
                         leg,
+                        naming,
                         port,
                         maps,
                         plan: plan.clone(),
@@ -1610,6 +1636,7 @@ impl Sessions {
             u16,
             Option<u16>,
             Opening,
+            Arc<LegNaming>,
         ),
         RouteFailure,
     > {
@@ -1703,7 +1730,7 @@ impl Sessions {
                 if let Some(leg) = &leg.leg {
                     leg.opened(true);
                 }
-                Ok((session, leg.leg, port, maps, opening))
+                Ok((session, leg.leg, port, maps, opening, leg.naming))
             }
             // A session that could not open on a leg whose path has a
             // failing hop could not open for that hop: a tunnel that never

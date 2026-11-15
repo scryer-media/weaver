@@ -10,16 +10,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn profile(id: u32) -> ProxyProfile {
     ProxyProfile {
+        dns_profile_id: 0,
         id,
         name: format!("proxy {id}"),
         kind: ProxyKind::Socks5,
         enabled: true,
         host: "127.0.0.1".into(),
         port: 9,
-        dns: crate::proxies::ProxyDns::plain(
-            crate::proxies::DnsPath::ThroughProxy,
-            ["192.0.2.53".parse().unwrap()],
-        ),
+        dns_servers: vec![],
         tunnel_addresses: vec![],
         peer_public_key: None,
         mtu: 1280,
@@ -277,6 +275,12 @@ fn routing_validation_and_atomic_consumer_save_preserve_existing_policy() {
     };
     db.insert_server_with_routing(&server, Some(&policy))
         .unwrap();
+    // A loaded route always names its DNS profile; a new one saved without
+    // one takes the System profile.
+    let policy = RoutingPolicy {
+        dns_profile_id: Some(crate::proxies::SYSTEM_DNS_PROFILE_ID),
+        ..policy
+    };
     server.host = "new.invalid".into();
     db.update_server(&server).unwrap();
     assert_eq!(
@@ -361,6 +365,12 @@ fn backup_restores_encrypted_profiles_ordered_routes_and_host_trust() {
     source
         .save_proxy_routing_policy(Consumer::Server(1), &policy)
         .unwrap();
+    // A loaded route always names its DNS profile; a new one saved without
+    // one takes the System profile.
+    let policy = RoutingPolicy {
+        dns_profile_id: Some(crate::proxies::SYSTEM_DNS_PROFILE_ID),
+        ..policy
+    };
     assert!(source.has_encrypted_credentials().unwrap());
     source.validate_encrypted_credentials(&key).unwrap();
     assert!(
@@ -517,7 +527,6 @@ async fn a_reload_asked_for_during_another_reads_the_rows_again() {
             download_bps: None,
             upload_bps: None,
             quota: Default::default(),
-            dns: Default::default(),
         })
         .unwrap();
 

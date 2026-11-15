@@ -290,7 +290,6 @@ mod tests {
                 download_bps: None,
                 upload_bps: None,
                 quota: Default::default(),
-                dns: Default::default(),
             })
             .unwrap();
         db.save_proxy_routing_policy(

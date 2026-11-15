@@ -20,7 +20,7 @@ async fn profile_crud_redacts_secrets_and_preserves_omitted_credentials() {
     let h = harness().await;
     let create = r#"mutation { saveProxyProfile(input: {
         name: "gateway", kind: SOCKS5, enabled: true, host: "127.0.0.1", port: 1080,
-        username: "private-user", password: "private-password", dns: { who: SERVERS, path: THROUGH_PROXY, trust: AS_SENT, servers: [{ wire: PLAIN, address: "192.0.2.53" }] }
+        username: "private-user", password: "private-password"
     }) { id kind hasUsername hasPassword } }"#;
     assert_has_errors(&h.execute_as(create, CallerScope::Control).await);
     let result = h.execute(create).await;
@@ -32,8 +32,7 @@ async fn profile_crud_redacts_secrets_and_preserves_omitted_credentials() {
     let result = h
         .execute(&format!(
             r#"mutation {{ saveProxyProfile(id: {id}, input: {{
-        name: "renamed", kind: SOCKS5, enabled: false, host: "127.0.0.1", port: 1080,
-        dns: {{ who: SERVERS, path: THROUGH_PROXY, trust: AS_SENT, servers: [{{ wire: PLAIN, address: "192.0.2.53" }}] }}
+        name: "renamed", kind: SOCKS5, enabled: false, host: "127.0.0.1", port: 1080
     }}) {{ id enabled hasUsername hasPassword }} }}"#
         ))
         .await;
@@ -75,74 +74,63 @@ const WIREGUARD_KEYS: &str = r#", tunnelAddresses: ["10.0.0.2/32"],
         peerPublicKey: "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
         privateKey: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=""#;
 
-// A save of a `kind` proxy with `extra` fields, asking for its DNS back.
-fn save_dns(id: Option<u64>, kind: &str, extra: &str) -> String {
-    let id = id.map_or("null".into(), |id| id.to_string());
+// A save of a DNS server list holding `servers`, asking for them back.
+fn save_dns(id: Option<u64>, servers: &str) -> String {
+    let id = id.map_or(String::new(), |id| format!("id: {id}, "));
     format!(
-        r#"mutation {{ saveProxyProfile(id: {id}, input: {{
-        name: "dns-{kind}", kind: {kind}, enabled: true, host: "127.0.0.1", port: 1080{extra}
-    }}) {{ id dns {{ who path trust servers {{ wire address tlsName url }} }} }} }}"#
+        r#"mutation {{ saveDnsServerList(input: {{ {id}name: "Resolvers", servers: [{servers}] }}) {{ id servers {{ wire address tlsName url }} }} }}"#
     )
 }
 
-// The saved proxy's id and DNS.
+// The saved list's id, and the list as it came back.
 fn saved_dns(result: &async_graphql::Response) -> (u64, serde_json::Value) {
     assert_no_errors(result);
     let data = response_data(result);
     (
-        data["saveProxyProfile"]["id"].as_u64().unwrap(),
-        data["saveProxyProfile"]["dns"].clone(),
+        data["saveDnsServerList"]["id"].as_u64().unwrap(),
+        data["saveDnsServerList"].clone(),
     )
 }
 
+// A WireGuard proxy's tunnel DNS servers are kept by an update that does
+// not name them, and any other kind is refused them.
 #[tokio::test]
-async fn a_save_without_dns_keeps_how_the_proxy_resolves() {
+async fn a_wireguard_proxys_dns_servers_are_kept_by_an_update_without_them() {
     let h = harness().await;
-    let who = |dns: &serde_json::Value| dns["who"].as_str().unwrap().to_owned();
-    let (socks, dns) = saved_dns(&h.execute(&save_dns(None, "SOCKS5", "")).await);
-    assert_eq!(
-        dns,
-        serde_json::json!({ "who": "PROXY", "path": "THROUGH_PROXY", "trust": "AS_SENT", "servers": [] })
-    );
-    let (_, dns) = saved_dns(
-        &h.execute(&save_dns(None, "WIRE_GUARD", WIREGUARD_KEYS))
+    let save = |id: Option<u64>, kind: &str, extra: &str| {
+        let id = id.map_or("null".into(), |id| id.to_string());
+        format!(
+            r#"mutation {{ saveProxyProfile(id: {id}, input: {{
+        name: "dns-{kind}", kind: {kind}, enabled: true, host: "127.0.0.1", port: 1080{extra}
+    }}) {{ id dnsServers }} }}"#
+        )
+    };
+    let saved = |result: &async_graphql::Response| {
+        assert_no_errors(result);
+        let data = response_data(result);
+        (
+            data["saveProxyProfile"]["id"].as_u64().unwrap(),
+            data["saveProxyProfile"]["dnsServers"].clone(),
+        )
+    };
+    let with_dns = format!(r#"{WIREGUARD_KEYS}, dnsServers: ["10.0.0.1", "10.0.0.2"]"#);
+    let (tunnel, servers) = saved(&h.execute(&save(None, "WIRE_GUARD", &with_dns)).await);
+    assert_eq!(servers, serde_json::json!(["10.0.0.1", "10.0.0.2"]));
+    let (_, servers) = saved(
+        &h.execute(&save(Some(tunnel), "WIRE_GUARD", WIREGUARD_KEYS))
             .await,
     );
-    assert_eq!(who(&dns), "HOST");
-    let with_dns = format!(
-        r#"{WIREGUARD_KEYS}, dns: {{ who: SERVERS, path: THROUGH_PROXY, trust: AS_SENT, servers: [{{ wire: PLAIN, address: "10.0.0.1" }}] }}"#
-    );
-    let (_, dns) = saved_dns(&h.execute(&save_dns(None, "WIRE_GUARD", &with_dns)).await);
-    assert_eq!(who(&dns), "SERVERS");
-
-    let host = r#", dns: { who: HOST, path: DIRECT, trust: REQUIRE_AD, servers: [] }"#;
-    let (_, dns) = saved_dns(&h.execute(&save_dns(Some(socks), "SOCKS5", host)).await);
     assert_eq!(
-        dns,
-        serde_json::json!({ "who": "HOST", "path": "THROUGH_PROXY", "trust": "AS_SENT", "servers": [] }),
-        "who answers alone is kept, in its normal form"
+        servers,
+        serde_json::json!(["10.0.0.1", "10.0.0.2"]),
+        "an update without DNS servers keeps the saved ones"
     );
-    let host = r#", dns: { who: HOST, path: DIRECT, trust: VALIDATE, servers: [] }"#;
-    let (_, dns) = saved_dns(&h.execute(&save_dns(Some(socks), "SOCKS5", host)).await);
+    let refused = h
+        .execute(&save(None, "SOCKS5", r#", dnsServers: ["10.0.0.1"]"#))
+        .await;
     assert_eq!(
-        dns,
-        serde_json::json!({ "who": "HOST", "path": "THROUGH_PROXY", "trust": "AS_SENT", "servers": [] }),
-        "validating is kept only while servers answer"
-    );
-    let (_, dns) = saved_dns(&h.execute(&save_dns(Some(socks), "SOCKS5", "")).await);
-    assert_eq!(
-        who(&dns),
-        "HOST",
-        "an update without DNS keeps the saved one"
-    );
-    let validated = r#", dns: { who: SERVERS, path: DIRECT, trust: VALIDATE, servers: [{ wire: TLS, address: "192.0.2.53" }] }"#;
-    let (_, dns) = saved_dns(&h.execute(&save_dns(Some(socks), "SOCKS5", validated)).await);
-    assert_eq!(dns["trust"], "VALIDATE");
-    assert_eq!(dns["who"], "SERVERS");
-    let (_, dns) = saved_dns(&h.execute(&save_dns(Some(socks), "SOCKS5", "")).await);
-    assert_eq!(
-        dns["trust"], "VALIDATE",
-        "an update without DNS keeps validating"
+        serde_json::to_value(&refused.errors[0]).unwrap()["extensions"]["code"],
+        "PROXY_DNS_SERVER_INVALID"
     );
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
@@ -152,17 +140,17 @@ async fn a_save_without_dns_keeps_how_the_proxy_resolves() {
 #[tokio::test]
 async fn dns_servers_come_back_as_they_were_given() {
     let h = harness().await;
-    let servers = r#", dns: { who: SERVERS, path: DIRECT, trust: REQUIRE_AD, servers: [
+    let servers = r#"
         { wire: PLAIN, address: "192.0.2.53" },
         { wire: PLAIN, address: "192.0.2.54:5353" },
         { wire: TLS, address: "[2001:db8::1]:853", tlsName: " dns.example " },
         { wire: HTTPS, address: "", url: "HTTPS://[2001:db8::2]:8443/dns-query?ct=1" }
-    ] }"#;
-    let (id, dns) = saved_dns(&h.execute(&save_dns(None, "SOCKS5", servers)).await);
+    "#;
+    let (id, dns) = saved_dns(&h.execute(&save_dns(None, servers)).await);
     assert_eq!(
         dns,
         serde_json::json!({
-            "who": "SERVERS", "path": "DIRECT", "trust": "REQUIRE_AD",
+            "id": id,
             "servers": [
                 { "wire": "PLAIN", "address": "192.0.2.53", "tlsName": null, "url": null },
                 { "wire": "PLAIN", "address": "192.0.2.54:5353", "tlsName": null, "url": null },
@@ -174,21 +162,21 @@ async fn dns_servers_come_back_as_they_were_given() {
             ],
         })
     );
-    let stored = h.db.list_proxy_profiles().unwrap();
-    let stored = stored.iter().find(|p| u64::from(p.id) == id).unwrap();
+    let stored = h.db.list_dns_server_lists().unwrap();
+    let stored = stored.iter().find(|list| u64::from(list.id) == id).unwrap();
     assert_eq!(
-        serde_json::to_value(&stored.dns).unwrap()["servers"][3],
+        serde_json::to_value(&stored.servers).unwrap()[3],
         serde_json::json!({
             "address": "[2001:db8::2]:8443",
             "wire": { "Https": { "path": "/dns-query?ct=1" } }
         })
     );
 
-    let default_port = r#", dns: { who: SERVERS, path: THROUGH_PROXY, trust: AS_SENT, servers: [
+    let default_port = r#"
         { wire: HTTPS, address: "", url: "https://192.0.2.1/dns-query" },
         { wire: TLS, address: "192.0.2.2", tlsName: "" }
-    ] }"#;
-    let (_, dns) = saved_dns(&h.execute(&save_dns(Some(id), "SOCKS5", default_port)).await);
+    "#;
+    let (_, dns) = saved_dns(&h.execute(&save_dns(Some(id), default_port)).await);
     assert_eq!(dns["servers"][0]["url"], "https://192.0.2.1/dns-query");
     assert_eq!(dns["servers"][0]["address"], "192.0.2.1");
     assert_eq!(dns["servers"][1]["address"], "192.0.2.2");
@@ -196,13 +184,13 @@ async fn dns_servers_come_back_as_they_were_given() {
 
     // A port is read as a number, leading zeros and all; a bare or bracketed
     // v6 address keeps the wire's port.
-    let spellings = r#", dns: { who: SERVERS, path: THROUGH_PROXY, trust: AS_SENT, servers: [
+    let spellings = r#"
         { wire: PLAIN, address: "192.0.2.53:05353" },
         { wire: PLAIN, address: "[2001:db8::3]:0053" },
         { wire: PLAIN, address: "2001:db8::4" },
         { wire: TLS, address: "[2001:db8::5]" }
-    ] }"#;
-    let (_, dns) = saved_dns(&h.execute(&save_dns(Some(id), "SOCKS5", spellings)).await);
+    "#;
+    let (_, dns) = saved_dns(&h.execute(&save_dns(Some(id), spellings)).await);
     let addresses: Vec<_> = dns["servers"]
         .as_array()
         .unwrap()
@@ -218,11 +206,10 @@ async fn dns_servers_come_back_as_they_were_given() {
             "2001:db8::5"
         ]
     );
-    let stored = h.db.list_proxy_profiles().unwrap();
-    let stored = stored.iter().find(|p| u64::from(p.id) == id).unwrap();
+    let stored = h.db.list_dns_server_lists().unwrap();
+    let stored = stored.iter().find(|list| u64::from(list.id) == id).unwrap();
     assert_eq!(
         stored
-            .dns
             .servers
             .iter()
             .map(|server| server.address.to_string())
@@ -238,7 +225,7 @@ async fn dns_servers_come_back_as_they_were_given() {
 }
 
 #[tokio::test]
-async fn a_dns_setting_no_proxy_could_use_is_refused() {
+async fn a_dns_server_list_no_resolver_could_use_is_refused() {
     let h = harness().await;
     let refused = |result: &async_graphql::Response| {
         assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
@@ -247,98 +234,70 @@ async fn a_dns_setting_no_proxy_could_use_is_refused() {
             .unwrap()
             .to_owned()
     };
-    let servers = |list: &str| {
-        format!(
-            r#", dns: {{ who: SERVERS, path: THROUGH_PROXY, trust: AS_SENT, servers: [{list}] }}"#
-        )
-    };
+    let servers = |list: &str| list.to_owned();
     let plain = r#"{ wire: PLAIN, address: "192.0.2.53" }"#;
     let cases = [
-        ("SOCKS5", servers(""), "PROXY_DNS_SERVERS_REQUIRED"),
+        (servers(""), "PROXY_DNS_SERVERS_REQUIRED"),
+        (servers(&[plain; 11].join(", ")), "PROXY_DNS_SERVER_COUNT"),
         (
-            "SOCKS5",
-            r#", dns: { who: SERVERS, path: DIRECT, trust: VALIDATE, servers: [] }"#.to_owned(),
-            "PROXY_DNS_SERVERS_REQUIRED",
-        ),
-        (
-            "SOCKS5",
-            servers(&[plain; 11].join(", ")),
-            "PROXY_DNS_SERVER_COUNT",
-        ),
-        (
-            "SOCKS5",
             servers(r#"{ wire: PLAIN, address: "192.0.2.53:0" }"#),
             "PROXY_DNS_SERVER_INVALID",
         ),
         (
-            "SOCKS5",
             servers(r#"{ wire: PLAIN, address: "dns.example" }"#),
             "PROXY_DNS_SERVER_INVALID",
         ),
         // Brackets hold a v6 address only, and no address carries a zone,
         // in any form it is written.
         (
-            "SOCKS5",
             servers(r#"{ wire: PLAIN, address: "[192.0.2.53]" }"#),
             "PROXY_DNS_SERVER_INVALID",
         ),
         (
-            "SOCKS5",
             servers(r#"{ wire: PLAIN, address: "[192.0.2.53]:53" }"#),
             "PROXY_DNS_SERVER_INVALID",
         ),
         (
-            "SOCKS5",
             servers(r#"{ wire: TLS, address: "[192.0.2.53]:853" }"#),
             "PROXY_DNS_SERVER_INVALID",
         ),
         (
-            "SOCKS5",
             servers(r#"{ wire: PLAIN, address: "[fe80::1%3]:53" }"#),
             "PROXY_DNS_SERVER_INVALID",
         ),
         (
-            "SOCKS5",
             servers(r#"{ wire: PLAIN, address: "[fe80::1%3]" }"#),
             "PROXY_DNS_SERVER_INVALID",
         ),
         (
-            "SOCKS5",
             servers(r#"{ wire: PLAIN, address: "fe80::1%3" }"#),
             "PROXY_DNS_SERVER_INVALID",
         ),
         (
-            "SOCKS5",
             servers(r#"{ wire: TLS, address: "[fe80::1%eth0]:853" }"#),
             "PROXY_DNS_SERVER_INVALID",
         ),
         (
-            "SOCKS5",
             servers(r#"{ wire: TLS, address: "fe80::1%3" }"#),
             "PROXY_DNS_SERVER_INVALID",
         ),
         (
-            "SOCKS5",
             servers(r#"{ wire: HTTPS, address: "", url: "https://[192.0.2.1]/dns-query" }"#),
             "PROXY_DNS_URL_INVALID",
         ),
         (
-            "SOCKS5",
             servers(r#"{ wire: HTTPS, address: "", url: "https://[fe80::1%3]/dns-query" }"#),
             "PROXY_DNS_URL_INVALID",
         ),
         (
-            "SOCKS5",
             servers(r#"{ wire: HTTPS, address: "", url: "https://[fe80::1%253]:443/dns-query" }"#),
             "PROXY_DNS_URL_INVALID",
         ),
         (
-            "SOCKS5",
             servers(r#"{ wire: TLS, address: "192.0.2.53", tlsName: "not a name" }"#),
             "PROXY_DNS_TLS_NAME_INVALID",
         ),
         (
-            "SOCKS5",
             servers(&format!(
                 r#"{{ wire: TLS, address: "192.0.2.53", tlsName: "{}" }}"#,
                 ["a"; 128].join(".")
@@ -346,47 +305,38 @@ async fn a_dns_setting_no_proxy_could_use_is_refused() {
             "PROXY_DNS_TLS_NAME_INVALID",
         ),
         (
-            "SOCKS5",
             servers(r#"{ wire: HTTPS, address: "", url: "https://dns.example/dns-query" }"#),
             "PROXY_DNS_URL_HOSTNAME",
         ),
         (
-            "SOCKS5",
             servers(r#"{ wire: HTTPS, address: "", url: "http://192.0.2.1/dns-query" }"#),
             "PROXY_DNS_URL_INVALID",
         ),
         (
-            "SOCKS5",
             servers(r#"{ wire: HTTPS, address: "", url: "https://192.0.2.1" }"#),
             "PROXY_DNS_URL_INVALID",
         ),
         (
-            "SOCKS5",
             servers(r#"{ wire: HTTPS, address: "", url: "https://user@192.0.2.1/dns-query" }"#),
             "PROXY_DNS_URL_INVALID",
         ),
         (
-            "SOCKS5",
             servers(r#"{ wire: HTTPS, address: "", url: "https://192.0.2.1/dns-query#top" }"#),
             "PROXY_DNS_URL_INVALID",
         ),
         (
-            "SOCKS5",
             servers(r#"{ wire: HTTPS, address: "", url: "https://192.0.2.1:0/dns-query" }"#),
             "PROXY_DNS_URL_INVALID",
         ),
         (
-            "SOCKS5",
             servers(r#"{ wire: HTTPS, address: "", url: "https://192.0.2.1/dns query" }"#),
             "PROXY_DNS_URL_INVALID",
         ),
         (
-            "SOCKS5",
             servers(r#"{ wire: HTTPS, address: "", url: "https://192.0.2.53/a<b" }"#),
             "PROXY_DNS_URL_INVALID",
         ),
         (
-            "SOCKS5",
             servers(&format!(
                 r#"{{ wire: HTTPS, address: "", url: "https://192.0.2.1/{}" }}"#,
                 "a".repeat(2048)
@@ -394,7 +344,6 @@ async fn a_dns_setting_no_proxy_could_use_is_refused() {
             "PROXY_DNS_URL_INVALID",
         ),
         (
-            "SOCKS5",
             servers(&format!(
                 r#"{{ wire: TLS, address: "192.0.2.53" }}, {plain}"#
             )),
@@ -402,53 +351,39 @@ async fn a_dns_setting_no_proxy_could_use_is_refused() {
         ),
         // One server named twice, once with its port spelled out.
         (
-            "SOCKS5",
             servers(&format!(
                 r#"{plain}, {{ wire: PLAIN, address: "192.0.2.53:53" }}"#
             )),
             "PROXY_DNS_SERVER_DUPLICATE",
         ),
         (
-            "SOCKS5",
             servers(
                 r#"{ wire: TLS, address: "192.0.2.53", tlsName: "dns.example" }, { wire: TLS, address: "192.0.2.53:853", tlsName: "dns.example" }"#,
             ),
             "PROXY_DNS_SERVER_DUPLICATE",
         ),
         (
-            "SOCKS5",
             servers(
                 r#"{ wire: HTTPS, address: "", url: "https://192.0.2.53/dns-query" }, { wire: HTTPS, address: "", url: "https://192.0.2.53:443/dns-query" }"#,
             ),
             "PROXY_DNS_SERVER_DUPLICATE",
         ),
-        (
-            "WIRE_GUARD",
-            format!(
-                r#"{WIREGUARD_KEYS}, dns: {{ who: PROXY, path: THROUGH_PROXY, trust: AS_SENT, servers: [] }}"#
-            ),
-            "PROXY_WIREGUARD_NEEDS_DNS_SERVERS",
-        ),
     ];
-    for (kind, extra, code) in cases {
+    for (extra, code) in cases {
         assert_eq!(
-            refused(&h.execute(&save_dns(None, kind, &extra)).await),
+            refused(&h.execute(&save_dns(None, &extra)).await),
             code,
             "{extra}"
         );
     }
-    assert!(h.db.list_proxy_profiles().unwrap().is_empty());
+    assert!(h.db.list_dns_server_lists().unwrap().is_empty());
 
-    // The most servers a proxy may ask, and a plain server asked directly
-    // with answers that must be authenticated, are taken.
-    let ten = format!(
-        r#", dns: {{ who: SERVERS, path: DIRECT, trust: REQUIRE_AD, servers: [{}] }}"#,
-        (1..=10)
-            .map(|n| format!(r#"{{ wire: PLAIN, address: "192.0.2.{n}" }}"#))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let (_, dns) = saved_dns(&h.execute(&save_dns(None, "SOCKS5", &ten)).await);
+    // The most servers a list holds are taken.
+    let ten = (1..=10)
+        .map(|n| format!(r#"{{ wire: PLAIN, address: "192.0.2.{n}" }}"#))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (_, dns) = saved_dns(&h.execute(&save_dns(None, &ten)).await);
     assert_eq!(dns["servers"].as_array().unwrap().len(), 10);
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
@@ -462,7 +397,7 @@ async fn a_wireguard_proxy_keeps_nat_pmp_or_a_forwarded_port() {
         let wireguard = if kind == "WIRE_GUARD" {
             r#", tunnelAddresses: ["10.2.0.2/32"],
         peerPublicKey: "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
-        privateKey: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=", dns: { who: SERVERS, path: THROUGH_PROXY, trust: AS_SENT, servers: [{ wire: PLAIN, address: "10.2.0.1" }] }"#
+        privateKey: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=", dnsServers: ["10.2.0.1"]"#
         } else {
             ""
         };
@@ -538,7 +473,7 @@ async fn http3_profiles_round_trip_and_feed_routes_keep_credentials_private() {
         .execute(
             r#"mutation { saveProxyProfile(input: {
         name: "QUIC gateway", kind: HTTP3_CONNECT, enabled: true,
-        host: "proxy.invalid", port: 443, dns: { who: SERVERS, path: THROUGH_PROXY, trust: AS_SENT, servers: [{ wire: PLAIN, address: "192.0.2.53" }] },
+        host: "proxy.invalid", port: 443,
         username: "fixture-user", password: "fixture-password"
     }) { id kind hasUsername hasPassword } }"#,
         )
@@ -566,7 +501,7 @@ async fn http3_profiles_round_trip_and_feed_routes_keep_credentials_private() {
         .execute(&format!(
             r#"mutation {{ saveProxyProfile(id: {id}, input: {{
         name: "renamed", kind: HTTP3_CONNECT, enabled: false,
-        host: "proxy.invalid", port: 443, dns: {{ who: SERVERS, path: THROUGH_PROXY, trust: AS_SENT, servers: [{{ wire: PLAIN, address: "192.0.2.53" }}] }}
+        host: "proxy.invalid", port: 443
     }}) {{ kind enabled hasUsername hasPassword }} }}"#
         ))
         .await;
@@ -730,7 +665,6 @@ async fn a_test_says_how_its_host_was_resolved() {
             "TIMED_OUT",
             "SERVER_FAILURE",
             "NO_REPLY",
-            "NOT_AUTHENTICATED",
             "BOGUS",
             "DNSSEC_UNAVAILABLE",
             "TLS_FAILED",
@@ -808,8 +742,8 @@ fn question(packet: &[u8]) -> Option<(String, u16, usize)> {
 
 // A test says which wire its listed servers were asked over and how their
 // answer was judged, as the lookup it made recorded them: a TLS server that
-// could not be reached is still the TLS wire, and servers that must
-// authenticate are taken when they do and refused when they do not.
+// could not be reached is still the TLS wire, and an answer Weaver
+// validates fails closed when it carries no signatures.
 #[tokio::test]
 async fn a_test_says_the_wire_and_trust_of_its_dns_servers() {
     let h = harness().await;
@@ -822,7 +756,6 @@ async fn a_test_says_the_wire_and_trust_of_its_dns_servers() {
     let tls_port = closed.local_addr().unwrap().port();
     drop(closed);
     let (marked, marked_task) = dns_server(true).await;
-    let (unmarked, unmarked_task) = dns_server(false).await;
 
     let resolution = |name: &'static str, trust: &'static str, server: String| {
         let h = &h;
@@ -831,19 +764,32 @@ async fn a_test_says_the_wire_and_trust_of_its_dns_servers() {
                 .execute(&format!(
                     r#"mutation {{ saveProxyProfile(input: {{
                 name: "{name}", kind: SOCKS5, enabled: true,
-                host: "127.0.0.1", port: {proxy_port},
-                dns: {{ who: SERVERS, path: DIRECT, trust: {trust}, servers: [{server}] }}
-            }}) {{ id }} }}"#
+                host: "127.0.0.1", port: {proxy_port}
+            }}) {{ id }} saveDnsServerList(input: {{ name: "{name}", servers: [{server}] }}) {{ id }} }}"#
                 ))
                 .await;
             assert_no_errors(&result);
             let id = response_data(&result)["saveProxyProfile"]["id"]
                 .as_u64()
                 .unwrap();
+            let list = response_data(&result)["saveDnsServerList"]["id"]
+                .as_u64()
+                .unwrap();
+            let result = h
+                .execute(&format!(
+                    r#"mutation {{ saveDnsProfile(input: {{
+                name: "{name}", kind: ROUTE, who: WEAVER, transit: EGRESS, trust: {trust}, serverListId: {list}
+            }}) {{ id }} }}"#
+                ))
+                .await;
+            assert_no_errors(&result);
+            let profile = response_data(&result)["saveDnsProfile"]["id"]
+                .as_u64()
+                .unwrap();
             let result = h
                 .execute(&format!(
                     r#"mutation {{ testVia(
-                route: {{ legs: [{{ egressId: 0, weight: 100, path: {{ direct: true }} }}] }},
+                route: {{ legs: [{{ egressId: 0, weight: 100, path: {{ direct: true }} }}], dnsProfileId: {profile} }},
                 subject: {{ proxy: {id} }}, target: {{ host: "named.invalid", port: 443 }}
             ) {{ success resolution {{
                 resolvedBy dnsServers addresses wire trust error {{ code }}
@@ -871,42 +817,6 @@ async fn a_test_says_the_wire_and_trust_of_its_dns_servers() {
     assert_eq!(tls["addresses"], serde_json::json!([]));
     assert!(!tls["error"].is_null(), "{tls}");
 
-    let authenticated = resolution(
-        "Marked",
-        "REQUIRE_AD",
-        format!(r#"{{ wire: PLAIN, address: "{marked}" }}"#),
-    )
-    .await;
-    assert_eq!(
-        authenticated,
-        serde_json::json!({
-            "resolvedBy": "SERVERS",
-            "dnsServers": ["127.0.0.1"],
-            "addresses": [NAMED],
-            "wire": "PLAIN",
-            "trust": "AUTHENTICATED",
-            "error": null,
-        })
-    );
-
-    let refused = resolution(
-        "Unmarked",
-        "REQUIRE_AD",
-        format!(r#"{{ wire: PLAIN, address: "{unmarked}" }}"#),
-    )
-    .await;
-    assert_eq!(
-        refused,
-        serde_json::json!({
-            "resolvedBy": "SERVERS",
-            "dnsServers": ["127.0.0.1"],
-            "addresses": [],
-            "wire": "PLAIN",
-            "trust": "REFUSED",
-            "error": { "code": "NOT_AUTHENTICATED" },
-        })
-    );
-
     // Validating here checks the signatures itself, against the root's
     // keys. A server that sends none, even one marking its answer
     // authenticated, fails closed: nothing resolves, and the lookup is
@@ -933,19 +843,8 @@ async fn a_test_says_the_wire_and_trust_of_its_dns_servers() {
         .unwrap()
         .split_whitespace()
         .collect::<Vec<_>>();
-    assert_eq!(
-        outcomes,
-        [
-            "AS_SENT",
-            "AUTHENTICATED",
-            "REFUSED",
-            "VALIDATED",
-            "UNSIGNED",
-            "BOGUS"
-        ]
-    );
+    assert_eq!(outcomes, ["AS_SENT", "VALIDATED", "UNSIGNED", "BOGUS"]);
     marked_task.abort();
-    unmarked_task.abort();
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
 
@@ -1038,8 +937,7 @@ async fn feed_policy_is_atomic_preserved_and_blocks_referenced_profile_deletion(
     let result = h
         .execute(
             r#"mutation { saveProxyProfile(input: {
-        name: "gateway", kind: HTTP_CONNECT, enabled: true, host: "127.0.0.1", port: 8080,
-        dns: { who: SERVERS, path: THROUGH_PROXY, trust: AS_SENT, servers: [{ wire: PLAIN, address: "192.0.2.53" }] }
+        name: "gateway", kind: HTTP_CONNECT, enabled: true, host: "127.0.0.1", port: 8080
     }) { id } }"#,
         )
         .await;
@@ -1163,5 +1061,152 @@ async fn a_proxy_save_rebuilds_usenet_connections_only_for_a_proxy_a_server_rout
     assert_no_errors(&h.execute(&save(Some(id), 1082)).await);
     assert_eq!(generation(), before);
     assert_eq!(*reloads.borrow(), reloaded);
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
+// A proxy selects the DNS profile that finds its own address: System or a
+// proxy name profile, never a route profile. A profile's kind is named when
+// it is created and kept, and a profile a proxy uses is not deleted.
+#[tokio::test]
+async fn a_proxy_selects_a_proxy_name_profile_for_its_own_address() {
+    let h = harness().await;
+    let code = |result: &async_graphql::Response| {
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        let error = serde_json::to_value(&result.errors[0]).unwrap();
+        (
+            error["extensions"]["code"].as_str().unwrap().to_owned(),
+            error["extensions"]["params"].clone(),
+        )
+    };
+    let result = h
+        .execute(
+            r#"mutation { saveDnsServerList(input: { name: "Resolvers", servers: [{ wire: PLAIN, address: "192.0.2.53" }] }) { id } }"#,
+        )
+        .await;
+    assert_no_errors(&result);
+    let list = response_data(&result)["saveDnsServerList"]["id"]
+        .as_u64()
+        .unwrap();
+    let profile = |kind: &str| {
+        format!(
+            r#"mutation {{ saveDnsProfile(input: {{
+        name: "listed", {kind} who: WEAVER, transit: EGRESS, trust: AS_SENT, serverListId: {list}
+    }}) {{ id kind }} }}"#
+        )
+    };
+    assert_eq!(
+        code(&h.execute(&profile("")).await).0,
+        "DNS_PROFILE_KIND_REQUIRED"
+    );
+    let saved = |result: &async_graphql::Response| {
+        assert_no_errors(result);
+        let data = response_data(result);
+        assert!(data["saveDnsProfile"]["kind"].is_string());
+        data["saveDnsProfile"]["id"].as_u64().unwrap()
+    };
+    let route = saved(&h.execute(&profile("kind: ROUTE,")).await);
+    let name = saved(&h.execute(&profile("kind: PROXY_NAME,")).await);
+    let refused = h
+        .execute(&format!(
+            r#"mutation {{ saveDnsProfile(input: {{
+        id: {name}, name: "listed", kind: ROUTE, who: WEAVER, transit: EGRESS, trust: AS_SENT, serverListId: {list}
+    }}) {{ id }} }}"#
+        ))
+        .await;
+    assert_eq!(code(&refused).0, "DNS_PROFILE_KIND_IMMUTABLE");
+    let refused = h
+        .execute(
+            r#"mutation { saveDnsProfile(input: {
+        name: "via proxy", kind: PROXY_NAME, who: PROXY, trust: AS_SENT
+    }) { id } }"#,
+        )
+        .await;
+    assert_eq!(code(&refused).0, "DNS_PROFILE_PROXY_NAME_INVALID");
+
+    // A drafted route on a proxy name profile is refused before any server
+    // is asked, as its save would be.
+    let refused = h
+        .execute(&format!(
+            r#"mutation {{ testDnsServers(
+                route: {{ legs: [{{ egressId: 0, weight: 100, path: {{ direct: true }} }}], dnsProfileId: {name} }},
+                servers: [{{ wire: PLAIN, address: "192.0.2.53" }}]
+            ) {{ index }} }}"#
+        ))
+        .await;
+    assert_eq!(
+        code(&refused),
+        (
+            "DNS_PROFILE_KIND".to_owned(),
+            serde_json::json!({ "expected": "ROUTE" })
+        )
+    );
+
+    let save = |id: Option<u64>, dns: &str| {
+        let id = id.map_or("null".into(), |id| id.to_string());
+        format!(
+            r#"mutation {{ saveProxyProfile(id: {id}, input: {{
+        name: "gateway", kind: SOCKS5, enabled: true, host: "proxy.example.test", port: 1080{dns}
+    }}) {{ id dnsProfileId }} }}"#
+        )
+    };
+    let result = h.execute(&save(None, "")).await;
+    assert_no_errors(&result);
+    let proxy = response_data(&result)["saveProxyProfile"]["id"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        response_data(&result)["saveProxyProfile"]["dnsProfileId"],
+        0
+    );
+    let (refusal, params) = code(
+        &h.execute(&save(Some(proxy), &format!(", dnsProfileId: {route}")))
+            .await,
+    );
+    assert_eq!(refusal, "DNS_PROFILE_KIND");
+    assert_eq!(params, serde_json::json!({ "expected": "PROXY_NAME" }));
+    let result = h
+        .execute(&save(Some(proxy), &format!(", dnsProfileId: {name}")))
+        .await;
+    assert_no_errors(&result);
+    assert_eq!(
+        response_data(&result)["saveProxyProfile"]["dnsProfileId"],
+        name
+    );
+    // An update that names no profile keeps the saved one.
+    let result = h.execute(&save(Some(proxy), "")).await;
+    assert_no_errors(&result);
+    assert_eq!(
+        response_data(&result)["saveProxyProfile"]["dnsProfileId"],
+        name
+    );
+
+    let result = h
+        .execute("{ dnsProfiles { id kind usedByProxies usedByRoutes } }")
+        .await;
+    assert_no_errors(&result);
+    let profiles = response_data(&result)["dnsProfiles"].clone();
+    let used = |id: u64| {
+        profiles
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|profile| profile["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(used(0)["kind"], "ROUTE");
+    assert_eq!(used(name)["kind"], "PROXY_NAME");
+    assert_eq!(used(name)["usedByProxies"], 1);
+    assert_eq!(used(route)["usedByProxies"], 0);
+
+    let (refusal, params) = code(
+        &h.execute(&format!("mutation {{ deleteDnsProfile(id: {name}) }}"))
+            .await,
+    );
+    assert_eq!(refusal, "DNS_PROFILE_IN_USE");
+    assert_eq!(
+        params,
+        serde_json::json!({ "routes": [], "proxies": [proxy] })
+    );
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }

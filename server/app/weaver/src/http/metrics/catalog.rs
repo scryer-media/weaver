@@ -505,7 +505,7 @@ metric_families! {
     NETWORK_DNS_ANSWERS = ("weaver_network_dns_answers_total", Counter, ["wire"],
         "Answers from listed DNS servers, by the wire the answering server was asked over.");
     NETWORK_DNS_TRUST = ("weaver_network_dns_trust_total", Counter, ["outcome"],
-        "Lookups at listed DNS servers, by how their answer was judged: taken as sent, authenticated, refused, validated here, unsigned, or bogus. A lookup that still answered also adds one bogus for each address family (A or AAAA) whose answer failed the check.");
+        "Lookups at listed DNS servers, by how their answer was judged: taken as sent, validated here, unsigned, or bogus. A lookup that still answered also adds one bogus for each address family (A or AAAA) whose answer failed the check.");
     NETWORK_DNSSEC_QUERIES = ("weaver_network_dnssec_queries_total", Counter, [],
         "DNS queries sent to check DNSSEC signatures.");
     NETWORK_RUNG_COOLDOWNS = ("weaver_network_rung_cooldowns_total", Counter, ["rung"],

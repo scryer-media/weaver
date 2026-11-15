@@ -18,7 +18,7 @@ use crate::settings::TorrentConfig;
 use crate::speed_test::torrent::{P2pLeg, P2pPath, P2pPlan, probe as p2p_probe};
 use crate::speed_test::{P2pReport, RunClock, TestTorrentSource};
 use crate::torrents::net::LegKind;
-use crate::torrents::sessions::{leg_kind, leg_unavailable, names_on};
+use crate::torrents::sessions::{leg_kind, leg_unavailable};
 
 // The most paths one test tries, counting a pool under test by its members.
 pub const MAX_TEST_PATHS: usize = 64;
@@ -95,6 +95,12 @@ struct Probe {
     kind: LegKind,
     down: Option<crate::torrents::sessions::RouteFailure>,
     names: Option<ResolvedBy>,
+    // The names the path dials with: the drafted route's DNS profile on the
+    // path's egress.
+    named: Arc<NamesSlot>,
+    // The first listed server a stream proxy under test carries a lookup to,
+    // when the route's names are asked through its proxy.
+    dns_server: Option<std::net::SocketAddr>,
 }
 
 // The runtime a test builds its paths in. It is shut down when the test
@@ -175,13 +181,18 @@ impl NetworkRuntime {
     // Tests `subject` through each path of the drafted `route`. A test of
     // the route alone reaches `target`; a proxy reaches `target` when one is
     // given, and otherwise shows how far it got by itself.
+    //
+    // Names are resolved as DNS profile `dns_profile` says, the one the
+    // drafted route names.
     pub async fn test_via(
         &self,
         route: &Route,
+        dns_profile: u32,
         subject: TestSubject,
         target: Option<(String, u16)>,
     ) -> Result<Vec<PathTest>, NetworkRefusal> {
-        self.test_paths(route, subject, target, None).await
+        self.test_paths(route, dns_profile, subject, target, None)
+            .await
     }
 
     // Tests a torrent route the same way, and then runs the test torrent
@@ -190,6 +201,7 @@ impl NetworkRuntime {
     pub async fn test_via_torrent(
         &self,
         route: &Route,
+        dns_profile: u32,
         subject: TestSubject,
         target: Option<(String, u16)>,
         p2p: P2pTest,
@@ -197,21 +209,24 @@ impl NetworkRuntime {
         let target = target
             .filter(|(host, _)| !host.trim().is_empty())
             .or_else(|| Some(p2p.source.target()));
-        self.test_paths(route, subject, target, Some(p2p)).await
+        self.test_paths(route, dns_profile, subject, target, Some(p2p))
+            .await
     }
 
     async fn test_paths(
         &self,
         route: &Route,
+        dns_profile: u32,
         subject: TestSubject,
         target: Option<(String, u16)>,
         p2p: Option<P2pTest>,
     ) -> Result<Vec<PathTest>, NetworkRefusal> {
         let target = target.filter(|(host, _)| !host.trim().is_empty());
         let probe = ProbeRuntime(Some(self.isolated_probe_runtime()));
-        let (probes, concurrency) = probe
-            .runtime()
-            .plan_test(route, subject, target.is_some())?;
+        let (probes, concurrency) =
+            probe
+                .runtime()
+                .plan_test(route, dns_profile, subject, target.is_some())?;
         let tests = run_probes(probes, target, concurrency, p2p.map(Arc::new)).await;
         probe.shutdown().await;
         for test in &tests {
@@ -235,6 +250,7 @@ impl NetworkRuntime {
     fn plan_test(
         &self,
         route: &Route,
+        dns_profile: u32,
         subject: TestSubject,
         targeted: bool,
     ) -> Result<(Vec<Probe>, usize), NetworkRefusal> {
@@ -271,6 +287,17 @@ impl NetworkRuntime {
         };
         let config = self.configuration.read().expect("network configuration");
         route.validate_references(&config.egresses, &config.profiles, &config.pools)?;
+        let dns = config.dns_choice(dns_profile);
+        let dns_server = match &dns {
+            DnsChoice::Weaver {
+                servers,
+                transit: weaver_tunnel::pipe::DnsTransit::Proxy,
+                ..
+            } => servers.first().map(|server| server.address),
+            _ => None,
+        };
+        // Only a route profile, as a route's save requires.
+        let resolved_by = config.route_profile(dns_profile)?;
         let paths = paths(route, &config.pools);
         let kind_of = |id: &u32| config.profiles.get(id).map(|profile| profile.kind);
         for (_, _, carriers) in &paths {
@@ -343,9 +370,26 @@ impl NetworkRuntime {
         for (leg, egress_id, carriers) in paths {
             let bottom = Self::bottom(&config, egress_id, ROUTE_TEST_WAIT)
                 .map_err(|_| NetworkRefusal::RouteEgressMissing)?;
+            let named = self.names_slot(&config, "test".into(), dns_profile, egress_id);
             // The leg a torrent route through this path would be, and how its
             // session would ride it.
             let torrent_leg = |rung: Option<Rung>| {
+                let exit = match &rung {
+                    None => None,
+                    Some(Rung::Proxy { id }) => Some(*id),
+                    Some(Rung::Chain { ids }) => ids.last().copied(),
+                    Some(Rung::Pool { .. }) => None,
+                };
+                let names = match &rung {
+                    Some(Rung::Pool { .. }) => None,
+                    _ => {
+                        let exit = exit.and_then(|id| config.profiles.get(&id));
+                        resolved_by.resolved_by(
+                            exit.map(|proxy| proxy.kind),
+                            exit.is_some_and(|proxy| !proxy.dns_servers.is_empty()),
+                        )
+                    }
+                };
                 let path = match rung {
                     None => LegPath::Direct,
                     Some(rung) => LegPath::Ladder {
@@ -356,7 +400,7 @@ impl NetworkRuntime {
                 (
                     leg_kind(self, egress_id, &path),
                     leg_unavailable(self, egress_id),
-                    names_on(self, egress_id, &path),
+                    names,
                 )
             };
             let beneath = self.carriers(&config, &carriers, &bottom);
@@ -384,6 +428,8 @@ impl NetworkRuntime {
                     kind,
                     down,
                     names,
+                    named: named.clone(),
+                    dns_server,
                     wait: subjects
                         .iter()
                         .flatten()
@@ -416,6 +462,8 @@ impl NetworkRuntime {
                     kind,
                     down,
                     names,
+                    named: named.clone(),
+                    dns_server,
                     carriers: carriers.clone(),
                     wait: subject
                         .as_ref()
@@ -450,6 +498,158 @@ impl NetworkRuntime {
                 .map_err(|detail| (ProxyFault::Other { detail }, Some(*id)))?;
         }
         Ok(stage)
+    }
+}
+
+// How many servers a DNS server test probes at once; each probes its four
+// wires together, so at most four times as many connections are open.
+const DNS_SERVERS_AT_ONCE: usize = 4;
+
+pub use weaver_tunnel::dns::{Probed as DnsProbed, ServerProbe as DnsServerProbe};
+
+// A DNS server test, built and ready to probe. Building it is quick and
+// touches nothing a route holds; probing waits on the servers, so it runs
+// apart from whatever guarded the build.
+pub struct DnsServerTest {
+    probe: ProbeRuntime,
+    stage: Result<Arc<dyn Dialer>, ProxyFault>,
+    servers: Vec<weaver_tunnel::dns::DnsServer>,
+}
+
+impl DnsServerTest {
+    // Probes each server on every wire and for DNSSEC, a few servers at a
+    // time. The probes come back in the order of the servers.
+    pub async fn run(self) -> Vec<DnsServerProbe> {
+        let Self {
+            probe,
+            stage,
+            servers,
+        } = self;
+        let probes = match stage {
+            Ok(stage) => {
+                let permits = Arc::new(tokio::sync::Semaphore::new(DNS_SERVERS_AT_ONCE));
+                let mut tasks = tokio::task::JoinSet::new();
+                let count = servers.len();
+                for (index, server) in servers.into_iter().enumerate() {
+                    let permits = permits.clone();
+                    let stage = stage.clone();
+                    tasks.spawn(async move {
+                        let _permit = permits.acquire_owned().await;
+                        (
+                            index,
+                            weaver_tunnel::dns::probe_server(&*stage, &server).await,
+                        )
+                    });
+                }
+                let mut probes: Vec<Option<DnsServerProbe>> = vec![None; count];
+                while let Some(joined) = tasks.join_next().await {
+                    match joined {
+                        Ok((index, probed)) => probes[index] = Some(probed),
+                        Err(error) => std::panic::resume_unwind(error.into_panic()),
+                    }
+                }
+                probes.into_iter().flatten().collect()
+            }
+            // The path could not be built: every probe fails as it did.
+            Err(fault) => {
+                let failed = DnsProbed {
+                    supported: false,
+                    elapsed: Duration::ZERO,
+                    error: Some(LookupError {
+                        failure: LookupFailure::NoReply,
+                        detail: fault.to_string(),
+                    }),
+                };
+                servers
+                    .iter()
+                    .map(|_| DnsServerProbe {
+                        plain: failed.clone(),
+                        tls: failed.clone(),
+                        https: failed.clone(),
+                        dnssec: failed.clone(),
+                    })
+                    .collect()
+            }
+        };
+        probe.shutdown().await;
+        probes
+    }
+}
+
+impl NetworkRuntime {
+    // A test of each of `servers`, asked from where the drafted `route`
+    // would ask its listed servers: its first path's egress, or that path's
+    // proxies when DNS profile `dns_profile` asks through the proxy.
+    // Everything is built in a runtime of the test's own, with naming of
+    // its own, and nothing is saved.
+    pub fn dns_server_test(
+        &self,
+        route: &Route,
+        dns_profile: u32,
+        servers: Vec<weaver_tunnel::dns::DnsServer>,
+    ) -> Result<DnsServerTest, NetworkRefusal> {
+        if servers.is_empty() {
+            return Err(NetworkRefusal::ProxyDnsServersRequired);
+        }
+        if servers.len() > MAX_DNS_SERVERS {
+            return Err(NetworkRefusal::ProxyDnsServerCount);
+        }
+        let probe = ProbeRuntime(Some(self.isolated_probe_runtime()));
+        let stage = probe.runtime().dns_probe_stage(route, dns_profile)?;
+        Ok(DnsServerTest {
+            probe,
+            stage,
+            servers,
+        })
+    }
+    // The same test, built and run.
+    pub async fn test_dns_servers(
+        &self,
+        route: &Route,
+        dns_profile: u32,
+        servers: Vec<weaver_tunnel::dns::DnsServer>,
+    ) -> Result<Vec<DnsServerProbe>, NetworkRefusal> {
+        Ok(self
+            .dns_server_test(route, dns_profile, servers)?
+            .run()
+            .await)
+    }
+
+    // The stage a DNS server test asks through, or why it cannot be built.
+    fn dns_probe_stage(
+        &self,
+        route: &Route,
+        dns_profile: u32,
+    ) -> Result<Result<Arc<dyn Dialer>, ProxyFault>, NetworkRefusal> {
+        let config = self.configuration.read().expect("network configuration");
+        route.validate_references(&config.egresses, &config.profiles, &config.pools)?;
+        // Only a route profile, as a route's save requires.
+        config.route_profile(dns_profile)?;
+        let Some((_, egress_id, carriers)) = paths(route, &config.pools).into_iter().next() else {
+            return Err(NetworkRefusal::RouteLegCount);
+        };
+        let bottom = Self::bottom(&config, egress_id, ROUTE_TEST_WAIT)
+            .map_err(|_| NetworkRefusal::RouteEgressMissing)?;
+        let through_proxy = matches!(
+            config.dns_choice(dns_profile),
+            DnsChoice::Weaver {
+                transit: weaver_tunnel::pipe::DnsTransit::Proxy,
+                ..
+            }
+        );
+        let stage: Arc<dyn Dialer> = if !through_proxy || carriers.is_empty() {
+            bottom
+        } else {
+            match self.carriers(&config, &carriers, &bottom) {
+                Ok(stage) => stage,
+                Err((fault, _)) => return Ok(Err(fault)),
+            }
+        };
+        // The probe dials with the names a route on the draft would: a
+        // proxy whose host is a name is looked up as that route's DNS
+        // profile says, from names of the test's own.
+        let names = self.names_slot(&config, "dns-server-test".into(), dns_profile, egress_id);
+        Ok(Ok(Arc::new(Revocable::named(stage, names))))
     }
 }
 
@@ -498,7 +698,13 @@ impl Probe {
         let (outcome, failing_proxy, source_address) = match &self.stages {
             Err((fault, proxy)) => (Err(fault.clone()), *proxy, None),
             Ok((beneath, top)) => {
-                match last(beneath, top.as_ref(), self.subject.as_ref(), target) {
+                match last(
+                    beneath,
+                    top.as_ref(),
+                    self.subject.as_ref(),
+                    target,
+                    self.dns_server,
+                ) {
                     Err(fault) => (Err(fault), None, None),
                     Ok(last) => {
                         let stage = top.as_ref().unwrap_or(beneath);
@@ -506,7 +712,10 @@ impl Probe {
                         // dial's do.
                         let recording = Arc::new(Recording::default());
                         let reached = recording
-                            .scope(tokio::time::timeout(stage.budget(), last.reach()))
+                            .scope(Names::scope(
+                                self.named.get(),
+                                tokio::time::timeout(stage.budget(), last.reach()),
+                            ))
                             .await;
                         let said = match &reached {
                             Ok(Err(Stopped::Dial(error) | Stopped::Endpoint(error))) => {
@@ -545,7 +754,10 @@ impl Probe {
             (Some(test), Ok(_), Ok((beneath, top))) => {
                 let opened = P2pPath::open(P2pLeg {
                     kind: self.kind.clone(),
-                    stage: top.as_ref().unwrap_or(beneath).clone(),
+                    stage: Arc::new(Revocable::named(
+                        top.as_ref().unwrap_or(beneath).clone(),
+                        self.named.clone(),
+                    )),
                     down: self.down.clone(),
                     names: self.names,
                     torrent: test.torrent.clone(),
@@ -671,6 +883,7 @@ fn last<'a>(
     top: Option<&'a Arc<dyn Dialer>>,
     subject: Option<&ProxyProfile>,
     target: Option<&(String, u16)>,
+    dns_server: Option<std::net::SocketAddr>,
 ) -> Result<Last<'a>, ProxyFault> {
     let probe = |host: String, port: u16| Target {
         host,
@@ -712,10 +925,10 @@ fn last<'a>(
             endpoint: (profile.host.clone(), profile.port),
         });
     }
-    if let Some(dns) = profile.proxy_dns_servers().first() {
+    if let Some(dns) = dns_server {
         return Ok(dial(
             top,
-            probe(dns.address.ip().to_string(), dns.address.port()),
+            probe(dns.ip().to_string(), dns.port()),
             ProxyTestPass::Forwarded,
         ));
     }

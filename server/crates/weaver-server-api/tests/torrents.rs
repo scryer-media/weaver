@@ -1586,7 +1586,8 @@ fn announcing(name: &str, announce: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_routes_and_trackers_say_who_resolves_their_names() {
     use weaver_server_core::proxies::{
-        Consumer, ProxyKind, ProxyProfile, ProxyRuntime, ProxySecrets, RouteLeg, Rung,
+        Consumer, DnsProfile, DnsProfileKind, DnsTrust, DnsWho, ProxyKind, ProxyProfile,
+        ProxyRuntime, ProxySecrets, RouteLeg, Rung,
     };
     use weaver_server_core::torrents::sessions::NetworkRoutes;
 
@@ -1601,7 +1602,7 @@ async fn the_routes_and_trackers_say_who_resolves_their_names() {
             enabled: true,
             host: "127.0.0.1".into(),
             port: 1,
-            dns: weaver_server_core::proxies::ProxyDns::proxy(),
+            dns_servers: vec![],
             tunnel_addresses: vec![],
             peer_public_key: None,
             mtu: 1280,
@@ -1612,6 +1613,7 @@ async fn the_routes_and_trackers_say_who_resolves_their_names() {
             forwarded_port: None,
             revision: 1,
             secrets: ProxySecrets::default(),
+            dns_profile_id: 0,
         })
         .unwrap();
         let proxies = ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
@@ -1633,11 +1635,30 @@ async fn the_routes_and_trackers_say_who_resolves_their_names() {
     let rule = response.data.into_json().unwrap()["saveTrackerRule"][0]["id"]
         .as_u64()
         .unwrap();
+    // The ladder's route has its exit proxy answer names.
+    let by_proxy = rig
+        .harness
+        .db
+        .save_dns_profile(
+            DnsProfile {
+                id: 0,
+                name: "by proxy".into(),
+                kind: DnsProfileKind::Route,
+                who: DnsWho::Proxy,
+                transit: None,
+                trust: DnsTrust::AsSent,
+                server_list_id: None,
+                system_fallback: false,
+            },
+            true,
+        )
+        .unwrap();
     rig.harness
         .db
         .save_proxy_routing_policy(
             Consumer::Torrent(TorrentScope::TrackerRule(rule as u32)),
             &RoutingPolicy {
+                dns_profile_id: Some(by_proxy.id),
                 legs: vec![RouteLeg {
                     egress_id: SYSTEM_EGRESS_ID,
                     weight: 100,

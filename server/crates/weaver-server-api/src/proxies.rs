@@ -48,353 +48,6 @@ impl From<proxies::ProxyKind> for ProxyKind {
     }
 }
 
-/// Who answers a name dialled through a proxy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
-#[graphql(name = "ProxyDnsWho")]
-pub enum ProxyDnsWho {
-    /// The host's own DNS.
-    Host,
-    /// The proxy is handed the name.
-    Proxy,
-    /// The listed servers.
-    Servers,
-}
-/// Where the listed servers are asked from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
-#[graphql(name = "ProxyDnsPath")]
-pub enum ProxyDnsPath {
-    /// From the route's egress, outside the proxy.
-    Direct,
-    ThroughProxy,
-}
-/// How the listed servers' answers are judged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
-#[graphql(name = "ProxyDnsTrust")]
-pub enum ProxyDnsTrust {
-    AsSent,
-    /// An answer the server did not mark authenticated is refused.
-    RequireAd,
-    /// Weaver checks the DNSSEC signatures itself: an unsigned name
-    /// resolves, one that fails the check does not.
-    Validate,
-}
-/// How a query travels to one server.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
-#[graphql(name = "ProxyDnsWire")]
-pub enum ProxyDnsWire {
-    Plain,
-    Tls,
-    Https,
-}
-impl From<proxies::WireKind> for ProxyDnsWire {
-    fn from(v: proxies::WireKind) -> Self {
-        match v {
-            proxies::WireKind::Plain => Self::Plain,
-            proxies::WireKind::Tls => Self::Tls,
-            proxies::WireKind::Https => Self::Https,
-        }
-    }
-}
-
-/// A proxy's DNS. Path, trust and servers mean something only when the
-/// servers answer.
-#[derive(Clone, PartialEq, SimpleObject)]
-#[graphql(name = "ProxyDns")]
-pub struct ProxyDnsGql {
-    pub who: ProxyDnsWho,
-    pub path: ProxyDnsPath,
-    pub trust: ProxyDnsTrust,
-    pub servers: Vec<ProxyDnsServerGql>,
-}
-#[derive(Clone, Debug, PartialEq, SimpleObject)]
-#[graphql(name = "ProxyDnsServer")]
-pub struct ProxyDnsServerGql {
-    pub wire: ProxyDnsWire,
-    /// The server's IP, with its port when that is not the wire's own.
-    pub address: String,
-    /// TLS: the name its certificate is checked against.
-    pub tls_name: Option<String>,
-    /// HTTPS: the URL queries are posted to.
-    pub url: Option<String>,
-}
-impl From<proxies::DnsWho> for ProxyDnsWho {
-    fn from(who: proxies::DnsWho) -> Self {
-        match who {
-            proxies::DnsWho::Host => Self::Host,
-            proxies::DnsWho::Proxy => Self::Proxy,
-            proxies::DnsWho::Servers => Self::Servers,
-        }
-    }
-}
-impl From<ProxyDnsWho> for proxies::DnsWho {
-    fn from(who: ProxyDnsWho) -> Self {
-        match who {
-            ProxyDnsWho::Host => Self::Host,
-            ProxyDnsWho::Proxy => Self::Proxy,
-            ProxyDnsWho::Servers => Self::Servers,
-        }
-    }
-}
-impl From<proxies::DnsTrust> for ProxyDnsTrust {
-    fn from(trust: proxies::DnsTrust) -> Self {
-        match trust {
-            proxies::DnsTrust::AsSent => Self::AsSent,
-            proxies::DnsTrust::RequireAd => Self::RequireAd,
-            proxies::DnsTrust::Validate => Self::Validate,
-        }
-    }
-}
-impl From<ProxyDnsTrust> for proxies::DnsTrust {
-    fn from(trust: ProxyDnsTrust) -> Self {
-        match trust {
-            ProxyDnsTrust::AsSent => Self::AsSent,
-            ProxyDnsTrust::RequireAd => Self::RequireAd,
-            ProxyDnsTrust::Validate => Self::Validate,
-        }
-    }
-}
-impl From<proxies::ProxyDns> for ProxyDnsGql {
-    fn from(dns: proxies::ProxyDns) -> Self {
-        Self {
-            who: dns.who.into(),
-            path: match dns.path {
-                proxies::DnsPath::Direct => ProxyDnsPath::Direct,
-                proxies::DnsPath::ThroughProxy => ProxyDnsPath::ThroughProxy,
-            },
-            trust: dns.trust.into(),
-            servers: dns.servers.iter().map(ProxyDnsServerGql::from).collect(),
-        }
-    }
-}
-
-/// How a name dialled straight out of an egress, with no proxy above it,
-/// is resolved: by the host, or by the listed servers asked from the
-/// egress. Trust and servers mean something only when the servers answer.
-#[derive(Clone, Debug, PartialEq, SimpleObject)]
-#[graphql(name = "EgressDns")]
-pub struct EgressDnsGql {
-    pub who: ProxyDnsWho,
-    pub trust: ProxyDnsTrust,
-    pub servers: Vec<ProxyDnsServerGql>,
-}
-impl From<&proxies::EgressDns> for EgressDnsGql {
-    fn from(dns: &proxies::EgressDns) -> Self {
-        Self {
-            who: dns.who.into(),
-            trust: dns.trust.into(),
-            servers: dns.servers.iter().map(ProxyDnsServerGql::from).collect(),
-        }
-    }
-}
-/// An egress's DNS as a save sends it. Who is HOST or SERVERS; trust and
-/// servers are kept only when the servers answer.
-#[derive(InputObject)]
-pub struct EgressDnsInput {
-    pub who: ProxyDnsWho,
-    pub trust: ProxyDnsTrust,
-    pub servers: Vec<ProxyDnsServerInput>,
-}
-impl EgressDnsInput {
-    pub(crate) fn dns(self) -> Result<proxies::EgressDns> {
-        let servers = self
-            .servers
-            .into_iter()
-            .map(ProxyDnsServerInput::server)
-            .collect::<std::result::Result<_, _>>()
-            .map_err(refusal_error)?;
-        Ok(proxies::EgressDns {
-            who: self.who.into(),
-            servers,
-            trust: self.trust.into(),
-        }
-        .normal())
-    }
-}
-impl From<&proxies::ProxyDnsServer> for ProxyDnsServerGql {
-    fn from(server: &proxies::ProxyDnsServer) -> Self {
-        let engine = server.engine();
-        let address = engine.to_string();
-        let (wire, tls_name, url) = match &server.wire {
-            proxies::ProxyDnsWire::Plain => (ProxyDnsWire::Plain, None, None),
-            proxies::ProxyDnsWire::Tls { name } => (ProxyDnsWire::Tls, name.clone(), None),
-            proxies::ProxyDnsWire::Https { path } => {
-                let host = match server.address.ip() {
-                    std::net::IpAddr::V4(ip) => ip.to_string(),
-                    std::net::IpAddr::V6(ip) => format!("[{ip}]"),
-                };
-                let port = server.address.port();
-                let port = if port == proxies::WireKind::Https.default_port() {
-                    String::new()
-                } else {
-                    format!(":{port}")
-                };
-                (
-                    ProxyDnsWire::Https,
-                    None,
-                    Some(format!("https://{host}{port}{path}")),
-                )
-            }
-        };
-        Self {
-            wire,
-            address,
-            tls_name,
-            url,
-        }
-    }
-}
-
-/// A proxy's DNS as a save sends it. Path, trust and servers are kept only
-/// when the servers answer.
-#[derive(InputObject)]
-pub struct ProxyDnsInput {
-    pub who: ProxyDnsWho,
-    pub path: ProxyDnsPath,
-    pub trust: ProxyDnsTrust,
-    pub servers: Vec<ProxyDnsServerInput>,
-}
-#[derive(InputObject)]
-pub struct ProxyDnsServerInput {
-    pub wire: ProxyDnsWire,
-    /// PLAIN and TLS: the server's IP, with a port when it is not the
-    /// wire's own (`192.0.2.53:5353`, `[2001:db8::53]:853`). HTTPS: unused.
-    pub address: String,
-    /// TLS: the name the certificate is checked against; absent checks it
-    /// against the address.
-    pub tls_name: Option<String>,
-    /// HTTPS: the URL queries are posted to, `https://` and an IP.
-    pub url: Option<String>,
-}
-impl ProxyDnsInput {
-    fn dns(self) -> Result<proxies::ProxyDns> {
-        let servers = self
-            .servers
-            .into_iter()
-            .map(ProxyDnsServerInput::server)
-            .collect::<std::result::Result<_, _>>()
-            .map_err(refusal_error)?;
-        Ok(proxies::ProxyDns {
-            who: self.who.into(),
-            path: match self.path {
-                ProxyDnsPath::Direct => proxies::DnsPath::Direct,
-                ProxyDnsPath::ThroughProxy => proxies::DnsPath::ThroughProxy,
-            },
-            servers,
-            trust: self.trust.into(),
-        }
-        .normal())
-    }
-}
-impl ProxyDnsServerInput {
-    fn server(self) -> std::result::Result<proxies::ProxyDnsServer, NetworkRefusal> {
-        let wire = match self.wire {
-            ProxyDnsWire::Plain => proxies::ProxyDnsWire::Plain,
-            ProxyDnsWire::Tls => proxies::ProxyDnsWire::Tls {
-                name: self
-                    .tls_name
-                    .map(|name| name.trim().to_owned())
-                    .filter(|name| !name.is_empty()),
-            },
-            ProxyDnsWire::Https => {
-                let (address, path) = doh_url(self.url.as_deref().unwrap_or("").trim())?;
-                return Ok(proxies::ProxyDnsServer {
-                    address,
-                    wire: proxies::ProxyDnsWire::Https { path },
-                });
-            }
-        };
-        let default_port = match self.wire {
-            ProxyDnsWire::Tls => proxies::WireKind::Tls,
-            _ => proxies::WireKind::Plain,
-        }
-        .default_port();
-        Ok(proxies::ProxyDnsServer {
-            address: server_address(self.address.trim(), default_port)
-                .ok_or(NetworkRefusal::ProxyDnsServerInvalid)?,
-            wire,
-        })
-    }
-}
-
-// An IP with an optional port; `default_port` without one. Brackets hold a
-// v6 address only, and no address carries a zone: a server is asked at an
-// address that means the same on every interface.
-fn server_address(text: &str, default_port: u16) -> Option<std::net::SocketAddr> {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-    let (ip, port): (IpAddr, &str) = match text.strip_prefix('[') {
-        Some(bracketed) => {
-            let (ip, after) = bracketed.split_once(']')?;
-            (IpAddr::V6(ip.parse::<Ipv6Addr>().ok()?), after)
-        }
-        // A bare v6 address has no room for a port.
-        None if text.matches(':').count() > 1 => (IpAddr::V6(text.parse::<Ipv6Addr>().ok()?), ""),
-        None => match text.split_once(':') {
-            Some((ip, _)) => (IpAddr::V4(ip.parse::<Ipv4Addr>().ok()?), &text[ip.len()..]),
-            None => (IpAddr::V4(text.parse::<Ipv4Addr>().ok()?), ""),
-        },
-    };
-    let port = match port {
-        "" => default_port,
-        port => port
-            .strip_prefix(':')
-            .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))?
-            .parse()
-            .ok()?,
-    };
-    Some(SocketAddr::new(ip, port))
-}
-
-// A DNS over HTTPS URL as the server's address and the path queries are
-// posted to: `https://`, an IP literal host (a v6 one in brackets), an
-// optional port, and a path from '/', its query string kept. Nothing else:
-// no user, no fragment, and no host name. The host is read as written, not
-// as a browser reads it, so `1.2.3` or `0x7f.1` is no address.
-fn doh_url(url: &str) -> std::result::Result<(std::net::SocketAddr, String), NetworkRefusal> {
-    use NetworkRefusal::{ProxyDnsUrlHostname, ProxyDnsUrlInvalid};
-    let scheme = url.get(..8).ok_or(ProxyDnsUrlInvalid)?;
-    if !scheme.eq_ignore_ascii_case("https://") || url.contains('#') {
-        return Err(ProxyDnsUrlInvalid);
-    }
-    let rest = &url[8..];
-    let slash = rest.find('/').ok_or(ProxyDnsUrlInvalid)?;
-    let (authority, path) = rest.split_at(slash);
-    if authority.contains(['@', '?']) {
-        return Err(ProxyDnsUrlInvalid);
-    }
-    let (host, port) = match authority.strip_prefix('[') {
-        Some(bracketed) => {
-            let (host, after) = bracketed.split_once(']').ok_or(ProxyDnsUrlInvalid)?;
-            let ip: std::net::Ipv6Addr = host.parse().map_err(|_| ProxyDnsUrlInvalid)?;
-            (std::net::IpAddr::V6(ip), after)
-        }
-        None => {
-            let (host, port) = match authority.split_once(':') {
-                Some((host, _)) => (host, &authority[host.len()..]),
-                None => (authority, ""),
-            };
-            let ip: std::net::Ipv4Addr = match host.parse() {
-                Ok(ip) => ip,
-                // A name, as against something in no address form at all.
-                Err(_) if host.bytes().any(|b| b.is_ascii_alphabetic()) => {
-                    return Err(ProxyDnsUrlHostname);
-                }
-                Err(_) => return Err(ProxyDnsUrlInvalid),
-            };
-            (std::net::IpAddr::V4(ip), port)
-        }
-    };
-    let port = match port {
-        "" => proxies::WireKind::Https.default_port(),
-        port => port
-            .strip_prefix(':')
-            .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
-            .and_then(|digits| digits.parse().ok())
-            .filter(|port| *port != 0)
-            .ok_or(ProxyDnsUrlInvalid)?,
-    };
-    Ok((std::net::SocketAddr::new(host, port), path.to_owned()))
-}
-
 #[derive(Clone, Debug, InputObject)]
 pub struct RoutingPolicyInput {
     pub proxy_ids: Vec<u32>,
@@ -467,7 +120,9 @@ pub struct ProxyProfileGql {
     pub enabled: bool,
     pub host: String,
     pub port: u16,
-    pub dns: ProxyDnsGql,
+    /// WireGuard: the tunnel's own DNS servers, asked in plain through the
+    /// tunnel when a route's DNS profile has the proxy answer.
+    pub dns_servers: Vec<String>,
     pub tunnel_addresses: Vec<String>,
     pub peer_public_key: Option<String>,
     pub tunnel_public_key: Option<String>,
@@ -484,6 +139,9 @@ pub struct ProxyProfileGql {
     pub has_private_key: bool,
     pub has_passphrase: bool,
     pub has_preshared_key: bool,
+    /// The DNS profile that finds this proxy's own address when it is a
+    /// name: 0, the built-in System profile, or a PROXY_NAME profile.
+    pub dns_profile_id: u32,
 }
 impl From<ProxyProfile> for ProxyProfileGql {
     fn from(p: ProxyProfile) -> Self {
@@ -499,7 +157,7 @@ impl From<ProxyProfile> for ProxyProfileGql {
             enabled: p.enabled,
             host: p.host,
             port: p.port,
-            dns: p.dns.into(),
+            dns_servers: p.dns_servers.iter().map(ToString::to_string).collect(),
             tunnel_addresses: p.tunnel_addresses,
             peer_public_key: p.peer_public_key,
             tunnel_public_key,
@@ -514,6 +172,7 @@ impl From<ProxyProfile> for ProxyProfileGql {
             has_private_key: p.secrets.private_key.is_some(),
             has_passphrase: p.secrets.passphrase.is_some(),
             has_preshared_key: p.secrets.preshared_key.is_some(),
+            dns_profile_id: p.dns_profile_id,
         }
     }
 }
@@ -525,9 +184,9 @@ pub struct ProxyProfileInput {
     pub enabled: bool,
     pub host: String,
     pub port: u16,
-    // Omitted: a saved proxy keeps its own, and a new one resolves as a
-    // proxy saved without one always has.
-    pub dns: Option<ProxyDnsInput>,
+    /// WireGuard only: the tunnel's own DNS servers, as IPs. Omitted keeps
+    /// the saved list; a new proxy starts with none.
+    pub dns_servers: Option<Vec<String>>,
     #[graphql(default)]
     pub tunnel_addresses: Vec<String>,
     pub peer_public_key: Option<String>,
@@ -544,6 +203,10 @@ pub struct ProxyProfileInput {
     pub private_key: MaybeUndefined<String>,
     pub passphrase: MaybeUndefined<String>,
     pub preshared_key: MaybeUndefined<String>,
+    /// The DNS profile that finds the proxy's own address: 0, System, or a
+    /// PROXY_NAME profile. Absent is 0 on create and keeps the saved one on
+    /// update.
+    pub dns_profile_id: Option<u32>,
 }
 fn secret_update(target: &mut Option<String>, value: MaybeUndefined<String>) {
     match value {
@@ -568,13 +231,14 @@ impl ProxyProfileInput {
         secret_update(&mut secrets.private_key, self.private_key);
         secret_update(&mut secrets.passphrase, self.passphrase);
         secret_update(&mut secrets.preshared_key, self.preshared_key);
-        let dns = match (self.dns, existing) {
-            (Some(dns), _) => dns.dns()?,
-            (None, Some(existing)) => existing.dns.clone(),
-            // A WireGuard tunnel cannot take a name, so the host resolves
-            // for it; every other proxy resolves for itself.
-            (None, None) if self.kind == ProxyKind::WireGuard => proxies::ProxyDns::host(),
-            (None, None) => proxies::ProxyDns::proxy(),
+        let dns_servers = match (self.dns_servers, existing) {
+            (Some(servers), _) => servers
+                .iter()
+                .map(|server| server.trim().parse::<std::net::IpAddr>())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|_| refusal_error(NetworkRefusal::ProxyDnsServerInvalid))?,
+            (None, Some(existing)) => existing.dns_servers.clone(),
+            (None, None) => Vec::new(),
         };
         let mut profile = ProxyProfile {
             id,
@@ -583,7 +247,7 @@ impl ProxyProfileInput {
             enabled: self.enabled,
             host: self.host.trim().trim_matches(['[', ']']).into(),
             port: self.port,
-            dns,
+            dns_servers,
             tunnel_addresses: self.tunnel_addresses,
             peer_public_key: self.peer_public_key,
             mtu: self.mtu,
@@ -597,6 +261,10 @@ impl ProxyProfileInput {
                 .forwarded_port
                 .filter(|port| *port != 0 && self.kind == ProxyKind::WireGuard && !self.natpmp),
             revision: 0,
+            dns_profile_id: self
+                .dns_profile_id
+                .or(existing.map(|p| p.dns_profile_id))
+                .unwrap_or(proxies::SYSTEM_DNS_PROFILE_ID),
             secrets,
         };
         profile.revision = profile
@@ -729,13 +397,20 @@ impl ProxiesMutation {
         );
         let profile = input.profile(id, existing)?;
         // A save that changes nothing keeps the revision, and everything
-        // built from the profile is keyed by it: nothing is rebuilt.
+        // built from the profile is keyed by it: nothing is rebuilt. The DNS
+        // profile the proxy selects is no part of the revision: a change of
+        // it alone reloads the names, and every session and connection
+        // stays.
         let unchanged = existing.is_some_and(|existing| existing.revision == profile.revision);
+        let renamed =
+            existing.is_some_and(|existing| existing.dns_profile_id != profile.dns_profile_id);
         let saved = profile.clone();
         let profile =
             spawn_blocking_db("proxies.save", move || db.save_proxy_profile(&saved)).await?;
         if !unchanged {
             refresh_profile(ctx, id).await?;
+        } else if renamed {
+            refresh(ctx).await?;
         }
         Ok(profile.into())
     }

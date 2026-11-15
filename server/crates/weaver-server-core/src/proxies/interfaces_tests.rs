@@ -32,7 +32,6 @@ fn egress(binding: EgressBinding) -> EgressInterface {
         download_bps: None,
         upload_bps: None,
         quota: Default::default(),
-        dns: Default::default(),
     }
 }
 

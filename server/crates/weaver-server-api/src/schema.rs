@@ -54,6 +54,7 @@ pub struct JobsSnapshot {
 #[derive(Default, MergedObject)]
 pub struct QueryRoot(
     crate::backup::BackupQuery,
+    crate::dns::DnsQuery,
     crate::networking::NetworkingQuery,
     crate::proxies::ProxiesQuery,
     crate::speed_test::SpeedTestQuery,
@@ -77,6 +78,7 @@ pub struct MutationRoot(ConnectivityMutations, ApplicationMutations);
 // crates' default compiler recursion limit when laying out resolver futures.
 #[derive(Default, MergedObject)]
 struct ConnectivityMutations(
+    crate::dns::DnsMutation,
     crate::networking::NetworkingMutation,
     crate::proxies::ProxiesMutation,
     crate::speed_test::SpeedTestMutation,

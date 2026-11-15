@@ -1690,27 +1690,22 @@ scope = "all"
 
 [[migration]]
 version = 121
-description = "every saved proxy spells out who answers its names, the path to its DNS servers, the wire each is asked over and how their answers are trusted"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "rust"
-hook_id = "spell_out_proxy_dns_v121"
-scope = "upgrade_only"
-
-[[migration]]
-version = 122
-description = "an egress can name the DNS servers that resolve what is dialled straight out of it; none is the host"
+description = "saved DNS server lists and profiles; a route names the profile its names follow, a proxy the profile that finds its own address, and each saved proxy's DNS setting becomes a list and profiles"
 checksum_algo = "blake3"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0122_egress_dns/sqlite.sql"
+file = "migrations/0121_dns_profiles/sqlite.sql"
 engine = "sqlite"
 scope = "all"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0122_egress_dns/postgres.sql"
+file = "migrations/0121_dns_profiles/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "dns_profiles_from_proxies_v121"
+scope = "upgrade_only"

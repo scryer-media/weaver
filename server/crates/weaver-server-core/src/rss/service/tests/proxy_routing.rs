@@ -3,7 +3,8 @@
 
 use super::*;
 use crate::proxies::{
-    Consumer, ProxyKind, ProxyProfile, ProxyRuntime, ProxySecrets, RouteState, RoutingPolicy,
+    Consumer, DnsProfile, DnsServerList, DnsTransit, DnsTrust, DnsWho, ListedServer, ListedWire,
+    ProxyKind, ProxyProfile, ProxyRuntime, ProxySecrets, RouteState, RoutingPolicy,
 };
 use std::{
     collections::HashMap,
@@ -28,6 +29,9 @@ pub(super) struct Fixture {
     _wg: Option<WireGuardTestPeer>,
     dns: DnsServerDouble,
     profile: ProxyProfile,
+    // Who answers the names the feed's route dials: Weaver's listed server
+    // at `DNS`, asked through the proxy, or the proxy itself.
+    answers: DnsWho,
     targets: Option<ObservedTargets>,
 }
 impl Fixture {
@@ -38,16 +42,14 @@ impl Fixture {
         ]))
         .await;
         let mut p = ProxyProfile {
+            dns_profile_id: 0,
             id: 1,
             name: "RSS proxy".into(),
             kind,
             enabled: true,
             host: "127.0.0.1".into(),
             port: 1,
-            dns: crate::proxies::ProxyDns::plain(
-                crate::proxies::DnsPath::ThroughProxy,
-                [DNS.parse().unwrap()],
-            ),
+            dns_servers: vec![],
             tunnel_addresses: vec![],
             peer_public_key: None,
             mtu: 1280,
@@ -73,6 +75,7 @@ impl Fixture {
         let mut ssh = None;
         let mut wg = None;
         let mut targets = None;
+        let mut answers = DnsWho::Weaver;
         match kind {
             ProxyKind::Http3Connect => {
                 let proxy = Http3ServerDouble::start(mapping).await;
@@ -125,10 +128,9 @@ impl Fixture {
                 let spec = proxy.client_spec("rss");
                 use base64::Engine;
                 p.port = proxy.endpoint().port();
-                p.dns = crate::proxies::ProxyDns::plain(
-                    crate::proxies::DnsPath::ThroughProxy,
-                    spec.dns_servers,
-                );
+                // The tunnel's own servers answer, asked through it.
+                p.dns_servers = spec.dns_servers;
+                answers = DnsWho::Proxy;
                 p.tunnel_addresses = vec!["10.63.0.2/32".into()];
                 p.peer_public_key =
                     Some(base64::engine::general_purpose::STANDARD.encode(spec.peer_public_key));
@@ -144,6 +146,7 @@ impl Fixture {
             _wg: wg,
             dns,
             profile: p,
+            answers,
             targets,
         }
     }
@@ -199,12 +202,43 @@ pub(super) fn service(
 ) -> (RssService, Arc<ProxyRuntime>, RssFeedRow, SchedulerHandle) {
     let db = Database::open_in_memory().unwrap();
     db.save_proxy_profile(&fixture.profile).unwrap();
+    let server_list_id = (fixture.answers == DnsWho::Weaver).then(|| {
+        db.save_dns_server_list(
+            DnsServerList {
+                id: 0,
+                name: "RSS".into(),
+                servers: vec![ListedServer {
+                    address: SocketAddr::new(DNS.parse().unwrap(), 53),
+                    wire: ListedWire::Plain,
+                }],
+            },
+            true,
+        )
+        .unwrap()
+        .id
+    });
+    let dns = db
+        .save_dns_profile(
+            DnsProfile {
+                kind: crate::proxies::DnsProfileKind::Route,
+                id: 0,
+                name: "RSS".into(),
+                who: fixture.answers,
+                transit: server_list_id.map(|_| DnsTransit::Proxy),
+                trust: DnsTrust::AsSent,
+                server_list_id,
+                system_fallback: false,
+            },
+            true,
+        )
+        .unwrap();
     let feed = basic_auth_feed(url.into());
     db.insert_rss_feed_with_routing(
         &feed,
         Some(&RoutingPolicy {
             proxy_ids: vec![1],
             allow_direct: false,
+            dns_profile_id: Some(dns.id),
             ..Default::default()
         }),
     )
@@ -314,7 +348,7 @@ async fn a_proxy_resolving_with_its_host_is_handed_the_feeds_name() {
         let temp = TempDir::new().unwrap();
         let (addr, captured, task) = origin().await;
         let mut fixture = Fixture::start(kind, addr).await;
-        fixture.profile.dns = crate::proxies::ProxyDns::proxy();
+        fixture.answers = DnsWho::Proxy;
         let (service, runtime, feed, _) =
             service(&temp, &fixture, "http://feed.invalid/redirect", false);
         let response = service
@@ -359,7 +393,7 @@ async fn a_proxy_resolving_with_its_host_is_never_handed_a_private_address() {
     let temp = TempDir::new().unwrap();
     let (addr, captured, task) = origin().await;
     let mut fixture = Fixture::start(ProxyKind::Socks5, addr).await;
-    fixture.profile.dns = crate::proxies::ProxyDns::proxy();
+    fixture.answers = DnsWho::Proxy;
     let (service, runtime, feed, _) =
         service(&temp, &fixture, &format!("http://{addr}/feed"), false);
     assert!(

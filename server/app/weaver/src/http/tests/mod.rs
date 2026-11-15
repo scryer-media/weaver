@@ -1153,10 +1153,7 @@ fn sample_dns() -> weaver_server_core::proxies::network_metrics::tunnel::DnsMetr
     use weaver_server_core::proxies::{TrustOutcome, WireKind};
     DnsMetricsSnapshot {
         wires: WireKind::ALL.into_iter().zip([7, 5, 3]).collect(),
-        trust: TrustOutcome::ALL
-            .into_iter()
-            .zip([9, 4, 2, 6, 8, 1])
-            .collect(),
+        trust: TrustOutcome::ALL.into_iter().zip([9, 6, 8, 1]).collect(),
         dnssec_queries: 11,
     }
 }

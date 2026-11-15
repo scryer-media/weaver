@@ -69,7 +69,8 @@ use weaver_server_core::bandwidth::ScheduleEntry;
 use weaver_server_core::categories::CategoryConfig;
 use weaver_server_core::jobs::diagnostic_names::{DiagnosticNzbSource, JobNameRecord};
 use weaver_server_core::proxies::{
-    EgressBinding, EgressInterface, ProxyDnsServer, ProxyDnsWire, ProxyPool, ProxyProfile,
+    DnsProfile, DnsServerList, EgressBinding, EgressInterface, ListedServer, ListedWire, ProxyPool,
+    ProxyProfile,
 };
 use weaver_server_core::rss::RssFeedRow;
 use weaver_server_core::servers::ServerConfig;
@@ -229,6 +230,8 @@ pub(super) struct StoredNames {
     pub(super) proxies: Vec<ProxyProfile>,
     pub(super) egress: Vec<EgressInterface>,
     pub(super) pools: Vec<ProxyPool>,
+    pub(super) dns_lists: Vec<DnsServerList>,
+    pub(super) dns_profiles: Vec<DnsProfile>,
     pub(super) feeds: Vec<RssFeedRow>,
     pub(super) script_dirs: Vec<String>,
     // Every script file in the scripts directory, every script an instance
@@ -329,6 +332,12 @@ pub(super) fn read_stored_names(db: &Database) -> Result<StoredNames, String> {
         pools: db
             .list_proxy_pools()
             .map_err(|error| failed("the proxy pools", error))?,
+        dns_lists: db
+            .list_dns_server_lists()
+            .map_err(|error| failed("the DNS server lists", error))?,
+        dns_profiles: db
+            .list_dns_profiles()
+            .map_err(|error| failed("the DNS profiles", error))?,
         feeds: db
             .list_rss_feeds()
             .map_err(|error| failed("the RSS feeds", error))?,
@@ -875,17 +884,17 @@ impl Table {
 
     // A DNS server's TLS name is a host name, and a DNS over HTTPS path can
     // name the operator's account at the service, so each is held as close
-    // as the host of the proxy or egress that lists the server.
-    fn dns_servers(&mut self, servers: &[ProxyDnsServer], stand_in: &str) {
+    // as a proxy's host.
+    fn dns_servers(&mut self, servers: &[ListedServer], stand_in: &str) {
         for (index, server) in servers.iter().enumerate() {
             match &server.wire {
-                ProxyDnsWire::Plain => {}
-                ProxyDnsWire::Tls { name } => {
+                ListedWire::Plain => {}
+                ListedWire::Tls { name } => {
                     if let Some(name) = name {
                         self.identity(name, &format!("{stand_in}/dns-{}", index + 1));
                     }
                 }
-                ProxyDnsWire::Https { path } => {
+                ListedWire::Https { path } => {
                     let bare = path.split('?').next().unwrap_or(path);
                     for spelling in [path.as_str(), bare] {
                         if spelling != "/" {
@@ -1235,7 +1244,6 @@ impl StandIns {
             if let EgressBinding::Interface { name } = &egress.binding {
                 table.name(name, &stand_in);
             }
-            table.dns_servers(&egress.dns.servers, &stand_in);
         }
         for proxy in &stored.proxies {
             let stand_in = format!("proxy-{}", proxy.id);
@@ -1262,10 +1270,22 @@ impl StandIns {
             {
                 table.identity(key, &format!("{stand_in}/key"));
             }
-            table.dns_servers(&proxy.dns.servers, &stand_in);
         }
         for pool in &stored.pools {
             table.name(&pool.name, &format!("proxy-pool-{}", pool.id));
+        }
+        for list in &stored.dns_lists {
+            let stand_in = format!("dns-list-{}", list.id);
+            table.name(&list.name, &stand_in);
+            table.dns_servers(&list.servers, &stand_in);
+        }
+        // The built-in System profile's name is Weaver's, not the operator's.
+        for profile in stored
+            .dns_profiles
+            .iter()
+            .filter(|profile| profile.id != weaver_server_core::proxies::SYSTEM_DNS_PROFILE_ID)
+        {
+            table.name(&profile.name, &format!("dns-profile-{}", profile.id));
         }
         let scripts: BTreeSet<&String> = stored.scripts.iter().collect();
         for (index, script) in scripts.into_iter().enumerate() {
@@ -3017,10 +3037,7 @@ mod json_log_spellings {
             enabled: true,
             host: "fra.vpn.example".into(),
             port: 51820,
-            dns: weaver_server_core::proxies::ProxyDns::plain(
-                weaver_server_core::proxies::DnsPath::ThroughProxy,
-                ["10.2.0.1".parse().unwrap()],
-            ),
+            dns_servers: vec!["10.2.0.1".parse().unwrap()],
             tunnel_addresses: vec!["10.2.0.2/32".into()],
             peer_public_key: Some(STANDARD.encode([9u8; 32])),
             mtu: 1420,
@@ -3035,6 +3052,7 @@ mod json_log_spellings {
                 preshared_key: Some(STANDARD.encode([5u8; 32])),
                 ..ProxySecrets::default()
             },
+            dns_profile_id: 0,
         };
         let spec = proxy.wireguard_spec().expect("spec");
         let peer_key = STANDARD.encode([9u8; 32]);
@@ -3083,54 +3101,42 @@ mod json_log_spellings {
         );
     }
 
-    // A proxy's DNS servers can be named by a TLS name and reached at a DNS
+    // A listed DNS server can be named by a TLS name and reached at a DNS
     // over HTTPS path that names an account. Neither reaches the package,
-    // in a URL or on its own.
+    // in a URL or on its own, and nor do the list's and profile's names.
     #[test]
-    fn a_dns_servers_tls_name_and_path_are_held_like_the_host() {
-        use weaver_server_core::proxies::{
-            DnsPath, DnsTrust, DnsWho, ProxyDns, ProxyDnsServer, ProxyKind, ProxySecrets,
+    fn a_dns_servers_tls_name_and_path_are_held_like_a_proxys_host() {
+        let list = DnsServerList {
+            id: 3,
+            name: "Quad home".into(),
+            servers: vec![
+                ListedServer {
+                    address: "192.0.2.53:853".parse().unwrap(),
+                    wire: ListedWire::Tls {
+                        name: Some("dns.private.example".into()),
+                    },
+                },
+                ListedServer {
+                    address: "192.0.2.54:443".parse().unwrap(),
+                    wire: ListedWire::Https {
+                        path: "/acct-7f3k9/dns-query?key=4q8z".into(),
+                    },
+                },
+            ],
         };
-
-        let proxy = ProxyProfile {
-            id: 1,
-            name: "Frankfurt".into(),
-            kind: ProxyKind::Socks5,
-            enabled: true,
-            host: "fra.proxy.example".into(),
-            port: 1080,
-            dns: ProxyDns {
-                who: DnsWho::Servers,
-                path: DnsPath::ThroughProxy,
-                servers: vec![
-                    ProxyDnsServer {
-                        address: "192.0.2.53:853".parse().unwrap(),
-                        wire: ProxyDnsWire::Tls {
-                            name: Some("dns.private.example".into()),
-                        },
-                    },
-                    ProxyDnsServer {
-                        address: "192.0.2.54:443".parse().unwrap(),
-                        wire: ProxyDnsWire::Https {
-                            path: "/acct-7f3k9/dns-query?key=4q8z".into(),
-                        },
-                    },
-                ],
-                trust: DnsTrust::Validate,
-            },
-            tunnel_addresses: vec![],
-            peer_public_key: None,
-            mtu: 1420,
-            keepalive_seconds: None,
-            timeout_seconds: 30,
-            host_key_fingerprint: None,
-            revision: 1,
-            natpmp: false,
-            forwarded_port: None,
-            secrets: ProxySecrets::default(),
+        let profile = DnsProfile {
+            id: 5,
+            name: "Family resolver".into(),
+            who: weaver_server_core::proxies::DnsWho::Weaver,
+            transit: Some(weaver_server_core::proxies::DnsTransit::Egress),
+            trust: weaver_server_core::proxies::DnsTrust::Validate,
+            server_list_id: Some(3),
+            system_fallback: false,
+            kind: weaver_server_core::proxies::DnsProfileKind::Route,
         };
         let stored = StoredNames {
-            proxies: vec![proxy],
+            dns_lists: vec![list],
+            dns_profiles: vec![profile],
             ..StoredNames::default()
         };
         let table = StandIns::build(&[], &local_unix(), &stored).expect("table");
@@ -3140,70 +3146,27 @@ mod json_log_spellings {
             "WARN routed DNS failed url=https://192.0.2.54/acct-7f3k9/dns-query?key=4q8z",
             "WARN routed DNS failed path=/acct-7f3k9/dns-query?key=4q8z",
             "WARN routed DNS failed path=/acct-7f3k9/dns-query",
+            "INFO saved list Quad home for profile Family resolver",
         ] {
             let text = table.sanitize_str(line);
-            for value in ["dns.private.example", "acct-7f3k9", "4q8z"] {
+            for value in [
+                "dns.private.example",
+                "acct-7f3k9",
+                "4q8z",
+                "Quad home",
+                "Family resolver",
+            ] {
                 assert!(!text.contains(value), "{value} in {text}");
             }
         }
         assert!(
             table
                 .sanitize_str("tls name dns.private.example")
-                .contains("proxy-1/dns-1")
+                .contains("dns-list-3/dns-1")
         );
         assert_eq!(
             table.sanitize_str("WARN routed DNS failed path=/acct-7f3k9/dns-query"),
             format!("WARN routed DNS failed path={PATH_STAND_IN}")
-        );
-    }
-
-    // An egress's DNS servers are held as a proxy's are: neither the TLS
-    // name nor the DNS over HTTPS path reaches the package.
-    #[test]
-    fn an_egress_dns_servers_tls_name_and_path_are_held_like_a_proxy_s() {
-        use weaver_server_core::proxies::{DnsTrust, DnsWho, EgressDns};
-
-        let egress = EgressInterface {
-            dns: EgressDns {
-                who: DnsWho::Servers,
-                servers: vec![
-                    ProxyDnsServer {
-                        address: "192.0.2.53:853".parse().unwrap(),
-                        wire: ProxyDnsWire::Tls {
-                            name: Some("dns.private.example".into()),
-                        },
-                    },
-                    ProxyDnsServer {
-                        address: "192.0.2.54:443".parse().unwrap(),
-                        wire: ProxyDnsWire::Https {
-                            path: "/acct-7f3k9/dns-query?key=4q8z".into(),
-                        },
-                    },
-                ],
-                trust: DnsTrust::Validate,
-            },
-            ..EgressInterface::system()
-        };
-        let stored = StoredNames {
-            egress: vec![egress],
-            ..StoredNames::default()
-        };
-        let table = StandIns::build(&[], &local_unix(), &stored).expect("table");
-
-        for line in [
-            "WARN routed DNS failed server=tls://dns.private.example@192.0.2.53",
-            "WARN routed DNS failed url=https://192.0.2.54/acct-7f3k9/dns-query?key=4q8z",
-            "WARN routed DNS failed path=/acct-7f3k9/dns-query",
-        ] {
-            let text = table.sanitize_str(line);
-            for value in ["dns.private.example", "acct-7f3k9", "4q8z"] {
-                assert!(!text.contains(value), "{value} in {text}");
-            }
-        }
-        assert!(
-            table
-                .sanitize_str("tls name dns.private.example")
-                .contains("egress-0/dns-1")
         );
     }
 

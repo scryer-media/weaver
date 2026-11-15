@@ -42,7 +42,6 @@ fn second_egress(db: &Database) -> u32 {
         download_bps: None,
         upload_bps: None,
         quota: Default::default(),
-        dns: Default::default(),
     })
     .unwrap()
     .id

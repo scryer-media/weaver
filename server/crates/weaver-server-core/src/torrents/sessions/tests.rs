@@ -334,6 +334,12 @@ impl Routes for FakeRoutes {
             };
             return OpenLeg::on(plan.kind.clone(), leg.dialer(), bridge, Some(leg));
         }
+        let names: Arc<dyn Resolver> = Arc::new(weaver_torrent::network::NoNames);
+        let http = tracker_client(
+            &LegKind::System,
+            crate::torrents::net::system_dialer(),
+            None,
+        )?;
         Ok(OpenLeg {
             kind: plan.kind.clone(),
             shape: {
@@ -344,14 +350,20 @@ impl Routes for FakeRoutes {
                 shape
             },
             factory,
-            names: Arc::new(weaver_torrent::network::NoNames),
-            http: tracker_client(
-                &LegKind::System,
-                crate::torrents::net::system_dialer(),
-                None,
-            )?,
+            naming: plain_naming(&names, &http),
+            names,
+            http,
             leg,
         })
+    }
+
+    // Through the legs, each scope's torrents name by its route's profile.
+    fn scope_names(&self, plan: &RoutePlan) -> Option<Arc<NamesSlot>> {
+        if !self.through_legs.load(Ordering::SeqCst) {
+            return None;
+        }
+        let network = self.network.lock().unwrap().clone()?;
+        Some(network.torrent_names(plan.scope, plan.egress_id))
     }
 
     fn join(&self, plan: &RoutePlan, _: usize) {
@@ -427,13 +439,14 @@ fn any_port() -> TorrentConfig {
 // A proxy at 127.0.0.1:`port`, as saved under id 1.
 pub(crate) fn loopback_proxy(port: u16) -> crate::proxies::ProxyProfile {
     crate::proxies::ProxyProfile {
+        dns_profile_id: 0,
         id: 1,
         name: "tunnel".into(),
         kind: crate::proxies::ProxyKind::Socks5,
         enabled: true,
         host: "127.0.0.1".into(),
         port,
-        dns: crate::proxies::ProxyDns::proxy(),
+        dns_servers: vec![],
         tunnel_addresses: vec![],
         peer_public_key: None,
         mtu: 1280,
@@ -1156,10 +1169,7 @@ fn wireguard_proxy(
         kind: crate::proxies::ProxyKind::WireGuard,
         host: spec.endpoint_host.clone(),
         port: spec.endpoint_port,
-        dns: crate::proxies::ProxyDns::plain(
-            crate::proxies::DnsPath::ThroughProxy,
-            spec.dns_servers.clone(),
-        ),
+        dns_servers: spec.dns_servers.clone(),
         tunnel_addresses: vec![format!(
             "{}/32",
             weaver_tunnel::test_support::TEST_CLIENT_ADDRESS
@@ -2378,18 +2388,32 @@ fn a_listening_ladder_takes_tcp_peers_and_announces_its_port() {
     assert!(!options.connect.unwrap().enable_tcp);
 }
 
+// A leg's naming that names every torrent as the session does.
+fn plain_naming(names: &Arc<dyn Resolver>, http: &Arc<dyn HttpClients>) -> Arc<LegNaming> {
+    Arc::new(LegNaming::new(
+        LegKind::System,
+        crate::torrents::net::system_dialer(),
+        None,
+        Arc::clone(names),
+        Arc::clone(http),
+    ))
+}
+
 fn leg(kind: LegKind) -> OpenLeg {
+    let names: Arc<dyn Resolver> = Arc::new(weaver_torrent::network::NoNames);
+    let http = tracker_client(
+        &LegKind::System,
+        crate::torrents::net::system_dialer(),
+        None,
+    )
+    .unwrap();
     OpenLeg {
         shape: kind.shape(None),
         kind,
         factory: Arc::new(weaver_torrent::network::KernelSockets::new(None).unwrap()),
-        names: Arc::new(weaver_torrent::network::NoNames),
-        http: tracker_client(
-            &LegKind::System,
-            crate::torrents::net::system_dialer(),
-            None,
-        )
-        .unwrap(),
+        naming: plain_naming(&names, &http),
+        names,
+        http,
         leg: None,
     }
 }
@@ -3335,6 +3359,21 @@ async fn a_system_leg_session_looks_names_up_on_the_record() {
 async fn a_route_plans_who_resolves_its_names() {
     let db = Database::open_in_memory().unwrap();
     db.save_proxy_profile(&loopback_proxy(1)).unwrap();
+    let handed = db
+        .save_dns_profile(
+            crate::proxies::DnsProfile {
+                kind: crate::proxies::DnsProfileKind::Route,
+                id: 0,
+                name: "Proxy".into(),
+                who: crate::proxies::DnsWho::Proxy,
+                transit: None,
+                trust: crate::proxies::DnsTrust::AsSent,
+                server_list_id: None,
+                system_fallback: false,
+            },
+            true,
+        )
+        .unwrap();
     let category = TorrentScope::Category(3);
     db.save_proxy_routing_policy(
         Consumer::Torrent(category),
@@ -3344,6 +3383,7 @@ async fn a_route_plans_who_resolves_its_names() {
                 weight: 100,
                 path: ladder(1),
             }],
+            dns_profile_id: Some(handed.id),
             ..Default::default()
         },
     )
@@ -3357,6 +3397,178 @@ async fn a_route_plans_who_resolves_its_names() {
     let laddered = routes.plan(category);
     assert_eq!(laddered.kind, LegKind::Ladder);
     assert_eq!(laddered.names, Some(ResolvedBy::Proxy));
+}
+
+// Torrent routes on one leg share its session whatever their DNS profiles,
+// and each torrent's lookups name by its own route's: here the default
+// scope's by the host, category 3's handed to the proxy. The session's own
+// lookups, its DHT's among them, name as the first route on the leg by key,
+// category 3. Moving category 3 to the host's profile keeps the session's
+// key and leaves the leg unrevoked, and the next lookup of a torrent already
+// on the session, and of the session, names by the host. A torrent moved to
+// another route on the same session names as that route from then on.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_torrent_on_a_shared_leg_names_by_its_own_route() {
+    use weaver_torrent::network::Resolved;
+
+    let db = Database::open_in_memory().unwrap();
+    db.save_proxy_profile(&loopback_proxy(1)).unwrap();
+    let handed = db
+        .save_dns_profile(
+            crate::proxies::DnsProfile {
+                kind: crate::proxies::DnsProfileKind::Route,
+                id: 0,
+                name: "Proxy".into(),
+                who: crate::proxies::DnsWho::Proxy,
+                transit: None,
+                trust: crate::proxies::DnsTrust::AsSent,
+                server_list_id: None,
+                system_fallback: false,
+            },
+            true,
+        )
+        .unwrap();
+    let category = TorrentScope::Category(3);
+    let through = |profile: u32| RoutingPolicy {
+        legs: vec![RouteLeg {
+            egress_id: SYSTEM_EGRESS_ID,
+            weight: 100,
+            path: ladder(1),
+        }],
+        dns_profile_id: Some(profile),
+        ..Default::default()
+    };
+    db.save_proxy_routing_policy(
+        Consumer::Torrent(TorrentScope::Default),
+        &through(crate::proxies::SYSTEM_DNS_PROFILE_ID),
+    )
+    .unwrap();
+    db.save_proxy_routing_policy(Consumer::Torrent(category), &through(handed.id))
+        .unwrap();
+    let proxies =
+        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let routes = NetworkRoutes::new(Arc::clone(&proxies), Duration::from_secs(30));
+    let by_host = routes.plan(TorrentScope::Default);
+    let by_proxy = routes.plan(category);
+    assert_eq!(by_host.key, by_proxy.key, "one session on the leg");
+
+    let open = routes.open(&by_host, 8).await.unwrap();
+    let naming = |plan: &RoutePlan| {
+        TorrentNames::new(
+            open.naming
+                .of(plan.scope, routes.scope_names(plan))
+                .unwrap(),
+        )
+    };
+    let host_torrent = naming(&by_host);
+    let proxy_torrent = naming(&by_proxy);
+    async fn resolves(resolver: &dyn Resolver) -> Resolved {
+        resolver.resolve("localhost", 6969).await.unwrap()
+    }
+    assert!(matches!(
+        resolves(&*host_torrent).await,
+        Resolved::Addresses(_)
+    ));
+    assert!(matches!(resolves(&*proxy_torrent).await, Resolved::AtExit));
+    // The session's own lookups: the first route by key is category 3's.
+    assert!(matches!(resolves(&*open.names).await, Resolved::AtExit));
+
+    db.save_proxy_routing_policy(
+        Consumer::Torrent(category),
+        &through(crate::proxies::SYSTEM_DNS_PROFILE_ID),
+    )
+    .unwrap();
+    proxies.network.reload().await.unwrap();
+    assert_eq!(routes.plan(category).key, by_proxy.key, "the session stays");
+    let leg = open.leg.as_ref().expect("a ladder's leg");
+    assert!(!leg.stage.is_revoked(), "the leg stays");
+    assert!(matches!(
+        resolves(&*proxy_torrent).await,
+        Resolved::Addresses(_)
+    ));
+    assert!(matches!(
+        resolves(&*open.names).await,
+        Resolved::Addresses(_)
+    ));
+
+    // Back on the proxy's profile, a torrent the host named that moves to
+    // category 3 names by the proxy from its next lookup.
+    db.save_proxy_routing_policy(Consumer::Torrent(category), &through(handed.id))
+        .unwrap();
+    proxies.network.reload().await.unwrap();
+    host_torrent.follow(
+        open.naming
+            .of(category, routes.scope_names(&by_proxy))
+            .unwrap(),
+    );
+    assert!(matches!(resolves(&*host_torrent).await, Resolved::AtExit));
+    proxies.network.shutdown().await;
+}
+
+// A route's naming on a shared leg lasts while a torrent names by it, and
+// its bridge while a client built on it does: a torrent moved to another
+// route keeps the connection it has open. Once the last of both is gone,
+// the leg holds neither, and so not the slot the route's names are read
+// from.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_routes_naming_ends_with_its_last_torrent_and_client() {
+    use weaver_torrent::{ClientShape, HttpClients};
+
+    let db = Database::open_in_memory().unwrap();
+    db.save_proxy_profile(&loopback_proxy(1)).unwrap();
+    let category = TorrentScope::Category(3);
+    let through = RoutingPolicy {
+        legs: vec![RouteLeg {
+            egress_id: SYSTEM_EGRESS_ID,
+            weight: 100,
+            path: ladder(1),
+        }],
+        ..Default::default()
+    };
+    for scope in [TorrentScope::Default, category] {
+        db.save_proxy_routing_policy(Consumer::Torrent(scope), &through)
+            .unwrap();
+    }
+    let proxies =
+        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let routes = NetworkRoutes::new(Arc::clone(&proxies), Duration::from_secs(30));
+    let by_default = routes.plan(TorrentScope::Default);
+    let by_category = routes.plan(category);
+    assert_eq!(by_default.key, by_category.key, "one session on the leg");
+    let open = routes.open(&by_default, 8).await.unwrap();
+    let leg = open.leg.clone().expect("a ladder's leg");
+    let slot = routes
+        .scope_names(&by_category)
+        .expect("category 3's names");
+    let unheld = Arc::strong_count(&slot);
+
+    let moving = TorrentNames::new(open.naming.of(category, Some(Arc::clone(&slot))).unwrap());
+    assert!(Arc::strong_count(&slot) > unheld);
+    assert_eq!(open.naming.held_scopes(), vec![category]);
+    assert_eq!(leg.own_bridges(), 1);
+    // A client of category 3's, as a web seed connection keeps one.
+    let client = moving.client(None, &ClientShape::FETCH).unwrap();
+
+    moving.follow(
+        open.naming
+            .of(TorrentScope::Default, routes.scope_names(&by_default))
+            .unwrap(),
+    );
+    assert_eq!(open.naming.held_scopes(), vec![TorrentScope::Default]);
+    assert_eq!(
+        leg.own_bridges(),
+        2,
+        "category 3's bridge stays up for its client"
+    );
+    assert!(Arc::strong_count(&slot) > unheld);
+
+    drop(client);
+    assert_eq!(leg.own_bridges(), 1);
+    // The bridge stops on the runtime; the slot is let go once it has.
+    while Arc::strong_count(&slot) > unheld {
+        tokio::task::yield_now().await;
+    }
+    proxies.network.shutdown().await;
 }
 
 // No limit leaves twenty files and a fifth of the rest to files, never

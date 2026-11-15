@@ -1200,7 +1200,11 @@ where
                     plain_builder(&self.kind)
                 }
             };
-            return shape.apply(builder.no_proxy().dns_resolver(Arc::new(NoLookups)));
+            return shape.apply(
+                builder
+                    .no_proxy()
+                    .dns_resolver(Arc::new(NoLookups { _keep: None })),
+            );
         }
         let builder = (self.base)().map_err(anyhow::Error::msg)?;
         let (host, port, addrs) = target.map_or(("", 0, &[][..]), |target| {
@@ -1216,9 +1220,16 @@ where
             }
             None => crate::proxies::pinned(builder, host, port, addrs),
         };
-        shape.apply(match target {
-            None => builder.dns_resolver(Arc::new(NoLookups)),
-            Some(_) => builder.redirect(reqwest::redirect::Policy::none()),
+        // A client on a bridge that is let go once unheld holds it up for as
+        // long as the client lives. Through the bridge the client hands it
+        // every name, so its own resolver is never asked.
+        let keep = self.bridge.as_ref().and_then(|bridge| bridge.keep.clone());
+        shape.apply(match (target, keep) {
+            (None, keep) => builder.dns_resolver(Arc::new(NoLookups { _keep: keep })),
+            (Some(_), None) => builder.redirect(reqwest::redirect::Policy::none()),
+            (Some(_), keep) => builder
+                .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(Arc::new(NoLookups { _keep: keep })),
         })
     }
 }
@@ -1226,8 +1237,11 @@ where
 // The resolver of a leg's client with no target: it answers no name, so a
 // name such a client meets is refused, never asked of the host's own DNS.
 // Through the leg's bridge the name is handed to the leg, and this is never
-// asked.
-struct NoLookups;
+// asked. It holds up the bridge its client rides, when that bridge is let go
+// once unheld.
+struct NoLookups {
+    _keep: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
 
 impl reqwest::dns::Resolve for NoLookups {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
@@ -1566,6 +1580,9 @@ mod tests {
             )),
             timeout: std::time::Duration::from_secs(30),
             naming: weaver_tunnel::pipe::Naming::Proxy,
+            endpoint_names: std::sync::Arc::new(weaver_tunnel::pipe::NamesSlot::new(
+                weaver_tunnel::pipe::Names::new(weaver_tunnel::pipe::DnsChoice::System, None),
+            )),
             failure: Default::default(),
         })
     }
@@ -2115,6 +2132,7 @@ mod tests {
                 )],
                 weaver_tunnel::dns::Trust::AsSent,
             ),
+            tunnel_dns: Vec::new(),
             resolver: Some(provider),
             forwarding,
             failure: Default::default(),

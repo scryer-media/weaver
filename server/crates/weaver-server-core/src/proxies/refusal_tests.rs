@@ -307,7 +307,7 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
         (
             R::ProxyDnsServerCount,
             "PROXY_DNS_SERVER_COUNT",
-            "a DNS setting lists at most 10 servers",
+            "a DNS server list holds at most 10 servers",
         ),
         (
             R::ProxyDnsServerInvalid,
@@ -315,14 +315,9 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
             "DNS servers must be IP addresses",
         ),
         (
-            R::ProxyWireGuardNeedsDnsServers,
-            "PROXY_WIREGUARD_NEEDS_DNS_SERVERS",
-            "a WireGuard proxy resolves names only through DNS servers",
-        ),
-        (
             R::ProxyDnsServersRequired,
             "PROXY_DNS_SERVERS_REQUIRED",
-            "a DNS setting whose listed servers answer needs at least one",
+            "a DNS server list needs at least one server",
         ),
         (
             R::ProxyDnsTlsNameInvalid,
@@ -350,9 +345,108 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
             "a DNS server is listed only once",
         ),
         (
-            R::EgressDnsWhoInvalid,
-            "EGRESS_DNS_WHO_INVALID",
-            "names dialled straight out of an egress are resolved by the host or by listed DNS servers",
+            R::DnsListNameLength,
+            "DNS_LIST_NAME_LENGTH",
+            "DNS server list name must contain 1–128 characters",
+        ),
+        (
+            R::DnsListNotFound,
+            "DNS_LIST_NOT_FOUND",
+            "DNS server list not found",
+        ),
+        (
+            R::DnsListLimitReached,
+            "DNS_LIST_LIMIT_REACHED",
+            "at most 128 DNS server lists are supported",
+        ),
+        (
+            R::DnsListInUse {
+                profiles: vec!["Quad".into(), "Home".into()],
+            },
+            "DNS_LIST_IN_USE",
+            "DNS server list is used by DNS profile Quad, DNS profile Home",
+        ),
+        (
+            R::DnsProfileNameLength,
+            "DNS_PROFILE_NAME_LENGTH",
+            "DNS profile name must contain 1–128 characters",
+        ),
+        (
+            R::DnsProfileNotFound,
+            "DNS_PROFILE_NOT_FOUND",
+            "DNS profile not found",
+        ),
+        (
+            R::DnsProfileLimitReached,
+            "DNS_PROFILE_LIMIT_REACHED",
+            "at most 128 DNS profiles are supported",
+        ),
+        (
+            R::DnsProfileBuiltIn,
+            "DNS_PROFILE_BUILT_IN",
+            "the System DNS profile cannot be changed or deleted",
+        ),
+        (
+            R::DnsProfileInUse {
+                routes: vec!["server:3".into(), "outbound".into(), "server:x".into()],
+                proxies: vec![4],
+            },
+            "DNS_PROFILE_IN_USE",
+            "DNS profile is used by server 3, the default outbound route, route server:x, proxy 4",
+        ),
+        (
+            R::DnsProfileListRequired,
+            "DNS_PROFILE_LIST_REQUIRED",
+            "a DNS profile where Weaver answers needs a server list",
+        ),
+        (
+            R::DnsProfileTrustInvalid,
+            "DNS_PROFILE_TRUST_INVALID",
+            "the system takes answers as sent, and the proxy's answers are taken as sent or validated here",
+        ),
+        (
+            R::DnsProfileNeedsProxy {
+                routes: vec![Consumer::Rss(2)],
+            },
+            "DNS_PROFILE_NEEDS_PROXY",
+            "the proxy cannot answer for RSS feed 2, which has a leg or rung with no proxy",
+        ),
+        (
+            R::DnsProfileNeedsWireGuard {
+                routes: vec![Consumer::Torrent(TorrentScope::Default)],
+            },
+            "DNS_PROFILE_NEEDS_WIREGUARD",
+            "only a WireGuard proxy's answers can be validated here, and the default torrent route reaches another kind",
+        ),
+        (
+            R::DnsProfileNeedsTunnelDns {
+                proxies: vec![3, 4],
+                routes: vec![Consumer::Server(1)],
+            },
+            "DNS_PROFILE_NEEDS_TUNNEL_DNS",
+            "proxy 3, proxy 4 list no DNS servers of its tunnel, and server 1 needs them to answer names",
+        ),
+        (
+            R::DnsProfileKind {
+                expected: crate::proxies::DnsProfileKind::Route,
+            },
+            "DNS_PROFILE_KIND",
+            "a route selects a route DNS profile or System",
+        ),
+        (
+            R::DnsProfileProxyNameInvalid,
+            "DNS_PROFILE_PROXY_NAME_INVALID",
+            "a proxy name DNS profile is answered by the system or by listed servers asked from the egress",
+        ),
+        (
+            R::DnsProfileKindImmutable,
+            "DNS_PROFILE_KIND_IMMUTABLE",
+            "what a DNS profile answers for cannot be changed after it is created",
+        ),
+        (
+            R::DnsProfileKindRequired,
+            "DNS_PROFILE_KIND_REQUIRED",
+            "a new DNS profile says whether routes or proxies select it",
         ),
         (
             R::ProxyCredentialTooLarge,
@@ -564,7 +658,7 @@ fn slot(refusal: &R) -> usize {
         R::ProxyTimeoutRange => 50,
         R::ProxyAddressCount => 51,
         R::ProxyDnsServerInvalid => 52,
-        R::ProxyWireGuardNeedsDnsServers => 53,
+        R::DnsListNameLength => 53,
         R::ProxyCredentialTooLarge => 54,
         R::ProxySshUsernameRequired => 55,
         R::ProxySshKeyRequired => 56,
@@ -606,12 +700,28 @@ fn slot(refusal: &R) -> usize {
         R::ProxyDnsUrlInvalid => 92,
         R::ProxyDnsUrlHostname => 93,
         R::ProxyDnsPlainAfterEncrypted => 94,
-        R::EgressDnsWhoInvalid => 95,
+        R::DnsListNotFound => 95,
         R::ProxyDnsServerDuplicate => 96,
         R::ProxyDnsServerCount => 97,
+        R::DnsListLimitReached => 98,
+        R::DnsListInUse { .. } => 99,
+        R::DnsProfileNameLength => 100,
+        R::DnsProfileNotFound => 101,
+        R::DnsProfileLimitReached => 102,
+        R::DnsProfileBuiltIn => 103,
+        R::DnsProfileInUse { .. } => 104,
+        R::DnsProfileListRequired => 105,
+        R::DnsProfileTrustInvalid => 106,
+        R::DnsProfileNeedsProxy { .. } => 107,
+        R::DnsProfileNeedsWireGuard { .. } => 108,
+        R::DnsProfileNeedsTunnelDns { .. } => 109,
+        R::DnsProfileKind { .. } => 110,
+        R::DnsProfileProxyNameInvalid => 111,
+        R::DnsProfileKindImmutable => 112,
+        R::DnsProfileKindRequired => 113,
     }
 }
-const SLOTS: usize = 98;
+const SLOTS: usize = 114;
 
 #[test]
 fn every_refusal_keeps_its_code_and_its_sentence() {
@@ -732,6 +842,24 @@ fn only_the_sentences_that_name_values_carry_them() {
             }
             "PROXY_IN_POOL" => assert_eq!(params, serde_json::json!({ "poolId": 2 })),
             "PROXY_IN_USE" => assert_eq!(params, serde_json::json!({ "consumer": "server:3" })),
+            "DNS_LIST_IN_USE" => {
+                assert_eq!(params, serde_json::json!({ "profiles": ["Quad", "Home"] }))
+            }
+            "DNS_PROFILE_IN_USE" => assert_eq!(
+                params,
+                serde_json::json!({ "routes": ["server:3", "outbound", "server:x"], "proxies": [4] })
+            ),
+            "DNS_PROFILE_KIND" => assert_eq!(params, serde_json::json!({ "expected": "ROUTE" })),
+            "DNS_PROFILE_NEEDS_PROXY" => {
+                assert_eq!(params, serde_json::json!({ "routes": ["rss:2"] }))
+            }
+            "DNS_PROFILE_NEEDS_WIREGUARD" => {
+                assert_eq!(params, serde_json::json!({ "routes": ["torrent:default"] }))
+            }
+            "DNS_PROFILE_NEEDS_TUNNEL_DNS" => assert_eq!(
+                params,
+                serde_json::json!({ "proxies": [3, 4], "routes": ["server:1"] })
+            ),
             _ => assert_eq!(params, serde_json::json!({}), "{code}"),
         }
     }
