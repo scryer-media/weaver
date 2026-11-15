@@ -5782,9 +5782,9 @@ dependencies = [
 
 [[package]]
 name = "unrar-rs"
-version = "0.16.2"
+version = "0.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa87457e1ba42bfe04ff0b3d0b3a1f1a69227944a263f25a0284876081fd433e"
+checksum = "68a270e0acc3c80936322a437e8ab0bd4affed2745304744e0a81fe4c035b9c8"
 dependencies = [
  "aws-lc-rs",
  "blake2s_simd",

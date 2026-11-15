@@ -197,7 +197,7 @@ This release changes the GraphQL API in ways that can break a client.
 
 ## Dependencies
 
-- unrar-rs 0.16.2.
+- unrar-rs 0.16.3.
 - par2-rs 0.12.0 and par3-rs 0.8.2, from the registry.
 
 ## Regression coverage
