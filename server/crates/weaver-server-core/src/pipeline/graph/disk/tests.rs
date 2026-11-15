@@ -575,12 +575,60 @@ fn a_volume_is_probed_once_when_a_job_first_writes_to_it() {
     probes.first_seen(&through.writers, &through.volume, &working_dir.join("one"));
     assert_eq!(probed.recv().unwrap(), (None, dir.path().to_path_buf()));
     probes.first_seen(&through.writers, &through.volume, &working_dir.join("two"));
+    // The job's directory is there: the probe is given the one above it.
     probes.first_seen(&through.writers, &other, &output_dir);
-    assert_eq!(probed.recv().unwrap(), (Some(2), output_dir.clone()));
+    assert_eq!(probed.recv().unwrap(), (Some(2), dir.path().to_path_buf()));
     probes.first_seen(&through.writers, &other, &output_dir);
     // Every sender left is in a probe still queued: none is.
     drop(probes);
     assert!(probed.recv().is_err(), "no volume is probed twice");
+}
+
+// The probe writes beside a job's folder, never in it, for every folder a
+// job writes to: a working directory under its plain or its suffixed name,
+// made or not yet, under a root made or not yet, and a staging directory
+// under a destination's `.weaver-staging`.
+#[test]
+fn the_probe_writes_outside_every_job_folder() {
+    use crate::jobs::ids::JobId;
+    use crate::jobs::working_dir::{claim_working_dir, compute_working_dir, make_job_staging_dir};
+    let dir = tempfile::tempdir().unwrap();
+    let intermediate = dir.path().join("intermediate");
+    let complete = dir.path().join("complete");
+    let beside = |job_dir: &Path, expected: &Path| {
+        let probed = super::probed_dir(job_dir).unwrap();
+        assert_eq!(probed, expected, "for {}", job_dir.display());
+        assert!(!probed.starts_with(job_dir), "not in {}", job_dir.display());
+    };
+
+    // Not made yet, nor its root: the nearest directory there.
+    beside(
+        &compute_working_dir(&intermediate, JobId(1), "lantern"),
+        dir.path(),
+    );
+    let plain = claim_working_dir(&intermediate, JobId(1), "lantern").unwrap();
+    beside(&plain.path, &intermediate);
+    let suffixed = claim_working_dir(&intermediate, JobId(2), "lantern").unwrap();
+    assert_ne!(suffixed.path, plain.path);
+    beside(&suffixed.path, &intermediate);
+    beside(
+        &compute_working_dir(&intermediate, JobId(3), "lantern later"),
+        &intermediate,
+    );
+
+    std::fs::create_dir(&complete).unwrap();
+    let staging = complete
+        .join("tv")
+        .join(crate::jobs::working_dir::STAGING_DIR_NAME)
+        .join("4");
+    beside(&staging, &complete);
+    make_job_staging_dir(&staging, JobId(4)).unwrap();
+    beside(&staging, staging.parent().unwrap());
+
+    // Where the intermediate root is the complete root, the jobs' folders
+    // are still its children.
+    let shared = claim_working_dir(&complete, JobId(5), "lantern").unwrap();
+    beside(&shared.path, &complete);
 }
 
 // On a machine that will start no thread for a volume, a job's first

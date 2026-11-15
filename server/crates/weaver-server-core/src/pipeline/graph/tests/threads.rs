@@ -1870,12 +1870,15 @@ async fn a_volume_is_probed_after_its_first_jobs_writes_and_a_slow_one_runs_one_
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let (said, probed) = mpsc::channel();
     let said = Mutex::new(said);
+    let job_file = Arc::new(std::sync::OnceLock::<PathBuf>::new());
+    let file_of_job = Arc::clone(&job_file);
     pipeline.volume_probes = Arc::new(crate::pipeline::graph::disk::VolumeProbes::with(
-        move |volume, dir| {
+        move |volume, _| {
             let said = said.lock().unwrap().clone();
+            let file_of_job = Arc::clone(&file_of_job);
             Box::new(move || {
                 // What the job's file holds as the probe begins.
-                let held = std::fs::read(dir.join("lantern.bin")).ok();
+                let held = file_of_job.get().and_then(|file| std::fs::read(file).ok());
                 volume.write_rate.store(60_000_000, Ordering::Relaxed);
                 let _ = said.send((Arc::clone(&volume), held));
                 Ok(())
@@ -1895,6 +1898,7 @@ async fn a_volume_is_probed_after_its_first_jobs_writes_and_a_slow_one_runs_one_
     )
     .await;
     let working_dir = pipeline.jobs[&job_id].working_dir.clone();
+    job_file.set(working_dir.join("lantern.bin")).unwrap();
     let (volume, hold) = held(&pipeline, job_id);
     assert!(Arc::ptr_eq(
         &volume,
@@ -1919,6 +1923,119 @@ async fn a_volume_is_probed_after_its_first_jobs_writes_and_a_slow_one_runs_one_
     pipeline.apply_queue_intents().await;
     assert_eq!(pipeline.tuner.max_concurrent_extractions(), 1);
     no_loop_waits(&volume);
+    drop(hold);
+    retire_pipeline_database(pipeline).await;
+}
+
+// The volume's probe runs once a job's file is down, beside the job's
+// delivery: held while its scratch file is there, the file is not among the
+// entries of the job's folder the final move lists, and once let go it is
+// gone and the delivery moves the job's own file alone.
+#[tokio::test]
+async fn a_probe_holding_its_scratch_file_leaves_the_jobs_folder_and_delivery_alone() {
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_431);
+    let posts = [Post::plain("lantern.bin", payload(3 * ARTICLE, 1))];
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let (made, scratch) = mpsc::channel::<PathBuf>();
+    let (release, released) = mpsc::channel::<()>();
+    let (made, released) = (Mutex::new(made), Mutex::new(released));
+    let store = crate::operations::disk::ProbeStore::writing_with(data.path(), move |path| {
+        made.lock().unwrap().send(path.to_path_buf()).unwrap();
+        released.lock().unwrap().recv().unwrap();
+        Some(crate::runtime::system_probe::ProbeWrite {
+            bytes: 1_000_000,
+            elapsed: Duration::from_millis(10),
+        })
+    });
+    let (ended, probe_ended) = mpsc::channel::<()>();
+    let ended = Mutex::new(ended);
+    pipeline.volume_probes = Arc::new(crate::pipeline::graph::disk::VolumeProbes::with(
+        move |volume, dir| {
+            let probe = crate::operations::disk::probe_once(volume, dir, Arc::clone(&store));
+            let ended = ended.lock().unwrap().clone();
+            Box::new(move || {
+                let probed = probe();
+                let _ = ended.send(());
+                probed
+            })
+        },
+    ));
+
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        spec("lantern joined", &posts, ARTICLE),
+    )
+    .await;
+    let working_dir = pipeline.jobs[&job_id].working_dir.clone();
+    let (volume, hold) = held(&pipeline, job_id);
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    hold.wait_held();
+    hold.open();
+
+    // The probe made its file once the job's writes were down, and holds.
+    let scratch = scratch.recv().unwrap();
+    assert!(scratch.is_file());
+    let listed: Vec<String> = std::fs::read_dir(&working_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !listed.iter().any(|name| name.contains("volume-probe")),
+        "the job's folder lists {listed:?}"
+    );
+    assert!(listed.contains(&"lantern.bin".to_string()), "{listed:?}");
+    assert!(!scratch.starts_with(&working_dir), "{}", scratch.display());
+    assert_eq!(
+        scratch.parent().and_then(Path::parent),
+        Some(pipeline.intermediate_dir.as_path())
+    );
+
+    // Let go, the probe removes its file and its directory.
+    release.send(()).unwrap();
+    probe_ended.recv().unwrap();
+    assert!(!scratch.exists());
+    assert!(!scratch.parent().unwrap().exists());
+    assert!(volume.write_rate.load(Ordering::Relaxed) > 0);
+
+    pipeline.start_move_to_complete(job_id).await.unwrap();
+    while !pipeline.inflight_moves.contains(&job_id) {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+        pipeline.start_move_to_complete(job_id).await.unwrap();
+    }
+    let done = pipeline.move_done_rx.recv().await.unwrap();
+    pipeline.handle_move_to_complete_done(done).await;
+    let status = job_status_for_assert(&pipeline, job_id);
+    assert!(
+        !matches!(status, Some(JobStatus::Failed { .. })),
+        "{status:?}"
+    );
+    let mut delivered = Vec::new();
+    let mut dirs = vec![pipeline.complete_dir.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                dirs.push(entry.path());
+            } else {
+                delivered.push((
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).unwrap(),
+                ));
+            }
+        }
+    }
+    delivered.retain(|(name, _)| !name.starts_with(".weaver-"));
+    assert_eq!(
+        delivered,
+        vec![("lantern.bin".to_string(), posts[0].bytes.clone())]
+    );
     drop(hold);
     retire_pipeline_database(pipeline).await;
 }
