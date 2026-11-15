@@ -174,6 +174,27 @@ impl Database {
         })
     }
 
+    // Whether a removal has marked the torrent of `job_id` (`retiring`): an
+    // add of the same torrent is refused as still being removed, not as a
+    // duplicate. One read by key, only when an add finds the torrent.
+    pub(crate) fn torrent_is_retiring(&self, job_id: JobId) -> Result<bool, StateError> {
+        let id = stored(job_id.0)?;
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT retiring FROM torrents WHERE job_id = {}",
+                &[SqlArg::I64(id)],
+            )
+            .await?;
+            Ok(row
+                .map(|row| row.opt_text("retiring"))
+                .transpose()?
+                .flatten()
+                .is_some())
+        })
+    }
+
     // Every torrent a removal left retiring, with what of its row finishing
     // the removal takes, and the history row its job has, if any. One
     // statement, served by the retiring index.
@@ -375,9 +396,11 @@ fn retiring_row(row: &crate::persistence::sql_runtime::SqlRow) -> Result<Retirin
             Some(text) => serde_json::from_str(&text).ok(),
             None => Some(Vec::new()),
         },
+        // Never written: what was there before is not known, and the
+        // start's delete takes none of the torrent's files.
         adopted: match row.opt_text("adopted")? {
             Some(text) => serde_json::from_str(&text).ok(),
-            None => Some(super::model::Adopted::default()),
+            None => None,
         },
         history,
     })
@@ -738,6 +761,100 @@ impl Database {
         })
     }
 
+    // What the torrents not leaving hold, each row as written, or only the
+    // rows of `job_id`. One statement: by the table's key for one torrent,
+    // and every row once at a start, as the restore reads its torrents.
+    pub(crate) fn held_rows(
+        &self,
+        job_id: Option<JobId>,
+    ) -> Result<Vec<(JobId, String)>, StateError> {
+        let only = job_id.map(|job_id| stored(job_id.0)).transpose()?;
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let select = "SELECT h.job_id, h.path FROM torrent_held_paths h \
+                          JOIN torrents t ON t.job_id = h.job_id \
+                          WHERE t.retiring IS NULL";
+            let rows = match only {
+                Some(id) => {
+                    SqlRuntime::fetch_all(
+                        datastore.read_exec(),
+                        &format!("{select} AND h.job_id = {{}}"),
+                        &[SqlArg::I64(id)],
+                    )
+                    .await?
+                }
+                None => SqlRuntime::fetch_all(datastore.read_exec(), select, &[]).await?,
+            };
+            rows.into_iter()
+                .map(|row| {
+                    let id = u64::try_from(row.i64("job_id")?)
+                        .map_err(|error| StateError::Database(error.to_string()))?;
+                    Ok((JobId(id), row.text("path")?))
+                })
+                .collect()
+        })
+    }
+
+    // Each `(job, was, now)` row of what a torrent holds spelled `now` in
+    // place of `was`, in one transaction: a row that is gone by then, as a
+    // move or a removal took it, stays gone. Two statements per chunk,
+    // whatever the number of torrents.
+    pub(crate) fn respell_held(&self, rows: &[(JobId, String, String)]) -> Result<(), StateError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let rows = rows
+            .iter()
+            .map(|(job_id, was, now)| Ok((stored(job_id.0)?, was.clone(), now.clone())))
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let datastore = self.datastore();
+        let rows_per = crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 3);
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "respell_held", |tx| {
+                let rows = rows.clone();
+                Box::pin(async move {
+                    for chunk in rows.chunks(rows_per) {
+                        let values = vec!["({}, {}, {})"; chunk.len()].join(", ");
+                        let args = chunk
+                            .iter()
+                            .flat_map(|(id, was, now)| {
+                                [
+                                    SqlArg::I64(*id),
+                                    SqlArg::Text(was.clone()),
+                                    SqlArg::Text(now.clone()),
+                                ]
+                            })
+                            .collect::<Vec<_>>();
+                        tx.execute(
+                            &format!(
+                                "WITH v (job_id, was, now) AS (VALUES {values}) \
+                                 INSERT INTO torrent_held_paths (job_id, path) \
+                                 SELECT v.job_id, v.now FROM v WHERE EXISTS \
+                                 (SELECT 1 FROM torrent_held_paths h \
+                                   WHERE h.job_id = v.job_id AND h.path = v.was) \
+                                 ON CONFLICT (job_id, path) DO NOTHING"
+                            ),
+                            &args,
+                        )
+                        .await?;
+                        let filters = vec!["(job_id = {} AND path = {})"; chunk.len()].join(" OR ");
+                        let args = chunk
+                            .iter()
+                            .flat_map(|(id, was, _)| [SqlArg::I64(*id), SqlArg::Text(was.clone())])
+                            .collect::<Vec<_>>();
+                        tx.execute(
+                            &format!("DELETE FROM torrent_held_paths WHERE {filters}"),
+                            &args,
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
     // One torrent's [`Self::set_torrents_held`].
     pub(crate) fn set_torrent_held(
         &self,
@@ -806,9 +923,11 @@ async fn delete_torrent_tx(tx: &mut SqlTx<'_>, id: i64) -> Result<bool, StateErr
     Ok(changed > 0)
 }
 
+// What was there before, written even when nothing was: a row whose
+// `adopted` was never written (a row from before it was kept) reads as not
+// known, never as nothing there (`retiring_row`).
 fn adopted_text(adopted: &super::model::Adopted) -> Result<Option<String>, StateError> {
-    (!adopted.is_empty())
-        .then(|| serde_json::to_string(adopted))
+    Some(serde_json::to_string(adopted))
         .transpose()
         .map_err(|error| StateError::Database(error.to_string()))
 }
@@ -1220,6 +1339,7 @@ impl Database {
 
     // What was on disk where the torrent's files go before Weaver wrote
     // them; nothing kept is nothing adopted.
+    #[cfg(test)]
     pub(crate) fn set_torrent_adopted(
         &self,
         job_id: JobId,
@@ -1232,11 +1352,20 @@ impl Database {
         self.set_torrent_column("adopted", args)
     }
 
-    // What [`Self::set_torrent_adopted`] kept.
+    // A row from before what was there was kept: `adopted` never written.
+    #[cfg(test)]
+    pub(crate) fn forget_torrent_adopted(&self, job_id: JobId) -> Result<bool, StateError> {
+        let args = vec![SqlArg::OptText(None), SqlArg::I64(stored(job_id.0)?)];
+        self.set_torrent_column("adopted", args)
+    }
+
+    // What was on disk where the torrent's files go before Weaver wrote
+    // them; None when that was never written (a row from before it was
+    // kept), which is not known and takes no file.
     pub(crate) fn torrent_adopted(
         &self,
         job_id: JobId,
-    ) -> Result<super::model::Adopted, StateError> {
+    ) -> Result<Option<super::model::Adopted>, StateError> {
         let id = stored(job_id.0)?;
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
@@ -1251,9 +1380,11 @@ impl Database {
                 .transpose()?
                 .flatten()
             else {
-                return Ok(super::model::Adopted::default());
+                return Ok(None);
             };
-            serde_json::from_str(&text).map_err(|error| StateError::Database(error.to_string()))
+            serde_json::from_str(&text)
+                .map(Some)
+                .map_err(|error| StateError::Database(error.to_string()))
         })
     }
 
@@ -1383,8 +1514,10 @@ impl Database {
         files_dir: Option<&str>,
         trackers: &[TrackerEntry],
         held: &[String],
+        adopted: &super::model::Adopted,
     ) -> Result<bool, StateError> {
         let id = stored(job_id.0)?;
+        let adopted = adopted_text(adopted)?;
         let head = vec![
             SqlArg::OptBytes(infohash_v1.map(|hash| hash.to_vec())),
             SqlArg::OptBytes(infohash_v2.map(|hash| hash.to_vec())),
@@ -1393,6 +1526,7 @@ impl Database {
             SqlArg::Text(storage_dir.to_owned()),
             SqlArg::OptText(files_dir.map(str::to_owned)),
             SqlArg::Bool(true),
+            SqlArg::OptText(adopted),
             SqlArg::I64(id),
         ];
         let trackers = trackers.to_vec();
@@ -1407,7 +1541,7 @@ impl Database {
                     let changed = tx
                         .execute(
                             "UPDATE torrents SET infohash_v1 = {}, infohash_v2 = {}, name = {}, metainfo = {},
-                                     storage_dir = {}, files_dir = {}, held_set = {}
+                                     storage_dir = {}, files_dir = {}, held_set = {}, adopted = {}
                               WHERE job_id = {}",
                             &head,
                         )

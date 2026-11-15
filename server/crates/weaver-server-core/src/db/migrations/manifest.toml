@@ -1690,7 +1690,7 @@ scope = "all"
 
 [[migration]]
 version = 121
-description = "a torrent removed while the database's disk is full keeps its history row until it is written"
+description = "a torrent being removed is marked kept or deleted, by whether its files go, and the next start finishes its removal"
 checksum_algo = "blake3"
 
 [[migration.steps]]

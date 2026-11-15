@@ -1920,3 +1920,328 @@ async fn a_move_whose_destination_cannot_be_held_moves_nothing() {
     assert!(holds_all(&rig, &there));
     rig.service.stop().await;
 }
+
+// Holds the next removal's mark until the returned sender lets it go, once
+// the removal has reached it.
+async fn hold_the_mark(
+    rig: &Rig,
+    job_id: JobId,
+    delete_files: bool,
+) -> (
+    tokio::task::JoinHandle<Result<(), ActionError>>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (reached, at) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *locked(&MARK_HOLD) = Some((reached, released));
+    let service = rig.service.clone();
+    let removing = tokio::spawn(async move { service.remove(job_id, delete_files, true).await });
+    at.await.unwrap();
+    (removing, release)
+}
+
+// A move asked for while a removal writes its mark is refused, and the
+// removal goes on: its files go, and it never moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_move_asked_while_a_removal_writes_its_mark_is_refused() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (job_id, dir) = with_every_piece(&rig).await;
+    let elsewhere = rig.dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let (removing, release) = hold_the_mark(&rig, job_id, true).await;
+
+    let moved = rig
+        .service
+        .set_location(job_id, elsewhere.to_string_lossy().into_owned())
+        .await;
+    assert_eq!(
+        moved,
+        Err(ActionError::Invalid(
+            "the torrent is being removed".to_owned()
+        ))
+    );
+    release.send(()).unwrap();
+    removing.await.unwrap().unwrap();
+    assert!(files_under(&dir).is_empty(), "its files went");
+    assert!(files_under(&elsewhere).is_empty(), "nothing moved");
+    assert!(rig.db.get_torrent(job_id).unwrap().is_none());
+    rig.service.stop().await;
+}
+
+// A removal asked for while the torrent's files move is refused before it
+// marks anything: the torrent stays live, its row unmarked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_asked_while_the_files_move_is_refused() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (job_id, dir) = with_every_piece(&rig).await;
+    let files = files_under(&dir);
+    // Its files moving, or unpacking placing its outputs beside them.
+    for moving in [Moving::Files, Moving::Outputs] {
+        rig.service
+            .inner
+            .live
+            .lock()
+            .await
+            .get_mut(&job_id)
+            .unwrap()
+            .moving = Some(moving);
+
+        let removed = rig.service.remove(job_id, true, true).await;
+        assert!(
+            matches!(&removed, Err(ActionError::Invalid(why)) if why.contains("moving")),
+            "{removed:?}"
+        );
+        assert_eq!(
+            rig.db.torrent_rows().unwrap(),
+            (vec![job_id], Vec::new()),
+            "its row is not marked"
+        );
+        assert_eq!(files_under(&dir), files, "nothing is deleted");
+    }
+    rig.service
+        .inner
+        .live
+        .lock()
+        .await
+        .get_mut(&job_id)
+        .unwrap()
+        .moving = None;
+    rig.service.remove(job_id, true, true).await.unwrap();
+    assert!(files_under(&dir).is_empty());
+    rig.service.stop().await;
+}
+
+// A failure while a removal writes its mark leaves the torrent to the
+// removal: it goes to history as removed, not failed, and no mark is left
+// for a later start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failure_while_a_removal_writes_its_mark_leaves_it_to_the_removal() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (job_id, dir) = with_every_piece(&rig).await;
+    let mut retired = rig.service.retired();
+    let (removing, release) = hold_the_mark(&rig, job_id, true).await;
+
+    rig.service
+        .fail(job_id, "the disk went away".to_owned())
+        .await;
+    assert!(
+        rig.service.inner.live.lock().await.contains_key(&job_id),
+        "the failure does not take it"
+    );
+    release.send(()).unwrap();
+    removing.await.unwrap().unwrap();
+    retired.wait_for(|retired| *retired >= 1).await.unwrap();
+    assert!(files_under(&dir).is_empty(), "its files went");
+    assert!(
+        rig.db.get_torrent(job_id).unwrap().is_none(),
+        "no mark is left"
+    );
+    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert_ne!(history.status, "failed");
+    assert_eq!(history.error_message, None);
+    rig.service.stop().await;
+}
+
+// A retiring row whose files go takes them at the start only when what was
+// there before the torrent was written: one from before that was kept
+// (`adopted` never written) keeps every file, one written empty takes them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retiring_torrent_whose_prior_contents_are_unknown_keeps_its_files() {
+    for written in [true, false] {
+        let rig = rig(set_clock());
+        rig.service.open().await.unwrap();
+        let (job_id, dir) = with_every_piece(&rig).await;
+        let files = files_under(&dir);
+        rig.service.stop().await;
+        rig.db.mark_torrent_retiring(job_id, true).unwrap();
+        if !written {
+            rig.db.forget_torrent_adopted(job_id).unwrap();
+        }
+        let rows = rig.db.retiring_torrents().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].adopted,
+            written.then(crate::torrents::model::Adopted::default),
+            "written empty, or never written"
+        );
+
+        let db = rig.db.clone();
+        let work = rig.dir.path().join("work");
+        let finished = tokio::task::spawn_blocking(move || finish_retiring(&db, &work))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(finished.len(), 1);
+        if written {
+            assert!(
+                files_under(&dir).is_empty(),
+                "nothing was there: its files go"
+            );
+        } else {
+            assert_eq!(files_under(&dir), files, "not known: every file stays");
+        }
+    }
+}
+
+// An add of a torrent whose removal has not ended is refused as still
+// being removed, at once, never as a duplicate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_add_of_a_torrent_still_being_removed_says_so() {
+    use crate::persistence::ArchiveNews;
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (news, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    rig.db.hear_archive_news(move |said| {
+        let _ = news.send(said);
+    });
+    let (job_id, _) = with_every_piece(&rig).await;
+    assert_eq!(
+        rig.service
+            .add(request(AddSource::Metainfo(plain("set", 1))))
+            .await,
+        Err(AddError::Duplicate(job_id)),
+        "a live torrent is a duplicate"
+    );
+    crate::persistence::connection::ARCHIVE_REFUSED
+        .lock()
+        .unwrap()
+        .push_back(crate::StateError::OutOfSpace(
+            "database or disk is full".into(),
+        ));
+    rig.service.remove(job_id, true, true).await.unwrap();
+    assert_eq!(heard.recv().await, Some(ArchiveNews::Kept(job_id)));
+    assert!(
+        rig.db.get_torrent(job_id).unwrap().is_some(),
+        "still retiring"
+    );
+
+    let added = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .await;
+    assert_eq!(added, Err(AddError::Refused(Refusal::Removing(job_id))));
+    let said = added.unwrap_err().to_string();
+    assert!(said.contains("still being removed"), "{said}");
+    rig.service.stop().await;
+}
+
+// A torrent's top folder made in another case before its first write: from
+// the next start, what the torrent holds is spelled as the filesystem
+// spells the folder its files went into. Where the filesystem tells case
+// apart, the torrent made its own folder and holds that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn what_a_torrent_holds_is_spelled_as_the_folder_its_files_went_into() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    let storage = PathBuf::from(
+        rig.service
+            .torrent(job_id)
+            .await
+            .unwrap()
+            .storage_dir
+            .unwrap(),
+    );
+    std::fs::create_dir_all(storage.join("SET")).unwrap();
+    let ignores_case = storage.join("set").exists();
+    fetch_every_piece(&rig.service, job_id, &[1; 3000]).await;
+    rig.service.stop().await;
+
+    let restarted = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    restarted.open().await.unwrap();
+    let spelled = if ignores_case { "SET" } else { "set" };
+    let expected = resolved(&storage)
+        .join(spelled)
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        rig.db.held_rows(Some(job_id)).unwrap(),
+        [(job_id, expected)]
+    );
+    restarted.stop().await;
+}
+
+// A removal whose request is dropped while it writes its mark goes on all
+// the same: once the mark is let go, the torrent is retired with its files
+// gone, never left flagged as being removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_whose_request_is_dropped_at_its_mark_still_ends() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (job_id, dir) = with_every_piece(&rig).await;
+    let mut retired = rig.service.retired();
+    let (reached, at) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *locked(&MARK_HOLD) = Some((reached, released));
+    let mut asked = Box::pin(rig.service.remove(job_id, true, true));
+    tokio::select! {
+        biased;
+        _ = at => {}
+        ended = &mut asked => panic!("the removal ended before its mark: {ended:?}"),
+    }
+    drop(asked);
+
+    release.send(()).unwrap();
+    retired.wait_for(|retired| *retired >= 1).await.unwrap();
+    assert!(rig.service.torrent(job_id).await.is_none(), "not live");
+    assert!(
+        rig.db.get_torrent(job_id).unwrap().is_none(),
+        "no mark is left"
+    );
+    assert!(files_under(&dir).is_empty(), "its files went");
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_some());
+    rig.service.stop().await;
+}
+
+// A failure while a removal writes its mark, and then the mark refused:
+// the removal does not go ahead, and the failure it held fails the
+// torrent, which goes to history as failed with that error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failure_held_by_a_removal_whose_mark_is_refused_fails_the_torrent() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (job_id, dir) = with_every_piece(&rig).await;
+    let files = files_under(&dir);
+    let mut retired = rig.service.retired();
+    crate::torrents::persistence::MARK_REFUSED.store(2, Ordering::Relaxed);
+    let (removing, release) = hold_the_mark(&rig, job_id, true).await;
+    rig.service
+        .fail(job_id, "the disk went away".to_owned())
+        .await;
+    release.send(()).unwrap();
+    let removed = removing.await.unwrap();
+    crate::torrents::persistence::MARK_REFUSED.store(0, Ordering::Relaxed);
+    assert!(matches!(removed, Err(ActionError::State(_))), "{removed:?}");
+
+    retired.wait_for(|retired| *retired >= 1).await.unwrap();
+    assert!(rig.service.torrent(job_id).await.is_none(), "not live");
+    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert_eq!(history.status, "failed");
+    assert_eq!(history.error_message.as_deref(), Some("the disk went away"));
+    assert_eq!(files_under(&dir), files, "a failure keeps its data");
+    rig.service.stop().await;
+}
+
+// A live removal of a torrent whose row never kept what was there before
+// it takes none of its files, as a start's finish of the same row would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_with_what_was_there_unknown_keeps_every_file() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (job_id, dir) = with_every_piece(&rig).await;
+    let files = files_under(&dir);
+    rig.db.forget_torrent_adopted(job_id).unwrap();
+    assert_eq!(rig.db.torrent_adopted(job_id).unwrap(), None);
+
+    rig.service.remove(job_id, true, true).await.unwrap();
+    assert!(rig.service.torrent(job_id).await.is_none(), "removed");
+    assert_eq!(files_under(&dir), files, "not known: every file stays");
+    rig.service.stop().await;
+}

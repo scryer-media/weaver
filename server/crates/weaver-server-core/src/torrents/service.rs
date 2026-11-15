@@ -1515,6 +1515,12 @@ struct Live {
     peers: (u32, u32, u32),
     // Where a move goes, while it is under way.
     moving: Option<Moving>,
+    // A removal has begun writing its mark: no move starts, and a failure
+    // leaves the torrent to the removal (`remove_as`).
+    removing: bool,
+    // A failure that came while `removing` was set, for the removal to
+    // act on if it does not go ahead (`fail`).
+    failed_removing: Option<String>,
     // A change of its files' levels that copies bytes out of its side
     // store, while it is under way.
     leveling: Option<Leveling>,
@@ -1676,6 +1682,8 @@ impl Live {
             speeds: (0, 0),
             peers: (0, 0, 0),
             moving: None,
+            removing: false,
+            failed_removing: None,
             leveling: None,
             copy_error: None,
             seed_verified: 0,
@@ -3801,7 +3809,7 @@ impl TorrentService {
     async fn unpacked(&self, job_id: JobId, store: &Arc<TorrentStore>, tee: &Arc<Tee>) -> Placing {
         let claimed = self
             .with_torrent(job_id, |torrent| {
-                if torrent.moving.is_some() {
+                if torrent.moving.is_some() || torrent.removing {
                     return Ok(false);
                 }
                 torrent.moving = Some(Moving::Outputs);
@@ -4222,6 +4230,9 @@ impl TorrentService {
         };
         let (landing, move_to) = landing;
         let _ = self.landed(landing).await;
+        // Its files are all there now: what it holds is spelled as the
+        // filesystem spells them.
+        self.respell_held(Some(job_id)).await;
         // One that downloaded under its download path moves under its save
         // path now, over any file of the same name there (qBittorrent
         // `TorrentImpl::handleTorrentFinished` and `adjustStorageLocation`).
@@ -5119,9 +5130,20 @@ impl TorrentService {
 
     fn duplicate(&self, hashes: InfoHashes) -> Result<(), AddError> {
         match self.inner.db.get_torrent_by_infohash(&infohashes(hashes)) {
-            Ok(Some(existing)) => Err(AddError::Duplicate(existing.job_id)),
+            Ok(Some(existing)) => Err(self.already(existing.job_id)),
             Ok(None) => Ok(()),
             Err(error) => Err(AddError::State(state_error(error))),
+        }
+    }
+
+    // Why an add of a torrent that is already `job_id` is refused: still
+    // being removed when a removal has marked it, a duplicate otherwise.
+    // The add never waits on that removal.
+    fn already(&self, job_id: JobId) -> AddError {
+        match self.inner.db.torrent_is_retiring(job_id) {
+            Ok(true) => AddError::Refused(Refusal::Removing(job_id)),
+            Ok(false) => AddError::Duplicate(job_id),
+            Err(error) => AddError::State(state_error(error)),
         }
     }
 
@@ -5339,7 +5361,7 @@ impl TorrentService {
                 torrent.trackers = in_table_order(trackers.to_vec());
                 Ok(torrent)
             }
-            Ok(TorrentInsert::Duplicate(existing)) => Err(AddError::Duplicate(existing)),
+            Ok(TorrentInsert::Duplicate(existing)) => Err(self.already(existing)),
             Err(error) => Err(AddError::State(state_error(error))),
         }
     }
@@ -5571,15 +5593,12 @@ impl TorrentService {
                 files_dir.as_deref(),
                 &trackers,
                 &held,
+                &adopted,
             )
             .map_err(|error| AddError::State(state_error(error)))?;
         // The table holds the merged list now, whatever the next write does.
         torrent.rule_id = self.rule_id(&trackers);
         torrent.trackers = in_table_order(trackers);
-        self.inner
-            .db
-            .set_torrent_adopted(job_id, &adopted)
-            .map_err(|error| AddError::State(state_error(error)))?;
         let made = self.give_metainfo(torrent, &parsed, &left_out);
         drop(live);
         if let Err(error) = made {
@@ -6239,7 +6258,22 @@ impl TorrentService {
 
     // The torrent cannot go on: it leaves as a failed job and its data stays.
     async fn fail(&self, job_id: JobId, error: String) {
-        let torrent = self.inner.live.lock().await.remove(&job_id);
+        let torrent = {
+            let mut live = self.inner.live.lock().await;
+            // One whose removal has begun is the removal's to retire: a
+            // failure written beside its mark would leave the mark for a
+            // later start to act on after its row went to history.
+            // Kept on it: a removal that then fails before its mark lands
+            // fails it with this.
+            if let Some(torrent) = live.get_mut(&job_id)
+                && torrent.removing
+            {
+                tracing::debug!(job_id = job_id.0, error = %error, "a torrent being removed failed; its removal retires it");
+                torrent.failed_removing.get_or_insert(error);
+                return;
+            }
+            live.remove(&job_id)
+        };
         let Some(mut torrent) = torrent else { return };
         let stopped = self.seeding_stopped(&torrent, "failed");
         // Its slot and rank go to the torrents after it.
@@ -6581,12 +6615,34 @@ impl TorrentService {
             .get(&job_id)
             .map(|torrent| Arc::clone(&torrent.gate))
             .ok_or(ActionError::NotFound(job_id))?;
-        let _removing = gate.lock().await;
+        let gated = gate.lock_owned().await;
+        // The rest runs on its own task: a request dropped part way, as a
+        // client that goes away drops it, cannot leave the torrent marked
+        // or flagged half removed. Once begun, the removal ends here.
+        let service = self.clone();
+        tokio::spawn(async move {
+            let _gated = gated;
+            service
+                .remove_gated(job_id, delete_files, confirm_unmet_goal, ending)
+                .await
+        })
+        .await
+        .map_err(|error| ActionError::State(format!("the removal did not finish: {error}")))?
+    }
+
+    // `remove_as` once its gate is held, on a task of its own.
+    async fn remove_gated(
+        &self,
+        job_id: JobId,
+        delete_files: bool,
+        confirm_unmet_goal: bool,
+        ending: Ending,
+    ) -> Result<(), ActionError> {
         let settings = self.settings();
         let now = self.inner.clock.now_ms();
         {
-            let live = self.inner.live.lock().await;
-            let torrent = live.get(&job_id).ok_or(ActionError::NotFound(job_id))?;
+            let mut live = self.inner.live.lock().await;
+            let torrent = live.get_mut(&job_id).ok_or(ActionError::NotFound(job_id))?;
             if torrent.private && !confirm_unmet_goal {
                 let policy = settings.policy(&torrent.record, torrent.rule(&self.rules()));
                 if let Some(left) =
@@ -6595,6 +6651,14 @@ impl TorrentService {
                     return Err(ActionError::UnmetGoal(left));
                 }
             }
+            // A move of its files and its removal never overlap: one under
+            // way refuses the other, each seen under this lock.
+            if torrent.moving.is_some() {
+                return Err(ActionError::Invalid(
+                    "the torrent's files are moving; remove it once the move ends".to_owned(),
+                ));
+            }
+            torrent.removing = true;
         }
         // Its row is marked retiring, with whether its files go, while it is
         // still live and before anything of it goes: a stop from here on
@@ -6609,6 +6673,21 @@ impl TorrentService {
                 tracing::warn!(job_id = job_id.0, error = %error, "no room to mark a torrent's removal; it goes on unmarked");
             }
             Err(error) => {
+                // A failure that came while it was being removed was the
+                // removal's to retire: with no removal, it fails now.
+                let failed = self
+                    .inner
+                    .live
+                    .lock()
+                    .await
+                    .get_mut(&job_id)
+                    .and_then(|torrent| {
+                        torrent.removing = false;
+                        torrent.failed_removing.take()
+                    });
+                if let Some(failed) = failed {
+                    self.fail(job_id, failed).await;
+                }
                 return Err(ActionError::State(format!(
                     "the torrent was not removed: its removal could not be recorded ({error})"
                 )));
@@ -6687,6 +6766,13 @@ impl TorrentService {
 
     // A removal's mark on the torrent's row, written off the runtime.
     async fn mark_retiring(&self, job_id: JobId, delete_files: bool) -> Result<(), StateError> {
+        #[cfg(test)]
+        let held = locked(&MARK_HOLD).take();
+        #[cfg(test)]
+        if let Some((reached, release)) = held {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
         let db = self.inner.db.clone();
         tokio::task::spawn_blocking(move || db.mark_torrent_retiring(job_id, delete_files))
             .await
@@ -7258,6 +7344,11 @@ impl TorrentService {
                         "the torrent is already moving".to_owned(),
                     ));
                 }
+                if torrent.removing {
+                    return Err(ActionError::Invalid(
+                        "the torrent is being removed".to_owned(),
+                    ));
+                }
                 match (torrent.store.clone(), torrent.record.storage_dir.clone()) {
                     (Some(store), Some(dir)) => Ok((
                         store,
@@ -7299,6 +7390,11 @@ impl TorrentService {
                 if torrent.moving.is_some() {
                     return Err(ActionError::Invalid(
                         "the torrent is already moving".to_owned(),
+                    ));
+                }
+                if torrent.removing {
+                    return Err(ActionError::Invalid(
+                        "the torrent is being removed".to_owned(),
                     ));
                 }
                 torrent.settle(self.inner.clock.now_ms());
@@ -7367,6 +7463,11 @@ impl TorrentService {
                     "the torrent is already moving".to_owned(),
                 ));
             }
+            if torrent.removing {
+                return Err(ActionError::Invalid(
+                    "the torrent is being removed".to_owned(),
+                ));
+            }
             let still_held = torrent.files_missing
                 && torrent
                     .store
@@ -7426,6 +7527,11 @@ impl TorrentService {
                 if torrent.moving.is_some() {
                     return Err(ActionError::Invalid(
                         "the torrent is already moving".to_owned(),
+                    ));
+                }
+                if torrent.removing {
+                    return Err(ActionError::Invalid(
+                        "the torrent is being removed".to_owned(),
                     ));
                 }
                 torrent.settle(self.inner.clock.now_ms());
@@ -8012,9 +8118,43 @@ impl TorrentService {
                 }
             }
         }
+        // A folder made in another spelling before a torrent's first write
+        // holds its files from then on: each start spells what the
+        // torrents hold as the filesystem does.
+        self.respell_held(None).await;
         self.apply_queue().await;
         self.publish().await;
         Ok(())
+    }
+
+    // What the torrents hold, or only `job_id`, spelled as the filesystem
+    // spells it now ([`held_key`]): a part the torrent named before it was
+    // there, and that came to be in another case or through a link, is
+    // held as it is on disk. One read, and one write only for the rows that
+    // differ; none when none does. Off the runtime.
+    async fn respell_held(&self, job_id: Option<JobId>) {
+        let db = self.inner.db.clone();
+        let respelled = tokio::task::spawn_blocking(move || {
+            let changed: Vec<(JobId, String, String)> = db
+                .held_rows(job_id)?
+                .into_iter()
+                .filter_map(|(job_id, was)| {
+                    let now = held_key(Path::new(&was)).to_string_lossy().into_owned();
+                    (now != was).then_some((job_id, was, now))
+                })
+                .collect();
+            db.respell_held(&changed)
+        })
+        .await;
+        match respelled {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "could not spell what the torrents hold as it is on disk");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "could not spell what the torrents hold as it is on disk");
+            }
+        }
     }
 
     // Which torrents the queue lets download, applied to their sessions.
@@ -9693,7 +9833,9 @@ pub(super) async fn read_written(of: WrittenOf) -> Wrote {
 // `storage_utils::delete_files`): its listed files Weaver made, what
 // unpacking placed beside them, and its tee's directory, nothing else.
 // A file that was there before the torrent stays; so does a folder
-// that was. On a failed read of what was there, every listed file is.
+// that was. On a failed read of what was there, every listed file is; when
+// what was there was never written (a row from before it was kept), it is
+// not known, and no file goes, as at a start (`retiring_deletion`).
 fn written_paths(of: &WrittenOf) -> Wrote {
     let job_id = of.job_id;
     let Some(store) = &of.store else {
@@ -9701,17 +9843,24 @@ fn written_paths(of: &WrittenOf) -> Wrote {
     };
     let adopted = of.db.torrent_adopted(job_id).unwrap_or_else(|error| {
         tracing::warn!(job_id = job_id.0, error = %error, "could not read what was on disk before a torrent");
-        Adopted {
+        Some(Adopted {
             all_files: true,
             dirs: vec![String::new()],
             ..Adopted::default()
-        }
+        })
     });
     let outputs = of.db.torrent_outputs(job_id).unwrap_or_else(|error| {
         tracing::warn!(job_id = job_id.0, error = %error, "could not read what a torrent unpacked");
         Vec::new()
     });
-    let mut deletion = deletion(store.files(), &adopted, &outputs, of.claimed.clone());
+    let mut deletion = match &adopted {
+        Some(adopted) => deletion(store.files(), adopted, &outputs, of.claimed.clone()),
+        None => Deletion {
+            dir: store.files().dir(),
+            claimed: of.claimed.clone(),
+            ..Deletion::default()
+        },
+    };
     deletion.owner = Some(job_id);
     // With or without a tee: one whose unpacked files were not placed
     // keeps its directory past it. It goes only as the torrent's job's.
@@ -9958,6 +10107,16 @@ async fn held_at(record: &TorrentRecord, tops: Option<BTreeSet<String>>) -> Vec<
             whole
         })
 }
+
+// Test seam: a removal's mark waits, once, until the test lets it go,
+// saying first that it has reached that point.
+#[cfg(test)]
+pub(crate) static MARK_HOLD: Mutex<
+    Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+> = Mutex::new(None);
 
 // Test seam: a write of what a torrent holds is refused, 1 once its files
 // moved (`sync_held`), 2 before they move (`hold_destination`).
