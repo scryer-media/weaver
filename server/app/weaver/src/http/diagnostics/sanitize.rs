@@ -1248,16 +1248,23 @@ impl StandIns {
             if let Some(username) = &proxy.secrets.username {
                 table.identity(username, &format!("{stand_in}/account"));
             }
-            let tunnel_key = proxy.wireguard_spec().ok().map(|spec| spec.public_key());
+            // A WireGuard log line names the peer by the first characters of
+            // its key (`wireguard AbCdEfGh…@host:port`), so that spelling is
+            // the key's too. A key is replaced wherever it is spelled, even a
+            // prefix of letters only that a name would not be matched by.
+            let spec = proxy.wireguard_spec().ok();
+            let tunnel_key = spec.as_ref().map(|spec| spec.public_key());
+            let peer_key_prefix = spec.as_ref().map(|spec| spec.peer_public_key_prefix());
             for key in [
                 &proxy.peer_public_key,
                 &proxy.host_key_fingerprint,
                 &tunnel_key,
+                &peer_key_prefix,
             ]
             .into_iter()
             .flatten()
             {
-                table.name(key, &format!("{stand_in}/key"));
+                table.identity(key, &format!("{stand_in}/key"));
             }
         }
         for pool in &stored.pools {
@@ -2996,6 +3003,123 @@ mod json_log_spellings {
             format!("2026-11-03T08:10:00.123456-07:00  INFO weaver: job added name={name:?}");
         let text = table.sanitize_str(&line);
         assert!(text.ends_with(r#"name="job-4""#), "text line: {text}");
+    }
+
+    fn wireguard_proxy(private_key: String) -> ProxyProfile {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        use weaver_server_core::proxies::{ProxyKind, ProxySecrets, Resolver};
+
+        ProxyProfile {
+            id: 1,
+            name: "Frankfurt".into(),
+            kind: ProxyKind::WireGuard,
+            enabled: true,
+            host: "fra.vpn.example".into(),
+            port: 51820,
+            resolver: Resolver::Proxy,
+            dns_servers: vec!["10.2.0.1".parse().unwrap()],
+            tunnel_addresses: vec!["10.2.0.2/32".into()],
+            peer_public_key: Some(STANDARD.encode([9u8; 32])),
+            mtu: 1420,
+            keepalive_seconds: None,
+            timeout_seconds: 30,
+            host_key_fingerprint: None,
+            revision: 1,
+            secrets: ProxySecrets {
+                private_key: Some(private_key),
+                preshared_key: Some(STANDARD.encode([5u8; 32])),
+                ..ProxySecrets::default()
+            },
+        }
+    }
+
+    fn failed_handshake(own_key: &str) -> String {
+        format!(
+            "WARN a route's session could not be opened reason=\"proxy 1: No handshake within 30 \
+             seconds. Check the endpoint, and that the server's peer list has public key {own_key}.\""
+        )
+    }
+
+    // The tunnel's log lines name its peer by a key prefix and its endpoint
+    // (`wireguard AbCdEfGh…@host:port`), its own public key after a failed
+    // handshake, and its interface address once the DHT listens there. The
+    // package holds none of them: the keys and the host become the proxy's
+    // stand-ins, the address its shape.
+    #[test]
+    fn a_wireguard_tunnel_line_names_no_key_host_or_address() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+
+        let proxy = wireguard_proxy(STANDARD.encode([7u8; 32]));
+        let spec = proxy.wireguard_spec().expect("spec");
+        let peer_key = STANDARD.encode([9u8; 32]);
+        let own_key = spec.public_key();
+        let stored = StoredNames {
+            proxies: vec![proxy],
+            ..StoredNames::default()
+        };
+        let table = StandIns::build(&[], &local_unix(), &stored).expect("table");
+
+        let up = format!(
+            r#"{{"level":"INFO","fields":{{"message":"brought up a WireGuard tunnel","proxy_config_id":"1","tunnel":{}}}}}"#,
+            serde_json::to_string(&spec.describe()).unwrap()
+        );
+        let failed = failed_handshake(&own_key);
+        let listening = "INFO DHT listening on 10.2.0.2:54180";
+        for line in [up.as_str(), failed.as_str(), listening] {
+            let text = table.sanitize_str(line);
+            for value in [
+                &peer_key[..8],
+                own_key.as_str(),
+                "fra.vpn.example",
+                "10.2.0.2",
+            ] {
+                assert!(!text.contains(value), "{value} in {text}");
+            }
+        }
+        assert!(
+            table
+                .sanitize_str(&up)
+                .contains(r#""tunnel":"wireguard proxy-1/key@proxy-1:51820""#),
+            "{}",
+            table.sanitize_str(&up)
+        );
+        assert!(
+            table
+                .sanitize_str(&failed)
+                .contains("public key proxy-1/key.")
+        );
+        assert_eq!(
+            table.sanitize_str(listening),
+            "INFO DHT listening on <ip>:54180"
+        );
+    }
+
+    // A public key spelled in letters only reads as a plain word, not a name
+    // a matcher would pick out; it is still the proxy's key, and a failed
+    // handshake that prints it prints the stand-in.
+    #[test]
+    fn an_all_letter_wireguard_key_is_replaced_in_a_failed_handshake_line() {
+        // This private key's public key is base64 letters only.
+        let proxy = wireguard_proxy("4GYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into());
+        let own_key = proxy.wireguard_spec().expect("spec").public_key();
+        assert!(
+            own_key
+                .trim_end_matches('=')
+                .chars()
+                .all(|character| character.is_ascii_alphabetic()),
+            "{own_key}"
+        );
+        let stored = StoredNames {
+            proxies: vec![proxy],
+            ..StoredNames::default()
+        };
+        let table = StandIns::build(&[], &local_unix(), &stored).expect("table");
+
+        let text = table.sanitize_str(&failed_handshake(&own_key));
+        assert!(!text.contains(&own_key), "{text}");
+        assert!(text.contains("public key proxy-1/key."), "{text}");
     }
 
     // A volume's label names the disk it is mounted from. Wherever the
