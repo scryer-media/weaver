@@ -159,18 +159,19 @@ impl FileRole {
     }
 
     // The roles of a post's files, from their names in order. A name alone
-    // gives every role but one: `name.z00` … `name.z99` is a split zip's
-    // part, or a RAR volume after `name.y99`, and only the post tells which.
-    // It is a RAR volume when the post holds a RAR volume of its stem and no
-    // `name.zip`; otherwise it is the zip's, and its role stays unknown, as by
-    // name alone.
+    // makes `.rar`, `.rNN` and `.sNN` RAR volumes. RAR numbers on, a hundred
+    // to a letter, through `.tNN` … `.zNN`, but by name alone those are
+    // ordinary files (`map.t01`, `setup.x64`), and `.zNN` a split zip's part.
+    // Such a name is a RAR volume when the post holds a RAR volume of its
+    // stem, and for a `.zNN` no `name.zip`; otherwise its role stays the one
+    // its name gives.
     pub fn of_post<'a>(names: impl IntoIterator<Item = Option<&'a str>>) -> Vec<Self> {
         let names: Vec<Option<&str>> = names.into_iter().collect();
         let mut roles: Vec<Self> = names
             .iter()
             .map(|name| name.map_or(FileRole::Unknown, FileRole::from_filename))
             .collect();
-        let mut z_parts = Vec::new();
+        let mut later = Vec::new();
         let mut rar_stems = HashSet::new();
         let mut zip_stems = HashSet::new();
         for (at, (name, role)) in names.iter().zip(&roles).enumerate() {
@@ -187,18 +188,16 @@ impl FileRole {
                     zip_stems.insert(lower[..lower.len() - 4].to_string());
                 }
                 FileRole::Unknown => {
-                    if let Some(part) = z_part(name) {
-                        z_parts.push((at, part));
+                    if let Some(volume) = later_volume(name) {
+                        later.push((at, volume));
                     }
                 }
                 _ => {}
             }
         }
-        for (at, (stem, number)) in z_parts {
-            if rar_stems.contains(&stem) && !zip_stems.contains(&stem) {
-                roles[at] = FileRole::RarVolume {
-                    volume_number: 801 + number,
-                };
+        for (at, (stem, letter, volume_number)) in later {
+            if rar_stems.contains(&stem) && (letter != b'z' || !zip_stems.contains(&stem)) {
+                roles[at] = FileRole::RarVolume { volume_number };
             }
         }
         roles
@@ -309,27 +308,36 @@ fn is_par3_volume_name(lower: &str) -> bool {
 // Whether a name numbers a file `.z00` … `.z99`: a split zip's part, or a
 // RAR volume after `.y99`. Either way it is a piece of something else.
 pub fn names_a_z_part(name: &str) -> bool {
-    z_part(name).is_some()
+    later_volume(name).is_some_and(|(_, letter, _)| letter == b'z')
 }
 
-// The stem and number of a `.zNN` name, lower-cased.
-fn z_part(name: &str) -> Option<(String, u32)> {
+// The stem, letter and volume number of a `.tNN` … `.zNN` name,
+// lower-cased: what it would be as a RAR volume.
+fn later_volume(name: &str) -> Option<(String, u8, u32)> {
     let lower = role_filename_view(name).to_ascii_lowercase();
     let lower = remove_duplicate_marker(&lower);
-    let (stem, number) = old_volume(&lower, b'z')?;
-    Some((stem.to_string(), number))
+    let (stem, letter, volume) = old_volume(&lower)?;
+    (b't'..=b'z')
+        .contains(&letter)
+        .then(|| (stem.to_string(), letter, volume))
 }
 
-// The stem and number of an old-numbered name `stem.<letter>NN`.
-fn old_volume(lower: &str, letter: u8) -> Option<(&str, u32)> {
+// The stem, letter and volume number of an old-numbered name
+// `stem.<letter>NN`, `r` to `z`: `.r00` is volume 1, a hundred to a letter.
+fn old_volume(lower: &str) -> Option<(&str, u8, u32)> {
     let at = lower.len().checked_sub(4)?;
     let ext = lower.get(at..)?.as_bytes();
-    if ext[0] != b'.' || ext[1] != letter || !ext[2..].iter().all(u8::is_ascii_digit) {
+    if ext[0] != b'.'
+        || !(b'r'..=b'z').contains(&ext[1])
+        || !ext[2..].iter().all(u8::is_ascii_digit)
+    {
         return None;
     }
+    let number = u32::from(ext[2] - b'0') * 10 + u32::from(ext[3] - b'0');
     Some((
         &lower[..at],
-        u32::from(ext[2] - b'0') * 10 + u32::from(ext[3] - b'0'),
+        ext[1],
+        u32::from(ext[1] - b'r') * 100 + number + 1,
     ))
 }
 
@@ -344,13 +352,12 @@ fn parse_rar_volume(lower: &str) -> Option<u32> {
         return Some(0);
     }
 
-    // The old numbering: `.rar`, then `.r00` … `.r99`, `.s00` … `.s99`, and
-    // on, a hundred to a letter, through `.y99`. RAR counts on through
-    // `.z99`, but by name alone a `.zNN` may be a split zip's part: see
-    // `FileRole::of_post`.
-    (b'r'..=b'y').find_map(|letter| {
-        old_volume(lower, letter).map(|(_, n)| u32::from(letter - b'r') * 100 + n + 1)
-    })
+    // The old numbering by name alone: `.rar`, then `.r00` … `.r99`, then
+    // `.s00` … `.s99`. The letters after are a RAR volume's only beside its
+    // set: see `FileRole::of_post`.
+    old_volume(lower)
+        .filter(|(_, letter, _)| matches!(letter, b'r' | b's'))
+        .map(|(_, _, volume)| volume)
 }
 
 fn parse_7z_file(lower: &str) -> Option<FileRole> {

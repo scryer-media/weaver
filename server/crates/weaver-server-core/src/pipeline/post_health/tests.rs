@@ -180,17 +180,17 @@ fn a_batch_across_a_pool_rebuild_carries_whom_it_asked() {
 }
 
 // The old numbering runs a hundred to a letter: `.s01` is not `.r01`'s
-// place. Every old volume, a `.zNN` one too, is a piece of its set; a split
-// zip's `.zNN` part is a piece of its zip.
+// place. A `.zNN` name is a piece either way, a split zip's part or a RAR
+// volume; a `.tNN` … `.yNN` name alone is an ordinary file.
 #[test]
 fn every_old_numbered_volume_is_a_piece_in_a_place_of_its_own() {
-    for name in [
-        "a.r00", "a.s01", "a.t05", "a.y99", "a.z00", "a.z01", "a.Z99",
-    ] {
+    for name in ["a.r00", "a.s01", "a.z00", "a.z01", "a.Z99"] {
         assert!(names_a_piece(name), "{name}");
     }
-    assert!(!names_a_piece("a.mkv"));
+    for name in ["a.mkv", "setup.x64", "lib.x86", "map.t01", "a.y99"] {
+        assert!(!names_a_piece(name), "{name}");
+    }
     assert_ne!(names_a_place("a.r01"), names_a_place("a.s01"));
-    assert_ne!(names_a_place("a.s01"), names_a_place("a.t01"));
+    assert_eq!(names_a_place("map.t01"), None);
     assert_eq!(names_a_place("a.s01"), names_a_place("A.S01"));
 }
