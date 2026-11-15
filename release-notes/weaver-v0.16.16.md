@@ -137,6 +137,9 @@ Everything below is new since 0.16.15.
   counts as refusing the login. Such a server was asked again without
   end, so the jobs waiting on it kept their slots and the rest of the
   queue did not start.
+- **No GROUP is sent to a server that has not asked for one,** on the
+  speed test and on an article several files share, as on every other
+  download.
 - **A held server recovers.** Its recovery probe carries real work and is
   never left unanswered, so jobs no longer stall after body timeouts or a
   refused login.
