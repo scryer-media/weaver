@@ -811,6 +811,44 @@ async fn a_stopped_job_cancelled_with_a_commit_owed_behind_its_writer_still_goes
     retire_pipeline_database(pipeline).await;
 }
 
+// A job that fails while its volume's thread holds operations on its files,
+// where the thread returns the last of them as the graph stops: the graph
+// held something when the failure looked, and nothing once stopped. The
+// failure is still carried out, by the release a graph that holds nothing
+// goes to, and the job ends Failed instead of waiting for a retirement
+// that was never kept.
+#[tokio::test]
+async fn a_job_whose_writer_returns_as_it_fails_still_settles() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_420);
+    let posts = [Post::plain("lantern.bin", payload(3 * ARTICLE, 1))];
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let (volume, hold) = held(&pipeline, job_id);
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    hold.wait_held();
+    let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    assert!(!disk.quiet());
+    crate::pipeline::activation::before_kept::set(move || {
+        hold.open();
+        disk.barrier().wait_returned();
+    });
+    pipeline.fail_job(job_id, "no file was delivered whole".to_string());
+    assert!(!pipeline.retiring_graph_jobs.contains_key(&job_id));
+    assert!(
+        pipeline.releasing_failed_jobs.contains(&job_id),
+        "nothing carries the failure out"
+    );
+    settle_failed_releases(&mut pipeline).await;
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. })
+    ));
+    assert_eq!(read(&working_dir.join("lantern.bin")), posts[0].bytes);
+    assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 0);
+    retire_pipeline_database(pipeline).await;
+}
+
 // A job that failed with its writer already caught up is released at once,
 // and its graph stopped later, as its runtime is purged. Whatever was
 // queued for its files in between still runs: a failed job keeps its file
