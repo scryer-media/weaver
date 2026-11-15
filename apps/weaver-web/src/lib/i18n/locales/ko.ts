@@ -133,7 +133,6 @@ const ko: LocaleDictionary = {
   "metrics.commitPending": "커밋 대기",
   "metrics.writeBufferedBytes": "버퍼링된 쓰기 바이트",
   "metrics.writeBufferedSegments": "버퍼링된 쓰기 세그먼트",
-  "metrics.diskWriteLatency": "디스크 쓰기 지연",
   "metrics.segmentsDownloaded": "다운로드된 세그먼트",
   "metrics.segmentsDecoded": "디코딩된 세그먼트",
   "metrics.segmentsCommitted": "커밋된 세그먼트",

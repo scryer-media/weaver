@@ -96,6 +96,11 @@ impl RuntimeTuner {
         profile_download_limit(self.total_connections, &self.tuning)
     }
 
+    // The sum of all configured server connections.
+    pub fn connection_limit(&self) -> usize {
+        self.total_connections
+    }
+
     // Update the connection limit (e.g. after adding/removing a server) and
     // recalculate `max_concurrent_downloads` so downloads can use the new capacity.
     pub fn set_connection_limit(&mut self, total_connections: usize) {
@@ -134,7 +139,8 @@ impl RuntimeTuner {
         self.profile.disk.random_read_iops = random_read_iops;
     }
 
-    // Apply the startup disk probe's write-through throughput the same way.
+    // Apply the live write rate of the volume extractions write to, in MB/s.
+    // Zero means the volume has not been measured.
     pub fn set_sequential_write_mbps(&mut self, sequential_write_mbps: f64) {
         self.profile.disk.sequential_write_mbps = sequential_write_mbps;
     }
@@ -163,7 +169,8 @@ impl RuntimeTuner {
             // Allow 2 only if IOPS suggests a decent drive and its writes
             // keep up: two extractions both write what they unpack, and a
             // slow writer behind them stalls both. Zero write throughput is
-            // "not measured" (pinned IOPS skip the probe) and says nothing.
+            // "not measured" (nothing has been written to the working
+            // directory's volume yet) and says nothing.
             let write_mbps = self.profile.disk.sequential_write_mbps;
             let slow_writes = write_mbps > 0.0 && write_mbps < 100.0;
             let by_disk = if self.profile.disk.random_read_iops > 500.0 && !slow_writes {

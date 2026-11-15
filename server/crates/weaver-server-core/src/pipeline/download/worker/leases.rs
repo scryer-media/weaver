@@ -536,17 +536,29 @@ impl Pipeline {
         checkpoint: CheckpointAdmission,
         bootstrap_files: Option<&Arc<[u32]>>,
     ) -> Result<(), BlockedBy> {
-        let Some(state) = self.jobs.get_mut(&job_id) else {
+        let Some(state) = self.jobs.get(&job_id) else {
             return Ok(());
         };
         let files = state.spec.files.len();
-        let Some(queue) = state.articles.download_queue_mut() else {
+        let Some(queue) = state.articles.download_queue() else {
             return Err(BlockedBy::only(SchedulerBlockClause::Activation));
         };
         if checkpoint.holds_every_payload_article() && queue.recovery_work_count() == 0 {
             return Err(BlockedBy::only(SchedulerBlockClause::Checkpoint));
         }
+        if self.volume_refuses_job(job_id) {
+            return Err(BlockedBy::only(SchedulerBlockClause::WriteBuffer));
+        }
         let Some(bootstrap_files) = bootstrap_files else {
+            return Ok(());
+        };
+        // The job's queue again, to keep the answer in: the volumes were
+        // asked in between.
+        let Some(queue) = self
+            .jobs
+            .get_mut(&job_id)
+            .and_then(|state| state.articles.download_queue_mut())
+        else {
             return Ok(());
         };
         let walk = |queue: &DownloadQueue| {
@@ -561,6 +573,48 @@ impl Pipeline {
             "the bootstrap answer changed without a change to a file's queued count"
         );
         answer
+    }
+
+    // Whether a volume the job writes to counts its lease limit: nothing
+    // more is leased for the job until it is below. Each such volume is
+    // asked for one wake at its room line (`Self::ask_room_wake`); a volume
+    // that fell there in the meantime holds nothing. True only with a wake
+    // on its way, which wakes dispatch (`Self::volume_room_changed`).
+    pub(in crate::pipeline) fn volume_refuses_job(&self, job_id: JobId) -> bool {
+        self.volume_holds_budget(job_id) && self.ask_room_wake(job_id)
+    }
+
+    // Whether a volume the job writes to counts more than its room line,
+    // with a wake asked for at that line. The line is an eighth of the hard
+    // limit below it (`Volume::resume_line`), so the loop is not woken per
+    // write, and lower still where that would leave no room for the job's
+    // next article below the lease limit: a lane woken there finds room.
+    // Each such volume is asked once; asking again for the same line costs
+    // a load. True only with a wake on its way, which wakes dispatch
+    // (`Self::volume_room_changed`): a volume that fell to its line in the
+    // meantime holds nothing.
+    pub(in crate::pipeline) fn ask_room_wake(&self, job_id: JobId) -> bool {
+        let Some(disk) = self.graph_jobs.get(&job_id).and_then(|graph| graph.disk()) else {
+            return false;
+        };
+        let need = self.next_article_bytes(job_id).max(1);
+        let mut asked = false;
+        for submitter in disk.each() {
+            let volume = submitter.volume();
+            if volume.buffer_limits().1 == u64::MAX {
+                continue;
+            }
+            let line = volume
+                .resume_line()
+                .min(volume.lease_limit().saturating_sub(need));
+            asked |=
+                volume.unwritten_bytes() > line && self.volume_writers.wake_below(volume, line);
+        }
+        if asked {
+            self.volume_budget_held
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        asked
     }
 
     // The fill servers a hinted article of `job_id` could be sent to instead

@@ -4235,6 +4235,9 @@ impl TorrentService {
             nesting: limits::NESTING,
             hardware: Default::default(),
             metrics: None,
+            // The tee writes its files itself as each byte is placed; its
+            // writes do not go through the volumes' writers.
+            disk: None,
             data_dir: env.data_dir.clone(),
             window_ledger: env.window_ledger.clone(),
         }

@@ -3,7 +3,7 @@
 
 use weaver_server_core::{
     COUNTER_METRIC_KEYS, GAUGE_METRIC_KEYS, JOB_STATUS_KEYS, MetricsHistoryQueryData,
-    MetricsHistoryQueryResult, MetricsHistoryTier,
+    MetricsHistoryQueryResult, MetricsHistoryTier, RETIRED_METRIC_KEY,
 };
 
 use crate::system::types::{
@@ -39,6 +39,15 @@ pub(crate) fn build_metrics_history(
     }
 }
 
+// The gauges history still serves, each with its place in a stored point. A
+// retired slot keeps its place and gives no series.
+fn live_gauge_keys() -> impl Iterator<Item = (usize, &'static &'static str)> {
+    GAUGE_METRIC_KEYS
+        .iter()
+        .enumerate()
+        .filter(|(_, metric)| **metric != RETIRED_METRIC_KEY)
+}
+
 fn build_raw_metrics_history(
     resolution_sec: i64,
     points: &[weaver_server_core::RawMetricsHistoryPoint],
@@ -61,7 +70,7 @@ fn build_raw_metrics_history(
         });
     }
 
-    for (index, metric) in GAUGE_METRIC_KEYS.iter().enumerate() {
+    for (index, metric) in live_gauge_keys() {
         series.push(MetricSeries {
             metric: (*metric).to_string(),
             labels: Vec::new(),
@@ -126,7 +135,7 @@ fn build_rollup_metrics_history(
         });
     }
 
-    for (index, metric) in GAUGE_METRIC_KEYS.iter().enumerate() {
+    for (index, metric) in live_gauge_keys() {
         series.push(MetricSeries {
             metric: (*metric).to_string(),
             labels: Vec::new(),

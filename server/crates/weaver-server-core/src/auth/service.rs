@@ -74,13 +74,15 @@ pub fn generate_browser_session_secret() -> String {
 // by eye from a terminal.
 pub const SETUP_CODE_ALPHABET: &[u8; 31] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 
-// Characters a first-run setup code carries, not counting its hyphen. Six
-// characters is about 30 bits, and the setup endpoint allows five wrong
-// guesses a minute for the life of one process, which puts a guessed code
-// centuries away.
-pub const SETUP_CODE_LENGTH: usize = 6;
+// Characters a first-run setup code carries, not counting its hyphen. Every
+// place that reads, parses or asks for a code takes its length from here.
+// Eight characters is about 40 bits (31^8 codes). The setup endpoint lets in
+// at most 1,024 client addresses with five wrong guesses each a minute, so
+// guessing the code takes about 160 years on average, however many addresses
+// a guesser holds.
+pub const SETUP_CODE_LENGTH: usize = 8;
 
-// The code is shown as two groups of three joined by a hyphen (`K7P-M2X`),
+// The code is shown as two groups of four joined by a hyphen (`K7PM-2XQR`),
 // so it is easy to read back and easy to spot in a log.
 const SETUP_CODE_GROUP: usize = SETUP_CODE_LENGTH / 2;
 
@@ -128,7 +130,8 @@ pub fn is_setup_code(code: &str) -> bool {
 }
 
 // The form a setup code is compared in: capitals, with the hyphen and any
-// spacing dropped, so `k7p-m2x`, `K7PM2X` and `K7P M2X` are the same code.
+// spacing dropped, so `k7pm-2xqr`, `K7PM2XQR` and `K7PM 2XQR` are the same
+// code.
 pub fn normalize_setup_code(input: &str) -> String {
     input
         .chars()

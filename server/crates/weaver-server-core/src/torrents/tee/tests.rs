@@ -96,6 +96,7 @@ fn storage(work: &Path, mail: &RunMail, free_disk: CapacityReader) -> Storage {
         nesting: u32::MAX,
         hardware: Default::default(),
         metrics: None,
+        disk: None,
     }
 }
 

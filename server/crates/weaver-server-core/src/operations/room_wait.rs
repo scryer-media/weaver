@@ -17,7 +17,7 @@
 // must also leave more than the reserve free to spend. A disk with no good
 // reading keeps it waiting.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -27,7 +27,7 @@ use crate::jobs::ids::JobId;
 
 // The disk a wait is on: a root's, or the disk of a path that lies on none
 // of theirs.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Disk {
     Root(StorageRoot),
     Path(PathBuf),
@@ -373,6 +373,85 @@ impl Promised {
     }
 }
 
+// What is promised by disk and by device, kept up to date with every
+// promise made or taken back, so a wait reads its total without walking
+// every promise. A promise counts for a disk when it is on that disk or on
+// the same known device, once when both.
+#[derive(Default)]
+struct PromisedTotals {
+    disk: HashMap<Disk, u128>,
+    device: HashMap<u64, u128>,
+    // Promises on the disk that also know their device: the ones the two
+    // totals above both count.
+    both: HashMap<Disk, HashMap<u64, u128>>,
+}
+
+impl PromisedTotals {
+    fn add(&mut self, promised: &Promised) {
+        let bytes = u128::from(promised.bytes);
+        *self.disk.entry(promised.disk.clone()).or_default() += bytes;
+        if let Some(device) = promised.device {
+            *self.device.entry(device).or_default() += bytes;
+            *self
+                .both
+                .entry(promised.disk.clone())
+                .or_default()
+                .entry(device)
+                .or_default() += bytes;
+        }
+    }
+
+    // `promised`, added before, is taken back. A total that reaches zero
+    // goes, so the maps hold only disks and devices something is promised
+    // on.
+    fn remove(&mut self, promised: &Promised) {
+        let bytes = u128::from(promised.bytes);
+        take(&mut self.disk, &promised.disk, bytes);
+        if let Some(device) = promised.device {
+            take(&mut self.device, &device, bytes);
+            if let Some(devices) = self.both.get_mut(&promised.disk) {
+                take(devices, &device, bytes);
+                if devices.is_empty() {
+                    self.both.remove(&promised.disk);
+                }
+            }
+        }
+    }
+
+    // What is promised on `disk`, whose device is `device`, held at
+    // `u64::MAX` as a saturating sum is.
+    fn on(&self, disk: &Disk, device: Option<u64>) -> u64 {
+        let mut total = self.disk.get(disk).copied().unwrap_or(0);
+        if let Some(device) = device {
+            total += self.device.get(&device).copied().unwrap_or(0);
+            total -= self
+                .both
+                .get(disk)
+                .and_then(|devices| devices.get(&device))
+                .copied()
+                .unwrap_or(0);
+        }
+        u64::try_from(total).unwrap_or(u64::MAX)
+    }
+}
+
+// `bytes` less on `key`'s total, which goes once it is zero.
+fn take<K: std::hash::Hash + Eq>(totals: &mut HashMap<K, u128>, key: &K, bytes: u128) {
+    if let Some(total) = totals.get_mut(key) {
+        *total -= bytes;
+        if *total == 0 {
+            totals.remove(key);
+        }
+    }
+}
+
+// The promises, and their totals by disk and device.
+#[derive(Default)]
+struct Book {
+    promised: BTreeMap<(Waiter, JobId), Promised>,
+    totals: PromisedTotals,
+}
+
 // Whose a promise is: a usenet job's, or a torrent's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Waiter {
@@ -386,7 +465,7 @@ pub(crate) enum Waiter {
 // count is kept apart, so a kind with none of its own checks one count.
 #[derive(Default)]
 pub(crate) struct RoomPromises {
-    promised: Mutex<BTreeMap<(Waiter, JobId), Promised>>,
+    book: Mutex<Book>,
     counts: [AtomicUsize; 2],
     // The promises of one kind that ended, with how many probes of their
     // disk had begun then, for the other kind's waits to count readings
@@ -406,8 +485,8 @@ pub(crate) struct RoomPromises {
 }
 
 impl RoomPromises {
-    fn locked(&self) -> std::sync::MutexGuard<'_, BTreeMap<(Waiter, JobId), Promised>> {
-        self.promised.lock().unwrap_or_else(PoisonError::into_inner)
+    fn locked(&self) -> std::sync::MutexGuard<'_, Book> {
+        self.book.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn count(&self, waiter: Waiter) -> &AtomicUsize {
@@ -422,8 +501,13 @@ impl RoomPromises {
     // `job_id` of `waiter`'s kind is promised `promised`, in place of any
     // promise it held.
     pub(crate) fn insert(&self, waiter: Waiter, job_id: JobId, promised: Promised) {
-        if self.locked().insert((waiter, job_id), promised).is_none() {
-            self.count(waiter).fetch_add(1, Ordering::AcqRel);
+        let mut book = self.locked();
+        book.totals.add(&promised);
+        match book.promised.insert((waiter, job_id), promised) {
+            Some(replaced) => book.totals.remove(&replaced),
+            None => {
+                self.count(waiter).fetch_add(1, Ordering::AcqRel);
+            }
         }
     }
 
@@ -432,8 +516,10 @@ impl RoomPromises {
         if self.none_of(waiter) {
             return None;
         }
-        let removed = self.locked().remove(&(waiter, job_id));
-        if removed.is_some() {
+        let mut book = self.locked();
+        let removed = book.promised.remove(&(waiter, job_id));
+        if let Some(removed) = &removed {
+            book.totals.remove(removed);
             self.count(waiter).fetch_sub(1, Ordering::AcqRel);
         }
         removed
@@ -486,9 +572,20 @@ impl RoomPromises {
         if self.none_of(waiter) {
             return;
         }
-        let mut promised = self.locked();
-        promised.retain(|(of, job_id), _| *of != waiter || keep(*job_id));
-        let left = promised.keys().filter(|(of, _)| *of == waiter).count();
+        let mut book = self.locked();
+        let Book { promised, totals } = &mut *book;
+        let mut left = 0;
+        promised.retain(|(of, job_id), promise| {
+            if *of != waiter {
+                return true;
+            }
+            if keep(*job_id) {
+                left += 1;
+                return true;
+            }
+            totals.remove(promise);
+            false
+        });
         self.count(waiter).store(left, Ordering::Release);
     }
 
@@ -498,7 +595,14 @@ impl RoomPromises {
         if self.none_of(Waiter::Usenet) && self.none_of(Waiter::Torrent) {
             return 0;
         }
+        self.locked().totals.on(disk, device)
+    }
+
+    // The walk the totals replace: every promise, for one disk.
+    #[cfg(test)]
+    fn on_by_walk(&self, disk: &Disk, device: Option<u64>) -> u64 {
         self.locked()
+            .promised
             .values()
             .filter(|promised| promised.on(disk, device))
             .fold(0u64, |sum, promised| sum.saturating_add(promised.bytes))
@@ -508,6 +612,7 @@ impl RoomPromises {
     #[cfg(test)]
     pub(crate) fn bytes_of(&self, waiter: Waiter) -> u64 {
         self.locked()
+            .promised
             .iter()
             .filter(|((of, _), _)| *of == waiter)
             .map(|(_, promised)| promised.bytes)
@@ -792,5 +897,93 @@ mod tests {
             .collect();
         assert_eq!(heard.len(), 1);
         assert_eq!(heard[0].disk, Disk::Path(path));
+    }
+
+    // A small fixed generator, so every run sees the same seeded promises.
+    struct Seeded(u64);
+
+    impl Seeded {
+        fn next(&mut self, below: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % below
+        }
+    }
+
+    // Over seeded promises of both kinds, on roots and paths that share
+    // devices and ones whose device is not known, the totals give what the
+    // walk over every promise gave, for every disk and device after each
+    // promise made, replaced, ended, taken back or dropped by `retain`.
+    #[test]
+    fn promised_totals_match_the_walk_over_every_promise() {
+        let disks = [
+            Disk::Root(StorageRoot::Data),
+            Disk::Root(StorageRoot::Intermediate),
+            Disk::Root(StorageRoot::Complete),
+            Disk::Path(PathBuf::from("/mnt/a")),
+            Disk::Path(PathBuf::from("/mnt/b")),
+        ];
+        const DEVICES: [Option<u64>; 3] = [None, Some(1), Some(2)];
+        let check = |promises: &RoomPromises| {
+            for disk in &disks {
+                for device in DEVICES {
+                    assert_eq!(
+                        promises.on(disk, device),
+                        promises.on_by_walk(disk, device),
+                        "{disk:?} {device:?}"
+                    );
+                }
+            }
+        };
+        let mut seeded = Seeded(0x9e37_79b9_7f4a_7c15);
+        let mut changes = 0;
+        for _ in 0..200 {
+            let promises = RoomPromises::default();
+            for _ in 0..seeded.next(120) {
+                let waiter = [Waiter::Usenet, Waiter::Torrent][seeded.next(2) as usize];
+                // A small id space, so promises are replaced as well as made.
+                let job_id = JobId(seeded.next(40));
+                match seeded.next(6) {
+                    0 => {
+                        promises.remove(waiter, job_id);
+                    }
+                    1 => {
+                        let cut = seeded.next(40);
+                        promises.retain(waiter, |job_id| job_id.0 < cut);
+                    }
+                    _ => {
+                        let bytes = match seeded.next(10) {
+                            0 => u64::MAX - seeded.next(1_000),
+                            _ => seeded.next(1 << 30),
+                        };
+                        promises.insert(
+                            waiter,
+                            job_id,
+                            Promised {
+                                disk: disks[seeded.next(disks.len() as u64) as usize].clone(),
+                                bytes,
+                                device: DEVICES[seeded.next(3) as usize],
+                            },
+                        );
+                    }
+                }
+                changes += 1;
+                check(&promises);
+            }
+            // Taken back one at a time, the totals end empty.
+            for waiter in [Waiter::Usenet, Waiter::Torrent] {
+                for job in 0..40 {
+                    promises.remove(waiter, JobId(job));
+                    check(&promises);
+                }
+            }
+            let book = promises.locked();
+            assert!(book.promised.is_empty());
+            assert!(book.totals.disk.is_empty());
+            assert!(book.totals.device.is_empty());
+            assert!(book.totals.both.is_empty());
+        }
+        assert!(changes > 5_000, "{changes}");
     }
 }

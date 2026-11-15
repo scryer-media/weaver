@@ -433,7 +433,14 @@ async fn restored_with_parked_retries(temp: &TempDir) -> Pipeline {
     .await;
     let state = pipeline.jobs.get_mut(&HOT).unwrap();
     state.restored_download_floor_bytes = 2904;
-    state.downloaded_bytes = Pipeline::restart_durable_lead_limit_bytes() + 2904 + 1024 * 1024;
+    let in_hand = Pipeline::restart_durable_lead_limit_bytes() + 2904 + 1024 * 1024;
+    state.downloaded_bytes = in_hand;
+    // The gate counts what the job's root holds, each article once.
+    pipeline
+        .graph_jobs
+        .get_mut(&HOT)
+        .expect("the job runs on the graph")
+        .add_in_hand_for_test(in_hand);
     for _ in 0..130 {
         park_one(&mut pipeline, None);
     }

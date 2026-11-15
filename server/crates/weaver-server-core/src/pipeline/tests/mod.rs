@@ -578,7 +578,7 @@ async fn new_direct_pipeline_with(
 // The cross-device probe in `direct_store/scenarios/cross_device.rs` hands in two roots on
 // genuinely different mounts.
 #[allow(clippy::too_many_arguments)]
-async fn new_direct_pipeline_at_roots(
+pub(in crate::pipeline) async fn new_direct_pipeline_at_roots(
     data_dir: PathBuf,
     intermediate_dir: PathBuf,
     complete_dir: PathBuf,
@@ -716,6 +716,12 @@ async fn new_direct_pipeline_on_machine(
     )
     .await
     .unwrap();
+    // Each root's volume is known once its first reading returns, as a
+    // running server's is soon after start-up: a test starts from there,
+    // not racing the reading of the disk's kind and name.
+    for root in crate::operations::disk::StorageRoot::ALL {
+        pipeline.storage_capacity.wait_for_probes(root, 1);
+    }
 
     // Reserve-specific scenarios install their own limits after construction.
     Arc::make_mut(&mut pipeline.extraction_limits).min_free_bytes = 1;
@@ -1779,7 +1785,7 @@ async fn insert_active_job_with_persisted_nzb_named(
         },
     );
     // The fixture's articles are built as a job's first handout builds them.
-    pipeline.activate_job_articles(job_id, &HashSet::new(), None, None, Vec::new());
+    pipeline.activate_job_articles(job_id, &HashSet::new(), None, None, Vec::new(), &[]);
     pipeline.job_order.push(job_id);
     pipeline.report_all_for_test();
     working_dir
