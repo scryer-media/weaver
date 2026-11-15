@@ -23,7 +23,7 @@ services:
     volumes:
       - nntp-certs:/certs
       - nntp-data:/data
-      - ./.bin/nntp-health:/nntp-health:ro
+      - ${E2E_NNTP_HEALTH_BINARY:-./.bin/nntp-health}:/nntp-health:ro
     healthcheck:
       test: ["CMD", "/nntp-health", "--addr", "127.0.0.1:119"]
       interval: 5s
@@ -48,7 +48,7 @@ services:
       - nntp-password
     volumes:
       - nntp2-data:/data
-      - ./.bin/nntp-health:/nntp-health:ro
+      - ${E2E_NNTP_HEALTH_BINARY:-./.bin/nntp-health}:/nntp-health:ro
     healthcheck:
       test: ["CMD", "/nntp-health", "--addr", "127.0.0.1:119"]
       interval: 2s
