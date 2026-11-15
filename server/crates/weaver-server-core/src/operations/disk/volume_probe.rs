@@ -29,10 +29,21 @@ use tracing::{debug, info};
 use super::volume::Volume;
 use crate::runtime::system_probe::{ProbeFileGuard, ProbeWrite, synced_probe_write_until};
 
-// The probe's scratch file, in the directory probed. A plain name with a
+// The probe's scratch file, in the directory probed, which may be a job's
+// own folder: the name carries random letters, the file is created only if
+// no file has that name, and only a file the probe created is removed, so a
+// downloaded file is never written over or deleted. A plain name with a
 // text extension rather than a dotfile, as the start-up probe's is: security
 // software treats a hidden file written with write-through as suspicious.
-const SCRATCH_FILE: &str = "weaver-volume-probe.txt";
+const SCRATCH_PREFIX: &str = "weaver-volume-probe-";
+const SCRATCH_SUFFIX: &str = ".txt";
+
+fn scratch_name() -> String {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).expect("getrandom failed");
+    let letters: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("{SCRATCH_PREFIX}{letters}{SCRATCH_SUFFIX}")
+}
 // Where the figures are kept, in the data directory.
 const PROBE_RECORD: &str = "volume-probes.json";
 // A stored figure older than this is taken again, and its row is dropped
@@ -179,7 +190,6 @@ pub(crate) fn probe_once(
     store: Arc<ProbeStore>,
 ) -> impl FnOnce() -> io::Result<()> + Send + 'static {
     move || {
-        let _ = std::fs::remove_file(dir.join(SCRATCH_FILE));
         if store.apply_stored(&volume) || volume.write_rate.load(Ordering::Relaxed) > 0 {
             return Ok(());
         }
@@ -230,10 +240,16 @@ fn measure_write_rate(dir: &Path, give_way: &dyn Fn() -> bool) -> Option<Measure
     })
 }
 
-// The probe with its file writer passed in. The scratch file is removed
-// however the writer ends.
+// The probe with its file writer passed in. The scratch file is created
+// here, only where no file has its name, and removed however the writer
+// ends; a name already taken means no probe, and that file is left alone.
 fn measure_with(dir: &Path, write: impl FnOnce(&Path) -> Option<ProbeWrite>) -> Option<u64> {
-    let path = dir.join(SCRATCH_FILE);
+    let path = dir.join(scratch_name());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .ok()?;
     let _guard = ProbeFileGuard(path.clone());
     probed_rate(write(&path)?)
 }
@@ -463,10 +479,12 @@ mod tests {
     #[test]
     fn the_scratch_file_is_removed_however_the_probe_ends() {
         let dir = tempfile::tempdir().unwrap();
-        let scratch = dir.path().join(SCRATCH_FILE);
+        let entries = || std::fs::read_dir(dir.path()).unwrap().count();
 
         let measured = measure_with(dir.path(), |path| {
-            assert_eq!(path, scratch);
+            assert_eq!(path.parent(), Some(dir.path()));
+            let name = path.file_name().unwrap().to_str().unwrap();
+            assert!(name.starts_with(SCRATCH_PREFIX) && name.ends_with(SCRATCH_SUFFIX));
             std::fs::write(path, b"probe").unwrap();
             Some(ProbeWrite {
                 bytes: 100,
@@ -474,38 +492,44 @@ mod tests {
             })
         });
         assert_eq!(measured, Some(100));
-        assert!(!scratch.exists());
+        assert_eq!(entries(), 0);
 
         let failed = measure_with(dir.path(), |path| {
             std::fs::write(path, b"probe").unwrap();
             None
         });
         assert_eq!(failed, None);
-        assert!(!scratch.exists());
+        assert_eq!(entries(), 0);
     }
 
-    // A scratch file a killed run left is removed by the next probe of that
-    // directory, even one that finds a stored figure and writes nothing.
+    // The probe runs in a job's folder: a downloaded file, even one named
+    // as the probe's file once was, is neither written over nor removed,
+    // whether the volume is probed or its stored figure is used.
     #[test]
-    fn a_leftover_scratch_file_is_removed_at_the_next_probe() {
+    fn a_probe_leaves_the_files_of_the_folder_alone() {
         let data = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let scratch = dir.path().join(SCRATCH_FILE);
+        let payloads = ["weaver-volume-probe.txt", "weaver-volume-probe-0.txt"];
+        for name in payloads {
+            std::fs::write(dir.path().join(name), b"downloaded").unwrap();
+        }
         let (store, probes) = store(data.path(), 1000, Some(50));
-
-        std::fs::write(&scratch, b"left behind").unwrap();
-        probe_once(
-            volume(Some(1), "/"),
-            dir.path().to_path_buf(),
-            store.clone(),
-        )()
-        .unwrap();
-        assert!(!scratch.exists());
-
-        std::fs::write(&scratch, b"left behind").unwrap();
-        probe_once(volume(Some(1), "/"), dir.path().to_path_buf(), store)().unwrap();
-        assert!(!scratch.exists());
+        for _ in 0..2 {
+            probe_once(
+                volume(Some(1), "/"),
+                dir.path().to_path_buf(),
+                store.clone(),
+            )()
+            .unwrap();
+        }
         assert_eq!(probes.load(Ordering::Relaxed), 1);
+        for name in payloads {
+            assert_eq!(std::fs::read(dir.path().join(name)).unwrap(), b"downloaded");
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            payloads.len()
+        );
     }
 
     #[test]
