@@ -691,6 +691,30 @@ func TestTCPChaosUsesHalfSizedRepresentativeFixtureProfile(t *testing.T) {
 	}
 }
 
+// Adaptive dispatch shares the TCP chaos profile, so a full run hands both
+// phases one preseeded NZB tree. Reseeding there rewrote large-segments.nzb
+// while TCP chaos was submitting it, and Weaver saw an NZB with no files.
+func TestAdaptiveDispatchDoesNotReseedPreseededFixtures(t *testing.T) {
+	shared := false
+	for _, phase := range fullPhaseDefinitions {
+		if phase.command == "adaptive-dispatch" && phase.seedProfile == "tcp-chaos" {
+			shared = true
+		}
+	}
+	if !shared {
+		t.Fatalf("adaptive-dispatch no longer shares the tcp-chaos profile; revisit this guard")
+	}
+
+	t.Setenv(nntpSeedImageActiveEnv, "1")
+	if adaptiveDispatchSeedsOwnFixture() {
+		t.Fatalf("adaptive-dispatch must not reseed a preseeded corpus")
+	}
+	t.Setenv(nntpSeedImageActiveEnv, "0")
+	if !adaptiveDispatchSeedsOwnFixture() {
+		t.Fatalf("standalone adaptive-dispatch without a preseeded image must seed its scenario")
+	}
+}
+
 func TestFullDashboardAlignsProgressBarsForDatastorePhaseNames(t *testing.T) {
 	phaseNames := []string{
 		"Functional SQLite",
