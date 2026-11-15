@@ -293,5 +293,5 @@ function Fixture() {
 createRoot(document.getElementById("root")!).render(
   <Provider value={client}><TranslateContext.Provider value={{
     t, uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {},
-  }}><MemoryRouter><NextDataContext.Provider value={{ torrents: "on", torrentPresence: { enabled: true, jobs: false, running: false, windingDown: false } } as NextData}><main className="mx-auto max-w-[1000px] p-8"><Fixture /></main></NextDataContext.Provider></MemoryRouter></TranslateContext.Provider></Provider>,
+  }}><MemoryRouter><NextDataContext.Provider value={{ torrents: "on", torrentPresence: { enabled: true, jobs: false, running: false, windingDown: false, windDown: null } } as NextData}><main className="mx-auto max-w-[1000px] p-8"><Fixture /></main></NextDataContext.Provider></MemoryRouter></TranslateContext.Provider></Provider>,
 );

@@ -7,6 +7,7 @@ import { isTorrentConsumer, type ConsumerKind } from "../src/lib/networking.ts";
 import {
   asksHowTorrentsEnd,
   stopNowInput,
+  torrentAddsOffered,
   torrentSettingsDisclosed,
   torrentSwitchWaits,
   torrentsShown,
@@ -25,6 +26,7 @@ const presence = (enabled: boolean, jobs: boolean, running = jobs): TorrentPrese
   jobs,
   running,
   windingDown: false,
+  windDown: null,
 });
 
 test("torrent things show while torrents are on or any torrent job is left, and never before the answer", () => {
@@ -43,6 +45,19 @@ test("torrent things show while torrents are on or any torrent job is left, and 
     ),
     [true, true, false, false],
   );
+});
+
+test("a new torrent is offered only while torrents are on, even while torrent jobs left still show", () => {
+  const winding = { ...presence(false, true), windingDown: true, windDown: "FINISH_ALL" as const };
+  assert.equal(torrentAddsOffered(presence(true, false)), true);
+  assert.equal(torrentAddsOffered(presence(true, true)), true);
+  for (const off of [presence(false, false), presence(false, true), presence(false, true, false), winding]) {
+    assert.equal(torrentAddsOffered(off), false);
+  }
+  // Jobs left keep torrent things showing, but offer no new torrent.
+  assert.equal(torrentsShown(torrentsStateFrom(winding)), true);
+  assert.equal(torrentAddsOffered(undefined), false);
+  assert.equal(torrentAddsOffered(null), false);
 });
 
 test("the Torrents panel shows the switch alone while it is off, torrent jobs left or not", () => {
@@ -75,7 +90,7 @@ test("the Torrents switch waits to be turned off until the server says which tor
 });
 
 test("a wind-down under way offers Stop now, which sends torrents off to stop at once", () => {
-  const winding: TorrentPresence = { ...presence(false, true), windingDown: true };
+  const winding: TorrentPresence = { ...presence(false, true), windingDown: true, windDown: "FINISH_ALL" as const };
   assert.equal(windDownStoppable(false, winding), true);
   // Not winding down, not known, or the switch turned on again in the form: nothing to stop.
   assert.equal(windDownStoppable(false, presence(false, true)), false);

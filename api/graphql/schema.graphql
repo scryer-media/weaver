@@ -6416,6 +6416,11 @@ type TorrentPresence {
 	Torrents are off and the torrents still running are let finish.
 	"""
 	windingDown: Boolean!
+	"""
+	While winding down, how the torrents still running end; null
+	otherwise.
+	"""
+	windDown: TorrentDisableMode
 }
 
 """

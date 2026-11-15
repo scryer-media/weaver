@@ -41,7 +41,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 122;
+const CURRENT_SCHEMA_VERSION: i64 = 123;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -1488,7 +1488,7 @@ mod tests {
         run_embedded_migrations_on_path_blocking(&db_path).unwrap();
 
         let pool = open_test_pool(&db_path).await;
-        assert_eq!(CURRENT_SCHEMA_VERSION, 122);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 123);
         assert_eq!(
             max_recorded_migration_version(&pool).await.unwrap(),
             Some(CURRENT_SCHEMA_VERSION)
@@ -2491,6 +2491,40 @@ mod tests {
         pool.close().await;
         let db = crate::Database::open(&db_path).unwrap();
         db.validate_backup_catalog().unwrap();
+    }
+
+    // A database at 122 upgrades to the current schema with the RSS items
+    // held while torrents are off found by their index, never by a scan of
+    // every seen item.
+    #[tokio::test]
+    async fn sqlite_migration_123_finds_rss_items_held_by_their_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("v122.db");
+        let pool = open_test_pool(&db_path).await;
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(122), true)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        for query in [
+            "EXPLAIN QUERY PLAN SELECT 1 FROM rss_seen_items WHERE decision = 'waiting' LIMIT 1",
+            "EXPLAIN QUERY PLAN SELECT feed_id FROM rss_seen_items WHERE decision = 'waiting'",
+        ] {
+            let detail: Vec<(i64, i64, i64, String)> =
+                sqlx::query_as(query).fetch_all(&pool).await.unwrap();
+            assert!(
+                detail
+                    .iter()
+                    .any(|(_, _, _, step)| step.contains("idx_rss_seen_waiting")),
+                "{query}: {detail:?}"
+            );
+        }
+        pool.close().await;
     }
 
     // A database at 0.16.16's schema (92) or at 120 upgrades to the current

@@ -14,6 +14,10 @@ const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
 struct Rig {
     service: RssService,
     db: Database,
+    torrents: TorrentService,
+    // How many times the feed's body was served whole, not as unchanged.
+    feed_reads: Arc<AtomicUsize>,
+    complete_dir: std::path::PathBuf,
     server: tokio::task::JoinHandle<()>,
     _dir: TempDir,
 }
@@ -39,8 +43,24 @@ async fn rig(items: &str, sizes: Option<(u64, u64)>, torrents_on: bool) -> Rig {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
     let feed = feed.replace("http://localhost", &base_url);
+    // The feed carries an ETag and answers a request that sends it back as
+    // unchanged, as an indexer does.
+    let feed_reads = Arc::new(AtomicUsize::new(0));
+    let reads = feed_reads.clone();
     let app = Router::new()
-        .route("/feed", get(move || async move { feed }))
+        .route(
+            "/feed",
+            get(move |headers: HeaderMap| async move {
+                if headers
+                    .get(header::IF_NONE_MATCH)
+                    .is_some_and(|tag| tag == "\"v1\"")
+                {
+                    return StatusCode::NOT_MODIFIED.into_response();
+                }
+                reads.fetch_add(1, Ordering::SeqCst);
+                ([(header::ETAG, "\"v1\"")], feed).into_response()
+            }),
+        )
         .route("/set.torrent", get(|| async { metainfo("set.bin") }))
         .route("/download.nzb", get(|| async { sample_nzb_bytes() }));
     let server = tokio::spawn(async move {
@@ -87,40 +107,48 @@ async fn rig(items: &str, sizes: Option<(u64, u64)>, torrents_on: bool) -> Rig {
         db.clone(),
     );
     sessions.turn(torrents_on).await;
+    let complete_dir = dir.path().join("complete");
     let torrents = TorrentService::new(
         db.clone(),
         sessions,
-        TorrentSettings {
-            upload_cap: None,
-            complete_dir: dir.path().join("complete"),
-            categories: vec![CategoryConfig {
-                upload_cap: Default::default(),
-                seeding: None,
-                torrent_route: true,
-                unpack: None,
-                id: 1,
-                name: "tv".to_string(),
-                dest_dir: None,
-                aliases: String::new(),
-            }],
-            seeding: None,
-            torrent: TorrentConfig {
-                enabled: torrents_on,
-                ..Default::default()
-            },
-        },
+        torrent_settings(&complete_dir, torrents_on),
         JobEnv::unbounded(),
         Arc::new(SystemClock),
     );
     torrents.open().await.unwrap();
 
     let service = build_service(dir.path(), db.clone());
-    service.use_torrents(torrents);
+    service.use_torrents(torrents.clone());
     Rig {
         service,
         db,
+        torrents,
+        feed_reads,
+        complete_dir,
         server,
         _dir: dir,
+    }
+}
+
+fn torrent_settings(complete_dir: &std::path::Path, on: bool) -> TorrentSettings {
+    TorrentSettings {
+        upload_cap: None,
+        complete_dir: complete_dir.to_path_buf(),
+        categories: vec![CategoryConfig {
+            upload_cap: Default::default(),
+            seeding: None,
+            torrent_route: true,
+            unpack: None,
+            id: 1,
+            name: "tv".to_string(),
+            dest_dir: None,
+            aliases: String::new(),
+        }],
+        seeding: None,
+        torrent: TorrentConfig {
+            enabled: on,
+            ..Default::default()
+        },
     }
 }
 
@@ -315,12 +343,19 @@ async fn an_nzb_beside_a_torrent_client_is_submitted_as_before() {
     assert!(seen[0].2.is_some());
 }
 
+// A torrent while torrents are off is held, once: later polls neither read
+// the unchanged feed nor write its row again. Once torrents are on, the
+// feed is read whole and the item is added.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_torrent_while_torrents_are_off_is_an_error_row() {
+async fn a_torrent_while_torrents_are_off_waits_and_is_added_once_they_are_on() {
     let rig = rig(
-        &item(
-            "a",
-            r#"<enclosure url="http://localhost/set.torrent" length="3000"/>"#,
+        &format!(
+            "{}{}",
+            item(
+                "a",
+                r#"<enclosure url="http://localhost/set.torrent" length="3000"/>"#,
+            ),
+            item("b", &format!("<link>{}</link>", magnet())),
         ),
         None,
         false,
@@ -331,15 +366,43 @@ async fn a_torrent_while_torrents_are_off_is_an_error_row() {
 
     assert_eq!(report.items_submitted, 0, "{report:?}");
     assert!(rig.torrent_jobs().is_empty());
-    assert_eq!(
-        rig.seen(),
-        vec![(
-            "a".into(),
-            "error".into(),
+    let held = |id: &str| {
+        (
+            id.to_string(),
+            WAITING.to_string(),
             None,
-            Some(crate::torrents::status::OFF.into())
-        )]
+            Some("torrents are off".to_string()),
+        )
+    };
+    assert_eq!(rig.seen(), vec![held("a"), held("b")]);
+    let rows = rig.db.list_rss_seen_items(Some(1), None).unwrap();
+    assert_eq!(rig.feed_reads.load(Ordering::SeqCst), 1);
+
+    // Still off: the feed is unchanged, nothing is read or written for it.
+    let report = rig.service.run_all_sync().await.unwrap();
+    assert_eq!(report.items_submitted, 0, "{report:?}");
+    assert_eq!(rig.feed_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.db.list_rss_seen_items(Some(1), None).unwrap(), rows);
+    assert!(rig.torrent_jobs().is_empty());
+
+    rig.torrents
+        .set_settings(torrent_settings(&rig.complete_dir, true))
+        .await;
+    let report = rig.service.run_all_sync().await.unwrap();
+
+    assert_eq!(rig.feed_reads.load(Ordering::SeqCst), 2);
+    let jobs = rig.torrent_jobs();
+    assert_eq!(jobs.len(), 2, "{report:?}");
+    let seen = rig.seen();
+    assert_eq!(
+        seen.iter().map(|row| row.1.as_str()).collect::<Vec<_>>(),
+        ["submitted", "submitted"]
     );
+
+    // Taken up once: the next poll with torrents still on reads nothing.
+    rig.service.run_all_sync().await.unwrap();
+    assert_eq!(rig.feed_reads.load(Ordering::SeqCst), 2);
+    assert_eq!(rig.seen(), seen);
 }
 
 // A torrent the client already holds, from this feed or any other origin.

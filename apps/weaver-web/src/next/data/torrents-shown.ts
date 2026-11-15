@@ -11,6 +11,8 @@ export interface TorrentPresence {
   running: boolean;
   /** Torrents are off and the torrents still running are let finish. */
   windingDown: boolean;
+  /** While winding down, how the torrents still running end; null otherwise. */
+  windDown: TorrentDisableMode | null;
 }
 
 /**
@@ -35,6 +37,16 @@ export function torrentsStateFrom(presence: TorrentPresence | null | undefined):
 /** Whether torrent things show: only once known to. */
 export function torrentsShown(state: TorrentsState): boolean {
   return state === "on";
+}
+
+/**
+ * Whether a screen offers to start a torrent (a magnet link, a .torrent file):
+ * only while the switch is on, as the server says. Torrent jobs left while
+ * torrents are off, or winding down, still show, but no new one is offered,
+ * since the server refuses it. Unknown offers none, as torrent things wait.
+ */
+export function torrentAddsOffered(presence: TorrentPresence | null | undefined): boolean {
+  return presence?.enabled === true;
 }
 
 /** What a torrent-only screen draws: `on` while torrent things show, `off` once known not to, `pending` until then. */

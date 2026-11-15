@@ -39,13 +39,22 @@ test("with torrents off and none left, Downloads says nothing of torrents", asyn
   await page.close();
 });
 
-test("with torrents off but some still seeding, Downloads shows torrent things as if on", async () => {
+test("with torrents off but some still seeding, Downloads shows those torrents' controls but asks for NZBs alone", async () => {
   const { page, errors } = await open("downloads", "offJobs");
   const empty = page.getByTestId("queue-empty");
   await empty.waitFor();
-  await empty.getByText("Add an NZB or torrent, or drop one anywhere on this list.", { exact: true }).waitFor();
+  await empty.getByText("Add an NZB, or drop one anywhere on this list.", { exact: true }).waitFor();
   await page.getByRole("button", { name: "Pause torrents", exact: true }).waitFor();
   await page.getByRole("button", { name: /^Torrent/ }).waitFor();
+  assert.equal(errors.length, 0, errors.join("\n"));
+  await page.close();
+});
+
+test("with torrents on, Downloads asks for an NZB or a torrent", async () => {
+  const { page, errors } = await open("downloads", "onIdle");
+  const empty = page.getByTestId("queue-empty");
+  await empty.waitFor();
+  await empty.getByText("Add an NZB or torrent, or drop one anywhere on this list.", { exact: true }).waitFor();
   assert.equal(errors.length, 0, errors.join("\n"));
   await page.close();
 });
@@ -116,6 +125,29 @@ test("a wind-down under way can be cut short: Stop now sends torrents off to sto
   assert.equal(errors.length, 0, errors.join("\n"));
   await page.close();
 });
+
+const FORCED_LINE = "A forced torrent, or one with no seeding limit, seeds until Stop now.";
+
+test("the question says a forced or goal-less torrent seeds on when every torrent is let finish", async () => {
+  const { page, errors } = await open("panel", "onRunning");
+  await page.getByTestId("section-connection").waitFor();
+  await page.getByTestId("field-enabled").click();
+  await save(page);
+  await page.getByTestId("torrents-off-option-FINISH_ALL-note").getByText(FORCED_LINE, { exact: true }).waitFor();
+  assert.equal(await page.getByTestId("torrents-off-option-FINISH_DOWNLOADS-note").count(), 0);
+  assert.equal(errors.length, 0, errors.join("\n"));
+  await page.close();
+});
+
+for (const [presence, line] of [["offJobs", FORCED_LINE], ["offFinishDownloads", "Every torrent stops at once."]]) {
+  test(`a wind-down under way (${presence}) says beside Stop now what it leaves running`, async () => {
+    const { page, errors } = await open("panel", presence);
+    await page.getByTestId("field-stopNow").waitFor();
+    await page.getByTestId("section-enabled").getByText(line, { exact: true }).waitFor();
+    assert.equal(errors.length, 0, errors.join("\n"));
+    await page.close();
+  });
+}
 
 test("with no wind-down under way there is no Stop now", async () => {
   const { page, errors } = await open("panel", "off");

@@ -85,9 +85,9 @@ use crate::torrents::storage::{PieceStorageFactory, Pieces};
 use crate::torrents::store::{Kept, Replayed, TorrentStore};
 use crate::torrents::tee::{Parts, Plan, Tee, plan_outputs};
 use crate::torrents::{
-    ContentLayout, FilePriority, Infohash, NamedBy, PeerInfo, TorrentCounters, TorrentFile,
-    TorrentInsert, TorrentIntent, TorrentRecord, TorrentSource, TorrentState, TorrentTracker,
-    TrackerEntry, TrackerStatus,
+    ContentLayout, FilePriority, Infohash, KeptIntent, NamedBy, PeerInfo, TorrentCounters,
+    TorrentFile, TorrentInsert, TorrentIntent, TorrentRecord, TorrentSource, TorrentState,
+    TorrentTracker, TrackerEntry, TrackerStatus,
 };
 
 pub mod fingerprint;
@@ -2682,6 +2682,19 @@ impl TorrentService {
             .clone()
     }
 
+    /// Whether a new torrent is taken: torrents are on and their sessions
+    /// open. Off, a wind-down's included, an add is refused as `Off`.
+    pub fn takes_new(&self) -> bool {
+        self.inner.sessions.on()
+            && self
+                .inner
+                .settings
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .torrent
+                .enabled
+    }
+
     fn rules(&self) -> Arc<[TrackerRule]> {
         Arc::clone(
             &self
@@ -2790,13 +2803,13 @@ impl TorrentService {
             settings,
         )
         .torrent;
+        let turned_on = enabled && !was.enabled;
         {
             let _turning = self.inner.turning.lock().await;
             // Turned on, nothing winds down; off, a wind-down with nothing
             // left running is over before it starts. While on and staying
             // on, one taken for the save that turns them off is kept: the
             // settings handed on before that save are the old ones.
-            let turned_on = enabled && !was.enabled;
             if turned_on || (!enabled && self.wind_down().is_some() && !self.running().await) {
                 self.keep_wind_down(None).await;
             }
@@ -2804,6 +2817,9 @@ impl TorrentService {
             if on != self.inner.sessions.on() {
                 self.turn(on).await;
             }
+        }
+        if turned_on {
+            self.resume_wound_down().await;
         }
         // Each torrent leg says how far its tunnel holds TCP peers below the
         // peer limit, so a new limit reads the routes again.
@@ -2819,6 +2835,49 @@ impl TorrentService {
         self.publish().await;
         // The routes follow the settings now too: the tick runs at once.
         self.inner.settings_changed.notify_one();
+    }
+
+    // Torrents a wind-down to the downloads alone stopped resume, now that
+    // torrents are on: their intents written together, off the runtime,
+    // under `live` as every intent write is. Torrents the operator stopped,
+    // or their goals did, stay stopped.
+    async fn resume_wound_down(&self) {
+        let now = self.inner.clock.now_ms();
+        let mut landings = Vec::new();
+        {
+            let mut live = self.inner.live.lock().await;
+            let mut resumed = Vec::new();
+            for torrent in live.values_mut() {
+                if !torrent.record.wound_down {
+                    continue;
+                }
+                torrent.settle(now);
+                torrent.record.intent = TorrentIntent::Resumed;
+                torrent.record.wound_down = false;
+                resumed.push(torrent.record.job_id);
+                landings.extend(self.queue_resume(torrent, now, true));
+            }
+            if resumed.is_empty() {
+                return;
+            }
+            let db = self.inner.db.clone();
+            match tokio::task::spawn_blocking(move || {
+                db.update_torrent_intents(&[(KeptIntent::Intent(TorrentIntent::Resumed), &resumed)])
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "could not keep the resumes of torrents a wind-down stopped");
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "could not keep the resumes of torrents a wind-down stopped");
+                }
+            }
+        }
+        for landing in landings {
+            let _ = self.landed(Some(landing)).await;
+        }
     }
 
     /// How the torrents still running end when the settings next turn
@@ -3259,6 +3318,11 @@ impl TorrentService {
         self.spawn_follow_egress_limits();
         self.spawn_follow_interfaces();
         self.restore().await?;
+        // Torrents turned on while a wind-down's stops were kept, with no
+        // pass since to resume them, resume now.
+        if self.settings().torrent.enabled {
+            self.resume_wound_down().await;
+        }
         self.retry_retiring().await;
         Ok(())
     }
@@ -5119,7 +5183,7 @@ impl TorrentService {
     pub async fn add(&self, request: AddRequest) -> Result<JobId, AddError> {
         // Off, a wind-down's sessions open included: no torrent is new.
         let settings = self.settings();
-        if !self.inner.sessions.on() || !settings.torrent.enabled {
+        if !self.takes_new() {
             return Err(AddError::Off);
         }
         let category = match request
@@ -5526,6 +5590,7 @@ impl TorrentService {
             } else {
                 TorrentIntent::Resumed
             },
+            wound_down: false,
             forced: request.forced,
             completed_at_ms: None,
             storage_dir: None,
@@ -7117,6 +7182,8 @@ impl TorrentService {
                     .map_err(|error| ActionError::State(state_error(error)))?;
                 torrent.settle(now);
                 torrent.record.intent = intent;
+                // The operator's word ends a wind-down's hold on it.
+                torrent.record.wound_down = false;
                 if let Some(tee) = torrent.store.as_ref().and_then(|store| store.tee()) {
                     tee.hold_own_clock(intent == TorrentIntent::Paused);
                 }
@@ -7133,6 +7200,7 @@ impl TorrentService {
         let job_id = torrent.record.job_id;
         torrent.settle(now);
         torrent.record.intent = TorrentIntent::Stopped;
+        torrent.record.wound_down = false;
         if let Err(error) = self
             .inner
             .db
@@ -8702,13 +8770,18 @@ impl TorrentService {
             !settings.torrent.enabled && self.wind_down() == Some(WindDown::FinishDownloads);
         {
             let mut live = self.inner.live.lock().await;
-            // Stopped by the wind-down: their intents are written together.
+            // Stopped by the wind-down, and by their goals: their intents
+            // are written together.
             let mut wound_down = Vec::new();
+            let mut met = Vec::new();
             for torrent in live.values_mut() {
                 if downloads_only && torrent.resumed() && (torrent.complete() || torrent.seeding())
                 {
                     torrent.settle(now);
                     torrent.record.intent = TorrentIntent::Stopped;
+                    // Not the operator's stop: it resumes when torrents are
+                    // turned on again.
+                    torrent.record.wound_down = true;
                     wound_down.push(torrent.record.job_id);
                     landings.extend(self.queue_resume(torrent, now, true));
                     continue;
@@ -8729,7 +8802,11 @@ impl TorrentService {
                 );
                 match policy.action {
                     SeedingAction::Stop => {
-                        landings.extend(self.stop_torrent(torrent, now));
+                        torrent.settle(now);
+                        torrent.record.intent = TorrentIntent::Stopped;
+                        torrent.record.wound_down = false;
+                        met.push(torrent.record.job_id);
+                        landings.extend(self.queue_resume(torrent, now, true));
                         self.queue_script_event(finished);
                     }
                     SeedingAction::Remove => {
@@ -8743,19 +8820,22 @@ impl TorrentService {
             // One transaction, off the runtime. `live` is held across it,
             // as for every other intent write: a resume taken between the
             // two would otherwise be written over.
-            if !wound_down.is_empty() {
+            if !wound_down.is_empty() || !met.is_empty() {
                 let db = self.inner.db.clone();
                 match tokio::task::spawn_blocking(move || {
-                    db.update_torrent_intents(&wound_down, TorrentIntent::Stopped)
+                    db.update_torrent_intents(&[
+                        (KeptIntent::WoundDown, &wound_down),
+                        (KeptIntent::Intent(TorrentIntent::Stopped), &met),
+                    ])
                 })
                 .await
                 {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        tracing::warn!(error = %error, "could not keep the stops of a wind-down");
+                        tracing::warn!(error = %error, "could not keep the stops of torrents done");
                     }
                     Err(error) => {
-                        tracing::warn!(error = %error, "could not keep the stops of a wind-down");
+                        tracing::warn!(error = %error, "could not keep the stops of torrents done");
                     }
                 }
             }

@@ -267,6 +267,47 @@ impl Database {
         })
     }
 
+    /// Items held while torrents were off are taken up again: their rows
+    /// go, and each feed that held one is read whole at its next poll, not
+    /// answered "not modified", so the items are judged anew. Whether any
+    /// were held. Nothing is written when none were. Both statements, and the
+    /// read before them, are served by the partial index on held items: the
+    /// state is a literal, never a bound parameter.
+    pub fn release_rss_waiting_items(&self) -> Result<bool, StateError> {
+        let datastore = self.datastore();
+        let held = self.run_sql_blocking_read(async move {
+            let held = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT 1 AS held FROM rss_seen_items WHERE decision = 'waiting' LIMIT 1",
+                &[],
+            )
+            .await?;
+            Ok(held.is_some())
+        })?;
+        if !held {
+            return Ok(false);
+        }
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "release_rss_waiting_items", |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE rss_feeds SET etag = NULL, last_modified = NULL
+                          WHERE id IN (SELECT feed_id FROM rss_seen_items
+                                        WHERE decision = 'waiting')",
+                        &[],
+                    )
+                    .await?;
+                    tx.execute("DELETE FROM rss_seen_items WHERE decision = 'waiting'", &[])
+                        .await?;
+                    Ok(())
+                })
+            })
+            .await
+        })?;
+        Ok(true)
+    }
+
     pub fn purge_old_rss_seen_items(&self, cutoff_ts: i64) -> Result<u64, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {

@@ -1345,7 +1345,12 @@ export function TorrentsPanel() {
                 {
                   id: "stopNow",
                   label: t("next.torrents.offStopNow"),
-                  help: t("next.torrents.offStopNowNote"),
+                  // Letting every torrent finish never ends one that is forced or has no seeding limit.
+                  help: t(
+                    torrentPresence?.windDown === "FINISH_ALL"
+                      ? "next.torrents.finishAllForced"
+                      : "next.torrents.offStopNowNote",
+                  ),
                   control: {
                     kind: "custom" as const,
                     control: (
@@ -1667,8 +1672,13 @@ export function TorrentsPanel() {
 const TORRENTS_OFF_DIALOG = "torrents-off";
 
 /** How the torrents still running end when torrents are turned off. */
-const TORRENTS_OFF_CHOICES: { mode: TorrentDisableMode; label: string; note: string }[] = [
-  { mode: "FINISH_ALL", label: "next.torrents.offFinishAll", note: "next.torrents.offFinishAllNote" },
+const TORRENTS_OFF_CHOICES: { mode: TorrentDisableMode; label: string; note: string; also?: string }[] = [
+  {
+    mode: "FINISH_ALL",
+    label: "next.torrents.offFinishAll",
+    note: "next.torrents.offFinishAllNote",
+    also: "next.torrents.finishAllForced",
+  },
   { mode: "FINISH_DOWNLOADS", label: "next.torrents.offFinishDownloads", note: "next.torrents.offFinishDownloadsNote" },
   { mode: "STOP_NOW", label: "next.torrents.offStopNow", note: "next.torrents.offStopNowNote" },
 ];
@@ -1708,6 +1718,11 @@ function TorrentsOffDialog({
           >
             <span className="text-[13px] font-medium text-wv-strong">{t(choice.label)}</span>
             <span className="text-[12px] text-wv-muted">{t(choice.note)}</span>
+            {choice.also === undefined ? null : (
+              <span data-testid={testIds.optionNote(TORRENTS_OFF_DIALOG, choice.mode)} className="text-[12px] text-wv-muted">
+                {t(choice.also)}
+              </span>
+            )}
           </button>
         ))}
       </div>

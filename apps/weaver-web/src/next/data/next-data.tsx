@@ -140,7 +140,11 @@ export interface NextData {
    * same way.
    */
   torrents: TorrentsState;
-  /** Whether torrents are on and the torrents there are; undefined until known. */
+  /**
+   * Whether torrents are on and the torrents there are; undefined until known.
+   * Screens read it through `useTorrentAddsOffered`; only the Torrents panel
+   * reads it here.
+   */
   torrentPresence: TorrentPresence | undefined;
   /** When a timed pause resumes on its own, in epoch milliseconds; null when none is set. */
   resumeAt: number | null;

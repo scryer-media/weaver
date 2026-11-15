@@ -14,7 +14,8 @@ use crate::torrents::model::{file_priorities_str, named_by_str};
 use crate::torrents::queries::{TORRENT_COLUMNS, count, counters_from_row, torrent_by_infohash_tx};
 use crate::torrents::store::Kept;
 use crate::torrents::{
-    FilePriority, TorrentCounters, TorrentInsert, TorrentIntent, TorrentRecord, TrackerEntry,
+    FilePriority, KeptIntent, TorrentCounters, TorrentInsert, TorrentIntent, TorrentRecord,
+    TrackerEntry,
 };
 use weaver_torrent::ResumePeers;
 
@@ -1103,42 +1104,49 @@ impl Database {
         self.set_torrent_column("state", args)
     }
 
-    // `intent` for every torrent of `job_ids`, and no other column, in one
-    // transaction: one statement per bind-limit chunk of the list.
+    // Each group's kept intent for every torrent of its ids, and no other
+    // column, in one transaction: one statement per bind-limit chunk of
+    // each group's ids.
     pub(crate) fn update_torrent_intents(
         &self,
-        job_ids: &[JobId],
-        intent: TorrentIntent,
+        groups: &[(KeptIntent, &[JobId])],
     ) -> Result<(), StateError> {
-        if job_ids.is_empty() {
+        let groups = groups
+            .iter()
+            .filter(|(_, job_ids)| !job_ids.is_empty())
+            .map(|(kept, job_ids)| {
+                let ids = job_ids
+                    .iter()
+                    .map(|job_id| stored(job_id.0))
+                    .collect::<Result<Vec<_>, StateError>>()?;
+                Ok((kept.as_str(), ids))
+            })
+            .collect::<Result<Vec<_>, StateError>>()?;
+        if groups.is_empty() {
             return Ok(());
         }
-        let ids = job_ids
-            .iter()
-            .map(|job_id| stored(job_id.0))
-            .collect::<Result<Vec<_>, StateError>>()?;
-        let intent = intent.as_str().to_string();
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "update_torrent_intents", |tx| {
-                let ids = ids.clone();
-                let intent = intent.clone();
+                let groups = groups.clone();
                 Box::pin(async move {
                     // The intent takes one bind of each statement.
                     let rows = crate::persistence::sql_runtime::max_rows_for_tx(tx, 1)
                         .saturating_sub(1)
                         .max(1);
-                    for chunk in ids.chunks(rows) {
-                        let placeholders = vec!["{}"; chunk.len()].join(", ");
-                        let mut args = vec![SqlArg::Text(intent.clone())];
-                        args.extend(chunk.iter().copied().map(SqlArg::I64));
-                        tx.execute(
-                            &format!(
-                                "UPDATE torrents SET state = {{}} WHERE job_id IN ({placeholders})"
-                            ),
-                            &args,
-                        )
-                        .await?;
+                    for (state, ids) in &groups {
+                        for chunk in ids.chunks(rows) {
+                            let placeholders = vec!["{}"; chunk.len()].join(", ");
+                            let mut args = vec![SqlArg::Text((*state).to_owned())];
+                            args.extend(chunk.iter().copied().map(SqlArg::I64));
+                            tx.execute(
+                                &format!(
+                                    "UPDATE torrents SET state = {{}} WHERE job_id IN ({placeholders})"
+                                ),
+                                &args,
+                            )
+                            .await?;
+                        }
                     }
                     Ok(())
                 })

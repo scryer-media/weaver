@@ -15,7 +15,7 @@ import { formatSize } from "@/next/data/format";
 import { WV } from "@/next/data/palette";
 import { countLabel } from "@/next/i18n/labels";
 import { UNPACK_CHOICES, unpackChoice, unpackOf } from "@/lib/torrents";
-import { useTorrentsShown } from "@/next/data/use-torrents-shown";
+import { useTorrentAddsOffered } from "@/next/data/use-torrents-shown";
 
 const NO_CATEGORY_VALUE = "__none__";
 
@@ -53,8 +53,8 @@ export function AddNzbDialog({
   const upload = useUploadNzb({ open, resetOnOpen: true, onSubmitted: onClose });
   const { addFiles, fileInputRef } = upload;
   const blocked = upload.entries.filter(isBlocked);
-  // While torrents are off the dialog speaks of NZBs only.
-  const torrentsOn = useTorrentsShown();
+  // While torrents are off the dialog speaks of NZBs only, even with torrent jobs left.
+  const torrentsOn = useTorrentAddsOffered();
   // Unpack is a torrent's choice: the row stands once a file read as a torrent is in the list, or
   // the link is a magnet or an infohash.
   const torrent =

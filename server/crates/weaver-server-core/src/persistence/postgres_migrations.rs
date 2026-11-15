@@ -1103,6 +1103,23 @@ mod tests {
         .await;
     }
 
+    // 0123: the RSS items held while torrents are off are found by a
+    // partial index of their own.
+    #[tokio::test]
+    async fn postgres_0123_indexes_rss_items_held_when_configured() {
+        in_scoped_schema(|pool| async move {
+            upgrade_from(&pool, 122, |_| async move {}).await;
+            let indexes = indexes_of(&pool, "rss_seen_items").await;
+            let partial = &indexes["idx_rss_seen_waiting"];
+            assert!(partial.contains("(feed_id)"), "{partial}");
+            assert!(
+                partial.contains("WHERE (decision = 'waiting'::text)"),
+                "{partial}"
+            );
+        })
+        .await;
+    }
+
     async fn insert_v26_history_row(pool: &PgPool, job_id: i64, metadata: Option<&str>) {
         sqlx::query(
             "INSERT INTO job_history

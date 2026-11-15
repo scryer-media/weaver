@@ -1038,6 +1038,7 @@ const TORRENT_PRESENCE_FIELDS = `
     jobs
     running
     windingDown
+    windDown
   }
 `;
 

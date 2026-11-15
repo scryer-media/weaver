@@ -184,7 +184,14 @@ const ACTIONS = [
   { value: "REJECT", label: "next.rss.reject" },
 ];
 
-const DECISIONS = new Set(["submitted", "accepted", "rejected", "ignored", "error"]);
+const DECISIONS = new Set([
+  "submitted",
+  "accepted",
+  "rejected",
+  "ignored",
+  "error",
+  "waiting",
+]);
 
 /** `key = value` per line — the same shape a feed's own metadata is written in. */
 function metadataText(entries: readonly MetadataEntry[]): string {

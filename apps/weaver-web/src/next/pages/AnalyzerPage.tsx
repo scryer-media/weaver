@@ -10,7 +10,7 @@ import { DetailBlock, EmptyState } from "../components/chrome";
 import { PrimaryButton, SecondaryButton, TextField } from "../components/controls";
 import { ANALYZER_ACCEPT, ANALYZER_ACCEPT_NZB, fileKind, isMagnet, maxBytes } from "../data/analyzer";
 import { formatSize } from "../data/format";
-import { useTorrentsShown } from "../data/use-torrents-shown";
+import { useTorrentAddsOffered } from "../data/use-torrents-shown";
 import { runtimeIds } from "../testids";
 import {
   copySupportReport,
@@ -43,8 +43,9 @@ function outcomeOf(
  */
 export function AnalyzerPage() {
   const t = useTranslate();
-  // While torrents are off the analyzer offers NZBs alone: no magnet link, no .torrent in the picker.
-  const torrentsOn = useTorrentsShown();
+  // While torrents are off the analyzer offers NZBs alone, even with torrent jobs left: no magnet
+  // link, no .torrent in the picker.
+  const torrentsOn = useTorrentAddsOffered();
   const [, analyzeNzb] = useMutation<AnalyzeNzbResponse>(ANALYZE_NZB_MUTATION);
   const [, analyzeTorrent] = useMutation<AnalyzeTorrentResponse>(ANALYZE_TORRENT_MUTATION);
   const inputRef = useRef<HTMLInputElement>(null);

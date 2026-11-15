@@ -3,7 +3,7 @@
 
 import type { ReactNode } from "react";
 import { useNextDataSelector } from "./next-data";
-import { torrentsShown, torrentsView } from "./torrents-shown";
+import { torrentAddsOffered, torrentsShown, torrentsView } from "./torrents-shown";
 
 /**
  * Whether torrent things show: while torrents are on or any torrent job is
@@ -15,6 +15,17 @@ import { torrentsShown, torrentsView } from "./torrents-shown";
  */
 export function useTorrentsShown(): boolean {
   return useNextDataSelector((data) => torrentsShown(data.torrents));
+}
+
+/**
+ * Whether a screen offers to start a torrent: a magnet link, a .torrent file,
+ * the words that ask for one. Only while torrents are on; jobs left while they
+ * are off still show through `useTorrentsShown`, but no new one is offered.
+ *
+ * The one way an add surface asks.
+ */
+export function useTorrentAddsOffered(): boolean {
+  return useNextDataSelector((data) => torrentAddsOffered(data.torrentPresence));
 }
 
 /**

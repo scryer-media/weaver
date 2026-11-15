@@ -67,12 +67,20 @@ pub enum RssServiceError {
     Http(String),
 }
 
-// Why an accepted item made no job: one already holds it, or it failed.
+// Why an accepted item made no job: one already holds it, it is a torrent
+// while torrents are off, or it failed.
 #[derive(Debug)]
 pub(super) enum NotAdded {
     Ignored(String),
+    // Held, not seen: judged anew once torrents are on.
+    Waiting,
     Failed(String),
 }
+
+/// What an item held while torrents are off is kept as, in place of a
+/// decision: not seen, it is judged anew once torrents are on. Matched as a
+/// literal in SQL, where the index on held items serves it.
+pub(super) const WAITING: &str = "waiting";
 
 impl From<String> for NotAdded {
     fn from(error: String) -> Self {
@@ -94,6 +102,10 @@ pub(super) struct RssServiceInner {
     pub(super) scheduled_paused: tokio::sync::watch::Sender<bool>,
     // The torrent client the feeds' torrents go to, once it runs.
     torrents: std::sync::OnceLock<TorrentService>,
+    // Whether torrents took new ones at the last sync, so the items held
+    // while they were off are taken up once, as they come on. False at
+    // start, so a start with torrents on takes up those a stop left.
+    pub(super) torrents_were_on: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     clock_origin: tokio::time::Instant,
     #[cfg(test)]
@@ -117,6 +129,14 @@ impl RssService {
     /// Send the torrents the feeds accept from now on to `torrents`.
     pub fn use_torrents(&self, torrents: TorrentService) {
         let _ = self.inner.torrents.set(torrents);
+    }
+
+    // Whether the torrent client takes a new torrent now.
+    pub(super) fn torrents_take_new(&self) -> bool {
+        self.inner
+            .torrents
+            .get()
+            .is_some_and(TorrentService::takes_new)
     }
 
     pub fn is_scheduled_paused(&self) -> bool {
@@ -166,6 +186,7 @@ impl RssService {
                 sync_lock: Mutex::new(()),
                 scheduled_paused: tokio::sync::watch::channel(false).0,
                 torrents: std::sync::OnceLock::new(),
+                torrents_were_on: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
                 clock_origin: tokio::time::Instant::now(),
                 #[cfg(test)]
@@ -302,6 +323,7 @@ impl RssService {
         match torrents.add(request).await {
             Ok(job_id) => Ok(job_id.0),
             Err(AddError::Duplicate(_)) => Err(NotAdded::Ignored("already added".into())),
+            Err(AddError::Off) => Err(NotAdded::Waiting),
             Err(AddError::Refused(crate::torrents::admission::Refusal::Removing(_))) => Err(
                 NotAdded::Ignored("the torrent is still being removed".into()),
             ),

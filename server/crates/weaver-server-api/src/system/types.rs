@@ -439,6 +439,9 @@ pub struct TorrentPresence {
     pub running: bool,
     /// Torrents are off and the torrents still running are let finish.
     pub winding_down: bool,
+    /// While winding down, how the torrents still running end; null
+    /// otherwise.
+    pub wind_down: Option<crate::settings::types::TorrentDisableModeGql>,
 }
 
 impl TorrentPresence {
@@ -449,13 +452,17 @@ impl TorrentPresence {
         let presence = torrents
             .map(|torrents| torrents.presence())
             .unwrap_or_default();
+        // A wind-down taken for a save still on its way is not one yet.
+        let wind_down = torrents
+            .and_then(|torrents| torrents.wind_down())
+            .filter(|_| !enabled)
+            .map(crate::settings::types::TorrentDisableModeGql::of_wind_down);
         Self {
             enabled,
             jobs: presence.jobs,
             running: presence.running,
-            // A wind-down taken for a save still on its way is not one yet.
-            winding_down: !enabled
-                && torrents.is_some_and(|torrents| torrents.wind_down().is_some()),
+            winding_down: wind_down.is_some(),
+            wind_down,
         }
     }
 }

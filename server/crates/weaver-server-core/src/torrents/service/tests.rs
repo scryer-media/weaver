@@ -4003,7 +4003,8 @@ async fn a_failed_save_drops_the_wind_down_it_took() {
 }
 
 // Many seeds done downloading are stopped by one pass of the wind-down,
-// written together, with the rows each stop alone wrote before.
+// written together, with the rows each stop alone wrote before, marked as
+// stopped by the wind-down.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn finishing_downloads_stops_many_seeds_in_one_pass_as_one_by_one_did() {
     const SEEDS: u8 = 24;
@@ -4063,13 +4064,176 @@ async fn finishing_downloads_stops_many_seeds_in_one_pass_as_one_by_one_did() {
             })
             .collect::<Vec<_>>()
     };
+    let (old_rows, mut new_rows) = (rows(&old, &old_ids), rows(&new, &new_ids));
+    assert!(
+        new_rows
+            .iter()
+            .all(|row| row.intent == TorrentIntent::Stopped && row.wound_down)
+    );
+    for row in &mut new_rows {
+        row.wound_down = false;
+    }
+    assert_eq!(new_rows, old_rows);
+}
+
+// Many seeds that met their goals with a stop are stopped by one pass,
+// written together, with the rows each stop alone wrote before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seeds_meeting_their_goals_stop_in_one_pass_as_one_by_one_did() {
+    const SEEDS: u8 = 24;
+    async fn seeded() -> (Rig, Vec<JobId>) {
+        let rig = rig(set_clock());
+        rig.service.open().await.unwrap();
+        let mut ids = Vec::new();
+        for seed in 1..=SEEDS {
+            let job_id = rig
+                .service
+                .add_opened(AddRequest {
+                    policy_override: stops_once_done(),
+                    ..request(AddSource::Metainfo(plain(&format!("seed{seed}"), seed)))
+                })
+                .await
+                .unwrap();
+            complete(&rig, job_id).await;
+            ids.push(job_id);
+        }
+        (rig, ids)
+    }
+
+    // One by one, as each stop wrote its own row.
+    let (old, old_ids) = seeded().await;
+    let now = old.service.inner.clock.now_ms();
+    let landings: Vec<_> = {
+        let mut live = old.service.inner.live.lock().await;
+        old_ids
+            .iter()
+            .filter_map(|job_id| old.service.stop_torrent(live.get_mut(job_id).unwrap(), now))
+            .collect()
+    };
+    for landing in landings {
+        let _ = old.service.landed(Some(landing)).await;
+    }
+
+    // One pass.
+    let (new, new_ids) = seeded().await;
+    new.service
+        .apply_goals(new.service.inner.clock.now_ms())
+        .await;
+
+    // Each rig keeps its files in a folder of its own.
+    let rows = |rig: &Rig, ids: &[JobId]| {
+        ids.iter()
+            .map(|job_id| {
+                let mut row = rig.db.get_torrent(*job_id).unwrap().unwrap();
+                let root = rig.dir.path().to_str().unwrap();
+                row.storage_dir = row
+                    .storage_dir
+                    .map(|dir| dir.strip_prefix(root).unwrap().to_owned());
+                row
+            })
+            .collect::<Vec<_>>()
+    };
     let (old_rows, new_rows) = (rows(&old, &old_ids), rows(&new, &new_ids));
     assert!(
         new_rows
             .iter()
-            .all(|row| row.intent == TorrentIntent::Stopped)
+            .all(|row| row.intent == TorrentIntent::Stopped && !row.wound_down)
     );
     assert_eq!(new_rows, old_rows);
+}
+
+// Seeds a wind-down to the downloads stopped resume by themselves when
+// torrents are turned on again. Those the operator paused, those their
+// goals stopped, and one the wind-down stopped that the operator then
+// paused stay as they are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seeds_a_wind_down_stopped_resume_when_torrents_are_on_again() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let add = |name: &'static str, seed: u8, policy_override| {
+        let service = rig.service.clone();
+        async move {
+            service
+                .add_opened(AddRequest {
+                    policy_override,
+                    ..request(AddSource::Metainfo(plain(name, seed)))
+                })
+                .await
+                .unwrap()
+        }
+    };
+    let wound = add("wound", 1, None).await;
+    let then_paused = add("then-paused", 2, None).await;
+    let paused = add("paused", 3, None).await;
+    let met = add("met", 4, stops_once_done()).await;
+    for job_id in [wound, then_paused, paused, met] {
+        complete(&rig, job_id).await;
+    }
+    rig.service.pause(paused).await.unwrap();
+    // Its goal met while torrents are on: stopped by its goal.
+    rig.service.tick().await;
+    let kept = |job_id| {
+        let row = rig.db.get_torrent(job_id).unwrap().unwrap();
+        (row.intent, row.wound_down)
+    };
+    assert_eq!(kept(met), (TorrentIntent::Stopped, false));
+
+    rig.service
+        .wind_down_when_off(Some(WindDown::FinishDownloads))
+        .await;
+    rig.service.set_settings(turned_off(&rig.service)).await;
+    rig.service.tick().await;
+    assert_eq!(kept(wound), (TorrentIntent::Stopped, true));
+    assert_eq!(kept(then_paused), (TorrentIntent::Stopped, true));
+    assert_eq!(kept(paused), (TorrentIntent::Paused, false));
+    // The operator's word ends the wind-down's hold.
+    rig.service.pause(then_paused).await.unwrap();
+    assert_eq!(kept(then_paused), (TorrentIntent::Paused, false));
+
+    let mut on = rig.service.settings();
+    on.torrent.enabled = true;
+    rig.service.set_settings(on).await;
+    assert_eq!(kept(wound), (TorrentIntent::Resumed, false));
+    assert_eq!(kept(then_paused), (TorrentIntent::Paused, false));
+    assert_eq!(kept(paused), (TorrentIntent::Paused, false));
+    assert_eq!(kept(met), (TorrentIntent::Stopped, false));
+    let view = rig.service.torrent(wound).await.unwrap();
+    assert_ne!(view.state, TorrentState::Stopped);
+    assert!(rig.service.presence().running);
+}
+
+// Seeds a wind-down stopped, kept across a restart with torrents on, resume
+// as the restart opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seeds_a_wind_down_stopped_resume_at_a_restart_with_torrents_on() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(plain("seed", 1))))
+        .await
+        .unwrap();
+    complete(&rig, job_id).await;
+    rig.service
+        .wind_down_when_off(Some(WindDown::FinishDownloads))
+        .await;
+    rig.service.set_settings(turned_off(&rig.service)).await;
+    rig.service.tick().await;
+    let kept = |job_id| {
+        let row = rig.db.get_torrent(job_id).unwrap().unwrap();
+        (row.intent, row.wound_down)
+    };
+    assert_eq!(kept(job_id), (TorrentIntent::Stopped, true));
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    assert_eq!(kept(job_id), (TorrentIntent::Resumed, false));
+    assert_ne!(
+        again.torrent(job_id).await.unwrap().state,
+        TorrentState::Stopped
+    );
+    again.stop().await;
 }
 
 // A run the session refuses leaves the operator's intent as it was, and the
@@ -7568,6 +7732,7 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         category_id: Some(1),
         added_at_ms: EPOCH_MS,
         intent: TorrentIntent::Resumed,
+        wound_down: false,
         forced: false,
         completed_at_ms: None,
         storage_dir: None,
@@ -7646,6 +7811,7 @@ fn chain() -> (TorrentRecord, TrackerRule, TorrentSettings) {
         category_id: Some(1),
         added_at_ms: EPOCH_MS,
         intent: TorrentIntent::Resumed,
+        wound_down: false,
         forced: false,
         completed_at_ms: None,
         storage_dir: None,

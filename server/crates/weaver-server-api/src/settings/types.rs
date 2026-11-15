@@ -1779,8 +1779,9 @@ pub struct TorrentSettingsInput {
 
 /// How the torrents still running end when torrents are turned off. No new
 /// torrent is taken in any of them.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Enum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Enum, Serialize, Deserialize)]
 #[graphql(name = "TorrentDisableMode")]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TorrentDisableModeGql {
     /// Every torrent stops now.
     #[default]
@@ -1799,6 +1800,15 @@ impl TorrentDisableModeGql {
             Self::StopNow => None,
             Self::FinishDownloads => Some(WindDown::FinishDownloads),
             Self::FinishAll => Some(WindDown::Finish),
+        }
+    }
+
+    /// The mode a wind-down under way was taken by.
+    pub fn of_wind_down(wind_down: weaver_server_core::torrents::service::WindDown) -> Self {
+        use weaver_server_core::torrents::service::WindDown;
+        match wind_down {
+            WindDown::FinishDownloads => Self::FinishDownloads,
+            WindDown::Finish => Self::FinishAll,
         }
     }
 }

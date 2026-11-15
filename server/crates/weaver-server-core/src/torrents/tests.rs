@@ -5,8 +5,8 @@ use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::settings::{Leaf, SeedingAction, SeedingGoalMode, SeedingPolicy};
 use crate::torrents::{
-    FilePriority, Infohash, NamedBy, TorrentCounters, TorrentInsert, TorrentIntent, TorrentRecord,
-    TorrentSource, TrackerEntry,
+    FilePriority, Infohash, KeptIntent, NamedBy, TorrentCounters, TorrentInsert, TorrentIntent,
+    TorrentRecord, TorrentSource, TrackerEntry,
 };
 
 fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRecord {
@@ -21,6 +21,7 @@ fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRe
         category_id: None,
         added_at_ms: 1_000 + job_id as i64,
         intent: TorrentIntent::Resumed,
+        wound_down: false,
         forced: false,
         completed_at_ms: None,
         storage_dir: None,
@@ -545,19 +546,34 @@ fn torrent_intents_past_the_bind_limit_are_written_together() {
         db.insert_torrent(&torrent(job_id, Some(hash), None), &[])
             .unwrap();
     }
-    // Every torrent but the last.
-    let named = (1..TORRENTS).map(JobId).collect::<Vec<_>>();
-    db.update_torrent_intents(&named, TorrentIntent::Stopped)
-        .unwrap();
+    // The first half stopped by a wind-down, the rest but the last by
+    // their goals, in one call.
+    let wound = (1..TORRENTS / 2).map(JobId).collect::<Vec<_>>();
+    let met = (TORRENTS / 2..TORRENTS).map(JobId).collect::<Vec<_>>();
+    db.update_torrent_intents(&[
+        (KeptIntent::WoundDown, &wound),
+        (KeptIntent::Intent(TorrentIntent::Stopped), &met),
+    ])
+    .unwrap();
     for job_id in 1..=TORRENTS {
-        let intent = db.get_torrent(JobId(job_id)).unwrap().unwrap().intent;
-        let want = if job_id < TORRENTS {
-            TorrentIntent::Stopped
+        let record = db.get_torrent(JobId(job_id)).unwrap().unwrap();
+        let want = if job_id < TORRENTS / 2 {
+            (TorrentIntent::Stopped, true)
+        } else if job_id < TORRENTS {
+            (TorrentIntent::Stopped, false)
         } else {
-            TorrentIntent::Resumed
+            (TorrentIntent::Resumed, false)
         };
-        assert_eq!(intent, want, "torrent {job_id}");
+        assert_eq!((record.intent, record.wound_down), want, "torrent {job_id}");
     }
-    db.update_torrent_intents(&[], TorrentIntent::Paused)
+    // A single intent written later writes the wind-down's mark away.
+    db.update_torrent_intent(JobId(1), TorrentIntent::Paused)
+        .unwrap();
+    let first = db.get_torrent(JobId(1)).unwrap().unwrap();
+    assert_eq!(
+        (first.intent, first.wound_down),
+        (TorrentIntent::Paused, false)
+    );
+    db.update_torrent_intents(&[(KeptIntent::Intent(TorrentIntent::Paused), &[])])
         .unwrap();
 }

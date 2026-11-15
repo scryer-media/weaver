@@ -177,6 +177,42 @@ impl TorrentIntent {
     }
 }
 
+/// What a torrent's kept state says: what the operator asked of it, or that
+/// a wind-down to the downloads alone stopped it. The second is stopped like
+/// any other, and resumes by itself when torrents are turned on again. It is
+/// kept in the same column as the intent, so it needs no column of its own,
+/// and any intent written later, as the operator's pause or resume, writes
+/// it away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeptIntent {
+    Intent(TorrentIntent),
+    WoundDown,
+}
+
+impl KeptIntent {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Intent(intent) => intent.as_str(),
+            Self::WoundDown => "wound_down",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "wound_down" => Some(Self::WoundDown),
+            _ => TorrentIntent::parse(value).map(Self::Intent),
+        }
+    }
+
+    /// The intent it is: stopped, for one a wind-down stopped.
+    pub const fn intent(self) -> TorrentIntent {
+        match self {
+            Self::Intent(intent) => intent,
+            Self::WoundDown => TorrentIntent::Stopped,
+        }
+    }
+}
+
 /// What was already on disk where a torrent's files go, before Weaver wrote
 /// any of them: a deletion of the torrent's files never removes these. Files
 /// are named as the metainfo names them; folders are relative to the
@@ -212,6 +248,10 @@ pub struct TorrentRecord {
     pub category_id: Option<u32>,
     pub added_at_ms: i64,
     pub intent: TorrentIntent,
+    // Stopped by a wind-down to the downloads alone, not by the operator:
+    // it resumes by itself when torrents are turned on again. Only ever
+    // set with `intent` stopped; writing any intent clears it.
+    pub wound_down: bool,
     pub forced: bool,
     pub completed_at_ms: Option<i64>,
     pub storage_dir: Option<String>,

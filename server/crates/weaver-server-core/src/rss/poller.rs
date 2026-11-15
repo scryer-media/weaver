@@ -10,7 +10,7 @@ use crate::rss::model::{
 };
 use crate::rss::service::{
     DueSyncOutcome, MAX_RSS_FEED_BODY_BYTES, NotAdded, RssFeedSyncReport, RssService,
-    RssServiceError, RssSyncReport,
+    RssServiceError, RssSyncReport, WAITING,
 };
 use crate::{RssFeedRow, RssRuleAction};
 
@@ -226,6 +226,7 @@ impl RssService {
         due_only: bool,
         cancellation: crate::bandwidth::schedule::ScheduleCancellation,
     ) -> Result<RssSyncReport, RssServiceError> {
+        self.take_up_waiting_items().await;
         let service = self.clone();
         let feeds =
             tokio::task::spawn_blocking(move || service.load_target_feeds(target, due_only))
@@ -280,6 +281,31 @@ impl RssService {
             .purge_old_rss_seen_items(self.now() - RSS_SEEN_RETENTION_SECS);
 
         Ok(report)
+    }
+
+    // The items held while torrents were off are taken up once, as torrents
+    // come on, before the feeds are read: their feeds are then read whole.
+    // A sync with torrents as they were reads and writes nothing for it.
+    async fn take_up_waiting_items(&self) {
+        let on = self.torrents_take_new();
+        let were_on = &self.inner.torrents_were_on;
+        if !on {
+            were_on.store(false, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        if were_on.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let db = self.inner.db.clone();
+        match tokio::task::spawn_blocking(move || db.release_rss_waiting_items()).await {
+            Ok(Ok(_)) => were_on.store(true, std::sync::atomic::Ordering::Relaxed),
+            Ok(Err(error)) => {
+                warn!(error = %error, "the RSS items held while torrents were off were not taken up");
+            }
+            Err(error) => {
+                warn!(error = %error, "the RSS items held while torrents were off were not taken up");
+            }
+        }
     }
 
     pub(super) fn load_target_feeds(
@@ -476,6 +502,18 @@ impl RssService {
                         Err(NotAdded::Ignored(reason)) => {
                             report.items_ignored += 1;
                             self.record_seen(feed.id, &item, "ignored", None, Some(&reason))?;
+                        }
+                        // A torrent while torrents are off: held, once, so
+                        // later polls fetch nothing for it, and judged anew
+                        // once torrents are on.
+                        Err(NotAdded::Waiting) => {
+                            self.record_seen(
+                                feed.id,
+                                &item,
+                                WAITING,
+                                None,
+                                Some("torrents are off"),
+                            )?;
                         }
                         Err(NotAdded::Failed(error)) => {
                             if cancellation.is_cancelled() {

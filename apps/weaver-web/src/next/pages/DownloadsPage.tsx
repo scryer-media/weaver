@@ -84,7 +84,7 @@ import { AddNzbDialog } from "../features/AddNzbDialog";
 import { ScheduleSeedingNote } from "../features/torrents/ScheduleSeedingNote";
 import { TorrentRemoveDialog } from "../features/torrents/TorrentRemoveDialog";
 import { useTorrentSummaries } from "../data/use-torrents";
-import { useTorrentsShown } from "../data/use-torrents-shown";
+import { useTorrentAddsOffered, useTorrentsShown } from "../data/use-torrents-shown";
 import { SpeedLimitControl, useSpeedLimitInForce } from "../features/SpeedLimitDialog";
 import { DownloadInspector } from "./downloads/DownloadInspector";
 import { DownloadRow } from "./downloads/DownloadRow";
@@ -253,6 +253,8 @@ export function DownloadsPage() {
   const statusLabel = useStatusLabel();
   const t = useTranslate();
   const torrentsOn = useTorrentsShown();
+  // The empty text and the drop hint ask for torrents only while torrents are on.
+  const torrentAdds = useTorrentAddsOffered();
 
   const [facets, setFacets] = useState<ReadonlySet<string>>(NO_FACETS);
   const [pickedProtocol, setProtocol] = useState<ProtocolFacet>(null);
@@ -903,7 +905,7 @@ export function DownloadsPage() {
               centered
               testId={testIds.queueEmpty}
               title={t("next.downloads.emptyTitle")}
-              body={t(torrentsOn ? "next.downloads.emptyBody" : "next.downloads.emptyBodyNzb")}
+              body={t(torrentAdds ? "next.downloads.emptyBody" : "next.downloads.emptyBodyNzb")}
               action={<PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>{t("next.addNzb.title")}</PrimaryButton>}
             />
           ) : jobs.length === 0 ? (
@@ -940,7 +942,7 @@ export function DownloadsPage() {
         </div>
         {dropping ? (
           <div className="pointer-events-none absolute inset-0 flex items-center justify-center border border-dashed border-wv-accent bg-wv-selected">
-            <span className="text-[13px] font-medium text-wv-strong">{t(torrentsOn ? "next.downloads.dropHint" : "next.downloads.dropHintNzb")}</span>
+            <span className="text-[13px] font-medium text-wv-strong">{t(torrentAdds ? "next.downloads.dropHint" : "next.downloads.dropHintNzb")}</span>
           </div>
         ) : null}
       </div>
