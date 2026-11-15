@@ -326,14 +326,20 @@ pub async fn recover_server_state(
     // read that fails stops the start, as the read of every row did.
     // A job's work that panicked would panic again as the job is restored,
     // so the markers the panic left are read before any job is.
-    // A torrent removed whose history row waited for room as the last run
-    // stopped is archived now, as a terminal NZB job's row is above: it
-    // does not come back.
+    // A torrent a removal left retiring, its history not yet written as
+    // the last run stopped, finishes its removal now: the files it asked to
+    // go are deleted, by the rules a live removal keeps, and it is archived
+    // as a terminal NZB job's row is above: it does not come back.
     // One that cannot be written, or all of them when they do not read,
-    // stays retiring: never live, its folders kept, written by the torrent
-    // service through the kept archives.
-    match db.archive_retiring_torrents() {
-        Ok(archived) => {
+    // stays retiring: never live, its folders kept, finished and written by
+    // the torrent service through the kept archives.
+    let finishing = {
+        let (db, work) = (db.clone(), intermediate_dir.to_path_buf());
+        tokio::task::spawn_blocking(move || crate::torrents::service::finish_retiring(&db, &work)).await
+    };
+    match finishing {
+        Ok(Ok(rows)) => {
+            let archived = db.archive_retiring_torrents(rows);
             if !archived.written.is_empty() {
                 info!(
                     job_ids = ?archived.written.iter().map(|job_id| job_id.0).collect::<Vec<_>>(),
@@ -341,10 +347,16 @@ pub async fn recover_server_state(
                 );
             }
         }
+        Ok(Err(error)) => {
+            warn!(
+                error = %error,
+                "could not read the torrents a removal left retiring; they stay retiring and are retried"
+            );
+        }
         Err(error) => {
             warn!(
                 error = %error,
-                "could not archive the torrents a removal left retiring; they stay retiring and are retried"
+                "could not finish the torrents a removal left retiring; they stay retiring and are retried"
             );
         }
     }

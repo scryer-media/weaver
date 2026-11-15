@@ -4086,7 +4086,7 @@ impl TorrentService {
                     held_tops(parsed.manifest.paths.iter().map(String::as_str)),
                 )
                 .await;
-                let mut torrent = match self.insert(record, &parsed.trackers, &adopted, held) {
+                let mut torrent = match self.insert(record, &parsed.trackers, &adopted, Some(held)) {
                     Ok(torrent) => torrent,
                     Err(error) => {
                         give_back(&dir, job_id).await;
@@ -4158,7 +4158,7 @@ impl TorrentService {
                 record.pool_member = pin;
                 // Nothing placed, nothing held, until its metainfo is.
                 let mut torrent =
-                    self.insert(record, &trackers, &Adopted::default(), Vec::new())?;
+                    self.insert(record, &trackers, &Adopted::default(), None)?;
                 self.tag_added(job_id, &request.tags);
                 let identity = identity_of(torrent.rule(&rules), &torrent.identity);
                 let terms = PeerTerms::of(&self.settings(), torrent.rule(&rules));
@@ -4442,7 +4442,9 @@ impl TorrentService {
         mut record: TorrentRecord,
         trackers: &[TrackerEntry],
         adopted: &Adopted,
-        held: Vec<String>,
+        // What it holds where its files go; None for a magnet, which holds
+        // its whole folder until its metainfo arrives.
+        held: Option<Vec<String>>,
     ) -> Result<Live, AddError> {
         let rules = self.rules();
         let rule = tracker_rule_for(&rules, trackers.iter().map(|tracker| tracker.url.as_str()));
@@ -4451,7 +4453,7 @@ impl TorrentService {
         match self
             .inner
             .db
-            .insert_placed_torrent(&record, trackers, adopted, Some(&held))
+            .insert_placed_torrent(&record, trackers, adopted, held.as_deref())
         {
             Ok(TorrentInsert::Inserted) => {
                 let now = self.inner.clock.now_ms();
@@ -4694,20 +4696,14 @@ impl TorrentService {
                 &parsed.manifest.name,
                 &bytes,
                 &dir,
+                files_dir.as_deref(),
                 &trackers,
+                &held,
             )
             .map_err(|error| AddError::State(state_error(error)))?;
         // The table holds the merged list now, whatever the next write does.
         torrent.rule_id = self.rule_id(&trackers);
         torrent.trackers = in_table_order(trackers);
-        self.inner
-            .db
-            .set_torrent_files_dir(job_id, files_dir.as_deref())
-            .map_err(|error| AddError::State(state_error(error)))?;
-        self.inner
-            .db
-            .set_torrent_held(job_id, held)
-            .map_err(|error| AddError::State(state_error(error)))?;
         self.inner
             .db
             .set_torrent_adopted(job_id, &adopted)
@@ -5634,12 +5630,13 @@ impl TorrentService {
     }
 
     // The torrents a removal left retiring that the start could not write
-    // to history: never live, each is written through the kept archives as
-    // a removal's row is, shown retiring while it waits for room. One whose
-    // kept row does not read stays retiring, said.
+    // to history: never live, each finishes its removal from its row as the
+    // start does (`finish_retiring`) and is written through the kept
+    // archives as a removal's row is, shown retiring while it waits for
+    // room.
     async fn retry_retiring(&self) {
-        let db = self.inner.db.clone();
-        let rows = match tokio::task::spawn_blocking(move || db.retiring_torrents()).await {
+        let (db, work) = (self.inner.db.clone(), self.inner.env.work.clone());
+        let rows = match tokio::task::spawn_blocking(move || finish_retiring(&db, &work)).await {
             Ok(Ok(rows)) => rows,
             Ok(Err(error)) => {
                 tracing::warn!(error = %error, "could not read the torrents a removal left retiring");
@@ -5650,17 +5647,10 @@ impl TorrentService {
                 return;
             }
         };
-        for (job_id, kept) in rows {
-            match kept {
-                Ok((history, files)) => {
-                    let mut job = crate::operations::backup::job_info_from_history(history.clone());
-                    job.protocol = crate::jobs::Protocol::Torrent;
-                    self.write_history(history, true, job, files).await;
-                }
-                Err(error) => {
-                    tracing::warn!(job_id = job_id.0, error = %error, "a removed torrent's kept history row does not read; it stays retiring");
-                }
-            }
+        for (_, history, files) in rows {
+            let mut job = crate::operations::backup::job_info_from_history(history.clone());
+            job.protocol = crate::jobs::Protocol::Torrent;
+            self.write_history(history, true, job, files).await;
         }
     }
 
@@ -5699,18 +5689,43 @@ impl TorrentService {
         let _removing = gate.lock().await;
         let settings = self.settings();
         let now = self.inner.clock.now_ms();
-        let mut live = self.inner.live.lock().await;
-        let torrent = live.get(&job_id).ok_or(ActionError::NotFound(job_id))?;
-        if torrent.private && !confirm_unmet_goal {
-            let policy = settings.policy(&torrent.record, torrent.rule(&self.rules()));
-            if let Some(left) =
-                status::goal_left(&policy, &torrent.counters, torrent.have_bytes, now)
-            {
-                return Err(ActionError::UnmetGoal(left));
+        {
+            let live = self.inner.live.lock().await;
+            let torrent = live.get(&job_id).ok_or(ActionError::NotFound(job_id))?;
+            if torrent.private && !confirm_unmet_goal {
+                let policy = settings.policy(&torrent.record, torrent.rule(&self.rules()));
+                if let Some(left) =
+                    status::goal_left(&policy, &torrent.counters, torrent.have_bytes, now)
+                {
+                    return Err(ActionError::UnmetGoal(left));
+                }
             }
         }
-        let torrent = live.remove(&job_id).ok_or(ActionError::NotFound(job_id))?;
-        drop(live);
+        // Its row is marked retiring, with whether its files go, while it is
+        // still live and before anything of it goes: a stop from here on
+        // brings it back retiring, never live, and the next start finishes
+        // the removal. A mark the database's disk has no room for does not
+        // hold the removal back, which may be what frees that room: it goes
+        // on as it did before marks, its history row kept for room. A mark
+        // refused any other way fails the removal, and nothing changed.
+        match self.mark_retiring(job_id, delete_files).await {
+            Ok(()) => {}
+            Err(StateError::OutOfSpace(error)) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "no room to mark a torrent's removal; it goes on unmarked");
+            }
+            Err(error) => {
+                return Err(ActionError::State(format!(
+                    "the torrent was not removed: its removal could not be recorded ({error})"
+                )));
+            }
+        }
+        let mut torrent = self
+            .inner
+            .live
+            .lock()
+            .await
+            .remove(&job_id)
+            .ok_or(ActionError::NotFound(job_id))?;
         let written = read_written(self.written_of(&torrent)).await;
         // The job's outcome: complete, short of what unpacking would
         // deliver, refused by unpacking, or cut short.
@@ -5728,18 +5743,6 @@ impl TorrentService {
             (false, Some(refusal)) => ("failed", Some(refusal)),
             (false, None) => ("cancelled", None),
         };
-        // Its row is marked retiring, with its history row, before anything
-        // of it goes: a stop from here on brings it back retiring, never
-        // live, and the next start writes that row. A mark that cannot be
-        // written fails the removal, and the torrent stays as it was.
-        let (_, row) = self.history_of(&torrent, status, error.clone());
-        if let Err(error) = self.mark_retiring(&row).await {
-            self.inner.live.lock().await.insert(job_id, torrent);
-            return Err(ActionError::State(format!(
-                "the torrent was not removed: its removal could not be recorded ({error})"
-            )));
-        }
-        let mut torrent = torrent;
         // What its scripts hear of a removal asked for: a seed stops
         // seeding; a download is cancelled, as an NZB job's is.
         let ended = match ending {
@@ -5787,15 +5790,12 @@ impl TorrentService {
         Ok(())
     }
 
-    // A removal's mark on the torrent's row, its history row kept there
-    // with no list yet, written off the runtime.
-    async fn mark_retiring(&self, row: &crate::history::JobHistoryRow) -> Result<(), String> {
+    // A removal's mark on the torrent's row, written off the runtime.
+    async fn mark_retiring(&self, job_id: JobId, delete_files: bool) -> Result<(), StateError> {
         let db = self.inner.db.clone();
-        let row = row.clone();
-        tokio::task::spawn_blocking(move || db.mark_torrent_retiring(&row))
+        tokio::task::spawn_blocking(move || db.mark_torrent_retiring(job_id, delete_files))
             .await
-            .map_err(|error| error.to_string())?
-            .map_err(state_error)
+            .map_err(|error| StateError::Database(error.to_string()))?
     }
 
     // What reading the torrent's written files takes, cloned under the
@@ -5823,7 +5823,31 @@ impl TorrentService {
     // written off the runtime and outside the live lock. One whose files
     // are not known holds its whole folder.
     async fn sync_held(&self, job_id: JobId) {
-        let Ok((storage, files, layout)) = self
+        if let Err(error) = self.write_held(job_id, None).await {
+            tracing::warn!(job_id = job_id.0, error = %error, "could not write what a moved torrent holds; the next start writes it");
+        }
+    }
+
+    // What the torrent holds once its files are at `to`, its storage and
+    // files folders, added to what it holds before the first of them moves
+    // there, so a file that reaches it is held from the moment it does
+    // (`add_torrent_held`); what it held where they were stays until the
+    // move ends (`sync_held`).
+    async fn hold_destination(
+        &self,
+        job_id: JobId,
+        to: (Option<String>, Option<String>),
+    ) -> Result<(), StateError> {
+        self.write_held(job_id, Some(to)).await
+    }
+
+    // `sync_held`, or with `to`, `hold_destination`.
+    async fn write_held(
+        &self,
+        job_id: JobId,
+        to: Option<(Option<String>, Option<String>)>,
+    ) -> Result<(), StateError> {
+        let (storage, files, layout) = self
             .with_torrent(job_id, |torrent| {
                 Ok((
                     torrent.record.storage_dir.clone(),
@@ -5832,11 +5856,11 @@ impl TorrentService {
                 ))
             })
             .await
-        else {
-            return;
-        };
+            .map_err(|error| StateError::Database(error.to_string()))?;
+        let adding = to.is_some();
+        let (storage, files) = to.unwrap_or((storage, files));
         let db = self.inner.db.clone();
-        let written = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let outputs = db.torrent_outputs(job_id)?;
             let tops = layout.as_deref().and_then(|layout| {
                 held_tops(
@@ -5847,21 +5871,18 @@ impl TorrentService {
                         .chain(outputs.iter().map(String::as_str)),
                 )
             });
-            db.set_torrent_held(
-                job_id,
-                held_of(storage.as_deref(), files.as_deref(), tops.as_ref()),
-            )
+            let held = held_of(storage.as_deref(), files.as_deref(), tops.as_ref());
+            #[cfg(test)]
+            if SYNC_HELD_FAILS.load(Ordering::Relaxed) == if adding { 2 } else { 1 } {
+                return Err(StateError::Database("the held paths were refused".into()));
+            }
+            if adding {
+                return db.add_torrent_held(job_id, &held);
+            }
+            db.set_torrent_held(job_id, held)
         })
-        .await;
-        match written {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(job_id = job_id.0, error = %error, "could not write what a moved torrent holds")
-            }
-            Err(error) => {
-                tracing::warn!(job_id = job_id.0, error = %error, "could not write what a moved torrent holds")
-            }
-        }
+        .await
+        .map_err(|error| StateError::Database(error.to_string()))?
     }
 
     async fn with_torrent<T>(
@@ -6381,6 +6402,14 @@ impl TorrentService {
             give_back(&to.to_string_lossy(), job_id).await;
             return Err(error);
         }
+        let destination = (Some(to.to_string_lossy().into_owned()), None);
+        if let Err(error) = self.hold_destination(job_id, destination).await {
+            self.move_refused(job_id).await;
+            give_back(&to.to_string_lossy(), job_id).await;
+            return Err(ActionError::State(format!(
+                "the torrent was not moved: what it holds there could not be recorded ({error})"
+            )));
+        }
         let outcome = tokio::task::spawn_blocking(move || {
             store.files().relocate(|dir| {
                 // Its marker is made for the folder's path, so the moved
@@ -6484,7 +6513,7 @@ impl TorrentService {
         tokio::fs::create_dir_all(&to).await.map_err(|error| {
             ActionError::Invalid(format!("could not make the torrent's directory: {error}"))
         })?;
-        self.with_torrent(job_id, |torrent| {
+        let storage = self.with_torrent(job_id, |torrent| {
             if torrent.moving.is_some() {
                 return Err(ActionError::Invalid(
                     "the torrent is already moving".to_owned(),
@@ -6492,9 +6521,16 @@ impl TorrentService {
             }
             torrent.settle(self.inner.clock.now_ms());
             torrent.moving = Some(Moving::Files);
-            Ok(())
+            Ok(torrent.record.storage_dir.clone())
         })
         .await?;
+        let destination = (storage, Some(to.to_string_lossy().into_owned()));
+        if let Err(error) = self.hold_destination(job_id, destination).await {
+            self.move_refused(job_id).await;
+            return Err(ActionError::State(format!(
+                "the torrent was not moved: what it holds there could not be recorded ({error})"
+            )));
+        }
         let outputs = self.inner.db.torrent_outputs(job_id).unwrap_or_else(|error| {
             tracing::warn!(job_id = job_id.0, error = %error, "could not read what a torrent unpacked");
             Vec::new()
@@ -6559,6 +6595,19 @@ impl TorrentService {
         }
         self.publish().await;
         Ok(())
+    }
+
+    // A move refused before any file moved: the torrent is as it was, and
+    // an unpacking that waited on the move goes on.
+    async fn move_refused(&self, job_id: JobId) {
+        let _ = self
+            .with_torrent(job_id, |torrent| {
+                torrent.settle(self.inner.clock.now_ms());
+                torrent.moving = None;
+                Ok(())
+            })
+            .await;
+        self.inner.signal.mark(job_id);
     }
 
     // The torrent's files moved, or could not: the record follows a move,
@@ -8786,7 +8835,17 @@ pub(super) fn deletion(
 // never a path a removal of the torrent with its files just took. Read off
 // the runtime.
 async fn history_files(deletion: Deletion) -> Vec<HistoryFile> {
-    tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || listed_files(&deletion))
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "could not list what a torrent wrote");
+            Vec::new()
+        })
+}
+
+// [`history_files`], on the calling thread.
+fn listed_files(deletion: &Deletion) -> Vec<HistoryFile> {
+    {
         let listed = deletion.paths.iter().map(|path| (path.clone(), false));
         let made = deletion.made.iter().map(|path| (path.clone(), true));
         let work = deletion.work.as_ref().and_then(|(root, work, job_id)| {
@@ -8803,12 +8862,128 @@ async fn history_files(deletion: Deletion) -> Vec<HistoryFile> {
                 whole,
             })
             .collect()
-    })
-    .await
-    .unwrap_or_else(|error| {
-        tracing::warn!(error = %error, "could not list what a torrent wrote");
-        Vec::new()
-    })
+    }
+}
+
+// Start-up, and the retry of what it left: each torrent a removal left
+// retiring finishes its removal from its row. One whose removal asked for
+// its files has them deleted as a live removal deletes them, from its
+// metainfo, what was there before it and what unpacking placed, under the
+// same rules a removal from history keeps (`spare_held`); one that kept
+// them lists them, its kept unpacking folder with them, so the sweep leaves
+// it. Each comes back with its history row, built from its torrents row
+// (`RetiringRow`), and the files that row lists. What live torrents hold
+// is read once for all of them; when that read fails, those that would
+// delete stay retiring for the next try. Reads and deletes on the calling
+// thread: run off the runtime.
+pub(crate) fn finish_retiring(
+    db: &Database,
+    work: &Path,
+) -> Result<Vec<(JobId, crate::history::JobHistoryRow, Vec<HistoryFile>)>, StateError> {
+    let rows = db.retiring_torrents()?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let planned: Vec<_> = rows
+        .into_iter()
+        .map(|row| {
+            let deletion = retiring_deletion(&row, work);
+            (row, deletion)
+        })
+        .collect();
+    let dirs: Vec<PathBuf> = planned
+        .iter()
+        .filter(|(row, _)| row.delete_files)
+        .map(|(_, deletion)| deletion.dir.clone())
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .collect();
+    let held = LiveHeld::under(db, &dirs);
+    if let Err(error) = &held {
+        tracing::warn!(error = %error, "could not read what live torrents hold; removed torrents whose files go stay retiring");
+    }
+    let mut finished = Vec::with_capacity(planned.len());
+    for (row, mut deletion) in planned {
+        if row.delete_files {
+            let Ok(held) = &held else {
+                continue;
+            };
+            spare_held(&mut deletion, held, row.job_id);
+            delete_written(&deletion);
+        }
+        finished.push((row.job_id, row.history, listed_files(&deletion)));
+    }
+    Ok(finished)
+}
+
+// What a retiring torrent's removal takes, from its row (`written_paths`
+// for a live one): its files by its metainfo under the folder they are in,
+// less what was there before it, and what unpacking placed; its unpacking
+// folder by its marker. One whose metainfo or what was there before it does
+// not read takes no file, and one with no folder takes only its unpacking
+// folder.
+fn retiring_deletion(row: &crate::torrents::persistence::RetiringRow, work: &Path) -> Deletion {
+    let job_id = row.job_id;
+    let claimed = row
+        .files_dir
+        .as_ref()
+        .and(row.storage_dir.as_deref())
+        .map(PathBuf::from);
+    let base = row.files_dir.as_deref().or(row.storage_dir.as_deref());
+    let files = match (row.metainfo.as_deref(), base) {
+        (Some(bytes), Some(base)) => match parse(bytes) {
+            Ok(parsed) => Files::new(&parsed.layout, PathBuf::from(base))
+                .map_err(|error| tracing::warn!(job_id = job_id.0, error = %error, "a removed torrent's files do not read; they stay"))
+                .ok(),
+            Err(error) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "a removed torrent's metainfo does not read; its files stay");
+                None
+            }
+        },
+        _ => None,
+    };
+    let mut deletion = match (files, &row.adopted, &row.outputs) {
+        (Some(files), Some(adopted), Some(outputs)) => deletion(&files, adopted, outputs, claimed),
+        (files, ..) => Deletion {
+            dir: files
+                .map(|files| files.dir())
+                .or_else(|| base.map(PathBuf::from))
+                .unwrap_or_default(),
+            claimed,
+            ..Deletion::default()
+        },
+    };
+    deletion.owner = Some(job_id);
+    deletion.work = Some((work.to_path_buf(), unpacking_dir(work, job_id), job_id));
+    deletion
+}
+
+// Leaves out of `deletion` what a removal from history would leave: what a
+// live torrent holds (`held`), what lies under a link inside its folder or
+// in a folder that is a link, and, in a folder of its own, everything while
+// that folder's marker does not name its job.
+fn spare_held(deletion: &mut Deletion, held: &LiveHeld, job_id: JobId) {
+    use crate::jobs::working_dir::{OutputDirOwner, output_dir_owner};
+    let dir = deletion.dir.clone();
+    let linked = std::fs::symlink_metadata(&dir).is_ok_and(|found| found.file_type().is_symlink());
+    let unowned = deletion.own && output_dir_owner(&dir) != Some(OutputDirOwner::Job(job_id));
+    if linked || unowned {
+        deletion.paths.clear();
+        deletion.made.clear();
+        deletion.own = false;
+        return;
+    }
+    let spared = |path: &Path, whole: bool| {
+        held.holds(path, whole)
+            || path
+                .ancestors()
+                .skip(1)
+                .take_while(|folder| *folder != dir && folder.starts_with(&dir))
+                .any(|folder| {
+                    std::fs::symlink_metadata(folder).is_ok_and(|found| found.file_type().is_symlink())
+                })
+    };
+    deletion.paths.retain(|path| !spared(path, false));
+    deletion.made.retain(|path| !spared(path, true));
 }
 
 // [`held_of`] for `record` as placed, off the runtime; its whole folder, as
@@ -8827,6 +9002,12 @@ async fn held_at(record: &TorrentRecord, tops: Option<BTreeSet<String>>) -> Vec<
             whole
         })
 }
+
+// Test seam: a write of what a torrent holds is refused, 1 once its files
+// moved (`sync_held`), 2 before they move (`hold_destination`).
+#[cfg(test)]
+pub(crate) static SYNC_HELD_FAILS: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
 
 // `path` as the filesystem spells it, so two spellings of one place (through
 // a link, or in another case where the filesystem ignores case) are one:
@@ -8871,11 +9052,15 @@ pub(crate) fn held_tops<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<
         .collect()
 }
 
-// What a torrent holds where its files are (`torrent_held_paths`), each
-// path as [`held_key`] spells it, through any link to its folders: under the folder its files are in, the
-// first part of each of its files' and outputs' paths (`tops`), or that
-// whole folder while they are not known, and the folder claimed for it
-// when its files lie elsewhere. Reads the filesystem: run off the runtime.
+// What a torrent holds where its files are (`torrent_held_paths`), through
+// any link to its folders: under the folder its files are in, the first
+// part of each of its files' and outputs' paths (`tops`), or that whole
+// folder while they are not known, and the folder claimed for it when its
+// files lie elsewhere. A part there now is held as the filesystem spells
+// it ([`held_key`]: its case and form on disk, which an adopted folder may
+// spell otherwise than the metainfo); one not there yet is held as the
+// metainfo writes it, the name the torrent creates it by. Reads the
+// filesystem: run off the runtime.
 pub(crate) fn held_of(
     storage_dir: Option<&str>,
     files_dir: Option<&str>,
@@ -8888,7 +9073,7 @@ pub(crate) fn held_of(
     // what lies where it leads.
     let base = resolved(Path::new(base));
     let mut held: Vec<PathBuf> = match tops {
-        Some(tops) => tops.iter().map(|top| base.join(top)).collect(),
+        Some(tops) => tops.iter().map(|top| held_key(&base.join(top))).collect(),
         None => vec![base],
     };
     if let (Some(storage), Some(files)) = (storage_dir, files_dir)
@@ -8913,9 +9098,15 @@ pub(crate) struct LiveHeld {
 impl LiveHeld {
     // What the live torrents hold under `dirs`, in one read for every
     // folder of the call (`live_held_paths`), never a torrent's metainfo.
-    // Reads the filesystem: run off the runtime.
+    // Each folder is asked for as the filesystem spells it and as given:
+    // the rows an upgrade seeds hold a torrent's folder as its row typed it,
+    // until its first start writes them again as the filesystem spells
+    // them. Reads the filesystem: run off the runtime.
     pub(crate) fn under(db: &Database, dirs: &[PathBuf]) -> Result<Self, StateError> {
-        let keys: Vec<PathBuf> = dirs.iter().map(|dir| held_key(dir)).collect();
+        let mut keys: Vec<PathBuf> = dirs.iter().map(|dir| held_key(dir)).collect();
+        keys.extend(dirs.iter().cloned());
+        keys.sort();
+        keys.dedup();
         let mut held = Self::default();
         for path in db.live_held_paths(&keys)? {
             held.above
@@ -8926,13 +9117,17 @@ impl LiveHeld {
     }
 
     // Whether a live torrent holds `path`, is in it, or, for one that goes
-    // `whole`, holds anything in it, by the path as the filesystem spells it.
+    // `whole`, holds anything in it, by the path as the filesystem spells it
+    // or as given (`under`).
     fn holds(&self, path: &Path, whole: bool) -> bool {
         if self.paths.is_empty() {
             return false;
         }
         let key = held_key(path);
-        key.ancestors().any(|at| self.paths.contains(at)) || (whole && self.above.contains(&key))
+        [key.as_path(), path].into_iter().any(|path| {
+            path.ancestors().any(|at| self.paths.contains(at))
+                || (whole && self.above.contains(path))
+        })
     }
 }
 

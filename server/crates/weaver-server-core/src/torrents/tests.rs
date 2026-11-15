@@ -324,7 +324,9 @@ fn the_hosts_a_torrent_announces_to_outlive_it() {
             "torrent 5",
             b"d4:infodee",
             "/data/t5",
-            &more
+            None,
+            &more,
+            &[]
         )
         .unwrap()
     );

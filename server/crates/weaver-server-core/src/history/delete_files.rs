@@ -624,20 +624,27 @@ pub(crate) async fn delete_history_rows(
     // Every accepted id's record is gone now, including an id that had no
     // row. No pipeline state participates in a history deletion.
     let removed = delete_ids.iter().copied().collect::<BTreeSet<_>>();
-    let held = live_held(db, &listed_dirs).await;
-    if let Err(error) = &held {
-        warn!(%error, "could not read what live torrents hold; deleted torrents' files stay");
-    }
+    // Every job's scripts stop first; what live torrents hold is read once
+    // after, so no wait leaves that read stale before the files go.
     let mut deleted = BTreeMap::new();
+    let mut stopped = Vec::with_capacity(cleanup.len());
     for (job_id, dirs) in cleanup {
-        if let Err(error) = retry_script_stop_wait(job_id, || {
+        match retry_script_stop_wait(job_id, || {
             crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0)
         })
         .await
         {
-            deleted.insert(job_id, Err(crate::SchedulerError::State(error)));
-            continue;
+            Ok(()) => stopped.push((job_id, dirs)),
+            Err(error) => {
+                deleted.insert(job_id, Err(crate::SchedulerError::State(error)));
+            }
         }
+    }
+    let held = live_held(db, &listed_dirs).await;
+    if let Err(error) = &held {
+        warn!(%error, "could not read what live torrents hold; deleted torrents' files stay");
+    }
+    for (job_id, dirs) in stopped {
         match dirs.remove(intermediate_dir, job_id).await {
             Ok(RemovedWorkingDirs { left_in_place, .. }) => {
                 // A delete reports only what it left of the working

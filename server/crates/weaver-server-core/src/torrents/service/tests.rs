@@ -7025,6 +7025,49 @@ async fn a_slot_freed_without_a_pass_goes_out_at_the_next_settle() {
     assert_eq!(one.turns(&[c, d]).await, [(false, None), (false, Some(1))]);
 }
 
+// A removal whose mark is refused changes nothing of the queue: the
+// torrent keeps its slot and its rank, and the one behind it still waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_whose_mark_is_refused_keeps_its_slot() {
+    let one = OneSlot::new().await;
+    let service = &one.rig.service;
+    let [a, b] = [one.add(1).await, one.add(2).await];
+    assert_eq!(
+        one.turns(&[a, b]).await,
+        [(false, Some(1)), (true, Some(2))]
+    );
+    crate::torrents::persistence::MARK_REFUSED.store(2, Ordering::Relaxed);
+    let removed = service.remove(a, false, true).await;
+    crate::torrents::persistence::MARK_REFUSED.store(0, Ordering::Relaxed);
+    removed.expect_err("the removal fails");
+    service.settle().await;
+    assert_eq!(
+        one.turns(&[a, b]).await,
+        [(false, Some(1)), (true, Some(2))]
+    );
+}
+
+// A seed whose removal's mark is refused still seeds and still announces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seed_whose_removals_mark_is_refused_still_announces() {
+    let mut seeded = seeded().await;
+    let service = seeded.rig.service.clone();
+    crate::torrents::persistence::MARK_REFUSED.store(2, Ordering::Relaxed);
+    let removed = service.remove(seeded.job_id, false, true).await;
+    crate::torrents::persistence::MARK_REFUSED.store(0, Ordering::Relaxed);
+    removed.expect_err("the removal fails");
+    assert_eq!(seeded.view().await.state, TorrentState::Seeding);
+    let heard = seeded.answered.borrow_and_update().len();
+    service.reannounce(seeded.job_id).await.unwrap();
+    seeded
+        .answered
+        .wait_for(|answered| answered.len() > heard)
+        .await
+        .unwrap();
+    assert_eq!(seeded.view().await.state, TorrentState::Seeding);
+    seeded.stop().await;
+}
+
 // Two adds at once take their places in one order and can join the live
 // torrents in the other. The one that arrives after a torrent placed
 // behind it asks for a pass, and the next settle gives the slot and the

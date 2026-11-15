@@ -136,75 +136,41 @@ impl crate::persistence::DatabaseWriterExecutor {
 }
 
 impl Database {
-    // A removal's mark, before anything of the torrent goes: its history
-    // row kept on its row with no list, so a stop from then on brings it
-    // back retiring and the next start writes that row. One small UPDATE.
-    pub(crate) fn mark_torrent_retiring(&self, entry: &JobHistoryRow) -> Result<(), StateError> {
-        #[cfg(test)]
-        if MARK_REFUSED.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(StateError::OutOfSpace("database or disk is full".into()));
-        }
-        let (kept, id) = retiring_mark(entry, &[])?;
-        let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            SqlRuntime::execute(
-                datastore.write_exec(),
-                "UPDATE torrents SET retiring = {} WHERE job_id = {}",
-                &[SqlArg::Text(kept), SqlArg::I64(id)],
-            )
-            .await?;
-            Ok(())
-        })
-    }
-}
-
-// A removal's mark as its row keeps it, and the row's id.
-fn retiring_mark(
-    entry: &JobHistoryRow,
-    files: &[HistoryFile],
-) -> Result<(String, i64), StateError> {
-    let kept = serde_json::to_string(&Retiring {
-        history: entry.clone(),
-        files: files.to_vec(),
-    })
-    .map_err(|error| StateError::Database(error.to_string()))?;
-    Ok((kept, stored(entry.job_id)?))
-}
-
-impl crate::persistence::DatabaseWriterExecutor {
-    // A removal's history row the database's disk had no room for, kept on
-    // the torrent's own row: a stop before room comes leaves it there, and
-    // the next start writes it, as it archives an NZB job left terminal in
-    // the active table. The torrent's row goes once the history row is
-    // written, and this with it. One statement, the smallest write that
-    // keeps it, on a disk that just refused one.
-    pub(crate) fn keep_torrent_retiring(
+    // A removal's mark, before anything of the torrent goes: the flag that
+    // it is leaving, and whether its files go with it (`delete_files`). A
+    // stop from then on brings it back retiring, never live, and the next
+    // start finishes the removal from its row. One small UPDATE.
+    pub(crate) fn mark_torrent_retiring(
         &self,
-        entry: &JobHistoryRow,
-        files: &[HistoryFile],
+        job_id: JobId,
+        delete_files: bool,
     ) -> Result<(), StateError> {
         #[cfg(test)]
-        if KEEP_REFUSED.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(StateError::OutOfSpace("database or disk is full".into()));
+        match MARK_REFUSED.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => return Err(StateError::OutOfSpace("database or disk is full".into())),
+            2 => return Err(StateError::Database("the mark was refused".into())),
+            _ => {}
         }
-        let (kept, id) = retiring_mark(entry, files)?;
+        let args = vec![
+            SqlArg::Text(if delete_files { RETIRING_DELETED } else { RETIRING_KEPT }.to_owned()),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
                 datastore.write_exec(),
                 "UPDATE torrents SET retiring = {} WHERE job_id = {}",
-                &[SqlArg::Text(kept), SqlArg::I64(id)],
+                &args,
             )
             .await?;
             Ok(())
         })
     }
-}
 
-impl Database {
-    // Every torrent a removal left retiring, its kept history row and list
-    // as written, or why it does not read. Served by the retiring index.
-    pub(crate) fn retiring_torrents(&self) -> Result<Vec<(JobId, KeptRow)>, StateError> {
+    // Every torrent a removal left retiring, with what of its row finishing
+    // the removal takes, and the history row its job has, if any. One
+    // statement, served by the retiring index.
+    pub(crate) fn retiring_torrents(&self) -> Result<Vec<RetiringRow>, StateError> {
         #[cfg(test)]
         if RETIRING_READ_FAILS.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(StateError::Database(
@@ -215,80 +181,34 @@ impl Database {
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT job_id, retiring, name, storage_dir, files_dir, added_at_ms, \
-                 completed_at_ms FROM torrents WHERE retiring IS NOT NULL",
+                "SELECT t.job_id, t.retiring, t.name, t.infohash_v1, t.infohash_v2, t.metainfo, \
+                        t.storage_dir, t.files_dir, t.outputs, t.adopted, t.added_at_ms, \
+                        t.completed_at_ms, h.status AS had_status, \
+                        h.error_message AS had_error, h.total_bytes AS had_total, \
+                        h.downloaded_bytes AS had_downloaded, h.category AS had_category, \
+                        h.metadata AS had_metadata \
+                   FROM torrents t LEFT JOIN job_history h ON h.job_id = t.job_id \
+                  WHERE t.retiring IS NOT NULL",
                 &[],
             )
             .await?;
-            rows.iter()
-                .map(|row| {
-                    let job_id = JobId(count(row, "job_id")?);
-                    let kept = match serde_json::from_str::<Retiring>(&row.text("retiring")?) {
-                        Ok(kept) => Ok((kept.history, kept.files)),
-                        // A mark whose history row does not read is
-                        // written from what the torrent's row holds: its
-                        // name and folder, cancelled unless it completed,
-                        // listing nothing.
-                        Err(error) => {
-                            tracing::warn!(job_id = job_id.0, error = %error, "a removed torrent's kept history row does not read; its history is written from its row");
-                            let completed = row.opt_i64("completed_at_ms")?;
-                            Ok((
-                                JobHistoryRow {
-                                    job_id: job_id.0,
-                                    job_hash: None,
-                                    name: row.text("name")?,
-                                    status: if completed.is_some() { "complete" } else { "cancelled" }
-                                        .to_owned(),
-                                    error_message: None,
-                                    total_bytes: 0,
-                                    downloaded_bytes: 0,
-                                    optional_recovery_bytes: 0,
-                                    optional_recovery_downloaded_bytes: 0,
-                                    failed_bytes: 0,
-                                    health: 1000,
-                                    category: None,
-                                    output_dir: row
-                                        .opt_text("files_dir")?
-                                        .or(row.opt_text("storage_dir")?),
-                                    nzb_path: None,
-                                    created_at: row.i64("added_at_ms")? / 1000,
-                                    completed_at: completed.unwrap_or_else(|| row.i64("added_at_ms").unwrap_or(0)) / 1000,
-                                    metadata: None,
-                                    server_attribution: None,
-                                    protocol: crate::jobs::Protocol::Torrent,
-                                    archived_at: None,
-                                },
-                                Vec::new(),
-                            ))
-                        }
-                    };
-                    Ok((job_id, kept))
-                })
-                .collect()
+            rows.iter().map(retiring_row).collect()
         })
     }
 
-    // Start-up: each torrent a removal left retiring, its history row kept
-    // for want of room as the last run stopped, goes to history with that
-    // row and leaves the torrents: all in one transaction, and when that
-    // fails, each in its own, so one row that cannot be written holds back
-    // none of the others. A row left retiring never loads as a live torrent;
-    // the service shows it and writes it through the kept archives
-    // (`TorrentService::retry_retiring`). The jobs written.
-    pub(crate) fn archive_retiring_torrents(&self) -> Result<RetiringArchived, StateError> {
+    // Each of `rows`, a retiring torrent's history row and the files it
+    // lists, to history and out of the torrents: all in one transaction,
+    // and when that fails, each in its own, so one row that cannot be
+    // written holds back none of the others. A row left retiring never
+    // loads as a live torrent; the service shows it and writes it through
+    // the kept archives (`TorrentService::retry_retiring`).
+    pub(crate) fn archive_retiring_torrents(
+        &self,
+        rows: Vec<(JobId, JobHistoryRow, Vec<HistoryFile>)>,
+    ) -> RetiringArchived {
         let mut archived = RetiringArchived::default();
-        let mut rows = Vec::new();
-        for (job_id, kept) in self.retiring_torrents()? {
-            match kept {
-                Ok((history, files)) => rows.push((job_id, history, files)),
-                Err(error) => {
-                    tracing::warn!(job_id = job_id.0, error = %error, "a removed torrent's kept history row does not read; it stays retiring");
-                    archived.left.push(job_id);
-                }
-            }
-        }
         if rows.is_empty() {
-            return Ok(archived);
+            return archived;
         }
         match self.write_retiring(&rows) {
             Ok(written) => archived.written = written,
@@ -306,7 +226,7 @@ impl Database {
                 }
             }
         }
-        Ok(archived)
+        archived
     }
 
     // `rows` to history, out of the torrents, in one transaction.
@@ -352,14 +272,9 @@ impl Database {
 pub(crate) static RETIRING_REFUSED: std::sync::Mutex<Vec<JobId>> =
     std::sync::Mutex::new(Vec::new());
 
-// Test seams: a removal's mark is refused; a removal's row kept for room
-// is refused on the torrent.
+// Test seam: a removal's mark is refused, 1 for want of room, 2 otherwise.
 #[cfg(test)]
-pub(crate) static MARK_REFUSED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-#[cfg(test)]
-pub(crate) static KEEP_REFUSED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub(crate) static MARK_REFUSED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 // Test seam: the retiring torrents do not read.
 #[cfg(test)]
@@ -374,15 +289,80 @@ pub(crate) struct RetiringArchived {
     pub(crate) left: Vec<JobId>,
 }
 
-// A retiring torrent's kept history row and the files it lists, or why
-// that does not read.
-pub(crate) type KeptRow = Result<(JobHistoryRow, Vec<HistoryFile>), String>;
+// The marks a removal leaves on a torrent's row: its files kept, or asked
+// to go with it.
+pub(crate) const RETIRING_KEPT: &str = "kept";
+pub(crate) const RETIRING_DELETED: &str = "deleted";
 
-// A removal's history row kept on the torrent, with the files it lists.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Retiring {
-    history: JobHistoryRow,
-    files: Vec<HistoryFile>,
+// A retiring torrent's row, as finishing its removal at a start reads it.
+#[derive(Debug)]
+pub(crate) struct RetiringRow {
+    pub(crate) job_id: JobId,
+    // Whether its removal asked for its files.
+    pub(crate) delete_files: bool,
+    pub(crate) metainfo: Option<Vec<u8>>,
+    pub(crate) storage_dir: Option<String>,
+    pub(crate) files_dir: Option<String>,
+    // None when it does not read.
+    pub(crate) outputs: Option<Vec<String>>,
+    pub(crate) adopted: Option<super::model::Adopted>,
+    // Its history row as its torrents row gives it, kept from the one its
+    // job has where there is one (a failed finish's status and why).
+    pub(crate) history: JobHistoryRow,
+}
+
+fn retiring_row(row: &crate::persistence::sql_runtime::SqlRow) -> Result<RetiringRow, StateError> {
+    let job_id = JobId(count(row, "job_id")?);
+    let completed = row.opt_i64("completed_at_ms")?;
+    let added = row.i64("added_at_ms")?;
+    let hash = row
+        .opt_bytes("infohash_v1")?
+        .or(row.opt_bytes("infohash_v2")?);
+    let had = row.opt_text("had_status")?;
+    let status = had.clone().unwrap_or_else(|| {
+        if completed.is_some() { "complete" } else { "cancelled" }.to_owned()
+    });
+    let storage_dir = row.opt_text("storage_dir")?;
+    let history = JobHistoryRow {
+        job_id: job_id.0,
+        job_hash: hash,
+        name: row.text("name")?,
+        status,
+        error_message: if had.is_some() { row.opt_text("had_error")? } else { None },
+        total_bytes: row.opt_i64("had_total")?.map_or(0, |bytes| bytes.max(0) as u64),
+        downloaded_bytes: row
+            .opt_i64("had_downloaded")?
+            .map_or(0, |bytes| bytes.max(0) as u64),
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: row.opt_text("had_category")?,
+        output_dir: storage_dir.clone(),
+        nzb_path: None,
+        created_at: added / 1000,
+        completed_at: completed.unwrap_or(added) / 1000,
+        metadata: row.opt_text("had_metadata")?,
+        server_attribution: None,
+        protocol: crate::jobs::Protocol::Torrent,
+        archived_at: None,
+    };
+    Ok(RetiringRow {
+        job_id,
+        delete_files: row.text("retiring")? == RETIRING_DELETED,
+        metainfo: row.opt_bytes("metainfo")?,
+        storage_dir,
+        files_dir: row.opt_text("files_dir")?,
+        outputs: match row.opt_text("outputs")? {
+            Some(text) => serde_json::from_str(&text).ok(),
+            None => Some(Vec::new()),
+        },
+        adopted: match row.opt_text("adopted")? {
+            Some(text) => serde_json::from_str(&text).ok(),
+            None => Some(super::model::Adopted::default()),
+        },
+        history,
+    })
 }
 
 // A file a torrent's job wrote, as its history row lists it: an absolute
@@ -704,6 +684,31 @@ impl Database {
                         )
                         .await?;
                     }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    // `held` added to what the torrent holds, before its files move there,
+    // and what it holds marked to be written again, in one transaction: a
+    // file that reaches the new folder is held from the moment it does, and
+    // a move that never ends leaves the next start to write what it holds.
+    pub(crate) fn add_torrent_held(&self, job_id: JobId, held: &[String]) -> Result<(), StateError> {
+        let id = stored(job_id.0)?;
+        let held = held.to_vec();
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "add_torrent_held", |tx| {
+                let held = held.clone();
+                Box::pin(async move {
+                    insert_held_tx(tx, id, &held).await?;
+                    tx.execute(
+                        "UPDATE torrents SET held_set = {} WHERE job_id = {}",
+                        &[SqlArg::Bool(false), SqlArg::I64(id)],
+                    )
+                    .await?;
                     Ok(())
                 })
             })
@@ -1338,8 +1343,12 @@ impl Database {
     }
 
     // A magnet's metainfo once its peers sent it: the hashes and name it
-    // carries, the file, the directory its files go to, and the files and
-    // trackers it lists. Returns whether the torrent exists.
+    // carries, the file, the directory its files go to and the folder they
+    // sit in when that is not it, the files and trackers it lists, and what
+    // it holds there (`torrent_held_paths`), all in one transaction: a crash
+    // leaves the torrent holding its whole folder as a magnet does, or what
+    // its files are, never a row with the files known and the paths not.
+    // Returns whether the torrent exists.
     #[allow(clippy::too_many_arguments)]
     pub fn set_torrent_metainfo(
         &self,
@@ -1349,7 +1358,9 @@ impl Database {
         name: &str,
         metainfo: &[u8],
         storage_dir: &str,
+        files_dir: Option<&str>,
         trackers: &[TrackerEntry],
+        held: &[String],
     ) -> Result<bool, StateError> {
         let id = stored(job_id.0)?;
         let head = vec![
@@ -1358,19 +1369,23 @@ impl Database {
             SqlArg::Text(name.to_owned()),
             SqlArg::Bytes(metainfo.to_vec()),
             SqlArg::Text(storage_dir.to_owned()),
+            SqlArg::OptText(files_dir.map(str::to_owned)),
+            SqlArg::Bool(true),
             SqlArg::I64(id),
         ];
         let trackers = trackers.to_vec();
+        let held = held.to_vec();
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "set_torrent_metainfo", |tx| {
                 let head = head.clone();
                 let trackers = trackers.clone();
+                let held = held.clone();
                 Box::pin(async move {
                     let changed = tx
                         .execute(
                             "UPDATE torrents SET infohash_v1 = {}, infohash_v2 = {}, name = {}, metainfo = {},
-                                     storage_dir = {}
+                                     storage_dir = {}, files_dir = {}, held_set = {}
                               WHERE job_id = {}",
                             &head,
                         )
@@ -1384,6 +1399,12 @@ impl Database {
                     )
                     .await?;
                     insert_trackers(tx, id, &trackers).await?;
+                    tx.execute(
+                        "DELETE FROM torrent_held_paths WHERE job_id = {}",
+                        &[SqlArg::I64(id)],
+                    )
+                    .await?;
+                    insert_held_tx(tx, id, &held).await?;
                     Ok(true)
                 })
             })
@@ -1391,15 +1412,17 @@ impl Database {
         })
     }
 
-    // The directory a torrent's files now live under. Returns whether the
-    // torrent exists.
+    // The directory a torrent's files now live under. What it holds is
+    // marked to be written again in the same statement, so a crash before
+    // that write leaves the next start to write it (`held_set`). Returns
+    // whether the torrent exists.
     pub fn set_torrent_storage_dir(&self, job_id: JobId, dir: &str) -> Result<bool, StateError> {
         let args = vec![SqlArg::Text(dir.to_owned()), SqlArg::I64(stored(job_id.0)?)];
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
                 datastore.write_exec(),
-                "UPDATE torrents SET storage_dir = {} WHERE job_id = {}",
+                "UPDATE torrents SET storage_dir = {}, held_set = FALSE WHERE job_id = {}",
                 &args,
             )
             .await?;
@@ -1469,7 +1492,9 @@ impl Database {
         self.set_torrent_column("first_last_piece_first", args)
     }
 
-    // Where the torrent's files sit when not in its storage directory.
+    // Where the torrent's files sit when not in its storage directory,
+    // what it holds marked to be written again as `set_torrent_storage_dir`
+    // marks it.
     pub fn set_torrent_files_dir(
         &self,
         job_id: JobId,
@@ -1479,7 +1504,16 @@ impl Database {
             SqlArg::OptText(dir.map(str::to_owned)),
             SqlArg::I64(stored(job_id.0)?),
         ];
-        self.set_torrent_column("files_dir", args)
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE torrents SET files_dir = {}, held_set = FALSE WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
     }
 
     // The directory the torrent's files go under, as asked or as it moved.

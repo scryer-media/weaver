@@ -1176,8 +1176,13 @@ fn history_row(job_id: JobId, dir: &Path, protocol: crate::jobs::Protocol) -> cr
 // A torrent removed keeping its files, and another seeding one of them in
 // place through the folder spelled as `spell` spells it: an archive of the
 // first one's entry takes its other files and leaves the one the live
-// torrent holds, whatever the spelling.
-async fn an_archive_leaves_what_a_torrent_seeds_through(spell: impl Fn(&Path) -> PathBuf) {
+// torrent holds, whatever the spelling. Where the filesystem makes that
+// spelling another folder (`same_place` false), the live torrent seeds a
+// copy there, and the archive takes all of the first one's files.
+async fn an_archive_leaves_what_a_torrent_seeds_through(
+    spell: impl Fn(&Path) -> PathBuf,
+    same_place: bool,
+) {
     let rig = rig(set_clock());
     on_loopback(&rig.routes);
     rig.service.open().await.unwrap();
@@ -1207,6 +1212,11 @@ async fn an_archive_leaves_what_a_torrent_seeds_through(spell: impl Fn(&Path) ->
     let inner = dir.join("set");
     let spelled = spell(&inner);
     assert_ne!(spelled, inner);
+    if !same_place {
+        assert!(!spelled.exists(), "another folder");
+        std::fs::create_dir_all(&spelled).unwrap();
+        std::fs::write(spelled.join("a.bin"), shared).unwrap();
+    }
     assert!(spelled.join("a.bin").exists());
 
     let (seeder, _) = seeding_placed(
@@ -1227,7 +1237,12 @@ async fn an_archive_leaves_what_a_torrent_seeds_through(spell: impl Fn(&Path) ->
         "{:?}",
         archived.message
     );
-    assert_eq!(std::fs::read(inner.join("a.bin")).unwrap(), shared);
+    if same_place {
+        assert_eq!(std::fs::read(inner.join("a.bin")).unwrap(), shared);
+    } else {
+        assert!(!inner.join("a.bin").exists(), "its own copy goes");
+        assert_eq!(std::fs::read(spelled.join("a.bin")).unwrap(), shared);
+    }
     assert!(!inner.join("b.bin").exists());
     assert!(rig.service.torrent(seeder).await.is_some());
     rig.service.stop().await;
@@ -1240,24 +1255,26 @@ async fn an_archive_leaves_a_file_a_live_torrent_seeds_through_a_linked_folder()
         let link = inner.parent().unwrap().parent().unwrap().join("linked-set");
         std::os::unix::fs::symlink(inner, &link).unwrap();
         link
-    })
+    }, true)
     .await;
 }
 
-// Run only where the filesystem the test runs on ignores case, as told by
-// that filesystem: a file made in one case found in the other.
+// Where the filesystem the test runs on ignores case, as told by that
+// filesystem (a file made in one case found in the other), the other case
+// is the same folder and its file stays; where it keeps case apart, it is
+// another folder, and the archive takes the first torrent's own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_archive_leaves_a_file_a_live_torrent_seeds_through_another_case() {
     let probe = tempfile::tempdir().unwrap();
     std::fs::write(probe.path().join("case-probe"), b"").unwrap();
-    if !probe.path().join("CASE-PROBE").exists() {
-        eprintln!("this filesystem keeps case apart: nothing to check");
-        return;
-    }
-    an_archive_leaves_what_a_torrent_seeds_through(|inner| {
-        let name = inner.file_name().unwrap().to_string_lossy().to_uppercase();
-        inner.with_file_name(name)
-    })
+    let ignores_case = probe.path().join("CASE-PROBE").exists();
+    an_archive_leaves_what_a_torrent_seeds_through(
+        |inner| {
+            let name = inner.file_name().unwrap().to_string_lossy().to_uppercase();
+            inner.with_file_name(name)
+        },
+        ignores_case,
+    )
     .await;
 }
 
@@ -1326,17 +1343,18 @@ async fn a_torrent_added_over_an_nzb_jobs_folder_leaves_it_the_nzb_jobs() {
     );
 }
 
-// A removal whose mark the database refuses fails, says so, and removes
-// nothing: the torrent stays live with its files.
+// A removal whose mark the database refuses for a reason other than room
+// fails, says so, and changes nothing: the torrent stays live with its
+// files, its row unmarked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_removal_whose_mark_is_refused_removes_nothing() {
     let rig = rig(set_clock());
     rig.service.open().await.unwrap();
     let (job_id, dir) = with_every_piece(&rig).await;
     let files = files_under(&dir);
-    crate::torrents::persistence::MARK_REFUSED.store(true, Ordering::Relaxed);
+    crate::torrents::persistence::MARK_REFUSED.store(2, Ordering::Relaxed);
     let removed = rig.service.remove(job_id, true, true).await;
-    crate::torrents::persistence::MARK_REFUSED.store(false, Ordering::Relaxed);
+    crate::torrents::persistence::MARK_REFUSED.store(0, Ordering::Relaxed);
     let error = removed.expect_err("the removal fails");
     assert!(
         error.to_string().contains("could not be recorded"),
@@ -1345,14 +1363,65 @@ async fn a_removal_whose_mark_is_refused_removes_nothing() {
     assert_eq!(files_under(&dir), files, "nothing is deleted");
     assert!(rig.service.torrent(job_id).await.is_some(), "still live");
     assert!(rig.db.get_torrent(job_id).unwrap().is_some());
+    assert_eq!(
+        rig.db.torrent_rows().unwrap(),
+        (vec![job_id], Vec::new()),
+        "its row is not marked"
+    );
     assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
     rig.service.stop().await;
 }
 
+// A removal whose mark finds no room on the database's disk goes on, as a
+// removal did before marks: its files go, and its history row waits for
+// room through the kept archives and is written once there is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_whose_mark_finds_no_room_goes_on() {
+    use crate::persistence::ArchiveNews;
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (news, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    rig.db.hear_archive_news(move |said| {
+        let _ = news.send(said);
+    });
+    let (job_id, dir) = with_every_piece(&rig).await;
+    let mut retired = rig.service.retired();
+    crate::persistence::connection::ARCHIVE_REFUSED
+        .lock()
+        .unwrap()
+        .push_back(crate::StateError::OutOfSpace(
+            "database or disk is full".into(),
+        ));
+    crate::torrents::persistence::MARK_REFUSED.store(1, Ordering::Relaxed);
+    let removed = rig.service.remove(job_id, true, true).await;
+    crate::torrents::persistence::MARK_REFUSED.store(0, Ordering::Relaxed);
+    removed.unwrap();
+    assert_eq!(heard.recv().await, Some(ArchiveNews::Kept(job_id)));
+    assert!(rig.service.torrent(job_id).await.is_none(), "not live");
+    assert!(files_under(&dir).is_empty(), "its files went");
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+
+    rig.db.retry_kept_archives(0);
+    assert_eq!(
+        heard.recv().await,
+        Some(ArchiveNews::LetGo {
+            job_id,
+            written: true
+        })
+    );
+    retired.wait_for(|retired| *retired >= 1).await.unwrap();
+    assert_eq!(
+        rig.db.get_job_history(job_id.0).unwrap().unwrap().status,
+        "complete"
+    );
+    assert!(rig.db.get_torrent(job_id).unwrap().is_none());
+    rig.service.stop().await;
+}
+
 // A removal with its files on a full disk: the mark lands first, the files
-// go, then neither the history row nor its kept copy finds room, and the
-// server stops. The next start archives it from the mark, and it never
-// comes back live to download again.
+// go, then the history row finds no room, and the server stops. The next
+// start archives it from its row, and it never comes back live to download
+// again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stop_after_a_removals_files_went_brings_it_back_retiring() {
     use crate::persistence::ArchiveNews;
@@ -1369,11 +1438,9 @@ async fn a_stop_after_a_removals_files_went_brings_it_back_retiring() {
         .push_back(crate::StateError::OutOfSpace(
             "database or disk is full".into(),
         ));
-    crate::torrents::persistence::KEEP_REFUSED.store(true, Ordering::Relaxed);
     rig.service.remove(job_id, true, true).await.unwrap();
     assert_eq!(heard.recv().await, Some(ArchiveNews::Kept(job_id)));
     rig.service.stop().await;
-    crate::torrents::persistence::KEEP_REFUSED.store(false, Ordering::Relaxed);
     assert!(files_under(&dir).is_empty(), "its files went");
     assert!(rig.db.get_torrent(job_id).unwrap().is_some());
     assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
@@ -1386,7 +1453,7 @@ async fn a_stop_after_a_removals_files_went_brings_it_back_retiring() {
     assert_eq!(
         rig.db.get_job_history(job_id.0).unwrap().unwrap().status,
         "complete",
-        "the row its mark kept"
+        "the status its row records"
     );
     assert!(rig.db.get_torrent(job_id).unwrap().is_none());
     let restarted = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
@@ -1530,4 +1597,294 @@ fn a_recorded_folder_that_is_a_link_is_not_managed() {
     assert_eq!(removal.removed, 0);
     assert_eq!(removal.not_managed, vec![dir.clone()]);
     assert!(real.join("a.bin").exists());
+}
+
+// What `held_of` writes for a torrent whose files' top-level folder is
+// `top`, over a folder already there as `on_disk`, as the history side
+// reads it.
+fn held_over(on_disk: &str, top: &str) -> (tempfile::TempDir, LiveHeld) {
+    let base = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(base.path().join(on_disk)).unwrap();
+    std::fs::write(base.path().join(on_disk).join("a.bin"), b"a").unwrap();
+    let tops = std::collections::BTreeSet::from([top.to_owned()]);
+    let written = held_of(base.path().to_str(), None, Some(&tops));
+    let mut held = LiveHeld::default();
+    for path in written.into_iter().map(PathBuf::from) {
+        held.above
+            .extend(path.ancestors().skip(1).map(Path::to_path_buf));
+        held.paths.insert(path);
+    }
+    (base, held)
+}
+
+// An adopted folder spelled `set` on disk, its metainfo naming it `Set`:
+// where the filesystem ignores case it is the folder the torrent holds, as
+// the filesystem spells it; where it keeps case apart, `Set` is another
+// folder, and the one on disk is not held.
+#[test]
+fn an_adopted_top_level_name_in_another_case_is_held_where_case_is_ignored() {
+    let (base, held) = held_over("set", "Set");
+    let file = base.path().join("set").join("a.bin");
+    let same = base.path().join("Set").exists();
+    assert_eq!(held.holds(&file, false), same);
+    assert_eq!(held.holds(&base.path().join("set"), true), same);
+}
+
+// An adopted folder whose name is on disk decomposed (NFD), its metainfo
+// naming it composed (NFC): where the filesystem finds one by the other it
+// is the folder the torrent holds; where it keeps them apart, it is not.
+#[test]
+fn an_adopted_top_level_name_in_another_unicode_form_is_held_where_forms_are_one() {
+    let (nfd, nfc) = ("e\u{301}te", "\u{e9}te");
+    let (base, held) = held_over(nfd, nfc);
+    let file = base.path().join(nfd).join("a.bin");
+    let same = base.path().join(nfc).exists();
+    assert_eq!(held.holds(&file, false), same);
+    // And the other way about.
+    let (base, held) = held_over(nfc, nfd);
+    let file = base.path().join(nfc).join("a.bin");
+    let same = base.path().join(nfd).exists();
+    assert_eq!(held.holds(&file, false), same);
+}
+
+// A stop after a removal's mark landed and before anything of the torrent
+// went (a crash between the two, the torrent's row marked and nothing
+// else): the next start finishes the removal from the row. Asked with its
+// files, its files and its unpacking folder go; kept, they stay, its kept
+// unpacking folder listed on its history row so the start's sweep leaves
+// it. Either way its history row is written from its torrents row, and it
+// never comes back live.
+async fn a_crash_after_the_mark_is_finished_at_the_next_start(delete_files: bool) {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (job_id, dir) = with_every_piece(&rig).await;
+    let files = files_under(&dir);
+    let work = rig.dir.path().join("work");
+    let unpacking = unpacking_dir(&work, job_id);
+    crate::jobs::working_dir::claim_named_working_dir(&work, &unpacking, job_id).unwrap();
+    std::fs::write(unpacking.join("set.part1.rar"), b"kept").unwrap();
+    rig.service.stop().await;
+    rig.db.mark_torrent_retiring(job_id, delete_files).unwrap();
+
+    let data = rig.dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    crate::operations::recover_server_state(&rig.db, &data, &work)
+        .await
+        .unwrap();
+    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert_eq!(history.status, "complete", "its row says it completed");
+    assert_eq!(history.protocol, crate::jobs::Protocol::Torrent);
+    assert!(rig.db.get_torrent(job_id).unwrap().is_none());
+    let listed: Vec<PathBuf> = rig.db.job_history_files(&[job_id]).unwrap()
+        .remove(&job_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|file| PathBuf::from(file.path))
+        .collect();
+    if delete_files {
+        assert!(files_under(&dir).is_empty(), "its files went");
+        assert!(!unpacking.exists(), "its unpacking folder went");
+    } else {
+        assert_eq!(files_under(&dir), files, "its files stay");
+        assert!(
+            unpacking.join("set.part1.rar").exists(),
+            "the sweep leaves its kept unpacking folder"
+        );
+        let unpacking = std::fs::canonicalize(&unpacking).unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|path| std::fs::canonicalize(path).ok().as_ref() == Some(&unpacking)),
+            "{listed:?}"
+        );
+    }
+    let restarted = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    restarted.open().await.unwrap();
+    assert!(restarted.torrent(job_id).await.is_none(), "never live");
+    restarted.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_after_a_removals_mark_with_its_files_deletes_them_at_the_next_start() {
+    a_crash_after_the_mark_is_finished_at_the_next_start(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_after_a_removals_mark_keeping_its_files_keeps_them_at_the_next_start() {
+    a_crash_after_the_mark_is_finished_at_the_next_start(false).await;
+}
+
+// A start while another live torrent holds a file the retiring one's
+// removal asked to go: that file stays, the rest go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_after_the_mark_leaves_what_a_live_torrent_holds() {
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let shared = [1_u8; 3000];
+    let other = [2_u8; 3000];
+    let whole: Vec<u8> = shared.iter().chain(other.iter()).copied().collect();
+    let first = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(metainfo(
+            "set",
+            &[("set/a.bin", &shared), ("set/b.bin", &other)],
+            1000,
+            false,
+        ))))
+        .await
+        .unwrap();
+    fetch_every_piece(&rig.service, first, &whole).await;
+    let dir = PathBuf::from(rig.service.torrent(first).await.unwrap().storage_dir.unwrap());
+    let inner = dir.join("set");
+    let (seeder, _) = seeding_placed(
+        &rig,
+        metainfo("a.bin", &[("a.bin", &shared)], 1000, false),
+        Placement {
+            save_path: Some(inner.to_string_lossy().into_owned()),
+            layout: Some(ContentLayout::NoSubfolder),
+            ..Placement::default()
+        },
+    )
+    .await;
+    rig.service.stop().await;
+    rig.db.mark_torrent_retiring(first, true).unwrap();
+
+    let data = rig.dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    crate::operations::recover_server_state(&rig.db, &data, &rig.dir.path().join("work"))
+        .await
+        .unwrap();
+    assert!(rig.db.get_job_history(first.0).unwrap().is_some());
+    assert_eq!(std::fs::read(inner.join("a.bin")).unwrap(), shared);
+    assert!(!inner.join("b.bin").exists());
+    assert!(rig.db.get_torrent(seeder).unwrap().is_some());
+}
+
+// Whether the torrents row of `job_id` says its held paths are its own.
+fn held_set(rig: &Rig, job_id: JobId) -> bool {
+    rig.db
+        .restored_torrents()
+        .unwrap()
+        .into_iter()
+        .find(|torrent| torrent.record.job_id == job_id)
+        .unwrap()
+        .held_set
+}
+
+// Whether a live torrent holds every file under `dir`, as a history
+// removal from `dir` reads it.
+fn holds_all(rig: &Rig, dir: &Path) -> bool {
+    let held = LiveHeld::under(&rig.db, &[dir.to_path_buf()]).unwrap();
+    let files = files_under(dir);
+    !files.is_empty() && files.iter().all(|file| held.holds(file, false))
+}
+
+// A magnet before its metainfo arrives holds its whole folder, and its row
+// says its paths are not yet its own, so the next start writes them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_magnet_before_its_metainfo_holds_its_whole_folder() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    rig.routes.set_down(Some("tunnel gone"));
+    let hash = "0123456789abcdef0123456789abcdef01234567";
+    let magnet = format!("magnet:?xt=urn:btih:{hash}&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce");
+    let job_id = rig
+        .service
+        .add(request(AddSource::Magnet(magnet)))
+        .await
+        .unwrap();
+    assert!(!held_set(&rig, job_id));
+    if let Some(dir) = rig.db.get_torrent(job_id).unwrap().unwrap().storage_dir {
+        let dir = PathBuf::from(dir);
+        let held = LiveHeld::under(&rig.db, &[dir.clone()]).unwrap();
+        assert!(held.holds(&dir.join("anything.bin"), false));
+    }
+    rig.service.stop().await;
+}
+
+// A torrent whose row knows its files and holds none of them (a crash
+// between writes that once came apart, set up here by state): the next
+// start writes what it holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_with_its_files_known_and_no_held_paths_is_written_at_the_next_start() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (job_id, dir) = with_every_piece(&rig).await;
+    assert!(held_set(&rig, job_id));
+    assert!(holds_all(&rig, &dir));
+    rig.service.stop().await;
+    rig.db.set_torrents_held(&[(job_id, Vec::new())]).unwrap();
+    rig.db
+        .set_torrent_storage_dir(job_id, &dir.to_string_lossy())
+        .unwrap();
+    assert!(!held_set(&rig, job_id), "a folder's write marks it");
+    assert!(!holds_all(&rig, &dir));
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    assert!(held_set(&rig, job_id));
+    assert!(holds_all(&rig, &dir));
+    again.stop().await;
+}
+
+// A move whose write of what the torrent holds after it fails: the
+// destination was held before the first file moved there, and the row
+// says its paths are to be written again at the next start, never rows
+// marked good that are not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_move_whose_held_write_fails_leaves_the_destination_held_and_unset() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (job_id, dir) = with_every_piece(&rig).await;
+    let elsewhere = rig.dir.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    crate::torrents::service::SYNC_HELD_FAILS.store(1, Ordering::Relaxed);
+    let moved = rig
+        .service
+        .set_location(job_id, elsewhere.to_string_lossy().into_owned())
+        .await;
+    crate::torrents::service::SYNC_HELD_FAILS.store(0, Ordering::Relaxed);
+    moved.unwrap();
+    let there = PathBuf::from(rig.service.torrent(job_id).await.unwrap().storage_dir.unwrap());
+    assert_ne!(there, dir);
+    assert!(there.starts_with(&elsewhere));
+    assert!(!held_set(&rig, job_id));
+    assert!(holds_all(&rig, &there));
+    rig.service.stop().await;
+}
+
+// A move whose destination cannot be held before its files move there
+// moves nothing and says so: a file reaches the destination only once the
+// destination is held. The torrent can be moved again after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_move_whose_destination_cannot_be_held_moves_nothing() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (job_id, dir) = with_every_piece(&rig).await;
+    let files = files_under(&dir);
+    let elsewhere = rig.dir.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    crate::torrents::service::SYNC_HELD_FAILS.store(2, Ordering::Relaxed);
+    let moved = rig
+        .service
+        .set_location(job_id, elsewhere.to_string_lossy().into_owned())
+        .await;
+    crate::torrents::service::SYNC_HELD_FAILS.store(0, Ordering::Relaxed);
+    let error = moved.expect_err("the move is refused");
+    assert!(error.to_string().contains("not moved"), "{error}");
+    assert_eq!(files_under(&dir), files, "nothing moved");
+    assert!(files_under(&elsewhere).is_empty());
+    assert_eq!(
+        rig.service.torrent(job_id).await.unwrap().storage_dir.map(PathBuf::from),
+        Some(dir.clone())
+    );
+    rig.service
+        .set_location(job_id, elsewhere.to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    let there = PathBuf::from(rig.service.torrent(job_id).await.unwrap().storage_dir.unwrap());
+    assert!(held_set(&rig, job_id));
+    assert!(holds_all(&rig, &there));
+    rig.service.stop().await;
 }

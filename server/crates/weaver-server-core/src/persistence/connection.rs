@@ -1165,7 +1165,6 @@ async fn execute_write_command(
             }
             let blocking = writer.clone();
             let failures = Arc::clone(&writer_db.checkpoint_failures);
-            let kept_files = Arc::clone(&files);
             let refused = tokio::task::spawn_blocking(move || {
                 let mut archive = KeptArchive {
                     job_id,
@@ -1185,23 +1184,6 @@ async fn execute_write_command(
             if let Some((archive, error)) = refused
                 && keeps_archive(&writer_db.target, &error)
             {
-                // A removal's row is kept on the torrent too, so a stop
-                // before room comes leaves it for the next start to write.
-                if retires {
-                    let blocking = writer.clone();
-                    let entry = archive.history.clone();
-                    let marked = tokio::task::spawn_blocking(move || {
-                        blocking.keep_torrent_retiring(&entry, &kept_files)
-                    })
-                    .await;
-                    if let Ok(Err(error)) = marked {
-                        tracing::warn!(
-                            job_id = job_id.0,
-                            error = %error,
-                            "could not keep a removed torrent's history list on the torrent; a stop before room comes writes its row without the list"
-                        );
-                    }
-                }
                 // Told before its waiter hears it is kept, so whoever counts
                 // the kept archives has counted it by then.
                 writer_db.kept_archives.list().push_back(archive);
