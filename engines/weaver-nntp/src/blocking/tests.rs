@@ -18,6 +18,7 @@ use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 mod buffer_cap;
 mod group_discovery;
 mod idle;
+mod login_refusal;
 mod socket_use;
 
 enum TestArticle {
@@ -2350,8 +2351,9 @@ fn a_drop_after_a_pipelined_answer_reports_the_pipelined_answer() {
 }
 
 // A server that refuses the in-place login poisons the connection. The lane
-// says so through its window, the article stays merely unanswered, and the
-// refusal is classified exactly as a dial's login reply is.
+// says so through its window, the article the 480 asked the login for takes
+// the refusal, told as a refused login, and the refusal is classified
+// exactly as a dial's login reply is.
 #[test]
 fn a_refused_reauth_poisons_the_connection() {
     const REFUSAL: &[u8] = b"481 authentication failed\r\n";
@@ -2365,7 +2367,18 @@ fn a_refused_reauth_poisons_the_connection() {
     let (first, _) = lane.ring_read_next().unwrap();
     assert_eq!(ring_payload(&first), vec![0x41; 256]);
     let (second, meta) = lane.ring_read_next().unwrap();
-    assert!(is_session_expired(&second), "got {:?}", second.result);
+    assert!(
+        matches!(
+            second.result,
+            Err(DecodedBodyError::Nntp(NntpError::AuthenticationFailed))
+        ),
+        "got {:?}",
+        second.result
+    );
+    assert_eq!(
+        second.attempts[0].outcome,
+        crate::client::FetchAttemptOutcome::AuthenticationFailure
+    );
     assert!(meta.connection_discarded);
     assert!(!lane.is_healthy());
     assert!(lane.ring_is_closed());
@@ -2398,10 +2411,11 @@ fn a_refused_reauth_poisons_the_connection() {
     handle.join().unwrap();
 }
 
-// Without credentials there is nothing to log in again with, and no later
-// dial is asked for any: the server asks at the BODY. So a 480 here is the
-// server refusing the account, as on a sequential BODY, and the connection
-// is dropped. Told as an expired session it was asked again without end.
+// With no account configured the dial sends no login, and a 480 at a BODY
+// is the server asking for one. It is asked as for an expired session: once
+// the replies queued behind the 480 are read, the lane logs in on the same
+// socket with an empty name and password, and the server that takes them
+// serves the next BODY. The article the 480 answered spends no try.
 #[test]
 fn a_480_on_an_anonymous_connection_is_the_server_asking_for_a_login() {
     let (port, seen, handle) = spawn_reauth_server(
@@ -2409,8 +2423,9 @@ fn a_480_on_an_anonymous_connection_is_the_server_asking_for_a_login() {
             Scripted::Body(vec![0x51; 256]),
             Scripted::Expire,
             Scripted::Body(vec![0x53; 256]),
+            Scripted::Body(vec![0x54; 256]),
         ],
-        Vec::new(),
+        vec![b"281 ok\r\n"],
     );
     let mut config = reauth_config(port);
     config.username = None;
@@ -2421,25 +2436,78 @@ fn a_480_on_an_anonymous_connection_is_the_server_asking_for_a_login() {
     let (first, _) = lane.ring_read_next().unwrap();
     assert_eq!(ring_payload(&first), vec![0x51; 256]);
     let (second, meta) = lane.ring_read_next().unwrap();
-    let Err(DecodedBodyError::Nntp(error)) = &second.result else {
-        panic!("got {:?}", second.result);
-    };
-    assert!(
-        matches!(error, NntpError::AuthenticationRequired),
-        "got {error:?}"
+    assert!(is_session_expired(&second), "got {:?}", second.result);
+    assert!(!meta.connection_discarded);
+    assert!(lane.holds_new_requests());
+    let (third, meta) = lane.ring_read_next().unwrap();
+    assert_eq!(ring_payload(&third), vec![0x53; 256]);
+    assert!(!meta.connection_discarded);
+    assert!(!lane.holds_new_requests(), "logged in on the last read");
+    assert!(lane.is_healthy());
+
+    issue_all(&mut lane, &["<4@t>"]);
+    let (fourth, _) = lane.ring_read_next().unwrap();
+    assert_eq!(ring_payload(&fourth), vec![0x54; 256]);
+
+    lane.park();
+    handle.join().unwrap();
+    let seen = seen.lock().unwrap().clone();
+    let bodies = positions(&seen, "BODY");
+    let users = positions(&seen, "AUTHINFO USER");
+    let passes = positions(&seen, "AUTHINFO PASS");
+    assert_eq!(
+        users.len(),
+        1,
+        "no login at the dial, one in place; saw {seen:?}"
     );
-    assert!(error.is_credentials_refusal());
+    assert_eq!(seen[users[0]], "AUTHINFO USER ", "an empty name");
+    assert_eq!(seen[passes[0]], "AUTHINFO PASS ", "an empty password");
+    assert!(
+        bodies[2] < users[0] && passes[0] < bodies[3],
+        "the login goes out after the last queued BODY and before the next; saw {seen:?}"
+    );
+}
+
+// The credentialed session the server expires asks for a login, takes it,
+// and answers the very next BODY with 480 again. That is the server refusing
+// the account it took, not another request to log in: the lane logs in once,
+// and the article takes the refusal.
+#[test]
+fn a_480_right_after_the_login_it_asked_for_is_a_refusal() {
+    let (port, seen, handle) = spawn_reauth_server(
+        vec![Scripted::Expire, Scripted::Expire],
+        vec![b"281 ok\r\n", b"281 ok\r\n"],
+    );
+    let mut lane = test_body_lane(&reauth_config(port));
+    issue_all(&mut lane, &["<1@t>"]);
+    let (first, _) = lane.ring_read_next().unwrap();
+    assert!(is_session_expired(&first), "got {:?}", first.result);
+    assert!(lane.is_healthy(), "the login was taken");
+
+    issue_all(&mut lane, &["<1@t>"]);
+    let (again, meta) = lane.ring_read_next().unwrap();
+    assert!(
+        matches!(
+            again.result,
+            Err(DecodedBodyError::Nntp(NntpError::AuthenticationRequired))
+        ),
+        "got {:?}",
+        again.result
+    );
+    assert_eq!(
+        again.attempts[0].outcome,
+        crate::client::FetchAttemptOutcome::AuthenticationFailure
+    );
     assert!(meta.connection_discarded);
-    assert!(!lane.is_healthy());
-    assert!(lane.ring_is_closed());
     assert!(!lane.holds_new_requests());
 
     lane.park();
     handle.join().unwrap();
     let seen = seen.lock().unwrap().clone();
-    assert!(
-        positions(&seen, "AUTHINFO").is_empty(),
-        "an anonymous session never logs in; saw {seen:?}"
+    assert_eq!(
+        positions(&seen, "AUTHINFO PASS").len(),
+        2,
+        "one login at the dial, one in place, none after; saw {seen:?}"
     );
 }
 
