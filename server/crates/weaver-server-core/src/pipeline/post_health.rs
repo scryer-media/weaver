@@ -397,13 +397,15 @@ pub(crate) fn declares_recovery(file: &FileSpec) -> bool {
 
 // Whether a file's name makes it a piece of something else: a RAR volume, a
 // 7z or zip archive or one of its volumes, a split part, or recovery data,
-// classified as the feed classifies the post's files. Whole or not, such a
-// file is never one the user opens as it was posted. A compressed stream or
-// a tar is not one: posted whole, it is a file as it stands, whatever
-// opening it gave.
+// classified as the feed classifies the post's files. A `.zNN` name is a
+// split zip's part or a RAR volume after `.y99`, a piece either way. Whole
+// or not, such a file is never one the user opens as it was posted. A
+// compressed stream or a tar is not one: posted whole, it is a file as it
+// stands, whatever opening it gave.
 pub(crate) fn names_a_piece(name: &str) -> bool {
     let role = FileRole::from_filename(name);
     name.to_ascii_lowercase().ends_with(".rev")
+        || weaver_model::files::names_a_z_part(name)
         || matches!(
             role,
             FileRole::Par2 { .. }

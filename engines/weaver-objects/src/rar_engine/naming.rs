@@ -4,15 +4,19 @@
 // How a RAR set numbers its volumes in their names: `name.part1.rar`,
 // `name.part2.rar`, … counted from one, or the old `name.rar`, `name.r00`,
 // … `name.r99`, then `name.s00` … `name.s99`, `name.t00` and on, a hundred
-// to a letter. Case never matters.
+// to a letter, through `name.z99`, as RAR counts them on. Case never
+// matters. A split zip names its parts `name.z01`, `name.z02`, … too: by
+// name alone a `.zNN` is either, and what tells them apart is the part's
+// front, RAR's signature or the zip's, and which set its stem is. A RAR set
+// is claimed by its signature, so a zip part never joins one.
 
 use std::ops::RangeInclusive;
 
 use crate::engine::SetName;
 
-// The letters the old numbering runs through. It stops before `z`, whose
-// `.zNN` names are a split zip's.
-const OLD_LETTERS: RangeInclusive<u8> = b'r'..=b'y';
+// The letters the old numbering runs through: nine hundred volumes after
+// the `.rar`.
+const OLD_LETTERS: RangeInclusive<u8> = b'r'..=b'z';
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Scheme {
@@ -76,6 +80,7 @@ fn parse_rar_volume(lower: &str) -> Option<u32> {
         let ext = &lower.as_bytes()[lower.len() - 4..];
         if ext[0] == b'.'
             && OLD_LETTERS.contains(&ext[1])
+            && ext[2..].iter().all(u8::is_ascii_digit)
             && let Ok(n) = lower[lower.len() - 2..].parse::<u32>()
         {
             return Some(u32::from(ext[1] - OLD_LETTERS.start()) * 100 + n + 1);
@@ -193,7 +198,16 @@ mod tests {
         assert_eq!(sibling("a.part01.RAR", 9).as_deref(), Some("a.part10.RAR"));
         assert_eq!(sibling("a.r00", 0).as_deref(), Some("a.rar"));
         assert_eq!(sibling("a.rar", 1).as_deref(), Some("a.r00"));
-        for name in ["a.part3.rar", "a.r05", "a.rar", "a.r99", "a.s00", "a.y99"] {
+        for name in [
+            "a.part3.rar",
+            "a.r05",
+            "a.rar",
+            "a.r99",
+            "a.s00",
+            "a.y99",
+            "a.z00",
+            "a.z99",
+        ] {
             let index = parse(name).unwrap().index();
             assert_eq!(sibling(name, index).as_deref(), Some(name));
         }
@@ -210,6 +224,9 @@ mod tests {
             ("a.s99", 200),
             ("a.t00", 201),
             ("a.y99", 800),
+            ("a.z00", 801),
+            ("a.Z01", 802),
+            ("a.z99", 900),
         ] {
             assert_eq!(parse(name).unwrap().index(), index, "{name}");
             assert_eq!(
@@ -217,9 +234,12 @@ mod tests {
                 Some(name.to_ascii_lowercase().as_str())
             );
         }
-        assert_eq!(sibling("a.rar", 801), None);
-        assert_eq!(parse("a.z01"), None);
+        assert_eq!(sibling("a.rar", 901), None);
         assert_eq!(parse("a.q00"), None);
+        assert_eq!(parse("a.z1"), None);
+        assert_eq!(parse("a.z100"), None);
+        assert_eq!(parse("a.r+1"), None);
+        assert_eq!(parse("a.zip"), None);
         assert!(parse("a.s00").unwrap().same_set(&parse("a.r00").unwrap()));
     }
 
