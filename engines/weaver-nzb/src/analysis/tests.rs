@@ -295,6 +295,44 @@ fn rnn_volumes_continue_into_snn() {
     assert_eq!(set.missing_volumes, 0);
 }
 
+// The old numbering runs a hundred to a letter through `.y99`, and RAR goes
+// on through `.z99`. The `.zNN` volumes beside the set's `.rar` are its own;
+// beside a `.zip` of their stem they are the zip's parts.
+#[test]
+fn old_numbered_volumes_run_through_z99_and_zip_parts_stay_the_zips() {
+    let one = |name: String, at: u32| {
+        file(
+            format!("\"{name}\" yEnc (1/1)"),
+            segments(&format!("v{at}"), "example.invalid", 1, 100),
+        )
+    };
+    let mut files = vec![one("pack.rar".into(), 0)];
+    for index in 1..=802u32 {
+        let letter = char::from(b'r' + u8::try_from((index - 1) / 100).unwrap());
+        files.push(one(format!("pack.{letter}{:02}", (index - 1) % 100), index));
+    }
+    files.push(one("disc.zip".into(), 900));
+    files.push(one("disc.z01".into(), 901));
+    files.push(one("disc.z02".into(), 902));
+    let report = report_of(&nzb_xml(&[], &files));
+    let sets = &report.layout.archive_sets;
+    let rar = sets.iter().find(|set| set.volumes > 100).unwrap();
+    assert_eq!(rar.scheme, NameShape::RNn);
+    assert_eq!(
+        (
+            rar.volumes,
+            rar.first_volume,
+            rar.last_volume,
+            rar.missing_volumes
+        ),
+        (803, 0, 802, 0)
+    );
+    assert!(
+        sets.iter().all(|set| set.volumes <= 1 || set.volumes > 100),
+        "{sets:?}"
+    );
+}
+
 // Volumes named by their first block and the one past their last declare
 // the blocks between, not the sum of the ends, and a set whose stem only
 // adds a dashed suffix is a set of its own.

@@ -336,10 +336,101 @@ fn rar_old_style() {
         FileRole::from_filename("movie.r01"),
         FileRole::RarVolume { volume_number: 2 }
     );
+    // `.s00` continues where `.r99` stops, a hundred to a letter.
+    for (name, volume_number) in [("movie.r99", 100), ("movie.s00", 101), ("movie.S01", 102)] {
+        assert_eq!(
+            FileRole::from_filename(name),
+            FileRole::RarVolume { volume_number },
+            "{name}"
+        );
+    }
+    // Later letters are ordinary files by name alone.
+    for name in [
+        "movie.r+1",
+        "movie.r1",
+        "movie.q00",
+        "movie.t00",
+        "movie.y99",
+        "movie.z00",
+        "map.t01",
+        "track.v10",
+    ] {
+        assert_eq!(FileRole::from_filename(name), FileRole::Unknown, "{name}");
+    }
+}
+
+// A `.tNN` … `.yNN` name is a RAR volume only beside its set's RAR
+// volumes; by name alone, or beside another stem's set, it is an ordinary
+// file.
+#[test]
+fn later_lettered_names_are_rar_volumes_only_beside_their_set() {
+    let roles = |names: &[&str]| FileRole::of_post(names.iter().map(|name| Some(*name)));
     assert_eq!(
-        FileRole::from_filename("movie.s00"),
-        FileRole::RarVolume { volume_number: 1 }
+        roles(&["name.rar", "Name.r00", "name.t00", "NAME.Y99", "other.t00"]),
+        vec![
+            FileRole::RarVolume { volume_number: 0 },
+            FileRole::RarVolume { volume_number: 1 },
+            FileRole::RarVolume { volume_number: 201 },
+            FileRole::RarVolume { volume_number: 800 },
+            FileRole::Unknown,
+        ]
     );
+    assert_eq!(
+        roles(&["setup.x64", "lib.x86", "map.t01"]),
+        vec![FileRole::Unknown; 3]
+    );
+    for name in ["setup.x64", "lib.x86", "map.t01", "tool.w32"] {
+        assert_eq!(FileRole::from_filename(name), FileRole::Unknown, "{name}");
+        assert!(!weaver_model::files::names_a_z_part(name), "{name}");
+    }
+}
+
+// A `.zNN` name is a split zip's part or a RAR volume after `.y99`: the
+// post tells which.
+#[test]
+fn z_numbered_names_take_their_role_from_the_post() {
+    let roles = |names: &[&str]| FileRole::of_post(names.iter().map(|name| Some(*name)));
+    assert_eq!(
+        roles(&[
+            "Movie.rar",
+            "movie.y99",
+            "movie.z00",
+            "Movie.Z99",
+            "other.z00"
+        ]),
+        vec![
+            FileRole::RarVolume { volume_number: 0 },
+            FileRole::RarVolume { volume_number: 800 },
+            FileRole::RarVolume { volume_number: 801 },
+            FileRole::RarVolume { volume_number: 900 },
+            FileRole::Unknown,
+        ]
+    );
+    // A split zip keeps its parts, with or without a RAR set of another stem.
+    assert_eq!(
+        roles(&["disc.z01", "disc.zip", "movie.r00", "movie.z01"]),
+        vec![
+            FileRole::Unknown,
+            FileRole::ZipArchive,
+            FileRole::RarVolume { volume_number: 1 },
+            FileRole::RarVolume { volume_number: 802 },
+        ]
+    );
+    // One stem with both a `.zip` and RAR volumes: its `.zNN` stay the zip's.
+    assert_eq!(
+        roles(&["both.rar", "both.zip", "both.z01"])[2],
+        FileRole::Unknown
+    );
+    assert_eq!(
+        FileRole::of_post([None, Some("a.z01")]),
+        vec![FileRole::Unknown; 2]
+    );
+    for name in ["a.z00", "a.Z01", "a.z99"] {
+        assert!(weaver_model::files::names_a_z_part(name), "{name}");
+    }
+    for name in ["a.zip", "a.z1", "a.z100", "a.r00"] {
+        assert!(!weaver_model::files::names_a_z_part(name), "{name}");
+    }
 }
 
 #[test]

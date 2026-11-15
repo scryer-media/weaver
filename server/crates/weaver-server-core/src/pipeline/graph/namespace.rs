@@ -294,6 +294,9 @@ pub(crate) struct NamespaceWriter {
     refused_in_batch: BTreeSet<(NodeId, MemberId)>,
     // Archives given up on since the job last asked, for its events.
     given_back: Vec<GivenBack>,
+    // Ranges of root members given back that came and are no longer in
+    // hand, since the job last asked: the job fetches them again.
+    unkept: Vec<(MemberId, ByteRange)>,
     // The archives already given up on: the object that gave its members
     // back (true), or the namespace whose members nothing held (false). One
     // archive is one event however many volumes it had.
@@ -419,6 +422,7 @@ impl NamespaceWriter {
             acknowledging: None,
             refused_in_batch: BTreeSet::new(),
             given_back: Vec::new(),
+            unkept: Vec::new(),
             given_up: BTreeSet::new(),
             gave_back: None,
             left_to_write: None,
@@ -551,6 +555,12 @@ impl NamespaceWriter {
     // The members given back since this was last asked.
     pub(crate) fn take_given_back(&mut self) -> Vec<GivenBack> {
         std::mem::take(&mut self.given_back)
+    }
+
+    // The root members' ranges a give-back left not in hand since this was
+    // last asked.
+    pub(crate) fn take_unkept(&mut self) -> Vec<(MemberId, ByteRange)> {
+        std::mem::take(&mut self.unkept)
     }
 
     // The breach of the job's extraction budget, once one stands.
@@ -1985,12 +1995,21 @@ impl NamespaceWriter {
 
     // A byte the member's coverage says arrived that neither the envelope
     // given back as its file nor its holds have is not in hand, as a
-    // restart's lost range is not, and comes again. Only a restore leaves
-    // one: an envelope comes back as far as its record and its file reach,
-    // the member's coverage as far as what arrived, which counts bytes that
-    // were only held in memory. A range held as damage may never have
-    // arrived at all, and stays.
-    fn uncover_unkept(&self, tree: &mut Tree, (node, member): (NodeId, MemberId), kept: &Coverage) {
+    // restart's lost range is not, and comes again. A restore leaves one:
+    // an envelope comes back as far as its record and its file reach, the
+    // member's coverage as far as what arrived, which counts bytes that
+    // were only held in memory. So does an object that placed a volume's
+    // bytes in a member of its own before the volume's last header said it
+    // is not where the object held it. A root member's range is fetched
+    // again, by the job; until it is in, the member is not whole, and
+    // nothing rules on it as though it were. A range held as damage may
+    // never have arrived at all, and stays.
+    fn uncover_unkept(
+        &mut self,
+        tree: &mut Tree,
+        (node, member): (NodeId, MemberId),
+        kept: &Coverage,
+    ) {
         let Some(record) = tree.namespace(node).and_then(|found| found.get(member)) else {
             return;
         };
@@ -2009,6 +2028,10 @@ impl NamespaceWriter {
             }
         }
         let unkept: Vec<ByteRange> = unkept.runs().map(|run| run.range).collect();
+        if node == NodeId::ROOT {
+            self.unkept
+                .extend(unkept.iter().map(|range| (member, *range)));
+        }
         if let Some(namespace) = tree.namespace_mut(node) {
             for range in unkept {
                 namespace.uncover(member, range);
