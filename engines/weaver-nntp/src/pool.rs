@@ -3877,6 +3877,206 @@ mod tests {
         assert_eq!(pool.next_connection_hold_deadline(), None);
     }
 
+    // A local server that greets and answers CAPABILITIES on its first
+    // `served` connections, and accepts then drops every later one.
+    fn spawn_dropping_server(served: usize) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_by_server = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            for socket in listener.incoming() {
+                let Ok(mut socket) = socket else { return };
+                let slot = accepted_by_server.fetch_add(1, Ordering::SeqCst);
+                if slot >= served {
+                    drop(socket);
+                    continue;
+                }
+                std::thread::spawn(move || {
+                    if socket.write_all(b"200 ready\r\n").is_err() {
+                        return;
+                    }
+                    let reader = BufReader::new(socket.try_clone().unwrap());
+                    for line in reader.lines() {
+                        let Ok(line) = line else { return };
+                        let reply: &[u8] = if line == "CAPABILITIES" {
+                            b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n"
+                        } else {
+                            b"500 unsupported\r\n"
+                        };
+                        if socket.write_all(reply).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, accepted)
+    }
+
+    fn blocking_lane_client(
+        port: u16,
+        max_connections: usize,
+        reconnect_delay: Duration,
+    ) -> (Arc<NntpPool>, crate::client::NntpClient) {
+        let mut config = test_pool_config(max_connections);
+        config.servers[0].server.host = "127.0.0.1".into();
+        config.servers[0].server.port = port;
+        config.servers[0].server.tls = false;
+        config.reconnect_delay = reconnect_delay;
+        let pool = Arc::new(NntpPool::new(config));
+        let client = crate::client::NntpClient::from_pool(Arc::clone(&pool));
+        (pool, client)
+    }
+
+    // The connection downloads use: a failed dial holds every new lane on its
+    // server until the reconnect delay ends, without a socket, and once the
+    // delay has passed the next lane dials again.
+    #[test]
+    fn a_failed_blocking_dial_holds_new_lanes_until_the_reconnect_delay_ends() {
+        use crate::client::BlockingBodyLaneAcquireError;
+        let (port, accepted) = spawn_dropping_server(0);
+        let (pool, client) = blocking_lane_client(port, 2, Duration::from_secs(3600));
+
+        let first = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .err()
+            .expect("the dropped dial fails");
+        assert!(
+            matches!(first, BlockingBodyLaneAcquireError::Other(_)),
+            "{first:?}"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        let recorded = pool.last_connect_failure[0]
+            .blocking_lock()
+            .expect("the failed dial records its failure");
+
+        let held = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .err()
+            .expect("the reconnect delay holds the next lane");
+        assert!(
+            matches!(held, BlockingBodyLaneAcquireError::ServerRecovering),
+            "{held:?}"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "a held lane opens no socket"
+        );
+
+        // Date the failure a full delay back rather than waiting it out.
+        *pool.last_connect_failure[0].blocking_lock() =
+            recorded.checked_sub(Duration::from_secs(3600));
+        let next = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .err()
+            .expect("the next dial is dropped too");
+        assert!(
+            matches!(next, BlockingBodyLaneAcquireError::Other(_)),
+            "{next:?}"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    // A dial the server accepted and then dropped is the server's health,
+    // however many lanes are busy on it: it never arms the over-limit
+    // holdoff, and the next lane waits the ordinary reconnect delay.
+    #[test]
+    fn a_dropped_blocking_dial_beside_busy_lanes_waits_the_reconnect_delay_not_the_holdoff() {
+        use crate::client::BlockingBodyLaneAcquireError;
+        let (port, accepted) = spawn_dropping_server(2);
+        let (pool, client) = blocking_lane_client(port, 4, Duration::from_secs(3600));
+
+        let busy: Vec<_> = (0..2)
+            .map(|_| {
+                client
+                    .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+                    .expect("the first two connections are served")
+            })
+            .collect();
+        assert_eq!(pool.socket_budgets[0].snapshot().physical, 2);
+
+        let dropped = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .err()
+            .expect("the dropped dial must fail");
+        assert!(
+            matches!(
+                &dropped,
+                BlockingBodyLaneAcquireError::Other(NntpError::ConnectionClosed | NntpError::Io(_))
+            ),
+            "{dropped:?}"
+        );
+        assert!(!pool.is_over_limit(ServerId(0)));
+        assert_eq!(pool.over_limit_refusals(ServerId(0)), 0);
+        assert!(pool.last_connect_failure[0].blocking_lock().is_some());
+
+        let next = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .err()
+            .expect("the reconnect delay holds the next lane");
+        assert!(
+            matches!(next, BlockingBodyLaneAcquireError::ServerRecovering),
+            "{next:?}"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 3);
+        assert!(!pool.is_over_limit(ServerId(0)));
+        assert_eq!(pool.over_limit_refusals(ServerId(0)), 0);
+        drop(busy);
+    }
+
+    // When the over-limit holdoff ends, lanes dial again. A dial that fails
+    // on the socket is not a refusal: the probe slot is given back, so the
+    // next lane dials too, and the episode's refusal count stands.
+    #[test]
+    fn a_blocking_lane_dials_again_once_the_over_limit_holdoff_expires() {
+        use crate::client::BlockingBodyLaneAcquireError;
+        let (port, accepted) = spawn_dropping_server(0);
+        let (pool, client) = blocking_lane_client(port, 4, Duration::ZERO);
+        pool.note_provider_over_limit(ServerId(0));
+
+        let held = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .err()
+            .expect("a held-off server opens no lane");
+        assert!(
+            matches!(
+                held,
+                BlockingBodyLaneAcquireError::ProviderCapacity(NntpError::ServerOverLimit { .. })
+            ),
+            "{held:?}"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+
+        // Rewind the deadline instead of waiting out the window.
+        pool.over_limit_until[0].store(unix_epoch_ms() - 1, Ordering::Release);
+        assert!(!pool.is_over_limit(ServerId(0)));
+
+        let probe = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .err()
+            .expect("the dropped dial fails");
+        assert!(
+            matches!(probe, BlockingBodyLaneAcquireError::Other(_)),
+            "{probe:?}"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.over_limit_episode(0).unwrap().probe_started, 0);
+
+        let next = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .err()
+            .expect("the next dial is dropped too");
+        assert!(
+            matches!(next, BlockingBodyLaneAcquireError::Other(_)),
+            "{next:?}"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        assert_eq!(pool.over_limit_refusals(ServerId(0)), 1);
+    }
+
     // A quarantined server whose deadline has lapsed, with no probe out,
     // admits one new connection, the probe, however many permits are free:
     // the dispatcher seats exactly one lease on it, not one per permit.
