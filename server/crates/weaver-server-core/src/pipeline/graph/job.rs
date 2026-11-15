@@ -198,6 +198,12 @@ pub(crate) struct GraphJob {
     // Where root members were last asked whether the sets proved them;
     // `None` before the first.
     sealed_at: Option<repair::Sealed>,
+    // The give-up the job went quiet into, while it has volumes to read
+    // back, one a turn.
+    quieting: Option<repair::Quieting>,
+    // Every give-up is applied in the one turn it was raised in.
+    #[cfg(test)]
+    one_turn: bool,
     // Counts the mutable borrows of this job: nothing of it changes without
     // one, so what was derived from it at a count holds while the count does.
     moved: u64,
@@ -311,6 +317,9 @@ impl GraphJob {
             notes: Vec::new(),
             fed: runs::Fed::default(),
             sealed_at: None,
+            quieting: None,
+            #[cfg(test)]
+            one_turn: false,
             moved: 0,
             indexes_kept: None,
         }
@@ -403,11 +412,19 @@ impl GraphJob {
         self.loans.out()
     }
 
-    // Whether an object of the job is out for its work. No checkpoint is
-    // taken meanwhile: its facts as it left hold the work undone, which a
-    // restart could not always do without the tree.
+    // Whether an object of the job is out for its work, or a give-up has
+    // volumes left to read back. No checkpoint is taken meanwhile: its facts
+    // as it left hold the work undone, which a restart could not always do
+    // without the tree, and a tree half given up is no state to restore. A
+    // restart gives up again from the checkpoint before.
     pub(crate) fn working(&self) -> bool {
-        self.works.working()
+        self.works.working() || self.quieting.is_some()
+    }
+
+    // Every give-up from here on is applied in the turn it was raised in.
+    #[cfg(test)]
+    pub(crate) fn give_up_in_one_turn(&mut self) {
+        self.one_turn = true;
     }
 
     // Every work loan from here on stays in the test's hand.
@@ -586,8 +603,10 @@ impl GraphJob {
         Ok(true)
     }
 
-    // Keep ownership until stopped workers report that they ended.
-    pub(in crate::pipeline) fn request_stop(&self) {
+    // Keep ownership until stopped workers report that they ended. A
+    // give-up's volumes not yet read back are not: the job goes.
+    pub(in crate::pipeline) fn request_stop(&mut self) {
+        self.quieting = None;
         self.runs.request_stop();
         self.loans.request_stop();
         self.works.request_stop();
@@ -618,6 +637,7 @@ impl GraphJob {
     pub(crate) fn work_pending(&self) -> bool {
         self.loans.out()
             || self.works.out()
+            || self.quieting.is_some()
             || self.tree.rewalks_owed()
             || self.writer.rechecks_waiting()
             || self.verifications_due()
