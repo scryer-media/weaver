@@ -110,6 +110,10 @@ Everything below is new since 0.16.15.
 - **PAR3 recovery volumes are read by location, a piece at a time.** PAR3
   length matching, binding and cover each take one pass.
 - **A RAR recovery set that covers no data volume rules on nothing.**
+- **A PAR2 set waits for recovery volumes whose names give no block
+  count,** such as `name.vol-01.par2`. Such a volume counted as bringing
+  no blocks, so a job that its queued recovery could repair was given up
+  as unrepairable.
 
 ## Servers and downloads
 
