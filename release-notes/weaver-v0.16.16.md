@@ -44,7 +44,8 @@ Everything below is new since 0.16.15.
 ## Disk writers
 
 - **Finished files are renamed into place by the writer of the volume
-  they land on.** A copy across volumes stays on its own thread.
+  they land on.** A file only a copy can place is copied by the mover on
+  its own thread, with progress shown as the bytes land.
 - **Repairs, checks and extraction reads wait for queued writes on their
   own threads,** not on the main loop.
 - **Each volume has its own buffer limit,** sized by the profile, memory,
@@ -59,6 +60,9 @@ Everything below is new since 0.16.15.
   throughput, buffered bytes and buffer limit. The metrics page and the
   Grafana dashboard have a Volumes row. The loop-side disk write timings
   are removed, since writes no longer run there.
+- **The disk speed probe never touches a downloaded file.** It writes a
+  file of its own, made only where no file has its name, and removes
+  nothing else.
 
 ## History
 
@@ -114,6 +118,9 @@ Everything below is new since 0.16.15.
   count,** such as `name.vol-01.par2`. Such a volume counted as bringing
   no blocks, so a job that its queued recovery could repair was given up
   as unrepairable.
+- **A lost run in a uuencoded volume starts where the article before it
+  ended.** Bytes that arrived were told lost, the repair read them as
+  zeros, and a 7z set with PAR2 that should complete failed.
 
 ## Servers and downloads
 
@@ -143,7 +150,8 @@ Everything below is new since 0.16.15.
 - **A cancelled job is not restarted while a move of its working folder
   is still out.** A retry waits for the move and the removal first.
 - **Housekeeping removes only folders that carry the job's marker,** and
-  sweeps a failed job's files once.
+  sweeps a failed job's files once. It looks up only the jobs those
+  folders name, not the whole queue and history.
 - **Database writes no longer queue behind every checkpoint pass.** Slow
   statements gained indexes.
 - **Long chains of files that want one name are seated without rescans.**
@@ -197,7 +205,10 @@ This release changes the GraphQL API in ways that can break a client.
   the web history. The old name is gone.
 - **New:** `archiveHistory` and its types, `HistoryItem.archivedAt`, and
   one row per volume in the system query.
-- **`jobOutputFiles` and `jobEvents` page at 100.**
+- **`jobOutputFiles` and `jobEvents` page at 100.** A `jobOutputFiles`
+  page of a folder on disk starts after the last file of the page before.
+  A cursor from an earlier version is refused there; list again from the
+  start.
 
 ## Dependencies
 
