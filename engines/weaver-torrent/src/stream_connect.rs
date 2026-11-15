@@ -43,13 +43,13 @@ mod dial;
 mod kind;
 pub(crate) use dial::UtpRebind;
 use dial::{DialPlan, PeerDialer, Tally, TcpDialer, UtpDialer};
-pub use kind::{ConnectionKind, Names};
+pub use kind::{ByKind, Capabilities, ConnectionKind, Names};
 
 /// An open connection to a peer, as its transport hands it over, dialed or
-/// accepted: the bytes each way, the remote end, and the thread the
-/// transport runs on when it has one of its own. What the connection
-/// guarantees is its kind's capabilities. The writing half is `W`: the
-/// transport's own, then whatever the connection's guard made of it.
+/// accepted: the bytes each way, the remote end, what the connection
+/// guarantees, and the thread the transport runs on when it has one of its
+/// own. The writing half is `W`: the transport's own, then whatever the
+/// connection's guard made of it.
 pub(crate) struct Link<W = BoxAsyncWrite> {
     pub kind: ConnectionKind,
     pub remote: SocketAddr,
@@ -58,6 +58,28 @@ pub(crate) struct Link<W = BoxAsyncWrite> {
     /// The thread the transport runs on, when it has one of its own (a uTP
     /// stream's): the connection's task moves there.
     pub home: Option<tokio::runtime::Handle>,
+    /// Its kind's, until a transport whose links differ fills its own.
+    pub caps: Capabilities,
+}
+
+impl Link {
+    /// A link over `kind` to `remote`, with its kind's capabilities.
+    pub fn new(
+        kind: ConnectionKind,
+        remote: SocketAddr,
+        read: BoxAsyncReadVectored,
+        write: BoxAsyncWrite,
+        home: Option<tokio::runtime::Handle>,
+    ) -> Self {
+        Self {
+            kind,
+            remote,
+            read,
+            write,
+            home,
+            caps: *kind.capabilities(),
+        }
+    }
 }
 
 /// The transports an outgoing connection to a peer may go over.
@@ -192,11 +214,49 @@ impl Drop for Unended<'_> {
         }
     }
 }
-gen_stats!(ConnectStatsAtomic ConnectStatsSnapshot, [], [
-    tcp PerFamilyAtomic PerFamilySnapshot,
-    utp PerFamilyAtomic PerFamilySnapshot,
-    encryption EncryptionStatsAtomic EncryptionStatsSnapshot
-]);
+/// Outgoing connections: attempts by kind and family, and handshakes.
+#[derive(Debug, Default)]
+pub struct ConnectStatsAtomic {
+    pub kinds: ByKind<PerFamilyAtomic>,
+    pub encryption: EncryptionStatsAtomic,
+}
+
+impl ConnectStatsAtomic {
+    pub fn snapshot(&self) -> ConnectStatsSnapshot {
+        let mut kinds = ByKind::<PerFamilySnapshot>::default();
+        for (kind, family) in self.kinds.iter() {
+            kinds[kind] = family.snapshot();
+        }
+        ConnectStatsSnapshot {
+            kinds,
+            encryption: self.encryption.snapshot(),
+        }
+    }
+}
+
+/// [`ConnectStatsAtomic`] read at one moment. It serializes as each kind
+/// under its key, then `encryption`, as when each kind had a field.
+#[derive(Debug, Default)]
+pub struct ConnectStatsSnapshot {
+    pub kinds: ByKind<PerFamilySnapshot>,
+    pub encryption: EncryptionStatsSnapshot,
+}
+
+impl serde::Serialize for ConnectStatsSnapshot {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut out =
+            serializer.serialize_struct("ConnectStatsSnapshot", ConnectionKind::COUNT + 1)?;
+        for (kind, family) in self.kinds.iter() {
+            out.serialize_field(kind.names().key, family)?;
+        }
+        out.serialize_field("encryption", &self.encryption)?;
+        out.end()
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct StreamConnector {
@@ -271,43 +331,9 @@ impl StreamConnector {
     /// tries what `encrypt` says then. The returned halves carry the peer's
     /// reply, the meter counts every byte they move, the encryption handshake
     /// and ours included, and the [`Encryption`] says how the handshake went.
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub async fn connect_and_send_handshake(
-        &self,
-        addr: SocketAddr,
-        transports: Transports,
-        guard: Guard<'_>,
-        info_hash: &Id20,
-        handshake: &[u8],
-        encrypt: impl FnOnce() -> bool,
-        connect_timeout: Duration,
-        rw_timeout: Duration,
-    ) -> Result<(
-        ConnectionKind,
-        BoxAsyncReadVectored,
-        mse::Outbound,
-        Meter,
-        Encryption,
-    )> {
-        self.connect_link(
-            addr,
-            transports,
-            guard,
-            info_hash,
-            handshake,
-            encrypt,
-            connect_timeout,
-            rw_timeout,
-        )
-        .await
-        .map(|(link, meter, encryption)| (link.kind, link.read, link.write, meter, encryption))
-    }
-
-    /// As [`Self::connect_and_send_handshake`], the connection as the
-    /// [`Link`] it is: with the peer's address and the thread the
-    /// connection's transport runs on when it has one of its own, a uTP
-    /// stream's.
+    /// The connection comes as the [`Link`] it is: with the peer's address
+    /// and the thread its transport runs on when it has one of its own, a
+    /// uTP stream's.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn connect_link(
         &self,
@@ -330,6 +356,7 @@ impl StreamConnector {
             read: r,
             write: w,
             home,
+            caps,
         } = {
             let dial = self.dial(addr, transports, &expired);
             tokio::pin!(dial);
@@ -348,6 +375,7 @@ impl StreamConnector {
             read,
             write,
             home,
+            caps,
         };
 
         let policy = match guard {
@@ -371,11 +399,14 @@ impl StreamConnector {
         };
 
         let stats = &self.stats.encryption;
-        let encrypted = match policy {
-            EncryptionPolicy::Disabled => false,
-            EncryptionPolicy::Prefer => encrypt(),
-            EncryptionPolicy::Require => true,
-        };
+        // A link its transport already encrypts takes no MSE over it (plan
+        // 185, 9.4.3); no kind does yet.
+        let encrypted = !caps.encrypted
+            && match policy {
+                EncryptionPolicy::Disabled => false,
+                EncryptionPolicy::Prefer => encrypt(),
+                EncryptionPolicy::Require => true,
+            };
         if !encrypted {
             stats.plaintext(1);
             with_timeout(
@@ -413,10 +444,7 @@ impl StreamConnector {
     }
 
     fn get_stat(&self, kind: ConnectionKind, is_v6: bool) -> &SingleStatAtomic {
-        let stat = match kind {
-            ConnectionKind::Tcp => &self.stats.tcp,
-            ConnectionKind::Utp => &self.stats.utp,
-        };
+        let stat = &self.stats.kinds[kind];
         if is_v6 { &stat.v6 } else { &stat.v4 }
     }
 
@@ -432,32 +460,14 @@ impl StreamConnector {
         }
     }
 
-    // Whether the outgoing uTP socket is bound.
-    #[cfg(test)]
-    fn has_utp(&self) -> bool {
-        self.utp.ready()
-    }
-
     /// The outgoing uTP socket a dial bound after the session started.
     pub fn rebound_utp(&self) -> Option<&UtpSocket> {
         self.utp.rebound()
     }
 
-    /// Connect to the peer at `addr` over `transports`.
-    #[cfg(test)]
-    pub async fn connect(
-        &self,
-        addr: SocketAddr,
-        transports: Transports,
-    ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
-        self.dial(addr, transports, &AtomicBool::new(false))
-            .await
-            .map(|link| (link.kind, link.read, link.write))
-    }
-
-    // Connect as `connect` does, with the thread a uTP stream runs on. An
-    // attempt dropped unfinished counts as timed out when `expired` is set
-    // by then, and as failed otherwise.
+    // Open a link to the peer at `addr` over `transports`, the first step of
+    // `connect_link`. An attempt dropped unfinished counts as timed out when
+    // `expired` is set by then, and as failed otherwise.
     async fn dial(
         &self,
         addr: SocketAddr,
@@ -505,6 +515,58 @@ mod tests {
     use crate::network::BoxFuture;
     use crate::peer_info_reader::tests::Dialed;
 
+    // What tests ask of a connector beyond its one product path.
+    impl StreamConnector {
+        // Whether the outgoing uTP socket is bound.
+        pub(crate) fn has_utp(&self) -> bool {
+            self.utp.ready()
+        }
+
+        /// Connect to the peer at `addr` over `transports`, and send nothing.
+        pub(crate) async fn connect(
+            &self,
+            addr: SocketAddr,
+            transports: Transports,
+        ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
+            self.dial(addr, transports, &AtomicBool::new(false))
+                .await
+                .map(|link| (link.kind, link.read, link.write))
+        }
+
+        /// [`StreamConnector::connect_link`], as the parts of the link.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) async fn connect_and_send_handshake(
+            &self,
+            addr: SocketAddr,
+            transports: Transports,
+            guard: Guard<'_>,
+            info_hash: &Id20,
+            handshake: &[u8],
+            encrypt: impl FnOnce() -> bool,
+            connect_timeout: Duration,
+            rw_timeout: Duration,
+        ) -> Result<(
+            ConnectionKind,
+            BoxAsyncReadVectored,
+            mse::Outbound,
+            Meter,
+            Encryption,
+        )> {
+            self.connect_link(
+                addr,
+                transports,
+                guard,
+                info_hash,
+                handshake,
+                encrypt,
+                connect_timeout,
+                rw_timeout,
+            )
+            .await
+            .map(|(link, meter, encryption)| (link.kind, link.read, link.write, meter, encryption))
+        }
+    }
+
     async fn loopback_utp() -> UtpSocket {
         crate::listen::bind_utp(
             crate::test_support::socket_factory().as_ref(),
@@ -547,7 +609,10 @@ mod tests {
     }
 
     fn tcp_attempts(connector: &StreamConnector) -> u64 {
-        connector.stats().tcp.snapshot().v4.attempts
+        connector.stats().kinds[crate::ConnectionKind::Tcp]
+            .snapshot()
+            .v4
+            .attempts
     }
 
     /// The kernel's sockets on a route that says whether a TCP peer finds a
@@ -830,7 +895,13 @@ mod tests {
         tokio::pin!(connect);
         assert!(futures::poll!(connect.as_mut()).is_pending());
         assert_eq!(tcp_attempts(&connector), 1);
-        assert_eq!(connector.stats().utp.snapshot().v4.attempts, 1);
+        assert_eq!(
+            connector.stats().kinds[crate::ConnectionKind::Utp]
+                .snapshot()
+                .v4
+                .attempts,
+            1
+        );
         let (accepted, connected) = tokio::join!(theirs.accept(), connect);
         accepted.unwrap();
         assert!(matches!(connected.unwrap().0, ConnectionKind::Utp));
@@ -866,7 +937,13 @@ mod tests {
         let (kind, _r, _w) = connected.unwrap();
         assert!(matches!(kind, ConnectionKind::Utp));
         assert_eq!(tcp_attempts(&connector), 0);
-        assert_eq!(connector.stats().utp.snapshot().v4.successes, 1);
+        assert_eq!(
+            connector.stats().kinds[crate::ConnectionKind::Utp]
+                .snapshot()
+                .v4
+                .successes,
+            1
+        );
     }
 
     // Without uTP there is no way to a peer that may be reached over uTP
@@ -1202,7 +1279,9 @@ mod tests {
             )
             .await;
         assert!(sent.is_err());
-        let v4 = connector.stats().tcp.snapshot().v4;
+        let v4 = connector.stats().kinds[crate::ConnectionKind::Tcp]
+            .snapshot()
+            .v4;
         [
             v4.attempts,
             v4.successes,
@@ -1232,6 +1311,50 @@ mod tests {
         assert_eq!(
             tcp_ends(Some(std::io::ErrorKind::ConnectionReset)).await,
             [1, 0, 0, 0, 1]
+        );
+    }
+
+    // A fixed run of counts, each to a kind and a family a seed picks, gives
+    // the snapshot it gave when each kind had a field of its own: the same
+    // JSON, byte for byte.
+    #[tokio::test]
+    async fn a_seeded_run_of_connect_counts_gives_the_json_it_always_gave() {
+        let connector = connector(false).await;
+        let mut seed = 0x5eed_u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        for _ in 0..200 {
+            let kind = ConnectionKind::ALL[(next() % 2) as usize];
+            let stat = connector.get_stat(kind, next() % 2 == 1);
+            let by = next() % 5 + 1;
+            match next() % 5 {
+                0 => stat.attempts(by),
+                1 => stat.successes(by),
+                2 => stat.refused(by),
+                3 => stat.timeouts(by),
+                _ => stat.errors(by),
+            }
+        }
+        let encryption = &connector.stats().encryption;
+        encryption.attempts(6);
+        encryption.rc4(3);
+        encryption.header_only(1);
+        encryption.failures(1);
+        encryption.cancelled(1);
+        encryption.plaintext(2);
+        assert_eq!(
+            serde_json::to_string(&connector.stats().snapshot()).unwrap(),
+            concat!(
+                r#"{"tcp":{"v4":{"attempts":32,"successes":23,"refused":17,"timeouts":28,"errors":54},"#,
+                r#""v6":{"attempts":39,"successes":38,"refused":23,"timeouts":29,"errors":49}},"#,
+                r#""utp":{"v4":{"attempts":29,"successes":39,"refused":29,"timeouts":31,"errors":8},"#,
+                r#""v6":{"attempts":17,"successes":27,"refused":23,"timeouts":32,"errors":37}},"#,
+                r#""encryption":{"attempts":6,"rc4":3,"header_only":1,"failures":1,"cancelled":1,"plaintext":2}}"#,
+            )
         );
     }
 }

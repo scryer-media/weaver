@@ -8333,6 +8333,51 @@ mod tests {
         session.stop().await;
     }
 
+    // Each listener mode has the session run one accept task for each socket
+    // it binds, under the name it had: TCP's `tcp_listen`, uTP's
+    // `utp_listen`. A task the session spawns has run once it stops, so the
+    // tasks polled are the tasks spawned.
+    #[tokio::test]
+    async fn each_listener_mode_runs_one_accept_task_per_socket() {
+        use crate::core::spawn_utils::polls;
+        let listen_tasks = || -> std::collections::BTreeMap<String, u64> {
+            polls::counted()
+                .into_iter()
+                .filter(|(task, _)| task.ends_with("_listen"))
+                .collect()
+        };
+        for (mode, tasks) in [
+            (crate::ListenerMode::TcpOnly, &["tcp_listen"][..]),
+            (crate::ListenerMode::UtpOnly, &["utp_listen"]),
+            (
+                crate::ListenerMode::TcpAndUtp,
+                &["tcp_listen", "utp_listen"],
+            ),
+        ] {
+            let before = listen_tasks();
+            let dir = TempDir::with_prefix("listen_tasks").unwrap();
+            let session = quiet_session(
+                &dir,
+                SessionOptions {
+                    listen: Some(crate::ListenerOptions {
+                        mode,
+                        listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                        ..Default::default()
+                    }),
+                    ..crate::test_support::session_options()
+                },
+            )
+            .await;
+            session.stop().await;
+            let ran: Vec<_> = listen_tasks()
+                .into_iter()
+                .filter(|(task, polled)| before.get(task) != Some(polled))
+                .map(|(task, _)| task)
+                .collect();
+            assert_eq!(ran, tasks, "{mode:?}");
+        }
+    }
+
     // A connection a peer opens to each of the listener's sockets is counted
     // under that socket's kind: a handshake for a torrent the session does
     // not hold ends the same over TCP as over uTP, under each its own.

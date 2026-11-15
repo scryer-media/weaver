@@ -86,7 +86,7 @@ pub mod upnp;
 mod v2_hashes;
 mod vectored_traits;
 
-pub use error::{Error, Result};
+pub use error::{DialErrors, Error, Result};
 
 pub use crate::core::spawn_utils::spawn as librqbit_spawn;
 pub use crate::tracker::{
@@ -108,7 +108,7 @@ pub use session::{
     SessionOptions, SessionPersistenceConfig, SharedLimits,
 };
 pub use ssl::SslIdentity;
-pub use stream_connect::{ConnectionKind, ConnectionOptions, Names};
+pub use stream_connect::{ByKind, Capabilities, ConnectionKind, ConnectionOptions, Names};
 pub use torrent_state::{
     ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
     TorrentStatsState, TorrentTotals,

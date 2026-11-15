@@ -17,11 +17,8 @@ pub enum Error {
     UtpConnect(#[source] weaver_utp::Error),
     #[error("can't connect, all connection methods disabled")]
     ConnectDisabled,
-    #[error("error connecting: TCP={tcp:#} uTP={utp:#}")]
-    Connect {
-        tcp: std::io::Error,
-        utp: weaver_utp::Error,
-    },
+    #[error("error connecting: {0}")]
+    Connect(DialErrors),
     #[error("uTP disabled")]
     UtpDisabled,
     #[error("TCP connections disabled")]
@@ -138,17 +135,27 @@ pub enum Error {
     Core(#[from] crate::core::Error),
 }
 
-impl Error {
-    // The error of a dial over two transports that both failed: TCP's and
-    // uTP's together, in either order, and otherwise the first.
-    pub(crate) fn and_dial(self, other: Error) -> Error {
-        match (self, other) {
-            (Error::TcpConnect(tcp), Error::UtpConnect(utp))
-            | (Error::UtpConnect(utp), Error::TcpConnect(tcp)) => Error::Connect { tcp, utp },
-            (first, _) => first,
-        }
-    }
+/// Every attempt's error of a dial whose attempts all failed, by kind, in
+/// the order they were tried. Each is written as `TCP=…` with what its
+/// transport said: `TCP=connection refused uTP=connect timed out`.
+#[derive(Debug)]
+pub struct DialErrors(pub Vec<(crate::ConnectionKind, Error)>);
 
+impl std::fmt::Display for DialErrors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (at, (kind, error)) in self.0.iter().enumerate() {
+            if at > 0 {
+                f.write_str(" ")?;
+            }
+            // What the transport said, without the attempt's own words.
+            let said = std::error::Error::source(error).unwrap_or(error);
+            write!(f, "{}={said:#}", kind.names().dial_error)?;
+        }
+        Ok(())
+    }
+}
+
+impl Error {
     /// Our own side turned the connect away before the peer had a say: no
     /// transport was enabled, or each that was refused locally. Such an
     /// error does not count against the peer.

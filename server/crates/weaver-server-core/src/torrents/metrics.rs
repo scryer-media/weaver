@@ -34,7 +34,8 @@ pub use super::files::{FileCallsSnapshot, FileStatsSnapshot};
 pub fn file_stats() -> FileStatsSnapshot {
     super::files::STATS.snapshot()
 }
-use weaver_torrent::{ConnectionKind, FetchPhase, Session};
+use weaver_torrent::session_stats::snapshot::SessionStatsSnapshot;
+use weaver_torrent::{FetchPhase, Session};
 
 use crate::jobs::JobId;
 use crate::settings::Seeding;
@@ -517,17 +518,7 @@ impl SessionSeries {
         let stats = session.stats_snapshot();
         let peers = &stats.peers;
         let connections = &stats.connections;
-        macro_rules! family {
-            ($single:expr) => {
-                [
-                    $single.attempts,
-                    $single.successes,
-                    $single.refused,
-                    $single.timeouts,
-                    $single.errors,
-                ]
-            };
-        }
+        let connects = connects(&stats);
         let external_ips = session.external_ips();
         Self {
             route: route.to_owned(),
@@ -554,28 +545,7 @@ impl SessionSeries {
                     peers.not_needed,
                 ])
                 .collect(),
-            connects: vec![
-                (
-                    ConnectionKind::Tcp.as_str(),
-                    "v4",
-                    family!(connections.tcp.v4),
-                ),
-                (
-                    ConnectionKind::Tcp.as_str(),
-                    "v6",
-                    family!(connections.tcp.v6),
-                ),
-                (
-                    ConnectionKind::Utp.as_str(),
-                    "v4",
-                    family!(connections.utp.v4),
-                ),
-                (
-                    ConnectionKind::Utp.as_str(),
-                    "v6",
-                    family!(connections.utp.v6),
-                ),
-            ],
+            connects,
             dht: session.get_dht().map(|dht| {
                 let dht = dht.stats();
                 (
@@ -616,6 +586,33 @@ impl SessionSeries {
     }
 }
 
+/// A session's outgoing connects, one row per transport and family, as
+/// `SessionSeries::connects` holds them.
+fn connects(stats: &SessionStatsSnapshot) -> Vec<(&'static str, &'static str, [u64; 5])> {
+    let connections = &stats.connections;
+    macro_rules! family {
+        ($single:expr) => {
+            [
+                $single.attempts,
+                $single.successes,
+                $single.refused,
+                $single.timeouts,
+                $single.errors,
+            ]
+        };
+    }
+    connections
+        .kinds
+        .iter()
+        .flat_map(|(kind, by_family)| {
+            [
+                (kind.as_str(), "v4", family!(by_family.v4)),
+                (kind.as_str(), "v6", family!(by_family.v6)),
+            ]
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, SystemTime};
@@ -625,6 +622,7 @@ mod tests {
     use super::{TrackerSeries, trackers};
     use crate::settings::model::tracker_host;
     use crate::torrents::{NamedBy, TorrentTracker, TrackerStatus};
+    use weaver_torrent::ConnectionKind;
 
     /// The series as they were built before: a walk of the kept series and
     /// of the announces for every tracker.
@@ -761,5 +759,53 @@ mod tests {
         // The data did repeat hosts and did carry intervals.
         assert!(kept_fewer > 40, "{kept_fewer}");
         assert!(with_interval > 40, "{with_interval}");
+    }
+
+    // A session's connect counts, each a seed picks, give the rows they gave
+    // when each kind had a field of its own: the same transports and
+    // families, in the same order, with the same figures.
+    #[test]
+    fn the_connect_rows_are_those_each_kind_gave() {
+        let mut stats = weaver_torrent::session_stats::snapshot::SessionStatsSnapshot {
+            counters: Default::default(),
+            download_speed: Default::default(),
+            upload_speed: Default::default(),
+            peers: Default::default(),
+            uptime_seconds: 0,
+            connections: Default::default(),
+            utp: Default::default(),
+            swarm: Default::default(),
+            trackers: Default::default(),
+            incoming: Default::default(),
+            web_seeds: Default::default(),
+            network: Default::default(),
+            lsd: None,
+            limiter: Default::default(),
+            unchoke_slots_held: 0,
+            disk: Default::default(),
+        };
+        let mut seed = 0x5eed;
+        macro_rules! seeded {
+            ($single:expr) => {
+                $single.attempts = next(&mut seed) % 1000;
+                $single.successes = next(&mut seed) % 1000;
+                $single.refused = next(&mut seed) % 1000;
+                $single.timeouts = next(&mut seed) % 1000;
+                $single.errors = next(&mut seed) % 1000;
+            };
+        }
+        seeded!(stats.connections.kinds[ConnectionKind::Tcp].v4);
+        seeded!(stats.connections.kinds[ConnectionKind::Tcp].v6);
+        seeded!(stats.connections.kinds[ConnectionKind::Utp].v4);
+        seeded!(stats.connections.kinds[ConnectionKind::Utp].v6);
+        assert_eq!(
+            super::connects(&stats),
+            [
+                ("tcp", "v4", [174, 191, 580, 879, 648]),
+                ("tcp", "v6", [787, 898, 350, 178, 127]),
+                ("utp", "v4", [887, 234, 421, 179, 778]),
+                ("utp", "v6", [819, 13, 993, 472, 331]),
+            ]
+        );
     }
 }

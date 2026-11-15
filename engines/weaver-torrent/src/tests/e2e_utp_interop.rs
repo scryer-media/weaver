@@ -312,7 +312,11 @@ async fn transfer(
         exact_payload(&seed, &download).await?;
         native.finish(true).await?;
         ensure!(
-            session.connector.stats().utp.snapshot().v4.successes > 0,
+            session.connector.stats().kinds[crate::ConnectionKind::Utp]
+                .snapshot()
+                .v4
+                .successes
+                > 0,
             "Weaver did not dial uTP"
         );
     } else {
@@ -359,7 +363,7 @@ async fn transfer(
             "Weaver did not accept uTP"
         );
     }
-    let tcp = session.connector.stats().tcp.snapshot();
+    let tcp = session.connector.stats().kinds[crate::ConnectionKind::Tcp].snapshot();
     ensure!(
         tcp.v4.attempts == 0 && tcp.v6.attempts == 0,
         "Weaver attempted TCP fallback"

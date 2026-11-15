@@ -431,13 +431,7 @@ impl Accept for Box<dyn StreamListener + '_> {
         let (remote, read, write) = StreamListener::accept(self.as_ref())
             .await
             .context("error accepting TCP")?;
-        Ok(Link {
-            kind: Self::KIND,
-            remote,
-            read,
-            write,
-            home: None,
-        })
+        Ok(Link::new(Self::KIND, remote, read, write, None))
     }
 }
 
@@ -457,13 +451,13 @@ impl Accept for UtpSocket {
         let remote = stream.remote_addr();
         let home = stream.home().cloned();
         let (read, write) = stream.split();
-        Ok(Link {
-            kind: Self::KIND,
+        Ok(Link::new(
+            Self::KIND,
             remote,
-            read: Box::new(read),
-            write: Box::new(write),
+            Box::new(read),
+            Box::new(write),
             home,
-        })
+        ))
     }
 }
 
@@ -473,8 +467,10 @@ mod tests {
 
     use super::*;
 
-    // Each listener mode binds the sockets it did, and gives the session one
-    // accept task for each, TCP's first, under the name it had.
+    // Each listener mode binds the sockets it did, and gives one acceptor for
+    // each, TCP's first; the session test
+    // `each_listener_mode_runs_one_accept_task_per_socket` proves the tasks
+    // it runs for them.
     #[tokio::test]
     async fn each_mode_gives_one_acceptor_for_each_socket_it_binds() {
         use ConnectionKind::{Tcp, Utp};
@@ -484,13 +480,10 @@ mod tests {
             0,
             std::num::NonZeroU32::new(10).unwrap(),
         );
-        for (mode, tasks) in [
-            (ListenerMode::TcpOnly, &[(Tcp, "tcp_listen")][..]),
-            (ListenerMode::UtpOnly, &[(Utp, "utp_listen")]),
-            (
-                ListenerMode::TcpAndUtp,
-                &[(Tcp, "tcp_listen"), (Utp, "utp_listen")],
-            ),
+        for (mode, kinds) in [
+            (ListenerMode::TcpOnly, &[Tcp][..]),
+            (ListenerMode::UtpOnly, &[Utp]),
+            (ListenerMode::TcpAndUtp, &[Tcp, Utp]),
         ] {
             let listening = bind(
                 mode,
@@ -515,9 +508,9 @@ mod tests {
             let acceptors: Vec<_> = listening
                 .acceptors()
                 .iter()
-                .map(|acceptor| (acceptor.kind(), acceptor.kind().listen_task()))
+                .map(|acceptor| acceptor.kind())
                 .collect();
-            assert_eq!(acceptors, tasks, "{mode:?}");
+            assert_eq!(acceptors, kinds, "{mode:?}");
         }
     }
 

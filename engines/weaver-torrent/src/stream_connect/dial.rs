@@ -20,9 +20,8 @@ use tracing::debug;
 
 use super::{ConnectionKind, Failed, Failure, Link, SingleStatAtomic, Transports};
 use crate::{
-    Error, Result,
+    DialErrors, Error, Result,
     network::{SocketFactory, UtpSocket},
-    type_aliases::BoxAsyncWrite,
 };
 
 /// Counts one transport's attempt: started when the connect starts, and
@@ -85,9 +84,10 @@ impl Drop for Attempt<'_> {
 /// Opens links to peers over one transport, with sockets from the
 /// session's route only.
 pub(crate) trait PeerDialer: Send + Sync {
-    /// Whether a connection that may go over `transports` may go over this
-    /// one, as the session set it up.
-    fn may_dial(&self, transports: Transports) -> bool;
+    /// Whether a connection to `to` that may go over `transports` may go
+    /// over this one, as the session set it up. It decides, not the peer
+    /// index: a later transport may need more than the address.
+    fn may_dial(&self, to: SocketAddr, transports: Transports) -> bool;
 
     /// Whether its socket is held now, and not only bound when a dial
     /// wants it.
@@ -113,7 +113,7 @@ pub(super) struct TcpDialer {
 }
 
 impl PeerDialer for TcpDialer {
-    fn may_dial(&self, transports: Transports) -> bool {
+    fn may_dial(&self, _: SocketAddr, transports: Transports) -> bool {
         self.enabled && transports == Transports::Any
     }
 
@@ -128,13 +128,7 @@ impl PeerDialer for TcpDialer {
                 .await
                 .map_err(Error::TcpConnect)?;
             debug!(addr = ?to, "connected over TCP");
-            Ok(Some(Link {
-                kind: ConnectionKind::Tcp,
-                remote: to,
-                read,
-                write,
-                home: None,
-            }))
+            Ok(Some(Link::new(ConnectionKind::Tcp, to, read, write, None)))
         })
     }
 }
@@ -202,7 +196,7 @@ impl UtpDialer {
 impl PeerDialer for UtpDialer {
     // A dial may go over uTP when the socket is bound, or a dial may bind it
     // again; a holepunched peer is dialed over it alone.
-    fn may_dial(&self, _: Transports) -> bool {
+    fn may_dial(&self, _: SocketAddr, _: Transports) -> bool {
         self.ready() || self.rebind.is_some()
     }
 
@@ -222,14 +216,13 @@ impl PeerDialer for UtpDialer {
             debug!(addr = ?to, "connected over uTP");
             let home = stream.home().cloned();
             let (read, write) = stream.split();
-            let write: BoxAsyncWrite = Box::new(write);
-            Ok(Some(Link {
-                kind: ConnectionKind::Utp,
-                remote: to,
-                read: Box::new(read),
-                write,
+            Ok(Some(Link::new(
+                ConnectionKind::Utp,
+                to,
+                Box::new(read),
+                Box::new(write),
                 home,
-            }))
+            )))
         })
     }
 }
@@ -255,17 +248,17 @@ pub(crate) struct Behind {
 /// first link to open wins and the other attempts are dropped; when every
 /// attempt fails, the error says each one's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DialPlan {
-    pub steps: &'static [DialStep],
+pub(crate) struct DialPlan<const N: usize> {
+    pub steps: [DialStep; N],
 }
 
-impl DialPlan {
+impl DialPlan<2> {
     /// TCP first, as it is the more mature and the simpler, and uTP once
     /// TCP has not connected within a second, or at once when it fails. A
     /// route with no TCP socket free goes straight to uTP when its socket
     /// is held.
     pub const DEFAULT: Self = Self {
-        steps: &[
+        steps: [
             DialStep {
                 kind: ConnectionKind::Tcp,
                 behind: None,
@@ -284,16 +277,15 @@ impl DialPlan {
 // Which steps of `plan` a connection over `transports` tries: each whose
 // dialer may dial, but one with no socket free on the route when another
 // step's socket is held.
-fn tried<'d>(
-    plan: DialPlan,
+fn tried<'d, const N: usize>(
+    plan: DialPlan<N>,
     dialers: impl Fn(ConnectionKind) -> &'d dyn PeerDialer,
+    to: SocketAddr,
     transports: Transports,
-) -> [bool; ConnectionKind::COUNT] {
-    let may: [bool; ConnectionKind::COUNT] = std::array::from_fn(|i| {
-        plan.steps
-            .get(i)
-            .is_some_and(|step| dialers(step.kind).may_dial(transports))
-    });
+) -> [bool; N] {
+    let may = plan
+        .steps
+        .map(|step| dialers(step.kind).may_dial(to, transports));
     std::array::from_fn(|i| {
         may[i] && {
             let dialer = dialers(plan.steps[i].kind);
@@ -308,34 +300,32 @@ fn tried<'d>(
 }
 
 /// Races `plan`'s dialers to `to`. `tally` gives each attempt its counts.
-pub(super) async fn race<'d>(
-    plan: DialPlan,
+pub(super) async fn race<'d, const N: usize>(
+    plan: DialPlan<N>,
     dialers: impl Fn(ConnectionKind) -> &'d dyn PeerDialer,
     tally: impl Fn(ConnectionKind) -> Tally<'d>,
     to: SocketAddr,
     transports: Transports,
 ) -> Result<Link> {
-    debug_assert!(plan.steps.len() <= ConnectionKind::COUNT);
-    let tried = tried(plan, &dialers, transports);
+    let tried = tried(plan, &dialers, to, transports);
     // Kept for an attempt behind another when that one fails before it
     // waits, as one does on its first poll.
-    let failed: [tokio::sync::Notify; ConnectionKind::COUNT] = Default::default();
+    let failed: [tokio::sync::Notify; N] = std::array::from_fn(|_| tokio::sync::Notify::new());
     let index = |kind| plan.steps.iter().position(|step| step.kind == kind);
-    let mut attempts: [Option<BoxFuture<'_, Result<Option<Link>>>>; ConnectionKind::COUNT] =
-        std::array::from_fn(|i| {
-            let DialStep { kind, behind } = *plan.steps.get(i)?;
-            let wait = behind
-                .filter(|behind| index(behind.kind).is_some_and(|j| tried[j]))
-                .map(|behind| behind.wait);
-            let attempt: BoxFuture<'_, _> = Box::pin(attempt(
-                tried[i].then(|| dialers(kind)),
-                tally(kind),
-                wait.map(|wait| (wait, &failed[i])),
-                to,
-            ));
-            Some(attempt)
-        });
-    let mut errors: [Option<Error>; ConnectionKind::COUNT] = Default::default();
+    let mut attempts: [Option<BoxFuture<'_, Result<Option<Link>>>>; N] = std::array::from_fn(|i| {
+        let DialStep { kind, behind } = plan.steps[i];
+        let wait = behind
+            .filter(|behind| index(behind.kind).is_some_and(|j| tried[j]))
+            .map(|behind| behind.wait);
+        let attempt: BoxFuture<'_, _> = Box::pin(attempt(
+            tried[i].then(|| dialers(kind)),
+            tally(kind),
+            wait.map(|wait| (wait, &failed[i])),
+            to,
+        ));
+        Some(attempt)
+    });
+    let mut errors: [Option<Error>; N] = std::array::from_fn(|_| None);
 
     // Every attempt is polled in the plan's order, the earliest first, as
     // it has priority; after one ends, the polling starts again from the
@@ -363,7 +353,7 @@ pub(super) async fn race<'d>(
                     }
                 }
                 if attempts.iter().all(Option::is_none) {
-                    return Poll::Ready(Err(failure(&mut errors)));
+                    return Poll::Ready(Err(failure(&plan, &mut errors)));
                 }
                 continue 'polled;
             }
@@ -393,15 +383,22 @@ async fn attempt<'a>(
     dialer.dial(to, tally).await
 }
 
-// The error of a dial whose every attempt failed: that attempt's, both
-// when TCP and uTP failed, and none tried when none was.
-fn failure(errors: &mut [Option<Error>; ConnectionKind::COUNT]) -> Error {
-    let mut failed = errors.iter_mut().filter_map(Option::take);
-    match (failed.next(), failed.next()) {
-        (None, _) => Error::ConnectDisabled,
-        (Some(only), None) => only,
-        (Some(first), Some(second)) => first.and_dial(second),
+// The error of a dial whose every attempt ended without a link: the one
+// attempt's when one failed, every failed attempt's, in the plan's order,
+// when more did, and none tried when none failed.
+fn failure<const N: usize>(plan: &DialPlan<N>, errors: &mut [Option<Error>; N]) -> Error {
+    let mut failed: Vec<_> = plan
+        .steps
+        .iter()
+        .zip(errors)
+        .filter_map(|(step, error)| Some((step.kind, error.take()?)))
+        .collect();
+    if failed.len() > 1 {
+        return Error::Connect(DialErrors(failed));
     }
+    failed
+        .pop()
+        .map_or(Error::ConnectDisabled, |(_, only)| only)
 }
 
 #[cfg(test)]
@@ -435,7 +432,9 @@ mod tests {
     }
 
     impl PeerDialer for Fake {
-        fn may_dial(&self, _: Transports) -> bool {
+        // Asked about the peer dialed, never another address.
+        fn may_dial(&self, to: SocketAddr, _: Transports) -> bool {
+            assert_eq!(to, TO);
             self.may
         }
 
@@ -466,13 +465,13 @@ mod tests {
                         }
                     })?;
                 let (read, write) = halves(tokio::io::duplex(64).0);
-                Ok(Some(Link {
+                Ok(Some(Link::new(
                     kind,
-                    remote: to,
+                    to,
                     read,
                     write,
-                    home: (kind == ConnectionKind::Utp).then(tokio::runtime::Handle::current),
-                }))
+                    (kind == ConnectionKind::Utp).then(tokio::runtime::Handle::current),
+                )))
             })
         }
     }
@@ -506,8 +505,16 @@ mod tests {
 
     impl Rig {
         fn race(&self, transports: Transports) -> impl Future<Output = Result<Link>> + '_ {
+            self.race_by(DialPlan::DEFAULT, transports)
+        }
+
+        fn race_by<const N: usize>(
+            &self,
+            plan: DialPlan<N>,
+            transports: Transports,
+        ) -> impl Future<Output = Result<Link>> + '_ {
             super::race(
-                DialPlan::DEFAULT,
+                plan,
                 |kind| match kind {
                     ConnectionKind::Tcp => &self.tcp as &dyn PeerDialer,
                     ConnectionKind::Utp => &self.utp,
@@ -681,5 +688,77 @@ mod tests {
         }
         assert_eq!(rig.stat(ConnectionKind::Tcp), (1, 0, 0, 1, 0));
         assert_eq!(rig.stat(ConnectionKind::Utp), (1, 0, 0, 1, 0));
+    }
+
+    // A plan of more steps than there are kinds runs every step, and when
+    // each fails the error keeps each one's, in the plan's order.
+    #[tokio::test(start_paused = true)]
+    async fn every_step_of_a_longer_plan_runs_and_every_failure_is_kept() {
+        let behind = |kind| {
+            Some(Behind {
+                kind,
+                wait: Duration::from_secs(1),
+            })
+        };
+        let plan = DialPlan {
+            steps: [
+                DialStep {
+                    kind: ConnectionKind::Utp,
+                    behind: None,
+                },
+                DialStep {
+                    kind: ConnectionKind::Tcp,
+                    behind: behind(ConnectionKind::Utp),
+                },
+                DialStep {
+                    kind: ConnectionKind::Tcp,
+                    behind: behind(ConnectionKind::Utp),
+                },
+            ],
+        };
+        let (rig, mut dials) = fakes();
+        let mut race = pin!(rig.race_by(plan, Transports::Any));
+        let (kind, _, utp) = began(race.as_mut(), &mut dials).await;
+        assert_eq!(kind, ConnectionKind::Utp);
+        utp.send(Err(refused())).unwrap();
+        for _ in 0..2 {
+            let (kind, _, tcp) = began(race.as_mut(), &mut dials).await;
+            assert_eq!(kind, ConnectionKind::Tcp);
+            tcp.send(Err(refused())).unwrap();
+        }
+        let error = race.await.err().unwrap();
+        let Error::Connect(DialErrors(each)) = &error else {
+            panic!("{error:?}");
+        };
+        let kinds: Vec<_> = each.iter().map(|(kind, _)| *kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                ConnectionKind::Utp,
+                ConnectionKind::Tcp,
+                ConnectionKind::Tcp
+            ]
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "error connecting: uTP={:#} TCP={:#} TCP={:#}",
+                weaver_utp::Error::StResetReceived,
+                refused(),
+                refused()
+            )
+        );
+        assert_eq!(rig.stat(ConnectionKind::Tcp), (2, 0, 2, 0, 0));
+    }
+
+    // A dialed link carries its kind's capabilities.
+    #[tokio::test(start_paused = true)]
+    async fn a_link_carries_its_kinds_capabilities() {
+        let (rig, mut dials) = fakes();
+        let mut race = pin!(rig.race(Transports::Any));
+        let (_, _, tcp) = began(race.as_mut(), &mut dials).await;
+        tcp.send(Ok(())).unwrap();
+        let link = race.await.unwrap();
+        assert_eq!(&link.caps, ConnectionKind::Tcp.capabilities());
     }
 }
