@@ -187,11 +187,15 @@ impl Drop for CachedBody {
     }
 }
 
+// A fetch's failure, replayed only to a reference asking the same server
+// with the same failure ledger: the server the lane fetching it was pinned
+// to, and the article's own ledger with the job's retention exclusions.
 struct CachedFailure {
     error: DownloadError,
     generation: u64,
     source: Option<usize>,
     groups: Arc<[String]>,
+    server: usize,
     requested_excludes: weaver_nntp::ServerSet,
     expires: Option<Instant>,
     _memory: Option<ProcessMemoryPermit>,
@@ -210,11 +214,32 @@ pub(crate) struct RepeatedArticles {
     _index_memory: ProcessMemoryPermit,
 }
 
-struct Reply {
-    data: Result<DownloadPayload, DownloadError>,
-    attempts: Vec<weaver_nntp::client::FetchAttemptTrace>,
-    source: Option<usize>,
-    excludes: weaver_nntp::ServerSet,
+// A reference answered from the cache: no request went out for it, so it
+// carries no attempts, and its source is the server whose answer it repeats.
+pub(in crate::pipeline::download) struct Reply {
+    pub(in crate::pipeline::download) data: Result<DownloadPayload, DownloadError>,
+    pub(in crate::pipeline::download) source: Option<usize>,
+}
+
+// What the cache says about one reference to a shared article.
+pub(in crate::pipeline::download) enum SharedLookup {
+    Replay(Reply),
+    // Nothing to replay: the caller fetches the article and settles the
+    // claim with the result. Every other reference to it waits on the claim.
+    Fetch(SharedClaim),
+}
+
+// The one fetch of a shared article that is in flight. Holding it holds the
+// article's entry, so it is settled, or dropped, before its holder waits on
+// anything else.
+pub(in crate::pipeline::download) struct SharedClaim {
+    state: tokio::sync::OwnedMutexGuard<Option<Entry>>,
+    cache: Arc<RepeatedArticles>,
+    segment_id: SegmentId,
+    generation: u64,
+    groups: Arc<[String]>,
+    server: usize,
+    requested_excludes: weaver_nntp::ServerSet,
 }
 
 impl RepeatedArticles {
@@ -286,45 +311,29 @@ impl RepeatedArticles {
         })))
     }
 
-    #[cfg(test)]
-    async fn fetch(
-        self: &Arc<Self>,
-        work: &DownloadWork,
-        excludes: weaver_nntp::ServerSet,
-        nntp: &NntpClient,
-        generation: u64,
-    ) -> Reply {
-        self.fetch_guarded(work, excludes, nntp, generation, || true)
-            .await
+    // Whether `id` is one of the articles several references share.
+    pub(in crate::pipeline::download) fn shares(&self, id: &MessageId) -> bool {
+        self.entries.contains_key(id)
     }
 
-    async fn fetch_guarded(
+    // Answer one reference from the cache, or hand back the claim on its one
+    // fetch. `server` is the server the caller would fetch it from, and
+    // `requested_excludes` the article's failure ledger with the job's
+    // retention exclusions; a cached failure is replayed only to the same
+    // request. `None` for an article no other reference shares.
+    //
+    // Blocks while another caller holds the claim, so it is asked only on a
+    // thread that may wait, holding no other claim: a download lane, never
+    // the async runtime or the pipeline loop.
+    pub(in crate::pipeline::download) fn lookup(
         self: &Arc<Self>,
         work: &DownloadWork,
-        excludes: weaver_nntp::ServerSet,
-        nntp: &NntpClient,
+        server: usize,
+        requested_excludes: weaver_nntp::ServerSet,
         generation: u64,
-        ready: impl Fn() -> bool,
-    ) -> Reply {
-        let obsolete = || Reply {
-            data: Err(DownloadError::Fetch(DownloadFailure::new(
-                DownloadFailureKind::Unrequested,
-                "duplicate article reservation became obsolete",
-            ))),
-            attempts: Vec::new(),
-            source: None,
-            excludes: work.exclude_servers,
-        };
-        if !ready() {
-            return obsolete();
-        }
-        let Some(entry) = self.entries.get(&work.message_id) else {
-            return Self::fetch_uncached(work, excludes, nntp).await;
-        };
-        let mut state = entry.clone().lock_owned().await;
-        if !ready() {
-            return obsolete();
-        }
+    ) -> Option<SharedLookup> {
+        let entry = self.entries.get(&work.message_id)?;
+        let mut state = Arc::clone(entry).blocking_lock_owned();
         match state.as_mut() {
             Some(Entry::Body(body))
                 if body.generation == generation
@@ -332,37 +341,19 @@ impl RepeatedArticles {
                         .source
                         .is_none_or(|source| !work.exclude_servers.contains(source)) =>
             {
-                let memory = self.memory.clone();
-                let id = work.segment_id;
-                let excludes = work.exclude_servers;
-                return tokio::task::spawn_blocking(move || {
-                    let Some(Entry::Body(body)) = state.as_mut() else {
-                        unreachable!()
-                    };
-                    Reply {
-                        data: body
-                            .read(id, &memory)
-                            .map(DownloadPayload::Decoded)
-                            .map_err(DownloadError::local),
-                        attempts: Vec::new(),
-                        source: body.source,
-                        excludes,
-                    }
-                })
-                .await
-                .unwrap_or_else(|error| Reply {
-                    data: Err(DownloadError::local(format!(
-                        "article cache task failed: {error}"
-                    ))),
-                    attempts: Vec::new(),
-                    source: None,
-                    excludes: weaver_nntp::ServerSet::EMPTY,
-                });
+                return Some(SharedLookup::Replay(Reply {
+                    data: body
+                        .read(work.segment_id, &self.memory)
+                        .map(DownloadPayload::Decoded)
+                        .map_err(DownloadError::local),
+                    source: body.source,
+                }));
             }
             Some(Entry::Failure(failure))
                 if failure.generation == generation
                     && failure.groups == work.groups
-                    && failure.requested_excludes == excludes
+                    && failure.server == server
+                    && failure.requested_excludes == requested_excludes
                     && failure.expires.is_none_or(|until| Instant::now() < until) =>
             {
                 // The replay reports the article's own ledger, exactly as
@@ -371,52 +362,71 @@ impl RepeatedArticles {
                 // would hand completion a set that already names the refusing
                 // server, which reads as a retry that learned nothing and
                 // books the segment after a single server's 430.
-                return Reply {
+                return Some(SharedLookup::Replay(Reply {
                     data: Err(failure.error.clone()),
-                    attempts: Vec::new(),
                     source: failure.source,
-                    excludes: work.exclude_servers,
-                };
+                }));
             }
             Some(Entry::Fatal(error)) => {
-                return Reply {
+                return Some(SharedLookup::Replay(Reply {
                     data: Err(DownloadError::local(error.clone())),
-                    attempts: Vec::new(),
                     source: None,
-                    excludes: work.exclude_servers,
-                };
+                }));
             }
             _ => {}
         }
         *state = None;
-        let mut reply = Self::fetch_uncached(work, excludes, nntp).await;
-        match reply.data {
+        Some(SharedLookup::Fetch(SharedClaim {
+            state,
+            cache: Arc::clone(self),
+            segment_id: work.segment_id,
+            generation,
+            groups: work.groups.clone(),
+            server,
+            requested_excludes,
+        }))
+    }
+}
+
+impl SharedClaim {
+    pub(in crate::pipeline::download) fn segment_id(&self) -> SegmentId {
+        self.segment_id
+    }
+
+    // Keep what the fetch answered for the references still to come. A
+    // decoded body is stored and handed back as a view of the stored copy; a
+    // body the cache cannot keep fails this reference locally, and every
+    // later one with it. A failure is kept for the same request; one that is
+    // local capacity rather than article evidence only briefly.
+    pub(in crate::pipeline::download) fn settle(
+        mut self,
+        data: &mut Result<DownloadPayload, DownloadError>,
+        source: Option<usize>,
+        attempts: usize,
+    ) {
+        let cache = &self.cache;
+        match std::mem::replace(data, Err(DownloadError::local(String::new()))) {
             Ok(DownloadPayload::Decoded(decoded)) => {
-                let cache = self.clone();
-                let source = reply.source;
                 let raw_size = decoded.raw_size;
-                let result = tokio::task::spawn_blocking(move || {
-                    match CachedBody::store(decoded, source, &cache.root, &cache.memory, generation)
-                    {
-                        Ok((cached, decoded)) => {
-                            *state = Some(Entry::Body(cached));
-                            Ok(decoded)
-                        }
-                        Err(error) => {
-                            *state = Some(Entry::Fatal(error.clone()));
-                            Err(error)
-                        }
+                *data = match CachedBody::store(
+                    decoded,
+                    source,
+                    &cache.root,
+                    &cache.memory,
+                    self.generation,
+                ) {
+                    Ok((cached, decoded)) => {
+                        *self.state = Some(Entry::Body(cached));
+                        Ok(DownloadPayload::Decoded(decoded))
                     }
-                })
-                .await;
-                reply.data = result
-                    .map_err(|error| format!("article cache task failed: {error}"))
-                    .and_then(|result| result)
-                    .map(DownloadPayload::Decoded)
-                    .map_err(|error| DownloadError::Local { raw_size, error });
+                    Err(error) => {
+                        *self.state = Some(Entry::Fatal(error.clone()));
+                        Err(DownloadError::Local { raw_size, error })
+                    }
+                };
             }
-            Err(ref error) => {
-                let (message_bytes, raw_size) = match error {
+            Err(error) => {
+                let (message_bytes, raw_size) = match &error {
                     DownloadError::Fetch(failure) => (failure.message.len(), 0),
                     DownloadError::Decode {
                         error, raw_size, ..
@@ -425,20 +435,23 @@ impl RepeatedArticles {
                 };
                 let cost = std::mem::size_of::<CachedFailure>()
                     + message_bytes * 2
-                    + (excludes.len() + reply.attempts.len() + work.exclude_servers.len()) * 32;
-                let reservation = match self.memory.try_reserve_retained(cost as u64) {
+                    + (self.requested_excludes.len() + attempts + 1) * 32;
+                let reservation = match cache.memory.try_reserve_retained(cost as u64) {
                     Ok(reservation) => reservation,
-                    Err(error) => {
-                        *state = Some(Entry::Fatal(error.clone()));
-                        reply.data = Err(DownloadError::Local { raw_size, error });
-                        return reply;
+                    Err(reserve) => {
+                        *self.state = Some(Entry::Fatal(reserve.clone()));
+                        *data = Err(DownloadError::Local {
+                            raw_size,
+                            error: reserve,
+                        });
+                        return;
                     }
                 };
                 let mut cached_error = error.clone();
                 if let DownloadError::Decode { raw_size, .. } = &mut cached_error {
                     *raw_size = 0;
                 }
-                let expires = match error {
+                let expires = match &error {
                     DownloadError::Fetch(failure)
                         if failure.kind.preserves_article_retry_budget() =>
                     {
@@ -446,154 +459,21 @@ impl RepeatedArticles {
                     }
                     _ => None,
                 };
-                *state = Some(Entry::Failure(CachedFailure {
+                *self.state = Some(Entry::Failure(CachedFailure {
                     error: cached_error,
-                    generation,
-                    source: reply.source,
-                    groups: work.groups.clone(),
-                    requested_excludes: excludes,
+                    generation: self.generation,
+                    source,
+                    groups: self.groups.clone(),
+                    server: self.server,
+                    requested_excludes: self.requested_excludes,
                     expires,
                     _memory: Some(reservation),
                 }));
+                *data = Err(error);
             }
             #[cfg(test)]
-            Ok(DownloadPayload::Raw(_)) => unreachable!("fused BODY fetch returns decoded data"),
+            Ok(raw @ DownloadPayload::Raw(_)) => *data = Ok(raw),
         }
-        reply
-    }
-
-    // The one fetch this cache cannot replay, and the last request in the
-    // pipeline still issued through an async connection.
-    //
-    // On a server the owned download lanes serve, this acquire refuses to
-    // queue behind them: it comes straight back as a capacity refusal rather
-    // than spending the whole soft-timeout budget waiting for an article
-    // transfer to end. That refusal is local capacity, never article
-    // evidence, so the work requeues without spending the segment's retry
-    // budget and the short-lived cached failure expires on its own. No
-    // article is lost; the duplicates simply wait for a lane to free up.
-    async fn fetch_uncached(
-        work: &DownloadWork,
-        excludes: weaver_nntp::ServerSet,
-        nntp: &NntpClient,
-    ) -> Reply {
-        let trace = nntp
-            .fetch_body_decoded_with_groups_excluding_traced(
-                &work.message_id.wire_form(),
-                &work.groups,
-                excludes,
-            )
-            .await;
-        let (mut data, attempts, source) =
-            Pipeline::download_data_from_decoded_trace(work.segment_id, trace);
-        // Whether this connection had a group selected is not known here, so
-        // only a work with no group to select settles a 412.
-        if let Err(DownloadError::Fetch(failure)) = &mut data {
-            failure.settle_group_refusal(work.groups.is_empty(), false);
-        }
-        // The one wire fetch here, credited exactly as a lane credits one.
-        if let Some(counters) = &work.counters {
-            super::owned_lane::credit_transfer(counters, &data);
-        }
-        Reply {
-            data,
-            attempts,
-            source,
-            excludes: work.exclude_servers,
-        }
-    }
-}
-
-impl Pipeline {
-    pub(in crate::pipeline::download) fn spawn_repeated_download_batch(
-        &self,
-        lease: DownloadBatchLease,
-        cache: Arc<RepeatedArticles>,
-    ) {
-        let nntp = self.nntp.clone();
-        let state = self.shared_state.clone();
-        let tx = self.download_done_tx.clone();
-        let parked = self.download_lane_parked_tx.clone();
-        tokio::spawn(async move {
-            for work in lease.works {
-                // The article's own failure ledger, unioned with the job's
-                // retention exclusions from the lease. A batch is cut for one
-                // job, not for one exclusion set, so the ledger has to come
-                // from the work: fetching on the lease's set alone re-asks a
-                // server this article has already been refused by, and the
-                // result then reports a set that never grows.
-                let article_excludes = work.exclude_servers.union(lease.effective_exclude_servers);
-                let excludes = article_excludes.union(lease.dial_exclude_servers);
-                let guard_state = state.clone();
-                let guard_excludes = article_excludes;
-                let job_id = lease.job_id;
-                let generation = lease.runtime_generation;
-                let estimate = Pipeline::bandwidth_reservation_estimate(work.byte_estimate);
-                // Judged by the view of the policy the client hands it: see
-                // `weaver_nntp::client::WorkGuard`.
-                let guarded = nntp.with_work_guard(move |server, policy| {
-                    super::owned_lane::job_work_is_current(&guard_state, job_id, generation)
-                        && matches!(
-                            policy.eligibility(
-                                server.0,
-                                guard_excludes,
-                                weaver_nntp::ServerSet::EMPTY,
-                                estimate
-                            ),
-                            weaver_nntp::provider_policy::ArticleEligibility::Eligible(_)
-                        )
-                });
-                let reply = cache
-                    .fetch_guarded(&work, excludes, &guarded, lease.runtime_generation, || {
-                        super::owned_lane::job_work_is_current(
-                            &state,
-                            lease.job_id,
-                            lease.runtime_generation,
-                        ) && {
-                            !nntp
-                                .pool()
-                                .provider_policy()
-                                .eligible_servers(
-                                    article_excludes,
-                                    weaver_nntp::ServerSet::EMPTY,
-                                    Pipeline::bandwidth_reservation_estimate(work.byte_estimate),
-                                )
-                                .difference(lease.dial_exclude_servers)
-                                .is_empty()
-                        }
-                    })
-                    .await;
-                let _ = tx
-                    .send(DownloadResult {
-                        lane_id: lease.lane_id,
-                        job_id: lease.job_id,
-                        segment_id: work.segment_id,
-                        runtime_generation: lease.runtime_generation,
-                        data: reply.data,
-                        attempts: reply.attempts,
-                        lane_observation: None,
-                        source_server_idx: reply.source,
-                        origin: DownloadResultOrigin::from_work(
-                            work.is_recovery,
-                            work.completion_critical,
-                        ),
-                        retry_count: work.retry_count,
-                        exclude_servers: reply.excludes.union(lease.effective_exclude_servers),
-                        release_connection_slot: false,
-                    })
-                    .await;
-            }
-            let _ = parked
-                .send(DownloadLaneParked {
-                    lane_id: lease.lane_id,
-                    job_id: lease.job_id,
-                    mode: lease.lane_mode,
-                    completion_critical: lease.completion_critical,
-                    reason: LaneParkReason::NoWork,
-                    release_connection_slot: true,
-                })
-                .await;
-        });
     }
 }
 
@@ -749,38 +629,161 @@ mod tests {
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
-    #[tokio::test]
-    async fn shared_missing_evidence_keeps_its_provider_scope_and_generation() {
+    fn cache_holding(work: &DownloadWork, entry: Option<Entry>) -> Arc<RepeatedArticles> {
         let root = CacheRoot::new(tempfile::tempdir().unwrap().keep());
         let memory = Arc::new(ProcessMemoryBudget::new(1 << 20));
-        let work = work();
-        let failure = CachedFailure {
-            error: DownloadError::from_nntp(weaver_nntp::NntpError::ArticleNotFound),
-            generation: 7,
-            source: Some(0),
-            groups: work.groups.clone(),
-            requested_excludes: weaver_nntp::ServerSet::EMPTY,
-            expires: None,
-            _memory: None,
-        };
-        let cache = Arc::new(RepeatedArticles {
+        Arc::new(RepeatedArticles {
             entries: HashMap::from([(
                 work.message_id.clone(),
-                Arc::new(tokio::sync::Mutex::new(Some(Entry::Failure(failure)))),
+                Arc::new(tokio::sync::Mutex::new(entry)),
             )]),
             root,
             _index_memory: memory.try_reserve_retained(0).unwrap(),
             memory,
-        });
-        let client = NntpClient::new(weaver_nntp::client::NntpClientConfig {
-            servers: Vec::new(),
-            max_idle_age: Duration::from_secs(1),
-            max_retries_per_server: 1,
-            soft_timeout: Duration::from_secs(1),
-        });
-        let reply = cache
-            .fetch(&work, weaver_nntp::ServerSet::EMPTY, &client, 7)
-            .await;
+        })
+    }
+
+    fn reference(work: &DownloadWork, file_index: u32) -> DownloadWork {
+        DownloadWork {
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    file_index,
+                    ..work.segment_id.file_id
+                },
+                ..work.segment_id
+            },
+            ..work.clone()
+        }
+    }
+
+    fn replay(lookup: Option<SharedLookup>) -> Reply {
+        match lookup {
+            Some(SharedLookup::Replay(reply)) => reply,
+            Some(SharedLookup::Fetch(_)) => panic!("expected a replay, got a claim"),
+            None => panic!("expected a replay of a shared article"),
+        }
+    }
+
+    fn claim(lookup: Option<SharedLookup>) -> SharedClaim {
+        match lookup {
+            Some(SharedLookup::Fetch(claim)) => claim,
+            Some(SharedLookup::Replay(_)) => panic!("expected a claim, got a replay"),
+            None => panic!("expected a claim on a shared article"),
+        }
+    }
+
+    #[test]
+    fn an_article_no_other_reference_shares_is_not_looked_up() {
+        let work = work();
+        let cache = cache_holding(&work, None);
+        let other = DownloadWork {
+            message_id: MessageId::new("alone@example.test"),
+            ..work.clone()
+        };
+        assert!(cache.shares(&work.message_id));
+        assert!(!cache.shares(&other.message_id));
+        assert!(
+            cache
+                .lookup(&other, 0, weaver_nntp::ServerSet::EMPTY, 7)
+                .is_none()
+        );
+    }
+
+    // One fetch answers every reference: the first takes the claim, a second
+    // asked while the fetch is out waits for it, and each one after is a
+    // view of the one stored body, crediting no wire bytes.
+    #[test]
+    fn one_fetch_serves_every_reference() {
+        let work = work();
+        let cache = cache_holding(&work, None);
+        let first = claim(cache.lookup(&work, 0, weaver_nntp::ServerSet::EMPTY, 7));
+        assert_eq!(first.segment_id(), work.segment_id);
+        let waiting = {
+            let cache = Arc::clone(&cache);
+            let second = reference(&work, 1);
+            std::thread::spawn(move || {
+                replay(cache.lookup(&second, 0, weaver_nntp::ServerSet::EMPTY, 7))
+            })
+        };
+        let bytes = [42u8; 1024];
+        let mut data = Ok(DownloadPayload::Decoded(decoded(work.segment_id, &bytes)));
+        first.settle(&mut data, Some(0), 1);
+        let Ok(DownloadPayload::Decoded(fetched)) = &data else {
+            panic!("the fetched reference keeps its body")
+        };
+        assert_eq!(fetched.raw_size, bytes.len() as u64 + 80);
+        let DecodedChunk::Shared(body) = &fetched.data else {
+            panic!("the fetched reference is a view of the stored body")
+        };
+        let second = waiting.join().unwrap();
+        let mut replies = vec![second];
+        for file_index in 2..4 {
+            replies.push(replay(cache.lookup(
+                &reference(&work, file_index),
+                1,
+                weaver_nntp::ServerSet::EMPTY,
+                7,
+            )));
+        }
+        for (index, reply) in replies.into_iter().enumerate() {
+            assert_eq!(reply.source, Some(0));
+            let Ok(DownloadPayload::Decoded(replayed)) = reply.data else {
+                panic!("every reference replays the body")
+            };
+            assert_eq!(replayed.segment_id.file_id.file_index, index as u32 + 1);
+            assert_eq!(replayed.raw_size, 0, "a replay is no new transfer");
+            let DecodedChunk::Shared(shared) = &replayed.data else {
+                panic!("a replay is shared")
+            };
+            assert!(Arc::ptr_eq(body, shared));
+        }
+        // A reference that has already been refused by the body's source,
+        // or a new generation, fetches again.
+        let refused = DownloadWork {
+            exclude_servers: weaver_nntp::ServerSet::from([0]),
+            ..reference(&work, 1)
+        };
+        drop(claim(cache.lookup(&refused, 1, refused.exclude_servers, 7)));
+        drop(claim(cache.lookup(&work, 0, weaver_nntp::ServerSet::EMPTY, 8)));
+    }
+
+    // A claim dropped without a result leaves nothing behind: the next
+    // reference fetches.
+    #[test]
+    fn a_claim_given_up_unsettled_leaves_the_next_reference_to_fetch() {
+        let work = work();
+        let cache = cache_holding(&work, None);
+        drop(claim(cache.lookup(&work, 0, weaver_nntp::ServerSet::EMPTY, 7)));
+        drop(claim(cache.lookup(
+            &reference(&work, 1),
+            0,
+            weaver_nntp::ServerSet::EMPTY,
+            7,
+        )));
+    }
+
+    #[test]
+    fn shared_missing_evidence_keeps_its_provider_scope_and_generation() {
+        let work = work();
+        let cache = cache_holding(&work, None);
+        let fetch = claim(cache.lookup(&work, 0, weaver_nntp::ServerSet::EMPTY, 7));
+        let mut data = Err(DownloadError::from_nntp(
+            weaver_nntp::NntpError::ArticleNotFound,
+        ));
+        fetch.settle(&mut data, Some(0), 1);
+        assert!(matches!(
+            data,
+            Err(DownloadError::Fetch(DownloadFailure {
+                kind: DownloadFailureKind::ArticleNotFound,
+                ..
+            }))
+        ));
+        let reply = replay(cache.lookup(
+            &reference(&work, 1),
+            0,
+            weaver_nntp::ServerSet::EMPTY,
+            7,
+        ));
         assert!(matches!(
             reply.data,
             Err(DownloadError::Fetch(DownloadFailure {
@@ -789,88 +792,75 @@ mod tests {
             }))
         ));
         assert_eq!(
-            reply.excludes,
-            Vec::<usize>::new(),
-            "the replay reports the article's own ledger; the proof rides as the source"
+            reply.source,
+            Some(0),
+            "the replay carries the proof as its source"
         );
-        assert_eq!(reply.source, Some(0));
-        assert!(reply.attempts.is_empty());
-        {
-            let mut state = cache.entries[&work.message_id].lock().await;
-            let Some(Entry::Failure(failure)) = state.as_mut() else {
-                panic!("cached failure")
-            };
-            failure.requested_excludes = weaver_nntp::ServerSet::from([1]);
-        }
-        let reply = cache
-            .fetch(&work, weaver_nntp::ServerSet::from([1]), &client, 7)
-            .await;
-        assert_eq!(
-            reply.excludes,
-            Vec::<usize>::new(),
-            "a transport avoidance hint is not a missing-article proof"
-        );
-        assert_eq!(reply.source, Some(0));
-        let reply = cache
-            .fetch(&work, weaver_nntp::ServerSet::EMPTY, &client, 8)
-            .await;
-        assert!(matches!(
-            reply.data,
-            Err(DownloadError::Fetch(DownloadFailure {
-                kind: DownloadFailureKind::CapacityUnavailable,
-                ..
-            }))
+        // Another server, another ledger or another generation is another
+        // request: it fetches, and its claim replaces the evidence.
+        drop(claim(cache.lookup(
+            &work,
+            1,
+            weaver_nntp::ServerSet::EMPTY,
+            7,
+        )));
+        let fetch = claim(cache.lookup(&work, 0, weaver_nntp::ServerSet::EMPTY, 7));
+        let mut data = Err(DownloadError::from_nntp(
+            weaver_nntp::NntpError::ArticleNotFound,
         ));
+        fetch.settle(&mut data, Some(0), 1);
+        drop(claim(cache.lookup(
+            &work,
+            0,
+            weaver_nntp::ServerSet::from([1]),
+            7,
+        )));
+        let fetch = claim(cache.lookup(&work, 0, weaver_nntp::ServerSet::EMPTY, 7));
+        let mut data = Err(DownloadError::from_nntp(
+            weaver_nntp::NntpError::ArticleNotFound,
+        ));
+        fetch.settle(&mut data, Some(0), 1);
+        drop(claim(cache.lookup(
+            &work,
+            0,
+            weaver_nntp::ServerSet::EMPTY,
+            8,
+        )));
     }
 
     // "Every connection is busy" is local capacity, not article evidence.
-    // A refusal that arrives without waiting must never latch as this
-    // message id's answer: it has to expire so the duplicates come back, and
-    // it has to leave the segment's retry budget alone.
-    #[tokio::test]
-    async fn a_capacity_refusal_expires_and_keeps_the_retry_budget() {
-        let root = CacheRoot::new(tempfile::tempdir().unwrap().keep());
-        let memory = Arc::new(ProcessMemoryBudget::new(1 << 20));
+    // It must never latch as this message id's answer: it expires so the
+    // duplicates come back, and it leaves the segment's retry budget alone.
+    #[test]
+    fn a_capacity_refusal_expires_and_keeps_the_retry_budget() {
         let work = work();
         let stale = CachedFailure {
             error: DownloadError::from_nntp(weaver_nntp::NntpError::AcquireTimeout(0)),
             generation: 7,
             source: None,
             groups: work.groups.clone(),
+            server: 0,
             requested_excludes: weaver_nntp::ServerSet::EMPTY,
             expires: Some(Instant::now() - Duration::from_millis(1)),
             _memory: None,
         };
-        let cache = Arc::new(RepeatedArticles {
-            entries: HashMap::from([(
-                work.message_id.clone(),
-                Arc::new(tokio::sync::Mutex::new(Some(Entry::Failure(stale)))),
-            )]),
-            root,
-            _index_memory: memory.try_reserve_retained(0).unwrap(),
-            memory,
-        });
-        let client = NntpClient::new(weaver_nntp::client::NntpClientConfig {
-            servers: Vec::new(),
-            max_idle_age: Duration::from_secs(1),
-            max_retries_per_server: 1,
-            soft_timeout: Duration::from_secs(1),
-        });
-        // The expired entry is discarded rather than replayed, so this reply
-        // is the fresh refusal from the fetch path.
-        let reply = cache
-            .fetch(&work, weaver_nntp::ServerSet::EMPTY, &client, 7)
-            .await;
-        let Err(DownloadError::Fetch(failure)) = &reply.data else {
-            panic!("the expired entry must be refetched into a capacity refusal")
+        let cache = cache_holding(&work, Some(Entry::Failure(stale)));
+        // The expired entry is discarded rather than replayed.
+        let fetch = claim(cache.lookup(&work, 0, weaver_nntp::ServerSet::EMPTY, 7));
+        let mut data = Err(DownloadError::from_nntp(
+            weaver_nntp::NntpError::AcquireTimeout(0),
+        ));
+        fetch.settle(&mut data, None, 0);
+        let Err(DownloadError::Fetch(failure)) = &data else {
+            panic!("the refusal stays this reference's answer")
         };
         assert_eq!(failure.kind, DownloadFailureKind::CapacityUnavailable);
         assert!(
             failure.kind.preserves_article_retry_budget(),
             "a busy-lane refusal must requeue without spending the segment's retries"
         );
-        let mut state = cache.entries[&work.message_id].lock().await;
-        let Some(Entry::Failure(cached)) = state.as_mut() else {
+        let state = cache.entries[&work.message_id].blocking_lock();
+        let Some(Entry::Failure(cached)) = state.as_ref() else {
             panic!("cached failure")
         };
         assert!(

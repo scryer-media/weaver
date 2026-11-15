@@ -1287,6 +1287,8 @@ struct LaneLeaseContext {
     pressure_clear: bool,
     mode: DownloadLaneMode,
     checkpoint_plan: weaver_yenc::CheckpointPlan,
+    // The job's repeated-article cache, when its files share articles.
+    repeated: Option<Arc<super::repeated::RepeatedArticles>>,
 }
 
 impl LaneLeaseContext {
@@ -1312,6 +1314,7 @@ impl LaneLeaseContext {
                 supports_pipelining,
             ),
             checkpoint_plan: std::mem::take(&mut lease.checkpoint_plan),
+            repeated: lease.repeated.take(),
         }
     }
 
@@ -1724,6 +1727,9 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
     let mut refill_denied = false;
     let mut stop: Option<LaneStop> = None;
     let mut stats_mark = lane.stats();
+    // The claim on the one fetch of a shared article, while its BODY is the
+    // only request on the ring. See `RepeatedArticles::lookup`.
+    let mut shared_claim: Option<super::repeated::SharedClaim> = None;
 
     let (park_reason, keep_cached_lane) = loop {
         // Adopt an answered refill without waiting for it. Taking it here is
@@ -1775,6 +1781,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         // Behind a mid-batch 480 the lane drains its ring and logs in again
         // before anything new goes out.
         while stop.is_none()
+            && shared_claim.is_none()
             && lane.ring_outstanding() < context.depth()
             && !lane.holds_new_requests()
         {
@@ -1792,7 +1799,50 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 stop = Some(LaneStop::ReservationObsolete);
                 break;
             }
+            // An article several files share goes out alone, on an empty
+            // ring: its claim is then never held while this lane waits on
+            // another's, and its response is the next one read.
+            let shared = work_context
+                .repeated
+                .as_ref()
+                .filter(|cache| cache.shares(&work.message_id))
+                .cloned();
+            if shared.is_some() && lane.ring_outstanding() > 0 {
+                break;
+            }
             let (work, work_context) = pending.pop_front().expect("pending front was inspected");
+            if let Some(cache) = shared {
+                match cache.lookup(
+                    &work,
+                    server_idx,
+                    result_exclude_servers(&work, work_context.retention_excludes),
+                    work_context.runtime_generation,
+                ) {
+                    Some(super::repeated::SharedLookup::Replay(reply)) => {
+                        let result = replayed_result(work, &work_context, reply);
+                        if stream_owned_result(&event_tx, lane, &mut stats_mark, result).is_err() {
+                            stop = Some(LaneStop::Error);
+                        }
+                        continue;
+                    }
+                    Some(super::repeated::SharedLookup::Fetch(claim)) => {
+                        // The lookup may have waited out another lane's fetch.
+                        if !issue_is_current(
+                            &state,
+                            &nntp,
+                            HeldConnection::of(lane),
+                            &work,
+                            &work_context,
+                        ) {
+                            pending.push_front((work, work_context));
+                            stop = Some(LaneStop::ReservationObsolete);
+                            break;
+                        }
+                        shared_claim = Some(claim);
+                    }
+                    None => {}
+                }
+            }
             let estimate = Pipeline::bandwidth_reservation_estimate(work.byte_estimate);
             let wire_form = work.message_id.wire_form();
             let outcome = lane.ring_issue(&wire_form, estimate, work_context.depth());
@@ -1815,7 +1865,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 }
             };
             let discarded = matches!(stop, Some(LaneStop::ConnectionLost));
-            let result = result_from_trace(
+            let mut result = result_from_trace(
                 work,
                 work_context.runtime_generation,
                 work_context.lane_id,
@@ -1845,6 +1895,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 work_context.retention_excludes,
                 group_selected,
             );
+            settle_shared_claim(&mut shared_claim, &mut result);
             if matches!(stop, Some(LaneStop::PolicyBlocked)) && egress_quota_refused(&result.data) {
                 stop = Some(LaneStop::EgressQuota);
             }
@@ -1984,7 +2035,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         if sample.settled && payload_bytes > 0 && work_context.pressure_clear {
             nntp.record_address_delivery(&trace.attempts, payload_bytes, policy_elapsed);
         }
-        let result = result_from_trace(
+        let mut result = result_from_trace(
             work,
             work_context.runtime_generation,
             work_context.lane_id,
@@ -2020,6 +2071,9 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 )
         );
         let egress_blocked = egress_quota_refused(&result.data);
+        // Settled after the connection's verdict is read: a body the cache
+        // cannot keep fails locally, which says nothing of the socket.
+        settle_shared_claim(&mut shared_claim, &mut result);
         if stream_owned_result(&event_tx, lane, &mut stats_mark, result).is_err() {
             stop = Some(LaneStop::Error);
         }
@@ -2058,6 +2112,9 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             }
         }
     };
+    // A claim whose response never came is given up before anything below
+    // waits: the article's next reference fetches it.
+    drop(shared_claim);
 
     // Return what this lane still holds before waiting on its refill. A
     // refill from a saturated lane is held in the actor until the lane has
@@ -2347,6 +2404,45 @@ fn result_from_trace(
     }
 }
 
+// Keep a shared article's fetched answer for its other references.
+fn settle_shared_claim(
+    claim: &mut Option<super::repeated::SharedClaim>,
+    result: &mut DownloadResult,
+) {
+    if let Some(claim) = claim.take() {
+        debug_assert_eq!(claim.segment_id(), result.segment_id);
+        claim.settle(
+            &mut result.data,
+            result.source_server_idx,
+            result.attempts.len(),
+        );
+    }
+}
+
+// A reference answered from the repeated-article cache. Nothing went on the
+// wire for it, so it carries no attempts, no lane observation and no
+// transfer credit.
+fn replayed_result(
+    work: DownloadWork,
+    context: &LaneLeaseContext,
+    reply: super::repeated::Reply,
+) -> DownloadResult {
+    DownloadResult {
+        lane_id: context.lane_id,
+        job_id: context.job_id,
+        segment_id: work.segment_id,
+        runtime_generation: context.runtime_generation,
+        exclude_servers: result_exclude_servers(&work, context.retention_excludes),
+        data: reply.data,
+        attempts: Vec::new(),
+        lane_observation: None,
+        source_server_idx: reply.source,
+        origin: DownloadResultOrigin::from_work(work.is_recovery, work.completion_critical),
+        retry_count: work.retry_count,
+        release_connection_slot: false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn unresolved_result(
     work: DownloadWork,
@@ -2494,6 +2590,7 @@ fn test_lease(
         dial_exclude_servers: exclude_servers,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
+        repeated: None,
         works,
     }
 }
