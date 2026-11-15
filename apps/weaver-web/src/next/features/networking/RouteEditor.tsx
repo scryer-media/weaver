@@ -21,7 +21,9 @@ import {
   type Rung,
 } from "@/lib/networking";
 import { chainHopProfiles, proxyLabels, withChainHop, type ChainLimits, type ProxyProfile } from "@/lib/proxies";
+import { SYSTEM_DNS_PROFILE_ID, dnsRouteProblem, dnsRouteProblemKey, wireGuardWithoutDns, type DnsProfileChoice } from "@/lib/dns";
 import { cn } from "@/lib/utils";
+import { networkIds, testIds } from "@/next/testids";
 import { Square } from "../../components/chrome";
 import { Icon } from "../../components/icons";
 import { NumberField, SecondaryButton, Segmented, Select } from "../../components/controls";
@@ -59,6 +61,11 @@ function LadderArrow() {
   );
 }
 
+/** The egress fields a route editor reads. */
+export type RouteEgress = Pick<Egress, "id" | "name" | "enabled">;
+/** The proxy fields a route editor reads. */
+export type RouteProxy = Pick<ProxyProfile, "id" | "name" | "kind" | "enabled" | "dnsServers">;
+
 /**
  * A consumer's route: its legs and the path each leg takes from its egress.
  * A server's connections are split across the legs by weight, and the route
@@ -80,16 +87,19 @@ export function RouteEditor({
   cap = 1,
   kind = "SERVER",
   status = [],
+  dnsProfiles,
 }: {
   value: NetworkRoute;
   onChange: (route: NetworkRoute) => void;
-  egresses: Egress[];
-  profiles: ProxyProfile[];
+  egresses: RouteEgress[];
+  profiles: RouteProxy[];
   pools: ProxyPool[];
   cap?: number;
   /** What owns the route. Only a server's connections are split across legs; anything else has one. */
   kind?: ConsumerKind;
   status?: LegFlow[];
+  /** The saved DNS profiles the route can follow; without them the route's DNS is not offered. */
+  dnsProfiles?: readonly DnsProfileChoice[];
 }) {
   const t = useTranslate();
   // Only a server's connections are shared out across legs by weight.
@@ -112,6 +122,10 @@ export function RouteEditor({
   const assigned = targets.reduce((sum, target) => sum + target, 0);
   const weight = (index: number, next: number) => onChange({ ...value, legs: adjustWeight(value.legs, index, next) });
   const problem = routeProblem(value, { egresses, pools, kind });
+  const dnsProfileId = value.dnsProfileId ?? SYSTEM_DNS_PROFILE_ID;
+  const dnsProblem = dnsProfiles
+    ? dnsRouteProblem(value, dnsProfiles.find((choice) => choice.id === dnsProfileId), { proxies: profiles, pools })
+    : null;
   const reorder = (legs: Leg[]) => {
     setDown(new Set());
     onChange({ ...value, legs });
@@ -259,6 +273,7 @@ export function RouteEditor({
                   label={t("next.networking.route.egress")}
                   value={String(leg.egressId)}
                   onChange={(next) => update(index, { ...leg, egressId: Number(next) })}
+                  testId={networkIds.routeLegEgress(index)}
                   className="w-full min-w-0"
                   options={egresses
                     .filter((egress) => egress.enabled || egress.id === leg.egressId)
@@ -513,9 +528,35 @@ export function RouteEditor({
         </div>
       ) : null}
 
+      {dnsProfiles ? (
+        <ControlLabel label={t("next.dns.routeProfile")} className="w-[268px] max-w-full">
+          <Select<string>
+            label={t("next.dns.routeProfile")}
+            value={String(dnsProfileId)}
+            options={dnsProfiles.map((choice) => ({ value: String(choice.id), label: choice.name }))}
+            testId={testIds.field("dnsProfile")}
+            onChange={(id) => onChange({ ...value, dnsProfileId: Number(id) })}
+          />
+        </ControlLabel>
+      ) : null}
+
       {problem ? (
         <p role="alert" className={cn("text-[12.5px] leading-[1.5] text-wv-error-text")}>
           {routeProblemText(t, problem)}
+        </p>
+      ) : null}
+      {dnsProblem ? (
+        <p
+          role="alert"
+          data-testid={testIds.fieldHelp("dnsProfile")}
+          data-problem={dnsProblem}
+          className="text-[12.5px] leading-[1.5] text-wv-error-text"
+        >
+          {t(dnsRouteProblemKey(dnsProblem), {
+            proxies: wireGuardWithoutDns(value, { proxies: profiles, pools })
+              .map((id) => profiles.find((profile) => profile.id === id)?.name ?? t("next.networking.proxyNumber", { id }))
+              .join(", "),
+          })}
         </p>
       ) : null}
     </div>

@@ -29,7 +29,7 @@ const egresses: Egress[] = [
   { id: 1, name: "WAN Fiber", bindingKind: "SOURCE_ADDRESS", interfaceName: null, sourceAddress: "192.0.2.10", enabled: true, downloadBps: null, uploadBps: null, health: "UP", reason: null },
 ];
 const profile = (id: number, name: string, kind: ProxyKind): ProxyProfile => ({
-  id, name, kind, enabled: true, host: `${name.toLowerCase()}.fixture.invalid`, port: 51820, dns: { who: "HOST", path: "THROUGH_PROXY", trust: "AS_SENT", servers: [] },
+  id, name, kind, enabled: true, host: `${name.toLowerCase()}.fixture.invalid`, port: 51820, dnsServers: [],
   tunnelAddresses: [`10.0.0.${id}/32`], peerPublicKey: null, tunnelPublicKey: null, mtu: 1420, keepaliveSeconds: null,
   timeoutSeconds: 10, hostKeyFingerprint: null, natpmp: false, forwardedPort: null, hasUsername: false, hasPassword: false, hasPrivateKey: true,
   hasPassphrase: false, hasPresharedKey: false,
@@ -286,6 +286,9 @@ const live = {
   isPaused: false,
   speed: query.has("gauge") ? 12 * 1024 * 1024 : 0,
   queue,
+  // The routes table offers no saved DNS profiles here.
+  dnsRouteProfiles: undefined,
+  wantDnsProfiles: () => {},
 } as NextData;
 const shell = { search: "", actionsRef: { current: null }, setFlags: () => {}, controlsHost: document.getElementById("controls") };
 createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t, uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter initialEntries={[query.has("routes") ? "/settings/networking/routes" : "/settings/networking/speed?consumer=server:1"]}><SettingsShellProvider {...shell}><NextDataContext.Provider value={live}><main className="mx-auto flex max-w-[1400px] flex-col p-8">{screen}</main></NextDataContext.Provider></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);

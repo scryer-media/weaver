@@ -4,7 +4,7 @@
 import type { Translate } from "@/lib/context/translate-context";
 import { directLeg, type Egress, type NetworkRoute, type ProxyPool } from "./networking.ts";
 import { proxyTestSentence } from "./proxy-fault.ts";
-import { dnsWireKey, lookupTrustKey, type LookupTrust, type ProxyDnsWire } from "./proxy-dns.ts";
+import { dnsWireKey, lookupTrustKey, type DnsWire, type LookupTrust } from "./dns.ts";
 import { codedSentence } from "./refusal.ts";
 import type { TorrentExposure } from "./torrents.ts";
 
@@ -59,7 +59,7 @@ export type HostResolution = {
   proxyId: number | null;
   dnsServers: string[];
   /** How the query reached the servers, when servers were asked. */
-  wire: ProxyDnsWire | null;
+  wire: DnsWire | null;
   /** The listed server whose answer was used, when one answered. */
   answeredBy: string | null;
   /** What the answer was taken as, when an answer came to judge. */
@@ -97,9 +97,10 @@ export function resolutionParts(
   const servers = resolution.answeredBy ?? resolution.dnsServers.join(", ");
   const by: Record<ResolvedBy, string> = {
     LITERAL: t("next.networking.testVia.resolvedLiteral"),
-    HOST: t("next.networking.testVia.resolvedHost"),
-    SERVERS: t("next.networking.testVia.resolvedServers", { servers, name: names.egress }),
+    HOST: t("next.networking.testVia.resolvedSystem"),
+    SERVERS: t("next.networking.testVia.resolvedWeaver", { servers, name: names.egress }),
     PROXY: t("next.networking.testVia.resolvedProxy", { name: proxy }),
+    // Asked through the proxy: Weaver's listed servers, or a WireGuard tunnel's own.
     PROXY_SERVERS: t("next.networking.testVia.resolvedServers", { servers, name: proxy }),
   };
   const error = resolution.error

@@ -15,14 +15,6 @@ import {
 } from "@/graphql/networking";
 import { useTranslate } from "@/lib/context/translate-context";
 import type { Bandwidth, BandwidthSplitState, Egress } from "@/lib/networking";
-import {
-  HOST_EGRESS_DNS,
-  egressDnsForm,
-  egressDnsInput,
-  egressDnsProblem,
-  egressPlainCanFakeAuthentication,
-  type DnsForm,
-} from "@/lib/proxy-dns";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { RecordEditor } from "../../components/RecordEditor";
 import { SecondaryButton, TextField } from "../../components/controls";
@@ -35,7 +27,6 @@ import {
   type SettingsBlock,
   type SettingsSectionModel,
 } from "../../pages/settings/framework";
-import { dnsFields, DnsPlainWarning } from "../../pages/settings/dns-fields";
 import { egressInput, liveAddresses, type NetworkingAction, type NetworkingData } from "./data";
 import {
   egressQuotaChanged,
@@ -63,7 +54,6 @@ const NEW_EGRESS: Egress = {
   uploadBps: null,
   health: "UNKNOWN",
   reason: null,
-  dns: HOST_EGRESS_DNS,
 };
 
 /** How often the rates the split holds each side to are read again. */
@@ -358,7 +348,6 @@ export function EgressEditor({
   const t = useTranslate();
   const [editing, setEditing] = useState(egress);
   const [quota, setQuota] = useState(() => egressQuotaDraft(egress.quota));
-  const [dns, setDnsForm] = useState(() => egressDnsForm(egress.dns));
   const [error, setError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<Egress | null>(null);
   const [testing, setTesting] = useState<Egress | null>(null);
@@ -372,7 +361,7 @@ export function EgressEditor({
         ? t("next.networking.egress.interfaceRequired")
         : editing.bindingKind === "SOURCE_ADDRESS" && !editing.sourceAddress?.trim()
           ? t("next.networking.egress.sourceRequired")
-          : (egressQuotaProblem(t, quota) ?? dnsMessage());
+          : egressQuotaProblem(t, quota);
     if (missing) {
       setError(missing);
       return;
@@ -380,7 +369,7 @@ export function EgressEditor({
     let id = editing.id;
     const failure = await action(
       editing.id < 0 ? CREATE_EGRESS : UPDATE_EGRESS,
-      { id: editing.id, input: egressInput(editing, egressDnsInput(dns)) },
+      { id: editing.id, input: egressInput(editing) },
       (saved) => {
         const created = (saved as { createEgressInterface?: { id: number } } | undefined)?.createEgressInterface;
         if (created) {
@@ -399,12 +388,6 @@ export function EgressEditor({
       onClose();
     }
   };
-
-  // The first thing wrong with the egress's DNS, in the words a refused save would use.
-  function dnsMessage() {
-    const problem = egressDnsProblem(dns);
-    return problem ? t(problem.key, problem.values) : null;
-  }
 
   const remove = async () => {
     if (!deleting) {
@@ -584,18 +567,6 @@ export function EgressEditor({
         }
         sections={[
           { id: "egress", title: t("next.networking.egress.section"), fields },
-          {
-            id: "resolution",
-            title: t("next.proxies.resolution"),
-            fields: dnsFields(
-              t,
-              dns,
-              (change: (current: DnsForm) => DnsForm) => setDnsForm(change),
-              ["HOST", "SERVERS"],
-              { path: false, whoHelp: t("next.networking.egress.dnsHelp") },
-            ),
-            body: egressPlainCanFakeAuthentication(dns) ? <DnsPlainWarning t={t} /> : null,
-          },
           {
             id: "quota",
             title: t("next.networking.egress.quota"),

@@ -238,93 +238,20 @@ test("the egress editor saves its limits and caps, and refuses a cap switched on
   await page.close();
 });
 
-test("an egress's own names are answered by the host or by its servers, in the order listed, with no proxy and no path", async () => {
+test("an egress's editor has no DNS of its own: a route's DNS profile says who answers", async () => {
   const { page, errors } = await open("egress");
-  const option = (scope, name) => scope.getByRole("radio", { name, exact: true });
   await page.getByText("WAN Fiber", { exact: true }).click();
   const editor = page.getByRole("dialog", { name: "WAN Fiber", exact: true });
-  // An egress saved before it had DNS is the host answering.
-  assert.equal(await option(editor, "The host").getAttribute("aria-checked"), "true");
-  assert.equal(await option(editor, "The proxy").count(), 0);
-  await option(editor, "These servers").click();
-  // Its servers are always asked straight from it: there is no path to choose.
-  assert.equal(await editor.getByTestId("field-dnsPath").count(), 0);
-  // Servers chosen and none named is refused before anything is sent.
-  await editor.getByRole("button", { name: "Save egress", exact: true }).click();
-  await editor.getByText("Add at least one DNS server.", { exact: true }).waitFor();
-  assert.equal((await saved(page)).length, 0);
-  await editor.getByTestId("field-dnsServer-0-address").fill("192.0.2.53");
-  const add = editor.getByTestId("field-dnsServerAdd");
-  for (let row = 1; row < 10; row += 1) {
-    await add.click();
-    await editor.getByTestId(`field-dnsServer-${row}-address`).fill(`192.0.2.${53 + row}`);
+  await editor.getByRole("button", { name: "Save egress", exact: true }).waitFor();
+  for (const id of ["field-dnsWho", "field-dnsTrust", "field-dnsServer-0-address", "field-dnsServerAdd"]) {
+    assert.equal(await editor.getByTestId(id).count(), 0, id);
   }
-  // Ten servers are the most an egress keeps, as for a proxy.
-  assert.equal(await add.isDisabled(), true);
-  // The last row moves to the top: it is asked first.
-  for (let row = 9; row > 0; row -= 1) {
-    await editor.getByTestId(`field-dnsServer-${row}-moveUp`).click();
-  }
-  assert.equal(await editor.getByTestId("field-dnsServer-0-address").inputValue(), "192.0.2.62");
-  for (let row = 9; row > 1; row -= 1) {
-    await editor.getByTestId(`field-dnsServer-${row}-remove`).click();
-  }
-  assert.equal(await add.isDisabled(), false);
-  await editor.getByTestId("field-dnsServer-1-wire").click();
-  await page.getByRole("menuitemradio", { name: "DNS over TLS", exact: true }).click();
-  // A plain server under required authentication can be faked, and that is said; validating here cannot.
-  const warning = editor.getByTestId("help-dnsPlainWarning");
-  await option(editor, "Require authenticated").click();
-  await warning.waitFor();
-  assert.equal(await warning.textContent(), "A plain query can be altered on the way, so the authenticated mark can be faked.");
-  await option(editor, "Validate here").click();
-  await warning.waitFor({ state: "detached" });
-  await option(editor, "Require authenticated").click();
-  if (shot("egress-dns")) await editor.screenshot({ path: shot("egress-dns") });
   await editor.getByRole("button", { name: "Save egress", exact: true }).click();
   await editor.waitFor({ state: "detached" });
   const [update] = await saved(page);
   assert.equal(update.name, "UpdateEgress");
-  assert.deepEqual(update.variables.input.dns, {
-    who: "SERVERS",
-    trust: "REQUIRE_AD",
-    servers: [
-      { wire: "PLAIN", address: "192.0.2.62", tlsName: null, url: null },
-      { wire: "TLS", address: "192.0.2.53", tlsName: null, url: null },
-    ],
-  });
-
-  // The host answering sends no servers, whatever was typed before it was chosen.
-  await page.getByText("LTE standby", { exact: true }).click();
-  const standby = page.getByRole("dialog", { name: "LTE standby", exact: true });
-  await option(standby, "These servers").click();
-  await standby.getByTestId("field-dnsServer-0-address").fill("192.0.2.53");
-  await option(standby, "The host").click();
-  assert.equal(await standby.getByTestId("field-dnsServer-0-address").count(), 0);
-  await standby.getByRole("button", { name: "Save egress", exact: true }).click();
-  await standby.waitFor({ state: "detached" });
-  const host = (await saved(page)).at(-1);
-  assert.equal(host.variables.id, 2);
-  assert.deepEqual(host.variables.input.dns, { who: "HOST", trust: "AS_SENT", servers: [] });
+  assert.equal("dns" in update.variables.input, false);
   assert.equal(errors.length, 0, errors.join("\n"));
-  await page.close();
-});
-
-test("an egress's DNS rows fit a phone, every control in reach", async () => {
-  const page = await browser.newPage({ viewport: { width: 375, height: 812 }, locale: "en-GB", timezoneId: "UTC" });
-  page.setDefaultTimeout(0);
-  await page.route("**/*", (route) => new URL(route.request().url()).origin === baseUrl ? route.continue() : route.abort());
-  await page.goto(`${baseUrl}/tests/browser/egress-quota.html?screen=egress`);
-  await page.getByText("WAN Fiber", { exact: true }).click();
-  const editor = page.getByRole("dialog", { name: "WAN Fiber", exact: true });
-  await editor.getByRole("radio", { name: "These servers", exact: true }).click();
-  await editor.getByTestId("field-dnsServerAdd").click();
-  const width = await page.evaluate(() => document.documentElement.clientWidth);
-  for (const id of ["wire", "moveUp", "moveDown", "remove", "address"]) {
-    const box = await editor.getByTestId(`field-dnsServer-1-${id}`).boundingBox();
-    assert.ok(box && box.x >= 0 && box.x + box.width <= width, id);
-  }
-  if (shot("egress-dns-phone")) await page.screenshot({ path: shot("egress-dns-phone") });
   await page.close();
 });
 
