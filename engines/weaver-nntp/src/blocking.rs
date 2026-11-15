@@ -500,6 +500,12 @@ impl BlockingBodyLane {
         self._permit.health_lease.0.probing()
     }
 
+    // Whether this lane may be kept idle between leases. See
+    // [`crate::recovery::ConnectionHealth::may_rest_idle`].
+    pub fn may_rest_idle(&self) -> bool {
+        self._permit.health_lease.0.may_rest_idle()
+    }
+
     pub fn accepts_new_work(&self) -> bool {
         self._permit.health_lease.0.current() && self._permit.socket_slot.claim_reuse()
     }
@@ -2060,6 +2066,7 @@ impl BlockingNntpConnection {
             let response = self.read_response()?;
             match response.code.raw() {
                 221 => {
+                    self.note_answered();
                     self.read_multiline_data()?;
                     results.push(true);
                 }
@@ -2081,6 +2088,14 @@ impl BlockingNntpConnection {
         match refusal {
             Some(error) => Err(error),
             None => Ok(results),
+        }
+    }
+
+    // The demanded command was answered with its 2xx status line. See
+    // [`crate::recovery::ConnectionHealth::answered`].
+    fn note_answered(&self) {
+        if let Some(health) = &self.health {
+            health.answered();
         }
     }
 
@@ -2115,7 +2130,10 @@ impl BlockingNntpConnection {
     // the probe switches to HEAD, and the connection stays healthy.
     fn classify_stat_response(&mut self, response: &Response) -> Result<bool> {
         match response.code.raw() {
-            223 => Ok(true),
+            223 => {
+                self.note_answered();
+                Ok(true)
+            }
             430 | 423 => Ok(false),
             code if crate::server_caps::is_command_unsupported(code) => {
                 if crate::server_caps::note_stat_unsupported(&self.host, self.port) {
@@ -2345,9 +2363,7 @@ impl BlockingNntpConnection {
                 return Err(error);
             }
         };
-        if let Some(health) = &self.health {
-            health.answered();
-        }
+        self.note_answered();
         let profile_cpu = profile_cpu_timings_enabled();
         decoder.set_profile_cpu(profile_cpu);
         decoder.set_checkpoint_plan(self.checkpoint_plan.clone());
