@@ -7,7 +7,7 @@ import { ifaceFor, setLink } from "./support/capture";
 import { waitTerminal } from "./support/downloads";
 import {
   FlowSubscription, createEgress, directLeg, discoverInterfaces, egressAddress, egressInterfaces,
-  flowAfter, flowMark, graphqlErrors, hostAddress, interfaceForAddress, legOn, networkHosts,
+  flowAfter, flowMark, graphqlErrors, hostAddress, interfaceForAddress, legacyDns, legOn, networkHosts,
   platformNetworking, serverKey, testEgress, updateEgress,
 } from "./support/network-flow";
 import { DIRECT_HOST, NetworkWorld, PROXIED_HOST, saveEvidence } from "./support/network-scenario";
@@ -164,7 +164,7 @@ test("E09 egress tests report the source address, go through a proxy, and fail w
   const fixture = await fixtureState(request);
   const primary = await world.profile({
     name: "e09-primary", kind: "HTTP_CONNECT", enabled: true, host: hostAddress("proxy-fixture", "a"), port: fixture.ports.primary!,
-    username: "fixture", password: "fixture", dnsServers: [hostAddress("proxy-fixture", "a")], timeoutSeconds: 5,
+    username: "fixture", password: "fixture", dns: legacyDns("PROXY", [hostAddress("proxy-fixture", "a")]), timeoutSeconds: 5,
   });
   const direct = await testEgress(request, egress.id, DIRECT_HOST, 119);
   expect(direct).toMatchObject({ success: true, proxyId: null });

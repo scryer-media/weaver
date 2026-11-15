@@ -6,7 +6,7 @@ import type { Locator, Page } from "@playwright/test";
 import { expect, test } from "./helpers";
 import { expectGraphqlErrors } from "./support/graphql-errors";
 import { byTestIdPrefix, saveSettings, tableRow } from "./support/settings-locators";
-import { testIds, torrentIds } from "./support/testids";
+import { jobIds, testIds, torrentIds } from "./support/testids";
 
 /**
  * Torrents as an operator drives them in the browser: the settings panel and
@@ -156,9 +156,12 @@ test("a torrent job shows its swarm, trackers, files and policy, and takes a see
   const filePaths = page.getByTestId(torrentIds.filePath);
   await expect(filePaths.filter({ hasText: /beryl\.bin$/ })).toBeVisible();
   await expect(filePaths.filter({ hasText: /notes\/beryl\.txt$/ })).toBeVisible();
-  // The whole download arrived: its file is complete.
-  const beryl = page.getByTestId(torrentIds.file).filter({ has: filePaths.filter({ hasText: /beryl\.bin$/ }) });
-  await expect(beryl.getByTestId(torrentIds.fileProgress)).toHaveText("100.0%");
+  // The whole download arrived: the torrent reads complete, and so does each of its files.
+  await expect(byTestIdPrefix(page, jobIds.jobProgressPrefix)).toHaveText(["100.0%"]);
+  for (const name of [/beryl\.bin$/, /notes\/beryl\.txt$/]) {
+    const file = page.getByTestId(torrentIds.file).filter({ has: filePaths.filter({ hasText: name }) });
+    await expect(file.getByTestId(torrentIds.fileProgress)).toHaveText("100.0%");
+  }
 
   await expect(page.getByTestId(torrentIds.seedingLevel("seedTimeGoalMinutes", "GLOBAL"))).toBeVisible();
   // 2880 minutes reads in the largest unit it divides into whole.

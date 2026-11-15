@@ -10,7 +10,7 @@ import { postProbeFile, waitTerminal } from "./downloads";
 import {
   type ConsumerKind, type Egress, type ProxyProfile, type ProxyProfileInput, type RouteInput,
   createPool, deleteEgress, deletePool, deleteProxyProfile, hostAddress, interfaceEgress,
-  saveProxyProfile, saveRoute,
+  legacyDns, saveProxyProfile, saveRoute,
 } from "./network-flow";
 import { fixtureState, resetRoutes, setFixtureNzb } from "./proxy-fixture";
 import { TOXIPROXY_PORTS, resetToxiproxy, type ToxiproxyName } from "./toxiproxy";
@@ -126,7 +126,7 @@ export class NetworkWorld {
       host: hostAddress(viaToxiproxy ? "toxiproxy" : "proxy-fixture", network),
       port: viaToxiproxy ? TOXIPROXY_PORTS[member as ToxiproxyName] : CONNECT_PORTS[member]!,
       username: "fixture", password: options.password === undefined ? "fixture" : options.password,
-      dnsServers: [hostAddress("proxy-fixture", network)], timeoutSeconds: options.timeoutSeconds ?? 5,
+      dns: legacyDns("PROXY", [hostAddress("proxy-fixture", network)]), timeoutSeconds: options.timeoutSeconds ?? 5,
     });
   }
 
@@ -137,7 +137,7 @@ export class NetworkWorld {
       name: `${member}-${network}-${Date.now()}`, kind: "SOCKS5", enabled: true,
       host: hostAddress(viaToxiproxy ? "toxiproxy" : "proxy-fixture", network),
       port: viaToxiproxy ? TOXIPROXY_PORTS[member as ToxiproxyName] : SOCKS_PORTS[member]!,
-      username: "fixture", password: "fixture", dnsServers: [hostAddress("proxy-fixture", network)], timeoutSeconds: 5,
+      username: "fixture", password: "fixture", dns: legacyDns("PROXY", [hostAddress("proxy-fixture", network)]), timeoutSeconds: 5,
     });
   }
 
@@ -176,7 +176,7 @@ export class NetworkWorld {
       name: `${endpoint}-${carrier ? `in-${carrier.endpoint}` : network}-${Date.now()}`, kind: "WIRE_GUARD", enabled: true,
       host: carrier?.host ?? hostAddress("tunnel-fixture", network), port: carrier?.port ?? TUNNEL_PORTS[endpoint],
       peerPublicKey: peer.peerPublicKey, privateKey: peer.clientPrivateKey, presharedKey: preshared,
-      tunnelAddresses: [peer.clientAddress], dnsServers: [peer.dnsServer], timeoutSeconds: 5,
+      tunnelAddresses: [peer.clientAddress], dns: legacyDns("PROXY", [peer.dnsServer]), timeoutSeconds: 5,
     });
   }
 

@@ -31,6 +31,10 @@ export const jobIds = {
   historyRowArchive: (jobId: string | number) => `history-entry-archive-${jobId}`,
   historyRowDelete: (jobId: string | number) => `history-entry-delete-${jobId}`,
   jobArchive: "job-archive",
+  // The whole job's percentage on its own screen, one per bar, keyed by the
+  // bar's phase ("job" for the lone bar of a job in no phase).
+  jobProgress: (bar: string) => `job-progress-${bar}`,
+  jobProgressPrefix: "job-progress-",
   jobArchived: "job-archived",
 
   // A job page's lists past one page: the control that loads the next, and a file kept only as a record.

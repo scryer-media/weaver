@@ -23,13 +23,34 @@ export type LegState = "UP" | "IDLE" | "PROBING" | "DOWN" | "BLOCKED";
 export type Egress = {
   id: number; name: string; bindingKind: BindingKind; interfaceName: string | null;
   sourceAddress: string | null; addresses: string[]; enabled: boolean; maxDownloadSpeed: number;
-  health: string; reason: string | null;
+  health: string; reason: string | null; dns: EgressDns;
 };
-/** Who resolves a name dialled through a proxy: Weaver, or the proxy. */
-export type ProxyResolver = "WEAVER" | "PROXY";
+/**
+ * How a name the egress dials with no proxy below it is resolved: by the host,
+ * or by the servers listed, asked in order from the egress, with no fallback
+ * to the host.
+ */
+export type EgressDns = { who: "HOST" | "SERVERS"; trust: ProxyDns["trust"]; servers: ProxyDnsServer[] };
+/** How a name dialled through a proxy is resolved: who answers, the path the query takes, and what the answer is taken as. */
+export type ProxyDnsServer = { wire: "PLAIN" | "TLS" | "HTTPS"; address: string; tlsName: string | null; url: string | null };
+export type ProxyDns = {
+  who: "HOST" | "PROXY" | "SERVERS"; path: "DIRECT" | "THROUGH_PROXY"; trust: "AS_SENT" | "REQUIRE_AD" | "VALIDATE"; servers: ProxyDnsServer[];
+};
+/**
+ * The DNS a proxy had under the old choice of resolver and list of servers:
+ * with no servers Weaver meant the host and the proxy meant the proxy; with
+ * servers they were asked plainly, directly by Weaver or through the proxy.
+ */
+export function legacyDns(resolver: "WEAVER" | "PROXY", servers: string[]): ProxyDns {
+  if (servers.length === 0) return { who: resolver === "WEAVER" ? "HOST" : "PROXY", path: "THROUGH_PROXY", trust: "AS_SENT", servers: [] };
+  return {
+    who: "SERVERS", path: resolver === "WEAVER" ? "DIRECT" : "THROUGH_PROXY", trust: "AS_SENT",
+    servers: servers.map(address => ({ wire: "PLAIN", address, tlsName: null, url: null })),
+  };
+}
 export type ProxyProfile = {
   id: number; name: string; kind: ProxyKind; enabled: boolean; host: string; port: number;
-  resolver: ProxyResolver; dnsServers: string[]; tunnelAddresses: string[]; peerPublicKey: string | null; tunnelPublicKey: string | null;
+  dns: ProxyDns; tunnelAddresses: string[]; peerPublicKey: string | null; tunnelPublicKey: string | null;
   mtu: number; keepaliveSeconds: number | null; timeoutSeconds: number; hostKeyFingerprint: string | null;
   hasUsername: boolean; hasPassword: boolean; hasPrivateKey: boolean; hasPassphrase: boolean; hasPresharedKey: boolean;
 };
@@ -57,8 +78,8 @@ export type TestResult = {
   success: boolean; message: string; sourceAddress: string | null; connectMillis: number | null; proxyId: number | null;
 };
 
-const EGRESS = "id name bindingKind interfaceName sourceAddress addresses enabled maxDownloadSpeed health reason";
-const PROFILE = `id name kind enabled host port resolver dnsServers tunnelAddresses peerPublicKey tunnelPublicKey mtu
+const EGRESS = "id name bindingKind interfaceName sourceAddress addresses enabled maxDownloadSpeed health reason dns { who trust servers { wire address tlsName url } }";
+const PROFILE = `id name kind enabled host port dns { who path trust servers { wire address tlsName url } } tunnelAddresses peerPublicKey tunnelPublicKey mtu
   keepaliveSeconds timeoutSeconds hostKeyFingerprint hasUsername hasPassword hasPrivateKey hasPassphrase hasPresharedKey`;
 const POOL = "id name kind memberIds enabled";
 const PATH = "path { kind directFallback rungs { kind proxyId poolId chainIds } }";
@@ -175,6 +196,8 @@ export async function platformNetworking(request: APIRequestContext): Promise<Pl
 export type EgressInput = {
   name: string; bindingKind: BindingKind; interfaceName?: string | null; sourceAddress?: string | null;
   enabled?: boolean; maxDownloadSpeed?: number; downloadQuota?: DownloadQuotaInput;
+  /** Absent keeps the saved setting on an update and asks the host on a create. */
+  dns?: EgressDns;
 };
 export async function createEgress(request: APIRequestContext, input: EgressInput): Promise<Egress> {
   return (await graphql<{ createEgressInterface: Egress }>(request,
@@ -258,7 +281,7 @@ export async function sourceEgress(request: APIRequestContext, name: string, net
 
 export type ProxyProfileInput = {
   name: string; kind: ProxyKind; enabled: boolean; host: string; port: number;
-  resolver?: ProxyResolver; dnsServers?: string[]; tunnelAddresses?: string[]; peerPublicKey?: string | null; mtu?: number; keepaliveSeconds?: number | null;
+  dns?: ProxyDns; tunnelAddresses?: string[]; peerPublicKey?: string | null; mtu?: number; keepaliveSeconds?: number | null;
   timeoutSeconds?: number; username?: string | null; password?: string | null; privateKey?: string | null;
   passphrase?: string | null; presharedKey?: string | null;
 };
@@ -266,7 +289,7 @@ export async function saveProxyProfile(request: APIRequestContext, input: ProxyP
   return (await graphql<{ saveProxyProfile: ProxyProfile }>(request,
     `mutation($id: Int, $input: ProxyProfileInput!) { saveProxyProfile(id: $id, input: $input) { ${PROFILE} } }`,
     // The proxy resolves unless a test says otherwise, as every proxy did before the choice existed.
-    { id: id ?? null, input: { resolver: "PROXY", ...input } })).saveProxyProfile;
+    { id: id ?? null, input: { dns: legacyDns("PROXY", []), ...input } })).saveProxyProfile;
 }
 export async function deleteProxyProfile(request: APIRequestContext, id: number): Promise<void> {
   await graphql(request, "mutation($id: Int!) { deleteProxyProfile(id: $id) }", { id });

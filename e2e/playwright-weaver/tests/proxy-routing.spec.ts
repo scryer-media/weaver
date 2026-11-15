@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { APIRequestContext } from "@playwright/test";
 import { expect, graphql, postMultipartProbeArticle, submitProbeNzb, test, updateConfiguredServer } from "./helpers";
+import { legacyDns } from "./support/network-flow";
 
 type Event = { sequence: number; at: number; kind: string; route?: string; host?: string; port?: number; path?: string; name?: string };
 type Evidence = { ip: string; ports: Record<string, number>; events: Event[]; active: Record<string, number> };
@@ -39,9 +40,9 @@ test("proxy ladder: ordered recovery, host fallback, fail closed and active revo
     await updateConfiguredServer(request, "nntp", { active: false });
     await updateConfiguredServer(request, "nntp2", { active: false });
     const profiles = names.map((name, index) => ({
-      name: `e2e-${name}`, kind: index === 1 ? "SOCKS5" : "HTTP_CONNECT", resolver: "PROXY",
+      name: `e2e-${name}`, kind: index === 1 ? "SOCKS5" : "HTTP_CONNECT", dns: legacyDns("PROXY", [fixture.ip]),
       enabled: true, host: fixture.ip, port: fixture.ports[name],
-      username: "fixture", password: "fixture", dnsServers: [fixture.ip], timeoutSeconds: 2,
+      username: "fixture", password: "fixture", timeoutSeconds: 2,
     }));
     const ids: number[] = [];
     for (const input of profiles) {
@@ -241,13 +242,13 @@ test("a proxy Weaver resolves for is handed the address and carries a download",
   expect(control.ok(), await control.text()).toBeTruthy();
   await updateConfiguredServer(request, "nntp", { active: false });
   await updateConfiguredServer(request, "nntp2", { active: false });
-  const saved = await graphql<{ saveProxyProfile: { id: number; resolver: string; dnsServers: string[] } }>(request,
-    `mutation($input: ProxyProfileInput!) { saveProxyProfile(input: $input) { id resolver dnsServers } }`,
+  const saved = await graphql<{ saveProxyProfile: { id: number; dns: { who: string; servers: unknown[] } } }>(request,
+    `mutation($input: ProxyProfileInput!) { saveProxyProfile(input: $input) { id dns { who servers { address } } } }`,
     { input: {
-      name: "e2e-weaver-resolves", kind: "HTTP_CONNECT", resolver: "WEAVER", enabled: true,
-      host: fixture.ip, port: fixture.ports.primary, username: "fixture", password: "fixture", dnsServers: [], timeoutSeconds: 2,
+      name: "e2e-weaver-resolves", kind: "HTTP_CONNECT", dns: legacyDns("WEAVER", []), enabled: true,
+      host: fixture.ip, port: fixture.ports.primary, username: "fixture", password: "fixture", timeoutSeconds: 2,
     } });
-  expect(saved.saveProxyProfile).toMatchObject({ resolver: "WEAVER", dnsServers: [] });
+  expect(saved.saveProxyProfile.dns).toMatchObject({ who: "HOST", servers: [] });
   const name = "weaver-resolves.proxy.test";
   const input = {
     host: name, port: fixture.ports.nntp, tls: false, username: "e2e-user", password: "e2e-pass", connections: 1,
@@ -298,8 +299,8 @@ test("a proxy hop holds its DNS servers' answer for its TTL", async ({ request }
   const saved = await graphql<{ saveProxyProfile: { id: number } }>(request,
     `mutation($input: ProxyProfileInput!) { saveProxyProfile(input: $input) { id } }`,
     { input: {
-      name: "e2e-held-answers", kind: "HTTP_CONNECT", resolver: "PROXY", enabled: true,
-      host: fixture.ip, port: fixture.ports.primary, username: "fixture", password: "fixture", dnsServers: [fixture.ip], timeoutSeconds: 2,
+      name: "e2e-held-answers", kind: "HTTP_CONNECT", dns: legacyDns("PROXY", [fixture.ip]), enabled: true,
+      host: fixture.ip, port: fixture.ports.primary, username: "fixture", password: "fixture", timeoutSeconds: 2,
     } });
   const name = "held-answers.proxy.test";
   const input = {

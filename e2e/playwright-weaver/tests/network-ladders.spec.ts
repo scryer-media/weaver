@@ -298,7 +298,7 @@ test("F14 reference rules reject unsound ladders", async ({ request }) => {
   for (const [label, kind, id, input, message] of cases) {
     expect((await graphqlErrors(request, SAVE_ROUTE, { kind, id, input })).join("\n"), label).toContain(message);
   }
-  const h3 = await world.profile({ name: `h3-${Date.now()}`, kind: "HTTP3_CONNECT", enabled: true, host: connect1.host, port: 8443, username: "fixture", password: "fixture", dnsServers: connect1.dnsServers });
+  const h3 = await world.profile({ name: `h3-${Date.now()}`, kind: "HTTP3_CONNECT", enabled: true, host: connect1.host, port: 8443, username: "fixture", password: "fixture", dns: connect1.dns });
   expect((await graphqlErrors(request, SAVE_ROUTE, { kind: "SERVER", id: server, input: { legs: [ladderLeg(a.id, [rung.chain([connect1.id, h3.id])], 100)] } })).join("\n"), "HTTP/3 above CONNECT")
     .toContain("WireGuard and HTTP/3 must be the first proxy in a chain");
   // Only WireGuard rides on WireGuard; HTTP/3 stays directly above the egress.
