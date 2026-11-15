@@ -894,7 +894,8 @@ impl Queue {
         let root = resources.intermediate_dir.clone();
         let db = resources.db.clone();
         let unclaimed = match tokio::task::spawn_blocking(move || {
-            let known = db.recorded_job_ids()?;
+            let owners = marked.iter().map(|(owner, _)| owner.0).collect::<Vec<_>>();
+            let known = db.recorded_job_ids_among(&owners)?;
             Ok::<_, crate::StateError>(
                 marked
                     .into_iter()
@@ -949,8 +950,8 @@ impl Queue {
         // the same step, off the runtime.
         let db = resources.db.clone();
         let removed = tokio::task::spawn_blocking(move || {
-            let known = db.recorded_job_ids()?;
             let owners = held.iter().map(|(_, owner, _)| owner.0).collect::<Vec<_>>();
+            let known = db.recorded_job_ids_among(&owners)?;
             let scripts = db.jobs_with_live_script_events(&owners)?;
             for (_guard, owner, path) in held {
                 if !known.contains(&owner.0) && !scripts.contains(&owner.0) {
