@@ -1539,7 +1539,7 @@ async fn a_job_of_three_members_all_withheld_fails() {
         &scenario,
         Graph {
             status: Some(Status::Failed(
-                "WEAVER_PASSWORD_REQUIRED: lantern.rar, quill.rar, ember.rar needs a password and none was given",
+                "WEAVER_PASSWORD_REQUIRED: ember.rar, lantern.rar, quill.rar needs a password and none was given",
             )),
             kind: Some("Password"),
             files: vec![],
@@ -1855,4 +1855,63 @@ async fn a_header_encrypted_solid_rar_under_a_starved_par2_delivers_the_members_
         .lost(1, 3)
         .password("moonlit-harbour");
     run_partial_with_whole(&scenario, &["part0.mkv"]).await;
+}
+
+// Another set's second volume posted as `archive.part03.rar` beside a four
+// volume set named `archive.partN.rar`: in every order the stray comes, the
+// set's own third volume takes its place, the member is delivered whole, and
+// the stray, a volume of a set whose first never came, makes the job
+// Partial.
+#[tokio::test]
+async fn a_stray_named_as_a_volume_never_keeps_that_volume_out_whatever_comes_first() {
+    let amber = payload(3600, 41);
+    let posts = || {
+        let mut posted: Vec<Post> = single_member_store_set("amber.mkv", &amber, 4)
+            .into_iter()
+            .enumerate()
+            .map(|(index, (_, bytes))| {
+                Post::plain(&format!("archive.part{}.rar", index + 1), bytes)
+            })
+            .collect();
+        let stray = single_member_store_set("cobalt.mkv", &payload(1800, 42), 2).remove(1);
+        posted.push(Post::plain("archive.part03.rar", stray.1));
+        posted
+    };
+    for order in [
+        [0, 1, 2, 3, 4],
+        [4, 0, 1, 2, 3],
+        [3, 4, 0, 1, 2],
+        [2, 4, 0, 1, 3],
+        [4, 2, 0, 1, 3],
+        [1, 2, 3, 4, 0],
+        [2, 3, 4, 0, 1],
+        [0, 4, 1, 2, 3],
+    ] {
+        let scenario = Scenario::new(posts()).together(&order);
+        let outcome = match try_run(&scenario).await {
+            Ok(outcome) => outcome,
+            Err(stall) => panic!(
+                "{order:?}: graph stalled at {:?}: {}",
+                stall.status, stall.state
+            ),
+        };
+        assert_eq!(
+            outcome.status,
+            Some(JobStatus::Partial),
+            "{order:?}: {:?}",
+            outcome.failure
+        );
+        let delivered: Vec<&Vec<u8>> = outcome
+            .files
+            .iter()
+            .filter(|(name, _)| name.ends_with("amber.mkv"))
+            .map(|(_, bytes)| bytes)
+            .collect();
+        assert_eq!(
+            delivered,
+            vec![&amber],
+            "{order:?}: {:?}",
+            outcome.files.keys()
+        );
+    }
 }
