@@ -237,7 +237,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn startup_client_dials_through_the_server_route() {
         use tokio::io::AsyncWriteExt;
         use weaver_server_core::proxies::{
@@ -313,16 +313,18 @@ mod tests {
         let proxies = ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
         let client = build_nntp_client(&config, &test_profile(), &registry, &proxies).unwrap();
 
-        let server = &client.pool().server_configs()[0];
+        let server = client.pool().server_configs()[0].clone();
         assert_eq!(server.pipelining_depth, Some(4));
         assert_eq!(
             server.tls_name_mismatch_certificate_der.as_deref(),
             Some(&[1, 2, 3][..])
         );
         assert!(
-            weaver_nntp::connection::NntpConnection::connect(server)
-                .await
-                .is_err(),
+            tokio::task::spawn_blocking(move || {
+                weaver_nntp::BlockingNntpConnection::connect(&server).is_err()
+            })
+            .await
+            .unwrap(),
             "a server whose route cannot leave must not fall back to the system route"
         );
         accept.abort();

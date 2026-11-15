@@ -79,7 +79,7 @@ async fn one_recovery_probe_and_cancellation_releases_it() {
     assert!(route.begin(1).is_some());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn policy_save_closes_active_direct_sockets_before_reload_returns() {
     let db = Database::open_in_memory().unwrap();
     db.insert_server(&server(1)).unwrap();
@@ -104,7 +104,12 @@ async fn policy_save_closes_active_direct_sockets_before_reload_returns() {
         pipelining: weaver_nntp::PipeliningCapability::Known(false),
         ..Default::default()
     };
-    let _connection = weaver_nntp::NntpConnection::connect(&config).await.unwrap();
+    let connect = config.clone();
+    let _connection =
+        tokio::task::spawn_blocking(move || weaver_nntp::BlockingNntpConnection::connect(&connect))
+            .await
+            .unwrap()
+            .unwrap();
     db.save_proxy_routing_policy(
         Consumer::Server(1),
         &RoutingPolicy {
@@ -117,7 +122,12 @@ async fn policy_save_closes_active_direct_sockets_before_reload_returns() {
     runtime.reload().await.unwrap();
     assert!(registry.check().is_err());
     assert_eq!(fixture.await.unwrap().unwrap(), 0);
-    assert!(weaver_nntp::NntpConnection::connect(&config).await.is_err());
+    assert!(
+        tokio::task::spawn_blocking(move || weaver_nntp::BlockingNntpConnection::connect(&config)
+            .is_err())
+        .await
+        .unwrap()
+    );
     runtime.stop_all().await;
 }
 
