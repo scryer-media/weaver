@@ -2,8 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
-use crate::pipeline::download::LoginRefusalView;
 use crate::operations::room_wait::ever_downloaded;
+use crate::pipeline::download::LoginRefusalView;
 use crate::pipeline::queue::Change;
 
 pub(crate) const NZB_SLOT_WAIT_REASON: &str = "nzb_slot";
