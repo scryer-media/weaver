@@ -785,8 +785,8 @@
     },
     {
       "path": "testdata/adv-par2-zero-twin-copy/zero-twin.par2",
-      "size": 796,
-      "blake3": "1185fdeb3c9f576b004eccff587e65f80a683f563535233f84f1e085fa6c082c",
+      "size": 804,
+      "blake3": "4dae522768bd2b640f31b7f961687969909dee26b7a8847d759ac8613f4cd420",
       "format": "par2",
       "source": {
         "kind": "generated",
@@ -1933,8 +1933,8 @@
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-archive-zip",
-          "go-fixture-bytes"
+          "go-archive-zip@go1.27.3",
+          "go-fixture-bytes@go1.27.3"
         ]
       }
     },

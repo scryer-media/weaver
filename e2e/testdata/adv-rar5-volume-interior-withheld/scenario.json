@@ -12,7 +12,7 @@
   "adversarial": {
     "group": "default",
     "outcome": "failed",
-    "errorContains": "was delivered whole"
+    "errorContains": "never placed every member it named"
   },
   "expectedOutputBLAKE3": {
     "amber.trail.s01e02.mkv": "0f9527235f4aeccd73d0ef80e25572b51b96d4a9dfe96d24a73911590efed9ab"

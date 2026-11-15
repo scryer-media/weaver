@@ -94,12 +94,13 @@ func AdversarialVolumeRecipes() []Recipe {
 			Slug: "adv-par2-zero-twin-copy", Family: "adversarial", ByteReproducible: true,
 			Notes: "A PAR2 index with 16 MiB slices describing a posted 4 KiB file of zeros and an unposted 128 MiB file of zeros. Every slice " +
 				"of the large file has the checksums of the small file's one padded slice, so the large file is rebuilt by copying with no recovery " +
-				"block at all. The copy goes a piece at a time within the memory granted, and the job completes with both files.",
+				"block at all. The copy goes a piece at a time within the memory granted, and the job completes with both files. The large file's " +
+				"name reads as a clean one, so the job's name never replaces it.",
 			Build: func(_ context.Context, env *Env) error {
 				if err := writeZeroFile(env.OutputPath("seed.mkv"), 4<<10); err != nil {
 					return err
 				}
-				hollow := env.StagePath("hollow/hollow.mkv")
+				hollow := env.StagePath("hollow/Hollow.Twin.Copy.mkv")
 				if err := writeZeroFile(hollow, 128<<20); err != nil {
 					return err
 				}
@@ -107,7 +108,7 @@ func AdversarialVolumeRecipes() []Recipe {
 				if err != nil {
 					return err
 				}
-				large, err := describeForPAR2(hollow, "hollow.mkv", 16<<20)
+				large, err := describeForPAR2(hollow, "Hollow.Twin.Copy.mkv", 16<<20)
 				if err != nil {
 					return err
 				}
@@ -116,8 +117,8 @@ func AdversarialVolumeRecipes() []Recipe {
 			},
 			ExpectedOutputs: func(_ context.Context, env *Env) (map[string]string, error) {
 				return map[string]string{
-					"seed.mkv":   env.OutputPath("seed.mkv"),
-					"hollow.mkv": env.StagePath("hollow/hollow.mkv"),
+					"seed.mkv":             env.OutputPath("seed.mkv"),
+					"Hollow.Twin.Copy.mkv": env.StagePath("hollow/Hollow.Twin.Copy.mkv"),
 				}, nil
 			},
 		},
