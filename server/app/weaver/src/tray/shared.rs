@@ -1442,7 +1442,7 @@ mod tests {
     #[test]
     fn setup_code_parser_accepts_only_the_exact_marker() {
         use weaver_server_core::auth::SETUP_CODE_MARKER;
-        let code = "K7P-M2X";
+        let code = "K7PM-2XQR";
         assert_eq!(
             parse_setup_code_line(&format!("#   {SETUP_CODE_MARKER}{code}   #")),
             Some(code.to_string())
@@ -1467,13 +1467,13 @@ mod tests {
         .unwrap();
         let setup = Arc::new(Mutex::new(None));
         for child in 0..2 {
-            let input = format!("{SETUP_CODE_MARKER}K7P-M2X\nchild {child}\n");
+            let input = format!("{SETUP_CODE_MARKER}K7PM-2XQR\nchild {child}\n");
             forward_server_stderr(input.as_bytes(), setup.clone(), Some(writer.clone()));
             assert_eq!(
                 received.recv().unwrap(),
                 format!("child {child}\n").as_bytes()
             );
-            assert_eq!(setup.lock().unwrap().as_deref(), Some("K7P-M2X"));
+            assert_eq!(setup.lock().unwrap().as_deref(), Some("K7PM-2XQR"));
         }
         drop(guard);
         assert!(received.recv().is_err());

@@ -98,6 +98,13 @@ pub(crate) enum Heard {
     CheckpointDue {
         control: crate::persistence::checkpoint_write::CheckpointControl,
     },
+    // The volumes' writers returned everything the job had submitted when
+    // a checkpoint or the job's end began to wait for it. Addressed to the
+    // root, under no run's generation.
+    DiskReturned,
+    // A volume's writer could not complete an operation on one of the
+    // job's files. Addressed to the root, under no run's generation.
+    DiskFailed(Box<crate::operations::disk::writer::Failure>),
 }
 
 // Where every graph job's runs speak, and where the database says a
@@ -461,6 +468,9 @@ pub(crate) struct Runs {
     // How many of `runs` have ended, so whether one is live is a count,
     // not a walk of them.
     ended: usize,
+    // The volumes the job's files are written through: a run waits on
+    // their budget, on its own thread, before it says more.
+    disk: Option<super::disk::JobDisk>,
 }
 
 impl Runs {
@@ -482,7 +492,16 @@ impl Runs {
             windows: None,
             held_back: BTreeSet::new(),
             ended: 0,
+            disk: None,
         }
+    }
+
+    // The runs, each waiting on the budget of the volumes of `disk` before
+    // it says more, so what a run unpacks is never queued for a slow
+    // volume faster than the volume takes it.
+    pub(crate) fn writing(mut self, disk: Option<super::disk::JobDisk>) -> Self {
+        self.disk = disk;
+        self
     }
 
     // The runs, lending their decoders windows from `windows`.
@@ -782,6 +801,7 @@ impl Runs {
             budget.window_reserved = true;
         }
         let (scope, mail, clock) = (self.scope, self.mail.clone(), self.clock.clone());
+        let disk = self.disk.clone();
         let said = move |heard| Said {
             scope,
             node,
@@ -810,6 +830,12 @@ impl Runs {
                 }
                 let _waiting = decoding.wait();
                 extracting_hook(&volumes);
+                // What the run said before is with the volumes' writers
+                // or on its way: no more is said while a volume holds
+                // its budget of it.
+                if let Some(disk) = &disk {
+                    disk.wait_below();
+                }
                 volumes.current() && mail.blocking_send(said(Heard::Emit(emit))).is_ok()
             };
             extraction.run(reader, &mut sink, budget);

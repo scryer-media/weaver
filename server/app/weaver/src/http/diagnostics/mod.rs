@@ -322,7 +322,13 @@ async fn collect_components(
 
     // Everything is collected; nothing leaves before the stand-ins replace
     // the names in it.
-    let local = sanitize::LocalNames::current(data_dir, intermediate_dir, complete_dir, watch_dir);
+    let local = sanitize::LocalNames::current(
+        data_dir,
+        intermediate_dir,
+        complete_dir,
+        watch_dir,
+        disk_space.volume_labels(),
+    );
     // The table is read once everything is collected, so a name added
     // during the collection is in it.
     // A table that cannot be read in time is a table that cannot be read:

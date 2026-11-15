@@ -35,6 +35,14 @@ const SYSTEM_INFO_QUERY: &str = r#"
       filesystem
       startupRandomReadIops
     }
+    volumes {
+      label
+      storageKind
+      writeRateBytesPerSecond
+      throughputBytesPerSecond
+      bufferedBytes
+      bufferLimitBytes
+    }
     configuredStorage {
       labels
       path
@@ -54,6 +62,25 @@ async fn system_info_exposes_safe_runtime_profile_to_read_scope() {
 
     assert!(!info["version"].as_str().unwrap().is_empty());
     assert!(info["uptimeSeconds"].as_f64().unwrap() >= 0.0);
+    // The per-volume list is present and is a list, and each row has the
+    // five fields with their types; a rate is null until measured and a
+    // throughput is null while nothing is written.
+    // The non-empty case is covered once the volume registry lands.
+    let volumes = info
+        .get("volumes")
+        .and_then(|volumes| volumes.as_array())
+        .expect("systemInfo.volumes is a list");
+    for volume in volumes {
+        assert!(volume["label"].is_string());
+        assert!(volume["storageKind"].is_string());
+        let rate = &volume["writeRateBytesPerSecond"];
+        assert!(rate.is_null() || rate.is_u64());
+        let throughput = &volume["throughputBytesPerSecond"];
+        assert!(throughput.is_null() || throughput.is_u64());
+        assert!(volume["bufferedBytes"].is_u64());
+        let limit = &volume["bufferLimitBytes"];
+        assert!(limit.is_null() || limit.as_u64().is_some_and(|limit| limit > 0));
+    }
     assert!(matches!(
         info["deployment"].as_str().unwrap(),
         "NATIVE" | "DOCKER" | "CONTAINER"

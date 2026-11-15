@@ -28,6 +28,10 @@ import (
 // job's extraction budget refuses it.
 const adversarialBudgetWarning = "graph job's extraction budget refused it"
 
+// adversarialDiskWaitMessage is the line the graph engine logs, once per
+// wait, when a job begins to wait for room on a disk.
+const adversarialDiskWaitMessage = "graph job waits for disk room"
+
 const adversarialRejectionMetric = "weaver_extraction_rejections_total"
 
 type adversarialBefore struct {
@@ -139,7 +143,7 @@ func observeAdversarialSettled(weaverURL string, jobID int, before adversarialBe
 		return settled, err
 	}
 	for _, kind := range kinds {
-		if kind == "JOB_COMPLETED" || kind == "JOB_FAILED" {
+		if kind == "JOB_COMPLETED" || kind == "JOB_FAILED" || kind == "JOB_CANCELLED" {
 			settled.TerminalEvents++
 		}
 	}
@@ -160,6 +164,8 @@ func checkAdversarialVerdict(tc adversarialCase, settled adversarialSettled) []e
 		"either":  {"COMPLETE", "FAILED"},
 		"partial": {"PARTIAL"},
 		"settles": {"COMPLETE", "PARTIAL", "FAILED"},
+		// A waiting job is cancelled by the lane once its wait is said.
+		"waits": {"CANCELLED"},
 	}[spec.Outcome]
 	if !adversarialHas(allowed, settled.Status) {
 		problems = append(problems, fmt.Errorf("settled %s (%q), want one of %v", settled.Status, settled.Error, allowed))
@@ -360,6 +366,21 @@ func checkAdversarialSignals(tc adversarialCase, settled adversarialSettled, bef
 		moved := settled.Rejections[reason] - before.Rejections[reason]
 		if moved != 1 {
 			problems = append(problems, fmt.Errorf("%s{reason=%q} moved by %v, want 1", adversarialRejectionMetric, reason, moved))
+		}
+	}
+	// A wait for room is said once, as it begins, and refused by nothing:
+	// the budget never warned, and no rejection was counted.
+	if tc.Spec.Outcome == "waits" {
+		if said := len(graphLogEvents(settled.LogWindow, settled.JobID, adversarialDiskWaitMessage)); said != 1 {
+			problems = append(problems, fmt.Errorf("the wait for disk room was said %d times, want 1", said))
+		}
+		if warnings > 0 {
+			problems = append(problems, fmt.Errorf("the budget refused a job that could wait for room, %d times", warnings))
+		}
+		for reason, count := range settled.Rejections {
+			if moved := count - before.Rejections[reason]; moved != 0 {
+				problems = append(problems, fmt.Errorf("%s{reason=%q} moved by %v for a job that waits", adversarialRejectionMetric, reason, moved))
+			}
 		}
 	}
 	return problems

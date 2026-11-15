@@ -10,12 +10,18 @@ use weaver_server_core::auth::service::verify_browser_csrf_token;
 use weaver_server_core::auth::{generate_setup_code, hash_api_key, normalize_setup_code};
 use weaver_server_core::security::canonical_ip;
 
-// Failures one client address may make inside the window.
+// Failures one client may make inside the window.
 const MAX_FAILURES: usize = 5;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
-// Client addresses whose failures are remembered at once. Past this, the
-// address whose last failure is oldest is forgotten first.
+// Clients whose failures are remembered at once. A client not among them is
+// refused while the table is full, before its code is looked at, so guessing
+// is capped at this many clients times `MAX_FAILURES` a window however many
+// addresses a guesser rotates through. The cost: 1,024 clients failing inside
+// one window keep setup closed to any new client until their failures expire.
 const MAX_TRACKED_CLIENTS: usize = 1024;
+// An IPv6 client is its /64: one host commonly holds a whole /64, so each of
+// its addresses is not a separate client.
+const IPV6_CLIENT_PREFIX: u32 = 64;
 
 // Asks for a setup code even on loopback, to try the flow a container gets.
 const ENV_REQUIRE_SETUP_CODE: &str = "WEAVER_REQUIRE_SETUP_CODE";
@@ -39,13 +45,61 @@ struct State {
     // `None` for a Weaver only this machine can reach, whose setup needs no
     // code: being able to open it at all already proves the operator is here.
     verifier: Option<String>,
-    // Recent failures per client address, so one client cannot hold setup
-    // closed for everyone else.
+    // Recent failures per client, so one client cannot hold setup closed for
+    // everyone else.
     failures: HashMap<IpAddr, VecDeque<Instant>>,
+    // While the table is full, no entry can expire before this, so a new
+    // client is refused without walking the table. It is the earliest expiry
+    // seen by the last walk; failures only move an entry's expiry later, so
+    // it never runs ahead of the real one. `None` until the first walk.
+    full_until: Option<Instant>,
+    #[cfg(test)]
+    walks: usize,
     consumed: bool,
 }
 
 impl State {
+    fn new(verifier: Option<String>) -> Self {
+        Self {
+            verifier,
+            failures: HashMap::new(),
+            full_until: None,
+            #[cfg(test)]
+            walks: 0,
+            consumed: false,
+        }
+    }
+
+    // Whether `client` may try a code at `now`. A tracked client always may,
+    // and its own limit applies; a new one only while the table has room.
+    // When it is full, expired entries are dropped first. That walk runs
+    // only for a new client at a full table, and only once `full_until` has
+    // passed, so it runs at most once per expiry of a tracked failure, not
+    // once per refused request.
+    fn admits(&mut self, client: IpAddr, now: Instant) -> bool {
+        if self.failures.contains_key(&client) || self.failures.len() < MAX_TRACKED_CLIENTS {
+            return true;
+        }
+        if self.full_until.is_some_and(|until| now < until) {
+            return false;
+        }
+        #[cfg(test)]
+        {
+            self.walks += 1;
+        }
+        self.failures.retain(|_, times| {
+            times
+                .back()
+                .is_some_and(|then| now.duration_since(*then) < FAILURE_WINDOW)
+        });
+        self.full_until = self
+            .failures
+            .values()
+            .filter_map(VecDeque::back)
+            .min()
+            .map(|then| *then + FAILURE_WINDOW);
+        self.failures.len() < MAX_TRACKED_CLIENTS
+    }
     // The failures `client` made inside the window ending at `now`.
     fn recent_failures(&mut self, client: IpAddr, now: Instant) -> usize {
         let Some(times) = self.failures.get_mut(&client) else {
@@ -64,24 +118,26 @@ impl State {
         count
     }
 
+    // Only a client `admits` let in reaches here, so the table never grows
+    // past its bound.
     fn record_failure(&mut self, client: IpAddr, now: Instant) {
-        if !self.failures.contains_key(&client) && self.failures.len() >= MAX_TRACKED_CLIENTS {
-            self.failures.retain(|_, times| {
-                times
-                    .back()
-                    .is_some_and(|then| now.duration_since(*then) < FAILURE_WINDOW)
-            });
-            if self.failures.len() >= MAX_TRACKED_CLIENTS
-                && let Some(stalest) = self
-                    .failures
-                    .iter()
-                    .min_by_key(|(_, times)| times.back().copied())
-                    .map(|(ip, _)| *ip)
-            {
-                self.failures.remove(&stalest);
-            }
-        }
+        debug_assert!(
+            self.failures.contains_key(&client) || self.failures.len() < MAX_TRACKED_CLIENTS
+        );
         self.failures.entry(client).or_default().push_back(now);
+    }
+}
+
+// The client a request counts against: its address in the canonical form,
+// with an IPv6 address cut to its /64. IPv4, and IPv4 in the mapped form,
+// stay whole addresses.
+fn client_key(address: IpAddr) -> IpAddr {
+    match canonical_ip(address) {
+        IpAddr::V6(address) => {
+            let mask = u128::MAX << (128 - IPV6_CLIENT_PREFIX);
+            IpAddr::V6((u128::from(address) & mask).into())
+        }
+        address => address,
     }
 }
 
@@ -99,23 +155,12 @@ impl SetupChallenge {
     pub(super) fn generate() -> (Self, String) {
         let code = generate_setup_code();
         let verifier = hex_hash(hash_api_key(&normalize_setup_code(&code)));
-        (
-            Self(Arc::new(Mutex::new(State {
-                verifier: Some(verifier),
-                failures: HashMap::new(),
-                consumed: false,
-            }))),
-            code,
-        )
+        (Self(Arc::new(Mutex::new(State::new(Some(verifier))))), code)
     }
 
     // Setup without a code, for a Weaver that listens on loopback only.
     pub(super) fn open() -> Self {
-        Self(Arc::new(Mutex::new(State {
-            verifier: None,
-            failures: HashMap::new(),
-            consumed: false,
-        })))
+        Self(Arc::new(Mutex::new(State::new(None))))
     }
 
     pub(super) fn code_required(&self) -> bool {
@@ -127,7 +172,7 @@ impl SetupChallenge {
     }
 
     // Checks `code` for a request attributed to `client`. Wrong and missing
-    // codes count against that client address only.
+    // codes count against that client only (its /64 for IPv6).
     pub(super) fn verify(&self, code: Option<&str>, client: IpAddr) -> Result<(), SetupCodeError> {
         self.verify_at(code, client, Instant::now())
     }
@@ -146,7 +191,7 @@ impl SetupChallenge {
         client: IpAddr,
         now: Instant,
     ) -> Result<(), SetupCodeError> {
-        let client = canonical_ip(client);
+        let client = client_key(client);
         let mut state = self.0.lock().expect("setup challenge lock poisoned");
         if state.consumed {
             return Err(SetupCodeError::Consumed);
@@ -154,7 +199,9 @@ impl SetupChallenge {
         let Some(verifier) = state.verifier.clone() else {
             return Ok(());
         };
-        if state.recent_failures(client, now) >= MAX_FAILURES {
+        // Before the code is looked at: a refused client learns nothing
+        // about it and leaves nothing in the table.
+        if !state.admits(client, now) || state.recent_failures(client, now) >= MAX_FAILURES {
             return Err(SetupCodeError::RateLimited);
         }
         // Accept the code however it was typed: any case, with or without
@@ -246,6 +293,27 @@ mod tests {
             challenge.verify(Some(&code.replace('-', "")), CLIENT),
             Ok(())
         );
+        assert_eq!(
+            weaver_server_core::auth::normalize_setup_code(&code).len(),
+            8
+        );
+    }
+
+    #[test]
+    fn a_six_character_code_is_refused() {
+        let (challenge, code) = SetupChallenge::generate();
+        let normal = weaver_server_core::auth::normalize_setup_code(&code);
+        // The first six characters of the right code, in the old 3-3 shape.
+        let short = format!("{}-{}", &normal[..3], &normal[3..6]);
+        assert_eq!(
+            challenge.verify(Some(&short), CLIENT),
+            Err(SetupCodeError::Invalid)
+        );
+        assert_eq!(
+            challenge.verify(Some(&normal[..6]), CLIENT),
+            Err(SetupCodeError::Invalid)
+        );
+        assert_eq!(challenge.verify(Some(&code), CLIENT), Ok(()));
     }
 
     const CLIENT: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 20));
@@ -312,30 +380,186 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_failure_table_stays_bounded() {
-        let (challenge, _) = SetupChallenge::generate();
-        let now = Instant::now();
-        let tracked = |challenge: &SetupChallenge| challenge.0.lock().unwrap().failures.len();
-        for index in 0..(MAX_TRACKED_CLIENTS as u32 * 2) {
-            let client = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + index));
+    fn tracked(challenge: &SetupChallenge) -> usize {
+        challenge.0.lock().unwrap().failures.len()
+    }
+
+    fn walks(challenge: &SetupChallenge) -> usize {
+        challenge.0.lock().unwrap().walks
+    }
+
+    // A distinct IPv4 client per index.
+    fn nth_client(index: u32) -> IpAddr {
+        IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + index))
+    }
+
+    // Fills the table with one failure from each of `MAX_TRACKED_CLIENTS`
+    // clients at `now`.
+    fn fill(challenge: &SetupChallenge, now: Instant) {
+        for index in 0..MAX_TRACKED_CLIENTS as u32 {
             assert_eq!(
-                challenge.verify_at(Some("wrong"), client, now),
+                challenge.verify_at(Some("wrong"), nth_client(index), now),
                 Err(SetupCodeError::Invalid)
             );
-            assert!(tracked(&challenge) <= MAX_TRACKED_CLIENTS);
         }
-        assert_eq!(tracked(&challenge), MAX_TRACKED_CLIENTS);
+        assert_eq!(tracked(challenge), MAX_TRACKED_CLIENTS);
+    }
 
-        // Expired entries are dropped before anyone still inside the window.
-        let later = now + FAILURE_WINDOW;
-        for _ in 0..MAX_FAILURES {
-            let _ = challenge.verify_at(Some("wrong"), CLIENT, later);
+    #[test]
+    fn an_ipv6_client_is_its_64() {
+        let (challenge, code) = SetupChallenge::generate();
+        let now = Instant::now();
+        let first: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let same_64: IpAddr = "2001:db8:1:2:ffff:ffff:ffff:fffe".parse().unwrap();
+        let other_64: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                challenge.verify_at(Some("wrong"), first, now),
+                Err(SetupCodeError::Invalid)
+            );
         }
+        for _ in 0..2 {
+            assert_eq!(
+                challenge.verify_at(Some("wrong"), same_64, now),
+                Err(SetupCodeError::Invalid)
+            );
+        }
+        // Five failures across the /64: both addresses are at the limit.
+        assert_eq!(
+            challenge.verify_at(Some(&code), first, now),
+            Err(SetupCodeError::RateLimited)
+        );
+        assert_eq!(
+            challenge.verify_at(Some(&code), same_64, now),
+            Err(SetupCodeError::RateLimited)
+        );
         assert_eq!(tracked(&challenge), 1);
+        // The next /64 has a count of its own.
+        assert_eq!(challenge.verify_at(Some(&code), other_64, now), Ok(()));
+    }
+
+    #[test]
+    fn an_ipv4_client_stays_its_whole_address() {
+        let v4: IpAddr = "192.168.1.66".parse().unwrap();
+        assert_eq!(client_key(v4), v4);
+        assert_eq!(client_key("::ffff:192.168.1.66".parse().unwrap()), v4);
+        assert_ne!(client_key("192.168.1.67".parse().unwrap()), v4);
+        assert_eq!(
+            client_key("2001:db8:1:2:3:4:5:6".parse().unwrap()),
+            "2001:db8:1:2::".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_full_table_refuses_a_new_client_before_its_code_is_compared() {
+        let (challenge, code) = SetupChallenge::generate();
+        let now = Instant::now();
+        fill(&challenge, now);
+        let newcomer = CLIENT;
+        // The right code is refused: the code was never compared.
+        assert_eq!(
+            challenge.verify_at(Some(&code), newcomer, now),
+            Err(SetupCodeError::RateLimited)
+        );
+        assert_eq!(
+            challenge.verify_at(None, newcomer, now),
+            Err(SetupCodeError::RateLimited)
+        );
+        // And it was not recorded.
+        assert_eq!(tracked(&challenge), MAX_TRACKED_CLIENTS);
+        assert!(!challenge.0.lock().unwrap().failures.contains_key(&newcomer));
+
+        // Once the window has passed, the full entries expire and it gets in.
+        assert_eq!(
+            challenge.verify_at(Some(&code), newcomer, now + FAILURE_WINDOW),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_tracked_client_under_its_limit_succeeds_while_the_table_is_full() {
+        let (challenge, code) = SetupChallenge::generate();
+        let now = Instant::now();
+        fill(&challenge, now);
+        let tracked_client = nth_client(7);
+        for _ in 1..MAX_FAILURES - 1 {
+            assert_eq!(
+                challenge.verify_at(Some("wrong"), tracked_client, now),
+                Err(SetupCodeError::Invalid)
+            );
+        }
+        assert_eq!(
+            challenge.verify_at(Some(&code), tracked_client, now),
+            Ok(())
+        );
+        // Its own fifth failure still limits it.
+        assert_eq!(
+            challenge.verify_at(Some("wrong"), tracked_client, now),
+            Err(SetupCodeError::Invalid)
+        );
+        assert_eq!(
+            challenge.verify_at(Some(&code), tracked_client, now),
+            Err(SetupCodeError::RateLimited)
+        );
+    }
+
+    #[test]
+    fn rotating_addresses_get_no_more_guesses_than_the_table_holds() {
+        let (challenge, _) = SetupChallenge::generate();
+        let now = Instant::now();
+        let addresses = MAX_TRACKED_CLIENTS as u32 * 2 + 1;
+        let mut compared = vec![0usize; addresses as usize];
+        // Seven rounds over twice the table's worth of addresses, all inside
+        // one window: every guess that reached the comparison is counted.
+        for _ in 0..7 {
+            for index in 0..addresses {
+                match challenge.verify_at(Some("wrong"), nth_client(index), now) {
+                    Err(SetupCodeError::Invalid) => compared[index as usize] += 1,
+                    Err(SetupCodeError::RateLimited) => {}
+                    other => panic!("{other:?}"),
+                }
+                assert!(tracked(&challenge) <= MAX_TRACKED_CLIENTS);
+            }
+        }
+        assert!(compared.iter().all(|guesses| *guesses <= MAX_FAILURES));
+        assert_eq!(
+            compared.iter().sum::<usize>(),
+            MAX_TRACKED_CLIENTS * MAX_FAILURES
+        );
+        // Thousands of refusals cost one walk of the table, not one each.
+        assert_eq!(walks(&challenge), 1);
+    }
+
+    #[test]
+    fn expired_entries_are_dropped_and_the_walk_waits_for_the_next_expiry() {
+        let (challenge, _) = SetupChallenge::generate();
+        let now = Instant::now();
+        fill(&challenge, now);
+        let later = now + FAILURE_WINDOW / 2;
+        // One tracked client fails again halfway through, so its entry
+        // outlives the rest.
+        assert_eq!(
+            challenge.verify_at(Some("wrong"), nth_client(0), later),
+            Err(SetupCodeError::Invalid)
+        );
         assert_eq!(
             challenge.verify_at(Some("wrong"), CLIENT, later),
             Err(SetupCodeError::RateLimited)
         );
+        assert_eq!(walks(&challenge), 1);
+        assert_eq!(
+            challenge.verify_at(Some("wrong"), CLIENT, later),
+            Err(SetupCodeError::RateLimited)
+        );
+        assert_eq!(walks(&challenge), 1);
+
+        // At the first expiry everyone but that client is dropped.
+        let expiry = now + FAILURE_WINDOW;
+        assert_eq!(
+            challenge.verify_at(Some("wrong"), CLIENT, expiry),
+            Err(SetupCodeError::Invalid)
+        );
+        assert_eq!(walks(&challenge), 2);
+        assert_eq!(tracked(&challenge), 2);
     }
 }

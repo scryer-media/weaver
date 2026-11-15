@@ -143,6 +143,16 @@ pub(in crate::pipeline::graph) fn job_with(
     files: &[RootFile],
     wants: Vec<Seek>,
 ) -> (GraphJob, tempfile::TempDir, Arc<Mutex<Vec<Pull>>>) {
+    job_through(files, wants, |_| None)
+}
+
+// [`job_with`], its files written through what `disk` gives for the job's
+// directory, or by the job itself when it gives nothing.
+pub(in crate::pipeline::graph) fn job_through(
+    files: &[RootFile],
+    wants: Vec<Seek>,
+    disk: impl FnOnce(&std::path::Path) -> Option<crate::pipeline::graph::disk::JobDisk>,
+) -> (GraphJob, tempfile::TempDir, Arc<Mutex<Vec<Pull>>>) {
     let answers = Arc::new(Mutex::new(Vec::new()));
     let builder = Probes {
         wants,
@@ -160,7 +170,8 @@ pub(in crate::pipeline::graph) fn job_with(
         dir.path().to_path_buf(),
         accountant,
         CapacityReader::unknown(),
-    );
+    )
+    .writing_through(disk(dir.path()));
     let runs = Runs::new(
         1,
         1,
@@ -355,7 +366,7 @@ fn a_graph_job_reports_each_phase_as_its_tree_moves() {
         1,
     )
     .unwrap();
-    assert_eq!(job.phase(), RootPhase::Downloading);
+    assert_eq!(job.checked_phase(), RootPhase::Downloading);
 
     job.intake(
         decoded(0, 0, 0, &zip_front(90), Some(180)),
@@ -363,7 +374,7 @@ fn a_graph_job_reports_each_phase_as_its_tree_moves() {
         1,
     )
     .unwrap();
-    assert_eq!(job.phase(), RootPhase::Downloading);
+    assert_eq!(job.checked_phase(), RootPhase::Downloading);
 
     // Every volume in and the probe never closes the member it announced:
     // the object refuses itself as unmapped once the job is quiet, in the
@@ -374,7 +385,7 @@ fn a_graph_job_reports_each_phase_as_its_tree_moves() {
         1,
     )
     .unwrap();
-    assert_eq!(job.phase(), RootPhase::Done);
+    assert_eq!(job.checked_phase(), RootPhase::Done);
     assert_eq!(
         job.writer().refused(NodeId::ROOT, MemberId(0)),
         Some(Why::Unmapped)
@@ -388,7 +399,7 @@ fn a_graph_job_reports_each_phase_as_its_tree_moves() {
             1,
         )
         .unwrap();
-    assert_eq!(plain.phase(), RootPhase::Done);
+    assert_eq!(plain.checked_phase(), RootPhase::Done);
 }
 
 #[test]

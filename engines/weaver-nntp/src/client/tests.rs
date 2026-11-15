@@ -1810,6 +1810,111 @@ async fn all_fill_quota_blocked_reads_published_state_without_locking() {
     assert!(!client.all_normal_fill_servers_quota_blocked());
 }
 
+// One server per entry: no transfer control, a control with no quota, or a
+// quota of the given limit.
+fn quota_policy_client(quotas: &[Option<Option<u64>>]) -> NntpClient {
+    let transfers = crate::transfer::ServerTransferRegistry::new();
+    let servers = quotas
+        .iter()
+        .enumerate()
+        .map(|(idx, quota)| ServerPoolConfig {
+            server: ServerConfig {
+                host: format!("policy-{idx}.example.com"),
+                ..Default::default()
+            },
+            stable_id: StableServerId(3_000 + idx as u32),
+            transfer_control: quota.map(|limit| {
+                transfers.configure(
+                    StableServerId(3_000 + idx as u32),
+                    crate::transfer::ServerTransferConfig {
+                        rate_bytes_per_sec: 0,
+                        quota: limit.map(|limit_bytes| crate::transfer::QuotaRuntimeConfig {
+                            limit_bytes,
+                            generation: 1,
+                            retry_at: None,
+                        }),
+                        closed: false,
+                    },
+                )
+            }),
+            max_connections: 1,
+            group: 0,
+            ..ServerPoolConfig::default()
+        })
+        .collect();
+    NntpClient::new(NntpClientConfig {
+        servers,
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        soft_timeout: UNREACHED_TIMEOUT,
+    })
+}
+
+// The pipeline samples the policy on every article it takes. A server with
+// no quota is read without its transfer state's lock; one with a quota, room
+// left or none, still reads its snapshot. Either way the policy is the one
+// reading every server's snapshot gives, and a quota taken away stops the
+// lock with it.
+#[tokio::test]
+async fn provider_policy_takes_no_transfer_lock_for_a_server_without_a_quota() {
+    let snapshot_locks = |client: &NntpClient, count: usize| -> Vec<Option<u64>> {
+        (0..count)
+            .map(|idx| {
+                client
+                    .pool
+                    .server_transfer_control(ServerId(idx))
+                    .map(|control| control.snapshot_lock_count())
+            })
+            .collect()
+    };
+    let remaining = |policy: &crate::provider_policy::ProviderPolicy| -> Vec<u64> {
+        policy
+            .servers
+            .iter()
+            .map(|state| state.quota_remaining)
+            .collect()
+    };
+
+    // No quota anywhere: no lock at all.
+    let client = quota_policy_client(&[None, Some(None)]);
+    let before = snapshot_locks(&client, 2);
+    let policy = client.pool.provider_policy();
+    assert_eq!(snapshot_locks(&client, 2), before);
+    assert_eq!(remaining(&policy), vec![u64::MAX, u64::MAX]);
+    assert_eq!(policy, client.pool.provider_policy_by_snapshot());
+
+    // A quota with room and one exhausted each take their lock once.
+    let client = quota_policy_client(&[None, Some(None), Some(Some(1_000)), Some(Some(0))]);
+    let before = snapshot_locks(&client, 4);
+    let policy = client.pool.provider_policy();
+    assert_eq!(
+        snapshot_locks(&client, 4),
+        vec![
+            None,
+            before[1],
+            before[2].map(|n| n + 1),
+            before[3].map(|n| n + 1)
+        ]
+    );
+    assert_eq!(remaining(&policy), vec![u64::MAX, u64::MAX, 1_000, 0]);
+    assert_eq!(policy, client.pool.provider_policy_by_snapshot());
+
+    // The quota with room taken away: no lock for it any more.
+    client
+        .pool
+        .server_transfer_control(ServerId(2))
+        .unwrap()
+        .update_config(crate::transfer::ServerTransferConfig::default());
+    let before = snapshot_locks(&client, 4);
+    let policy = client.pool.provider_policy();
+    assert_eq!(
+        snapshot_locks(&client, 4),
+        vec![None, before[1], before[2], before[3].map(|n| n + 1)]
+    );
+    assert_eq!(remaining(&policy), vec![u64::MAX, u64::MAX, u64::MAX, 0]);
+    assert_eq!(policy, client.pool.provider_policy_by_snapshot());
+}
+
 #[tokio::test]
 async fn backfill_server_absent_from_ordinary_order() {
     let client = tiered_client(&[false, false, true]);
