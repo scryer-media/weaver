@@ -239,6 +239,9 @@ pub struct BlockingNntpConnection {
     // How long the last decoded article waited for its status line. The lane
     // takes this to separate distance from transfer cost.
     last_response_line_wait: Duration,
+    // Command-to-status-line time of the CAPABILITIES exchange session setup
+    // made, when it made one.
+    capabilities_round_trip: Option<Duration>,
     // Armed when session setup declined to select a group this caller
     // offered, because the server has never been shown to need one. See
     // [`crate::server_caps`].
@@ -1368,6 +1371,7 @@ impl BlockingNntpConnection {
             egress_accounting: VecDeque::new(),
             checkpoint_plan: CheckpointPlan::None,
             last_response_line_wait: Duration::ZERO,
+            capabilities_round_trip: None,
             group_probe_armed: false,
             health: None,
         };
@@ -1488,6 +1492,23 @@ impl BlockingNntpConnection {
         &self.capabilities
     }
 
+    // How long the CAPABILITIES command session setup sent took to answer;
+    // `None` when setup sent none.
+    pub fn capabilities_round_trip(&self) -> Option<Duration> {
+        self.capabilities_round_trip
+    }
+
+    // Name of the negotiated TLS cipher suite, as the backend reports it, the
+    // same as the asynchronous transport's; `None` on plaintext.
+    pub fn negotiated_cipher_suite(&self) -> Option<String> {
+        match &self.transport {
+            BlockingTransport::Plain(_) => None,
+            BlockingTransport::Rustls(inner) => inner.session.negotiated_cipher_suite(),
+            #[cfg(not(windows))]
+            BlockingTransport::S2n(inner) => inner.negotiated_cipher_suite(),
+        }
+    }
+
     pub fn current_group(&self) -> Option<&str> {
         self.current_group.as_deref()
     }
@@ -1541,7 +1562,9 @@ impl BlockingNntpConnection {
     }
 
     fn fetch_capabilities(&mut self) -> Result<()> {
+        let started = Instant::now();
         let resp = self.send_command(&Command::Capabilities)?;
+        self.capabilities_round_trip = Some(started.elapsed());
         if resp.code.raw() == 101 {
             let data = self.read_multiline_data()?;
             self.capabilities = Capabilities::parse(&data);
@@ -3080,6 +3103,18 @@ impl BlockingS2nStream {
 
     fn peek_buffered_ciphertext(&self) -> u32 {
         unsafe { s2n::s2n_peek_buffered(self.conn.as_ptr()) }
+    }
+
+    fn negotiated_cipher_suite(&self) -> Option<String> {
+        // s2n owns the returned static string; a null means no suite.
+        let name = unsafe { s2n::s2n_connection_get_cipher(self.conn.as_ptr()) };
+        if name.is_null() {
+            return None;
+        }
+        unsafe { CStr::from_ptr(name) }
+            .to_str()
+            .ok()
+            .map(str::to_string)
     }
 
     fn write_all(&mut self, mut bytes: &[u8], timeout: Duration) -> Result<()> {
