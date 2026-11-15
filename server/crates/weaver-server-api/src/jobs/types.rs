@@ -1263,6 +1263,53 @@ pub fn encode_offset_cursor(offset: usize) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("off:{offset}"))
 }
 
+/// Where the next page of a job's output files starts: its position, which
+/// an archived entry's record pages by, and the last file listed, which a
+/// folder on disk pages by so a deep page keeps only its own files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutputFilesCursor {
+    pub offset: usize,
+    pub after: Option<weaver_server_core::history::output_files::ListingKey>,
+}
+
+pub fn decode_output_files_cursor(cursor: Option<&str>) -> Result<OutputFilesCursor, String> {
+    let Some(cursor) = cursor else {
+        return Ok(OutputFilesCursor::default());
+    };
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| "cursor is not valid base64".to_string())?;
+    let decoded =
+        String::from_utf8(decoded).map_err(|_| "cursor is not valid UTF-8".to_string())?;
+    if decoded.starts_with("off:") {
+        return Ok(OutputFilesCursor {
+            offset: decode_offset_cursor(Some(cursor))?,
+            after: None,
+        });
+    }
+    let Some(body) = decoded.strip_prefix("fil:") else {
+        return Err("cursor has an invalid prefix".to_string());
+    };
+    let (offset, name, rel_path): (usize, String, String) =
+        serde_json::from_str(body).map_err(|_| "cursor does not name a file".to_string())?;
+    Ok(OutputFilesCursor {
+        offset,
+        after: Some(weaver_server_core::history::output_files::ListingKey { name, rel_path }),
+    })
+}
+
+pub fn encode_output_files_cursor(cursor: &OutputFilesCursor) -> String {
+    let body = match &cursor.after {
+        Some(after) => format!(
+            "fil:{}",
+            serde_json::to_string(&(cursor.offset, &after.name, &after.rel_path))
+                .expect("a tuple of a number and two strings serializes")
+        ),
+        None => format!("off:{}", cursor.offset),
+    };
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(body)
+}
+
 pub const PRIORITY_ATTRIBUTE_KEY: &str = "priority";
 
 pub fn normalize_priority_value(value: &str) -> std::result::Result<String, String> {

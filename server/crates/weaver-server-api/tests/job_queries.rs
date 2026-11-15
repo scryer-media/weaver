@@ -2222,6 +2222,42 @@ async fn output_files_refuse_a_bad_cursor() {
     assert_has_errors(&resp);
 }
 
+// On disk a page starts after the file its cursor names, so a cursor that
+// names only a position past the first file is refused rather than met by
+// keeping every file before it.
+#[tokio::test]
+async fn output_files_on_disk_refuse_a_position_only_cursor() {
+    use base64::Engine as _;
+    let h = TestHarness::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    for n in 0..3 {
+        std::fs::write(dir.path().join(format!("f{n}.bin")), [0u8]).unwrap();
+    }
+    let mut row = sample_history_row(7_104, "Deep", "complete", 1_700_000_000);
+    row.output_dir = Some(dir.path().to_string_lossy().into_owned());
+    h.insert_history_row(&row);
+    let deep = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("off:1000000000");
+    let resp = h
+        .execute(&format!(
+            "{{ jobOutputFiles(jobId: 7104, after: \"{deep}\") {{ totalCount }} }}"
+        ))
+        .await;
+    assert_has_errors(&resp);
+
+    // The cursor a page gives takes up after its last file.
+    let first = output_files_page(&h, 7_104, ", first: 2").await;
+    let after = first["nextCursor"].as_str().unwrap().to_string();
+    let second = output_files_page(&h, 7_104, &format!(", first: 2, after: \"{after}\"")).await;
+    assert_eq!(
+        page_files(&second)
+            .into_iter()
+            .map(|f| f.0)
+            .collect::<Vec<_>>(),
+        ["f2.bin"]
+    );
+    assert!(second["nextCursor"].is_null());
+}
+
 // The folder on disk lists no link and walks no linked folder, as the record
 // an archive keeps does not.
 #[cfg(unix)]

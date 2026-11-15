@@ -32,11 +32,32 @@ pub struct OutputFileListing {
     pub total_bytes: u64,
 }
 
+impl OutputFile {
+    /// Where this file stands in listing order: a page that starts after
+    /// it takes up from this key.
+    pub fn listing_key(&self) -> ListingKey {
+        ListingKey {
+            name: self.name.to_ascii_lowercase(),
+            rel_path: self.rel_path.clone(),
+        }
+    }
+}
+
+/// A place in listing order: the lowercased file name, then the relative
+/// path, which is unique.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ListingKey {
+    pub name: String,
+    pub rel_path: String,
+}
+
 // Listing order: lowercased name, then relative path, which is unique.
 type Keyed = (String, String, String, u64);
 
 struct Selection {
     keep: usize,
+    // Only files after this key are kept; every file is still counted.
+    after: Option<ListingKey>,
     // The largest kept key on top, so a smaller one replaces it.
     kept: BinaryHeap<Keyed>,
     total_count: u64,
@@ -51,6 +72,11 @@ impl Selection {
             return;
         }
         let key = (name.to_ascii_lowercase(), rel_path, name, size_bytes);
+        if self.after.as_ref().is_some_and(|after| {
+            (key.0.as_str(), key.1.as_str()) <= (after.name.as_str(), after.rel_path.as_str())
+        }) {
+            return;
+        }
         if self.kept.len() < self.keep {
             self.kept.push(key);
         } else if self.kept.peek().is_some_and(|largest| key < *largest) {
@@ -83,8 +109,21 @@ impl Selection {
 /// cannot be read is an error; an entry whose metadata cannot be read is
 /// passed over. Blocks: call it off the async runtime.
 pub fn list_output_files(dir: &Path, keep: usize) -> io::Result<OutputFileListing> {
+    list_output_files_after(dir, None, keep)
+}
+
+/// As [`list_output_files`], keeping the first `keep` files that come after
+/// `after` in listing order, so a later page holds no more than its own
+/// files however deep into the folder it starts. The totals still count
+/// every file.
+pub fn list_output_files_after(
+    dir: &Path,
+    after: Option<&ListingKey>,
+    keep: usize,
+) -> io::Result<OutputFileListing> {
     let mut selection = Selection {
         keep,
+        after: after.cloned(),
         kept: BinaryHeap::with_capacity(keep.min(1024)),
         total_count: 0,
         total_bytes: 0,
@@ -208,6 +247,29 @@ mod tests {
         let skipped = list_output_files(dir.path(), 10).unwrap();
         assert_eq!(names(&skipped), ["real.mkv"]);
         assert_eq!((skipped.total_count, skipped.total_bytes), (1, 2));
+    }
+
+    // A page after a key is the files that follow it in the whole order,
+    // with the whole folder's totals, for a key at every position.
+    #[test]
+    fn a_page_after_a_key_is_the_files_that_follow_it() {
+        let dir = tempfile::tempdir().unwrap();
+        for (n, rel) in ["b.mkv", "A.nfo", "Sub/a.nfo", "Other/B.MKV", "c.txt"]
+            .iter()
+            .enumerate()
+        {
+            write(dir.path(), rel, n + 1);
+        }
+        let all = list_output_files(dir.path(), 100).unwrap();
+        for (at, file) in all.files.iter().enumerate() {
+            for keep in 0..=5 {
+                let page =
+                    list_output_files_after(dir.path(), Some(&file.listing_key()), keep).unwrap();
+                let end = (at + 1 + keep).min(all.files.len());
+                assert_eq!(page.files, all.files[at + 1..end]);
+                assert_eq!((page.total_count, page.total_bytes), (5, 15));
+            }
+        }
     }
 
     #[test]
