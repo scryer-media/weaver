@@ -6,7 +6,7 @@
 // volume and seven reserved bytes, with or without the volume's number.
 
 use super::harness::{ARTICLE, Scenario, payload, try_run};
-use super::rar::{posts, with_par2};
+use super::rar::{delivered, posts, with_par2};
 use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::single_member_rar4_old_numbering_set_ending;
 
@@ -61,4 +61,29 @@ async fn a_set_whose_volumes_all_state_one_number_fails() {
 #[tokio::test]
 async fn a_set_whose_volumes_all_state_one_number_fails_beside_its_par2() {
     assert_fails_unplaced(with_par2(numbered_alike())).await;
+}
+
+// RAR 3.1 to 3.3 end each volume with a CRC32 and seven reserved bytes and
+// state no number (flags 0x4007, 0x4006 on the last). The names order the
+// set, posted last volume first, and the member comes out whole.
+#[tokio::test]
+async fn a_set_whose_end_records_state_no_number_delivers_in_name_order() {
+    let body = body();
+    let mut volumes =
+        single_member_rar4_old_numbering_set_ending("silver.horizon", MEMBER, &body, 4, None);
+    volumes.reverse();
+    let outcome = try_run(&Scenario::new(posts(volumes)))
+        .await
+        .unwrap_or_else(|stall| panic!("stalled at {:?}: {}", stall.status, stall.state));
+    assert_eq!(
+        outcome.status,
+        Some(JobStatus::Complete),
+        "{:?}",
+        outcome.failure
+    );
+    assert_eq!(
+        outcome.files.keys().cloned().collect::<Vec<_>>(),
+        vec![delivered(MEMBER)]
+    );
+    assert_eq!(outcome.files.get(&delivered(MEMBER)), Some(&body));
 }
