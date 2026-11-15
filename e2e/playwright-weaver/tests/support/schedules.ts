@@ -154,7 +154,14 @@ export class Rules {
   }
 }
 
-/** Run `body` with a rule tracker whose rules are removed afterwards. */
+/**
+ * Run `body` with a rule tracker whose rules are removed afterwards.
+ *
+ * Rules are deleted in the order they were created. Deleting the rule in
+ * force exposes the next one on its track, and the evaluator applies it on
+ * its next tick, so a test that ends with a hold behind its last rule in
+ * force calls `releaseLast` before it ends.
+ */
 export async function withRules(request: APIRequestContext, tag: string, body: (rules: Rules) => Promise<void>): Promise<void> {
   const rules = new Rules(request, tag);
   try {
@@ -162,6 +169,18 @@ export async function withRules(request: APIRequestContext, tag: string, body: (
   } finally {
     await rules.clear();
   }
+}
+
+/**
+ * Put a release rule at the current minute in force, before the test's rules
+ * are removed. Created last, it wins every earlier rule on its tracks and is
+ * deleted last, so removing the others exposes no older hold. The witness
+ * tick proves the evaluator applied it on every track. The test must not use
+ * the global Speed track.
+ */
+export async function releaseLast(request: APIRequestContext, rules: Rules, release: Record<string, unknown> & { actionType: string }): Promise<void> {
+  await rules.create({ ...release, time: hhmm(readClock()) });
+  await witnessTick(request);
 }
 
 let witnessSerial = 0;

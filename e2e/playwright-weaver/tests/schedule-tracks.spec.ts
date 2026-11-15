@@ -13,7 +13,7 @@ import {
   DAY_MS, Rules, SCHEDULE_FIELDS, type RuleInput, type ScheduleRow, addCountedFeed, at, cancelledJob, clockWhileStoppedPending,
   completedJob, deleteFeed, egressSpeed, feedCount, freshDay, generalSettings, historyItem, hhmm, note, postPaused,
   profileState, queueState, restoreServer, resumeAll, schedules, serverRow, setClockWhileStopped, token, updateSettings,
-  waitPaused, waitProfile, waitQueue, watchFolderPaused, withRules, witnessTick,
+  releaseLast, waitPaused, waitProfile, waitQueue, watchFolderPaused, withRules, witnessTick,
 } from "./support/schedules";
 
 /**
@@ -701,7 +701,8 @@ test("O02 an operator resume sticks until the rule's next occurrence", async ({ 
       setClock(at(day, 11, 0));
       await waitPaused(request, false, "O02 the 11:00 resume");
     } finally {
-      await resumeAll(request);
+      // Deleting the 11:00 resume first would put the 10:45 pause back in force.
+      await releaseLast(request, rules, { actionType: "resume" });
     }
   });
 });
@@ -758,7 +759,8 @@ test("O04 the NZBGet post-processing controls override a rule until its next occ
         await witnessTick(request);
         expect(await postPaused(request, key), "the 10:30 resume does not reapply").toBe(true);
       } finally {
-        await nzbgetRpc(request, key, "resumepost", []);
+        // Deleting the 10:30 resume first would put the 10:00 pause back in force.
+        await releaseLast(request, rules, { actionType: "resume_post_processing" });
       }
     });
   });
@@ -782,7 +784,8 @@ test("O05 an operator watch-folder resume overrides a rule until its next occurr
       setClock(at(day, 11, 0));
       await expect.poll(() => watchFolderPaused(request), { message: "O05 the 11:00 resume", timeout: 0 }).toBe(false);
     } finally {
-      await updateSettings(request, { watchFolder: { mode: "off", scanningPaused: false } });
+      // Deleting the 11:00 resume first would put the 10:30 pause back in force.
+      await releaseLast(request, rules, { actionType: "resume_watch_folder_scanning" });
     }
   });
 });
@@ -809,6 +812,8 @@ test("O06 a scheduled profile stays in force over the operator's choice", async 
       setClock(at(day, 10, 30));
       await waitProfile(request, home, "O06 the 10:30 rule");
     } finally {
+      // Deleting the 10:30 rule first would put the 10:00 profile back in force.
+      await releaseLast(request, rules, { actionType: "hardware_profile", hardwareProfile: home });
       if (before.selected !== null) {
         await graphql(request, "mutation($profile: HardwareProfileGql!) { setHardwareProfile(profile: $profile) { selected } }", { profile: before.selected });
       }
@@ -835,6 +840,8 @@ test("O07 an operator putting a server back overrides a rule until its next occu
       setClock(at(day, 10, 45));
       await expect.poll(async () => (await serverRow(request, "nntp2")).active, { message: "O07 back at 10:45", timeout: 0 }).toBe(true);
     } finally {
+      // Deleting the 10:45 rule first would put the 10:30 one back in force.
+      await releaseLast(request, rules, { actionType: "set_server_active", serverId: backup.id, serverActive: true });
       await restoreServer(request, "nntp2");
     }
   });
@@ -970,6 +977,8 @@ test("R01 pause_rss and resume_rss hold the feed poller", async ({ request }) =>
       await expect.poll(() => feedCount(held), { message: "R01 the resume reads the waiting feed", timeout: 0 }).toBe(1);
     } finally {
       for (const id of feeds) await deleteFeed(request, id);
+      // Deleting the 10:30 resume first would put the 10:00 pause back in force.
+      await releaseLast(request, rules, { actionType: "resume_rss" });
     }
   });
 });
@@ -1000,8 +1009,8 @@ test("R02 pause_all holds downloads, watch intake and RSS, and resume releases a
       await expect.poll(() => feedCount(held), { message: "R02 RSS resumed", timeout: 0 }).toBe(1);
     } finally {
       for (const id of feeds) await deleteFeed(request, id);
-      await resumeAll(request);
-      await updateSettings(request, { watchFolder: { mode: "off", scanningPaused: false } });
+      // Deleting the 10:30 resume first would put the pause_all back in force.
+      await releaseLast(request, rules, { actionType: "resume" });
     }
   });
 });
