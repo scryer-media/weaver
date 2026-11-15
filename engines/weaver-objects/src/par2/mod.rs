@@ -257,11 +257,24 @@ impl Par2 {
     // The most recovery blocks the volumes that serve the set may still
     // bring. Nothing is ruled short while they may.
     fn coming(&self, set: &[u8; 16]) -> u64 {
+        let packet = self.smallest_packet();
         self.volumes
             .iter()
             .filter(|volume| volume.serves(set))
-            .map(Volume::left)
-            .sum()
+            .map(|volume| volume.left(packet))
+            .fold(0, u64::saturating_add)
+    }
+
+    // The blocks still to come that can be counted, for a figure that is
+    // shown: a volume with no bound known yet adds none to it.
+    fn counted(&self, set: &[u8; 16]) -> u64 {
+        let packet = self.smallest_packet();
+        self.volumes
+            .iter()
+            .filter(|volume| volume.serves(set))
+            .map(|volume| volume.left(packet))
+            .filter(|&left| left != u64::MAX)
+            .fold(0, u64::saturating_add)
     }
 
     // The slices of the set's members that a refused range touches: each
@@ -331,7 +344,7 @@ impl Par2 {
                 && volume.serves(key)
                 && (volume.named_blocks.is_none() || volume.arrived.runs().next().is_none())
         });
-        (!unknown).then(|| self.sets[key].recovery.len() as u64 + self.coming(key))
+        (!unknown).then(|| (self.sets[key].recovery.len() as u64).saturating_add(self.coming(key)))
     }
 
     // The set's ruling on what was refused: impossible once the refused
@@ -774,7 +787,9 @@ impl Object for Par2 {
     // The walk reads no packet past the volume's end.
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {
         let mut found = Vec::new();
-        self.volume(volume).walker.sized(length, &mut found);
+        let state = self.volume(volume);
+        state.length = Some(length);
+        state.walker.sized(length, &mut found);
         self.take(volume, found);
         self.ask_again(out);
     }
@@ -898,8 +913,10 @@ impl Object for Par2 {
             .collect()
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
-        self.volume(volume).name(name);
+    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], length: Option<u64>) {
+        let state = self.volume(volume);
+        state.name(name);
+        state.length = length.or(state.length);
         for state in self.sets.values_mut() {
             state.reopen();
         }
@@ -1187,7 +1204,9 @@ impl Recovery for Par2 {
 
     // Per set, ask for the volumes that serve it and are not yet in hand,
     // the fewest blocks first, so the least recovery data is fetched, until
-    // what they are named to carry covers its shortfall. Every
+    // what they are named to carry covers its shortfall. A volume whose
+    // name gives no count promises nothing toward it, so each such volume
+    // is asked for while the shortfall stands. Every
     // other volume the walk has shown carries recovery blocks is deferred:
     // its head told what it is, and the rest waits until a shortfall wants
     // it. Nothing of the deferral is kept: the same walk says it again on
@@ -1392,7 +1411,7 @@ impl Recovery for Par2 {
             out.push(SetRuling {
                 id: par2_rs::RecoverySetId::from_bytes(key).to_string(),
                 slice_size: state.index.as_ref().map_or(0, |index| index.slice_size),
-                blocks_reachable: state.recovery.len() as u64 + self.coming(&key),
+                blocks_reachable: (state.recovery.len() as u64).saturating_add(self.counted(&key)),
                 damaged_slices: damaged,
                 outcome: short.or(last.map(|last| last.outcome)),
                 read: short.is_none() && last.is_some_and(|last| last.read),
