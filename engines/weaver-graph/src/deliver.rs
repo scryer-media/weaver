@@ -365,6 +365,10 @@ pub enum Emit {
     // claim that bound it was provisional: the member goes back to its
     // namespace, with what I parsed of it, to be offered again.
     GiveBack(VolumeIndex),
+    // "My headers say the volume at this place, which I do not hold, is
+    // mine": a sibling holding there a volume it may carry lets it go to
+    // me, where I claim it at that place. Said once per place.
+    Wants(VolumeIndex),
 }
 
 #[cfg(test)]

@@ -203,6 +203,17 @@ pub fn maybe_trip(name: &str) {
     }
 
     tracing::warn!(failpoint = name, "tripping e2e failpoint");
+    // The log's delivery thread may not write the line above, or the ones
+    // before it, before the abort. Standard error is written here, so the
+    // harness always finds the trip.
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "level": "WARN",
+            "target": "weaver_server_core::e2e_failpoint",
+            "fields": { "message": "tripping e2e failpoint", "failpoint": name },
+        })
+    );
     std::process::abort();
 }
 

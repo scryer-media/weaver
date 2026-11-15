@@ -489,6 +489,11 @@ pub struct Tree {
     rewalks: BTreeMap<NodeId, Vec<(VolumeIndex, ByteRange)>>,
     // The nodes whose restart asks are being read: see `rewalk`.
     rewalking: BTreeSet<NodeId>,
+    // The places an object said are its own and none of its siblings could
+    // yet give it, by the namespace they are in: a volume bound there to a
+    // sibling later is offered to it at once. Never recorded: a restored
+    // object walks its volumes again and says them again.
+    wanting: BTreeSet<(NodeId, VolumeIndex, NodeId)>,
 }
 
 impl Default for Tree {
@@ -517,6 +522,7 @@ impl Tree {
             again_depth: 0,
             rewalks: BTreeMap::new(),
             rewalking: BTreeSet::new(),
+            wanting: BTreeSet::new(),
         }
     }
 
@@ -2086,6 +2092,13 @@ impl Tree {
             }
         }
         self.forget_empty(node, empty, effects);
+        // An object that gave volumes up and still holds some has places
+        // free that its siblings' volumes may be: it takes what they can
+        // carry and it claims, before the members given up are offered
+        // again. Only on a give-back, never per volume bound.
+        if !empty && !self.founded_by_name(node) {
+            self.take_claimed(parent, node, effects);
+        }
         for member in offered {
             self.identify_again(parent, member, builder, effects);
         }
@@ -2256,6 +2269,8 @@ impl Tree {
     fn remove_node(&mut self, node: NodeId, effects: &mut Vec<Effect>) -> Option<Node> {
         let removed = self.nodes.remove(&node)?;
         forget_given(&mut self.given, node);
+        self.wanting
+            .retain(|(parent, _, wanter)| *parent != node && *wanter != node);
         for record in removed.namespace.members() {
             self.release_name((node, record.id), effects);
         }
@@ -3022,11 +3037,27 @@ impl Tree {
     // volume it accepts. The existing give-back/adopt path keeps its bytes
     // in place.
     fn take_claimed(&mut self, node: NodeId, child: NodeId, effects: &mut Vec<Effect>) {
-        let siblings: Vec<NodeId> = self
-            .bound_below(node)
-            .into_iter()
-            .filter(|sibling| *sibling != child && !self.lent(*sibling))
-            .collect();
+        self.take_claimed_at(node, child, None, None, effects);
+    }
+
+    // As `take_claimed`, keeping only the volumes the object claims at one
+    // of `wanted`'s places, when it names any, and asking only `from`, when
+    // it names one.
+    fn take_claimed_at(
+        &mut self,
+        node: NodeId,
+        child: NodeId,
+        wanted: Option<&[VolumeIndex]>,
+        from: Option<NodeId>,
+        effects: &mut Vec<Effect>,
+    ) {
+        let siblings: Vec<NodeId> = match from {
+            Some(from) => vec![from],
+            None => self.bound_below(node),
+        }
+        .into_iter()
+        .filter(|sibling| *sibling != child && !self.lent(*sibling))
+        .collect();
         for sibling in siblings {
             let named = self.founded_by_name(sibling);
             let held = self.transferable(sibling, named);
@@ -3063,7 +3094,9 @@ impl Tree {
                                 })
                         })
                 };
-                let Some(place) = place else {
+                let Some(place) =
+                    place.filter(|place| wanted.is_none_or(|wanted| wanted.contains(place)))
+                else {
                     continue;
                 };
                 // A place the object holds already: the member is another
@@ -3509,6 +3542,7 @@ impl Tree {
             self.bound(node, member, kind, child, effects);
         }
         self.offer_given(node, child, effects);
+        self.offer_wanted(node, child, volume, effects);
     }
 
     // An object's set grew, which is evidence for the members given back
@@ -3743,6 +3777,7 @@ impl Tree {
         // back as the object stood before any of them comes again.
         let mut given = Vec::new();
         let mut again = Vec::new();
+        let mut wanted = Vec::new();
         for emit in emits.drain(..) {
             match emit {
                 Emit::Pending => {}
@@ -3841,6 +3876,7 @@ impl Tree {
                     self.unbind(node, refuted, builder, effects);
                 }
                 Emit::GiveBack(volume) => given.push(volume),
+                Emit::Wants(volume) => wanted.push(volume),
             }
             if self.nodes.get(&node).is_none_or(|found| found.retired) {
                 // Whatever the object said after giving its volumes up is
@@ -3856,6 +3892,75 @@ impl Tree {
         }
         if !given.is_empty() {
             self.give_back(node, &given, builder, effects);
+        }
+        if !wanted.is_empty() {
+            self.take_wanted(node, &wanted, effects);
+        }
+    }
+
+    // An object whose headers say volumes it does not hold are its own
+    // takes them from its siblings, as it would at its founding, but only
+    // where it claims them at those places. Only when it says so, once per
+    // place, never per volume bound.
+    fn take_wanted(&mut self, node: NodeId, wanted: &[VolumeIndex], effects: &mut Vec<Effect>) {
+        let Some(parent) = self
+            .nodes
+            .get(&node)
+            .filter(|found| !found.retired)
+            .and_then(|found| found.binding.as_ref())
+            .filter(|binding| binding.window.is_none())
+            .map(|binding| binding.parent)
+        else {
+            return;
+        };
+        if self.founded_by_name(node) {
+            return;
+        }
+        self.take_claimed_at(parent, node, Some(wanted), None, effects);
+        for place in wanted {
+            let held = self
+                .nodes
+                .get(&node)
+                .and_then(|found| found.binding.as_ref())
+                .is_some_and(|binding| binding.volumes.contains_key(place));
+            if !held {
+                self.wanting.insert((parent, *place, node));
+            }
+        }
+    }
+
+    // A member just bound at `volume` of `child` in `node`'s namespace, at a
+    // place a sibling said is its own: that sibling takes it from `child`
+    // where it claims it there. Only the siblings that said the place are
+    // asked, never every object of the namespace.
+    fn offer_wanted(
+        &mut self,
+        node: NodeId,
+        child: NodeId,
+        volume: VolumeIndex,
+        effects: &mut Vec<Effect>,
+    ) {
+        self.wanting.remove(&(node, volume, child));
+        let wanters: Vec<NodeId> = self
+            .wanting
+            .range((node, volume, NodeId(0))..=(node, volume, NodeId(u32::MAX)))
+            .map(|(_, _, wanter)| *wanter)
+            .collect();
+        for wanter in wanters {
+            if !self.nodes.get(&wanter).is_some_and(|found| !found.retired) {
+                self.wanting.remove(&(node, volume, wanter));
+                continue;
+            }
+            self.take_claimed_at(node, wanter, Some(&[volume]), Some(child), effects);
+            let taken = self
+                .nodes
+                .get(&wanter)
+                .and_then(|found| found.binding.as_ref())
+                .is_some_and(|binding| binding.volumes.contains_key(&volume));
+            if taken {
+                self.wanting.remove(&(node, volume, wanter));
+                return;
+            }
         }
     }
 
