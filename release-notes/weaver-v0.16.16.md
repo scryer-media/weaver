@@ -90,6 +90,9 @@ Everything below is new since 0.16.15.
 - **A RAR volume held by the wrong store is given back, taken by the
   store that wants it, and fetched again if its bytes are gone.** A job
   could stay at Verifying.
+- **A stored set that is given up reads its volumes back one at a
+  time.** The whole set was read back in one step, so on a large set
+  downloads stopped and a cancel or a stop was not heard until it ended.
 - **A stray file under a RAR volume's name no longer keeps the real
   volume out.** A volume's place comes from its headers.
 - **A split set whose first piece is numbered zero counts from zero.**
