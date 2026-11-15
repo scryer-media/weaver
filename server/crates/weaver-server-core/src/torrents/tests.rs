@@ -114,7 +114,7 @@ fn what_was_on_disk_before_a_torrent_is_kept_with_it() {
         files: vec!["kept/a.bin".to_owned()],
         dirs: vec![String::new(), "kept".to_owned()],
     };
-    db.insert_placed_torrent(&torrent(5, Some([5; 20]), None), &[], &found)
+    db.insert_placed_torrent(&torrent(5, Some([5; 20]), None), &[], &found, None)
         .unwrap();
     assert_eq!(db.torrent_adopted(JobId(5)).unwrap(), found);
 

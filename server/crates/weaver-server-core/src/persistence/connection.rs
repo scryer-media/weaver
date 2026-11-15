@@ -1198,7 +1198,7 @@ async fn execute_write_command(
                         tracing::warn!(
                             job_id = job_id.0,
                             error = %error,
-                            "could not keep a removed torrent's history row on the torrent; a stop before room comes brings it back"
+                            "could not keep a removed torrent's history list on the torrent; a stop before room comes writes its row without the list"
                         );
                     }
                 }

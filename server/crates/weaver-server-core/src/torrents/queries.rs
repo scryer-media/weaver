@@ -183,17 +183,31 @@ impl Database {
     // The job of every torrent a start brings back, read alone: never one a
     // removal left retiring, which goes to history instead.
     pub fn torrent_job_ids(&self) -> Result<Vec<JobId>, StateError> {
+        Ok(self.torrent_rows()?.0)
+    }
+
+    // Every torrent row's job, those that come back live and those a
+    // removal left retiring, in one read.
+    pub(crate) fn torrent_rows(&self) -> Result<(Vec<JobId>, Vec<JobId>), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT job_id FROM torrents WHERE retiring IS NULL",
+                "SELECT job_id, CASE WHEN retiring IS NULL THEN 0 ELSE 1 END AS retiring \
+                 FROM torrents",
                 &[],
             )
             .await?;
-            rows.iter()
-                .map(|row| Ok(JobId(count(row, "job_id")?)))
-                .collect()
+            let (mut live, mut retiring) = (Vec::new(), Vec::new());
+            for row in &rows {
+                let job_id = JobId(count(row, "job_id")?);
+                if row.i64("retiring")? == 0 {
+                    live.push(job_id);
+                } else {
+                    retiring.push(job_id);
+                }
+            }
+            Ok((live, retiring))
         })
     }
 
@@ -389,7 +403,8 @@ impl Database {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 &format!(
-                    "SELECT {TORRENT_COLUMNS}, file_priorities, seed_verified \
+                    "SELECT {TORRENT_COLUMNS}, file_priorities, seed_verified, held_set, \
+                            CASE WHEN held_set THEN NULL ELSE outputs END AS unheld_outputs \
                        FROM torrents WHERE retiring IS NULL ORDER BY added_at_ms, job_id"
                 ),
                 &[],
@@ -401,6 +416,10 @@ impl Database {
                         record: torrent_from_row(row)?,
                         levels: file_priorities_from_row(row),
                         seed_verified: row.opt_bytes("seed_verified"),
+                        held_set: row.bool("held_set")?,
+                        unheld_outputs: row
+                            .opt_text("unheld_outputs")?
+                            .map_or(Some(Vec::new()), |text| serde_json::from_str(&text).ok()),
                     })
                 })
                 .collect()
@@ -436,6 +455,11 @@ pub(crate) struct RestoredTorrent {
     pub(crate) record: TorrentRecord,
     pub(crate) levels: Result<Vec<FilePriority>, StateError>,
     pub(crate) seed_verified: Result<Option<Vec<u8>>, StateError>,
+    // Whether its held paths are its own; when not, what unpacking placed
+    // beside its files, read only for it, to write them from; None when
+    // that list does not read.
+    pub(crate) held_set: bool,
+    pub(crate) unheld_outputs: Option<Vec<String>>,
 }
 
 pub(crate) fn counters_from_row(row: &SqlRow) -> Result<TorrentCounters, StateError> {

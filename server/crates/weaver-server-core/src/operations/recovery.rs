@@ -329,9 +329,10 @@ pub async fn recover_server_state(
     // A torrent removed whose history row waited for room as the last run
     // stopped is archived now, as a terminal NZB job's row is above: it
     // does not come back.
-    // One that cannot be written stays retiring: never live, its folders
-    // kept, written by the torrent service through the kept archives.
-    let retiring = match db.archive_retiring_torrents() {
+    // One that cannot be written, or all of them when they do not read,
+    // stays retiring: never live, its folders kept, written by the torrent
+    // service through the kept archives.
+    match db.archive_retiring_torrents() {
         Ok(archived) => {
             if !archived.written.is_empty() {
                 info!(
@@ -339,20 +340,21 @@ pub async fn recover_server_state(
                     "archived torrents removed before their history could be written"
                 );
             }
-            archived.left
         }
         Err(error) => {
             warn!(
                 error = %error,
                 "could not archive the torrents a removal left retiring; they stay retiring and are retried"
             );
-            Vec::new()
         }
-    };
-    // The torrents come back too, each with its own job.
-    let torrents: HashSet<crate::jobs::ids::JobId> = db.torrent_job_ids()?.into_iter().collect();
+    }
+    // The torrents come back too, each with its own job; those still
+    // retiring do not.
+    let (torrents, retiring) = db.torrent_rows()?;
+    let torrents: HashSet<crate::jobs::ids::JobId> = torrents.into_iter().collect();
     // A torrent's unpacking directory carries its marker as a job's does:
-    // it is live while the torrent's row is, retiring or not.
+    // it is live while the torrent's row is, retiring or not, read after
+    // the archive whatever it came to.
     live_jobs.extend(torrents.iter().copied());
     live_jobs.extend(retiring);
     let restoring: HashSet<crate::jobs::ids::JobId> =

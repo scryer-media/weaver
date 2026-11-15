@@ -2986,11 +2986,23 @@ impl TorrentService {
             let _job = JobScope::enter(job_id);
             let files = planned.files();
             let listed: Vec<PathBuf> = files.names().flatten().map(Path::to_path_buf).collect();
-            plan_outputs(tee.work(), &files.dir(), &listed, &spent)
+            let dir = files.dir();
+            let outputs = plan_outputs(tee.work(), &dir, &listed, &spent);
+            // Held before they move, as the row keeps them.
+            let held = held_tops(outputs.names.iter().map(String::as_str)).map_or_else(
+                || vec![resolved(&dir).to_string_lossy().into_owned()],
+                |tops| {
+                    let base = resolved(&dir);
+                    tops.iter()
+                        .map(|top| base.join(top).to_string_lossy().into_owned())
+                        .collect()
+                },
+            );
+            (outputs, held)
         })
         .await;
-        let outputs = match planned {
-            Ok(outputs) => Arc::new(outputs),
+        let (outputs, held) = match planned {
+            Ok((outputs, held)) => (Arc::new(outputs), held),
             Err(error) => {
                 tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files were not placed");
                 let recorded = self.queue_save(job_id, "finish_torrent_unpack", move |db| {
@@ -3008,7 +3020,7 @@ impl TorrentService {
         // file of the torrent's that its delete does not know of.
         let names = outputs.names.clone();
         let kept = self.queue_save(job_id, "keep_torrent_outputs", move |db| {
-            db.keep_torrent_outputs(job_id, &names)
+            db.keep_torrent_outputs(job_id, &names, &held)
         });
         self.recorded(job_id, kept.await);
         let (from, moving) = (work.clone(), Arc::clone(&outputs));
@@ -4069,7 +4081,12 @@ impl TorrentService {
                 record.storage_dir = Some(dir.clone());
                 record.files_dir = files_dir;
                 record.seed_mode = request.placement.seed_mode;
-                let mut torrent = match self.insert(record, &parsed.trackers, &adopted) {
+                let held = held_at(
+                    &record,
+                    held_tops(parsed.manifest.paths.iter().map(String::as_str)),
+                )
+                .await;
+                let mut torrent = match self.insert(record, &parsed.trackers, &adopted, held) {
                     Ok(torrent) => torrent,
                     Err(error) => {
                         give_back(&dir, job_id).await;
@@ -4139,7 +4156,9 @@ impl TorrentService {
                     None,
                 );
                 record.pool_member = pin;
-                let mut torrent = self.insert(record, &trackers, &Adopted::default())?;
+                // Nothing placed, nothing held, until its metainfo is.
+                let mut torrent =
+                    self.insert(record, &trackers, &Adopted::default(), Vec::new())?;
                 self.tag_added(job_id, &request.tags);
                 let identity = identity_of(torrent.rule(&rules), &torrent.identity);
                 let terms = PeerTerms::of(&self.settings(), torrent.rule(&rules));
@@ -4423,6 +4442,7 @@ impl TorrentService {
         mut record: TorrentRecord,
         trackers: &[TrackerEntry],
         adopted: &Adopted,
+        held: Vec<String>,
     ) -> Result<Live, AddError> {
         let rules = self.rules();
         let rule = tracker_rule_for(&rules, trackers.iter().map(|tracker| tracker.url.as_str()));
@@ -4431,7 +4451,7 @@ impl TorrentService {
         match self
             .inner
             .db
-            .insert_placed_torrent(&record, trackers, adopted)
+            .insert_placed_torrent(&record, trackers, adopted, Some(&held))
         {
             Ok(TorrentInsert::Inserted) => {
                 let now = self.inner.clock.now_ms();
@@ -4637,6 +4657,16 @@ impl TorrentService {
                 job_id,
             )
             .await?;
+        let held = {
+            let mut placed = record.clone();
+            placed.storage_dir = Some(dir.clone());
+            placed.files_dir = files_dir.clone();
+            held_at(
+                &placed,
+                held_tops(parsed.manifest.paths.iter().map(String::as_str)),
+            )
+            .await
+        };
         let mut live = self.inner.live.lock().await;
         let Some(torrent) = live.get_mut(&job_id) else {
             drop(live);
@@ -4673,6 +4703,10 @@ impl TorrentService {
         self.inner
             .db
             .set_torrent_files_dir(job_id, files_dir.as_deref())
+            .map_err(|error| AddError::State(state_error(error)))?;
+        self.inner
+            .db
+            .set_torrent_held(job_id, held)
             .map_err(|error| AddError::State(state_error(error)))?;
         self.inner
             .db
@@ -5408,10 +5442,26 @@ impl TorrentService {
                 }
             }
         }
+        let (report, row) = self.history_of(&torrent, status, error);
+        // Its history row and its removal are one write: the job is never
+        // in neither, so an event raised while it was live, still being
+        // queued, finds it.
+        self.write_history(row, true, report.job_info(), files)
+            .await;
+    }
+
+    // The torrent's job as it ends now, `status` for `error`, and its
+    // history row.
+    fn history_of(
+        &self,
+        torrent: &Live,
+        status: &str,
+        error: Option<String>,
+    ) -> (JobReport, crate::history::JobHistoryRow) {
         let settings = self.settings();
         let now = self.inner.clock.now_ms();
         let mut report = report(
-            self.view(&settings, &torrent, now),
+            self.view(&settings, torrent, now),
             job_status_from_persisted_str(status, error.as_deref()),
             now,
         );
@@ -5421,11 +5471,7 @@ impl TorrentService {
             Some(hashes_of(&torrent.record).best().0.to_vec()),
             now,
         );
-        // Its history row and its removal are one write: the job is never
-        // in neither, so an event raised while it was live, still being
-        // queued, finds it.
-        self.write_history(row, true, report.job_info(), files)
-            .await;
+        (report, row)
     }
 
     // A torrent's job, finished as `status`: into history and the queue's
@@ -5663,8 +5709,37 @@ impl TorrentService {
                 return Err(ActionError::UnmetGoal(left));
             }
         }
-        let mut torrent = live.remove(&job_id).ok_or(ActionError::NotFound(job_id))?;
+        let torrent = live.remove(&job_id).ok_or(ActionError::NotFound(job_id))?;
         drop(live);
+        let written = read_written(self.written_of(&torrent)).await;
+        // The job's outcome: complete, short of what unpacking would
+        // deliver, refused by unpacking, or cut short.
+        let (status, error) = match (torrent.complete(), torrent.refusal()) {
+            (true, None) => ("complete", None),
+            (true, Some(why)) => {
+                let own = torrent
+                    .store
+                    .as_ref()
+                    .map(|store| store.whole_names())
+                    .unwrap_or_default();
+                let status = short_status(&own, &written.outputs, &why);
+                (status.persisted_status(), Some(why))
+            }
+            (false, Some(refusal)) => ("failed", Some(refusal)),
+            (false, None) => ("cancelled", None),
+        };
+        // Its row is marked retiring, with its history row, before anything
+        // of it goes: a stop from here on brings it back retiring, never
+        // live, and the next start writes that row. A mark that cannot be
+        // written fails the removal, and the torrent stays as it was.
+        let (_, row) = self.history_of(&torrent, status, error.clone());
+        if let Err(error) = self.mark_retiring(&row).await {
+            self.inner.live.lock().await.insert(job_id, torrent);
+            return Err(ActionError::State(format!(
+                "the torrent was not removed: its removal could not be recorded ({error})"
+            )));
+        }
+        let mut torrent = torrent;
         // What its scripts hear of a removal asked for: a seed stops
         // seeding; a download is cancelled, as an NZB job's is.
         let ended = match ending {
@@ -5685,7 +5760,6 @@ impl TorrentService {
             fetch.abort();
             self.inner.counters.fetch(FetchOutcome::Cancelled);
         }
-        let written = read_written(self.written_of(&torrent)).await;
         self.detach(&mut torrent).await;
         // Nothing of its unpacking writes as its files go.
         if let Some(tee) = torrent.store.as_ref().and_then(|store| store.tee()) {
@@ -5707,26 +5781,21 @@ impl TorrentService {
         } else {
             written
         };
-        // The job's outcome: complete, short of what unpacking would
-        // deliver, refused by unpacking, or cut short.
-        let (status, error) = match (torrent.complete(), torrent.refusal()) {
-            (true, None) => ("complete", None),
-            (true, Some(why)) => {
-                let own = torrent
-                    .store
-                    .as_ref()
-                    .map(|store| store.whole_names())
-                    .unwrap_or_default();
-                let status = short_status(&own, &written.outputs, &why);
-                (status.persisted_status(), Some(why))
-            }
-            (false, Some(refusal)) => ("failed", Some(refusal)),
-            (false, None) => ("cancelled", None),
-        };
         self.inner.counters.event(TorrentEvent::Removed);
         self.retire(torrent, status, error, written).await;
         self.queue_script_event(ended);
         Ok(())
+    }
+
+    // A removal's mark on the torrent's row, its history row kept there
+    // with no list yet, written off the runtime.
+    async fn mark_retiring(&self, row: &crate::history::JobHistoryRow) -> Result<(), String> {
+        let db = self.inner.db.clone();
+        let row = row.clone();
+        tokio::task::spawn_blocking(move || db.mark_torrent_retiring(&row))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(state_error)
     }
 
     // What reading the torrent's written files takes, cloned under the
@@ -5746,6 +5815,52 @@ impl TorrentService {
                 .and(torrent.record.storage_dir.as_deref())
                 .map(PathBuf::from),
             work: self.inner.env.work.clone(),
+        }
+    }
+
+    // What the torrent holds, written again from where its files are now
+    // and what its row says unpacking placed beside them, read and
+    // written off the runtime and outside the live lock. One whose files
+    // are not known holds its whole folder.
+    async fn sync_held(&self, job_id: JobId) {
+        let Ok((storage, files, layout)) = self
+            .with_torrent(job_id, |torrent| {
+                Ok((
+                    torrent.record.storage_dir.clone(),
+                    torrent.record.files_dir.clone(),
+                    torrent.layout.clone(),
+                ))
+            })
+            .await
+        else {
+            return;
+        };
+        let db = self.inner.db.clone();
+        let written = tokio::task::spawn_blocking(move || {
+            let outputs = db.torrent_outputs(job_id)?;
+            let tops = layout.as_deref().and_then(|layout| {
+                held_tops(
+                    layout
+                        .files()
+                        .filter(|file| !file.padding)
+                        .map(|file| file.name.as_str())
+                        .chain(outputs.iter().map(String::as_str)),
+                )
+            });
+            db.set_torrent_held(
+                job_id,
+                held_of(storage.as_deref(), files.as_deref(), tops.as_ref()),
+            )
+        })
+        .await;
+        match written {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not write what a moved torrent holds")
+            }
+            Err(error) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not write what a moved torrent holds")
+            }
         }
     }
 
@@ -6340,6 +6455,7 @@ impl TorrentService {
             Ok(())
         })
         .await?;
+        self.sync_held(job_id).await;
         if self.look_again(job_id).await {
             self.apply_queue().await;
             self.spawn_attach(job_id).await;
@@ -6495,6 +6611,7 @@ impl TorrentService {
                 if let Ok(Err(error)) = recorded {
                     tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's new directory");
                 }
+                self.sync_held(job_id).await;
                 if files
                     && kept_existing
                     && let Some(store) = &store
@@ -6810,6 +6927,10 @@ impl TorrentService {
                 .next_queue_position
                 .fetch_max(last + 1, Ordering::Relaxed);
         }
+        // Torrents kept before their held paths were written, each with
+        // what it holds by name, written in one transaction after the
+        // loop, from the metainfo the restore reads anyway.
+        let mut unheld = Vec::new();
         for row in records {
             let record = row.record;
             let job_id = record.job_id;
@@ -6840,6 +6961,24 @@ impl TorrentService {
             torrent.rule_id = self.rule_id(torrent.trackers.iter());
             match record.metainfo.as_deref().map(parse) {
                 Some(Ok(parsed)) => {
+                    if !row.held_set {
+                        let tops = row.unheld_outputs.as_ref().and_then(|outputs| {
+                            held_tops(
+                                parsed
+                                    .manifest
+                                    .paths
+                                    .iter()
+                                    .chain(outputs)
+                                    .map(String::as_str),
+                            )
+                        });
+                        unheld.push((
+                            job_id,
+                            record.storage_dir.clone(),
+                            record.files_dir.clone(),
+                            tops,
+                        ));
+                    }
                     let levels = row.levels.unwrap_or_else(|error| {
                         tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's file levels");
                         Vec::new()
@@ -6867,6 +7006,31 @@ impl TorrentService {
                 None => {
                     self.inner.live.lock().await.insert(job_id, torrent);
                     self.resolve(job_id).await;
+                }
+            }
+        }
+        if !unheld.is_empty() {
+            let db = self.inner.db.clone();
+            let written = tokio::task::spawn_blocking(move || {
+                let held: Vec<(JobId, Vec<String>)> = unheld
+                    .into_iter()
+                    .map(|(job_id, storage, files, tops)| {
+                        (
+                            job_id,
+                            held_of(storage.as_deref(), files.as_deref(), tops.as_ref()),
+                        )
+                    })
+                    .collect();
+                db.set_torrents_held(&held)
+            })
+            .await;
+            match written {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "could not write what the torrents hold; each holds its whole folder until its next start")
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "could not write what the torrents hold; each holds its whole folder until its next start")
                 }
             }
         }
@@ -8229,22 +8393,21 @@ async fn give_back(dir: &str, job_id: JobId) {
 // The marker of the folder a torrent's files go in, `dir`, naming its job:
 // the one job that may remove from it once the torrent is in history. A
 // folder Weaver made for the torrent (`existed` false) takes it; one that
-// was there takes it only from a job that is gone, neither a torrent nor an
-// active job, as when a torrent removed with its files kept is added again
-// over them. An unmarked folder that was there, or one another live job's
-// marker holds, stays as it is: nothing in history removes from it.
+// was there takes it only from a torrent's job that is in history and no
+// longer a torrent, as when a torrent removed with its files kept is added
+// again over them. An unmarked folder that was there, an NZB job's, or one
+// a live torrent's marker holds, stays as it is: nothing in the new
+// torrent's history removes from it. A read that fails takes nothing.
 fn mark_storage(db: &Database, dir: &Path, job_id: JobId, existed: bool) {
     use crate::jobs::working_dir::{OutputDirOwner, output_dir_owner};
     let take = !existed
         || match output_dir_owner(dir) {
             Some(OutputDirOwner::Job(owner)) if owner != job_id => {
-                let torrent = db
+                let in_history = db.history_job_is_torrent(owner).unwrap_or(false);
+                let live = db
                     .torrent_job_ids_among(&[owner])
                     .map_or(true, |live| !live.is_empty());
-                let active = db
-                    .load_active_job_root_phase(owner)
-                    .map_or(true, |phase| phase.is_some());
-                !torrent && !active
+                in_history && !live
             }
             _ => false,
         };
@@ -8648,9 +8811,99 @@ async fn history_files(deletion: Deletion) -> Vec<HistoryFile> {
     })
 }
 
-// The paths live torrents hold under the folders history removes from: their
-// own files, and what unpacking placed beside them, with every folder above
-// each, so a listed folder that goes whole is known to hold one.
+// [`held_of`] for `record` as placed, off the runtime; its whole folder, as
+// spelled, when that cannot run.
+async fn held_at(record: &TorrentRecord, tops: Option<BTreeSet<String>>) -> Vec<String> {
+    let (storage, files) = (record.storage_dir.clone(), record.files_dir.clone());
+    let whole: Vec<String> = files
+        .clone()
+        .or_else(|| storage.clone())
+        .into_iter()
+        .collect();
+    tokio::task::spawn_blocking(move || held_of(storage.as_deref(), files.as_deref(), tops.as_ref()))
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(job_id = record.job_id.0, error = %error, "could not read where a torrent's files are; it holds its whole folder");
+            whole
+        })
+}
+
+// `path` as the filesystem spells it, so two spellings of one place (through
+// a link, or in another case where the filesystem ignores case) are one:
+// the whole of it resolved when it is there and not a link; a link at its
+// end kept, not followed, under its folder resolved; and a part that is not
+// there yet as given, under the deepest folder of it that is.
+pub(crate) fn held_key(path: &Path) -> PathBuf {
+    if std::fs::symlink_metadata(path).is_ok_and(|found| !found.file_type().is_symlink())
+        && let Ok(found) = std::fs::canonicalize(path)
+    {
+        return found;
+    }
+    under_resolved(path)
+}
+
+// `path` resolved, links and all, as far as it is there, and the rest as
+// given: a folder's own spelling, a link to it included.
+fn resolved(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| under_resolved(path))
+}
+
+// `path`'s folder resolved, links and all, as far as it is there, and the
+// rest as given.
+fn under_resolved(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => resolved(parent).join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
+// The first part of each of `names`, paths relative to a torrent's folder;
+// None when one names the folder itself.
+pub(crate) fn held_tops<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<BTreeSet<String>> {
+    names
+        .into_iter()
+        .map(|name| {
+            Path::new(name).components().find_map(|part| match part {
+                std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+// What a torrent holds where its files are (`torrent_held_paths`), each
+// path as [`held_key`] spells it, through any link to its folders: under the folder its files are in, the
+// first part of each of its files' and outputs' paths (`tops`), or that
+// whole folder while they are not known, and the folder claimed for it
+// when its files lie elsewhere. Reads the filesystem: run off the runtime.
+pub(crate) fn held_of(
+    storage_dir: Option<&str>,
+    files_dir: Option<&str>,
+    tops: Option<&BTreeSet<String>>,
+) -> Vec<String> {
+    let Some(base) = files_dir.or(storage_dir) else {
+        return Vec::new();
+    };
+    // The folders resolved whole: a save path given through a link holds
+    // what lies where it leads.
+    let base = resolved(Path::new(base));
+    let mut held: Vec<PathBuf> = match tops {
+        Some(tops) => tops.iter().map(|top| base.join(top)).collect(),
+        None => vec![base],
+    };
+    if let (Some(storage), Some(files)) = (storage_dir, files_dir)
+        && storage != files
+    {
+        held.push(resolved(Path::new(storage)));
+    }
+    held.into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+// The paths live torrents hold under the folders history removes from, as
+// [`held_key`] spells them, with every folder above each, so a listed
+// folder that goes whole is known to hold one.
 #[derive(Debug, Default)]
 pub(crate) struct LiveHeld {
     paths: HashSet<PathBuf>,
@@ -8658,46 +8911,28 @@ pub(crate) struct LiveHeld {
 }
 
 impl LiveHeld {
-    // What the live torrents whose files may lie under `dirs` hold there, in
-    // one read for every folder of the call (`live_torrents_over`); each
-    // torrent's files by its metainfo, as its store lays them out.
+    // What the live torrents hold under `dirs`, in one read for every
+    // folder of the call (`live_held_paths`), never a torrent's metainfo.
+    // Reads the filesystem: run off the runtime.
     pub(crate) fn under(db: &Database, dirs: &[PathBuf]) -> Result<Self, StateError> {
+        let keys: Vec<PathBuf> = dirs.iter().map(|dir| held_key(dir)).collect();
         let mut held = Self::default();
-        for live in db.live_torrents_over(dirs)? {
-            let base = PathBuf::from(&live.base);
-            let names = live
-                .metainfo
-                .as_deref()
-                .map(|bytes| match parse(bytes) {
-                    Ok(parsed) => parsed.manifest.paths,
-                    Err(error) => {
-                        tracing::warn!(job_id = live.job_id.0, error = %error, "could not read a live torrent's files; history leaves its folder");
-                        vec![String::new()]
-                    }
-                })
-                .unwrap_or_default();
-            let paths = names
-                .iter()
-                .map(|name| {
-                    name.split('/')
-                        .filter(|part| !part.is_empty())
-                        .collect::<PathBuf>()
-                })
-                .chain(live.outputs.iter().map(PathBuf::from))
-                .map(|name| base.join(name));
-            for path in paths {
-                held.above
-                    .extend(path.ancestors().skip(1).map(Path::to_path_buf));
-                held.paths.insert(path);
-            }
+        for path in db.live_held_paths(&keys)? {
+            held.above
+                .extend(path.ancestors().skip(1).map(Path::to_path_buf));
+            held.paths.insert(path);
         }
         Ok(held)
     }
 
     // Whether a live torrent holds `path`, is in it, or, for one that goes
-    // `whole`, holds anything in it.
+    // `whole`, holds anything in it, by the path as the filesystem spells it.
     fn holds(&self, path: &Path, whole: bool) -> bool {
-        path.ancestors().any(|at| self.paths.contains(at)) || (whole && self.above.contains(path))
+        if self.paths.is_empty() {
+            return false;
+        }
+        let key = held_key(path);
+        key.ancestors().any(|at| self.paths.contains(at)) || (whole && self.above.contains(&key))
     }
 }
 
@@ -8767,6 +9002,13 @@ pub(crate) fn remove_history_files(
     removal.not_managed.extend(outside);
     match std::fs::symlink_metadata(dir) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return removal,
+        // A recorded folder that is a link is never followed: what it
+        // points at was not proven the job's where the row recorded it.
+        Ok(found) if found.file_type().is_symlink() => {
+            tracing::warn!(job_id = job_id.0, dir = %dir.display(), "a torrent's recorded folder is a link; history leaves its files");
+            removal.not_managed.push(dir.to_path_buf());
+            return removal;
+        }
         _ => {}
     }
     if crate::jobs::working_dir::output_dir_owner(dir)

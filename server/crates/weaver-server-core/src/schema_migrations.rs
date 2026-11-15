@@ -2387,29 +2387,42 @@ mod tests {
                     .any(|(_, _, _, step)| step.contains("sqlite_autoindex_job_history_files")),
                 "from {from}: {detail:?}"
             );
-            // The live torrents under a folder history removes from are
-            // found by the folder columns' indexes, never a scan.
+            // The paths live torrents hold under a folder history removes
+            // from are found by the path index, never a scan.
             let detail: Vec<(i64, i64, i64, String)> = sqlx::query_as(
-                "EXPLAIN QUERY PLAN SELECT job_id FROM torrents WHERE retiring IS NULL AND \
-                 (storage_dir = '/d' OR (storage_dir >= '/d/' AND storage_dir < '/d0') \
-                  OR files_dir = '/d' OR (files_dir >= '/d/' AND files_dir < '/d0') \
-                  OR storage_dir IN ('/') OR files_dir IN ('/'))",
+                "EXPLAIN QUERY PLAN SELECT DISTINCT h.path FROM torrent_held_paths h \
+                 JOIN torrents t ON t.job_id = h.job_id WHERE t.retiring IS NULL AND \
+                 (h.path = '/d' OR (h.path >= '/d/' AND h.path < '/d0'))",
             )
             .fetch_all(&pool)
             .await
             .unwrap();
-            for index in ["idx_torrents_storage_dir", "idx_torrents_files_dir"] {
-                assert!(
-                    detail.iter().any(|(_, _, _, step)| step.contains(index)),
-                    "from {from}: {detail:?}"
-                );
-            }
             assert!(
-                !detail
+                detail
                     .iter()
-                    .any(|(_, _, _, step)| step.starts_with("SCAN torrents")),
+                    .any(|(_, _, _, step)| step.contains("idx_torrent_held_paths_path")),
                 "from {from}: {detail:?}"
             );
+            let detail_above: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+                "EXPLAIN QUERY PLAN SELECT DISTINCT h.path FROM torrent_held_paths h \
+                 JOIN torrents t ON t.job_id = h.job_id WHERE t.retiring IS NULL AND \
+                 h.path IN ('/', '/e')",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert!(
+                detail_above
+                    .iter()
+                    .any(|(_, _, _, step)| step.contains("idx_torrent_held_paths_path")),
+                "from {from}: {detail_above:?}"
+            );
+            for step in detail.iter().chain(&detail_above) {
+                assert!(
+                    !step.3.starts_with("SCAN h") && !step.3.starts_with("SCAN torrent_held_paths"),
+                    "from {from}: {step:?}"
+                );
+            }
             pool.close().await;
             let db = crate::Database::open(&db_path).unwrap();
             db.validate_backup_catalog().unwrap();
