@@ -9,7 +9,7 @@ use crate::{Name, Policy, rdata::Dnskey};
 
 pub(crate) fn supported_algorithm(algorithm: u8, policy: &Policy) -> bool {
     match algorithm {
-        8 | 10 | 13 | 14 | 15 | 16 | 18 => true,
+        8 | 10 | 13 | 14 | 15 | 18 => true,
         5 | 7 => policy.sha1_signatures,
         _ => false,
     }
@@ -144,7 +144,6 @@ pub(crate) fn verify(key: &Dnskey, message: &[u8], signed: &[u8]) -> bool {
                     .verify(message, signed)
                     .is_ok()
         }
-        16 => verify_ed448(&key.public_key, message, signed),
         18 => {
             // DNSSEC uses raw ML-DSA-44 with empty context and no prehash.
             // Reject DER keys and other parameter sets before the backend.
@@ -156,36 +155,6 @@ pub(crate) fn verify(key: &Dnskey, message: &[u8], signed: &[u8]) -> bool {
         }
         _ => false,
     }
-}
-
-fn verify_ed448(key: &[u8], message: &[u8], signed: &[u8]) -> bool {
-    use ed448_goldilocks_plus::{EdwardsPoint, Signature, VerifyingKey};
-
-    let Ok(key_bytes) = <&[u8; 57]>::try_from(key) else {
-        return false;
-    };
-    let Ok(signature_bytes) = <&[u8; 114]>::try_from(signed) else {
-        return false;
-    };
-    // The backend rejects identity, torsion and noncanonical scalars. Its point
-    // decoder permits alternate encodings, so require canonical round trips too.
-    let Ok(key) = VerifyingKey::from_bytes(key_bytes) else {
-        return false;
-    };
-    if key.to_edwards().compress().as_bytes() != key_bytes {
-        return false;
-    }
-    let Ok(signature) = Signature::from_bytes(signature_bytes) else {
-        return false;
-    };
-    let Some(r) = Option::<EdwardsPoint>::from(signature.r().decompress()) else {
-        return false;
-    };
-    if r.compress() != signature.r() {
-        return false;
-    }
-    // RFC 8080: pure Ed448, with an empty context and no prehash.
-    key.verify_raw(&signature, message).is_ok()
 }
 
 fn verify_ec(
@@ -236,146 +205,13 @@ pub(crate) fn nsec3_hash(owner: &Name, salt: &[u8], iterations: u16) -> Vec<u8> 
 mod tests {
     use super::*;
 
-    fn ed448_key(seed: u8) -> (ed448_goldilocks_plus::SigningKey, Dnskey) {
-        let signing = ed448_goldilocks_plus::SigningKey::try_from(&[seed; 57][..]).unwrap();
-        let key = Dnskey {
-            flags: 256,
-            protocol: 3,
-            algorithm: 16,
-            public_key: signing.verifying_key().to_bytes().to_vec(),
-        };
-        (signing, key)
-    }
-
-    #[test]
-    fn ed448_requires_exact_raw_lengths_and_authenticates_all_inputs() {
-        let message = b"DNSSEC Ed448 length and mutation regression";
-        let (signing, key) = ed448_key(7);
-        let signed = signing.sign_raw(message).to_bytes();
-        assert!(verify(&key, message, &signed));
-        for length in [0, 1, 56, 58, 64, 114] {
-            let mut malformed = key.clone();
-            malformed.public_key.resize(length, 0);
-            assert!(!verify(&malformed, message, &signed), "key length {length}");
-        }
-        for length in [0, 1, 57, 64, 113, 115, 228] {
-            let mut malformed = signed.to_vec();
-            malformed.resize(length, 0);
-            assert!(
-                !verify(&key, message, &malformed),
-                "signature length {length}"
-            );
-        }
-        assert!(!verify(&key, b"changed message", &signed));
-        let (_, different_key) = ed448_key(8);
-        assert!(!verify(&different_key, message, &signed));
-        for index in [0, 28, 56, 57, 85, 113] {
-            let mut changed = signed;
-            changed[index] ^= 1;
-            assert!(!verify(&key, message, &changed), "signature byte {index}");
-        }
-    }
-
-    #[test]
-    fn ed448_rejects_identity_small_order_and_noncanonical_points() {
-        let message = b"DNSSEC Ed448 point encoding regression";
-        let (signing, key) = ed448_key(9);
-        let signed = signing.sign_raw(message).to_bytes();
-        let mut identity = [0; 57];
-        identity[0] = 1;
-        // p - 1 encodes the order-two point (0, -1), where
-        // p = 2^448 - 2^224 - 1. y = 0 gives the order-four points.
-        let mut order_two = [0xff; 57];
-        order_two[0] = 0xfe;
-        order_two[28] = 0xfe;
-        order_two[56] = 0;
-        let mut negative_order_four = [0; 57];
-        negative_order_four[56] = 0x80;
-        let mut noncanonical_y = order_two;
-        noncanonical_y[0] = 0xff; // y = p is not a field encoding.
-        for point in [
-            identity,
-            order_two,
-            [0; 57],
-            negative_order_four,
-            noncanonical_y,
-            [0xff; 57],
-        ] {
-            let mut malformed = key.clone();
-            malformed.public_key = point.to_vec();
-            assert!(!verify(&malformed, message, &signed));
-            let mut malformed = signed;
-            malformed[..57].copy_from_slice(&point);
-            assert!(!verify(&key, message, &malformed));
-        }
-        // The backend decoder ignores the seven unused bits. The DNSSEC
-        // wrapper must reject these alternate encodings of valid points.
-        for bit in 0..7 {
-            let mut malformed = key.clone();
-            malformed.public_key[56] |= 1 << bit;
-            assert!(!verify(&malformed, message, &signed));
-            let mut malformed = signed;
-            malformed[56] |= 1 << bit;
-            assert!(!verify(&key, message, &malformed));
-        }
-    }
-
-    #[test]
-    fn ed448_rejects_noncanonical_signature_scalars() {
-        let message = b"DNSSEC Ed448 scalar regression";
-        let (signing, key) = ed448_key(10);
-        let signed = signing.sign_raw(message).to_bytes();
-        let mut group_order = [0; 57];
-        group_order[..56].copy_from_slice(&ed448_goldilocks_plus::ORDER.to_le_bytes());
-        for scalar in [[0; 57], group_order, [0xff; 57]] {
-            let mut malformed = signed;
-            malformed[57..].copy_from_slice(&scalar);
-            assert!(!verify(&key, message, &malformed));
-        }
-        let mut malformed = signed;
-        malformed[113] = 1;
-        assert!(!verify(&key, message, &malformed));
-    }
-
-    #[test]
-    fn ed448_dnssec_uses_pure_mode_and_empty_context() {
-        struct Prehashed;
-        impl ed448_goldilocks_plus::PreHash for Prehashed {
-            fn fill_bytes(&mut self, output: &mut [u8]) {
-                // Independent Python hashlib SHAKE256(message, 64) output.
-                output.copy_from_slice(&crate::test_vectors::hex(concat!(
-                    "37ef8b414c85bf13f1d2c7f4dda13c132658f1c9de74176a3bf043261e6b621b3",
-                    "a7a205e4d545f30d2aa4b8084c60ce22e126a0b237e2821581b85653764d630"
-                )));
-            }
-        }
-
-        let message = b"DNSSEC Ed448 domain separation regression";
-        let (signing, key) = ed448_key(11);
-        let verifier = signing.verifying_key();
-        let pure = signing.sign_raw(message);
-        assert!(verify(&key, message, &pure.to_bytes()));
-        let empty_context = signing.sign_ctx(&[], message).unwrap();
-        assert_eq!(pure, empty_context);
-        let context = signing.sign_ctx(b"DNSSEC", message).unwrap();
-        assert!(verifier.verify_ctx(&context, b"DNSSEC", message).is_ok());
-        assert!(!verify(&key, message, &context.to_bytes()));
-        let prehashed = signing.sign_prehashed(None, Prehashed).unwrap();
-        assert!(
-            verifier
-                .verify_prehashed(&prehashed, None, Prehashed)
-                .is_ok()
-        );
-        assert!(!verify(&key, message, &prehashed.to_bytes()));
-    }
-
     #[test]
     fn support_is_explicit_and_sha1_policies_are_independent() {
         for value in 0_u8..=255 {
             let default = Policy::default();
             assert_eq!(
                 supported_algorithm(value, &default),
-                [8, 10, 13, 14, 15, 16, 18].contains(&value)
+                [8, 10, 13, 14, 15, 18].contains(&value)
             );
             assert_eq!(
                 supported_digest(value, &default),
@@ -387,7 +223,7 @@ mod tests {
             };
             assert_eq!(
                 supported_algorithm(value, &signatures),
-                [5, 7, 8, 10, 13, 14, 15, 16, 18].contains(&value)
+                [5, 7, 8, 10, 13, 14, 15, 18].contains(&value)
             );
             assert_eq!(
                 supported_digest(value, &signatures),

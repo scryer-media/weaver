@@ -170,17 +170,11 @@ fn cases(now: u32) -> Vec<Case> {
             "algorithm 18 signed positive control",
             tree(KeyAlgorithm::MlDsa44, now),
         ),
-        case(
-            "ed448-good",
-            "algorithm 16 signed positive control",
-            tree(KeyAlgorithm::Ed448, now),
-        ),
     ];
 
     for (algorithm, id) in [
         (KeyAlgorithm::P256, "p256-bad"),
         (KeyAlgorithm::MlDsa44, "mldsa44-bad"),
-        (KeyAlgorithm::Ed448, "ed448-bad"),
     ] {
         let mut resolver = tree(algorithm, now);
         resolver.tamper(|query, reply| {

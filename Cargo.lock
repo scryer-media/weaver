@@ -9,17 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fe438c63458706e03479442743baae6c88256498e6431708f6dfc520a26515d3"
 
 [[package]]
-name = "addchain"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6197d231bf46c01da9e5cc6df822fbae247d160dc94bfb1b2034800bdd9038a9"
-dependencies = [
- "num-bigint",
- "num-integer",
- "num-traits",
-]
-
-[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1432,21 +1421,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
-name = "crypto-bigint"
-version = "0.7.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "914c195c4d7fbc5ed7f88d14cbf85914d5c664967658d43404b263913a477e82"
-dependencies = [
- "cpubits",
- "ctutils",
- "hybrid-array",
- "num-traits",
- "rand_core 0.10.1",
- "subtle",
- "zeroize",
-]
-
-[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1484,7 +1458,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "261af4dc7a06ea8a527a8717d8cbba3417530d6ea14e1edb3de6b67806be474f"
 dependencies = [
  "cmov",
- "subtle",
 ]
 
 [[package]]
@@ -1797,51 +1770,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "ed448-goldilocks-plus"
-version = "0.18.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ade2f948c0176fd311668a767449034786d2d0db2c247ca4c99c6471f53370dd"
-dependencies = [
- "crypto-bigint",
- "elliptic-curve",
- "ff",
- "group",
- "hash2curve",
- "rand_core 0.10.1",
- "sha3",
- "shake",
- "signature",
- "subtle",
- "zeroize",
-]
-
-[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "elliptic-curve"
-version = "0.14.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "900f37e7e18d74a2347389af6cd69e3a30d5cc9e697f40004865679aa75e9c7c"
-dependencies = [
- "base16ct",
- "crypto-bigint",
- "crypto-common 0.2.2",
- "ff",
- "group",
- "hybrid-array",
- "pem-rfc7468",
- "pkcs8",
- "rand_core 0.10.1",
- "sec1",
- "subtle",
- "zeroize",
 ]
 
 [[package]]
@@ -1973,33 +1907,6 @@ name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
-
-[[package]]
-name = "ff"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1f686ab92a9fb0eaf188f6c6c87b89490baa6fdb0db4544ba4dc47f7942489f"
-dependencies = [
- "bitvec",
- "ff_derive",
- "rand_core 0.10.1",
- "subtle",
-]
-
-[[package]]
-name = "ff_derive"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "241afe8c15ffa21933eaefe8a563af36fd9fc98a3e8a044e8f7db52eb1fae3d8"
-dependencies = [
- "addchain",
- "num-bigint",
- "num-integer",
- "num-traits",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
 
 [[package]]
 name = "fiat-crypto"
@@ -2386,17 +2293,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "group"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fd1a1c7a5206c5b7a3f5a0d7ccd3ff85d0c8f5133d62a02680255b0004af5f4"
-dependencies = [
- "ff",
- "rand_core 0.10.1",
- "subtle",
-]
-
-[[package]]
 name = "h2"
 version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2450,16 +2346,6 @@ dependencies = [
  "cfg-if",
  "crunchy",
  "zerocopy",
-]
-
-[[package]]
-name = "hash2curve"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1eaf40612d7d854743e7189228a6d528f0f6e8502cf6a0cb831d28a218b7f3f6"
-dependencies = [
- "digest 0.11.3",
- "elliptic-curve",
 ]
 
 [[package]]
@@ -2627,7 +2513,6 @@ version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
 dependencies = [
- "subtle",
  "typenum",
  "zeroize",
 ]
@@ -3039,16 +2924,6 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "keccak"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8f198d1db720e4940b5a493201d199d9f24f568f8f746bd13706243a2f71598"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.3.1",
 ]
 
 [[package]]
@@ -4738,11 +4613,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d56d437c2f19203ce5f7122e507831de96f3d2d4d3be5af44a0b0a09d8a80e4d"
 dependencies = [
  "base16ct",
- "ctutils",
- "der",
  "hybrid-array",
- "subtle",
- "zeroize",
 ]
 
 [[package]]
@@ -4971,28 +4842,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sha3"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc9bad02c26382724b2d2692c6f179285e4b54eeecd7968f52a50059c3c11759"
-dependencies = [
- "digest 0.11.3",
- "keccak",
- "sponge-cursor",
-]
-
-[[package]]
-name = "shake"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09057cb2149ad4cbd2da1e26b351f9a4c354219421229c69c3063e6f61947c4a"
-dependencies = [
- "digest 0.11.3",
- "keccak",
- "sponge-cursor",
-]
-
-[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5023,7 +4872,6 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
 dependencies = [
- "digest 0.11.3",
  "rand_core 0.10.1",
 ]
 
@@ -5144,12 +4992,6 @@ dependencies = [
  "base64ct",
  "der",
 ]
-
-[[package]]
-name = "sponge-cursor"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 
 [[package]]
 name = "sqlx"
@@ -6434,7 +6276,6 @@ name = "weaver-dnssec"
 version = "0.16.15"
 dependencies = [
  "aws-lc-rs",
- "ed448-goldilocks-plus",
  "thiserror 2.0.21",
 ]
 

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use aws_lc_rs::{
     digest,
     encoding::{AsDer, PublicKeyX509Der},
-    rand::{SecureRandom, SystemRandom},
+    rand::SystemRandom,
     rsa::KeySize,
     signature::{self, KeyPair},
 };
@@ -17,7 +17,6 @@ use crate::{Name, RecordType, TrustAnchor};
 pub enum KeyAlgorithm {
     P256,
     Ed25519,
-    Ed448,
     Rsa2048,
     MlDsa44,
 }
@@ -35,7 +34,6 @@ pub enum EquipmentError {
 enum PrivateKey {
     P256(signature::EcdsaKeyPair),
     Ed25519(signature::Ed25519KeyPair),
-    Ed448(Box<ed448_goldilocks_plus::SigningKey>),
     Rsa(signature::RsaKeyPair),
     MlDsa44(signature::PqdsaKeyPair),
 }
@@ -71,15 +69,6 @@ impl SigningKey {
                     signature::Ed25519KeyPair::generate().map_err(|_| EquipmentError::Crypto)?;
                 let public = key.public_key().as_ref().to_vec();
                 (PrivateKey::Ed25519(key), public, 15)
-            }
-            KeyAlgorithm::Ed448 => {
-                let mut seed = ed448_goldilocks_plus::SecretKey::default();
-                SystemRandom::new()
-                    .fill(seed.as_mut())
-                    .map_err(|_| EquipmentError::Crypto)?;
-                let key = ed448_goldilocks_plus::SigningKey::from(seed);
-                let public = key.verifying_key().to_bytes().to_vec();
-                (PrivateKey::Ed448(Box::new(key)), public, 16)
             }
             KeyAlgorithm::Rsa2048 => {
                 let key = signature::RsaKeyPair::generate(KeySize::Rsa2048)
@@ -164,7 +153,6 @@ impl SigningKey {
                 .map(|s| s.as_ref().to_vec())
                 .map_err(|_| EquipmentError::Crypto),
             PrivateKey::Ed25519(key) => Ok(key.sign(bytes).as_ref().to_vec()),
-            PrivateKey::Ed448(key) => Ok(key.sign_raw(bytes).to_bytes().to_vec()),
             PrivateKey::Rsa(key) => {
                 let mut signature = vec![0; key.public_modulus_len()];
                 key.sign(&signature::RSA_PKCS1_SHA256, &random, bytes, &mut signature)

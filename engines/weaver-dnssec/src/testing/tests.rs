@@ -47,7 +47,6 @@ fn generated_keys_sign_and_independent_validator_verifies() {
     for algorithm in [
         KeyAlgorithm::P256,
         KeyAlgorithm::Ed25519,
-        KeyAlgorithm::Ed448,
         KeyAlgorithm::Rsa2048,
         KeyAlgorithm::MlDsa44,
     ] {
@@ -80,16 +79,6 @@ fn generated_keys_sign_and_independent_validator_verifies() {
             assert_eq!(zone.keys[0].algorithm_number, 8);
             assert_eq!(zone.keys[0].public_key.len(), 260);
             assert_eq!(zone.keys[0].public_key.first(), Some(&3));
-        }
-        if algorithm == KeyAlgorithm::Ed448 {
-            assert_eq!(zone.keys[0].algorithm_number, 16);
-            assert_eq!(zone.keys[0].public_key.len(), 57);
-            let signature = reply
-                .answer
-                .iter()
-                .find(|record| record.rtype == RecordType::RRSIG)
-                .unwrap();
-            assert_eq!(signature.rdata.len(), 18 + zone.apex.as_wire().len() + 114);
         }
         if algorithm == KeyAlgorithm::MlDsa44 {
             assert_eq!(zone.keys[0].algorithm_number, 18);

@@ -13,8 +13,6 @@ mod anchor;
 mod cache;
 mod canonical;
 mod denial;
-#[cfg(test)]
-mod ed448_tests;
 mod keys;
 #[cfg(test)]
 mod ml_dsa_tests;

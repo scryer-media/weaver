@@ -3,8 +3,8 @@
 
 use weaver_dnssec::testing::{FakeResolver, KeyAlgorithm, Record, Zone, drive, signature_checks};
 use weaver_dnssec::{
-    AnchorError, BogusReason, Name, Outcome, Policy, Query, Question, RecordType as T, Step,
-    Validator, Verdict,
+    AnchorError, BogusReason, InsecureReason, Name, Outcome, Policy, Query, Question,
+    RecordType as T, Step, Validator, Verdict,
 };
 
 const NOW: u64 = 1_500_000;
@@ -58,7 +58,7 @@ fn default_anchor_policy_excludes_deprecated_algorithms_and_preserves_current_al
         let mut candidate = anchor.clone();
         candidate.algorithm = algorithm;
         let result = Validator::new(vec![candidate], Policy::default());
-        if matches!(algorithm, 8 | 10 | 13 | 14 | 15 | 16 | 18) {
+        if matches!(algorithm, 8 | 10 | 13 | 14 | 15 | 18) {
             assert!(result.is_ok(), "algorithm {algorithm}");
         } else {
             assert!(
@@ -340,5 +340,88 @@ fn empty_gost_payloads_fail_structural_parsing_before_crypto() {
         };
         assert!(queries.contains(&expected_query));
         assert_eq!(checks, 0, "empty payload in {target:?}");
+    }
+}
+
+/// A child zone with an algorithm 16 (Ed448) key, alone or beside a P-256
+/// key. The algorithm 16 key is a P-256 key labelled 16: the validator does
+/// not implement Ed448, so it never checks that key's signatures, and one
+/// that it did check could never verify.
+fn ed448_tree(with_p256: bool) -> FakeResolver {
+    let root = Zone::new(Name::root(), KeyAlgorithm::Ed25519).unwrap();
+    let mut child = Zone::new(name("example"), KeyAlgorithm::P256).unwrap();
+    child.add_record(name("news.example"), T::A, ADDRESS.to_vec());
+    if with_p256 {
+        let ed448 = child.add_key(KeyAlgorithm::P256, 257).unwrap();
+        child.keys[ed448].algorithm_number = 16;
+        // The algorithm 16 key signs first, so its DS and signatures come first.
+        child.dnskey_signers = vec![ed448, 0];
+        child.record_signers = vec![ed448, 0];
+    } else {
+        child.keys[0].algorithm_number = 16;
+    }
+    FakeResolver::new(vec![root, child]).unwrap()
+}
+
+#[test]
+fn an_ed448_only_zone_is_insecure_without_a_key_fetch() {
+    let resolver = ed448_tree(false);
+    let validator =
+        Validator::new(resolver.zones()[0].anchors().unwrap(), Policy::default()).unwrap();
+    let owner = name("news.example");
+    let (verdict, queries, checks) = counted(&validator, &resolver, &owner);
+    let Verdict::Insecure(answer) = &verdict else {
+        panic!("expected insecure, got {verdict:?}");
+    };
+    assert_eq!(answer.insecure, Some(InsecureReason::UnsupportedAlgorithm));
+    address(verdict, &owner, false);
+    assert!(queries.contains(&Query {
+        name: name("example"),
+        rtype: T::DS,
+    }));
+    assert!(!queries.contains(&Query {
+        name: name("example"),
+        rtype: T::DNSKEY,
+    }));
+    // The root's DNSKEY set and the DS set; nothing signed with algorithm 16.
+    assert_eq!(checks, 2);
+}
+
+#[test]
+fn an_ed448_and_p256_zone_validates_through_p256_alone() {
+    let resolver = ed448_tree(true);
+    let validator =
+        Validator::new(resolver.zones()[0].anchors().unwrap(), Policy::default()).unwrap();
+    let owner = name("news.example");
+    let (verdict, _, checks) = counted(&validator, &resolver, &owner);
+    address(verdict, &owner, true);
+    // One check each for the root's keys, the DS set, the child's keys and
+    // the address, though every algorithm 16 DS and signature comes first.
+    assert_eq!(checks, 4);
+}
+
+#[test]
+fn an_ed448_signature_alone_never_authenticates_in_a_p256_zone() {
+    // RFC 4035 section 5.2: the DS set names a supported algorithm, so each
+    // RRset needs a signature by it. One signed only with 16 is unsigned.
+    for (target, reason) in [
+        (T::A, BogusReason::SignaturesMissing),
+        (T::DNSKEY, BogusReason::KeysNotProven),
+    ] {
+        let mut resolver = ed448_tree(true);
+        resolver.tamper(move |query, reply| {
+            if query.rtype == target && query.name != Name::root() {
+                reply
+                    .answer
+                    .retain(|record| record.rtype != T::RRSIG || record.rdata[2] == 16);
+            }
+        });
+        let validator =
+            Validator::new(resolver.zones()[0].anchors().unwrap(), Policy::default()).unwrap();
+        let (verdict, _, _) = counted(&validator, &resolver, &name("news.example"));
+        assert!(
+            matches!(&verdict, Verdict::Bogus(failure) if failure.reason == reason),
+            "{target:?}: {verdict:?}"
+        );
     }
 }

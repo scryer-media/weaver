@@ -11,15 +11,10 @@ test-support = []
 
 [dependencies]
 aws-lc-rs = { workspace = true }
-ed448-goldilocks-plus = { version = "0.18.1", default-features = false, features = ["signing"] }
 thiserror = { workspace = true }
 
 [[test]]
 name = "validator"
-required-features = ["test-support"]
-
-[[test]]
-name = "ed448"
 required-features = ["test-support"]
 
 [[test]]
