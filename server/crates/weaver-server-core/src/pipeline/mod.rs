@@ -804,8 +804,8 @@ impl DownloadError {
     //
     // `Unanswered` says nothing about the socket either. A 480 at the status
     // line is one complete line; the blocking lane drains the replies behind
-    // it and re-authenticates in place, and when that fails, or the session
-    // had no credentials, or the batch was abandoned, the lane reports the
+    // it and re-authenticates in place, and when that fails, or the batch
+    // was abandoned, the lane reports the
     // connection discarded (`connection_discarded`, `ring_is_closed`) and that
     // verdict drops it.
     //

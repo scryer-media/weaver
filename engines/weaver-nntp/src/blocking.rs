@@ -2324,13 +2324,16 @@ impl BlockingNntpConnection {
             if self.credentials.is_some() {
                 self.abort_active_body();
                 self.reauth_pending = true;
-            } else {
-                // An anonymous session has nothing to re-authenticate with:
-                // the connection is dropped and the next dial meets the
-                // server's demand for credentials where it is booked today.
-                self.fail_body_pipeline();
+                return Err(NntpError::SessionExpired.into());
             }
-            return Err(NntpError::SessionExpired.into());
+            // An anonymous session has nothing to re-authenticate with, and
+            // no later dial is asked for a login either: the server asks at
+            // the BODY. So this is the server refusing the account, as on a
+            // sequential BODY, and it is booked as one. Told as an expired
+            // session, the article was asked again on a new connection
+            // without end and the server was never held.
+            self.fail_body_pipeline();
+            return Err(NntpError::AuthenticationRequired.into());
         }
         self.last_response_line_wait = response_started.elapsed();
         self.stream_yenc_article_response(initial, budget, on_chunk)
@@ -3384,7 +3387,7 @@ fn decoded_result_keeps_connection(
     match result {
         Ok(_) => true,
         // A 480 at the status line is one line too. When it cost the socket
-        // (no credentials, or the re-auth after the drain failed) the lane
+        // (the re-auth after the drain failed) the lane
         // closes its window as unhealthy on its own.
         Err(DecodedBodyError::Nntp(NntpError::SessionExpired)) => true,
         Err(DecodedBodyError::Nntp(error)) => error.is_article_not_found(),
