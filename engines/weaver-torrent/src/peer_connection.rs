@@ -50,7 +50,7 @@ use crate::{
     read_buf::ReadBuf,
     spawn_utils::BlockingSpawner,
     ssl::SslTorrent,
-    stream_connect::{Guard, StreamConnector, Transports},
+    stream_connect::{Guard, Link, StreamConnector, Transports},
     type_aliases::BoxAsyncReadVectored,
 };
 
@@ -498,16 +498,12 @@ fn count_on_utp_thread(outgoing: bool) {
 /// An outgoing connection open, our handshake sent and the peer's still to
 /// read.
 pub(crate) struct Connected {
-    kind: ConnectionKind,
-    read: BoxAsyncReadVectored,
-    write: crate::mse::Outbound,
+    /// The connection, its writing half under the guard it was made under.
+    pub link: Link<crate::mse::Outbound>,
     meter: Meter,
     encryption: crate::mse::Encryption,
     write_buf: Box<[u8]>,
     greeting: Id20,
-    /// The thread the connection's transport runs on, when it has one of
-    /// its own: a uTP stream's.
-    pub home: Option<tokio::runtime::Handle>,
 }
 
 struct ManagePeerArgs {
@@ -896,9 +892,9 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         // Connecting includes sending our handshake: an encrypted connection
         // carries it inside the encryption handshake.
         let now = Instant::now();
-        let ((kind, read, write, meter, encryption), home) = self
+        let (link, meter, encryption) = self
             .connector
-            .connect_and_send_handshake_homed(
+            .connect_link(
                 self.addr,
                 self.transports,
                 match &self.ssl {
@@ -914,14 +910,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .await?;
         self.handler.on_connected(now.elapsed());
         Ok(Connected {
-            kind,
-            read,
-            write,
+            link,
             meter,
             encryption,
             write_buf,
             greeting,
-            home,
         })
     }
 
@@ -933,14 +926,17 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
     ) -> Result<()> {
         let Connected {
-            kind: ckind,
-            mut read,
-            write,
+            link:
+                Link {
+                    kind: ckind,
+                    mut read,
+                    write,
+                    ..
+                },
             meter,
             encryption,
             write_buf,
             greeting,
-            home: _,
         } = connected;
         let handshake_timeout = self.options.handshake_timeout();
         #[cfg(test)]

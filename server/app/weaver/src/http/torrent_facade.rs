@@ -52,11 +52,14 @@ use weaver_server_core::torrents::service::{
     ActionError, AddError, AddRequest, Placement, TorrentService, TorrentSettings, TorrentView,
 };
 use weaver_server_core::torrents::{
-    ConnectionKind, ContentLayout, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag,
-    TorrentState, TorrentTracker, TrackerStatus, redacted_tracker_url, status,
+    ContentLayout, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag, TorrentState,
+    TorrentTracker, TrackerStatus, redacted_tracker_url, status,
 };
 use weaver_server_core::watch_folder::WatchFolderService;
 use weaver_server_core::{Database, RssFeedRow, SchedulerHandle};
+// The tests build peers of each kind; the facade reads a kind's names only.
+#[cfg(test)]
+use weaver_server_core::torrents::ConnectionKind;
 
 use super::auth::{LoginRateLimiter, login_client_id, same_origin_request};
 
@@ -3793,6 +3796,7 @@ fn peer_id_client(peer_id: &[u8; 20]) -> String {
 // (qBittorrent `PeerInfo::determineFlags`).
 fn peer_flags(peer: &PeerInfo) -> (String, String) {
     let flags = peer.flags;
+    let transport = peer.connection.names();
     let letters = [
         (
             flags.interesting && flags.remote_choked,
@@ -3836,7 +3840,11 @@ fn peer_flags(peer: &PeerInfo) -> (String, String) {
             'e',
             "encrypted handshake",
         ),
-        (matches!(peer.connection, ConnectionKind::Utp), 'P', "μTP"),
+        (
+            transport.qbit_flag.is_some(),
+            transport.qbit_flag.unwrap_or_default(),
+            transport.qbit_connection,
+        ),
         (flags.holepunched, 'h', "holepunched"),
     ];
     let set: Vec<_> = letters.iter().filter(|(on, ..)| *on).collect();
@@ -3877,13 +3885,7 @@ fn peer_json(peer: &PeerInfo, total_bytes: u64) -> Value {
         ("up_speed", json!(peer.upload_rate)),
         ("downloaded", json!(peer.downloaded)),
         ("uploaded", json!(peer.uploaded)),
-        (
-            "connection",
-            json!(match peer.connection {
-                ConnectionKind::Tcp => "BT",
-                ConnectionKind::Utp => "μTP",
-            }),
-        ),
+        ("connection", json!(peer.connection.names().qbit_connection)),
         ("flags", json!(flags)),
         ("flags_desc", json!(flags_desc)),
         ("contribution", json!(contribution)),

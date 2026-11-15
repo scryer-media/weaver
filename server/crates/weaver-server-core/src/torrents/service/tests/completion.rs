@@ -1660,7 +1660,22 @@ fn an_adopted_top_level_name_in_another_unicode_form_is_held_where_forms_are_one
 async fn a_crash_after_the_mark_is_finished_at_the_next_start(delete_files: bool) {
     let rig = rig(set_clock());
     rig.service.open().await.unwrap();
+    let mut published = rig.service.inner.published.subscribe();
     let (job_id, dir) = with_every_piece(&rig).await;
+    // Its row says it completed before the stop: the settle that writes
+    // that runs on its own, and a stop ahead of it leaves a row the start
+    // reads as cancelled.
+    published
+        .wait_for(|_| {
+            rig.db
+                .get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+        })
+        .await
+        .unwrap();
     let files = files_under(&dir);
     let work = rig.dir.path().join("work");
     let unpacking = unpacking_dir(&work, job_id);
