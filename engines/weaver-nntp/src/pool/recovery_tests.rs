@@ -52,30 +52,22 @@ async fn recovery_probe_is_shared_fresh_and_single_article_until_reply() {
     };
     let client = NntpClient::new(config());
     let pool = client.pool();
-    for _ in 0..10 {
-        pool.health.lock().await.record_failure(0, false);
-    }
+    // Quarantined for transport with health left alone: a server that health
+    // has disabled is not offered to the async fetch at all.
+    pool.quarantine_for_transport_for_test(0);
     assert!(pool.requires_recovery(0));
-    pool.recovery_gates[0].expire_now();
+    pool.expire_quarantine_for_test(0);
     let replacement = NntpClient::new(config());
     assert!(replacement.pool().requires_recovery(0));
     assert!(
         pool.try_acquire_blocking_permit_for_work(ServerId(0), false)
             .is_err()
     );
-    let mut lane = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
-    assert!(pool.requires_recovery(0), "handshake is insufficient");
-    assert!(
-        replacement
-            .pool()
-            .try_acquire_blocking_permit(ServerId(0))
-            .is_err()
-    );
+    let fetcher = client.clone();
     let fetch = tokio::spawn(async move {
-        let stats = lane
-            .fetch_decoded_pipeline(&["<first@test>", "<second@test>"], 8, |_, _, _| async {})
-            .await;
-        (lane, stats)
+        fetcher
+            .fetch_body_decoded_with_groups("<first@test>", &[])
+            .await
     });
     assert_eq!(seen_rx.recv().await.unwrap(), "BODY <first@test>");
     assert!(seen_rx.try_recv().is_err());
@@ -87,8 +79,12 @@ async fn recovery_probe_is_shared_fresh_and_single_article_until_reply() {
             .is_err()
     );
     answer.send(()).await.unwrap();
-    let (lane, stats) = fetch.await.unwrap();
-    assert_eq!(stats.offered, 1);
+    assert!(matches!(
+        fetch.await.unwrap(),
+        Err(crate::client::DecodedBodyError::Nntp(
+            NntpError::NoSuchArticle { .. }
+        ))
+    ));
     assert!(
         !pool.requires_recovery(0),
         "a valid 430 proves transport recovery"
@@ -99,79 +95,9 @@ async fn recovery_probe_is_shared_fresh_and_single_article_until_reply() {
         .try_acquire_blocking_permit(ServerId(0))
         .unwrap();
     drop(peer);
-    drop(lane);
     pool.drain_all_idle().await;
     server.await.unwrap();
     assert_eq!(pool.socket_budget_snapshot(0).physical, 0);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recovered_batch_tries_unsent_articles_before_leaving_the_provider() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel(4);
-    let server = tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.unwrap();
-        let (reader, mut writer) = socket.into_split();
-        writer.write_all(b"200 ready\r\n").await.unwrap();
-        let mut lines = BufReader::new(reader).lines();
-        while let Some(line) = lines.next_line().await.unwrap() {
-            if line == "CAPABILITIES" {
-                writer
-                    .write_all(b"101 capabilities\r\nVERSION 2\r\nPIPELINING\r\n.\r\n")
-                    .await
-                    .unwrap();
-            } else {
-                assert!(line.starts_with("BODY "));
-                seen_tx.send(line).await.unwrap();
-                writer.write_all(b"430 unavailable\r\n").await.unwrap();
-            }
-        }
-    });
-    let config = NntpClientConfig::single(
-        ServerConfig {
-            host: address.ip().to_string(),
-            port: address.port(),
-            tls: false,
-            ..Default::default()
-        },
-        2,
-    );
-    let client = NntpClient::from_pool(Arc::new(NntpPool::new(PoolConfig {
-        servers: config.servers,
-        health_config: crate::health::HealthConfig {
-            base_backoff: Duration::ZERO,
-            max_backoff: Duration::ZERO,
-            ..Default::default()
-        },
-        ..Default::default()
-    })));
-    let pool = client.pool();
-    for _ in 0..10 {
-        pool.health.lock().await.record_failure(0, false);
-    }
-    pool.recovery_gates[0].expire_now();
-    let traces = client
-        .fetch_bodies_decoded_with_groups_prefer_excluding_traced(
-            &["<first@test>", "<second@test>", "<third@test>"],
-            &[],
-            crate::ServerSet::EMPTY,
-        )
-        .await;
-    assert!(!pool.requires_recovery(0));
-    for (trace, id) in traces.iter().zip(["first", "second", "third"]) {
-        assert_eq!(seen_rx.try_recv().unwrap(), format!("BODY <{id}@test>"));
-        assert_eq!(trace.attempts.len(), 1);
-        assert!(matches!(
-            trace.result,
-            Err(crate::client::DecodedBodyError::Nntp(
-                NntpError::NoSuchArticle { .. }
-            ))
-        ));
-    }
-    assert!(seen_rx.try_recv().is_err());
-    pool.drain_all_idle().await;
-    server.await.unwrap();
 }
 
 // A server that has been re-enabled but still owes a recovery probe refuses
@@ -761,22 +687,17 @@ async fn recovery_probe_clears_the_quarantine_on_its_answer_before_the_body_ends
         soft_timeout: Duration::from_secs(365 * 24 * 60 * 60),
     });
     let pool = client.pool();
-    for _ in 0..10 {
-        pool.health.lock().await.record_failure(0, false);
-    }
+    // Quarantined for transport with health left alone: a server that health
+    // has disabled is not offered to the async fetch at all.
+    pool.quarantine_for_transport_for_test(0);
     assert!(pool.requires_recovery(0));
-    pool.recovery_gates[0].expire_now();
+    pool.expire_quarantine_for_test(0);
     let mut changes = pool.recovery_gates[0].subscribe();
-    let mut lane = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
-    assert!(pool.requires_recovery(0), "handshake is insufficient");
+    let fetcher = client.clone();
     let fetch = tokio::spawn(async move {
-        let mut decoded = None;
-        lane.fetch_decoded_pipeline(&["<probe@test>"], 1, |_, trace, _| {
-            decoded = Some(trace.result.is_ok());
-            async {}
-        })
-        .await;
-        (lane, decoded)
+        fetcher
+            .fetch_body_decoded_with_groups("<probe@test>", &[])
+            .await
     });
 
     while pool.requires_recovery(0) {
@@ -793,14 +714,255 @@ async fn recovery_probe_clears_the_quarantine_on_its_answer_before_the_body_ends
     );
 
     finish.send(()).await.unwrap();
-    let (lane, decoded) = fetch.await.unwrap();
-    assert_eq!(decoded, Some(true));
+    assert!(fetch.await.unwrap().is_ok());
     assert!(!pool.requires_recovery(0));
     assert_eq!(
         *pool.health.lock().await.server(0).state(),
         crate::health::ServerState::Healthy
     );
-    drop(lane);
     pool.drain_all_idle().await;
     server.await.unwrap();
+}
+
+// A local reader server on a std thread for the connection downloads use.
+// Each BODY it reads is sent on `seen`; it then sends `head`, waits for
+// `release`, and sends `tail`.
+fn spawn_probe_server(
+    head: &'static [u8],
+    tail: &'static [u8],
+) -> (
+    std::net::SocketAddr,
+    std::sync::mpsc::Receiver<String>,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::io::{BufRead, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket.write_all(b"200 ready\r\n").unwrap();
+        let reader = std::io::BufReader::new(socket.try_clone().unwrap());
+        for line in reader.lines() {
+            let Ok(line) = line else { return };
+            if line == "CAPABILITIES" {
+                socket
+                    .write_all(b"101 capabilities\r\nVERSION 2\r\nPIPELINING\r\n.\r\n")
+                    .unwrap();
+            } else if line == "QUIT" {
+                let _ = socket.write_all(b"205 closing\r\n");
+                return;
+            } else {
+                assert!(line.starts_with("BODY "), "{line}");
+                seen_tx.send(line).unwrap();
+                socket.write_all(head).unwrap();
+                socket.flush().unwrap();
+                if release_rx.recv().is_err() {
+                    return;
+                }
+                if socket.write_all(tail).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    (address, seen_rx, release_tx, server)
+}
+
+// On the connection downloads use, a server whose quarantine has lapsed
+// takes one fresh lane as its recovery probe. Every pool built over the same
+// server shares the probe: none opens another lane while it is out, and a
+// warm dial never spends it. The probe's own lane still sees its server as
+// eligible, so a guard reading that lane's policy keeps the work. A valid
+// 430 is an answer: it proves the transport, and every pool takes new lanes
+// again.
+#[test]
+fn a_blocking_recovery_probe_is_shared_fresh_and_answered_by_its_430() {
+    use crate::provider_policy::ArticleEligibility;
+    let (address, seen, release, server) = spawn_probe_server(b"", b"430 unavailable\r\n");
+    let registry = ServerTransferRegistry::new();
+    let control = registry.control(StableServerId(17));
+    let config = || NntpClientConfig {
+        servers: vec![ServerPoolConfig {
+            server: ServerConfig {
+                host: address.ip().to_string(),
+                port: address.port(),
+                tls: false,
+                ..Default::default()
+            },
+            stable_id: StableServerId(17),
+            transfer_control: Some(Arc::clone(&control)),
+            max_connections: 8,
+            ..Default::default()
+        }],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(365 * 24 * 60 * 60),
+    };
+    let client = NntpClient::new(config());
+    let pool = Arc::clone(client.pool());
+    pool.quarantine_for_transport_for_test(0);
+    assert!(pool.requires_recovery(0));
+    pool.expire_quarantine_for_test(0);
+    let replacement = NntpClient::new(config());
+    assert!(replacement.pool().requires_recovery(0));
+    assert!(
+        pool.try_acquire_blocking_permit_for_work(ServerId(0), false)
+            .is_err(),
+        "a warm dial never spends the probe"
+    );
+
+    let mut probe = client
+        .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+        .expect("the lapsed quarantine admits its probe");
+    assert!(probe.is_recovery_probe());
+    assert_eq!(pool.socket_budget_snapshot(0).physical, 1);
+    assert!(
+        !matches!(
+            pool.provider_policy()
+                .eligibility(0, crate::ServerSet::EMPTY, crate::ServerSet::EMPTY, 1),
+            ArticleEligibility::Eligible(_)
+        ),
+        "a new connection still finds the server held by its probe"
+    );
+    assert!(
+        matches!(
+            pool.provider_policy_on_connection(0, true).eligibility(
+                0,
+                crate::ServerSet::EMPTY,
+                crate::ServerSet::EMPTY,
+                1
+            ),
+            ArticleEligibility::Eligible(_)
+        ),
+        "the probe's own lane sees its server as eligible"
+    );
+
+    std::thread::scope(|scope| {
+        let fetch = scope.spawn(|| probe.fetch_decoded_sequential("<first@test>"));
+        assert_eq!(seen.recv().unwrap(), "BODY <first@test>");
+        let held = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .err()
+            .expect("no second lane while the probe is out");
+        // Refused before any dial: the policy reads the server as held by
+        // its probe, so the lane is turned away as a wait, not a failure.
+        assert!(
+            matches!(
+                held,
+                crate::client::BlockingBodyLaneAcquireError::LocalCapacity
+                    | crate::client::BlockingBodyLaneAcquireError::ServerRecovering
+            ),
+            "{held:?}"
+        );
+        assert_eq!(pool.socket_budget_snapshot(0).physical, 1);
+        assert!(
+            replacement
+                .pool()
+                .try_acquire_blocking_permit(ServerId(0))
+                .is_err(),
+            "a rebuilt pool shares the probe"
+        );
+        assert!(seen.try_recv().is_err(), "the probe carries one article");
+        release.send(()).unwrap();
+        let trace = fetch.join().unwrap();
+        assert!(
+            matches!(
+                trace.result,
+                Err(crate::client::DecodedBodyError::Nntp(
+                    NntpError::NoSuchArticle { .. }
+                ))
+            ),
+            "{:?}",
+            trace.result.as_ref().err()
+        );
+        client.record_blocking_attempts(&trace.attempts);
+    });
+
+    assert!(
+        !pool.requires_recovery(0),
+        "a valid 430 proves transport recovery"
+    );
+    assert!(!replacement.pool().requires_recovery(0));
+    drop(
+        replacement
+            .pool()
+            .try_acquire_blocking_permit(ServerId(0))
+            .expect("a recovered server takes new connections in every pool"),
+    );
+    drop(probe);
+    drop(release);
+    server.join().unwrap();
+    assert_eq!(pool.socket_budget_snapshot(0).physical, 0);
+}
+
+// On the connection downloads use, the probe proves the server is up the
+// moment the demanded BODY's 2xx status line arrives: the quarantine lifts
+// while the body is still streaming.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blocking_recovery_probe_clears_the_quarantine_on_its_answer_before_the_body_ends() {
+    let (address, _seen, release, server) = spawn_probe_server(
+        b"222 1 <probe@test>\r\n=ybegin line=128 size=2 name=x\r\nk\r\n",
+        b"k\r\n=yend size=2\r\n.\r\n",
+    );
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![ServerPoolConfig {
+            server: ServerConfig {
+                host: address.ip().to_string(),
+                port: address.port(),
+                tls: false,
+                ..Default::default()
+            },
+            stable_id: StableServerId(18),
+            max_connections: 2,
+            ..Default::default()
+        }],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        // No runner waits this long: the body's hold ends only when the
+        // test releases it.
+        soft_timeout: Duration::from_secs(365 * 24 * 60 * 60),
+    });
+    let pool = Arc::clone(client.pool());
+    pool.quarantine_for_transport_for_test(0);
+    assert!(pool.requires_recovery(0));
+    pool.expire_quarantine_for_test(0);
+    let mut changes = pool.recovery_gates[0].subscribe();
+    let fetcher = client.clone();
+    let fetch = tokio::task::spawn_blocking(move || {
+        let mut lane = fetcher
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .expect("the lapsed quarantine admits its probe");
+        assert!(lane.is_recovery_probe());
+        let trace = lane.fetch_decoded_sequential("<probe@test>");
+        fetcher.record_blocking_attempts(&trace.attempts);
+        drop(lane);
+        trace.result.is_ok()
+    });
+
+    while pool.requires_recovery(0) {
+        changes.changed().await.unwrap();
+    }
+    assert!(
+        !fetch.is_finished(),
+        "the quarantine lifted on the answer, before the body ended"
+    );
+    drop(
+        pool.try_acquire_blocking_permit_for_work(ServerId(0), false)
+            .expect("a lifted quarantine admits ordinary work again"),
+    );
+
+    release.send(()).unwrap();
+    assert!(fetch.await.unwrap(), "the probe's body completes");
+    assert!(!pool.requires_recovery(0));
+    assert_eq!(
+        *pool.health.lock().await.server(0).state(),
+        crate::health::ServerState::Healthy
+    );
+    drop(release);
+    tokio::task::spawn_blocking(move || server.join().unwrap())
+        .await
+        .unwrap();
 }

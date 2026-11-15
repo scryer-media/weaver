@@ -43,7 +43,7 @@ const PROBE_DIR: &str = ".wvr-vol";
 // name with a text extension rather than a dotfile, as the start-up probe's
 // is: security software treats a hidden file written with write-through as
 // suspicious.
-const SCRATCH_PREFIX: &str = "weaver-volume-probe-";
+const SCRATCH_PREFIX: &str = "wvr-";
 const SCRATCH_SUFFIX: &str = ".txt";
 
 fn is_scratch_name(name: &std::ffi::OsStr) -> bool {
@@ -661,7 +661,7 @@ mod tests {
     fn a_probe_leaves_the_files_of_the_folder_alone() {
         let data = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let payloads = ["weaver-volume-probe.txt", "weaver-volume-probe-0.txt"];
+        let payloads = ["wvr.txt", "wvr-0.txt"];
         for name in payloads {
             std::fs::write(dir.path().join(name), b"downloaded").unwrap();
         }

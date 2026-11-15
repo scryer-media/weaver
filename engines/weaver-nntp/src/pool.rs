@@ -782,7 +782,7 @@ impl NntpPool {
                         }
                     }
                     if let Ok(mut connection) = result {
-                        *pool.last_connect_failure[idx].lock().await = None;
+                        pool.clear_connect_failure(&mut *pool.last_connect_failure[idx].lock().await);
                         slot.set_path(connection.route_path.as_ref());
                         slot.observe_outcome(connection.route_outcome.as_ref());
                         slot.active();
@@ -889,17 +889,6 @@ impl NntpPool {
         }
     }
 
-    pub(crate) async fn acquire_before_deadline(
-        &self,
-        server: ServerId,
-        initial_group: Option<&str>,
-        demanded: bool,
-        deadline: &mut tokio::time::Instant,
-    ) -> Result<PooledConnection> {
-        self.acquire_guarded_before_deadline(server, initial_group, demanded, deadline, None)
-            .await
-    }
-
     pub(crate) async fn acquire_guarded_before_deadline(
         &self,
         server: ServerId,
@@ -922,20 +911,6 @@ impl NntpPool {
             guard,
         )
         .await
-    }
-
-    pub(crate) async fn acquire_extra_before_deadline(
-        &self,
-        server: ServerId,
-        initial_group: Option<&str>,
-        deadline: &mut tokio::time::Instant,
-    ) -> Result<PooledConnection> {
-        if self.shutdown.is_cancelled() {
-            return Err(NntpError::PoolShutdown);
-        }
-        self.configs.get(server.0).ok_or(NntpError::PoolExhausted)?;
-        self.acquire_fresh_with_permit(server.0, None, initial_group, Some(deadline))
-            .await
     }
 
     // Acquire a connection; a fresh connection to a pipelining server
@@ -977,19 +952,6 @@ impl NntpPool {
                 .leg_targets()
                 .is_none_or(|targets| targets.borrow().iter().any(|target| *target > 0))
         })
-    }
-
-    // Acquire an explicit over-max connection from a specific server.
-    pub async fn acquire_extra(&self, server: ServerId) -> Result<PooledConnection> {
-        if self.shutdown.is_cancelled() {
-            return Err(NntpError::PoolShutdown);
-        }
-
-        let idx = server.0;
-        if idx >= self.pools.len() {
-            return Err(NntpError::PoolExhausted);
-        }
-        self.acquire_fresh_with_permit(idx, None, None, None).await
     }
 
     // Internal: acquire a connection using an already-obtained permit.
@@ -1103,8 +1065,9 @@ impl NntpPool {
                             c.socket_slot = Some(slot);
                             c.health_lease = Some(Arc::new(health_lease));
                             // Clear the failure timestamp on success.
-                            let mut last_failure = self.last_connect_failure[idx].lock().await;
-                            *last_failure = None;
+                            self.clear_connect_failure(
+                                &mut *self.last_connect_failure[idx].lock().await,
+                            );
                             break c;
                         }
                         Err(e) => {
@@ -1169,77 +1132,6 @@ impl NntpPool {
                         }
                     }
                 }
-            }
-        };
-
-        lock_recovering(&self.pools[idx]).active_count += 1;
-
-        Ok(PooledConnection {
-            conn: Some(conn),
-            pool: self.pools[idx].clone(),
-            server_idx: idx,
-            return_to_pool: permit.is_some(),
-            shutdown: self.shutdown.clone(),
-            _permit: permit,
-        })
-    }
-
-    async fn acquire_fresh_with_permit(
-        &self,
-        idx: usize,
-        permit: Option<tokio::sync::OwnedSemaphorePermit>,
-        initial_group: Option<&str>,
-        deadline: Option<&mut tokio::time::Instant>,
-    ) -> Result<PooledConnection> {
-        if deadline
-            .as_deref()
-            .is_some_and(|deadline| tokio::time::Instant::now() >= *deadline)
-        {
-            return Err(NntpError::AcquireTimeout(0));
-        }
-        {
-            let last_failure = self.last_connect_failure[idx].lock().await;
-            if let Some(ts) = *last_failure {
-                let elapsed = ts.elapsed();
-                if elapsed < self.reconnect_delay {
-                    let remaining = self.reconnect_delay - elapsed;
-                    drop(last_failure);
-                    acquisition_budget(deadline.as_deref(), async {
-                        tokio::time::sleep(remaining).await;
-                        Ok(())
-                    })
-                    .await?;
-                }
-            }
-        }
-
-        debug!(server = idx, "creating fresh over-max connection");
-        // An over-max connection is never a transport-recovery probe.
-        let health_lease = self.recovery_gates[idx]
-            .admit(false)
-            .ok_or(NntpError::PoolExhausted)?;
-        let slot = self.socket_budgets[idx]
-            .try_acquire_replacement()
-            .ok_or(NntpError::PoolExhausted)?;
-        let started = tokio::time::Instant::now();
-        let connected = self.connect_server(idx, initial_group, false).await;
-        if let Some(deadline) = deadline {
-            *deadline += started.elapsed();
-        }
-        let conn = match connected {
-            Ok(mut conn) => {
-                slot.set_path(conn.route_path.as_ref());
-                slot.observe_outcome(conn.route_outcome.as_ref());
-                slot.active();
-                conn.socket_slot = Some(slot);
-                conn.health_lease = Some(Arc::new(health_lease));
-                let mut last_failure = self.last_connect_failure[idx].lock().await;
-                *last_failure = None;
-                conn
-            }
-            Err(error) => {
-                self.note_connect_failure(idx, &error).await;
-                return Err(error);
             }
         };
 
@@ -2009,17 +1901,37 @@ impl NntpPool {
         server: ServerId,
         demanded: bool,
     ) -> Result<BlockingConnectionPermit> {
+        self.try_acquire_blocking_permit_uncontended(server, demanded)
+            .unwrap_or(Err(NntpError::PoolExhausted))
+    }
+
+    // As [`Self::try_acquire_blocking_permit_for_work`], with `None` when
+    // the server's reconnect stamp was held by another caller for the
+    // moment. That is a lock collision to retry at once, not a shortage:
+    // nothing announces its end, so a caller that waits for an event on it
+    // waits for nothing.
+    pub(crate) fn try_acquire_blocking_permit_uncontended(
+        &self,
+        server: ServerId,
+        demanded: bool,
+    ) -> Option<Result<BlockingConnectionPermit>> {
         let idx = server.0;
         if idx >= self.semaphores.len() {
-            return Err(NntpError::PoolExhausted);
+            return Some(Err(NntpError::PoolExhausted));
         }
-        let recent_failure = self.last_connect_failure[idx]
-            .try_lock()
-            .map_err(|_| NntpError::PoolExhausted)?;
+        let recent_failure = self.last_connect_failure[idx].try_lock().ok()?;
         if self.reconnect_hold(*recent_failure).is_some() {
-            return Err(NntpError::ServerRecovering);
+            return Some(Err(NntpError::ServerRecovering));
         }
         drop(recent_failure);
+        Some(self.acquire_blocking_permit_past_reconnect_hold(idx, demanded))
+    }
+
+    fn acquire_blocking_permit_past_reconnect_hold(
+        &self,
+        idx: usize,
+        demanded: bool,
+    ) -> Result<BlockingConnectionPermit> {
         let permit = self.semaphores[idx]
             .clone()
             .try_acquire_owned()
@@ -2065,6 +1977,16 @@ impl NntpPool {
     async fn note_connect_failure(&self, idx: usize, error: &NntpError) {
         if !dial_declined_over_limit(error) {
             *self.last_connect_failure[idx].lock().await = Some(Instant::now());
+        }
+    }
+
+    // Clear a server's reconnect stamp after a dial to it succeeded. A
+    // delay still running ends here, early and by no clock, so the health
+    // watch rings for whoever waits on that delay's end.
+    fn clear_connect_failure(&self, failed_at: &mut Option<Instant>) {
+        if self.reconnect_hold(failed_at.take()).is_some() {
+            self.health_changed
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
         }
     }
 
@@ -2339,8 +2261,7 @@ impl Drop for PooledConnection {
     // it should reuse is already on the list. Handing the return to a spawned
     // task inverted that — the permit went back first and the return landed
     // whenever the runtime got to it, so a caller that re-acquired
-    // immediately (the probe's per-miss HEAD right after its STAT batch)
-    // reliably raced past a warm socket and dialled a new one.
+    // immediately reliably raced past a warm socket and dialled a new one.
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
             let server_idx = self.server_idx;
@@ -3264,7 +3185,7 @@ mod tests {
 
         // Established lanes are untouched by the holdoff.
         for lane in &mut accepted_lanes {
-            let body = lane.body_by_id_raw("<test>").await.unwrap();
+            let body = lane.body_by_id("<test>").await.unwrap();
             assert_eq!(body.data.as_ref(), b"payload\r\n");
         }
 
@@ -3278,7 +3199,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         let mut reused = pool.acquire(ServerId(0)).await.unwrap();
-        let body = reused.body_by_id_raw("<test>").await.unwrap();
+        let body = reused.body_by_id("<test>").await.unwrap();
         assert_eq!(body.data.as_ref(), b"payload\r\n");
         assert_eq!(accepted.load(Ordering::SeqCst), accepted_after_rejection);
 
@@ -3985,6 +3906,206 @@ mod tests {
             failed_at.checked_sub(Duration::from_secs(7200));
         assert_eq!(pool.connection_hold(0, true), None);
         assert_eq!(pool.next_connection_hold_deadline(), None);
+    }
+
+    // A local server that greets and answers CAPABILITIES on its first
+    // `served` connections, and accepts then drops every later one.
+    fn spawn_dropping_server(served: usize) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_by_server = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            for socket in listener.incoming() {
+                let Ok(mut socket) = socket else { return };
+                let slot = accepted_by_server.fetch_add(1, Ordering::SeqCst);
+                if slot >= served {
+                    drop(socket);
+                    continue;
+                }
+                std::thread::spawn(move || {
+                    if socket.write_all(b"200 ready\r\n").is_err() {
+                        return;
+                    }
+                    let reader = BufReader::new(socket.try_clone().unwrap());
+                    for line in reader.lines() {
+                        let Ok(line) = line else { return };
+                        let reply: &[u8] = if line == "CAPABILITIES" {
+                            b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n"
+                        } else {
+                            b"500 unsupported\r\n"
+                        };
+                        if socket.write_all(reply).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, accepted)
+    }
+
+    fn blocking_lane_client(
+        port: u16,
+        max_connections: usize,
+        reconnect_delay: Duration,
+    ) -> (Arc<NntpPool>, crate::client::NntpClient) {
+        let mut config = test_pool_config(max_connections);
+        config.servers[0].server.host = "127.0.0.1".into();
+        config.servers[0].server.port = port;
+        config.servers[0].server.tls = false;
+        config.reconnect_delay = reconnect_delay;
+        let pool = Arc::new(NntpPool::new(config));
+        let client = crate::client::NntpClient::from_pool(Arc::clone(&pool));
+        (pool, client)
+    }
+
+    // The connection downloads use: a failed dial holds every new lane on its
+    // server until the reconnect delay ends, without a socket, and once the
+    // delay has passed the next lane dials again.
+    #[test]
+    fn a_failed_blocking_dial_holds_new_lanes_until_the_reconnect_delay_ends() {
+        use crate::client::BlockingBodyLaneAcquireError;
+        let (port, accepted) = spawn_dropping_server(0);
+        let (pool, client) = blocking_lane_client(port, 2, Duration::from_secs(3600));
+
+        let first = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .err()
+            .expect("the dropped dial fails");
+        assert!(
+            matches!(first, BlockingBodyLaneAcquireError::Other(_)),
+            "{first:?}"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        let recorded = pool.last_connect_failure[0]
+            .blocking_lock()
+            .expect("the failed dial records its failure");
+
+        let held = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .err()
+            .expect("the reconnect delay holds the next lane");
+        assert!(
+            matches!(held, BlockingBodyLaneAcquireError::ServerRecovering),
+            "{held:?}"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "a held lane opens no socket"
+        );
+
+        // Date the failure a full delay back rather than waiting it out.
+        *pool.last_connect_failure[0].blocking_lock() =
+            recorded.checked_sub(Duration::from_secs(3600));
+        let next = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .err()
+            .expect("the next dial is dropped too");
+        assert!(
+            matches!(next, BlockingBodyLaneAcquireError::Other(_)),
+            "{next:?}"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    // A dial the server accepted and then dropped is the server's health,
+    // however many lanes are busy on it: it never arms the over-limit
+    // holdoff, and the next lane waits the ordinary reconnect delay.
+    #[test]
+    fn a_dropped_blocking_dial_beside_busy_lanes_waits_the_reconnect_delay_not_the_holdoff() {
+        use crate::client::BlockingBodyLaneAcquireError;
+        let (port, accepted) = spawn_dropping_server(2);
+        let (pool, client) = blocking_lane_client(port, 4, Duration::from_secs(3600));
+
+        let busy: Vec<_> = (0..2)
+            .map(|_| {
+                client
+                    .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+                    .expect("the first two connections are served")
+            })
+            .collect();
+        assert_eq!(pool.socket_budgets[0].snapshot().physical, 2);
+
+        let dropped = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .err()
+            .expect("the dropped dial must fail");
+        assert!(
+            matches!(
+                &dropped,
+                BlockingBodyLaneAcquireError::Other(NntpError::ConnectionClosed | NntpError::Io(_))
+            ),
+            "{dropped:?}"
+        );
+        assert!(!pool.is_over_limit(ServerId(0)));
+        assert_eq!(pool.over_limit_refusals(ServerId(0)), 0);
+        assert!(pool.last_connect_failure[0].blocking_lock().is_some());
+
+        let next = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .err()
+            .expect("the reconnect delay holds the next lane");
+        assert!(
+            matches!(next, BlockingBodyLaneAcquireError::ServerRecovering),
+            "{next:?}"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 3);
+        assert!(!pool.is_over_limit(ServerId(0)));
+        assert_eq!(pool.over_limit_refusals(ServerId(0)), 0);
+        drop(busy);
+    }
+
+    // When the over-limit holdoff ends, lanes dial again. A dial that fails
+    // on the socket is not a refusal: the probe slot is given back, so the
+    // next lane dials too, and the episode's refusal count stands.
+    #[test]
+    fn a_blocking_lane_dials_again_once_the_over_limit_holdoff_expires() {
+        use crate::client::BlockingBodyLaneAcquireError;
+        let (port, accepted) = spawn_dropping_server(0);
+        let (pool, client) = blocking_lane_client(port, 4, Duration::ZERO);
+        pool.note_provider_over_limit(ServerId(0));
+
+        let held = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .err()
+            .expect("a held-off server opens no lane");
+        assert!(
+            matches!(
+                held,
+                BlockingBodyLaneAcquireError::ProviderCapacity(NntpError::ServerOverLimit { .. })
+            ),
+            "{held:?}"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+
+        // Rewind the deadline instead of waiting out the window.
+        pool.over_limit_until[0].store(unix_epoch_ms() - 1, Ordering::Release);
+        assert!(!pool.is_over_limit(ServerId(0)));
+
+        let probe = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .err()
+            .expect("the dropped dial fails");
+        assert!(
+            matches!(probe, BlockingBodyLaneAcquireError::Other(_)),
+            "{probe:?}"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.over_limit_episode(0).unwrap().probe_started, 0);
+
+        let next = client
+            .try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY)
+            .err()
+            .expect("the next dial is dropped too");
+        assert!(
+            matches!(next, BlockingBodyLaneAcquireError::Other(_)),
+            "{next:?}"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        assert_eq!(pool.over_limit_refusals(ServerId(0)), 1);
     }
 
     // A quarantined server whose deadline has lapsed, with no probe out,

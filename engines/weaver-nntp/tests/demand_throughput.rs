@@ -5,10 +5,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use weaver_nntp::client::{NntpClient, NntpClientConfig};
+use weaver_nntp::client::{DecodedBodyTrace, NntpClient, NntpClientConfig};
 use weaver_nntp::route_dialer::{AddressPlanned, RouteDialer};
 use weaver_nntp::transfer::ServerTransferRegistry;
-use weaver_nntp::{ServerConfig, ServerPoolConfig};
+use weaver_nntp::{BlockingBodyLane, ServerConfig, ServerPoolConfig, ServerSet};
+
+// The decoded size of each payload article.
+const PAYLOAD_BYTES: usize = 2048 * 128;
+
+fn decoded_len(trace: DecodedBodyTrace) -> usize {
+    trace.result.unwrap().decoded.iter().map(|chunk| chunk.len()).sum()
+}
 
 #[expect(
     clippy::disallowed_methods,
@@ -55,16 +62,18 @@ async fn primary_only_cold_bootstrap_and_warm_reuse() {
     let server = tokio::spawn(async move {
         let mut sockets = tokio::task::JoinSet::new();
         let mut payload = b"222 1 <payload@example.invalid>\r\n".to_vec();
-        for _ in 0..2048 {
-            payload.extend_from_slice(&[b'x'; 128]);
-            payload.extend_from_slice(b"\r\n");
-        }
+        weaver_yenc::encode(&vec![b'x'; PAYLOAD_BYTES], &mut payload, 128, "payload.bin").unwrap();
         payload.extend_from_slice(b".\r\n");
         let payload = Arc::new(payload);
+        let mut index = b"222 1 <index@example.invalid>\r\n".to_vec();
+        weaver_yenc::encode(b"metadata", &mut index, 128, "index.bin").unwrap();
+        index.extend_from_slice(b".\r\n");
+        let index = Arc::new(index);
         loop {
             let (socket, _) = listener.accept().await.unwrap();
             count.fetch_add(1, Ordering::SeqCst);
             let payload = Arc::clone(&payload);
+            let index = Arc::clone(&index);
             let peak = Arc::clone(&server_peak);
             let mut reached = peak.subscribe();
             let in_flight = Arc::clone(&server_in_flight);
@@ -73,10 +82,12 @@ async fn primary_only_cold_bootstrap_and_warm_reuse() {
                 write.write_all(b"200 ready\r\n").await.unwrap();
                 let mut lines = BufReader::new(read).lines();
                 while let Some(command) = lines.next_line().await.unwrap() {
-                    let response = if command == "CAPABILITIES" {
+                    let response = if command == "QUIT" {
+                        break;
+                    } else if command == "CAPABILITIES" {
                         b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n".as_slice()
                     } else if command.contains("index") {
-                        b"222 1 <index@example.invalid>\r\nmetadata\r\n.\r\n".as_slice()
+                        index.as_slice()
                     } else {
                         let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                         peak.send_if_modified(|peak| {
@@ -107,35 +118,53 @@ async fn primary_only_cold_bootstrap_and_warm_reuse() {
         ..ServerConfig::new(route())
     });
     config.max_connections = CONNECTIONS;
-    let client = Arc::new(NntpClient::new(NntpClientConfig {
+    let client = NntpClient::new(NntpClientConfig {
         servers: vec![config],
         max_idle_age: Duration::from_mins(5),
         max_retries_per_server: 0,
         soft_timeout: Duration::from_secs(3600),
-    }));
+    });
+    // The download lanes' owned connections. The cold phase opens them; the
+    // warm phases keep using them.
+    let mut lanes: Vec<BlockingBodyLane> = Vec::new();
     for phase in ["cold", "warm", "warm-repeat"] {
         peak_tx.send_replace(0);
         let before = dials.load(Ordering::SeqCst);
         let start = Instant::now();
-        client.fetch_body("<index@example.invalid>").await.unwrap();
+        if lanes.is_empty() {
+            let client = client.clone();
+            lanes = tokio::task::spawn_blocking(move || {
+                (0..CONNECTIONS)
+                    .map(|_| {
+                        client
+                            .try_acquire_blocking_body_lane(&[], ServerSet::EMPTY)
+                            .unwrap()
+                    })
+                    .collect()
+            })
+            .await
+            .unwrap();
+        }
         let mut workers = tokio::task::JoinSet::new();
-        for worker in 0..CONNECTIONS {
-            let client = Arc::clone(&client);
-            workers.spawn(async move {
+        for (worker, mut lane) in lanes.drain(..).enumerate() {
+            workers.spawn_blocking(move || {
+                if worker == 0 {
+                    decoded_len(lane.fetch_decoded_sequential("<index@example.invalid>"));
+                }
                 let mut bytes = 0;
                 for article in 0..128 {
-                    bytes += client
-                        .fetch_body(&format!("<payload-{worker}-{article}@example.invalid>"))
-                        .await
-                        .unwrap()
-                        .len();
+                    bytes += decoded_len(lane.fetch_decoded_sequential(&format!(
+                        "<payload-{worker}-{article}@example.invalid>"
+                    )));
                 }
-                bytes
+                (lane, bytes)
             });
         }
         let mut bytes = 0;
         while let Some(result) = workers.join_next().await {
-            bytes += result.unwrap();
+            let (lane, worker_bytes) = result.unwrap();
+            lanes.push(lane);
+            bytes += worker_bytes;
         }
         let elapsed = start.elapsed().as_secs_f64();
         eprintln!(
@@ -143,14 +172,16 @@ async fn primary_only_cold_bootstrap_and_warm_reuse() {
             bytes as f64 / 1_048_576.0 / elapsed,
             dials.load(Ordering::SeqCst) - before
         );
-        assert_eq!(bytes, 1024 * 2048 * 130);
+        assert_eq!(bytes, 1024 * PAYLOAD_BYTES);
         assert_eq!(
             *peak_rx.borrow(),
             CONNECTIONS,
             "{phase}: every connection carried a payload request at once"
         );
     }
-    client.pool().drain_all_idle().await;
+    tokio::task::spawn_blocking(move || drop(lanes))
+        .await
+        .unwrap();
     server.abort();
     let _ = server.await;
 }

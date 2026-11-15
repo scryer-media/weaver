@@ -204,12 +204,6 @@ impl SocketBudget {
         self.acquire(false)
     }
 
-    // Only the explicitly enabled IP-replacement path may use this extra
-    // slot; it is never poolable or available to ordinary dispatch.
-    pub(crate) fn try_acquire_replacement(self: &Arc<Self>) -> Option<SocketSlot> {
-        self.acquire(true)
-    }
-
     pub(crate) fn note_provider_refusal(&self) {
         let mut state = self.state.lock().expect("socket budget poisoned");
         state.provider_refusals = state.provider_refusals.saturating_add(1);
