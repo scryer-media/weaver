@@ -12,7 +12,8 @@ import { NextDataContext, type NextData } from "@/next/data/next-data";
 import type { NetworkingAction, NetworkingData } from "@/next/features/networking/data";
 import { EgressPage } from "@/next/features/networking/EgressPage";
 import { nextEn } from "@/next/i18n/en";
-import { SettingsShellProvider } from "@/next/pages/settings/framework";
+import { SettingsShellProvider, type PanelFlags } from "@/next/pages/settings/framework";
+import { SearchRegistry } from "@/next/pages/settings/search";
 import { SETTINGS_REDIRECTS } from "@/next/pages/settings/redirects";
 import { AttentionBlock } from "@/next/shell/rail-blocks";
 import "@/next/fonts.css";
@@ -95,27 +96,29 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
     : name === "BandwidthSplit" ? { networking: { bandwidthSplit: splitState() } }
     : name === "SetBandwidth" ? { setBandwidth: bandwidth }
     : {};
-  return fromValue({ operation, data: answer });
+  return fromValue({ operation, data: answer, stale: false, hasNext: false });
 }))] });
 
 // What the rail reads while the metered egress has spent its allowance.
-const blockedBy = (windowEndsAtEpochMs: number | null) => ({
-  version: "fixture", update: undefined, speed: 0, peakSpeed: 0, isPaused: false, torrentsPaused: false, speedLimit: 0,
+const blockedBy = (windowEndsAtEpochMs: number | null): NextData => ({
+  version: "fixture", update: undefined, speed: 0, peakSpeed: 0, isPaused: false, torrentsPaused: false, resumeAt: null, speedLimit: 0,
   downloadBlock: {
     kind: "EGRESS_QUOTA", egressId: 2, egressName: "LTE standby", usedBytes: 20 * GIB, limitBytes: 20 * GIB, remainingBytes: 0,
     windowStartsAtEpochMs: windowStart, windowEndsAtEpochMs, timezoneName: "UTC", scheduledSpeedLimit: null, speedLimitInForce: null, speedLimitBySchedule: false,
   },
   queue: {} as NextData["queue"], categories: [], refreshCategories: () => {}, historyCount: 0, refreshHistoryCount: () => {},
   providers: [], providersLoaded: true, holdoffs: [], connection: { status: "connected", isDisconnected: false, isPolling: false },
-}) as NextData;
+  torrents: "on", torrentPresence: { enabled: true, jobs: false, running: false, windingDown: false, windDown: null },
+});
+const torrentsOn = { torrents: "on", torrentPresence: { enabled: true, jobs: false, running: false, windingDown: false, windDown: null } } as NextData;
 
 const query = new URLSearchParams(location.search);
 const screen = query.get("screen") ?? "egress";
 const dictionary = { ...en, ...nextEn } as Record<string, string>;
 const status = document.getElementById("status")!;
 const shell = {
-  search: query.get("search") ?? "", actionsRef, controlsHost: document.getElementById("controls"), registry: new Map(),
-  setFlags: (flags: { dirty: boolean; status: string | null }) => { status.textContent = `${flags.dirty ? "dirty" : "clean"} ${flags.status ?? ""}`.trim(); },
+  search: query.get("search") ?? "", actionsRef, controlsHost: document.getElementById("controls"), registry: new SearchRegistry(),
+  setFlags: (flags: PanelFlags) => { status.textContent = `${flags.dirty ? "dirty" : "clean"} ${typeof flags.status === "string" ? flags.status : ""}`.trim(); },
 };
 
 /** Where a settings address lands once the route table has had its say. */
@@ -133,7 +136,7 @@ function Fixture() {
     return <NextDataContext.Provider value={block}><aside style={{ width: 300 }}><AttentionBlock /></aside></NextDataContext.Provider>;
   }
   if (screen === "redirect") return <Redirects />;
-  return <EgressPage data={data} egresses={egresses} action={action} busy={false} />;
+  return <NextDataContext.Provider value={torrentsOn}><EgressPage data={data} egresses={egresses} action={action} busy={false} /></NextDataContext.Provider>;
 }
 
 createRoot(document.getElementById("root")!).render(

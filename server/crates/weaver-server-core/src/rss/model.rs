@@ -25,6 +25,8 @@ pub(crate) struct FeedItem {
     pub(crate) categories: Vec<String>,
     pub(crate) download_url: Option<String>,
     pub(crate) display_url: Option<String>,
+    // The download link's declared type says it is a torrent file.
+    pub(crate) declared_torrent: bool,
 }
 
 #[derive(Debug, Default)]
@@ -46,6 +48,8 @@ struct ParsedFeedEntry {
 struct ParsedFeedLink {
     href: String,
     length: Option<u64>,
+    // Its `type` attribute is application/x-bittorrent.
+    torrent_type: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -300,17 +304,21 @@ fn feed_item_from_entry(entry: ParsedFeedEntry) -> FeedItem {
                 })
         })
     };
-    let download_url = media_content
-        .as_ref()
-        .map(|link| link.href.clone())
-        .or_else(magnet)
-        .or_else(|| {
-            entry
-                .links
-                .iter()
-                .find(|link| looks_like_direct_download_url(&link.href))
-                .map(|link| link.href.clone())
-        });
+    let direct = || {
+        entry
+            .links
+            .iter()
+            .find(|link| looks_like_direct_download_url(&link.href))
+    };
+    let (download_url, declared_torrent) = match media_content {
+        Some(link) => (Some(link.href.clone()), link.torrent_type),
+        None => match magnet() {
+            Some(uri) => (Some(uri), false),
+            None => direct().map_or((None, false), |link| {
+                (Some(link.href.clone()), link.torrent_type)
+            }),
+        },
+    };
     let display_url = entry.links.first().map(|link| link.href.clone());
     let item_id = if !entry.id.is_empty() {
         entry.id
@@ -339,6 +347,7 @@ fn feed_item_from_entry(entry: ParsedFeedEntry) -> FeedItem {
         categories: entry.categories,
         download_url,
         display_url,
+        declared_torrent,
     }
 }
 
@@ -409,6 +418,7 @@ fn apply_text_feed_element(local_name: &str, text: &str, entry: &mut ParsedFeedE
         "link" => entry.links.push(ParsedFeedLink {
             href: text.to_string(),
             length: None,
+            torrent_type: false,
         }),
         "category" => entry.categories.push(text.to_string()),
         "pubdate" | "published" => entry.published_at = parse_feed_timestamp(text),
@@ -433,7 +443,17 @@ fn feed_link_from_attrs<R: std::io::BufRead>(
         None => attr_value_by_name(reader, element, "filesize")?,
     }
     .and_then(|value| value.parse::<u64>().ok());
-    Ok(Some(ParsedFeedLink { href, length }))
+    let torrent_type = attr_value_by_name(reader, element, "type")?.is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("application/x-bittorrent"))
+    });
+    Ok(Some(ParsedFeedLink {
+        href,
+        length,
+        torrent_type,
+    }))
 }
 
 fn attr_value_by_name<R: std::io::BufRead>(

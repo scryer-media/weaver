@@ -202,9 +202,17 @@ impl SettingsMutation {
             MaybeUndefined::Null => Some(None),
             MaybeUndefined::Value(cap) => Some(Some(cap)),
         };
+        // Turning torrents off, or choosing again how a wind-down ends: how
+        // the torrents still running end, `None` for at once.
+        let mut wind_down = None;
         let torrent_update = match &input.torrent {
             Some(update) => {
                 let mut torrent = config.read().await.torrent.clone();
+                if update.enabled == Some(false)
+                    && (torrent.enabled || update.when_disabled.is_some())
+                {
+                    wind_down = Some(update.when_disabled.unwrap_or_default().wind_down());
+                }
                 update.apply(&mut torrent);
                 let torrent = torrent
                     .checked()
@@ -358,7 +366,15 @@ impl SettingsMutation {
             }
         };
 
-        let (settings, runtime_paths) = persist_then_update_config(
+        // How the torrents still running end is taken before the settings
+        // that turn torrents off are saved: any caller that hands the saved
+        // settings to the torrents before this mutation does finds it.
+        let torrents = ctx.data_opt::<weaver_server_core::torrents::service::TorrentService>();
+        let wind_down_was = match (wind_down, torrents) {
+            (Some(wind_down), Some(torrents)) => Some(torrents.wind_down_when_off(wind_down).await),
+            _ => None,
+        };
+        let saved = persist_then_update_config(
             config,
             "settings.mutation.update_settings.apply",
             settings_persist,
@@ -434,7 +450,16 @@ impl SettingsMutation {
                 (settings, runtime_paths)
             },
         )
-        .await?;
+        .await;
+        let (settings, runtime_paths) = match saved {
+            Ok(saved) => saved,
+            Err(error) => {
+                if let (Some(was), Some(torrents)) = (wind_down_was, torrents) {
+                    torrents.keep_wind_down_after_failed_save(was).await;
+                }
+                return Err(error);
+            }
+        };
 
         if let Some(seconds) = propagation_delay_secs {
             handle.set_propagation_delay(seconds).await?;

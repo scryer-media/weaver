@@ -105,7 +105,10 @@ async fn rig() -> Rig {
             categories: Vec::new(),
             seeding: None,
             upload_cap: None,
-            torrent: TorrentConfig::default(),
+            torrent: TorrentConfig {
+                enabled: true,
+                ..TorrentConfig::default()
+            },
         },
         JobEnv::unbounded(),
         Arc::new(SystemClock),
@@ -348,4 +351,48 @@ async fn staging_names_a_torrent_and_leaves_it_to_submit() {
     let result = response_data(&submitted)["submitStagedNzbs"]["results"][0].clone();
     assert_eq!(result["accepted"], true);
     assert_eq!(result["item"]["state"], "PAUSED");
+}
+
+// While torrents take no new ones, staging refuses a torrent itself, so every
+// client's row says so before anything is submitted. An NZB stages as ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staging_refuses_a_torrent_while_torrents_are_off() {
+    let rig = rig().await;
+    rig.torrents
+        .set_settings(TorrentSettings {
+            complete_dir: rig._dir.path().join("complete"),
+            categories: Vec::new(),
+            seeding: None,
+            upload_cap: None,
+            torrent: TorrentConfig {
+                enabled: false,
+                ..TorrentConfig::default()
+            },
+        })
+        .await;
+
+    let staged = rig
+        .run(
+            STAGE,
+            json!({ "input": { "nzbUpload": null } }),
+            Some(("a.torrent", &metainfo("one.mkv"))),
+        )
+        .await;
+    assert_no_errors(&staged);
+    let data = response_data(&staged)["stageNzbUpload"].clone();
+    assert_eq!(data["kind"], "TORRENT");
+    assert_eq!(data["accepted"], false);
+    assert_eq!(data["error"], weaver_server_core::torrents::status::OFF);
+
+    let staged = rig
+        .run(
+            STAGE,
+            json!({ "input": { "nzbUpload": null } }),
+            Some(("a.nzb", &nzb("staged-off"))),
+        )
+        .await;
+    assert_no_errors(&staged);
+    let data = response_data(&staged)["stageNzbUpload"].clone();
+    assert_eq!(data["kind"], "NZB");
+    assert_eq!(data["accepted"], true);
 }

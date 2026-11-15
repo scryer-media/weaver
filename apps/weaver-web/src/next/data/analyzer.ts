@@ -7,6 +7,9 @@ export type AnalyzerKind = "nzb" | "torrent" | "magnet";
 /** What the picker offers. The kind is read from the bytes, not the name. */
 export const ANALYZER_ACCEPT = ".nzb,.gz,.zst,.xz,.torrent";
 
+/** What the picker offers while torrents are off: NZBs alone. */
+export const ANALYZER_ACCEPT_NZB = ".nzb,.gz,.zst,.xz";
+
 /** The daemon's default inline NZB limit; a larger NZB is refused before it is read. */
 export const NZB_MAX_BYTES = 268_435_456;
 

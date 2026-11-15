@@ -5,12 +5,16 @@ import { lazy, Suspense, type ComponentType, type LazyExoticComponent } from "re
 import { Navigate, useNavigate, useParams } from "react-router";
 import { useTranslate } from "@/lib/context/translate-context";
 import { Tabs } from "../../components/Tabs";
+import { withoutTorrentOnly } from "../../data/torrents-shown";
+import { TorrentsOnly, useTorrentsShown } from "../../data/use-torrents-shown";
 import { NextRouteFallback } from "../../shell/route-states";
 
 interface Dashboard {
   id: string;
   label: string;
   page: LazyExoticComponent<ComponentType>;
+  /** Shown only while torrents are on. */
+  torrentOnly?: boolean;
 }
 
 /**
@@ -36,6 +40,7 @@ const DASHBOARDS: readonly Dashboard[] = [
   {
     id: "torrents",
     label: "next.monitoring.dash.torrents",
+    torrentOnly: true,
     page: lazy(() => import("./TorrentsDashboard").then((module) => ({ default: module.TorrentsDashboard }))),
   },
   {
@@ -49,9 +54,10 @@ const DASHBOARDS: readonly Dashboard[] = [
 export function DashboardNav({ active }: { active: string }) {
   const t = useTranslate();
   const navigate = useNavigate();
+  const shown = withoutTorrentOnly(DASHBOARDS, useTorrentsShown(), (dashboard) => dashboard.torrentOnly === true);
   return (
     <Tabs
-      tabs={DASHBOARDS.map((dashboard) => ({ id: dashboard.id, label: t(dashboard.label) }))}
+      tabs={shown.map((dashboard) => ({ id: dashboard.id, label: t(dashboard.label) }))}
       active={active}
       onSelect={(id) => navigate(id === DASHBOARDS[0]!.id ? "/monitoring" : `/monitoring/${id}`)}
     />
@@ -65,9 +71,18 @@ export function MonitoringRoute() {
     return <Navigate to="/monitoring" replace />;
   }
   const Page = dashboard.page;
-  return (
+  const page = (
     <Suspense fallback={<NextRouteFallback />}>
       <Page />
     </Suspense>
+  );
+  // A torrent-only dashboard waits for whether torrents are on, and leaves
+  // for the first dashboard once they are known to be off.
+  return dashboard.torrentOnly ? (
+    <TorrentsOnly pending={<NextRouteFallback />} fallback={<Navigate to="/monitoring" replace />}>
+      {page}
+    </TorrentsOnly>
+  ) : (
+    page
   );
 }

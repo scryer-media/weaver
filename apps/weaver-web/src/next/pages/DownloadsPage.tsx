@@ -84,6 +84,7 @@ import { AddNzbDialog } from "../features/AddNzbDialog";
 import { ScheduleSeedingNote } from "../features/torrents/ScheduleSeedingNote";
 import { TorrentRemoveDialog } from "../features/torrents/TorrentRemoveDialog";
 import { useTorrentSummaries } from "../data/use-torrents";
+import { useTorrentAddsOffered, useTorrentsShown } from "../data/use-torrents-shown";
 import { SpeedLimitControl, useSpeedLimitInForce } from "../features/SpeedLimitDialog";
 import { DownloadInspector } from "./downloads/DownloadInspector";
 import { DownloadRow } from "./downloads/DownloadRow";
@@ -251,9 +252,14 @@ export function DownloadsPage() {
   const speedLimit = useSpeedLimitInForce().inForce ?? 0;
   const statusLabel = useStatusLabel();
   const t = useTranslate();
+  const torrentsOn = useTorrentsShown();
+  // The empty text and the drop hint ask for torrents only while torrents are on.
+  const torrentAdds = useTorrentAddsOffered();
 
   const [facets, setFacets] = useState<ReadonlySet<string>>(NO_FACETS);
-  const [protocol, setProtocol] = useState<ProtocolFacet>(null);
+  const [pickedProtocol, setProtocol] = useState<ProtocolFacet>(null);
+  // The protocol filter is torrent-only: while it is hidden it filters nothing.
+  const protocol = torrentsOn ? pickedProtocol : null;
   const [tag, setTag] = useState<string | null>(null);
   const [tab, setTab] = useState<TabId>("all");
   const [sort, setSort] = useState<SortId>("priority");
@@ -337,7 +343,7 @@ export function DownloadsPage() {
     [jobs],
   );
   const torrents = useTorrentSummaries(torrentIds);
-  const seedingColumn = [...torrents.values()].some((torrent) => showsSeeding(torrent.state));
+  const seedingColumn = torrentsOn && [...torrents.values()].some((torrent) => showsSeeding(torrent.state));
   // The row handlers read a job's protocol by id, so they keep their identity while the rows move.
   const jobsRef = useRef(jobs);
   useLayoutEffect(() => {
@@ -709,15 +715,19 @@ export function DownloadsPage() {
             className="w-[132px] sm:w-[224px]"
           />
           <PauseAllControl paused={isPaused} resumeAt={resumeAt} />
-          <ScheduleSeedingNote torrents={torrents} />
-          <SecondaryButton
-            icon={torrentsPaused ? "resume" : "pause"}
-            onClick={() => {
-              void (torrentsPaused ? resumeTorrents({}) : pauseTorrents({}));
-            }}
-          >
-            {torrentsPaused ? t("next.downloads.resumeTorrents") : t("next.downloads.pauseTorrents")}
-          </SecondaryButton>
+          {torrentsOn ? (
+            <>
+              <ScheduleSeedingNote torrents={torrents} />
+              <SecondaryButton
+                icon={torrentsPaused ? "resume" : "pause"}
+                onClick={() => {
+                  void (torrentsPaused ? resumeTorrents({}) : pauseTorrents({}));
+                }}
+              >
+                {torrentsPaused ? t("next.downloads.resumeTorrents") : t("next.downloads.pauseTorrents")}
+              </SecondaryButton>
+            </>
+          ) : null}
           <SpeedLimitControl />
           <PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>{t("next.addNzb.title")}</PrimaryButton>
         </>
@@ -728,11 +738,13 @@ export function DownloadsPage() {
               looks stalled, so Downloads says so rather than leaving it to the
               diagnostic screens. The block draws nothing when all is well. */}
           <AttentionBlock />
-          <ProtocolFilterBlock
-            counts={protocolCounts}
-            selected={protocol}
-            onSelect={(facet) => reset(() => setProtocol(facet))}
-          />
+          {torrentsOn ? (
+            <ProtocolFilterBlock
+              counts={protocolCounts}
+              selected={protocol}
+              onSelect={(facet) => reset(() => setProtocol(facet))}
+            />
+          ) : null}
           <CategoryListBlock
             items={categories}
             selected={facets}
@@ -893,7 +905,7 @@ export function DownloadsPage() {
               centered
               testId={testIds.queueEmpty}
               title={t("next.downloads.emptyTitle")}
-              body={t("next.downloads.emptyBody")}
+              body={t(torrentAdds ? "next.downloads.emptyBody" : "next.downloads.emptyBodyNzb")}
               action={<PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>{t("next.addNzb.title")}</PrimaryButton>}
             />
           ) : jobs.length === 0 ? (
@@ -930,7 +942,7 @@ export function DownloadsPage() {
         </div>
         {dropping ? (
           <div className="pointer-events-none absolute inset-0 flex items-center justify-center border border-dashed border-wv-accent bg-wv-selected">
-            <span className="text-[13px] font-medium text-wv-strong">{t("next.downloads.dropHint")}</span>
+            <span className="text-[13px] font-medium text-wv-strong">{t(torrentAdds ? "next.downloads.dropHint" : "next.downloads.dropHintNzb")}</span>
           </div>
         ) : null}
       </div>

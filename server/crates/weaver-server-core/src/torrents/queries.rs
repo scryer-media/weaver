@@ -8,7 +8,7 @@ use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx, max_row
 use crate::settings::SeedingPolicy;
 use crate::torrents::model::{parse_file_priorities, parse_named_by};
 use crate::torrents::{
-    ContentLayout, FilePriority, Infohash, TorrentCounters, TorrentIntent, TorrentRecord,
+    ContentLayout, FilePriority, Infohash, KeptIntent, TorrentCounters, TorrentRecord,
     TorrentSource, TrackerEntry,
 };
 
@@ -59,7 +59,8 @@ fn opt_u32(row: &SqlRow, column: &str) -> Result<Option<u32>, StateError> {
 
 pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError> {
     let source = row.text("source")?;
-    let intent = row.text("state")?;
+    let state = row.text("state")?;
+    let kept = KeptIntent::parse(&state).ok_or_else(|| corrupt("intent", &state))?;
     let policy_override = SeedingPolicy::kept(
         row.opt_text("policy_override")?
             .map(|json| serde_json::from_str(&json).map_err(|error| corrupt("policy", error)))
@@ -79,7 +80,8 @@ pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError
         metainfo: row.opt_bytes("metainfo")?.map(bytes::Bytes::from),
         category_id: opt_u32(row, "category_id")?,
         added_at_ms: row.i64("added_at_ms")?,
-        intent: TorrentIntent::parse(&intent).ok_or_else(|| corrupt("intent", &intent))?,
+        intent: kept.intent(),
+        wound_down: kept == KeptIntent::WoundDown,
         forced: row.bool("forced")?,
         completed_at_ms: row.opt_i64("completed_at_ms")?,
         storage_dir: row.opt_text("storage_dir")?,

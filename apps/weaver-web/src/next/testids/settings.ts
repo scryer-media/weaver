@@ -43,6 +43,8 @@ export const testIds = {
   // A control's own parts, keyed by the control's ID.
   menu: (ownerId: string) => `${ownerId}-menu`,
   option: (ownerId: string, value: string) => `${ownerId}-option-${value}`,
+  /** A further line said of an option. */
+  optionNote: (ownerId: string, value: string) => `${ownerId}-option-${value}-note`,
   /** A Select's trigger showing `value` as the current choice. */
   selected: (ownerId: string, value: string) => `${ownerId}-selected-${value}`,
   browse: (ownerId: string) => `${ownerId}-browse`,

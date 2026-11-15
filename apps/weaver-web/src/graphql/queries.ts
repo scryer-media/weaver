@@ -1031,6 +1031,17 @@ export const METRICS_PAGE_QUERY = gql`
   ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
+/** Whether torrents are on and whether there are torrents: what torrent things show by. */
+const TORRENT_PRESENCE_FIELDS = `
+  fragment TorrentPresenceFields on TorrentPresence {
+    enabled
+    jobs
+    running
+    windingDown
+    windDown
+  }
+`;
+
 export const LIVE_METRICS_QUERY = gql`
   query LiveMetrics {
     metrics: systemMetrics {
@@ -1045,8 +1056,12 @@ export const LIVE_METRICS_QUERY = gql`
         ...DownloadBlockFields
       }
     }
+    torrents: torrentPresence {
+      ...TorrentPresenceFields
+    }
   }
   ${DOWNLOAD_BLOCK_FIELDS}
+  ${TORRENT_PRESENCE_FIELDS}
 `;
 
 export const SYSTEM_INFO_QUERY = gql`
@@ -1430,9 +1445,13 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
         busy
         max
       }
+      torrents {
+        ...TorrentPresenceFields
+      }
     }
   }
   ${DOWNLOAD_BLOCK_FIELDS}
+  ${TORRENT_PRESENCE_FIELDS}
 `;
 
 export const METRICS_PAGE_SUBSCRIPTION = gql`
