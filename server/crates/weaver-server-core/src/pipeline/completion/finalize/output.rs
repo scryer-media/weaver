@@ -9,6 +9,7 @@ use super::deobfuscate::{self, DeliveryNamingPlan, SrrdbInputs};
 use crate::jobs::working_dir::{WORKING_DIR_MARKER, mark_weaver_owned_output_dir};
 use crate::pipeline::full_disk::{Stage, Wants};
 use crate::post_processing::model::PostProcessingSettings;
+use crate::runtime::fs::Placement;
 use crate::runtime::{file_cache, fs as runtime_fs};
 
 #[derive(Debug)]
@@ -228,6 +229,21 @@ fn move_path_with_copy_fallback(
     dst: &std::path::Path,
     phase_counters: &PhaseCounters,
 ) -> std::io::Result<()> {
+    move_path_by_copy(src, dst, &mut |copied| {
+        phase_counters
+            .completed_bytes
+            .fetch_add(copied, Ordering::Relaxed);
+        Ok(())
+    })
+}
+
+// The copy that stands in for a move, each file created exclusively and
+// told to `on_copied` as it lands, which may stop it.
+fn move_path_by_copy(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    on_copied: &mut dyn FnMut(u64) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let metadata = std::fs::symlink_metadata(src)?;
 
     if metadata.file_type().is_symlink() {
@@ -251,22 +267,14 @@ fn move_path_with_copy_fallback(
         })?;
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
-            move_path_with_copy_fallback(
-                &entry.path(),
-                &dst.join(entry.file_name()),
-                phase_counters,
-            )?;
+            move_path_by_copy(&entry.path(), &dst.join(entry.file_name()), on_copied)?;
         }
         std::fs::remove_dir(src)?;
         return Ok(());
     }
 
     let parent_fingerprint = runtime_fs::prepare_destination_parent(dst)?;
-    file_cache::copy_large_file_with_progress(src, dst, |copied| {
-        phase_counters
-            .completed_bytes
-            .fetch_add(copied, Ordering::Relaxed);
-    })?;
+    file_cache::copy_large_file_with_progress(src, dst, on_copied)?;
     if !runtime_fs::destination_parent_matches(dst, &parent_fingerprint)? {
         return Err(std::io::Error::other(format!(
             "destination parent changed during copy: {}",
@@ -277,13 +285,24 @@ fn move_path_with_copy_fallback(
     Ok(())
 }
 
+// The step of a delivery move made by name alone: the metadata change, a
+// rename or a link and unlink, never a copy. What only a copy can place is
+// said, for the mover to copy.
 fn rename_path_for_publication(
     src: &std::path::Path,
     dst: &std::path::Path,
-) -> std::io::Result<()> {
+) -> std::io::Result<Placement> {
+    rename_path_for_publication_with(src, dst, |src, dst| std::fs::hard_link(src, dst))
+}
+
+fn rename_path_for_publication_with(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    link: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<Placement> {
     let metadata = std::fs::symlink_metadata(src)?;
     if !metadata.is_dir() {
-        return runtime_fs::rename_no_overwrite(src, dst);
+        return runtime_fs::place_no_overwrite_with_link(src, dst, link);
     }
 
     match std::fs::symlink_metadata(dst) {
@@ -296,8 +315,17 @@ fn rename_path_for_publication(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    std::fs::rename(src, dst)
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(Placement::Placed),
+        Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+            Ok(Placement::Copy(error))
+        }
+        Err(error) => Err(error),
+    }
 }
+
+// The step a move makes by name, given where it is made.
+type Place = fn(&std::path::Path, &std::path::Path) -> std::io::Result<Placement>;
 
 fn move_path_with_safe_rename_or_copy_fallback(
     src: &std::path::Path,
@@ -311,8 +339,10 @@ fn move_path_with_safe_rename_or_copy_fallback(
 // The writer of the volume a delivery lands on. Each rename into the
 // destination runs on that volume's thread, behind whatever else is queued
 // for the volume, and its own result comes back to the mover, which waits
-// for it on a thread of its own. A move that crosses devices is then
-// copied by the mover, never by the volume's thread.
+// for it on a thread of its own. The volume's thread makes only the
+// metadata change: a move that only a copy can make, across devices or on
+// a mount without links, comes back to the mover, which copies it on its
+// own thread, never the volume's.
 #[derive(Clone)]
 pub(crate) struct Renames(Arc<crate::operations::disk::writer::Submitter>);
 
@@ -321,18 +351,16 @@ impl Renames {
         Self(to)
     }
 
-    fn rename(&self, src: &Path, dst: &Path) -> std::io::Result<()> {
+    fn place(&self, src: &Path, dst: &Path, place: Place) -> std::io::Result<Placement> {
         let (answer, answered) = std::sync::mpsc::sync_channel(1);
         let (from, to) = (src.to_path_buf(), dst.to_path_buf());
         // The writer hears no failure: the mover judges the result, and a
         // volume with no thread is none either.
         self.0.ask(src.to_path_buf(), move || {
-            let _ = answer.send(rename_path_for_publication(&from, &to));
+            let _ = answer.send(place(&from, &to));
         });
         // A volume with no thread drops the rename unrun: it is made here.
-        answered
-            .recv()
-            .unwrap_or_else(|_| rename_path_for_publication(src, dst))
+        answered.recv().unwrap_or_else(|_| place(src, dst))
     }
 }
 
@@ -343,19 +371,45 @@ fn move_path_through(
     source_bytes: u64,
     phase_counters: Arc<PhaseCounters>,
 ) -> Result<(), (std::io::Error, std::io::Error)> {
+    move_path_through_using(
+        renames,
+        src,
+        dst,
+        source_bytes,
+        phase_counters,
+        rename_path_for_publication,
+        move_path_with_copy_fallback,
+    )
+}
+
+fn move_path_through_using<C>(
+    renames: Option<&Renames>,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    source_bytes: u64,
+    phase_counters: Arc<PhaseCounters>,
+    place: Place,
+    copy: C,
+) -> Result<(), (std::io::Error, std::io::Error)>
+where
+    C: FnOnce(&std::path::Path, &std::path::Path, &PhaseCounters) -> std::io::Result<()>,
+{
     move_path_with_safe_rename_or_copy_fallback_using(
         src,
         dst,
         source_bytes,
         phase_counters,
         |src, dst| match renames {
-            Some(renames) => renames.rename(src, dst),
-            None => rename_path_for_publication(src, dst),
+            Some(renames) => renames.place(src, dst, place),
+            None => place(src, dst),
         },
-        move_path_with_copy_fallback,
+        copy,
     )
 }
 
+// The one place a move's copy is decided: the step by name says whether
+// only a copy can place the entry, and the copy then runs here, on the
+// mover's thread, reporting each file as it lands.
 fn move_path_with_safe_rename_or_copy_fallback_using<R, C>(
     src: &std::path::Path,
     dst: &std::path::Path,
@@ -365,11 +419,11 @@ fn move_path_with_safe_rename_or_copy_fallback_using<R, C>(
     copy: C,
 ) -> Result<(), (std::io::Error, std::io::Error)>
 where
-    R: FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+    R: FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<Placement>,
     C: FnOnce(&std::path::Path, &std::path::Path, &PhaseCounters) -> std::io::Result<()>,
 {
     match rename(src, dst) {
-        Ok(()) => {
+        Ok(Placement::Placed) => {
             if source_bytes > 0 {
                 phase_counters
                     .completed_bytes
@@ -377,12 +431,12 @@ where
             }
             Ok(())
         }
-        Err(rename_err) if rename_err.kind() == std::io::ErrorKind::CrossesDevices => {
+        Ok(Placement::Copy(rename_err)) => {
             copy(src, dst, &phase_counters).map_err(|copy_err| (rename_err, copy_err))
         }
         Err(rename_err) => Err((
             rename_err,
-            std::io::Error::other("copy fallback not attempted for a non-cross-device error"),
+            std::io::Error::other("copy fallback not attempted for an error a copy cannot mend"),
         )),
     }
 }
