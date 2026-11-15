@@ -930,6 +930,7 @@ impl NntpClient {
         }
 
         let mut saw_local_capacity = false;
+        let mut saw_contention = false;
         let mut saw_recovery_gate = false;
         let mut credentials_refused = None;
         let mut provider_capacity_error = None;
@@ -948,10 +949,17 @@ impl NntpClient {
                 saw_local_capacity = true;
                 continue;
             }
-            let permit = match self
+            let Some(permit) = self
                 .pool
-                .try_acquire_blocking_permit_for_work(server, demanded)
-            {
+                .try_acquire_blocking_permit_uncontended(server, demanded)
+            else {
+                // Another caller held the server's reconnect stamp for the
+                // moment: a lost race, retried at once like a contended
+                // selection, never waited on as if capacity were short.
+                saw_contention = true;
+                continue;
+            };
+            let permit = match permit {
                 Ok(permit) => permit,
                 // Kept apart from a permit or socket shortage: one is a queue
                 // to wait in, the other is a server holding itself open for a
@@ -1061,6 +1069,8 @@ impl NntpClient {
             Err(BlockingBodyLaneAcquireError::ProviderCapacity(error))
         } else if let Some(error) = other_error {
             Err(BlockingBodyLaneAcquireError::Other(error))
+        } else if saw_contention {
+            Err(BlockingBodyLaneAcquireError::SelectionContended)
         } else if saw_local_capacity {
             Err(BlockingBodyLaneAcquireError::LocalCapacity)
         } else if saw_recovery_gate {

@@ -4,6 +4,7 @@
 use super::*;
 
 pub(super) mod owned_lane;
+pub(crate) use owned_lane::acquire_owned_lane_through_contention;
 pub mod queue;
 pub(crate) mod repeated;
 mod retention;

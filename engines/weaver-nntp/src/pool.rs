@@ -782,7 +782,7 @@ impl NntpPool {
                         }
                     }
                     if let Ok(mut connection) = result {
-                        *pool.last_connect_failure[idx].lock().await = None;
+                        pool.clear_connect_failure(&mut *pool.last_connect_failure[idx].lock().await);
                         slot.set_path(connection.route_path.as_ref());
                         slot.observe_outcome(connection.route_outcome.as_ref());
                         slot.active();
@@ -1065,8 +1065,9 @@ impl NntpPool {
                             c.socket_slot = Some(slot);
                             c.health_lease = Some(Arc::new(health_lease));
                             // Clear the failure timestamp on success.
-                            let mut last_failure = self.last_connect_failure[idx].lock().await;
-                            *last_failure = None;
+                            self.clear_connect_failure(
+                                &mut *self.last_connect_failure[idx].lock().await,
+                            );
                             break c;
                         }
                         Err(e) => {
@@ -1900,17 +1901,37 @@ impl NntpPool {
         server: ServerId,
         demanded: bool,
     ) -> Result<BlockingConnectionPermit> {
+        self.try_acquire_blocking_permit_uncontended(server, demanded)
+            .unwrap_or(Err(NntpError::PoolExhausted))
+    }
+
+    // As [`Self::try_acquire_blocking_permit_for_work`], with `None` when
+    // the server's reconnect stamp was held by another caller for the
+    // moment. That is a lock collision to retry at once, not a shortage:
+    // nothing announces its end, so a caller that waits for an event on it
+    // waits for nothing.
+    pub(crate) fn try_acquire_blocking_permit_uncontended(
+        &self,
+        server: ServerId,
+        demanded: bool,
+    ) -> Option<Result<BlockingConnectionPermit>> {
         let idx = server.0;
         if idx >= self.semaphores.len() {
-            return Err(NntpError::PoolExhausted);
+            return Some(Err(NntpError::PoolExhausted));
         }
-        let recent_failure = self.last_connect_failure[idx]
-            .try_lock()
-            .map_err(|_| NntpError::PoolExhausted)?;
+        let recent_failure = self.last_connect_failure[idx].try_lock().ok()?;
         if self.reconnect_hold(*recent_failure).is_some() {
-            return Err(NntpError::ServerRecovering);
+            return Some(Err(NntpError::ServerRecovering));
         }
         drop(recent_failure);
+        Some(self.acquire_blocking_permit_past_reconnect_hold(idx, demanded))
+    }
+
+    fn acquire_blocking_permit_past_reconnect_hold(
+        &self,
+        idx: usize,
+        demanded: bool,
+    ) -> Result<BlockingConnectionPermit> {
         let permit = self.semaphores[idx]
             .clone()
             .try_acquire_owned()
@@ -1956,6 +1977,16 @@ impl NntpPool {
     async fn note_connect_failure(&self, idx: usize, error: &NntpError) {
         if !dial_declined_over_limit(error) {
             *self.last_connect_failure[idx].lock().await = Some(Instant::now());
+        }
+    }
+
+    // Clear a server's reconnect stamp after a dial to it succeeded. A
+    // delay still running ends here, early and by no clock, so the health
+    // watch rings for whoever waits on that delay's end.
+    fn clear_connect_failure(&self, failed_at: &mut Option<Instant>) {
+        if self.reconnect_hold(failed_at.take()).is_some() {
+            self.health_changed
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
         }
     }
 
