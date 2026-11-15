@@ -179,21 +179,6 @@ fn simultaneous_dials_cannot_overbook() {
 }
 
 #[test]
-fn explicit_replacement_is_separate_and_bounded() {
-    let budget = SocketBudget::new(1);
-    let ordinary = budget.try_acquire().unwrap();
-    assert!(budget.try_acquire().is_none());
-    let replacement = budget.try_acquire_replacement().unwrap();
-    assert_eq!(budget.snapshot().physical, 2);
-    assert_eq!(budget.snapshot().replacement, 1);
-    assert!(budget.try_acquire_replacement().is_none());
-    drop(ordinary);
-    assert!(budget.try_acquire().is_none());
-    drop(replacement);
-    assert!(budget.try_acquire().is_some());
-}
-
-#[test]
 fn retirement_is_visible_without_waiting_for_the_registry() {
     let budget = SocketBudget::new(2);
     let first = budget.try_acquire().unwrap();

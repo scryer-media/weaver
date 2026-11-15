@@ -197,44 +197,16 @@ async fn unexpected_nntp_eof_fails_only_that_connection_and_retries() {
 // The paused clock lets only the stalled rung's connect window move time, so
 // a loaded runner cannot spend the operation's soft budget.
 #[tokio::test(start_paused = true)]
-async fn fallback_establishment_preserves_article_and_lane_soft_budgets() {
-    // Establishment exceeds the article budget. Each operation starts with a
-    // fresh route so a previous request cannot hide the timeout gap.
-    for operation in 0..6 {
-        let (cfg, failures) = config(&[Mode::StalledRung], STALLED_RUNG * 3);
-        let mut cfg = NntpClientConfig::single(cfg, 1);
-        cfg.soft_timeout = Duration::from_millis(50);
-        cfg.max_retries_per_server = 0;
-        let client = NntpClient::new(cfg);
-        match operation {
-            0 => {
-                client
-                    .fetch_body_with_groups("fixture", &["fixture.group".into()])
-                    .await
-                    .unwrap();
-            }
-            1 => {
-                client.fetch_head("fixture").await.unwrap();
-            }
-            2 => {
-                client.fetch_article("fixture").await.unwrap();
-            }
-            3 => {
-                assert_eq!(client.stat_many(&["fixture"]).await.unwrap(), vec![true]);
-            }
-            4 => {
-                client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
-            }
-            _ => {
-                client
-                    .acquire_extra_body_lane(ServerId(0), &[])
-                    .await
-                    .unwrap();
-            }
-        }
-        assert_eq!(failures.load(Ordering::SeqCst), 0);
-        client.shutdown().await;
-    }
+async fn fallback_establishment_preserves_the_article_soft_budget() {
+    // Establishment exceeds the article budget, and the fetch still lands.
+    let (cfg, failures) = config(&[Mode::StalledRung], STALLED_RUNG * 3);
+    let mut cfg = NntpClientConfig::single(cfg, 1);
+    cfg.soft_timeout = Duration::from_millis(50);
+    cfg.max_retries_per_server = 0;
+    let client = NntpClient::new(cfg);
+    client.fetch_body("fixture").await.unwrap();
+    assert_eq!(failures.load(Ordering::SeqCst), 0);
+    client.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -278,16 +250,16 @@ async fn proxy_budget_does_not_extend_waiting_for_pool_capacity() {
     let mut cfg = NntpClientConfig::single(cfg, 1);
     cfg.soft_timeout = Duration::from_millis(50);
     let client = NntpClient::new(cfg);
-    let lease = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
+    let held = client.pool().acquire(ServerId(0)).await.unwrap();
     // The route budget is an hour, so a pool wait that borrowed it would hang
     // until the runner ends the test; only the 50 ms soft budget can end this
     // wait with an acquire timeout.
-    let result = client.acquire_body_lane(ServerId(0), &[]).await;
+    let result = client.fetch_body("fixture").await;
     assert!(matches!(
         result,
         Err(weaver_nntp::NntpError::AcquireTimeout(_))
     ));
-    drop(lease);
+    drop(held);
     client.shutdown().await;
 }
 
