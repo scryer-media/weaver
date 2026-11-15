@@ -3636,9 +3636,20 @@ impl NntpClient {
 
     // Try to select one of the given groups on the connection.
     //
-    // Returns `Ok(true)` if a group was selected, `Ok(false)` if none were
-    // accepted, or `Err` on a connection-level error.
+    // Returns `Ok(true)` if a group was selected or the server needs none,
+    // `Ok(false)` if none were accepted, or `Err` on a connection-level
+    // error.
+    //
+    // A server that has not proven it refuses message-id fetches without a
+    // selected group is sent no GROUP, as on the download lanes: the round
+    // trip is spent only where a 412 has asked for it.
     async fn try_select_group(conn: &mut PooledConnection, groups: &[String]) -> Result<bool> {
+        if !conn.needs_group_prologue() {
+            if !groups.is_empty() {
+                conn.decline_group();
+            }
+            return Ok(true);
+        }
         for group in groups {
             match conn.select_group(group).await {
                 Ok(()) => return Ok(true),

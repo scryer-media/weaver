@@ -1037,6 +1037,13 @@ impl NntpConnection {
         crate::server_caps::requires_group_selection(&self.host, self.port)
     }
 
+    // The caller had a group to select and did not spend the round trip on
+    // it: a 412 to its next command teaches the process that this server
+    // needs one. See [`Self::observe_group_requirement`].
+    pub(crate) fn decline_group(&mut self) {
+        self.group_probe_armed = true;
+    }
+
     fn reset_multiline_decode_state(&mut self) {
         self.codec.set_multiline(false);
         self.codec.set_streaming_multiline(false);
