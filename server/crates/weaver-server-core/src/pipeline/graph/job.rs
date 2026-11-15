@@ -15,6 +15,7 @@ pub(crate) mod restore;
 mod runs;
 mod works;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -1331,6 +1332,7 @@ impl GraphJob {
                 }
             }
             if !offered {
+                self.fetch_unkept();
                 return Ok(());
             }
             self.writer.apply_all(
@@ -1340,6 +1342,42 @@ impl GraphJob {
                 effects,
                 &mut out,
             )?;
+        }
+    }
+
+    // What a give-back left of a root member not in hand comes again: the
+    // root waits on the articles under it again, the queue fetches them as
+    // first dispatched, and the member is open until they are in. Without
+    // them the member never closes, and a set covering it never rules.
+    fn fetch_unkept(&mut self) {
+        let mut unkept: BTreeMap<MemberId, Vec<weaver_graph::ByteRange>> = BTreeMap::new();
+        for (member, range) in self.writer.take_unkept() {
+            unkept.entry(member).or_default().push(range);
+        }
+        for (member, ranges) in unkept {
+            let volume = VolumeIndex(member.0);
+            let under: Vec<(u32, weaver_graph::ByteRange)> = self
+                .root
+                .map
+                .arrived_ranges(volume)
+                .into_iter()
+                .filter(|(_, placed)| {
+                    ranges
+                        .iter()
+                        .any(|range| placed.start < range.end && range.start < placed.end)
+                })
+                .collect();
+            if under.is_empty() {
+                continue;
+            }
+            for (ordinal, placed) in under {
+                self.root.map.unarrive(volume, ordinal);
+                self.tree.uncover(NodeId::ROOT, volume, placed);
+                self.notes.push(Note::Unread(volume, ordinal));
+            }
+            if let Some(namespace) = self.tree.namespace_mut(NodeId::ROOT) {
+                namespace.reopen(member);
+            }
         }
     }
 }
