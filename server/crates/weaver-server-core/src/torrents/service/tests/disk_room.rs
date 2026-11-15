@@ -380,7 +380,8 @@ async fn a_torrent_saved_on_another_disk_waits_on_that_disk() {
 // no room over the reserve waits on the ledger, as a usenet job's refused
 // booking does. Those writers give their promises back: the disk's free
 // figure never moves, and the torrent is woken by the ledger's ring, its
-// piece promised to it at once.
+// piece promised to it at once. The seeds it let go while it only
+// uploaded are dialled again at once, and it completes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_torrent_held_by_promises_wakes_when_they_are_released() {
     // 70 KiB over the reserve, 60 of them promised elsewhere: room to start,
@@ -389,15 +390,34 @@ async fn a_torrent_held_by_promises_wakes_when_they_are_released() {
     let disk = on_disk_promised(&room, 60 << 10).await;
     let service = &disk.rig.service;
     let ledger = disk.capacity.ledger(StorageRoot::Complete);
-    let run = held(&disk).await.live().unwrap();
+    let torrent = held(&disk).await;
+    let run = torrent.live().unwrap();
     assert_eq!(ledger_wait(service, disk.job_id), Some(16_384));
 
-    // The wake ends upload mode. A refusal heard once it has, from a write
-    // the run made before the wake, installs no wait: nothing could end
-    // one while the run is out of upload mode. It is heard again only if
-    // the run enters upload mode, which a refusal from before the wake
-    // cannot make it do. The seeder goes first, so no piece written after
-    // the wake can be refused and enter upload mode on its own.
+    ledger.release(60 << 10);
+    run.wait_for_upload_mode(false).await;
+    waits_for_room(service, disk.job_id, false).await;
+    torrent.wait_until_completed().await.unwrap();
+    assert!(!run.upload_mode());
+    assert!(!locked(&service.inner.disk_waits).contains_key(&disk.job_id));
+    assert!(!ledger.waited_on());
+    service.stop().await;
+    disk.seeding.stop().await;
+}
+
+// The wake ends upload mode. A refusal heard once it has, from a write the
+// run made before the wake, installs no wait: nothing could end one while
+// the run is out of upload mode. It is heard again only if the run enters
+// upload mode, which a refusal from before the wake cannot make it do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_heard_after_the_wake_installs_no_wait() {
+    let room = Arc::new(AtomicU64::new(70 << 10));
+    let disk = on_disk_promised(&room, 60 << 10).await;
+    let service = &disk.rig.service;
+    let ledger = disk.capacity.ledger(StorageRoot::Complete);
+    let run = held(&disk).await.live().unwrap();
+    // The seeder goes first, so no piece written after the wake can be
+    // refused and enter upload mode on its own.
     disk.seeding.stop().await;
     ledger.release(60 << 10);
     run.wait_for_upload_mode(false).await;
@@ -680,6 +700,69 @@ async fn a_torrent_that_joins_again_books_on_the_disk_it_kept() {
     assert_eq!((kept.disk, kept.dir), (place.disk, place.dir));
     assert_eq!(disk.capacity.root_looks(), looks);
     service.stop().await;
+}
+
+// A refusal kept while the run was out of upload mode is heard again once
+// the run enters it: a seeder named by a new tracker sends a piece, its
+// write finds no room, and the run waits on the ledger, shown waiting for
+// disk space, with nothing kept aside.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_kept_aside_is_heard_once_the_run_enters_upload_mode() {
+    let room = Arc::new(AtomicU64::new(1));
+    let disk = on_disk(&room).await;
+    let service = &disk.rig.service;
+    let job_id = disk.job_id;
+    held(&disk).await;
+    // No peer is left until the new seeder below is named.
+    disk.seeding.stop().await;
+    service.pause(job_id).await.unwrap();
+    waits_for_room(service, job_id, false).await;
+    service.resume(job_id).await.unwrap();
+    let torrent = handle_of(service, job_id).await;
+    torrent.wait_until_initialized().await.unwrap();
+    let run = torrent.live().unwrap();
+    let intake = service.inner.live.lock().await[&job_id]
+        .intake
+        .clone()
+        .unwrap();
+    let piece = bytes::Bytes::from(vec![0u8; 16_384]);
+    assert!(weaver_torrent::storage::write_refused(
+        &intake.verified(0, &piece).unwrap_err()
+    ));
+    service
+        .inner
+        .settled
+        .subscribe()
+        .wait_for(|_| locked(&service.inner.entering).contains_key(&job_id))
+        .await
+        .unwrap();
+    assert!(!run.upload_mode());
+
+    // A seeder of the same torrent, named by a tracker of its own.
+    let data: Vec<u8> = (0..65_536u32).map(|at| (at % 251) as u8).collect();
+    let files = [("set/a.bin", data.as_slice())];
+    let plain = metainfo("set", &files, 16_384, false);
+    let seeds = tempfile::tempdir().unwrap();
+    let seeding = seeder(seeds.path(), &plain, &files).await;
+    let std::net::SocketAddr::V4(peer) = seeding.listen_addr().unwrap() else {
+        panic!("the seeder listens on IPv4 loopback");
+    };
+    let url = tracker(peer).await;
+    service.add_trackers(job_id, vec![vec![url]]).await.unwrap();
+    run.wait_for_upload_mode(true).await;
+    waits_for_room(service, job_id, true).await;
+    assert_eq!(ledger_wait(service, job_id), Some(16_384));
+    service
+        .inner
+        .settled
+        .subscribe()
+        .wait_for(|_| !locked(&service.inner.entering).contains_key(&job_id))
+        .await
+        .unwrap();
+    let view = service.torrent(job_id).await.unwrap();
+    assert_eq!(view.detail.as_deref(), Some(DISK_SPACE_WAIT_REASON));
+    service.stop().await;
+    seeding.stop().await;
 }
 
 // A piece refused on the ledger while the place known is that of a folder
