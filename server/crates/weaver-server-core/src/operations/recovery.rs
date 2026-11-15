@@ -335,7 +335,8 @@ pub async fn recover_server_state(
     // the torrent service through the kept archives.
     let finishing = {
         let (db, work) = (db.clone(), intermediate_dir.to_path_buf());
-        tokio::task::spawn_blocking(move || crate::torrents::service::finish_retiring(&db, &work)).await
+        tokio::task::spawn_blocking(move || crate::torrents::service::finish_retiring(&db, &work))
+            .await
     };
     match finishing {
         Ok(Ok(rows)) => {

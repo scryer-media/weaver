@@ -263,6 +263,10 @@ fn nearest_device(path: &Path) -> Option<u64> {
     #[cfg(any(test, feature = "test-support"))]
     count_disk_look();
     #[cfg(test)]
+    if crate::runtime::fs::test_devices::refused(path) {
+        return None;
+    }
+    #[cfg(test)]
     if let Some(device) = crate::runtime::fs::test_devices::of(path) {
         return Some(device);
     }
@@ -738,6 +742,14 @@ struct Counts {
     device: [AtomicU64; LEDGERS],
     // How many times any of the ledgers rang those waiting for room.
     rings: AtomicU64,
+    // Rung with every ring for each listener waiting then: the pipeline
+    // hears `readings`, which keeps one ring for its next turn; a waiter
+    // outside it, such as a torrent waiting for room, listens here.
+    rung: tokio::sync::Notify,
+    // Held while a writer checks the room and books it, so two writers on
+    // the ledgers cannot pass one check. Nothing is read from the disk
+    // under it: only the cached reading and the counts.
+    booking: std::sync::Mutex<()>,
 }
 
 impl fmt::Debug for DiskLedger {
@@ -883,6 +895,90 @@ impl DiskLedger {
         })
     }
 
+    // `need` bytes are booked when the room above `reserve` that a good
+    // reading of `reader` leaves here holds them, with up to `extra` more
+    // beside them: checked and promised in one step, so no other writer
+    // books between the two. Returns how much of `extra` was booked; `None`
+    // books nothing. A volume with no reading, or a stale one, or no
+    // reserve, is not checked.
+    pub(crate) fn book(
+        &self,
+        reader: &CapacityReader,
+        reserve: u64,
+        need: u64,
+        extra: u64,
+    ) -> Option<u64> {
+        let _booking = self
+            .counts
+            .booking
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let room = checked_room(self, reader, reserve);
+        if need > room {
+            return None;
+        }
+        let extra = extra.min(room - need);
+        self.promise(need + extra);
+        Some(extra)
+    }
+
+    // `need` bytes are promised to a waiter a reading wakes, when the room
+    // it shows above `reserve` holds them: [`DiskLedger::book_wake`] on
+    // this ledger alone.
+    pub(crate) fn book_woken(&self, reader: &CapacityReader, reserve: u64, need: u64) -> bool {
+        Self::book_wake(&[(self, reader, need)], reserve)
+    }
+
+    // A waiter a reading wakes is promised what it needs on each ledger it
+    // waits on, `(ledger, reader, need)`, when every one has room for it
+    // above `reserve`: the one wake judgement every ledger waiter wakes by,
+    // a usenet job's and a torrent's alike, checked and promised in one
+    // step under the booking lock of each ledger, so no writer books
+    // between the two. A ledger at or under its reserve wakes no one,
+    // whatever it is owed. Ledgers on one disk are judged once, together,
+    // by the room the first of them shows; each is promised its own need,
+    // in the order given. Nothing is promised unless all fit.
+    pub(crate) fn book_wake(parts: &[(&DiskLedger, &CapacityReader, u64)], reserve: u64) -> bool {
+        let mut locks: Vec<&Counts> = parts.iter().map(|(ledger, ..)| &*ledger.counts).collect();
+        locks.sort_by_key(|counts| std::ptr::from_ref::<Counts>(counts) as usize);
+        locks.dedup_by(|one, other| std::ptr::eq(*one, *other));
+        let _booking: Vec<_> = locks
+            .iter()
+            .map(|counts| {
+                counts
+                    .booking
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            })
+            .collect();
+        let rooms: Vec<Option<u64>> = parts
+            .iter()
+            .map(|(ledger, reader, _)| waking_room(ledger, reader, reserve))
+            .collect();
+        if rooms.contains(&Some(0)) {
+            return false;
+        }
+        for (at, (ledger, ..)) in parts.iter().enumerate() {
+            if parts[..at]
+                .iter()
+                .any(|(first, ..)| first.same_disk(ledger))
+            {
+                continue;
+            }
+            let need = parts[at..]
+                .iter()
+                .filter(|(other, ..)| ledger.same_disk(other))
+                .fold(0u64, |sum, (.., need)| sum.saturating_add(*need));
+            if !super::room_wait::room_holds(rooms[at], need) {
+                return false;
+            }
+        }
+        for (ledger, _, need) in parts {
+            ledger.promise(*need);
+        }
+        true
+    }
+
     // `bytes` more are promised.
     pub(crate) fn promise(&self, bytes: u64) {
         if bytes > 0 {
@@ -991,6 +1087,7 @@ impl DiskLedger {
         if waited {
             self.counts.rings.fetch_add(1, Ordering::Release);
             self.readings.notify_one();
+            self.counts.rung.notify_waiters();
         }
     }
 
@@ -1041,6 +1138,34 @@ impl CapacityReader {
 
     pub fn current(&self) -> Capacity {
         (self.read)()
+    }
+}
+
+// The room above `reserve` a good reading of `reader` leaves on `ledger`:
+// every byte with no reserve, no reading, or a stale one, which checks
+// nothing. The one reserve sum every writer books by, through
+// [`DiskLedger::book`], usenet's and torrents' alike.
+fn checked_room(ledger: &DiskLedger, reader: &CapacityReader, reserve: u64) -> u64 {
+    match ledger.free_with(|| reader.current()) {
+        Some(free) if reserve > 0 && !free.stale => free.bytes.saturating_sub(reserve),
+        _ => u64::MAX,
+    }
+}
+
+// What a writer waiting here for room sees of a reading: the room above
+// `reserve` the ledger leaves, `None` with no reading, and none at all for
+// the last good reading held across a failed probe, which shows nothing
+// made. The one judgement every writer waiting on a ledger wakes by,
+// usenet's jobs and torrents alike.
+pub(crate) fn waking_room(
+    ledger: &DiskLedger,
+    reader: &CapacityReader,
+    reserve: u64,
+) -> Option<u64> {
+    match ledger.free_with(|| reader.current()) {
+        None => None,
+        Some(free) if free.stale => Some(0),
+        Some(free) => Some(free.bytes.saturating_sub(reserve)),
     }
 }
 
@@ -1402,7 +1527,14 @@ fn spawn_look(
             && let Some(entry) = lock_paths(cache).entries.get_mut(&path)
         {
             entry.space = Some(Arc::clone(&space));
-            entry.flight = None;
+            // A look begun after this one's device read failed is out still.
+            if entry
+                .flight
+                .as_ref()
+                .is_some_and(|flight| flight.same_channel(&sender.subscribe()))
+            {
+                entry.flight = None;
+            }
         }
         sender.send_modify(|progress| progress.space = Some(space));
     }));
@@ -1705,6 +1837,7 @@ impl HeldPaths {
         }
         ledger.counts.rings.fetch_add(1, Ordering::Release);
         ledger.readings.notify_one();
+        ledger.counts.rung.notify_waiters();
     }
 }
 
@@ -1758,6 +1891,13 @@ pub struct StorageCapacity {
     interval: Duration,
     probe: SharedProbeFn,
     clock: Arc<Clock>,
+    // The room promised to waiters let go on a reading, of every kind,
+    // until their steps end.
+    promises: super::room_wait::RoomPromises,
+    // How many times anything looked up the root a path lies on, through
+    // this owner: a test's own count, whatever other tests look up.
+    #[cfg(test)]
+    root_looks: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for StorageCapacity {
@@ -1891,7 +2031,21 @@ impl StorageCapacity {
             interval,
             probe,
             clock,
+            promises: super::room_wait::RoomPromises::default(),
+            #[cfg(test)]
+            root_looks: Arc::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_looks(&self) -> u64 {
+        self.root_looks.load(Ordering::Relaxed)
+    }
+
+    // The room promised to waiters let go on a reading, usenet's jobs and
+    // torrents alike, until their steps end.
+    pub(crate) fn promises(&self) -> &super::room_wait::RoomPromises {
+        &self.promises
     }
 
     // The free space of each asked path, in the order asked: a root's
@@ -2024,13 +2178,69 @@ impl StorageCapacity {
                 .and_then(|entry| entry.device)
                 .and_then(|look| look.device)
         })?;
-        [
+        self.root_on(device).flatten()
+    }
+
+    // The root whose disk `path` lies on, looked up now: the device of
+    // `path` from a root's own latest look, a current read, or one made
+    // now, set against each root's device from its latest look. The answer
+    // is the look's own, never read back from the path cache, which may
+    // have dropped it since. `Some(None)` when `path` lies on no root's
+    // disk. `None` when that is not known: the device could not be read,
+    // the look was lost or did not answer within [`ON_DEMAND_TIMEOUT`], or
+    // it matches no root while a root has not been looked at since it was
+    // pointed where it is.
+    pub(crate) async fn root_of_path(&self, path: &Path) -> Option<Option<StorageRoot>> {
+        #[cfg(test)]
+        self.root_looks.fetch_add(1, Ordering::Relaxed);
+        let deadline = tokio::time::Instant::now() + ON_DEMAND_TIMEOUT;
+        let ticket = self
+            .root_device(path)
+            .map_or_else(|| self.begin(path, Want::Device), Ticket::Device);
+        let device = match ticket.settle(Want::Device, deadline).await {
+            Ok(settled) => settled.device(),
+            Err(Unsettled::Lost) => {
+                debug!(path = %path.display(), "the device look was lost; the disk stays unknown");
+                None
+            }
+            Err(Unsettled::TimedOut) => {
+                debug!(path = %path.display(), "the device look did not answer in time; the disk stays unknown");
+                None
+            }
+        }?;
+        self.root_on(device)
+    }
+
+    // The root on `device`, by each root's device from its latest look:
+    // `Some(None)` when it is none of theirs, `None` when no root matches
+    // and one has not been looked at since it was pointed where it is.
+    fn root_on(&self, device: u64) -> Option<Option<StorageRoot>> {
+        let mut unlooked = false;
+        for root in [
             StorageRoot::Complete,
             StorageRoot::Intermediate,
             StorageRoot::Data,
-        ]
-        .into_iter()
-        .find(|root| self.slot(*root).lock().device.flatten() == Some(device))
+        ] {
+            match self.slot(root).lock().device {
+                Some(Some(at)) if at == device => return Some(Some(root)),
+                None => unlooked = true,
+                Some(_) => {}
+            }
+        }
+        (!unlooked).then_some(None)
+    }
+
+    // Whether some wait could be on `device`: a root's latest look found
+    // it, or a path a wait reads lies on it.
+    pub(crate) fn device_waited_on(&self, device: u64) -> bool {
+        StorageRoot::ALL
+            .into_iter()
+            .any(|root| self.root_slot_device(root) == Some(device))
+            || self
+                .held
+                .lock()
+                .iter()
+                .any(|held| held.device == Some(device))
     }
 
     // The entry for `path`, made when there is none. Past the cap, the
@@ -2078,9 +2288,16 @@ impl StorageCapacity {
             }
         }
         // A look that panicked closed its channel; the next ask starts
-        // another. One that returned is no longer out.
+        // another. One that returned is no longer out. A device ask does
+        // not share a look whose device read failed already, which is a
+        // failed reading answered from again: it looks anew.
         if let Some(flight) = &entry.flight
             && flight.has_changed().is_ok()
+            && !(matches!(want, Want::Device)
+                && flight
+                    .borrow()
+                    .device
+                    .is_some_and(|look| look.device.is_none()))
         {
             return Ticket::Wait(flight.clone());
         }
@@ -2233,6 +2450,14 @@ impl StorageCapacity {
     // rang since, heard by a turn that does not wait on it.
     pub(crate) fn rings(&self) -> u64 {
         self.slots[0].ledger.counts.rings.load(Ordering::Acquire)
+    }
+
+    // Resolves at the next ring, for a listener outside the pipeline: every
+    // listener waiting hears each ring. A listener enables the future, then
+    // judges what it waits for, then awaits it, so a ring between the two
+    // is not missed.
+    pub(crate) fn rung(&self) -> tokio::sync::futures::Notified<'_> {
+        self.slots[0].ledger.counts.rung.notified()
     }
 
     fn slot(&self, root: StorageRoot) -> &Arc<RootSlot> {

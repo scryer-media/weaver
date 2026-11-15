@@ -41,7 +41,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 121;
+const CURRENT_SCHEMA_VERSION: i64 = 122;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -1488,7 +1488,7 @@ mod tests {
         run_embedded_migrations_on_path_blocking(&db_path).unwrap();
 
         let pool = open_test_pool(&db_path).await;
-        assert_eq!(CURRENT_SCHEMA_VERSION, 121);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 122);
         assert_eq!(
             max_recorded_migration_version(&pool).await.unwrap(),
             Some(CURRENT_SCHEMA_VERSION)
@@ -2009,6 +2009,164 @@ mod tests {
         pool.close().await;
     }
 
+    // Migration 120 lets a torrent list read its page in the order the
+    // torrents were added: the existing torrents stay, the two ordered
+    // indexes exist, the category-only index they cover is gone, and a page
+    // of every torrent or of one category walks an index instead of sorting.
+    #[tokio::test]
+    async fn sqlite_migration_120_orders_the_torrent_list_by_an_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("pre-list-order.db");
+        let pool = open_test_pool(&db_path).await;
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(119), true)
+            .await
+            .unwrap();
+        for (job_id, category) in [(7_i64, Some(3_i64)), (8, None), (9, Some(3)), (10, Some(4))] {
+            sqlx::query(
+                "INSERT INTO torrents (job_id, infohash_v1, name, source, added_at_ms, state, category_id)
+                 VALUES (?, ?, 'order', 'magnet', ?, 'queued', ?)",
+            )
+            .bind(job_id)
+            .bind(vec![job_id as u8; 20])
+            .bind(100 - job_id)
+            .bind(category)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'index' AND tbl_name = 'torrents' AND name LIKE 'idx_torrents_%'
+             ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            indexes,
+            [
+                "idx_torrents_added",
+                "idx_torrents_category_added",
+                "idx_torrents_retiring"
+            ]
+        );
+        let page: Vec<i64> = sqlx::query_scalar(
+            "SELECT job_id FROM torrents ORDER BY added_at_ms, job_id LIMIT 10 OFFSET 0",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(page, [10, 9, 8, 7]);
+        for (query, index) in [
+            (
+                "SELECT job_id FROM torrents ORDER BY added_at_ms, job_id LIMIT 10 OFFSET 0",
+                "idx_torrents_added",
+            ),
+            (
+                "SELECT job_id FROM torrents WHERE category_id IN (3)
+                 ORDER BY added_at_ms, job_id LIMIT 10 OFFSET 0",
+                "idx_torrents_category_added",
+            ),
+        ] {
+            let plan = explain(&pool, query).await;
+            assert!(
+                plan.iter().any(|step| step.contains(index)),
+                "{query}: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+                "{query}: {plan:?}"
+            );
+        }
+
+        // The list's own statements for two categories and more, with and
+        // without the torrents in none: each category walks its index in
+        // the order of adding, and the compound merges them unsorted, to the
+        // rows `IN` keeps, in the same order.
+        use crate::persistence::sql_runtime::{SqlArg, SqlEngine};
+        use crate::torrents::queries::{CategoryIds, TorrentListFilter, list_statements};
+        for (ids, none, kept) in [
+            (vec![3, 4], false, vec![10, 9, 7]),
+            (vec![3, 4, 5], false, vec![10, 9, 7]),
+            (vec![4, 3], true, vec![10, 9, 8, 7]),
+            (vec![3], true, vec![9, 8, 7]),
+        ] {
+            let filter = TorrentListFilter {
+                categories: Some(CategoryIds {
+                    ids: ids.clone(),
+                    none,
+                    known: vec![3, 4, 5],
+                }),
+                hashes: None,
+            };
+            let statements = list_statements(SqlEngine::Sqlite, &filter, 0, Some(10));
+            assert_eq!(statements.len(), 1);
+            let (sql, args) = &statements[0];
+            let sql = sql.replace("{}", "?");
+            let bind = |query: &str| {
+                let mut statement = sqlx::query(sqlx::AssertSqlSafe(query.to_owned()));
+                for arg in args {
+                    let SqlArg::I64(value) = arg else {
+                        panic!("a category list binds integers")
+                    };
+                    statement = statement.bind(*value);
+                }
+                statement
+            };
+            let plan: Vec<String> = {
+                use sqlx::Row;
+                bind(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.get::<String, _>("detail"))
+                    .collect()
+            };
+            assert!(
+                plan.iter()
+                    .filter(|step| step.contains("idx_torrents_category_added"))
+                    .count()
+                    >= ids.len(),
+                "{sql}: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+                "{sql}: {plan:?}"
+            );
+            let rows: Vec<i64> = {
+                use sqlx::Row;
+                bind(&sql)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.get::<i64, _>("job_id"))
+                    .collect()
+            };
+            assert_eq!(rows, kept, "{ids:?}, none {none}");
+        }
+        pool.close().await;
+    }
+
+    async fn explain(pool: &sqlx::SqlitePool, query: &str) -> Vec<String> {
+        use sqlx::Row;
+        sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {query}")))
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect()
+    }
+
     // Migration 106 gives each torrent its own upload and download limits: a
     // fresh database has them, and an existing torrent is unlimited both
     // ways.
@@ -2286,17 +2444,17 @@ mod tests {
         pool.close().await;
     }
 
-    // A database at 119 upgrades to the current schema: each torrent it
+    // A database at 120 upgrades to the current schema: each torrent it
     // holds stays live, with no history row kept on it, and the start finds
     // the torrents a removal left retiring by their index.
     #[tokio::test]
-    async fn sqlite_migration_119_torrents_upgrade_with_no_kept_history_row() {
+    async fn sqlite_migration_120_torrents_upgrade_with_no_kept_history_row() {
         let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("v119.db");
+        let db_path = temp.path().join("v120.db");
         let pool = open_test_pool(&db_path).await;
         let catalog = embedded_catalog().unwrap();
         let payload = embedded_payload_bytes().unwrap();
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(119), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(120), true)
             .await
             .unwrap();
         sqlx::query(
@@ -2335,13 +2493,13 @@ mod tests {
         db.validate_backup_catalog().unwrap();
     }
 
-    // A database at 0.16.16's schema (92) or at 119 upgrades to the current
+    // A database at 0.16.16's schema (92) or at 120 upgrades to the current
     // one with the history files list there and empty: a history row it
     // held lists no files, its archive goes by its marked folders as before,
     // and a read of one job's list is served by the list's key.
     #[tokio::test]
-    async fn sqlite_upgrades_from_0_16_16_and_119_add_an_empty_history_files_list() {
-        for from in [92, 119] {
+    async fn sqlite_upgrades_from_0_16_16_and_120_add_an_empty_history_files_list() {
+        for from in [92, 120] {
             let temp = tempfile::tempdir().unwrap();
             let db_path = temp.path().join(format!("v{from}.db"));
             let pool = open_test_pool(&db_path).await;

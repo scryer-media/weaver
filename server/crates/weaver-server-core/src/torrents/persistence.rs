@@ -152,7 +152,14 @@ impl Database {
             _ => {}
         }
         let args = vec![
-            SqlArg::Text(if delete_files { RETIRING_DELETED } else { RETIRING_KEPT }.to_owned()),
+            SqlArg::Text(
+                if delete_files {
+                    RETIRING_DELETED
+                } else {
+                    RETIRING_KEPT
+                }
+                .to_owned(),
+            ),
             SqlArg::I64(stored(job_id.0)?),
         ];
         let datastore = self.datastore();
@@ -320,7 +327,12 @@ fn retiring_row(row: &crate::persistence::sql_runtime::SqlRow) -> Result<Retirin
         .or(row.opt_bytes("infohash_v2")?);
     let had = row.opt_text("had_status")?;
     let status = had.clone().unwrap_or_else(|| {
-        if completed.is_some() { "complete" } else { "cancelled" }.to_owned()
+        if completed.is_some() {
+            "complete"
+        } else {
+            "cancelled"
+        }
+        .to_owned()
     });
     let storage_dir = row.opt_text("storage_dir")?;
     let history = JobHistoryRow {
@@ -328,8 +340,14 @@ fn retiring_row(row: &crate::persistence::sql_runtime::SqlRow) -> Result<Retirin
         job_hash: hash,
         name: row.text("name")?,
         status,
-        error_message: if had.is_some() { row.opt_text("had_error")? } else { None },
-        total_bytes: row.opt_i64("had_total")?.map_or(0, |bytes| bytes.max(0) as u64),
+        error_message: if had.is_some() {
+            row.opt_text("had_error")?
+        } else {
+            None
+        },
+        total_bytes: row
+            .opt_i64("had_total")?
+            .map_or(0, |bytes| bytes.max(0) as u64),
         downloaded_bytes: row
             .opt_i64("had_downloaded")?
             .map_or(0, |bytes| bytes.max(0) as u64),
@@ -695,7 +713,11 @@ impl Database {
     // and what it holds marked to be written again, in one transaction: a
     // file that reaches the new folder is held from the moment it does, and
     // a move that never ends leaves the next start to write what it holds.
-    pub(crate) fn add_torrent_held(&self, job_id: JobId, held: &[String]) -> Result<(), StateError> {
+    pub(crate) fn add_torrent_held(
+        &self,
+        job_id: JobId,
+        held: &[String],
+    ) -> Result<(), StateError> {
         let id = stored(job_id.0)?;
         let held = held.to_vec();
         let datastore = self.datastore();

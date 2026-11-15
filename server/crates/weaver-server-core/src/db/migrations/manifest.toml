@@ -1673,34 +1673,51 @@ scope = "all"
 
 [[migration]]
 version = 120
-description = "a torrent removed while the database's disk is full keeps its history row until it is written"
+description = "a torrent list reads its page in the order torrents were added"
 checksum_algo = "blake3"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0120_torrent_retiring/sqlite.sql"
+file = "migrations/0120_torrent_list_order/sqlite.sql"
 engine = "sqlite"
 scope = "all"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0120_torrent_retiring/postgres.sql"
+file = "migrations/0120_torrent_list_order/postgres.sql"
 engine = "postgres"
 scope = "all"
 
 [[migration]]
 version = 121
-description = "a torrent's history row lists the files it wrote, which an archive from history removes"
+description = "a torrent removed while the database's disk is full keeps its history row until it is written"
 checksum_algo = "blake3"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0121_job_history_files/sqlite.sql"
+file = "migrations/0121_torrent_retiring/sqlite.sql"
 engine = "sqlite"
 scope = "all"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0121_job_history_files/postgres.sql"
+file = "migrations/0121_torrent_retiring/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 122
+description = "a torrent's history row lists the files it wrote, which an archive from history removes"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0122_job_history_files/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0122_job_history_files/postgres.sql"
 engine = "postgres"
 scope = "all"

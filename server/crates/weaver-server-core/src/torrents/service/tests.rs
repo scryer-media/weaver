@@ -20,6 +20,7 @@ use crate::torrents::sessions::tests::{
 use crate::torrents::storage::PieceStorage;
 
 mod completion;
+mod disk_room;
 mod listing;
 mod readings;
 mod scale_bench;

@@ -45,7 +45,9 @@ use weaver_server_core::tags::{TagSnapshot, split_tags};
 use weaver_server_core::torrents::metrics::{Published, SessionSeries};
 use weaver_server_core::torrents::model::{file_priority_number, file_priority_of};
 use weaver_server_core::torrents::service::fingerprint::ViewParts;
-use weaver_server_core::torrents::service::listing::{CategoryPick, FileTotals, Pick, Shown};
+use weaver_server_core::torrents::service::listing::{
+    CategoryPick, FileTotals, Pick, Shown, Window,
+};
 use weaver_server_core::torrents::service::{
     ActionError, AddError, AddRequest, Placement, TorrentService, TorrentSettings, TorrentView,
 };
@@ -233,21 +235,25 @@ impl TorrentFacadeContext {
         torrents.torrents_with_files().await
     }
 
-    async fn by_hash(&self, hash: &str) -> Option<TorrentView> {
-        let torrents = self.inner.torrents.as_ref()?;
-        torrents.torrent_by_hash(hash).await
+    // The torrent of `hash`; a failure to read the table is the answer to
+    // give, never none.
+    async fn by_hash(&self, hash: &str) -> Result<Option<TorrentView>, Response> {
+        let Some(torrents) = &self.inner.torrents else {
+            return Ok(None);
+        };
+        torrents.torrent_by_hash(hash).await.map_err(internal)
     }
 
     // The torrents a `hashes` parameter names: `|`-separated, or `all`.
-    async fn targets(&self, params: &Params) -> Vec<TorrentView> {
+    async fn targets(&self, params: &Params) -> Result<Vec<TorrentView>, Response> {
         self.named(params.get("hashes").unwrap_or_default()).await
     }
 
     // The torrents `wanted` names: `|`-separated hashes, or `all`
     // (qBittorrent `applyToTorrents`).
-    async fn named(&self, wanted: &str) -> Vec<TorrentView> {
+    async fn named(&self, wanted: &str) -> Result<Vec<TorrentView>, Response> {
         if wanted.trim() == "all" {
-            return self.views().await;
+            return Ok(self.views().await);
         }
         let wanted: Vec<&str> = wanted.split('|').map(str::trim).collect();
         self.picked(Pick {
@@ -258,27 +264,33 @@ impl TorrentFacadeContext {
     }
 
     // Every torrent `pick` keeps, with its files, which its paths follow.
-    async fn picked(&self, pick: Pick<'_>) -> Vec<TorrentView> {
+    async fn picked(&self, pick: Pick<'_>) -> Result<Vec<TorrentView>, Response> {
         let Some(torrents) = &self.inner.torrents else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        torrents.picked(pick, |kept| 0..kept, Shown::WHOLE).await
+        torrents
+            .picked(pick, Window::Every, Shown::WHOLE)
+            .await
+            .map_err(internal)
     }
 
-    // The torrents `pick` keeps at the places `page` gives, as a list's rows
-    // read them: with their trackers and tags, and their files' totals in
-    // place of their files unless `files` asks for those too.
+    // The torrents `pick` keeps at `window`'s places, as a list's rows read
+    // them: with their trackers and tags, and their files' totals in place
+    // of their files unless `files` asks for those too.
     async fn rows(
         &self,
         pick: Pick<'_>,
-        page: impl FnOnce(usize) -> std::ops::Range<usize>,
+        window: Window,
         files: bool,
-    ) -> Vec<(TorrentView, FileTotals)> {
+    ) -> Result<Vec<(TorrentView, FileTotals)>, Response> {
         let Some(torrents) = &self.inner.torrents else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let shown = if files { Shown::WHOLE } else { Shown::LISTED };
-        torrents.picked_rows(pick, page, shown).await
+        torrents
+            .picked_rows(pick, window, shown)
+            .await
+            .map_err(internal)
     }
 
     // Every torrent `pick` keeps, its own fields alone: no files, trackers
@@ -293,11 +305,14 @@ impl TorrentFacadeContext {
             .unwrap_or_default()
     }
 
-    async fn bare(&self, pick: Pick<'_>) -> Vec<TorrentView> {
+    async fn bare(&self, pick: Pick<'_>) -> Result<Vec<TorrentView>, Response> {
         let Some(torrents) = &self.inner.torrents else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        torrents.picked(pick, |kept| 0..kept, Shown::BARE).await
+        torrents
+            .picked(pick, Window::Every, Shown::BARE)
+            .await
+            .map_err(internal)
     }
 
     async fn resolve(&self, key: &str) -> Result<CallerScope, StatusCode> {
@@ -565,6 +580,17 @@ fn held(result: Result<(), weaver_server_core::SchedulerError>) -> Response {
 fn internal(error: impl std::fmt::Display) -> Response {
     tracing::warn!(%error, "torrent client compatibility request failed");
     text(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+}
+
+// What a read of the torrents found, or, when the table could not be read,
+// the failure answered at once in place of an empty list.
+macro_rules! found {
+    ($read:expr) => {
+        match $read {
+            Ok(found) => found,
+            Err(failed) => return failed,
+        }
+    };
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1115,7 +1141,7 @@ async fn torrents(
         "properties" => properties(ctx, params).await,
         "trackers" => trackers(ctx, params, scope).await,
         // Weaver fetches from no web seed.
-        "webseeds" => match ctx.by_hash(params.get("hash").unwrap_or_default()).await {
+        "webseeds" => match found!(ctx.by_hash(params.get("hash").unwrap_or_default()).await) {
             Some(_) => axum::Json(json!([])).into_response(),
             None => not_found(),
         },
@@ -1258,7 +1284,7 @@ async fn transfer_action(ctx: &TorrentFacadeContext, action: &str, params: &Para
     };
     match action {
         "info" => {
-            let views = ctx.bare(Pick::default()).await;
+            let views = found!(ctx.bare(Pick::default()).await);
             axum::Json(transfer(
                 &views.iter().collect::<Vec<_>>(),
                 &ctx.published_sessions().sessions,
@@ -1783,16 +1809,12 @@ async fn torrents_info(
         private,
     };
     // A row's files are read only when the answer lists them.
-    let rows = if ask.paged_first() {
-        ctx.rows(
-            pick,
-            |size| info_page(ask.limit, ask.offset, size).unwrap_or(0..size),
-            ask.with_files,
-        )
-        .await
+    let window = if ask.paged_first() {
+        info_window(ask.limit, ask.offset)
     } else {
-        ctx.rows(pick, |kept| 0..kept, ask.with_files).await
+        Window::Every
     };
+    let rows = found!(ctx.rows(pick, window, ask.with_files).await);
     info_list(rows, &ask, scope, ctx.api())
 }
 
@@ -1909,6 +1931,25 @@ fn info_list(
     axum::Json(list).into_response()
 }
 
+// The places `info_page` takes, as a window the table can read without a
+// count: only an offset from the end needs how many torrents there are.
+fn info_window(limit: i64, offset: i64) -> Window {
+    if offset < 0 {
+        return Window::Counted(Box::new(move |size| {
+            info_page(limit, offset, size).unwrap_or(0..size)
+        }));
+    }
+    match (usize::try_from(offset), usize::try_from(limit)) {
+        (Ok(0), _) if limit <= 0 => Window::Every,
+        (Ok(offset), Ok(first)) if first > 0 => Window::Page { offset, first },
+        (Ok(offset), _) => Window::Page {
+            offset,
+            first: usize::MAX,
+        },
+        (Err(_), _) => Window::Every,
+    }
+}
+
 // The rows of `size` a `torrents/info` page of `limit` after `offset`
 // keeps; `None` keeps them all. A negative offset counts back from the
 // end; a limit of 0 or less is none.
@@ -1972,7 +2013,7 @@ fn capped(ratio: f64) -> f64 {
 
 // qBittorrent `propertiesAction`.
 async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
-    let Some(view) = ctx.by_hash(params.get("hash").unwrap_or_default()).await else {
+    let Some(view) = found!(ctx.by_hash(params.get("hash").unwrap_or_default()).await) else {
         return not_found();
     };
     let now = now_secs();
@@ -2083,7 +2124,7 @@ async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
 // qBittorrent `filesAction`: the torrent's files, or those `indexes`
 // names, `|`-separated.
 async fn files(ctx: &TorrentFacadeContext, params: &Params) -> Response {
-    let Some(view) = ctx.by_hash(params.get("hash").unwrap_or_default()).await else {
+    let Some(view) = found!(ctx.by_hash(params.get("hash").unwrap_or_default()).await) else {
         return not_found();
     };
     if view.pieces.is_none() {
@@ -2182,7 +2223,7 @@ async fn file_prio(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     else {
         return text(StatusCode::BAD_REQUEST, "File IDs must be integers");
     };
-    let Some(view) = ctx.by_hash(hash).await else {
+    let Some(view) = found!(ctx.by_hash(hash).await) else {
         return not_found();
     };
     let Some(torrents) = &ctx.inner.torrents else {
@@ -2220,7 +2261,7 @@ async fn trackers(ctx: &TorrentFacadeContext, params: &Params, scope: CallerScop
     let Some(torrents) = &ctx.inner.torrents else {
         return not_found();
     };
-    let Some(view) = ctx.by_hash(params.get("hash").unwrap_or_default()).await else {
+    let Some(view) = found!(ctx.by_hash(params.get("hash").unwrap_or_default()).await) else {
         return not_found();
     };
     let peers = match torrents.peers(view.job_id).await {
@@ -2370,7 +2411,7 @@ async fn add_trackers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
             _ => tiers.push(Vec::new()),
         }
     }
-    each_of(ctx, ctx.named(hash).await, move |torrents, view| {
+    each_of(ctx, found!(ctx.named(hash).await), move |torrents, view| {
         let tiers = tiers.clone();
         async move { torrents.add_trackers(view.job_id, tiers).await }
     })
@@ -2392,7 +2433,7 @@ async fn edit_tracker(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     let Some(torrents) = &ctx.inner.torrents else {
         return not_found();
     };
-    let Some(view) = ctx.by_hash(hash).await else {
+    let Some(view) = found!(ctx.by_hash(hash).await) else {
         return not_found();
     };
     let (new_url, new_tier) = (params.get("newUrl"), params.get("tier"));
@@ -2457,7 +2498,7 @@ async fn remove_trackers(ctx: &TorrentFacadeContext, params: &Params) -> Respons
     };
     let hash = if hash.trim() == "*" { "all" } else { hash };
     let urls = url_list(urls);
-    each_of(ctx, ctx.named(hash).await, move |torrents, view| {
+    each_of(ctx, found!(ctx.named(hash).await), move |torrents, view| {
         let urls = urls.clone();
         async move { torrents.remove_trackers(view.job_id, &urls).await }
     })
@@ -2468,21 +2509,25 @@ async fn remove_trackers(ctx: &TorrentFacadeContext, params: &Params) -> Respons
 // `urls` names, else every tracker and the DHT.
 async fn reannounce(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     let urls = url_list(params.get("urls").unwrap_or_default());
-    each_of(ctx, ctx.targets(params).await, move |torrents, view| {
-        let urls = urls.clone();
-        async move {
-            if urls.is_empty() {
-                torrents.reannounce(view.job_id).await?;
-                return torrents.dht_announce(view.job_id).await;
+    each_of(
+        ctx,
+        found!(ctx.targets(params).await),
+        move |torrents, view| {
+            let urls = urls.clone();
+            async move {
+                if urls.is_empty() {
+                    torrents.reannounce(view.job_id).await?;
+                    return torrents.dht_announce(view.job_id).await;
+                }
+                for tracker in view.trackers.iter().filter(|t| urls.contains(&t.url)) {
+                    torrents
+                        .reannounce_tracker(view.job_id, &tracker.url)
+                        .await?;
+                }
+                Ok(())
             }
-            for tracker in view.trackers.iter().filter(|t| urls.contains(&t.url)) {
-                torrents
-                    .reannounce_tracker(view.job_id, &tracker.url)
-                    .await?;
-            }
-            Ok(())
-        }
-    })
+        },
+    )
     .await
 }
 
@@ -2804,7 +2849,7 @@ async fn set_share_limits(ctx: &TorrentFacadeContext, params: &Params) -> Respon
     let Some(torrents) = &ctx.inner.torrents else {
         return ok();
     };
-    for view in ctx.targets(params).await {
+    for view in found!(ctx.targets(params).await) {
         let policy = match share_policy(params, view.seeding_override, false) {
             Ok(policy) => policy,
             Err(response) => return *response,
@@ -2828,7 +2873,7 @@ async fn delete(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     // qBittorrent's `torrents/delete` removes what it is asked to, a private
     // torrent short of its seeding goal too (torrentscontroller.cpp
     // `deleteAction`): the client that asks decided.
-    for view in ctx.targets(params).await {
+    for view in found!(ctx.targets(params).await) {
         match torrents.remove(view.job_id, delete_files, true).await {
             Ok(()) | Err(ActionError::NotFound(_)) => {}
             Err(error) => return internal(error),
@@ -2871,9 +2916,7 @@ async fn tag_torrents(ctx: &TorrentFacadeContext, action: &str, params: &Params)
     let named = params.get("tags").unwrap_or_default();
     let tags = split_tags(named);
     let any_named = named.split(',').any(|part| !part.is_empty());
-    let jobs: Vec<JobId> = ctx
-        .targets(params)
-        .await
+    let jobs: Vec<JobId> = found!(ctx.targets(params).await)
         .iter()
         .map(|view| view.job_id)
         .collect();
@@ -2933,7 +2976,7 @@ where
     F: Fn(TorrentService, TorrentView) -> Fut,
     Fut: std::future::Future<Output = Result<(), ActionError>>,
 {
-    each_of(ctx, ctx.targets(params).await, action).await
+    each_of(ctx, found!(ctx.targets(params).await), action).await
 }
 
 // The torrents `hashes` names moved in the download queue together, as
@@ -2946,9 +2989,7 @@ async fn move_in_queue(
     let Some(torrents) = &ctx.inner.torrents else {
         return ok();
     };
-    let job_ids: Vec<JobId> = ctx
-        .targets(params)
-        .await
+    let job_ids: Vec<JobId> = found!(ctx.targets(params).await)
         .iter()
         .map(|view| view.job_id)
         .collect();
@@ -3018,12 +3059,13 @@ async fn rate_limits(
         .split('|')
         .map(str::trim)
         .collect();
-    let views = ctx
-        .bare(Pick {
+    let views = found!(
+        ctx.bare(Pick {
             hashes: (!all).then_some(named.as_slice()),
             ..Pick::default()
         })
-        .await;
+        .await
+    );
     let reading = |view: &TorrentView| client_limit(limit(view), 0);
     let map: Map<String, Value> = if all {
         views
@@ -3634,7 +3676,7 @@ async fn maindata(
         .and_then(|rid| rid.trim().parse::<u64>().ok())
         .unwrap_or(0);
     // Each row reads its files' totals alone, not its files.
-    let rows = ctx.rows(Pick::default(), |kept| 0..kept, false).await;
+    let rows = found!(ctx.rows(Pick::default(), Window::Every, false).await);
     let tags = match tag_snapshot(ctx).await {
         Ok(tags) => tags.made().to_vec(),
         Err(error) => return internal(error),
@@ -3857,7 +3899,7 @@ async fn torrent_peers(ctx: &TorrentFacadeContext, params: &Params) -> Response 
     let Some(torrents) = &ctx.inner.torrents else {
         return not_found();
     };
-    let Some(view) = ctx.by_hash(params.get("hash").unwrap_or_default()).await else {
+    let Some(view) = found!(ctx.by_hash(params.get("hash").unwrap_or_default()).await) else {
         return not_found();
     };
     let peers = match torrents.peers(view.job_id).await {
@@ -4078,7 +4120,7 @@ async fn set_location(
     else {
         return text(StatusCode::BAD_REQUEST, "Save path cannot be empty");
     };
-    let views = ctx.named(params.get(ids).unwrap_or_default()).await;
+    let views = found!(ctx.named(params.get(ids).unwrap_or_default()).await);
     each_of(ctx, views, move |torrents, view| {
         let location = location.clone();
         async move { torrents.set_location(view.job_id, location).await }
@@ -4093,7 +4135,7 @@ async fn export(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         return text(StatusCode::NOT_FOUND, "Not Found");
     };
     let hash = params.get("hash").unwrap_or_default();
-    let Some(view) = ctx.by_hash(hash).await else {
+    let Some(view) = found!(ctx.by_hash(hash).await) else {
         return text(StatusCode::NOT_FOUND, "Not Found");
     };
     let Some(metainfo) = torrents

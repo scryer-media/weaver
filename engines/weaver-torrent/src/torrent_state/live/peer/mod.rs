@@ -786,6 +786,16 @@ impl Peer {
         self.holepunch = false;
     }
 
+    /// The wait since the peer's last connection closed is dropped, its
+    /// failures in a row kept, when it has no connection now: the next is
+    /// due at once. Whether it changed anything.
+    pub(crate) fn forget_last_close(&mut self) -> bool {
+        if matches!(self.state, PeerState::Connecting(_) | PeerState::Live(_)) {
+            return false;
+        }
+        self.last_connected.take().is_some()
+    }
+
     /// We want a peer we let go again.
     pub(crate) fn needed_again(&mut self, counters: &PeerStates) {
         if matches!(self.state, PeerState::NotNeeded) {

@@ -4,7 +4,7 @@
 use crate::StateError;
 use crate::jobs::ids::JobId;
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
+use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx, max_rows_for_engine};
 use crate::settings::SeedingPolicy;
 use crate::torrents::model::{parse_file_priorities, parse_named_by};
 use crate::torrents::{
@@ -119,6 +119,261 @@ fn infohash_filter(infohashes: &[Infohash]) -> (String, Vec<SqlArg>) {
         columns.join(" OR ")
     };
     (filter, args)
+}
+
+/// The categories a torrent list keeps, by id: the torrents in one of
+/// `ids`, and, when `none` is set, those in no category, which is no id or
+/// one that is not among `known`, the ids the settings name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CategoryIds {
+    pub(crate) ids: Vec<u32>,
+    pub(crate) none: bool,
+    pub(crate) known: Vec<u32>,
+}
+
+/// Which torrents a list reads from the table: every one, or those a
+/// category match and named hashes keep.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TorrentListFilter {
+    pub(crate) categories: Option<CategoryIds>,
+    /// The torrents whose hash is one of these: the v1 hash, or the v2 hash
+    /// cut to 20 bytes for a torrent with no v1 hash.
+    pub(crate) hashes: Option<Vec<[u8; 20]>>,
+}
+
+impl TorrentListFilter {
+    // Its predicate after `WHERE`, its binds pushed onto `args`, with the
+    // named hashes of `hashes`, a chunk of its own; `1 = 1` keeps every
+    // torrent.
+    fn predicate(&self, hashes: Option<&[[u8; 20]]>, args: &mut Vec<SqlArg>) -> String {
+        let mut terms = Vec::new();
+        if let Some(categories) = &self.categories {
+            let mut kept = Vec::new();
+            if !categories.ids.is_empty() {
+                kept.push(format!("category_id IN ({})", binds(categories.ids.len())));
+                args.extend(categories.ids.iter().map(|id| SqlArg::I64(i64::from(*id))));
+            }
+            if categories.none {
+                kept.push("category_id IS NULL".to_owned());
+                if !categories.known.is_empty() {
+                    kept.push(format!(
+                        "category_id NOT IN ({})",
+                        binds(categories.known.len())
+                    ));
+                    args.extend(
+                        categories
+                            .known
+                            .iter()
+                            .map(|id| SqlArg::I64(i64::from(*id))),
+                    );
+                } else {
+                    kept.push("category_id IS NOT NULL".to_owned());
+                }
+            }
+            terms.push(match kept.len() {
+                0 => "1 = 0".to_owned(),
+                _ => format!("({})", kept.join(" OR ")),
+            });
+        }
+        if let Some(hashes) = hashes {
+            // A v2-only torrent goes by its v2 hash cut to 20 bytes: every v2
+            // hash that starts with those bytes lies between them padded
+            // with zeros and them padded with 0xff.
+            let named = hashes
+                .iter()
+                .map(|hash| {
+                    args.push(SqlArg::Bytes(hash.to_vec()));
+                    args.push(SqlArg::Bytes(padded(hash, 0x00)));
+                    args.push(SqlArg::Bytes(padded(hash, 0xff)));
+                    "infohash_v1 = {} OR (infohash_v1 IS NULL AND infohash_v2 BETWEEN {} AND {})"
+                })
+                .collect::<Vec<_>>();
+            terms.push(match named.len() {
+                0 => "1 = 0".to_owned(),
+                _ => format!("({})", named.join(" OR ")),
+            });
+        }
+        match terms.len() {
+            0 => "1 = 1".to_owned(),
+            _ => terms.join(" AND "),
+        }
+    }
+
+    // Its category match as arms that keep no torrent twice, each with its
+    // binds: one per category id, which walks the index of that category
+    // in the order of adding, and one for the torrents in no category.
+    // Every torrent is one arm, `1 = 1`, and a match of nothing is none.
+    fn arms(&self) -> Vec<(String, Vec<SqlArg>)> {
+        let Some(categories) = &self.categories else {
+            return vec![("1 = 1".to_owned(), Vec::new())];
+        };
+        let mut arms: Vec<(String, Vec<SqlArg>)> = categories
+            .ids
+            .iter()
+            .map(|id| {
+                (
+                    "category_id = {}".to_owned(),
+                    vec![SqlArg::I64(i64::from(*id))],
+                )
+            })
+            .collect();
+        if categories.none {
+            arms.push(if categories.known.is_empty() {
+                ("1 = 1".to_owned(), Vec::new())
+            } else {
+                (
+                    format!(
+                        "(category_id IS NULL OR category_id NOT IN ({}))",
+                        binds(categories.known.len())
+                    ),
+                    categories
+                        .known
+                        .iter()
+                        .map(|id| SqlArg::I64(i64::from(*id)))
+                        .collect(),
+                )
+            });
+        }
+        arms
+    }
+
+    // The binds its category match takes in each statement.
+    fn category_binds(&self) -> usize {
+        self.categories.as_ref().map_or(0, |categories| {
+            categories.ids.len()
+                + if categories.none {
+                    categories.known.len()
+                } else {
+                    0
+                }
+        })
+    }
+}
+
+// The most arms one compound statement joins: under SQLite's default
+// `SQLITE_MAX_COMPOUND_SELECT` of 500.
+const MAX_ARMS: usize = 400;
+
+// `arms` cut into the groups one statement each reads: as many as fit the
+// engine's binds, beside the page's two, and `MAX_ARMS`.
+fn arm_groups(
+    engine: crate::persistence::sql_runtime::SqlEngine,
+    arms: Vec<(String, Vec<SqlArg>)>,
+) -> Vec<Vec<(String, Vec<SqlArg>)>> {
+    let limit = max_rows_for_engine(engine, 1).saturating_sub(2);
+    let mut groups: Vec<Vec<(String, Vec<SqlArg>)>> = Vec::new();
+    let mut taken = 0;
+    for arm in arms {
+        let full = groups
+            .last()
+            .is_none_or(|group| group.len() == MAX_ARMS || taken + arm.1.len() > limit);
+        if full {
+            groups.push(Vec::new());
+            taken = 0;
+        }
+        taken += arm.1.len();
+        groups.last_mut().expect("pushed").push(arm);
+    }
+    groups
+}
+
+// The statement that reads `group`'s torrents, `added_at_ms` and `job_id`,
+// in the order they were added, then its `LIMIT` and `OFFSET`; their binds
+// pushed onto `args`. Each arm walks its own index in that order and the
+// compound's `ORDER BY` merges them, so no arm is sorted. A torrent a
+// removal left retiring is in no list, as in no other read of the live
+// torrents.
+fn ordered_arms(group: Vec<(String, Vec<SqlArg>)>, args: &mut Vec<SqlArg>) -> String {
+    let selects: Vec<String> = group
+        .into_iter()
+        .map(|(predicate, binds)| {
+            args.extend(binds);
+            format!(
+                "SELECT added_at_ms, job_id FROM torrents WHERE retiring IS NULL AND ({predicate})"
+            )
+        })
+        .collect();
+    format!(
+        "{} ORDER BY added_at_ms, job_id LIMIT {{}} OFFSET {{}}",
+        selects.join(" UNION ALL ")
+    )
+}
+
+// The statements that read the page at `offset` of at most `limit` of the
+// torrents `filter`'s category match keeps, with no named hashes, each with
+// its binds. One statement cuts the page itself; several each read as far
+// as the page's end, for the page to be cut from them merged.
+pub(crate) fn list_statements(
+    engine: crate::persistence::sql_runtime::SqlEngine,
+    filter: &TorrentListFilter,
+    offset: usize,
+    limit: Option<usize>,
+) -> Vec<(String, Vec<SqlArg>)> {
+    let bound = |n: usize| SqlArg::I64(i64::try_from(n).unwrap_or(i64::MAX));
+    let groups = arm_groups(engine, filter.arms());
+    let one = groups.len() == 1;
+    groups
+        .into_iter()
+        .map(|group| {
+            let mut args = Vec::new();
+            let sql = ordered_arms(group, &mut args);
+            if one {
+                args.push(limit.map_or(SqlArg::I64(i64::MAX), bound));
+                args.push(bound(offset));
+            } else {
+                args.push(limit.map_or(SqlArg::I64(i64::MAX), |limit| {
+                    bound(offset.saturating_add(limit))
+                }));
+                args.push(bound(0));
+            }
+            (sql, args)
+        })
+        .collect()
+}
+
+// `n` placeholders, comma-separated.
+fn binds(n: usize) -> String {
+    vec!["{}"; n].join(", ")
+}
+
+// A 20-byte hash padded to a v2 hash's 32 bytes with `fill`.
+fn padded(hash: &[u8; 20], fill: u8) -> Vec<u8> {
+    let mut bytes = hash.to_vec();
+    bytes.resize(32, fill);
+    bytes
+}
+
+// The torrents `filter` keeps among `hashes`, in the order they were added,
+// each once: one statement per chunk of hashes that fits the engine's binds
+// beside the category's.
+async fn named_torrents(
+    datastore: &crate::persistence::sql_runtime::StoreDatastore,
+    filter: &TorrentListFilter,
+    hashes: &[[u8; 20]],
+) -> Result<Vec<JobId>, StateError> {
+    let fixed = filter.category_binds().div_ceil(3);
+    let per = max_rows_for_engine(datastore.engine(), 3)
+        .saturating_sub(fixed)
+        .max(1);
+    let mut kept: Vec<(i64, u64)> = Vec::new();
+    for chunk in hashes.chunks(per) {
+        let mut args = Vec::new();
+        let predicate = filter.predicate(Some(chunk), &mut args);
+        let rows = SqlRuntime::fetch_all(
+            datastore.read_exec(),
+            &format!(
+                "SELECT added_at_ms, job_id FROM torrents WHERE retiring IS NULL AND ({predicate})"
+            ),
+            &args,
+        )
+        .await?;
+        for row in &rows {
+            kept.push((row.i64("added_at_ms")?, count(row, "job_id")?));
+        }
+    }
+    kept.sort_unstable();
+    kept.dedup();
+    Ok(kept.into_iter().map(|(_, job_id)| JobId(job_id)).collect())
 }
 
 pub(crate) async fn torrent_by_infohash_tx(
@@ -240,6 +495,84 @@ impl Database {
                 }
             }
             Ok(torrents)
+        })
+    }
+
+    /// The torrents `filter` keeps, in the order they were added: the
+    /// `limit` after the first `offset`, every one after it with no limit.
+    /// Without named hashes the page is cut in the statement, each of whose
+    /// arms walks an index in that order; named hashes are read in chunks
+    /// that fit the engine's binds, a page of them at most as many torrents
+    /// as named.
+    pub(crate) fn torrent_list_ids(
+        &self,
+        filter: &TorrentListFilter,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> Result<Vec<JobId>, StateError> {
+        let datastore = self.datastore();
+        let filter = filter.clone();
+        self.run_sql_blocking_read(async move {
+            let Some(hashes) = &filter.hashes else {
+                let statements = list_statements(datastore.engine(), &filter, offset, limit);
+                let one = statements.len() == 1;
+                let mut kept: Vec<(i64, u64)> = Vec::new();
+                for (sql, args) in statements {
+                    let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
+                    for row in &rows {
+                        kept.push((row.i64("added_at_ms")?, count(row, "job_id")?));
+                    }
+                }
+                if !one {
+                    kept.sort_unstable();
+                    let end = limit.map_or(kept.len(), |limit| offset.saturating_add(limit));
+                    kept.truncate(end.min(kept.len()));
+                    kept.drain(..offset.min(kept.len()));
+                }
+                return Ok(kept.into_iter().map(|(_, job_id)| JobId(job_id)).collect());
+            };
+            let mut kept = named_torrents(&datastore, &filter, hashes).await?;
+            let end = limit.map_or(kept.len(), |limit| offset.saturating_add(limit));
+            kept.truncate(end.min(kept.len()));
+            kept.drain(..offset.min(kept.len()));
+            Ok(kept)
+        })
+    }
+
+    /// How many torrents `filter` keeps, counted in the statement.
+    pub(crate) fn count_torrent_list(
+        &self,
+        filter: &TorrentListFilter,
+    ) -> Result<usize, StateError> {
+        let datastore = self.datastore();
+        let filter = filter.clone();
+        self.run_sql_blocking_read(async move {
+            if let Some(hashes) = &filter.hashes {
+                return Ok(named_torrents(&datastore, &filter, hashes).await?.len());
+            }
+            // The arms keep no torrent twice, so their counts add up.
+            let mut kept = 0;
+            for group in arm_groups(datastore.engine(), filter.arms()) {
+                let mut args = Vec::new();
+                let predicate = group
+                    .into_iter()
+                    .map(|(predicate, binds)| {
+                        args.extend(binds);
+                        predicate
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                let row = SqlRuntime::fetch_optional(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT COUNT(*) AS kept FROM torrents WHERE retiring IS NULL AND ({predicate})"
+                    ),
+                    &args,
+                )
+                .await?;
+                kept += row.map(|row| count(&row, "kept")).transpose()?.unwrap_or(0) as usize;
+            }
+            Ok(kept)
         })
     }
 

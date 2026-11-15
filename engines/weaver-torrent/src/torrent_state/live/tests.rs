@@ -248,6 +248,7 @@ impl Harness {
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
             sent_dht_port: AtomicBool::new(false),
+            let_go_in_upload_mode: AtomicU64::new(0),
             pex_started: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(self.live.max_request_window())),
             state: self.live.clone(),
@@ -3461,13 +3462,15 @@ async fn choking_a_peer_starts_its_count_of_unservable_requests_again() {
 }
 
 /// A memory storage that refuses the next `refusals` pieces it is handed,
-/// then the next `no_room` for want of space, and the next `no_room_writes`
-/// block writes for want of space.
+/// then the next `no_room` for want of space, the next `read_only` as a
+/// read-only file system does, and the next `no_room_writes` block writes
+/// for want of space.
 #[derive(Clone, Default)]
 struct RefusingStorageFactory {
     inner: MemoryStorageFactory,
     refusals: Arc<AtomicU32>,
     no_room: Arc<AtomicU32>,
+    read_only: Arc<AtomicU32>,
     no_room_writes: Arc<AtomicU32>,
 }
 
@@ -3475,6 +3478,7 @@ struct RefusingStorage {
     inner: Box<dyn TorrentStorage>,
     refusals: Arc<AtomicU32>,
     no_room: Arc<AtomicU32>,
+    read_only: Arc<AtomicU32>,
     no_room_writes: Arc<AtomicU32>,
 }
 
@@ -3501,6 +3505,7 @@ impl StorageFactory for RefusingStorageFactory {
             inner: Box::new(self.inner.create(shared, metadata)?),
             refusals: self.refusals.clone(),
             no_room: self.no_room.clone(),
+            read_only: self.read_only.clone(),
             no_room_writes: self.no_room_writes.clone(),
         })
     }
@@ -3547,6 +3552,7 @@ impl TorrentStorage for RefusingStorage {
             inner: self.inner.take()?,
             refusals: self.refusals.clone(),
             no_room: self.no_room.clone(),
+            read_only: self.read_only.clone(),
             no_room_writes: self.no_room_writes.clone(),
         }))
     }
@@ -3555,6 +3561,12 @@ impl TorrentStorage for RefusingStorage {
         anyhow::ensure!(!take_one(&self.refusals), "refused piece {piece:?}");
         if take_one(&self.no_room) {
             return Err(no_room());
+        }
+        if take_one(&self.read_only) {
+            return Err(anyhow::Error::from(std::io::Error::from(
+                std::io::ErrorKind::ReadOnlyFilesystem,
+            ))
+            .context("writing"));
         }
         self.inner.on_piece_completed(piece)
     }
@@ -3569,6 +3581,44 @@ impl Harness {
             .get_have_pieces()
             .as_slice()[index as usize]
     }
+}
+
+// A torrent added with `owner_wakes_full_disk` whose write is refused for
+// any cause, a read-only file system here, waits for its owner, which
+// fails the torrent: no retry spell of its own runs for a write its owner
+// refuses.
+#[tokio::test]
+async fn an_owner_decides_a_write_refused_for_no_want_of_room() {
+    let storage = RefusingStorageFactory::default();
+    storage.read_only.store(1, Ordering::SeqCst);
+    let add = AddTorrentOptions {
+        storage_factory: Some(storage.clone_box()),
+        owner_wakes_full_disk: true,
+        ..Default::default()
+    };
+    let h = Harness::build_added(
+        "owner_read_only",
+        3,
+        0x20,
+        isolated_session_opts(false),
+        add,
+    )
+    .await;
+    tokio::time::pause();
+    let (fetcher, _fetcher_rx) = h.peer_with("127.0.0.1:6881", &[0]).await;
+
+    h.take(&fetcher, 0);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&fetcher, (0, chunk), false).await.unwrap();
+    }
+    assert!(h.upload_mode());
+    h.retry_declined
+        .subscribe()
+        .wait_for(|seen| *seen >= 1)
+        .await
+        .unwrap();
+    tokio::time::advance(OPTIMISTIC_DISK_RETRY * 2).await;
+    assert!(h.upload_mode());
 }
 
 // libtorrent: the write completes before the hash job, and only then
@@ -3748,6 +3798,203 @@ async fn a_block_write_that_finds_no_room_is_fetched_again_after_upload_mode() {
     h.take(&peer, 0);
     h.send(&peer, (0, 0), false).await.unwrap();
     assert_eq!(h.missing_chunks(0), vec![1, 2, 3]);
+}
+
+// A torrent added with `owner_wakes_full_disk` whose write found no room
+// stays in upload mode past `optimistic_disk_retry`, serving what it has,
+// until its owner says room was made; then it asks again. Weaver's own: its
+// server watches the disk the torrent writes to.
+#[tokio::test]
+async fn a_full_disk_its_owner_wakes_lasts_until_the_owner_ends_it() {
+    let storage = RefusingStorageFactory::default();
+    storage.no_room.store(1, Ordering::SeqCst);
+    let add = AddTorrentOptions {
+        storage_factory: Some(storage.clone_box()),
+        owner_wakes_full_disk: true,
+        ..Default::default()
+    };
+    // Three pieces, the last had.
+    let h = Harness::build_added(
+        "owner_full_disk",
+        3,
+        0x20,
+        isolated_session_opts(false),
+        add,
+    )
+    .await;
+    tokio::time::pause();
+    let (fetcher, _fetcher_rx) = h.peer_with("127.0.0.1:6881", &[0]).await;
+    let (_asked, mut asked_rx) = h.peer_taking_upload_only("127.0.0.2:6881", &[1]).await;
+    let (leecher, mut leecher_rx) = h.peer_with("127.0.0.3:6881", &[]).await;
+    let leecher = &leecher;
+
+    h.take(&fetcher, 0);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&fetcher, (0, chunk), false).await.unwrap();
+    }
+    assert!(h.upload_mode());
+    assert!(matches!(
+        messages_sent(&mut asked_rx).pop(),
+        Some(Message::Extended(ExtendedMessage::UploadOnly(true)))
+    ));
+
+    // The retry task saw the mode and left it to the owner: it waits for
+    // the mode to change, so no time passing ends it. Twice the retry
+    // passes and it stays in upload mode.
+    h.retry_declined
+        .subscribe()
+        .wait_for(|seen| *seen >= 1)
+        .await
+        .unwrap();
+    tokio::time::advance(OPTIMISTIC_DISK_RETRY * 2).await;
+    assert!(h.upload_mode());
+    assert!(messages_sent(&mut asked_rx).is_empty());
+
+    // The piece it has is served all the while.
+    leecher
+        .on_received_message(Message::Interested)
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut leecher_rx).await, Sent::Unchoke);
+    leecher
+        .on_received_message(Message::Request(request(2, 0)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut leecher_rx).await, Sent::Block(2, 0));
+
+    // The owner ends it: the peers are told, and piece 0 is fetched again.
+    h.leave_upload_mode();
+    assert!(!h.upload_mode());
+    assert!(matches!(
+        messages_sent(&mut asked_rx).pop(),
+        Some(Message::Extended(ExtendedMessage::UploadOnly(false)))
+    ));
+    h.take(&fetcher, 0);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&fetcher, (0, chunk), false).await.unwrap();
+    }
+    assert!(h.have(0));
+    assert!(!h.upload_mode());
+}
+
+// A refusal made before its owner left upload mode, and handled after,
+// enters nothing: the wake stands, and the torrent fetches. One made after
+// the leave enters upload mode as any refusal does. The order is driven by
+// hand: the write's count is taken, the owner leaves, then the refusal is
+// handled.
+#[tokio::test]
+async fn a_refusal_made_before_its_owner_left_upload_mode_does_not_enter_it_again() {
+    let storage = RefusingStorageFactory::default();
+    let add = AddTorrentOptions {
+        storage_factory: Some(storage.clone_box()),
+        owner_wakes_full_disk: true,
+        ..Default::default()
+    };
+    let h = Harness::build_added("late_refusal", 3, 0x20, isolated_session_opts(false), add).await;
+    let no_room = || anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::StorageFull));
+
+    // Pieces A and B are written at the same count; A's refusal enters
+    // upload mode.
+    let at = h.upload_epoch();
+    assert!(h.handle_disk_error(&no_room(), at));
+    assert!(h.upload_mode());
+    // Room was made: the owner wakes it.
+    h.leave_upload_mode();
+    assert!(!h.upload_mode());
+    // B's refusal lands now, from before the wake: it is still a refusal,
+    // but it does not undo the wake.
+    assert!(h.handle_disk_error(&no_room(), at));
+    assert!(
+        !h.upload_mode(),
+        "a refusal from before the wake enters nothing"
+    );
+    // A write made after the wake that finds no room enters it again.
+    assert!(h.handle_disk_error(&no_room(), h.upload_epoch()));
+    assert!(h.upload_mode());
+}
+
+// libtorrent `torrent::set_upload_mode`: leaving upload mode clears every
+// peer's `last_connected` to force a fast reconnect. A seed let go as of no
+// use while we only uploaded waits a reconnect time; once upload mode ends
+// the connect loop wakes and dials it at once, the clock not moved.
+#[tokio::test]
+async fn a_seed_let_go_in_upload_mode_is_dialled_at_once_when_it_ends() {
+    let h = Harness::new("upload_mode_redial").await;
+    tokio::time::pause();
+    let (seed, mut seed_rx) = h.peer("127.0.0.1:6881");
+    let mut hs = ExtendedHandshake::new();
+    hs.p = Some(u32::from(seed.addr.port()));
+    (&seed).on_extended_handshake(&hs).unwrap();
+    h.enter_upload_mode(false, h.upload_epoch());
+    assert!(h.upload_mode());
+
+    let mut requester: Task<'_> = Box::pin(seed.request_chunks());
+    loop {
+        match next_queued(&mut requester, &mut seed_rx).await {
+            WriterRequest::Disconnect(Ok(())) => break,
+            WriterRequest::Message(_) => {}
+            other => panic!("unexpected writer request {other:?}"),
+        }
+    }
+    drop(requester);
+    seed.on_peer_died(Some(crate::Error::Disconnect)).unwrap();
+
+    let now = tokio::time::Instant::now();
+    assert_eq!(
+        h.peers
+            .with_peer(sock("127.0.0.1:6881"), |p| p.reconnect_at())
+            .unwrap(),
+        Some(now + peer::MIN_RECONNECT_TIME)
+    );
+    assert!(h.peers.connect_next(now).is_none());
+    let mut candidate = std::pin::pin!(h.peers.wait_for_candidate());
+    assert!(candidate.as_mut().now_or_never().is_none());
+
+    h.leave_upload_mode();
+    assert!(candidate.as_mut().now_or_never().is_some());
+    assert_eq!(tokio::time::Instant::now(), now);
+    assert_eq!(
+        h.peers.connect_next(now).map(|(addr, ..)| addr),
+        Some(sock("127.0.0.1:6881"))
+    );
+}
+
+// A seed let go as of no use while we only uploaded, its close heard only
+// after upload mode was left: the leave found it still connected, so its
+// close is due again at once, the clock not moved.
+#[tokio::test]
+async fn a_seed_let_go_in_upload_mode_and_closed_after_it_ends_is_dialled_at_once() {
+    let h = Harness::new("upload_mode_late_close").await;
+    tokio::time::pause();
+    let (seed, mut seed_rx) = h.peer("127.0.0.1:6881");
+    let mut hs = ExtendedHandshake::new();
+    hs.p = Some(u32::from(seed.addr.port()));
+    (&seed).on_extended_handshake(&hs).unwrap();
+    h.enter_upload_mode(false, h.upload_epoch());
+
+    let mut requester: Task<'_> = Box::pin(seed.request_chunks());
+    loop {
+        match next_queued(&mut requester, &mut seed_rx).await {
+            WriterRequest::Disconnect(Ok(())) => break,
+            WriterRequest::Message(_) => {}
+            other => panic!("unexpected writer request {other:?}"),
+        }
+    }
+    drop(requester);
+    h.leave_upload_mode();
+    seed.on_peer_died(Some(crate::Error::Disconnect)).unwrap();
+
+    let now = tokio::time::Instant::now();
+    assert_eq!(
+        h.peers
+            .with_peer(sock("127.0.0.1:6881"), |p| p.reconnect_at())
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        h.peers.connect_next(now).map(|(addr, ..)| addr),
+        Some(sock("127.0.0.1:6881"))
+    );
 }
 
 // A piece is counted into every file with bytes in it, an empty file among
@@ -6620,6 +6867,7 @@ impl Harness {
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
             sent_dht_port: AtomicBool::new(false),
+            let_go_in_upload_mode: AtomicU64::new(0),
             pex_started: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(self.live.max_request_window())),
             state: self.live.clone(),

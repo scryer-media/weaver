@@ -1251,11 +1251,14 @@ async fn an_archive_leaves_what_a_torrent_seeds_through(
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_archive_leaves_a_file_a_live_torrent_seeds_through_a_linked_folder() {
-    an_archive_leaves_what_a_torrent_seeds_through(|inner| {
-        let link = inner.parent().unwrap().parent().unwrap().join("linked-set");
-        std::os::unix::fs::symlink(inner, &link).unwrap();
-        link
-    }, true)
+    an_archive_leaves_what_a_torrent_seeds_through(
+        |inner| {
+            let link = inner.parent().unwrap().parent().unwrap().join("linked-set");
+            std::os::unix::fs::symlink(inner, &link).unwrap();
+            link
+        },
+        true,
+    )
     .await;
 }
 
@@ -1675,7 +1678,10 @@ async fn a_crash_after_the_mark_is_finished_at_the_next_start(delete_files: bool
     assert_eq!(history.status, "complete", "its row says it completed");
     assert_eq!(history.protocol, crate::jobs::Protocol::Torrent);
     assert!(rig.db.get_torrent(job_id).unwrap().is_none());
-    let listed: Vec<PathBuf> = rig.db.job_history_files(&[job_id]).unwrap()
+    let listed: Vec<PathBuf> = rig
+        .db
+        .job_history_files(&[job_id])
+        .unwrap()
         .remove(&job_id)
         .unwrap_or_default()
         .into_iter()
@@ -1735,7 +1741,14 @@ async fn a_crash_after_the_mark_leaves_what_a_live_torrent_holds() {
         .await
         .unwrap();
     fetch_every_piece(&rig.service, first, &whole).await;
-    let dir = PathBuf::from(rig.service.torrent(first).await.unwrap().storage_dir.unwrap());
+    let dir = PathBuf::from(
+        rig.service
+            .torrent(first)
+            .await
+            .unwrap()
+            .storage_dir
+            .unwrap(),
+    );
     let inner = dir.join("set");
     let (seeder, _) = seeding_placed(
         &rig,
@@ -1797,7 +1810,7 @@ async fn a_magnet_before_its_metainfo_holds_its_whole_folder() {
     assert!(!held_set(&rig, job_id));
     if let Some(dir) = rig.db.get_torrent(job_id).unwrap().unwrap().storage_dir {
         let dir = PathBuf::from(dir);
-        let held = LiveHeld::under(&rig.db, &[dir.clone()]).unwrap();
+        let held = LiveHeld::under(&rig.db, std::slice::from_ref(&dir)).unwrap();
         assert!(held.holds(&dir.join("anything.bin"), false));
     }
     rig.service.stop().await;
@@ -1846,7 +1859,14 @@ async fn a_move_whose_held_write_fails_leaves_the_destination_held_and_unset() {
         .await;
     crate::torrents::service::SYNC_HELD_FAILS.store(0, Ordering::Relaxed);
     moved.unwrap();
-    let there = PathBuf::from(rig.service.torrent(job_id).await.unwrap().storage_dir.unwrap());
+    let there = PathBuf::from(
+        rig.service
+            .torrent(job_id)
+            .await
+            .unwrap()
+            .storage_dir
+            .unwrap(),
+    );
     assert_ne!(there, dir);
     assert!(there.starts_with(&elsewhere));
     assert!(!held_set(&rig, job_id));
@@ -1876,14 +1896,26 @@ async fn a_move_whose_destination_cannot_be_held_moves_nothing() {
     assert_eq!(files_under(&dir), files, "nothing moved");
     assert!(files_under(&elsewhere).is_empty());
     assert_eq!(
-        rig.service.torrent(job_id).await.unwrap().storage_dir.map(PathBuf::from),
+        rig.service
+            .torrent(job_id)
+            .await
+            .unwrap()
+            .storage_dir
+            .map(PathBuf::from),
         Some(dir.clone())
     );
     rig.service
         .set_location(job_id, elsewhere.to_string_lossy().into_owned())
         .await
         .unwrap();
-    let there = PathBuf::from(rig.service.torrent(job_id).await.unwrap().storage_dir.unwrap());
+    let there = PathBuf::from(
+        rig.service
+            .torrent(job_id)
+            .await
+            .unwrap()
+            .storage_dir
+            .unwrap(),
+    );
     assert!(held_set(&rig, job_id));
     assert!(holds_all(&rig, &there));
     rig.service.stop().await;
