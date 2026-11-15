@@ -265,6 +265,18 @@ impl Par2 {
             .fold(0, u64::saturating_add)
     }
 
+    // The blocks still to come that can be counted, for a figure that is
+    // shown: a volume with no bound known yet adds none to it.
+    fn counted(&self, set: &[u8; 16]) -> u64 {
+        let packet = self.smallest_packet();
+        self.volumes
+            .iter()
+            .filter(|volume| volume.serves(set))
+            .map(|volume| volume.left(packet))
+            .filter(|&left| left != u64::MAX)
+            .fold(0, u64::saturating_add)
+    }
+
     // The slices of the set's members that a refused range touches: each
     // will never come, so each needs a block of its own, unless a slice of
     // a member it binds that is neither refused nor came damaged carries
@@ -1399,7 +1411,7 @@ impl Recovery for Par2 {
             out.push(SetRuling {
                 id: par2_rs::RecoverySetId::from_bytes(key).to_string(),
                 slice_size: state.index.as_ref().map_or(0, |index| index.slice_size),
-                blocks_reachable: (state.recovery.len() as u64).saturating_add(self.coming(&key)),
+                blocks_reachable: (state.recovery.len() as u64).saturating_add(self.counted(&key)),
                 damaged_slices: damaged,
                 outcome: short.or(last.map(|last| last.outcome)),
                 read: short.is_none() && last.is_some_and(|last| last.read),

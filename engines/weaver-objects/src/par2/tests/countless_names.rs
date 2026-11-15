@@ -194,6 +194,8 @@ fn a_waiting_set_of_countless_volumes_waits_after_a_restore() {
     assert_eq!(old.job.object.outcome(), Some(RepairOutcome::Waiting));
     assert_eq!(repair(&mut old.job), RepairOutcome::Waiting);
     assert!(!asked_now(&old.job.object).is_empty());
+    // A volume with no bound known adds nothing to the figure that is shown.
+    assert!(reachable(&old.job.object) < u64::from(u32::MAX));
 }
 
 // Volume facts encoded before the length was kept still decode, with no
