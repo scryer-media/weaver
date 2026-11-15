@@ -626,16 +626,21 @@ fn given_up(count: u32, one_turn: bool) -> Refusing {
 // the write stamps too: they are drawn from one sequence every namespace in
 // the process shares, so two rigs never draw the same ones.
 fn said(refusing: &mut Refusing) -> (String, String) {
+    // Paths are spelled plain and in their debug form, which doubles each
+    // Windows separator.
     let dir = refusing.dir.path().display().to_string();
+    let quoted = format!("{:?}", refusing.dir.path());
+    let debug_dir = quoted.trim_matches('"').to_string();
+    let unpath = |text: String| text.replace(&debug_dir, "<dir>").replace(&dir, "<dir>");
     let notes = format!("{:?}", refusing.job.take_notes());
-    let status = refusing.status().replace(&dir, "<dir>");
+    let status = unpath(refusing.status());
     let mut parts = status.split("stamp: ");
     let mut unstamped = parts.next().unwrap_or_default().to_string();
     for part in parts {
         unstamped.push_str("stamp: _");
         unstamped.push_str(part.trim_start_matches(|c: char| c.is_ascii_digit()));
     }
-    (unstamped, notes.replace(&dir, "<dir>"))
+    (unstamped, unpath(notes))
 }
 
 // A store given up as the job goes quiet reads back one volume a turn, so
