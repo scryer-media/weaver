@@ -977,6 +977,61 @@ impl NamespaceWriter {
         write: Write,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        let end = BatchEnd::of(effects);
+        for effect in effects.drain(..) {
+            self.apply(tree, builder, segments, effect, write, out)?;
+            self.apply_unnamed(tree, builder, segments, out)?;
+        }
+        self.finish_batch(tree, builder, segments, end, out)
+    }
+
+    // What a batch leaves to do once every effect of it is applied.
+    fn finish_batch(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        BatchEnd {
+            bound,
+            folded,
+            given_back,
+            reached,
+        }: BatchEnd,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        if given_back {
+            self.prune(tree)?;
+        }
+        let depth = self.reached_now.len();
+        self.reached_now.extend(reached);
+        let mut handed = Ok(());
+        for (node, member, child) in bound {
+            handed = self.hand_over(tree, builder, segments, (node, member), child, out);
+            if handed.is_err() {
+                break;
+            }
+        }
+        self.reached_now.truncate(depth);
+        handed?;
+        for (node, copy, held) in folded {
+            self.fold_over(tree, builder, segments, (node, copy), &held, out)?;
+        }
+        Ok(())
+    }
+}
+
+// What a batch of effects leaves to do once all of them are applied, read
+// off the batch before the first is.
+#[derive(Default)]
+struct BatchEnd {
+    bound: Vec<(NodeId, MemberId, NodeId)>,
+    folded: Vec<(NodeId, MemberId, Coverage)>,
+    given_back: bool,
+    reached: Vec<(NodeId, MemberId, (NodeId, VolumeIndex), ByteRange)>,
+}
+
+impl BatchEnd {
+    fn of(effects: &[Effect]) -> Self {
         // What a member received before it was bound reaches its object
         // once every effect raised with the bind is applied: the tree said
         // them in order, and bytes it gave the owner before the bind, for
@@ -1034,30 +1089,16 @@ impl NamespaceWriter {
                 _ => None,
             })
             .collect();
-        for effect in effects.drain(..) {
-            self.apply(tree, builder, segments, effect, write, out)?;
-            self.apply_unnamed(tree, builder, segments, out)?;
+        Self {
+            bound,
+            folded,
+            given_back,
+            reached,
         }
-        if given_back {
-            self.prune(tree)?;
-        }
-        let depth = self.reached_now.len();
-        self.reached_now.extend(reached);
-        let mut handed = Ok(());
-        for (node, member, child) in bound {
-            handed = self.hand_over(tree, builder, segments, (node, member), child, out);
-            if handed.is_err() {
-                break;
-            }
-        }
-        self.reached_now.truncate(depth);
-        handed?;
-        for (node, copy, held) in folded {
-            self.fold_over(tree, builder, segments, (node, copy), &held, out)?;
-        }
-        Ok(())
     }
+}
 
+impl NamespaceWriter {
     // What a posting received before it folded into the member it repeats:
     // held, or in its own file when it was a leaf first. It goes down as
     // the member's bytes, each run with the provenance `held` says it
@@ -3827,5 +3868,6 @@ pub(crate) use moves::restored_at;
 #[cfg(test)]
 pub(crate) use moves::{TALLY, Tally};
 pub(crate) use recovery::{Coming, Lender, SetState};
+pub(crate) use refusal::GivingUp;
 #[cfg(test)]
 mod tests;

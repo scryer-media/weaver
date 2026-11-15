@@ -26,10 +26,95 @@ use weaver_graph::{
     Provenance, Segment, Tree, VolumeIndex,
 };
 
-use super::{Arrival, NamespaceWriter, READ_BACK, Segments, Write, WriteError};
+use super::{Arrival, BatchEnd, NamespaceWriter, READ_BACK, Segments, Write, WriteError};
 use crate::pipeline::graph::leaf::Leaf;
 
+// A batch the tree raised as an object heard the job was quiet, that gives
+// more than one volume up: each volume given up is read back into its own
+// file on a turn of its own, a stored set's volume by volume, so the loop
+// turns between them. What it leaves to do once all are applied, and what
+// it passed on, are kept with it, so the batch ends as it would in one turn.
+pub(crate) struct GivingUp {
+    effects: std::collections::VecDeque<Effect>,
+    end: BatchEnd,
+    out: Vec<Effect>,
+}
+
+impl GivingUp {
+    // What the batch passed on to the owner, once it is applied.
+    pub(crate) fn into_out(self) -> Vec<Effect> {
+        self.out
+    }
+}
+
+// An effect that reads a volume given up back into its own file.
+fn gives_up(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::Refused { .. } | Effect::NeedsEngine { .. } | Effect::Disclaimed { .. }
+    )
+}
+
 impl NamespaceWriter {
+    // Effects the tree raised as an object heard the job was quiet, as
+    // [`Self::apply_all`] applies them, the ones left for the owner going to
+    // `out`. A batch that gives more than one volume up applies the first
+    // here and is handed back, to go on with [`Self::give_up_next`].
+    pub(crate) fn apply_quiet(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        effects: Vec<Effect>,
+        out: &mut Vec<Effect>,
+    ) -> Result<Option<GivingUp>, WriteError> {
+        if effects.iter().filter(|effect| gives_up(effect)).count() < 2 {
+            return self
+                .apply_all(tree, builder, segments, effects, out)
+                .map(|()| None);
+        }
+        let mut batch = GivingUp {
+            end: BatchEnd::of(&effects),
+            effects: effects.into(),
+            out: Vec::new(),
+        };
+        Ok((!self.give_up_next(tree, builder, segments, &mut batch)?).then_some(batch))
+    }
+
+    // The batch's effects up to the next volume given up after the first,
+    // in order: true once none is left and the batch has ended as
+    // [`Self::apply_all`] ends one. On an error the effects not yet applied
+    // are dropped, as they always were.
+    pub(crate) fn give_up_next(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        batch: &mut GivingUp,
+    ) -> Result<bool, WriteError> {
+        let mut gave_up = false;
+        while let Some(effect) = batch.effects.pop_front() {
+            if gave_up && gives_up(&effect) {
+                batch.effects.push_front(effect);
+                return Ok(false);
+            }
+            gave_up |= gives_up(&effect);
+            self.apply(
+                tree,
+                builder,
+                segments,
+                effect,
+                Write::Again,
+                &mut batch.out,
+            )?;
+            self.apply_unnamed(tree, builder, segments, &mut batch.out)?;
+        }
+        let end = std::mem::take(&mut batch.end);
+        self.finish_batch(tree, builder, segments, end, &mut batch.out)?;
+        self.release_held(tree, builder, segments, &mut batch.out)?;
+        Ok(true)
+    }
+
     pub(super) fn materialise(
         &mut self,
         tree: &mut Tree,

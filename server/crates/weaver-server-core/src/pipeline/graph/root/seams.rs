@@ -394,6 +394,10 @@ impl Pipeline {
             self.graph_checkpoint_due(job_id, control);
             return;
         }
+        if matches!(said.heard, Heard::GivingUp) {
+            self.graph_give_up_next(job_id);
+            return;
+        }
         if let Some(graph) = self.retiring_graph_jobs.get_mut(&job_id) {
             if self.pending_graph_terminals.contains_key(&job_id)
                 || matches!(
@@ -440,6 +444,23 @@ impl Pipeline {
         if ended || moved {
             self.schedule_job_completion_check(job_id);
         }
+    }
+
+    // The next volume of a job's give-up, on the turn its wake brought. A
+    // wake for a job that is gone, stopped or no longer giving up does
+    // nothing.
+    fn graph_give_up_next(&mut self, job_id: JobId) {
+        let limit = self.graph_job_slot_limit(job_id);
+        let Some(graph) = self
+            .graph_jobs
+            .get_mut(&job_id)
+            .filter(|graph| graph.giving_up())
+        else {
+            return;
+        };
+        let result = graph.give_up_next(&mut self.graph_status.repairs, limit);
+        self.after_graph_result(job_id, result);
+        self.schedule_job_completion_check(job_id);
     }
 
     // Each job that kept a repair the stop ended takes it back when its
@@ -601,6 +622,20 @@ impl Pipeline {
         // The step's bytes are written: the checkpoint can say so.
         self.step_graph_checkpoint(job_id);
         self.wake_memory_waiters();
+        // A give-up with volumes left goes on at the job's next turn, which
+        // its wake brings: the loop turns between volumes.
+        if self
+            .graph_jobs
+            .get_mut(&job_id)
+            .is_some_and(GraphJob::ring_give_up)
+        {
+            let _ = self.graph_runs.written().send(Said {
+                scope: job_id.0,
+                node: weaver_graph::NodeId::ROOT,
+                generation: 0,
+                heard: Heard::GivingUp,
+            });
+        }
     }
 
     // Whether the job's graph waits for room on a disk, read from the job

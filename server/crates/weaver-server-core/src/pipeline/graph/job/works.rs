@@ -158,6 +158,11 @@ impl Works {
         self.owed = true;
     }
 
+    // Whether the pipeline is shutting down.
+    pub(crate) fn stopping(&self) -> bool {
+        self.hardware.shutdown().started()
+    }
+
     pub(crate) fn checkpointed(&mut self) {
         self.owed = false;
     }
