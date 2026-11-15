@@ -491,11 +491,11 @@ fn a_nameless_middle_volume_fitting_two_places_takes_the_lower_and_moves_when_it
     );
     assert_eq!(volumes.len(), 4);
     // Each volume's end record states its number: more volumes follow
-    // (0x0001), the number is present (0x0004).
+    // (0x0001), the number is present (0x0008).
     let numbered = |index: usize| {
         let mut bytes = volumes[index].clone();
         bytes.truncate(bytes.len() - 7);
-        let flags = u16::from(index + 1 < volumes.len()) | 0x0004;
+        let flags = u16::from(index + 1 < volumes.len()) | 0x0008;
         let mut rest = vec![0x7b];
         rest.extend(flags.to_le_bytes());
         rest.extend(9u16.to_le_bytes());
@@ -535,12 +535,13 @@ fn a_nameless_volume_its_links_misplace_never_refuses_the_set() {
         &split(Version::Rar4),
     );
     assert_eq!(volumes.len(), 4);
-    // Each volume's end record states its number, as RAR 3 and later write
-    // it: more volumes follow (0x0001), the number is present (0x0004).
+    // Each volume's end record states its number, as RAR 3.4 and later
+    // write it: more volumes follow (0x0001), the number is present
+    // (0x0008).
     let numbered = |index: usize| {
         let mut bytes = volumes[index].clone();
         bytes.truncate(bytes.len() - 7);
-        let flags = u16::from(index + 1 < volumes.len()) | 0x0004;
+        let flags = u16::from(index + 1 < volumes.len()) | 0x0008;
         let mut rest = vec![0x7b];
         rest.extend(flags.to_le_bytes());
         rest.extend(9u16.to_le_bytes());
