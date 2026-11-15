@@ -68,15 +68,28 @@ impl NntpClientConfig {
 #[derive(Clone)]
 pub struct NntpClient {
     pool: Arc<NntpPool>,
-    work_guard: Option<Arc<dyn Fn(ServerId) -> bool + Send + Sync>>,
+    work_guard: Option<Arc<WorkGuard>>,
     max_retries_per_server: u32,
     // Per-article inactivity budget, excluding deliberate local rate waits.
     soft_timeout: Duration,
 }
 
+// Whether work bound to a server is still to be done there, judged by the
+// view of the provider policy it is handed. The guard does not pick the view:
+// before a connection is admitted it is handed the pool's
+// ([`NntpPool::provider_policy`]); once the work has a connection, that
+// connection's ([`NntpPool::provider_policy_on_connection`]), in which the
+// recovery probe a quarantine admitted is past its own server's hold. Read
+// otherwise, the probe would find its own work obsolete and be put down
+// unanswered, holding the server it was admitted to recover.
+pub type WorkGuard =
+    dyn Fn(ServerId, &crate::provider_policy::ProviderPolicy) -> bool + Send + Sync;
+
 // A queued probe rechecks the same article eligibility and caller lifecycle
-// at its socket owner before issuing commands.
-pub type ProbeWorkGuard = Arc<dyn Fn() -> bool + Send + Sync>;
+// at its socket owner before issuing commands, against the view of the
+// policy its connection is judged by: see [`WorkGuard`].
+pub type ProbeWorkGuard =
+    Arc<dyn Fn(&crate::provider_policy::ProviderPolicy) -> bool + Send + Sync>;
 
 // How many yielding `try_lock` attempts an owned-lane server selection makes
 // on the shared health mutex before reporting contention. The critical
@@ -1068,12 +1081,18 @@ impl NntpClient {
 
     pub fn with_work_guard(
         &self,
-        guard: impl Fn(ServerId) -> bool + Send + Sync + 'static,
+        guard: impl Fn(ServerId, &crate::provider_policy::ProviderPolicy) -> bool
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         let mut client = self.clone();
         let previous = client.work_guard.take();
-        client.work_guard = Some(Arc::new(move |server| {
-            previous.as_ref().is_none_or(|previous| previous(server)) && guard(server)
+        client.work_guard = Some(Arc::new(move |server, policy| {
+            previous
+                .as_ref()
+                .is_none_or(|previous| previous(server, policy))
+                && guard(server, policy)
         }));
         client
     }
@@ -1416,29 +1435,25 @@ impl NntpClient {
                 .iter()
                 .map(|&i| message_ids[i].to_string())
                 .collect();
-            let pool = Arc::clone(&self.pool);
             let excluded = exclude;
             let attempted: Vec<_> = selected.iter().map(|&i| missing[i]).collect();
             let caller_guard = self.work_guard.clone();
-            let guard: ProbeWorkGuard = Arc::new(move || {
+            let guard: ProbeWorkGuard = Arc::new(move |policy| {
                 caller_guard
                     .as_ref()
-                    .is_none_or(|guard| guard(ServerId(server)))
-                    && {
-                        let policy = pool.provider_policy();
-                        attempted.iter().all(|missing| {
-                            matches!(
-                                policy.eligibility(server, *missing, excluded, 1),
-                                crate::provider_policy::ArticleEligibility::Eligible(_)
-                            )
-                        })
-                    }
+                    .is_none_or(|guard| guard(ServerId(server), policy))
+                    && attempted.iter().all(|missing| {
+                        matches!(
+                            policy.eligibility(server, *missing, excluded, 1),
+                            crate::provider_policy::ArticleEligibility::Eligible(_)
+                        )
+                    })
             });
             let result = match cached(server, batch.clone(), Arc::clone(&guard)).await {
                 Some(result) => result,
                 None => {
                     let borrowed: Vec<_> = batch.iter().map(String::as_str).collect();
-                    let client = self.with_work_guard(move |_| guard());
+                    let client = self.with_work_guard(move |_, policy| guard(policy));
                     client.confirm_probe_on_server(server, &borrowed).await
                 }
             };
@@ -2788,17 +2803,20 @@ impl NntpClient {
             };
             let started = Instant::now();
             let health_lease = Arc::clone(&permit.health_lease);
-            match self.pool.with_blocking_connect_admission(server, || {
-                crate::blocking::BlockingBodyLane::connect(
-                    server,
-                    self.pool.stable_server_id(server).unwrap_or_default(),
-                    self.pool.server_transfer_control(server),
-                    &config,
-                    groups,
-                    self.soft_timeout,
-                    permit,
-                )
-            }) {
+            let probe = health_lease.0.probing();
+            match self
+                .pool
+                .with_blocking_connect_admission(server, probe, || {
+                    crate::blocking::BlockingBodyLane::connect(
+                        server,
+                        self.pool.stable_server_id(server).unwrap_or_default(),
+                        self.pool.server_transfer_control(server),
+                        &config,
+                        groups,
+                        self.soft_timeout,
+                        permit,
+                    )
+                }) {
                 Ok(lane) => {
                     self.pool.note_provider_admitted(server, admission);
                     return Ok(lane);
@@ -3281,8 +3299,13 @@ impl NntpClient {
         server: ServerId,
         conn: PooledConnection,
     ) -> Result<PooledConnection> {
-        if self.work_guard.as_ref().is_some_and(|guard| !guard(server)) {
-            return Err(NntpError::WorkObsolete);
+        if let Some(guard) = &self.work_guard {
+            let policy = self
+                .pool
+                .provider_policy_on_connection(server.0, conn.holds_recovery_probe());
+            if !guard(server, &policy) {
+                return Err(NntpError::WorkObsolete);
+            }
         }
         Ok(conn)
     }

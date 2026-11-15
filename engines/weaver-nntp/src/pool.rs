@@ -195,6 +195,35 @@ impl AuthAdmission {
             Err(_) => {}
         }
     }
+
+    // Asked before every dial, blocking or async; `probe` says the dial is
+    // its server's recovery probe. A refused login latches the admission so
+    // cold dials stop fanning out, and quarantines the server; the
+    // quarantine's probe is then the one dial due, and it must reach the
+    // server. The latch is re-armed by every sibling dial the refusal turned
+    // away, so it can outlast the quarantine by the spread of their answers;
+    // were it asked for the probe, the probe would be turned away without
+    // dialing, the quarantine re-armed for its whole length, and the server
+    // waited for twice as long. So the probe passes the latch.
+    fn before_dial(&self, probe: bool) -> Result<()> {
+        if probe { Ok(()) } else { self.check() }
+    }
+
+    // Told every dial's outcome, after [`Self::before_dial`]. A probe that
+    // logs in ends the latch: the login is taken again. Any other dial that
+    // connects is turned away still if a sibling's refusal latched the
+    // admission meanwhile.
+    fn after_dial<T>(&self, probe: bool, result: &Result<T>) -> Result<()> {
+        if probe {
+            match result {
+                Ok(_) => self.state.store(1, Ordering::Release),
+                Err(_) => self.finish(result),
+            }
+            return Ok(());
+        }
+        self.finish(result);
+        if result.is_ok() { self.check() } else { Ok(()) }
+    }
 }
 
 pub struct BlockingConnectionPermit {
@@ -739,7 +768,7 @@ impl NntpPool {
                     };
                     let result = tokio::select! {
                         _ = stopped.cancelled() => break,
-                        result = pool.connect_server(idx, None) => result,
+                        result = pool.connect_server(idx, None, false) => result,
                     };
                     if let Err(error) = &result {
                         let provider_evidence = !matches!(error, NntpError::Route(route) if route.is_path_evidence() || !route.is_evidence());
@@ -791,27 +820,25 @@ impl NntpPool {
         &self,
         idx: usize,
         initial_group: Option<&str>,
+        probe: bool,
     ) -> Result<NntpConnection> {
         let auth = &self.auth_admission[idx];
-        // Cold handshakes fan out. A rejection latches subsequent admission;
-        // connection-limit recovery has its own single-probe gate below.
-        auth.check()?;
+        // Cold handshakes fan out. A rejection latches subsequent admission,
+        // which the recovery probe passes: see [`AuthAdmission::before_dial`].
+        // Connection-limit recovery has its own single-probe gate below.
+        auth.before_dial(probe)?;
         // Asked only once this connect will actually dial, so a probe slot is
         // never taken by a caller the auth gate turns away.
         let admission = self.admit_fresh_connect(ServerId(idx))?;
         let result = self.connect_server_untracked(idx, initial_group).await;
-        auth.finish(&result);
+        let latched = auth.after_dial(probe, &result);
         // A refusal here is the provider declining a new socket, not answering
         // for the sessions already held, so it arms the holdoff and stays out
         // of health entirely.
         self.note_fresh_connect_outcome(ServerId(idx), admission, &result);
-        match result {
-            Ok(connection) => {
-                auth.check()?;
-                Ok(connection)
-            }
-            Err(error) => Err(error),
-        }
+        let connection = result?;
+        latched?;
+        Ok(connection)
     }
 
     async fn connect_server_untracked(
@@ -879,7 +906,7 @@ impl NntpPool {
         initial_group: Option<&str>,
         demanded: bool,
         deadline: &mut tokio::time::Instant,
-        guard: Option<&(dyn Fn(ServerId) -> bool + Send + Sync)>,
+        guard: Option<&crate::client::WorkGuard>,
     ) -> Result<PooledConnection> {
         if self.shutdown.is_cancelled() {
             return Err(NntpError::PoolShutdown);
@@ -983,11 +1010,15 @@ impl NntpPool {
         initial_group: Option<&str>,
         mut deadline: Option<&mut tokio::time::Instant>,
         demanded: bool,
-        guard: Option<&(dyn Fn(ServerId) -> bool + Send + Sync)>,
+        guard: Option<&crate::client::WorkGuard>,
     ) -> Result<PooledConnection> {
+        // The guard is asked before a connection is admitted, so it is handed
+        // the pool's view of the policy: see [`crate::client::WorkGuard`].
+        let still_wanted =
+            || guard.is_none_or(|guard| guard(ServerId(idx), &self.provider_policy()));
         // Try to get a healthy idle connection, with stale-check loop.
         let conn = loop {
-            if guard.is_some_and(|guard| !guard(ServerId(idx))) {
+            if !still_wanted() {
                 return Err(NntpError::WorkObsolete);
             }
             // Subscribe before inspecting the cache and physical capacity.
@@ -1048,15 +1079,19 @@ impl NntpPool {
                         }
                     }
 
-                    if guard.is_some_and(|guard| !guard(ServerId(idx))) {
+                    if !still_wanted() {
                         return Err(NntpError::WorkObsolete);
                     }
                     debug!(server = idx, "creating new connection");
                     let health_lease = self.recovery_gates[idx]
                         .admit(demanded)
                         .ok_or(NntpError::PoolExhausted)?;
+                    // The socket is already had: see `ConnectionHealthLease::announce`.
+                    health_lease.announce();
                     let started = tokio::time::Instant::now();
-                    let connected = self.connect_server(idx, initial_group).await;
+                    let connected = self
+                        .connect_server(idx, initial_group, health_lease.0.probing())
+                        .await;
                     if let Some(deadline) = deadline.as_deref_mut() {
                         *deadline += started.elapsed();
                     }
@@ -1187,7 +1222,7 @@ impl NntpPool {
             .try_acquire_replacement()
             .ok_or(NntpError::PoolExhausted)?;
         let started = tokio::time::Instant::now();
-        let connected = self.connect_server(idx, initial_group).await;
+        let connected = self.connect_server(idx, initial_group, false).await;
         if let Some(deadline) = deadline {
             *deadline += started.elapsed();
         }
@@ -1622,20 +1657,39 @@ impl NntpPool {
     // quota takes its transfer state's lock, briefly, to read what is left;
     // one without a quota is known from a lock-free read to have no limit.
     pub fn provider_policy(&self) -> crate::provider_policy::ProviderPolicy {
-        self.provider_policy_with(|control| {
-            if control.quota_configured() {
-                Self::quota_left(control)
-            } else {
-                u64::MAX
-            }
-        })
+        self.provider_policy_with(Self::quota_left_lock_free, None)
+    }
+
+    // The policy as a connection already open to `server` reads it before it
+    // issues its next request: the one view every recheck of an admitted
+    // connection, or of work already bound to one, is judged by (a work
+    // guard, an owned lane's lease and pre-BODY checks). A quarantine holds
+    // back new connections; the one it has admitted, its probe, is past that
+    // hold and must still be able to carry the request it was admitted for,
+    // so `holds_probe`, the connection being its server's unanswered probe,
+    // reads the server without its own hold. Any other connection, and
+    // every other server, stands as in [`Self::provider_policy`].
+    pub fn provider_policy_on_connection(
+        &self,
+        server: usize,
+        holds_probe: bool,
+    ) -> crate::provider_policy::ProviderPolicy {
+        self.provider_policy_with(Self::quota_left_lock_free, holds_probe.then_some(server))
+    }
+
+    fn quota_left_lock_free(control: &crate::transfer::ServerTransferControl) -> u64 {
+        if control.quota_configured() {
+            Self::quota_left(control)
+        } else {
+            u64::MAX
+        }
     }
 
     // The policy with every server's quota read from a snapshot, as it once
     // was, for the tests that hold the lock-free read to it.
     #[cfg(test)]
     pub(crate) fn provider_policy_by_snapshot(&self) -> crate::provider_policy::ProviderPolicy {
-        self.provider_policy_with(Self::quota_left)
+        self.provider_policy_with(Self::quota_left, None)
     }
 
     // What the quota leaves before local reservations; no limit without one.
@@ -1650,9 +1704,12 @@ impl NntpPool {
         }
     }
 
+    // `connected` is the server of the connection asking, if one is: see
+    // [`Self::provider_policy_on_connection`].
     fn provider_policy_with(
         &self,
         quota_left: impl Fn(&crate::transfer::ServerTransferControl) -> u64,
+        connected: Option<usize>,
     ) -> crate::provider_policy::ProviderPolicy {
         use crate::provider_policy::{ProviderGroup, ProviderPolicy, ProviderState};
         ProviderPolicy::sampled(
@@ -1666,7 +1723,9 @@ impl NntpPool {
                             backfill: self.backfill[idx],
                             priority: self.server_groups()[idx],
                         },
-                        available: self.availability.is_available(idx) && self.route_available(idx),
+                        available: self.availability.is_available(idx)
+                            && self.route_available(idx)
+                            && (connected == Some(idx) || !self.recovery_holds_new_work(idx)),
                         refuses_credentials: self.refuses_credentials(idx),
                         quota_remaining,
                     }
@@ -1986,6 +2045,10 @@ impl NntpPool {
                 budget.try_acquire()
             })
             .ok_or(NntpError::PoolExhausted)?;
+        // Told only now that the probe has its socket: a probe given back
+        // for want of one goes unannounced, and its giving back is the one
+        // change its watchers hear.
+        health_lease.announce();
         Ok(BlockingConnectionPermit {
             max_idle_age: self.max_idle_age,
             _permit: permit,
@@ -2009,21 +2072,21 @@ impl NntpPool {
         *self.last_connect_failure[idx].blocking_lock() = Some(Instant::now());
     }
 
+    // `probe` says the dial is its server's recovery probe: see
+    // [`AuthAdmission::before_dial`], which the async dial asks too.
     pub(crate) fn with_blocking_connect_admission<T>(
         &self,
         server: ServerId,
+        probe: bool,
         connect: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         let admission = self
             .auth_admission
             .get(server.0)
             .ok_or(NntpError::PoolExhausted)?;
-        admission.check()?;
+        admission.before_dial(probe)?;
         let result = connect();
-        admission.finish(&result);
-        if result.is_ok() {
-            admission.check()?;
-        }
+        admission.after_dial(probe, &result)?;
         result
     }
 
@@ -2149,9 +2212,32 @@ impl NntpPool {
         let gate = &self.recovery_gates[idx];
         gate.quarantine(Duration::ZERO, None)
             .expect("an unconditional quarantine always lands");
-        RecoveryProbeForTest(
-            gate.admit(true)
-                .expect("a lapsed quarantine admits one demanded probe"),
+        let probe = gate
+            .admit(true)
+            .expect("a lapsed quarantine admits one demanded probe");
+        probe.announce();
+        RecoveryProbeForTest(probe)
+    }
+
+    // Whether server `idx`'s quarantine holds every new connection now:
+    // before its deadline, or while its one probe is out. Such a server
+    // takes no new article until its recovery changes, so the provider
+    // policy reads it as unavailable and the next priority level takes the
+    // work meanwhile, as it does for a server health has disabled. A
+    // quarantine whose probe is due is available, so the probe has work;
+    // taking the probe is a recovery change, which the next pass sees. The
+    // probe's own connection is past the hold and reads the policy without
+    // it: see [`Self::provider_policy_on_connection`]. The one owner of this
+    // answer for the policy; lock-free on a server that is not quarantined.
+    pub(crate) fn recovery_holds_new_work(&self, idx: usize) -> bool {
+        matches!(
+            self.recovery_gates
+                .get(idx)
+                .and_then(|gate| gate.hold(true)),
+            Some(
+                crate::recovery::ConnectionHold::Until(_)
+                    | crate::recovery::ConnectionHold::Recovery
+            )
         )
     }
 
@@ -2261,10 +2347,15 @@ impl Drop for PooledConnection {
             let healthy = conn.is_healthy() && conn.accepts_new_work();
             let poisoned = conn.is_poisoned();
             let return_to_pool = self.return_to_pool;
+            // An unanswered recovery probe is never kept idle; dropped, it
+            // gives the probe back. See `ConnectionHealth::may_rest_idle`.
+            let may_rest = conn.may_rest_idle();
 
             let mut pool = lock_recovering(&self.pool);
             pool.active_count = pool.active_count.saturating_sub(1);
-            if healthy && return_to_pool {
+            if healthy && return_to_pool && !may_rest {
+                trace!(server = server_idx, "dropped unanswered recovery probe");
+            } else if healthy && return_to_pool {
                 if self.shutdown.is_cancelled() {
                     trace!(server = server_idx, "dropped connection from shutdown pool");
                 } else {
@@ -2517,7 +2608,7 @@ mod tests {
             for _ in 0..4 {
                 scope.spawn(|| {
                     let result: Result<()> =
-                        pool.with_blocking_connect_admission(ServerId(0), || {
+                        pool.with_blocking_connect_admission(ServerId(0), false, || {
                             attempts.fetch_add(1, Ordering::Relaxed);
                             started.send(()).unwrap();
                             let (lock, ready) = &release;
@@ -2539,7 +2630,7 @@ mod tests {
         });
         assert_eq!(attempts.load(Ordering::Relaxed), 4);
         assert!(matches!(
-            pool.with_blocking_connect_admission(ServerId(0), || {
+            pool.with_blocking_connect_admission(ServerId(0), false, || {
                 panic!("latched authentication failure must prevent another dial")
             }),
             Err::<(), _>(NntpError::AuthenticationRejected)
@@ -2549,14 +2640,55 @@ mod tests {
         assert!(pool.auth_admission[0].check().is_err());
         pool.auth_admission[0].state.store(2, Ordering::Release);
         assert!(
-            pool.with_blocking_connect_admission(ServerId(0), || Ok(()))
+            pool.with_blocking_connect_admission(ServerId(0), false, || Ok(()))
                 .is_ok()
         );
         let rebuilt = NntpPool::new(test_pool_config(4));
         assert!(
             rebuilt
-                .with_blocking_connect_admission(ServerId(0), || Ok(()))
+                .with_blocking_connect_admission(ServerId(0), false, || Ok(()))
                 .is_ok()
+        );
+    }
+
+    // A refused login latches the admission, and the siblings it turned
+    // away re-arm the latch past the quarantine's deadline. The quarantine's
+    // probe still dials: turned away by the latch, it would re-arm the
+    // quarantine without asking the server. Logging in, it ends the latch.
+    #[test]
+    fn the_recovery_probe_dials_through_a_latched_login_refusal() {
+        let pool = NntpPool::new(test_pool_config(4));
+        let refused: Result<()> = Err(NntpError::AuthenticationFailed);
+        pool.auth_admission[0].finish(&refused);
+        assert!(matches!(
+            pool.with_blocking_connect_admission(ServerId(0), false, || {
+                panic!("a latched refusal turns an ordinary dial away")
+            }),
+            Err::<(), _>(NntpError::AuthenticationRejected)
+        ));
+        let dials = std::sync::atomic::AtomicUsize::new(0);
+        let refused_again = pool.with_blocking_connect_admission(ServerId(0), true, || {
+            dials.fetch_add(1, Ordering::Relaxed);
+            Err::<(), _>(NntpError::AuthenticationFailed)
+        });
+        assert!(matches!(
+            refused_again,
+            Err(NntpError::AuthenticationFailed)
+        ));
+        assert_eq!(dials.load(Ordering::Relaxed), 1, "the probe dialed");
+        assert!(pool.auth_admission[0].check().is_err(), "still latched");
+        assert!(
+            pool.with_blocking_connect_admission(ServerId(0), true, || {
+                dials.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+            .is_ok()
+        );
+        assert_eq!(dials.load(Ordering::Relaxed), 2);
+        assert!(
+            pool.with_blocking_connect_admission(ServerId(0), false, || Ok(()))
+                .is_ok(),
+            "the probe's login ends the latch"
         );
     }
 
@@ -2602,7 +2734,7 @@ mod tests {
         let mut dials = tokio::task::JoinSet::new();
         for _ in 0..4 {
             let pool = Arc::clone(&pool);
-            dials.spawn(async move { pool.connect_server(0, None).await });
+            dials.spawn(async move { pool.connect_server(0, None, false).await });
         }
         async {
             while let Some(result) = dials.join_next().await {
@@ -2640,10 +2772,10 @@ mod tests {
         });
         let failures = || route.snapshot().addresses[0].consecutive_failures;
 
-        assert!(pool.connect_server(0, None).await.is_err());
+        assert!(pool.connect_server(0, None, false).await.is_err());
         assert_eq!(failures(), 1);
 
-        assert!(pool.connect_server(0, None).await.is_err());
+        assert!(pool.connect_server(0, None, false).await.is_err());
         assert_eq!(failures(), 0);
         server.await.unwrap();
     }
@@ -3887,5 +4019,205 @@ mod tests {
         assert!(changes.follows(&pool));
         let other = Arc::new(NntpPool::new(test_pool_config(2)));
         assert!(!changes.follows(&other));
+    }
+
+    // A primary whose quarantine has lapsed is ranked again while its one
+    // probe is out, yet takes no new connection until that probe answers. A
+    // probe whose BODY hangs held every article of a job behind it: the
+    // backup, one priority level down, was refused each article as
+    // `HigherPriority` and nothing downloaded. While the probe is out the
+    // primary is unavailable to the policy, the backup takes the work, and
+    // the probe's taking wakes the watch so the next pass sees it. Once the
+    // probe answers, the primary is first again.
+    #[tokio::test]
+    async fn a_primary_with_its_probe_out_leaves_its_work_to_the_next_level() {
+        use crate::provider_policy::{ArticleEligibility, ProviderGroup};
+        let server = |host: &str, group: u32| ServerPoolConfig {
+            server: ServerConfig {
+                host: host.into(),
+                ..Default::default()
+            },
+            max_connections: 4,
+            group,
+            ..ServerPoolConfig::default()
+        };
+        let pool = Arc::new(NntpPool::new(PoolConfig {
+            servers: vec![
+                server("primary.example.com", 0),
+                server("backup.example.com", 1),
+            ],
+            ..PoolConfig::default()
+        }));
+        let none = crate::ServerSet::EMPTY;
+        let primary = ProviderGroup {
+            backfill: false,
+            priority: 0,
+        };
+        let backup = ProviderGroup {
+            backfill: false,
+            priority: 1,
+        };
+        let backup_answer = |pool: &NntpPool| pool.provider_policy().eligibility(1, none, none, 1);
+
+        // A lapsed quarantine with its probe due: the primary has work for
+        // the probe, and the backup still waits on it.
+        pool.recovery_gates[0].quarantine(Duration::ZERO, None);
+        assert_eq!(
+            pool.provider_policy().eligibility(0, none, none, 1),
+            ArticleEligibility::Eligible(primary)
+        );
+        assert_eq!(
+            backup_answer(&pool),
+            ArticleEligibility::HigherPriority(primary)
+        );
+
+        // The probe goes out: the watch wakes, and the backup takes the work.
+        // Read as a value, not awaited, so a missing publish fails at once.
+        let mut changes = pool.server_health_changes();
+        changes.receiver.borrow_and_update();
+        let probe = pool.take_recovery_probe_for_test(0);
+        assert!(
+            changes.receiver.has_changed().unwrap(),
+            "the probe going out wakes the watch"
+        );
+        changes.receiver.borrow_and_update();
+        assert_eq!(
+            pool.provider_policy().eligibility(0, none, none, 1),
+            ArticleEligibility::Unavailable
+        );
+        assert_eq!(backup_answer(&pool), ArticleEligibility::Eligible(backup));
+        // The probe's own connection is past the hold: it may still issue
+        // the article it was admitted for, or the probe could never answer
+        // and the primary would never come back.
+        assert_eq!(
+            pool.provider_policy_on_connection(0, true)
+                .eligibility(0, none, none, 1),
+            ArticleEligibility::Eligible(primary)
+        );
+        // Any other connection to the primary is held with it.
+        assert_eq!(
+            pool.provider_policy_on_connection(0, false)
+                .eligibility(0, none, none, 1),
+            ArticleEligibility::Unavailable
+        );
+        assert_eq!(
+            pool.provider_policy_on_connection(1, false)
+                .eligibility(1, none, none, 1),
+            ArticleEligibility::Eligible(backup)
+        );
+
+        // The probe answers: the primary is first again.
+        probe.answer();
+        assert!(
+            changes.receiver.has_changed().unwrap(),
+            "the probe's answer wakes the watch"
+        );
+        assert_eq!(
+            pool.provider_policy().eligibility(0, none, none, 1),
+            ArticleEligibility::Eligible(primary)
+        );
+        assert_eq!(
+            backup_answer(&pool),
+            ArticleEligibility::HigherPriority(primary)
+        );
+
+        // A quarantine before its deadline holds every connection: the
+        // backup takes the work then too.
+        pool.recovery_gates[0].quarantine(Duration::from_hours(1), None);
+        assert_eq!(backup_answer(&pool), ArticleEligibility::Eligible(backup));
+    }
+
+    // A probe admitted and given back at once because no socket was free
+    // changes nothing its watchers could act on, and they hear of it once,
+    // by its giving back, not once for the admission and again for that.
+    #[tokio::test]
+    async fn a_probe_given_back_for_want_of_a_socket_is_heard_of_once() {
+        let pool = Arc::new(NntpPool::new(test_pool_config(1)));
+        let held: Vec<_> = std::iter::from_fn(|| pool.socket_budgets[0].try_acquire()).collect();
+        assert!(!held.is_empty(), "the server's every socket is held");
+        pool.recovery_gates[0].quarantine(Duration::ZERO, None);
+        let mut changes = pool.server_health_changes();
+        let before = *changes.receiver.borrow_and_update();
+
+        assert!(matches!(
+            pool.try_acquire_blocking_permit_for_work(ServerId(0), true),
+            Err(NntpError::PoolExhausted)
+        ));
+
+        assert_eq!(
+            changes.receiver.borrow().wrapping_sub(before),
+            1,
+            "one change heard for the attempt"
+        );
+        assert_eq!(
+            pool.recovery_gates[0].hold(true),
+            Some(crate::recovery::ConnectionHold::Probe),
+            "the probe is due again"
+        );
+        drop(held);
+    }
+
+    // The async dial asks the login latch as the blocking dial does: a
+    // latched refusal turns an ordinary dial away without dialing, and the
+    // quarantine's probe still reaches the server, whose login then ends
+    // the latch.
+    #[tokio::test]
+    async fn the_async_recovery_probe_dials_through_a_latched_login_refusal() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_pool_config(4);
+        config.servers[0].server.host = "127.0.0.1".into();
+        config.servers[0].server.port = listener.local_addr().unwrap().port();
+        config.servers[0].server.tls = false;
+        let pool = Arc::new(NntpPool::new(config));
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted = Arc::clone(&dials);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                accepted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let (reader, mut writer) = socket.into_split();
+                    writer.write_all(b"200 ready\r\n").await.unwrap();
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let reply: &[u8] = if line == "CAPABILITIES" {
+                            b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n"
+                        } else {
+                            b"500 unsupported\r\n"
+                        };
+                        if writer.write_all(reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        pool.auth_admission[0].finish(&Err::<(), _>(NntpError::AuthenticationFailed));
+
+        assert!(matches!(
+            pool.connect_server(0, None, false).await,
+            Err(NntpError::AuthenticationRejected)
+        ));
+        assert_eq!(dials.load(Ordering::SeqCst), 0, "the latch turned it away");
+
+        let probe = pool.connect_server(0, None, true).await;
+        assert!(
+            probe.is_ok(),
+            "the probe dials through the latch: {:?}",
+            probe.err()
+        );
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
+
+        let after = pool.connect_server(0, None, false).await;
+        assert!(
+            after.is_ok(),
+            "the probe's login ends the latch: {:?}",
+            after.err()
+        );
+        drop((probe, after));
+        server.abort();
     }
 }

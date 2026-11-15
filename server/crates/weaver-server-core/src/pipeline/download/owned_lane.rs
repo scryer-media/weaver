@@ -920,13 +920,15 @@ fn run_owned_lane_work(
     cached_lane: &mut Option<CachedOwnedLane>,
     work: QueuedOwnedLaneWork,
 ) -> Option<OwedProbeAnswer> {
-    match work {
+    let owed = match work {
         QueuedOwnedLaneWork::Run(run) => {
             run_owned_blocking_download_lane(cached_lane, *run);
             None
         }
         QueuedOwnedLaneWork::Probe(probe) => Some(ask_owned_lane_probe(cached_lane, *probe)),
-    }
+    };
+    give_back_unanswered_probe(cached_lane);
+    owed
 }
 
 // A probe batch's answer on its way back through the probes' mail.
@@ -1009,6 +1011,7 @@ fn answer_idle_command(
         }
         OwnedLanePoolCommand::Warm(warm) => {
             warm_cached_lane(cached_lane, *warm);
+            give_back_unanswered_probe(cached_lane);
             lock_pool(shared)
                 .note_idle_lane(seat, cached_lane.as_ref().map(IdleOwnedLane::from_cached));
         }
@@ -1225,6 +1228,20 @@ fn ask_owned_lane_probe(
 fn park_cached_lane(cached_lane: &mut Option<CachedOwnedLane>) {
     if let Some(cached) = cached_lane.take() {
         cached.lane.park();
+    }
+}
+
+// The cached connection is about to rest: an unanswered recovery probe never
+// does (see `BlockingBodyLane::may_rest_idle`), so it is parked here, which
+// gives the probe back. Asked wherever the worker's connection goes idle:
+// after every piece of work, after a warm, and on a run's way out before it
+// tells the pipeline it is done, so the probe is back before the work moves.
+fn give_back_unanswered_probe(cached_lane: &mut Option<CachedOwnedLane>) {
+    if cached_lane
+        .as_ref()
+        .is_some_and(|cached| !cached.lane.may_rest_idle())
+    {
+        park_cached_lane(cached_lane);
     }
 }
 
@@ -1475,15 +1492,20 @@ pub(super) fn job_work_is_current(
 // to it by `dial_exclude_servers` (see `Pipeline::lease_for_handout`). The
 // lease is current while some undialled-out server may still serve every one
 // of its works, which for a lease cut by dispatch is its own server.
+// `connected` is the connection the lane already holds, if it holds one.
 fn lease_is_current(
     state: &crate::jobs::handle::SharedPipelineState,
     nntp: &weaver_nntp::NntpClient,
     lease: &DownloadBatchLease,
+    connected: Option<HeldConnection>,
 ) -> bool {
     if !job_work_is_current(state, lease.job_id, lease.runtime_generation) {
         return false;
     }
-    let policy = nntp.pool().provider_policy();
+    let policy = match connected {
+        Some(connection) => connection.policy(nntp),
+        None => nntp.pool().provider_policy(),
+    };
     (0..nntp.pool().server_count()).any(|server| {
         !lease.dial_exclude_servers.contains(server)
             && lease.works.iter().all(|work| {
@@ -1500,6 +1522,55 @@ fn lease_is_current(
     })
 }
 
+// The connection a lane holds, as every recheck of work bound to it reads
+// the provider policy: see `NntpPool::provider_policy_on_connection`, where
+// the server's unanswered recovery probe is past its own server's hold.
+#[derive(Clone, Copy, Debug)]
+struct HeldConnection {
+    server: usize,
+    holds_probe: bool,
+}
+
+impl HeldConnection {
+    fn of(lane: &weaver_nntp::blocking::BlockingBodyLane) -> Self {
+        Self {
+            server: lane.server_id().0,
+            holds_probe: lane.is_recovery_probe(),
+        }
+    }
+
+    fn policy(
+        self,
+        nntp: &weaver_nntp::NntpClient,
+    ) -> weaver_nntp::provider_policy::ProviderPolicy {
+        nntp.pool()
+            .provider_policy_on_connection(self.server, self.holds_probe)
+    }
+}
+
+// Whether `work` may still go out on the connection a lane holds, asked just
+// before its BODY is written: the job is still running at the generation
+// the work was cut for, and the work is still eligible on that connection's
+// server, as the connection reads the policy.
+fn issue_is_current(
+    state: &crate::jobs::handle::SharedPipelineState,
+    nntp: &weaver_nntp::NntpClient,
+    connection: HeldConnection,
+    work: &DownloadWork,
+    context: &LaneLeaseContext,
+) -> bool {
+    job_work_is_current(state, context.job_id, context.runtime_generation)
+        && matches!(
+            connection.policy(nntp).eligibility(
+                connection.server,
+                work.exclude_servers,
+                context.retention_excludes,
+                Pipeline::bandwidth_reservation_estimate(work.byte_estimate),
+            ),
+            weaver_nntp::provider_policy::ArticleEligibility::Eligible(_)
+        )
+}
+
 // Run one lease to its park on this worker's connection.
 #[allow(clippy::too_many_lines)]
 fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, run: OwnedLaneRun) {
@@ -1514,7 +1585,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
     } = run;
     let mut lease = initial_lease;
 
-    if !lease_is_current(&state, &nntp, &lease) {
+    if !lease_is_current(&state, &nntp, &lease, None) {
         let _ = event_tx.blocking_send(OwnedDownloadLaneEvent::LeaseObsolete { lease });
         return;
     }
@@ -1557,7 +1628,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         // every server before it.
         let group_required = servers_requiring_group(&nntp);
         let dialled = acquire_owned_lane_through_contention(
-            || lease_is_current(&state, &nntp, &lease),
+            || lease_is_current(&state, &nntp, &lease, None),
             || {
                 nntp.try_acquire_blocking_body_lane_with_estimate(
                     lease_groups(&lease),
@@ -1589,7 +1660,14 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         }
     }
 
-    if !lease_is_current(&state, &nntp, &lease) {
+    let connected = cached_lane
+        .as_ref()
+        .map(|cached| HeldConnection::of(&cached.lane));
+    if !lease_is_current(&state, &nntp, &lease, connected) {
+        // A probe that leaves without its article is given back, never kept
+        // idle: kept, it would hold its server's every other connection with
+        // nothing on the wire to answer for.
+        give_back_unanswered_probe(cached_lane);
         let _ = event_tx.blocking_send(OwnedDownloadLaneEvent::LeaseObsolete { lease });
         return;
     }
@@ -1710,17 +1788,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             // A refill can wait behind an in-flight response after the actor
             // granted it. Its grant is not permission to issue after pause,
             // cancellation, a provider edit, or higher-priority recovery.
-            if !job_work_is_current(&state, work_context.job_id, work_context.runtime_generation)
-                || !matches!(
-                    nntp.pool().provider_policy().eligibility(
-                        server_idx,
-                        work.exclude_servers,
-                        work_context.retention_excludes,
-                        Pipeline::bandwidth_reservation_estimate(work.byte_estimate),
-                    ),
-                    weaver_nntp::provider_policy::ArticleEligibility::Eligible(_)
-                )
-            {
+            if !issue_is_current(&state, &nntp, HeldConnection::of(lane), work, work_context) {
                 stop = Some(LaneStop::ReservationObsolete);
                 break;
             }
@@ -2034,7 +2102,9 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
 
     if !keep_cached_lane {
         park_cached_lane(cached_lane);
-    } else if frees_read_buffers_after_park(park_reason)
+    }
+    give_back_unanswered_probe(cached_lane);
+    if frees_read_buffers_after_park(park_reason)
         && let Some(cached) = cached_lane.as_mut()
     {
         cached.lane.release_idle_buffers();
@@ -3229,31 +3299,31 @@ mod routing_tests {
             weaver_nntp::ServerSet::EMPTY,
             vec![tail_work(1, 0)],
         );
-        assert!(lease_is_current(&state, &nntp, &lease));
+        assert!(lease_is_current(&state, &nntp, &lease, None));
         state.queue.write(|inner| {
             inner.jobs[0].report.nzb_admitted = false;
             crate::pipeline::queue::Change::changed(())
         });
-        assert!(!lease_is_current(&state, &nntp, &lease));
+        assert!(!lease_is_current(&state, &nntp, &lease, None));
         state.queue.write(|inner| {
             inner.jobs[0].report.nzb_admitted = true;
             inner.jobs[0].intents.paused = Some(true);
             crate::pipeline::queue::Change::changed(())
         });
-        assert!(!lease_is_current(&state, &nntp, &lease));
+        assert!(!lease_is_current(&state, &nntp, &lease, None));
         state.queue.write(|inner| {
             inner.jobs[0].intents.paused = Some(false);
             inner.globals.nntp_generation = 1;
             crate::pipeline::queue::Change::changed(())
         });
-        assert!(!lease_is_current(&state, &nntp, &lease));
+        assert!(!lease_is_current(&state, &nntp, &lease, None));
         lease.runtime_generation = 1;
-        assert!(lease_is_current(&state, &nntp, &lease));
+        assert!(lease_is_current(&state, &nntp, &lease, None));
         state.queue.write(|inner| {
             inner.globals.paused = true;
             crate::pipeline::queue::Change::changed(())
         });
-        assert!(!lease_is_current(&state, &nntp, &lease));
+        assert!(!lease_is_current(&state, &nntp, &lease, None));
     }
 
     // A lease is cut for one server and pinned to it, so two works whose own
@@ -3287,7 +3357,46 @@ mod routing_tests {
             weaver_nntp::ServerSet::from([0]),
             vec![not_found_on_zero, tail_work(2, 0)],
         );
-        assert!(lease_is_current(&state, &nntp, &lease));
+        assert!(lease_is_current(&state, &nntp, &lease, None));
+    }
+
+    // A lease cut for a server whose quarantine has lapsed is carried by the
+    // dial that becomes the probe. While that probe is out the server takes
+    // no new connection, so a lane with no connection finds the lease
+    // obsolete; the probe's own connection does not, or it would never issue
+    // the article it was admitted for, the probe would never answer, and the
+    // server would never come back.
+    #[test]
+    fn the_probe_connection_still_carries_its_lease_while_the_probe_is_out() {
+        let nntp = test_client();
+        let state = test_admitted_state(JobId(42));
+        let lease = test_lease(
+            JobId(42),
+            0,
+            weaver_nntp::ServerSet::EMPTY,
+            vec![tail_work(1, 0)],
+        );
+        nntp.pool().quarantine_for_transport_for_test(0);
+        nntp.pool().expire_quarantine_for_test(0);
+        assert!(
+            lease_is_current(&state, &nntp, &lease, None),
+            "the probe is due, so the lease has a server to dial"
+        );
+        let probe = nntp.pool().take_recovery_probe_for_test(0);
+        assert!(!lease_is_current(&state, &nntp, &lease, None));
+        let on = |holds_probe| {
+            Some(HeldConnection {
+                server: 0,
+                holds_probe,
+            })
+        };
+        assert!(lease_is_current(&state, &nntp, &lease, on(true)));
+        assert!(
+            !lease_is_current(&state, &nntp, &lease, on(false)),
+            "a connection that is not the probe is held with the server"
+        );
+        drop(probe);
+        assert!(lease_is_current(&state, &nntp, &lease, None));
     }
 
     fn test_run(
@@ -3822,6 +3931,154 @@ mod routing_tests {
             "the lane that answered stays with the worker"
         );
 
+        park_cached_lane(&mut cached);
+        server.join().unwrap();
+    }
+
+    // The check just before a BODY is written reads the policy as the lane's
+    // connection does: the server's recovery probe still issues the work it
+    // was admitted for while its probe is out, and any other connection to
+    // the server is held with it.
+    #[test]
+    fn the_probe_connection_still_issues_its_work_while_the_probe_is_out() {
+        let nntp = test_client();
+        let state = test_admitted_state(JobId(42));
+        let mut lease = test_lease(
+            JobId(42),
+            0,
+            weaver_nntp::ServerSet::EMPTY,
+            vec![tail_work(1, 0)],
+        );
+        let context = LaneLeaseContext::from_lease(&mut lease, 0, false);
+        let work = &lease.works[0];
+        let on = |holds_probe| HeldConnection {
+            server: 0,
+            holds_probe,
+        };
+        nntp.pool().quarantine_for_transport_for_test(0);
+        nntp.pool().expire_quarantine_for_test(0);
+        let probe = nntp.pool().take_recovery_probe_for_test(0);
+        assert!(issue_is_current(&state, &nntp, on(true), work, &context));
+        assert!(!issue_is_current(&state, &nntp, on(false), work, &context));
+        drop(probe);
+        assert!(issue_is_current(&state, &nntp, on(false), work, &context));
+    }
+
+    // A server whose quarantine has lapsed, and the probe batch a worker asks
+    // on its seat there: the worker's dial is the server's recovery probe.
+    fn probe_due_on_stat_fixture(
+        ids: &[&str],
+    ) -> (
+        Arc<weaver_nntp::NntpClient>,
+        OwnedLaneProbe,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (port, server) = stat_fixture();
+        let nntp = Arc::new(weaver_nntp::client::NntpClient::new(
+            weaver_nntp::client::NntpClientConfig::single(
+                weaver_nntp::ServerConfig {
+                    host: "127.0.0.1".to_string(),
+                    port,
+                    tls: false,
+                    ..Default::default()
+                },
+                1,
+            ),
+        ));
+        nntp.pool().quarantine_for_transport_for_test(0);
+        nntp.pool().expire_quarantine_for_test(0);
+        // The answer is handed back unsent, so nothing reads the mail.
+        let (mail, _) = mpsc::channel(4);
+        let batch = crate::pipeline::post_health::ProbeBatch::new(
+            JobId(1),
+            1,
+            ids.iter().map(|id| (*id).into()).collect(),
+        );
+        let probe = OwnedLaneProbe {
+            nntp: Arc::clone(&nntp),
+            seat: weaver_nntp::pool::ServerId(0),
+            ids: batch.unfound(),
+            batch,
+            mail,
+        };
+        (nntp, probe, server)
+    }
+
+    fn server_takes_new_work(nntp: &weaver_nntp::NntpClient) -> bool {
+        matches!(
+            nntp.pool().provider_policy().eligibility(
+                0,
+                weaver_nntp::ServerSet::EMPTY,
+                weaver_nntp::ServerSet::EMPTY,
+                1
+            ),
+            weaver_nntp::provider_policy::ArticleEligibility::Eligible(_)
+        )
+    }
+
+    // An existence probe asks no BODY. A STAT the server answers 223 is its
+    // answer, so a probe dialled for it recovers the server, and the lane is
+    // then kept like any other.
+    #[test]
+    fn an_existence_probe_answered_found_recovers_its_server() {
+        let (nntp, probe, server) = probe_due_on_stat_fixture(&["<lantern-0@example.com>"]);
+        let mut cached = None;
+
+        let owed = run_owned_lane_work(&mut cached, QueuedOwnedLaneWork::Probe(Box::new(probe)));
+
+        assert!(owed.is_some());
+        assert!(
+            !nntp.pool().requires_recovery(0),
+            "the 223 answered the probe"
+        );
+        assert!(cached.is_some(), "an answered lane is kept");
+        park_cached_lane(&mut cached);
+        server.join().unwrap();
+    }
+
+    // A probe batch the server answers with nothing found leaves the probe
+    // unanswered. The lane is not kept idle holding it: it is parked, the
+    // probe is given back, and the server takes new work again.
+    #[test]
+    fn an_existence_probe_that_finds_nothing_gives_the_probe_back() {
+        let (nntp, probe, server) = probe_due_on_stat_fixture(&["<lantern-1@example.com>"]);
+        let mut cached = None;
+
+        let owed = run_owned_lane_work(&mut cached, QueuedOwnedLaneWork::Probe(Box::new(probe)));
+
+        assert!(owed.is_some());
+        assert!(nntp.pool().requires_recovery(0), "a 430 is no answer");
+        assert!(cached.is_none(), "the unanswered probe is not kept idle");
+        assert!(server_takes_new_work(&nntp), "the probe was given back");
+        server.join().unwrap();
+    }
+
+    // The one rule for a resting lane: an unanswered probe is parked, which
+    // gives the probe back; a lane that is not a probe is kept.
+    #[test]
+    fn a_resting_lane_gives_back_an_unanswered_probe_and_keeps_anything_else() {
+        let (nntp, probe, server) = probe_due_on_stat_fixture(&["<lantern-1@example.com>"]);
+        let mut cached = None;
+        let owed = ask_owned_lane_probe(&mut cached, probe);
+        drop(owed);
+        assert!(
+            cached.is_some(),
+            "the probe's lane came back from its batch"
+        );
+        assert!(!server_takes_new_work(&nntp), "its probe is out");
+
+        give_back_unanswered_probe(&mut cached);
+
+        assert!(cached.is_none());
+        assert!(server_takes_new_work(&nntp));
+        server.join().unwrap();
+
+        let (nntp, probe, server) = probe_due_on_stat_fixture(&["<lantern-0@example.com>"]);
+        let mut cached = None;
+        drop(ask_owned_lane_probe(&mut cached, probe));
+        assert!(!nntp.pool().requires_recovery(0));
+        give_back_unanswered_probe(&mut cached);
+        assert!(cached.is_some(), "a lane that is no probe is kept");
         park_cached_lane(&mut cached);
         server.join().unwrap();
     }

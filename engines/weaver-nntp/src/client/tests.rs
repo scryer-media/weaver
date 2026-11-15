@@ -3461,3 +3461,122 @@ fn candidacy_probe_leaves_the_quota_blocked_signal_alone() {
     assert!(client.server_quota_rejection(ServerId(0), 41).is_some());
     assert!(limited.snapshot().quota_blocked);
 }
+
+// A client over one scripted server whose own timeouts never decide a test.
+fn patient_client(port: u16) -> NntpClient {
+    NntpClient::new(NntpClientConfig {
+        servers: vec![scripted_server(port, 0)],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        soft_timeout: UNREACHED_TIMEOUT,
+    })
+}
+
+// The setup a scripted server greets a reader session with.
+fn greeted_reader(mut rest: Vec<ScriptStep>) -> Vec<ScriptStep> {
+    let mut steps = vec![
+        ScriptStep {
+            expect_prefix: None,
+            response: b"200 ready\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("CAPABILITIES"),
+            response: READER_CAPABILITIES,
+        },
+    ];
+    steps.append(&mut rest);
+    steps
+}
+
+// A guarded fetch on a server whose quarantine has lapsed dials the server's
+// recovery probe. The guard, asked again once the probe's connection is had,
+// reads that connection's view of the policy, where the probe is past its
+// own server's hold: read as a new connection, the server would stand held
+// by the very probe, the work would be found obsolete, and the probe would
+// be put down unanswered.
+#[tokio::test]
+async fn a_guarded_fetch_carries_the_due_probe_and_its_server_recovers() {
+    let port = spawn_scripted_server(greeted_reader(vec![ScriptStep {
+        expect_prefix: Some("BODY "),
+        response: b"222 1 <probe@example.com>\r\npayload\r\n.\r\n",
+    }]))
+    .await;
+    let client = patient_client(port);
+    let pool = Arc::clone(client.pool());
+    pool.quarantine_for_transport_for_test(0);
+    pool.expire_quarantine_for_test(0);
+    let guarded = client.with_work_guard(|server, policy| {
+        matches!(
+            policy.eligibility(server.0, ServerSet::EMPTY, ServerSet::EMPTY, 1),
+            crate::provider_policy::ArticleEligibility::Eligible(_)
+        )
+    });
+
+    let trace = guarded
+        .fetch_body_with_groups_traced("<probe@example.com>", &[])
+        .await;
+
+    assert!(trace.result.is_ok(), "{:?}", trace.result.err());
+    assert!(!pool.requires_recovery(0), "the probe answered");
+}
+
+// An async connection that is its server's unanswered recovery probe is
+// never put back on the idle list: kept there, it would hold the server's
+// every other connection with nothing on the wire. Dropped, it gives the
+// probe back, and the probe is due again.
+#[tokio::test]
+async fn an_async_probe_put_down_unanswered_gives_the_probe_back() {
+    let port = spawn_scripted_server(greeted_reader(Vec::new())).await;
+    let client = patient_client(port);
+    let pool = Arc::clone(client.pool());
+    pool.quarantine_for_transport_for_test(0);
+    pool.expire_quarantine_for_test(0);
+    let mut deadline = TokioInstant::now() + UNREACHED_TIMEOUT;
+
+    let probe = pool
+        .acquire_guarded_before_deadline(ServerId(0), None, true, &mut deadline, None)
+        .await
+        .unwrap();
+    assert!(probe.holds_recovery_probe());
+    assert!(pool.recovery_holds_new_work(0), "the probe is out");
+    drop(probe);
+
+    assert!(
+        !pool.recovery_holds_new_work(0),
+        "the probe was given back, not kept idle"
+    );
+    assert!(pool.requires_recovery(0), "nothing answered it");
+}
+
+// An existence check asks no BODY, so a STAT's 223 is the probe's answer:
+// the server answered the command it was asked. A 430 is not, and the
+// probe stays out.
+#[tokio::test]
+async fn a_stat_found_on_the_async_probe_recovers_its_server() {
+    let port = spawn_scripted_server(greeted_reader(vec![
+        ScriptStep {
+            expect_prefix: Some("STAT "),
+            response: b"430 no such article\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("STAT "),
+            response: b"223 0 <found@example.com>\r\n",
+        },
+    ]))
+    .await;
+    let client = patient_client(port);
+    let pool = Arc::clone(client.pool());
+    pool.quarantine_for_transport_for_test(0);
+    pool.expire_quarantine_for_test(0);
+    let mut deadline = TokioInstant::now() + UNREACHED_TIMEOUT;
+    let mut probe = pool
+        .acquire_guarded_before_deadline(ServerId(0), None, true, &mut deadline, None)
+        .await
+        .unwrap();
+
+    assert!(!probe.stat_by_id("<missing@example.com>").await.unwrap());
+    assert!(pool.requires_recovery(0), "a 430 is no answer");
+    assert!(probe.stat_by_id("<found@example.com>").await.unwrap());
+    assert!(!pool.requires_recovery(0), "a 223 is the probe's answer");
+    assert!(probe.may_rest_idle());
+}

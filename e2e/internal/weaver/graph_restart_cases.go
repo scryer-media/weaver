@@ -49,10 +49,12 @@ func graphRestartCases() []restartCase {
 		},
 		{
 			Name:        "backfill_is_no_backup_for_refused_credentials",
-			Description: "The fill server refuses credentials while a backfill server has every article; the backfill server serves nothing and the job does not complete from it.",
+			Description: "The fill server refuses credentials while a backfill server has every article; the job waits on the fill server with nothing booked missing, the backfill server serves nothing, and the job completes from the fill server once the login is taken again.",
 			Slugs:       []string{graphCaseSlug},
-			Timeout:     5 * time.Minute,
-			Run:         runBackfillIsNoBackupForRefusedCredentials,
+			// The fill server's recovery probe, which finds the login taken
+			// again, runs every five minutes.
+			Timeout: 10 * time.Minute,
+			Run:     runBackfillIsNoBackupForRefusedCredentials,
 		},
 		{
 			Name:        "lower_priority_server_covers_a_down_primary",
@@ -293,7 +295,9 @@ func runBackfillServesOnlyWhatTheFillTierLacks(ctx *restartCaseContext) (restart
 	return classifyRestartResult(ctx.Profile, pass, "the backfill server served exactly the articles the fill server lacked: "+detail, false, "", detail), nil
 }
 
-// G2b. A fill server that refuses credentials does not unlock backfill.
+// G2b. A fill server that refuses credentials does not unlock backfill: the
+// refusal is a wait for the fill server, which serves the job once it takes
+// the login again.
 func runBackfillIsNoBackupForRefusedCredentials(ctx *restartCaseContext) (restartCaseResult, error) {
 	if err := ctx.backfillSetup(0, true); err != nil {
 		return restartCaseResult{}, err
@@ -309,32 +313,57 @@ func runBackfillIsNoBackupForRefusedCredentials(ctx *restartCaseContext) (restar
 		_ = release()
 		return restartCaseResult{}, err
 	}
-	statuses, waitErr := ctx.waitForAllTerminal([]int{jobID}, ctx.Timeout)
+	// A refused login is a wait for the fill server until its give-up time:
+	// the job says it waits on that server and books nothing missing, and
+	// the backfill server is not asked in its place.
+	wait, waitErr := ctx.waitForLoginRefusalWait(jobID, nntpPort())
+	if waitErr != nil {
+		_ = release()
+		return classifyRestartResult(ctx.Profile, false, "", false, "", "the job never reported waiting on the refusing server: "+waitErr.Error()), nil
+	}
+	backfillWhileRefused, err := backfillBodyCount()
+	if err != nil {
+		_ = release()
+		return restartCaseResult{}, err
+	}
 	if err := release(); err != nil {
 		return restartCaseResult{}, err
 	}
+	// The login is taken again: the fill server's next recovery probe finds
+	// it, and the job completes from it.
+	statuses, waitErr := ctx.waitForAllTerminal([]int{jobID}, ctx.Timeout)
 	if waitErr != nil {
-		return classifyRestartResult(ctx.Profile, false, "", false, "", "the job never settled with credentials refused: "+waitErr.Error()), nil
+		return classifyRestartResult(ctx.Profile, false, "", false, "", "the job never completed once the login was taken again: "+waitErr.Error()), nil
 	}
-	backup, err := fetchNntpBodyMetricsFrom(nntpHost(), backupNntpPort(), "")
+	backfillBodies, err := backfillBodyCount()
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	backfillBodies := 0
-	for _, count := range backup.BodyCounts {
-		backfillBodies += count
+	size, digest, err := singleMKVSource()
+	if err != nil {
+		return restartCaseResult{}, err
 	}
 	final := statuses[jobID]
-	detail := fmt.Sprintf("final=%s backfill_bodies=%d", final, backfillBodies)
-	pass := backfillBodies == 0 && final != "COMPLETE"
-	// The code today unlocks backfill once every fill server is excluded,
-	// refused credentials among the reasons, so the backfill server serving
-	// the job is the known gap the ruling removes.
-	gap := backfillBodies > 0
+	outputOK := final == "COMPLETE" && deliveredCopy(completeDirOf(caseDBPath(ctx), jobID), size, digest)
+	detail := fmt.Sprintf("while_refused={state=%s wait=%q failed_bytes=%d backfill_bodies=%d} final=%s output_ok=%t backfill_bodies=%d",
+		wait.State, wait.WaitReason, wait.FailedBytes, backfillWhileRefused, final, outputOK, backfillBodies)
+	pass := wait.State != "FAILED" && wait.FailedBytes == 0 && backfillBodies == 0 && outputOK
 	return classifyRestartResult(ctx.Profile, pass,
-		"refused credentials left the backfill server idle and the job unfinished: "+detail,
-		gap, "refused credentials unlocked the backfill server: "+detail,
-		"refused credentials: "+detail), nil
+		"refused credentials left the job waiting on the fill server, the backfill server idle, and the job completed from the fill server: "+detail,
+		false, "", "refused credentials: "+detail), nil
+}
+
+// backfillBodyCount is how many bodies the backfill server has served.
+func backfillBodyCount() (int, error) {
+	backup, err := fetchNntpBodyMetricsFrom(nntpHost(), backupNntpPort(), "")
+	if err != nil {
+		return 0, err
+	}
+	bodies := 0
+	for _, count := range backup.BodyCounts {
+		bodies += count
+	}
+	return bodies, nil
 }
 
 // G2c. Priority levels are the backup: a lower-priority fill server covers a

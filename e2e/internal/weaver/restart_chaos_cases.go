@@ -144,9 +144,9 @@ func nzbFileSubjects(slug string) ([]string, error) {
 }
 
 // C1. The news server starts refusing the account mid-job: every BODY asks
-// for authentication again and every AUTHINFO is refused. With the only
-// server refusing credentials, the queued articles are retired in one sweep
-// and the job settles instead of requeueing.
+// for authentication again and every AUTHINFO is refused. Until its give-up
+// time a refused login is a wait for the server: the job says it waits on
+// it, books no article missing, and completes once the login is taken again.
 func runCredentialsRefusedMidJobSettles(ctx *restartCaseContext) (restartCaseResult, error) {
 	const slug = "single-mkv"
 	segments, err := nzbSegments(slug)
@@ -179,7 +179,6 @@ func runCredentialsRefusedMidJobSettles(ctx *restartCaseContext) (restartCaseRes
 	if !started {
 		return classifyRestartResult(ctx.Profile, false, "", false, "", "the job ended before the refusal could start"), nil
 	}
-	logBefore, _ := os.ReadFile(ctx.caseLogPath)
 	// The refusal also refuses the harness, so the gate is set and cleared
 	// over one control session that authenticated before it. It replaces the
 	// hold, so the bodies the hold caught finish and every later BODY is
@@ -188,28 +187,38 @@ func runCredentialsRefusedMidJobSettles(ctx *restartCaseContext) (restartCaseRes
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	statuses, err := ctx.waitForAllTerminal([]int{jobID}, ctx.Timeout)
+	// A refused login is a wait for the server until its give-up time, not a
+	// verdict: the job says it waits on that server, books nothing missing,
+	// and stays in the queue.
+	wait, waitErr := ctx.waitForLoginRefusalWait(jobID, nntpPort())
 	if releaseErr := releaseRefusal(); releaseErr != nil {
 		return restartCaseResult{}, releaseErr
 	}
+	if waitErr != nil {
+		_, _, _, _ = ctx.captureEvidence("pre_timeout", "")
+		return classifyRestartResult(ctx.Profile, false, "", false, "", fmt.Sprintf("the job never reported waiting on the refusing server: %v", waitErr)), nil
+	}
+	// The login is taken again: the server's next recovery probe finds it,
+	// and the job completes from it.
+	statuses, err := ctx.waitForAllTerminal([]int{jobID}, ctx.Timeout)
 	if err != nil {
 		_, _, _, _ = ctx.captureEvidence("pre_timeout", "")
-		return classifyRestartResult(ctx.Profile, false, "", false, "", fmt.Sprintf("the job never settled once credentials were refused: %v", err)), nil
+		return classifyRestartResult(ctx.Profile, false, "", false, "", fmt.Sprintf("the job never completed once the login was taken again: %v", err)), nil
 	}
 	_, _, post, err := ctx.captureEvidence("post_refusal", "")
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	full, _ := os.ReadFile(ctx.caseLogPath)
-	after := string(full[len(logBefore):])
-	jobField := fmt.Sprintf("job_id=%d", jobID)
-	sweeps := countLogLines(after, "no server may fetch these queued articles", jobField)
-	refusals := countLogLines(after, "refusing_credentials=[0]")
+	size, digest, err := singleMKVSource()
+	if err != nil {
+		return restartCaseResult{}, err
+	}
 	final := statuses[jobID]
-	detail := fmt.Sprintf("bodies_before_refusal=%d bodies_total=%d of %d sweep_lines=%d lines_naming_the_refusing_server=%d final=%s",
-		served, totalBodiesFor(post, ids), len(ids), sweeps, refusals, final)
-	pass := sweeps == 1 && final != "COMPLETE" && final != ""
-	return classifyRestartResult(ctx.Profile, pass, "credentials refused mid-job retired the queue in one sweep and the job settled: "+detail, false, "", "credentials refused mid-job: "+detail), nil
+	outputOK := final == "COMPLETE" && deliveredCopy(completeDirOf(caseDBPath(ctx), jobID), size, digest)
+	detail := fmt.Sprintf("bodies_before_refusal=%d bodies_total=%d of %d while_refused={state=%s wait=%q failed_bytes=%d} final=%s output_ok=%t",
+		served, totalBodiesFor(post, ids), len(ids), wait.State, wait.WaitReason, wait.FailedBytes, final, outputOK)
+	pass := wait.State != "FAILED" && wait.FailedBytes == 0 && outputOK
+	return classifyRestartResult(ctx.Profile, pass, "credentials refused mid-job left the job waiting on the server, and it completed once the login was taken: "+detail, false, "", "credentials refused mid-job: "+detail), nil
 }
 
 // C2. The operator stops Weaver while pipelined batches are in flight. The

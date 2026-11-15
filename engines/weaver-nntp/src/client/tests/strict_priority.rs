@@ -139,7 +139,7 @@ async fn obsolete_work_cannot_dial_or_take_a_socket_after_waiting_for_capacity()
     let guard = Arc::clone(&allowed);
     let client = fixture
         .client
-        .with_work_guard(move |_| guard.load(Ordering::SeqCst));
+        .with_work_guard(move |_, _| guard.load(Ordering::SeqCst));
     let mut deadline = TokioInstant::now() + UNREACHED_TIMEOUT;
     assert!(matches!(
         client
@@ -179,7 +179,7 @@ async fn obsolete_work_cannot_dial_or_take_a_socket_after_waiting_for_capacity()
 #[tokio::test]
 async fn obsolete_work_leaves_no_attempt_and_no_health_mark() {
     let fixture = Providers::new().await;
-    let client = fixture.client.with_work_guard(|_| false);
+    let client = fixture.client.with_work_guard(|_, _| false);
     let trace = client
         .fetch_body_with_groups_prefer_excluding_traced(
             "<obsolete@example.invalid>",
@@ -396,13 +396,15 @@ async fn queued_probe_guard_rechecks_recovery_before_using_a_cached_fallback() {
                 let pool = Arc::clone(&pool);
                 async move {
                     assert_eq!(server, 1);
-                    assert!(guard());
+                    // The cached socket's own view, as its owner reads it.
+                    let on_socket = || pool.provider_policy_on_connection(server, false);
+                    assert!(guard(&on_socket()));
                     pool.health()
                         .lock()
                         .await
                         .set_reenable_clock(now + Duration::from_secs(3600));
                     assert!(
-                        !guard(),
+                        !guard(&on_socket()),
                         "a recovered primary invalidates unissued fallback work"
                     );
                     Some(ProbeBatchResult {

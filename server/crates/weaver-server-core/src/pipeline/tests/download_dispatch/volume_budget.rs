@@ -309,6 +309,40 @@ async fn a_lane_that_parks_on_an_error_gives_its_reservations_back() {
     assert_reservations_match_lanes(&pipeline);
 }
 
+// A lane that cannot get a connection hands its lease back whether the
+// refusal says "ask again" (the articles go back to the queue) or is a
+// verdict (each article takes the failure): either way the volume counts
+// nothing for them, and a volume with room for one lease grants the next.
+#[tokio::test]
+async fn a_lane_refused_a_connection_gives_its_reservations_back() {
+    let errors = [
+        weaver_nntp::client::BlockingBodyLaneAcquireError::LocalCapacity,
+        weaver_nntp::client::BlockingBodyLaneAcquireError::Other(weaver_nntp::NntpError::Timeout),
+    ];
+    for (index, error) in errors.into_iter().enumerate() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let job_id = JobId(42120 + index as u64);
+        let mut pipeline = sized_job(&temp_dir, job_id, 40, 8 * u64::from(ARTICLE)).await;
+        let volume = volume_of(&pipeline, job_id);
+        let lease = book_lease(&mut pipeline).expect("room for a lease");
+        assert!(volume.unwritten_bytes() > 0);
+        assert_reservations_match_lanes(&pipeline);
+        let mut pending = VecDeque::new();
+        pipeline.handle_owned_download_lane_event(
+            OwnedDownloadLaneEvent::AcquireFailed { lease, error },
+            &mut pending,
+        );
+        for result in pending {
+            pipeline.process_released_download_done(result).await;
+        }
+        assert_eq!(volume.unwritten_bytes(), 0);
+        assert!(pipeline.volume_reserved_by_job.is_empty());
+        assert_reservations_match_lanes(&pipeline);
+        book_lease(&mut pipeline).expect("the volume has room for the next lease");
+        assert_reservations_match_lanes(&pipeline);
+    }
+}
+
 // A cancelled job's articles come off its lanes, and their reservations
 // with them; the late result is refused and counts nothing.
 #[tokio::test]
