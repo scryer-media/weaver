@@ -661,6 +661,197 @@ async fn a_job_cancelled_with_bytes_queued_ends_once_its_volume_let_go() {
     retire_pipeline_database(pipeline).await;
 }
 
+// A job that fails while its volume's thread still holds operations on its
+// files keeps them, unlike a cancelled one: a failed job keeps what it
+// delivered, so the bytes queued for its file are written and a removal
+// queued for a file that no longer belongs to it runs, both before its
+// working directory is released.
+#[tokio::test]
+async fn a_job_failed_with_operations_queued_runs_them_before_its_release() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_416);
+    let posts = [Post::plain("lantern.bin", payload(3 * ARTICLE, 1))];
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let leftover = working_dir.join("lantern.half");
+    std::fs::write(&leftover, b"half of a decode").unwrap();
+    let (volume, hold) = held(&pipeline, job_id);
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    let removed = leftover.clone();
+    pipeline.graph_jobs[&job_id]
+        .disk()
+        .unwrap()
+        .working()
+        .run(None, leftover.clone(), move || {
+            std::fs::remove_file(&removed)
+        });
+    hold.wait_held();
+    pipeline.fail_job(job_id, "no file was delivered whole".to_string());
+    assert!(pipeline.retiring_graph_jobs.contains_key(&job_id));
+    // Asked while the volume stands still: a wait of the loop would not
+    // have come back.
+    no_loop_waits(&volume);
+    hold.open();
+    hear_retirement(&mut pipeline, job_id).await;
+    settle_failed_releases(&mut pipeline).await;
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. })
+    ));
+    assert_eq!(read(&working_dir.join("lantern.bin")), posts[0].bytes);
+    assert!(!leftover.exists(), "the queued removal did not run");
+    assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 0);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A job that fails while a move waits on a checkpoint that itself waits for
+// the volume's writer: that checkpoint is never written now, and the move
+// hears so at once, so the job's retirement ends once the writer returns
+// instead of waiting for word of a commit that never comes.
+#[tokio::test]
+async fn a_job_failed_with_a_commit_owed_behind_its_writer_still_settles() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_417);
+    let posts = [Post::plain("lantern.bin", payload(3 * ARTICLE, 1))];
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let (volume, hold) = held(&pipeline, job_id);
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    hold.wait_held();
+    let mail = pipeline.graph_runs.written();
+    // The checkpoint taken so far commits, so nothing of the job is on its
+    // way to the database.
+    let first = pipeline.graph_jobs[&job_id].pending().stamp();
+    if pipeline.graph_jobs[&job_id]
+        .pending()
+        .await_commit(first, job_id.0, &mail, &pipeline.db)
+        .is_none()
+    {
+        loop {
+            let said = pipeline.graph_runs.recv().await.unwrap();
+            let written = matches!(said.heard, Heard::Written { .. });
+            pipeline.graph_run_said(said);
+            if written {
+                break;
+            }
+        }
+    }
+    // The next waits for the held writer, and a move waits on its commit,
+    // as `checkpoint_graph_job` leaves one.
+    pipeline.flush_graph_checkpoint(job_id);
+    {
+        let graph = pipeline.graph_jobs.get_mut(&job_id).unwrap();
+        let pending = graph.pending().clone();
+        assert!(pending.gated());
+        assert!(
+            pending
+                .await_commit(pending.stamp(), job_id.0, &mail, &pipeline.db)
+                .is_none()
+        );
+        graph.owe_mail(pending.stamp());
+    }
+    pipeline.fail_job(job_id, "no file was delivered whole".to_string());
+    assert!(pipeline.retiring_graph_jobs.contains_key(&job_id));
+    no_loop_waits(&volume);
+    hold.open();
+    hear_retirement(&mut pipeline, job_id).await;
+    settle_failed_releases(&mut pipeline).await;
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. })
+    ));
+    assert_eq!(read(&working_dir.join("lantern.bin")), posts[0].bytes);
+    assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 0);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A job stopped while its last checkpoint waits for the volume's writer, as
+// one held for a full disk is, waits on that checkpoint's commit. A cancel
+// then stops its checkpoints, so the commit never comes: the stopped graph
+// hears so at once and goes once the writer returns, and the cancel can
+// end.
+#[tokio::test]
+async fn a_stopped_job_cancelled_with_a_commit_owed_behind_its_writer_still_goes() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_419);
+    let posts = [Post::plain("lantern.bin", payload(3 * ARTICLE, 1))];
+    let (mut pipeline, _working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let (volume, hold) = held(&pipeline, job_id);
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    hold.wait_held();
+    let mail = pipeline.graph_runs.written();
+    // The checkpoint taken so far commits, so nothing of the job is on its
+    // way to the database.
+    let first = pipeline.graph_jobs[&job_id].pending().stamp();
+    if pipeline.graph_jobs[&job_id]
+        .pending()
+        .await_commit(first, job_id.0, &mail, &pipeline.db)
+        .is_none()
+    {
+        loop {
+            let said = pipeline.graph_runs.recv().await.unwrap();
+            let written = matches!(said.heard, Heard::Written { .. });
+            pipeline.graph_run_said(said);
+            if written {
+                break;
+            }
+        }
+    }
+    // The next waits for the held writer, and the stop waits on its commit.
+    pipeline.flush_graph_checkpoint(job_id);
+    assert!(pipeline.graph_jobs[&job_id].pending().gated());
+    pipeline.retire_graph_job(job_id);
+    assert!(pipeline.retiring_graph_jobs[&job_id].awaits_mail());
+    pipeline.cancel_graph_checkpoint_retries(job_id);
+    no_loop_waits(&volume);
+    hold.open();
+    hear_retirement(&mut pipeline, job_id).await;
+    assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 0);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A job that failed with its writer already caught up is released at once,
+// and its graph stopped later, as its runtime is purged. Whatever was
+// queued for its files in between still runs: a failed job keeps its file
+// operations whichever path stops its graph, and its working directory is
+// released only once its writer has returned the release of its handles.
+#[tokio::test]
+async fn a_failed_job_stopped_later_still_runs_what_was_queued_for_it() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_418);
+    let posts = [Post::plain("lantern.bin", payload(3 * ARTICLE, 1))];
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let leftover = working_dir.join("lantern.half");
+    std::fs::write(&leftover, b"half of a decode").unwrap();
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    disk.barrier().wait_returned();
+    let (volume, hold) = held(&pipeline, job_id);
+    pipeline.fail_job(job_id, "no file was delivered whole".to_string());
+    // Nothing held the graph, so the failure went straight to its release,
+    // which waits for the writer to let the job's handles go.
+    assert!(!pipeline.retiring_graph_jobs.contains_key(&job_id));
+    assert!(pipeline.releasing_failed_jobs.contains(&job_id));
+    assert!(pipeline.graph_jobs.contains_key(&job_id));
+    let removed = leftover.clone();
+    disk.working().run(None, leftover.clone(), move || {
+        std::fs::remove_file(&removed)
+    });
+    pipeline.retire_graph_job(job_id);
+    assert!(pipeline.retiring_graph_jobs.contains_key(&job_id));
+    no_loop_waits(&volume);
+    hold.open();
+    hear_retirement(&mut pipeline, job_id).await;
+    settle_failed_releases(&mut pipeline).await;
+    assert!(!leftover.exists(), "the queued removal did not run");
+    assert_eq!(read(&working_dir.join("lantern.bin")), posts[0].bytes);
+    assert!(!working_dir.join(".weaver-chunks").exists());
+    assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 0);
+    retire_pipeline_database(pipeline).await;
+}
+
 // A volume that holds the write budget stops dispatch for its job. The
 // batch that brings it below the line wakes the loop, and the job is
 // handed work again.

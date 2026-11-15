@@ -634,6 +634,28 @@ impl JobBarrier {
         }
     }
 
+    // Ready once every operation behind it returned, failed or not, for a
+    // task off the loop. A volume's writer that has gone returns nothing
+    // more, and is not waited for.
+    pub(crate) fn returned_later(&self) -> impl std::future::Future<Output = ()> + Send + use<> {
+        let heard: Vec<_> = self
+            .0
+            .iter()
+            .map(|barrier| {
+                let (tell, heard) = tokio::sync::oneshot::channel();
+                barrier.then(move || {
+                    let _ = tell.send(());
+                });
+                heard
+            })
+            .collect();
+        async move {
+            for heard in heard {
+                let _ = heard.await;
+            }
+        }
+    }
+
     // The job hears `DiskReturned` once the operations behind it returned.
     pub(crate) fn then_tell(
         &self,
