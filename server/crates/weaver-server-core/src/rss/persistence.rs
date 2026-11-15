@@ -548,7 +548,7 @@ fn rss_seen_item_args(item: &RssSeenItemRow) -> Vec<SqlArg> {
         SqlArg::Text(item.item_title.clone()),
         SqlArg::OptI64(item.published_at),
         SqlArg::OptI64(item.size_bytes.map(|value| value as i64)),
-        SqlArg::Text(item.decision.clone()),
+        SqlArg::Text(item.decision.as_str().to_owned()),
         SqlArg::I64(item.seen_at),
         SqlArg::OptI64(item.job_id.map(|value| value as i64)),
         SqlArg::OptText(item.item_url.clone()),

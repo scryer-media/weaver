@@ -71,7 +71,7 @@ fn rss_seen_items_dedupe_and_purge() {
         item_title: "Example".to_string(),
         published_at: Some(123),
         size_bytes: Some(456),
-        decision: "accepted".to_string(),
+        decision: crate::RssSeenDecision::Accepted,
         seen_at: 1_000,
         job_id: Some(42),
         item_url: Some("https://example.com/a.nzb".to_string()),
@@ -92,7 +92,7 @@ fn rss_seen_items_dedupe_and_purge() {
         item_title: "Example".to_string(),
         published_at: Some(123),
         size_bytes: Some(456),
-        decision: "accepted".to_string(),
+        decision: crate::RssSeenDecision::Accepted,
         seen_at: 1_000,
         job_id: Some(42),
         item_url: Some("https://example.com/a.nzb".to_string()),
@@ -123,7 +123,7 @@ fn seen_items_per_feed_match_one_read_per_feed() {
                 item_title: format!("Item {feed_id}/{id}"),
                 published_at: (id % 3 == 0).then_some(id as i64),
                 size_bytes: Some(id as u64 * 1_000),
-                decision: "accepted".to_string(),
+                decision: crate::RssSeenDecision::Accepted,
                 seen_at: 10_000 + (item / 10) as i64,
                 job_id: None,
                 item_url: Some(format!("https://example.com/{feed_id}/{id}.torrent")),
@@ -173,7 +173,7 @@ fn clear_rss_seen_items_can_scope_to_feed() {
         item_title: "Example".to_string(),
         published_at: None,
         size_bytes: None,
-        decision: "submitted".to_string(),
+        decision: crate::RssSeenDecision::Submitted,
         seen_at: 1_000,
         job_id: Some(1),
         item_url: None,
@@ -186,7 +186,7 @@ fn clear_rss_seen_items_can_scope_to_feed() {
         item_title: "Example Two".to_string(),
         published_at: None,
         size_bytes: None,
-        decision: "ignored".to_string(),
+        decision: crate::RssSeenDecision::Ignored,
         seen_at: 2_000,
         job_id: None,
         item_url: None,
@@ -200,4 +200,71 @@ fn clear_rss_seen_items_can_scope_to_feed() {
     assert_eq!(remaining[0].feed_id, 2);
     assert_eq!(db.clear_rss_seen_items(None).unwrap(), 1);
     assert!(db.list_rss_seen_items(None, None).unwrap().is_empty());
+}
+
+// Each decision reads back as itself, its stored word stays what rows
+// already hold, and a word no decision is reads back unchanged.
+#[test]
+fn a_seen_decision_keeps_its_stored_word() {
+    use crate::RssSeenDecision;
+    for decision in RssSeenDecision::KNOWN {
+        assert_eq!(RssSeenDecision::parse(decision.as_str()), decision);
+    }
+    assert_eq!(
+        RssSeenDecision::KNOWN.map(|decision| decision.as_str().to_owned()),
+        [
+            "accepted",
+            "rejected",
+            "ignored",
+            "submitted",
+            "error",
+            "waiting"
+        ]
+    );
+    assert_eq!(
+        RssSeenDecision::parse("rejected_by_size"),
+        RssSeenDecision::Other("rejected_by_size".to_owned())
+    );
+
+    let db = Database::open_in_memory().unwrap();
+    db.insert_rss_feed(&sample_feed(1)).unwrap();
+    for (index, decision) in RssSeenDecision::KNOWN
+        .into_iter()
+        .chain([RssSeenDecision::Other("rejected_by_size".to_owned())])
+        .enumerate()
+    {
+        db.insert_rss_seen_item(&RssSeenItemRow {
+            feed_id: 1,
+            item_id: format!("guid-{index}"),
+            item_title: "Example".to_string(),
+            published_at: None,
+            size_bytes: None,
+            decision,
+            seen_at: 1_000 + index as i64,
+            job_id: None,
+            item_url: None,
+            error: None,
+        })
+        .unwrap();
+    }
+    let mut read: Vec<(String, String)> = db
+        .list_rss_seen_items(None, None)
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.item_id, row.decision.as_str().to_owned()))
+        .collect();
+    read.sort();
+    assert_eq!(
+        read,
+        [
+            ("guid-0", "accepted"),
+            ("guid-1", "rejected"),
+            ("guid-2", "ignored"),
+            ("guid-3", "submitted"),
+            ("guid-4", "error"),
+            ("guid-5", "waiting"),
+            ("guid-6", "rejected_by_size"),
+        ]
+        .map(|(id, word)| (id.to_owned(), word.to_owned()))
+    );
 }

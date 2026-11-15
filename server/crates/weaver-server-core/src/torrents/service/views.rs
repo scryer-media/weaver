@@ -45,6 +45,8 @@ pub struct TorrentView {
     pub source: TorrentSource,
     pub state: TorrentState,
     pub detail: Option<String>,
+    /// The reason the service states itself, when `detail` is its words.
+    pub stated: Option<status::Stated>,
     /// Why its route holds it, while the state comes from that hold.
     pub route_reason: Option<TorrentRouteReason>,
     /// Who holds it stopped, while a hold does.
@@ -424,7 +426,11 @@ impl TorrentService {
         now: i64,
     ) -> TorrentView {
         let (state, why) = status::project(&torrent.observed(reading.engine));
-        let (detail, route_reason) = status::Why::split(why);
+        let status::WhyParts {
+            detail,
+            stated,
+            route_reason,
+        } = status::Why::split(why);
         let counters = &reading.counters;
         let record = &torrent.record;
         let total = torrent.total;
@@ -454,6 +460,7 @@ impl TorrentService {
             source: record.source,
             state,
             detail,
+            stated,
             route_reason,
             paused_by: torrent.paused_by,
             category: settings
@@ -896,7 +903,7 @@ pub(super) fn job_status(view: &TorrentView) -> JobStatus {
         TorrentState::FilesMissing => JobStatus::Paused,
         // A stop with any reason but its met goal is a failure.
         TorrentState::Stopped => match view.detail.as_deref() {
-            Some(status::GOAL_MET) => JobStatus::Complete,
+            _ if view.stated == Some(status::Stated::GoalMet) => JobStatus::Complete,
             None if view.completed_at_ms.is_some() => JobStatus::Complete,
             detail => JobStatus::Failed {
                 error: detail.unwrap_or_default().to_owned(),

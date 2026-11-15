@@ -411,6 +411,7 @@ fn view(state: TorrentState) -> TorrentView {
         source: TorrentSource::Metainfo,
         state,
         detail: None,
+        stated: None,
         route_reason: None,
         paused_by: None,
         category: None,
@@ -664,7 +665,8 @@ fn every_weaver_state_maps_to_one_client_state() {
         (
             TorrentView {
                 completed_at_ms: done,
-                detail: Some(status::GOAL_MET.into()),
+                detail: Some(status::Stated::GoalMet.as_str().into()),
+                stated: Some(status::Stated::GoalMet),
                 ..view(TorrentState::Stopped)
             },
             "stoppedUP",
@@ -1896,7 +1898,10 @@ async fn pausing_all_is_one_hold_over_each_torrents_own_pause() {
             .flatten()
             .unwrap()
             .job_id;
-        assert_eq!(rig.db.get_torrent(job_id).unwrap().unwrap().intent, intent);
+        assert_eq!(
+            rig.db.get_torrent(job_id).unwrap().unwrap().intent(),
+            intent
+        );
     }
 }
 
@@ -3981,7 +3986,7 @@ async fn rss_articles_are_each_feeds_last_fifty() {
                     item_title: format!("{} {id}", feed.name),
                     published_at: None,
                     size_bytes: None,
-                    decision: "accepted".to_owned(),
+                    decision: weaver_server_core::RssSeenDecision::Accepted,
                     seen_at: 1_700_000_000 + (item / 10) as i64,
                     job_id: None,
                     item_url: Some(format!("http://feeds.invalid/{id}.torrent")),
@@ -4099,7 +4104,7 @@ async fn a_read_key_sees_no_article_link_passkey() {
                 item_title: item_id.to_owned(),
                 published_at: None,
                 size_bytes: None,
-                decision: "accepted".to_owned(),
+                decision: weaver_server_core::RssSeenDecision::Accepted,
                 seen_at: 1_700_000_000 + seen_at as i64,
                 job_id: None,
                 item_url: Some(url.to_owned()),

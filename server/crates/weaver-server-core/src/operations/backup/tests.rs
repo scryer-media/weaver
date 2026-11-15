@@ -206,7 +206,7 @@ async fn export_and_import_stable_state_roundtrip() {
         item_title: "release".into(),
         published_at: Some(5),
         size_bytes: Some(10),
-        decision: "accepted".into(),
+        decision: crate::RssSeenDecision::Accepted,
         seen_at: 6,
         job_id: Some(77),
         item_url: Some("https://example.com/file.nzb".into()),

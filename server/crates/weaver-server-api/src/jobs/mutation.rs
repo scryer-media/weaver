@@ -219,7 +219,7 @@ impl JobsMutation {
             let refusal = match ctx.data_opt::<TorrentService>() {
                 None => Some("the torrent client is not running".to_string()),
                 Some(torrents) if !torrents.takes_new() => {
-                    Some(weaver_server_core::torrents::status::OFF.to_string())
+                    Some(weaver_server_core::torrents::status::TORRENTS_OFF.to_string())
                 }
                 Some(_) => None,
             };

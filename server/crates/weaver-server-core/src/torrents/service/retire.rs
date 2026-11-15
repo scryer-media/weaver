@@ -3,7 +3,7 @@
 
 use super::intake::{Resolving, parse};
 use super::live::Live;
-use super::scripts::Ending;
+use super::scripts::{Ending, StoppedSeeding};
 use super::{ActionError, TorrentService, hashes_of, report, short_status, unpacking_dir};
 #[cfg(test)]
 use super::{MARK_HOLD, MOVE_HOLD, SYNC_HELD_FAILS, locked};
@@ -17,6 +17,7 @@ use crate::post_processing::model::QueueEvent;
 use crate::torrents::files::Files;
 use crate::torrents::metrics::{FetchOutcome, TorrentEvent};
 use crate::torrents::model::Adopted;
+use crate::torrents::model::HistoryEnd;
 use crate::torrents::persistence::HistoryFile;
 use crate::torrents::side::Side;
 use crate::torrents::store::TorrentStore;
@@ -69,13 +70,14 @@ impl TorrentService {
             live.remove(&job_id)
         };
         let Some(mut torrent) = torrent else { return };
-        let stopped = self.seeding_stopped(&torrent, "failed");
+        let stopped = self.seeding_stopped(&torrent, StoppedSeeding::Failed);
         // Its slot and rank go to the torrents after it.
         self.inner.signal.want_pass();
         self.inner.counters.event(TorrentEvent::Failed);
         self.detach(&mut torrent).await;
         let written = read_written(self.written_of(&torrent)).await;
-        self.retire(torrent, "failed", Some(error), written).await;
+        self.retire(torrent, HistoryEnd::Failed, Some(error), written)
+            .await;
         self.queue_script_event(stopped);
     }
 
@@ -98,7 +100,7 @@ impl TorrentService {
             let Some(torrent) = live.get_mut(&job_id) else {
                 return;
             };
-            self.queue_script_event(self.seeding_stopped(torrent, "failed"));
+            self.queue_script_event(self.seeding_stopped(torrent, StoppedSeeding::Failed));
             let landing = self.stop_torrent(torrent, now);
             let report = report(
                 self.view(&settings, torrent, now),
@@ -110,13 +112,19 @@ impl TorrentService {
         let _ = self.landed(landing).await;
         self.inner.counters.event(TorrentEvent::Failed);
         self.apply_queue().await;
-        self.finish(report, "failed", hash, now).await;
+        self.finish(report, HistoryEnd::Failed, hash, now).await;
     }
 
     // A torrent that left the live ones goes to history: its row, then out
     // of the torrents and into the finished jobs, listing of what it
     // `written` what is still there once its removal is done with it.
-    async fn retire(&self, mut torrent: Live, status: &str, error: Option<String>, written: Wrote) {
+    async fn retire(
+        &self,
+        mut torrent: Live,
+        status: HistoryEnd,
+        error: Option<String>,
+        written: Wrote,
+    ) {
         let job_id = torrent.record.job_id;
         let files = history_files(written.deletion).await;
         self.inner.env.outside.leave(job_id.0);
@@ -147,19 +155,19 @@ impl TorrentService {
     fn history_of(
         &self,
         torrent: &Live,
-        status: &str,
+        status: HistoryEnd,
         error: Option<String>,
     ) -> (JobReport, crate::history::JobHistoryRow) {
         let settings = self.settings();
         let now = self.inner.clock.now_ms();
         let mut report = report(
             self.view(&settings, torrent, now),
-            job_status_from_persisted_str(status, error.as_deref()),
+            job_status_from_persisted_str(status.as_str(), error.as_deref()),
             now,
         );
         report.shortfall = error;
         let row = report.history_row(
-            status,
+            status.as_str(),
             Some(hashes_of(&torrent.record).best().0.to_vec()),
             now,
         );
@@ -168,7 +176,7 @@ impl TorrentService {
 
     // A torrent's job, finished as `status`: into history and the queue's
     // finished jobs, listing the files it wrote so far.
-    pub(super) async fn finish(&self, report: JobReport, status: &str, hash: Id20, now: i64) {
+    pub(super) async fn finish(&self, report: JobReport, status: HistoryEnd, hash: Id20, now: i64) {
         let of = {
             let live = self.inner.live.lock().await;
             live.get(&report.job_id)
@@ -178,7 +186,7 @@ impl TorrentService {
             Some(of) => history_files(read_written(of).await.deletion).await,
             None => Vec::new(),
         };
-        let row = report.history_row(status, Some(hash.0.to_vec()), now);
+        let row = report.history_row(status.as_str(), Some(hash.0.to_vec()), now);
         self.write_history(row, false, report.job_info(), files)
             .await;
     }
@@ -471,7 +479,7 @@ impl TorrentService {
         // The job's outcome: complete, short of what unpacking would
         // deliver, refused by unpacking, or cut short.
         let (status, error) = match (torrent.complete(), torrent.refusal()) {
-            (true, None) => ("complete", None),
+            (true, None) => (HistoryEnd::Complete, None),
             (true, Some(why)) => {
                 let own = torrent
                     .store
@@ -479,17 +487,17 @@ impl TorrentService {
                     .map(|store| store.whole_names())
                     .unwrap_or_default();
                 let status = short_status(&own, &written.outputs, &why);
-                (status.persisted_status(), Some(why))
+                (HistoryEnd::delivered(&status), Some(why))
             }
-            (false, Some(refusal)) => ("failed", Some(refusal)),
-            (false, None) => ("cancelled", None),
+            (false, Some(refusal)) => (HistoryEnd::Failed, Some(refusal)),
+            (false, None) => (HistoryEnd::Cancelled, None),
         };
         // What its scripts hear of a removal asked for: a seed stops
         // seeding; a download is cancelled, as an NZB job's is.
         let ended = match ending {
             Ending::Goal => None,
             Ending::Asked if torrent.seeding() && torrent.resumed() => {
-                self.seeding_stopped(&torrent, "removed")
+                self.seeding_stopped(&torrent, StoppedSeeding::Removed)
             }
             Ending::Asked if !torrent.complete() => self.script_event(
                 &torrent,

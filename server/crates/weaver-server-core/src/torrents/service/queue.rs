@@ -4,6 +4,7 @@
 use super::disk_room::{DiskHeld, StartHold};
 use super::intake::Resolving;
 use super::live::Live;
+use super::scripts::StoppedSeeding;
 use super::{ActionError, Inner, TorrentService, queued, state_error, take_turn};
 use crate::SchedulerError;
 use crate::jobs::JobId;
@@ -74,10 +75,9 @@ impl TorrentService {
 
     pub async fn pause(&self, job_id: JobId) -> Result<(), ActionError> {
         let stopped = self
-            .with_torrent(
-                job_id,
-                |torrent| Ok(self.seeding_stopped(torrent, "paused")),
-            )
+            .with_torrent(job_id, |torrent| {
+                Ok(self.seeding_stopped(torrent, StoppedSeeding::Paused))
+            })
             .await?;
         self.set_intent(job_id, TorrentIntent::Paused).await?;
         self.queue_script_event(stopped);

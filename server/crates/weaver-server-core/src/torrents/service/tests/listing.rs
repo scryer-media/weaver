@@ -525,8 +525,7 @@ fn the_tables_pick_is_the_walk_of_every_record() {
             category_id: [None, Some(1), Some(2), Some(3), Some(9), Some(4)][job_id as usize % 6],
             // Three at each instant, added out of job order.
             added_at_ms: EPOCH_MS + ((SEEDED - job_id) / 3) as i64,
-            intent: TorrentIntent::Paused,
-            wound_down: false,
+            kept: KeptIntent::Intent(TorrentIntent::Paused),
             forced: false,
             completed_at_ms: None,
             storage_dir: None,

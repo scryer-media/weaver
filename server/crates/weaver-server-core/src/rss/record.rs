@@ -28,6 +28,59 @@ impl RssRuleAction {
     }
 }
 
+/// What a feed's item was judged, as its seen row keeps it and the API
+/// sends it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RssSeenDecision {
+    /// A rule accepted it (a preview's judgement; a poll records what the
+    /// accept came to).
+    Accepted,
+    Rejected,
+    /// No rule took it, or one already holds it.
+    Ignored,
+    /// It became a job.
+    Submitted,
+    /// Adding it failed.
+    Error,
+    /// A torrent held while torrents are off, in place of a decision: not
+    /// seen, it is judged anew once torrents are on. Matched as a literal in
+    /// SQL, where the index on held items serves it.
+    Waiting,
+    /// A stored word this build does not know, kept as it reads.
+    Other(String),
+}
+
+impl RssSeenDecision {
+    pub const KNOWN: [Self; 6] = [
+        Self::Accepted,
+        Self::Rejected,
+        Self::Ignored,
+        Self::Submitted,
+        Self::Error,
+        Self::Waiting,
+    ];
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Ignored => "ignored",
+            Self::Submitted => "submitted",
+            Self::Error => "error",
+            Self::Waiting => "waiting",
+            Self::Other(word) => word,
+        }
+    }
+
+    /// The decision `value` names; a word no decision is stays as it is.
+    pub fn parse(value: &str) -> Self {
+        Self::KNOWN
+            .into_iter()
+            .find(|decision| decision.as_str() == value)
+            .unwrap_or_else(|| Self::Other(value.to_owned()))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RssFeedRow {
     // Ids of the feed instances attached to this feed, in the order they run.
@@ -71,7 +124,7 @@ pub struct RssSeenItemRow {
     pub item_title: String,
     pub published_at: Option<i64>,
     pub size_bytes: Option<u64>,
-    pub decision: String,
+    pub decision: RssSeenDecision,
     pub seen_at: i64,
     pub job_id: Option<u64>,
     pub item_url: Option<String>,

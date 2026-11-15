@@ -690,7 +690,7 @@ async fn held_for_its_files(service: &TorrentService, job_id: JobId, dir: &Path)
             .get_torrent(job_id)
             .unwrap()
             .unwrap()
-            .intent,
+            .intent(),
         TorrentIntent::Resumed
     );
     assert!(!dir.exists());
@@ -967,8 +967,7 @@ fn chain() -> (TorrentRecord, TrackerRule, TorrentSettings) {
         metainfo: None,
         category_id: Some(1),
         added_at_ms: EPOCH_MS,
-        intent: TorrentIntent::Resumed,
-        wound_down: false,
+        kept: KeptIntent::Intent(TorrentIntent::Resumed),
         forced: false,
         completed_at_ms: None,
         storage_dir: None,

@@ -30,7 +30,7 @@ use crate::torrents::status::{Engine, Held};
 use crate::torrents::storage::{PieceStorageFactory, Pieces};
 use crate::torrents::store::{Kept, Replayed, TorrentStore};
 use crate::torrents::tee::{Parts, Plan, Tee};
-use crate::torrents::{FilePriority, TorrentCounters, TorrentIntent, TrackerEntry};
+use crate::torrents::{FilePriority, KeptIntent, TorrentCounters, TorrentIntent, TrackerEntry};
 use bytes::Bytes;
 use std::collections::{BTreeMap, HashSet};
 use std::net::IpAddr;
@@ -465,7 +465,7 @@ impl TorrentService {
         }
         torrent.hold(store.file_have());
         if let Some(tee) = store.tee() {
-            tee.hold_own_clock(torrent.record.intent == TorrentIntent::Paused);
+            tee.hold_own_clock(torrent.record.intent() == TorrentIntent::Paused);
         }
         torrent.store = Some(store);
         torrent.intake = Some(intake);
@@ -788,7 +788,7 @@ impl TorrentService {
         let Some(torrent) = live.get_mut(&job_id) else {
             return true;
         };
-        if torrent.record.intent == TorrentIntent::Resumed {
+        if torrent.record.intent() == TorrentIntent::Resumed {
             if let Err(error) = self
                 .inner
                 .db
@@ -797,7 +797,7 @@ impl TorrentService {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not keep a crashed torrent's pause");
             }
             torrent.settle(self.inner.clock.now_ms());
-            torrent.record.intent = TorrentIntent::Paused;
+            torrent.record.kept = KeptIntent::Intent(TorrentIntent::Paused);
         }
         torrent.restore_held = Some(why);
         true

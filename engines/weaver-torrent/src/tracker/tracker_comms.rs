@@ -294,7 +294,7 @@ pub(crate) fn only_reachable<A>(
 #[derive(Clone)]
 struct SupportedTracker {
     url: Url,
-    udp: bool,
+    kind: TrackerKind,
     named_by: NamedBy,
 }
 
@@ -318,9 +318,9 @@ impl SupportedTracker {
     }
 
     fn new(Tracker { url, named_by }: Tracker) -> Option<Self> {
-        let udp = match url.scheme() {
-            "http" | "https" => false,
-            "udp" => true,
+        let kind = match url.scheme() {
+            "http" | "https" => TrackerKind::Http,
+            "udp" => TrackerKind::Udp,
             _ => {
                 debug!(
                     "unsupported tracker URL: {}",
@@ -329,7 +329,11 @@ impl SupportedTracker {
                 return None;
             }
         };
-        Some(Self { url, udp, named_by })
+        Some(Self {
+            url,
+            kind,
+            named_by,
+        })
     }
 }
 
@@ -1358,22 +1362,22 @@ impl Scraper {
     ) -> anyhow::Result<ScrapeOk> {
         let asked = Instant::now();
         let result = within_completion_timeout(async {
-            if tracker.udp {
-                self.scrape_udp(tracker, info_hash)
-                    .instrument(trace_span!("udp_scrape", ?tracker))
-                    .await
-            } else {
-                self.scrape_http(tracker, info_hash)
-                    .instrument(trace_span!("http_scrape", ?tracker))
-                    .await
+            match tracker.kind {
+                TrackerKind::Udp => {
+                    self.scrape_udp(tracker, info_hash)
+                        .instrument(trace_span!("udp_scrape", ?tracker))
+                        .await
+                }
+                TrackerKind::Http => {
+                    self.scrape_http(tracker, info_hash)
+                        .instrument(trace_span!("http_scrape", ?tracker))
+                        .await
+                }
             }
         })
         .await;
-        self.counts.scraped(
-            TrackerKind::of(tracker.udp),
-            counted_result(&result),
-            asked.elapsed(),
-        );
+        self.counts
+            .scraped(tracker.kind, counted_result(&result), asked.elapsed());
         result.map_err(without_url)
     }
 
@@ -2769,25 +2773,28 @@ impl TrackerComms {
         stats: &TrackerCommsStats,
     ) -> anyhow::Result<Announced> {
         // An HTTP announce waits for its turn first, outside its time limit.
-        let _turn = match tracker.udp {
-            true => None,
-            false => Some(self.http_announces.take(events.any()).await),
+        let _turn = match tracker.kind {
+            TrackerKind::Udp => None,
+            TrackerKind::Http => Some(self.http_announces.take(events.any()).await),
         };
         let asked = Instant::now();
         let result = within_completion_timeout(async {
-            if tracker.udp {
-                self.announce_udp(tracker, events, stats)
-                    .instrument(trace_span!("udp_tracker", ?tracker))
-                    .await
-            } else {
-                self.announce_http(tracker, events, stats)
-                    .instrument(trace_span!("http_tracker", ?tracker))
-                    .await
+            match tracker.kind {
+                TrackerKind::Udp => {
+                    self.announce_udp(tracker, events, stats)
+                        .instrument(trace_span!("udp_tracker", ?tracker))
+                        .await
+                }
+                TrackerKind::Http => {
+                    self.announce_http(tracker, events, stats)
+                        .instrument(trace_span!("http_tracker", ?tracker))
+                        .await
+                }
             }
         })
         .await;
         self.counts.announced(
-            TrackerKind::of(tracker.udp),
+            tracker.kind,
             events.counted_as(),
             counted_result(&result),
             asked.elapsed(),
