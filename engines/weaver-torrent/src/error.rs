@@ -139,6 +139,16 @@ pub enum Error {
 }
 
 impl Error {
+    // The error of a dial over two transports that both failed: TCP's and
+    // uTP's together, in either order, and otherwise the first.
+    pub(crate) fn and_dial(self, other: Error) -> Error {
+        match (self, other) {
+            (Error::TcpConnect(tcp), Error::UtpConnect(utp))
+            | (Error::UtpConnect(utp), Error::TcpConnect(tcp)) => Error::Connect { tcp, utp },
+            (first, _) => first,
+        }
+    }
+
     /// Our own side turned the connect away before the peer had a say: no
     /// transport was enabled, or each that was refused locally. Such an
     /// error does not count against the peer.

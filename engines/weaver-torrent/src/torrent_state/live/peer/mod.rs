@@ -29,7 +29,7 @@ use tokio::time::Instant;
 use crate::mse::Encryption;
 use crate::peer_connection::WriterRequest;
 use crate::peer_protocol::extended::ut_pex::{
-    PEX_ENCRYPTION, PEX_HOLEPUNCH, PEX_SEED, PEX_UTP, PexPeerInfo,
+    PEX_ENCRYPTION, PEX_HOLEPUNCH, PEX_SEED, PexPeerInfo,
 };
 use crate::stream_connect::{ConnectionKind, Transports};
 use crate::type_aliases::{BF, PeerSourceFlag, PeerSources};
@@ -314,10 +314,9 @@ impl Trust {
 /// says: uTP runs over the peer's listening UDP socket, while TCP connects from
 /// an ephemeral port.
 pub(crate) fn listen_address(addr: SocketAddr, kind: ConnectionKind) -> Option<SocketAddr> {
-    match kind {
-        ConnectionKind::Utp => Some(addr),
-        ConnectionKind::Tcp => None,
-    }
+    kind.capabilities()
+        .source_port_is_listen_port
+        .then_some(addr)
 }
 
 /// A peer bitfield holding no piece, shaped as BITFIELD carries one: a bit
@@ -1423,9 +1422,7 @@ impl LivePeerState {
         if self.seeder {
             flags |= PEX_SEED;
         }
-        if matches!(self.connection_kind, ConnectionKind::Utp) {
-            flags |= PEX_UTP;
-        }
+        flags |= self.connection_kind.capabilities().pex_flag;
         if self.supports_holepunch {
             flags |= PEX_HOLEPUNCH;
         }
@@ -2291,6 +2288,58 @@ mod tests {
         },
         stream_connect::ConnectionKind,
     };
+
+    // The flags our PEX messages give a peer, and where a peer that
+    // connected to us listens, read off the kind's capabilities: for every
+    // kind, seed, encryption and holepunch, what the match on uTP gave.
+    #[test]
+    fn the_kinds_capabilities_give_the_pex_flags_and_listen_address_the_utp_match_gave() {
+        use crate::mse::Encryption;
+        use crate::peer_protocol::extended::ut_pex::{
+            PEX_ENCRYPTION, PEX_HOLEPUNCH, PEX_SEED, PEX_UTP,
+        };
+
+        let addr: std::net::SocketAddr = "192.0.2.7:6881".parse().unwrap();
+        for &kind in ConnectionKind::ALL {
+            let utp = matches!(kind, ConnectionKind::Utp);
+            assert_eq!(
+                super::listen_address(addr, kind),
+                utp.then_some(addr),
+                "{kind}"
+            );
+            for seeder in [false, true] {
+                for encryption in [Encryption::None, Encryption::HeaderOnly, Encryption::Rc4] {
+                    for holepunch in [false, true] {
+                        let (tx, _rx) = unbounded_channel();
+                        let counters = stats::atomic::PeerStats::default().counters;
+                        let mut live =
+                            LivePeerState::new(Id20::default(), tx, kind, &counters, true);
+                        live.seeder = seeder;
+                        live.encryption = encryption;
+                        live.supports_holepunch = holepunch;
+                        let mut old = 0;
+                        if encryption.is_encrypted() {
+                            old |= PEX_ENCRYPTION;
+                        }
+                        if seeder {
+                            old |= PEX_SEED;
+                        }
+                        if utp {
+                            old |= PEX_UTP;
+                        }
+                        if holepunch {
+                            old |= PEX_HOLEPUNCH;
+                        }
+                        assert_eq!(
+                            live.advertised_pex_flags(),
+                            old,
+                            "{kind} seed {seeder} {encryption:?} holepunch {holepunch}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn the_latest_suggestion_goes_first_and_the_oldest_past_sixteen_is_dropped() {

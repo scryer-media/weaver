@@ -68,7 +68,7 @@ use crate::{
     dht_utils::{MetadataPeers, ReadMetainfoResult, read_metainfo_from_peer_receiver},
     ip_ranges::IpRanges,
     limits::{Limits, LimitsConfig},
-    listen::{Accept, ListenerOptions},
+    listen::{ListenerOptions, PeerAcceptor},
     merge_streams::merge_streams,
     network::SocketFactory,
     peer_connection::PeerConnectionOptions,
@@ -79,12 +79,14 @@ use crate::{
     },
     read_buf::ReadBuf,
     session_persistence::{SessionPersistenceStore, json::JsonSessionPersistenceStore},
-    session_stats::{SessionStats, Transport, incoming::IncomingEnd},
+    session_stats::{SessionStats, incoming::IncomingEnd},
     spawn_utils::BlockingSpawner,
     storage::{
         BoxStorageFactory, StorageFactoryExt, TorrentStorage, filesystem::FilesystemStorageFactory,
     },
-    stream_connect::{ConnectionKind, ConnectionOptions, StreamConnector, StreamConnectorArgs},
+    stream_connect::{
+        ConnectionKind, ConnectionOptions, Link, StreamConnector, StreamConnectorArgs,
+    },
     torrent_state::{
         AddIncomingPeerResult, ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions,
         ManagedTorrentState, TorrentMetadata, TorrentStateLive, TorrentTotals,
@@ -2183,8 +2185,7 @@ impl Session {
         writer: BoxAsyncWrite,
     ) -> anyhow::Result<(Arc<TorrentStateLive>, CheckedIncomingConnection)> {
         let handshake_timeout = self.peer_opts.handshake_timeout();
-        let transport = Transport::of(kind);
-        let refused = |end: IncomingEnd| self.stats.incoming.ended(transport, end);
+        let refused = |end: IncomingEnd| self.stats.incoming.ended(kind, end);
 
         // The session's one address rule, whichever direction the connection
         // goes (libtorrent `session_impl::incoming_connection` refuses a
@@ -2370,36 +2371,27 @@ impl Session {
         max_pending_incoming_handshake_checks: usize,
     ) {
         let addr = listening.addr;
-        if let Some(tcp) = listening.tcp_socket {
+        for acceptor in listening.acceptors() {
+            let kind = acceptor.kind();
             let this = self.clone();
             self.spawn_on_swarm(
-                debug_span!(parent: self.rs(), "tcp_listen", ?addr, tls),
-                "tcp_listen",
+                kind.listen_span(self.rs(), addr, tls),
+                kind.listen_task(),
                 async move {
-                    this.task_listener(tcp, tls, max_pending_incoming_handshake_checks)
-                        .await
-                },
-            );
-        }
-        if let Some(utp) = listening.utp_socket {
-            let this = self.clone();
-            self.spawn_on_swarm(
-                debug_span!(parent: self.rs(), "utp_listen", ?addr, tls),
-                "utp_listen",
-                async move {
-                    this.task_listener(utp, tls, max_pending_incoming_handshake_checks)
+                    this.task_listener(acceptor, tls, max_pending_incoming_handshake_checks)
                         .await
                 },
             );
         }
     }
 
-    async fn task_listener<A: Accept>(
+    async fn task_listener(
         self: Arc<Self>,
-        l: A,
+        l: Box<dyn PeerAcceptor>,
         tls: bool,
         max_pending_incoming_handshake_checks: usize,
     ) -> anyhow::Result<()> {
+        let kind = l.kind();
         let mut futs = FuturesUnordered::new();
         let session = Arc::downgrade(&self);
         drop(self);
@@ -2414,19 +2406,19 @@ impl Session {
                 () = backoff.as_mut(), if resting => resting = false,
                 r = l.accept(), if !resting && futs.len() < max_pending_incoming_handshake_checks => {
                     match r {
-                        Ok((addr, home, (read, write))) => {
+                        Ok(Link { remote: addr, read, write, home, .. }) => {
                             trace!("accepted connection from {addr}");
                             let session = session.upgrade().context("session is dead")?;
                             // Dropping the halves closes a connection past the
                             // session's cap and its slack.
                             let Some(slot) = session.connection_slots.try_accept() else {
                                 debug!(%addr, "at the session's connection limit, closing incoming connection");
-                                session.stats.incoming.ended(Transport::of(A::KIND), IncomingEnd::SessionLimit);
+                                session.stats.incoming.ended(kind, IncomingEnd::SessionLimit);
                                 continue;
                             };
                             let span = debug_span!(parent: session.rs(), "incoming", addr=%addr);
                             futs.push(
-                                session.check_incoming_connection(addr, A::KIND, tls, Box::new(read), Box::new(write))
+                                session.check_incoming_connection(addr, kind, tls, read, write)
                                     .map_ok(|(live, checked)| (live, checked, slot, home))
                                     .map_err(|e| {
                                         debug!("error checking incoming connection: {e:#}");
@@ -2435,7 +2427,7 @@ impl Session {
                                     .instrument(span)
                             );
                         }
-                        Err(e) if A::is_closed(&e) => {
+                        Err(e) if l.is_closed(&e) => {
                             debug!("listener closed: {e:#}");
                             return Ok(());
                         }
@@ -2457,7 +2449,7 @@ impl Session {
                     let added = live.add_incoming_peer(checked, slot, home);
                     let session = session.upgrade();
                     if let Some(session) = &session {
-                        session.stats.incoming.ended(Transport::of(kind), IncomingEnd::of(&added));
+                        session.stats.incoming.ended(kind, IncomingEnd::of(&added));
                     }
                     match added {
                         Ok(AddIncomingPeerResult::Added) => {
@@ -8338,6 +8330,64 @@ mod tests {
         );
 
         assert_eq!(check_once(&session, "192.0.2.1:6881"), None);
+        session.stop().await;
+    }
+
+    // A connection a peer opens to each of the listener's sockets is counted
+    // under that socket's kind: a handshake for a torrent the session does
+    // not hold ends the same over TCP as over uTP, under each its own.
+    #[tokio::test]
+    async fn each_listener_socket_counts_its_incoming_connections_under_its_kind() {
+        use crate::session_stats::{Transport, incoming::IncomingEnd};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = TempDir::with_prefix("incoming_kinds").unwrap();
+        let session = quiet_session(
+            &dir,
+            SessionOptions {
+                listen: Some(crate::ListenerOptions {
+                    mode: crate::ListenerMode::TcpAndUtp,
+                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                    ..Default::default()
+                }),
+                ..crate::test_support::session_options()
+            },
+        )
+        .await;
+        let listening = session.listen_addr().unwrap();
+        let mut handshake = b"\x13BitTorrent protocol".to_vec();
+        handshake.extend_from_slice(&[0; 8]);
+        handshake.extend_from_slice(&[7; 20]);
+        handshake.extend_from_slice(&[9; 20]);
+
+        // Each connection ends once the session has refused and closed it.
+        let (mut read, mut write) = crate::test_support::tcp(listening).await.unwrap();
+        write.write_all(&handshake).await.unwrap();
+        let _ = read.read_to_end(&mut Vec::new()).await;
+        let peer = crate::listen::bind_utp(
+            crate::test_support::socket_factory().as_ref(),
+            (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            Default::default(),
+            crate::udp_options::STREAM_WINDOW,
+            None,
+        )
+        .await
+        .unwrap();
+        let (mut read, mut write) = peer.connect(listening).await.unwrap().split();
+        write.write_all(&handshake).await.unwrap();
+        let _ = read.read_to_end(&mut Vec::new()).await;
+
+        let ends = session.stats.incoming.snapshot().ends;
+        let refused = |kind: Transport| {
+            let mut end = [0; IncomingEnd::COUNT];
+            end[IncomingEnd::UnknownTorrent as usize] = 1;
+            (kind, ends[kind as usize] == end)
+        };
+        assert_eq!(
+            [refused(Transport::Tcp), refused(Transport::Utp)],
+            [(Transport::Tcp, true), (Transport::Utp, true)],
+            "{ends:?}"
+        );
         session.stop().await;
     }
 

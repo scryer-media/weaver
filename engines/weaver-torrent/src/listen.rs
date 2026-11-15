@@ -11,14 +11,13 @@ use std::{
 };
 
 use anyhow::Context;
-use tokio::io::AsyncWrite;
+use futures::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::{
     network::{DatagramTransport, DhtShare, DhtTap, SocketFactory, StreamListener, UtpSocket},
-    stream_connect::ConnectionKind,
-    vectored_traits::AsyncReadVectored,
+    stream_connect::{ConnectionKind, Link},
 };
 
 /// Why a session failed to build when its listeners could not start: a
@@ -371,7 +370,22 @@ async fn bind_shared_utp(
     Ok((UtpSocket(sock), share))
 }
 
-pub(crate) trait Accept {
+impl Listening {
+    /// One acceptor for each socket the listener's mode bound, TCP's first:
+    /// the session runs one accept task for each.
+    pub(crate) fn acceptors(self) -> Vec<Box<dyn PeerAcceptor>> {
+        let tcp = self
+            .tcp_socket
+            .map(|listener| Box::new(listener) as Box<dyn PeerAcceptor>);
+        let utp = self
+            .utp_socket
+            .map(|socket| Box::new(socket) as Box<dyn PeerAcceptor>);
+        tcp.into_iter().chain(utp).collect()
+    }
+}
+
+/// Takes the connections peers open to one of a listener's sockets.
+pub(crate) trait Accept: Send + Sync {
     const KIND: ConnectionKind;
 
     /// Whether `error` says the listener is gone for good, so no later
@@ -380,36 +394,50 @@ pub(crate) trait Accept {
         false
     }
 
-    /// The connection's address, the thread its transport runs on when it
-    /// has one of its own, and its halves.
-    async fn accept(
-        &self,
-    ) -> anyhow::Result<(
-        SocketAddr,
-        Option<tokio::runtime::Handle>,
-        (
-            impl AsyncReadVectored + Send + 'static,
-            impl AsyncWrite + Unpin + Send + 'static,
-        ),
-    )>;
+    /// The next connection a peer opened.
+    fn accept(&self) -> impl Future<Output = anyhow::Result<Link>> + Send;
+}
+
+/// An [`Accept`] as the session's accept task holds it, whatever its
+/// transport. It is reached once per accept, never per message or packet.
+pub(crate) trait PeerAcceptor: Send + Sync {
+    fn kind(&self) -> ConnectionKind;
+
+    /// As [`Accept::is_closed`].
+    fn is_closed(&self, error: &anyhow::Error) -> bool;
+
+    /// As [`Accept::accept`].
+    fn accept(&self) -> BoxFuture<'_, anyhow::Result<Link>>;
+}
+
+impl<A: Accept> PeerAcceptor for A {
+    fn kind(&self) -> ConnectionKind {
+        A::KIND
+    }
+
+    fn is_closed(&self, error: &anyhow::Error) -> bool {
+        A::is_closed(error)
+    }
+
+    fn accept(&self) -> BoxFuture<'_, anyhow::Result<Link>> {
+        Box::pin(Accept::accept(self))
+    }
 }
 
 impl Accept for Box<dyn StreamListener + '_> {
     const KIND: ConnectionKind = ConnectionKind::Tcp;
-    async fn accept(
-        &self,
-    ) -> anyhow::Result<(
-        SocketAddr,
-        Option<tokio::runtime::Handle>,
-        (
-            impl AsyncReadVectored + Send + 'static,
-            impl AsyncWrite + Unpin + Send + 'static,
-        ),
-    )> {
-        let (addr, read, write) = StreamListener::accept(self.as_ref())
+
+    async fn accept(&self) -> anyhow::Result<Link> {
+        let (remote, read, write) = StreamListener::accept(self.as_ref())
             .await
             .context("error accepting TCP")?;
-        Ok((addr, None, (read, write)))
+        Ok(Link {
+            kind: Self::KIND,
+            remote,
+            read,
+            write,
+            home: None,
+        })
     }
 }
 
@@ -423,21 +451,19 @@ impl Accept for UtpSocket {
             Some(weaver_utp::Error::DispatcherDead | weaver_utp::Error::TaskCancelled)
         )
     }
-    async fn accept(
-        &self,
-    ) -> anyhow::Result<(
-        SocketAddr,
-        Option<tokio::runtime::Handle>,
-        (
-            impl AsyncReadVectored + Send + 'static,
-            impl AsyncWrite + Unpin + Send + 'static,
-        ),
-    )> {
+
+    async fn accept(&self) -> anyhow::Result<Link> {
         let stream = self.accept().await.context("error accepting uTP")?;
-        let addr = stream.remote_addr();
+        let remote = stream.remote_addr();
         let home = stream.home().cloned();
         let (read, write) = stream.split();
-        Ok((addr, home, (read, write)))
+        Ok(Link {
+            kind: Self::KIND,
+            remote,
+            read: Box::new(read),
+            write: Box::new(write),
+            home,
+        })
     }
 }
 
@@ -446,6 +472,54 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
+
+    // Each listener mode binds the sockets it did, and gives the session one
+    // accept task for each, TCP's first, under the name it had.
+    #[tokio::test]
+    async fn each_mode_gives_one_acceptor_for_each_socket_it_binds() {
+        use ConnectionKind::{Tcp, Utp};
+        let factory = crate::test_support::socket_factory();
+        let slots = crate::connection_slots::ConnectionSlots::new(
+            8,
+            0,
+            std::num::NonZeroU32::new(10).unwrap(),
+        );
+        for (mode, tasks) in [
+            (ListenerMode::TcpOnly, &[(Tcp, "tcp_listen")][..]),
+            (ListenerMode::UtpOnly, &[(Utp, "utp_listen")]),
+            (
+                ListenerMode::TcpAndUtp,
+                &[(Tcp, "tcp_listen"), (Utp, "utp_listen")],
+            ),
+        ] {
+            let listening = bind(
+                mode,
+                (Ipv4Addr::LOCALHOST, 0).into(),
+                Default::default(),
+                crate::udp_options::STREAM_WINDOW,
+                &factory,
+                false,
+                &slots,
+            )
+            .await
+            .unwrap()
+            .listening;
+            assert_eq!(
+                (
+                    listening.tcp_socket.is_some(),
+                    listening.utp_socket.is_some()
+                ),
+                (mode.tcp_enabled(), mode.utp_enabled()),
+                "{mode:?}"
+            );
+            let acceptors: Vec<_> = listening
+                .acceptors()
+                .iter()
+                .map(|acceptor| (acceptor.kind(), acceptor.kind().listen_task()))
+                .collect();
+            assert_eq!(acceptors, tasks, "{mode:?}");
+        }
+    }
 
     // A uTP socket that shut down tells its accept loop it is gone, which
     // then ends instead of retrying; any other accept error is retried.

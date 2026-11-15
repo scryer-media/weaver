@@ -34,7 +34,7 @@ pub use super::files::{FileCallsSnapshot, FileStatsSnapshot};
 pub fn file_stats() -> FileStatsSnapshot {
     super::files::STATS.snapshot()
 }
-use weaver_torrent::{FetchPhase, Session};
+use weaver_torrent::{ConnectionKind, FetchPhase, Session};
 
 use crate::jobs::JobId;
 use crate::settings::Seeding;
@@ -555,10 +555,26 @@ impl SessionSeries {
                 ])
                 .collect(),
             connects: vec![
-                ("tcp", "v4", family!(connections.tcp.v4)),
-                ("tcp", "v6", family!(connections.tcp.v6)),
-                ("utp", "v4", family!(connections.utp.v4)),
-                ("utp", "v6", family!(connections.utp.v6)),
+                (
+                    ConnectionKind::Tcp.as_str(),
+                    "v4",
+                    family!(connections.tcp.v4),
+                ),
+                (
+                    ConnectionKind::Tcp.as_str(),
+                    "v6",
+                    family!(connections.tcp.v6),
+                ),
+                (
+                    ConnectionKind::Utp.as_str(),
+                    "v4",
+                    family!(connections.utp.v4),
+                ),
+                (
+                    ConnectionKind::Utp.as_str(),
+                    "v6",
+                    family!(connections.utp.v6),
+                ),
             ],
             dht: session.get_dht().map(|dht| {
                 let dht = dht.stats();

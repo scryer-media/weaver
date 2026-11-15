@@ -17,7 +17,6 @@ use std::{
 use crate::core::hash_id::Id20;
 use anyhow::bail;
 use futures::TryFutureExt;
-use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
@@ -40,21 +39,25 @@ pub(crate) enum Guard<'a> {
     Tls(&'a SslTorrent),
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
-pub enum ConnectionKind {
-    #[serde(rename = "tcp")]
-    Tcp,
-    #[serde(rename = "utp")]
-    Utp,
-}
+mod dial;
+mod kind;
+pub(crate) use dial::UtpRebind;
+use dial::{DialPlan, PeerDialer, Tally, TcpDialer, UtpDialer};
+pub use kind::{ConnectionKind, Names};
 
-impl std::fmt::Display for ConnectionKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConnectionKind::Tcp => f.write_str("tcp"),
-            ConnectionKind::Utp => f.write_str("uTP"),
-        }
-    }
+/// An open connection to a peer, as its transport hands it over, dialed or
+/// accepted: the bytes each way, the remote end, and the thread the
+/// transport runs on when it has one of its own. What the connection
+/// guarantees is its kind's capabilities. The writing half is `W`: the
+/// transport's own, then whatever the connection's guard made of it.
+pub(crate) struct Link<W = BoxAsyncWrite> {
+    pub kind: ConnectionKind,
+    pub remote: SocketAddr,
+    pub read: BoxAsyncReadVectored,
+    pub write: W,
+    /// The thread the transport runs on, when it has one of its own (a uTP
+    /// stream's): the connection's task moves there.
+    pub home: Option<tokio::runtime::Handle>,
 }
 
 /// The transports an outgoing connection to a peer may go over.
@@ -88,25 +91,6 @@ impl Default for ConnectionOptions {
             enable_utp: None,
             peer_opts: None,
         }
-    }
-}
-
-/// How the connector binds the session's outgoing uTP socket on a later
-/// dial when the bind at the session's start failed, as it does on a tunnel
-/// whose sockets were all held then.
-#[derive(Clone)]
-pub(crate) struct UtpRebind {
-    pub address: SocketAddr,
-    pub opts: weaver_utp::SocketOpts,
-    pub receive_buffer: usize,
-    pub connection_slots: Arc<crate::connection_slots::ConnectionSlots>,
-}
-
-impl std::fmt::Debug for UtpRebind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UtpRebind")
-            .field("address", &self.address)
-            .finish_non_exhaustive()
     }
 }
 
@@ -180,41 +164,6 @@ impl Failed for weaver_utp::Error {
     }
 }
 
-// Counts the end of one attempt once: as it finished, or, when it is
-// dropped unfinished, as timed out when the dial's time ran out and as
-// failed otherwise.
-struct Attempt<'a> {
-    stat: &'a SingleStatAtomic,
-    expired: &'a AtomicBool,
-    ended: bool,
-}
-
-impl Attempt<'_> {
-    fn end<R, E: Failed>(&mut self, result: &std::result::Result<R, E>) {
-        self.ended = true;
-        match result {
-            Ok(_) => self.stat.successes(1),
-            Err(e) => match e.failure() {
-                Failure::Refused => self.stat.refused(1),
-                Failure::TimedOut => self.stat.timeouts(1),
-                Failure::Other => self.stat.errors(1),
-            },
-        }
-    }
-}
-
-impl Drop for Attempt<'_> {
-    fn drop(&mut self) {
-        if self.ended {
-            return;
-        }
-        if self.expired.load(Ordering::Relaxed) {
-            self.stat.timeouts(1);
-        } else {
-            self.stat.errors(1);
-        }
-    }
-}
 gen_stats!(PerFamilyAtomic PerFamilySnapshot, [], [
     v4 SingleStatAtomic SingleStatSnapshot,
     v6 SingleStatAtomic SingleStatSnapshot
@@ -251,12 +200,10 @@ gen_stats!(ConnectStatsAtomic ConnectStatsSnapshot, [], [
 
 #[derive(Debug)]
 pub(crate) struct StreamConnector {
-    enable_tcp: bool,
-    utp_socket: tokio::sync::OnceCell<UtpSocket>,
-    utp_rebind: Option<UtpRebind>,
+    tcp: TcpDialer,
+    utp: UtpDialer,
     stats: ConnectStatsAtomic,
     ipv4_only: bool,
-    socket_factory: Arc<dyn SocketFactory>,
     // The session's encryption, as `policy_code` writes it: a change of the
     // settings moves it while the session runs.
     encryption: AtomicU8,
@@ -286,12 +233,17 @@ impl StreamConnector {
         }
 
         Ok(Self {
-            enable_tcp: config.enable_tcp,
-            utp_socket: tokio::sync::OnceCell::new_with(config.utp_socket),
-            utp_rebind: config.utp_rebind,
+            tcp: TcpDialer {
+                enabled: config.enable_tcp,
+                sockets: Arc::clone(&config.socket_factory),
+            },
+            utp: UtpDialer {
+                socket: tokio::sync::OnceCell::new_with(config.utp_socket),
+                rebind: config.utp_rebind,
+                sockets: config.socket_factory,
+            },
             stats: Default::default(),
             ipv4_only: config.ipv4_only,
-            socket_factory: config.socket_factory,
             encryption: AtomicU8::new(policy_code(config.encryption)),
         })
     }
@@ -338,7 +290,7 @@ impl StreamConnector {
         Meter,
         Encryption,
     )> {
-        self.connect_and_send_handshake_homed(
+        self.connect_link(
             addr,
             transports,
             guard,
@@ -349,14 +301,15 @@ impl StreamConnector {
             rw_timeout,
         )
         .await
-        .map(|(connected, _home)| connected)
+        .map(|(link, meter, encryption)| (link.kind, link.read, link.write, meter, encryption))
     }
 
-    /// As [`Self::connect_and_send_handshake`], with the thread the
-    /// connection's transport runs on when it has one of its own: a uTP
+    /// As [`Self::connect_and_send_handshake`], the connection as the
+    /// [`Link`] it is: with the peer's address and the thread the
+    /// connection's transport runs on when it has one of its own, a uTP
     /// stream's.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn connect_and_send_handshake_homed(
+    pub(crate) async fn connect_link(
         &self,
         addr: SocketAddr,
         transports: Transports,
@@ -366,21 +319,18 @@ impl StreamConnector {
         encrypt: impl FnOnce() -> bool,
         connect_timeout: Duration,
         rw_timeout: Duration,
-    ) -> Result<(
-        (
-            ConnectionKind,
-            BoxAsyncReadVectored,
-            mse::Outbound,
-            Meter,
-            Encryption,
-        ),
-        Option<tokio::runtime::Handle>,
-    )> {
+    ) -> Result<(Link<mse::Outbound>, Meter, Encryption)> {
         // The attempts still running when the time runs out end as timed
         // out: the flag is set before the dial, and with it its attempts, is
         // dropped.
         let expired = AtomicBool::new(false);
-        let (kind, r, w, home) = {
+        let Link {
+            kind,
+            remote,
+            read: r,
+            write: w,
+            home,
+        } = {
             let dial = self.dial(addr, transports, &expired);
             tokio::pin!(dial);
             match tokio::time::timeout(connect_timeout, &mut dial).await {
@@ -392,6 +342,13 @@ impl StreamConnector {
             }
         };
         let (meter, r, mut w) = Meter::wrap(r, w);
+        let link = |read, write| Link {
+            kind,
+            remote,
+            read,
+            write,
+            home,
+        };
 
         let policy = match guard {
             Guard::Mse(policy) => policy,
@@ -409,7 +366,7 @@ impl StreamConnector {
                     w.write_all(handshake).map_err(Error::WriteHandshake),
                 )
                 .await?;
-                return Ok(((kind, r, w.into(), meter, Encryption::None), home));
+                return Ok((link(r, w.into()), meter, Encryption::None));
             }
         };
 
@@ -427,7 +384,7 @@ impl StreamConnector {
                 w.write_all(handshake).map_err(Error::WriteHandshake),
             )
             .await?;
-            return Ok(((kind, r, w.into(), meter, Encryption::None), home));
+            return Ok((link(r, w.into()), meter, Encryption::None));
         }
 
         stats.attempts(1);
@@ -449,14 +406,9 @@ impl StreamConnector {
             stats.header_only(1);
         }
         Ok((
-            (
-                kind,
-                established.reader,
-                established.writer,
-                meter,
-                encryption,
-            ),
-            home,
+            link(established.reader, established.writer),
+            meter,
+            encryption,
         ))
     }
 
@@ -468,69 +420,27 @@ impl StreamConnector {
         if is_v6 { &stat.v6 } else { &stat.v4 }
     }
 
-    async fn with_stat<R, E: Failed>(
-        &self,
-        kind: ConnectionKind,
-        is_v6: bool,
-        expired: &AtomicBool,
-        fut: impl Future<Output = std::result::Result<R, E>>,
-    ) -> std::result::Result<R, E> {
-        let stat = self.get_stat(kind, is_v6);
-        stat.attempts(1);
-        let mut attempt = Attempt {
-            stat,
-            expired,
-            ended: false,
-        };
-        let result = fut.await;
-        attempt.end(&result);
-        result
-    }
-
     pub fn stats(&self) -> &ConnectStatsAtomic {
         &self.stats
     }
 
-    // Whether the outgoing uTP socket is bound.
-    fn has_utp(&self) -> bool {
-        self.utp_socket.initialized()
+    // The dialer of `kind`.
+    fn dialer(&self, kind: ConnectionKind) -> &dyn PeerDialer {
+        match kind {
+            ConnectionKind::Tcp => &self.tcp,
+            ConnectionKind::Utp => &self.utp,
+        }
     }
 
-    // Whether a dial may go over uTP: the socket is bound, or a dial may
-    // bind it again.
-    fn may_utp(&self) -> bool {
-        self.has_utp() || self.utp_rebind.is_some()
+    // Whether the outgoing uTP socket is bound.
+    #[cfg(test)]
+    fn has_utp(&self) -> bool {
+        self.utp.ready()
     }
 
     /// The outgoing uTP socket a dial bound after the session started.
     pub fn rebound_utp(&self) -> Option<&UtpSocket> {
-        self.utp_rebind.as_ref().and(self.utp_socket.get())
-    }
-
-    // The outgoing uTP socket, bound now when the last bind failed and the
-    // route has a datagram socket free. Dials that want it meanwhile wait
-    // for the one bind and try again after it when it fails.
-    async fn utp(&self) -> Option<&UtpSocket> {
-        if let Some(socket) = self.utp_socket.get() {
-            return Some(socket);
-        }
-        let rebind = self.utp_rebind.as_ref()?;
-        if !self.socket_factory.datagram_room() {
-            return None;
-        }
-        self.utp_socket
-            .get_or_try_init(|| {
-                crate::listen::bind_utp(
-                    self.socket_factory.as_ref(),
-                    rebind.address,
-                    rebind.opts.clone(),
-                    rebind.receive_buffer,
-                    Some(&rebind.connection_slots),
-                )
-            })
-            .await
-            .inspect_err(|e| debug!("error binding outgoing uTP socket again: {e:#}"))
-            .ok()
+        self.utp.rebound()
     }
 
     /// Connect to the peer at `addr` over `transports`.
@@ -542,7 +452,7 @@ impl StreamConnector {
     ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
         self.dial(addr, transports, &AtomicBool::new(false))
             .await
-            .map(|(kind, r, w, _home)| (kind, r, w))
+            .map(|link| (link.kind, link.read, link.write))
     }
 
     // Connect as `connect` does, with the thread a uTP stream runs on. An
@@ -553,12 +463,7 @@ impl StreamConnector {
         addr: SocketAddr,
         transports: Transports,
         expired: &AtomicBool,
-    ) -> Result<(
-        ConnectionKind,
-        BoxAsyncReadVectored,
-        BoxAsyncWrite,
-        Option<tokio::runtime::Handle>,
-    )> {
+    ) -> Result<Link> {
         let addr = crate::network::canonical_socket_addr(addr);
         if addr.port() == 0 {
             return Err(Error::Anyhow(anyhow::anyhow!(
@@ -574,117 +479,18 @@ impl StreamConnector {
             )));
         }
 
-        // Try to connect over TCP first, when it may be used. If in 1 second
-        // we haven't connected, try uTP also (if configured). Whoever
-        // connects first wins. A route with no TCP socket free goes straight
-        // to uTP when it has it.
-        let tcp = self.enable_tcp
-            && transports == Transports::Any
-            && (!self.has_utp() || self.socket_factory.tcp_room());
-        let tcp_connect = async {
-            if !tcp {
-                return Ok(None);
-            }
-            let conn = self
-                .with_stat(
-                    ConnectionKind::Tcp,
-                    addr.is_ipv6(),
-                    expired,
-                    self.socket_factory.connect_tcp(addr),
-                )
-                .await?;
-            debug!(?addr, "connected over TCP");
-            Ok::<_, std::io::Error>(Some(conn))
-        };
-
-        // Kept for the uTP attempt when TCP fails before it waits, as one
-        // does on its first poll.
-        let tcp_failed_notify = tokio::sync::Notify::new();
-
-        let utp_connect = async {
-            if !self.may_utp() {
-                return Ok(None);
-            }
-
-            // Give TCP priority as it's more mature and simpler.
-            if tcp {
-                // wait until either 1 second has passed or TCP failed.
-                tokio::select! {
-                    _ = tcp_failed_notify.notified() => {},
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                }
-            }
-
-            let Some(sock) = self.utp().await else {
-                return Ok(None);
-            };
-
-            let conn = self
-                .with_stat(
-                    ConnectionKind::Utp,
-                    addr.is_ipv6(),
-                    expired,
-                    sock.connect(addr),
-                )
-                .await?;
-
-            debug!(?addr, "connected over uTP");
-            Ok(Some(conn))
-        };
-
-        tokio::pin!(tcp_connect);
-        tokio::pin!(utp_connect);
-
-        let mut tcp_err: Option<Option<std::io::Error>> = None;
-        let mut utp_err: Option<Option<weaver_utp::Error>> = None;
-
-        // wait until all fail, or one succeeds.
-        loop {
-            if let (Some(tcp), Some(utp)) = (tcp_err.as_mut(), utp_err.as_mut()) {
-                match (tcp.take(), utp.take()) {
-                    (Some(tcp), Some(utp)) => return Err(Error::Connect { tcp, utp }),
-                    (Some(tcp), None) => return Err(Error::TcpConnect(tcp)),
-                    (None, Some(utp)) => return Err(Error::UtpConnect(utp)),
-                    (None, None) => return Err(Error::ConnectDisabled),
-                }
-            }
-            // TCP is polled first, as it has priority. A TCP attempt that
-            // fails on its first poll is told to the uTP attempt before that
-            // attempt waits, so the notify keeps it for that wait.
-            tokio::select! {
-                biased;
-                tcp_res = &mut tcp_connect, if tcp_err.is_none() => {
-                    match tcp_res {
-                        Ok(Some((r, w))) => {
-                            return Ok((ConnectionKind::Tcp, r, w, None));
-                        },
-                        Ok(None) => {
-                            tcp_err = Some(None);
-                            tcp_failed_notify.notify_one();
-                        }
-                        Err(e) => {
-                            tcp_err = Some(Some(e));
-                            tcp_failed_notify.notify_one();
-                        }
-                    }
-                },
-                utp_res = &mut utp_connect, if utp_err.is_none() => {
-                    match utp_res {
-                        Ok(Some(stream)) => {
-                            let home = stream.home().cloned();
-                            let (r, w) = stream.split();
-                            return Ok((ConnectionKind::Utp, Box::new(r), Box::new(w), home));
-                        },
-                        Ok(None) => {
-                            utp_err = Some(None);
-                        }
-                        Err(e) => {
-                            utp_err = Some(Some(e));
-                        }
-                    }
-                },
-            };
-        }
+        let is_v6 = addr.is_ipv6();
+        dial::race(
+            DialPlan::DEFAULT,
+            |kind| self.dialer(kind),
+            |kind| Tally {
+                stat: self.get_stat(kind, is_v6),
+                expired,
+            },
+            addr,
+            transports,
+        )
+        .await
     }
 }
 
@@ -1076,6 +882,21 @@ mod tests {
             .await;
         assert!(matches!(res, Err(Error::ConnectDisabled)));
         assert_eq!(tcp_attempts(&connector), 0);
+    }
+
+    // The connector's TCP dialer hands over a link to the peer dialed, with
+    // no home; only a uTP stream brings one.
+    #[tokio::test(start_paused = true)]
+    async fn a_tcp_link_is_to_the_peer_dialed_and_has_no_home() {
+        let (connector, mut dialed) = dialing(EncryptionPolicy::Disabled).await;
+        let addr: SocketAddr = (Ipv4Addr::LOCALHOST, 6881).into();
+        let link = connector
+            .dial(addr, Transports::Any, &AtomicBool::new(false))
+            .await
+            .unwrap();
+        assert_eq!((link.kind, link.remote), (ConnectionKind::Tcp, addr));
+        assert!(link.home.is_none());
+        assert_eq!(dialed.recv().await.unwrap().0, addr);
     }
 
     const HANDSHAKE: &[u8] = b"\x13BitTorrent protocol, and the rest";

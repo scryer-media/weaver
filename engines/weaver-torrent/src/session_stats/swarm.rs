@@ -16,7 +16,6 @@ use serde::Serialize;
 use crate::{
     peer_connection::WriterRequest,
     peer_protocol::{Message, extended::ExtendedMessage},
-    stream_connect::ConnectionKind,
     type_aliases::PeerSourceFlag,
 };
 
@@ -149,22 +148,9 @@ impl WriterRequest {
     }
 }
 
-counted! {
-    /// What carries a connection.
-    Transport {
-        Tcp => "tcp",
-        Utp => "utp",
-    }
-}
-
-impl Transport {
-    pub fn of(kind: ConnectionKind) -> Self {
-        match kind {
-            ConnectionKind::Tcp => Self::Tcp,
-            ConnectionKind::Utp => Self::Utp,
-        }
-    }
-}
+/// What carries a connection, as the counts index it: its kind, read
+/// under the kind's metrics name.
+pub use crate::stream_connect::ConnectionKind as Transport;
 
 counted! {
     /// How a handshake that completed left its connection.

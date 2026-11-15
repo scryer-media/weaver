@@ -4847,6 +4847,29 @@ impl Seeded {
             .unwrap()
     }
 
+    // Forces an announce and waits for its answer: the tracker's answers
+    // from the forced one on. An announce still waiting for its answer is not
+    // sent again, and the tracker counts an answer before the torrent reads
+    // it, so the force waits until the `completed` the run owes is answered
+    // and no announce of the torrent waits.
+    async fn reannounced(&mut self) -> Vec<(String, i64)> {
+        self.answered
+            .wait_for(|answers| answers.iter().any(|(event, _)| event == "completed"))
+            .await
+            .unwrap();
+        trackers_once(&self.rig.service, self.job_id, |announces| {
+            announces.iter().all(|announce| !announce.in_flight)
+        })
+        .await;
+        let heard = self.answered.borrow_and_update().len();
+        self.rig.service.reannounce(self.job_id).await.unwrap();
+        self.answered
+            .wait_for(|answers| answers.len() > heard)
+            .await
+            .unwrap()[heard..]
+            .to_vec()
+    }
+
     async fn stop(self) {
         self.rig.service.stop().await;
         self.seeder.stop().await;
@@ -5103,15 +5126,7 @@ async fn an_egress_upload_quota_throttles_its_seeds_and_never_pauses_them() {
     assert_eq!(session_limits(&seeding), (None, Some(0)));
     assert_eq!(session_limits(&elsewhere), (None, None));
     assert_eq!(seeded.view().await.state, TorrentState::Seeding);
-    let heard = seeded.answered.borrow_and_update().len();
-    service.reannounce(seeded.job_id).await.unwrap();
-    let answered = seeded
-        .answered
-        .wait_for(|answered| answered.len() > heard)
-        .await
-        .unwrap()
-        .clone();
-    assert_eq!(answered[heard].0, "");
+    assert_eq!(seeded.reannounced().await[0].0, "");
     assert_eq!(seeded.view().await.state, TorrentState::Seeding);
 
     // Lifted: the session moves as it did.
@@ -7058,13 +7073,7 @@ async fn a_seed_whose_removals_mark_is_refused_still_announces() {
     crate::torrents::persistence::MARK_REFUSED.store(0, Ordering::Relaxed);
     removed.expect_err("the removal fails");
     assert_eq!(seeded.view().await.state, TorrentState::Seeding);
-    let heard = seeded.answered.borrow_and_update().len();
-    service.reannounce(seeded.job_id).await.unwrap();
-    seeded
-        .answered
-        .wait_for(|answered| answered.len() > heard)
-        .await
-        .unwrap();
+    seeded.reannounced().await;
     assert_eq!(seeded.view().await.state, TorrentState::Seeding);
     seeded.stop().await;
 }

@@ -108,7 +108,7 @@ pub use session::{
     SessionOptions, SessionPersistenceConfig, SharedLimits,
 };
 pub use ssl::SslIdentity;
-pub use stream_connect::{ConnectionKind, ConnectionOptions};
+pub use stream_connect::{ConnectionKind, ConnectionOptions, Names};
 pub use torrent_state::{
     ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
     TorrentStatsState, TorrentTotals,

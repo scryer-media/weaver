@@ -1177,7 +1177,7 @@ impl TorrentStateLive {
                     // connection moves there, so the stream and the peer
                     // that reads and writes it hand bytes to one another
                     // without waking another thread.
-                    Ok(connected) if runs_elsewhere(connected.home.as_ref()) => {
+                    Ok(connected) if runs_elsewhere(connected.link.home.as_ref()) => {
                         Ran::Moving(Box::new(connected))
                     }
                     Ok(connected) => {
@@ -1204,6 +1204,7 @@ impl TorrentStateLive {
         // The rest of the connection runs on the stream's thread, as a task
         // of the torrent's run.
         let home = connected
+            .link
             .home
             .clone()
             .expect("a moving connection has a home");
@@ -3045,8 +3046,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         speaks_v2: bool,
     ) -> anyhow::Result<()> {
         self.speaks_v2.store(speaks_v2, Ordering::Relaxed);
-        self.transport
-            .store(swarm::Transport::of(ckind) as u8 + 1, Ordering::Relaxed);
+        self.transport.store(ckind as u8 + 1, Ordering::Relaxed);
         // A connection closed for its peer id is closed by us, which is no
         // failure (libtorrent disconnects with `duplicate_peer_id` at normal
         // severity).
