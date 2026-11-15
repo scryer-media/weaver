@@ -103,8 +103,8 @@ func TestFlowProcessInheritsTheNNTPHealthBinary(t *testing.T) {
 	// would fail: only the inherited binary can satisfy the call.
 	dir := t.TempDir()
 	t.Setenv("E2E_DIR", dir)
-	t.Setenv(nntpHealthBuiltEnv, "1")
-	binary := filepath.Join(dir, ".bin", "nntp-health")
+	binary := filepath.Join(dir, ".bin", "nntp-health-0123456789abcdef")
+	t.Setenv(nntpHealthBinaryEnv, binary)
 	if err := os.MkdirAll(filepath.Dir(binary), 0o755); err != nil {
 		t.Fatal(err)
 	}
