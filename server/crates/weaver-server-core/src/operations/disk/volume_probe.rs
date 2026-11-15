@@ -37,7 +37,7 @@ use crate::runtime::system_probe::{ProbeFileGuard, ProbeWrite, synced_probe_writ
 // the probe's files and removed by the next probe of that directory. One
 // that holds anything else is not the probe's: it is left alone, and the
 // volume is not probed there.
-const PROBE_DIR: &str = ".weaver-volume-probe";
+const PROBE_DIR: &str = ".wvr-vol";
 // The probe's scratch file, in its own directory: the name carries random
 // letters and the file is created only if no file has that name. A plain
 // name with a text extension rather than a dotfile, as the start-up probe's
