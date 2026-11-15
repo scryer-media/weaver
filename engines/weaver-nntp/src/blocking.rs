@@ -217,12 +217,16 @@ pub struct BlockingNntpConnection {
     current_group: Option<String>,
     credentials: Option<(String, String)>,
     poisoned: bool,
-    // The server answered a pipelined BODY with 480: the session expired,
-    // but the socket is still framed. Nothing new may be written until every
-    // reply queued behind that 480 has been read and the session has been
-    // re-authenticated in place. See
+    // The server answered a pipelined BODY with 480, asking for a login,
+    // and the socket is still framed. Nothing new may be written until every
+    // reply queued behind that 480 has been read and the session has logged
+    // in in place. See
     // [`Self::reauthenticate_expired_session`].
     reauth_pending: bool,
+    // A 480 at a BODY was answered by logging in, and no BODY has been
+    // answered on this socket since. A 480 now is the server refusing the
+    // account it just took, not another request to log in.
+    login_unproven: bool,
     transfer_control: Option<Arc<ServerTransferControl>>,
     body_accounting: VecDeque<BodyTransferAccounting>,
     body_activity: Option<Arc<AtomicU64>>,
@@ -683,8 +687,9 @@ impl BlockingBodyLane {
             }
             // The whole batch is read: a session that expired part-way
             // through logs in again before the lane is handed back.
+            let mut result = result;
             if idx + 1 == requested && !closed_early {
-                self.reauthenticate_drained_session();
+                self.reauthenticate_drained_session(&mut result);
             }
             if self.conn.poisoned
                 || matches!(result, Err(DecodedBodyError::Nntp(ref e)) if is_connection_error(e))
@@ -907,8 +912,9 @@ impl BlockingBodyLane {
         // The last reply owed behind a 480 has been read: log in again on
         // this socket. A refusal poisons the connection, so the window below
         // closes as unhealthy and the caller discards the lane.
+        let mut result = result;
         if self.ring.outstanding.is_empty() && !self.ring.closed {
-            self.reauthenticate_drained_session();
+            self.reauthenticate_drained_session(&mut result);
         }
         if self.conn.poisoned
             || matches!(result, Err(DecodedBodyError::Nntp(ref e)) if is_connection_error(e))
@@ -965,9 +971,15 @@ impl BlockingBodyLane {
         dropped
     }
 
-    // Re-authenticate a session that expired mid-batch, once nothing is
-    // outstanding on it. A no-op unless a 480 is pending.
-    fn reauthenticate_drained_session(&mut self) {
+    // Log in again on a session a 480 asked to, once nothing is outstanding
+    // on it, and give `result`, the reply just read, the login's refusal if
+    // that reply was itself a 480 asking for it: the refusal is the answer
+    // the article got, and is told to health as one. A no-op unless a 480
+    // is pending.
+    fn reauthenticate_drained_session(
+        &mut self,
+        result: &mut std::result::Result<DecodedBody, DecodedBodyError>,
+    ) {
         if !self.conn.reauth_pending() || self.conn.poisoned {
             return;
         }
@@ -975,13 +987,21 @@ impl BlockingBodyLane {
         match self.conn.reauthenticate_expired_session(Some(&budget)) {
             Ok(()) => debug!(
                 server = self.server_id.0,
-                "re-authenticated an expired session in place"
+                "logged in again in place after a 480"
             ),
-            Err(error) => debug!(
-                server = self.server_id.0,
-                error = %error,
-                "could not re-authenticate an expired session; dropping the connection"
-            ),
+            Err(error) => {
+                debug!(
+                    server = self.server_id.0,
+                    error = %error,
+                    "the login a 480 asked for was not taken; dropping the connection"
+                );
+                if matches!(
+                    result,
+                    Err(DecodedBodyError::Nntp(NntpError::SessionExpired))
+                ) {
+                    *result = Err(DecodedBodyError::Nntp(error));
+                }
+            }
         }
     }
 
@@ -1077,11 +1097,12 @@ impl BlockingBodyLane {
                 FetchAttemptOutcome::QuotaUnrequested,
                 Some("BODY was not issued after quota rejection".to_string()),
             ),
-            Err(DecodedBodyError::Nntp(
-                NntpError::AuthenticationFailed
-                | NntpError::AuthenticationRejected
-                | NntpError::AccessDenied,
-            )) => (
+            // A login a 480 asked for and the server did not take, or a 480
+            // to the first BODY after it, is the server refusing the account
+            // as surely as a refused login at the dial is, and health must
+            // hear it as one: told as anything else, the server is never held
+            // and the article is asked of it again without end.
+            Err(DecodedBodyError::Nntp(error)) if error.is_credentials_refusal() => (
                 FetchAttemptOutcome::AuthenticationFailure,
                 Some("authentication/access failure".to_string()),
             ),
@@ -1340,6 +1361,7 @@ impl BlockingNntpConnection {
             credentials: None,
             poisoned: false,
             reauth_pending: false,
+            login_unproven: false,
             transfer_control: None,
             body_accounting: VecDeque::new(),
             body_activity: None,
@@ -1591,15 +1613,13 @@ impl BlockingNntpConnection {
         self.reauth_pending
     }
 
-    // Re-authenticate, on this socket, a session the server expired part-way
-    // through a batch. Call it only once every reply queued behind the 480
+    // Log in, on this socket, a session a 480 part-way through a batch asked
+    // to. Call it only once every reply queued behind the 480
     // has been read: an AUTHINFO written earlier would be answered by one of
     // them.
     //
-    // The login replies are classified as at dial time. Any refusal, or a
-    // socket that goes away, poisons the connection: the next dial then logs
-    // in from the start, and that is where a credential that has really gone
-    // bad is booked.
+    // Any refusal, or a socket that goes away, poisons the connection, and
+    // the refusal is returned for the caller to tell.
     pub(crate) fn reauthenticate_expired_session(
         &mut self,
         budget: Option<&ActiveTransferBudget>,
@@ -1607,23 +1627,47 @@ impl BlockingNntpConnection {
         if !self.reauth_pending || self.poisoned {
             return Ok(());
         }
-        let Some((user, pass)) = self.credentials.clone() else {
-            // Never set without credentials; kept total for safety.
-            self.fail_body_pipeline();
-            return Err(NntpError::SessionExpired);
-        };
-        match self.authenticate_with_active_budget(&user, &pass, budget) {
+        match self.log_in_for_body(budget) {
             Ok(()) => {
                 self.reauth_pending = false;
-                // As on the sequential re-auth: a new session need not keep
-                // the old one's group.
-                self.current_group = None;
                 Ok(())
             }
             Err(error) => {
                 self.fail_body_pipeline();
                 Err(error)
             }
+        }
+    }
+
+    // Log in on this socket because the server answered a BODY with 480,
+    // which asks for a login whether or not an account is configured. With
+    // none, the name and password sent are empty: a server that needs no
+    // login takes them (281), and one that wants an account refuses them.
+    // The dial never logs in without an account; only a 480 does.
+    //
+    // A login not taken is the server refusing the account. Any answer
+    // other than a refusal, a connection limit or a busy server, and a
+    // connection closed in place of an answer, is told as a refused login.
+    fn log_in_for_body(&mut self, budget: Option<&ActiveTransferBudget>) -> Result<()> {
+        let (user, pass) = self.credentials.clone().unwrap_or_default();
+        match self.authenticate_with_active_budget(&user, &pass, budget) {
+            Ok(()) => {
+                // A new session need not keep the old one's group.
+                self.current_group = None;
+                self.login_unproven = true;
+                Ok(())
+            }
+            Err(error)
+                if error.is_credentials_refusal()
+                    || matches!(
+                        error,
+                        NntpError::TooManyConnections | NntpError::ServiceUnavailable
+                    )
+                    || (is_transient(&error) && !matches!(error, NntpError::ConnectionClosed)) =>
+            {
+                Err(error)
+            }
+            Err(_) => Err(NntpError::AuthenticationFailed),
         }
     }
 
@@ -2239,27 +2283,22 @@ impl BlockingNntpConnection {
                 return Err(error.into());
             }
         };
-        let initial = if initial.code.raw() == 480 {
-            if let Some((user, pass)) = self.credentials.clone() {
-                if let Err(error) =
-                    self.authenticate_with_active_budget(&user, &pass, budget.as_deref())
-                {
+        let initial = if initial.code.raw() == 480 && !self.login_unproven {
+            // The server asks for a login: log in and ask again. A 480 to
+            // the BODY asked again, or to the first BODY after an earlier
+            // 480's login, is the server refusing the account it took.
+            if let Err(error) = self.log_in_for_body(budget.as_deref()) {
+                self.poison_on_soft_timeout(&error);
+                self.abort_active_body();
+                return Err(error.into());
+            }
+            match self.send_command_with_active_budget(&cmd, budget.as_deref()) {
+                Ok(initial) => initial,
+                Err(error) => {
                     self.poison_on_soft_timeout(&error);
                     self.abort_active_body();
                     return Err(error.into());
                 }
-                self.current_group = None;
-                match self.send_command_with_active_budget(&cmd, budget.as_deref()) {
-                    Ok(initial) => initial,
-                    Err(error) => {
-                        self.poison_on_soft_timeout(&error);
-                        self.abort_active_body();
-                        return Err(error.into());
-                    }
-                }
-            } else {
-                self.abort_active_body();
-                return Err(NntpError::AuthenticationRequired.into());
             }
         } else {
             initial
@@ -2309,29 +2348,24 @@ impl BlockingNntpConnection {
                 return Err(error.into());
             }
         };
-        if initial.code.raw() == 480 {
-            // Mid-batch, a 480 says the session expired, not that the
-            // credentials are wrong: they were accepted when this connection
-            // was set up. Reporting it as an auth failure disabled the whole
-            // server for the auth backoff.
+        if initial.code.raw() == 480 && !self.login_unproven {
+            // Mid-batch, a 480 asks for a login: the session expired, or the
+            // server wants one on a connection that sent none. It is not a
+            // refusal of the account, and the article spends no try.
             //
             // A 480 is one line, so the reply stream is still in step. The
             // rest of the batch's replies are queued behind it and an AUTHINFO
             // written now would be answered by one of them, so the session is
-            // only marked: the caller reads those replies first, then
-            // re-authenticates on this socket (RFC 4643 §2.3; SABnzbd and
-            // NZBGet do the same).
-            if self.credentials.is_some() {
-                self.abort_active_body();
-                self.reauth_pending = true;
-                return Err(NntpError::SessionExpired.into());
-            }
-            // An anonymous session has nothing to re-authenticate with, and
-            // no later dial is asked for a login either: the server asks at
-            // the BODY. So this is the server refusing the account, as on a
-            // sequential BODY, and it is booked as one. Told as an expired
-            // session, the article was asked again on a new connection
-            // without end and the server was never held.
+            // only marked: the caller reads those replies first, then logs in
+            // on this socket (RFC 4643 §2.3).
+            self.abort_active_body();
+            self.reauth_pending = true;
+            return Err(NntpError::SessionExpired.into());
+        }
+        if initial.code.raw() == 480 {
+            // The first BODY after a 480's login is refused again: the
+            // server refuses the account it took. Logging in once more
+            // would ask the article again without end.
             self.fail_body_pipeline();
             return Err(NntpError::AuthenticationRequired.into());
         }
@@ -2348,6 +2382,10 @@ impl BlockingNntpConnection {
     where
         F: FnMut(&[u8]) -> Result<()>,
     {
+        if initial.code.raw() != 480 {
+            // A BODY answered with anything but 480: the login holds.
+            self.login_unproven = false;
+        }
         let mut decoder = match FusedYencArticleDecoder::from_body_response(initial) {
             Ok(decoder) => decoder,
             Err(error) => {

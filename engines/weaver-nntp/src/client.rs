@@ -1334,9 +1334,7 @@ impl NntpClient {
                     }
                     remaining.retain(|&i| !found[i]);
                 }
-                Err(NntpError::AuthenticationFailed)
-                | Err(NntpError::AuthenticationRejected)
-                | Err(NntpError::AccessDenied) => {
+                Err(e) if e.is_credentials_refusal() => {
                     last_error = Some(NntpError::AuthenticationFailed);
                 }
                 Err(e) if is_retryable_stat_error(&e) => {
@@ -1678,9 +1676,7 @@ impl NntpClient {
                     last_error = Some(e);
                     continue;
                 }
-                Err(NntpError::AuthenticationFailed)
-                | Err(NntpError::AuthenticationRejected)
-                | Err(NntpError::AccessDenied) => {
+                Err(e) if e.is_credentials_refusal() => {
                     attempts.push(FetchAttemptTrace {
                         route_feedback: None,
                         connection_health: None,
@@ -2373,11 +2369,7 @@ impl NntpClient {
                 *last_error = Some(DecodedBodyError::Nntp(error));
                 DecodedBatchDisposition::Retry
             }
-            Err(DecodedBodyError::Nntp(
-                NntpError::AuthenticationFailed
-                | NntpError::AuthenticationRejected
-                | NntpError::AccessDenied,
-            )) => {
+            Err(DecodedBodyError::Nntp(error)) if error.is_credentials_refusal() => {
                 attempts.push(FetchAttemptTrace {
                     route_feedback: route_feedback.clone(),
                     connection_health: None,
@@ -2544,11 +2536,7 @@ impl NntpClient {
                     last_error = Some(DecodedBodyError::Nntp(e));
                     continue;
                 }
-                Err(DecodedBodyError::Nntp(
-                    NntpError::AuthenticationFailed
-                    | NntpError::AuthenticationRejected
-                    | NntpError::AccessDenied,
-                )) => {
+                Err(DecodedBodyError::Nntp(error)) if error.is_credentials_refusal() => {
                     attempts.push(FetchAttemptTrace {
                         route_feedback: None,
                         connection_health: None,
