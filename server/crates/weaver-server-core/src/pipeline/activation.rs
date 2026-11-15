@@ -1030,13 +1030,27 @@ impl Pipeline {
     // belongs and the release of its handles, before its working directory
     // is released.
     pub(in crate::pipeline) fn retire_graph_job(&mut self, job_id: JobId) {
+        if let Some(graph) = self.stop_graph_job(job_id) {
+            // Gone with what its runs reserved: the memory goes to whoever
+            // waits for it.
+            drop(graph);
+            self.wake_memory_waiters();
+        }
+    }
+
+    // As `retire_graph_job`, but a stopped graph that holds nothing is
+    // handed back rather than dropped. Whether a graph holds anything is
+    // known only here, as it stops: a volume's thread may return the job's
+    // last operation at any moment before.
+    pub(in crate::pipeline) fn stop_graph_job(
+        &mut self,
+        job_id: JobId,
+    ) -> Option<crate::pipeline::graph::job::GraphJob> {
         let keep_files = self.pipeline_failure_stages.contains_key(&job_id);
         self.forget_graph_repair(job_id);
         self.disk_waiting.remove(&job_id);
         self.disk_idle.remove(&job_id);
-        let Some(mut graph) = self.graph_jobs.remove(&job_id) else {
-            return;
-        };
+        let mut graph = self.graph_jobs.remove(&job_id)?;
         let pending = graph.pending().clone();
         if !pending.control().cancelled()
             && pending
@@ -1058,13 +1072,35 @@ impl Pipeline {
         if let Some(disk) = graph.disk().filter(|disk| !disk.quiet()) {
             disk.barrier().then_tell(job_id, &self.graph_runs.written());
         }
+        #[cfg(test)]
+        before_kept::run();
         if graph.holds_retirement() {
             self.retiring_graph_jobs.insert(job_id, graph);
+            None
         } else {
-            // Gone with what its runs reserved: the memory goes to whoever
-            // waits for it.
-            drop(graph);
-            self.wake_memory_waiters();
+            Some(graph)
+        }
+    }
+}
+
+// What a test runs as a graph stops, just before whether it holds anything
+// is looked at, on the thread that stops it: once, then it is gone.
+#[cfg(test)]
+pub(crate) mod before_kept {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static RUN: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set(run: impl FnOnce() + 'static) {
+        RUN.with(|slot| *slot.borrow_mut() = Some(Box::new(run)));
+    }
+
+    pub(super) fn run() {
+        let run = RUN.with(|slot| slot.borrow_mut().take());
+        if let Some(run) = run {
+            run();
         }
     }
 }

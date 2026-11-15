@@ -703,8 +703,10 @@ impl Pending {
     pub(super) fn take(&self) -> (Option<Delta>, u64) {
         let mut slot = self.slot();
         Self::release(&mut slot);
+        // A write that takes everything carries whatever forced it.
         if slot.gated.is_empty() {
             slot.oldest = None;
+            slot.forced = false;
         }
         slot.dirty_bytes = 0;
         slot.enqueued = false;
@@ -1367,19 +1369,22 @@ impl Pending {
         let Some(oldest) = slot.oldest else {
             return;
         };
-        if slot.enqueued || slot.control.cancelled() {
+        if slot.control.cancelled() {
             return;
         }
         // The job hears when the writes a held change waits for returned,
-        // and its write is queued then.
+        // and its write is queued then. It is told whether or not a write
+        // is out now: that write takes only what was released when it ran,
+        // and nothing else asks for the next one.
         for gated in slot.gated.iter_mut().filter(|gated| !gated.told) {
             if let Some(barrier) = &gated.barrier {
                 gated.told = true;
                 barrier.then_tell(job_id, mail);
             }
         }
-        // Nothing may be written yet.
-        if slot.queued.is_none() && !slot.gated.is_empty() {
+        // Nothing may be written yet, or the write out takes it: a forced
+        // write that cannot go now goes next.
+        if slot.enqueued || (slot.queued.is_none() && !slot.gated.is_empty()) {
             slot.forced |= force;
             return;
         }
