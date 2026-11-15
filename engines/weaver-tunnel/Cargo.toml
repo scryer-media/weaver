@@ -24,7 +24,8 @@ if-addrs = "0.15.0"
 # DNS over TLS and over HTTPS, on the stream the routing layer dials.
 tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
-httparse = { version = "1", default-features = false, features = ["std"] }
+# HTTP/2 or HTTP/1.1 on that stream only: no pooled client, no connector, no resolver.
+hyper = { version = "1", default-features = false, features = ["client", "http1", "http2"] }
 
 # Reuse the approved HTTP/3 stack for local fixtures; absent from product builds.
 bytes = { workspace = true, optional = true }
@@ -43,6 +44,10 @@ windows-sys = { workspace = true, features = ["Win32_NetworkManagement_IpHelper"
 proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.5.0", features = ["http3", "test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
+# The DNS over HTTPS fixture servers: HTTP/1.1 read by hand, HTTP/2 through
+# the protocol crate hyper itself uses, which can send a GOAWAY on cue.
+httparse = { workspace = true }
+h2 = "0.4"
 
 # The host name lookup lint names itself in `cfg(dylint_lib)` when it runs.
 [lints.rust]

@@ -352,7 +352,7 @@ impl<E: Replicate> ResolutionCache<E> {
     // How many callers wait on the lookup in flight for `name`, or `None`
     // when none is.
     #[cfg(test)]
-    fn waiting(&self, name: &str) -> Option<usize> {
+    pub(crate) fn waiting(&self, name: &str) -> Option<usize> {
         match self
             .slots
             .lock()

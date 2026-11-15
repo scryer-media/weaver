@@ -4,22 +4,27 @@
 // The connection one server's queries ride during one lookup. Plain DNS
 // opens a stream per query. DNS over TLS (RFC 7858) and over HTTPS (RFC
 // 8484) wrap the stream the stage dials in TLS, and keep that one
-// connection for the lookup's queries.
+// connection for the lookup's queries while the server keeps it open.
 use super::{Carrier, DnsServer, Failed, Wire};
 use crate::TunnelStream;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_rustls::{
     TlsConnector,
     client::TlsStream,
-    rustls::{ClientConfig, RootCertStore, crypto::aws_lc_rs, pki_types::ServerName},
+    rustls::{
+        CertificateError, ClientConfig, RootCertStore, client::Resumption, crypto::aws_lc_rs,
+        pki_types::ServerName,
+    },
 };
 
 // The largest reply taken on any wire.
 pub(super) const REPLY_CAP: usize = 16384;
 
-// The TLS settings of each encrypted wire, built once and shared by every
-// lookup. Sessions resume across lookups.
+// TLS sessions one naming keeps for resumption.
+const SESSIONS: usize = 32;
+
+// The TLS settings of each encrypted wire.
 pub(super) struct Wires {
     dot: Arc<ClientConfig>,
     doh: Arc<ClientConfig>,
@@ -28,41 +33,65 @@ pub(super) struct Wires {
 impl Wires {
     pub(super) fn trusting(roots: RootCertStore) -> Self {
         let roots = Arc::new(roots);
-        let config = |alpn: &[u8]| {
+        let config = |alpn: &[&[u8]]| {
             let mut config =
                 ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
                     .with_safe_default_protocol_versions()
                     .expect("aws-lc-rs supports Rustls safe default protocol versions")
                     .with_root_certificates(roots.clone())
                     .with_no_client_auth();
-            config.alpn_protocols = vec![alpn.to_vec()];
+            config.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
             Arc::new(config)
         };
         Self {
-            dot: config(b"dot"),
-            // Only HTTP/1.1 is spoken over HTTPS.
-            doh: config(b"http/1.1"),
+            dot: config(&[b"dot"]),
+            // HTTP/2 when the server takes it, else HTTP/1.1.
+            doh: config(&[b"h2", b"http/1.1"]),
+        }
+    }
+
+    // The same settings with a session store of their own. The provider,
+    // roots and verifier stay shared; only resumption state is apart.
+    pub(super) fn apart(&self) -> Self {
+        let fresh = |config: &Arc<ClientConfig>| {
+            let mut config = ClientConfig::clone(config);
+            config.resumption = Resumption::in_memory_sessions(SESSIONS);
+            Arc::new(config)
+        };
+        Self {
+            dot: fresh(&self.dot),
+            doh: fresh(&self.doh),
         }
     }
 }
 
-// The web PKI roots: the only trust a product build has.
+// The web PKI roots: the only trust a product build has. Built once; every
+// naming takes its own copy through `DnsSessions`.
 pub(super) static WIRES: LazyLock<Wires> = LazyLock::new(|| {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     Wires::trusting(roots)
 });
 
-type Tls = TlsStream<Box<dyn TunnelStream>>;
+// The TLS sessions one naming resumes. A ticket from a server asked on one
+// route is never offered to it on another, which would tie the two routes
+// together in the clear ClientHello. Built on first use, kept with the
+// naming's answers, and dropped with them when the hop is rebuilt.
+#[derive(Default)]
+pub struct DnsSessions(OnceLock<Wires>);
+
+impl DnsSessions {
+    pub(super) fn wires(&self) -> &Wires {
+        self.0.get_or_init(|| WIRES.apart())
+    }
+}
+
+pub(super) type Tls = TlsStream<Box<dyn TunnelStream>>;
 
 enum Link {
     Tls(Box<Tls>),
-    Https(Box<super::https::Connection<Tls>>),
+    Https(Box<super::https::Connection>),
 }
-
-// Connections opened to one server in one lookup: the first, and one more
-// when the server closes it between queries.
-const OPENS: u8 = 2;
 
 // One server, asked for one lookup.
 pub(super) struct Session<'a> {
@@ -70,7 +99,6 @@ pub(super) struct Session<'a> {
     wires: &'a Wires,
     server: &'a DnsServer,
     link: Option<Link>,
-    opened: u8,
 }
 
 impl<'a> Session<'a> {
@@ -80,7 +108,6 @@ impl<'a> Session<'a> {
             wires,
             server,
             link: None,
-            opened: 0,
         }
     }
 
@@ -90,6 +117,12 @@ impl<'a> Session<'a> {
 
     // Sends `packet` and returns the reply. `reached` is set once the
     // server answers the dial, or a kept connection is used.
+    //
+    // A query rides the kept connection when there is one, else a new one.
+    // A kept connection found dead before any byte of the reply came is
+    // replaced once. So one query opens at most two connections, and a
+    // server that closes after every reply costs one per query, as plain
+    // DNS does.
     pub(super) async fn ask(
         &mut self,
         packet: &[u8],
@@ -104,33 +137,29 @@ impl<'a> Session<'a> {
             *reached = true;
             return framed(&mut stream, packet).await;
         }
-        loop {
-            // The link is out of its slot while in use, so a query cut off
-            // part way leaves no half-used connection behind.
-            let (mut link, kept) = match self.link.take() {
-                Some(link) => {
-                    *reached = true;
-                    (link, true)
-                }
-                None => (self.connect(reached).await?, false),
-            };
+        // The link is out of its slot while in use, so a query cut off part
+        // way leaves no half-used connection behind.
+        if let Some(mut link) = self.link.take() {
+            *reached = true;
             match link.exchange(self.server, packet).await {
-                Ok((reply, open)) => {
-                    if open {
-                        self.link = Some(link);
-                    }
-                    return Ok(reply);
-                }
-                Err(Failed::Closed) if kept && self.opened < OPENS => {}
+                Ok(reply) => return Ok(self.keep(link, reply)),
+                Err(Failed::Closed) => {}
                 Err(failed) => return Err(failed),
             }
         }
+        let mut link = self.connect(reached).await?;
+        let reply = link.exchange(self.server, packet).await?;
+        Ok(self.keep(link, reply))
+    }
+
+    fn keep(&mut self, link: Link, (reply, open): (Vec<u8>, bool)) -> Vec<u8> {
+        if open {
+            self.link = Some(link);
+        }
+        reply
     }
 
     async fn connect(&mut self, reached: &mut bool) -> Result<Link, Failed> {
-        if self.opened >= OPENS {
-            return Err(Failed::Closed);
-        }
         let (config, name) = match &self.server.wire {
             Wire::Tls { name } => (&self.wires.dot, name.as_deref()),
             Wire::Https { .. } => (&self.wires.doh, None),
@@ -138,11 +167,11 @@ impl<'a> Session<'a> {
         };
         // The certificate must name the server's address, or the name given.
         let verified = match name {
-            Some(name) => ServerName::try_from(name.to_owned())
-                .map_err(|error| Failed::Tls(format!("{name} is not a server name: {error}")))?,
+            Some(name) => {
+                ServerName::try_from(name.to_owned()).map_err(|_| Failed::Tls(NOT_A_SERVER_NAME))?
+            }
             None => ServerName::IpAddress(self.server.address.ip().into()),
         };
-        self.opened += 1;
         let stream = self
             .provider
             .open(self.server)
@@ -154,11 +183,47 @@ impl<'a> Session<'a> {
         let tls = TlsConnector::from(config.clone())
             .connect(verified, stream)
             .await
-            .map_err(|error| Failed::Tls(error.to_string()))?;
+            .map_err(|error| Failed::Tls(reason(&error)))?;
         if let Wire::Tls { .. } = self.server.wire {
             return Ok(Link::Tls(Box::new(tls)));
         }
-        Ok(Link::Https(Box::new(super::https::Connection::new(tls))))
+        Ok(Link::Https(Box::new(
+            super::https::Connection::new(tls).await?,
+        )))
+    }
+}
+
+// Why a TLS connection failed, in a few fixed words. Nothing the peer sent,
+// such as the names on its certificate, reaches the detail.
+const NOT_A_SERVER_NAME: &str = "the configured name is not a server name";
+const WRONG_NAME: &str = "certificate not valid for this server";
+const UNKNOWN_ISSUER: &str = "unknown issuer";
+const OUT_OF_DATE: &str = "certificate expired or not yet valid";
+const OTHER_CERTIFICATE: &str = "other certificate error";
+const HANDSHAKE: &str = "handshake failed";
+const CLOSED: &str = "connection closed";
+
+fn reason(error: &std::io::Error) -> &'static str {
+    use tokio_rustls::rustls::Error;
+    let Some(error) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<Error>())
+    else {
+        return CLOSED;
+    };
+    match error {
+        Error::InvalidCertificate(
+            CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
+        ) => WRONG_NAME,
+        Error::InvalidCertificate(CertificateError::UnknownIssuer) => UNKNOWN_ISSUER,
+        Error::InvalidCertificate(
+            CertificateError::Expired
+            | CertificateError::ExpiredContext { .. }
+            | CertificateError::NotValidYet
+            | CertificateError::NotValidYetContext { .. },
+        ) => OUT_OF_DATE,
+        Error::InvalidCertificate(_) => OTHER_CERTIFICATE,
+        _ => HANDSHAKE,
     }
 }
 
@@ -184,6 +249,8 @@ impl Link {
 }
 
 // One query over a stream, with the two-byte length prefix of DNS over TCP.
+// A stream that ends before the first byte of the reply is closed; one that
+// ends part way cut the reply short.
 async fn framed<S>(stream: &mut S, packet: &[u8]) -> Result<Vec<u8>, Failed>
 where
     S: AsyncRead + AsyncWrite + Unpin + ?Sized,
@@ -196,7 +263,16 @@ where
         .await
         .map_err(|_| Failed::Closed)?;
     stream.flush().await.map_err(|_| Failed::Closed)?;
-    let size = stream.read_u16().await.map_err(|_| Failed::Closed)? as usize;
+    let mut prefix = [0; 2];
+    match stream.read(&mut prefix[..1]).await {
+        Ok(1) => {}
+        _ => return Err(Failed::Closed),
+    }
+    stream
+        .read_exact(&mut prefix[1..])
+        .await
+        .map_err(|_| Failed::Cut)?;
+    let size = u16::from_be_bytes(prefix) as usize;
     if !(12..=REPLY_CAP).contains(&size) {
         return Err(Failed::Invalid);
     }
@@ -204,6 +280,6 @@ where
     stream
         .read_exact(&mut bytes)
         .await
-        .map_err(|_| Failed::Closed)?;
+        .map_err(|_| Failed::Cut)?;
     Ok(bytes)
 }

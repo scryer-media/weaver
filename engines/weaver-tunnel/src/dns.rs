@@ -14,7 +14,10 @@ use crate::{
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU16, Ordering};
-use wire::{Session, WIRES, Wires};
+pub use wire::DnsSessions;
+#[cfg(test)]
+use wire::WIRES;
+use wire::{Session, Wires};
 
 mod https;
 mod wire;
@@ -111,6 +114,10 @@ pub enum Trust {
 // What routed DNS says when it fails, and `fault` reads back.
 pub(crate) const INVALID: &str = "routed DNS returned an invalid response";
 pub(crate) const UNRESOLVED: &str = "routed DNS could not resolve the destination";
+// A lookup whose servers gave no answer marked authenticated. It reads as
+// unresolved, and says why, so a caller that joined the lookup can tell.
+pub(crate) const NOT_AUTHENTICATED: &str =
+    "routed DNS could not resolve the destination: no answer was marked authenticated";
 
 fn invalid() -> TunnelError {
     TunnelError::Engine(INVALID.into())
@@ -173,9 +180,21 @@ pub fn unresolved() -> DialError {
 // server could be reached at all, the error is the stage's own, so a dead
 // path counts against the path and not against the name. Every server
 // saying the name has no address is a negative answer: no addresses, with
-// how long that holds. `trust` is how the answers are to be judged.
+// how long that holds. `trust` is how the answers are to be judged. TLS
+// sessions are not resumed from one call to the next.
 pub async fn resolve_through(
     dialer: &dyn Dialer,
+    servers: &[DnsServer],
+    trust: Trust,
+    host: &str,
+) -> Result<Lookup, DialError> {
+    resolve_routed(dialer, &DnsSessions::default(), servers, trust, host).await
+}
+
+// `resolve_through`, resuming the TLS sessions of one naming.
+pub(crate) async fn resolve_routed(
+    dialer: &dyn Dialer,
+    sessions: &DnsSessions,
     servers: &[DnsServer],
     trust: Trust,
     host: &str,
@@ -191,7 +210,7 @@ pub async fn resolve_through(
         dialer,
         failure: Mutex::new(None),
     };
-    let resolved = resolve(&stage, &WIRES, servers, trust, host).await;
+    let resolved = resolve(&stage, sessions.wires(), servers, trust, host).await;
     crate::metrics::record_resolution(
         crate::metrics::Resolver::Routed,
         resolved
@@ -221,15 +240,17 @@ struct Found {
 enum Failed {
     // The server could not be reached.
     Unreached(TunnelError),
-    // The connection closed before a whole reply came.
+    // The connection closed before any byte of the reply came.
     Closed,
+    // The connection closed part way through the reply.
+    Cut,
     // The server answered with this error code instead of an answer.
     Rcode(u16),
     Invalid,
     // The naming requires the AD bit and the reply did not carry it.
     NotAuthenticated,
-    // The TLS handshake or certificate check failed, saying this.
-    Tls(String),
+    // The TLS handshake or certificate check failed, for this fixed reason.
+    Tls(&'static str),
     // The HTTPS server answered with this status instead of 200.
     Http(u16),
 }
@@ -245,10 +266,10 @@ impl Why {
             LookupFailure::NotAuthenticated => 7,
             LookupFailure::NoSuchName => 6,
             LookupFailure::NoAddress => 5,
-            LookupFailure::ServerFailure => 4,
-            LookupFailure::TimedOut => 3,
-            LookupFailure::Other => 2,
-            LookupFailure::TlsFailed => 1,
+            LookupFailure::TlsFailed => 4,
+            LookupFailure::ServerFailure => 3,
+            LookupFailure::TimedOut => 2,
+            LookupFailure::Other => 1,
             LookupFailure::NoReply => 0,
         }
     }
@@ -280,6 +301,9 @@ impl Why {
             }
             Ok(Err(Failed::Closed)) => self.consider(LookupFailure::NoReply, || {
                 format!("{server}: the connection closed without a reply")
+            }),
+            Ok(Err(Failed::Cut)) => self.consider(LookupFailure::NoReply, || {
+                format!("{server}: the connection closed part way through a reply")
             }),
             Ok(Err(Failed::Rcode(rcode))) => self.consider(LookupFailure::ServerFailure, || {
                 let said = match rcode {
@@ -366,7 +390,15 @@ async fn resolve(
     // How long the name's having no address holds, while every server
     // asked has said so for both families.
     let mut negative = Some(u32::MAX);
+    let mut encrypted_before = false;
     for server in servers {
+        if never_in_plain(server, encrypted_before) {
+            why.consider(LookupFailure::Other, || {
+                format!("{server}: not asked in plain after an encrypted server")
+            });
+            continue;
+        }
+        encrypted_before |= server.wire != Wire::Plain;
         // An encrypted wire keeps one connection to the server for both
         // families and every alias followed.
         let mut session = Session::new(provider, wires, server);
@@ -443,11 +475,26 @@ async fn resolve(
                 crate::metrics::record_dns_trust(TrustOutcome::Refused);
             }
             Err(Unanswered {
-                error: TunnelError::Engine(UNRESOLVED.into()),
+                error: TunnelError::Engine(
+                    if refused {
+                        NOT_AUTHENTICATED
+                    } else {
+                        UNRESOLVED
+                    }
+                    .into(),
+                ),
                 reached: reached_any,
             })
         }
     }
+}
+
+// No downgrade (SECURITY.md): within one lookup, a plain server listed after
+// an encrypted one is never asked, whatever came of the encrypted ones, so a
+// name meant to go out encrypted never goes out in the clear. A plain server
+// listed before them is asked in its turn.
+fn never_in_plain(server: &DnsServer, encrypted_before: bool) -> bool {
+    encrypted_before && server.wire == Wire::Plain
 }
 
 // Whether a reply carries the AD bit: the server says it validated the

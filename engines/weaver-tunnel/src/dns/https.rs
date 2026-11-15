@@ -1,234 +1,299 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// DNS over HTTPS (RFC 8484) as HTTP/1.1, written and read on the TLS
-// stream the stage dialled: one POST per query. Every part of a reply is
-// read under a fixed cap, so nothing a server sends makes a read or an
-// allocation unbounded.
-use super::{DnsServer, Failed, wire::REPLY_CAP};
+// DNS over HTTPS (RFC 8484), one POST per query, on the TLS stream the stage
+// dialled: HTTP/2 when the server picks it in the handshake, else HTTP/1.1.
+// hyper's client connection reads and writes the messages; it opens nothing
+// and resolves nothing. Its connection, and the HTTP/2 work it hands to an
+// executor, are polled here inside each exchange and never spawned, so they
+// do no work outside a lookup and go when the lookup drops them. Every part
+// of a reply is read under a fixed cap.
+use super::{
+    DnsServer, Failed,
+    wire::{REPLY_CAP, Tls},
+};
+use hyper::{
+    Method, Request, Response, StatusCode, Uri, Version,
+    body::{Body, Bytes, Frame, Incoming, SizeHint},
+    client::conn::{http1, http2},
+    header::{
+        ACCEPT, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderMap, TRANSFER_ENCODING,
+    },
+};
+use std::convert::Infallible;
+use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::pin::{Pin, pin};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll, ready};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 // RFC 8484 §6.
 const DNS_MESSAGE: &str = "application/dns-message";
-// The whole of one response head, and the headers it may carry.
+// The whole of one response head, and the headers it may carry. The head cap
+// also bounds a chunked body's trailer section, and an HTTP/2 header list.
 const HEAD_CAP: usize = 8192;
 const HEADERS: usize = 32;
 // Interim (1xx) responses passed over before the final one.
 const INTERIM: usize = 4;
-// A chunk-size line, extension included, and the hex digits of the size.
-const CHUNK_LINE_CAP: usize = 256;
-const CHUNK_DIGITS: usize = 16;
-// The trailer section of a chunked body, read and dropped.
-const TRAILER_CAP: usize = 1024;
 // Bytes asked of the stream by each read.
 const READ: usize = 4096;
+// HTTP/2 flow control: a stream may hold one reply before it is read, and
+// the connection the protocol's initial window.
+const STREAM_WINDOW: u32 = REPLY_CAP as u32;
+const CONNECTION_WINDOW: u32 = 65_535;
 
-// One HTTP/1.1 connection, with what was read past the last thing taken.
-pub(super) struct Connection<S> {
-    stream: S,
-    buffer: Vec<u8>,
+// One connection to the server. `read` counts the bytes the server sent, so
+// a failed HTTP/1.1 exchange can tell a connection found dead from a reply
+// cut short.
+pub(super) struct Connection {
+    http: Http,
+    read: Arc<AtomicUsize>,
 }
 
-// How a response body is delimited.
-enum Framing {
-    Length(usize),
-    Chunked,
+// The connection futures hyper hands back, kept until they end.
+type Driver1 = Pin<Box<http1::Connection<Io<Tls>, Query>>>;
+type Driver2 = Pin<Box<http2::Connection<Io<Tls>, Query, Tasks>>>;
+
+enum Http {
+    One {
+        send: http1::SendRequest<Query>,
+        driver: Option<Driver1>,
+    },
+    Two {
+        send: http2::SendRequest<Query>,
+        driver: Option<Driver2>,
+        tasks: Tasks,
+        running: Vec<Task>,
+    },
 }
 
-// What a response head says that matters here.
-struct Head {
-    status: u16,
-    // None when the body cannot be delimited safely: both length headers,
-    // neither, a coding other than chunked, or a length past the cap.
-    framing: Option<Framing>,
-    // The content type is a DNS message.
-    typed: bool,
-    // The server closes the connection after this response.
-    close: bool,
-}
-
-impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
-    pub(super) fn new(stream: S) -> Self {
-        Self {
+impl Connection {
+    pub(super) async fn new(stream: Tls) -> Result<Self, Failed> {
+        let two = stream.get_ref().1.alpn_protocol() == Some(b"h2");
+        let read = Arc::new(AtomicUsize::new(0));
+        let io = Io {
             stream,
-            buffer: Vec::new(),
-        }
+            read: read.clone(),
+        };
+        let http = if two {
+            let tasks = Tasks::default();
+            // No pings or timers of its own, no push, fixed small windows.
+            let (send, driver) = http2::Builder::new(tasks.clone())
+                .initial_stream_window_size(STREAM_WINDOW)
+                .initial_connection_window_size(CONNECTION_WINDOW)
+                .max_header_list_size(HEAD_CAP as u32)
+                .max_send_buf_size(REPLY_CAP)
+                .handshake(io)
+                .await
+                .map_err(|_| Failed::Closed)?;
+            Http::Two {
+                send,
+                driver: Some(Box::pin(driver)),
+                tasks,
+                running: Vec::new(),
+            }
+        } else {
+            let (send, driver) = http1::Builder::new()
+                .max_buf_size(HEAD_CAP)
+                .max_header_size(HEAD_CAP)
+                .max_headers(HEADERS)
+                .handshake(io)
+                .await
+                .map_err(|_| Failed::Closed)?;
+            Http::One {
+                send,
+                driver: Some(Box::pin(driver)),
+            }
+        };
+        Ok(Self { http, read })
     }
 
     // The reply to `packet`, and whether the connection may carry the next
-    // query: the response was read whole and did not say it closes.
+    // query: the response was read whole, the connection still runs, and
+    // the server did not say it closes.
     pub(super) async fn exchange(
         &mut self,
         server: &DnsServer,
         path: &str,
         packet: &[u8],
     ) -> Result<(Vec<u8>, bool), Failed> {
-        let request = request(server.address, path, packet)?;
-        self.stream
-            .write_all(&request)
-            .await
-            .map_err(|_| Failed::Closed)?;
-        self.stream.flush().await.map_err(|_| Failed::Closed)?;
-        let head = self.final_head().await?;
-        if head.status != 200 {
-            return Err(Failed::Http(head.status));
-        }
-        if !head.typed {
-            return Err(Failed::Invalid);
-        }
-        let body = match head.framing.ok_or(Failed::Invalid)? {
-            Framing::Length(length) => self.take(length).await?,
-            Framing::Chunked => self.chunked().await?,
-        };
-        // Bytes past the response would be read as the next one's.
-        Ok((body, !head.close && self.buffer.is_empty()))
-    }
-
-    // Reads more of the stream into the buffer. A closed stream is a
-    // connection closed before the whole reply came.
-    async fn fill(&mut self) -> Result<(), Failed> {
-        let start = self.buffer.len();
-        self.buffer.resize(start + READ, 0);
-        match self.stream.read(&mut self.buffer[start..]).await {
-            Ok(read) if read > 0 => {
-                self.buffer.truncate(start + read);
-                Ok(())
-            }
-            _ => {
-                self.buffer.truncate(start);
-                Err(Failed::Closed)
-            }
-        }
-    }
-
-    // The head of the final response, after at most `INTERIM` interim ones.
-    async fn final_head(&mut self) -> Result<Head, Failed> {
-        for _ in 0..=INTERIM {
-            let head = self.head().await?;
-            if !(100..200).contains(&head.status) {
-                return Ok(head);
-            }
-        }
-        Err(Failed::Invalid)
-    }
-
-    async fn head(&mut self) -> Result<Head, Failed> {
-        loop {
-            let window = &self.buffer[..self.buffer.len().min(HEAD_CAP)];
-            let mut headers = [httparse::EMPTY_HEADER; HEADERS];
-            let mut response = httparse::Response::new(&mut headers);
-            match response.parse(window) {
-                Ok(httparse::Status::Complete(size)) => {
-                    let head = judge(&response)?;
-                    self.buffer.drain(..size);
-                    return Ok(head);
+        let two = matches!(self.http, Http::Two { .. });
+        let mut request = request(server.address, path, packet, two)?;
+        let interim = Arc::new(AtomicUsize::new(0));
+        let counted = interim.clone();
+        hyper::ext::on_informational(&mut request, move |_| {
+            counted.fetch_add(1, Ordering::Relaxed);
+        });
+        let interims = || interim.load(Ordering::Relaxed) > INTERIM;
+        match &mut self.http {
+            Http::One { send, driver } => {
+                let before = self.read.load(Ordering::Relaxed);
+                let outcome = {
+                    let mut call = pin!(call(
+                        async {
+                            send.ready().await.map_err(failed)?;
+                            send.send_request(request).await.map_err(failed)
+                        },
+                        false,
+                    ));
+                    poll_fn(|cx| {
+                        // The connection runs only while a query waits on
+                        // it. Once it ends it is dropped, which fails a call
+                        // still waiting on it.
+                        if let Some(running) = driver.as_mut()
+                            && running.as_mut().poll(cx).is_ready()
+                        {
+                            *driver = None;
+                        }
+                        if interims() {
+                            return Poll::Ready(Err(Failed::Invalid));
+                        }
+                        call.as_mut().poll(cx)
+                    })
+                    .await
+                };
+                match outcome {
+                    // Nothing came back: the connection was dead before the
+                    // query.
+                    Err(Failed::Cut) if self.read.load(Ordering::Relaxed) == before => {
+                        Err(Failed::Closed)
+                    }
+                    Ok((reply, open)) => Ok((reply, open && driver.is_some())),
+                    outcome => outcome,
                 }
-                Ok(httparse::Status::Partial) if self.buffer.len() < HEAD_CAP => {}
-                // Past the cap, too many headers, or not a response head.
-                _ => return Err(Failed::Invalid),
             }
-            self.fill().await?;
-        }
-    }
-
-    // Exactly `length` bytes, which the caller has checked against a cap.
-    async fn take(&mut self, length: usize) -> Result<Vec<u8>, Failed> {
-        while self.buffer.len() < length {
-            self.fill().await?;
-        }
-        let mut taken = Vec::with_capacity(length);
-        taken.extend(self.buffer.drain(..length));
-        Ok(taken)
-    }
-
-    // One line, without its CRLF, no longer than `cap` with it.
-    async fn line(&mut self, cap: usize) -> Result<Vec<u8>, Failed> {
-        loop {
-            let window = &self.buffer[..self.buffer.len().min(cap)];
-            if let Some(at) = window.windows(2).position(|pair| pair == b"\r\n") {
-                let line = self.buffer[..at].to_vec();
-                self.buffer.drain(..at + 2);
-                return Ok(line);
-            }
-            if self.buffer.len() >= cap {
-                return Err(Failed::Invalid);
-            }
-            self.fill().await?;
-        }
-    }
-
-    // A chunked body, no larger in all than the reply cap. The trailer
-    // section is read and dropped.
-    async fn chunked(&mut self) -> Result<Vec<u8>, Failed> {
-        let mut body = Vec::new();
-        loop {
-            let line = self.line(CHUNK_LINE_CAP).await?;
-            let size = chunk_size(&line).ok_or(Failed::Invalid)?;
-            if size == 0 {
-                break;
-            }
-            if size > REPLY_CAP - body.len() {
-                return Err(Failed::Invalid);
-            }
-            body.extend(self.take(size).await?);
-            if !self.line(2).await?.is_empty() {
-                return Err(Failed::Invalid);
-            }
-        }
-        let mut left = TRAILER_CAP;
-        loop {
-            let line = self.line(left).await?;
-            left -= line.len() + 2;
-            if line.is_empty() {
-                return Ok(body);
+            Http::Two {
+                send,
+                driver,
+                tasks,
+                running,
+            } => {
+                let outcome = {
+                    let mut call = pin!(call(
+                        async {
+                            // No response head came: the connection had gone
+                            // away or refused the stream, so the query was
+                            // never answered.
+                            send.ready().await.map_err(unsent)?;
+                            send.send_request(request).await.map_err(unsent)
+                        },
+                        true,
+                    ));
+                    poll_fn(|cx| {
+                        if let Some(connection) = driver.as_mut()
+                            && connection.as_mut().poll(cx).is_ready()
+                        {
+                            *driver = None;
+                        }
+                        tasks.run(running, cx);
+                        if interims() {
+                            return Poll::Ready(Err(Failed::Invalid));
+                        }
+                        call.as_mut().poll(cx)
+                    })
+                    .await
+                };
+                outcome.map(|(reply, open)| (reply, open && driver.is_some() && !send.is_closed()))
             }
         }
     }
 }
 
-// What a final or interim response head says.
-fn judge(response: &httparse::Response<'_, '_>) -> Result<Head, Failed> {
-    let status = response.code.ok_or(Failed::Invalid)?;
-    // An HTTP/1.0 response does not keep the connection.
-    let mut close = response.version != Some(1);
-    let mut lengths = Vec::new();
-    let mut codings = Vec::new();
-    let mut types = Vec::new();
-    for header in response.headers.iter() {
-        let Ok(value) = std::str::from_utf8(header.value) else {
+// Reads the response `sent` resolves to.
+async fn call(
+    sent: impl Future<Output = Result<Response<Incoming>, Failed>>,
+    two: bool,
+) -> Result<(Vec<u8>, bool), Failed> {
+    let response = sent.await?;
+    if response.status() != StatusCode::OK {
+        return Err(Failed::Http(response.status().as_u16()));
+    }
+    let length = judge(response.headers(), two)?;
+    let close = !two && (response.version() != Version::HTTP_11 || closes(response.headers()));
+    let mut body = response.into_body();
+    let mut reply = Vec::with_capacity(length.unwrap_or(0));
+    while let Some(frame) = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
+        let Ok(data) = frame.map_err(failed)?.into_data() else {
             continue;
         };
-        let name = header.name;
-        if name.eq_ignore_ascii_case("content-length") {
-            lengths.push(value);
-        } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            codings.push(value);
-        } else if name.eq_ignore_ascii_case("content-type") {
-            types.push(value);
-        } else if name.eq_ignore_ascii_case("connection")
-            && value
-                .split(',')
-                .any(|token| token.trim().eq_ignore_ascii_case("close"))
-        {
-            close = true;
+        if data.len() > REPLY_CAP - reply.len() {
+            return Err(Failed::Invalid);
+        }
+        reply.extend_from_slice(&data);
+    }
+    Ok((reply, !close))
+}
+
+// What a hyper error says of the exchange: a response that does not parse is
+// invalid, anything else a reply cut short.
+fn failed(error: hyper::Error) -> Failed {
+    if error.is_parse() {
+        Failed::Invalid
+    } else {
+        Failed::Cut
+    }
+}
+
+// The same, before any of an HTTP/2 response came.
+fn unsent(error: hyper::Error) -> Failed {
+    match failed(error) {
+        Failed::Cut => Failed::Closed,
+        failed => failed,
+    }
+}
+
+// The headers that frame and type a response, and its length when it gives
+// one. Their values must be visible ASCII, the content type a DNS message,
+// and the body delimited by a single length within the cap, by chunked alone
+// over HTTP/1.1, or by the end of the stream over HTTP/2.
+fn judge(headers: &HeaderMap, two: bool) -> Result<Option<usize>, Failed> {
+    for name in [CONTENT_LENGTH, TRANSFER_ENCODING, CONNECTION, CONTENT_TYPE] {
+        if headers.get_all(&name).iter().any(|value| {
+            !value
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_graphic() || matches!(byte, b' ' | b'\t'))
+        }) {
+            return Err(Failed::Invalid);
         }
     }
-    let framing = match (lengths.as_slice(), codings.as_slice()) {
-        ([length], []) => length_of(length).map(Framing::Length),
-        ([], [coding]) if coding.trim().eq_ignore_ascii_case("chunked") => Some(Framing::Chunked),
-        _ => None,
+    let text = |name| -> Vec<&str> {
+        headers
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect()
     };
+    let types = text(CONTENT_TYPE);
     // The media type, without its parameters, compared without regard to case.
     let typed = matches!(types.as_slice(), [content] if content
         .split(';')
         .next()
         .is_some_and(|media| media.trim().eq_ignore_ascii_case(DNS_MESSAGE)));
-    Ok(Head {
-        status,
-        framing,
-        typed,
-        close,
+    if !typed {
+        return Err(Failed::Invalid);
+    }
+    match (
+        text(CONTENT_LENGTH).as_slice(),
+        text(TRANSFER_ENCODING).as_slice(),
+    ) {
+        ([length], []) => length_of(length).map(Some).ok_or(Failed::Invalid),
+        ([], []) if two => Ok(None),
+        ([], [coding]) if !two && coding.trim().eq_ignore_ascii_case("chunked") => Ok(None),
+        _ => Err(Failed::Invalid),
+    }
+}
+
+// Whether the response says the server closes the connection after it.
+fn closes(headers: &HeaderMap) -> bool {
+    headers.get_all(CONNECTION).iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("close"))
+        })
     })
 }
 
@@ -239,21 +304,6 @@ fn length_of(value: &str) -> Option<usize> {
         return None;
     }
     value.parse().ok().filter(|length| *length <= REPLY_CAP)
-}
-
-// The size a chunk-size line gives, its extension ignored.
-fn chunk_size(line: &[u8]) -> Option<usize> {
-    let digits = line.split(|byte| *byte == b';').next()?;
-    let digits = std::str::from_utf8(digits)
-        .ok()?
-        .trim_end_matches([' ', '\t']);
-    if digits.is_empty()
-        || digits.len() > CHUNK_DIGITS
-        || !digits.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return None;
-    }
-    usize::try_from(u64::from_str_radix(digits, 16).ok()?).ok()
 }
 
 // The server's address as an HTTP authority: an IPv6 address in brackets,
@@ -269,18 +319,176 @@ fn authority(address: SocketAddr) -> String {
     }
 }
 
-// The request for one query: these four headers and the query, nothing
-// else.
-fn request(address: SocketAddr, path: &str, packet: &[u8]) -> Result<Vec<u8>, Failed> {
+// The path a request may be sent to: it starts with '/' and holds only
+// visible ASCII, so no space, control byte or line break reaches the
+// request line.
+fn target(path: &str) -> Result<Uri, Failed> {
     if !path.starts_with('/') || !path.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err(Failed::Invalid);
     }
-    let mut request = format!(
-        "POST {path} HTTP/1.1\r\nhost: {}\r\ncontent-type: {DNS_MESSAGE}\r\naccept: {DNS_MESSAGE}\r\ncontent-length: {}\r\n\r\n",
-        authority(address),
-        packet.len()
-    )
-    .into_bytes();
-    request.extend_from_slice(packet);
-    Ok(request)
+    Uri::try_from(path).map_err(|_| Failed::Invalid)
+}
+
+// The request for one query: these four headers and the query, nothing
+// else. HTTP/2 carries the host as the request's authority instead.
+fn request(
+    address: SocketAddr,
+    path: &str,
+    packet: &[u8],
+    two: bool,
+) -> Result<Request<Query>, Failed> {
+    let path = target(path)?;
+    let host = authority(address);
+    let builder = if two {
+        let uri = Uri::builder()
+            .scheme("https")
+            .authority(host)
+            .path_and_query(path.path_and_query().map_or("/", |path| path.as_str()))
+            .build()
+            .map_err(|_| Failed::Invalid)?;
+        Request::builder().uri(uri)
+    } else {
+        Request::builder().uri(path).header(HOST, host)
+    };
+    builder
+        .method(Method::POST)
+        .header(CONTENT_TYPE, DNS_MESSAGE)
+        .header(ACCEPT, DNS_MESSAGE)
+        .header(CONTENT_LENGTH, packet.len())
+        .body(Query(Some(Bytes::copy_from_slice(packet))))
+        .map_err(|_| Failed::Invalid)
+}
+
+// A query as a request body: one frame.
+pub(super) struct Query(Option<Bytes>);
+
+impl Body for Query {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        Poll::Ready(self.0.take().map(|packet| Ok(Frame::data(packet))))
+    }
+    fn is_end_stream(&self) -> bool {
+        self.0.is_none()
+    }
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.0.as_ref().map_or(0, |packet| packet.len() as u64))
+    }
+}
+
+// The HTTP/2 connection and its streams, which hyper hands to an executor.
+// They are kept here, not spawned, and polled with the exchange that waits
+// on them, so they run only inside a lookup and are dropped with it.
+type Task = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+#[derive(Clone, Default)]
+struct Tasks(Arc<Mutex<Vec<Task>>>);
+
+impl<F: Future<Output = ()> + Send + 'static> hyper::rt::Executor<F> for Tasks {
+    fn execute(&self, future: F) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Box::pin(future));
+    }
+}
+
+impl Tasks {
+    // Polls each task, then those handed over meanwhile, until no new one
+    // comes.
+    fn run(&self, running: &mut Vec<Task>, cx: &mut Context<'_>) {
+        running.retain_mut(|task| task.as_mut().poll(cx).is_pending());
+        loop {
+            let fresh = std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner));
+            if fresh.is_empty() {
+                return;
+            }
+            for mut task in fresh {
+                if task.as_mut().poll(cx).is_pending() {
+                    running.push(task);
+                }
+            }
+        }
+    }
+}
+
+// The TLS stream as hyper's IO, counting what it reads.
+struct Io<S> {
+    stream: S,
+    read: Arc<AtomicUsize>,
+}
+
+impl<S: AsyncRead + Unpin> hyper::rt::Read for Io<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let mut scratch = [0; READ];
+        let room = buf.remaining().min(READ);
+        let mut read = ReadBuf::new(&mut scratch[..room]);
+        ready!(Pin::new(&mut this.stream).poll_read(cx, &mut read))?;
+        this.read.fetch_add(read.filled().len(), Ordering::Relaxed);
+        buf.put_slice(read.filled());
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<S: AsyncWrite + Unpin> hyper::rt::Write for Io<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_path_with_a_space_a_line_break_or_other_than_ascii_is_refused() {
+        assert!(target("/dns-query").is_ok());
+        for path in [
+            "/dns query",
+            "/dns\rquery",
+            "/dns\nquery",
+            "/dns\r\nhost: x",
+            "/dns\tquery",
+            "/dnsé",
+            "dns-query",
+            "",
+        ] {
+            assert!(matches!(target(path), Err(Failed::Invalid)), "{path:?}");
+            for two in [false, true] {
+                assert!(
+                    request("192.0.2.53:443".parse().unwrap(), path, &[0; 12], two).is_err(),
+                    "{path:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_http_2_request_names_the_server_as_its_authority() {
+        let Ok(request) = request("192.0.2.53:8443".parse().unwrap(), "/q?a=b", &[0; 12], true)
+        else {
+            panic!("a request");
+        };
+        assert_eq!(request.uri(), "https://192.0.2.53:8443/q?a=b");
+        assert!(request.headers().get(HOST).is_none());
+    }
 }

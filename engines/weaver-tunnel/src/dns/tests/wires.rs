@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use super::trust::through_cache;
 use super::ttl::{ASKED, Answer, failure, respond, rr, soa, v4, wire};
 use super::*;
+use crate::resolution::ResolutionCache;
 use crate::resolution::record::{LookupError, Recording};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
 use std::pin::Pin;
@@ -27,7 +29,14 @@ struct Authority {
 
 impl Authority {
     fn new() -> Self {
+        // A name of its own, so a certificate from another authority is
+        // never taken for one of this one's.
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
         let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            format!("authority {}", NEXT.fetch_add(1, Ordering::Relaxed)),
+        );
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         let key = KeyPair::generate().unwrap();
         let certificate = params.self_signed(&key).unwrap().der().clone();
@@ -45,7 +54,7 @@ impl Authority {
     }
 
     // A server's TLS settings, with a certificate for `names` (addresses or
-    // DNS names) signed by this authority.
+    // DNS names) signed by this authority. An empty `alpn` offers none.
     fn server(&self, names: &[&str], alpn: &[u8]) -> Arc<ServerConfig> {
         let params = CertificateParams::new(
             names
@@ -66,7 +75,10 @@ impl Authority {
                     PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
                 )
                 .unwrap();
-        config.alpn_protocols = vec![alpn.to_vec()];
+        config.alpn_protocols = [alpn.to_vec()]
+            .into_iter()
+            .filter(|alpn| !alpn.is_empty())
+            .collect();
         Arc::new(config)
     }
 }
@@ -136,7 +148,16 @@ enum Speaks {
         respond: Arc<Respond>,
         dribble: bool,
     },
+    // HTTP/2. `respond` makes the response from the reply. With
+    // `goaway_after`, the request after that many is met with a GOAWAY and
+    // the connection closed.
+    H2 {
+        respond: Arc<H2Respond>,
+        goaway_after: Option<usize>,
+    },
 }
+
+type H2Respond = dyn Fn(Vec<u8>) -> hyper::Response<Vec<u8>> + Send + Sync;
 
 #[derive(Default)]
 struct Log {
@@ -149,9 +170,16 @@ struct Log {
     requests: Vec<Seen>,
 }
 
-// Encrypted DNS servers, by address, in process.
+// DNS servers, by address, in process: encrypted ones, plain ones, and
+// ones that take the connection and never say anything.
 struct Servers {
     tls: Vec<(IpAddr, Arc<ServerConfig>)>,
+    plain: Vec<IpAddr>,
+    silent: Vec<IpAddr>,
+    held: Mutex<Vec<DuplexStream>>,
+    // Replies left across every connection, when bounded; a query past the
+    // last is read and the connection closed without a reply.
+    replies: Option<Arc<AtomicUsize>>,
     speaks: Speaks,
     answer: Arc<Answer>,
     log: Arc<Mutex<Log>>,
@@ -164,6 +192,10 @@ impl Servers {
     ) -> Self {
         Self {
             tls: Vec::new(),
+            plain: Vec::new(),
+            silent: Vec::new(),
+            held: Mutex::default(),
+            replies: None,
             speaks,
             answer: Arc::new(answer),
             log: Default::default(),
@@ -172,6 +204,33 @@ impl Servers {
     fn at(mut self, ip: &str, config: Arc<ServerConfig>) -> Self {
         self.tls.push((ip.parse().unwrap(), config));
         self
+    }
+    fn plain_at(mut self, ip: &str) -> Self {
+        self.plain.push(ip.parse().unwrap());
+        self
+    }
+    fn silent_at(mut self, ip: &str) -> Self {
+        self.silent.push(ip.parse().unwrap());
+        self
+    }
+    fn replying(mut self, replies: usize) -> Self {
+        self.replies = Some(Arc::new(AtomicUsize::new(replies)));
+        self
+    }
+    // Every byte the client sent, on every connection.
+    fn sent(&self) -> Vec<Vec<u8>> {
+        let log = self.log.lock().unwrap();
+        log.sent
+            .iter()
+            .map(|sent| sent.lock().unwrap().clone())
+            .collect()
+    }
+    fn answered(&self) -> Vec<usize> {
+        let log = self.log.lock().unwrap();
+        log.queries
+            .iter()
+            .map(|queries| queries.load(Ordering::Relaxed))
+            .collect()
     }
     fn dials(&self) -> Vec<SocketAddr> {
         self.log.lock().unwrap().dials.clone()
@@ -191,37 +250,41 @@ impl Carrier for Servers {
             log.queries.push(queries.clone());
         }
         let asked = server.address.ip();
+        let answer = self.answer.clone();
+        let replies = self.replies.clone();
+        if self.silent.contains(&asked) {
+            self.held.lock().unwrap().push(inner);
+            return Ok(Box::new(client));
+        }
+        if self.plain.contains(&asked) {
+            tokio::spawn(async move {
+                let mut stream = Tap { inner, seen };
+                framed_replies(&mut stream, asked, &*answer, None, None, &queries).await;
+            });
+            return Ok(Box::new(client));
+        }
         let Some((_, config)) = self.tls.iter().find(|(ip, _)| *ip == asked) else {
             return Err(TunnelError::Engine(format!("nothing listens at {asked}")));
         };
         let acceptor = TlsAcceptor::from(config.clone());
         let speaks = self.speaks.clone();
-        let answer = self.answer.clone();
         let log = self.log.clone();
         tokio::spawn(async move {
             let Ok(mut tls) = acceptor.accept(Tap { inner, seen }).await else {
                 return;
             };
             match speaks {
-                Speaks::Dot { close_after } => loop {
-                    if close_after.is_some_and(|after| queries.load(Ordering::Relaxed) >= after) {
-                        return;
-                    }
-                    let Ok(size) = tls.read_u16().await else {
-                        return;
-                    };
-                    let mut query = vec![0; size as usize];
-                    if tls.read_exact(&mut query).await.is_err() {
-                        return;
-                    }
-                    queries.fetch_add(1, Ordering::Relaxed);
-                    let reply = answer(asked, u16_at(&query, query.len() - 4).unwrap(), &query);
-                    let mut framed = (reply.len() as u16).to_be_bytes().to_vec();
-                    framed.extend(reply);
-                    if tls.write_all(&framed).await.is_err() || tls.flush().await.is_err() {
-                        return;
-                    }
-                },
+                Speaks::Dot { close_after } => {
+                    framed_replies(
+                        &mut tls,
+                        asked,
+                        &*answer,
+                        close_after,
+                        replies.as_deref(),
+                        &queries,
+                    )
+                    .await
+                }
                 Speaks::Doh { respond, dribble } => loop {
                     let Some(seen) = read_request(&mut tls).await else {
                         return;
@@ -249,9 +312,108 @@ impl Carrier for Servers {
                         return;
                     }
                 },
+                Speaks::H2 {
+                    respond,
+                    goaway_after,
+                } => serve_h2(tls, asked, answer, respond, goaway_after, queries, log).await,
             }
         });
         Ok(Box::new(client))
+    }
+}
+
+// An HTTP/2 server on one connection: each request is answered on a task of
+// its own while the connection is driven here.
+async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    asked: IpAddr,
+    answer: Arc<Answer>,
+    respond: Arc<H2Respond>,
+    goaway_after: Option<usize>,
+    queries: Arc<AtomicUsize>,
+    log: Arc<Mutex<Log>>,
+) {
+    let Ok(mut connection) = h2::server::handshake(stream).await else {
+        return;
+    };
+    let mut accepted = 0;
+    while let Some(Ok((request, mut send))) = connection.accept().await {
+        accepted += 1;
+        if goaway_after.is_some_and(|after| accepted > after) {
+            connection.abrupt_shutdown(h2::Reason::NO_ERROR);
+            continue;
+        }
+        let (answer, respond, queries, log) = (
+            answer.clone(),
+            respond.clone(),
+            queries.clone(),
+            log.clone(),
+        );
+        tokio::spawn(async move {
+            let (parts, mut body) = request.into_parts();
+            let mut query = Vec::new();
+            while let Some(Ok(chunk)) = body.data().await {
+                let _ = body.flow_control().release_capacity(chunk.len());
+                query.extend_from_slice(&chunk);
+            }
+            queries.fetch_add(1, Ordering::Relaxed);
+            log.lock().unwrap().requests.push(Seen {
+                method: parts.method.to_string(),
+                target: parts.uri.to_string(),
+                headers: parts
+                    .headers
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_owned()))
+                    .collect(),
+                body: query.clone(),
+            });
+            let reply = answer(asked, u16_at(&query, query.len() - 4).unwrap(), &query);
+            let (head, bytes) = respond(reply).into_parts();
+            let Ok(mut stream) = send.send_response(hyper::Response::from_parts(head, ()), false)
+            else {
+                return;
+            };
+            let _ = stream.send_data(bytes.into(), true);
+        });
+    }
+}
+
+// DNS over TCP replies to each query read, until the client goes, the
+// connection has answered `close_after`, or no `replies` are left.
+async fn framed_replies<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    asked: IpAddr,
+    answer: &Answer,
+    close_after: Option<usize>,
+    replies: Option<&AtomicUsize>,
+    queries: &AtomicUsize,
+) {
+    loop {
+        if close_after.is_some_and(|after| queries.load(Ordering::Relaxed) >= after) {
+            return;
+        }
+        let Ok(size) = stream.read_u16().await else {
+            return;
+        };
+        let mut query = vec![0; size as usize];
+        if stream.read_exact(&mut query).await.is_err() {
+            return;
+        }
+        if replies.is_some_and(|left| {
+            left.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                left.checked_sub(1)
+            })
+            .is_err()
+        }) {
+            return;
+        }
+        queries.fetch_add(1, Ordering::Relaxed);
+        let reply = answer(asked, u16_at(&query, query.len() - 4).unwrap(), &query);
+        let mut framed = (reply.len() as u16).to_be_bytes().to_vec();
+        framed.extend(reply);
+        if stream.write_all(&framed).await.is_err() || stream.flush().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -393,11 +555,11 @@ async fn recorded(
     recording.finish(host, 80, None).expect("a resolution")
 }
 
-fn tls_failed(error: &Option<LookupError>, server: &str) -> bool {
-    error.as_ref().is_some_and(|error| {
-        error.failure == LookupFailure::TlsFailed
-            && error.detail.starts_with(&format!("{server}: TLS failed: "))
-    })
+fn tls_failed(server: &str, reason: &str) -> Option<LookupError> {
+    Some(failure(
+        LookupFailure::TlsFailed,
+        &format!("{server}: TLS failed: {reason}"),
+    ))
 }
 
 // The TLS record types in what a client sent.
@@ -411,7 +573,7 @@ fn records(sent: &[u8]) -> Vec<u8> {
     kinds
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn dot_verifies_a_certificate_for_the_servers_address() {
     let authority = Authority::new();
     let servers = Servers::new(Speaks::Dot { close_after: None }, answers)
@@ -429,7 +591,7 @@ async fn dot_verifies_a_certificate_for_the_servers_address() {
     assert_eq!(servers.dials(), ["192.0.2.53:853".parse().unwrap()]);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn dot_fails_a_certificate_that_does_not_name_the_address_and_never_asks_in_plain() {
     let authority = Authority::new();
     let servers = Servers::new(Speaks::Dot { close_after: None }, answers).at(
@@ -444,9 +606,9 @@ async fn dot_fails_a_certificate_that_does_not_name_the_address_and_never_asks_i
         "fixture.test",
     )
     .await;
-    assert!(
-        tls_failed(&resolution.error, "192.0.2.53"),
-        "{resolution:?}"
+    assert_eq!(
+        resolution.error,
+        tls_failed("192.0.2.53", "certificate not valid for this server")
     );
     // One dial, to the TLS port. No second family, nothing on port 53.
     assert_eq!(servers.dials(), ["192.0.2.53:853".parse().unwrap()]);
@@ -463,7 +625,7 @@ async fn dot_fails_a_certificate_that_does_not_name_the_address_and_never_asks_i
     assert!(!sent.windows(7).any(|bytes| bytes == b"fixture"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn dot_with_a_name_verifies_against_the_name_and_sends_it() {
     let authority = Authority::new();
     let servers = Servers::new(Speaks::Dot { close_after: None }, answers)
@@ -491,13 +653,13 @@ async fn dot_with_a_name_verifies_against_the_name_and_sends_it() {
         "fixture.test",
     )
     .await;
-    assert!(
-        tls_failed(&resolution.error, "192.0.2.53"),
-        "{resolution:?}"
+    assert_eq!(
+        resolution.error,
+        tls_failed("192.0.2.53", "certificate not valid for this server")
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn dot_fails_a_certificate_from_an_untrusted_issuer() {
     let trusted = Authority::new();
     let stranger = Authority::new();
@@ -511,14 +673,11 @@ async fn dot_fails_a_certificate_from_an_untrusted_issuer() {
         "fixture.test",
     )
     .await;
-    assert!(
-        tls_failed(&resolution.error, "192.0.2.53"),
-        "{resolution:?}"
-    );
+    assert_eq!(resolution.error, tls_failed("192.0.2.53", "unknown issuer"));
     assert_eq!(resolution.trust, Some(record::TrustOutcome::AsSent));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_server_failing_tls_is_passed_over_for_the_next() {
     let trusted = Authority::new();
     let stranger = Authority::new();
@@ -566,7 +725,7 @@ fn alias(_: IpAddr, qtype: u16, query: &[u8]) -> Vec<u8> {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn dot_asks_both_families_and_an_alias_on_one_connection() {
     let authority = Authority::new();
     let servers = Servers::new(Speaks::Dot { close_after: None }, alias)
@@ -586,14 +745,35 @@ async fn dot_asks_both_families_and_an_alias_on_one_connection() {
     assert_eq!(log.queries[0].load(Ordering::Relaxed), 3);
 }
 
-#[tokio::test]
-async fn a_connection_the_server_closes_between_queries_is_opened_once_more() {
+// An alias, its target, and an IPv6 address: three queries.
+fn alias_and_six(asked: IpAddr, qtype: u16, query: &[u8]) -> Vec<u8> {
+    match qtype {
+        28 => respond(query, 0, &[rr(&ASKED, 28, 60, &SIX)], &[]),
+        _ => alias(asked, qtype, query),
+    }
+}
+
+fn seven_then_six(_: IpAddr, qtype: u16, query: &[u8]) -> Vec<u8> {
+    match qtype {
+        1 => v4(query, 60),
+        _ => respond(query, 0, &[rr(&ASKED, 28, 60, &SIX)], &[]),
+    }
+}
+
+const SIX: [u8; 16] = [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7];
+
+fn seven_and_six() -> Vec<IpAddr> {
+    vec!["192.0.2.7".parse().unwrap(), "2001:db8::7".parse().unwrap()]
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_server_that_closes_after_every_reply_still_answers_every_query() {
     let authority = Authority::new();
     let servers = Servers::new(
         Speaks::Dot {
             close_after: Some(1),
         },
-        alias,
+        alias_and_six,
     )
     .at("192.0.2.53", authority.server(&["192.0.2.53"], b"dot"));
     let resolution = recorded(
@@ -604,17 +784,56 @@ async fn a_connection_the_server_closes_between_queries_is_opened_once_more() {
         "alias.test",
     )
     .await;
-    // The first connection answers the alias, the second its target; the
-    // third query finds the second closed too, and no third is opened.
+    // The alias, its target and the IPv6 address each took a connection.
+    assert_eq!(resolution.addresses, seven_and_six());
+    assert_eq!(resolution.error, None);
+    assert_eq!(servers.dials().len(), 3);
+    assert_eq!(servers.answered(), [1, 1, 1]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_kept_connection_found_dead_is_replaced_once_and_no_more() {
+    // The first query is answered; every connection after it is taken and
+    // closed without a reply.
+    let authority = Authority::new();
+    let servers = Servers::new(Speaks::Dot { close_after: None }, seven_then_six)
+        .at("192.0.2.53", authority.server(&["192.0.2.53"], b"dot"))
+        .replying(1);
+    let resolution = recorded(
+        &servers,
+        &authority.wires(),
+        &[dot("192.0.2.53", None)],
+        Trust::AsSent,
+        "fixture.test",
+    )
+    .await;
     assert_eq!(resolution.addresses, seven());
-    let log = servers.log.lock().unwrap();
-    assert_eq!(log.dials.len(), 2);
-    let answered: Vec<_> = log
-        .queries
-        .iter()
-        .map(|queries| queries.load(Ordering::Relaxed))
-        .collect();
-    assert_eq!(answered, [1, 1]);
+    // The IPv6 query found the kept connection dead, opened one more, found
+    // that closed too, and stopped there.
+    assert_eq!(servers.dials().len(), 2);
+    assert_eq!(servers.answered(), [1, 0]);
+
+    let servers = Servers::new(Speaks::Dot { close_after: None }, seven_then_six)
+        .at("192.0.2.53", authority.server(&["192.0.2.53"], b"dot"))
+        .replying(0);
+    let resolution = recorded(
+        &servers,
+        &authority.wires(),
+        &[dot("192.0.2.53", None)],
+        Trust::AsSent,
+        "fixture.test",
+    )
+    .await;
+    // A new connection that closes is not retried: one for each family.
+    assert!(resolution.addresses.is_empty());
+    assert_eq!(
+        resolution.error,
+        Some(failure(
+            LookupFailure::NoReply,
+            "192.0.2.53: the connection closed without a reply"
+        ))
+    );
+    assert_eq!(servers.dials().len(), 2);
 }
 
 fn doh_fixture(
@@ -627,7 +846,7 @@ fn doh_fixture(
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn doh_posts_the_query_with_id_zero_to_the_path_at_the_servers_address() {
     let authority = Authority::new();
     let servers = Servers::new(doh_fixture(plain_reply, false), answers)
@@ -708,7 +927,7 @@ async fn refused_as_invalid(respond: impl Fn(&[u8], Vec<u8>) -> Vec<u8> + Send +
     assert!(resolution.addresses.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn doh_fails_a_status_other_than_200() {
     let (servers, wires) = doh_servers(|_, _| {
         http(
@@ -727,7 +946,7 @@ async fn doh_fails_a_status_other_than_200() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn doh_takes_a_dns_message_with_parameters_and_refuses_another_type() {
     let (servers, wires) = doh_servers(|_, reply| {
         http(
@@ -756,7 +975,7 @@ async fn doh_takes_a_dns_message_with_parameters_and_refuses_another_type() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn doh_fails_a_reply_over_the_size_cap() {
     refused_as_invalid(|_, mut reply| {
         reply.resize(16385, 0);
@@ -765,7 +984,7 @@ async fn doh_fails_a_reply_over_the_size_cap() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn doh_decodes_a_chunked_body() {
     let (servers, wires) = doh_servers(|_, reply| {
         http(
@@ -783,7 +1002,7 @@ async fn doh_decodes_a_chunked_body() {
     assert_eq!(servers.dials().len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn doh_fails_a_chunked_body_over_the_size_cap() {
     refused_as_invalid(|_, mut reply| {
         reply.resize(16385, 0);
@@ -799,41 +1018,7 @@ async fn doh_fails_a_chunked_body_over_the_size_cap() {
     .await;
 }
 
-#[tokio::test]
-async fn doh_fails_a_chunk_size_line_too_long() {
-    // Sixteen hex digits fit; seventeen do not, nor an extension that runs
-    // the line past its cap.
-    for line in [
-        "0000000000000005\r\n".to_owned(),
-        "00000000000000005\r\n".to_owned(),
-        format!("5;{}\r\n", "x".repeat(300)),
-    ] {
-        let digits_fit = line.starts_with("0000000000000005\r");
-        let respond = move |_: &[u8], reply: Vec<u8>| {
-            let mut body = line.clone().into_bytes();
-            body.extend_from_slice(&reply[..5]);
-            body.extend_from_slice(b"\r\n");
-            body.extend(chunked(&reply[5..], 64));
-            http(
-                "200 OK",
-                &[
-                    "content-type: application/dns-message",
-                    "transfer-encoding: chunked",
-                ],
-                &body,
-            )
-        };
-        if digits_fit {
-            let (servers, wires) = doh_servers(respond);
-            let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
-            assert_eq!(resolution.addresses, seven());
-        } else {
-            refused_as_invalid(respond).await;
-        }
-    }
-}
-
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn doh_fails_a_body_it_cannot_delimit() {
     // Both length headers, neither, and codings other than chunked alone.
     for headers in [
@@ -859,7 +1044,7 @@ async fn doh_fails_a_body_it_cannot_delimit() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn doh_fails_a_head_over_its_cap_or_with_too_many_headers() {
     refused_as_invalid(|_, reply| {
         let padding = format!("x-padding: {}", "p".repeat(8200));
@@ -884,7 +1069,7 @@ async fn doh_fails_a_head_over_its_cap_or_with_too_many_headers() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn doh_passes_over_interim_responses_a_few_times_only() {
     let (servers, wires) = doh_servers(|_, reply| {
         let mut response = http("100 Continue", &[], b"");
@@ -904,7 +1089,7 @@ async fn doh_passes_over_interim_responses_a_few_times_only() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn doh_opens_a_new_connection_after_one_that_says_it_closes() {
     let (servers, wires) = doh_servers(|_, reply| {
         http(
@@ -930,7 +1115,7 @@ async fn doh_opens_a_new_connection_after_one_that_says_it_closes() {
     assert_eq!(answered, [1, 1]);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn doh_asks_two_queries_on_one_connection_kept_alive() {
     let (servers, wires) = doh_servers(plain_reply);
     let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
@@ -940,7 +1125,7 @@ async fn doh_asks_two_queries_on_one_connection_kept_alive() {
     assert_eq!(log.queries[0].load(Ordering::Relaxed), 2);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn doh_reads_a_response_that_arrives_a_byte_at_a_time() {
     for respond in [plain_reply as fn(&[u8], Vec<u8>) -> Vec<u8>, |_, reply| {
         http(
@@ -959,7 +1144,7 @@ async fn doh_reads_a_response_that_arrives_a_byte_at_a_time() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn doh_replies_are_held_to_the_ad_bit() {
     let (servers, wires) = doh_servers(plain_reply);
     let resolution = doh_lookup(&servers, &wires, Trust::RequireAd).await;
@@ -979,6 +1164,455 @@ async fn doh_replies_are_held_to_the_ad_bit() {
         reply[3] |= 0x20;
         dns_message(reply)
     });
+    let resolution = doh_lookup(&servers, &wires, Trust::RequireAd).await;
+    assert_eq!(resolution.addresses, seven());
+    assert_eq!(resolution.trust, Some(record::TrustOutcome::Authenticated));
+    assert_eq!(resolution.wire, Some(WireKind::Https));
+}
+
+// Whether any connection carried the name asked, in the clear.
+fn leaked(servers: &Servers) -> bool {
+    servers
+        .sent()
+        .iter()
+        .any(|sent| sent.windows(7).any(|bytes| bytes == b"fixture"))
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_plain_server_after_an_encrypted_one_is_never_asked() {
+    let trusted = Authority::new();
+    let stranger = Authority::new();
+    let plain = DnsServer::plain("192.0.2.54".parse().unwrap());
+    let servfail = |asked: IpAddr, qtype, query: &[u8]| match asked.to_string().as_str() {
+        "192.0.2.55" => respond(query, 2, &[], &[]),
+        _ => answers(asked, qtype, query),
+    };
+    let servers = Servers::new(Speaks::Dot { close_after: None }, servfail)
+        // A certificate the client does not trust.
+        .at("192.0.2.53", stranger.server(&["192.0.2.53"], b"dot"))
+        // A server that says SERVFAIL.
+        .at("192.0.2.55", trusted.server(&["192.0.2.55"], b"dot"))
+        // A server that takes the connection and never speaks.
+        .silent_at("192.0.2.56")
+        .plain_at("192.0.2.54");
+    let wires = trusted.wires();
+    for (encrypted, failure) in [
+        ("192.0.2.53", LookupFailure::TlsFailed),
+        ("192.0.2.55", LookupFailure::ServerFailure),
+        ("192.0.2.56", LookupFailure::TimedOut),
+    ] {
+        let listed = [dot(encrypted, None), plain.clone()];
+        let resolution = recorded(&servers, &wires, &listed, Trust::AsSent, "fixture.test").await;
+        assert!(resolution.addresses.is_empty(), "{encrypted}");
+        assert_eq!(
+            resolution.error.map(|error| error.failure),
+            Some(failure),
+            "{encrypted}"
+        );
+    }
+    // Nothing was dialled on port 53, and no query went out in the clear.
+    assert!(
+        servers.dials().iter().all(|dial| dial.port() == 853),
+        "{:?}",
+        servers.dials()
+    );
+    assert!(!leaked(&servers));
+
+    // An encrypted server that cannot be reached at all: the record says
+    // why the plain one was not asked.
+    let resolution = recorded(
+        &servers,
+        &wires,
+        &[dot("192.0.2.99", None), plain.clone()],
+        Trust::AsSent,
+        "fixture.test",
+    )
+    .await;
+    assert_eq!(
+        resolution.error,
+        Some(failure(
+            LookupFailure::Other,
+            "192.0.2.54: not asked in plain after an encrypted server"
+        ))
+    );
+    assert!(!servers.dials().iter().any(|dial| dial.port() == 53));
+    assert!(!leaked(&servers));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_plain_server_listed_before_an_encrypted_one_is_asked_first() {
+    let authority = Authority::new();
+    let servers = Servers::new(Speaks::Dot { close_after: None }, answers)
+        .at("192.0.2.53", authority.server(&["192.0.2.53"], b"dot"))
+        .plain_at("192.0.2.54");
+    let resolution = recorded(
+        &servers,
+        &authority.wires(),
+        &[
+            DnsServer::plain("192.0.2.54".parse().unwrap()),
+            dot("192.0.2.53", None),
+        ],
+        Trust::AsSent,
+        "fixture.test",
+    )
+    .await;
+    assert_eq!(resolution.addresses, seven());
+    assert_eq!(resolution.wire, Some(WireKind::Plain));
+    assert_eq!(
+        servers.dials(),
+        [
+            "192.0.2.54:53".parse::<SocketAddr>().unwrap(),
+            "192.0.2.54:53".parse().unwrap()
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_tls_failure_outranks_a_server_that_timed_out() {
+    let trusted = Authority::new();
+    let stranger = Authority::new();
+    let servers = Servers::new(Speaks::Dot { close_after: None }, answers)
+        .at("192.0.2.53", stranger.server(&["192.0.2.53"], b"dot"))
+        .silent_at("192.0.2.54");
+    let resolution = recorded(
+        &servers,
+        &trusted.wires(),
+        &[dot("192.0.2.53", None), dot("192.0.2.54", None)],
+        Trust::AsSent,
+        "fixture.test",
+    )
+    .await;
+    assert_eq!(resolution.error, tls_failed("192.0.2.53", "unknown issuer"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_tls_failure_says_a_fixed_reason_and_nothing_the_server_sent() {
+    let authority = Authority::new();
+    // Thousands of long names, none of them the server's address.
+    let names: Vec<String> = (0..1200)
+        .map(|n| format!("n{n:04}.a-long-subject-alternative-name.test"))
+        .collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let servers = Servers::new(Speaks::Dot { close_after: None }, answers)
+        .at("192.0.2.53", authority.server(&names, b"dot"));
+    let resolution = recorded(
+        &servers,
+        &authority.wires(),
+        &[dot("192.0.2.53", None)],
+        Trust::AsSent,
+        "fixture.test",
+    )
+    .await;
+    assert_eq!(
+        resolution.error,
+        tls_failed("192.0.2.53", "certificate not valid for this server")
+    );
+}
+
+// The extensions of the ClientHello that opens `sent`, by type.
+fn hello_extensions(sent: &[u8]) -> Vec<(u16, Vec<u8>)> {
+    assert_eq!((sent[0], sent[5]), (0x16, 1), "a ClientHello");
+    let size = |at: usize, width: usize| {
+        sent[at..at + width]
+            .iter()
+            .fold(0usize, |size, byte| size << 8 | *byte as usize)
+    };
+    // The record and handshake headers, the version and the random.
+    let mut at = 5 + 4 + 2 + 32;
+    at += 1 + size(at, 1);
+    at += 2 + size(at, 2);
+    at += 1 + size(at, 1);
+    let end = at + 2 + size(at, 2);
+    at += 2;
+    let mut extensions = Vec::new();
+    while at < end {
+        let kind = size(at, 2) as u16;
+        let length = size(at + 2, 2);
+        extensions.push((kind, sent[at + 4..at + 4 + length].to_vec()));
+        at += 4 + length;
+    }
+    extensions
+}
+
+// Whether a ClientHello offers to resume a session: a pre-shared key (TLS
+// 1.3), or a ticket in the session ticket extension (TLS 1.2).
+fn offers_a_session(sent: &[u8]) -> bool {
+    hello_extensions(sent)
+        .iter()
+        .any(|(kind, data)| *kind == 41 || (*kind == 35 && !data.is_empty()))
+}
+
+#[tokio::test(start_paused = true)]
+async fn tls_sessions_resume_within_a_naming_and_never_across_two() {
+    let authority = Authority::new();
+    let servers = Servers::new(Speaks::Dot { close_after: None }, answers)
+        .at("192.0.2.53", authority.server(&["192.0.2.53"], b"dot"));
+    let base = authority.wires();
+    let (first, second) = (base.apart(), base.apart());
+    let listed = [dot("192.0.2.53", None)];
+    for wires in [&first, &first, &second] {
+        resolve(&servers, wires, &listed, Trust::AsSent, "fixture.test")
+            .await
+            .unwrap();
+    }
+    let sent = servers.sent();
+    assert_eq!(sent.len(), 3);
+    assert!(!offers_a_session(&sent[0]));
+    // The same naming asked again resumes its session.
+    assert!(offers_a_session(&sent[1]));
+    // Another naming offers nothing from the first.
+    let other = hello_extensions(&sent[2]);
+    assert!(!other.iter().any(|(kind, _)| *kind == 41), "{other:?}");
+    assert!(
+        other
+            .iter()
+            .all(|(kind, data)| *kind != 35 || data.is_empty())
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_naming_records_a_failed_lookup_under_require_ad_as_judged_by_nobody() {
+    let trusted = Authority::new();
+    let stranger = Authority::new();
+    let servers = Servers::new(Speaks::Dot { close_after: None }, answers)
+        .at("192.0.2.53", stranger.server(&["192.0.2.53"], b"dot"))
+        .silent_at("192.0.2.54");
+    let wires = trusted.wires();
+    for (address, failure) in [
+        ("192.0.2.53", LookupFailure::TlsFailed),
+        ("192.0.2.54", LookupFailure::TimedOut),
+    ] {
+        let listed = [dot(address, None)];
+        let cache = ResolutionCache::<DialError>::default();
+        let resolution = through_cache(&cache, &listed, Trust::RequireAd, "fixture.test", || {
+            resolve(&servers, &wires, &listed, Trust::RequireAd, "fixture.test")
+        })
+        .await;
+        assert!(!resolution.cached);
+        assert_eq!(resolution.trust, None, "{address}");
+        assert_eq!(
+            resolution.error.map(|error| error.failure),
+            Some(failure),
+            "{address}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn doh_fails_a_framing_header_that_is_not_visible_ascii() {
+    for (name, value) in [
+        ("transfer-encoding", &b"chunked\xff"[..]),
+        ("content-length", b"\x7f12"),
+        ("connection", b"keep-alive\x01"),
+        ("content-type", b"application/dns-message\xe9"),
+    ] {
+        refused_as_invalid(move |_, reply| {
+            let mut response = b"HTTP/1.1 200 OK\r\n".to_vec();
+            if name != "content-type" {
+                response.extend_from_slice(b"content-type: application/dns-message\r\n");
+            }
+            response.extend_from_slice(format!("{name}: ").as_bytes());
+            response.extend_from_slice(value);
+            response.extend_from_slice(b"\r\n");
+            if name != "content-length" {
+                response
+                    .extend_from_slice(format!("content-length: {}\r\n", reply.len()).as_bytes());
+            }
+            response.extend_from_slice(b"\r\n");
+            response.extend(reply);
+            response
+        })
+        .await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn doh_fails_a_switching_protocols_response() {
+    let (servers, wires) = doh_servers(|_, reply| {
+        let mut response = http("101 Switching Protocols", &["upgrade: dns"], b"");
+        response.extend(dns_message(reply));
+        response
+    });
+    let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
+    assert_eq!(
+        resolution.error,
+        Some(failure(
+            LookupFailure::ServerFailure,
+            "192.0.2.53: HTTP 101"
+        ))
+    );
+    assert!(resolution.addresses.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn doh_opens_a_new_connection_after_bytes_left_over_past_a_response() {
+    let (servers, wires) = doh_servers(|_, reply| {
+        let mut response = dns_message(reply);
+        response.extend_from_slice(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+        response
+    });
+    let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
+    assert_eq!(resolution.addresses, seven());
+    assert_eq!(resolution.error, None);
+    assert_eq!(servers.dials().len(), 2);
+    assert_eq!(servers.answered(), [1, 1]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn doh_opens_a_new_connection_after_http_1_0_or_a_close_among_other_tokens() {
+    for (version, connection) in [("HTTP/1.0", None), ("HTTP/1.1", Some("keep-alive, close"))] {
+        let (servers, wires) = doh_servers(move |_, reply| {
+            let mut response = format!("{version} 200 OK\r\n").into_bytes();
+            let mut headers = vec![
+                "content-type: application/dns-message".to_owned(),
+                format!("content-length: {}", reply.len()),
+            ];
+            headers.extend(connection.map(|connection| format!("connection: {connection}")));
+            for header in headers {
+                response.extend_from_slice(header.as_bytes());
+                response.extend_from_slice(b"\r\n");
+            }
+            response.extend_from_slice(b"\r\n");
+            response.extend(reply);
+            response
+        });
+        let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
+        assert_eq!(resolution.addresses, seven(), "{version}");
+        assert_eq!(servers.dials().len(), 2, "{version}");
+        assert_eq!(servers.answered(), [1, 1], "{version}");
+    }
+}
+
+fn h2_message(reply: Vec<u8>) -> hyper::Response<Vec<u8>> {
+    hyper::Response::builder()
+        .header("content-type", "application/dns-message")
+        .body(reply)
+        .unwrap()
+}
+
+// One server at 192.0.2.53 that speaks only HTTP/2.
+fn h2_servers(
+    respond: impl Fn(Vec<u8>) -> hyper::Response<Vec<u8>> + Send + Sync + 'static,
+    goaway_after: Option<usize>,
+    answer: impl Fn(IpAddr, u16, &[u8]) -> Vec<u8> + Send + Sync + 'static,
+) -> (Servers, Wires) {
+    let authority = Authority::new();
+    let speaks = Speaks::H2 {
+        respond: Arc::new(respond),
+        goaway_after,
+    };
+    let servers =
+        Servers::new(speaks, answer).at("192.0.2.53", authority.server(&["192.0.2.53"], b"h2"));
+    (servers, authority.wires())
+}
+
+#[tokio::test(start_paused = true)]
+async fn doh_over_http_2_asks_both_families_and_an_alias_on_one_connection() {
+    let (servers, wires) = h2_servers(h2_message, None, alias_and_six);
+    let lookup = resolve(
+        &servers,
+        &wires,
+        &[doh("192.0.2.53:443")],
+        Trust::AsSent,
+        "alias.test",
+    )
+    .await
+    .unwrap();
+    assert_eq!(lookup.addresses, seven_and_six());
+    assert_eq!(servers.dials().len(), 1);
+    assert_eq!(servers.answered(), [3]);
+    let requests = servers.log.lock().unwrap().requests.clone();
+    for seen in requests {
+        assert_eq!(seen.method, "POST");
+        assert_eq!(seen.target, "https://192.0.2.53/dns-query");
+        assert!(seen.headers.iter().all(|(name, _)| name != "host"));
+        assert_eq!(seen.body[..2], [0, 0]);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn doh_speaks_http_1_1_to_a_server_that_offers_only_it_or_no_alpn() {
+    for alpn in [&b"http/1.1"[..], b""] {
+        let authority = Authority::new();
+        let servers = Servers::new(doh_fixture(plain_reply, false), answers)
+            .at("192.0.2.53", authority.server(&["192.0.2.53"], alpn));
+        let resolution = doh_lookup(&servers, &authority.wires(), Trust::AsSent).await;
+        assert_eq!(resolution.addresses, seven(), "{alpn:?}");
+        assert_eq!(servers.dials().len(), 1, "{alpn:?}");
+        assert_eq!(servers.answered(), [2], "{alpn:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn doh_over_http_2_fails_another_status_another_type_or_an_over_long_body() {
+    let (servers, wires) = h2_servers(
+        |reply| {
+            let mut response = h2_message(reply);
+            *response.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
+            response
+        },
+        None,
+        answers,
+    );
+    let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
+    assert_eq!(
+        resolution.error,
+        Some(failure(
+            LookupFailure::ServerFailure,
+            "192.0.2.53: HTTP 500"
+        ))
+    );
+    for respond in [
+        (|reply| {
+            hyper::Response::builder()
+                .header("content-type", "text/html")
+                .body(reply)
+                .unwrap()
+        }) as fn(Vec<u8>) -> hyper::Response<Vec<u8>>,
+        |mut reply| {
+            reply.resize(16385, 0);
+            h2_message(reply)
+        },
+    ] {
+        let (servers, wires) = h2_servers(respond, None, answers);
+        let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
+        assert_eq!(resolution.error, invalid(), "{resolution:?}");
+        assert!(resolution.addresses.is_empty());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn doh_over_http_2_completes_on_a_new_connection_after_a_goaway() {
+    let (servers, wires) = h2_servers(h2_message, Some(1), seven_then_six);
+    let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
+    assert_eq!(resolution.addresses, seven_and_six());
+    assert_eq!(resolution.error, None);
+    assert_eq!(servers.dials().len(), 2);
+    assert_eq!(servers.answered(), [1, 1]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn doh_over_http_2_replies_are_held_to_the_ad_bit() {
+    let (servers, wires) = h2_servers(h2_message, None, answers);
+    let resolution = doh_lookup(&servers, &wires, Trust::RequireAd).await;
+    assert_eq!(
+        resolution.error,
+        Some(failure(
+            LookupFailure::NotAuthenticated,
+            "192.0.2.53: the answer was not marked authenticated"
+        ))
+    );
+    assert_eq!(resolution.trust, Some(record::TrustOutcome::Refused));
+    assert!(resolution.addresses.is_empty());
+
+    let (servers, wires) = h2_servers(
+        |mut reply| {
+            reply[3] |= 0x20;
+            h2_message(reply)
+        },
+        None,
+        answers,
+    );
     let resolution = doh_lookup(&servers, &wires, Trust::RequireAd).await;
     assert_eq!(resolution.addresses, seven());
     assert_eq!(resolution.trust, Some(record::TrustOutcome::Authenticated));

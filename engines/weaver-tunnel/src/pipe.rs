@@ -124,6 +124,9 @@ pub enum Naming {
         trust: Trust,
         egress: Arc<dyn Dialer>,
         answers: Arc<ResolutionCache<DialError>>,
+        // The TLS sessions these servers are resumed with, held apart from
+        // every other naming's.
+        sessions: Arc<crate::dns::DnsSessions>,
     },
     // The proxy is handed the name and resolves it.
     Proxy,
@@ -133,6 +136,7 @@ pub enum Naming {
         servers: Vec<DnsServer>,
         trust: Trust,
         answers: Arc<ResolutionCache<DialError>>,
+        sessions: Arc<crate::dns::DnsSessions>,
     },
 }
 
@@ -143,6 +147,7 @@ impl Naming {
             trust,
             egress,
             answers: Default::default(),
+            sessions: Default::default(),
         }
     }
     pub fn proxy_servers(servers: Vec<DnsServer>, trust: Trust) -> Self {
@@ -150,6 +155,7 @@ impl Naming {
             servers,
             trust,
             answers: Default::default(),
+            sessions: Default::default(),
         }
     }
     // How long a lookup may take on top of a hop's connect: the same bound
@@ -193,9 +199,10 @@ impl Naming {
                     trust,
                     egress,
                     answers,
+                    sessions,
                 } => answers
                     .resolve(Resolver::Routed, host, || {
-                        crate::dns::resolve_through(egress.as_ref(), servers, *trust, host)
+                        crate::dns::resolve_routed(egress.as_ref(), sessions, servers, *trust, host)
                     })
                     .await
                     .and_then(routed)
@@ -204,9 +211,10 @@ impl Naming {
                     servers,
                     trust,
                     answers,
+                    sessions,
                 } => answers
                     .resolve(Resolver::Routed, host, || {
-                        crate::dns::resolve_through(hop, servers, *trust, host)
+                        crate::dns::resolve_routed(hop, sessions, servers, *trust, host)
                     })
                     .await
                     .and_then(routed)
@@ -1549,6 +1557,7 @@ impl Dialer for SessionHop {
                 servers,
                 trust,
                 answers,
+                ..
             },
             Some(provider),
         ) = (&self.naming, &self.resolver)

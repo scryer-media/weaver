@@ -293,13 +293,7 @@ impl Recording {
             });
             let trust = asker.trust.and_then(|trust| match trust {
                 Trust::AsSent => Some(TrustOutcome::AsSent),
-                // An answer that came through the cache without a lookup of
-                // this dial's was authenticated when it was stored: a
-                // naming's cache holds only answers judged by its own trust,
-                // which never changes.
-                Trust::RequireAd => entry
-                    .judged
-                    .or(entry.cached.map(|_| TrustOutcome::Authenticated)),
+                Trust::RequireAd => entry.judged.or_else(|| required(entry)),
             });
             return Some(HostResolution {
                 host: host.to_owned(),
@@ -351,6 +345,28 @@ impl Recording {
     }
 }
 
+// How an answer under `RequireAd` was judged when this dial's own lookup
+// did not say: it came through the cache, held or from a lookup another
+// caller made. A naming's cache holds and shares only answers judged by its
+// own trust, which never changes, so an answer from it was authenticated. A
+// lookup that failed for want of one was refused. Any other failure had
+// nothing to judge.
+fn required(entry: &Entry) -> Option<TrustOutcome> {
+    entry.cached?;
+    match &entry.answer {
+        Some(Ok(_)) => Some(TrustOutcome::Authenticated),
+        Some(Err(error)) => match error.failure {
+            // A negative answer is an answer.
+            LookupFailure::NoSuchName | LookupFailure::NoAddress => {
+                Some(TrustOutcome::Authenticated)
+            }
+            LookupFailure::NotAuthenticated => Some(TrustOutcome::Refused),
+            _ => None,
+        },
+        None => None,
+    }
+}
+
 // What a WireGuard engine's own failed lookup of its endpoint came to.
 fn endpoint_failure(text: &str) -> Option<LookupError> {
     let (failure, detail) = if let Some((_, said)) = text.split_once(ENDPOINT_UNRESOLVED) {
@@ -399,12 +415,15 @@ const SERVER_FAILURE: [&str; 7] = [
     "(os error 11003)",
 ];
 const TIMED_OUT: [&str; 3] = ["timed out", "in time", "deadline exceeded"];
+const NOT_AUTHENTICATED: &str = "marked authenticated";
 
 // Why a lookup failed, by what its resolver said.
 pub(crate) fn classify(text: &str) -> LookupFailure {
     let text = text.to_ascii_lowercase();
     let said = |phrases: &[&str]| phrases.iter().any(|phrase| text.contains(phrase));
-    if said(&NO_SUCH_NAME) {
+    if text.contains(NOT_AUTHENTICATED) {
+        LookupFailure::NotAuthenticated
+    } else if said(&NO_SUCH_NAME) {
         LookupFailure::NoSuchName
     } else if said(&NO_ADDRESS) {
         LookupFailure::NoAddress
