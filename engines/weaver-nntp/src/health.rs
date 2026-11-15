@@ -720,32 +720,6 @@ impl HealthTracker {
         );
     }
 
-    pub(crate) fn record_connection_cooldown(
-        &mut self,
-        idx: usize,
-        ticket: &crate::recovery::ConnectionHealth,
-        reason: CooldownReason,
-    ) {
-        if !ticket.first_failure() {
-            return;
-        }
-        if !ticket.current() {
-            self.servers[idx].failure_count += 1;
-            return;
-        }
-        self.servers[idx].settle_answered_recovery();
-        if ticket.probing() {
-            Self::warn_probe_failed(idx, &self.servers[idx]);
-            self.servers[idx].recovery_pending = true;
-            self.servers[idx].recovery_attempts = self.servers[idx].recovery_attempts.max(1);
-            self.servers[idx].state = ServerState::Degraded {
-                consecutive_failures: 0,
-            };
-        }
-        self.servers[idx].recovery_event = Some(ticket.event_key());
-        self.record_cooldown(idx, reason);
-        self.servers[idx].recovery_event = None;
-    }
     // Create a tracker for `server_count` servers, all starting Healthy and
     // all treated as fill servers.
     pub fn new(server_count: usize, config: HealthConfig) -> Self {

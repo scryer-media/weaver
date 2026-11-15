@@ -102,15 +102,6 @@ async fn selective_fallback_and_mixed_probes_reuse_only_eligible_sockets() {
         .fetch_body("<primary-again@example.invalid>")
         .await
         .unwrap();
-    let result = fixture
-        .client
-        .confirm_exists_for_probe(&[
-            "<primary-probe@example.invalid>",
-            "<fallback-probe@example.invalid>",
-        ])
-        .await;
-    assert_eq!(result.exists, vec![true, true]);
-    assert!(!result.inconclusive);
     let commands = fixture.commands.lock().unwrap().clone();
     assert!(commands.iter().all(|(server, _)| *server != 2));
     assert!(
@@ -181,14 +172,17 @@ async fn obsolete_work_leaves_no_attempt_and_no_health_mark() {
     let fixture = Providers::new().await;
     let client = fixture.client.with_work_guard(|_, _| false);
     let trace = client
-        .fetch_body_with_groups_prefer_excluding_traced(
+        .fetch_body_decoded_with_groups_excluding_traced(
             "<obsolete@example.invalid>",
             &["alt.binaries.test".to_string()],
             crate::ServerSet::EMPTY,
         )
         .await;
     assert!(
-        matches!(trace.result, Err(NntpError::WorkObsolete)),
+        matches!(
+            trace.result,
+            Err(crate::client::DecodedBodyError::Nntp(NntpError::WorkObsolete))
+        ),
         "{:?}",
         trace.result
     );
@@ -361,11 +355,6 @@ async fn ordinary_outages_do_not_unlock_a_cached_backfill_socket() {
             .await
             .is_err()
     );
-    let result = fixture
-        .client
-        .confirm_exists_for_probe(&["<protected@example.invalid>"])
-        .await;
-    assert!(result.inconclusive);
     assert!(
         fixture
             .commands
@@ -377,52 +366,3 @@ async fn ordinary_outages_do_not_unlock_a_cached_backfill_socket() {
     fixture.close().await;
 }
 
-#[tokio::test]
-async fn queued_probe_guard_rechecks_recovery_before_using_a_cached_fallback() {
-    let fixture = Providers::new().await;
-    let now = Instant::now();
-    let pool = Arc::clone(fixture.client.pool());
-    {
-        let mut health = pool.health().lock().await;
-        health.set_reenable_clock(now);
-        health.record_cooldown(0, crate::health::CooldownReason::Transport);
-    }
-    let result = fixture
-        .client
-        .confirm_exists_for_probe_using(
-            &["<queued-probe@example.invalid>"],
-            crate::ServerSet::EMPTY,
-            |server, batch, guard| {
-                let pool = Arc::clone(&pool);
-                async move {
-                    assert_eq!(server, 1);
-                    // The cached socket's own view, as its owner reads it.
-                    let on_socket = || pool.provider_policy_on_connection(server, false);
-                    assert!(guard(&on_socket()));
-                    pool.health()
-                        .lock()
-                        .await
-                        .set_reenable_clock(now + Duration::from_secs(3600));
-                    assert!(
-                        !guard(&on_socket()),
-                        "a recovered primary invalidates unissued fallback work"
-                    );
-                    Some(ProbeBatchResult {
-                        exists: vec![false; batch.len()],
-                        inconclusive: true,
-                    })
-                }
-            },
-        )
-        .await
-        .unwrap();
-    assert!(result.inconclusive);
-    assert!(fixture.commands.lock().unwrap().is_empty());
-    assert!(
-        fixture
-            .dials
-            .iter()
-            .all(|count| count.load(Ordering::SeqCst) == 0)
-    );
-    fixture.close().await;
-}

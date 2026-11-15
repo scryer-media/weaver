@@ -889,17 +889,6 @@ impl NntpPool {
         }
     }
 
-    pub(crate) async fn acquire_before_deadline(
-        &self,
-        server: ServerId,
-        initial_group: Option<&str>,
-        demanded: bool,
-        deadline: &mut tokio::time::Instant,
-    ) -> Result<PooledConnection> {
-        self.acquire_guarded_before_deadline(server, initial_group, demanded, deadline, None)
-            .await
-    }
-
     pub(crate) async fn acquire_guarded_before_deadline(
         &self,
         server: ServerId,
@@ -922,20 +911,6 @@ impl NntpPool {
             guard,
         )
         .await
-    }
-
-    pub(crate) async fn acquire_extra_before_deadline(
-        &self,
-        server: ServerId,
-        initial_group: Option<&str>,
-        deadline: &mut tokio::time::Instant,
-    ) -> Result<PooledConnection> {
-        if self.shutdown.is_cancelled() {
-            return Err(NntpError::PoolShutdown);
-        }
-        self.configs.get(server.0).ok_or(NntpError::PoolExhausted)?;
-        self.acquire_fresh_with_permit(server.0, None, initial_group, Some(deadline))
-            .await
     }
 
     // Acquire a connection; a fresh connection to a pipelining server
@@ -977,19 +952,6 @@ impl NntpPool {
                 .leg_targets()
                 .is_none_or(|targets| targets.borrow().iter().any(|target| *target > 0))
         })
-    }
-
-    // Acquire an explicit over-max connection from a specific server.
-    pub async fn acquire_extra(&self, server: ServerId) -> Result<PooledConnection> {
-        if self.shutdown.is_cancelled() {
-            return Err(NntpError::PoolShutdown);
-        }
-
-        let idx = server.0;
-        if idx >= self.pools.len() {
-            return Err(NntpError::PoolExhausted);
-        }
-        self.acquire_fresh_with_permit(idx, None, None, None).await
     }
 
     // Internal: acquire a connection using an already-obtained permit.
@@ -1169,77 +1131,6 @@ impl NntpPool {
                         }
                     }
                 }
-            }
-        };
-
-        lock_recovering(&self.pools[idx]).active_count += 1;
-
-        Ok(PooledConnection {
-            conn: Some(conn),
-            pool: self.pools[idx].clone(),
-            server_idx: idx,
-            return_to_pool: permit.is_some(),
-            shutdown: self.shutdown.clone(),
-            _permit: permit,
-        })
-    }
-
-    async fn acquire_fresh_with_permit(
-        &self,
-        idx: usize,
-        permit: Option<tokio::sync::OwnedSemaphorePermit>,
-        initial_group: Option<&str>,
-        deadline: Option<&mut tokio::time::Instant>,
-    ) -> Result<PooledConnection> {
-        if deadline
-            .as_deref()
-            .is_some_and(|deadline| tokio::time::Instant::now() >= *deadline)
-        {
-            return Err(NntpError::AcquireTimeout(0));
-        }
-        {
-            let last_failure = self.last_connect_failure[idx].lock().await;
-            if let Some(ts) = *last_failure {
-                let elapsed = ts.elapsed();
-                if elapsed < self.reconnect_delay {
-                    let remaining = self.reconnect_delay - elapsed;
-                    drop(last_failure);
-                    acquisition_budget(deadline.as_deref(), async {
-                        tokio::time::sleep(remaining).await;
-                        Ok(())
-                    })
-                    .await?;
-                }
-            }
-        }
-
-        debug!(server = idx, "creating fresh over-max connection");
-        // An over-max connection is never a transport-recovery probe.
-        let health_lease = self.recovery_gates[idx]
-            .admit(false)
-            .ok_or(NntpError::PoolExhausted)?;
-        let slot = self.socket_budgets[idx]
-            .try_acquire_replacement()
-            .ok_or(NntpError::PoolExhausted)?;
-        let started = tokio::time::Instant::now();
-        let connected = self.connect_server(idx, initial_group, false).await;
-        if let Some(deadline) = deadline {
-            *deadline += started.elapsed();
-        }
-        let conn = match connected {
-            Ok(mut conn) => {
-                slot.set_path(conn.route_path.as_ref());
-                slot.observe_outcome(conn.route_outcome.as_ref());
-                slot.active();
-                conn.socket_slot = Some(slot);
-                conn.health_lease = Some(Arc::new(health_lease));
-                let mut last_failure = self.last_connect_failure[idx].lock().await;
-                *last_failure = None;
-                conn
-            }
-            Err(error) => {
-                self.note_connect_failure(idx, &error).await;
-                return Err(error);
             }
         };
 
@@ -2339,8 +2230,7 @@ impl Drop for PooledConnection {
     // it should reuse is already on the list. Handing the return to a spawned
     // task inverted that — the permit went back first and the return landed
     // whenever the runtime got to it, so a caller that re-acquired
-    // immediately (the probe's per-miss HEAD right after its STAT batch)
-    // reliably raced past a warm socket and dialled a new one.
+    // immediately reliably raced past a warm socket and dialled a new one.
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
             let server_idx = self.server_idx;
@@ -3264,7 +3154,7 @@ mod tests {
 
         // Established lanes are untouched by the holdoff.
         for lane in &mut accepted_lanes {
-            let body = lane.body_by_id_raw("<test>").await.unwrap();
+            let body = lane.body_by_id("<test>").await.unwrap();
             assert_eq!(body.data.as_ref(), b"payload\r\n");
         }
 
@@ -3278,7 +3168,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         let mut reused = pool.acquire(ServerId(0)).await.unwrap();
-        let body = reused.body_by_id_raw("<test>").await.unwrap();
+        let body = reused.body_by_id("<test>").await.unwrap();
         assert_eq!(body.data.as_ref(), b"payload\r\n");
         assert_eq!(accepted.load(Ordering::SeqCst), accepted_after_rejection);
 
