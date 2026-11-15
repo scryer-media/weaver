@@ -863,6 +863,7 @@ function JobDetailContent() {
             decimals={1}
             barClassName="min-w-0 flex-1"
             percentClassName="text-[13px] font-medium text-wv-fg"
+            percentTestId={jobIds.jobProgress}
           />
           <div className="font-wv-mono text-[11.5px] text-wv-muted">{statusSentence}</div>
         </div>

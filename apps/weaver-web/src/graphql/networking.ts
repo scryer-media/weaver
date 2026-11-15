@@ -5,8 +5,9 @@ import { gql } from "urql";
 
 const QUOTA_FIELDS = `quota { downloadBytes uploadSoftBytes uploadTrickleBps uploadHardBytes period resetTimeMinutesLocal weeklyResetWeekday monthlyResetDay }
   quotaUsage { down { usedBytes remainingBytes state } up { usedBytes remainingBytes state } state periodStartEpochMs periodEndEpochMs timezoneName }`;
-/** An egress as every page reads it: its limits, its quota settings, and how much of each cap is spent. */
+/** An egress as every page reads it: its limits, its DNS, its quota settings, and how much of each cap is spent. */
 const EGRESS_FIELDS = `id name bindingKind interfaceName sourceAddress addresses enabled downloadBps uploadBps health reason
+  dns { who trust servers { wire address tlsName url } }
   ${QUOTA_FIELDS}`;
 
 /** Every egress's caps and how much of them the current period has spent. */
@@ -48,7 +49,7 @@ export const DELETE_POOL = gql`mutation DeletePool($id:Int!) { deleteProxyPool(i
 export const SAVE_ROUTE = gql`mutation SaveNetworkRoute($kind:NetworkConsumerKind!,$id:Int!,$input:RouteInput!) { saveNetworkRoute(kind:$kind,id:$id,input:$input) { consumer } }`;
 /** Every path through a drafted route, with a proxy or a pool on top. Nothing is saved. */
 export const TEST_VIA = gql`mutation TestVia($route:RouteInput!,$subject:TestSubjectInput,$target:TestTargetInput,$torrent:Boolean) { testVia(route:$route,subject:$subject,target:$target,torrent:$torrent) { leg egressId carrierIds proxyId poolId success code message params failingProxyId sourceAddress connectMillis
-  resolution { host resolvedBy proxyId dnsServers addresses cached connectedAddress error { code detail } }
+  resolution { host resolvedBy proxyId dnsServers wire answeredBy trust addresses cached connectedAddress error { code detail } }
   p2p { rungs { step outcome message } mappedPort exposure { resolvedBy address announcedPort inbound udpTrackers dht utp } } } }`;
 const PATH_FIELDS = "kind directFallback rungs { kind proxyId poolId chainIds }";
 /** A speed test run as every speed test screen reads it: the route it took and what it measured. */

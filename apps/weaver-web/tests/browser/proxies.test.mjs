@@ -94,7 +94,8 @@ PersistentKeepalive = off
 const DETAILS = ["Endpoint", "Port", "Private key", "Peer public key", "Preshared key", "Interface addresses", "MTU", "Keepalive"];
 /** What the configuration above fills the form with, as the daemon is sent it. */
 const FILLED = {
-  kind: "WIRE_GUARD", enabled: true, host: "vpn.fixture.invalid", port: 51999, resolver: "PROXY", dnsServers: ["10.6.0.1"],
+  kind: "WIRE_GUARD", enabled: true, host: "vpn.fixture.invalid", port: 51999,
+  dns: { who: "SERVERS", path: "THROUGH_PROXY", trust: "AS_SENT", servers: [{ wire: "PLAIN", address: "10.6.0.1", tlsName: null, url: null }] },
   tunnelAddresses: ["10.6.0.2/32", "fd00::2/128"], peerPublicKey: KEY("b"), mtu: 1380, keepaliveSeconds: 0,
   natpmp: false, forwardedPort: null, timeoutSeconds: 30, privateKey: KEY("a"), presharedKey: KEY("c"),
 };
@@ -112,10 +113,13 @@ async function filled(editor) {
   assert.equal(await field(editor, "Peer public key").inputValue(), KEY("b"));
   assert.equal(await field(editor, "Preshared key").inputValue(), KEY("c"));
   assert.equal(await field(editor, "Interface addresses").inputValue(), "10.6.0.2/32\nfd00::2/128");
-  // The tunnel's DNS servers answer inside it, so the proxy resolves, and only with servers.
-  assert.equal(await option(editor, "Proxy").getAttribute("aria-checked"), "true");
-  assert.equal(await editor.getByRole("radiogroup", { name: "Using", exact: true }).count(), 0);
-  assert.equal(await field(editor, "DNS servers").inputValue(), "10.6.0.1");
+  // The tunnel's DNS servers answer inside it: plain queries, asked through it, taken as sent.
+  assert.equal(await option(editor, "These servers").getAttribute("aria-checked"), "true");
+  assert.equal(await option(editor, "The proxy").count(), 0);
+  assert.equal(await option(editor, "Through the proxy").getAttribute("aria-checked"), "true");
+  assert.equal(await option(editor, "As sent").getAttribute("aria-checked"), "true");
+  assert.equal(await field(editor, "Address").inputValue(), "10.6.0.1");
+  assert.equal(await action(editor, "Protocol").textContent(), "Plain");
   assert.equal(await field(editor, "MTU").inputValue(), "1380");
   assert.equal(await field(editor, "Keepalive").inputValue(), "0");
 }
@@ -142,10 +146,10 @@ test("a new WireGuard proxy has three ways in and opens on the file, and enterin
     for (const name of ["Endpoint", "Private key", "Peer public key", "Preshared key", "Interface addresses", "MTU", "Keepalive"]) {
       assert.equal(await field(editor, name).inputValue(), "", name);
     }
-    // Weaver resolves with the host's own DNS until told otherwise.
-    assert.equal(await option(editor, "Weaver").getAttribute("aria-checked"), "true");
-    assert.equal(await option(editor, "Host").getAttribute("aria-checked"), "true");
-    assert.equal(await field(editor, "DNS servers").count(), 0);
+    // The host answers until told otherwise, and that is the whole of it.
+    assert.equal(await option(editor, "The host").getAttribute("aria-checked"), "true");
+    assert.equal(await editor.getByRole("radiogroup", { name: "Path", exact: true }).count(), 0);
+    assert.equal(await field(editor, "Address").count(), 0);
     assert.equal(await field(editor, "Port").inputValue(), "51820");
     assert.equal(await action(editor, "Save").isDisabled(), false);
     await shot(page, "proxy-wireguard-manual");
@@ -479,47 +483,119 @@ test("SSH signs in with an Ed25519 key and has no password", async () => {
   } finally { await page.close(); }
 });
 
-test("a proxy's names are resolved by Weaver or the proxy, with the host's DNS or servers asked in order", async () => {
+test("a proxy's names are answered by the host, the proxy or the servers listed, each server asked over its own wire", async () => {
   const page = await open();
   try {
     const seedbox = await editing(page, "Seedbox");
-    assert.equal(await option(seedbox, "Proxy").getAttribute("aria-checked"), "true");
-    assert.equal(await option(seedbox, "Host").getAttribute("aria-checked"), "true");
-    assert.equal(await field(seedbox, "DNS servers").count(), 0);
-    await option(seedbox, "DNS servers").click();
-    // Servers chosen and none named is not the host's DNS by another name.
+    // The proxy answering is the whole answer: nothing more is asked.
+    assert.equal(await option(seedbox, "The proxy").getAttribute("aria-checked"), "true");
+    for (const group of ["Path", "Trust"]) {
+      assert.equal(await seedbox.getByRole("radiogroup", { name: group, exact: true }).count(), 0, group);
+    }
+    assert.equal(await field(seedbox, "Address").count(), 0);
+    await option(seedbox, "These servers").click();
+    assert.equal(await option(seedbox, "Through the proxy").getAttribute("aria-checked"), "true");
+    assert.equal(await option(seedbox, "As sent").getAttribute("aria-checked"), "true");
+    // One row at least: the only one cannot be removed.
+    assert.equal(await seedbox.getByTestId("field-dnsServer-0-remove").isDisabled(), true);
+    // Servers chosen and none named is not the host answering by another name.
     await action(seedbox, "Save").click();
     await seedbox.getByText("Add at least one DNS server.", { exact: true }).waitFor();
-    await field(seedbox, "DNS servers").fill("192.0.2.53\n192.0.2.54");
+    await field(seedbox, "Address").fill("192.0.2.53");
+    await action(seedbox, "Add server").click();
+    await seedbox.getByTestId("field-dnsServer-1-wire").click();
+    await page.getByRole("menuitemradio", { name: "DNS over TLS", exact: true }).click();
+    await seedbox.getByTestId("field-dnsServer-1-address").fill("192.0.2.54");
+    await seedbox.getByTestId("field-dnsServer-1-tlsName").fill("dns.fixture.invalid");
+    await action(seedbox, "Add server").click();
+    await seedbox.getByTestId("field-dnsServer-2-wire").click();
+    await page.getByRole("menuitemradio", { name: "DNS over HTTPS", exact: true }).click();
+    assert.equal(await seedbox.getByTestId("field-dnsServer-2-tlsName").count(), 0);
+    // A name is refused for now: the address must be an IP.
+    await seedbox.getByTestId("field-dnsServer-2-address").fill("https://dns.fixture.invalid/dns-query");
+    await action(seedbox, "Save").click();
+    await seedbox.getByText("DNS server 3: the address must be an IP for now.", { exact: true }).waitFor();
+    await seedbox.getByTestId("field-dnsServer-2-address").fill("https://192.0.2.55/dns-query");
+    // Ten servers are the most a proxy keeps.
+    for (let added = 3; added < 10; added += 1) {
+      await action(seedbox, "Add server").click();
+    }
+    await seedbox.getByTestId("field-dnsServer-9-address").waitFor();
+    assert.equal(await action(seedbox, "Add server").isDisabled(), true);
+    for (let removed = 3; removed < 10; removed += 1) {
+      await seedbox.getByTestId("field-dnsServer-3-remove").click();
+    }
+    assert.equal(await seedbox.getByTestId("field-dnsServer-3-address").count(), 0);
+    assert.equal(await action(seedbox, "Add server").isDisabled(), false);
+
+    // The rows are the order the servers are asked in, and they move.
+    assert.equal(await seedbox.getByTestId("field-dnsServer-0-moveUp").isDisabled(), true);
+    assert.equal(await seedbox.getByTestId("field-dnsServer-2-moveDown").isDisabled(), true);
+    await seedbox.getByTestId("field-dnsServer-1-moveUp").click();
+    assert.equal(await seedbox.getByTestId("field-dnsServer-0-address").inputValue(), "192.0.2.54");
+    assert.equal(await seedbox.getByTestId("field-dnsServer-1-address").inputValue(), "192.0.2.53");
+    await seedbox.getByTestId("field-dnsServer-0-moveDown").click();
+    assert.equal(await seedbox.getByTestId("field-dnsServer-0-address").inputValue(), "192.0.2.53");
+
+    // Authenticated answers over a plain query can be faked, whichever way it goes, and that is said.
+    const warning = seedbox.getByTestId("help-dnsPlainWarning");
+    await option(seedbox, "Require authenticated").click();
+    await seedbox.getByText("Names in zones that are not signed will not resolve.", { exact: true }).waitFor();
+    await warning.waitFor();
+    assert.equal(await warning.textContent(), "A plain query can be altered on the way, so the authenticated mark can be faked.");
+    await option(seedbox, "Direct from the egress").click();
+    await warning.waitFor();
+    // Validating here checks the signatures, not the mark, so nothing can be faked that way.
+    await option(seedbox, "Validate here").click();
+    await seedbox.getByText(
+      "Weaver checks the DNSSEC signatures itself. Unsigned names still resolve; names that fail the check do not.",
+      { exact: true },
+    ).waitFor();
+    assert.equal(await warning.count(), 0);
+    await option(seedbox, "Require authenticated").click();
+    await warning.waitFor();
     await shot(page, "proxy-resolution-servers");
     await action(seedbox, "Save").click();
     await seedbox.waitFor({ state: "detached" });
     let input = (await daemon(page)).requests.at(-1).variables.input;
-    assert.equal(input.resolver, "PROXY");
-    assert.deepEqual(input.dnsServers, ["192.0.2.53", "192.0.2.54"]);
+    assert.equal("resolver" in input || "dnsServers" in input, false);
+    assert.deepEqual(input.dns, {
+      who: "SERVERS",
+      path: "DIRECT",
+      trust: "REQUIRE_AD",
+      servers: [
+        { wire: "PLAIN", address: "192.0.2.53", tlsName: null, url: null },
+        { wire: "TLS", address: "192.0.2.54", tlsName: "dns.fixture.invalid", url: null },
+        { wire: "HTTPS", address: "", tlsName: null, url: "https://192.0.2.55/dns-query" },
+      ],
+    });
+    // Opened again, the servers read as they were saved.
+    const saved = await editing(page, "Seedbox");
+    assert.equal(await saved.getByTestId("field-dnsServer-2-address").inputValue(), "https://192.0.2.55/dns-query");
+    assert.equal(await saved.getByTestId("field-dnsServer-1-tlsName").inputValue(), "dns.fixture.invalid");
+    await action(saved, "Cancel").click();
 
-    // WireGuard hands its peer no name, so a WireGuard proxy resolves only with servers.
+    // A WireGuard peer has nobody to hand a name to. Its servers start inside the tunnel, and the operator may move them.
     const amsterdam = await editing(page, "Amsterdam");
-    assert.equal(await option(amsterdam, "Weaver").getAttribute("aria-checked"), "true");
-    await option(amsterdam, "Proxy").click();
-    assert.equal(await amsterdam.getByRole("radiogroup", { name: "Using", exact: true }).count(), 0);
-    await field(amsterdam, "DNS servers").waitFor();
-    await option(amsterdam, "Weaver").click();
-    assert.equal(await option(amsterdam, "Host").getAttribute("aria-checked"), "true");
-    assert.equal(await field(amsterdam, "DNS servers").count(), 0);
+    assert.equal(await option(amsterdam, "The host").getAttribute("aria-checked"), "true");
+    assert.equal(await option(amsterdam, "The proxy").count(), 0);
+    await option(amsterdam, "These servers").click();
+    assert.equal(await option(amsterdam, "Through the proxy").getAttribute("aria-checked"), "true");
+    assert.equal(await option(amsterdam, "Through the proxy").isDisabled(), false);
+    await option(amsterdam, "Direct from the egress").click();
+    assert.equal(await option(amsterdam, "Direct from the egress").getAttribute("aria-checked"), "true");
     await action(amsterdam, "Cancel").click();
 
-    // The host's DNS sends no servers, whatever was typed before it was chosen.
+    // The host answering sends no servers, whatever was typed before it was chosen.
     const relay = await editing(page, "Relay");
-    await option(relay, "Weaver").click();
-    await option(relay, "DNS servers").click();
-    await field(relay, "DNS servers").fill("192.0.2.53");
-    await option(relay, "Host").click();
+    await option(relay, "These servers").click();
+    await field(relay, "Address").fill("192.0.2.53");
+    await option(relay, "The host").click();
+    assert.equal(await field(relay, "Address").count(), 0);
     await action(relay, "Save").click();
     await relay.waitFor({ state: "detached" });
     input = (await daemon(page)).requests.at(-1).variables.input;
-    assert.equal(input.resolver, "WEAVER");
-    assert.deepEqual(input.dnsServers, []);
+    assert.deepEqual(input.dns, { who: "HOST", path: "THROUGH_PROXY", trust: "AS_SENT", servers: [] });
   } finally { await page.close(); }
 });
 
@@ -604,7 +680,7 @@ test("a proxy is tested through a route drafted for it, which cannot use the pro
     assert.deepEqual((await runs(page)).at(-1).variables.target, { host: "news.fixture.invalid", port: 563 });
     // Each path says how the host was resolved, the address it reached marked among several.
     const resolved = rows.first().locator("p").nth(1);
-    assert.equal(await resolved.textContent(), "news.fixture.invalid → 192.0.2.80, 192.0.2.81 · DNS 192.0.2.53 via Relay");
+    assert.equal(await resolved.textContent(), "news.fixture.invalid → 192.0.2.80, 192.0.2.81 · DNS 192.0.2.53 via Relay · DNS over TLS · Authenticated");
     assert.equal(await resolved.locator("strong").textContent(), "192.0.2.81");
     // A path that failed before its lookup says nothing of one.
     assert.equal(await rows.nth(1).locator("p").count(), 1);

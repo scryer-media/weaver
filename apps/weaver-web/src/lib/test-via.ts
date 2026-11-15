@@ -4,6 +4,7 @@
 import type { Translate } from "@/lib/context/translate-context";
 import { directLeg, type Egress, type NetworkRoute, type ProxyPool } from "./networking.ts";
 import { proxyTestSentence } from "./proxy-fault.ts";
+import { dnsWireKey, lookupTrustKey, type LookupTrust, type ProxyDnsWire } from "./proxy-dns.ts";
 import { codedSentence } from "./refusal.ts";
 import type { TorrentExposure } from "./torrents.ts";
 
@@ -57,6 +58,12 @@ export type HostResolution = {
   /** The proxy that resolved the name, or that the servers were asked through. */
   proxyId: number | null;
   dnsServers: string[];
+  /** How the query reached the servers, when servers were asked. */
+  wire: ProxyDnsWire | null;
+  /** The listed server whose answer was used, when one answered. */
+  answeredBy: string | null;
+  /** What the answer was taken as, when an answer came to judge. */
+  trust: LookupTrust | null;
   addresses: string[];
   /** The answer was held from an earlier lookup. */
   cached: boolean;
@@ -86,7 +93,8 @@ export function resolutionParts(
   names: { egress: string; proxy: (id: number) => string },
 ): ResolutionParts {
   const proxy = resolution.proxyId === null ? "" : names.proxy(resolution.proxyId);
-  const servers = resolution.dnsServers.join(", ");
+  // The server that answered, else every server asked.
+  const servers = resolution.answeredBy ?? resolution.dnsServers.join(", ");
   const by: Record<ResolvedBy, string> = {
     LITERAL: t("next.networking.testVia.resolvedLiteral"),
     HOST: t("next.networking.testVia.resolvedHost"),
@@ -97,6 +105,14 @@ export function resolutionParts(
   const error = resolution.error
     ? codedSentence(t, lookupErrorKey(resolution.error.code), undefined, resolution.error.detail)
     : null;
+  // Who answered, then how the query went and what its answer was taken as.
+  const answered = [
+    by[resolution.resolvedBy],
+    resolution.wire ? t(dnsWireKey(resolution.wire)) : null,
+    resolution.trust ? t(lookupTrustKey(resolution.trust)) : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
   const marked = resolution.addresses.length > 1;
   return {
     host: resolution.host,
@@ -108,7 +124,7 @@ export function resolutionParts(
             connected: marked && address === resolution.connectedAddress,
           })),
     said: [
-      [by[resolution.resolvedBy], error].filter(Boolean).join(": "),
+      [answered, error].filter(Boolean).join(": "),
       ...(resolution.cached ? [t("next.networking.testVia.cached")] : []),
     ]
       .filter(Boolean)

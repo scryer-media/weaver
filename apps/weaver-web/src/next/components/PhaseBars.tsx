@@ -132,6 +132,7 @@ export const PhaseBars = memo(function PhaseBars({
   percentClassName,
   decimals = 0,
   className,
+  percentTestId,
 }: {
   job: Pick<JobData, "progress">;
   view: JobProgressView;
@@ -140,6 +141,8 @@ export const PhaseBars = memo(function PhaseBars({
   percentClassName?: string;
   decimals?: number;
   className?: string;
+  /** Each bar's percentage test ID, by the bar's key: its phase, or "job". */
+  percentTestId?: (bar: string) => string;
 }) {
   const t = useTranslate();
   const statusLabel = useStatusLabel();
@@ -181,7 +184,11 @@ export const PhaseBars = memo(function PhaseBars({
               className={barClassName}
               label={line.name}
             />
-            <span aria-hidden="true" className={cn("flex-none font-wv-mono", percentClassName)}>
+            <span
+              aria-hidden="true"
+              data-testid={percentTestId?.(line.key)}
+              className={cn("flex-none font-wv-mono", percentClassName)}
+            >
               {percent.toFixed(decimals)}%
             </span>
             {line.labelled ? (

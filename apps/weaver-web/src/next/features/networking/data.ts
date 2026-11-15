@@ -19,6 +19,7 @@ import {
   type ProxyPool,
 } from "@/lib/networking";
 import type { ProxyProfile } from "@/lib/proxies";
+import type { EgressDns } from "@/lib/proxy-dns";
 import { refusalMessage } from "@/lib/refusal";
 
 export type NetworkingData = {
@@ -289,8 +290,10 @@ export function liveAddresses(egress: Egress, data: NetworkingData): string[] {
   );
 }
 
-export function egressInput(egress: Egress) {
+/** An egress as its save sends it; with no `dns`, an update keeps the saved one and a new egress asks the host. */
+export function egressInput(egress: Egress, dns?: EgressDns) {
   return {
+    ...(dns ? { dns } : {}),
     name: egress.name,
     bindingKind: egress.bindingKind,
     interfaceName: egress.bindingKind === "INTERFACE" ? egress.interfaceName : null,

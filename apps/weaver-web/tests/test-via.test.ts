@@ -92,6 +92,9 @@ const resolution = (fields: Partial<HostResolution>): HostResolution => ({
   resolvedBy: "HOST",
   proxyId: null,
   dnsServers: [],
+  wire: null,
+  answeredBy: null,
+  trust: null,
   addresses: [],
   cached: false,
   connectedAddress: null,
@@ -118,6 +121,56 @@ test("a resolution line names what the host resolved to, who resolved it, and wh
   assert.equal(
     line({ host: "192.0.2.9", resolvedBy: "LITERAL", addresses: ["192.0.2.9"], connectedAddress: "192.0.2.9" }),
     "192.0.2.9 · address",
+  );
+});
+
+test("servers asked say how the query went and what the answer was taken as, beside who answered", () => {
+  assert.equal(
+    line({ resolvedBy: "PROXY_SERVERS", proxyId: 4, dnsServers: ["192.0.2.53"], wire: "TLS", trust: "AUTHENTICATED", addresses: ["192.0.2.1"], cached: true }),
+    "news.example.com → 192.0.2.1 · DNS 192.0.2.53 via proxy 4 · DNS over TLS · Authenticated · cached",
+  );
+  assert.equal(
+    line({ resolvedBy: "SERVERS", dnsServers: ["192.0.2.53"], wire: "HTTPS", trust: "AS_SENT", addresses: ["192.0.2.1"] }),
+    "news.example.com → 192.0.2.1 · DNS 192.0.2.53 via WAN · DNS over HTTPS · As sent",
+  );
+  assert.equal(
+    line({ resolvedBy: "SERVERS", dnsServers: ["192.0.2.53"], wire: "PLAIN", trust: "REFUSED", error: { code: "NOT_AUTHENTICATED", detail: "no AD bit" } }),
+    "news.example.com · DNS 192.0.2.53 via WAN · Plain · Refused: The server did not mark the answer authenticated",
+  );
+  assert.equal(
+    line({ resolvedBy: "SERVERS", dnsServers: ["192.0.2.53"], wire: "TLS", error: { code: "TLS_FAILED", detail: "handshake" } }),
+    "news.example.com · DNS 192.0.2.53 via WAN · DNS over TLS: The secure connection to the DNS server failed",
+  );
+});
+
+test("a line names the server that answered, not every server asked", () => {
+  assert.equal(
+    line({ resolvedBy: "SERVERS", dnsServers: ["192.0.2.53", "192.0.2.54"], wire: "HTTPS", answeredBy: "192.0.2.54", trust: "AS_SENT", addresses: ["192.0.2.1"] }),
+    "news.example.com → 192.0.2.1 · DNS 192.0.2.54 via WAN · DNS over HTTPS · As sent",
+  );
+  // No server answered: every server asked is named, and nothing was judged.
+  assert.equal(
+    line({ resolvedBy: "PROXY_SERVERS", proxyId: 4, dnsServers: ["192.0.2.53", "192.0.2.54"], wire: "PLAIN", error: { code: "SERVER_FAILURE", detail: "SERVFAIL" } }),
+    "news.example.com · DNS 192.0.2.53, 192.0.2.54 via proxy 4 · Plain: " + english(lookupErrorKey("SERVER_FAILURE")),
+  );
+});
+
+test("an answer validated here says whether its signatures held, were absent, or failed", () => {
+  assert.equal(
+    line({ resolvedBy: "SERVERS", dnsServers: ["192.0.2.53"], wire: "TLS", trust: "VALIDATED", addresses: ["192.0.2.1"] }),
+    "news.example.com → 192.0.2.1 · DNS 192.0.2.53 via WAN · DNS over TLS · Validated",
+  );
+  assert.equal(
+    line({ resolvedBy: "SERVERS", dnsServers: ["192.0.2.53"], wire: "TLS", trust: "UNSIGNED", addresses: ["192.0.2.1"] }),
+    "news.example.com → 192.0.2.1 · DNS 192.0.2.53 via WAN · DNS over TLS · Not signed",
+  );
+  assert.equal(
+    line({ resolvedBy: "SERVERS", dnsServers: ["192.0.2.53"], wire: "PLAIN", trust: "BOGUS", error: { code: "BOGUS", detail: "bad signature" } }),
+    "news.example.com · DNS 192.0.2.53 via WAN · Plain · Failed the check: The answer failed the DNSSEC check",
+  );
+  assert.equal(
+    line({ resolvedBy: "SERVERS", dnsServers: ["192.0.2.53"], wire: "PLAIN", error: { code: "DNSSEC_UNAVAILABLE", detail: "no records" } }),
+    "news.example.com · DNS 192.0.2.53 via WAN · Plain: The DNS server sent no DNSSEC records to check",
   );
 });
 

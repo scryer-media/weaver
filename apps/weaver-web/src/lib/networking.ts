@@ -2,11 +2,12 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import type { ProxyKind } from "./proxies";
+import type { EgressDns } from "./proxy-dns";
 
 export type Rung = { kind: "PROXY" | "POOL" | "CHAIN"; proxyId: number | null; poolId: number | null; chainIds: number[] };
 export type Leg = { egressId: number; weight: number; path: { kind: "DIRECT" | "LADDER"; rungs: Rung[]; directFallback: boolean } };
 export type NetworkRoute = { legs: Leg[]; failover: "REDISTRIBUTE" | "HOLD" };
-export type Egress = { addresses?:string[]; id: number; name: string; bindingKind: "SYSTEM" | "INTERFACE" | "SOURCE_ADDRESS"; interfaceName: string | null; sourceAddress: string | null; enabled: boolean; downloadBps: number | null; uploadBps: number | null; quota?: EgressQuota; quotaUsage?: EgressQuotaUsage | null; health: string; reason: string | null };
+export type Egress = { addresses?:string[]; id: number; name: string; bindingKind: "SYSTEM" | "INTERFACE" | "SOURCE_ADDRESS"; interfaceName: string | null; sourceAddress: string | null; enabled: boolean; downloadBps: number | null; uploadBps: number | null; quota?: EgressQuota; quotaUsage?: EgressQuotaUsage | null; health: string; reason: string | null; dns?: EgressDns };
 export type QuotaPeriod = "ONE_TIME" | "DAILY" | "WEEKLY" | "MONTHLY";
 export type Weekday = "MON" | "TUE" | "WED" | "THU" | "FRI" | "SAT" | "SUN";
 /** A server's download allowance as it is configured. */

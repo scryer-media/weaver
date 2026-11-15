@@ -10,7 +10,19 @@ import {
   SAVE_PROXY_MUTATION,
 } from "@/graphql/proxies";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { proxyLabels, type ProxyKind, type ProxyProfile, type ProxyResolver } from "@/lib/proxies";
+import { proxyLabels, type ProxyKind, type ProxyProfile } from "@/lib/proxies";
+import {
+  NEW_DNS,
+  dnsForm,
+  dnsInput,
+  dnsProblem,
+  effectiveDns,
+  plainCanFakeAuthentication,
+  proxyAnswers,
+  wireguardDns,
+  type DnsForm,
+} from "@/lib/proxy-dns";
+import { testIds } from "@/next/testids";
 import { cn } from "@/lib/utils";
 import { refusalMessage } from "@/lib/refusal";
 import { TestViaDialog } from "../../../features/networking/TestViaDialog";
@@ -25,6 +37,7 @@ import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
 import { DangerButton, SecondaryButton, Segmented, TextArea, TextField } from "../../../components/controls";
+import { dnsFields, DnsPlainWarning } from "../dns-fields";
 import { Cell } from "../../../components/rows";
 import { WV } from "../../../data/palette";
 import {
@@ -55,10 +68,8 @@ interface ProxyForm {
   enabled: boolean;
   host: string;
   port: number;
-  resolver: ProxyResolver;
-  /** The resolver's host resolves, or the servers in `dns`, in order. */
-  dnsSource: DnsSource;
-  dns: string;
+  /** Who answers the proxy's names, and for servers how they are asked, in order. */
+  dns: DnsForm;
   addresses: string;
   peerPublicKey: string;
   mtu: string;
@@ -88,7 +99,6 @@ const TIMEOUT_MAX = 300;
 const KEEPALIVE_DEFAULT = 25;
 /** The largest configuration read: no real one comes near it. */
 const CONFIG_MAX = 65536;
-type DnsSource = "host" | "servers";
 /** Where a WireGuard profile's details come from. */
 type WireguardStart = "upload" | "paste" | "manual";
 const CONFIG_KEYS = {
@@ -107,9 +117,7 @@ const NEW_PROXY: ProxyForm = {
   enabled: true,
   host: "",
   port: DEFAULT_PORTS.WIRE_GUARD,
-  resolver: "WEAVER",
-  dnsSource: "host",
-  dns: "",
+  dns: NEW_DNS,
   addresses: "",
   peerPublicKey: "",
   mtu: "",
@@ -148,9 +156,7 @@ function formFor(profile: ProxyProfile): ProxyForm {
     enabled: profile.enabled,
     host: profile.host,
     port: profile.port,
-    resolver: profile.resolver,
-    dnsSource: profile.dnsServers.length ? "servers" : "host",
-    dns: profile.dnsServers.join("\n"),
+    dns: dnsForm(profile.dns),
     addresses: profile.tunnelAddresses.join("\n"),
     peerPublicKey: profile.peerPublicKey ?? "",
     mtu: profile.mtu ? String(profile.mtu) : "",
@@ -212,11 +218,6 @@ function wireguardProblem(t: Translate, form: ProxyForm, profile: ProxyProfile |
   return null;
 }
 
-/** WireGuard carries no name to its peer, so a WireGuard proxy resolves only with servers. */
-function dnsSource(form: ProxyForm): DnsSource {
-  return form.kind === "WIRE_GUARD" && form.resolver === "PROXY" ? "servers" : form.dnsSource;
-}
-
 function proxyInput(form: ProxyForm) {
   const secrets = { ...form.secrets };
   if (form.kind === "SSH") {
@@ -229,8 +230,7 @@ function proxyInput(form: ProxyForm) {
     enabled: form.enabled,
     host: form.host.trim(),
     port: form.port,
-    resolver: form.resolver,
-    dnsServers: dnsSource(form) === "servers" ? splitList(form.dns) : [],
+    dns: dnsInput(form.dns, form.kind),
     tunnelAddresses: splitList(form.addresses),
     peerPublicKey: form.peerPublicKey || null,
     mtu: Number(form.mtu || MTU_DEFAULT),
@@ -558,10 +558,8 @@ export function ProxyEditor({
       host: endpoint?.host || current.host,
       port: endpoint?.port ?? current.port,
       addresses: parsed.tunnelAddresses || current.addresses,
-      // The tunnel's DNS servers answer inside it, so the proxy resolves.
-      ...(parsed.tunnelDnsServers
-        ? { resolver: "PROXY" as const, dnsSource: "servers" as const, dns: parsed.tunnelDnsServers }
-        : {}),
+      // The tunnel's DNS servers answer inside it, so they are asked through it.
+      ...(parsed.tunnelDnsServers ? { dns: wireguardDns(splitList(parsed.tunnelDnsServers)) } : {}),
       peerPublicKey: parsed.peerPublicKey || current.peerPublicKey,
       mtu: digits(parsed.tunnelMtu, CONFIG_KEYS.mtu) || current.mtu,
       keepaliveSeconds: digits(keepalive, CONFIG_KEYS.keepalive) || current.keepaliveSeconds,
@@ -628,8 +626,9 @@ export function ProxyEditor({
         return;
       }
     }
-    if (dnsSource(clean) === "servers" && splitList(clean.dns).length === 0) {
-      setError(t("next.proxies.needsDns"));
+    const dnsFault = dnsProblem(clean.dns, clean.kind);
+    if (dnsFault) {
+      setError(t(dnsFault.key, dnsFault.values));
       return;
     }
     setBusy(true);
@@ -879,55 +878,18 @@ export function ProxyEditor({
           : []),
       ];
 
-  const source = dnsSource(form);
-  const resolutionFields: FieldSpec[] = [
-    {
-      id: "resolver",
-      label: t("next.proxies.resolvedBy"),
-      help: t(form.resolver === "PROXY" ? "next.proxies.resolverProxyHelp" : "next.proxies.resolverWeaverHelp"),
-      control: {
-        kind: "segmented",
-        value: form.resolver,
-        options: [
-          { value: "WEAVER", label: t("next.proxies.resolverWeaver") },
-          { value: "PROXY", label: t("next.proxies.resolverProxy") },
-        ],
-        onChange: (next) => patch({ resolver: next as ProxyResolver }),
-      },
-    },
-    ...(isWireguard && form.resolver === "PROXY"
-      ? []
-      : [
-          {
-            id: "dnsSource",
-            label: t("next.proxies.using"),
-            control: {
-              kind: "segmented" as const,
-              value: form.dnsSource,
-              options: [
-                { value: "host", label: t("next.proxies.dnsHost") },
-                { value: "servers", label: t("next.proxies.dns") },
-              ],
-              onChange: (next: string) => patch({ dnsSource: next as DnsSource }),
-            },
-          },
-        ]),
-    ...(source === "servers"
-      ? [
-          {
-            id: "dns",
-            label: t("next.proxies.dns"),
-            help: t("next.proxies.dnsHelp"),
-            control: {
-              kind: "textarea" as const,
-              value: form.dns,
-              rows: 3,
-              onChange: (next: string) => patch({ dns: next }),
-            },
-          },
-        ]
-      : []),
-  ];
+  // What the form's DNS comes to for this type: on a WireGuard proxy, the proxy answering means its servers.
+  const dns = effectiveDns(form.dns, form.kind);
+  const setDns = (change: (current: DnsForm) => DnsForm) =>
+    setForm((current) => ({ ...current, dns: change(effectiveDns(current.dns, current.kind)) }));
+  const resolutionFields = dnsFields(
+    t,
+    dns,
+    setDns,
+    proxyAnswers(form.kind) ? ["HOST", "PROXY", "SERVERS"] : ["HOST", "SERVERS"],
+    { path: true, whoHelp: t("next.proxies.dnsWhoHelp") },
+  );
+  const dnsWarning = plainCanFakeAuthentication(form.dns, form.kind) ? <DnsPlainWarning t={t} /> : null;
 
   const problemList = (problems: readonly string[]) =>
     problems.length === 0 ? null : (
@@ -1042,7 +1004,7 @@ export function ProxyEditor({
             note: t("next.proxies.secretsNote"),
             fields: credentialFields,
           },
-          { id: "resolution", title: t("next.proxies.resolution"), fields: resolutionFields },
+          { id: "resolution", title: t("next.proxies.resolution"), fields: resolutionFields, body: dnsWarning },
         ]
       : []),
   ];

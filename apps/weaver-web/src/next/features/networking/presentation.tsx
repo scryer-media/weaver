@@ -231,15 +231,18 @@ export function IconButton({
   label,
   onClick,
   disabled = false,
+  testId,
 }: {
   icon: IconName;
   label: string;
   onClick: () => void;
   disabled?: boolean;
+  testId?: string;
 }) {
   return (
     <button
       type="button"
+      data-testid={testId}
       aria-label={label}
       title={label}
       disabled={disabled}

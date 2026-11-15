@@ -56,6 +56,19 @@ test("a sentence repeats the numbers a refusal names", () => {
   assert.equal(refusalMessage(english, refused), "These routes need 3 WireGuard instances; this host allows 2.");
 });
 
+test("too many DNS servers and too many tunnel addresses each name their own limit", () => {
+  const servers = failed({
+    message: "a DNS setting lists at most 10 servers",
+    extensions: { code: "PROXY_DNS_SERVER_COUNT", params: { limit: 10 } },
+  });
+  assert.equal(refusalMessage(english, servers), "List at most 10 DNS servers.");
+  const addresses = failed({
+    message: "a WireGuard proxy takes at most 8 tunnel addresses",
+    extensions: { code: "PROXY_ADDRESS_COUNT", params: { limit: 8 } },
+  });
+  assert.equal(refusalMessage(english, addresses), "A WireGuard proxy takes at most 8 tunnel addresses.");
+});
+
 // Left to the daemon's own words: the tunnel engine's text, and two refusals of
 // requests this interface never sends.
 const UNWORDED = ["PROXY_TUNNEL_CONFIGURATION", "ROUTE_AND_ROUTING_BOTH", "ROUTE_DIRECT_PATH_FALSE"];
