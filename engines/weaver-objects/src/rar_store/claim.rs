@@ -265,9 +265,22 @@ impl RarStore {
     // A transferable volume is judged by its parsed headers, or by the
     // retained front and name while those headers say nothing. Both are
     // the same evidence an unowned member offers, without reading it again,
-    // and are answered as it is, not yet included.
+    // and are answered as it is, not yet included. A volume whose end
+    // record says its set ends with it is taken nowhere a volume held here
+    // lies past: held there, that volume would go back at once, as one past
+    // the last does, only to be taken again.
     pub(super) fn reclaim_volume(&self, name: &str, front: &[u8], given: &Volume) -> Claim {
-        self.reclaim_front(name, front, given.stated())
+        let ends = given.walk.is_last();
+        let mut placing = self.reclaim_placing(name, front, given.stated());
+        placing.placed = placing.placed.filter(|at| {
+            !ends
+                || self
+                    .volumes
+                    .range((std::ops::Bound::Excluded(*at), std::ops::Bound::Unbounded))
+                    .next()
+                    .is_none()
+        });
+        placing.claim(self)
     }
 
     pub(super) fn reclaim_front(
@@ -276,6 +289,10 @@ impl RarStore {
         front: &[u8],
         facts: Option<&RarVolumeFacts>,
     ) -> Claim {
+        self.reclaim_placing(name, front, facts).claim(self)
+    }
+
+    fn reclaim_placing(&self, name: &str, front: &[u8], facts: Option<&RarVolumeFacts>) -> Placing {
         let mut placing = self.placing_front(name, front, facts);
         // A volume another store holds is taken nowhere it cannot sit
         // beside a volume held here: what its holder links it to outranks
@@ -284,7 +301,7 @@ impl RarStore {
         placing.placed = placing
             .placed
             .filter(|at| !facts.is_some_and(|facts| breaks(facts, at.0, &held)));
-        placing.claim(self)
+        placing
     }
 
     fn placing_front(&self, name: &str, front: &[u8], facts: Option<&RarVolumeFacts>) -> Placing {
@@ -525,14 +542,6 @@ fn meets(facts: &RarVolumeFacts, index: u32, held: &impl Holds) -> [Option<bool>
 // end, does not carry on. A front not read that far says nothing.
 fn breaks(facts: &RarVolumeFacts, index: u32, held: &impl Holds) -> bool {
     let this = Nameless { facts };
-    let apart = |tail: &Nameless<'_>, ended: bool, head: &Nameless<'_>| {
-        !tail.kin(head)
-            || match (tail.continuing_member(), head.first_member()) {
-                (Some(tail), Some(head)) => !(head.split_before && continues(tail, head)),
-                (None, Some(head)) => head.split_before && ended && tail.last_member().is_some(),
-                (_, None) => false,
-            }
-    };
     let before = index
         .checked_sub(1)
         .and_then(|at| held.at(at))
@@ -549,6 +558,104 @@ fn breaks(facts: &RarVolumeFacts, index: u32, held: &impl Holds) -> bool {
                 .is_some_and(|facts| apart(&this, false, &Nameless { facts }))
         });
     before || after
+}
+
+// Whether `head` cannot follow `tail`, by what both state at the boundary
+// between them; `ended` when `tail` was read to its end.
+fn apart(tail: &Nameless<'_>, ended: bool, head: &Nameless<'_>) -> bool {
+    !tail.kin(head)
+        || match (tail.continuing_member(), head.first_member()) {
+            (Some(tail), Some(head)) => !(head.split_before && continues(tail, head)),
+            (None, Some(head)) => head.split_before && ended && tail.last_member().is_some(),
+            (_, None) => false,
+        }
+}
+
+// The places beside the volume at `index` its headers run into: the place
+// after it when a member carries on past its end and a volume follows it
+// before any last one, and the place before it when its first member
+// carries on from a volume before it.
+pub(super) fn beside(
+    index: VolumeIndex,
+    volume: &Volume,
+    last: Option<VolumeIndex>,
+) -> [Option<VolumeIndex>; 2] {
+    let Some(facts) = volume.stated() else {
+        return [None, None];
+    };
+    let this = Nameless { facts };
+    let after = (volume.walk.successor() == Some(true)
+        && this.continuing_member().is_some()
+        && last.is_none_or(|last| index < last))
+    .then(|| index.0.checked_add(1).map(VolumeIndex))
+    .flatten();
+    let before = this
+        .first_member()
+        .is_some_and(|member| member.split_before)
+        .then(|| index.0.checked_sub(1).map(VolumeIndex))
+        .flatten();
+    [after, before]
+}
+
+// The held volumes beside the one at `index` that cannot sit beside it,
+// where one of the two is anchored and the other is not: a member runs
+// across between it and its other neighbour, or it states it is its set's
+// first, at the first place. The one not anchored is no volume of this set
+// there, whichever came first; where both or neither are anchored, what the
+// store holds does not say which, and it keeps both.
+pub(super) fn misfits(
+    index: VolumeIndex,
+    volumes: &BTreeMap<VolumeIndex, Volume>,
+) -> Vec<VolumeIndex> {
+    let held = Bound(volumes);
+    let anchored = |at: u32| {
+        held.at(at)
+            .and_then(|held| held.facts)
+            .is_some_and(|facts| {
+                (at == 0 && Nameless { facts }.position() == Some(0))
+                    || meets(facts, at, &held).contains(&Some(true))
+            })
+    };
+    let Some(this) = held.at(index.0) else {
+        return Vec::new();
+    };
+    let Some(facts) = this.facts else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for at in [index.0.checked_sub(1), index.0.checked_add(1)]
+        .into_iter()
+        .flatten()
+    {
+        let Some(other) = held.at(at) else {
+            continue;
+        };
+        let Some(theirs) = other.facts else {
+            continue;
+        };
+        let broken = if at < index.0 {
+            apart(
+                &Nameless { facts: theirs },
+                other.successor.is_some(),
+                &Nameless { facts },
+            )
+        } else {
+            apart(
+                &Nameless { facts },
+                this.successor.is_some(),
+                &Nameless { facts: theirs },
+            )
+        };
+        if !broken {
+            continue;
+        }
+        match (anchored(index.0), anchored(at)) {
+            (true, false) => out.push(VolumeIndex(at)),
+            (false, true) => out.push(index),
+            _ => {}
+        }
+    }
+    out
 }
 
 // Whether the volume held at `index` is tied there: its headers state that

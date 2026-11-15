@@ -335,6 +335,9 @@ pub struct RarStore {
     // headers say no volume follows them, and the volumes whose headers
     // were read in each format. Filed as a volume is walked, comes or goes.
     lasts: BTreeSet<VolumeIndex>,
+    // The places a held volume's headers ran on into, or ran in from, while
+    // nothing was held there: each said once, so siblings are asked once.
+    wanted: BTreeSet<VolumeIndex>,
     formats: [BTreeSet<VolumeIndex>; 3],
     // The layout kept: extended past its tail as volumes are read, laid
     // afresh only where a volume it holds changed what it said.
@@ -396,6 +399,7 @@ impl RarStore {
             pieces_in: BTreeMap::new(),
             dirty: BTreeSet::new(),
             lasts: BTreeSet::new(),
+            wanted: BTreeSet::new(),
             formats: Default::default(),
             layout: None,
             entries: Vec::new(),
@@ -624,6 +628,8 @@ impl RarStore {
                 return;
             }
             self.give_back_misplaced(volume, out);
+            self.give_back_misfits(volume, out);
+            self.want_beside(volume, out);
         }
         self.give_back_past_last(out);
     }
@@ -660,6 +666,39 @@ impl RarStore {
             false => vec![volume],
         };
         self.give_back_held(going, out);
+    }
+
+    // A volume whose headers moved meets the volumes beside it again: one
+    // of a pair that cannot sit side by side, beside nothing that ties it
+    // there while the other is tied, goes back at its close, as a misplaced
+    // one does, whichever of them came first. Only the two places beside
+    // the volume are read.
+    fn give_back_misfits(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>) {
+        let going: Vec<VolumeIndex> = claim::misfits(volume, &self.volumes)
+            .into_iter()
+            .filter(|index| self.volumes.get(index).is_some_and(|found| found.closed))
+            .collect();
+        if !going.is_empty() {
+            self.give_back_held(going, out);
+        }
+    }
+
+    // A volume whose headers run on into the place after it, or in from the
+    // place before it, while nothing is held there, says that place is the
+    // store's: a sibling holding a volume there it may carry lets it go to
+    // the store, which takes it where its claim places it. Each place is said
+    // once; only the two places beside the volume are read.
+    fn want_beside(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>) {
+        let Some(found) = self.volumes.get(&volume) else {
+            return;
+        };
+        let last = self.last();
+        let places = claim::beside(volume, found, last);
+        for place in places.into_iter().flatten() {
+            if !self.volumes.contains_key(&place) && self.wanted.insert(place) {
+                out.push(Emit::Wants(place));
+            }
+        }
     }
 
     // A set ends at the volume whose headers say no volume follows it. A
