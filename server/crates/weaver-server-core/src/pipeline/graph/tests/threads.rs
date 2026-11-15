@@ -1853,3 +1853,72 @@ async fn a_profile_change_sizes_the_volume_limits_again() {
     assert_eq!(volume.buffer_limits(), (will * 70 / 100, will));
     retire_pipeline_database(pipeline).await;
 }
+
+// A volume's probe waits for the first job's writes: it is queued as the job
+// is given the volume's writer, and runs on the volume's thread once that
+// writer first runs out of work, after the job's file is down whole. The
+// rate it measures is the one extraction admission reads: on a disk whose
+// writes run under 100 MB/s one extraction runs at a time, where two did
+// before the volume was measured.
+#[tokio::test]
+async fn a_volume_is_probed_after_its_first_jobs_writes_and_a_slow_one_runs_one_extraction() {
+    use std::sync::{Mutex, mpsc};
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_430);
+    let posts = [Post::plain("lantern.bin", payload(3 * ARTICLE, 1))];
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let (said, probed) = mpsc::channel();
+    let said = Mutex::new(said);
+    pipeline.volume_probes = Arc::new(crate::pipeline::graph::disk::VolumeProbes::with(
+        move |volume, dir| {
+            let said = said.lock().unwrap().clone();
+            Box::new(move || {
+                // What the job's file holds as the probe begins.
+                let held = std::fs::read(dir.join("lantern.bin")).ok();
+                volume.write_rate.store(60_000_000, Ordering::Relaxed);
+                let _ = said.send((Arc::clone(&volume), held));
+                Ok(())
+            })
+        },
+    ));
+    // A drive with seeks to spare: two extractions while its writes are not
+    // measured.
+    pipeline.tuner.set_random_read_iops(600.0);
+    pipeline.apply_queue_intents().await;
+    assert_eq!(pipeline.tuner.max_concurrent_extractions(), 2);
+
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        spec("lantern joined", &posts, ARTICLE),
+    )
+    .await;
+    let working_dir = pipeline.jobs[&job_id].working_dir.clone();
+    let (volume, hold) = held(&pipeline, job_id);
+    assert!(Arc::ptr_eq(
+        &volume,
+        &pipeline.storage_capacity.volume(&pipeline.intermediate_dir)
+    ));
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    // The thread stands before the job's first write: the probe has not
+    // run ahead of it.
+    hold.wait_held();
+    assert!(probed.try_recv().is_err(), "not ahead of the job's writes");
+    hold.open();
+    let (probed_volume, held_then) = probed.recv().unwrap();
+    assert!(Arc::ptr_eq(&probed_volume, &volume));
+    assert_eq!(
+        held_then.as_deref(),
+        Some(posts[0].bytes.as_slice()),
+        "the probe ran once the job's file was down whole"
+    );
+    assert_eq!(read(&working_dir.join("lantern.bin")), posts[0].bytes);
+
+    // The next turn reads the probed rate: one extraction at a time.
+    pipeline.apply_queue_intents().await;
+    assert_eq!(pipeline.tuner.max_concurrent_extractions(), 1);
+    no_loop_waits(&volume);
+    drop(hold);
+    retire_pipeline_database(pipeline).await;
+}

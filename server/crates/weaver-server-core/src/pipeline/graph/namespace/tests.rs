@@ -23,6 +23,7 @@ mod replay;
 mod split;
 mod store_proof;
 mod streams;
+mod threads;
 mod verification;
 mod windows;
 
