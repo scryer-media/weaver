@@ -21,7 +21,7 @@ use crate::rss::model::{compile_rules, evaluate_item, parse_feed_items};
 use crate::security::RuntimeSecurityConfig;
 use crate::settings::SharedConfig;
 use crate::torrents::service::{AddError, AddRequest, AddSource, TorrentService};
-use crate::{Database, RssFeedRow, RssRuleRow, RssSeenItemRow};
+use crate::{Database, RssFeedRow, RssRuleRow, RssSeenDecision, RssSeenItemRow};
 
 const MAX_RSS_REDIRECTS: usize = 10;
 pub(super) const MAX_RSS_FEED_BODY_BYTES: u64 = 16 * 1024 * 1024;
@@ -76,11 +76,6 @@ pub(super) enum NotAdded {
     Waiting,
     Failed(String),
 }
-
-/// What an item held while torrents are off is kept as, in place of a
-/// decision: not seen, it is judged anew once torrents are on. Matched as a
-/// literal in SQL, where the index on held items serves it.
-pub(super) const WAITING: &str = "waiting";
 
 impl From<String> for NotAdded {
     fn from(error: String) -> Self {
@@ -394,7 +389,7 @@ impl RssService {
     pub(super) fn seen_row(
         feed_id: u32,
         item: &FeedItem,
-        decision: &str,
+        decision: RssSeenDecision,
         job_id: Option<u64>,
         error: Option<&str>,
     ) -> RssSeenItemRow {
@@ -404,7 +399,7 @@ impl RssService {
             item_title: item.title.clone(),
             published_at: item.published_at,
             size_bytes: item.size_bytes,
-            decision: decision.to_string(),
+            decision,
             seen_at: crate::rss::model::unix_now_secs(),
             job_id,
             item_url: item

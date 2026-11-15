@@ -45,7 +45,7 @@ use crate::torrents::sessions::{
 use crate::torrents::status::{self, Engine, Held, Queued};
 use crate::torrents::tee::Tee;
 use crate::torrents::{
-    FilePriority, NamedBy, TorrentCounters, TorrentFile, TorrentIntent, TorrentRecord,
+    FilePriority, KeptIntent, NamedBy, TorrentCounters, TorrentFile, TorrentIntent, TorrentRecord,
     TorrentState, TrackerEntry,
 };
 
@@ -1067,9 +1067,8 @@ impl TorrentService {
                     .update_torrent_intent(job_id, intent)
                     .map_err(|error| ActionError::State(state_error(error)))?;
                 torrent.settle(now);
-                torrent.record.intent = intent;
                 // The operator's word ends a wind-down's hold on it.
-                torrent.record.wound_down = false;
+                torrent.record.kept = KeptIntent::Intent(intent);
                 if let Some(tee) = torrent.store.as_ref().and_then(|store| store.tee()) {
                     tee.hold_own_clock(intent == TorrentIntent::Paused);
                 }
@@ -1085,12 +1084,11 @@ impl TorrentService {
     fn stop_torrent(&self, torrent: &mut Live, now: i64) -> Option<Landing> {
         let job_id = torrent.record.job_id;
         torrent.settle(now);
-        torrent.record.intent = TorrentIntent::Stopped;
-        torrent.record.wound_down = false;
+        torrent.record.kept = KeptIntent::Intent(TorrentIntent::Stopped);
         if let Err(error) = self
             .inner
             .db
-            .update_torrent_intent(job_id, torrent.record.intent)
+            .update_torrent_intent(job_id, TorrentIntent::Stopped)
         {
             tracing::warn!(job_id = job_id.0, error = %error, "could not keep a torrent's stop");
         }

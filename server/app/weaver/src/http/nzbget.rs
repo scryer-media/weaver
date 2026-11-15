@@ -27,8 +27,8 @@ use weaver_server_core::post_processing::hooks::UrlStatus;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::SharedConfig;
 use weaver_server_core::{
-    Database, FieldUpdate, HistoryFilter, HistoryRows, JobId, JobStatus, JobUpdate, SchedulerError,
-    SchedulerHandle,
+    Database, FieldUpdate, HistoryFilter, HistoryRows, JobId, JobStatus, JobUpdate,
+    RssSeenDecision, SchedulerError, SchedulerHandle,
 };
 
 #[derive(Clone)]
@@ -3738,11 +3738,14 @@ async fn viewfeed(
         .map(|(index, item)| {
             let size = item.size_bytes.unwrap_or(0);
             let (size_lo, size_hi) = size_parts(size);
-            let fetched = item.decision == "submitted" && item.job_id.is_some();
-            let match_status = match item.decision.as_str() {
-                "submitted" | "accepted" => "ACCEPTED",
-                "rejected" => "REJECTED",
-                _ => "IGNORED",
+            let fetched = item.decision == RssSeenDecision::Submitted && item.job_id.is_some();
+            let match_status = match item.decision {
+                RssSeenDecision::Submitted | RssSeenDecision::Accepted => "ACCEPTED",
+                RssSeenDecision::Rejected => "REJECTED",
+                RssSeenDecision::Ignored
+                | RssSeenDecision::Error
+                | RssSeenDecision::Waiting
+                | RssSeenDecision::Other(_) => "IGNORED",
             };
             json!({
                 "ID": index as u64 + 1,

@@ -92,6 +92,28 @@ fn a_tracker_shows_only_its_scheme_host_and_port() {
     assert_eq!(super::redacted_tracker_url("not a url"), "…");
 }
 
+// A tracker's scheme names how it is spoken to, and the kind's text is the
+// metric label its counts carry.
+#[test]
+fn a_trackers_scheme_names_its_kind() {
+    use crate::session_stats::tracker::TrackerKind;
+    let kind = |url: &str| {
+        SupportedTracker::new(Tracker::operator(Url::parse(url).unwrap()))
+            .map(|tracker| tracker.kind)
+    };
+    assert_eq!(kind("http://t.invalid/announce"), Some(TrackerKind::Http));
+    assert_eq!(kind("https://t.invalid/announce"), Some(TrackerKind::Http));
+    assert_eq!(kind("udp://t.invalid:6969"), Some(TrackerKind::Udp));
+    assert_eq!(kind("wss://t.invalid/announce"), None);
+    assert_eq!(
+        TrackerKind::ALL
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>(),
+        ["http", "udp"]
+    );
+}
+
 /// Every log line written while it is the thread's subscriber.
 #[derive(Clone, Default)]
 struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);

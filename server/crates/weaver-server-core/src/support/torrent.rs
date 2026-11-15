@@ -491,12 +491,17 @@ impl TorrentJobSection {
         let view = &held.view;
         let mut section = Self::empty(JobSource::Queue, known_status(view.state.as_str()));
         section.state = Some(view.state.as_str());
-        section.why = view.detail.as_deref().map(why);
+        section.why = view
+            .stated
+            .map(status::Stated::key)
+            .or_else(|| view.detail.as_deref().map(why));
         section.route_reason = view.route_reason.map(route_reason);
         section.paused_by = view.paused_by.map(HoldOrigin::reason);
         // A stop for any reason but its met goal is the torrent's failure.
         section.failure = match (view.state, view.detail.as_deref()) {
-            (TorrentState::Stopped, Some(status::GOAL_MET)) => None,
+            (TorrentState::Stopped, Some(_)) if view.stated == Some(status::Stated::GoalMet) => {
+                None
+            }
             (TorrentState::Stopped, Some(detail)) => Some(FailureVerdict::classify(detail)),
             _ => None,
         };
@@ -841,35 +846,31 @@ impl TorrentJobSection {
     }
 }
 
-// The state's reason, as a constant: one the service states itself, else
-// the cause its words name.
+// The reason in a state's words, as a constant, for words the service
+// does not state itself: the cause they name.
 fn why(detail: &str) -> &'static str {
-    match detail {
-        status::DISK_FULL => "disk_full",
-        status::GOAL_MET => "goal_met",
-        status::OFF => "torrents_off",
-        _ => {
-            for origin in [
-                HoldOrigin::Manual,
-                HoldOrigin::Scheduled,
-                HoldOrigin::SpeedTest,
-            ] {
-                if detail == origin.reason() {
-                    return origin.reason();
-                }
-            }
-            for phase in [
-                FetchPhase::Trackers,
-                FetchPhase::Discovery,
-                FetchPhase::Waiting,
-            ] {
-                if detail == phase.to_string() {
-                    return fetch_phase(phase);
-                }
-            }
-            FailureVerdict::classify(detail).as_str()
+    if detail == status::TORRENTS_OFF {
+        return "torrents_off";
+    }
+    for origin in [
+        HoldOrigin::Manual,
+        HoldOrigin::Scheduled,
+        HoldOrigin::SpeedTest,
+    ] {
+        if detail == origin.reason() {
+            return origin.reason();
         }
     }
+    for phase in [
+        FetchPhase::Trackers,
+        FetchPhase::Discovery,
+        FetchPhase::Waiting,
+    ] {
+        if detail == phase.to_string() {
+            return fetch_phase(phase);
+        }
+    }
+    FailureVerdict::classify(detail).as_str()
 }
 
 fn fetch_phase(phase: FetchPhase) -> &'static str {

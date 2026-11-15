@@ -200,7 +200,14 @@ impl Rig {
         let mut rows = self.db.list_rss_seen_items(Some(1), None).unwrap();
         rows.sort_by(|a, b| a.item_id.cmp(&b.item_id));
         rows.into_iter()
-            .map(|row| (row.item_id, row.decision, row.job_id, row.error))
+            .map(|row| {
+                (
+                    row.item_id,
+                    row.decision.as_str().to_owned(),
+                    row.job_id,
+                    row.error,
+                )
+            })
             .collect()
     }
 
@@ -400,7 +407,7 @@ async fn a_torrent_while_torrents_are_off_waits_and_is_added_once_they_are_on() 
     let held = |id: &str| {
         (
             id.to_string(),
-            WAITING.to_string(),
+            "waiting".to_string(),
             None,
             Some("torrents are off".to_string()),
         )
@@ -449,7 +456,7 @@ async fn an_item_held_by_a_switch_inside_a_sync_is_taken_up_at_the_next() {
     rig.service.run_all_sync().await.unwrap();
 
     assert!(rig.torrent_jobs().is_empty());
-    assert_eq!(rig.seen()[0].1, WAITING);
+    assert_eq!(rig.seen()[0].1, "waiting");
 
     rig.turn_torrents(true).await;
     rig.service.run_all_sync().await.unwrap();
@@ -479,7 +486,7 @@ async fn a_declared_torrent_enclosure_is_not_fetched_while_torrents_are_off() {
     rig.service.run_all_sync().await.unwrap();
 
     assert_eq!(rig.torrent_fetches.load(Ordering::SeqCst), 0);
-    assert_eq!(rig.seen()[0].1, WAITING);
+    assert_eq!(rig.seen()[0].1, "waiting");
 
     rig.turn_torrents(true).await;
     rig.service.run_all_sync().await.unwrap();
@@ -540,7 +547,7 @@ async fn a_poll_records_its_items_together_with_the_rows_one_by_one_gave() {
         item_title: "Silver Horizon old".to_string(),
         published_at: None,
         size_bytes: None,
-        decision: "submitted".to_string(),
+        decision: crate::RssSeenDecision::Submitted,
         seen_at: crate::rss::model::unix_now_secs() - 60,
         job_id: Some(77),
         item_url: None,

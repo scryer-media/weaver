@@ -112,7 +112,7 @@ impl RouteFailure {
             TorrentRouteReason::LegMissing => "the route's egress is missing",
             TorrentRouteReason::LegRevoked => "the route's leg was revoked",
             TorrentRouteReason::QuotaSilenced => "quota reached",
-            TorrentRouteReason::TorrentsDisabled => crate::torrents::status::OFF,
+            TorrentRouteReason::TorrentsDisabled => crate::torrents::status::TORRENTS_OFF,
             TorrentRouteReason::RouteBroken(fault) => fault.message(),
             TorrentRouteReason::LegOpenFailed => "the route's leg could not be opened",
             TorrentRouteReason::StateDirectoryFailed => {

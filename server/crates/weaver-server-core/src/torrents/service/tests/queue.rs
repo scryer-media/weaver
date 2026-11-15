@@ -78,9 +78,9 @@ async fn the_queues_actions_reach_a_torrent() {
     let record = |rig: &Rig| rig.db.get_torrent(job_id).unwrap().unwrap();
 
     queue.pause_job(job_id).await.unwrap();
-    assert_eq!(record(&rig).intent, TorrentIntent::Paused);
+    assert_eq!(record(&rig).intent(), TorrentIntent::Paused);
     queue.resume_job(job_id).await.unwrap();
-    assert_eq!(record(&rig).intent, TorrentIntent::Resumed);
+    assert_eq!(record(&rig).intent(), TorrentIntent::Resumed);
 
     queue
         .update_job(
@@ -162,6 +162,7 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         source: TorrentSource::Metainfo,
         state: TorrentState::Downloading,
         detail: None,
+        stated: None,
         route_reason: None,
         paused_by: None,
         category: None,
@@ -260,12 +261,12 @@ async fn pause_resume_and_force_are_kept() {
         TorrentState::Paused
     );
     assert_eq!(
-        rig.db.get_torrent(job_id).unwrap().unwrap().intent,
+        rig.db.get_torrent(job_id).unwrap().unwrap().intent(),
         TorrentIntent::Paused
     );
     rig.service.tick().await;
     assert_eq!(
-        rig.db.get_torrent(job_id).unwrap().unwrap().intent,
+        rig.db.get_torrent(job_id).unwrap().unwrap().intent(),
         TorrentIntent::Paused
     );
     rig.service.resume(job_id).await.unwrap();
@@ -297,7 +298,7 @@ async fn a_refused_unpause_keeps_the_intent_and_shows_the_error() {
         torrent.record.completed_at_ms = Some(EPOCH_MS);
     }
     assert_eq!(
-        rig.db.get_torrent(job_id).unwrap().unwrap().intent,
+        rig.db.get_torrent(job_id).unwrap().unwrap().intent(),
         TorrentIntent::Resumed
     );
     let view = rig.service.torrent(job_id).await.unwrap();
@@ -342,7 +343,7 @@ async fn a_forced_torrent_seeds_past_its_goal() {
         .record
         .completed_at_ms = Some(EPOCH_MS);
     rig.service.apply_goals(EPOCH_MS).await;
-    let intent = |rig: &Rig| rig.db.get_torrent(job_id).unwrap().unwrap().intent;
+    let intent = |rig: &Rig| rig.db.get_torrent(job_id).unwrap().unwrap().intent();
     assert_eq!(intent(&rig), TorrentIntent::Resumed);
 
     rig.service.set_forced(job_id, false).await.unwrap();
@@ -351,7 +352,10 @@ async fn a_forced_torrent_seeds_past_its_goal() {
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_eq!(
         (view.state, view.detail.as_deref()),
-        (TorrentState::Stopped, Some(status::GOAL_MET))
+        (
+            TorrentState::Stopped,
+            Some(status::Stated::GoalMet.as_str())
+        )
     );
 }
 
@@ -439,7 +443,10 @@ async fn the_global_pause_reaches_the_torrents() {
         (seeding, TorrentIntent::Resumed),
         (kept, TorrentIntent::Paused),
     ] {
-        assert_eq!(rig.db.get_torrent(job_id).unwrap().unwrap().intent, intent);
+        assert_eq!(
+            rig.db.get_torrent(job_id).unwrap().unwrap().intent(),
+            intent
+        );
     }
 }
 
@@ -1023,10 +1030,10 @@ async fn a_pause_racing_completion_keeps_the_completion() {
     let (paused, ()) = tokio::join!(rig.service.pause(job_id), rig.service.completed(job_id));
     paused.unwrap();
     let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
-    assert_eq!(stored.intent, TorrentIntent::Paused);
+    assert_eq!(stored.intent(), TorrentIntent::Paused);
     assert_eq!(stored.completed_at_ms, Some(EPOCH_MS));
     rig.service.resume(job_id).await.unwrap();
     let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
-    assert_eq!(stored.intent, TorrentIntent::Resumed);
+    assert_eq!(stored.intent(), TorrentIntent::Resumed);
     assert_eq!(stored.completed_at_ms, Some(EPOCH_MS));
 }

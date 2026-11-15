@@ -71,7 +71,7 @@ async fn an_unwanted_member_found_while_unpacking_fails_the_job_and_keeps_the_to
     assert_eq!(history.status, "failed");
     assert!(history.error_message.unwrap().contains("txt"));
     let record = rig.db.get_torrent(job_id).unwrap().unwrap();
-    assert_eq!(record.intent, TorrentIntent::Stopped);
+    assert_eq!(record.intent(), TorrentIntent::Stopped);
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_eq!(view.state, TorrentState::Stopped);
     assert!(view.detail.unwrap().contains("txt"));
@@ -81,7 +81,7 @@ async fn an_unwanted_member_found_while_unpacking_fails_the_job_and_keeps_the_to
     rig.service.inner.signal.mark(job_id);
     rig.service.settle().await;
     assert_eq!(
-        rig.db.get_torrent(job_id).unwrap().unwrap().intent,
+        rig.db.get_torrent(job_id).unwrap().unwrap().intent(),
         TorrentIntent::Resumed
     );
     assert_eq!(*retired.borrow(), 1);

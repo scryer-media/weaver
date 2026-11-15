@@ -106,7 +106,7 @@ pub use operations::{
 pub use persistence::{Database, LoadError, Refusal, StateError};
 pub use pipeline::Pipeline;
 pub use pipeline::download::{DownloadQueue, DownloadWork};
-pub use rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
+pub use rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenDecision, RssSeenItemRow};
 pub use runtime::affinity::{
     install_tokio_worker_affinity, pin_current_thread_for_hot_download_path,
 };

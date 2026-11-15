@@ -157,7 +157,7 @@ async fn turning_torrents_off_to_let_them_finish_ends_after_the_last_goal() {
     assert!(!rig.service.inner.sessions.on());
     assert_eq!(kept_wind_down(&rig), None);
     assert_eq!(
-        rig.db.get_torrent(job_id).unwrap().unwrap().intent,
+        rig.db.get_torrent(job_id).unwrap().unwrap().intent(),
         TorrentIntent::Stopped
     );
     assert_eq!(
@@ -196,7 +196,7 @@ async fn turning_torrents_off_to_finish_downloads_stops_seeding() {
     rig.service.set_settings(turned_off(&rig.service)).await;
     assert_eq!(kept_wind_down(&rig).as_deref(), Some("finish_downloads"));
 
-    let intent = |job_id| rig.db.get_torrent(job_id).unwrap().unwrap().intent;
+    let intent = |job_id| rig.db.get_torrent(job_id).unwrap().unwrap().intent();
     rig.service.tick().await;
     assert_eq!(intent(seeding), TorrentIntent::Stopped);
     assert_eq!(intent(downloading), TorrentIntent::Resumed);
@@ -295,7 +295,7 @@ async fn turning_torrents_on_again_ends_a_wind_down() {
     assert_eq!(kept_wind_down(&rig), None);
     assert!(rig.service.inner.sessions.on());
     assert_eq!(
-        rig.db.get_torrent(job_id).unwrap().unwrap().intent,
+        rig.db.get_torrent(job_id).unwrap().unwrap().intent(),
         TorrentIntent::Resumed
     );
 }
@@ -484,10 +484,10 @@ async fn finishing_downloads_stops_many_seeds_in_one_pass_as_one_by_one_did() {
     assert!(
         new_rows
             .iter()
-            .all(|row| row.intent == TorrentIntent::Stopped && row.wound_down)
+            .all(|row| row.intent() == TorrentIntent::Stopped && row.wound_down())
     );
     for row in &mut new_rows {
-        row.wound_down = false;
+        row.kept = KeptIntent::Intent(TorrentIntent::Stopped);
     }
     assert_eq!(new_rows, old_rows);
 }
@@ -553,7 +553,7 @@ async fn seeds_meeting_their_goals_stop_in_one_pass_as_one_by_one_did() {
     assert!(
         new_rows
             .iter()
-            .all(|row| row.intent == TorrentIntent::Stopped && !row.wound_down)
+            .all(|row| row.intent() == TorrentIntent::Stopped && !row.wound_down())
     );
     assert_eq!(new_rows, old_rows);
 }
@@ -590,7 +590,7 @@ async fn seeds_a_wind_down_stopped_resume_when_torrents_are_on_again() {
     rig.service.tick().await;
     let kept = |job_id| {
         let row = rig.db.get_torrent(job_id).unwrap().unwrap();
-        (row.intent, row.wound_down)
+        (row.intent(), row.wound_down())
     };
     assert_eq!(kept(met), (TorrentIntent::Stopped, false));
 
@@ -637,7 +637,7 @@ async fn seeds_a_wind_down_stopped_resume_at_a_restart_with_torrents_on() {
     rig.service.tick().await;
     let kept = |job_id| {
         let row = rig.db.get_torrent(job_id).unwrap().unwrap();
-        (row.intent, row.wound_down)
+        (row.intent(), row.wound_down())
     };
     assert_eq!(kept(job_id), (TorrentIntent::Stopped, true));
     rig.service.stop().await;
@@ -676,7 +676,7 @@ async fn a_seed_meeting_its_goal_as_a_wind_down_stops_it_is_stopped_by_its_goal(
 
     let row = rig.db.get_torrent(job_id).unwrap().unwrap();
     assert_eq!(
-        (row.intent, row.wound_down),
+        (row.intent(), row.wound_down()),
         (TorrentIntent::Stopped, false)
     );
     let mut on = rig.service.settings();
@@ -684,7 +684,7 @@ async fn a_seed_meeting_its_goal_as_a_wind_down_stops_it_is_stopped_by_its_goal(
     rig.service.set_settings(on).await;
     let row = rig.db.get_torrent(job_id).unwrap().unwrap();
     assert_eq!(
-        (row.intent, row.wound_down),
+        (row.intent(), row.wound_down()),
         (TorrentIntent::Stopped, false)
     );
 }
@@ -720,7 +720,7 @@ async fn a_wound_down_seed_whose_goal_is_met_stays_stopped_when_torrents_are_on(
     rig.service.tick().await;
     let kept = |job_id| {
         let row = rig.db.get_torrent(job_id).unwrap().unwrap();
-        (row.intent, row.wound_down)
+        (row.intent(), row.wound_down())
     };
     assert_eq!(kept(met), (TorrentIntent::Stopped, true));
     assert_eq!(kept(forced), (TorrentIntent::Stopped, true));
@@ -751,8 +751,7 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         metainfo: None,
         category_id: Some(1),
         added_at_ms: EPOCH_MS,
-        intent: TorrentIntent::Resumed,
-        wound_down: false,
+        kept: KeptIntent::Intent(TorrentIntent::Resumed),
         forced: false,
         completed_at_ms: None,
         storage_dir: None,

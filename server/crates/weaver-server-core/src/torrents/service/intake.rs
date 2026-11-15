@@ -24,8 +24,8 @@ use crate::torrents::metrics::{FetchOutcome, TorrentEvent};
 use crate::torrents::model::Adopted;
 use crate::torrents::sessions::{RoutePlan, SessionError};
 use crate::torrents::{
-    ContentLayout, Infohash, TorrentCounters, TorrentInsert, TorrentIntent, TorrentRecord,
-    TorrentSource, TrackerEntry, admission, files, status,
+    ContentLayout, Infohash, KeptIntent, TorrentCounters, TorrentInsert, TorrentIntent,
+    TorrentRecord, TorrentSource, TrackerEntry, admission, files, status,
 };
 use bytes::Bytes;
 use std::collections::HashSet;
@@ -136,7 +136,7 @@ pub enum AddError {
     Duplicate(JobId),
     #[error("no network for this torrent: {0}")]
     NoNetwork(String),
-    #[error("{}", status::OFF)]
+    #[error("{}", status::TORRENTS_OFF)]
     Off,
     #[error("{0}")]
     State(String),
@@ -667,12 +667,11 @@ impl TorrentService {
             metainfo,
             category_id: category.map(|category| category.id),
             added_at_ms: self.inner.clock.now_ms(),
-            intent: if request.paused {
+            kept: KeptIntent::Intent(if request.paused {
                 TorrentIntent::Paused
             } else {
                 TorrentIntent::Resumed
-            },
-            wound_down: false,
+            }),
             forced: request.forced,
             completed_at_ms: None,
             storage_dir: None,

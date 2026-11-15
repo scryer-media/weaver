@@ -10,9 +10,9 @@ use crate::rss::model::{
 };
 use crate::rss::service::{
     DueSyncOutcome, MAX_RSS_FEED_BODY_BYTES, NotAdded, RssFeedSyncReport, RssService,
-    RssServiceError, RssSyncReport, WAITING,
+    RssServiceError, RssSyncReport,
 };
-use crate::{RssFeedRow, RssRuleAction};
+use crate::{RssFeedRow, RssRuleAction, RssSeenDecision};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RssSyncTarget {
@@ -66,18 +66,20 @@ impl RssService {
         Ok(items
             .into_iter()
             .map(|item| {
-                let decision =
-                    evaluate_item(&rules, &item).map_or("ignored", |rule| match rule.row.action {
-                        RssRuleAction::Accept => "accepted",
-                        RssRuleAction::Reject => "rejected",
-                    });
+                let decision = evaluate_item(&rules, &item).map_or(
+                    RssSeenDecision::Ignored,
+                    |rule| match rule.row.action {
+                        RssRuleAction::Accept => RssSeenDecision::Accepted,
+                        RssRuleAction::Reject => RssSeenDecision::Rejected,
+                    },
+                );
                 crate::RssSeenItemRow {
                     feed_id,
                     item_id: item.item_id,
                     item_title: item.title,
                     published_at: item.published_at,
                     size_bytes: item.size_bytes,
-                    decision: decision.into(),
+                    decision,
                     seen_at: self.now(),
                     job_id: None,
                     item_url: item.download_url.or(item.display_url),
@@ -498,7 +500,7 @@ impl RssService {
             match decision {
                 Some(rule) if rule.row.action == RssRuleAction::Reject => {
                     report.items_ignored += 1;
-                    record!(&item, "rejected", None, None);
+                    record!(&item, RssSeenDecision::Rejected, None, None);
                 }
                 Some(rule) => {
                     report.items_accepted += 1;
@@ -508,17 +510,22 @@ impl RssService {
                     {
                         Ok(job_id) => {
                             report.items_submitted += 1;
-                            record!(&item, "submitted", Some(job_id), None);
+                            record!(&item, RssSeenDecision::Submitted, Some(job_id), None);
                         }
                         Err(NotAdded::Ignored(reason)) => {
                             report.items_ignored += 1;
-                            record!(&item, "ignored", None, Some(&reason));
+                            record!(&item, RssSeenDecision::Ignored, None, Some(&reason));
                         }
                         // A torrent while torrents are off: held, once, so
                         // later polls fetch nothing for it, and judged anew
                         // once torrents are on.
                         Err(NotAdded::Waiting) => {
-                            record!(&item, WAITING, None, Some("torrents are off"));
+                            record!(
+                                &item,
+                                RssSeenDecision::Waiting,
+                                None,
+                                Some(crate::torrents::status::TORRENTS_OFF)
+                            );
                         }
                         Err(NotAdded::Failed(error)) => {
                             if cancellation.is_cancelled() {
@@ -526,7 +533,7 @@ impl RssService {
                             }
                             report.items_ignored += 1;
                             report.errors.push(error.clone());
-                            record!(&item, "error", None, Some(&error));
+                            record!(&item, RssSeenDecision::Error, None, Some(&error));
                         }
                     }
                 }
@@ -537,7 +544,7 @@ impl RssService {
                     // recording its items then would leave them for good
                     // before the first accept rule could ever see them.
                     if accepts_any {
-                        record!(&item, "ignored", None, None);
+                        record!(&item, RssSeenDecision::Ignored, None, None);
                     }
                 }
             }

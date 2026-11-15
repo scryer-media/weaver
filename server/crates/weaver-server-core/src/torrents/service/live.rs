@@ -332,7 +332,7 @@ impl Live {
     }
 
     pub(super) fn resumed(&self) -> bool {
-        self.record.intent == TorrentIntent::Resumed
+        self.record.intent() == TorrentIntent::Resumed
     }
 
     // The session took a change to the torrent's run, or refused it.
@@ -525,7 +525,7 @@ impl Live {
             has_metadata: self.layout.is_some(),
             fetch: self.fetching.as_ref().map(|fetch| *fetch.phase.borrow()),
             complete: self.complete(),
-            intent: self.record.intent,
+            intent: self.record.intent(),
             queued: self.queued,
             paused_by: self.paused_by,
             failed: self.refusal(),

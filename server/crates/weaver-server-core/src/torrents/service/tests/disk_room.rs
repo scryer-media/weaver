@@ -933,7 +933,7 @@ fn the_disk_warning_names_the_volume_and_the_waiting() {
 async fn a_full_disk_leaves_the_selection_as_it_was() {
     use crate::operations::disk::{Capacity, CapacityReading};
     use crate::torrents::net::{LegKind, LegSockets};
-    use crate::torrents::status::DISK_FULL;
+    use crate::torrents::status::Stated;
 
     let data: Vec<u8> = (0..65_536u32).map(|at| (at % 251) as u8).collect();
     let files = [("set/a.bin", data.as_slice())];
@@ -991,7 +991,7 @@ async fn a_full_disk_leaves_the_selection_as_it_was() {
     rig.service.tick().await;
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_eq!(view.state, TorrentState::Stalled);
-    assert_eq!(view.detail.as_deref(), Some(DISK_FULL));
+    assert_eq!(view.detail.as_deref(), Some(Stated::DiskFull.as_str()));
     assert_eq!(view.completed_at_ms, None);
     assert_eq!(torrent.file_priorities(), [FilePriority::Normal]);
     let warnings = rig.service.warnings().await;
@@ -1004,7 +1004,7 @@ async fn a_full_disk_leaves_the_selection_as_it_was() {
             .unwrap()
             .download_wait_reason
             .as_deref(),
-        Some(DISK_FULL)
+        Some(Stated::DiskFull.as_str())
     );
     rig.service.stop().await;
     seeding.stop().await;

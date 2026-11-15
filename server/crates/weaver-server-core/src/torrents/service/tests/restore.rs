@@ -26,7 +26,7 @@ async fn a_restart_restores_the_intent_not_the_state() {
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
     reopen(&again).await;
     assert_eq!(
-        rig.db.get_torrent(job_id).unwrap().unwrap().intent,
+        rig.db.get_torrent(job_id).unwrap().unwrap().intent(),
         TorrentIntent::Resumed
     );
     let view = again.torrent(job_id).await.unwrap();
@@ -394,7 +394,7 @@ async fn a_torrent_that_crashed_the_daemon_stays_paused_until_resumed() {
         assert!(live[&job_id].attached.is_none());
     }
     assert_eq!(
-        rig.db.get_torrent(job_id).unwrap().unwrap().intent,
+        rig.db.get_torrent(job_id).unwrap().unwrap().intent(),
         TorrentIntent::Paused
     );
     let view = again.torrent(job_id).await.unwrap();
@@ -525,7 +525,7 @@ async fn a_resume_racing_the_restore_pass_is_never_undone() {
         .unwrap();
     rig.service.stop().await;
     let marks = rig.dir.path().join("marks");
-    let intent = || rig.db.get_torrent(job_id).unwrap().unwrap().intent;
+    let intent = || rig.db.get_torrent(job_id).unwrap().unwrap().intent();
 
     // The resume lands between the pass starting and its park.
     Trap::new(&marks, "test")
@@ -585,7 +585,7 @@ async fn a_stopped_torrent_that_crashed_the_daemon_says_why() {
     again.park_crashed(boot_marks(&marks, |job| job == job_id));
     reopen(&again).await;
     assert_eq!(
-        rig.db.get_torrent(job_id).unwrap().unwrap().intent,
+        rig.db.get_torrent(job_id).unwrap().unwrap().intent(),
         TorrentIntent::Stopped
     );
     let view = again.torrent(job_id).await.unwrap();

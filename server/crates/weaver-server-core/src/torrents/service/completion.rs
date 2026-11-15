@@ -15,6 +15,7 @@ use crate::runtime::panic_trap::JobScope;
 use crate::settings::model::TrackerRule;
 use crate::settings::{Seeding, SeedingAction};
 use crate::torrents::metrics::TorrentEvent;
+use crate::torrents::model::HistoryEnd;
 use crate::torrents::relocate::Existing;
 use crate::torrents::store::TorrentStore;
 use crate::torrents::tee::{Tee, plan_outputs};
@@ -57,16 +58,17 @@ impl TorrentService {
             let mut resumed = Vec::new();
             let mut met = Vec::new();
             for torrent in live.values_mut() {
-                if !torrent.record.wound_down {
+                if !torrent.record.wound_down() {
                     continue;
                 }
-                torrent.record.wound_down = false;
+                // Its wind-down's mark goes; it stays stopped until resumed.
+                torrent.record.kept = KeptIntent::Intent(TorrentIntent::Stopped);
                 if goal_met(&settings, &rules, torrent, now).is_some() {
                     met.push(torrent.record.job_id);
                     continue;
                 }
                 torrent.settle(now);
-                torrent.record.intent = TorrentIntent::Resumed;
+                torrent.record.kept = KeptIntent::Intent(TorrentIntent::Resumed);
                 resumed.push(torrent.record.job_id);
                 landings.extend(self.queue_resume(torrent, now, true));
             }
@@ -405,7 +407,7 @@ impl TorrentService {
         if matches!(status, JobStatus::Failed { .. }) {
             self.inner.counters.event(TorrentEvent::Failed);
         }
-        self.finish(report, status.persisted_status(), hash, now)
+        self.finish(report, HistoryEnd::delivered(&status), hash, now)
             .await;
     }
 
@@ -437,10 +439,9 @@ impl TorrentService {
                     && (torrent.complete() || torrent.seeding())
                 {
                     torrent.settle(now);
-                    torrent.record.intent = TorrentIntent::Stopped;
                     // Not the operator's stop: it resumes when torrents are
                     // turned on again.
-                    torrent.record.wound_down = true;
+                    torrent.record.kept = KeptIntent::WoundDown;
                     wound_down.push(torrent.record.job_id);
                     landings.extend(self.queue_resume(torrent, now, true));
                     continue;
@@ -456,8 +457,7 @@ impl TorrentService {
                 match policy.action {
                     SeedingAction::Stop => {
                         torrent.settle(now);
-                        torrent.record.intent = TorrentIntent::Stopped;
-                        torrent.record.wound_down = false;
+                        torrent.record.kept = KeptIntent::Intent(TorrentIntent::Stopped);
                         met.push(torrent.record.job_id);
                         landings.extend(self.queue_resume(torrent, now, true));
                         self.queue_script_event(finished);

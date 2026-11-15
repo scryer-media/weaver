@@ -2685,7 +2685,7 @@ async fn postgres_runtime_smoke_when_configured() {
         item_title: "Example".to_string(),
         published_at: Some(123),
         size_bytes: Some(456),
-        decision: "accepted".to_string(),
+        decision: crate::RssSeenDecision::Accepted,
         seen_at: 1000,
         job_id: Some(42),
         item_url: Some("https://example.com/item.nzb".to_string()),

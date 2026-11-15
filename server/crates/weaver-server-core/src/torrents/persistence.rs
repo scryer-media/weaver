@@ -10,7 +10,7 @@ use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
 use crate::settings::SeedingPolicy;
 use crate::settings::model::tracker_host;
-use crate::torrents::model::{file_priorities_str, named_by_str};
+use crate::torrents::model::{HistoryEnd, file_priorities_str, named_by_str};
 use crate::torrents::queries::{TORRENT_COLUMNS, count, counters_from_row, torrent_by_infohash_tx};
 use crate::torrents::store::Kept;
 use crate::torrents::{
@@ -153,14 +153,7 @@ impl Database {
             _ => {}
         }
         let args = vec![
-            SqlArg::Text(
-                if delete_files {
-                    RETIRING_DELETED
-                } else {
-                    RETIRING_KEPT
-                }
-                .to_owned(),
-            ),
+            SqlArg::Text(RetiringMark::of(delete_files).as_str().to_owned()),
             SqlArg::I64(stored(job_id.0)?),
         ];
         let datastore = self.datastore();
@@ -318,10 +311,36 @@ pub(crate) struct RetiringArchived {
     pub(crate) left: Vec<JobId>,
 }
 
-// The marks a removal leaves on a torrent's row: its files kept, or asked
+// The mark a removal leaves on a torrent's row: its files kept, or asked
 // to go with it.
-pub(crate) const RETIRING_KEPT: &str = "kept";
-pub(crate) const RETIRING_DELETED: &str = "deleted";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetiringMark {
+    Kept,
+    Deleted,
+}
+
+impl RetiringMark {
+    pub(crate) const ALL: [Self; 2] = [Self::Kept, Self::Deleted];
+
+    pub(crate) const fn of(delete_files: bool) -> Self {
+        if delete_files {
+            Self::Deleted
+        } else {
+            Self::Kept
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Kept => "kept",
+            Self::Deleted => "deleted",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mark| mark.as_str() == value)
+    }
+}
 
 // A retiring torrent's row, as finishing its removal at a start reads it.
 #[derive(Debug)]
@@ -350,10 +369,11 @@ fn retiring_row(row: &crate::persistence::sql_runtime::SqlRow) -> Result<Retirin
     let had = row.opt_text("had_status")?;
     let status = had.clone().unwrap_or_else(|| {
         if completed.is_some() {
-            "complete"
+            HistoryEnd::Complete
         } else {
-            "cancelled"
+            HistoryEnd::Cancelled
         }
+        .as_str()
         .to_owned()
     });
     let storage_dir = row.opt_text("storage_dir")?;
@@ -389,7 +409,8 @@ fn retiring_row(row: &crate::persistence::sql_runtime::SqlRow) -> Result<Retirin
     };
     Ok(RetiringRow {
         job_id,
-        delete_files: row.text("retiring")? == RETIRING_DELETED,
+        // A mark of any other word keeps its files, as one never asked.
+        delete_files: RetiringMark::parse(&row.text("retiring")?) == Some(RetiringMark::Deleted),
         metainfo: row.opt_bytes("metainfo")?,
         storage_dir,
         files_dir: row.opt_text("files_dir")?,
@@ -972,7 +993,7 @@ fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
         SqlArg::OptBytes(torrent.metainfo.as_deref().map(<[u8]>::to_vec)),
         SqlArg::OptI64(torrent.category_id.map(i64::from)),
         SqlArg::I64(torrent.added_at_ms),
-        SqlArg::Text(torrent.intent.as_str().to_string()),
+        SqlArg::Text(torrent.kept.as_str().to_string()),
         SqlArg::Bool(torrent.forced),
         SqlArg::OptI64(torrent.completed_at_ms),
         SqlArg::OptText(torrent.storage_dir.clone()),

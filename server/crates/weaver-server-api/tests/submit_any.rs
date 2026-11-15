@@ -382,7 +382,10 @@ async fn staging_refuses_a_torrent_while_torrents_are_off() {
     let data = response_data(&staged)["stageNzbUpload"].clone();
     assert_eq!(data["kind"], "TORRENT");
     assert_eq!(data["accepted"], false);
-    assert_eq!(data["error"], weaver_server_core::torrents::status::OFF);
+    assert_eq!(
+        data["error"],
+        weaver_server_core::torrents::status::TORRENTS_OFF
+    );
 
     let staged = rig
         .run(
