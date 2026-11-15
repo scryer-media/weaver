@@ -227,9 +227,10 @@ impl Delivery {
     // walk reads a whole leaf: one whose name makes it a piece of something
     // else (`names_a_piece`), an archive volume, a split part or recovery
     // data, is delivered as it stands and is no usable file; any other is
-    // whole. A posted file that is furniture (`root_furniture`) is no file
-    // of the delivery, as the walk leaves a root member that is out; an
-    // unpacked one is payload, whatever it is named. A directory is no file.
+    // whole. A posted file at the root, its name with no folder, that is
+    // furniture (`root_furniture`) is no file of the delivery, as the walk
+    // leaves a root member that is out; one in a folder, and an unpacked
+    // one, is payload, whatever it is named. A directory is no file.
     // Its `status` is then every delivery's.
     pub(crate) fn of_whole_files(
         posted: impl IntoIterator<Item = String>,
@@ -238,7 +239,7 @@ impl Delivery {
         let furniture = root_furniture();
         let names = posted
             .into_iter()
-            .filter(|name| !furniture(name))
+            .filter(|name| name.contains(['/', '\\']) || !furniture(name))
             .chain(unpacked);
         let mut delivery = Self::default();
         for name in names {
