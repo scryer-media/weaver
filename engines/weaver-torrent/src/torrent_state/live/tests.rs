@@ -248,6 +248,7 @@ impl Harness {
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
             sent_dht_port: AtomicBool::new(false),
+            let_go_in_upload_mode: AtomicU64::new(0),
             pex_started: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(self.live.max_request_window())),
             state: self.live.clone(),
@@ -3912,6 +3913,90 @@ async fn a_refusal_made_before_its_owner_left_upload_mode_does_not_enter_it_agai
     assert!(h.upload_mode());
 }
 
+// libtorrent `torrent::set_upload_mode`: leaving upload mode clears every
+// peer's `last_connected` to force a fast reconnect. A seed let go as of no
+// use while we only uploaded waits a reconnect time; once upload mode ends
+// the connect loop wakes and dials it at once, the clock not moved.
+#[tokio::test]
+async fn a_seed_let_go_in_upload_mode_is_dialled_at_once_when_it_ends() {
+    let h = Harness::new("upload_mode_redial").await;
+    tokio::time::pause();
+    let (seed, mut seed_rx) = h.peer("127.0.0.1:6881");
+    let mut hs = ExtendedHandshake::new();
+    hs.p = Some(u32::from(seed.addr.port()));
+    (&seed).on_extended_handshake(&hs).unwrap();
+    h.enter_upload_mode(false, h.upload_epoch());
+    assert!(h.upload_mode());
+
+    let mut requester: Task<'_> = Box::pin(seed.request_chunks());
+    loop {
+        match next_queued(&mut requester, &mut seed_rx).await {
+            WriterRequest::Disconnect(Ok(())) => break,
+            WriterRequest::Message(_) => {}
+            other => panic!("unexpected writer request {other:?}"),
+        }
+    }
+    drop(requester);
+    seed.on_peer_died(Some(crate::Error::Disconnect)).unwrap();
+
+    let now = tokio::time::Instant::now();
+    assert_eq!(
+        h.peers
+            .with_peer(sock("127.0.0.1:6881"), |p| p.reconnect_at())
+            .unwrap(),
+        Some(now + peer::MIN_RECONNECT_TIME)
+    );
+    assert!(h.peers.connect_next(now).is_none());
+    let mut candidate = std::pin::pin!(h.peers.wait_for_candidate());
+    assert!(candidate.as_mut().now_or_never().is_none());
+
+    h.leave_upload_mode();
+    assert!(candidate.as_mut().now_or_never().is_some());
+    assert_eq!(tokio::time::Instant::now(), now);
+    assert_eq!(
+        h.peers.connect_next(now).map(|(addr, ..)| addr),
+        Some(sock("127.0.0.1:6881"))
+    );
+}
+
+// A seed let go as of no use while we only uploaded, its close heard only
+// after upload mode was left: the leave found it still connected, so its
+// close is due again at once, the clock not moved.
+#[tokio::test]
+async fn a_seed_let_go_in_upload_mode_and_closed_after_it_ends_is_dialled_at_once() {
+    let h = Harness::new("upload_mode_late_close").await;
+    tokio::time::pause();
+    let (seed, mut seed_rx) = h.peer("127.0.0.1:6881");
+    let mut hs = ExtendedHandshake::new();
+    hs.p = Some(u32::from(seed.addr.port()));
+    (&seed).on_extended_handshake(&hs).unwrap();
+    h.enter_upload_mode(false, h.upload_epoch());
+
+    let mut requester: Task<'_> = Box::pin(seed.request_chunks());
+    loop {
+        match next_queued(&mut requester, &mut seed_rx).await {
+            WriterRequest::Disconnect(Ok(())) => break,
+            WriterRequest::Message(_) => {}
+            other => panic!("unexpected writer request {other:?}"),
+        }
+    }
+    drop(requester);
+    h.leave_upload_mode();
+    seed.on_peer_died(Some(crate::Error::Disconnect)).unwrap();
+
+    let now = tokio::time::Instant::now();
+    assert_eq!(
+        h.peers
+            .with_peer(sock("127.0.0.1:6881"), |p| p.reconnect_at())
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        h.peers.connect_next(now).map(|(addr, ..)| addr),
+        Some(sock("127.0.0.1:6881"))
+    );
+}
+
 // A piece is counted into every file with bytes in it, an empty file among
 // them or not (libtorrent `torrent::we_have` updates every file the piece
 // maps to).
@@ -6782,6 +6867,7 @@ impl Harness {
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
             sent_dht_port: AtomicBool::new(false),
+            let_go_in_upload_mode: AtomicU64::new(0),
             pex_started: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(self.live.max_request_window())),
             state: self.live.clone(),

@@ -825,6 +825,7 @@ impl TorrentStateLive {
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
             sent_dht_port: AtomicBool::new(false),
+            let_go_in_upload_mode: AtomicU64::new(0),
             pex_started: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(self.max_request_window())),
             state: self.clone(),
@@ -1006,6 +1007,7 @@ impl TorrentStateLive {
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
             sent_dht_port: AtomicBool::new(false),
+            let_go_in_upload_mode: AtomicU64::new(0),
             pex_started: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(self.max_request_window())),
             state: self.clone(),
@@ -1128,6 +1130,7 @@ impl TorrentStateLive {
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
             sent_dht_port: AtomicBool::new(false),
+            let_go_in_upload_mode: AtomicU64::new(0),
             pex_started: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(state.max_request_window())),
             state: state.clone(),
@@ -2217,7 +2220,8 @@ impl TorrentStateLive {
     /// Upload mode was entered or left. Entering, every request outstanding
     /// is cancelled and every piece in flight goes back to the queue, each
     /// under its peer's lock, under which a requester picks and asks;
-    /// leaving, the requesters ask again. Either way each requester looks
+    /// leaving, the requesters ask again and the peers with no connection
+    /// are due to be connected to at once. Either way each requester looks
     /// at its interest again, and the peers are told whether we only
     /// upload.
     fn upload_mode_changed(&self, on: bool) {
@@ -2231,6 +2235,10 @@ impl TorrentStateLive {
                     live.cancel_all_requests();
                 }
             });
+        } else {
+            // The seeds let go while we only uploaded are due again now,
+            // not a reconnect time after they were let go.
+            self.peers.reconnect_after_upload_mode();
         }
         self.new_pieces_notify.notify_waiters();
         self.update_upload_only();
@@ -2773,6 +2781,11 @@ struct PeerHandler {
 
     // Our DHT port went to the peer on this connection (BEP 5 PORT).
     sent_dht_port: AtomicBool,
+
+    // We let the connection go as of no use while in upload mode: one more
+    // than the upload-mode count then, 0 when we did not. A close heard
+    // after upload mode was left since is due again at once.
+    let_go_in_upload_mode: AtomicU64,
 
     // The connection's PEX sender is started (BEP 11): once, at the first
     // extended handshake that names ut_pex.
@@ -3692,6 +3705,13 @@ impl PeerHandler {
         if failed {
             self.counters.errors.fetch_add(1, Ordering::Relaxed);
         }
+        // Let go while we only uploaded, and upload mode was left before the
+        // close came: the leave found the peer still connected, so the
+        // close is due again at once, as the leave makes every other peer.
+        let let_go = self.let_go_in_upload_mode.load(Ordering::Relaxed);
+        if !failed && let_go != 0 && let_go - 1 != self.state.upload_epoch() {
+            pe.value_mut().forget_last_close();
+        }
         peers.settle_closed(pe.value_mut(), needed);
         trace!(state = %pe.value().get_state(), "peer settled after its connection closed");
         drop(pe);
@@ -4372,6 +4392,13 @@ impl PeerHandler {
             // `do_update_interest`, `set_upload_only` and `torrent::finished`).
             if redundant {
                 debug!("the peer only uploads and we want nothing of it, disconnecting peer");
+                // The count is read before the mode, so a leave between the
+                // two moves it past what is kept.
+                let epoch = self.state.upload_epoch();
+                if self.state.upload_mode() {
+                    self.let_go_in_upload_mode
+                        .store(epoch + 1, Ordering::Relaxed);
+                }
                 self.tx
                     .send(WriterRequest::Disconnect(Ok(())))
                     .ok()
