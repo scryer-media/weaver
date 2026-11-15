@@ -247,6 +247,45 @@ impl Database {
         })
     }
 
+    /// Which of `item_ids` the feed has seen: one statement per bind-sized
+    /// chunk, served by the table's key.
+    pub fn seen_rss_item_ids(
+        &self,
+        feed_id: u32,
+        item_ids: &[String],
+    ) -> Result<std::collections::HashSet<String>, StateError> {
+        if item_ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let datastore = self.datastore();
+        let item_ids = item_ids.to_vec();
+        self.run_sql_blocking_read(async move {
+            let mut seen = std::collections::HashSet::new();
+            // One bind of each chunk is the feed's id.
+            let per_chunk =
+                (crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 1) - 1)
+                    .max(1);
+            for chunk in item_ids.chunks(per_chunk) {
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let mut args = vec![SqlArg::I64(i64::from(feed_id))];
+                args.extend(chunk.iter().cloned().map(SqlArg::Text));
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT item_id FROM rss_seen_items
+                          WHERE feed_id = {{}} AND item_id IN ({placeholders})"
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    seen.insert(row.text("item_id")?);
+                }
+            }
+            Ok(seen)
+        })
+    }
+
     pub fn list_rss_seen_items(
         &self,
         feed_id: Option<u32>,

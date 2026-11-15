@@ -4236,6 +4236,93 @@ async fn seeds_a_wind_down_stopped_resume_at_a_restart_with_torrents_on() {
     again.stop().await;
 }
 
+// A seed whose goal is met in the pass a wind-down to the downloads stops
+// it ends by its goal: no mark, so it does not resume when torrents are on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seed_meeting_its_goal_as_a_wind_down_stops_it_is_stopped_by_its_goal() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            policy_override: stops_once_done(),
+            ..request(AddSource::Metainfo(plain("met", 1)))
+        })
+        .await
+        .unwrap();
+    complete(&rig, job_id).await;
+    rig.service
+        .wind_down_when_off(Some(WindDown::FinishDownloads))
+        .await;
+    rig.service.set_settings(turned_off(&rig.service)).await;
+
+    rig.service.tick().await;
+
+    let row = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(
+        (row.intent, row.wound_down),
+        (TorrentIntent::Stopped, false)
+    );
+    let mut on = rig.service.settings();
+    on.torrent.enabled = true;
+    rig.service.set_settings(on).await;
+    let row = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(
+        (row.intent, row.wound_down),
+        (TorrentIntent::Stopped, false)
+    );
+}
+
+// A seed the wind-down stopped whose goal is met by the time torrents are
+// on again (here the goal set while they were off) is not resumed: its mark
+// is cleared and it stays stopped, beside one with a goal left, which
+// resumes, in the same write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wound_down_seed_whose_goal_is_met_stays_stopped_when_torrents_are_on() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let met = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(plain("met", 1))))
+        .await
+        .unwrap();
+    let forced = rig
+        .service
+        .add_opened(AddRequest {
+            forced: true,
+            ..request(AddSource::Metainfo(plain("forced", 2)))
+        })
+        .await
+        .unwrap();
+    for job_id in [met, forced] {
+        complete(&rig, job_id).await;
+    }
+    rig.service
+        .wind_down_when_off(Some(WindDown::FinishDownloads))
+        .await;
+    rig.service.set_settings(turned_off(&rig.service)).await;
+    rig.service.tick().await;
+    let kept = |job_id| {
+        let row = rig.db.get_torrent(job_id).unwrap().unwrap();
+        (row.intent, row.wound_down)
+    };
+    assert_eq!(kept(met), (TorrentIntent::Stopped, true));
+    assert_eq!(kept(forced), (TorrentIntent::Stopped, true));
+
+    let mut on = rig.service.settings();
+    on.torrent.enabled = true;
+    on.seeding = stops_once_done();
+    rig.service.set_settings(on).await;
+
+    assert_eq!(kept(met), (TorrentIntent::Stopped, false));
+    assert_eq!(
+        rig.service.torrent(met).await.unwrap().state,
+        TorrentState::Stopped
+    );
+    // A forced torrent seeds past its goal, so it resumes.
+    assert_eq!(kept(forced), (TorrentIntent::Resumed, false));
+}
+
 // A run the session refuses leaves the operator's intent as it was, and the
 // state shows the session's error, never a met goal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

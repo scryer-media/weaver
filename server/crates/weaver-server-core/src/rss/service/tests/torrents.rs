@@ -17,10 +17,17 @@ struct Rig {
     torrents: TorrentService,
     // How many times the feed's body was served whole, not as unchanged.
     feed_reads: Arc<AtomicUsize>,
+    // How many times the torrent file was fetched.
+    torrent_fetches: Arc<AtomicUsize>,
+    // Filled, the next whole read of the feed turns torrents off before it
+    // answers: a switch that falls inside a sync.
+    off_at_feed_read: OffAtRead,
     complete_dir: std::path::PathBuf,
     server: tokio::task::JoinHandle<()>,
     _dir: TempDir,
 }
+
+type OffAtRead = Arc<StdMutex<Option<(TorrentService, std::path::PathBuf)>>>;
 
 impl Drop for Rig {
     fn drop(&mut self) {
@@ -47,6 +54,10 @@ async fn rig(items: &str, sizes: Option<(u64, u64)>, torrents_on: bool) -> Rig {
     // unchanged, as an indexer does.
     let feed_reads = Arc::new(AtomicUsize::new(0));
     let reads = feed_reads.clone();
+    let torrent_fetches = Arc::new(AtomicUsize::new(0));
+    let fetches = torrent_fetches.clone();
+    let off_at_feed_read: OffAtRead = Arc::default();
+    let off_at = off_at_feed_read.clone();
     let app = Router::new()
         .route(
             "/feed",
@@ -58,10 +69,22 @@ async fn rig(items: &str, sizes: Option<(u64, u64)>, torrents_on: bool) -> Rig {
                     return StatusCode::NOT_MODIFIED.into_response();
                 }
                 reads.fetch_add(1, Ordering::SeqCst);
+                let off = off_at.lock().unwrap().take();
+                if let Some((torrents, complete_dir)) = off {
+                    torrents
+                        .set_settings(torrent_settings(&complete_dir, false))
+                        .await;
+                }
                 ([(header::ETAG, "\"v1\"")], feed).into_response()
             }),
         )
-        .route("/set.torrent", get(|| async { metainfo("set.bin") }))
+        .route(
+            "/set.torrent",
+            get(move || async move {
+                fetches.fetch_add(1, Ordering::SeqCst);
+                metainfo("set.bin")
+            }),
+        )
         .route("/download.nzb", get(|| async { sample_nzb_bytes() }));
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -124,6 +147,8 @@ async fn rig(items: &str, sizes: Option<(u64, u64)>, torrents_on: bool) -> Rig {
         db,
         torrents,
         feed_reads,
+        torrent_fetches,
+        off_at_feed_read,
         complete_dir,
         server,
         _dir: dir,
@@ -153,6 +178,12 @@ fn torrent_settings(complete_dir: &std::path::Path, on: bool) -> TorrentSettings
 }
 
 impl Rig {
+    async fn turn_torrents(&self, on: bool) {
+        self.torrents
+            .set_settings(torrent_settings(&self.complete_dir, on))
+            .await;
+    }
+
     // The NZB jobs the feed submitted to the queue.
     fn nzb_jobs(&self) -> Vec<crate::jobs::JobInfo> {
         self.service
@@ -385,9 +416,7 @@ async fn a_torrent_while_torrents_are_off_waits_and_is_added_once_they_are_on() 
     assert_eq!(rig.db.list_rss_seen_items(Some(1), None).unwrap(), rows);
     assert!(rig.torrent_jobs().is_empty());
 
-    rig.torrents
-        .set_settings(torrent_settings(&rig.complete_dir, true))
-        .await;
+    rig.turn_torrents(true).await;
     let report = rig.service.run_all_sync().await.unwrap();
 
     assert_eq!(rig.feed_reads.load(Ordering::SeqCst), 2);
@@ -403,6 +432,61 @@ async fn a_torrent_while_torrents_are_off_waits_and_is_added_once_they_are_on() 
     rig.service.run_all_sync().await.unwrap();
     assert_eq!(rig.feed_reads.load(Ordering::SeqCst), 2);
     assert_eq!(rig.seen(), seen);
+}
+
+// Torrents go off inside a sync, after it began with them on, and come back
+// on before the next: the item held in between is still taken up then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_item_held_by_a_switch_inside_a_sync_is_taken_up_at_the_next() {
+    let rig = rig(
+        &item("a", &format!("<link>{}</link>", magnet())),
+        None,
+        true,
+    )
+    .await;
+    *rig.off_at_feed_read.lock().unwrap() = Some((rig.torrents.clone(), rig.complete_dir.clone()));
+
+    rig.service.run_all_sync().await.unwrap();
+
+    assert!(rig.torrent_jobs().is_empty());
+    assert_eq!(rig.seen()[0].1, WAITING);
+
+    rig.turn_torrents(true).await;
+    rig.service.run_all_sync().await.unwrap();
+
+    let jobs = rig.torrent_jobs();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        rig.seen(),
+        vec![("a".into(), "submitted".into(), Some(jobs[0]), None)]
+    );
+}
+
+// An enclosure the feed declares a torrent is not fetched while torrents are
+// off; it is fetched once, when they are on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_torrent_enclosure_is_not_fetched_while_torrents_are_off() {
+    let rig = rig(
+        &item(
+            "a",
+            r#"<enclosure url="http://localhost/set.torrent" length="3000" type="application/x-bittorrent"/>"#,
+        ),
+        None,
+        false,
+    )
+    .await;
+
+    rig.service.run_all_sync().await.unwrap();
+
+    assert_eq!(rig.torrent_fetches.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.seen()[0].1, WAITING);
+
+    rig.turn_torrents(true).await;
+    rig.service.run_all_sync().await.unwrap();
+
+    assert_eq!(rig.torrent_fetches.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.torrent_jobs().len(), 1);
+    assert_eq!(rig.seen()[0].1, "submitted");
 }
 
 // A torrent the client already holds, from this feed or any other origin.
@@ -433,4 +517,129 @@ async fn a_torrent_the_client_already_holds_is_ignored_as_already_added() {
             ),
         ]
     );
+}
+
+// One read of which items are seen and one write of what the poll records
+// give the rows and counts the per-item check and write gave: an item seen
+// before is left as it was, an item the page lists twice is judged once,
+// and each new item gets the row it got before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_poll_records_its_items_together_with_the_rows_one_by_one_gave() {
+    let page = format!(
+        "{}{}{}{}{}",
+        item("old", &format!("<link>{}</link>", magnet())),
+        item("a", &format!("<link>{}</link>", magnet())),
+        item("a", &format!("<link>{}</link>", magnet())),
+        "<item><guid>x</guid><title>Other x</title></item>",
+        item("b", &format!("<link>{}</link>", magnet())),
+    );
+    let rig = rig(&page, None, true).await;
+    let before = RssSeenItemRow {
+        feed_id: 1,
+        item_id: "old".to_string(),
+        item_title: "Silver Horizon old".to_string(),
+        published_at: None,
+        size_bytes: None,
+        decision: "submitted".to_string(),
+        seen_at: crate::rss::model::unix_now_secs() - 60,
+        job_id: Some(77),
+        item_url: None,
+        error: None,
+    };
+    rig.db.insert_rss_seen_item(&before).unwrap();
+
+    let report = rig.service.run_all_sync().await.unwrap();
+
+    assert_eq!(
+        (
+            report.items_fetched,
+            report.items_new,
+            report.items_accepted,
+            report.items_submitted,
+            report.items_ignored,
+        ),
+        (5, 3, 2, 1, 2),
+        "{report:?}"
+    );
+    let jobs = rig.torrent_jobs();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        rig.seen(),
+        vec![
+            ("a".into(), "submitted".into(), Some(jobs[0]), None),
+            (
+                "b".into(),
+                "ignored".into(),
+                None,
+                Some("already added".into())
+            ),
+            ("old".into(), "submitted".into(), Some(77), None),
+            ("x".into(), "ignored".into(), None, None),
+        ]
+    );
+    let rows = rig.db.list_rss_seen_items(Some(1), None).unwrap();
+    let old = rows.iter().find(|row| row.item_id == "old").unwrap();
+    assert_eq!(old, &before);
+    let a = rows.iter().find(|row| row.item_id == "a").unwrap();
+    assert_eq!(a.item_title, "Silver Horizon a");
+    assert_eq!(a.item_url, Some(magnet().replace("&amp;", "&")));
+    let x = rows.iter().find(|row| row.item_id == "x").unwrap();
+    assert_eq!((x.item_url.as_deref(), x.size_bytes), (None, None));
+}
+
+// A due pass with no feed due writes no row, and a poll the feed answers
+// "not modified" writes only the feed's poll time: no seen row is written
+// again. Triggers on the two tables count every row written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_pass_and_an_unchanged_feed_write_no_seen_rows() {
+    use sqlx::Connection;
+    let rig = rig(
+        &item("a", &format!("<link>{}</link>", magnet())),
+        None,
+        true,
+    )
+    .await;
+    rig.service.run_all_sync().await.unwrap();
+    let seen = rig.db.list_rss_seen_items(Some(1), None).unwrap();
+
+    let options =
+        sqlx::sqlite::SqliteConnectOptions::new().filename(rig._dir.path().join("rss.sqlite"));
+    let mut connection = sqlx::SqliteConnection::connect_with(&options)
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE test_rss_writes (target TEXT NOT NULL);
+         CREATE TRIGGER test_seen_insert AFTER INSERT ON rss_seen_items
+           BEGIN INSERT INTO test_rss_writes VALUES ('seen'); END;
+         CREATE TRIGGER test_seen_update AFTER UPDATE ON rss_seen_items
+           BEGIN INSERT INTO test_rss_writes VALUES ('seen'); END;
+         CREATE TRIGGER test_seen_delete AFTER DELETE ON rss_seen_items
+           BEGIN INSERT INTO test_rss_writes VALUES ('seen'); END;
+         CREATE TRIGGER test_feed_update AFTER UPDATE ON rss_feeds
+           BEGIN INSERT INTO test_rss_writes VALUES ('feed'); END;",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    async fn writes(connection: &mut sqlx::SqliteConnection) -> Vec<String> {
+        sqlx::query_as::<_, (String,)>("SELECT target FROM test_rss_writes ORDER BY rowid")
+            .fetch_all(connection)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(target,)| target)
+            .collect()
+    }
+
+    assert!(matches!(
+        rig.service.try_run_due_sync().await.unwrap(),
+        DueSyncOutcome::NoFeedsDue
+    ));
+    assert!(writes(&mut connection).await.is_empty());
+
+    let report = rig.service.run_all_sync().await.unwrap();
+    assert_eq!(report.items_fetched, 0, "{report:?}");
+    assert_eq!(writes(&mut connection).await, ["feed"]);
+    assert_eq!(rig.db.list_rss_seen_items(Some(1), None).unwrap(), seen);
+    connection.close().await.unwrap();
 }

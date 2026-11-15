@@ -283,22 +283,16 @@ impl RssService {
         Ok(report)
     }
 
-    // The items held while torrents were off are taken up once, as torrents
-    // come on, before the feeds are read: their feeds are then read whole.
-    // A sync with torrents as they were reads and writes nothing for it.
+    // While torrents take new ones, every sync first takes up the items
+    // held while they were off, before the feeds are read: those feeds are
+    // then read whole. With none held this is one indexed read, no write.
     async fn take_up_waiting_items(&self) {
-        let on = self.torrents_take_new();
-        let were_on = &self.inner.torrents_were_on;
-        if !on {
-            were_on.store(false, std::sync::atomic::Ordering::Relaxed);
-            return;
-        }
-        if were_on.load(std::sync::atomic::Ordering::Relaxed) {
+        if !self.torrents_take_new() {
             return;
         }
         let db = self.inner.db.clone();
         match tokio::task::spawn_blocking(move || db.release_rss_waiting_items()).await {
-            Ok(Ok(_)) => were_on.store(true, std::sync::atomic::Ordering::Relaxed),
+            Ok(Ok(_)) => {}
             Ok(Err(error)) => {
                 warn!(error = %error, "the RSS items held while torrents were off were not taken up");
             }
@@ -469,16 +463,33 @@ impl RssService {
             ..Default::default()
         };
 
+        // Which items are seen is read once, and the rows this poll records
+        // are written together with its success. An item the page lists
+        // twice is judged once, as when each row was written as it came.
+        let item_ids = items
+            .iter()
+            .map(|item| item.item_id.clone())
+            .collect::<Vec<_>>();
+        let mut seen = self
+            .inner
+            .db
+            .seen_rss_item_ids(feed.id, &item_ids)
+            .map_err(|e| RssServiceError::Http(e.to_string()))?;
+        let mut rows = Vec::new();
+        macro_rules! record {
+            ($item:expr, $decision:expr, $job:expr, $error:expr) => {{
+                seen.insert($item.item_id.clone());
+                rows.push(RssService::seen_row(
+                    feed.id, $item, $decision, $job, $error,
+                ));
+            }};
+        }
+
         for item in items {
             if cancellation.is_cancelled() {
-                return Ok(report);
+                return self.keep_cut_short(rows, report);
             }
-            if self
-                .inner
-                .db
-                .rss_seen_item_exists(feed.id, &item.item_id)
-                .map_err(|e| RssServiceError::Http(e.to_string()))?
-            {
+            if seen.contains(&item.item_id) {
                 continue;
             }
 
@@ -487,7 +498,7 @@ impl RssService {
             match decision {
                 Some(rule) if rule.row.action == RssRuleAction::Reject => {
                     report.items_ignored += 1;
-                    self.record_seen(feed.id, &item, "rejected", None, None)?;
+                    record!(&item, "rejected", None, None);
                 }
                 Some(rule) => {
                     report.items_accepted += 1;
@@ -497,31 +508,25 @@ impl RssService {
                     {
                         Ok(job_id) => {
                             report.items_submitted += 1;
-                            self.record_seen(feed.id, &item, "submitted", Some(job_id), None)?;
+                            record!(&item, "submitted", Some(job_id), None);
                         }
                         Err(NotAdded::Ignored(reason)) => {
                             report.items_ignored += 1;
-                            self.record_seen(feed.id, &item, "ignored", None, Some(&reason))?;
+                            record!(&item, "ignored", None, Some(&reason));
                         }
                         // A torrent while torrents are off: held, once, so
                         // later polls fetch nothing for it, and judged anew
                         // once torrents are on.
                         Err(NotAdded::Waiting) => {
-                            self.record_seen(
-                                feed.id,
-                                &item,
-                                WAITING,
-                                None,
-                                Some("torrents are off"),
-                            )?;
+                            record!(&item, WAITING, None, Some("torrents are off"));
                         }
                         Err(NotAdded::Failed(error)) => {
                             if cancellation.is_cancelled() {
-                                return Ok(report);
+                                return self.keep_cut_short(rows, report);
                             }
                             report.items_ignored += 1;
                             report.errors.push(error.clone());
-                            self.record_seen(feed.id, &item, "error", None, Some(&error))?;
+                            record!(&item, "error", None, Some(&error));
                         }
                     }
                 }
@@ -532,7 +537,7 @@ impl RssService {
                     // recording its items then would leave them for good
                     // before the first accept rule could ever see them.
                     if accepts_any {
-                        self.record_seen(feed.id, &item, "ignored", None, None)?;
+                        record!(&item, "ignored", None, None);
                     }
                 }
             }
@@ -540,7 +545,27 @@ impl RssService {
 
         self.inner
             .db
-            .record_rss_poll_success(feed.id, now, etag.as_deref(), last_modified.as_deref())
+            .record_rss_feed_sync(
+                feed.id,
+                &rows,
+                now,
+                etag.as_deref(),
+                last_modified.as_deref(),
+            )
+            .map_err(|e| RssServiceError::Http(e.to_string()))?;
+        Ok(report)
+    }
+
+    // A poll cut short keeps the rows of the items it judged, as it did when
+    // each was written as it came, and records no success.
+    fn keep_cut_short(
+        &self,
+        rows: Vec<crate::RssSeenItemRow>,
+        report: RssFeedSyncReport,
+    ) -> Result<RssFeedSyncReport, RssServiceError> {
+        self.inner
+            .db
+            .insert_rss_seen_items(&rows)
             .map_err(|e| RssServiceError::Http(e.to_string()))?;
         Ok(report)
     }

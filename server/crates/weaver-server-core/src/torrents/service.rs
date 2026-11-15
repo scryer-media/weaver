@@ -1435,6 +1435,23 @@ fn root_index(root: StorageRoot) -> usize {
         .unwrap_or_default()
 }
 
+// The seeding terms of a torrent whose seeding goal is met, `None` while one
+// is left or for a forced torrent, which seeds past its goal.
+fn goal_met(
+    settings: &TorrentSettings,
+    rules: &[TrackerRule],
+    torrent: &Live,
+    now: i64,
+) -> Option<Seeding> {
+    if torrent.record.forced {
+        return None;
+    }
+    let policy = settings.policy(&torrent.record, torrent.rule(rules));
+    status::goal_left(&policy, &torrent.counters, torrent.have_bytes, now)
+        .is_none()
+        .then_some(policy)
+}
+
 // What the service keeps of each torrent while it lives.
 struct Live {
     record: TorrentRecord,
@@ -2840,29 +2857,40 @@ impl TorrentService {
     // Torrents a wind-down to the downloads alone stopped resume, now that
     // torrents are on: their intents written together, off the runtime,
     // under `live` as every intent write is. Torrents the operator stopped,
-    // or their goals did, stay stopped.
+    // or their goals did, stay stopped, and so does one whose goal is met
+    // by now: its mark is cleared in the same write, as its goal's stop.
     async fn resume_wound_down(&self) {
         let now = self.inner.clock.now_ms();
+        let settings = self.settings();
+        let rules = self.rules();
         let mut landings = Vec::new();
         {
             let mut live = self.inner.live.lock().await;
             let mut resumed = Vec::new();
+            let mut met = Vec::new();
             for torrent in live.values_mut() {
                 if !torrent.record.wound_down {
                     continue;
                 }
+                torrent.record.wound_down = false;
+                if goal_met(&settings, &rules, torrent, now).is_some() {
+                    met.push(torrent.record.job_id);
+                    continue;
+                }
                 torrent.settle(now);
                 torrent.record.intent = TorrentIntent::Resumed;
-                torrent.record.wound_down = false;
                 resumed.push(torrent.record.job_id);
                 landings.extend(self.queue_resume(torrent, now, true));
             }
-            if resumed.is_empty() {
+            if resumed.is_empty() && met.is_empty() {
                 return;
             }
             let db = self.inner.db.clone();
             match tokio::task::spawn_blocking(move || {
-                db.update_torrent_intents(&[(KeptIntent::Intent(TorrentIntent::Resumed), &resumed)])
+                db.update_torrent_intents(&[
+                    (KeptIntent::Intent(TorrentIntent::Resumed), &resumed),
+                    (KeptIntent::Intent(TorrentIntent::Stopped), &met),
+                ])
             })
             .await
             {
@@ -8775,7 +8803,15 @@ impl TorrentService {
             let mut wound_down = Vec::new();
             let mut met = Vec::new();
             for torrent in live.values_mut() {
-                if downloads_only && torrent.resumed() && (torrent.complete() || torrent.seeding())
+                // A seed whose goal is met in this pass ends by its goal,
+                // wind-down or not.
+                let met_policy = (torrent.seeding() && torrent.resumed())
+                    .then(|| goal_met(&settings, &rules, torrent, now))
+                    .flatten();
+                if met_policy.is_none()
+                    && downloads_only
+                    && torrent.resumed()
+                    && (torrent.complete() || torrent.seeding())
                 {
                     torrent.settle(now);
                     torrent.record.intent = TorrentIntent::Stopped;
@@ -8786,15 +8822,9 @@ impl TorrentService {
                     landings.extend(self.queue_resume(torrent, now, true));
                     continue;
                 }
-                // A forced torrent seeds past its goal.
-                if !torrent.seeding() || !torrent.resumed() || torrent.record.forced {
+                let Some(policy) = met_policy else {
                     continue;
-                }
-                let policy = settings.policy(&torrent.record, torrent.rule(&rules));
-                if status::goal_left(&policy, &torrent.counters, torrent.have_bytes, now).is_some()
-                {
-                    continue;
-                }
+                };
                 let finished = self.script_event(
                     torrent,
                     QueueEvent::SeedingFinished,

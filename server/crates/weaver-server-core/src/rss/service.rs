@@ -102,10 +102,6 @@ pub(super) struct RssServiceInner {
     pub(super) scheduled_paused: tokio::sync::watch::Sender<bool>,
     // The torrent client the feeds' torrents go to, once it runs.
     torrents: std::sync::OnceLock<TorrentService>,
-    // Whether torrents took new ones at the last sync, so the items held
-    // while they were off are taken up once, as they come on. False at
-    // start, so a start with torrents on takes up those a stop left.
-    pub(super) torrents_were_on: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     clock_origin: tokio::time::Instant,
     #[cfg(test)]
@@ -186,7 +182,6 @@ impl RssService {
                 sync_lock: Mutex::new(()),
                 scheduled_paused: tokio::sync::watch::channel(false).0,
                 torrents: std::sync::OnceLock::new(),
-                torrents_were_on: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
                 clock_origin: tokio::time::Instant::now(),
                 #[cfg(test)]
@@ -215,6 +210,17 @@ impl RssService {
 
         let fetched = match classify(download_url.as_bytes()) {
             Kind::Magnet(uri) => Ok(AddSource::Magnet(uri)),
+            // A link the feed says is a torrent waits unfetched while
+            // torrents take no new ones; it is fetched once they do.
+            _ if item.declared_torrent
+                && self
+                    .inner
+                    .torrents
+                    .get()
+                    .is_some_and(|torrents| !torrents.takes_new()) =>
+            {
+                return Err(NotAdded::Waiting);
+            }
             _ => {
                 let response = tokio::select! {
                     biased;
@@ -384,32 +390,29 @@ impl RssService {
         .map_err(RssServiceError::Http)
     }
 
-    pub(super) fn record_seen(
-        &self,
+    // The seen row of `item`, written with the rest of its poll's.
+    pub(super) fn seen_row(
         feed_id: u32,
         item: &FeedItem,
         decision: &str,
         job_id: Option<u64>,
         error: Option<&str>,
-    ) -> Result<(), RssServiceError> {
-        self.inner
-            .db
-            .insert_rss_seen_item(&RssSeenItemRow {
-                feed_id,
-                item_id: item.item_id.clone(),
-                item_title: item.title.clone(),
-                published_at: item.published_at,
-                size_bytes: item.size_bytes,
-                decision: decision.to_string(),
-                seen_at: crate::rss::model::unix_now_secs(),
-                job_id,
-                item_url: item
-                    .download_url
-                    .clone()
-                    .or_else(|| item.display_url.clone()),
-                error: error.map(str::to_string),
-            })
-            .map_err(|e| RssServiceError::Http(e.to_string()))
+    ) -> RssSeenItemRow {
+        RssSeenItemRow {
+            feed_id,
+            item_id: item.item_id.clone(),
+            item_title: item.title.clone(),
+            published_at: item.published_at,
+            size_bytes: item.size_bytes,
+            decision: decision.to_string(),
+            seen_at: crate::rss::model::unix_now_secs(),
+            job_id,
+            item_url: item
+                .download_url
+                .clone()
+                .or_else(|| item.display_url.clone()),
+            error: error.map(str::to_string),
+        }
     }
 }
 
