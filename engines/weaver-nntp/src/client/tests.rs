@@ -565,6 +565,135 @@ async fn blocking_capacity_holdoff_never_cools_healthy_server() {
     assert!(health.is_available(0));
 }
 
+// A provider that turns a dial away with 502 parks fresh lanes on that
+// server only: the next lane meets the holdoff without a socket, the lanes
+// already open keep fetching, the configured limit stands, and a peer server
+// is untouched.
+#[test]
+fn blocking_provider_rejection_parks_fresh_lanes_for_that_server_only() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_by_server = Arc::clone(&accepted);
+    std::thread::spawn(move || {
+        for socket in listener.incoming() {
+            let Ok(mut socket) = socket else { return };
+            let slot = accepted_by_server.fetch_add(1, Ordering::SeqCst);
+            std::thread::spawn(move || {
+                if slot >= 2 {
+                    let _ = socket.write_all(b"502 Too Many Connections\r\n");
+                    return;
+                }
+                socket.write_all(b"200 test server ready\r\n").unwrap();
+                let reader = BufReader::new(socket.try_clone().unwrap());
+                for line in reader.lines() {
+                    let Ok(line) = line else { return };
+                    let reply: &[u8] = if line == "CAPABILITIES" {
+                        READER_CAPABILITIES
+                    } else if line.starts_with("BODY ") {
+                        b"222 1 <test> body follows\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n"
+                    } else if line == "QUIT" {
+                        let _ = socket.write_all(b"205 closing\r\n");
+                        return;
+                    } else {
+                        b"500 unsupported\r\n"
+                    };
+                    if socket.write_all(reply).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    let mut capped = scripted_server(port, 0);
+    capped.max_connections = 8;
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![
+            capped,
+            ServerPoolConfig {
+                server: ServerConfig {
+                    host: "backup.example.com".into(),
+                    ..Default::default()
+                },
+                max_connections: 4,
+                group: 0,
+                ..ServerPoolConfig::default()
+            },
+        ],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        soft_timeout: UNREACHED_TIMEOUT,
+    });
+    // The peer is excluded throughout, so nothing ever dials it.
+    let only_capped = ServerSet::from([1]);
+
+    let mut open: Vec<_> = (0..2)
+        .map(|_| {
+            client
+                .try_acquire_blocking_body_lane(&[], only_capped)
+                .expect("the provider admits its first two connections")
+        })
+        .collect();
+    let refused = client
+        .try_acquire_blocking_body_lane(&[], only_capped)
+        .err()
+        .expect("the third connection is refused");
+    assert!(
+        matches!(
+            refused,
+            BlockingBodyLaneAcquireError::ProviderCapacity(NntpError::TooManyConnections)
+        ),
+        "{refused:?}"
+    );
+    assert!(client.pool().is_over_limit(ServerId(0)));
+    let accepted_after_rejection = accepted.load(Ordering::SeqCst);
+    assert_eq!(accepted_after_rejection, 3);
+
+    let held = client
+        .try_acquire_blocking_body_lane(&[], only_capped)
+        .err()
+        .expect("a held-off server opens no lane");
+    assert!(
+        matches!(
+            held,
+            BlockingBodyLaneAcquireError::ProviderCapacity(NntpError::ServerOverLimit { .. })
+        ),
+        "{held:?}"
+    );
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        accepted_after_rejection,
+        "a held-off server must not open another socket"
+    );
+    // The provider refused connections, not the configuration.
+    assert_eq!(client.pool().configured_connections(ServerId(0)), Some(8));
+    assert_eq!(client.pool().server_load(0), (6, 8));
+
+    // Lanes already open are untouched by the holdoff.
+    for lane in &mut open {
+        let trace = lane.fetch_decoded_sequential("<test>");
+        client.record_blocking_attempts(&trace.attempts);
+        let decoded = trace.result.expect("an open lane keeps fetching");
+        let bytes: Vec<u8> = decoded
+            .decoded
+            .iter()
+            .flat_map(|chunk| chunk.iter().copied())
+            .collect();
+        assert_eq!(bytes, b"A");
+    }
+    assert_eq!(accepted.load(Ordering::SeqCst), accepted_after_rejection);
+    assert_eq!(client.pool().health().blocking_lock().server(0).failure_count, 0);
+
+    // A peer server that never rejected anything is unaffected.
+    assert!(!client.pool().is_over_limit(ServerId(1)));
+    assert_eq!(client.pool().server_load(1), (4, 4));
+    drop(open);
+}
+
 #[test]
 fn blocking_lane_preserves_provider_capacity_rejection() {
     let error = NntpError::from_status(crate::types::StatusCode::new(502), "Too many connections");
@@ -1062,6 +1191,187 @@ async fn quota_blocked_fill_does_not_unlock_or_report_locked_backfill() {
         .await;
     assert_eq!(selection.eligible, vec![ServerId(1)]);
     assert!(selection.quota_blocked.is_none());
+}
+
+// A local listener a test must never dial. Nothing ever accepts on it, so
+// `never_dialled` reads the kernel's backlog without waiting.
+fn undialled_listener() -> (std::net::TcpListener, u16) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    (listener, port)
+}
+
+fn never_dialled(listener: &std::net::TcpListener) -> bool {
+    matches!(
+        listener.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    )
+}
+
+// The connection downloads use skips a fill server whose quota is spent and
+// opens on the next fill server, which serves the article. The capped server
+// is never dialled.
+#[tokio::test]
+async fn blocking_quota_rejection_fails_over_to_another_fill_server() {
+    let (capped_listener, capped_port) = undialled_listener();
+    let healthy_port = spawn_scripted_server(greeted_reader(vec![ScriptStep {
+        expect_prefix: Some("BODY "),
+        response: b"222 1 <quota-failover@example.com>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
+    }]))
+    .await;
+    let transfers = crate::transfer::ServerTransferRegistry::new();
+    let capped_control = transfers.configure(
+        StableServerId(111),
+        crate::transfer::ServerTransferConfig {
+            rate_bytes_per_sec: 0,
+            quota: Some(crate::transfer::QuotaRuntimeConfig {
+                limit_bytes: 0,
+                generation: 1,
+                retry_at: None,
+            }),
+        },
+    );
+    let mut capped = scripted_server(capped_port, 0);
+    capped.stable_id = StableServerId(111);
+    capped.transfer_control = Some(capped_control);
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![capped, scripted_server(healthy_port, 1)],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        soft_timeout: UNREACHED_TIMEOUT,
+    });
+
+    let trace = tokio::task::spawn_blocking(move || {
+        let mut lane = client
+            .try_acquire_blocking_body_lane(&[], ServerSet::EMPTY)
+            .expect("the second fill server opens a lane");
+        assert_eq!(lane.server_id(), ServerId(1));
+        let trace = lane.fetch_decoded_sequential("<quota-failover@example.com>");
+        client.record_blocking_attempts(&trace.attempts);
+        trace
+    })
+    .await
+    .unwrap();
+
+    let decoded = trace.result.expect("second fill server should succeed");
+    let decoded_bytes: Vec<u8> = decoded
+        .decoded
+        .iter()
+        .flat_map(|chunk| chunk.iter().copied())
+        .collect();
+    assert_eq!(decoded_bytes, b"A");
+    assert_eq!(trace.attempts.len(), 1);
+    assert_eq!(trace.attempts[0].server_idx, 1);
+    assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::Success);
+    assert!(never_dialled(&capped_listener));
+}
+
+// A fill server out of quota is no reason to open the backfill: the
+// connection downloads use reports that quota and opens no lane, and the
+// backfill is offered only once the fill server is excluded for the article.
+#[test]
+fn blocking_quota_blocked_fill_does_not_unlock_or_report_locked_backfill() {
+    let retry_at = Instant::now() + Duration::from_secs(60);
+    let client = quota_selection_client(&[false, true], &[(0, Some(retry_at))]);
+
+    let refused = client
+        .try_acquire_blocking_body_lane(&[], ServerSet::EMPTY)
+        .err()
+        .expect("a quota-blocked fill server must not open the backfill");
+    assert!(
+        matches!(
+            &refused,
+            BlockingBodyLaneAcquireError::Other(NntpError::QuotaBlocked(rejection))
+                if rejection.stable_server_id == StableServerId(1_000)
+        ),
+        "{refused:?}"
+    );
+    let selection = client
+        .try_blocking_body_server_selection_with_estimate(ServerSet::EMPTY, 0)
+        .expect("the health state is uncontended in this test");
+    assert!(selection.eligible.is_empty());
+
+    let selection = client
+        .try_blocking_body_server_selection_with_estimate(ServerSet::from([0]), 0)
+        .expect("the health state is uncontended in this test");
+    assert_eq!(selection.eligible, vec![ServerId(1)]);
+    assert!(selection.quota_blocked.is_none());
+}
+
+// A primary that goes silent spends the lane's active budget and fails the
+// article on that server alone. One soft timeout leaves the primary first in
+// line, and the healthy lower group stays behind it: nothing dials it. The
+// silence comes either before the body's status line or in the login a
+// mid-session 480 asks for.
+#[tokio::test]
+async fn blocking_soft_timeout_on_the_primary_does_not_unlock_a_healthy_lower_group() {
+    for reauth in [false, true] {
+        let primary_port = if reauth {
+            spawn_delayed_reauth_server().await
+        } else {
+            spawn_delayed_body_initial_server().await
+        };
+        let (backup_listener, backup_port) = undialled_listener();
+        let mut primary = scripted_server(primary_port, 0);
+        if reauth {
+            primary.server.username = Some("user".to_string());
+            primary.server.password = Some("pass".to_string());
+        }
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![primary, scripted_server(backup_port, 1)],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_millis(75),
+        });
+
+        let (client, trace) = tokio::task::spawn_blocking(move || {
+            let mut lane = client
+                .try_acquire_blocking_body_lane(&[], ServerSet::EMPTY)
+                .expect("the primary opens a lane");
+            assert_eq!(lane.server_id(), ServerId(0));
+            let trace = lane.fetch_decoded_sequential("<delayed@example.com>");
+            drop(lane);
+            client.record_blocking_attempts(&trace.attempts);
+            (client, trace)
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(
+                trace.result,
+                Err(DecodedBodyError::Nntp(NntpError::SoftTimeout(_)))
+            ),
+            "reauth={reauth}: {:?}",
+            trace.result.as_ref().err()
+        );
+        assert_eq!(trace.attempts.len(), 1, "reauth={reauth}");
+        assert_eq!(trace.attempts[0].server_idx, 0, "reauth={reauth}");
+        assert!(
+            trace.attempts[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("soft timeout")),
+            "reauth={reauth}: {:?}",
+            trace.attempts[0].error
+        );
+        let order = client
+            .blocking_body_server_order(ServerSet::EMPTY)
+            .expect("the health state is uncontended in this test");
+        assert_eq!(order.first(), Some(&ServerId(0)), "reauth={reauth}");
+        assert!(
+            matches!(
+                client
+                    .pool()
+                    .provider_policy()
+                    .eligibility(1, ServerSet::EMPTY, ServerSet::EMPTY, 1),
+                crate::provider_policy::ArticleEligibility::HigherPriority(_)
+            ),
+            "reauth={reauth}"
+        );
+        assert!(never_dialled(&backup_listener), "reauth={reauth}");
+    }
 }
 
 // The pipeline asks this on every article it takes, so it reads what each

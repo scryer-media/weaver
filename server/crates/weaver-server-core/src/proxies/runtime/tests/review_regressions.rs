@@ -5,7 +5,8 @@ use super::*;
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicUsize;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use weaver_nntp::{NntpClient, NntpConnection, ServerConfig, ServerId, client::NntpClientConfig};
+use weaver_nntp::client::{BlockingBodyLaneAcquireError, NntpClientConfig};
+use weaver_nntp::{BlockingNntpConnection, NntpClient, ServerConfig, ServerId, ServerSet};
 use weaver_tunnel::bridge::ConnectionOutcome;
 use weaver_tunnel::pipe::{DialError, Dialed, DialedStream, Dialer, Target};
 
@@ -16,9 +17,6 @@ enum Mode {
     AuthRejected,
     Truncated,
     NoResponse,
-    // The first rung's connect window runs out before the next rung answers,
-    // as a route's ladder does when its primary stalls.
-    StalledRung,
 }
 
 // What the network runtime hands NNTP for a server's route: one dial per
@@ -41,9 +39,6 @@ impl Dialer for FixtureDialer {
                 *modes.front().unwrap()
             }
         };
-        if matches!(mode, Mode::StalledRung) {
-            let _ = tokio::time::timeout(STALLED_RUNG, std::future::pending::<()>()).await;
-        }
         let outcome = Arc::new(ConnectionOutcome::default());
         let failures = self.failures.clone();
         outcome.on_failure(move || {
@@ -69,6 +64,9 @@ impl Dialer for FixtureDialer {
 fn nntp_fixture(mode: Mode) -> tokio::io::DuplexStream {
     let (client, peer) = tokio::io::duplex(4096);
     tokio::spawn(async move {
+        let mut body = b"222 1 <fixture> body\r\n".to_vec();
+        weaver_yenc::encode(b"payload", &mut body, 128, "fixture.bin").unwrap();
+        body.extend_from_slice(b".\r\n");
         let mut peer = BufReader::new(peer);
         peer.get_mut()
             .write_all(b"200 fixture ready\r\n")
@@ -95,7 +93,7 @@ fn nntp_fixture(mode: Mode) -> tokio::io::DuplexStream {
                 if matches!(mode, Mode::Truncated) {
                     (b"222 1 <fixture> body\r\npartial", true)
                 } else {
-                    (b"222 1 <fixture> body\r\npayload\r\n.\r\n", false)
+                    (body.as_slice(), false)
                 }
             } else if command.starts_with("HEAD") {
                 (
@@ -129,8 +127,6 @@ fn nntp_fixture(mode: Mode) -> tokio::io::DuplexStream {
 // Route and NNTP timeouts that a test does not exercise, set out of reach of a
 // slow runner so only the behavior under test can decide the outcome.
 const NOT_UNDER_TEST: Duration = Duration::from_secs(3600);
-// The connect window of a stalled rung.
-const STALLED_RUNG: Duration = Duration::from_millis(150);
 
 // A server reached through `modes`, and the count of stream failures its
 // connections report to their route.
@@ -161,52 +157,21 @@ fn config(modes: &[Mode], budget: Duration) -> (ServerConfig, Arc<AtomicUsize>) 
     (config, failures)
 }
 
-#[tokio::test]
-async fn quit_and_auth_rejection_do_not_fail_the_route_stream() {
-    for mode in [Mode::Healthy, Mode::AuthRejected] {
-        let (mut cfg, failures) = config(&[mode], NOT_UNDER_TEST);
-        if matches!(mode, Mode::AuthRejected) {
-            cfg.username = Some("fixture".into());
-            cfg.password = Some("fixture".into());
-        }
-        match NntpConnection::connect(&cfg).await {
-            Ok(mut connection) => connection.quit().await.unwrap(),
-            Err(error) => assert!(matches!(mode, Mode::AuthRejected), "{error}"),
-        }
-        tokio::task::yield_now().await;
-        assert_eq!(
-            failures.load(Ordering::SeqCst),
-            0,
-            "expected NNTP closure must not fail its route"
-        );
-    }
-}
-
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unexpected_nntp_eof_fails_only_that_connection_and_retries() {
     let (cfg, failures) = config(&[Mode::Truncated, Mode::Healthy], NOT_UNDER_TEST);
-    let mut cfg = NntpClientConfig::single(cfg, 1);
-    cfg.max_retries_per_server = 1;
-    let client = NntpClient::new(cfg);
-    let body = client.fetch_body("fixture").await.unwrap();
-    assert_eq!(body.as_ref(), b"payload\r\n");
+    let body = tokio::task::spawn_blocking(move || {
+        let mut truncated = BlockingNntpConnection::connect(&cfg).unwrap();
+        assert!(truncated.stream_yenc_article("fixture").is_err());
+        let mut retry = BlockingNntpConnection::connect(&cfg).unwrap();
+        let body = retry.stream_yenc_article("fixture").unwrap().chunks.concat();
+        retry.quit().unwrap();
+        body
+    })
+    .await
+    .unwrap();
+    assert_eq!(body, b"payload");
     assert_eq!(failures.load(Ordering::SeqCst), 1);
-    client.shutdown().await;
-}
-
-// The paused clock lets only the stalled rung's connect window move time, so
-// a loaded runner cannot spend the operation's soft budget.
-#[tokio::test(start_paused = true)]
-async fn fallback_establishment_preserves_the_article_soft_budget() {
-    // Establishment exceeds the article budget, and the fetch still lands.
-    let (cfg, failures) = config(&[Mode::StalledRung], STALLED_RUNG * 3);
-    let mut cfg = NntpClientConfig::single(cfg, 1);
-    cfg.soft_timeout = Duration::from_millis(50);
-    cfg.max_retries_per_server = 0;
-    let client = NntpClient::new(cfg);
-    client.fetch_body("fixture").await.unwrap();
-    assert_eq!(failures.load(Ordering::SeqCst), 0);
-    client.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -218,7 +183,7 @@ async fn blocking_nntp_reports_unexpected_eof_but_not_quit_or_auth_rejection() {
             cfg.password = Some("fixture".into());
         }
         tokio::task::spawn_blocking(move || {
-            match weaver_nntp::BlockingNntpConnection::connect(&cfg) {
+            match BlockingNntpConnection::connect(&cfg) {
                 Ok(mut connection) => {
                     if matches!(mode, Mode::NoResponse) {
                         assert!(
@@ -244,23 +209,27 @@ async fn blocking_nntp_reports_unexpected_eof_but_not_quit_or_auth_rejection() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_budget_does_not_extend_waiting_for_pool_capacity() {
     let (cfg, _) = config(&[Mode::Healthy], NOT_UNDER_TEST);
-    let mut cfg = NntpClientConfig::single(cfg, 1);
-    cfg.soft_timeout = Duration::from_millis(50);
-    let client = NntpClient::new(cfg);
-    let held = client.pool().acquire(ServerId(0)).await.unwrap();
-    // The route budget is an hour, so a pool wait that borrowed it would hang
-    // until the runner ends the test; only the 50 ms soft budget can end this
-    // wait with an acquire timeout.
-    let result = client.fetch_body("fixture").await;
+    let client = NntpClient::new(NntpClientConfig::single(cfg, 1));
+    let held = client
+        .pool()
+        .try_acquire_blocking_permit(ServerId(0))
+        .unwrap();
+    // The route budget is an hour, so a lane acquire that waited for the held
+    // connection under it would hang until the runner ends the test. With
+    // every connection held, the acquire answers at once.
+    let result = tokio::task::spawn_blocking(move || {
+        client.try_acquire_blocking_body_lane(&[], ServerSet::EMPTY)
+    })
+    .await
+    .unwrap();
     assert!(matches!(
         result,
-        Err(weaver_nntp::NntpError::AcquireTimeout(_))
+        Err(BlockingBodyLaneAcquireError::LocalCapacity)
     ));
     drop(held);
-    client.shutdown().await;
 }
 
 #[test]
