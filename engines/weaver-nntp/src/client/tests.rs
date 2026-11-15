@@ -108,13 +108,6 @@ async fn spawn_unterminated_body_server() -> u16 {
             .await
             .unwrap();
 
-        let group = read_command_line(&mut socket).await;
-        assert!(group.starts_with("GROUP "));
-        socket
-            .write_all(b"211 1 1 1 alt.binaries.test\r\n")
-            .await
-            .unwrap();
-
         let body = read_command_line(&mut socket).await;
         assert!(body.starts_with("BODY "));
         socket
@@ -2192,10 +2185,6 @@ async fn fetch_body_with_groups_traced_reports_successful_server_idx() {
             response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
         },
         ScriptStep {
-            expect_prefix: Some("GROUP "),
-            response: b"211 1 1 1 alt.binaries.test\r\n",
-        },
-        ScriptStep {
             expect_prefix: Some("BODY "),
             response: b"222 1 <exists@example.com>\r\npayload\r\n.\r\n",
         },
@@ -2221,6 +2210,83 @@ async fn fetch_body_with_groups_traced_reports_successful_server_idx() {
         Some("127.0.0.1".parse().unwrap())
     );
     assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::Success);
+}
+
+// A fetch with a group to select sends no GROUP to a server that has not
+// asked for one. The server answers the BODY with 412: the process learns
+// it needs a group, that connection is not used again, and the retry
+// selects the group on a new one before it asks for the BODY.
+#[tokio::test]
+async fn a_fetch_selects_a_group_only_after_a_412_asks_for_one() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        first.write_all(b"200 ready\r\n").await.unwrap();
+        assert!(
+            read_command_line(&mut first)
+                .await
+                .starts_with("CAPABILITIES")
+        );
+        first
+            .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+            .await
+            .unwrap();
+        let asked = read_command_line(&mut first).await;
+        assert!(
+            asked.starts_with("BODY "),
+            "no GROUP is sent first: {asked}"
+        );
+        first.write_all(b"412 no group selected\r\n").await.unwrap();
+
+        let (mut second, _) = listener.accept().await.unwrap();
+        second.write_all(b"200 ready\r\n").await.unwrap();
+        assert!(
+            read_command_line(&mut second)
+                .await
+                .starts_with("CAPABILITIES")
+        );
+        second
+            .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+            .await
+            .unwrap();
+        let asked = read_command_line(&mut second).await;
+        assert!(asked.starts_with("GROUP alt.binaries.test"), "{asked}");
+        second
+            .write_all(b"211 1 1 1 alt.binaries.test\r\n")
+            .await
+            .unwrap();
+        let asked = read_command_line(&mut second).await;
+        assert!(asked.starts_with("BODY "), "{asked}");
+        second
+            .write_all(b"222 1 <exists@example.com>\r\npayload\r\n.\r\n")
+            .await
+            .unwrap();
+    });
+
+    assert!(!crate::server_caps::requires_group_selection(
+        "127.0.0.1",
+        port
+    ));
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![scripted_server(port, 0)],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 1,
+        soft_timeout: Duration::from_secs(3600),
+    });
+    let trace = client
+        .fetch_body_with_groups_traced("<exists@example.com>", &[String::from("alt.binaries.test")])
+        .await;
+
+    assert_eq!(
+        trace.result.expect("the retry brings the article"),
+        "payload\r\n"
+    );
+    assert!(crate::server_caps::requires_group_selection(
+        "127.0.0.1",
+        port
+    ));
+    server.await.expect("the server saw the commands in order");
 }
 
 #[tokio::test]
@@ -2526,10 +2592,6 @@ async fn raw_timeout_cleanup_preserves_rate_debt_without_waiting() {
             response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
         },
         ScriptStep {
-            expect_prefix: Some("GROUP "),
-            response: b"211 1 1 1 alt.binaries.test\r\n",
-        },
-        ScriptStep {
             expect_prefix: Some("BODY "),
             response: b"222 1 <unterminated@example.com>\r\nbackup\r\n.\r\n",
         },
@@ -2586,10 +2648,6 @@ async fn grouped_body_missing_plus_transport_uncertainty_is_not_authoritative_no
             response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
         },
         ScriptStep {
-            expect_prefix: Some("GROUP "),
-            response: b"211 1 1 1 alt.binaries.test\r\n",
-        },
-        ScriptStep {
             expect_prefix: Some("BODY "),
             response: b"430 No such article\r\n",
         },
@@ -2604,10 +2662,6 @@ async fn grouped_body_missing_plus_transport_uncertainty_is_not_authoritative_no
         ScriptStep {
             expect_prefix: Some("CAPABILITIES"),
             response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("GROUP "),
-            response: b"211 1 1 1 alt.binaries.test\r\n",
         },
         ScriptStep {
             expect_prefix: Some("BODY "),
@@ -2788,10 +2842,6 @@ async fn fetch_body_prefer_excluding_falls_back_when_only_server_excluded() {
             response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
         },
         ScriptStep {
-            expect_prefix: Some("GROUP "),
-            response: b"211 1 1 1 alt.binaries.test\r\n",
-        },
-        ScriptStep {
             expect_prefix: Some("BODY "),
             response: b"222 1 <exists@example.com>\r\npayload\r\n.\r\n",
         },
@@ -2829,10 +2879,6 @@ async fn fetch_body_prefer_excluding_uses_alternate_server_first() {
         ScriptStep {
             expect_prefix: Some("CAPABILITIES"),
             response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("GROUP "),
-            response: b"211 1 1 1 alt.binaries.test\r\n",
         },
         ScriptStep {
             expect_prefix: Some("BODY "),
