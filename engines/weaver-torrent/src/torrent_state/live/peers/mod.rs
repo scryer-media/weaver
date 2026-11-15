@@ -3466,7 +3466,7 @@ mod tests {
     // afresh, so the test checks they are 50 of the right ones.
     #[tokio::test(start_paused = true)]
     async fn each_pex_message_from_the_shared_map_is_the_one_a_fresh_map_gives() {
-        use crate::torrent_state::live::{MAX_SENT_PEX_PEERS, pex_diff};
+        use crate::torrent_state::live::pex::{MAX_SENT_PEX_PEERS, pex_diff};
         use holepunch::is_local;
         let host = |i: u64| -> SocketAddr {
             let i = u8::try_from(i % 120).unwrap();

@@ -8,12 +8,38 @@ mod mapped_endpoint_tests;
 mod mapped_filter_tests;
 mod swarm_tests;
 
+use super::blocks::land_block;
+use super::peer::MAX_ALLOWED_IN_REQUEST_QUEUE;
+use super::peer::PeerRx;
+use crate::limits::LimitKind;
+use crate::peer_connection::PeerConnectionHandler;
+use crate::peer_connection::WriterRequest;
+use crate::peer_protocol::MY_EXTENDED_UT_HOLEPUNCH;
+use crate::peer_protocol::Message;
+use crate::peer_protocol::Piece;
+use crate::peer_protocol::Request;
+use crate::peer_protocol::extended::ExtendedMessage;
+use crate::peer_protocol::extended::handshake::ExtendedHandshake;
+use crate::peer_protocol::extended::ut_holepunch;
+use crate::peer_protocol::extended::ut_holepunch::UtHolepunch;
+use crate::peer_protocol::extended::ut_metadata::UtMetadata;
+use crate::peer_protocol::extended::ut_pex::MAX_PEX_MESSAGE_LEN;
+use crate::peer_protocol::extended::ut_pex::PexPeerInfo;
+use crate::peer_protocol::extended::ut_pex::UtPex;
+use crate::piece_priority::PiecePriority;
+use crate::session::CheckedIncomingConnection;
+use crate::session_stats::network::HolepunchEvent;
+use crate::torrent_state::paused::TorrentStatePaused;
+use futures::FutureExt;
+use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 use std::{
     collections::BTreeSet,
     future::Future,
     pin::Pin,
     sync::atomic::{AtomicBool, AtomicU32, AtomicUsize},
 };
+use tokio::sync::mpsc::unbounded_channel;
 
 use tempfile::TempDir;
 
