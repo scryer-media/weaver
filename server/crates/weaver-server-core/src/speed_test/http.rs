@@ -199,7 +199,7 @@ impl RoutedClient {
                     host: self.host.clone(),
                 }
             } else {
-                format!("GET {url} failed: {error}").into()
+                get_failed(url, &error).into()
             }
         })?;
         if !response.status().is_success() {
@@ -212,6 +212,24 @@ impl RoutedClient {
         drop(self.client);
         self.bridge.revoke().await;
     }
+}
+
+// A failed GET, named with the error's whole source chain: the request
+// error alone says only "error sending request for url", and the cause, a
+// refused connection or a reset, is in its sources. A source whose text the
+// message already carries is not repeated.
+pub(crate) fn get_failed(url: &reqwest::Url, error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = format!("GET {url} failed: {error}");
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !message.contains(&cause_text) {
+            message.push_str(": ");
+            message.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    message
 }
 
 // The roots the PEM file at `path` holds, each checked to be a certificate a
