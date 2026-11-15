@@ -991,6 +991,10 @@ async fn a_wireguard_session_carries_another_and_stays_up_while_it_rides() {
     // The lower session is busy for as long as the upper tunnel rides on it.
     assert!(!lower.retire_idle().await);
     assert!(upper.retire_idle().await);
+    // The upper tunnel's tasks are cancelled by its retire and let go of the
+    // socket they hold in the lower session as they end, which can be after
+    // the retire returns: wait for the last rider to leave.
+    drop(lower.activity.write().await);
     assert!(lower.retire_idle().await);
     assert_eq!(budget.available_permits(), 2);
 
