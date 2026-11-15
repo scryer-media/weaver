@@ -54,23 +54,6 @@ fn each_resolver_says_why_in_its_own_words() {
     }
 }
 
-// Only the DNS client's own failure says an answer was not authenticated;
-// words a peer echoed never do.
-#[test]
-fn no_words_read_as_not_authenticated() {
-    for said in [
-        crate::dns::NOT_AUTHENTICATED,
-        "proxy 7: the answer was not marked authenticated",
-        "upstream said: marked authenticated? no such host",
-    ] {
-        assert_ne!(classify(said), LookupFailure::NotAuthenticated, "{said}");
-    }
-    assert_eq!(
-        classify("upstream said: marked authenticated? no such host"),
-        LookupFailure::NoSuchName
-    );
-}
-
 #[tokio::test]
 async fn nothing_is_noted_outside_a_recording() {
     asking("outside.test", Asker::host);
@@ -100,11 +83,7 @@ async fn the_first_note_of_each_kind_stands() {
                 TrustOutcome::AsSent,
             );
             let later = DnsServer::plain(ip("192.0.2.54"));
-            answered(
-                "name.test",
-                Some(Answerer::of(&later)),
-                TrustOutcome::Refused,
-            );
+            answered("name.test", Some(Answerer::of(&later)), TrustOutcome::Bogus);
         })
         .await;
     assert_eq!(
@@ -284,10 +263,10 @@ async fn a_held_answer_is_noted_as_held_and_a_held_negative_says_what_kind() {
 }
 
 // A lookup judges its answer whatever the naming's trust, so one that
-// failed under As sent claims no trust, as under Require AD and Validate.
+// failed under As sent claims no trust, as under Validate.
 #[tokio::test]
 async fn a_failed_lookup_claims_no_trust_under_any_naming() {
-    for trust in [Trust::AsSent, Trust::RequireAd, Trust::Validate] {
+    for trust in [Trust::AsSent, Trust::Validate] {
         let recording = Arc::new(Recording::default());
         recording
             .scope(async {

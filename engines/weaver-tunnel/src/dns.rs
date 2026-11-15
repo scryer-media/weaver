@@ -22,7 +22,9 @@ use wire::{Session, Wires};
 
 mod dnssec;
 mod https;
+mod probe;
 mod wire;
+pub use probe::{Probed, ServerProbe, probe_server};
 
 // One DNS server Weaver asks, and how it is asked.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -109,8 +111,6 @@ impl std::fmt::Display for DnsServer {
 pub enum Trust {
     #[default]
     AsSent,
-    // Refuse an answer the server did not mark authenticated (the AD bit).
-    RequireAd,
     // Check the DNSSEC signatures here: unsigned names resolve, names that
     // fail the check do not.
     Validate,
@@ -119,10 +119,6 @@ pub enum Trust {
 // What routed DNS says when it fails, and `fault` reads back.
 pub(crate) const INVALID: &str = "routed DNS returned an invalid response";
 pub(crate) const UNRESOLVED: &str = "routed DNS could not resolve the destination";
-// A lookup whose servers gave no answer marked authenticated. It reads as
-// unresolved, and says why.
-pub(crate) const NOT_AUTHENTICATED: &str =
-    "routed DNS could not resolve the destination: no answer was marked authenticated";
 // A lookup whose answers failed the DNSSEC check, or came without the
 // records to check, under `Validate`.
 pub(crate) const NOT_VALIDATED: &str =
@@ -274,8 +270,6 @@ enum Failed {
     // The server answered with this error code instead of an answer.
     Rcode(u16),
     Invalid,
-    // The naming requires the AD bit and the reply did not carry it.
-    NotAuthenticated,
     // The TLS handshake or certificate check failed, for this fixed reason.
     Tls(&'static str),
     // The HTTPS server answered with this status instead of 200.
@@ -295,8 +289,7 @@ struct Why(Option<(LookupFailure, String)>);
 impl Why {
     fn rank(failure: LookupFailure) -> u8 {
         match failure {
-            LookupFailure::Bogus => 9,
-            LookupFailure::NotAuthenticated => 8,
+            LookupFailure::Bogus => 8,
             LookupFailure::DnssecUnavailable => 7,
             LookupFailure::NoSuchName => 6,
             LookupFailure::NoAddress => 5,
@@ -353,10 +346,6 @@ impl Why {
             Ok(Err(Failed::Invalid)) => {
                 self.consider(LookupFailure::Other, || format!("{server}: {INVALID}"))
             }
-            Ok(Err(Failed::NotAuthenticated)) => self
-                .consider(LookupFailure::NotAuthenticated, || {
-                    format!("{server}: the answer was not marked authenticated")
-                }),
             Ok(Err(Failed::Tls(reason))) => self.consider(LookupFailure::TlsFailed, || {
                 format!("{server}: TLS failed: {reason}")
             }),
@@ -410,7 +399,6 @@ async fn resolve_name(
 fn judged(trust: Trust) -> TrustOutcome {
     match trust {
         Trust::AsSent => TrustOutcome::AsSent,
-        Trust::RequireAd => TrustOutcome::Authenticated,
         Trust::Validate => TrustOutcome::Validated,
     }
 }
@@ -448,12 +436,10 @@ async fn resolve(
 }
 
 // Asks `servers` in order for `host`, and says how the lookup was judged:
-// `Authenticated` or `AsSent` for an answer it returns, positive or
-// negative, every used reply of which met `trust`; `Refused` for a lookup
-// that failed for want of an authenticated answer. Under `Validate`,
-// `Validated` or `Unsigned` for an answer it returns, and `Bogus` for a
-// lookup that failed for want of one that passed the check. Nothing
-// otherwise.
+// `AsSent` for an answer it returns, positive or negative. Under
+// `Validate`, `Validated` or `Unsigned` for an answer it returns, and
+// `Bogus` for a lookup that failed for want of one that passed the check.
+// Nothing otherwise.
 async fn resolve_judged(
     provider: &dyn Carrier,
     wires: &Wires,
@@ -579,7 +565,6 @@ async fn resolve_judged(
         negative_unsigned |= unsigned;
     }
     let nonexistent = matches!(why.0, Some((LookupFailure::NoSuchName, _)));
-    let refused = matches!(why.0, Some((LookupFailure::NotAuthenticated, _)));
     let not_validated = matches!(
         why.0,
         Some((LookupFailure::Bogus | LookupFailure::DnssecUnavailable, _))
@@ -601,25 +586,16 @@ async fn resolve_judged(
             (Ok(lookup), account)
         }
         None => {
-            // A lookup with no authenticated answer, or none that passed the
-            // DNSSEC check, fails. It is never a negative answer, so nothing
-            // holds it.
-            let judged = if refused {
-                Some(TrustOutcome::Refused)
-            } else if not_validated {
-                Some(TrustOutcome::Bogus)
-            } else {
-                None
-            };
+            // A lookup with no answer that passed the DNSSEC check fails. It
+            // is never a negative answer, so nothing holds it.
+            let judged = not_validated.then_some(TrustOutcome::Bogus);
             if let Some(judged) = judged {
                 record::answered(host, None, judged);
                 crate::metrics::record_dns_trust(judged);
             }
             let unanswered = Unanswered {
                 error: TunnelError::Engine(
-                    if refused {
-                        NOT_AUTHENTICATED
-                    } else if not_validated {
+                    if not_validated {
                         NOT_VALIDATED
                     } else {
                         UNRESOLVED
@@ -648,12 +624,6 @@ fn never_in_plain(server: &DnsServer, encrypted_before: bool) -> bool {
     encrypted_before && server.wire == Wire::Plain
 }
 
-// Whether a reply carries the AD bit: the server says it validated the
-// answer (RFC 4035 §3.2.3).
-fn authenticated(bytes: &[u8]) -> bool {
-    u16_at(bytes, 2).is_ok_and(|flags| flags & 0x0020 != 0)
-}
-
 async fn query(
     session: &mut Session<'_>,
     dnssec: &Dnssec,
@@ -670,6 +640,7 @@ async fn query(
         if !host_name(&name) || name.contains('\\') {
             return Err(Failed::Invalid);
         }
+        session.counting();
         return dnssec::validated(session, dnssec, &name, qtype, reached).await;
     }
     // The shortest TTL of the aliases followed so far.
@@ -682,13 +653,8 @@ async fn query(
             Wire::Plain | Wire::Tls { .. } => NEXT_ID.fetch_add(1, Ordering::Relaxed),
         };
         let mut packet = Vec::from(id.to_be_bytes());
-        // Recursion desired, and under `RequireAd` the AD bit, which asks
-        // the server to say whether it validated the answer (RFC 6840 §5.7).
-        let ad = match trust {
-            Trust::AsSent => 0,
-            Trust::RequireAd | Trust::Validate => 0x20,
-        };
-        packet.extend_from_slice(&[1, ad, 0, 1, 0, 0, 0, 0, 0, 0]);
+        // Recursion desired.
+        packet.extend_from_slice(&[1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
         if !host_name(&name) {
             return Err(Failed::Invalid);
         }
@@ -702,11 +668,6 @@ async fn query(
         let bytes = session.ask(&packet, reached).await?;
         let reply = parse_response(&bytes, id, &name, qtype)
             .map_err(|_| refusal(&bytes, id).map_or(Failed::Invalid, Failed::Rcode))?;
-        // Under `RequireAd` every reply the answer rests on must carry the
-        // AD bit: each alias step, and a reply saying there is no address.
-        if trust == Trust::RequireAd && !authenticated(&bytes) {
-            return Err(Failed::NotAuthenticated);
-        }
         ttl = ttl.min(reply.ttl);
         if !reply.addresses.is_empty() {
             return Ok(Found {

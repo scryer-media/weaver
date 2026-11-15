@@ -408,6 +408,7 @@ mod tests {
             endpoint: None,
             timeout: Duration::from_secs(30),
             naming: Naming::proxy_servers(Vec::new(), crate::dns::Trust::AsSent),
+            tunnel_dns: Vec::new(),
             resolver: Some(resolver),
             forwarding: Default::default(),
             failure: Default::default(),

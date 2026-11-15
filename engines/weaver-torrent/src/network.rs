@@ -30,6 +30,7 @@ pub use weaver_utp::{
 
 pub use crate::core::net::{
     BoxFuture, DatagramSend, DatagramSocket, Fragmenting, NoNames, Resolved, Resolver,
+    TorrentNaming,
 };
 pub use crate::type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite};
 pub use crate::vectored_traits::{

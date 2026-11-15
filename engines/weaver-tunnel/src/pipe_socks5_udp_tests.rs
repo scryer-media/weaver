@@ -34,6 +34,10 @@ fn hop(
         inner,
         timeout: Duration::from_secs(30),
         naming: Naming::Proxy,
+        endpoint_names: std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
+            crate::pipe::DnsChoice::System,
+            None,
+        ))),
         failure: HopFailure::default(),
     })
 }

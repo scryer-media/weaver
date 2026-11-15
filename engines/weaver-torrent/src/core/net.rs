@@ -368,6 +368,17 @@ impl Resolver for NoNames {
     }
 }
 
+/// How one torrent looks its names up and asks over HTTP: its trackers,
+/// HTTP and UDP, announces and scrapes, and its web seeds. A torrent added
+/// with none takes the session's resolver and clients. What the session
+/// looks up for no torrent, its DHT's bootstrap nodes among them, stays on
+/// the session's.
+#[derive(Clone)]
+pub struct TorrentNaming {
+    pub resolver: Arc<dyn Resolver>,
+    pub http_clients: Arc<dyn HttpClients>,
+}
+
 /// Where one HTTP request goes: the host its URL names, its port, and the
 /// addresses the engine checked for that host, none when the network
 /// resolves the name where it exits ([`Resolved::AtExit`]).

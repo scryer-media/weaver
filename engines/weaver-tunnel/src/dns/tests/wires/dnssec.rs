@@ -6,6 +6,8 @@ use super::*;
 use weaver_dnssec::testing::{FakeResolver, KeyAlgorithm, Zone as Signed};
 use weaver_dnssec::{Name, Query, RecordType};
 
+mod probe;
+
 // The time the fixture's signatures hold at: inside their window.
 const NOW: u64 = 1_100_000;
 // Well past the window's end, beyond any allowance for skew.

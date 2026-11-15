@@ -303,6 +303,9 @@ impl AddressDialer for TcpDialer {
 pub struct AddressPlan {
     label: String,
     state: Mutex<PlanState>,
+    // The DNS setting the kept addresses were looked up under. Only touched
+    // with `state` held.
+    naming: Mutex<Option<weaver_tunnel::pipe::DnsChoice>>,
     race_finished: Condvar,
     // The address families a dial on this leg found unreachable, one bit per
     // family (see [`family_bit`]). Kept for the life of the leg.
@@ -318,6 +321,7 @@ impl AddressPlan {
         Self {
             label,
             state: Mutex::new(PlanState::default()),
+            naming: Mutex::new(None),
             race_finished: Condvar::new(),
             unreachable_families: AtomicU8::new(0),
             #[cfg(test)]
@@ -393,9 +397,16 @@ impl AddressPlan {
         self: &Arc<Self>,
         dialer: &Arc<D>,
     ) -> io::Result<(D::Stream, SocketAddr)> {
+        let naming = weaver_tunnel::pipe::Names::current().map(|names| names.choice().clone());
         loop {
             let now = self.now();
-            let next = self.state().next(now);
+            let next = {
+                let mut state = self.state();
+                if !state.racing {
+                    self.adopt_naming(&mut state, &naming);
+                }
+                state.next(now)
+            };
             match next {
                 Next::Dial {
                     order, announce, ..
@@ -425,6 +436,25 @@ impl AddressPlan {
                 }
             }
         }
+    }
+
+    // Addresses looked up under another DNS setting are not this one's
+    // answer: drop them, and the pin among them, so a lookup under the new
+    // setting that answers nothing dials nothing. Connections already open
+    // are left alone.
+    fn adopt_naming(&self, state: &mut PlanState, naming: &Option<weaver_tunnel::pipe::DnsChoice>) {
+        let mut kept = self
+            .naming
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *kept == *naming {
+            return;
+        }
+        if !state.candidates.is_empty() || state.pinned.is_some() {
+            debug!(server = %self.label, "DNS setting changed; dropping the addresses found under the old one");
+        }
+        state.forget_candidates();
+        *kept = naming.clone();
     }
 
     fn dial_in_order<D: AddressDialer>(

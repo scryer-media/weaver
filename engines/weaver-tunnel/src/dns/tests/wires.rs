@@ -1307,29 +1307,15 @@ async fn doh_reads_a_response_that_arrives_a_byte_at_a_time() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn doh_replies_are_held_to_the_ad_bit() {
+async fn doh_replies_taken_as_sent_are_recorded_so() {
     let (servers, wires) = doh_servers(plain_reply);
-    let resolution = doh_lookup(&servers, &wires, Trust::RequireAd).await;
-    assert_eq!(
-        resolution.error,
-        Some(failure(
-            LookupFailure::NotAuthenticated,
-            "192.0.2.53: the answer was not marked authenticated"
-        ))
-    );
-    assert_eq!(resolution.trust, Some(record::TrustOutcome::Refused));
-    // The query asked for the AD bit.
-    let requests = servers.log.lock().unwrap().requests.clone();
-    assert_eq!(requests[0].body[2..4], [0x01, 0x20]);
-
-    let (servers, wires) = doh_servers(|_, mut reply| {
-        reply[3] |= 0x20;
-        dns_message(reply)
-    });
-    let resolution = doh_lookup(&servers, &wires, Trust::RequireAd).await;
+    let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
     assert_eq!(resolution.addresses, seven());
-    assert_eq!(resolution.trust, Some(record::TrustOutcome::Authenticated));
+    assert_eq!(resolution.trust, Some(record::TrustOutcome::AsSent));
     assert_eq!(resolution.wire, Some(WireKind::Https));
+    // The query asked for recursion and nothing else.
+    let requests = servers.log.lock().unwrap().requests.clone();
+    assert_eq!(requests[0].body[2..4], [0x01, 0x00]);
 }
 
 // Whether any connection carried the name asked, in the clear.
@@ -1533,7 +1519,7 @@ async fn tls_sessions_resume_within_a_naming_and_never_across_two() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_naming_records_a_failed_lookup_under_require_ad_as_judged_by_nobody() {
+async fn a_naming_records_a_failed_lookup_as_judged_by_nobody() {
     let trusted = Authority::new();
     let stranger = Authority::new();
     let servers = Servers::new(Speaks::Dot { close_after: None }, answers)
@@ -1544,7 +1530,7 @@ async fn a_naming_records_a_failed_lookup_under_require_ad_as_judged_by_nobody()
         ("192.0.2.53", LookupFailure::TlsFailed),
         ("192.0.2.54", LookupFailure::TimedOut),
     ] {
-        let naming = Naming::proxy_servers(vec![dot(address, None)], Trust::RequireAd);
+        let naming = Naming::proxy_servers(vec![dot(address, None)], Trust::AsSent);
         sessions(&naming).trust(&wires);
         let before = counted();
         let resolution = through_naming(&naming, &servers, "fixture.test").await;
@@ -1763,30 +1749,11 @@ async fn doh_over_http_2_completes_on_a_new_connection_after_a_goaway() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn doh_over_http_2_replies_are_held_to_the_ad_bit() {
+async fn doh_over_http_2_replies_taken_as_sent_are_recorded_so() {
     let (servers, wires) = h2_servers(h2_message, None, answers);
-    let resolution = doh_lookup(&servers, &wires, Trust::RequireAd).await;
-    assert_eq!(
-        resolution.error,
-        Some(failure(
-            LookupFailure::NotAuthenticated,
-            "192.0.2.53: the answer was not marked authenticated"
-        ))
-    );
-    assert_eq!(resolution.trust, Some(record::TrustOutcome::Refused));
-    assert!(resolution.addresses.is_empty());
-
-    let (servers, wires) = h2_servers(
-        |mut reply| {
-            reply[3] |= 0x20;
-            h2_message(reply)
-        },
-        None,
-        answers,
-    );
-    let resolution = doh_lookup(&servers, &wires, Trust::RequireAd).await;
+    let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
     assert_eq!(resolution.addresses, seven());
-    assert_eq!(resolution.trust, Some(record::TrustOutcome::Authenticated));
+    assert_eq!(resolution.trust, Some(record::TrustOutcome::AsSent));
     assert_eq!(resolution.wire, Some(WireKind::Https));
 }
 

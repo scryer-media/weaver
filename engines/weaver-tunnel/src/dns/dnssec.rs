@@ -58,6 +58,7 @@ impl Dnssec {
 // Asks the session's server for `name`'s records of `qtype`, and for every
 // key, delegation and denial that proves them, and checks the signatures.
 // A reply whose id is not the query's is a failed query, never one taken.
+// The caller says whether the session counts the queries it sends.
 pub(super) async fn validated(
     session: &mut Session<'_>,
     dnssec: &Dnssec,
@@ -70,7 +71,6 @@ pub(super) async fn validated(
         .and_then(|name| Question::new(name, RecordType(qtype)).ok())
         .ok_or(Failed::Invalid)?;
     let source = source(session.server());
-    session.counting();
     let mut validation = dnssec
         .validator()
         .begin_from(source, question, dnssec.now());

@@ -46,8 +46,13 @@ impl Dialer for AddressPlanned {
             self.egress.clone(),
         ));
         let plan = self.plan.clone();
+        // A blocking thread is outside the task, so the route's names go
+        // with the work.
+        let names = weaver_tunnel::pipe::Names::current();
         let (socket, peer) = tokio::task::spawn_blocking(move || {
-            weaver_tunnel::pipe::blocking(|| plan.connect(&dialer))
+            weaver_tunnel::pipe::Names::sync_scope(names, || {
+                weaver_tunnel::pipe::blocking(|| plan.connect(&dialer))
+            })
         })
         .await
         .map_err(|e| DialError::Egress(std::io::Error::other(e)))?

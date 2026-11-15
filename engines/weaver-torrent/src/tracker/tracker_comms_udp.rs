@@ -345,7 +345,6 @@ struct ClientLocked {
 
 struct ClientShared {
     sock: Arc<dyn DatagramSocket>,
-    resolver: Arc<dyn Resolver>,
     locked: RwLock<ClientLocked>,
 }
 
@@ -372,6 +371,9 @@ impl std::error::Error for NoAnswer {}
 #[derive(Clone)]
 pub struct UdpTrackerClient {
     state: Arc<ClientShared>,
+    // Looks up the hostnames of the trackers asked through this handle: a
+    // torrent's own resolver on the handle its trackers hold.
+    resolver: Arc<dyn Resolver>,
 }
 
 struct TransactionIdGuard<'a> {
@@ -415,9 +417,9 @@ impl UdpTrackerClient {
         let client = Self {
             state: Arc::new(ClientShared {
                 sock,
-                resolver,
                 locked: RwLock::new(Default::default()),
             }),
+            resolver,
         };
 
         spawn_with_cancel(debug_span!("udp_tracker"), "udp_tracker", cancel_token, {
@@ -428,9 +430,19 @@ impl UdpTrackerClient {
         client
     }
 
+    /// This client on the same socket, looking tracker hostnames up
+    /// through `resolver`: the handle one torrent's trackers are asked
+    /// through.
+    pub fn with_resolver(&self, resolver: Arc<dyn Resolver>) -> Self {
+        Self {
+            state: self.state.clone(),
+            resolver,
+        }
+    }
+
     /// The resolver for tracker hostnames.
     pub(crate) fn resolver(&self) -> &dyn Resolver {
-        &*self.state.resolver
+        &*self.resolver
     }
 
     async fn run(self) -> anyhow::Result<()> {

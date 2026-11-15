@@ -55,9 +55,6 @@ pub enum LookupFailure {
     ServerFailure,
     // No server answered at all.
     NoReply,
-    // The server answered without marking the answer authenticated, and the
-    // naming requires it.
-    NotAuthenticated,
     // The answer failed DNSSEC validation.
     Bogus,
     // The server returns no DNSSEC records, so nothing can be validated.
@@ -75,7 +72,6 @@ impl LookupFailure {
             Self::TimedOut => "TIMED_OUT",
             Self::ServerFailure => "SERVER_FAILURE",
             Self::NoReply => "NO_REPLY",
-            Self::NotAuthenticated => "NOT_AUTHENTICATED",
             Self::Bogus => "BOGUS",
             Self::DnssecUnavailable => "DNSSEC_UNAVAILABLE",
             Self::TlsFailed => "TLS_FAILED",
@@ -96,10 +92,6 @@ pub struct LookupError {
 pub enum TrustOutcome {
     // Taken as the server sent it.
     AsSent,
-    // The server marked it authenticated.
-    Authenticated,
-    // Refused, as the server did not mark it authenticated.
-    Refused,
     // Weaver checked its DNSSEC signatures and they held.
     Validated,
     // The zone is not signed, so there was nothing to check.
@@ -109,20 +101,11 @@ pub enum TrustOutcome {
 }
 
 impl TrustOutcome {
-    pub const ALL: [Self; 6] = [
-        Self::AsSent,
-        Self::Authenticated,
-        Self::Refused,
-        Self::Validated,
-        Self::Unsigned,
-        Self::Bogus,
-    ];
+    pub const ALL: [Self; 4] = [Self::AsSent, Self::Validated, Self::Unsigned, Self::Bogus];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::AsSent => "as_sent",
-            Self::Authenticated => "authenticated",
-            Self::Refused => "refused",
             Self::Validated => "validated",
             Self::Unsigned => "unsigned",
             Self::Bogus => "bogus",
@@ -439,7 +422,6 @@ const TIMED_OUT: [&str; 3] = ["timed out", "in time", "deadline exceeded"];
 pub(crate) fn classify(text: &str) -> LookupFailure {
     let text = text.to_ascii_lowercase();
     let said = |phrases: &[&str]| phrases.iter().any(|phrase| text.contains(phrase));
-    // Never NotAuthenticated: only the DNS client's own failure says that.
     if said(&NO_SUCH_NAME) {
         LookupFailure::NoSuchName
     } else if said(&NO_ADDRESS) {

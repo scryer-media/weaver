@@ -488,7 +488,9 @@ pub(crate) async fn get(
     }
     shape.place_query(&mut url, tracker.query(), query);
     let mut redirects = 0;
-    let response = loop {
+    // The client is kept until the body is read: what it rides may end with
+    // it, and a response does not hold its client.
+    let (_client, response) = loop {
         // Every hop, before its name is looked up (libtorrent
         // `http_tracker_connection::on_filter_hostname`, which
         // `http_connection::get` runs on the first URL and each redirect).
@@ -504,7 +506,7 @@ pub(crate) async fn get(
             .await
             .map_err(|_| anyhow::anyhow!("the tracker sent nothing for {RECEIVE_TIMEOUT:?}"))??;
         if !response.status().is_redirection() || redirects == MAX_REDIRECTS {
-            break response;
+            break (client, response);
         }
         let location = response
             .headers()

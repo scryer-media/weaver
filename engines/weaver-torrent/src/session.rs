@@ -26,7 +26,7 @@ use crate::clone_to_owned::CloneToOwned;
 use crate::core::{
     hash_id::InfoHashes,
     magnet::Magnet,
-    net::{ClientShape, HttpClients, NamedBy, NoClients, NoNames, Resolver},
+    net::{ClientShape, HttpClients, NamedBy, NoClients, NoNames, Resolver, TorrentNaming},
     spawn_utils::spawn_with_cancel,
     torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info, WebSeed, WebSeedKind},
     v2_tree::torrent_name,
@@ -835,6 +835,10 @@ pub struct AddTorrentOptions {
     /// the session's identity is used.
     #[serde(skip)]
     pub identity: Option<Identity>,
+    /// How the torrent looks its names up and asks its trackers and web
+    /// seeds. If not set, the session's resolver and HTTP clients are used.
+    #[serde(skip)]
+    pub naming: Option<TorrentNaming>,
     /// What the torrent moved before this session took it, as another
     /// session's [`ManagedTorrent::totals`] last read: its counters, and
     /// what its trackers hear, go on from there.
@@ -941,6 +945,7 @@ impl Default for AddTorrentOptions {
             checkpoint: None,
             piece_priorities: None,
             identity: None,
+            naming: None,
             totals: TorrentTotals::default(),
             disable_v1_hashes: v1_hashes_disabled_by_default(),
             super_seeding: false,
@@ -1656,6 +1661,7 @@ fn merge_tracker_tiers(
 struct PeerRequest<'a> {
     info_hashes: InfoHashes,
     identity: &'a Identity,
+    naming: &'a TorrentNaming,
     tracker_tiers: Vec<Vec<Tracker>>,
     announce: bool,
     force_tracker_interval: Option<Duration>,
@@ -1669,6 +1675,17 @@ struct PeerRequest<'a> {
     trackers: Option<TrackerTask>,
 }
 
+// What a torrent's tracker task starts from.
+struct TrackerStart<'a> {
+    info_hashes: InfoHashes,
+    identity: &'a Identity,
+    naming: &'a TorrentNaming,
+    tracker_tiers: Vec<Vec<Tracker>>,
+    force_tracker_interval: Option<Duration>,
+    trackers_only: bool,
+    ssl: Option<&'a Arc<SslTorrent>>,
+}
+
 impl Session {
     pub fn cancellation_token(&self) -> &CancellationToken {
         &self.cancellation_token
@@ -1676,6 +1693,15 @@ impl Session {
 
     pub fn identity(&self) -> &Identity {
         &self.identity
+    }
+
+    /// How a torrent added with no naming of its own looks names up and
+    /// asks over HTTP: the session's resolver and clients.
+    pub fn naming(&self) -> TorrentNaming {
+        TorrentNaming {
+            resolver: self.resolver.clone(),
+            http_clients: self.http_clients.clone(),
+        }
     }
 
     /// Create a new session with options.
@@ -3276,6 +3302,7 @@ impl Session {
             .identity
             .take()
             .unwrap_or_else(|| self.identity.clone());
+        let naming = opts.naming.take().unwrap_or_else(|| self.naming());
         let dht_announce = tokio::sync::watch::channel(()).0;
 
         let make_peer_rx = |info_hashes: InfoHashes,
@@ -3285,6 +3312,7 @@ impl Session {
             self.make_peer_rx(PeerRequest {
                 info_hashes,
                 identity,
+                naming: &naming,
                 tracker_tiers: tracker_tiers.clone(),
                 announce: !opts.paused && !opts.list_only,
                 force_tracker_interval: opts.force_tracker_interval,
@@ -3333,14 +3361,15 @@ impl Session {
                 // metadata arrives: until then it is taken to be, and asks
                 // its own trackers alone.
                 handover = handover.or_else(|| {
-                    self.start_trackers(
+                    self.start_trackers(TrackerStart {
                         info_hashes,
-                        &identity,
-                        tracker_tiers.clone(),
-                        opts.force_tracker_interval,
-                        true,
-                        None,
-                    )
+                        identity: &identity,
+                        naming: &naming,
+                        tracker_tiers: tracker_tiers.clone(),
+                        force_tracker_interval: opts.force_tracker_interval,
+                        trackers_only: true,
+                        ssl: None,
+                    })
                     .map(TrackerHandover::new)
                 });
                 let fetched = handover.as_ref().map(TrackerHandover::task);
@@ -3643,6 +3672,7 @@ impl Session {
                 announced_from: parking_lot::Mutex::new(handed_from.unwrap_or(opts.totals)),
                 handed_over: handed_from.is_some().into(),
                 web_seeds: Arc::new(WebSeeds::of_torrent(&metadata, &opts.web_seeds)),
+                naming: naming.clone(),
                 ssl,
                 run: Default::default(),
             });
@@ -3799,6 +3829,7 @@ impl Session {
         self.make_peer_rx(PeerRequest {
             info_hashes: t.info_hashes(),
             identity: &t.shared().identity(),
+            naming: &t.shared().naming,
             tracker_tiers: t.shared().tracker_tiers(),
             announce,
             force_tracker_interval: t.shared().options.force_tracker_interval,
@@ -3874,15 +3905,16 @@ impl Session {
     // A torrent's tracker task, under every hash it goes by. The task runs
     // with no tracker too, so trackers added later are announced to; a
     // session without trackers starts none.
-    fn start_trackers(
-        self: &Arc<Self>,
-        info_hashes: InfoHashes,
-        identity: &Identity,
-        tracker_tiers: Vec<Vec<Tracker>>,
-        force_tracker_interval: Option<Duration>,
-        trackers_only: bool,
-        ssl: Option<&Arc<SslTorrent>>,
-    ) -> Option<TrackerTask> {
+    fn start_trackers(self: &Arc<Self>, start: TrackerStart<'_>) -> Option<TrackerTask> {
+        let TrackerStart {
+            info_hashes,
+            identity,
+            naming,
+            tracker_tiers,
+            force_tracker_interval,
+            trackers_only,
+            ssl,
+        } = start;
         if self.disable_trackers {
             return None;
         }
@@ -3904,13 +3936,14 @@ impl Session {
             self.external_ips.tracker_vote(),
             match ssl {
                 Some(ssl) => Arc::new(SslHttpClients {
-                    inner: self.http_clients.clone(),
+                    inner: naming.http_clients.clone(),
                     ssl: ssl.clone(),
                 }),
-                None => self.http_clients.clone(),
+                None => naming.http_clients.clone(),
             },
             self.reachable(),
-            self.udp_tracker_client.clone(),
+            self.udp_tracker_client
+                .with_resolver(naming.resolver.clone()),
             self.stopped_announces.clone(),
             self.http_announces.clone(),
             self.allow_idna,
@@ -3937,6 +3970,7 @@ impl Session {
         let PeerRequest {
             info_hashes,
             identity,
+            naming,
             tracker_tiers,
             announce,
             force_tracker_interval,
@@ -3956,14 +3990,15 @@ impl Session {
 
         let (tracker_rx, trackers) = trackers
             .or_else(|| {
-                self.start_trackers(
+                self.start_trackers(TrackerStart {
                     info_hashes,
                     identity,
+                    naming,
                     tracker_tiers,
                     force_tracker_interval,
                     trackers_only,
                     ssl,
-                )
+                })
             })
             .map(|task| (task.peers, task.status))
             .unzip();

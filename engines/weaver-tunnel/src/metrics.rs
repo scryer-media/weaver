@@ -203,12 +203,22 @@ pub fn record_dns_wire(wire: WireKind) {
 }
 
 // How a lookup of routed DNS was judged: an answer taken as sent,
-// authenticated, validated or unsigned, or one refused for want of the AD
-// bit or for failing the DNSSEC check. Once per lookup; and bogus once more
+// validated or unsigned, or one refused for failing the DNSSEC check. Once per lookup; and bogus once more
 // for each address family that failed the check in a lookup the other
 // family answered.
 pub fn record_dns_trust(outcome: TrustOutcome) {
     DNS_TRUST[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    TRUST_HERE.with_borrow_mut(|judged| judged.push(outcome));
+}
+
+#[cfg(test)]
+thread_local! {
+    // Every outcome counted on this thread, in order. A test on a runtime of
+    // one thread reads the outcomes of its own lookups here, whatever other
+    // tests count at the same time.
+    pub(crate) static TRUST_HERE: std::cell::RefCell<Vec<TrustOutcome>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 // Queries sent to listed servers to check DNSSEC signatures, the address
