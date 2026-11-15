@@ -13,6 +13,7 @@ members = [
     "engines/weaver-objects",
     "engines/weaver-torrent",
     "engines/weaver-utp",
+    "engines/weaver-dnssec",
 ]
 exclude = ["fuzz"]
 resolver = "2"

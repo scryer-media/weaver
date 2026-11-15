@@ -26,6 +26,11 @@ tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 # HTTP/2 or HTTP/1.1 on that stream only: no pooled client, no connector, no resolver.
 hyper = { version = "1", default-features = false, features = ["client", "http1", "http2"] }
+# The HTTP/2 errors hyper passes on, read to tell a connection gone from a
+# query the server reset or a response this side refused.
+h2 = "0.4"
+# DNSSEC validation of the replies the listed servers send. No I/O of its own.
+weaver-dnssec = { path = "../weaver-dnssec" }
 
 # Reuse the approved HTTP/3 stack for local fixtures; absent from product builds.
 bytes = { workspace = true, optional = true }
@@ -45,9 +50,10 @@ proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag
 tokio = { workspace = true, features = ["test-util"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 # The DNS over HTTPS fixture servers: HTTP/1.1 read by hand, HTTP/2 through
-# the protocol crate hyper itself uses, which can send a GOAWAY on cue.
+# h2, the protocol crate hyper itself uses, which can send a GOAWAY on cue.
 httparse = { workspace = true }
-h2 = "0.4"
+# Signed fixture zones for the DNSSEC validation tests.
+weaver-dnssec = { path = "../weaver-dnssec", features = ["test-support"] }
 
 # The host name lookup lint names itself in `cfg(dylint_lib)` when it runs.
 [lints.rust]

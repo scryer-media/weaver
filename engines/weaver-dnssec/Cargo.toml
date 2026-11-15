@@ -1,0 +1,55 @@
+[package]
+name = "weaver-dnssec"
+publish = false
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+aws-lc-rs = { workspace = true }
+ed448-goldilocks-plus = { version = "0.18.1", default-features = false, features = ["signing"] }
+thiserror = { workspace = true }
+
+[[test]]
+name = "validator"
+required-features = ["test-support"]
+
+[[test]]
+name = "ed448"
+required-features = ["test-support"]
+
+[[test]]
+name = "deprecated_algorithms"
+required-features = ["test-support"]
+
+[[test]]
+name = "signature_parity"
+required-features = ["test-support"]
+
+[[test]]
+name = "denial_parity"
+required-features = ["test-support"]
+
+[[test]]
+name = "policy_parity"
+required-features = ["test-support"]
+
+[[test]]
+name = "assessment"
+required-features = ["test-support"]
+
+[[test]]
+name = "robustness"
+required-features = ["test-support"]
+
+[[test]]
+name = "replay_attacks"
+required-features = ["test-support"]
+
+[[example]]
+name = "parity_fixtures"
+required-features = ["test-support"]
