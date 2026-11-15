@@ -105,7 +105,10 @@ async fn rig() -> Rig {
             categories: Vec::new(),
             seeding: None,
             upload_cap: None,
-            torrent: TorrentConfig::default(),
+            torrent: TorrentConfig {
+                enabled: true,
+                ..TorrentConfig::default()
+            },
         },
         JobEnv::unbounded(),
         Arc::new(SystemClock),

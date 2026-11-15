@@ -423,6 +423,41 @@ pub struct SystemMetricsSnapshot {
     /// connection meter can follow the pool instead of waiting for the next
     /// `serverHealth` read.
     pub provider_connections: Vec<ProviderConnections>,
+    /// Whether torrents are on and whether there are torrents, so the web
+    /// shows torrent controls while either holds.
+    pub torrents: TorrentPresence,
+}
+
+/// Whether torrents are on, and the torrents there are.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct TorrentPresence {
+    /// The settings turn torrents on.
+    pub enabled: bool,
+    /// There is a torrent job, in any state.
+    pub jobs: bool,
+    /// A torrent job is not paused or stopped.
+    pub running: bool,
+    /// Torrents are off and the torrents still running are let finish.
+    pub winding_down: bool,
+}
+
+impl TorrentPresence {
+    pub(crate) fn of(
+        enabled: bool,
+        torrents: Option<&weaver_server_core::torrents::service::TorrentService>,
+    ) -> Self {
+        let presence = torrents
+            .map(|torrents| torrents.presence())
+            .unwrap_or_default();
+        Self {
+            enabled,
+            jobs: presence.jobs,
+            running: presence.running,
+            // A wind-down taken for a save still on its way is not one yet.
+            winding_down: !enabled
+                && torrents.is_some_and(|torrents| torrents.wind_down().is_some()),
+        }
+    }
 }
 
 /// How many of a server's connections are in use at one instant.

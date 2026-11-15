@@ -7,10 +7,12 @@ import { MemoryRouter } from "react-router";
 import { Client, Provider, fetchExchange } from "urql";
 import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
+import { NextDataContext, type NextData } from "@/next/data/next-data";
 import { nextEn } from "@/next/i18n/en";
 import { BackupPanel } from "@/next/pages/settings/panels/BackupPanel";
 import { SchedulesPanel } from "@/next/pages/settings/panels/SchedulesPanel";
-import { SettingsShellProvider } from "@/next/pages/settings/framework";
+import { SettingsShellProvider, type PanelFlags } from "@/next/pages/settings/framework";
+import { SearchRegistry } from "@/next/pages/settings/search";
 import "@/next/fonts.css";
 import "@/next/theme.css";
 
@@ -111,5 +113,5 @@ window.fetch = async (request, init) => {
 };
 const dictionary = { ...en, ...nextEn };
 const status = document.getElementById("status")!;
-const shell = { search: "", actionsRef: { current: null }, setFlags: (flags: { status: string | null }) => { status.textContent = flags.status ?? ""; }, controlsHost: document.getElementById("controls") };
-createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t: (key, values) => Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key), uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter><SettingsShellProvider {...shell}><main className="mx-auto max-w-[1400px] p-8">{location.search.includes("schedules") ? <SchedulesPanel /> : <BackupPanel />}</main></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);
+const shell = { search: "", actionsRef: { current: null }, setFlags: (flags: PanelFlags) => { status.textContent = typeof flags.status === "string" ? flags.status : ""; }, controlsHost: document.getElementById("controls"), registry: new SearchRegistry() };
+createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t: (key, values) => Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key), uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter><SettingsShellProvider {...shell}><NextDataContext.Provider value={{ torrents: "on", torrentPresence: { enabled: true, jobs: false, running: false, windingDown: false } } as NextData}><main className="mx-auto max-w-[1400px] p-8">{location.search.includes("schedules") ? <SchedulesPanel /> : <BackupPanel />}</main></NextDataContext.Provider></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);

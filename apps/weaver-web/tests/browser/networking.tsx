@@ -70,7 +70,7 @@ const client=new Client({url:"http://fixture.invalid/graphql",exchanges:[()=>ope
  const definition=operation.query.definitions.find(entry=>entry.kind==="OperationDefinition");
  const name=definition?.kind==="OperationDefinition"?definition.name?.value??"":"";
  const flow={...flowFor(initial,false),consumers:consumersFor(initial),proxies:profiles,proxyPools:pools,egresses};
- return fromValue({operation,data:name==="ProxyProfiles"?{proxyProfiles:profiles}:name==="Networking"?data:name==="NetworkFlow"||name==="NetworkFlowUpdates"?{networkFlow:flow}:name==="TestVia"?{testVia:testVia(operation.variables as TestVariables)}:{}});
+ return fromValue({operation,data:name==="ProxyProfiles"?{proxyProfiles:profiles}:name==="Networking"?data:name==="NetworkFlow"||name==="NetworkFlowUpdates"?{networkFlow:flow}:name==="TestVia"?{testVia:testVia(operation.variables as TestVariables)}:{},stale:false,hasNext:false});
 }))]});
 const action:NetworkingAction=async()=>null;
 const width=Number(new URLSearchParams(location.search).get("width")??1400);

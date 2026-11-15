@@ -221,9 +221,20 @@ impl Pick<'_> {
         settings: &TorrentSettings,
         live: &BTreeMap<JobId, Live>,
     ) -> Vec<JobId> {
+        self.ids_noting(settings, live, |_| {})
+    }
+
+    // As `ids`, with `note` shown every torrent of `live` in the same walk.
+    pub(super) fn ids_noting(
+        &self,
+        settings: &TorrentSettings,
+        live: &BTreeMap<JobId, Live>,
+        mut note: impl FnMut(&Live),
+    ) -> Vec<JobId> {
         let hashes = self.hashes.map(parsed);
         let mut kept: Vec<(i64, JobId)> = live
             .values()
+            .inspect(|torrent| note(torrent))
             .filter(|torrent| {
                 let record = &torrent.record;
                 hashes

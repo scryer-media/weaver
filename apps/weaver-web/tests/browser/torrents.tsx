@@ -11,6 +11,7 @@ import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
 import type { JobData } from "@/lib/job-types";
 import { ProtocolTag } from "@/next/components/chrome";
+import { NextDataContext, type NextData } from "@/next/data/next-data";
 import { statusDetail, useStatusLabel } from "@/next/data/status";
 import { AddNzbDialog } from "@/next/features/AddNzbDialog";
 import { TorrentDetail } from "@/next/features/torrents/TorrentDetail";
@@ -120,7 +121,7 @@ window.fetch = async (input, init) => {
 };
 
 const job = (rest: Partial<JobData>): JobData => ({
-  id: 1, name: "fixture", displayTitle: "fixture", originalTitle: "fixture", parsedRelease: {} as JobData["parsedRelease"],
+  id: 1, name: "fixture", displayTitle: "fixture", originalTitle: "fixture",
   status: "DOWNLOADING", progress: 0, totalBytes: 0, downloadedBytes: 0, optionalRecoveryBytes: 0, optionalRecoveryDownloadedBytes: 0,
   phaseProgress: [], failedBytes: 0, health: 1000, hasPassword: false, category: null, metadata: [], ...rest,
 });
@@ -180,7 +181,7 @@ const INHERIT = { state: "INHERIT", value: null } as const;
 
 /** A torrent's own terms: its ratio goal, every other term inherited. */
 const ratioOverride = (ratioGoal: number): SeedingPolicyData => ({
-  ratioGoal: { state: "SET", value: ratioGoal }, seedTimeGoalMinutes: INHERIT, inactiveGoalMinutes: INHERIT, mode: INHERIT, action: INHERIT,
+  ratioGoal: { state: "SET", value: ratioGoal }, seedTimeGoalMinutes: INHERIT, inactiveGoalMinutes: INHERIT, mode: INHERIT, action: INHERIT, seedTimeCounting: INHERIT,
 });
 
 /** A torrent whose ratio goal comes from `level`, and every other term from the global settings. */
@@ -189,15 +190,15 @@ const torrent = (id: number, level: SettingLevel, override: SeedingPolicyData | 
   forced: false, progress: 1, totalBytes: 2048, haveBytes: 2048, uploadedBytes: 0, downloadedBytes: 2048, ratio: 0.4,
   downloadBps: 0, uploadBps: 0, uploadLimit: null, downloadLimit: null, etaSeconds: null,
   peers: 9, seeds: 3, leechers: 6, maxPeers: 50, swarmSeeds: 12, swarmLeechers: 20, reannounceSeconds: null,
-  activeSeconds: 0, downloadAvgBps: 0, uploadAvgBps: 0, wastedBytes: 0, lastSeenCompleteMs: null,
+  activeSeconds: 0, seedingSeconds: 0, consecutiveSeedingSeconds: 0, downloadAvgBps: 0, uploadAvgBps: 0, wastedBytes: 0, lastSeenCompleteMs: null,
   pieceCount: null, pieceSize: null, piecesHave: null, createdBy: null, createdAtMs: null, comment: null,
   addedAtMs: 0, completedAtMs: null, savePath: null, unpack: false, unpackOverride: null, seedingLeft: null, route: null,
   seedingOverride: override,
   seedingPolicy: {
     ratioGoal: override?.ratioGoal.value ?? (level === "CATEGORY" ? 1.5 : 1),
-    seedTimeGoalMinutes: null, inactiveGoalMinutes: null, mode: "ANY", action: "STOP", uploadCap: null,
+    seedTimeGoalMinutes: null, inactiveGoalMinutes: null, mode: "ANY", action: "STOP", seedTimeCounting: "CUMULATIVE", uploadCap: null,
     levels: {
-      ratioGoal: level, seedTimeGoalMinutes: "GLOBAL", inactiveGoalMinutes: "GLOBAL", mode: "GLOBAL", action: "GLOBAL", uploadCap: "GLOBAL",
+      ratioGoal: level, seedTimeGoalMinutes: "GLOBAL", inactiveGoalMinutes: "GLOBAL", mode: "GLOBAL", action: "GLOBAL", seedTimeCounting: "GLOBAL", uploadCap: "GLOBAL",
     },
   },
   trackerRule: null,
@@ -268,7 +269,7 @@ function Fixture() {
   if (screen === "seeding") return <Seeding />;
   if (screen === "trackers" || screen === "privateTrackers") {
     const tracker = (url: string, source: TorrentTrackerData["source"]): TorrentTrackerData => ({
-      tier: 0, url, source, status: "WORKING", updating: false, message: null, seeders: 1, leechers: 0, peers: 1,
+      tier: 0, url, source, resolvedBy: null, status: "WORKING", updating: false, message: null, seeders: 1, leechers: 0, peers: 1,
     });
     const named = {
       ...torrent(5, "GLOBAL", null),
@@ -292,5 +293,5 @@ function Fixture() {
 createRoot(document.getElementById("root")!).render(
   <Provider value={client}><TranslateContext.Provider value={{
     t, uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {},
-  }}><MemoryRouter><main className="mx-auto max-w-[1000px] p-8"><Fixture /></main></MemoryRouter></TranslateContext.Provider></Provider>,
+  }}><MemoryRouter><NextDataContext.Provider value={{ torrents: "on", torrentPresence: { enabled: true, jobs: false, running: false, windingDown: false } } as NextData}><main className="mx-auto max-w-[1000px] p-8"><Fixture /></main></NextDataContext.Provider></MemoryRouter></TranslateContext.Provider></Provider>,
 );

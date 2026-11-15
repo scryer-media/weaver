@@ -13,8 +13,8 @@ export const SCHEDULE_ACTIONS = [
   { value: "pause", label: "next.schedules.pause" },
   { value: "resume", label: "next.schedules.resume" },
   { value: "pause_all", label: "next.schedules.pauseAll" },
-  { value: "pause_torrents", label: "next.schedules.pauseTorrents" },
-  { value: "resume_torrents", label: "next.schedules.resumeTorrents" },
+  { value: "pause_torrents", label: "next.schedules.pauseTorrents", torrentOnly: true },
+  { value: "resume_torrents", label: "next.schedules.resumeTorrents", torrentOnly: true },
   { value: "pause_post_processing", label: "next.schedules.pausePost" },
   { value: "resume_post_processing", label: "next.schedules.resumePost" },
   { value: "pause_watch_folder_scanning", label: "next.schedules.pauseWatchFolder" },
@@ -22,12 +22,17 @@ export const SCHEDULE_ACTIONS = [
   { value: "pause_rss", label: "next.schedules.pauseRss" },
   { value: "resume_rss", label: "next.schedules.resumeRss" },
   { value: "speed_limit", label: "next.schedules.setLimit" },
-  { value: "bandwidth_split", label: "next.schedules.setSplit" },
+  { value: "bandwidth_split", label: "next.schedules.setSplit", torrentOnly: true },
   { value: "hardware_profile", label: "next.schedules.setProfile" },
   { value: "set_server_active", label: "next.schedules.serverActive" },
   { value: "prune_history", label: "next.schedules.pruneHistory" },
   { value: "set_quota_metering", label: "next.schedules.quotaMetering" },
 ] as const;
+
+/** Whether a rule taking `actionType` acts on torrents alone. */
+export function torrentOnlyAction(actionType: string): boolean {
+  return SCHEDULE_ACTIONS.some((option) => option.value === actionType && "torrentOnly" in option);
+}
 
 /** The weekdays a rule may be narrowed to. Labels are translation keys. */
 export const SCHEDULE_DAYS = [

@@ -10,6 +10,7 @@ import {
   allocation,
   closedPath,
   directLeg,
+  isTorrentConsumer,
   OUTBOUND_CONSUMER,
   TORRENT_DEFAULT_CONSUMER,
   type ConsumerKind,
@@ -20,6 +21,8 @@ import {
 } from "@/lib/networking";
 import type { ProxyProfile } from "@/lib/proxies";
 import { refusalMessage } from "@/lib/refusal";
+import { withoutTorrentOnly } from "../../data/torrents-shown";
+import { useTorrentsShown } from "../../data/use-torrents-shown";
 
 export type NetworkingData = {
   egressInterfaces: Egress[];
@@ -239,7 +242,12 @@ export function useNetworkingWorkspace(page: string) {
   const measured = subscription.data?.networkFlow ?? initial.data?.networkFlow ?? EMPTY_FLOW;
   // Every sample carries the consumers, egresses and proxies afresh, and they
   // seldom change; what draws them is drawn again only when one of them has.
-  const consumers = useSameWhileUnchanged(flowConsumers(measured, data, t));
+  // The torrent routes (default, per category, per tracker rule) are listed,
+  // drawn and offered to the speed test only while torrents are on.
+  const torrentsOn = useTorrentsShown();
+  const consumers = useSameWhileUnchanged(
+    withoutTorrentOnly(flowConsumers(measured, data, t), torrentsOn, (consumer) => isTorrentConsumer(consumer.kind)),
+  );
   const flow = useMemo(() => plannedFlow(measured, consumers), [consumers, measured]);
   const egresses = useSameWhileUnchanged(measured.egresses ?? data?.egressInterfaces ?? NO_EGRESSES);
   const profiles = useSameWhileUnchanged(measured.proxies ?? data?.proxyProfiles ?? NO_PROFILES);

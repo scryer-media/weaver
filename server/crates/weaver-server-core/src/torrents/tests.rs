@@ -532,3 +532,32 @@ fn a_stored_file_level_reads_back_as_the_level_it_was() {
         assert_eq!(parse_file_priorities(value), None, "{value}");
     }
 }
+
+// The intents of more torrents than one statement can bind are written in
+// one call, each named torrent's and no other's.
+#[test]
+fn torrent_intents_past_the_bind_limit_are_written_together() {
+    let db = Database::open_in_memory().unwrap();
+    const TORRENTS: u64 = 2_000;
+    for job_id in 1..=TORRENTS {
+        let mut hash = [0u8; 20];
+        hash[..8].copy_from_slice(&job_id.to_be_bytes());
+        db.insert_torrent(&torrent(job_id, Some(hash), None), &[])
+            .unwrap();
+    }
+    // Every torrent but the last.
+    let named = (1..TORRENTS).map(JobId).collect::<Vec<_>>();
+    db.update_torrent_intents(&named, TorrentIntent::Stopped)
+        .unwrap();
+    for job_id in 1..=TORRENTS {
+        let intent = db.get_torrent(JobId(job_id)).unwrap().unwrap().intent;
+        let want = if job_id < TORRENTS {
+            TorrentIntent::Stopped
+        } else {
+            TorrentIntent::Resumed
+        };
+        assert_eq!(intent, want, "torrent {job_id}");
+    }
+    db.update_torrent_intents(&[], TorrentIntent::Paused)
+        .unwrap();
+}

@@ -120,7 +120,10 @@ fn config(complete_dir: &std::path::Path) -> SharedConfig {
     Arc::new(RwLock::new(Config {
         upload_cap: None,
         seeding: None,
-        torrent: Default::default(),
+        torrent: TorrentConfig {
+            enabled: true,
+            ..TorrentConfig::default()
+        },
         data_dir: complete_dir.to_string_lossy().into_owned(),
         hardware_profile: None,
         intermediate_dir: None,
@@ -218,7 +221,10 @@ async fn rig_on(
                 complete_dir: complete.clone(),
                 categories: Vec::new(),
                 seeding: None,
-                torrent: TorrentConfig::default(),
+                torrent: TorrentConfig {
+                    enabled: true,
+                    ..TorrentConfig::default()
+                },
             },
             JobEnv::unbounded(),
             Arc::new(SystemClock),
@@ -1438,7 +1444,10 @@ async fn the_dht_row_follows_the_torrents_rule_before_its_category() {
                 unpack: None,
             }],
             seeding: None,
-            torrent: TorrentConfig::default(),
+            torrent: TorrentConfig {
+                enabled: true,
+                ..TorrentConfig::default()
+            },
         })
         .await;
     let mut rule = rig

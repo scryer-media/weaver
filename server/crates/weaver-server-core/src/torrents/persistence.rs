@@ -1103,6 +1103,50 @@ impl Database {
         self.set_torrent_column("state", args)
     }
 
+    // `intent` for every torrent of `job_ids`, and no other column, in one
+    // transaction: one statement per bind-limit chunk of the list.
+    pub(crate) fn update_torrent_intents(
+        &self,
+        job_ids: &[JobId],
+        intent: TorrentIntent,
+    ) -> Result<(), StateError> {
+        if job_ids.is_empty() {
+            return Ok(());
+        }
+        let ids = job_ids
+            .iter()
+            .map(|job_id| stored(job_id.0))
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let intent = intent.as_str().to_string();
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "update_torrent_intents", |tx| {
+                let ids = ids.clone();
+                let intent = intent.clone();
+                Box::pin(async move {
+                    // The intent takes one bind of each statement.
+                    let rows = crate::persistence::sql_runtime::max_rows_for_tx(tx, 1)
+                        .saturating_sub(1)
+                        .max(1);
+                    for chunk in ids.chunks(rows) {
+                        let placeholders = vec!["{}"; chunk.len()].join(", ");
+                        let mut args = vec![SqlArg::Text(intent.clone())];
+                        args.extend(chunk.iter().copied().map(SqlArg::I64));
+                        tx.execute(
+                            &format!(
+                                "UPDATE torrents SET state = {{}} WHERE job_id IN ({placeholders})"
+                            ),
+                            &args,
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
     // When the torrent completed. Returns whether the torrent exists.
     pub fn set_torrent_completed(&self, job_id: JobId, at_ms: i64) -> Result<bool, StateError> {
         let args = vec![SqlArg::I64(at_ms), SqlArg::I64(stored(job_id.0)?)];

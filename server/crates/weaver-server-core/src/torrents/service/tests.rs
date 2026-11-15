@@ -3618,6 +3618,460 @@ async fn torrents_turn_off_and_on_while_running() {
     rig.service.stop().await;
 }
 
+// The settings with torrents turned off.
+fn turned_off(service: &TorrentService) -> TorrentSettings {
+    let mut settings = service.settings();
+    settings.torrent.enabled = false;
+    settings
+}
+
+// The wind-down a restart would read.
+fn kept_wind_down(rig: &Rig) -> Option<String> {
+    rig.db.get_setting(WIND_DOWN_KEY).unwrap()
+}
+
+// A torrent's download done, as the session would have said.
+async fn complete(rig: &Rig, job_id: JobId) {
+    rig.service
+        .inner
+        .live
+        .lock()
+        .await
+        .get_mut(&job_id)
+        .unwrap()
+        .record
+        .completed_at_ms = Some(EPOCH_MS);
+}
+
+// A seeding goal met as soon as the download is done, then a stop.
+fn stops_once_done() -> Option<SeedingPolicy> {
+    Some(SeedingPolicy {
+        seed_time_counting: Default::default(),
+        ratio_goal: Leaf::Set(0.0),
+        seed_time_goal_minutes: Leaf::Inherit,
+        inactive_goal_minutes: Leaf::Inherit,
+        mode: Leaf::Set(SeedingGoalMode::Any),
+        action: Leaf::Set(SeedingAction::Stop),
+    })
+}
+
+// Turning off with "stop now" asked for is turning off as ever: every
+// torrent stops at once, nothing is kept for a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turning_torrents_off_to_stop_now_stops_them_at_once() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    rig.service.wind_down_when_off(None).await;
+    rig.service.set_settings(turned_off(&rig.service)).await;
+    assert!(!rig.service.inner.sessions.on());
+    assert_eq!(rig.service.wind_down(), None);
+    assert_eq!(kept_wind_down(&rig), None);
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (view.state, view.route_reason),
+        (
+            TorrentState::Stopped,
+            Some(TorrentRouteReason::TorrentsDisabled)
+        )
+    );
+    assert_eq!(
+        rig.service
+            .add_opened(request(AddSource::Metainfo(plain("other", 2))))
+            .await,
+        Err(AddError::Off)
+    );
+}
+
+// Turning off to let torrents finish keeps them running, takes no new
+// one, and is kept for a restart; once the last has met its goal and
+// stopped, torrents are off and nothing is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turning_torrents_off_to_let_them_finish_ends_after_the_last_goal() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            policy_override: stops_once_done(),
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.service.presence(),
+        Presence {
+            jobs: true,
+            running: true
+        }
+    );
+    rig.service.wind_down_when_off(Some(WindDown::Finish)).await;
+    rig.service.set_settings(turned_off(&rig.service)).await;
+
+    // Still running, and no torrent is new.
+    assert!(rig.service.inner.sessions.on());
+    assert_eq!(rig.service.wind_down(), Some(WindDown::Finish));
+    assert_eq!(kept_wind_down(&rig).as_deref(), Some("finish"));
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_ne!(view.state, TorrentState::Stopped);
+    assert_eq!(view.route_reason, None);
+    assert_eq!(
+        rig.service
+            .add_opened(request(AddSource::Metainfo(plain("other", 2))))
+            .await,
+        Err(AddError::Off)
+    );
+    // A tick with the torrent still downloading ends nothing.
+    rig.service.tick().await;
+    assert_eq!(rig.service.wind_down(), Some(WindDown::Finish));
+
+    // Its download done, its goal is met: it stops, and torrents are off.
+    complete(&rig, job_id).await;
+    let mut wind_downs = rig.service.wind_downs();
+    rig.service.tick().await;
+    wind_downs
+        .wait_for(|wind_down| wind_down.is_none())
+        .await
+        .unwrap();
+    let _turning = rig.service.inner.turning.lock().await;
+    assert!(!rig.service.inner.sessions.on());
+    assert_eq!(kept_wind_down(&rig), None);
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().intent,
+        TorrentIntent::Stopped
+    );
+    assert_eq!(
+        rig.service.presence(),
+        Presence {
+            jobs: true,
+            running: false
+        }
+    );
+}
+
+// Turning off to finish the downloads stops every torrent done
+// downloading, a forced one included, and lets the others download; once
+// the last is done, torrents are off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turning_torrents_off_to_finish_downloads_stops_seeding() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let seeding = rig
+        .service
+        .add_opened(AddRequest {
+            forced: true,
+            ..request(AddSource::Metainfo(plain("seeding", 1)))
+        })
+        .await
+        .unwrap();
+    let downloading = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(plain("downloading", 2))))
+        .await
+        .unwrap();
+    complete(&rig, seeding).await;
+    rig.service
+        .wind_down_when_off(Some(WindDown::FinishDownloads))
+        .await;
+    rig.service.set_settings(turned_off(&rig.service)).await;
+    assert_eq!(kept_wind_down(&rig).as_deref(), Some("finish_downloads"));
+
+    let intent = |job_id| rig.db.get_torrent(job_id).unwrap().unwrap().intent;
+    rig.service.tick().await;
+    assert_eq!(intent(seeding), TorrentIntent::Stopped);
+    assert_eq!(intent(downloading), TorrentIntent::Resumed);
+    assert!(rig.service.inner.sessions.on());
+    assert_eq!(rig.service.wind_down(), Some(WindDown::FinishDownloads));
+
+    complete(&rig, downloading).await;
+    let mut wind_downs = rig.service.wind_downs();
+    rig.service.tick().await;
+    wind_downs
+        .wait_for(|wind_down| wind_down.is_none())
+        .await
+        .unwrap();
+    let _turning = rig.service.inner.turning.lock().await;
+    assert_eq!(intent(downloading), TorrentIntent::Stopped);
+    assert!(!rig.service.inner.sessions.on());
+    assert_eq!(kept_wind_down(&rig), None);
+}
+
+// A wind-down asked for with nothing running is over before it starts:
+// torrents are off at once. One asked for while torrents are already off
+// is not taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wind_down_with_nothing_running_turns_torrents_off_at_once() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    rig.service.wind_down_when_off(Some(WindDown::Finish)).await;
+    rig.service.set_settings(turned_off(&rig.service)).await;
+    assert!(!rig.service.inner.sessions.on());
+    assert_eq!(rig.service.wind_down(), None);
+    assert_eq!(kept_wind_down(&rig), None);
+
+    rig.service.wind_down_when_off(Some(WindDown::Finish)).await;
+    assert_eq!(rig.service.wind_down(), None);
+    assert_eq!(kept_wind_down(&rig), None);
+    assert_eq!(
+        rig.service
+            .add_opened(request(AddSource::Metainfo(plain("set", 1))))
+            .await,
+        Err(AddError::Off)
+    );
+}
+
+// A restart while torrents wind down keeps winding them down, sessions
+// open; a restart with torrents on drops a wind-down kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wind_down_is_kept_across_a_restart() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    rig.service
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    rig.service
+        .wind_down_when_off(Some(WindDown::FinishDownloads))
+        .await;
+    rig.service.set_settings(turned_off(&rig.service)).await;
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.turn_at_start(false).await;
+    assert_eq!(again.wind_down(), Some(WindDown::FinishDownloads));
+    assert!(again.inner.sessions.on());
+
+    let on = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    on.turn_at_start(true).await;
+    assert_eq!(on.wind_down(), None);
+    assert!(on.inner.sessions.on());
+    assert_eq!(kept_wind_down(&rig), None);
+}
+
+// A rig winding down to let its one torrent finish, and that torrent.
+async fn winding_down(wind_down: WindDown) -> (Rig, JobId) {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    rig.service.wind_down_when_off(Some(wind_down)).await;
+    rig.service.set_settings(turned_off(&rig.service)).await;
+    assert_eq!(rig.service.wind_down(), Some(wind_down));
+    assert!(kept_wind_down(&rig).is_some());
+    (rig, job_id)
+}
+
+// Turning torrents on again ends a wind-down, and a restart finds none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turning_torrents_on_again_ends_a_wind_down() {
+    let (rig, job_id) = winding_down(WindDown::Finish).await;
+    let mut on = rig.service.settings();
+    on.torrent.enabled = true;
+    rig.service.set_settings(on).await;
+    assert_eq!(rig.service.wind_down(), None);
+    assert_eq!(kept_wind_down(&rig), None);
+    assert!(rig.service.inner.sessions.on());
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().intent,
+        TorrentIntent::Resumed
+    );
+}
+
+// "Stop now" asked for while torrents wind down stops every one at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_now_during_a_wind_down_stops_them_at_once() {
+    let (rig, job_id) = winding_down(WindDown::Finish).await;
+    // As the settings save sends it: the wind-down first, then the settings.
+    assert_eq!(
+        rig.service.wind_down_when_off(None).await,
+        Some(WindDown::Finish)
+    );
+    rig.service.set_settings(turned_off(&rig.service)).await;
+    assert!(!rig.service.inner.sessions.on());
+    assert_eq!(rig.service.wind_down(), None);
+    assert_eq!(kept_wind_down(&rig), None);
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (view.state, view.route_reason),
+        (
+            TorrentState::Stopped,
+            Some(TorrentRouteReason::TorrentsDisabled)
+        )
+    );
+}
+
+// Removing the last torrent still running ends the wind-down at the next
+// tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_the_last_torrent_ends_a_wind_down() {
+    let (rig, job_id) = winding_down(WindDown::Finish).await;
+    rig.service.remove(job_id, false, true).await.unwrap();
+    assert!(!rig.service.presence().running);
+    let mut wind_downs = rig.service.wind_downs();
+    rig.service.tick().await;
+    wind_downs
+        .wait_for(|wind_down| wind_down.is_none())
+        .await
+        .unwrap();
+    let _turning = rig.service.inner.turning.lock().await;
+    assert!(!rig.service.inner.sessions.on());
+    assert_eq!(kept_wind_down(&rig), None);
+}
+
+// A wind-down a restart found, with nothing left running, ends at the
+// first tick after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_with_nothing_running_ends_its_wind_down_at_the_first_tick() {
+    let rig = rig(set_clock());
+    rig.service.stop().await;
+    rig.db.set_setting(WIND_DOWN_KEY, "finish").unwrap();
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    let mut settings = again.settings();
+    settings.torrent.enabled = false;
+    *again.inner.settings.write().unwrap() = settings;
+    again.turn_at_start(false).await;
+    assert_eq!(again.wind_down(), Some(WindDown::Finish));
+    assert!(again.inner.sessions.on());
+
+    let mut wind_downs = again.wind_downs();
+    again.tick().await;
+    wind_downs
+        .wait_for(|wind_down| wind_down.is_none())
+        .await
+        .unwrap();
+    let _turning = again.inner.turning.lock().await;
+    assert!(!again.inner.sessions.on());
+    assert_eq!(kept_wind_down(&rig), None);
+}
+
+// The settings save takes the wind-down before it saves the settings that
+// turn torrents off. Any caller that hands settings to the torrents in
+// between, the old ones or the saved ones, keeps it: none turns a wind-down
+// into a stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_handed_on_around_the_save_keep_its_wind_down() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    let before = rig.service.settings();
+    // The save's first step.
+    rig.service.wind_down_when_off(Some(WindDown::Finish)).await;
+    // Another caller, before the settings are saved, hands on the old ones.
+    rig.service.set_settings(before.clone()).await;
+    assert_eq!(rig.service.wind_down(), Some(WindDown::Finish));
+    // Another caller, after they are saved, hands on the new ones before
+    // the save does.
+    let mut off = before;
+    off.torrent.enabled = false;
+    rig.service.set_settings(off.clone()).await;
+    // And the save's own.
+    rig.service.set_settings(off).await;
+    assert_eq!(rig.service.wind_down(), Some(WindDown::Finish));
+    assert_eq!(kept_wind_down(&rig).as_deref(), Some("finish"));
+    assert!(rig.service.inner.sessions.on());
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_ne!(view.state, TorrentState::Stopped);
+    assert_eq!(view.route_reason, None);
+}
+
+// A save that failed after the wind-down was taken puts back what was
+// there: nothing while torrents are on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_save_drops_the_wind_down_it_took() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    rig.service
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    let was = rig.service.wind_down_when_off(Some(WindDown::Finish)).await;
+    assert_eq!(was, None);
+    rig.service.keep_wind_down_after_failed_save(was).await;
+    assert_eq!(rig.service.wind_down(), None);
+    assert_eq!(kept_wind_down(&rig), None);
+}
+
+// Many seeds done downloading are stopped by one pass of the wind-down,
+// written together, with the rows each stop alone wrote before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finishing_downloads_stops_many_seeds_in_one_pass_as_one_by_one_did() {
+    const SEEDS: u8 = 24;
+    async fn seeded() -> (Rig, Vec<JobId>) {
+        let rig = rig(set_clock());
+        rig.service.open().await.unwrap();
+        let mut ids = Vec::new();
+        for seed in 1..=SEEDS {
+            let job_id = rig
+                .service
+                .add_opened(request(AddSource::Metainfo(plain(
+                    &format!("seed{seed}"),
+                    seed,
+                ))))
+                .await
+                .unwrap();
+            complete(&rig, job_id).await;
+            ids.push(job_id);
+        }
+        rig.service
+            .wind_down_when_off(Some(WindDown::FinishDownloads))
+            .await;
+        rig.service.set_settings(turned_off(&rig.service)).await;
+        (rig, ids)
+    }
+
+    // One by one, as each stop wrote its own row.
+    let (old, old_ids) = seeded().await;
+    let now = old.service.inner.clock.now_ms();
+    let landings: Vec<_> = {
+        let mut live = old.service.inner.live.lock().await;
+        old_ids
+            .iter()
+            .filter_map(|job_id| old.service.stop_torrent(live.get_mut(job_id).unwrap(), now))
+            .collect()
+    };
+    for landing in landings {
+        let _ = old.service.landed(Some(landing)).await;
+    }
+
+    // One pass.
+    let (new, new_ids) = seeded().await;
+    new.service
+        .apply_goals(new.service.inner.clock.now_ms())
+        .await;
+
+    // Each rig keeps its files in a folder of its own.
+    let rows = |rig: &Rig, ids: &[JobId]| {
+        ids.iter()
+            .map(|job_id| {
+                let mut row = rig.db.get_torrent(*job_id).unwrap().unwrap();
+                let root = rig.dir.path().to_str().unwrap();
+                row.storage_dir = row
+                    .storage_dir
+                    .map(|dir| dir.strip_prefix(root).unwrap().to_owned());
+                row
+            })
+            .collect::<Vec<_>>()
+    };
+    let (old_rows, new_rows) = (rows(&old, &old_ids), rows(&new, &new_ids));
+    assert!(
+        new_rows
+            .iter()
+            .all(|row| row.intent == TorrentIntent::Stopped)
+    );
+    assert_eq!(new_rows, old_rows);
+}
+
 // A run the session refuses leaves the operator's intent as it was, and the
 // state shows the session's error, never a met goal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

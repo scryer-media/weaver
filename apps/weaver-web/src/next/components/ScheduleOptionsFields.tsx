@@ -235,10 +235,13 @@ function RateControl({
  * The targets a speed rule can set, one group per heading: the global limit,
  * then each egress, then each provider. Each is left as it is, lifted, or
  * given a rate; the global one also takes the upload rate it sets with it.
+ * Only torrents upload, so the upload rate shows only with `uploads`; a
+ * hidden one is saved as it was.
  */
-export function scheduleSpeedSections({ t, value, onChange, targets }: Omit<ScheduleOptionFields, "action"> & {
+export function scheduleSpeedSections({ t, value, onChange, targets, uploads }: Omit<ScheduleOptionFields, "action"> & {
   targets: ScheduleTargets | undefined;
-}): { id: string; title: string; note?: string; fields: FieldSpec[] }[] {
+  uploads: boolean;
+}):{ id: string; title: string; note?: string; fields: FieldSpec[] }[] {
   const setEntry = (key: string, entry: SpeedEntry | undefined) => {
     const { [key]: _dropped, ...rest } = value.speeds;
     onChange({ ...value, speeds: entry ? { ...rest, [key]: entry } : rest });
@@ -272,7 +275,7 @@ export function scheduleSpeedSections({ t, value, onChange, targets }: Omit<Sche
   const uploadProblem = globalEntry && globalEntry.upload !== null
     ? speedProblem({ download: null, upload: globalEntry.upload }, "GLOBAL")
     : null;
-  const globalUpload: FieldSpec[] = globalEntry
+  const globalUpload: FieldSpec[] = globalEntry && uploads
     ? [
         {
           id: "speed-GLOBAL-upload",

@@ -1772,6 +1772,35 @@ pub struct TorrentSettingsInput {
     pub ssl_enabled: Option<bool>,
     /// Null leaves the port to be chosen at random and kept.
     pub ssl_port: MaybeUndefined<u16>,
+    /// With `enabled: false`: how the torrents still running end. Left
+    /// out, they stop at once.
+    pub when_disabled: Option<TorrentDisableModeGql>,
+}
+
+/// How the torrents still running end when torrents are turned off. No new
+/// torrent is taken in any of them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentDisableMode")]
+pub enum TorrentDisableModeGql {
+    /// Every torrent stops now.
+    #[default]
+    StopNow,
+    /// Downloads finish; seeding stops; then torrents are off.
+    FinishDownloads,
+    /// Torrents download and seed to their own limits; then torrents are
+    /// off.
+    FinishAll,
+}
+
+impl TorrentDisableModeGql {
+    pub fn wind_down(self) -> Option<weaver_server_core::torrents::service::WindDown> {
+        use weaver_server_core::torrents::service::WindDown;
+        match self {
+            Self::StopNow => None,
+            Self::FinishDownloads => Some(WindDown::FinishDownloads),
+            Self::FinishAll => Some(WindDown::Finish),
+        }
+    }
 }
 
 impl TorrentSettingsInput {

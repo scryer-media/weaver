@@ -15,6 +15,7 @@ import { RoutesPage } from "@/next/features/networking/RoutesPage";
 import { nextEn } from "@/next/i18n/en";
 import { ProxiesPanel } from "@/next/pages/settings/panels/ProxiesPanel";
 import { SettingsShellProvider } from "@/next/pages/settings/framework";
+import { SearchRegistry } from "@/next/pages/settings/search";
 import "@/next/fonts.css";
 import "@/next/theme.css";
 
@@ -185,6 +186,6 @@ window.fetch = async (request, init) => {
 };
 const dictionary: Record<string, string> = { ...en, ...nextEn };
 const shell = {
-  search: "", actionsRef: { current: null }, setFlags: () => {}, controlsHost: document.getElementById("controls"),
+  search: "", actionsRef: { current: null }, setFlags: () => {}, controlsHost: document.getElementById("controls"), registry: new SearchRegistry(),
 };
 createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t: (key, values) => Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key), uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter><SettingsShellProvider {...shell}><main className="mx-auto flex max-w-[1400px] flex-col p-8"><PasswordManagersKeptOut value>{screen}</PasswordManagersKeptOut></main></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);

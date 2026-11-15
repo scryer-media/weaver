@@ -16,10 +16,11 @@ import { UNPACK_CHOICES, unpackChoice, unpackOf } from "@/lib/torrents";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Toggle } from "../../../components/controls";
-import { RecordEditor } from "../../../components/RecordEditor";
+import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
 import { Cell } from "../../../components/rows";
 import { testIds } from "../../../testids";
 import { useNextData } from "../../../data/next-data";
+import { useTorrentsShown } from "../../../data/use-torrents-shown";
 import { categoryColor } from "../../../data/palette";
 import { SettingsBlocks, type SettingsBlock } from "../framework";
 import {
@@ -96,6 +97,9 @@ export function CategoriesPanel() {
   const [{ data, fetching }, reexecute] = useQuery<{ categories: Category[] }>({ query: CATEGORIES_QUERY });
   // The rails and pickers elsewhere read the shared copy, which this panel's own query does not reach.
   const { refreshCategories } = useNextData("refreshCategories");
+  // A category's Torrents section shows only while torrents are on; a save
+  // sends its fields only when they were edited, so hiding it keeps them.
+  const torrentsOn = useTorrentsShown();
   const [{ data: settingsData }] = useQuery<{ settings: { completeDir: string; dataDir: string } }>({
     query: SETTINGS_QUERY,
   });
@@ -264,7 +268,7 @@ export function CategoriesPanel() {
               },
             ],
           },
-          {
+          ...(torrentsOn ? [{
             id: "torrents",
             title: t("next.categories.torrents"),
             fields: [
@@ -316,7 +320,7 @@ export function CategoriesPanel() {
               }),
               uploadCapField(t, form.uploadCap, (uploadCap) => setForm((current) => ({ ...current, uploadCap })), "categorySeeding"),
             ],
-          },
+          } satisfies EditorSection] : []),
         ]}
       />
 

@@ -3551,6 +3551,11 @@ type QueryRoot {
 	"""
 	systemStatus: SystemStatus!
 	"""
+	Whether torrents are on and whether there are torrents: the same
+	reading `systemMetricsUpdates` carries as `torrents`.
+	"""
+	torrentPresence: TorrentPresence!
+	"""
 	System metrics facade for integrations.
 	"""
 	systemMetrics: Metrics!
@@ -5627,6 +5632,41 @@ input StartApplicationUpgradeInput {
 }
 
 """
+One volume as the operating system presents it: what it takes and what
+is being written to it now.
+"""
+type StorageVolumeWriteRate {
+	"""
+	The mount path or drive root.
+	"""
+	label: String!
+	"""
+	"ssd", "platter", "network" or "unknown".
+	"""
+	storageKind: String!
+	"""
+	What the volume takes, in bytes per second; null until measured.
+	"""
+	writeRateBytesPerSecond: Int
+	"""
+	What Weaver wrote to the volume over the last window, in bytes per
+	second, whether or not the volume was the limit; null when nothing
+	was written.
+	"""
+	throughputBytesPerSecond: Int
+	"""
+	Bytes waiting in memory to be written to the volume.
+	"""
+	bufferedBytes: Int!
+	"""
+	The most bytes Weaver lets wait in memory for the volume before it
+	stops fetching for the jobs that write to it; null until the volume
+	has been given a limit.
+	"""
+	bufferLimitBytes: Int
+}
+
+"""
 What a submission became, read from its bytes.
 """
 enum SubmissionKind {
@@ -5850,6 +5890,12 @@ type SystemInfo {
 	memory: SystemMemoryInfo!
 	primaryStorage: SystemStorageProfile!
 	configuredStorage: [ConfiguredStorage!]!
+	"""
+	Every volume Weaver writes to, each with what it takes and what is
+	being written to it. Read
+	from what the disk owner holds; asks no disk.
+	"""
+	volumes: [StorageVolumeWriteRate!]!
 }
 
 type SystemMemoryInfo {
@@ -5880,6 +5926,11 @@ type SystemMetricsSnapshot {
 	`serverHealth` read.
 	"""
 	providerConnections: [ProviderConnections!]!
+	"""
+	Whether torrents are on and whether there are torrents, so the web
+	shows torrent controls while either holds.
+	"""
+	torrents: TorrentPresence!
 }
 
 type SystemStatus {
@@ -6134,6 +6185,26 @@ enum TorrentClient {
 	QBITTORRENT
 }
 
+"""
+How the torrents still running end when torrents are turned off. No new
+torrent is taken in any of them.
+"""
+enum TorrentDisableMode {
+	"""
+	Every torrent stops now.
+	"""
+	STOP_NOW
+	"""
+	Downloads finish; seeding stops; then torrents are off.
+	"""
+	FINISH_DOWNLOADS
+	"""
+	Torrents download and seed to their own limits; then torrents are
+	off.
+	"""
+	FINISH_ALL
+}
+
 enum TorrentEncryption {
 	PREFER
 	REQUIRE
@@ -6326,6 +6397,28 @@ type TorrentPortMapping {
 }
 
 """
+Whether torrents are on, and the torrents there are.
+"""
+type TorrentPresence {
+	"""
+	The settings turn torrents on.
+	"""
+	enabled: Boolean!
+	"""
+	There is a torrent job, in any state.
+	"""
+	jobs: Boolean!
+	"""
+	A torrent job is not paused or stopped.
+	"""
+	running: Boolean!
+	"""
+	Torrents are off and the torrents still running are let finish.
+	"""
+	windingDown: Boolean!
+}
+
+"""
 A torrent route and whether peers can reach its session.
 """
 type TorrentRoute {
@@ -6491,6 +6584,11 @@ input TorrentSettingsInput {
 	Null leaves the port to be chosen at random and kept.
 	"""
 	sslPort: Int
+	"""
+	With `enabled: false`: how the torrents still running end. Left
+	out, they stop at once.
+	"""
+	whenDisabled: TorrentDisableMode
 }
 
 enum TorrentState {

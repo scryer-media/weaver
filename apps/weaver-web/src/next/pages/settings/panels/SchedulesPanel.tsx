@@ -18,6 +18,8 @@ import { Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { settingsIds, testIds } from "../../../testids";
 import { SCHEDULE_TRACKS, type ScheduleTrack } from "../../../data/schedule-tracks";
+import { withoutTorrentOnly } from "../../../data/torrents-shown";
+import { useTorrentsShown } from "../../../data/use-torrents-shown";
 import {
   profileName,
   type HardwareProfileName,
@@ -25,7 +27,7 @@ import {
 } from "../../../data/hardware-profiles";
 import { SettingsBlocks, usePanelStatus, type SettingsBlock } from "../framework";
 import { scheduleActionFields, scheduleActionHelp, scheduleSpeedSections, scheduleTimingFields, useScheduleTargets } from "../../../components/ScheduleOptionsFields";
-import { NEW_SCHEDULE_OPTIONS, SCHEDULE_ACTIONS, SCHEDULE_DAYS, isOneShot, optionsFromSchedule, optionsInput, scheduleActionDetails, scheduleDaysLabel, scheduleTimeLabel, speedProblem, speedTarget, type ScheduleOptions, type ScheduleOptionsForm, type ScheduleTargets } from "../../../data/schedule-options";
+import { NEW_SCHEDULE_OPTIONS, SCHEDULE_ACTIONS, SCHEDULE_DAYS, isOneShot, optionsFromSchedule, optionsInput, scheduleActionDetails, scheduleDaysLabel, scheduleTimeLabel, speedProblem, speedTarget, torrentOnlyAction, type ScheduleOptions, type ScheduleOptionsForm, type ScheduleTargets } from "../../../data/schedule-options";
 
 /**
  * Schedules: a clock that pauses, resumes or throttles the queue, or switches
@@ -81,6 +83,7 @@ function actionLabel(t: Translate, schedule: Schedule, targets?: ScheduleTargets
 export function SchedulesPanel() {
   const t = useTranslate();
   const targets = useScheduleTargets();
+  const torrentsOn = useTorrentsShown();
   const [{ data, fetching }, reexecute] = useQuery<{ schedules: Schedule[] }>({ query: SCHEDULES_QUERY });
   const [, createSchedule] = useMutation(CREATE_SCHEDULE_MUTATION);
   const [, updateSchedule] = useMutation(UPDATE_SCHEDULE_MUTATION);
@@ -251,9 +254,13 @@ export function SchedulesPanel() {
         title: t(track.label),
         // The one group whose rules do not hold says so in place of the list's note.
         note: track.value === "ONE_SHOT" ? t("next.schedules.oneShotNote") : undefined,
-        rows: schedules
-          .filter((schedule) => schedule.track === track.value)
-          .map((schedule) => row(schedule)),
+        // A torrent-only rule is hidden with torrent things. Each rule saves
+        // on its own, so a hidden one is left as it is.
+        rows: withoutTorrentOnly(
+          schedules.filter((schedule) => schedule.track === track.value),
+          torrentsOn,
+          (schedule) => torrentOnlyAction(schedule.actionType),
+        ).map((schedule) => row(schedule)),
       })),
     },
   ];
@@ -352,7 +359,13 @@ export function SchedulesPanel() {
                 control: {
                   kind: "select",
                   value: form.actionType,
-                  options: SCHEDULE_ACTIONS.map((option) => ({ value: option.value, label: t(option.label) })),
+                  // Torrent-only actions are offered while torrents are on; a
+                  // rule that already takes one keeps it in the picker.
+                  options: withoutTorrentOnly(
+                    SCHEDULE_ACTIONS,
+                    torrentsOn,
+                    (option) => "torrentOnly" in option && option.value !== form.actionType,
+                  ).map((option) => ({ value: option.value, label: t(option.label) })),
                   onChange: (next) => setForm((current) => ({ ...current, actionType: next })),
                 },
               },
@@ -406,6 +419,7 @@ export function SchedulesPanel() {
             ? scheduleSpeedSections({
                 ...optionFields,
                 targets,
+                uploads: torrentsOn,
                 // A rate typed after a refused save takes back what was said about it.
                 onChange: (options) => {
                   setError(null);

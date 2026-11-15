@@ -109,7 +109,11 @@ async fn rig_on(routes: impl FnOnce(&weaver_server_core::Database) -> Arc<dyn Ro
             complete_dir: complete.clone(),
             categories: Vec::new(),
             seeding: None,
-            torrent: TorrentConfig::default(),
+            // Torrents on, as the open sessions say: a torrent is added only then.
+            torrent: TorrentConfig {
+                enabled: true,
+                ..TorrentConfig::default()
+            },
         },
         JobEnv::unbounded(),
         Arc::new(SystemClock),
@@ -376,7 +380,10 @@ async fn a_torrent_reads_its_leechers_file_progress_and_seeding_policy() {
             unpack: None,
         }],
         seeding: Some(policy(1.5)),
-        torrent: TorrentConfig::default(),
+        torrent: TorrentConfig {
+            enabled: true,
+            ..TorrentConfig::default()
+        },
     };
     rig.torrents.set_settings(settings.clone()).await;
 

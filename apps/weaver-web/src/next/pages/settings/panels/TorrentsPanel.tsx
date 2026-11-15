@@ -22,10 +22,21 @@ import type { ResolvedBy } from "@/lib/test-via";
 import { announceHosts, patternsOf, torrentAnnounces } from "@/lib/tracker-hosts";
 import { toBase64 } from "@/lib/utils";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
+import { Dialog } from "../../../components/Dialog";
+import {
+  asksHowTorrentsEnd,
+  stopNowInput,
+  torrentSettingsDisclosed,
+  torrentSwitchWaits,
+  windDownStoppable,
+  type TorrentDisableMode,
+} from "../../../data/torrents-shown";
+import { testIds } from "@/next/testids";
 import { SecondaryButton, Segmented, Select, TextField, Toggle } from "../../../components/controls";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { Cell } from "../../../components/rows";
 import { EM_DASH } from "../../../data/format";
+import { useNextData } from "../../../data/next-data";
 import { SettingsBlocks, useDraft, usePanelState, type FieldSpec, type SettingsBlock } from "../framework";
 import {
   GoalControl,
@@ -1209,6 +1220,10 @@ export function TorrentsPanel() {
     settings: { seeding: SeedingPolicy | null; uploadCap: number | null; torrent: TorrentConnection | null };
   }>({ query: TORRENT_SETTINGS_QUERY });
   const [updateState, updateSettings] = useMutation(UPDATE_TORRENT_SETTINGS_MUTATION);
+  // Whether torrents still run, so turning them off asks how they end; every
+  // other screen follows the same reading, pushed when the save lands.
+  const { torrentPresence } = useNextData("torrentPresence");
+  const [asking, setAsking] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const trackerRules = useTrackerRules(t);
@@ -1231,6 +1246,34 @@ export function TorrentsPanel() {
   });
   const values = draft.value;
 
+  // Saves the form; `whenDisabled` says how running torrents end when the
+  // save turns torrents off.
+  const send = (whenDisabled?: TorrentDisableMode) => {
+    if (!values || !source) {
+      return;
+    }
+    const seeding = seedingInput(values.seeding);
+    const seedingChanged = JSON.stringify(seeding) !== JSON.stringify(seedingInput(source.seeding));
+    const changed = connectionChanges(values.torrent, source.torrent);
+    const torrent = whenDisabled === undefined ? changed : { ...changed, whenDisabled };
+    setError(null);
+    void updateSettings({
+      input: {
+        ...(seedingChanged ? { seeding } : {}),
+        ...(values.uploadCap !== source.uploadCap ? { uploadCap: values.uploadCap } : {}),
+        ...(Object.keys(torrent).length > 0 ? { torrent } : {}),
+      },
+    }).then((result) => {
+      if (result.error || !result.data?.updateSettings) {
+        setError(result.error?.message ?? t("next.torrents.saveFailed"));
+        return;
+      }
+      draft.markSaved();
+      setStatus(t("next.settings.saved"));
+      void reexecute({ requestPolicy: "network-only" });
+    });
+  };
+
   usePanelState({
     dirty: draft.dirty,
     busy: updateState.fetching,
@@ -1252,33 +1295,74 @@ export function TorrentsPanel() {
         setError(t("next.torrents.portInvalid"));
         return;
       }
-      const seeding = seedingInput(values.seeding);
-      const seedingChanged = JSON.stringify(seeding) !== JSON.stringify(seedingInput(source.seeding));
-      const torrent = connectionChanges(values.torrent, source.torrent);
-      setError(null);
-      void updateSettings({
-        input: {
-          ...(seedingChanged ? { seeding } : {}),
-          ...(values.uploadCap !== source.uploadCap ? { uploadCap: values.uploadCap } : {}),
-          ...(Object.keys(torrent).length > 0 ? { torrent } : {}),
-        },
-      }).then((result) => {
-        if (result.error || !result.data?.updateSettings) {
-          setError(result.error?.message ?? t("next.torrents.saveFailed"));
-          return;
-        }
-        draft.markSaved();
-        setStatus(t("next.settings.saved"));
-        void reexecute({ requestPolicy: "network-only" });
-      });
+      // Turning torrents off while some run asks first how they end.
+      if (asksHowTorrentsEnd(source.torrent.enabled, values.torrent.enabled, torrentPresence)) {
+        setAsking(true);
+        return;
+      }
+      send();
     },
   });
 
   const patchTorrent = (next: Partial<TorrentConnection>) =>
     values && draft.set({ torrent: { ...values.torrent, ...next } });
 
-  const blocks: SettingsBlock[] = values
-    ? [
+  // A wind-down under way, cut short: every torrent stops now.
+  const stopNow = () => {
+    setError(null);
+    void updateSettings({ input: stopNowInput() }).then((result) => {
+      if (result.error || !result.data?.updateSettings) {
+        setError(result.error?.message ?? t("next.torrents.saveFailed"));
+        return;
+      }
+      void reexecute({ requestPolicy: "network-only" });
+    });
+  };
+
+  // The switch discloses the rest: off, it shows alone, torrent jobs left or not.
+  const enabledBlock: SettingsBlock | null = values
+    ? {
+        kind: "section",
+        id: "enabled",
+        title: t("next.settings.panel.torrents"),
+        note: windDownStoppable(values.torrent.enabled, torrentPresence)
+          ? t("next.torrents.windingDown")
+          : undefined,
+        fields: [
+          {
+            id: "enabled",
+            label: t("next.torrents.enabled"),
+            control: {
+              kind: "toggle",
+              value: values.torrent.enabled,
+              // Turning off asks how running torrents end, which waits on the server's answer.
+              disabled: torrentSwitchWaits(values.torrent.enabled, torrentPresence),
+              onChange: (enabled) => patchTorrent({ enabled }),
+            },
+          },
+          ...(windDownStoppable(values.torrent.enabled, torrentPresence)
+            ? [
+                {
+                  id: "stopNow",
+                  label: t("next.torrents.offStopNow"),
+                  help: t("next.torrents.offStopNowNote"),
+                  control: {
+                    kind: "custom" as const,
+                    control: (
+                      <SecondaryButton onClick={stopNow} disabled={updateState.fetching} testId={testIds.field("stopNow")}>
+                        {t("next.torrents.stopNow")}
+                      </SecondaryButton>
+                    ),
+                  },
+                },
+              ]
+            : []),
+        ],
+      }
+    : null;
+  const blocks: SettingsBlock[] = !values || !enabledBlock
+    ? []
+    : torrentSettingsDisclosed<SettingsBlock>(values.torrent.enabled, enabledBlock, [
         {
           kind: "section",
           id: "seeding",
@@ -1294,11 +1378,6 @@ export function TorrentsPanel() {
           id: "connection",
           title: t("next.torrents.connection"),
           fields: [
-            {
-              id: "enabled",
-              label: t("next.torrents.enabled"),
-              control: { kind: "toggle", value: values.torrent.enabled, onChange: (enabled) => patchTorrent({ enabled }) },
-            },
             {
               id: "peerProtocol",
               label: t("next.torrents.peerProtocol"),
@@ -1561,13 +1640,77 @@ export function TorrentsPanel() {
             },
           ],
         },
-      ]
-    : [];
+      ]);
+
+  const choose = (mode: TorrentDisableMode) => {
+    setAsking(false);
+    send(mode);
+  };
 
   return (
     <>
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
       {trackerRules.overlays}
+      <TorrentsOffDialog
+        open={asking}
+        onChoose={choose}
+        // Cancel leaves torrents on: the switch goes back.
+        onDismiss={() => {
+          setAsking(false);
+          patchTorrent({ enabled: true });
+        }}
+      />
     </>
+  );
+}
+
+const TORRENTS_OFF_DIALOG = "torrents-off";
+
+/** How the torrents still running end when torrents are turned off. */
+const TORRENTS_OFF_CHOICES: { mode: TorrentDisableMode; label: string; note: string }[] = [
+  { mode: "FINISH_ALL", label: "next.torrents.offFinishAll", note: "next.torrents.offFinishAllNote" },
+  { mode: "FINISH_DOWNLOADS", label: "next.torrents.offFinishDownloads", note: "next.torrents.offFinishDownloadsNote" },
+  { mode: "STOP_NOW", label: "next.torrents.offStopNow", note: "next.torrents.offStopNowNote" },
+];
+
+/** Asks how running torrents end before torrents are turned off. */
+function TorrentsOffDialog({
+  open,
+  onChoose,
+  onDismiss,
+}: {
+  open: boolean;
+  onChoose: (mode: TorrentDisableMode) => void;
+  onDismiss: () => void;
+}) {
+  const t = useTranslate();
+  return (
+    <Dialog
+      open={open}
+      title={t("next.torrents.offTitle")}
+      onDismiss={onDismiss}
+      testId={testIds.dialog(TORRENTS_OFF_DIALOG)}
+      footer={
+        <SecondaryButton onClick={onDismiss} testId={testIds.confirmDismiss}>
+          {t("action.cancel")}
+        </SecondaryButton>
+      }
+    >
+      <div className="flex flex-col gap-3 px-4 py-5 sm:px-6">
+        <p className="text-[13px] leading-[1.55] text-pretty text-wv-secondary">{t("next.torrents.offBody")}</p>
+        {TORRENTS_OFF_CHOICES.map((choice) => (
+          <button
+            key={choice.mode}
+            type="button"
+            data-testid={testIds.option(TORRENTS_OFF_DIALOG, choice.mode)}
+            onClick={() => onChoose(choice.mode)}
+            className="flex flex-col items-start gap-1 border border-wv-control bg-wv-button px-4 py-3 text-left hover:border-wv-control-hover-strong"
+          >
+            <span className="text-[13px] font-medium text-wv-strong">{t(choice.label)}</span>
+            <span className="text-[12px] text-wv-muted">{t(choice.note)}</span>
+          </button>
+        ))}
+      </div>
+    </Dialog>
   );
 }

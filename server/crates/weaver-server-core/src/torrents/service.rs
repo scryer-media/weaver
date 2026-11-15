@@ -679,7 +679,7 @@ impl TorrentService {
         );
         service.publish_to(queue);
         service.park_crashed(crashed);
-        service.inner.sessions.turn(config.torrent.enabled).await;
+        service.turn_at_start(config.torrent.enabled).await;
         service.start().await?;
         Ok(service)
     }
@@ -2367,6 +2367,67 @@ pub struct Written {
     pub checkpoints_read: u64,
 }
 
+/// How torrents that are still running end after torrents are turned off.
+/// Turning off with neither stops every torrent at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindDown {
+    /// Every torrent downloads and seeds to its own limits; then torrents
+    /// are off.
+    Finish,
+    /// Every torrent downloads; a torrent seeding stops; then torrents are
+    /// off.
+    FinishDownloads,
+}
+
+impl WindDown {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Finish => "finish",
+            Self::FinishDownloads => "finish_downloads",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "finish" => Some(Self::Finish),
+            "finish_downloads" => Some(Self::FinishDownloads),
+            _ => None,
+        }
+    }
+}
+
+// Where a wind-down is kept, so a restart while torrents end keeps ending
+// them instead of stopping them or running them on.
+const WIND_DOWN_KEY: &str = "torrent.wind_down";
+
+/// Whether there are torrents, as last published: any torrent job, and any
+/// torrent not paused or stopped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Presence {
+    pub jobs: bool,
+    pub running: bool,
+}
+
+impl Presence {
+    // `torrent` counted: the one place that says what running is.
+    fn note(&mut self, torrent: &Live) {
+        self.jobs = true;
+        self.running |= torrent.resumed();
+    }
+
+    // Of the live torrents; the walk ends at the first one running.
+    fn of(live: &BTreeMap<JobId, Live>) -> Self {
+        let mut presence = Self::default();
+        for torrent in live.values() {
+            presence.note(torrent);
+            if presence.running {
+                break;
+            }
+        }
+        presence
+    }
+}
+
 struct Inner {
     db: Database,
     sessions: Sessions,
@@ -2412,6 +2473,14 @@ struct Inner {
     hearing: Mutex<Option<tokio::task::JoinHandle<()>>>,
     // Rung by a settings change: the tick runs then, not at its next turn.
     settings_changed: Notify,
+    // How the torrents still running end while torrents are off: none when
+    // they are on, or off with nothing left to end.
+    wind_down: watch::Sender<Option<WindDown>>,
+    // Held while sessions are turned on or off for the settings or for a
+    // wind-down's end, so the two never cross.
+    turning: tokio::sync::Mutex<()>,
+    // Whether there are torrents, as last published.
+    presence: watch::Sender<Presence>,
     // The torrents and their sessions as last published, for the exporter.
     published: watch::Sender<Arc<Published>>,
     // Each route's session as last read. The tick reads them, and turning
@@ -2560,6 +2629,9 @@ impl TorrentService {
                 tick: Mutex::new(None),
                 hearing: Mutex::new(None),
                 settings_changed: Notify::new(),
+                wind_down: watch::channel(None).0,
+                turning: tokio::sync::Mutex::new(()),
+                presence: watch::channel(Presence::default()).0,
                 published: watch::channel(Arc::default()).0,
                 sessions_read: Mutex::default(),
                 counters: Counters::default(),
@@ -2700,9 +2772,10 @@ impl TorrentService {
     }
 
     /// Take the settings as they are now. Turning torrents off closes every
-    /// session and leaves each torrent stopped until they are turned on.
+    /// session and leaves each torrent stopped until they are turned on,
+    /// unless a wind-down asked for keeps them running until they end.
     pub async fn set_settings(&self, settings: TorrentSettings) {
-        let on = settings.torrent.enabled;
+        let enabled = settings.torrent.enabled;
         let peer_limit = |torrent: &TorrentConfig| {
             crate::torrents::sessions::session_limits(torrent).connections_limit
         };
@@ -2717,8 +2790,20 @@ impl TorrentService {
             settings,
         )
         .torrent;
-        if on != was.enabled {
-            self.turn(on).await;
+        {
+            let _turning = self.inner.turning.lock().await;
+            // Turned on, nothing winds down; off, a wind-down with nothing
+            // left running is over before it starts. While on and staying
+            // on, one taken for the save that turns them off is kept: the
+            // settings handed on before that save are the old ones.
+            let turned_on = enabled && !was.enabled;
+            if turned_on || (!enabled && self.wind_down().is_some() && !self.running().await) {
+                self.keep_wind_down(None).await;
+            }
+            let on = enabled || self.wind_down().is_some();
+            if on != self.inner.sessions.on() {
+                self.turn(on).await;
+            }
         }
         // Each torrent leg says how far its tunnel holds TCP peers below the
         // peer limit, so a new limit reads the routes again.
@@ -2734,6 +2819,121 @@ impl TorrentService {
         self.publish().await;
         // The routes follow the settings now too: the tick runs at once.
         self.inner.settings_changed.notify_one();
+    }
+
+    /// How the torrents still running end when the settings next turn
+    /// torrents off: `None` stops them at once. Taken only while torrents
+    /// are on or already winding down; turning them on clears it.
+    ///
+    /// Given before the settings that turn torrents off are saved, so any
+    /// caller that hands those settings on finds it. Returns the wind-down
+    /// it replaced, for `keep_wind_down_after_failed_save`.
+    pub async fn wind_down_when_off(&self, wind_down: Option<WindDown>) -> Option<WindDown> {
+        let _turning = self.inner.turning.lock().await;
+        let was = self.wind_down();
+        if self.settings().torrent.enabled || was.is_some() {
+            self.keep_wind_down(wind_down).await;
+        }
+        was
+    }
+
+    /// The wind-down `was` back, when the save that `wind_down_when_off`
+    /// went before failed: none while torrents are on.
+    pub async fn keep_wind_down_after_failed_save(&self, was: Option<WindDown>) {
+        let _turning = self.inner.turning.lock().await;
+        let enabled = self.settings().torrent.enabled;
+        self.keep_wind_down(if enabled { None } else { was }).await;
+    }
+
+    /// How the torrents still running end, while torrents are off and some
+    /// still run.
+    pub fn wind_down(&self) -> Option<WindDown> {
+        *self.inner.wind_down.borrow()
+    }
+
+    /// Whether there are torrents, as last published.
+    pub fn presence(&self) -> Presence {
+        *self.inner.presence.borrow()
+    }
+
+    /// The wind-down as it changes: what a test waits on for one to end.
+    pub fn wind_downs(&self) -> watch::Receiver<Option<WindDown>> {
+        self.inner.wind_down.subscribe()
+    }
+
+    // Whether any torrent is to run: not paused or stopped.
+    async fn running(&self) -> bool {
+        Presence::of(&*self.inner.live.lock().await).running
+    }
+
+    // The wind-down, kept where a restart reads it. Unchanged writes
+    // nothing.
+    async fn keep_wind_down(&self, wind_down: Option<WindDown>) {
+        if self.wind_down() == wind_down {
+            return;
+        }
+        let db = self.inner.db.clone();
+        let kept = tokio::task::spawn_blocking(move || match wind_down {
+            Some(wind_down) => db.set_setting(WIND_DOWN_KEY, wind_down.as_str()),
+            None => db.delete_setting(WIND_DOWN_KEY),
+        })
+        .await;
+        match kept {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "the torrents' wind-down was not kept for a restart");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "the torrents' wind-down was not kept for a restart");
+            }
+        }
+        self.inner.wind_down.send_replace(wind_down);
+    }
+
+    /// Open sessions at start as the settings and a kept wind-down say: a
+    /// wind-down a restart cut short goes on; one kept while torrents are
+    /// on is dropped.
+    pub(crate) async fn turn_at_start(&self, enabled: bool) {
+        let db = self.inner.db.clone();
+        let stored = match tokio::task::spawn_blocking(move || db.get_setting(WIND_DOWN_KEY)).await
+        {
+            Ok(Ok(stored)) => stored,
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "the torrents' wind-down was not read");
+                None
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "the torrents' wind-down was not read");
+                None
+            }
+        };
+        let kept = stored
+            .as_deref()
+            .and_then(WindDown::parse)
+            .filter(|_| !enabled);
+        if stored.is_some() && kept.is_none() {
+            let db = self.inner.db.clone();
+            if let Ok(Err(error)) =
+                tokio::task::spawn_blocking(move || db.delete_setting(WIND_DOWN_KEY)).await
+            {
+                tracing::warn!(error = %error, "a torrents' wind-down no longer in force was kept");
+            }
+        }
+        self.inner.wind_down.send_replace(kept);
+        self.inner.sessions.turn(enabled || kept.is_some()).await;
+    }
+
+    // A wind-down with nothing left running ends: torrents are off. Rung
+    // from the tick, on a task of its own, as turning off ends the tick.
+    async fn end_wind_down(&self) {
+        let _turning = self.inner.turning.lock().await;
+        if self.wind_down().is_none() || self.settings().torrent.enabled || self.running().await {
+            return;
+        }
+        self.keep_wind_down(None).await;
+        if self.inner.sessions.on() {
+            self.turn(false).await;
+        }
     }
 
     // Every torrent is read before its session changes, as `stop` reads
@@ -2815,7 +3015,11 @@ impl TorrentService {
     // them: one reading of each torrent.
     async fn publish(&self) {
         let now = self.inner.clock.now_ms();
-        let listed = self.listed(None, false, now).await;
+        // Presence is counted in the walk that picks the torrents.
+        let mut presence = Presence::default();
+        let listed = self
+            .listed_noting(None, false, now, |torrent| presence.note(torrent))
+            .await;
         let sessions = self
             .inner
             .sessions_read
@@ -2823,6 +3027,11 @@ impl TorrentService {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         let (views, torrents): (Vec<TorrentView>, Vec<TorrentSeries>) = listed.into_iter().unzip();
+        self.inner.presence.send_if_modified(|was| {
+            let changed = *was != presence;
+            *was = presence;
+            changed
+        });
         let sessions = with_routes_of(sessions, &torrents);
         self.inner
             .published
@@ -4908,10 +5117,11 @@ impl TorrentService {
     }
 
     pub async fn add(&self, request: AddRequest) -> Result<JobId, AddError> {
-        if !self.inner.sessions.on() {
+        // Off, a wind-down's sessions open included: no torrent is new.
+        let settings = self.settings();
+        if !self.inner.sessions.on() || !settings.torrent.enabled {
             return Err(AddError::Off);
         }
-        let settings = self.settings();
         let category = match request
             .category
             .as_deref()
@@ -5105,6 +5315,12 @@ impl TorrentService {
             }
             take_turn(&mut torrent, &queued, turn, &holds, now);
         }
+        // There is a torrent from here, not from the next publish.
+        self.inner.presence.send_if_modified(|presence| {
+            let was = *presence;
+            presence.note(&torrent);
+            *presence != was
+        });
         live.insert(torrent.record.job_id, torrent);
     }
 
@@ -8281,6 +8497,15 @@ impl TorrentService {
         self.drop_idle_sessions().await;
         self.read_sessions().await;
         self.publish().await;
+        // A wind-down with nothing left running ends, off the tick, which
+        // turning torrents off ends.
+        if self.wind_down().is_some()
+            && !self.settings().torrent.enabled
+            && !self.presence().running
+        {
+            let service = self.clone();
+            self.keep(tokio::spawn(async move { service.end_wind_down().await }));
+        }
         self.inner.ticks.send_modify(|ticks| *ticks += 1);
     }
 
@@ -8471,9 +8696,23 @@ impl TorrentService {
         let rules = self.rules();
         let mut actions = Vec::new();
         let mut landings = Vec::new();
+        // Winding down to the downloads alone, a torrent done downloading,
+        // forced or not, seeding or waiting to, stops: its goal is not met.
+        let downloads_only =
+            !settings.torrent.enabled && self.wind_down() == Some(WindDown::FinishDownloads);
         {
             let mut live = self.inner.live.lock().await;
+            // Stopped by the wind-down: their intents are written together.
+            let mut wound_down = Vec::new();
             for torrent in live.values_mut() {
+                if downloads_only && torrent.resumed() && (torrent.complete() || torrent.seeding())
+                {
+                    torrent.settle(now);
+                    torrent.record.intent = TorrentIntent::Stopped;
+                    wound_down.push(torrent.record.job_id);
+                    landings.extend(self.queue_resume(torrent, now, true));
+                    continue;
+                }
                 // A forced torrent seeds past its goal.
                 if !torrent.seeding() || !torrent.resumed() || torrent.record.forced {
                     continue;
@@ -8498,6 +8737,25 @@ impl TorrentService {
                     }
                     SeedingAction::RemoveWithData => {
                         actions.push((torrent.record.job_id, true, finished));
+                    }
+                }
+            }
+            // One transaction, off the runtime. `live` is held across it,
+            // as for every other intent write: a resume taken between the
+            // two would otherwise be written over.
+            if !wound_down.is_empty() {
+                let db = self.inner.db.clone();
+                match tokio::task::spawn_blocking(move || {
+                    db.update_torrent_intents(&wound_down, TorrentIntent::Stopped)
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(error = %error, "could not keep the stops of a wind-down");
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "could not keep the stops of a wind-down");
                     }
                 }
             }
@@ -9173,13 +9431,25 @@ impl TorrentService {
         files: bool,
         now: i64,
     ) -> Vec<(TorrentView, TorrentSeries)> {
+        self.listed_noting(category, files, now, |_| {}).await
+    }
+
+    // As `listed`, with `note` shown every live torrent in the walk that
+    // picks them.
+    async fn listed_noting(
+        &self,
+        category: Option<&str>,
+        files: bool,
+        now: i64,
+        note: impl FnMut(&Live) + Send,
+    ) -> Vec<(TorrentView, TorrentSeries)> {
         let shown = if files { Shown::WHOLE } else { Shown::LISTED };
         let pick = Pick {
             category: category.map(CategoryPick::Named),
             ..Pick::default()
         };
         self.listed_by(shown, true, false, now, |settings, live| {
-            pick.ids(settings, live)
+            pick.ids_noting(settings, live, note)
         })
         .await
         .into_iter()

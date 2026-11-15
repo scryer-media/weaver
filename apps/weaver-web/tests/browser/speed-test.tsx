@@ -15,6 +15,7 @@ import { RoutesPage } from "@/next/features/networking/RoutesPage";
 import { SpeedPage } from "@/next/features/networking/SpeedPage";
 import { nextEn } from "@/next/i18n/en";
 import { SettingsShellProvider } from "@/next/pages/settings/framework";
+import { SearchRegistry } from "@/next/pages/settings/search";
 import "@/next/fonts.css";
 import "@/next/theme.css";
 
@@ -73,7 +74,7 @@ const runs: SpeedTestRun[] = [
     id: 1, consumer: "server:1", consumerName: "news.fixture.invalid", kind: "BANDWIDTH",
     request: { bandwidth: { providerId: "cloudflare", server: null, customUrl: null, uploadMib: null }, usenet: null, torrent: null },
     status: "COMPLETED", phase: null, startedAt: 1790640000000, finishedAt: 1790640010000, failure: null,
-    tested: { legs: [{ position: 0, egressId: 0, weight: 100, down: false, downReason: null, path: { kind: "DIRECT" }, target: 4 }], failover: "REDISTRIBUTE", overrides: noOverrides(), names: [{ kind: "egress", id: 0, name: "System" }] },
+    tested: { legs: [{ position: 0, egressId: 0, weight: 100, down: false, downReason: null, path: { kind: "DIRECT", rungs: [], directFallback: false }, target: 4 }], failover: "REDISTRIBUTE", overrides: noOverrides(), names: [{ kind: "egress", id: 0, name: "System" }] },
     result: {
       bytes: 100 * MIB, elapsedMs: 10000, averageBps: 10 * MIB, peakBps: 12 * MIB,
       legs: [{ position: 0, bytes: 100 * MIB, averageBps: 10 * MIB, peakBps: 12 * MIB, connections: 4, sourceAddresses: ["192.0.2.10"] }],
@@ -127,10 +128,10 @@ function reported(route: NonNullable<SpeedTestInput["route"]>): NetworkRoute {
               directFallback: leg.path.ladder.directFallback,
               rungs: leg.path.ladder.rungs.map((rung) =>
                 "proxy" in rung
-                  ? { kind: "PROXY", proxyId: rung.proxy, poolId: null, chainIds: [] }
+                  ? { kind: "PROXY", proxyId: rung.proxy ?? null, poolId: null, chainIds: [] }
                   : "pool" in rung
-                    ? { kind: "POOL", poolId: rung.pool, proxyId: null, chainIds: [] }
-                    : { kind: "CHAIN", chainIds: rung.chain, proxyId: null, poolId: null },
+                    ? { kind: "POOL", poolId: rung.pool ?? null, proxyId: null, chainIds: [] }
+                    : { kind: "CHAIN", chainIds: rung.chain ?? [], proxyId: null, poolId: null },
               ),
             },
     })),
@@ -286,6 +287,8 @@ const live = {
   isPaused: false,
   speed: query.has("gauge") ? 12 * 1024 * 1024 : 0,
   queue,
+  torrents: "on",
+  torrentPresence: { enabled: true, jobs: false, running: false, windingDown: false },
 } as NextData;
-const shell = { search: "", actionsRef: { current: null }, setFlags: () => {}, controlsHost: document.getElementById("controls") };
+const shell = { search: "", actionsRef: { current: null }, setFlags: () => {}, controlsHost: document.getElementById("controls"), registry: new SearchRegistry() };
 createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t, uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter initialEntries={[query.has("routes") ? "/settings/networking/routes" : "/settings/networking/speed?consumer=server:1"]}><SettingsShellProvider {...shell}><NextDataContext.Provider value={live}><main className="mx-auto flex max-w-[1400px] flex-col p-8">{screen}</main></NextDataContext.Provider></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);

@@ -170,6 +170,19 @@ impl SystemQuery {
             summary: crate::jobs::paging::summary(state, &metrics),
         })
     }
+    /// Whether torrents are on and whether there are torrents: the same
+    /// reading `systemMetricsUpdates` carries as `torrents`.
+    #[graphql(guard = "ReadGuard")]
+    async fn torrent_presence(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<crate::system::types::TorrentPresence> {
+        let enabled = ctx.data::<SharedConfig>()?.read().await.torrent.enabled;
+        Ok(crate::system::types::TorrentPresence::of(
+            enabled,
+            ctx.data_opt::<weaver_server_core::torrents::service::TorrentService>(),
+        ))
+    }
     /// System metrics facade for integrations.
     #[graphql(guard = "ReadGuard")]
     async fn system_metrics(&self, ctx: &Context<'_>) -> Result<Metrics> {

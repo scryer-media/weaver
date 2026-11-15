@@ -15,6 +15,7 @@ import { formatSize } from "@/next/data/format";
 import { WV } from "@/next/data/palette";
 import { countLabel } from "@/next/i18n/labels";
 import { UNPACK_CHOICES, unpackChoice, unpackOf } from "@/lib/torrents";
+import { useTorrentsShown } from "@/next/data/use-torrents-shown";
 
 const NO_CATEGORY_VALUE = "__none__";
 
@@ -52,11 +53,14 @@ export function AddNzbDialog({
   const upload = useUploadNzb({ open, resetOnOpen: true, onSubmitted: onClose });
   const { addFiles, fileInputRef } = upload;
   const blocked = upload.entries.filter(isBlocked);
+  // While torrents are off the dialog speaks of NZBs only.
+  const torrentsOn = useTorrentsShown();
   // Unpack is a torrent's choice: the row stands once a file read as a torrent is in the list, or
   // the link is a magnet or an infohash.
   const torrent =
-    upload.entries.some((entry) => entry.kind === "TORRENT") ||
-    /^(magnet:|[0-9a-f]{40}$|[0-9a-f]{64}$|[a-z2-7]{32}$)/i.test(upload.text.trim());
+    torrentsOn &&
+    (upload.entries.some((entry) => entry.kind === "TORRENT") ||
+      /^(magnet:|[0-9a-f]{40}$|[0-9a-f]{64}$|[a-z2-7]{32}$)/i.test(upload.text.trim()));
   // Set once a submit has answered, so its verdict is read from the entries it updated.
   const [awaitingVerdict, setAwaitingVerdict] = useState(false);
   const [confirmForce, setConfirmForce] = useState(false);
@@ -161,7 +165,9 @@ export function AddNzbDialog({
               event.target.value = "";
             }}
           />
-          <span className="font-medium text-wv-fg">{t("next.addNzb.dropZone")}</span>
+          <span className="font-medium text-wv-fg">
+            {t(torrentsOn ? "next.addNzb.dropZone" : "next.addNzb.dropZoneNzb")}
+          </span>
           {upload.entries.length === 0 ? null : (
             <span className="font-wv-mono text-[11px] text-wv-faint">
               {`${t("bulk.selected", { count: upload.entries.length })} · ${formatSize(upload.totalBytes)}`}
@@ -222,7 +228,7 @@ export function AddNzbDialog({
                 label={t("next.addNzb.link")}
                 value={upload.text}
                 onChange={upload.setText}
-                placeholder="https:// · magnet:?"
+                placeholder={torrentsOn ? "https:// · magnet:?" : "https://"}
                 className="w-full"
               />
               {upload.textError === null ? null : (
