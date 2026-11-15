@@ -4776,6 +4776,41 @@ input StartApplicationUpgradeInput {
 	expectedVersion: String!
 }
 
+"""
+One volume as the operating system presents it: what it takes and what
+is being written to it now.
+"""
+type StorageVolumeWriteRate {
+	"""
+	The mount path or drive root.
+	"""
+	label: String!
+	"""
+	"ssd", "platter", "network" or "unknown".
+	"""
+	storageKind: String!
+	"""
+	What the volume takes, in bytes per second; null until measured.
+	"""
+	writeRateBytesPerSecond: Int
+	"""
+	What Weaver wrote to the volume over the last window, in bytes per
+	second, whether or not the volume was the limit; null when nothing
+	was written.
+	"""
+	throughputBytesPerSecond: Int
+	"""
+	Bytes waiting in memory to be written to the volume.
+	"""
+	bufferedBytes: Int!
+	"""
+	The most bytes Weaver lets wait in memory for the volume before it
+	stops fetching for the jobs that write to it; null until the volume
+	has been given a limit.
+	"""
+	bufferLimitBytes: Int
+}
+
 type SubmissionResult {
 	accepted: Boolean!
 	status: SubmissionStatus!
@@ -4934,6 +4969,12 @@ type SystemInfo {
 	memory: SystemMemoryInfo!
 	primaryStorage: SystemStorageProfile!
 	configuredStorage: [ConfiguredStorage!]!
+	"""
+	Every volume Weaver writes to, each with what it takes and what is
+	being written to it. Read
+	from what the disk owner holds; asks no disk.
+	"""
+	volumes: [StorageVolumeWriteRate!]!
 }
 
 type SystemMemoryInfo {
