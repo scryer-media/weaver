@@ -796,6 +796,29 @@ fn scripted_plain_config(port: u16) -> ServerConfig {
     }
 }
 
+// The product's BODY reads all run under an inactivity budget. These tests
+// drive the same reads with one no test reaches.
+impl NntpConnection {
+    async fn body_by_id_raw(&mut self, message_id: &str) -> Result<MultiLineResponse> {
+        let mut budget = ActiveTransferBudget::new(UNREACHED_TIMEOUT);
+        self.body_by_id_raw_with_active_budget(message_id, &mut budget)
+            .await
+    }
+
+    async fn stream_yenc_article<F>(
+        &mut self,
+        message_id: &str,
+        on_chunk: F,
+    ) -> std::result::Result<FusedYencArticle, FusedYencError>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
+        let mut budget = ActiveTransferBudget::new(UNREACHED_TIMEOUT);
+        self.stream_yenc_article_with_active_budget(message_id, 0, &mut budget, on_chunk)
+            .await
+    }
+}
+
 // A server that answers each AUTHINFO line as it arrives, then answers
 // nothing until every pipelined line has arrived — so a client that
 // pipelined AUTHINFO, or serialized MODE READER and GROUP, fails here.
@@ -1236,73 +1259,6 @@ async fn body_by_id_reauthenticates_on_mid_session_480() {
 }
 
 #[tokio::test]
-async fn stream_body_chunked_raw_reauthenticates_on_mid_session_480() {
-    let port = spawn_scripted_server(
-        vec![
-            ScriptStep {
-                expect_prefix: None,
-                response: b"200 ready\r\n",
-                delay: Duration::ZERO,
-            },
-            ScriptStep {
-                expect_prefix: Some("AUTHINFO USER"),
-                response: b"381 password required\r\n",
-                delay: Duration::ZERO,
-            },
-            ScriptStep {
-                expect_prefix: Some("AUTHINFO PASS"),
-                response: b"281 authentication accepted\r\n",
-                delay: Duration::ZERO,
-            },
-            ScriptStep {
-                expect_prefix: Some("CAPABILITIES"),
-                response: b"500 unknown\r\n",
-                delay: Duration::ZERO,
-            },
-            ScriptStep {
-                expect_prefix: Some("BODY "),
-                response: b"480 authentication required\r\n",
-                delay: Duration::ZERO,
-            },
-            ScriptStep {
-                expect_prefix: Some("AUTHINFO USER"),
-                response: b"381 password required\r\n",
-                delay: Duration::ZERO,
-            },
-            ScriptStep {
-                expect_prefix: Some("AUTHINFO PASS"),
-                response: b"281 authentication accepted\r\n",
-                delay: Duration::ZERO,
-            },
-            ScriptStep {
-                expect_prefix: Some("BODY "),
-                response: b"222 body follows\r\nhello\r\n.\r\n",
-                delay: Duration::ZERO,
-            },
-        ],
-        Duration::ZERO,
-    )
-    .await;
-
-    let mut config = scripted_plain_config(port);
-    config.username = Some("user".into());
-    config.password = Some("pass".into());
-
-    let mut conn = NntpConnection::connect(&config).await.unwrap();
-    let mut chunks = Vec::new();
-    let total = conn
-        .stream_body_chunked_raw("<test@example.com>", |chunk| {
-            chunks.push(chunk.to_vec());
-            Ok(())
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(total.bytes, b"hello\r\n".len() as u64);
-    assert_eq!(chunks, vec![b"hello\r\n".to_vec()]);
-}
-
-#[tokio::test]
 async fn body_by_id_handles_split_terminator() {
     let port = spawn_scripted_server(
         vec![
@@ -1412,13 +1368,8 @@ async fn buffered_body_counts_wire_bytes_before_dot_unstuffing() {
         crate::transfer::ServerTransferConfig::default(),
     );
     conn.set_transfer_control(Some(control.clone()));
-    conn.write_body_request("<buffered@example.com>")
-        .await
-        .unwrap();
-    conn.flush_commands().await.unwrap();
-    assert_eq!(conn.read_response().await.unwrap().code.raw(), 222);
-    let data = conn.read_multiline_data().await.unwrap();
-    assert_eq!(data.as_ref(), b".dot-stuffed\r\n");
+    let body = conn.body_by_id("<buffered@example.com>").await.unwrap();
+    assert_eq!(body.data.as_ref(), b".dot-stuffed\r\n");
     assert_eq!(
         control.snapshot().lifetime_body_bytes,
         b"..dot-stuffed\r\n".len() as u64
@@ -1458,12 +1409,10 @@ async fn buffered_partial_failure_counts_wire_bytes_before_dot_unstuffing() {
         crate::transfer::ServerTransferConfig::default(),
     );
     conn.set_transfer_control(Some(control.clone()));
-    conn.write_body_request("<buffered-partial@example.com>")
+    let err = conn
+        .body_by_id("<buffered-partial@example.com>")
         .await
-        .unwrap();
-    conn.flush_commands().await.unwrap();
-    assert_eq!(conn.read_response().await.unwrap().code.raw(), 222);
-    let err = conn.read_multiline_data().await.unwrap_err();
+        .unwrap_err();
     assert!(matches!(err, NntpError::ServerDisconnectedMidBody));
     assert_eq!(
         control.snapshot().lifetime_body_bytes,
@@ -1624,7 +1573,7 @@ async fn body_by_id_reports_truncated_multiline_body_on_timeout() {
 }
 
 #[tokio::test]
-async fn stream_body_chunked_raw_finishes_when_data_and_terminator_arrive_together() {
+async fn raw_body_finishes_when_data_and_terminator_arrive_together() {
     let port = spawn_scripted_server(
         vec![
             ScriptStep {
@@ -1650,17 +1599,9 @@ async fn stream_body_chunked_raw_finishes_when_data_and_terminator_arrive_togeth
     let mut conn = NntpConnection::connect(&scripted_plain_config(port))
         .await
         .unwrap();
-    let mut chunks = Vec::new();
-    let total = conn
-        .stream_body_chunked_raw("<test@example.com>", |chunk| {
-            chunks.push(chunk.to_vec());
-            Ok(())
-        })
-        .await
-        .unwrap();
+    let body = conn.body_by_id_raw("<test@example.com>").await.unwrap();
 
-    assert_eq!(total.bytes, b"line one\r\nline two\r\n".len() as u64);
-    assert_eq!(chunks, vec![b"line one\r\nline two\r\n".to_vec()]);
+    assert_eq!(body.data.as_ref(), b"line one\r\nline two\r\n");
 }
 
 #[tokio::test]
@@ -1873,51 +1814,6 @@ async fn stream_yenc_article_drains_trailer_junk_and_keeps_the_connection() {
 }
 
 #[tokio::test]
-async fn stream_next_yenc_article_decodes_queued_body_response() {
-    let original = b"queued fused response";
-    let port = spawn_scripted_server(
-        vec![
-            ScriptStep {
-                expect_prefix: None,
-                response: b"200 ready\r\n",
-                delay: Duration::ZERO,
-            },
-            ScriptStep {
-                expect_prefix: Some("CAPABILITIES"),
-                response: b"500 unknown\r\n",
-                delay: Duration::ZERO,
-            },
-            ScriptStep {
-                expect_prefix: Some("BODY "),
-                response: yenc_body_response(original, b".\r\n"),
-                delay: Duration::ZERO,
-            },
-        ],
-        Duration::ZERO,
-    )
-    .await;
-
-    let mut conn = NntpConnection::connect(&scripted_plain_config(port))
-        .await
-        .unwrap();
-    conn.write_body_request("<test@example.com>").await.unwrap();
-    conn.flush_commands().await.unwrap();
-
-    let mut chunks = Vec::new();
-    let article = conn
-        .stream_next_yenc_article(|chunk| {
-            chunks.push(chunk.to_vec());
-            Ok(())
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(chunks, vec![original.to_vec()]);
-    assert_eq!(article.to_data(), original);
-    assert_eq!(article.yenc_result().bytes_written, original.len());
-}
-
-#[tokio::test]
 #[ignore] // Requires a real NNTP server
 async fn connect_to_real_server() {
     let config = ServerConfig {
@@ -1979,15 +1875,15 @@ async fn a_body_that_goes_silent_partway_exhausts_its_budget() {
     let mut conn = NntpConnection::connect(&scripted_plain_config(port))
         .await
         .unwrap();
-    conn.write_body_request("<silent-partway@example.com>")
-        .await
-        .unwrap();
-    conn.flush_commands().await.unwrap();
-    let initial = conn.read_response().await.unwrap();
     let mut budget = ActiveTransferBudget::new(Duration::from_millis(50));
 
     let error = conn
-        .stream_yenc_article_response(initial, Some(&mut budget), |_| Ok(()))
+        .stream_yenc_article_with_active_budget(
+            "<silent-partway@example.com>",
+            0,
+            &mut budget,
+            |_| Ok(()),
+        )
         .await
         .unwrap_err();
 
