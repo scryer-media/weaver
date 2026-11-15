@@ -21,6 +21,9 @@ enum Answer {
     NeedsGroup,
     // Refuses the login.
     RefuseLogin,
+    // Drops the connection partway through the first body it sends, and
+    // serves every BODY after it.
+    DropFirst,
 }
 
 struct FakeServer {
@@ -68,6 +71,7 @@ async fn fake_server(answer: Answer) -> FakeServer {
     let recorded = commands.clone();
     let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = served.clone();
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let task = tokio::spawn(async move {
         let mut connections = tokio::task::JoinSet::new();
         loop {
@@ -77,6 +81,7 @@ async fn fake_server(answer: Answer) -> FakeServer {
                     let body = body.clone();
                     let recorded = recorded.clone();
                     let counted = counted.clone();
+                    let dropped = dropped.clone();
                     connections.spawn(async move {
                         let (read, mut write) = stream.into_split();
                         if write.write_all(b"200 fixture ready\r\n").await.is_err() {
@@ -107,6 +112,14 @@ async fn fake_server(answer: Answer) -> FakeServer {
                                     Answer::Missing => b"430 no such article\r\n",
                                     Answer::NeedsGroup if !group_selected => {
                                         b"412 no newsgroup selected\r\n"
+                                    }
+                                    Answer::DropFirst
+                                        if !dropped.swap(true, std::sync::atomic::Ordering::SeqCst) =>
+                                    {
+                                        let header = format!("222 0 <{SHARED}> body\r\n");
+                                        let _ = write.write_all(header.as_bytes()).await;
+                                        let _ = write.write_all(&body[..body.len() / 2]).await;
+                                        break;
                                     }
                                     _ => {
                                         counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -160,8 +173,10 @@ fn client_for(servers: &[(&FakeServer, Answer)]) -> NntpClient {
                         tls: false,
                         username: login.then(|| "user".to_string()),
                         password: login.then(|| "secret".to_string()),
-                        connect_timeout: Duration::from_secs(2),
-                        command_timeout: Duration::from_secs(2),
+                        // Far above any real run: a stall on a loaded runner must
+                        // never turn into a retry that changes what is counted.
+                        connect_timeout: Duration::from_secs(3600),
+                        command_timeout: Duration::from_secs(3600),
                         ..Default::default()
                     },
                     stable_id: weaver_nntp::transfer::StableServerId(idx as u32 + 1),
@@ -173,7 +188,7 @@ fn client_for(servers: &[(&FakeServer, Answer)]) -> NntpClient {
             .collect(),
         max_idle_age: Duration::from_secs(60),
         max_retries_per_server: 1,
-        soft_timeout: Duration::from_secs(15),
+        soft_timeout: Duration::from_secs(3600),
     })
 }
 
@@ -183,6 +198,7 @@ struct Run {
     failed_bytes: u64,
     wire_bytes: u64,
     not_found: u64,
+    transient: u64,
 }
 
 // Every file of the job names the one shared article.
@@ -232,6 +248,7 @@ async fn run_shared_job(servers: &[(&FakeServer, Answer)], id: JobId) -> Run {
         failed_bytes: job.failed_bytes,
         wire_bytes: metrics.bytes_downloaded,
         not_found: metrics.download_failures_article_not_found,
+        transient: metrics.download_failures_transient,
     }
 }
 
@@ -282,8 +299,12 @@ async fn a_shared_article_missing_on_one_server_is_fetched_once_from_the_next() 
     second.task.abort();
 }
 
-// Missing everywhere: each server is asked once, every reference is
-// answered not found by both, and nothing is delivered.
+// Missing everywhere: every reference is answered not found by both servers,
+// and nothing is delivered. The cache keeps one answer per article, so a
+// reference that looks up after another server's answer replaced the first
+// server's asks that server again; how often depends on scheduling. What
+// holds is that each server is asked, and never more often than the
+// references it could answer.
 #[tokio::test]
 async fn a_shared_article_missing_everywhere_books_every_reference_missing() {
     let first = fake_server(Answer::Missing).await;
@@ -299,8 +320,13 @@ async fn a_shared_article_missing_everywhere_books_every_reference_missing() {
         run.status
     );
     assert_eq!(run.delivered, 0);
-    assert_eq!(first.bodies(), 1, "{:?}", first.commands());
-    assert_eq!(second.bodies(), 1, "{:?}", second.commands());
+    for server in [&first, &second] {
+        assert!(
+            (1..=COPIES).contains(&server.bodies()),
+            "{:?}",
+            server.commands()
+        );
+    }
     assert_eq!(
         run.not_found,
         (COPIES * 2) as u64,
@@ -360,5 +386,25 @@ async fn a_shared_article_selects_a_group_only_after_a_412() {
     // A connection dialled before the 412 was learned may ask once more
     // without a group; the article is still served once.
     assert_eq!(server.served(), 1, "{commands:?}");
+    server.task.abort();
+}
+
+// The connection fetching the shared article drops partway through its
+// body. That is the one connection's fault, not the server's answer: no
+// other reference is handed it, so the only transport failure booked is the
+// dropped fetch's own, and the next fetch, on another connection to the same
+// server, serves every reference.
+#[tokio::test]
+async fn a_dropped_fetch_is_never_replayed_to_another_reference() {
+    let server = fake_server(Answer::DropFirst).await;
+    let run = run_shared_job(&[(&server, Answer::DropFirst)], JobId(81006)).await;
+    assert_eq!(run.status, JobStatus::Complete);
+    assert_eq!(run.delivered, COPIES);
+    assert_eq!(server.bodies(), 2, "{:?}", server.commands());
+    assert_eq!(server.served(), 1);
+    assert_eq!(
+        run.transient, 1,
+        "only the dropped fetch meets the fault; no reference replays it"
+    );
     server.task.abort();
 }

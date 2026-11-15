@@ -1730,6 +1730,10 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
     // The claim on the one fetch of a shared article, while its BODY is the
     // only request on the ring. See `RepeatedArticles::lookup`.
     let mut shared_claim: Option<super::repeated::SharedClaim> = None;
+    // Whether the ring is being drained so a shared article can go out
+    // alone. Neither that drain nor the lone request is a pipe the lane
+    // failed to keep fed, so neither is sampled as fed.
+    let mut draining_for_shared;
 
     let (park_reason, keep_cached_lane) = loop {
         // Adopt an answered refill without waiting for it. Taking it here is
@@ -1780,6 +1784,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         // Top the ring back up to the depth in force.
         // Behind a mid-batch 480 the lane drains its ring and logs in again
         // before anything new goes out.
+        draining_for_shared = false;
         while stop.is_none()
             && shared_claim.is_none()
             && lane.ring_outstanding() < context.depth()
@@ -1799,50 +1804,64 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 stop = Some(LaneStop::ReservationObsolete);
                 break;
             }
-            // An article several files share goes out alone, on an empty
-            // ring: its claim is then never held while this lane waits on
-            // another's, and its response is the next one read.
+            // An article several files share is answered from the cache when
+            // it can be, whatever the ring holds: a replay puts nothing on the
+            // wire. Its one fetch goes out alone, on an empty ring: the claim
+            // is then never held while this lane waits on another's, and its
+            // response is the next one read. With requests in flight the lane
+            // neither waits on another lane's fetch nor claims one; it drains
+            // first.
             let shared = work_context
                 .repeated
                 .as_ref()
                 .filter(|cache| cache.shares(&work.message_id))
                 .cloned();
-            if shared.is_some() && lane.ring_outstanding() > 0 {
-                break;
-            }
-            let (work, work_context) = pending.pop_front().expect("pending front was inspected");
+            let mut claim = None;
             if let Some(cache) = shared {
-                match cache.lookup(
-                    &work,
+                let lookup = cache.lookup(
+                    work,
                     server_idx,
-                    result_exclude_servers(&work, work_context.retention_excludes),
+                    result_exclude_servers(work, work_context.retention_excludes),
                     work_context.runtime_generation,
-                ) {
+                    lane.ring_outstanding() == 0,
+                    // A lookup may wait out another lane's fetch.
+                    || issue_is_current(&state, &nntp, HeldConnection::of(lane), work, work_context),
+                );
+                match lookup {
                     Some(super::repeated::SharedLookup::Replay(reply)) => {
+                        let (work, work_context) =
+                            pending.pop_front().expect("pending front was inspected");
                         let result = replayed_result(work, &work_context, reply);
-                        if stream_owned_result(&event_tx, lane, &mut stats_mark, result).is_err() {
+                        // Nothing went on the wire for it, so it carries none
+                        // of the lane's transfer counts.
+                        if send_owned_batch(
+                            &event_tx,
+                            result.lane_id,
+                            vec![result],
+                            Vec::new(),
+                            weaver_nntp::blocking::BlockingLaneStats::default(),
+                            false,
+                        )
+                        .is_err()
+                        {
                             stop = Some(LaneStop::Error);
                         }
                         continue;
                     }
-                    Some(super::repeated::SharedLookup::Fetch(claim)) => {
-                        // The lookup may have waited out another lane's fetch.
-                        if !issue_is_current(
-                            &state,
-                            &nntp,
-                            HeldConnection::of(lane),
-                            &work,
-                            &work_context,
-                        ) {
-                            pending.push_front((work, work_context));
-                            stop = Some(LaneStop::ReservationObsolete);
-                            break;
-                        }
-                        shared_claim = Some(claim);
+                    Some(super::repeated::SharedLookup::Fetch(fetch)) => claim = Some(fetch),
+                    Some(super::repeated::SharedLookup::Obsolete) => {
+                        stop = Some(LaneStop::ReservationObsolete);
+                        break;
+                    }
+                    Some(super::repeated::SharedLookup::NotReady) => {
+                        draining_for_shared = true;
+                        break;
                     }
                     None => {}
                 }
             }
+            let (work, work_context) = pending.pop_front().expect("pending front was inspected");
+            shared_claim = claim;
             let estimate = Pipeline::bandwidth_reservation_estimate(work.byte_estimate);
             let wire_form = work.message_id.wire_form();
             let outcome = lane.ring_issue(&wire_form, estimate, work_context.depth());
@@ -2012,6 +2031,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         // request among it: a full rung means the pipe never waited on the
         // lane's next lease.
         let held = inflight.len() + pending.len();
+        let starved_for_shared = draining_for_shared || shared_claim.is_some();
         // The head response is decoded as it is read: a panic decoding it
         // is its job's.
         let read = {
@@ -2051,7 +2071,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 payload_bytes,
                 policy_elapsed,
                 pressure_clear: work_context.pressure_clear,
-                fed: held >= usize::from(work_context.mode.depth()),
+                fed: !starved_for_shared && held >= usize::from(work_context.mode.depth()),
                 batch_complete: meta.batch_complete,
                 batch_clean: meta.batch_clean,
                 unresolved_count: meta.unresolved_count,
