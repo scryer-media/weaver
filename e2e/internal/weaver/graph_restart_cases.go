@@ -394,7 +394,11 @@ func runLowerPriorityServerCoversADownPrimary(ctx *restartCaseContext) (restartC
 // leaves out of its session counts, so the peak is Weaver's alone and the
 // allowance is the configured count exactly.
 func runWarmDialNeverExceedsTheSeatCap(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaverWithOptions("", seatCap); err != nil {
+	// The dropped bodies leave the route's legs cooling down before the
+	// redials. The cap is a count of sessions, not a duration, so the
+	// connection plans' timers run scaled down here as the networking lanes
+	// run them; the empty clock file keeps the real clock.
+	if err := ctx.startWeaverWithOptions("", seatCap, "WEAVER_E2E_MODE=1", "WEAVER_E2E_CLOCK_FILE=", "WEAVER_E2E_NETWORK_TIME_SCALE="+advancedNetworkingTimeScale); err != nil {
 		return restartCaseResult{}, err
 	}
 	// Keep one control session for the entire observation window. Resetting

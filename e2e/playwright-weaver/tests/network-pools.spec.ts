@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { expect, metricValue, metrics, test } from "./helpers";
-import { waitTerminal } from "./support/downloads";
+import { expect, metricValue, metrics, requiredMetricValue, test } from "./helpers";
+import { jobState, waitTerminal } from "./support/downloads";
 import {
   type NetworkFlow, type PoolFlow, type ProxyProfile, extended, flowAfter, flowMark, graphqlErrors, ladderLeg, legOn,
-  platformNetworking, poolOn, proxyProfiles, rung, serverKey, testPool, updatePool,
+  networkFlow, platformNetworking, poolOn, proxyProfiles, rung, serverKey, testPool, updatePool,
 } from "./support/network-flow";
 import { NetworkWorld, PROXIED_HOST, saveEvidence, serverHealth } from "./support/network-scenario";
 import { controlRoute, fixtureEvents, fixtureMark, waitFixtureEvents } from "./support/proxy-fixture";
@@ -73,12 +73,29 @@ test("P02 a throttled pin loses to a faster member once that member has delivery
   const mark = await fixtureMark(request);
   const flowStart = await flowMark(request);
   // 200 MiB with connection churn, so the pool keeps re-dialling and racing.
-  const download = await world.download("p02-throttled", { parts: 3200, partBytes: 64 * 1024, beforeSubmit: () => world.setChaos("drop_conn=30") });
-  await addBandwidth(request, "connect1", 64);
-  const switched = await pinned(request, view, connect2.id, "connect2 pinned", flowStart);
-  expect(member(view(switched), connect2.id)!.samples).toBeGreaterThanOrEqual(16);
+  // connect1 is throttled before the job starts, so no bytes pass it at full
+  // speed first, however fast the machine.
+  const download = await world.download("p02-throttled", { parts: 3200, partBytes: 64 * 1024, beforeSubmit: async () => {
+    // One connection in ten is dropped: enough that the pool keeps
+    // re-dialling, while most connections live to their fifth answer, the
+    // first one that counts as a delivery sample.
+    await world.setChaos("drop_conn=10");
+    await addBandwidth(request, "connect1", 64);
+  } });
+  // The switch needs the job's traffic: a job that ends first fails here
+  // instead of leaving the wait with nothing to switch on.
+  let state = "PENDING";
+  let switched: NetworkFlow | undefined;
+  await expect.poll(async () => {
+    state = await jobState(request, download.jobId);
+    const flow = await networkFlow(request);
+    if (flow.sampledAt > flowStart && view(flow)?.pinnedMember === connect2.id) switched = flow;
+    return switched !== undefined || ["COMPLETED", "FAILED"].includes(state);
+  }, { message: "connect2 pinned, or the job ended first", timeout: 0 }).toBe(true);
+  expect(switched, `connect2 pinned before job ${download.jobId} ended ${state}`).toBeDefined();
+  expect(member(view(switched!), connect2.id)!.samples).toBeGreaterThanOrEqual(16);
   const events = await waitFixtureEvents(request, mark, list => list.some(event => event.kind === "nntp-bytes" && event.route === "connect2"), "article bytes through connect2");
-  await saveEvidence(info, "P02", { pool: view(switched), bytes: events.filter(event => event.kind === "nntp-bytes").map(event => event.route) });
+  await saveEvidence(info, "P02", { pool: view(switched!), bytes: events.filter(event => event.kind === "nntp-bytes").map(event => event.route) });
   await world.setChaos("off");
   expect(await waitTerminal(request, download.jobId)).toBe("COMPLETED");
 });
@@ -129,7 +146,8 @@ test("P05 a race runs once a server over-limit clears and the pin holds", async 
   const download = await world.pacedDownload("p05-over-limit");
   const before = await pinned(request, view, connect1.id, "connect1 pinned");
   // The held control session takes one slot of max_conns=2, leaving Weaver one.
-  const refusals = async () => metricValue(await metrics(request), "weaver_server_provider_refusals_total", { server_id: String(server) }) ?? 0;
+  // The server is downloading, so its pool reports the counter; a missing one fails rather than reading as a 0 baseline.
+  const refusals = async () => requiredMetricValue(await metrics(request), "weaver_server_provider_refusals_total", { server_id: String(server) });
   const refusalsBefore = await refusals();
   await world.setChaos("slow_body=10,max_conns=2");
   // Admission limits do not evict established sessions. Force fresh admissions

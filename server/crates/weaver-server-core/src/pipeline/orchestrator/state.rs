@@ -92,6 +92,22 @@ impl Pipeline {
     }
 
     pub(crate) fn clear_job_write_backlog(&mut self, job_id: JobId) {
+        // Memory and disk parks use distinct ledgers; each part is let go
+        // as any part is, its spool file with it.
+        for bytes in self.take_job_write_backlog(job_id) {
+            self.release_parked_bytes(bytes);
+        }
+    }
+
+    // Forget everything kept for the job's files between an article's
+    // arrival and its placement: each uuencode cursor, the requeue counts
+    // and the releases owed, which all speak of the graph the job had, and
+    // every part parked. The parts' bytes come back still charged to their
+    // ledgers, for the caller to let go.
+    pub(in crate::pipeline) fn take_job_write_backlog(
+        &mut self,
+        job_id: JobId,
+    ) -> Vec<ParkedBytes> {
         // A uuencode file keeps its entry in `uu_files` until teardown drops
         // it here. A file can also hold nothing but parked articles still
         // waiting for the part before them.
@@ -102,10 +118,54 @@ impl Pipeline {
             .copied()
             .filter(|file_id| file_id.job_id == job_id)
             .collect();
+        let mut parts = Vec::new();
+        for &file_id in &file_ids {
+            if let Some(uu) = self.uu_files.remove(&file_id) {
+                for part in uu.parked.into_values() {
+                    parts.push(part.bytes);
+                    self.release_uu_parked_segment();
+                }
+            }
+            parts.extend(
+                self.unanchored_parked
+                    .remove_file(file_id)
+                    .into_iter()
+                    .flat_map(BTreeMap::into_values)
+                    .map(|part| part.bytes),
+            );
+        }
+        // One pass over each list for the whole job, not one per file, and
+        // by the job, not by the files above: an article sent back for
+        // another fetch because the park had no room leaves an entry for a
+        // file that holds nothing parked. An empty list costs nothing.
+        if !self.uu_park_requeues.is_empty() {
+            self.uu_park_requeues
+                .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+        }
+        if !self.unanchored_requeues.is_empty() {
+            self.unanchored_requeues
+                .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+        }
+        if !self.pending_unanchored_release.is_empty() {
+            self.pending_unanchored_release
+                .retain(|segment_id| segment_id.file_id.job_id != job_id);
+        }
+        parts
+    }
+
+    // The cleanup as it was, with a pass over each list per file, kept to
+    // compare the single pass against.
+    #[cfg(test)]
+    pub(crate) fn clear_job_write_backlog_per_file(&mut self, job_id: JobId) {
+        let file_ids: std::collections::HashSet<NzbFileId> = self
+            .uu_files
+            .keys()
+            .chain(self.unanchored_parked.keys())
+            .copied()
+            .filter(|file_id| file_id.job_id == job_id)
+            .collect();
 
         for file_id in file_ids {
-            // Memory and disk parks use distinct ledgers; each part is let
-            // go as any part is, its spool file with it.
             if let Some(uu) = self.uu_files.remove(&file_id) {
                 for part in uu.parked.into_values() {
                     self.release_parked_bytes(part.bytes);

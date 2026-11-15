@@ -973,10 +973,9 @@ pub(crate) struct FollowedDir {
     // suffixed name: giving the claim up leaves it.
     existed: bool,
     // The directory the job had, when it was there: this job's own, holding
-    // nothing but its marker. Only its path is kept: a directory handle
-    // held while the move is out would stop anyone else removing it (on
-    // Windows a directory open without delete sharing cannot be deleted),
-    // so the one that removes it opens it then.
+    // nothing but its marker. Only its path is kept: on Windows a folder held
+    // open cannot be removed by anyone else, and a cancel's cleanup may
+    // remove it while the row is written.
     old: Option<PathBuf>,
 }
 
@@ -990,16 +989,20 @@ impl FollowedDir {
         let Some(old_root) = path.parent() else {
             return;
         };
-        let emptied = (|| {
-            let dir = match open_working_directory(old_root, &path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-                result => result?,
-            };
-            if !holds_only_its_marker(&dir, &path, self.job_id)? {
-                return Ok(false);
-            }
-            dir.remove_open_dir_all().map(|()| true)
-        })();
+        // Opened again by its path and judged as at the claim: gone
+        // meanwhile, or no longer the job's own with nothing but its marker,
+        // and it is left.
+        let emptied = match open_working_directory(old_root, &path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+            Ok(dir) => holds_only_its_marker(&dir, &path, self.job_id).and_then(|only| {
+                if only {
+                    dir.remove_open_dir_all().map(|()| true)
+                } else {
+                    Ok(false)
+                }
+            }),
+        };
         if let Err(error) = emptied {
             tracing::warn!(job_id = self.job_id.0, dir = %path.display(), %error, "could not remove the working directory a job moved out of");
         }
@@ -1048,16 +1051,8 @@ impl FollowedDir {
     }
 }
 
-// A job that never started works under the intermediate folder set now. Its
-// working directory elsewhere is claimed again, marked, under `root`, when
-// the one it has is this job's own and holds nothing but its marker, or is
-// gone, folder or root: a job that never started left nothing there. One
-// that is another's or holds anything else is left as it is, and the job
-// keeps it: None. A directory already under `root` is kept while it is
-// there, and claimed again when it is gone. Nothing is removed here: the
-// caller records the new directory, then leaves the old.
-// Whether `dir`, at `path`, is `job_id`'s own working directory and holds
-// nothing but its marker.
+// Whether the working directory `dir`, at `path`, is `job_id`'s own and holds
+// nothing but its marker. A marker that cannot be read proves nothing.
 fn holds_only_its_marker(dir: &Dir, path: &Path, job_id: JobId) -> std::io::Result<bool> {
     let Ok(stored) = read_working_marker(dir) else {
         return Ok(false);
@@ -1078,6 +1073,14 @@ fn holds_only_its_marker(dir: &Dir, path: &Path, job_id: JobId) -> std::io::Resu
     Ok(true)
 }
 
+// A job that never started works under the intermediate folder set now. Its
+// working directory elsewhere is claimed again, marked, under `root`, when
+// the one it has is this job's own and holds nothing but its marker, or is
+// gone, folder or root: a job that never started left nothing there. One
+// that is another's or holds anything else is left as it is, and the job
+// keeps it: None. A directory already under `root` is kept while it is
+// there, and claimed again when it is gone. Nothing is removed here: the
+// caller records the new directory, then leaves the old.
 pub(crate) fn follow_intermediate_dir(
     root: &Path,
     current: &Path,

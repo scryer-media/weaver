@@ -152,6 +152,13 @@ fn examine(
             let said = said(&repair.assessment, repair.patches.len() as u64);
             found_damaged(volume, &repair.assessment);
             if matches!(said, Said::Rebuilt { .. }) {
+                volume.will_write(
+                    repair
+                        .patches
+                        .iter()
+                        .map(|patch| patch.bytes.len() as u64)
+                        .sum(),
+                );
                 for patch in &repair.patches {
                     volume.write_repaired(patch.offset, &patch.bytes);
                 }

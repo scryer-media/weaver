@@ -90,6 +90,60 @@ pub(crate) struct JobActivated {
     pub(crate) result: Result<ReadArticles, String>,
 }
 
+// Whether a move of a job's working directory is out, was cancelled while
+// out, or is done with. A cancel marks it under the queue's lock in the same
+// write that holds the job's cleanup, so the guard that ends it after that
+// write always lets the job go, and a guard that ended first holds nothing.
+pub(crate) struct MoveWatch(std::sync::atomic::AtomicU8);
+
+const MOVE_OUT: u8 = 0;
+const MOVE_CANCELLED: u8 = 1;
+const MOVE_ENDED: u8 = 2;
+
+impl MoveWatch {
+    fn new() -> Self {
+        Self(std::sync::atomic::AtomicU8::new(MOVE_OUT))
+    }
+
+    // The job is cancelled while the move is out: true when the move is
+    // still out, and its guard will let the job go.
+    pub(crate) fn cancel(&self) -> bool {
+        self.0
+            .compare_exchange(
+                MOVE_OUT,
+                MOVE_CANCELLED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+// The guard of one holder of a job's pending cleanup: dropped, however its
+// work ends, it lets that holder go. A move's guard carries the move's
+// watch, and lets the job go only when it was cancelled while the move was
+// out: nothing is written for a move whose job was not cancelled.
+pub(crate) struct CleanupHold {
+    queue: Arc<crate::pipeline::queue::Queue>,
+    job_id: JobId,
+    holder: crate::pipeline::queue::CleanupHolder,
+    watch: Option<Arc<MoveWatch>>,
+}
+
+impl Drop for CleanupHold {
+    fn drop(&mut self) {
+        let held = self.watch.as_ref().is_none_or(|watch| {
+            watch
+                .0
+                .swap(MOVE_ENDED, std::sync::atomic::Ordering::AcqRel)
+                == MOVE_CANCELLED
+        });
+        if held {
+            self.queue.release_cleanup(self.job_id, self.holder);
+        }
+    }
+}
+
 pub(crate) struct ReadArticles {
     // Every file's article list, in the spec's file order.
     lists: Vec<Vec<SegmentSpec>>,
@@ -105,6 +159,9 @@ pub(crate) struct ReadArticles {
     // job is admitted: its writes go through these, whatever memory says of
     // the paths by then.
     volumes: crate::pipeline::graph::disk::ReadVolumes,
+    // That staging directory, when it is not the one the job had: made by
+    // this read, and the job's to lose should the job leave first.
+    made_staging: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -234,6 +291,8 @@ async fn follow_working_dir(
     #[cfg(test)] gate: Option<Arc<MoveGate>>,
 ) -> Option<PathBuf> {
     let from = current.clone();
+    #[cfg(test)]
+    let seam_root = root.clone();
     let followed = tokio::task::spawn_blocking(move || {
         crate::jobs::working_dir::follow_intermediate_dir(&root, &current, job_id, &name)
     })
@@ -251,6 +310,8 @@ async fn follow_working_dir(
     let stored = dir.clone();
     let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let moved_in_row = Arc::clone(&moved);
+    #[cfg(test)]
+    move_seams::before_row_write(&seam_root).await;
     let recorded =
         match db.try_queue_job_write_committed(job_id, "move_active_job_output_dir", move |db| {
             let took = db.move_active_job_output_dir(job_id, &from, &stored)?;
@@ -260,7 +321,7 @@ async fn follow_working_dir(
             Ok(committed) => committed
                 .await
                 .map_err(|error| error.to_string())
-                .and_then(|written| written),
+                .and_then(|written| written.map_err(|error| error.to_string())),
             Err(error) => Err(error.to_string()),
         };
     if let Err(error) = &recorded {
@@ -269,6 +330,10 @@ async fn follow_working_dir(
     // The row is the arbiter: a row that no longer names the directory the
     // job started in, or has gone, did not move, and the claim is given up.
     let recorded = recorded.is_ok() && moved.load(std::sync::atomic::Ordering::Acquire);
+    #[cfg(test)]
+    if !recorded {
+        move_seams::before_abandon(&seam_root).await;
+    }
     let _ = tokio::task::spawn_blocking(move || {
         #[cfg(test)]
         if let Some(gate) = gate {
@@ -281,6 +346,10 @@ async fn follow_working_dir(
         }
     })
     .await;
+    #[cfg(test)]
+    if !recorded {
+        move_seams::after_abandon(&seam_root);
+    }
     recorded.then_some(dir)
 }
 
@@ -348,11 +417,27 @@ impl Pipeline {
                 .queue
                 .read(|inner| inner.row(job_id).is_none_or(|row| self.job_started(row)))
         });
-        // The move is out from here until its last step on disk returned.
-        let move_out = follow.is_some().then(|| {
-            self.moving_jobs.insert(job_id, activation);
-            crate::pipeline::queue::MoveOut::take(&self.shared_state.queue, job_id)
-        });
+        // The move is out from here until its last step on disk returned,
+        // and so is its hold, which a cancel meanwhile turns into a hold on
+        // the job's cleanup. A folder the reply then removes is counted out
+        // again, in the write that judged it.
+        let (move_out, hold) = follow
+            .is_some()
+            .then(|| {
+                let watch = Arc::new(MoveWatch::new());
+                self.moving_jobs
+                    .insert(job_id, (activation, Arc::clone(&watch)));
+                let move_out =
+                    crate::pipeline::queue::MoveOut::take(&self.shared_state.queue, job_id);
+                let hold = CleanupHold {
+                    queue: Arc::clone(&self.shared_state.queue),
+                    job_id,
+                    holder: crate::pipeline::queue::CleanupHolder::Move,
+                    watch: Some(watch),
+                };
+                (move_out, hold)
+            })
+            .unzip();
         #[cfg(test)]
         let gate = self.move_gates.moving.clone();
         let seat = self
@@ -393,6 +478,7 @@ impl Pipeline {
                 None => None,
             };
             drop(move_out);
+            drop(hold);
             let moved = moved_to.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let seat = match moved {
@@ -420,7 +506,9 @@ impl Pipeline {
                         // from memory alone, never gives it the volume of an
                         // unknown device.
                         let storage = Arc::clone(&staging.storage);
+                        let had = staging.current.clone();
                         let chosen = staging.choose(job_id, destination);
+                        read.made_staging = chosen.clone().filter(|dir| had.as_ref() != Some(dir));
                         read.volumes
                             .push((working_dir.clone(), storage.read_volume(&working_dir)));
                         if let Some(dir) = &chosen {
@@ -482,7 +570,7 @@ impl Pipeline {
             let busy =
                 inner.admissions.contains(&job_id) || inner.history_operations.contains(&job_id);
             let (taken, changed) = match inner.job_mut(job_id) {
-                Some(row)
+                Some(mut row)
                     if !row.report.retiring
                         && row.report.job.output_dir.as_deref() == Some(from.as_str()) =>
                 {
@@ -520,7 +608,11 @@ impl Pipeline {
         } = done;
         // The activation that had the job's working directory to move is
         // heard: the job may be sent for again.
-        if self.moving_jobs.get(&job_id) == Some(&activation) {
+        if self
+            .moving_jobs
+            .get(&job_id)
+            .is_some_and(|(current, _)| *current == activation)
+        {
             self.moving_jobs.remove(&job_id);
             self.download_dispatch_wake = true;
         }
@@ -532,32 +624,91 @@ impl Pipeline {
         // left as they are. A directory nothing took, and nothing names, is
         // of a job that left, and goes as that job's own cleanup would have
         // taken it.
-        if let Some(dir) = moved_to
-            && !self.take_or_hold_moved_dir(job_id, &started_in, &dir, true)
-        {
-            let out = crate::pipeline::queue::MoveOut::counted(&self.shared_state.queue, job_id);
+        let left_dir = moved_to
+            .filter(|dir| !self.take_or_hold_moved_dir(job_id, &started_in, dir, true))
+            .map(|dir| {
+                let out =
+                    crate::pipeline::queue::MoveOut::counted(&self.shared_state.queue, job_id);
+                (dir, out)
+            });
+        let heard = self.jobs.get(&job_id).is_some_and(|state| {
+            matches!(state.articles, JobArticles::Activating(_, current) if current == activation)
+        });
+        // A staging directory this read made for a job that has left, with
+        // no row and no one working with the id, goes too: an id being
+        // admitted or restarted owns any staging directory with its marker.
+        // The same write holds the id's cleanup until it is gone, so no one
+        // admitted after it makes that directory again under the removal.
+        let left_staging = match &result {
+            Ok(read) if !heard && !self.jobs.contains_key(&job_id) => {
+                read.made_staging.clone().filter(|_| {
+                    self.shared_state.queue.write(|inner| {
+                        let free = inner.row(job_id).is_none()
+                            && !inner.admissions.contains(&job_id)
+                            && !inner.history_operations.contains(&job_id);
+                        if free {
+                            let holder = crate::pipeline::queue::CleanupHolder::Staging;
+                            inner.pending_cleanup.hold(job_id, holder);
+                        }
+                        crate::pipeline::queue::Change::unchanged(free)
+                    })
+                })
+            }
+            _ => None,
+        }
+        .map(|staging| {
+            let hold = CleanupHold {
+                queue: Arc::clone(&self.shared_state.queue),
+                job_id,
+                holder: crate::pipeline::queue::CleanupHolder::Staging,
+                watch: None,
+            };
+            (staging, hold)
+        });
+        // Both go off the actor, their counts and holds with them.
+        if left_dir.is_some() || left_staging.is_some() {
             #[cfg(test)]
-            let gate = self.move_gates.leaving.clone();
+            let gate = self
+                .move_gates
+                .leaving
+                .clone()
+                .filter(|_| left_dir.is_some());
             tokio::task::spawn_blocking(move || {
-                let _out = out;
                 #[cfg(test)]
                 if let Some(gate) = gate {
                     gate.pass();
                 }
-                let Some(root) = dir.parent() else {
-                    return;
-                };
-                if let Err(error) =
-                    crate::jobs::working_dir::remove_job_working_dir(root, &dir, job_id)
+                if let Some((dir, _out)) = left_dir
+                    && let Some(root) = dir.parent()
+                    && let Err(error) =
+                        crate::jobs::working_dir::remove_job_working_dir(root, &dir, job_id)
                     && error.kind() != std::io::ErrorKind::NotFound
                 {
                     warn!(job_id = job_id.0, dir = %dir.display(), %error, "could not remove the working directory claimed for a job that left");
                 }
+                if let Some((staging, _staging_hold)) = left_staging {
+                    #[cfg(test)]
+                    move_seams::before_staging_removal(&staging);
+                    // The read named it, not necessarily made it: one that
+                    // holds files, or cannot be read, is kept.
+                    match crate::jobs::working_dir::job_staging_dir_holds_files(&staging, job_id) {
+                        Ok(false) => {
+                            if let Err(error) =
+                                crate::jobs::working_dir::remove_job_staging_dir(&staging, job_id)
+                            {
+                                warn!(job_id = job_id.0, dir = %staging.display(), %error, "could not remove the staging directory made for a job that left");
+                            }
+                        }
+                        held => {
+                            tracing::debug!(job_id = job_id.0, dir = %staging.display(), ?held, "kept the staging directory of a job that left: it holds files or cannot be read");
+                        }
+                    }
+                    #[cfg(test)]
+                    move_seams::after_staging_removal(&staging);
+                }
             });
         }
-        if !self.jobs.get(&job_id).is_some_and(|state| {
-            matches!(state.articles, JobArticles::Activating(_, current) if current == activation)
-        }) {
+        if !heard {
             return;
         }
         match result {
@@ -737,8 +888,8 @@ impl Pipeline {
         self.park_drained_jobs();
     }
 
-    // Park every paused job with nothing left out, once its held parts are
-    // spooled. Each turn asks.
+    // Park every paused job, and every job held for a full disk, with nothing
+    // left out, a paused one once its held parts are spooled. Each turn asks.
     pub(crate) fn park_drained_jobs(&mut self) {
         if self.parking_jobs.is_empty() {
             return;
@@ -749,10 +900,21 @@ impl Pipeline {
                 .jobs
                 .get(&job_id)
                 .is_some_and(|state| state.run_state == crate::jobs::model::RunState::Paused);
-            if paused && self.job_has_results_out(job_id) {
+            let full_disk = self.held_for_full_disk(job_id);
+            if (paused || full_disk) && self.job_has_results_out(job_id) {
                 continue;
             }
             self.parking_jobs.remove(&job_id);
+            // A job held for a full disk has no graph to checkpoint: it parks
+            // as it is, what it kept past its checkpoint let go, and goes on at once if a reading
+            // since its write already shows room.
+            if full_disk {
+                self.forget_parts_past_checkpoint(job_id);
+                self.park_drained_job(job_id);
+                self.settle_held_summaries(job_id);
+                self.wake_full_disk();
+                continue;
+            }
             if !paused {
                 continue;
             }
@@ -1002,5 +1164,147 @@ fn read_job_articles(
         restored,
         staging: None,
         volumes: Vec::new(),
+        made_staging: None,
     })
+}
+
+// Seams that hold a move of a working directory, and a restart's clearing of
+// the folders left with the job's marker, at chosen points, so a test sets
+// the order of each step against a cancel and a restart. Armed for one
+// intermediate root at a time; unarmed, each is a no-op.
+#[cfg(test)]
+pub(crate) mod move_seams {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+
+    #[derive(Default)]
+    pub(crate) struct Gate {
+        open: Mutex<bool>,
+        opened: Condvar,
+        notify: tokio::sync::Notify,
+    }
+
+    impl Gate {
+        pub(crate) fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+            self.notify.notify_waiters();
+        }
+
+        fn is_open(&self) -> bool {
+            *self.open.lock().unwrap()
+        }
+
+        async fn pass(&self) {
+            loop {
+                let notified = self.notify.notified();
+                if self.is_open() {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn pass_blocking(&self) {
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.opened.wait(open).unwrap();
+            }
+        }
+    }
+
+    #[derive(Default)]
+    pub(crate) struct Seams {
+        // Before the move's row write.
+        pub(crate) row: Gate,
+        pub(crate) claimed: AtomicBool,
+        // Before the move gives up a directory the row did not take.
+        pub(crate) abandon: Gate,
+        pub(crate) abandoned: AtomicBool,
+        // After a restart has listed the folders it clears: held there until
+        // this gate opens. None holds nothing.
+        pub(crate) listing: Option<Gate>,
+        pub(crate) listed: AtomicBool,
+        // A wait for a pending cleanup has found one.
+        pub(crate) cleanup_waited: AtomicBool,
+        // Before the removal of a staging directory made for a job that
+        // left: held there until this gate opens. None holds nothing.
+        pub(crate) staging_removal: Option<Gate>,
+        pub(crate) staging_removed: AtomicBool,
+    }
+
+    static ARMED: Mutex<Option<(PathBuf, Arc<Seams>)>> = Mutex::new(None);
+
+    pub(crate) fn arm(root: &Path, seams: Seams) -> Arc<Seams> {
+        let seams = Arc::new(seams);
+        *ARMED.lock().unwrap() = Some((root.to_path_buf(), Arc::clone(&seams)));
+        seams
+    }
+
+    pub(crate) fn disarm() {
+        *ARMED.lock().unwrap() = None;
+    }
+
+    fn armed(root: Option<&Path>) -> Option<Arc<Seams>> {
+        ARMED
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(armed, _)| root.is_none_or(|root| root == armed))
+            .map(|(_, seams)| Arc::clone(seams))
+    }
+
+    pub(super) async fn before_row_write(root: &Path) {
+        if let Some(seams) = armed(Some(root)) {
+            seams.claimed.store(true, Ordering::Release);
+            seams.row.pass().await;
+        }
+    }
+
+    pub(super) async fn before_abandon(root: &Path) {
+        if let Some(seams) = armed(Some(root)) {
+            seams.abandon.pass().await;
+        }
+    }
+
+    pub(super) fn after_abandon(root: &Path) {
+        if let Some(seams) = armed(Some(root)) {
+            seams.abandoned.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn after_listing(root: &Path) {
+        if let Some(seams) = armed(Some(root)) {
+            seams.listed.store(true, Ordering::Release);
+            if let Some(gate) = &seams.listing {
+                gate.pass_blocking();
+            }
+        }
+    }
+
+    // A staging directory lies at `<root>/<staging>/<id>`: armed by its root.
+    fn staging_root(staging: &Path) -> Option<&Path> {
+        staging.parent().and_then(Path::parent)
+    }
+
+    pub(super) fn before_staging_removal(staging: &Path) {
+        if let Some(seams) = staging_root(staging).and_then(|root| armed(Some(root)))
+            && let Some(gate) = &seams.staging_removal
+        {
+            gate.pass_blocking();
+        }
+    }
+
+    pub(super) fn after_staging_removal(staging: &Path) {
+        if let Some(seams) = staging_root(staging).and_then(|root| armed(Some(root))) {
+            seams.staging_removed.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn cleanup_waited() {
+        if let Some(seams) = armed(None) {
+            seams.cleanup_waited.store(true, Ordering::Release);
+        }
+    }
 }

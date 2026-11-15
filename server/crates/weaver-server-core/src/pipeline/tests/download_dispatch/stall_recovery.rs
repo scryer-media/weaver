@@ -540,6 +540,7 @@ async fn with_recovery_off_a_stall_is_only_logged() {
     pipeline.dispatch_downloads_at(t0);
     // One pass that opens nothing is not yet a stall.
     assert_eq!(pipeline.last_download_dispatch_stall_log_at, None);
+    assert_eq!(pipeline.download_dispatch_liveness_since, Some(t0));
     let logged_at = t0 + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL;
     pipeline.dispatch_downloads_at(logged_at);
     assert_eq!(
@@ -671,14 +672,12 @@ async fn verification_exclude_healthy_and_cool_remaining(pipeline: &mut Pipeline
         queue.push(work);
     }
     // A genuine auth rejection uses the unmodified production five-minute
-    // backoff. The watchdog can have an older history than this latest rejection.
-    pipeline
-        .nntp
-        .pool()
-        .health()
-        .lock()
-        .await
-        .record_failure(1, true);
+    // backoff. The watchdog can have an older history than this latest
+    // rejection. The server has refused the login for its whole give-up
+    // time, so its refusal is the verdict, not a wait that holds the job:
+    // a refusal still inside the give-up time is
+    // `a_fresh_login_refusal_holds_the_stall_watchdog_until_its_give_up_time`.
+    refuse_login_past_give_up(pipeline, 1).await;
     assert_eq!(
         pipeline
             .nntp
@@ -848,6 +847,711 @@ async fn a_valid_wait_after_kick_restarts_the_recovery_window() {
     );
 }
 
+// Two fill servers: server 0 answered that it lacks the job's articles, and
+// server 1 has just begun refusing the login. The articles wait for server 1
+// as through an outage: while they wait the watchdog's clock restarts at
+// each pass, its windows pass and nothing is booked, and the job names the
+// server. Once server 1 has refused for its whole give-up time, the refusal
+// is the verdict and the release books them as before.
+#[tokio::test]
+async fn a_fresh_login_refusal_holds_the_stall_watchdog_until_its_give_up_time() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pipeline = verification_pipeline(&temp, true).await;
+    let job = JobId(41916);
+    insert_stalled_job(&mut pipeline, job, 3).await;
+    let queue = &mut pipeline
+        .jobs
+        .get_mut(&job)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue;
+    let mut works = queue.drain_all();
+    for work in &mut works {
+        work.exclude_servers = weaver_nntp::ServerSet::from([0]);
+    }
+    for work in works {
+        queue.push(work);
+    }
+    refuse_login(&pipeline, 1).await;
+    let queued = |pipeline: &Pipeline| {
+        pipeline.jobs[&job]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len()
+    };
+
+    // The kick window has passed: the clock restarts now, not at the
+    // verdict instant an hour ahead.
+    let now = Instant::now();
+    pipeline.download_dispatch_stall = Some(crate::pipeline::download::DispatchStallWatch {
+        since: now - DOWNLOAD_DISPATCH_STALL_KICK_AFTER - Duration::from_secs(1),
+        segments_downloaded: pipeline.metrics.segments_downloaded.load(Ordering::Relaxed),
+        kick: None,
+    });
+    pipeline.dispatch_downloads();
+    assert_eq!(kicks(&pipeline), 0);
+    let watch = pipeline.download_dispatch_stall.as_ref().unwrap();
+    assert!(watch.kick.is_none());
+    assert!(watch.since >= now, "the clock restarts");
+    assert!(
+        watch.since <= Instant::now(),
+        "at the pass, not at the verdict instant ahead"
+    );
+    assert_eq!(
+        pipeline
+            .dispatch_wait_reason(job, pipeline.login_refusal_view())
+            .as_deref(),
+        Some(login_refused_name(&pipeline, &[1]).as_str())
+    );
+
+    // A kick of long ago and its release window passed: nothing is booked.
+    verification_old_kick(&mut pipeline, &[job]);
+    pipeline.dispatch_downloads();
+    assert_eq!(releases(&pipeline), 0);
+    assert_eq!(
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(queued(&pipeline), 3);
+    assert_eq!(pipeline.jobs[&job].status, JobStatus::Downloading);
+    assert_eq!(pipeline.jobs[&job].failed_bytes, 0);
+
+    // Server 1 has refused the login for its whole give-up time.
+    pipeline.nntp.pool().set_login_refusal_clock(
+        1,
+        Instant::now() + weaver_nntp::health::LOGIN_REFUSAL_GIVE_UP,
+    );
+    assert!(pipeline.nntp.pool().refuses_credentials(1));
+    verification_old_kick(&mut pipeline, &[job]);
+    pipeline.dispatch_downloads();
+    assert_eq!(releases(&pipeline), 1);
+    assert_eq!(
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+        3
+    );
+}
+
+// The wait reason naming pool servers `servers` as refusing the login.
+fn login_refused_name(pipeline: &Pipeline, servers: &[usize]) -> String {
+    let configs = pipeline.nntp.pool().server_configs();
+    format!(
+        "{}:{}",
+        crate::jobs::handle::LOGIN_REFUSED_WAIT_REASON,
+        servers
+            .iter()
+            .map(|idx| format!("{}:{}", configs[*idx].host, configs[*idx].port))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+// Server 1 has just begun refusing the login, but the job's download work
+// all excludes it, and only its parked optional recovery (which dispatches
+// nothing) could go there. The job does not wait on server 1: it shows no
+// login wait and the watchdog kicks its stall as before.
+#[tokio::test]
+async fn a_login_refusal_holds_nothing_when_the_download_work_all_excludes_the_server() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pipeline = verification_pipeline(&temp, true).await;
+    let job = JobId(41917);
+    insert_stalled_job(&mut pipeline, job, 3).await;
+    let active = pipeline
+        .jobs
+        .get_mut(&job)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap();
+    let mut works = active.download_queue.drain_all();
+    let parked = works.pop().unwrap();
+    for work in &mut works {
+        work.exclude_servers = weaver_nntp::ServerSet::from([0, 1]);
+    }
+    for work in works {
+        active.download_queue.push(work);
+    }
+    active.recovery_queue.push(parked);
+    refuse_login(&pipeline, 1).await;
+    assert_eq!(
+        pipeline.login_refusal_view().waiting,
+        weaver_nntp::ServerSet::from([1])
+    );
+    assert_eq!(
+        pipeline.job_login_refusal_wait(job, pipeline.login_refusal_view(), None),
+        None
+    );
+    assert_eq!(
+        pipeline.dispatch_wait_reason(job, pipeline.login_refusal_view()),
+        None
+    );
+    verification_run_real_kick(&mut pipeline);
+}
+
+// Server 1 has just begun refusing the login, and server 0 may serve the
+// job's work: nothing waits on server 1, the job shows no login wait and
+// the watchdog is not held for it.
+#[tokio::test]
+async fn a_login_refusal_holds_nothing_while_another_server_may_serve_the_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pipeline = verification_pipeline(&temp, true).await;
+    let job = JobId(41918);
+    insert_stalled_job(&mut pipeline, job, 3).await;
+    refuse_login(&pipeline, 1).await;
+    let view = pipeline.login_refusal_view();
+    assert_eq!(view.waiting, weaver_nntp::ServerSet::from([1]));
+    assert_eq!(pipeline.job_login_refusal_wait(job, view, None), None);
+    assert_eq!(pipeline.dispatch_wait_reason(job, view), None);
+    assert_eq!(
+        pipeline.earliest_explained_dispatch_wait(Instant::now()),
+        None,
+        "the stall is unexplained"
+    );
+}
+
+// Server 1 refuses the login, then fails on transport inside the same run
+// of refusals: its work still waits for it to the run's verdict instant.
+// The watchdog's windows pass during the transport quarantine and nothing
+// is booked; the job still names the server as refusing the login.
+#[tokio::test]
+async fn a_transport_quarantine_inside_a_login_refusal_run_keeps_the_work_waiting() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pipeline = verification_pipeline(&temp, true).await;
+    let job = JobId(41919);
+    insert_stalled_job(&mut pipeline, job, 3).await;
+    let queue = &mut pipeline
+        .jobs
+        .get_mut(&job)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue;
+    let mut works = queue.drain_all();
+    for work in &mut works {
+        work.exclude_servers = weaver_nntp::ServerSet::from([0]);
+    }
+    for work in works {
+        queue.push(work);
+    }
+    refuse_login(&pipeline, 1).await;
+    pipeline.nntp.pool().quarantine_for_transport_for_test(1);
+    assert!(!pipeline.nntp.pool().refuses_credentials(1));
+    assert_eq!(
+        pipeline.login_refusal_view().waiting,
+        weaver_nntp::ServerSet::from([1])
+    );
+
+    let now = Instant::now();
+    pipeline.download_dispatch_stall = Some(crate::pipeline::download::DispatchStallWatch {
+        since: now - DOWNLOAD_DISPATCH_STALL_KICK_AFTER - Duration::from_secs(1),
+        segments_downloaded: pipeline.metrics.segments_downloaded.load(Ordering::Relaxed),
+        kick: None,
+    });
+    pipeline.dispatch_downloads();
+    assert_eq!(kicks(&pipeline), 0);
+    verification_old_kick(&mut pipeline, &[job]);
+    pipeline.dispatch_downloads();
+    assert_eq!(releases(&pipeline), 0);
+    assert_eq!(
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        pipeline.jobs[&job]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        3
+    );
+    assert_eq!(pipeline.jobs[&job].failed_bytes, 0);
+    assert_eq!(
+        pipeline
+            .dispatch_wait_reason(job, pipeline.login_refusal_view())
+            .as_deref(),
+        Some(login_refused_name(&pipeline, &[1]).as_str())
+    );
+}
+
+// The wait reason the job's queue row stores.
+fn stored_reason(pipeline: &Pipeline, job: JobId) -> Option<String> {
+    pipeline.shared_state.queue.read(|inner| {
+        inner
+            .job(job)
+            .and_then(|row| row.report.job.download_wait_reason.clone())
+    })
+}
+
+// A stalled job whose three articles server 0 lacks, on the two-server
+// pipeline, with server 1 just begun refusing the login and the row told.
+async fn job_waiting_on_server_1(temp: &tempfile::TempDir, job: JobId) -> Pipeline {
+    let mut pipeline = verification_pipeline(temp, true).await;
+    insert_stalled_job(&mut pipeline, job, 3).await;
+    let queue = &mut pipeline
+        .jobs
+        .get_mut(&job)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue;
+    let mut works = queue.drain_all();
+    for work in &mut works {
+        work.exclude_servers = weaver_nntp::ServerSet::from([0]);
+    }
+    for work in works {
+        queue.push(work);
+    }
+    refuse_login(&pipeline, 1).await;
+    pipeline.report_changed_dispatch_holds();
+    assert_eq!(
+        stored_reason(&pipeline, job),
+        Some(login_refused_name(&pipeline, &[1]))
+    );
+    pipeline
+}
+
+// The row stops saying the job waits on the login once the server takes it.
+#[tokio::test]
+async fn the_stored_login_wait_clears_once_the_login_is_taken() {
+    let temp = tempfile::tempdir().unwrap();
+    let job = JobId(41920);
+    let mut pipeline = job_waiting_on_server_1(&temp, job).await;
+    pipeline
+        .nntp
+        .pool()
+        .take_recovery_probe_for_test(1)
+        .answer();
+    pipeline.report_changed_dispatch_holds();
+    assert_eq!(stored_reason(&pipeline, job), None);
+}
+
+// The hour passes with no probe out and nothing else happening. The loop's
+// wake for that instant tells the verdict once and asks for a dispatch
+// pass, whose report restates the row: no later, unrelated pass is needed.
+#[tokio::test]
+async fn the_stored_login_wait_clears_at_the_verdict_instant_with_no_probe_out() {
+    let temp = tempfile::tempdir().unwrap();
+    let job = JobId(41921);
+    let mut pipeline = job_waiting_on_server_1(&temp, job).await;
+    assert!(
+        pipeline.nntp.pool().next_login_refusal_verdict().is_some(),
+        "the loop has an instant to wait for"
+    );
+    pipeline.tell_login_refusal_verdicts();
+    assert!(!pipeline.download_dispatch_wake, "the hour is not up");
+    assert_eq!(
+        stored_reason(&pipeline, job),
+        Some(login_refused_name(&pipeline, &[1]))
+    );
+
+    pipeline.nntp.pool().set_login_refusal_clock(
+        1,
+        Instant::now() + weaver_nntp::health::LOGIN_REFUSAL_GIVE_UP,
+    );
+    pipeline.tell_login_refusal_verdicts();
+    assert!(pipeline.download_dispatch_wake);
+    assert_eq!(
+        pipeline.nntp.pool().next_login_refusal_verdict(),
+        None,
+        "told once: nothing is left to wake for"
+    );
+    assert!(
+        pipeline
+            .nntp
+            .pool()
+            .login_refusal_verdicts_untold()
+            .is_none()
+    );
+    pipeline.report_changed_dispatch_holds();
+    assert_eq!(stored_reason(&pipeline, job), None);
+}
+
+// The refusing server is removed from the pool: the row stops naming it.
+#[tokio::test]
+async fn the_stored_login_wait_clears_once_the_server_is_removed() {
+    let temp = tempfile::tempdir().unwrap();
+    let job = JobId(41922);
+    let mut pipeline = job_waiting_on_server_1(&temp, job).await;
+    let kept = pipeline.nntp.pool().server_configs()[0].clone();
+    let generation = pipeline.pool_generation + 1;
+    pipeline.activate_nntp(
+        weaver_nntp::NntpClient::new(weaver_nntp::client::NntpClientConfig::single(kept, 1)),
+        1,
+        generation,
+    );
+    assert!(pipeline.login_refusal_view().waiting.is_empty());
+    pipeline.report_changed_dispatch_holds();
+    assert_eq!(stored_reason(&pipeline, job), None);
+}
+
+// A server's password is edited while it refuses the login and a job waits
+// on it. A pool is built from the new password while the pool of the old
+// one is still in use: a dispatch pass in between is not handed the probe
+// and the run of refusals goes on, as it would if the rebuild failed there.
+// Once the new pool is put in use its probe is due at once, the run is
+// over and the row stops saying the job waits on a refused login.
+#[tokio::test]
+async fn a_credential_edit_ends_the_login_wait_and_makes_the_new_pools_probe_due() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_backlog(&temp, 6 * 1024 * 1024, 1).await;
+    let registry = weaver_nntp::transfer::ServerTransferRegistry::new();
+    let control = registry.control(weaver_nntp::transfer::StableServerId(9));
+    let port = refusing_harness_server_port();
+    let client = |password: &str| {
+        let mut config = weaver_nntp::client::NntpClientConfig::single(
+            weaver_nntp::ServerConfig {
+                host: "127.0.0.1".into(),
+                port,
+                tls: false,
+                username: Some("user".into()),
+                password: Some(password.into()),
+                ..Default::default()
+            },
+            1,
+        );
+        config.servers[0].stable_id = weaver_nntp::transfer::StableServerId(9);
+        config.servers[0].transfer_control = Some(Arc::clone(&control));
+        weaver_nntp::NntpClient::new(config)
+    };
+    pipeline.nntp = Arc::new(client("old"));
+    let job = JobId(41923);
+    insert_stalled_job(&mut pipeline, job, 3).await;
+    refuse_login(&pipeline, 0).await;
+    pipeline.report_changed_dispatch_holds();
+    assert_eq!(
+        stored_reason(&pipeline, job),
+        Some(login_refused_name(&pipeline, &[0]))
+    );
+
+    // The new pool exists; the old one is still the pool in use.
+    let verdict_at = control.login_refusal_verdict_at();
+    let rebuilt = client("new");
+    pipeline.dispatch_downloads();
+    assert!(
+        matches!(
+            pipeline.nntp.pool().connection_hold(0, true),
+            Some(weaver_nntp::recovery::ConnectionHold::Until(_))
+        ),
+        "the pool of the old password is not handed the probe"
+    );
+    assert_eq!(pipeline.active_download_connections, 0);
+    assert_eq!(control.login_refusal_verdict_at(), verdict_at);
+    pipeline.report_changed_dispatch_holds();
+    assert_eq!(
+        stored_reason(&pipeline, job),
+        Some(login_refused_name(&pipeline, &[0])),
+        "a rebuild that failed here would leave the wait as it was"
+    );
+    let generation = pipeline.pool_generation + 1;
+    pipeline.activate_nntp(rebuilt, 1, generation);
+    assert_eq!(
+        pipeline.nntp.pool().connection_hold(0, true),
+        Some(weaver_nntp::recovery::ConnectionHold::Probe)
+    );
+    assert_eq!(control.login_refusal_verdict_at(), None);
+    assert!(pipeline.login_refusal_view().waiting.is_empty());
+    pipeline.report_changed_dispatch_holds();
+    assert_eq!(stored_reason(&pipeline, job), None);
+}
+
+// Two of the job's articles wait on server 1, which refuses the login, and
+// the third is work server 0 may serve that nothing is fetching. The job
+// names server 1, but the wedged third article is not explained by it: the
+// watchdog is not held.
+#[tokio::test]
+async fn a_login_wait_on_some_of_a_jobs_work_does_not_explain_the_rest_being_wedged() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pipeline = verification_pipeline(&temp, true).await;
+    let job = JobId(41924);
+    insert_stalled_job(&mut pipeline, job, 3).await;
+    let queue = &mut pipeline
+        .jobs
+        .get_mut(&job)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue;
+    let mut works = queue.drain_all();
+    for work in works.iter_mut().take(2) {
+        work.exclude_servers = weaver_nntp::ServerSet::from([0]);
+    }
+    for work in works {
+        queue.push(work);
+    }
+    refuse_login(&pipeline, 1).await;
+    let view = pipeline.login_refusal_view();
+    assert_eq!(
+        pipeline.job_login_refusal_wait(job, view, None),
+        Some(crate::pipeline::download::LoginRefusalWait {
+            servers: weaver_nntp::ServerSet::from([1]),
+            every: false,
+        })
+    );
+    assert_eq!(
+        pipeline.dispatch_wait_reason(job, view).as_deref(),
+        Some(login_refused_name(&pipeline, &[1]).as_str())
+    );
+    assert_eq!(
+        pipeline.earliest_explained_dispatch_wait(Instant::now()),
+        None,
+        "the stall is unexplained"
+    );
+}
+
+// Two jobs wait on the one server refusing the login, with no probe out for
+// either. When the hour lands the verdict is on both: the turn that tells
+// it books the waiting articles of each, not only those of a job a later
+// probe happens to carry.
+#[tokio::test]
+async fn the_verdict_instant_books_every_job_that_waited_on_the_server() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = JobId(41925);
+    let second = JobId(41926);
+    let mut pipeline = two_jobs_waiting_on_server_1(&temp, first, second).await;
+    let queued = queued_for_download;
+    pipeline.tell_login_refusal_verdicts();
+    assert_eq!(
+        (queued(&pipeline, first), queued(&pipeline, second)),
+        (3, 3)
+    );
+    assert_eq!(
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+        0,
+        "inside the hour nothing is booked"
+    );
+
+    pipeline.nntp.pool().set_login_refusal_clock(
+        1,
+        Instant::now() + weaver_nntp::health::LOGIN_REFUSAL_GIVE_UP,
+    );
+    pipeline.tell_login_refusal_verdicts();
+    assert_eq!(
+        (queued(&pipeline, first), queued(&pipeline, second)),
+        (0, 0)
+    );
+    assert_eq!(
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+        6
+    );
+}
+
+// Two jobs, each with all its work waiting on server 1, which refuses the
+// login.
+async fn two_jobs_waiting_on_server_1(
+    temp: &tempfile::TempDir,
+    first: JobId,
+    second: JobId,
+) -> Pipeline {
+    let mut pipeline = job_waiting_on_server_1(temp, first).await;
+    insert_stalled_job(&mut pipeline, second, 3).await;
+    let queue = &mut pipeline
+        .jobs
+        .get_mut(&second)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue;
+    let mut works = queue.drain_all();
+    for work in &mut works {
+        work.exclude_servers = weaver_nntp::ServerSet::from([0]);
+    }
+    for work in works {
+        queue.push(work);
+    }
+    pipeline
+}
+
+// How many articles `job` has queued for download.
+fn queued_for_download(pipeline: &Pipeline, job: JobId) -> usize {
+    pipeline
+        .jobs
+        .get(&job)
+        .and_then(|state| state.articles.active())
+        .map_or(0, |active| active.download_queue.len())
+}
+
+// The hour lands when the quarantine's deadline already has: the probe is
+// due, the server does not refuse just then, and the sweep has nothing to
+// book. It must not mark the verdict told for that: when the probe is then
+// refused, the verdict is still to be told and both jobs are booked.
+#[tokio::test]
+async fn a_verdict_instant_with_the_probe_due_tells_nothing_until_the_probe_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = JobId(41928);
+    let second = JobId(41929);
+    let mut pipeline = two_jobs_waiting_on_server_1(&temp, first, second).await;
+    let pool = Arc::clone(pipeline.nntp.pool());
+    let give_up = weaver_nntp::health::LOGIN_REFUSAL_GIVE_UP;
+    pool.set_login_refusal_clock(1, Instant::now() + give_up);
+    pool.expire_quarantine_for_test(1);
+    assert!(!pool.refuses_credentials(1), "the probe is due");
+    pipeline.tell_login_refusal_verdicts();
+    assert!(!pipeline.download_dispatch_wake);
+    assert_eq!(
+        (
+            queued_for_download(&pipeline, first),
+            queued_for_download(&pipeline, second)
+        ),
+        (3, 3)
+    );
+    assert_eq!(
+        pool.next_login_refusal_verdict(),
+        None,
+        "nothing to wake for until the server refuses again"
+    );
+
+    pool.refuse_login_for_test(1, give_up);
+    assert!(pool.refuses_credentials(1));
+    assert!(
+        pool.next_login_refusal_verdict()
+            .is_some_and(|at| at <= Instant::now() + give_up),
+        "the verdict is still to be told"
+    );
+    assert!(pool.login_refusal_verdicts_untold().is_some());
+    pipeline.tell_login_refusal_verdicts();
+    assert_eq!(
+        (
+            queued_for_download(&pipeline, first),
+            queued_for_download(&pipeline, second)
+        ),
+        (0, 0)
+    );
+    assert_eq!(
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+        6
+    );
+    assert!(pool.login_refusal_verdicts_untold().is_none());
+    assert_eq!(pool.next_login_refusal_verdict(), None);
+}
+
+// The loop itself, with nothing else to wake it: a job waits on a server
+// refusing the login, no probe is out, and the run's give-up time comes up.
+// The loop's own wait for that instant ends, the waiting articles are
+// booked and the verdict is told. The loop's clock is the paused one, so
+// the instant is reached only by the wait the loop set for it: the system
+// clock the turn's own check reads has not moved.
+#[tokio::test(start_paused = true)]
+async fn the_loop_wakes_itself_at_the_verdict_instant_and_books_the_waiting_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pipeline = verification_pipeline(&temp, true).await;
+    let job = JobId(41930);
+    insert_stalled_job(&mut pipeline, job, 3).await;
+    let queue = &mut pipeline
+        .jobs
+        .get_mut(&job)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue;
+    let mut works = queue.drain_all();
+    for work in &mut works {
+        work.exclude_servers = weaver_nntp::ServerSet::from([0]);
+    }
+    for work in works {
+        queue.push(work);
+    }
+    let pool = Arc::clone(pipeline.nntp.pool());
+    // The run gives up before the quarantine's deadline, so the wait for
+    // the verdict is the first the loop has set on this server.
+    pool.refuse_login_for_test(1, Duration::from_mins(4));
+    let verdict_at = pool
+        .next_login_refusal_verdict()
+        .expect("the loop has an instant to wait for");
+    assert!(verdict_at > Instant::now());
+    // The server's run is read as its give-up time old from here on; only
+    // the loop's wait has still to come up.
+    pool.set_login_refusal_clock(1, verdict_at);
+    assert!(pool.login_refusal_verdicts_untold().is_some());
+
+    let handle =
+        crate::SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let metrics = Arc::clone(&pipeline.metrics);
+    let mut health = pool.server_health_changes();
+    let runner = tokio::spawn(async move { pipeline.run().await });
+    while pool.login_refusal_verdicts_untold().is_some() {
+        health.changed().await;
+    }
+    assert_eq!(pool.next_login_refusal_verdict(), None, "told once");
+    assert_eq!(metrics.articles_not_found.load(Ordering::Relaxed), 3);
+    handle.shutdown().await.unwrap();
+    runner.await.unwrap();
+}
+
+// Two of the job's articles wait on server 1, which refuses the login, and
+// the third is one both servers were tried for and nothing has booked. The
+// watchdog's release books that one and leaves the two that wait for the
+// server's verdict in the queue.
+#[tokio::test]
+async fn the_stall_release_leaves_the_articles_waiting_on_a_refused_login() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pipeline = verification_pipeline(&temp, true).await;
+    let job = JobId(41927);
+    insert_stalled_job(&mut pipeline, job, 3).await;
+    let queue = &mut pipeline
+        .jobs
+        .get_mut(&job)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue;
+    let mut works = queue.drain_all();
+    for (n, work) in works.iter_mut().enumerate() {
+        work.exclude_servers = if n < 2 {
+            weaver_nntp::ServerSet::from([0])
+        } else {
+            weaver_nntp::ServerSet::from([0, 1])
+        };
+    }
+    for work in works {
+        queue.push(work);
+    }
+    refuse_login(&pipeline, 1).await;
+    let view = pipeline.login_refusal_view();
+    assert_eq!(
+        pipeline.earliest_explained_dispatch_wait(Instant::now()),
+        None,
+        "the job is not explained by the login wait, so a release takes it"
+    );
+    let released = pipeline.take_stall_released_work(job, view);
+    assert_eq!(
+        released
+            .iter()
+            .map(|work| work.exclude_servers)
+            .collect::<Vec<_>>(),
+        [weaver_nntp::ServerSet::from([0, 1])]
+    );
+    let left = &pipeline.jobs[&job]
+        .articles
+        .active()
+        .unwrap()
+        .download_queue;
+    assert_eq!(left.len(), 2);
+    assert_eq!(
+        left.steered_exclusion_sets().collect::<Vec<_>>(),
+        [weaver_nntp::ServerSet::from([0])],
+        "the two that wait"
+    );
+
+    // With no server refusing the login, a release takes everything.
+    pipeline
+        .nntp
+        .pool()
+        .take_recovery_probe_for_test(1)
+        .answer();
+    let view = pipeline.login_refusal_view();
+    assert_eq!(pipeline.take_stall_released_work(job, view).len(), 2);
+}
+
 // The liveness stall lines a test hears: every WARN event on this thread
 // whose message is the liveness stall's, as `message key=value...`.
 #[derive(Clone, Default)]
@@ -942,10 +1646,10 @@ async fn the_liveness_stall_counts_promoted_recovery_and_not_parked() {
     let _capture = tracing::subscriber::set_default(lines.clone());
     let t0 = Instant::now();
     pipeline.dispatch_downloads_at(t0);
-    assert_eq!(pipeline.articles_in_flight, 0);
-    // The first pass that opens nothing says nothing; the line comes once
-    // the passes have opened nothing for the log interval.
-    assert_eq!(lines.take(), Vec::<String>::new());
+    assert!(
+        lines.take().is_empty(),
+        "the first pass only starts the clock"
+    );
     pipeline.dispatch_downloads_at(t0 + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL);
     assert_eq!(pipeline.articles_in_flight, 0);
     let heard = lines.take();
@@ -1003,7 +1707,7 @@ async fn passes_that_open_nothing_warn_only_once_they_have_lasted_the_log_interv
     let almost = t0 + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL - Duration::from_millis(1);
     pipeline.dispatch_downloads_at(almost);
     assert_eq!(lines.take(), Vec::<String>::new());
-    assert_eq!(pipeline.download_dispatch_idle_since, Some(t0));
+    assert_eq!(pipeline.download_dispatch_liveness_since, Some(t0));
 
     let lasted = t0 + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL;
     pipeline.dispatch_downloads_at(lasted);
@@ -1049,4 +1753,226 @@ async fn a_job_held_by_its_volume_is_not_warned_of_as_a_stall() {
     let heard = lines.take();
     assert_eq!(heard.len(), 1, "{heard:?}");
     assert_eq!(field(&heard[0], "job_id"), Some("40021"), "{}", heard[0]);
+}
+
+// Queued work with nothing in flight is reported only once it has held for a
+// whole interval. One job ending and the next starting looks like that for a
+// moment; a pass with work in flight in between starts the clock over.
+#[tokio::test]
+async fn the_liveness_stall_speaks_only_after_a_whole_interval() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = stalled_pipeline(&temp_dir).await;
+    pipeline.download_stall_recovery = false;
+    let job_id = JobId(40012);
+    insert_stalled_job(&mut pipeline, job_id, 2).await;
+
+    let lines = LivenessLines::default();
+    let _capture = tracing::subscriber::set_default(lines.clone());
+    let t0 = Instant::now();
+    pipeline.dispatch_downloads_at(t0);
+    assert!(lines.take().is_empty(), "the first pass says nothing");
+    assert_eq!(pipeline.download_dispatch_liveness_since, Some(t0));
+
+    // A pass with an article in flight clears the clock. The article is
+    // only counted, held by no lane, so the lane audit stays off for it.
+    let busy_at = t0 + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL - Duration::from_secs(1);
+    pipeline.audit_lane_holdings = false;
+    pipeline.articles_in_flight = 1;
+    pipeline.dispatch_downloads_at(busy_at);
+    pipeline.articles_in_flight = 0;
+    pipeline.audit_lane_holdings = true;
+    assert!(lines.take().is_empty());
+    assert_eq!(pipeline.download_dispatch_liveness_since, None);
+
+    // The interval since the first pass has passed, but not since the
+    // condition came back.
+    let back_at = t0 + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL;
+    pipeline.dispatch_downloads_at(back_at);
+    assert!(lines.take().is_empty(), "the clock started over");
+    assert_eq!(pipeline.download_dispatch_liveness_since, Some(back_at));
+
+    pipeline.dispatch_downloads_at(back_at + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL);
+    let heard = lines.take();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(field(&heard[0], "job_id"), Some("40012"), "{}", heard[0]);
+}
+
+// The first pass of a stalled job, with the liveness lines it writes captured.
+async fn liveness_clock_started(
+    temp_dir: &tempfile::TempDir,
+    job_id: JobId,
+) -> (
+    Pipeline,
+    LivenessLines,
+    tracing::subscriber::DefaultGuard,
+    Instant,
+) {
+    let mut pipeline = stalled_pipeline(temp_dir).await;
+    pipeline.download_stall_recovery = false;
+    insert_stalled_job(&mut pipeline, job_id, 2).await;
+    let lines = LivenessLines::default();
+    let capture = tracing::subscriber::set_default(lines.clone());
+    let t0 = Instant::now();
+    pipeline.dispatch_downloads_at(t0);
+    assert!(lines.take().is_empty());
+    assert_eq!(pipeline.download_dispatch_liveness_since, Some(t0));
+    (pipeline, lines, capture, t0)
+}
+
+// After a spell that cleared the clock, the first pass that finds queued
+// work and nothing in flight starts it again and says nothing, however long
+// ago the first stall began; a whole interval later the line is written.
+fn assert_the_liveness_clock_started_over(
+    pipeline: &mut Pipeline,
+    lines: &LivenessLines,
+    t0: Instant,
+    job: &str,
+) {
+    assert!(lines.take().is_empty());
+    assert_eq!(pipeline.download_dispatch_liveness_since, None);
+    let back_at = t0 + Duration::from_secs(60 * 60);
+    pipeline.dispatch_downloads_at(back_at);
+    assert!(lines.take().is_empty(), "the clock started over");
+    assert_eq!(pipeline.download_dispatch_liveness_since, Some(back_at));
+
+    let inside = back_at + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL - Duration::from_secs(1);
+    pipeline.dispatch_downloads_at(inside);
+    assert!(lines.take().is_empty());
+
+    pipeline.dispatch_downloads_at(back_at + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL);
+    let heard = lines.take();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(field(&heard[0], "job_id"), Some(job), "{}", heard[0]);
+}
+
+// A connection handoff means dispatch is stopped on purpose, so the stall
+// timed before it is over: the first pass after it is not taken for a stall
+// that has held all along.
+#[tokio::test]
+async fn a_handoff_starts_the_liveness_clock_over() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, lines, _capture, t0) = liveness_clock_started(&temp_dir, JobId(40013)).await;
+
+    pipeline.nntp_handoff_draining = true;
+    pipeline.dispatch_downloads_at(t0 + Duration::from_secs(60));
+    pipeline.nntp_handoff_draining = false;
+    assert_the_liveness_clock_started_over(&mut pipeline, &lines, t0, "40013");
+}
+
+// So does an operator pause.
+#[tokio::test]
+async fn an_operator_pause_starts_the_liveness_clock_over() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, lines, _capture, t0) = liveness_clock_started(&temp_dir, JobId(40014)).await;
+
+    let queue = pipeline.shared_state.queue.clone();
+    let set_paused = |paused: bool| {
+        queue.write(|inner| {
+            inner.globals.paused = paused;
+            crate::pipeline::queue::Change::changed(())
+        })
+    };
+    set_paused(true);
+    pipeline.dispatch_downloads_at(t0 + Duration::from_secs(60));
+    set_paused(false);
+    assert_the_liveness_clock_started_over(&mut pipeline, &lines, t0, "40014");
+}
+
+// And so does a pass that finds nothing dispatch would serve.
+#[tokio::test]
+async fn a_pass_with_no_queued_work_starts_the_liveness_clock_over() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(40015);
+    let (mut pipeline, lines, _capture, t0) = liveness_clock_started(&temp_dir, job_id).await;
+
+    fn active(pipeline: &mut Pipeline, job_id: JobId) -> &mut crate::jobs::model::ActiveArticles {
+        pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .articles
+            .active_mut()
+            .unwrap()
+    }
+    let parked: Vec<_> = active(&mut pipeline, job_id)
+        .download_queue
+        .drain_all()
+        .into_iter()
+        .collect();
+    pipeline.dispatch_downloads_at(t0 + Duration::from_secs(60));
+    for work in parked {
+        active(&mut pipeline, job_id).download_queue.push(work);
+    }
+    assert_the_liveness_clock_started_over(&mut pipeline, &lines, t0, "40015");
+}
+
+// The rate limit only holds a pass back; it does not show the stall over.
+// The clock runs through it, and the first pass that gets as far as the work
+// after a whole interval writes the line.
+#[tokio::test]
+async fn a_rate_limit_wait_leaves_the_liveness_clock_running() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, lines, _capture, t0) = liveness_clock_started(&temp_dir, JobId(40016)).await;
+
+    // A debt at one byte a second that no test run outlasts.
+    pipeline.rate_limiter.set_rate(1);
+    pipeline.rate_limiter.consume(u64::from(u32::MAX));
+    assert!(pipeline.rate_limiter.should_wait());
+    pipeline.dispatch_downloads_at(t0 + Duration::from_secs(60));
+    assert!(lines.take().is_empty());
+    assert_eq!(pipeline.download_dispatch_liveness_since, Some(t0));
+
+    pipeline.rate_limiter.set_rate(0);
+    assert!(!pipeline.rate_limiter.should_wait());
+    pipeline.dispatch_downloads_at(t0 + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL);
+    let heard = lines.take();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(field(&heard[0], "job_id"), Some("40016"), "{}", heard[0]);
+}
+
+// Soft byte pressure spaces passes out; a pass it turns away leaves the
+// clock running, and a stall that holds under soft pressure is still
+// reported after a whole interval.
+#[tokio::test]
+async fn a_stall_under_soft_byte_pressure_is_still_reported() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, lines, _capture, t0) = liveness_clock_started(&temp_dir, JobId(40017)).await;
+
+    pipeline.decode_backlog_budget_bytes = 1000;
+    pipeline
+        .metrics
+        .decode_pending_bytes
+        .store(700, Ordering::Relaxed);
+    let turned_away_at = t0 + Duration::from_secs(60);
+    pipeline.download_pressure_soft_dispatch_after =
+        Some(turned_away_at + Duration::from_secs(60 * 60));
+    pipeline.dispatch_downloads_at(turned_away_at);
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        crate::DownloadPressureState::Soft.as_code()
+    );
+    assert_eq!(
+        pipeline.download_pressure_soft_dispatch_after,
+        Some(turned_away_at + Duration::from_secs(60 * 60)),
+        "the pass was turned away"
+    );
+    assert!(lines.take().is_empty());
+    assert_eq!(pipeline.download_dispatch_liveness_since, Some(t0));
+
+    // Still under soft pressure, a pass that is let through writes the line.
+    pipeline.download_pressure_soft_dispatch_after = None;
+    pipeline.dispatch_downloads_at(t0 + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL);
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        crate::DownloadPressureState::Soft.as_code()
+    );
+    let heard = lines.take();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(field(&heard[0], "job_id"), Some("40017"), "{}", heard[0]);
 }

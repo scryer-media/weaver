@@ -15,6 +15,9 @@ pub(in crate::pipeline) use worker::volume_pace;
 #[cfg(test)]
 pub(in crate::pipeline) use worker::lane_acquire_failure_for_work;
 
+pub(in crate::pipeline) use retention::LoginRefusalView;
+#[cfg(test)]
+pub(in crate::pipeline) use retention::LoginRefusalWait;
 pub(super) use worker::HeldDownloadRefill;
 #[cfg(test)]
 pub(in crate::pipeline) use worker::{

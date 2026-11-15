@@ -932,6 +932,176 @@ async fn uu_job_teardown_releases_only_its_parked_resident_bytes() {
     assert_eq!(pipeline.write_buffered_bytes, 0);
 }
 
+// Two jobs of 3,000 files each. A file in three holds a parked uuencode
+// part, one in three a part held for the part before it, and one in three
+// nothing; every file has an article in each of the three requeue lists.
+fn seed_write_backlog(pipeline: &mut Pipeline, jobs: [JobId; 2]) {
+    const FILES: u32 = 3_000;
+    let generation = pipeline.pool_generation;
+    let source = move || SegmentSource {
+        servers: PoolServers::stamped(generation, None, weaver_nntp::ServerSet::EMPTY),
+    };
+    for job_id in jobs {
+        for file_index in 0..FILES {
+            let file_id = NzbFileId { job_id, file_index };
+            let segment = |segment_number| SegmentId {
+                file_id,
+                segment_number,
+            };
+            match file_index % 3 {
+                0 => {
+                    let mut uu = UuFileAssembly::default();
+                    uu.parked.insert(
+                        1,
+                        crate::pipeline::ParkedUu {
+                            bytes: crate::pipeline::ParkedBytes::Memory(DecodedChunk::from(vec![
+                                1u8;
+                                8
+                            ])),
+                            facts: crate::pipeline::UuSegmentFacts {
+                                damaged: false,
+                                ended: false,
+                            },
+                            source: source(),
+                        },
+                    );
+                    pipeline.uu_files.insert(file_id, uu);
+                    pipeline.note_write_buffered(8, 1);
+                    pipeline.note_uu_parked_segment();
+                }
+                1 => {
+                    let data = vec![3u8; 16];
+                    pipeline.unanchored_parked.insert(
+                        file_id,
+                        1,
+                        crate::pipeline::UnanchoredPart {
+                            result: DecodeResult {
+                                encoding: SegmentEncoding::Yenc,
+                                segment_id: segment(1),
+                                raw_size: 16,
+                                yenc_layout: YencLayoutAssertions {
+                                    file_size: 0,
+                                    part: None,
+                                    total: None,
+                                    begin: None,
+                                    end: None,
+                                },
+                                crc_valid: true,
+                                part_crc_verified: true,
+                                part_crc: par2_rs::checksum::crc32(&data),
+                                truncation_suspected: false,
+                                expected_file_crc: None,
+                                segments: Vec::new(),
+                                data: DecodedChunk::from(Vec::<u8>::new()),
+                                yenc_name: "held.bin".to_string(),
+                                checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+                            },
+                            bytes: crate::pipeline::ParkedBytes::Memory(DecodedChunk::from(data)),
+                            source: source(),
+                        },
+                    );
+                    pipeline.note_write_buffered(16, 1);
+                }
+                _ => {}
+            }
+            pipeline.uu_park_requeues.insert(segment(1), (1, 1));
+            pipeline.unanchored_requeues.insert(segment(2), (1, 1));
+            pipeline.pending_unanchored_release.push(segment(3));
+        }
+    }
+}
+
+// Everything the cleanup can change, in a form two pipelines compare by.
+#[allow(clippy::type_complexity)]
+fn write_backlog_state(
+    pipeline: &Pipeline,
+) -> (
+    Vec<(u64, u32)>,
+    Vec<(u64, u32)>,
+    Vec<(u64, u32, u32)>,
+    Vec<(u64, u32, u32)>,
+    Vec<(u64, u32, u32)>,
+    [usize; 4],
+) {
+    let file = |id: &NzbFileId| (id.job_id.0, id.file_index);
+    let segment = |id: &SegmentId| {
+        (
+            id.file_id.job_id.0,
+            id.file_id.file_index,
+            id.segment_number,
+        )
+    };
+    fn sorted<T: Ord>(mut list: Vec<T>) -> Vec<T> {
+        list.sort_unstable();
+        list
+    }
+    (
+        sorted(pipeline.uu_files.keys().map(file).collect()),
+        sorted(pipeline.unanchored_parked.keys().map(file).collect()),
+        sorted(pipeline.uu_park_requeues.keys().map(segment).collect()),
+        sorted(pipeline.unanchored_requeues.keys().map(segment).collect()),
+        // Kept in its own order: the release works through it front to back.
+        pipeline
+            .pending_unanchored_release
+            .iter()
+            .map(segment)
+            .collect(),
+        [
+            pipeline.unanchored_parked.parts(),
+            pipeline.write_buffered_bytes,
+            pipeline.write_buffered_segments,
+            pipeline.uu_parked_segments,
+        ],
+    )
+}
+
+// A job of 3,000 files is cleaned in one pass over each list, and nothing
+// of the job is left in any list: a third of its files hold no part and
+// have only entries for articles sent back for another fetch. The other job
+// is whole and the ledgers are at its share. The pass per file it replaced
+// is compared on the parts both clean, the parks and the ledgers: it left
+// the entries of a file with nothing parked, which is the defect.
+#[tokio::test]
+async fn a_job_of_thousands_of_files_is_cleaned_as_a_pass_per_file_cleans_it() {
+    let cleaned = JobId(20181);
+    let kept = JobId(20182);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut one_pass, _, _) = new_direct_pipeline(&temp_dir).await;
+    let other_dir = tempfile::tempdir().unwrap();
+    let (mut per_file, _, _) = new_direct_pipeline(&other_dir).await;
+    seed_write_backlog(&mut one_pass, [cleaned, kept]);
+    seed_write_backlog(&mut per_file, [cleaned, kept]);
+    assert_eq!(
+        write_backlog_state(&one_pass),
+        write_backlog_state(&per_file)
+    );
+
+    one_pass.clear_job_write_backlog(cleaned);
+    per_file.clear_job_write_backlog_per_file(cleaned);
+
+    let (uu, held, park_requeues, held_requeues, pending, ledgers) = write_backlog_state(&one_pass);
+    let old = write_backlog_state(&per_file);
+    assert_eq!((&uu, &held, &ledgers), (&old.0, &old.1, &old.5));
+    assert!(uu.iter().chain(&held).all(|(job, _)| *job == kept.0));
+    assert_eq!((uu.len(), held.len()), (1_000, 1_000));
+    for (list, old) in [
+        (&park_requeues, &old.2),
+        (&held_requeues, &old.3),
+        (&pending, &old.4),
+    ] {
+        assert_eq!(list.len(), 3_000);
+        assert!(list.iter().all(|(job, _, _)| *job == kept.0));
+        // The old pass kept the entries of the files with nothing parked.
+        assert_eq!(old.len(), 3_000 + 1_000);
+    }
+    assert_eq!(ledgers, [1_000, 1_000 * 8 + 1_000 * 16, 2_000, 1_000]);
+
+    one_pass.clear_job_write_backlog(kept);
+    let (uu, held, _, _, _, ledgers) = write_backlog_state(&one_pass);
+    assert!(uu.is_empty() && held.is_empty());
+    assert_eq!(ledgers, [0; 4]);
+}
+
 #[tokio::test]
 async fn uu_duplicate_segment_is_replaced_at_its_original_offset() {
     let temp_dir = tempfile::tempdir().unwrap();

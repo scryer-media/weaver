@@ -9,6 +9,16 @@ use super::*;
 pub(crate) static RUNTIME_WRITES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+// What the writer answers the next moving-row writes with in place of
+// running them, first in first out, and how many moving rows it wrote.
+#[cfg(test)]
+pub(crate) static MOVING_ROW_REFUSED: std::sync::Mutex<
+    std::collections::VecDeque<crate::StateError>,
+> = std::sync::Mutex::new(std::collections::VecDeque::new());
+#[cfg(test)]
+pub(crate) static MOVING_ROWS_WRITTEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 // A job's runtime columns in its active row, as the pipeline writes them.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ActiveRuntimeValues {
@@ -119,7 +129,8 @@ impl Pipeline {
         &self,
         job_id: JobId,
         output_dir: Option<std::path::PathBuf>,
-    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), crate::persistence::error::WriteFailed>>>
+    {
         let values = self.active_runtime_values(job_id)?;
         self.persist_runtime_values(job_id, values, output_dir)
     }
@@ -178,7 +189,8 @@ impl Pipeline {
         job_id: JobId,
         values: ActiveRuntimeValues,
         output_dir: Option<std::path::PathBuf>,
-    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), crate::persistence::error::WriteFailed>>>
+    {
         #[cfg(test)]
         RUNTIME_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let output_dir = output_dir
@@ -217,6 +229,16 @@ impl Pipeline {
         match self
             .db
             .try_queue_job_write_committed(job_id, "set_active_job_runtime", move |db| {
+                #[cfg(test)]
+                if status == "moving"
+                    && let Some(refused) = MOVING_ROW_REFUSED.lock().unwrap().pop_front()
+                {
+                    return Err(refused);
+                }
+                #[cfg(test)]
+                if status == "moving" {
+                    MOVING_ROWS_WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 db.set_active_job_runtime_at(
                     job_id,
                     output_dir.as_deref(),
@@ -292,6 +314,11 @@ impl Pipeline {
         ) {
             return;
         }
+        // A job held for a full disk has nothing to judge: it goes on from
+        // its checkpoint once there is room.
+        if self.held_for_full_disk(job_id) {
+            return;
+        }
         if !self.pending_completion_checks.contains(&job_id) {
             self.pending_completion_checks.push_back(job_id);
         }
@@ -331,7 +358,8 @@ impl Pipeline {
         new_post_state: crate::jobs::model::PostState,
         new_run_state: crate::jobs::model::RunState,
         persist_status: Option<&'static str>,
-    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), crate::persistence::error::WriteFailed>>>
+    {
         // A moving row is the one durable mark that the delivery has begun:
         // a restart must resume the move into the recorded destination, never
         // fetch the job again.
@@ -573,6 +601,19 @@ impl Pipeline {
                 "placement recovery must succeed before resume".into(),
             ));
         }
+        // A job held for a full disk tries its disk again when resumed. One
+        // that is paused is let go by the wake at the end, once it is
+        // active again: a wake now would find it paused and take the
+        // promise this resume just gave it.
+        if self.held_for_full_disk(job_id) {
+            self.try_full_disk_now(job_id);
+            let paused = self.jobs.get(&job_id).is_some_and(|state| {
+                matches!(state.run_state, crate::jobs::model::RunState::Paused)
+            });
+            if !paused {
+                self.wake_full_disk();
+            }
+        }
         let (resume_status, resume_download_state, resume_post_state) =
             match self.jobs.get_mut(&job_id) {
                 Some(state) => {
@@ -637,6 +678,7 @@ impl Pipeline {
         ) {
             self.schedule_job_completion_check(job_id);
         }
+        self.wake_full_disk();
         Ok(())
     }
 
@@ -645,7 +687,8 @@ impl Pipeline {
         job_id: JobId,
         new_status: JobStatus,
         persist_status: Option<&'static str>,
-    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), crate::persistence::error::WriteFailed>>>
+    {
         let (new_download_state, new_post_state, new_run_state) =
             crate::jobs::model::runtime_lanes_from_status_snapshot(&new_status);
         self.transition_runtime_snapshot(

@@ -271,6 +271,9 @@ impl Pipeline {
         if let Some(ticket) = graph.as_mut().and_then(GraphJob::forget_slot) {
             self.graph_status.repairs.release(ticket);
         }
+        // A job held for a full disk may go on now its old graph has
+        // nothing out.
+        self.wake_full_disk();
         match self.pending_graph_terminals.remove(&job_id) {
             Some(crate::pipeline::health::PendingGraphTerminal::Failed(failure)) => {
                 let cancelling = self.shared_state.queue.read(|inner| {
@@ -396,6 +399,9 @@ impl Pipeline {
                 }
             }
         }
+        // A write the disk had no room for holds the job until it has room,
+        // as one the job made itself would: the error names the device.
+        let device = graph.device_of(&failure.path);
         tracing::warn!(
             job_id = job_id.0,
             path = %failure.path.display(),
@@ -403,7 +409,7 @@ impl Pipeline {
             "a volume's writer could not complete a file operation"
         );
         self.moves_awaiting_disk.remove(&job_id);
-        self.after_graph_result(job_id, Err(disk_error(failure)));
+        self.after_graph_result(job_id, Err(disk_error(failure, device)));
     }
 
     // The same for a job that was stopped while the operation was queued.
@@ -430,7 +436,8 @@ impl Pipeline {
             error = %failure.error,
             "a volume's writer could not complete a file operation of a stopped job"
         );
-        self.fail_job_on_extraction_error(job_id, disk_error(failure).to_extraction());
+        let device = graph.device_of(&failure.path);
+        self.fail_job_on_extraction_error(job_id, disk_error(failure, device).to_extraction());
     }
 
     // A delivery that waited for the job's file operations looks again:
@@ -459,10 +466,11 @@ impl Pipeline {
     }
 }
 
-fn disk_error(failure: Failure) -> GraphError {
+fn disk_error(failure: Failure, device: crate::pipeline::graph::limits::Device) -> GraphError {
     GraphError::Write(WriteError::Leaf(LeafError::Io {
         path: failure.path,
         source: failure.error,
+        device,
     }))
 }
 

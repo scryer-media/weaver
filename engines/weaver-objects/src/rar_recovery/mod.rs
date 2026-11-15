@@ -433,6 +433,7 @@ impl RarRecovery {
                 file.name = self.name_of(member);
             }
         }
+        access.will_write(self.writes(&staged, judged, access));
         let Some(rebuilt) = restore::restore(&dir, &staged, access) else {
             return impossible(missing, unjudged);
         };
@@ -459,6 +460,43 @@ impl RarRecovery {
             0 => RepairOutcome::Repaired { slices: written },
             left => impossible(left, unjudged),
         }
+    }
+
+    // What a restore writes in all: the whole volumes and the recovery
+    // volumes it stages, and each volume it rebuilds twice, once beside the
+    // staged ones and once into its member. A volume no member is bound to
+    // is taken for the widest of the set, which a rebuilt one never passes.
+    fn writes(
+        &self,
+        staged: &[Staged],
+        judged: &BTreeMap<u32, bool>,
+        access: &dyn MemberAccess,
+    ) -> u64 {
+        let (mut data, mut revs, mut widest) = (0u64, 0u64, 0u64);
+        for file in staged {
+            match file.source {
+                Source::Member(_) => {
+                    data = data.saturating_add(file.length);
+                    widest = widest.max(file.length);
+                }
+                Source::Volume(_) => revs = revs.saturating_add(file.length),
+            }
+        }
+        let mut rebuilt = 0u64;
+        for index in 0..self.slots() {
+            if judged.get(&index) == Some(&true) {
+                continue;
+            }
+            let length = self
+                .bound
+                .get(&index)
+                .and_then(|&member| access.length(member));
+            // A volume not whole is not staged: it is rebuilt.
+            data = data.saturating_sub(length.unwrap_or(0));
+            rebuilt = rebuilt.saturating_add(length.unwrap_or(widest));
+        }
+        data.saturating_add(revs)
+            .saturating_add(rebuilt.saturating_mul(2))
     }
 
     fn name_of(&self, member: MemberId) -> String {

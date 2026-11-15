@@ -78,7 +78,7 @@ async fn a_blocked_verification_keeps_ownership_and_allows_checkpoints_until_ack
     started.await.unwrap();
     assert!(job.awaits_mail());
     assert!(!job.repair_out(), "an in-flight checksum is not a repair");
-    assert_eq!(job.phase(), RootPhase::Verifying);
+    assert_eq!(job.checked_phase(), RootPhase::Verifying);
     assert!(matches!(
         crate::pipeline::graph::status::drive(&mut job, &mut slots, AskerId(1), 1),
         Step::Wait
@@ -101,7 +101,7 @@ async fn a_blocked_verification_keeps_ownership_and_allows_checkpoints_until_ack
     let other_checkpoint = Pending::default();
     assert!(other_checkpoint.put(&other, Vec::new()));
     assert!(other_checkpoint.take().0.is_some());
-    assert_eq!(other.phase(), RootPhase::Done);
+    assert_eq!(other.checked_phase(), RootPhase::Done);
 
     job.stop_runs(0);
     assert!(
@@ -138,7 +138,7 @@ async fn a_blocked_verification_keeps_ownership_and_allows_checkpoints_until_ack
     let said = mail.recv().await.unwrap();
     job.run_said(said, &mut slots, 1).unwrap();
     assert!(job.writer.pending_verifications().is_empty());
-    assert_eq!(job.phase(), RootPhase::Done);
+    assert_eq!(job.checked_phase(), RootPhase::Done);
     assert!(checkpoint.put(&job, Vec::new()));
     let delta = checkpoint.take().0.unwrap();
     assert_eq!(delta.nodes.len(), 1, "only the sparse root state changes");
@@ -193,7 +193,7 @@ async fn a_checkpoint_before_verification_cannot_restore_an_unchecked_crc_as_pas
         "pending verification does not refetch recorded bytes"
     );
     assert_eq!(restored.job.writer.pending_verifications(), vec![(0, 0)]);
-    assert_eq!(restored.job.phase(), RootPhase::Verifying);
+    assert_eq!(restored.job.checked_phase(), RootPhase::Verifying);
     let mut slots = RepairSlots::default();
     restored.job.lend(&mut slots, 1).unwrap();
     let said = mail.recv().await.unwrap();
@@ -239,7 +239,7 @@ fn an_ineligible_obligation_in_an_ended_namespace_is_not_pending_work() {
     assert!(job.writer.ruled(&job.tree, NodeId::ROOT, &job.coming()));
 
     assert!(!job.work_pending());
-    assert_ne!(job.phase(), RootPhase::Verifying);
+    assert_ne!(job.checked_phase(), RootPhase::Verifying);
     assert_eq!(
         crate::pipeline::graph::status::drive(&mut job, &mut slots, AskerId(1), 1),
         Step::Deliver
@@ -261,7 +261,7 @@ fn a_queued_checksum_is_verifying_whatever_was_reported_before() {
     ] {
         let (mut job, _dir, _mail, _) = pending();
         job.reported = reported;
-        assert_eq!(job.phase(), RootPhase::Verifying, "{reported:?}");
+        assert_eq!(job.checked_phase(), RootPhase::Verifying, "{reported:?}");
         assert_eq!(
             job.phase_change(),
             (reported != Some(RootPhase::Verifying)).then_some(RootPhase::Verifying)

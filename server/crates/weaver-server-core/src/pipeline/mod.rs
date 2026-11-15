@@ -14,6 +14,7 @@ mod decode;
 pub mod diagnostics;
 pub mod download;
 mod extraction;
+mod full_disk;
 pub mod graph;
 mod health;
 pub(crate) mod held;
@@ -495,6 +496,10 @@ pub(super) struct DownloadWaitStatus {
     pub(super) reason: &'static str,
     pub(super) retry_at_epoch_ms: Option<f64>,
     pub(super) pending_count: usize,
+    // The servers the article parked last under this wait excludes, so a
+    // job whose refused article waits out its retry names the servers that
+    // article waits on without walking the retry queue.
+    pub(super) exclude_servers: weaver_nntp::ServerSet,
 }
 
 #[derive(Debug, Clone)]
@@ -530,6 +535,13 @@ pub(super) struct DownloadLaneObservation {
     pub(super) batch_clean: bool,
     pub(super) unresolved_count: u64,
     pub(super) connection_discarded: bool,
+    // The server answered a request on this connection while a later one
+    // was already on the wire, since the connection last had nothing
+    // outstanding: it demonstrably took pipelined requests. A fault without
+    // it is how any connection fails (an idle close, a restart, an outage)
+    // and says nothing about pipelining; a clean batch without it ran one
+    // request at a time and proves nothing either.
+    pub(super) answered_pipelined: bool,
 }
 
 pub(super) enum DownloadPayload {
@@ -582,11 +594,14 @@ impl DownloadFailureKind {
             Self::EstablishedTransport | Self::Unanswered => {
                 Some("NNTP BODY transport unavailable")
             }
-            Self::Auth => Some("NNTP authentication blocked"),
+            Self::Auth => Some(AUTH_WAIT_REASON),
             Self::ArticleNotFound | Self::ContentOrProtocol => None,
         }
     }
 }
+
+// The wait an article refused for the login records for its one-second retry.
+pub(in crate::pipeline) const AUTH_WAIT_REASON: &str = "NNTP authentication blocked";
 
 // What a refusal for want of a selected group (412) says about the article.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -846,12 +861,34 @@ pub(super) struct MoveToCompleteResult {
 pub(super) enum MoveToCompleteFailure {
     Security(String),
     Operational(String),
+    // The row that says the move began could not be written for want of
+    // room on the database's disk: nothing moved, and the job waits for
+    // room on the data folder's disk.
+    RowFull(String),
+    // An operational failure whose cause is known: the disk `path` lies on
+    // had no room for an entry. The job waits for room there.
+    // `needs` is what the entries whose copy found no room still have to
+    // deliver: what is left of each in the working directory, which is what
+    // the move writes when it goes on. `again` are the names in the
+    // destination those copies were writing: a copy removes what it wrote as
+    // it fails, but not on every mount, so the move replaces them.
+    OutOfSpace {
+        path: PathBuf,
+        message: String,
+        needs: u64,
+        again: Vec<PathBuf>,
+        // An entry was refused by a quota, not by the disk.
+        quota: bool,
+    },
 }
 
 impl std::fmt::Display for MoveToCompleteFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Security(message) | Self::Operational(message) => formatter.write_str(message),
+            Self::Security(message)
+            | Self::Operational(message)
+            | Self::RowFull(message)
+            | Self::OutOfSpace { message, .. } => formatter.write_str(message),
         }
     }
 }
@@ -1518,8 +1555,15 @@ pub(in crate::pipeline) enum SegmentTerminalState {
     // Bodies arrived but no attempt decoded into the declared placement.
     DecodeExhausted,
     // No server may fetch the article: one that would refuses the
-    // credentials. The servers never said the article is gone.
+    // credentials. The servers never said the article is gone, but none
+    // can bring it, so the post's health and its first-article sample count
+    // it as they count a missing article.
     Unservable,
+    // Unservable too, after every server asked said the article is not
+    // there: a server that would have been asked next refuses the
+    // credentials. Counted the same; only the support facts tell the two
+    // apart, by what the servers said.
+    UnservableNotFound,
     // The feed stopped asking for the article once it gave the post up.
     Abandoned,
 }
@@ -1593,8 +1637,9 @@ pub struct Pipeline {
     // The jobs whose working directory an activation is moving under the
     // intermediate folder, each with that activation's number. No other
     // activation is sent for one until that reply is heard, so one move at a
-    // time has the directory.
-    pub(super) moving_jobs: HashMap<JobId, u64>,
+    // time has the directory. The watch is shared with the move's guard,
+    // which lets a job cancelled meanwhile go once the move is done.
+    pub(super) moving_jobs: HashMap<JobId, (u64, Arc<activation::MoveWatch>)>,
     // The repair slots graph jobs share, and what each job's recovery
     // objects said when it last advanced.
     pub(super) graph_status: graph::status::GraphStatus,
@@ -1670,6 +1715,12 @@ pub struct Pipeline {
     // Typed terminal provenance retained until the ordered history archive has
     // durably updated duplicate-promotion eligibility.
     pub(super) semantic_terminal_causes: HashMap<JobId, crate::jobs::SemanticTerminalCause>,
+    // Per job, the servers refusing the login that an article every other
+    // server answered not-found for was never asked of, by identity so a
+    // change of the server list cannot point an entry at another server.
+    // Written when such an article is booked, read when a failure for want
+    // of articles is worded, dropped with the job, on cancel as at its end.
+    pub(super) login_refusals: HashMap<JobId, Vec<weaver_nntp::pool::ServerIdentity>>,
     // The stage a failed job was in when it failed, kept until its history
     // row records the failure kind.
     pub(super) pipeline_failure_stages:
@@ -1724,6 +1775,24 @@ pub struct Pipeline {
     pub(super) admission_disk_held: bool,
     // The jobs the last walk would have started but for that.
     pub(super) disk_unadmitted: std::collections::BTreeSet<JobId>,
+    // The jobs a write found the disk full for: each fetches nothing until
+    // a reading taken since shows room, and then runs on from its last
+    // checkpoint.
+    pub(super) full_disk: std::collections::BTreeMap<JobId, full_disk::FullDisk>,
+    // The jobs let go whose final move goes on into the destination named,
+    // started at the top of the next turn as a restart starts one.
+    pub(super) full_disk_moves: Vec<(JobId, full_disk::Stage)>,
+    // The room promised to each job let go on the figure its step needs,
+    // counted against its disk until that step ends, so one reading does
+    // not promise the same room to two jobs. Empty unless such a job runs.
+    pub(super) full_disk_promised: std::collections::BTreeMap<JobId, full_disk::Promised>,
+    // The wait of the history archives the database had no room for, on the
+    // database's folder. None unless an archive is kept.
+    pub(super) archive_wait: Option<full_disk::ArchiveWait>,
+    // The removals of spool files a held job no longer reads, for a test to
+    // wait on.
+    #[cfg(test)]
+    pub(super) full_disk_sweeps: Vec<tokio::task::JoinHandle<()>>,
     // A `RebuildNntp` has activated a new pool whose predecessor still holds
     // sockets at the provider. Fresh dials wait until the old generation has
     // drained: the provider counts both generations against one allowance,
@@ -1987,14 +2056,17 @@ pub struct Pipeline {
     // Queued articles the dispatch-hold reason has read.
     #[cfg(test)]
     pub(super) dispatch_hold_items_examined: std::sync::atomic::AtomicUsize,
+    // Exclusion sets the login-refusal wait has asked about.
+    #[cfg(test)]
+    pub(super) login_refusal_sets_examined: std::sync::atomic::AtomicUsize,
     // Last time we logged a queued/no-active-download liveness stall.
     pub(super) last_download_dispatch_stall_log_at: Option<Instant>,
-    // The first dispatch pass of the current run of passes that found work
-    // queued and opened no download; `None` once one opens or nothing is
-    // queued. The liveness line speaks only once such a run has lasted
+    // When the dispatch pass first found queued work and nothing in flight,
+    // in the run of such passes going on now; `None` outside one. The
+    // liveness line speaks only once such a run has lasted
     // `DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL`, so the passes right after an
     // add or a restart, before the job's volume is sized, say nothing.
-    pub(super) download_dispatch_idle_since: Option<Instant>,
+    pub(super) download_dispatch_liveness_since: Option<Instant>,
     // The dispatch stall the watchdog is timing toward a kick or a release.
     pub(super) download_dispatch_stall: Option<download::DispatchStallWatch>,
     // The available fill servers of the dispatch attempt running now, in
@@ -2153,8 +2225,10 @@ pub struct Pipeline {
     pub(super) phase_progress: HashMap<(JobId, JobPhase), progress::JobPhaseRuntime>,
     // Cached per-job retention exclusions (pool server indices whose
     // retention window is older than the job). TTL'd; cleared on NNTP
-    // client rebuilds and job removal.
-    pub(super) job_retention_exclude_cache: HashMap<JobId, (Instant, weaver_nntp::ServerSet)>,
+    // client rebuilds and job removal. Behind a lock so a read-only pass
+    // refreshes it in place; only the pipeline's own turn takes it.
+    pub(super) job_retention_exclude_cache:
+        std::sync::Mutex<HashMap<JobId, (Instant, weaver_nntp::ServerSet)>>,
     // Rate limiter, per job, for the "no eligible news server" warning.
     pub(super) no_eligible_server_warn_throttle: download::JobLogThrottle,
     // Rate limiter, per job, for BODY work waiting on local lane capacity.

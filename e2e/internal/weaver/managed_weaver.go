@@ -312,13 +312,17 @@ func killWeaver() {
 				_ = process.Signal(os.Interrupt)
 				if !waitForPIDExit(pid, 10*time.Second) {
 					_ = process.Kill()
+					_ = waitForPIDExit(pid, 10*time.Second)
 				}
 			}
 		}
 	}
 	_ = os.Remove(localWeaverPIDPath())
-	killWeaverListenersOnPort(localWeaverPort())
-	time.Sleep(time.Second)
+	// The next start binds the same port: it is free once every process that
+	// listened on it is gone, so wait for those processes, not for time.
+	for _, pid := range killWeaverListenersOnPort(localWeaverPort()) {
+		_ = waitForPIDExit(pid, 10*time.Second)
+	}
 }
 
 func stopManagedWeaverAfterProfileCollection() {
@@ -439,26 +443,32 @@ func pidExists(pid int) bool {
 	return err == nil || err == syscall.EPERM
 }
 
-func killWeaverListenersOnPort(port string) {
+// killWeaverListenersOnPort kills every process listening on the port and
+// returns their pids.
+func killWeaverListenersOnPort(port string) []int {
 	port = strings.TrimSpace(port)
 	if port == "" {
-		return
+		return nil
 	}
 
 	out, err := exec.Command("lsof", "-tiTCP:"+port, "-sTCP:LISTEN").Output()
 	if err != nil || len(out) == 0 {
-		return
+		return nil
 	}
 
+	var killed []int
 	for _, field := range strings.Fields(string(out)) {
 		pid, parseErr := strconv.Atoi(strings.TrimSpace(field))
 		if parseErr != nil || pid <= 0 {
 			continue
 		}
 		if process, findErr := os.FindProcess(pid); findErr == nil {
-			_ = process.Kill()
+			if process.Kill() == nil {
+				killed = append(killed, pid)
+			}
 		}
 	}
+	return killed
 }
 
 func cleanWeaverState() {

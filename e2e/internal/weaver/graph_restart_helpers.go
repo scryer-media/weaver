@@ -466,10 +466,13 @@ type schemaRewind struct {
 
 // rustStepReverse undoes one Rust migration step: the tables whose columns it
 // reads from the shape, and the statements that undo the step on a database
-// of that shape.
+// of that shape. Refuse, when set, reads the database before anything is
+// planned and names a state the reverse cannot undo, so the rewind stops
+// there instead of leaving the step's work in place.
 type rustStepReverse struct {
 	Tables []string
 	Plan   func(shape schemaShape) []string
+	Refuse func(db *stateConn) error
 }
 
 // rustStepReverses is every Rust migration step a rewind can undo, by hook.
@@ -483,6 +486,32 @@ var rustStepReverses = map[string]rustStepReverse{
 	// function and, where pg_trgm installs, an index: both go first, so the
 	// step makes them again when it is replayed.
 	"fill_history_search_keys_v88": {Plan: reverseHistorySearchV88},
+	// Migration 89 writes history_retention_days = 0 when history has rows
+	// and the key is not saved yet. No schema before 89 knew the key, so an
+	// older build never left it: the rewind deletes it, and the replayed
+	// step writes it again from the history the case left.
+	"seed_history_retention_v89": {Plan: func(schemaShape) []string {
+		return []string{`DELETE FROM settings WHERE key = 'history_retention_days'`}
+	}},
+	// Migration 92 deletes servers only past the limit of 50, and a list of
+	// 50 or fewer it leaves as it is, so on such a list there is nothing to
+	// undo. A list past the limit is one the rewind cannot put back: it is
+	// refused, never passed through.
+	"trim_servers_to_limit_v92": {Plan: func(schemaShape) []string { return nil }, Refuse: refuseServersPastLimitV92},
+}
+
+// serverLimitV92 is the server limit migration 92 trims a stored list to.
+const serverLimitV92 = 50
+
+func refuseServersPastLimitV92(db *stateConn) error {
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM servers`).Scan(&count); err != nil {
+		return err
+	}
+	if count > serverLimitV92 {
+		return fmt.Errorf("the database stores %d servers, past the limit of %d migration 92 trims to; the rewind cannot undo that trim", count, serverLimitV92)
+	}
+	return nil
 }
 
 func reverseHistorySearchV88(shape schemaShape) []string {
@@ -639,6 +668,13 @@ func readSchemaShape(db *stateConn, rewind schemaRewind) (schemaShape, error) {
 // plant what the older build would have left in it.
 func applySchemaRewind(dbPath string, rewind schemaRewind, plant []string) error {
 	return withStateDB(dbPath, func(db *stateConn) error {
+		for _, hook := range rewind.Reverses {
+			if refuse := rustStepReverses[hook].Refuse; refuse != nil {
+				if err := refuse(db); err != nil {
+					return fmt.Errorf("reverse of %s: %w", hook, err)
+				}
+			}
+		}
 		shape, err := readSchemaShape(db, rewind)
 		if err != nil {
 			return err

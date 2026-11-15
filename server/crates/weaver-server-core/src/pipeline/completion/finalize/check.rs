@@ -194,7 +194,7 @@ impl Pipeline {
     }
 
     async fn weigh_job_completion(&mut self, job_id: JobId) {
-        if !self.nzb_admitted.contains(&job_id) {
+        if !self.nzb_admitted.contains(&job_id) || self.held_for_full_disk(job_id) {
             return;
         }
         // A retiring job does not advance: its archive's done event either

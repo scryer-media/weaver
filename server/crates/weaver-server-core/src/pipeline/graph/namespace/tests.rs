@@ -1862,6 +1862,55 @@ fn two_members_that_want_one_name_are_both_written() {
     assert!(job.root().get(second).unwrap().is_complete());
 }
 
+// Every member wants one name and takes the next suffix; then a member that
+// outranks them all takes the name, and each moves on one suffix, the last
+// first. Each move waits for the commit that frees the name the one after it
+// left, so the chain takes a checkpoint per member, and each pass of the
+// moves reads the files once however many moves wait: the files read grow
+// with the members times the checkpoints, never times the moves weighed too.
+#[test]
+fn a_chain_of_moves_reads_the_files_once_per_pass() {
+    const N: usize = 300;
+    let mut job = Job::new(PLENTY);
+    let top = job.member("other.txt", Some(1));
+    job.send(top, 0, b"t", Provenance::Fresh);
+    let members: Vec<MemberId> = (0..N)
+        .map(|k| {
+            let member = job.member("beacon.txt", Some(1));
+            job.send(member, 0, &[k as u8], Provenance::Fresh);
+            member
+        })
+        .collect();
+    let mut build = job.build();
+    job.writer
+        .rename(&mut job.tree, &mut build, NodeId::ROOT, top, "beacon.txt")
+        .unwrap();
+    let before = super::moves::TALLY.with(std::cell::Cell::get);
+    let mut checkpoints = 0;
+    while job.writer.moves_waiting() {
+        let stamp = job.writer.committed + 1;
+        job.writer.recorded(stamp);
+        job.writer
+            .commit_moves(&mut job.tree, stamp)
+            .expect("moves");
+        checkpoints += 1;
+    }
+    let after = super::moves::TALLY.with(std::cell::Cell::get);
+    assert_eq!(after.moves - before.moves, N as u64 + 1);
+    assert_eq!(checkpoints, N + 2);
+    let weighed = after.weighed - before.weighed;
+    assert!(
+        weighed <= ((checkpoints + 1) * (N + 1)) as u64,
+        "{weighed} files read over {checkpoints} checkpoints"
+    );
+    assert_eq!(job.file("beacon.txt"), b"t");
+    for (k, member) in members.iter().enumerate() {
+        let name = format!("beacon ({}).txt", k + 1);
+        assert_eq!(job.root().get(*member).unwrap().output_name, name);
+        assert_eq!(job.file(&name), [k as u8]);
+    }
+}
+
 #[test]
 fn a_member_closes_exactly_when_covered_at_its_length() {
     let mut job = Job::new(PLENTY);
@@ -5306,4 +5355,63 @@ fn a_refused_name_reaches_the_owner_as_damage_once() {
     );
     assert!(job.root().get(member).unwrap().coverage.damaged(whole));
     assert_eq!(std::fs::read_dir(job.dir.path()).unwrap().count(), 0);
+}
+
+// A member whose name was refused, then recognised under a name the file
+// system takes and rebuilt there, is a file on disk: it is no longer
+// marked, and the delivery counts it whole. A member still under its
+// refused name stays marked and is no usable file.
+#[test]
+fn a_refused_name_recognised_and_rebuilt_is_a_usable_file() {
+    // The set rebuilds the member once it is known by the name it gave it.
+    let mut job = Job::new(PLENTY).with_set(Some(Fix {
+        name: "show.mkv",
+        read: ByteRange::new(0, 8),
+        fix: (0, b"abcdefgh"),
+    }));
+    // Parts of 300 bytes, past the 255 a part may hold.
+    let rebuilt = job.member(&format!("{}.mkv", "a".repeat(296)), Some(8));
+    let stays = job.member(&format!("{}.mkv", "b".repeat(296)), Some(4));
+    job.send(rebuilt, 0, b"abcdefgh", Provenance::Fresh);
+    job.send(stays, 0, b"wxyz", Provenance::Fresh);
+    assert!(job.writer.unnamable(NodeId::ROOT, rebuilt));
+    assert!(job.writer.unnamable(NodeId::ROOT, stays));
+    let mut build = job.build();
+    job.writer
+        .rename(&mut job.tree, &mut build, NodeId::ROOT, rebuilt, "show.mkv")
+        .expect("rename");
+    job.commit();
+    // A member the set does not cover, announced so the set binds again
+    // and finds the member under its new name.
+    let other = job.member("other.nfo", Some(4));
+    // A set proves only bytes it read, and the refused member has none.
+    job.par.lock().unwrap().proof = Some(ByteRange::new(0, 0));
+    let mut build = job.build();
+    let due = job.tree.recovery_nodes(NodeId::ROOT);
+    let outcomes: Vec<RepairOutcome> = job
+        .repair(&mut build, NodeId::ROOT, &due)
+        .into_iter()
+        .map(|(_, outcome)| outcome)
+        .collect();
+    assert_eq!(outcomes, vec![RepairOutcome::Repaired { slices: 1 }]);
+    assert_eq!(job.file("show.mkv"), b"abcdefgh");
+    assert!(job.root().get(rebuilt).unwrap().coverage.is_clean());
+    assert!(!job.writer.unnamable(NodeId::ROOT, rebuilt));
+    assert!(job.writer.unnamable(NodeId::ROOT, stays));
+    // Read as the job's ruling reads it: a refused name is no usable file.
+    let delivery = crate::pipeline::graph::status::Delivery::read(
+        &job.tree,
+        |member| member != other,
+        |_| false,
+        |_, _| false,
+        |node, member| job.writer.refused(node, member),
+        |node, member| job.writer.unnamable(node, member),
+        |_| crate::pipeline::graph::status::Unarrived::Short,
+    );
+    assert_eq!(delivery.whole, ["show.mkv"], "{delivery:?}");
+    assert_eq!(
+        delivery.status(None),
+        crate::jobs::model::JobStatus::Partial,
+        "{delivery:?}"
+    );
 }

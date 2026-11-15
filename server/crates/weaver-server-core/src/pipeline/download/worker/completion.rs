@@ -23,6 +23,7 @@ impl Pipeline {
         job_id: JobId,
         kind: DownloadFailureKind,
         delay: Option<std::time::Duration>,
+        exclude_servers: weaver_nntp::ServerSet,
     ) {
         let Some(reason) = kind.infrastructure_wait_reason() else {
             return;
@@ -42,8 +43,10 @@ impl Pipeline {
                 reason,
                 retry_at_epoch_ms,
                 pending_count: 0,
+                exclude_servers,
             });
         wait.reason = reason;
+        wait.exclude_servers = exclude_servers;
         wait.retry_at_epoch_ms = match (wait.retry_at_epoch_ms, retry_at_epoch_ms) {
             (Some(current), Some(next)) => Some(current.min(next)),
             (Some(current), None) => Some(current),
@@ -301,7 +304,12 @@ impl Pipeline {
         };
         self.note_retry_scheduled(segment_id);
         let scheduled_pool_generation = self.pool_generation;
-        self.note_infrastructure_retry_scheduled(segment_id.file_id.job_id, failure_kind, delay);
+        self.note_infrastructure_retry_scheduled(
+            segment_id.file_id.job_id,
+            failure_kind,
+            delay,
+            exclude_servers,
+        );
         self.schedule_infrastructure_retry(
             delay,
             RetryWork {
@@ -1373,7 +1381,11 @@ impl Pipeline {
                         crate::jobs::SemanticTerminalCause::DecodeOrCorruptData
                     }
                 };
-                self.semantic_terminal_causes.insert(job_id, terminal_cause);
+                // The failure becomes the job's cause only where it ends the
+                // article, below. A failure the article is retried past says
+                // nothing of the job once the article is served, and left
+                // standing a login or transport failure would keep a later
+                // failure of the job from trying its next duplicate.
                 match &failure.kind {
                     DownloadFailureKind::ArticleNotFound => self
                         .metrics
@@ -1501,23 +1513,44 @@ impl Pipeline {
                     // Every server is missing the id in use: the article moves
                     // to its next id, or with every id spent is booked missing.
                     if !self.spend_message_id(result.segment_id) {
+                        self.semantic_terminal_causes.insert(job_id, terminal_cause);
                         self.metrics
                             .articles_not_found
                             .fetch_add(1, Ordering::Relaxed);
                         self.send_segment_event(|| PipelineEvent::ArticleNotFound {
                             segment_id: result.segment_id,
                         });
-                        if self.book_failed_segment(result.segment_id) {
+                        // A server that refuses the login was never asked:
+                        // the article is unservable, not known to be gone,
+                        // and the job keeps which server refused.
+                        let refused_by = self.login_refused_unasked(job_id, retry_exclude_servers);
+                        let booked = if refused_by.is_empty() {
+                            self.book_failed_segment(result.segment_id)
+                        } else {
+                            self.book_terminal_segment(
+                                result.segment_id,
+                                SegmentTerminalState::UnservableNotFound,
+                            )
+                        };
+                        if booked {
                             self.note_gap_servers_support_fact(job_id, retry_exclude_servers);
                         }
+                        self.note_login_refusals(job_id, refused_by);
                     }
                 } else if credentials_exhausted {
+                    // The refusal is not the job's cause: the article may move
+                    // to its next id and be served, and booked past a refusing
+                    // server it records the missing articles itself.
                     self.book_unservable_segment(result.segment_id, retry_exclude_servers);
                     // The refusal holds for the job's queued articles too:
                     // every one only refusing servers could serve is booked
                     // in this pass, not leased one batch at a time to be
                     // refused again.
                     self.retire_unservable_queued_work(job_id);
+                    // A login refused past the give-up time is the verdict
+                    // for every job that waited on the server, not this
+                    // one alone.
+                    self.tell_login_refusal_verdicts();
                 } else {
                     let seg_id = result.segment_id;
                     let completion_critical = self.segment_is_completion_critical(seg_id);
@@ -1555,6 +1588,7 @@ impl Pipeline {
                         // article: without this, health stays optimistic and
                         // recovery promotion waits for post-download verify.
                         self.transport_failure_streaks.remove(&seg_id);
+                        self.semantic_terminal_causes.insert(job_id, terminal_cause);
                         if self
                             .book_terminal_segment(seg_id, SegmentTerminalState::RetriesExhausted)
                         {
@@ -1620,6 +1654,7 @@ impl Pipeline {
                                     job_id,
                                     failure.kind,
                                     Some(delay),
+                                    retry_exclude_servers,
                                 );
                             }
                             debug!(

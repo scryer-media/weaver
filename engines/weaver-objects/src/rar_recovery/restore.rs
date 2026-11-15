@@ -43,7 +43,16 @@ pub(super) fn restore(
         .filter_map(|file| stage(dir, file, access))
         .collect();
     let report =
-        unrar_rs::restore_volumes_from_paths(&paths, &unrar_rs::RecoveryOptions::default()).ok()?;
+        match unrar_rs::restore_volumes_from_paths(&paths, &unrar_rs::RecoveryOptions::default()) {
+            Ok(report) => report,
+            // The rebuilt volumes are written beside the staged ones, so a
+            // write that failed there is the scratch directory's to hear.
+            Err(unrar_rs::RarError::Io(error)) => {
+                access.scratch_failed(error);
+                return None;
+            }
+            Err(_) => return None,
+        };
     report
         .missing_volume_numbers
         .into_iter()
@@ -53,11 +62,19 @@ pub(super) fn restore(
 }
 
 // Copy one file of the set into `dir` under its own name. A file whose bytes
-// cannot all be read is left out, which the restore counts as missing.
+// cannot all be read is left out, which the restore counts as missing. A
+// copy the scratch directory refused is told to the namespace.
 fn stage(dir: &Path, file: &Staged, access: &mut dyn MemberAccess) -> Option<PathBuf> {
     let name = Path::new(&file.name).file_name()?;
     let path = dir.join(name);
-    let copied = File::create(&path).ok().and_then(|mut out| {
+    let created = match File::create(&path) {
+        Ok(out) => Some(out),
+        Err(error) => {
+            access.scratch_failed(error);
+            None
+        }
+    };
+    let copied = created.and_then(|mut out| {
         let mut buffer = Vec::new();
         let mut at = 0;
         while at < file.length {
@@ -70,7 +87,10 @@ fn stage(dir: &Path, file: &Staged, access: &mut dyn MemberAccess) -> Option<Pat
             if !read || buffer.len() as u64 != range.len() {
                 return None;
             }
-            out.write_all(&buffer).ok()?;
+            if let Err(error) = out.write_all(&buffer) {
+                access.scratch_failed(error);
+                return None;
+            }
             at = range.end;
         }
         Some(())

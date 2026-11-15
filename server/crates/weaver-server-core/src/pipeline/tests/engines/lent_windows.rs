@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use sevenz_turbo::encoder_options::{AesEncoderOptions, Lzma2Options, PpmdOptions};
@@ -25,7 +26,8 @@ use sevenz_turbo::{EncoderConfiguration, Password};
 use weaver_graph::holds::HoldBudgets;
 use weaver_graph::{Emit, NodeId, Why};
 
-use super::harness::{Outcome, Post, Scenario, payload, run_then};
+use super::harness::{JOB, Outcome, Post, Scenario, admit, payload, run_then};
+use super::lifecycle::drive;
 use super::too_large::sevenz;
 use crate::history::attributes::NO_MEMORY_LIMIT_ATTRIBUTE_KEY;
 use crate::jobs::model::JobStatus;
@@ -126,6 +128,16 @@ fn tune(pipeline: &mut Pipeline, lab: Lab) {
 // The disks as `room` says: the job's folder at the reserve, the data
 // folder `room` over it, the complete folder with room for anything.
 fn disks(pipeline: &mut Pipeline, room: u64) {
+    disks_reading(
+        pipeline,
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(room)),
+    );
+}
+
+// The same, the job's folder reading `folder` bytes over the reserve and
+// the data folder `room`, each as it stands when its disk is looked at.
+fn disks_reading(pipeline: &mut Pipeline, folder: Arc<AtomicU64>, room: Arc<AtomicU64>) {
     let data = pipeline.script_data_dir.clone();
     let intermediate = pipeline.intermediate_dir.clone();
     let complete = pipeline.complete_dir.clone();
@@ -133,11 +145,11 @@ fn disks(pipeline: &mut Pipeline, room: u64) {
         let (intermediate, complete) = (intermediate.clone(), complete.clone());
         Arc::new(move |path: &Path| {
             let available_bytes = if path == intermediate {
-                RESERVE
+                RESERVE + folder.load(Ordering::Acquire)
             } else if path == complete {
                 RESERVE * 4
             } else {
-                RESERVE + room
+                RESERVE + room.load(Ordering::Acquire)
             };
             Ok(DiskSpace {
                 total_bytes: RESERVE * 8,
@@ -345,13 +357,6 @@ fn held_in_ram(record: &Record, name: &str) {
 // Runs per node that returned, nodes in order.
 fn runs(record: &Record) -> Vec<u32> {
     record.ended.values().copied().collect()
-}
-
-// Whether the job's history row offers a retry with no memory limit.
-fn offers_retry(outcome: &Outcome) -> bool {
-    crate::history::attributes::failed_for_memory(&crate::parse_history_metadata(
-        outcome.history_metadata.as_deref(),
-    ))
 }
 
 // ---- archives ----
@@ -578,50 +583,74 @@ async fn lent_from_a_mapped_scratch_window(wide: Wide, name: &str) {
 
 // ---- 2 and 8: scratch-then-fail with no room ----
 
-// The same archives with no room on any disk under scratch-then-fail: the
-// run is refused, nothing is mapped, the job fails naming what the decoder
-// asked for and the window it was held to, nothing is placed in RAM above
-// the ceiling, and the job offers a retry with no memory limit. That retry
-// is lifted to scratch-then-RAM: the scratch still refuses, the run starts
-// again in RAM, and the members come out whole.
-per_family!(full_scratch_fails_with_the_sizes_and_a_lifted_retry_decodes);
+// `posts` as a job under `lab`, served until it is held for a full disk or
+// ends. Held, it is not failed and says it waits for disk space: what it
+// waits for its disk to show, and whether a window was ever mapped. `None`
+// when it was not held.
+async fn held_for_room(
+    posts: Vec<Post>,
+    lab: Lab,
+    more: impl FnOnce(Scenario) -> Scenario,
+) -> Option<(u64, bool)> {
+    let watch = Shared::default();
+    let scenario = more(scenario(posts, lab, &watch));
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    drive(&mut pipeline, &scenario, JOB, |pipeline| {
+        pipeline.held_for_full_disk(JOB)
+    })
+    .await;
+    if !pipeline.held_for_full_disk(JOB) {
+        return None;
+    }
+    let status = crate::pipeline::tests::job_status_for_assert(&pipeline, JOB);
+    assert!(
+        !matches!(status, Some(JobStatus::Failed { .. })),
+        "{status:?}"
+    );
+    assert_eq!(
+        pipeline
+            .dispatch_wait_reason(JOB, pipeline.login_refusal_view())
+            .as_deref(),
+        Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON)
+    );
+    let needs = pipeline.full_disk_needs(JOB).expect("the window's size");
+    Some((needs, spare(&pipeline).is_dir()))
+}
 
-async fn full_scratch_fails_with_the_sizes_and_a_lifted_retry_decodes(wide: Wide, name: &str) {
+// The same on the stock profile `more` sets, with no room in any folder:
+// what the job waits for its disk to show, when it is held. Nothing was
+// mapped.
+pub(super) async fn held_without_room(
+    posts: Vec<Post>,
+    more: impl FnOnce(Scenario) -> Scenario,
+) -> Option<u64> {
+    let lab = Lab {
+        room: 0,
+        ..Lab::stock()
+    };
+    let (needs, mapped) = held_for_room(posts, lab, more).await?;
+    assert!(!mapped);
+    Some(needs)
+}
+
+// The free space every disk here keeps.
+pub(super) const KEPT_FREE: u64 = RESERVE;
+
+// The same archives with no room on any disk under scratch-then-fail: the
+// run is refused, nothing is mapped, and the job is held for a full disk,
+// not failed, waiting for a window wider than the one it was held to and
+// the free space its disk keeps. A run with no memory limit is lifted to
+// scratch-then-RAM: the scratch still refuses, the run starts again in RAM,
+// and the members come out whole.
+per_family!(full_scratch_holds_the_job_and_a_lifted_run_decodes);
+
+async fn full_scratch_holds_the_job_and_a_lifted_run_decodes(wide: Wide, name: &str) {
     let lab = Lab::granting(MEMORY, WINDOW, OverLimit::ScratchThenFail, 0);
-    let (outcome, left, record) = run_lab_with(wide.posts(), lab, with_password(&wide)).await;
-    let Some(JobStatus::Failed { error }) = &outcome.status else {
-        panic!("{name}: {outcome:?}");
-    };
-    // A 7z decode was allowed the run's memory, and kept in RAM what fit
-    // there; a RAR decode was held to the window.
-    let (held, said) = if name.starts_with("7z") {
-        (MEMORY, "of decode memory, 3.0 MiB allowed")
-    } else {
-        (WINDOW, "of decode memory, 128.0 KiB allowed")
-    };
-    assert!(error.contains(said), "{name}: {error}");
-    let withheld = &outcome.graph().delivery.withheld;
-    assert_eq!(withheld.len(), 1, "{name}: {withheld:?}");
-    let Why::TooLarge { needed, allowed } = withheld[0].1 else {
-        panic!("{name}: {withheld:?}");
-    };
-    assert_eq!(allowed, Some(held), "{name}");
-    assert!(
-        needed.is_some_and(|needed| needed > held),
-        "{name}: {needed:?}"
-    );
-    assert!(
-        outcome.files.is_empty(),
-        "{name}: {:?}",
-        outcome.files.keys()
-    );
-    assert!(offers_retry(&outcome), "{name}");
-    never_lent(&left);
-    assert!(
-        runs(&record).iter().all(|runs| *runs == wide.once()),
-        "{name}: {record:?}"
-    );
-    assert_eq!(record.above, 0, "{name}: {record:?}");
+    let (needs, mapped) = held_for_room(wide.posts(), lab, with_password(&wide))
+        .await
+        .unwrap_or_else(|| panic!("{name}: the job is held"));
+    assert!(!mapped, "{name}");
+    assert!(needs > RESERVE + WINDOW, "{name}: {needs}");
 
     let password = with_password(&wide);
     let (outcome, left, record) = run_lab_with(wide.posts(), lab, |scenario| {
@@ -635,6 +664,96 @@ async fn full_scratch_fails_with_the_sizes_and_a_lifted_retry_decodes(wide: Wide
         "{name}: {record:?}"
     );
     held_in_ram(&record, name);
+}
+
+// A dictionary wider than the window under scratch-then-fail, with a
+// quarter of the room it takes free in both folders: the job is held for a
+// full disk, not failed, and waits for the window and the free space its
+// disk keeps. Three quarters of the room keeps it held, and so does a byte
+// short of it. Once the job's folder shows the whole window over the
+// reserve, the job runs again from its checkpoint, the window is lent, and
+// the member comes out whole.
+#[tokio::test]
+async fn a_window_with_no_room_holds_the_job_until_its_folder_shows_the_room() {
+    let wide = wide_xz();
+    // The dictionary the window is asked for.
+    let window = 4 * MIB;
+    let folder = Arc::new(AtomicU64::new(window / 4));
+    let room = Arc::new(AtomicU64::new(window / 4));
+    let lab = Lab::granting(MEMORY, WINDOW, OverLimit::ScratchThenFail, 0);
+    let watch = Shared::default();
+    let (probe_folder, probe_room) = (Arc::clone(&folder), Arc::clone(&room));
+    let scenario = scenario(wide.posts(), lab, &watch).setup(move |pipeline| {
+        tune(pipeline, lab);
+        disks_reading(pipeline, Arc::clone(&probe_folder), Arc::clone(&probe_room));
+    });
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
+    let held = |pipeline: &Pipeline| {
+        let status = crate::pipeline::tests::job_status_for_assert(pipeline, JOB);
+        assert!(
+            !matches!(status, Some(JobStatus::Failed { .. })),
+            "{status:?}"
+        );
+        assert_eq!(
+            pipeline
+                .dispatch_wait_reason(JOB, pipeline.login_refusal_view())
+                .as_deref(),
+            Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON)
+        );
+        pipeline.held_for_full_disk(JOB)
+    };
+    let hears = |pipeline: &mut Pipeline, value: u64| {
+        folder.store(value, Ordering::Release);
+        let root = StorageRoot::Intermediate;
+        let begun = pipeline.storage_capacity.probes_begun(root);
+        pipeline.storage_capacity.request_refresh(root);
+        pipeline
+            .storage_capacity
+            .wait_for_reading_begun_after(root, begun);
+        pipeline.disk_reading();
+    };
+
+    drive(&mut pipeline, &scenario, JOB, |pipeline| {
+        pipeline.held_for_full_disk(JOB)
+    })
+    .await;
+    assert!(held(&pipeline), "the job is held for the window");
+    assert_eq!(pipeline.full_disk_needs(JOB), Some(window + RESERVE));
+    assert!(!spare(&pipeline).is_dir(), "nothing was mapped");
+    // The job parks, and what its old graph had out is heard.
+    pipeline.park_drained_jobs();
+    while pipeline.retiring_graph_jobs.contains_key(&JOB) {
+        let said = pipeline.graph_runs.recv().await.expect("the runs answer");
+        pipeline.graph_run_said(said);
+    }
+
+    hears(&mut pipeline, 3 * window / 4);
+    assert!(held(&pipeline), "three quarters of the room is not enough");
+    hears(&mut pipeline, window - 1);
+    assert!(held(&pipeline), "a byte short is not enough");
+
+    hears(&mut pipeline, window);
+    assert!(!pipeline.held_for_full_disk(JOB), "the job was let go");
+    let done = pipeline
+        .job_activated_rx
+        .recv()
+        .await
+        .expect("the activation channel stays open");
+    pipeline.handle_job_activated(done);
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    assert_eq!(
+        crate::pipeline::tests::job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    let mut files = BTreeMap::new();
+    super::harness::collect(&complete_dir, &complete_dir, &mut files);
+    let (name, len, crc32) = &wide.members[0];
+    let bytes = files
+        .iter()
+        .find(|(path, _)| path.rsplit('/').next() == Some(name.as_str()))
+        .map(|(_, bytes)| bytes)
+        .unwrap_or_else(|| panic!("{name} is delivered: {:?}", files.keys()));
+    assert_eq!((bytes.len(), crc(bytes)), (*len, *crc32));
 }
 
 // ---- 3: scratch-then-RAM with no room ----
@@ -673,27 +792,20 @@ async fn full_scratch_reruns_once_in_ram(wide: Wide, name: &str) {
 
 // RAR3 PPMd asks for two windows, its 1 MiB dictionary and its 1 MiB
 // model; the data folder has room for one. The first is lent, the second
-// refused. Under scratch-then-fail the job fails with the sizes and the
-// lent window is given back; under scratch-then-RAM the run starts once
-// more in RAM and every member comes out whole.
+// refused. Under scratch-then-fail the job is held for a full disk, waiting
+// for the window refused; under scratch-then-RAM the run starts once more
+// in RAM and every member comes out whole.
 #[tokio::test]
-async fn a_second_window_refused_after_the_first_was_lent_fails_or_reruns_in_ram() {
+async fn a_second_window_refused_after_the_first_was_lent_holds_the_job_or_reruns_in_ram() {
     let wide = wide_rar3_ppmd();
     let room = MIB + MIB / 2;
 
     let lab = Lab::granting(MEMORY, WINDOW, OverLimit::ScratchThenFail, room);
-    let (outcome, left, record) = run_lab(wide.posts(), lab).await;
-    let Some(JobStatus::Failed { error }) = &outcome.status else {
-        panic!("{outcome:?}");
-    };
-    assert!(
-        error.contains("1.0 MiB of decode memory, 128.0 KiB allowed"),
-        "{error}"
-    );
-    assert!(outcome.files.is_empty(), "{:?}", outcome.files.keys());
-    lent_and_given_back(&left);
-    assert_eq!(runs(&record), [1], "{record:?}");
-    assert_eq!(record.above, 0, "{record:?}");
+    let (needs, mapped) = held_for_room(wide.posts(), lab, |scenario| scenario)
+        .await
+        .expect("the job is held");
+    assert!(mapped, "the first window was lent");
+    assert_eq!(needs, RESERVE + MIB, "it waits for the window refused");
 
     let lab = Lab::granting(MEMORY, WINDOW, OverLimit::ScratchThenRam, room);
     let (outcome, left, record) = run_lab(wide.posts(), lab).await;

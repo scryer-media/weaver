@@ -83,6 +83,8 @@ pub(crate) async fn clear_left_working_dirs(
     tokio::task::spawn_blocking(move || {
         let jobs = BTreeSet::from([id]);
         let marked = crate::jobs::working_dir::job_working_dirs(&root, &jobs)?;
+        #[cfg(test)]
+        crate::pipeline::activation::move_seams::after_listing(&root);
         for dir in marked.into_values().flatten().filter(|dir| *dir != keep) {
             crate::jobs::working_dir::remove_job_working_dir_if_there(&root, &dir, id)?;
         }
@@ -284,6 +286,8 @@ impl Queue {
             ids.iter()
                 .any(|id| inner.pending_cleanup.contains(id) || inner.moves_out.contains_key(id))
         }) {
+            #[cfg(test)]
+            crate::pipeline::activation::move_seams::cleanup_waited();
             // Counted once, and rung for the test that waits on the count;
             // that ring is marked seen and the wait looks again, so no
             // other ring is missed.
@@ -349,6 +353,7 @@ impl Queue {
             }
             inner.admissions.insert(id);
             inner.sweep_listed.remove(&id);
+            inner.sweep_warned.remove(&id);
             Change::unchanged(Ok(()))
         })?;
         let guard = HistoryOperation {
@@ -689,13 +694,33 @@ impl Queue {
         )
         .await
         {
-            Ok(swept) => swept.then_some(id),
+            Ok(swept) => {
+                if swept && self.read(|inner| inner.sweep_warned.contains(&id)) {
+                    self.write(|inner| {
+                        inner.sweep_warned.remove(&id);
+                        Change::unchanged(())
+                    });
+                }
+                swept.then_some(id)
+            }
             Err(error) => {
-                tracing::warn!(
-                    job_id = id.0,
-                    error = %error,
-                    "could not remove a failed job's files; the next housekeeping sweep tries again"
-                );
+                // Warned once per job in a run; every later sweep tries again,
+                // and only reads the set.
+                let first = !self.read(|inner| inner.sweep_warned.contains(&id))
+                    && self.write(|inner| Change::unchanged(inner.sweep_warned.insert(id)));
+                if first {
+                    tracing::warn!(
+                        job_id = id.0,
+                        error = %error,
+                        "could not remove a failed job's files; the next housekeeping sweep tries again"
+                    );
+                } else {
+                    tracing::debug!(
+                        job_id = id.0,
+                        error = %error,
+                        "still could not remove a failed job's files"
+                    );
+                }
                 None
             }
         }
@@ -1011,6 +1036,9 @@ impl Queue {
                     .collect::<Vec<_>>()
                     .into();
                 self.replace_history(inner, history);
+                for id in &removed {
+                    inner.sweep_warned.remove(id);
+                }
                 Change::changed(())
             });
             let mut outcome = result?;

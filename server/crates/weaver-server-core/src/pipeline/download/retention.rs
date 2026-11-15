@@ -123,19 +123,27 @@ impl Pipeline {
     // post age. These servers are skipped for the job's articles without a
     // network attempt, carry no health penalty, and count toward
     // per-article exhaustion.
+    //
+    // Computing them reads the newest post date across the job's files, so
+    // the answer is kept for a minute whoever asks: a pass that reads it
+    // for every watched job, every turn, walks a job's files at most once a
+    // minute, however many files the job has.
     pub(in crate::pipeline) fn job_retention_excludes(
-        &mut self,
+        &self,
         job_id: JobId,
     ) -> weaver_nntp::ServerSet {
         let now = Instant::now();
-        if let Some((computed_at, excludes)) = self.job_retention_exclude_cache.get(&job_id)
+        let mut cache = self
+            .job_retention_exclude_cache
+            .lock()
+            .expect("retention exclude cache poisoned");
+        if let Some((computed_at, excludes)) = cache.get(&job_id)
             && now.duration_since(*computed_at) < JOB_RETENTION_EXCLUDES_TTL
         {
             return *excludes;
         }
         let excludes = self.compute_job_retention_excludes(job_id);
-        self.job_retention_exclude_cache
-            .insert(job_id, (now, excludes));
+        cache.insert(job_id, (now, excludes));
         excludes
     }
 
@@ -221,11 +229,206 @@ impl Pipeline {
         failure_excludes: weaver_nntp::ServerSet,
         retention_excludes: weaver_nntp::ServerSet,
     ) -> bool {
+        Self::server_may_serve_when(
+            pool,
+            idx,
+            failure_excludes,
+            retention_excludes,
+            pool.refuses_credentials(idx),
+        )
+    }
+
+    // [`Self::server_may_serve`] with whether the server refuses this pool's
+    // credentials already read, so a caller asking for many articles reads
+    // the pool's refusals once.
+    pub(in crate::pipeline) fn server_may_serve_when(
+        pool: &weaver_nntp::NntpPool,
+        idx: usize,
+        failure_excludes: weaver_nntp::ServerSet,
+        retention_excludes: weaver_nntp::ServerSet,
+        refuses_credentials: bool,
+    ) -> bool {
         !failure_excludes.contains(idx)
             && !retention_excludes.contains(idx)
-            && !pool.refuses_credentials(idx)
+            && !refuses_credentials
             && (!pool.is_backfill(idx)
                 || pool.backfill_open_for(failure_excludes, retention_excludes))
+    }
+
+    // The pool's login refusals, read once for every job a pass asks about,
+    // and outside any queue lock: the fill servers whose refusal is still a
+    // wait and, only while there is one, the servers whose refusal is the
+    // verdict. Empty in the common case, at one atomic read per server.
+    pub(in crate::pipeline) fn login_refusal_view(&self) -> LoginRefusalView {
+        let pool = self.nntp.pool();
+        let waiting = pool.login_refusal_waits();
+        if waiting.is_empty() {
+            return LoginRefusalView::default();
+        }
+        LoginRefusalView {
+            waiting,
+            refusing: (0..pool.server_count())
+                .filter(|idx| pool.refuses_credentials(*idx))
+                .collect(),
+        }
+    }
+
+    // A fill server's run of login refusals has lasted its give-up time
+    // and the server refuses now: the one sweep every path to the verdict
+    // leads to, whether the hour itself came up or a login was refused
+    // past it. The verdict is on every job whose work waited for the
+    // server, not only the one whose article a probe carried, so each job
+    // dispatch would draw from is asked whether any of its queued work is
+    // now work no server may serve, and that work is booked missing. A
+    // paused job, or one being cancelled, is left alone: dispatch weighs
+    // its work when it is drawn from again. Dispatch then runs again, which
+    // restates the rows that said they waited.
+    //
+    // The verdict is marked told, and its one line said, only after the
+    // sweep, and only for a server that refused from before the sweep to
+    // after it. Otherwise it stays untold and the sweep runs again when
+    // the server next refuses.
+    //
+    // Nothing runs while no verdict is untold, at one atomic read per
+    // server. Asking costs one question per distinct set of exclusions a
+    // job's queues carry; a queue is walked only to take out what is
+    // booked. Called at the verdict instant the loop waits for and after a
+    // refused login, never on a poll.
+    pub(in crate::pipeline) fn tell_login_refusal_verdicts(&mut self) {
+        let pool = Arc::clone(self.nntp.pool());
+        let Some(untold) = pool.login_refusal_verdicts_untold() else {
+            return;
+        };
+        self.download_dispatch_wake = true;
+        let unservable: Vec<JobId> = self
+            .download_scheduler_eligible_jobs()
+            .into_iter()
+            .filter(|job_id| self.job_has_unservable_queued_work(*job_id))
+            .collect();
+        for job_id in unservable {
+            self.retire_unservable_queued_work(job_id);
+        }
+        pool.mark_login_refusal_verdicts_told(&untold);
+    }
+
+    // Whether any article `job_id` has queued, for download or as parked
+    // recovery, is one no server may fetch: what
+    // [`Self::retire_unservable_queued_work`] would book. Asked once per
+    // distinct set of exclusions, never per article.
+    fn job_has_unservable_queued_work(&self, job_id: JobId) -> bool {
+        let pool = self.nntp.pool();
+        let server_count = pool.server_count();
+        let Some(active) = self
+            .jobs
+            .get(&job_id)
+            .and_then(|state| state.articles.active())
+        else {
+            return false;
+        };
+        if server_count == 0 {
+            return false;
+        }
+        let retention = self.job_retention_excludes(job_id);
+        [&active.download_queue, &active.recovery_queue]
+            .into_iter()
+            .any(|queue| {
+                (queue.len() > queue.excluded_work_count())
+                    .then_some(weaver_nntp::ServerSet::EMPTY)
+                    .into_iter()
+                    .chain(queue.steered_exclusion_sets())
+                    .any(|excludes| {
+                        Self::unavailable_server_count_from_excludes(pool, excludes, retention)
+                            >= server_count
+                    })
+            })
+    }
+
+    // The servers an article carrying `failure_excludes`, in a job whose
+    // retention rules out `retention_excludes`, waits on for the login: some
+    // server may serve it ([`Self::server_may_serve`]) and every server that
+    // may is one whose refusal is still a wait. None when any other server
+    // may serve it, or none may.
+    pub(in crate::pipeline) fn login_refusal_waited_by(
+        &self,
+        view: LoginRefusalView,
+        failure_excludes: weaver_nntp::ServerSet,
+        retention_excludes: weaver_nntp::ServerSet,
+    ) -> Option<weaver_nntp::ServerSet> {
+        Self::login_refusal_waited_by_in(
+            self.nntp.pool(),
+            view,
+            failure_excludes,
+            retention_excludes,
+        )
+    }
+
+    // [`Self::login_refusal_waited_by`] against a pool the caller holds.
+    pub(in crate::pipeline) fn login_refusal_waited_by_in(
+        pool: &weaver_nntp::NntpPool,
+        view: LoginRefusalView,
+        failure_excludes: weaver_nntp::ServerSet,
+        retention_excludes: weaver_nntp::ServerSet,
+    ) -> Option<weaver_nntp::ServerSet> {
+        let may_serve: weaver_nntp::ServerSet = (0..pool.server_count())
+            .filter(|idx| {
+                Self::server_may_serve_when(
+                    pool,
+                    *idx,
+                    failure_excludes,
+                    retention_excludes,
+                    view.refusing.contains(*idx),
+                )
+            })
+            .collect();
+        (!may_serve.is_empty() && may_serve.difference(view.waiting).is_empty())
+            .then_some(may_serve)
+    }
+
+    // The one answer to "does this job wait on a server refusing the login":
+    // the servers its queued download work waits on for the login
+    // ([`Self::login_refusal_waited_by`]), and whether all of that work
+    // does. Parked optional recovery dispatches nothing and is not asked
+    // about; recovery a round promoted sits in the download queue and is.
+    // With `parked`, the article the job parked for its refused-login retry
+    // is asked about too, by the exclusions its recorded wait keeps, so an
+    // article refused at a probe names the same servers parked as queued.
+    //
+    // Nothing runs while no server's refusal is a wait. Otherwise the
+    // question is asked once for the work with no exclusion and once per
+    // distinct set of exclusions the steered work carries, which the queue
+    // counts as it goes: the cost is bounded by the combinations of servers
+    // tried, never by the articles queued. The servers named are those of
+    // every waiting set together, so the answer does not depend on which
+    // set is read first.
+    pub(in crate::pipeline) fn job_login_refusal_wait(
+        &self,
+        job_id: JobId,
+        view: LoginRefusalView,
+        parked: Option<weaver_nntp::ServerSet>,
+    ) -> Option<LoginRefusalWait> {
+        if view.waiting.is_empty() {
+            return None;
+        }
+        let queue = self.jobs.get(&job_id)?.articles.download_queue()?;
+        let retention = self.job_retention_excludes(job_id);
+        let unsteered =
+            (queue.len() > queue.excluded_work_count()).then_some(weaver_nntp::ServerSet::EMPTY);
+        let mut servers = weaver_nntp::ServerSet::EMPTY;
+        let mut every = true;
+        for excludes in unsteered
+            .into_iter()
+            .chain(queue.steered_exclusion_sets())
+            .chain(parked)
+        {
+            #[cfg(test)]
+            self.login_refusal_sets_examined
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match self.login_refusal_waited_by(view, excludes, retention) {
+                Some(waited) => servers = servers.union(waited),
+                None => every = false,
+            }
+        }
+        (!servers.is_empty()).then_some(LoginRefusalWait { servers, every })
     }
 
     // Whether an article carrying `failure_excludes` has no server left
@@ -247,8 +450,8 @@ impl Pipeline {
     // downloading forever with nothing in flight.
     //
     // When a server refusing this pool's credentials is among those that
-    // would otherwise serve it, the refusal is why: the job's terminal cause
-    // says so, not that the article is missing from Usenet.
+    // would otherwise serve it, the refusal is why: the job keeps which
+    // server refused, and its failure for want of articles says so.
     pub(in crate::pipeline) fn book_unservable_work(&mut self, work: &DownloadWork) {
         self.book_unservable_segment(work.segment_id, work.exclude_servers);
     }
@@ -338,15 +541,7 @@ impl Pipeline {
         warn_per_article: bool,
     ) -> weaver_nntp::ServerSet {
         let job_id = segment_id.file_id.job_id;
-        let retention = self.job_retention_excludes(job_id);
-        let pool = self.nntp.pool();
-        let refused_by: weaver_nntp::ServerSet = (0..pool.server_count())
-            .filter(|idx| {
-                !exclude_servers.contains(*idx)
-                    && !retention.contains(*idx)
-                    && pool.refuses_credentials(*idx)
-            })
-            .collect();
+        let refused_by = self.login_refused_unasked(job_id, exclude_servers);
         if warn_per_article {
             warn!(
                 segment = %segment_id,
@@ -362,18 +557,25 @@ impl Pipeline {
                 "no server may fetch this article; booking it as missing so repair can proceed"
             );
         }
+        // The job lacks the article whether or not a server refused: its
+        // cause is the missing articles, as when every server asked said
+        // the article is not there, so its next duplicate is tried. The job
+        // keeps which server refused, and a failure for want of articles
+        // names it.
         if !refused_by.is_empty() {
             self.semantic_terminal_causes.insert(
                 job_id,
-                crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage,
+                crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth,
             );
+            self.note_login_refusals(job_id, refused_by);
         }
         self.metrics
             .articles_not_found
             .fetch_add(1, Ordering::Relaxed);
         self.send_segment_event(|| PipelineEvent::ArticleNotFound { segment_id });
         // A server that refuses the credentials never said the article is
-        // gone, so the post's health does not count it.
+        // gone, and the state says so; the post's health counts it missing
+        // all the same, since no server can bring it.
         let state = if refused_by.is_empty() {
             SegmentTerminalState::Missing
         } else {
@@ -383,6 +585,92 @@ impl Pipeline {
             self.note_gap_servers_support_fact(job_id, exclude_servers);
         }
         refused_by
+    }
+
+    // The servers refusing the login that an article of `job_id` carrying
+    // `exclude_servers` was never asked of: neither excluded for the article
+    // nor out of the post's retention. One pass over the server list, from
+    // what the pool and the job already hold.
+    pub(in crate::pipeline) fn login_refused_unasked(
+        &mut self,
+        job_id: JobId,
+        exclude_servers: weaver_nntp::ServerSet,
+    ) -> weaver_nntp::ServerSet {
+        let retention = self.job_retention_excludes(job_id);
+        let pool = self.nntp.pool();
+        (0..pool.server_count())
+            .filter(|idx| {
+                !exclude_servers.contains(*idx)
+                    && !retention.contains(*idx)
+                    && pool.refuses_credentials(*idx)
+            })
+            .collect()
+    }
+
+    // An article was booked past `refused_by`, every other server having
+    // answered not-found for it or being out of the post's retention: the
+    // job keeps which servers refused, by identity (stable
+    // id, host, port and account) so the set outlives a change of the server
+    // list as the tried servers of an article do. Nothing else changes
+    // here: the job's cause is whatever its failures record.
+    pub(in crate::pipeline) fn note_login_refusals(
+        &mut self,
+        job_id: JobId,
+        refused_by: weaver_nntp::ServerSet,
+    ) {
+        if refused_by.is_empty() {
+            return;
+        }
+        let pool = self.nntp.pool();
+        let configs = pool.server_configs();
+        let held = self.login_refusals.entry(job_id).or_default();
+        for server in refused_by.iter() {
+            let (Some(stable), Some(config)) = (
+                pool.stable_server_id(weaver_nntp::pool::ServerId(server)),
+                configs.get(server),
+            ) else {
+                continue;
+            };
+            // Compared in place: a server already held costs no allocation.
+            if !held.iter().any(|known| {
+                known.stable_id == stable
+                    && known.host == config.host
+                    && known.port == config.port
+                    && known.username == config.username
+            }) {
+                held.push(weaver_nntp::pool::ServerIdentity {
+                    stable_id: stable,
+                    host: config.host.clone(),
+                    port: config.port,
+                    username: config.username.clone(),
+                });
+            }
+        }
+    }
+
+    // The words a job failing for want of articles gains when a server
+    // refusing the login left articles of it unasked for, naming each such
+    // server still in the server list, in the list's order. A server since
+    // removed is not named, and with none left there are no words.
+    pub(in crate::pipeline) fn login_refusal_words(&self, job_id: JobId) -> Option<String> {
+        let refused_by = self.login_refusals.get(&job_id)?;
+        let names = self
+            .nntp
+            .pool()
+            .server_identities()
+            .into_iter()
+            .filter(|server| refused_by.contains(server))
+            .map(|server| format!("{}:{}", server.host, server.port))
+            .collect::<Vec<_>>();
+        let rest = "never asked for the articles no other server had";
+        match names.as_slice() {
+            [] => None,
+            [name] => Some(format!("server {name} refuses the login and was {rest}")),
+            names => Some(format!(
+                "servers {} refuse the login and were {rest}",
+                names.join(", ")
+            )),
+        }
     }
 
     // Book as missing every queued article of `job_id` that no server may
@@ -433,10 +721,37 @@ impl Pipeline {
     }
 
     pub(in crate::pipeline) fn clear_job_retention_excludes(&mut self, job_id: JobId) {
-        self.job_retention_exclude_cache.remove(&job_id);
+        self.job_retention_exclude_cache
+            .get_mut()
+            .expect("retention exclude cache poisoned")
+            .remove(&job_id);
     }
 
     pub(in crate::pipeline) fn clear_retention_exclude_cache(&mut self) {
-        self.job_retention_exclude_cache.clear();
+        self.job_retention_exclude_cache
+            .get_mut()
+            .expect("retention exclude cache poisoned")
+            .clear();
     }
+}
+
+// The pool's login refusals as one pass reads them; see
+// [`Pipeline::login_refusal_view`].
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::pipeline) struct LoginRefusalView {
+    // Fill servers whose refusal is still a wait.
+    pub(in crate::pipeline) waiting: weaver_nntp::ServerSet,
+    // Servers whose refusal is the verdict.
+    pub(in crate::pipeline) refusing: weaver_nntp::ServerSet,
+}
+
+// A job's wait on servers refusing the login; see
+// [`Pipeline::job_login_refusal_wait`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::pipeline) struct LoginRefusalWait {
+    // The servers the waiting work waits on.
+    pub(in crate::pipeline) servers: weaver_nntp::ServerSet,
+    // Whether all the job's queued download work waits on them, so nothing
+    // of it could be dispatched now whatever else is wrong.
+    pub(in crate::pipeline) every: bool,
 }

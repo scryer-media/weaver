@@ -94,6 +94,38 @@ async fn cancel_batch_of_queued_jobs_archives_every_row() {
     }
 }
 
+// A cancelled job leaves neither its cause nor its refusing servers behind.
+// A restore keeps the job id: the job under that id again, failing for want
+// of articles, says nothing of the earlier run's refusal.
+#[tokio::test]
+async fn a_cancelled_job_restored_under_its_id_carries_no_refusal_from_the_earlier_run() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(two_server_retention_client());
+    let job_id = JobId(31_071);
+    insert_queued_jobs(&mut pipeline, &[job_id]).await;
+    pipeline.note_login_refusals(job_id, [1usize].into_iter().collect());
+    pipeline.semantic_terminal_causes.insert(
+        job_id,
+        crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth,
+    );
+    assert!(pipeline.login_refusal_words(job_id).is_some());
+
+    let outcome = cancel_batch(&mut pipeline, &[job_id]).await;
+    assert!(outcome[&job_id].is_ok());
+    assert!(!pipeline.login_refusals.contains_key(&job_id));
+    assert!(!pipeline.semantic_terminal_causes.contains_key(&job_id));
+
+    insert_queued_jobs(&mut pipeline, &[job_id]).await;
+    assert_eq!(pipeline.login_refusal_words(job_id), None);
+    pipeline.fail_job_on_health(job_id, "the post cannot complete".into());
+    assert!(matches!(
+        pipeline.jobs.get(&job_id).map(|state| &state.status),
+        Some(JobStatus::Failed { error }) if error == "the post cannot complete"
+    ));
+    assert!(!pipeline.semantic_terminal_causes.contains_key(&job_id));
+}
+
 #[tokio::test]
 async fn an_operator_cancel_is_recorded_as_cancelled_by_the_operator() {
     let temp_dir = tempfile::tempdir().unwrap();

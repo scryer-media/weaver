@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,6 +36,67 @@ func (ctx *restartCaseContext) interruptWeaverAndWaitForExit() error {
 	if err := ctx.weaver.cmd.Process.Signal(os.Interrupt); err != nil {
 		return fmt.Errorf("send SIGINT to weaver pid %d: %w", ctx.weaver.PID, err)
 	}
+	return ctx.waitForInterruptedWeaverExit()
+}
+
+// shutdownSignalLine is what Weaver logs once it has taken the operator's
+// Ctrl-C and begun to shut down.
+const shutdownSignalLine = "received shutdown signal"
+
+// interruptHeldWeaverAndWaitForExit is the operator's Ctrl-C to a Weaver whose
+// bodies the news server is holding. The hold is lifted once Weaver logs
+// that it took the signal, after the log length read before sending it, so
+// the bodies the signal caught mid-transfer finish at full speed while the
+// shutdown drains them instead of waiting on the hold. `lift` replaces the
+// hold.
+func (ctx *restartCaseContext) interruptHeldWeaverAndWaitForExit(lift func() error) error {
+	if ctx.weaver == nil || ctx.weaver.cmd == nil || ctx.weaver.cmd.Process == nil {
+		return fmt.Errorf("no managed weaver to interrupt")
+	}
+	mark := int64(0)
+	if info, err := os.Stat(ctx.caseLogPath); err == nil {
+		mark = info.Size()
+	}
+	if err := ctx.weaver.cmd.Process.Signal(os.Interrupt); err != nil {
+		return fmt.Errorf("send SIGINT to weaver pid %d: %w", ctx.weaver.PID, err)
+	}
+	done := ctx.weaver.done
+	if err := ctx.pollFor("weaver to log the shutdown signal", func() (bool, error) {
+		select {
+		case <-done:
+			return true, nil
+		default:
+		}
+		return logHoldsAfter(ctx.caseLogPath, mark, shutdownSignalLine)
+	}); err != nil {
+		return err
+	}
+	if err := lift(); err != nil {
+		return fmt.Errorf("lift the news server's hold after the shutdown signal: %w", err)
+	}
+	return ctx.waitForInterruptedWeaverExit()
+}
+
+// logHoldsAfter reports whether the log, past byte `mark`, holds `needle`.
+func logHoldsAfter(path string, mark int64, needle string) (bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+	if _, err := file.Seek(mark, io.SeekStart); err != nil {
+		return false, err
+	}
+	tail, err := io.ReadAll(file)
+	if err != nil {
+		return false, err
+	}
+	return strings.Contains(cleanWeaverLog(string(tail)), needle), nil
+}
+
+// waitForInterruptedWeaverExit waits for a Weaver sent the Ctrl-C to exit on
+// its own. The case timeout only catches a hang.
+func (ctx *restartCaseContext) waitForInterruptedWeaverExit() error {
 	select {
 	case <-ctx.weaver.done:
 	case <-time.After(ctx.Timeout):
@@ -230,12 +292,35 @@ func articleDecodedRange(wire []byte) (decodedRange, error) {
 // to, from the articles the news server holds. ARTICLE is not a BODY, so the
 // server's body counts do not see it.
 func segmentDecodedRanges(host, port string, segments []nzbSegmentRef) (map[string]decodedRange, error) {
+	shapes, err := segmentArticleShapes(host, port, segments)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]decodedRange, len(shapes))
+	for id, shape := range shapes {
+		out[id] = shape.Range
+	}
+	return out, nil
+}
+
+// articleShape is what a case reads of one stored article before it runs:
+// the range it decodes to, and how many body lines a BODY of it serves, the
+// unit the news server's hold_body budget counts.
+type articleShape struct {
+	Range decodedRange
+	Lines int
+}
+
+// segmentArticleShapes reads, by message id, each segment's shape from the
+// articles the news server holds. ARTICLE is not a BODY: the server's body
+// counts do not see it and it spends no hold.
+func segmentArticleShapes(host, port string, segments []nzbSegmentRef) (map[string]articleShape, error) {
 	session, err := openNntpCommandSession(host, port, true)
 	if err != nil {
 		return nil, err
 	}
 	defer session.close()
-	out := make(map[string]decodedRange, len(segments))
+	out := make(map[string]articleShape, len(segments))
 	for _, segment := range segments {
 		wire, err := readStoredArticle(session, segment.MessageID)
 		if err != nil {
@@ -245,9 +330,105 @@ func segmentDecodedRanges(host, port string, segments []nzbSegmentRef) (map[stri
 		if err != nil {
 			return nil, fmt.Errorf("<%s>: %w", segment.MessageID, err)
 		}
-		out[segment.MessageID] = decoded
+		lines, err := articleBodyLines(wire)
+		if err != nil {
+			return nil, fmt.Errorf("<%s>: %w", segment.MessageID, err)
+		}
+		out[segment.MessageID] = articleShape{Range: decoded, Lines: lines}
 	}
 	return out, nil
+}
+
+// articleBodyLines counts the lines a BODY serves of an article in the wire
+// form readStoredArticle returns: from its `=ybegin` line up to the
+// terminating dot, which is where the news server's body starts and ends.
+func articleBodyLines(wire []byte) (int, error) {
+	start := bytes.Index(wire, []byte("\r\n=ybegin"))
+	if start < 0 {
+		return 0, fmt.Errorf("no =ybegin line")
+	}
+	body := wire[start+2:]
+	if !bytes.HasSuffix(body, []byte("\r\n.\r\n")) {
+		return 0, fmt.Errorf("article is not dot-terminated")
+	}
+	return bytes.Count(body, []byte("\r\n")) - 1, nil
+}
+
+// bodyHoldBudget is the hold_body line budget under which at least `need` of
+// the bodies with these line counts complete, whatever order they are served
+// in and however they spread over up to `sessions` connections: each
+// connection serves one body at a time, so at most one body per connection
+// is cut short by the hold, and the budget pays for the `need` longest
+// bodies plus one longest body per connection. `most` is the most bodies the
+// budget can complete: the shortest bodies, taken while they fit.
+func bodyHoldBudget(lines []int, need, sessions int) (budget, most int, err error) {
+	if need <= 0 || need > len(lines) || sessions <= 0 {
+		return 0, 0, fmt.Errorf("a hold for %d of %d bodies over %d connections is not a hold", need, len(lines), sessions)
+	}
+	sorted := slices.Clone(lines)
+	slices.Sort(sorted)
+	for _, count := range sorted[len(sorted)-need:] {
+		budget += count
+	}
+	budget += sessions * sorted[len(sorted)-1]
+	spent := 0
+	for _, count := range sorted {
+		if spent+count > budget {
+			break
+		}
+		spent += count
+		most++
+	}
+	return budget, most, nil
+}
+
+// holdAfterBodies arms a hold on the primary news server that lets at least
+// `need` of these articles' bodies complete over `sessions` connections and
+// then holds every body, and fails when the hold could let every one of them
+// complete, which would let the job finish before the case's stop.
+func holdAfterBodies(shapes map[string]articleShape, ids []string, need, sessions int) (int, error) {
+	lines := make([]int, 0, len(ids))
+	for _, id := range ids {
+		shape, ok := shapes[id]
+		if !ok {
+			return 0, fmt.Errorf("no shape read for <%s>", id)
+		}
+		lines = append(lines, shape.Lines)
+	}
+	budget, most, err := bodyHoldBudget(lines, need, sessions)
+	if err != nil {
+		return 0, err
+	}
+	if most >= len(ids) {
+		return 0, fmt.Errorf("a hold for %d bodies over %d connections could complete all %d; the job could finish first", need, sessions, len(ids))
+	}
+	if err := setNntpChaosOnServer(nntpHost(), nntpPort(), fmt.Sprintf("hold_body=%d", budget)); err != nil {
+		return 0, err
+	}
+	return budget, nil
+}
+
+// bodiesCovering is how many of these articles' bodies must complete for
+// their decoded bytes to reach `bytes` whichever of them complete: the
+// smallest articles, summed until they reach it.
+func bodiesCovering(shapes map[string]articleShape, ids []string, bytes uint64) (int, error) {
+	sizes := make([]uint64, 0, len(ids))
+	for _, id := range ids {
+		shape, ok := shapes[id]
+		if !ok {
+			return 0, fmt.Errorf("no shape read for <%s>", id)
+		}
+		sizes = append(sizes, shape.Range.End-shape.Range.Start)
+	}
+	slices.Sort(sizes)
+	var total uint64
+	for count := 1; count <= len(sizes); count++ {
+		total += sizes[count-1]
+		if total >= bytes {
+			return count, nil
+		}
+	}
+	return 0, fmt.Errorf("all %d articles decode to %d bytes, short of %d", len(sizes), total, bytes)
 }
 
 // coveredArticles names the articles whose decoded bytes the checkpoint rows
@@ -333,12 +514,30 @@ func runEarlyGapRestartPreservesBytesAndRefusal(ctx *restartCaseContext) (restar
 		return restartCaseResult{}, fmt.Errorf("%s has no segment %d", slug, gapNumber)
 	}
 	// The checkpoint holds decoded bytes, so each article is named by the
-	// range it decodes to, read before the gap's article is taken away.
-	ranges, err := segmentDecodedRanges(nntpHost(), nntpPort(), segments)
+	// range it decodes to, read with its body lines before the gap's article
+	// is taken away.
+	shapes, err := segmentArticleShapes(nntpHost(), nntpPort(), segments)
 	if err != nil {
 		return restartCaseResult{}, err
 	}
+	ranges := make(map[string]decodedRange, len(shapes))
+	for id, shape := range shapes {
+		ranges[id] = shape.Range
+	}
 	gapRange := ranges[gap.MessageID]
+	var servable []string
+	for _, segment := range segments {
+		if segment.MessageID != gap.MessageID {
+			servable = append(servable, segment.MessageID)
+		}
+	}
+	// The stop needs the floor written past the hole, plus two barriers: the
+	// checkpoint lags the bytes written by less than one, and one more keeps
+	// the floor clear of that edge.
+	need, err := bodiesCovering(shapes, servable, coveredFloor+2*checkpointBytes)
+	if err != nil {
+		return restartCaseResult{}, err
+	}
 	putBack, err := withholdArticles(nntpHost(), nntpPort(), []string{gap.MessageID})
 	if err != nil {
 		return restartCaseResult{}, err
@@ -350,12 +549,14 @@ func runEarlyGapRestartPreservesBytesAndRefusal(ctx *restartCaseContext) (restar
 		}
 	}()
 
-	if err := ctx.startWeaverWithOptions("", 8, checkpointEnv); err != nil {
+	const connections = 8
+	if err := ctx.startWeaverWithOptions("", connections, checkpointEnv); err != nil {
 		return restartCaseResult{}, err
 	}
-	// Slow every body so the restart point is reached with most of the file
-	// still to come, whatever the machine's speed.
-	if err := setNntpChaos("slow_body=1"); err != nil {
+	// Let through enough bodies for the floor, then hold every body, so the
+	// restart point is reached with the rest of the file still to come,
+	// whatever the machine's speed.
+	if _, err := holdAfterBodies(shapes, servable, need, connections); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug(slug)
@@ -364,37 +565,28 @@ func runEarlyGapRestartPreservesBytesAndRefusal(ctx *restartCaseContext) (restar
 	}
 
 	dbPath := filepath.Join(ctx.CaseDir, "weaver.db")
-	deadline := time.Now().Add(ctx.Timeout)
-	reached := false
 	var lastCoverage []fileCoverageRow
-	for time.Now().Before(deadline) {
-		status, _ := restartJobStatusFromDB(dbPath, jobID)
-		if dbStatusTerminal(normalizeDBStatus(status)) {
-			break
-		}
+	if err := ctx.pollJob("the restart point", dbPath, jobID, func() (bool, error) {
 		rows, err := readJobFileCoverage(dbPath, jobID)
-		if err == nil {
-			lastCoverage = rows
-			for _, row := range rows {
-				healthy := row.Coverage.Healthy()
-				if row.FileIndex == gap.FileIndex && !healthy.Covers(gapRange.Start, gapRange.End) && healthy.CoveredBytes() >= coveredFloor {
-					reached = true
-				}
+		if err != nil {
+			return false, nil
+		}
+		lastCoverage = rows
+		for _, row := range rows {
+			healthy := row.Coverage.Healthy()
+			if row.FileIndex == gap.FileIndex && !healthy.Covers(gapRange.Start, gapRange.End) && healthy.CoveredBytes() >= coveredFloor {
+				return true, nil
 			}
 		}
-		if reached {
-			break
-		}
-		time.Sleep(250 * time.Millisecond)
-	}
-	if !reached {
+		return false, nil
+	}); err != nil {
 		_, _, _, _ = ctx.captureEvidence("pre_timeout", "")
 		coverageJSON, _ := json.Marshal(lastCoverage)
 		return classifyRestartResult(ctx.Profile, false, "", false, "",
-			fmt.Sprintf("the restart point was never reached: no checkpoint covered %d healthy bytes past the missing ordinal %d (last coverage %s)", coveredFloor, gap.Ordinal, coverageJSON)), nil
+			fmt.Sprintf("the restart point was never reached: no checkpoint covered %d healthy bytes past the missing ordinal %d (%v; last coverage %s)", coveredFloor, gap.Ordinal, err, coverageJSON)), nil
 	}
 
-	if err := ctx.interruptWeaverAndWaitForExit(); err != nil {
+	if err := ctx.interruptHeldWeaverAndWaitForExit(liftPrimaryHold); err != nil {
 		return restartCaseResult{}, err
 	}
 	preDB, _, preNntp, err := ctx.captureEvidence("pre_restart", "")

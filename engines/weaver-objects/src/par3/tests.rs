@@ -463,6 +463,9 @@ fn a_hole_in_a_volume_costs_only_the_blocks_it_cuts() {
     );
     assert_eq!(reachable(&job.object), 2);
     assert!(job.store.members[&first] == one);
+    // The block it rebuilt is counted twice: staged, then placed into the
+    // member while the staged output still stands.
+    assert_eq!(job.store.will_write, 2 * BLOCK);
 }
 
 // Two lost blocks need two syndromes and two rebuilt blocks, a block of

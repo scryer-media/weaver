@@ -82,6 +82,7 @@ impl Verification {
     pub(super) fn run_with(self, shutdown: &Shutdown, mut read: impl FnMut(usize)) -> Verified {
         let stopped = || self.stop.load(Ordering::Relaxed) || shutdown.started();
         let io = |source| LeafError::Io {
+            device: crate::pipeline::graph::limits::Device::Working,
             path: self.path.clone(),
             source,
         };

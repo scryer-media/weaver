@@ -374,6 +374,30 @@ fn one_device(a: Option<u64>, b: Option<u64>) -> bool {
     }
 }
 
+// True when an out-of-space error is the caller's quota refusing the write,
+// not the filesystem: its free figure may show room the caller cannot use.
+pub fn is_quota_exceeded(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::QuotaExceeded {
+        return true;
+    }
+    let Some(code) = error.raw_os_error() else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        code == libc::EDQUOT
+    }
+    #[cfg(windows)]
+    {
+        code as u32 == windows_sys::Win32::Foundation::ERROR_DISK_QUOTA_EXCEEDED
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = code;
+        false
+    }
+}
+
 // True when an I/O error means the filesystem (or the caller's quota on it)
 // ran out of room, as opposed to a corrupt path, permission problem, or
 // hardware fault.
@@ -1109,6 +1133,16 @@ struct RootState {
     stopped: bool,
     begun_probes: u64,
     completed_probes: u64,
+    // Which probe, by its count among those begun, took the reading now
+    // published: 0 while there is none.
+    published_probe: u64,
+    // The probe whose reading was published before the one now, and the
+    // free bytes it showed: a job that waits on a failed write may hear
+    // of two readings at once, and one of them may have begun before its
+    // failure.
+    prior: Option<(u64, u64)>,
+    // How many times the root was pointed at another directory.
+    retargets: u64,
     // A probe of `path` finished, and why the latest failed while it fails.
     // A retarget clears both.
     probed: bool,
@@ -1341,19 +1375,12 @@ enum Unsettled {
     TimedOut,
 }
 
-// `path` when it exists, else the nearest folder above it that does. On
-// Windows a disk is read only at a folder, so a file there is passed over
-// for the folder that holds it.
+// `path` when it is a folder that exists, else the nearest folder above it
+// that does. A file on the way is passed over: Windows reads free space only
+// at a folder.
 fn nearest_existing_ancestor(path: &Path) -> PathBuf {
-    let reads_a_disk = |at: &Path| {
-        if cfg!(windows) {
-            at.is_dir()
-        } else {
-            at.exists()
-        }
-    };
     path.ancestors()
-        .find(|candidate| !candidate.as_os_str().is_empty() && reads_a_disk(candidate))
+        .find(|candidate| !candidate.as_os_str().is_empty() && candidate.is_dir())
         .unwrap_or(path)
         .to_path_buf()
 }
@@ -1596,6 +1623,138 @@ impl PublishedCapacity {
     }
 }
 
+// A path on none of the roots' disks that a job waits for room on after a
+// write there found it full. It is read with the complete root, each pass,
+// from the first wait on it to the end of the last.
+#[derive(Debug)]
+struct HeldPath {
+    path: PathBuf,
+    holds: usize,
+    // The probes of the path begun, and which of them took `free`.
+    begun: u64,
+    published: u64,
+    // The free bytes of its latest probe that read them, whether that was
+    // its latest probe, and the probe and figure before, as a root keeps.
+    free: Option<u64>,
+    good: bool,
+    prior: Option<(u64, u64)>,
+    // The device the path lay on at its latest probe that could read it.
+    device: Option<u64>,
+}
+
+impl HeldPath {
+    fn look(&self) -> DiskLook {
+        DiskLook {
+            begun: self.begun,
+            probe: self.published,
+            shown: self.free,
+            good: self.good,
+            prior: self.prior,
+            moved: 0,
+        }
+    }
+}
+
+// What a disk shows a job that waits on it after a write found it full:
+// how many probes it has begun, which of them took the figure it shows,
+// that figure (the last one read, even when the latest probe failed),
+// whether the latest probe read it, and the probe and figure shown before.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DiskLook {
+    pub(crate) begun: u64,
+    pub(crate) probe: u64,
+    pub(crate) shown: Option<u64>,
+    pub(crate) good: bool,
+    pub(crate) prior: Option<(u64, u64)>,
+    // How many times the root was pointed at another directory: a job that
+    // waits on a root moved since then waits on another disk.
+    pub(crate) moved: u64,
+}
+
+impl DiskLook {
+    // The figure the probe counted `probe` published, while it is the
+    // latest or the one before.
+    pub(crate) fn figure_of(&self, probe: u64) -> Option<u64> {
+        if self.probe == probe {
+            self.shown
+        } else {
+            self.prior
+                .filter(|(prior, _)| *prior == probe)
+                .map(|(_, figure)| figure)
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct HeldPaths {
+    // How many paths are listed, so a pass with none takes no lock.
+    listed: std::sync::atomic::AtomicUsize,
+    list: Mutex<Vec<HeldPath>>,
+}
+
+impl HeldPaths {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<HeldPath>> {
+        self.list
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    // One pass over the listed paths: each is probed with no lock held.
+    // Whoever waits hears that the paths were read.
+    fn sample(&self, probe: &ProbeFn, ledger: &DiskLedger) {
+        let paths: Vec<(PathBuf, Option<u64>)> = self
+            .lock()
+            .iter_mut()
+            .map(|held| {
+                held.begun += 1;
+                (held.path.clone(), held.device)
+            })
+            .collect();
+        for (path, known) in paths {
+            // A path removed while a job waits on it, as a destination
+            // folder its user deleted to make room, is read at the nearest
+            // folder above it that answers: the disk it will be made on
+            // again.
+            let (space, device) = match probe(&path) {
+                Ok(space) => (Some(space), nearest_device(&path)),
+                Err(_) => path
+                    .ancestors()
+                    .skip(1)
+                    .find_map(|at| {
+                        probe(at)
+                            .ok()
+                            .map(|space| (Some(space), nearest_device(at)))
+                    })
+                    .unwrap_or((None, None)),
+            };
+            // What answered lies on another device than the path was last
+            // read on, as the folder above a mount that went away does:
+            // room there is not room for the job, and a move let go on it
+            // would deliver under the mount point. It is a failed reading,
+            // and the job waits on, shown waiting. A path no device was yet
+            // read for takes the first that answers.
+            let other = matches!((known, device), (Some(known), Some(now)) if known != now);
+            let free = space.filter(|_| !other).map(|space| space.available_bytes);
+            let mut list = self.lock();
+            if let Some(held) = list.iter_mut().find(|held| held.path == path) {
+                // The device first read stands: another is never taken in
+                // its place.
+                if held.device.is_none() {
+                    held.device = device;
+                }
+                held.prior = held.free.map(|figure| (held.published, figure));
+                held.published = held.begun;
+                held.good = free.is_some();
+                if free.is_some() {
+                    held.free = free;
+                }
+            }
+        }
+        ledger.counts.rings.fetch_add(1, Ordering::Release);
+        ledger.readings.notify_one();
+    }
+}
+
 #[derive(Debug)]
 struct RootSlot {
     root: StorageRoot,
@@ -1644,6 +1803,8 @@ pub struct StorageCapacity {
     // The volumes asked after, one per device. Shared with the threads
     // that read a device, which make its volume known as they do.
     volumes: Arc<volumes::Volumes>,
+    // The paths off the roots' disks that jobs wait for room on.
+    held: Arc<HeldPaths>,
     interval: Duration,
     probe: SharedProbeFn,
     clock: Arc<Clock>,
@@ -1724,6 +1885,9 @@ impl StorageCapacity {
                         stopped: false,
                         begun_probes: 0,
                         completed_probes: 0,
+                        published_probe: 0,
+                        prior: None,
+                        retargets: 0,
                         probed: false,
                         error: None,
                         device: None,
@@ -1742,6 +1906,7 @@ impl StorageCapacity {
                 }
             })
         });
+        let held = Arc::new(HeldPaths::default());
         for slot in &slots {
             // The sampler waits on its own slot's condition variable, so
             // the gate opening has to wake it there.
@@ -1754,6 +1919,8 @@ impl StorageCapacity {
             let thread_probe: SharedProbeFn = Arc::clone(&probe);
             let thread_gate = startup_disk_work.clone();
             let thread_volumes = Arc::clone(&volumes);
+            // The complete root's thread reads the held paths with it.
+            let thread_held = (slot.root == StorageRoot::Complete).then(|| Arc::clone(&held));
             let spawned = std::thread::Builder::new()
                 .name(format!("{SAMPLER_THREAD}{}", slot.root.label()))
                 .spawn(move || {
@@ -1763,6 +1930,7 @@ impl StorageCapacity {
                         thread_probe,
                         &thread_gate,
                         &thread_volumes,
+                        thread_held.as_deref(),
                     )
                 });
             if let Err(error) = spawned {
@@ -1778,6 +1946,7 @@ impl StorageCapacity {
             readings,
             paths: Arc::default(),
             volumes,
+            held,
             interval,
             probe,
             clock,
@@ -1927,6 +2096,29 @@ impl StorageCapacity {
             let state = slot.lock();
             (state.path == path).then_some(state.device.flatten())
         })
+    }
+
+    // The root whose disk `path` is known to lie on, from what is held
+    // already: a root's own directory, or the device last read for `path`
+    // itself, set against each root's device. Nothing is guessed from a
+    // folder above it, which a mount below may not share a disk with. No
+    // look is started and none is waited on; a path whose own device was
+    // never read answers `None`.
+    pub(crate) fn known_root_of(&self, path: &Path) -> Option<StorageRoot> {
+        let device = self.root_device(path).flatten().or_else(|| {
+            lock_paths(&self.paths)
+                .entries
+                .get(path)
+                .and_then(|entry| entry.device)
+                .and_then(|look| look.device)
+        })?;
+        [
+            StorageRoot::Complete,
+            StorageRoot::Intermediate,
+            StorageRoot::Data,
+        ]
+        .into_iter()
+        .find(|root| self.slot(*root).lock().device.flatten() == Some(device))
     }
 
     // The entry for `path`, made when there is none. Past the cap, the
@@ -2177,6 +2369,8 @@ impl StorageCapacity {
                 return;
             }
             state.path = path;
+            state.retargets += 1;
+            state.prior = None;
             state.probed = false;
             state.error = None;
             state.device = None;
@@ -2187,6 +2381,104 @@ impl StorageCapacity {
             state.refresh_requested = true;
             slot.wake.notify_all();
         }
+    }
+
+    // How many probes `root` has begun. A reading whose probe is counted
+    // after this one began after this call, whatever was running then.
+    #[cfg(test)]
+    pub(crate) fn probes_begun(&self, root: StorageRoot) -> u64 {
+        self.slot(root).lock().begun_probes
+    }
+
+    // What `root` shows now of its probes and its free space, for a job
+    // that waits on it after a write found it full.
+    pub(crate) fn look(&self, root: StorageRoot) -> DiskLook {
+        let slot = self.slot(root);
+        let state = slot.lock();
+        let reading = slot.capacity.read().reading();
+        DiskLook {
+            begun: state.begun_probes,
+            probe: state.published_probe,
+            shown: reading.map(|reading| reading.available_bytes),
+            good: reading.is_some_and(|reading| !reading.stale),
+            prior: state.prior,
+            moved: state.retargets,
+        }
+    }
+
+    // A write on `path`, which lies on none of the roots' disks, failed now
+    // for want of room, and a job waits on it: the path is read with the
+    // complete root from here, and a reading is asked for now. What the
+    // path showed as the write failed.
+    pub(crate) fn hold_path(&self, path: &Path) -> DiskLook {
+        let look = {
+            let mut list = self.held.lock();
+            let at = match list.iter().position(|held| held.path == path) {
+                Some(at) => at,
+                None => {
+                    list.push(HeldPath {
+                        path: path.to_path_buf(),
+                        holds: 0,
+                        begun: 0,
+                        published: 0,
+                        free: None,
+                        good: false,
+                        prior: None,
+                        device: None,
+                    });
+                    self.held.listed.store(list.len(), Ordering::Release);
+                    list.len() - 1
+                }
+            };
+            let held = &mut list[at];
+            held.holds += 1;
+            held.look()
+        };
+        self.slot(StorageRoot::Complete).request_refresh();
+        look
+    }
+
+    // The device a held path lay on at its latest probe, and the device a
+    // root's directory lay on at its latest look: what is held already,
+    // with no look started. `None` until one could read it.
+    pub(crate) fn held_path_device(&self, path: &Path) -> Option<u64> {
+        let list = self.held.lock();
+        list.iter()
+            .find(|held| held.path == path)
+            .and_then(|held| held.device)
+    }
+
+    pub(crate) fn root_slot_device(&self, root: StorageRoot) -> Option<u64> {
+        self.slot(root).lock().device.flatten()
+    }
+
+    // What a held path shows now, as `look` tells of a root.
+    pub(crate) fn path_look(&self, path: &Path) -> Option<DiskLook> {
+        let list = self.held.lock();
+        list.iter()
+            .find(|held| held.path == path)
+            .map(HeldPath::look)
+    }
+
+    // A job no longer waits on `path`: the path leaves the list with its
+    // last wait.
+    pub(crate) fn release_path(&self, path: &Path) {
+        let mut list = self.held.lock();
+        let Some(at) = list.iter().position(|held| held.path == path) else {
+            return;
+        };
+        let held = &mut list[at];
+        held.holds = held.holds.saturating_sub(1);
+        if held.holds == 0 {
+            list.swap_remove(at);
+            self.held.listed.store(list.len(), Ordering::Release);
+        }
+    }
+
+    // How many paths off the roots' disks are being read for a wait.
+    #[cfg(test)]
+    pub(crate) fn waited_paths(&self) -> usize {
+        self.held.listed.load(Ordering::Acquire)
     }
 
     // Ask `root`'s thread to probe again without waiting out its interval.
@@ -2236,6 +2528,19 @@ impl StorageCapacity {
                         .reading()
                         .is_some_and(|reading| ready(&reading))
                 })
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+    }
+
+    // Block until `root` publishes a reading whose probe began after `begun`
+    // probes had.
+    #[cfg(test)]
+    pub(crate) fn wait_for_reading_begun_after(&self, root: StorageRoot, begun: u64) {
+        let slot = self.slot(root);
+        let state = slot.lock();
+        drop(
+            slot.wake
+                .wait_while(state, |state| state.published_probe <= begun)
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );
     }
@@ -2292,6 +2597,7 @@ fn run_root_sampler(
     probe: SharedProbeFn,
     startup_disk_work: &StartupDiskGate,
     volumes: &volumes::Volumes,
+    held: Option<&HeldPaths>,
 ) {
     // Hold the first probe until the startup disk work is done. Stopping the
     // storage meanwhile ends the wait as well.
@@ -2344,12 +2650,25 @@ fn run_root_sampler(
         let mark = slot.ledger.mark();
         let sampler = sampler.as_mut().expect("a sampler for the current path");
         let capacity = sampler.refresh();
+        // The paths jobs wait on off the roots' disks are read in the same
+        // pass: with none listed, this is one look at a count.
+        if let Some(held) = held
+            && held.listed.load(Ordering::Acquire) > 0
+        {
+            held.sample(&*probe, &slot.ledger);
+        }
         let mut state = slot.lock();
         // A retarget while the probe ran makes this reading the old
         // directory's; the thread probes the new one straight away.
         if state.path == path {
+            state.prior = slot
+                .capacity
+                .read()
+                .reading()
+                .map(|reading| (state.published_probe, reading.available_bytes));
             slot.capacity.publish(capacity);
             slot.ledger.published(mark, capacity);
+            state.published_probe = state.begun_probes;
             state.probed = true;
             state.device = Some(device);
             if kind.is_some() {
@@ -3269,6 +3588,64 @@ mod tests {
         drop(release);
     }
 
+    // A path a job waits on that cannot be read, as a destination folder
+    // its user removed to make room, shows what the nearest folder above it
+    // that answers shows: the wait is not stuck on a folder that is gone.
+    #[test]
+    fn a_held_path_that_is_gone_is_read_at_the_nearest_folder_above_it() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let probe = counting_probe(calls);
+        let storage = StorageCapacity::with_probe(roots(), NEVER, Arc::clone(&probe));
+        let gone = Path::new("/folders/tv/unmounted");
+        storage.hold_path(gone);
+        let ledger = Arc::clone(&storage.slot(StorageRoot::Complete).ledger);
+        storage.held.sample(&*probe, &ledger);
+        let look = storage.path_look(gone).expect("the path is held");
+        assert!(look.good, "the folder above answered");
+        assert_eq!(look.shown, Some("/folders/tv".len() as u64));
+    }
+
+    // A held path that answered and then goes: the folder above it is
+    // taken while it lies on the device the path was read on, as after its
+    // user deleted the folder. A folder above on another device, as the
+    // mount point of a disk that went away, is a failed reading: the wait
+    // keeps the path's own device and its last figure.
+    #[test]
+    fn a_folder_above_a_held_path_is_taken_only_on_the_paths_own_device() {
+        for (name, above_device, taken) in [("same", 41, true), ("other", 42, false)] {
+            let mount = PathBuf::from(format!("/t4-{name}/mount"));
+            let held_path = mount.join("tv");
+            crate::runtime::fs::test_devices::assign(&mount, above_device);
+            crate::runtime::fs::test_devices::assign(&held_path, 41);
+            let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let probe: SharedProbeFn = {
+                let (gone, held_path) = (Arc::clone(&gone), held_path.clone());
+                Arc::new(move |path: &Path| {
+                    if path == held_path && gone.load(Ordering::Acquire) {
+                        return Err(DiskProbeError::Io(io::Error::from(io::ErrorKind::NotFound)));
+                    }
+                    Ok(DiskSpace {
+                        total_bytes: 1000,
+                        available_bytes: if path == held_path { 5 } else { 900 },
+                    })
+                })
+            };
+            let storage = StorageCapacity::with_probe(roots(), NEVER, Arc::clone(&probe));
+            storage.hold_path(&held_path);
+            let ledger = Arc::clone(&storage.slot(StorageRoot::Complete).ledger);
+            storage.held.sample(&*probe, &ledger);
+            assert_eq!(storage.held_path_device(&held_path), Some(41));
+            assert_eq!(storage.path_look(&held_path).unwrap().shown, Some(5));
+
+            gone.store(true, Ordering::Release);
+            storage.held.sample(&*probe, &ledger);
+            let look = storage.path_look(&held_path).unwrap();
+            assert_eq!(look.good, taken, "{name}");
+            assert_eq!(look.shown, Some(if taken { 900 } else { 5 }), "{name}");
+            assert_eq!(storage.held_path_device(&held_path), Some(41), "{name}");
+        }
+    }
+
     // The paths held are bounded: past the cap, a new path drops the one
     // asked after longest ago that has no look out.
     #[tokio::test(start_paused = true)]
@@ -3534,7 +3911,8 @@ mod tests {
         let through = file.join("sub");
         probe_disk_space(&through).expect_err("a path through a file");
         // More than a folder not made yet: the climb over missing folders
-        // ends at the file, and does not answer for the path.
+        // ends at the file, and does not answer for the path. Either way
+        // the folder above answers for the look.
         let error = probe_nearest_disk_space(&through).expect_err("no folder to climb to");
         assert!(!error.is_not_found(), "{error}");
         let storage = StorageCapacity::with_probe(roots(), NEVER, Arc::new(probe_disk_space));

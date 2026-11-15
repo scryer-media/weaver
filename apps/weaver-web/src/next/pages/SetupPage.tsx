@@ -4,7 +4,7 @@
 import { useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { BrandLockup, BrandMark } from "@/lib/brand";
 import { PASSWORD_MANAGER_IGNORE } from "@/lib/password-manager";
-import { SETUP_CODE_DISPLAY_LENGTH } from "@/lib/setup-code";
+import { SETUP_CODE_DISPLAY_LENGTH, SETUP_CODE_PLACEHOLDER } from "@/lib/setup-code";
 import {
   BIND_CHOICES,
   CONTAINER_BIND_NOTE,
@@ -127,8 +127,8 @@ export default function SetupPage({ environment }: { environment?: SetupEnvironm
             autoCapitalize="characters"
             spellCheck={false}
             maxLength={SETUP_CODE_DISPLAY_LENGTH}
-            placeholder="···-···"
-            className="h-[42px] w-[180px] border !border-wv-control bg-wv-input px-3 font-wv-mono text-[18px] tracking-[0.35em] text-wv-strong uppercase outline-none placeholder:text-wv-faint focus:!border-wv-control-focus"
+            placeholder={SETUP_CODE_PLACEHOLDER}
+            className="h-[42px] w-[220px] border !border-wv-control bg-wv-input px-3 font-wv-mono text-[18px] tracking-[0.35em] text-wv-strong uppercase outline-none placeholder:text-wv-faint focus:!border-wv-control-focus"
           />
         </FormField>
       ) : null}

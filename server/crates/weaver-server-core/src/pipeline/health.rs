@@ -71,6 +71,17 @@ impl Pipeline {
             crate::post_processing::model::QueueEvent::NzbDeleted,
             Some("HEALTH"),
         );
+        // Only here, where the job fails for want of articles: when a server
+        // refusing the login left articles of it unasked for, the reason
+        // names it. The cause is not touched: the job lacks the articles,
+        // whether the servers asked said they are not there or the last
+        // server that might have them refuses the login, so it stays a
+        // missing-article failure and the job's next duplicate is tried.
+        // Every other way a job fails keeps its own reason.
+        let error = match self.login_refusal_words(job_id) {
+            Some(words) => format!("{error}; {words}"),
+            None => error,
+        };
         self.fail_job(job_id, error);
     }
 

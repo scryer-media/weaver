@@ -443,6 +443,11 @@ pub struct DownloadQueue {
     // that may need a backfill lane) or a rotation hint. Maintained on
     // push/pop.
     excluded_work: usize,
+    // How many of those items carry each distinct set of failure
+    // exclusions (the empty set for an item with a rotation hint alone).
+    // Maintained with `excluded_work`, so a question about what the steered
+    // work may be served by is asked once per distinct set, never per item.
+    steered_sets: HashMap<weaver_nntp::ServerSet, usize>,
     // Queued recovery items, which the restart checkpoint never holds back.
     // Maintained on push/pop.
     recovery_work: usize,
@@ -504,6 +509,7 @@ impl DownloadQueue {
             job_id: None,
             extras: Extras::default(),
             excluded_work: 0,
+            steered_sets: HashMap::new(),
             recovery_work: 0,
             files: HashMap::new(),
             first_articles: HashSet::new(),
@@ -725,6 +731,7 @@ impl DownloadQueue {
         let steered = item.is_steered();
         if steered {
             self.excluded_work += 1;
+            *self.steered_sets.entry(item.exclude_servers).or_default() += 1;
         }
         self.recovery_work += usize::from(item.is_recovery);
         let key = Key::new(
@@ -859,6 +866,13 @@ impl DownloadQueue {
             Some(extra) => {
                 if !extra.exclude_servers.is_empty() || extra.avoid_server.is_some() {
                     self.excluded_work = self.excluded_work.saturating_sub(1);
+                    // A field at a time: the file's groups are still borrowed.
+                    if let Some(count) = self.steered_sets.get_mut(&extra.exclude_servers) {
+                        *count -= 1;
+                        if *count == 0 {
+                            self.steered_sets.remove(&extra.exclude_servers);
+                        }
+                    }
                 }
                 QueueItem {
                     segment_id,
@@ -894,6 +908,14 @@ impl DownloadQueue {
         self.excluded_work
     }
 
+    // The distinct sets of failure exclusions the queued items steered off
+    // a server carry (`excluded_work_count`), in no particular order: one
+    // entry per distinct set however many items carry it, so the read is
+    // bounded by the combinations of servers tried, never by the queue.
+    pub fn steered_exclusion_sets(&self) -> impl Iterator<Item = weaver_nntp::ServerSet> + '_ {
+        self.steered_sets.keys().copied()
+    }
+
     // Carry every queued item's tried servers and hint into a rebuilt pool:
     // a server still in the pool keeps its bit under its new index, one that
     // left or is no longer the same server drops out. One pass over the
@@ -906,12 +928,14 @@ impl DownloadQueue {
         // their steering may now pass.
         self.scan_floors.clear();
         let mut steered = 0;
+        self.steered_sets.clear();
         // Only an item with extras can hold either; neither is in the key.
         for extra in self.extras.iter_mut() {
             extra.exclude_servers = remap.set(extra.exclude_servers);
             extra.avoid_server = extra.avoid_server.and_then(|server| remap.index(server));
             if !extra.exclude_servers.is_empty() || extra.avoid_server.is_some() {
                 steered += 1;
+                *self.steered_sets.entry(extra.exclude_servers).or_default() += 1;
             }
         }
         self.excluded_work = steered;
@@ -926,12 +950,22 @@ impl DownloadQueue {
         }
         self.scan_floors.clear();
         let mut cleared = 0;
+        let mut unsteered = 0;
         for extra in self.extras.iter_mut() {
             if extra.avoid_server.take().is_some() {
                 cleared += 1;
                 if extra.exclude_servers.is_empty() {
-                    self.excluded_work = self.excluded_work.saturating_sub(1);
+                    unsteered += 1;
                 }
+            }
+        }
+        // An item with a hint and no exclusion was counted under the empty
+        // set; it is steered no longer.
+        self.excluded_work = self.excluded_work.saturating_sub(unsteered);
+        if let Some(count) = self.steered_sets.get_mut(&weaver_nntp::ServerSet::EMPTY) {
+            *count = count.saturating_sub(unsteered);
+            if *count == 0 {
+                self.steered_sets.remove(&weaver_nntp::ServerSet::EMPTY);
             }
         }
         cleared
@@ -988,6 +1022,13 @@ impl DownloadQueue {
         slots_match
             && slot_count as usize == self.order.len()
             && self.excluded_work == self.iter().filter(|work| work.is_steered()).count()
+            && {
+                let mut sets: HashMap<weaver_nntp::ServerSet, usize> = HashMap::new();
+                for work in self.iter().filter(|work| work.is_steered()) {
+                    *sets.entry(work.exclude_servers).or_default() += 1;
+                }
+                sets == self.steered_sets
+            }
             && self.recovery_work == self.iter().filter(|work| work.is_recovery).count()
             && self.critical_len == self.iter().filter(|work| work.completion_critical).count()
             && self.files.iter().all(|(file, slots)| {

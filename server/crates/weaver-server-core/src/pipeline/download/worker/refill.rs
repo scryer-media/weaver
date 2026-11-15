@@ -62,7 +62,9 @@ impl Pipeline {
         2 * lane_mode.max_depth().max(1) + 2
     }
 
-    // The depth a lane on `server_idx` should run at for its next batch.
+    // The depth the lanes on `server_idx` run at, whichever lane asks: on a
+    // pin's trial, the depth of the lanes that are not running it.
+    #[cfg(test)]
     pub(in crate::pipeline) fn download_lane_mode_for_server(
         &self,
         server_idx: usize,
@@ -77,6 +79,34 @@ impl Pipeline {
             .servers
             .get(&server_idx)
             .map(|explorer| explorer.choose_mode(pressure_clear))
+            .unwrap_or(DownloadLaneMode::Sequential)
+    }
+
+    // The depth `lane_id`, a lane on `server_idx`, should run at for its
+    // next batch. It differs from the server's depth only while the server
+    // is on the trial a lapsed pin gets, which one lane alone runs: see
+    // `ServerPipelineExplorer::choose_mode_for_lane`. One map lookup more
+    // than the server's mode, and only during a trial.
+    pub(in crate::pipeline) fn download_lane_mode_for_lane(
+        &mut self,
+        server_idx: usize,
+        pressure: DownloadPressure,
+        supports_pipelining: bool,
+        lane_id: u64,
+    ) -> DownloadLaneMode {
+        if !supports_pipelining {
+            return DownloadLaneMode::Sequential;
+        }
+        let pressure_clear = pressure.state == DownloadPressureState::Clear;
+        let owners = &self.download_lane_owners;
+        self.download_lane_runtime
+            .servers
+            .get_mut(&server_idx)
+            .map(|explorer| {
+                explorer.choose_mode_for_lane(pressure_clear, lane_id, |holder| {
+                    owners.contains_key(&holder)
+                })
+            })
             .unwrap_or(DownloadLaneMode::Sequential)
     }
 
@@ -351,10 +381,11 @@ impl Pipeline {
         }
 
         let pressure = self.refresh_download_pressure();
-        let lane_mode = self.download_lane_mode_for_server(
+        let lane_mode = self.download_lane_mode_for_lane(
             server_idx,
             Self::refill_mode_pressure(pressure),
             request.supports_pipelining,
+            lane_id,
         );
         let want = self.download_refill_want(lane_mode);
         let spill_in_flight = self.spill_job_in_flight_on(server_idx);

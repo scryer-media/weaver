@@ -261,7 +261,7 @@ fn served(kind: Kind, shape: Shape, serve: Serve, candidates: &[&str]) {
     rig.settle();
     assert!(rig.lent, "a loan went out");
     assert!(rig.delivered(), "the member delivered whole");
-    assert_eq!(rig.job.phase(), RootPhase::Done);
+    assert_eq!(rig.job.checked_phase(), RootPhase::Done);
 }
 
 // Every article served while the first loan is out, none given back until
@@ -274,7 +274,11 @@ fn held_to_the_end(kind: Kind, shape: Shape, serve: Serve) {
     }
     assert!(!rig.in_hand.is_empty(), "a loan is out at the last article");
     assert!(rig.job.work_pending(), "a loan out is pending work");
-    assert_ne!(rig.job.phase(), RootPhase::Done, "not done with a loan out");
+    assert_ne!(
+        rig.job.checked_phase(),
+        RootPhase::Done,
+        "not done with a loan out"
+    );
     assert!(!rig.delivered(), "nothing delivered with a loan out");
     rig.settle();
     assert!(rig.delivered(), "the member delivered whole");
@@ -394,7 +398,7 @@ fn sent_back(kind: Kind, shape: Shape, serve: Serve, mode: Mode, at: At, lag: us
     }
     rig.settle();
     assert!(rig.delivered(), "the member delivered whole");
-    assert_eq!(rig.job.phase(), RootPhase::Done);
+    assert_eq!(rig.job.checked_phase(), RootPhase::Done);
 }
 
 // The bad copy is sent back once two more articles are in and a loan is

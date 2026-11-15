@@ -352,6 +352,20 @@ async fn restart_heard(
     // the coverage a crash loses before the writer's barrier is due.
     pipeline.flush_graph_checkpoint(JOB);
     in_memory.extend(pipeline.graph_jobs[&JOB].in_memory());
+    // Boxed: the restore's future is large, and a caller's frame holds it
+    // once already.
+    Box::pin(restart_as_it_stands(temp_dir, pipeline, scenario, inspect)).await
+}
+
+// The pipeline dropped as it stands and the next made over the same
+// folders, the job restored from the database's rows: a restart of a job
+// whose graph is not live, as one held for a full disk.
+pub(in crate::pipeline::tests) async fn restart_as_it_stands(
+    temp_dir: &tempfile::TempDir,
+    pipeline: Pipeline,
+    scenario: &Scenario,
+    inspect: Inspect<'_>,
+) -> (Pipeline, tokio::sync::broadcast::Receiver<PipelineEvent>) {
     let working_dir = pipeline.jobs[&JOB].working_dir.clone();
     let db = pipeline.db.clone();
     retire_pipeline_database(pipeline).await;
@@ -709,11 +723,15 @@ pub(in crate::pipeline::tests) async fn run_restarted_while_repairing(
             lent_again = true;
         }
         if repair_out && !restarted {
+            // A repair out writes the job's files: the drain waits for it to
+            // its end rather than for a bound.
+            assert!(pipeline.graph_drain_waits_for_loans());
             pipeline.drain().await;
             assert!(
                 !pipeline.graph_jobs[&JOB].awaits_mail(),
                 "the drain left the job's repair out on its thread"
             );
+            assert!(!pipeline.graph_drain_waits_for_loans());
             drain(&mut sent, &mut events);
             (pipeline, sent) =
                 restart_heard(&temp_dir, pipeline, scenario, &mut in_memory, &mut |_| {}).await;

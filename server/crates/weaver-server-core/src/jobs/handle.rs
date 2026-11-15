@@ -23,6 +23,10 @@ pub const FINISHED_JOBS_RUNTIME_CAP: usize = 1_000;
 pub const PROPAGATION_WAIT_REASON: &str = "propagation_delay";
 // The job waits for room on a disk, in whatever phase it is in.
 pub const DISK_SPACE_WAIT_REASON: &str = "disk_space";
+// The job waits on a fill server refusing the login until the refusal is
+// the verdict. The stored reason is this code, a colon, and the servers as
+// `host:port`, joined by ", ".
+pub const LOGIN_REFUSED_WAIT_REASON: &str = "login_refused";
 
 #[derive(Clone)]
 pub struct SharedPipelineState {
@@ -613,7 +617,8 @@ pub struct ServerTransportHealth {
     pub latency_band: Option<String>,
     // BODY pipelining depth in use, where 1 means sequential.
     pub pipeline_depth: u32,
-    // Set once a server has proved twice that it cannot pipeline cleanly.
+    // Set while a server is held sequential after twice failing a pipelined
+    // batch; cleared by a clean trial once the hold lapses.
     pub pinned_sequential: bool,
 }
 

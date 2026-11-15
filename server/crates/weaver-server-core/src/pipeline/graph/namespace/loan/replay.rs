@@ -111,6 +111,7 @@ impl Replay {
         }));
         if staged.is_err() {
             self.access.repaired.failed = Some(LeafError::Io {
+                device: crate::pipeline::graph::limits::Device::Working,
                 path: self.access.repaired.output.path().to_path_buf(),
                 source: std::io::Error::other("posted-input reconstruction worker panicked"),
             });
@@ -258,6 +259,7 @@ impl NamespaceWriter {
         mut replayed: Replayed,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        self.gave_back(&replayed.bytes);
         if let Some(error) = replayed.bytes.failed() {
             let _ = replayed.remove();
             return Err(error.into());

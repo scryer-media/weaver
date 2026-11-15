@@ -167,6 +167,9 @@ struct BodyRing {
     window_depth: usize,
     window_responses: u64,
     window_clean: bool,
+    // The server answered a request while a later one was already on the
+    // wire, since the ring was last empty. Cleared when the ring drains.
+    answered_pipelined: bool,
 }
 
 pub struct BlockingBodyLane {
@@ -640,6 +643,7 @@ impl BlockingBodyLane {
                         batch_response_count: if is_last { requested as u64 } else { 0 },
                         unresolved_count: 0,
                         connection_discarded: true,
+                        answered_pipelined: false,
                     },
                 ));
             }
@@ -647,6 +651,9 @@ impl BlockingBodyLane {
         }
 
         let mut closed_early = false;
+        // Every request was written before the first read, so an answer
+        // with a later request still owed was read with that one on the wire.
+        let mut answered_pipelined = false;
         for (idx, message_id) in message_ids.iter().take(requested).enumerate() {
             let started = Instant::now();
             let result = if closed_early {
@@ -679,7 +686,9 @@ impl BlockingBodyLane {
                 closed_early = true;
             }
             let trace = self.trace_item(message_id, policy_elapsed, result);
-            batch_clean &= decoded_result_keeps_connection(&trace.result);
+            let kept = decoded_result_keeps_connection(&trace.result);
+            batch_clean &= kept;
+            answered_pipelined |= kept && !closed_early && idx + 1 < requested;
             let is_complete = closed_early || (idx + 1 == requested && quota_rejection.is_none());
             out.push((
                 idx,
@@ -694,6 +703,7 @@ impl BlockingBodyLane {
                         0
                     },
                     connection_discarded: closed_early,
+                    answered_pipelined,
                 },
             ));
         }
@@ -736,6 +746,7 @@ impl BlockingBodyLane {
                         batch_response_count: if batch_complete { requested as u64 } else { 0 },
                         unresolved_count: 0,
                         connection_discarded: closed_early,
+                        answered_pipelined,
                     },
                 ));
             }
@@ -902,6 +913,12 @@ impl BlockingBodyLane {
         let kept_connection = decoded_result_keeps_connection(&trace.result);
         self.ring.window_clean &= kept_connection;
         self.ring.window_responses += 1;
+        // Everything still on the ring was flushed before this read, so an
+        // answer read with requests still owed was read with them on the
+        // wire: the server takes pipelined requests on this connection.
+        if kept_connection && !self.ring.closed && !self.ring.outstanding.is_empty() {
+            self.ring.answered_pipelined = true;
+        }
 
         let meta = if self.ring.closed {
             self.close_ring_window(false)
@@ -914,8 +931,14 @@ impl BlockingBodyLane {
                 batch_response_count: 0,
                 unresolved_count: 0,
                 connection_discarded: false,
+                answered_pipelined: self.ring.answered_pipelined,
             }
         };
+        // A drained ring starts the next run from nothing: a connection the
+        // server drops while it sits idle must not inherit this run's proof.
+        if self.ring.outstanding.is_empty() {
+            self.ring.answered_pipelined = false;
+        }
         Some((trace, meta))
     }
 
@@ -932,6 +955,7 @@ impl BlockingBodyLane {
         self.ring.closed = true;
         self.ring.window_depth = 0;
         self.ring.window_responses = 0;
+        self.ring.answered_pipelined = false;
         dropped
     }
 
@@ -966,6 +990,7 @@ impl BlockingBodyLane {
                 self.ring.outstanding.len() as u64
             },
             connection_discarded: !healthy,
+            answered_pipelined: self.ring.answered_pipelined,
         };
         self.ring.window_depth = 0;
         self.ring.window_responses = 0;

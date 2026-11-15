@@ -366,7 +366,7 @@ fn a_graph_job_reports_each_phase_as_its_tree_moves() {
         1,
     )
     .unwrap();
-    assert_eq!(job.phase(), RootPhase::Downloading);
+    assert_eq!(job.checked_phase(), RootPhase::Downloading);
 
     job.intake(
         decoded(0, 0, 0, &zip_front(90), Some(180)),
@@ -374,7 +374,7 @@ fn a_graph_job_reports_each_phase_as_its_tree_moves() {
         1,
     )
     .unwrap();
-    assert_eq!(job.phase(), RootPhase::Downloading);
+    assert_eq!(job.checked_phase(), RootPhase::Downloading);
 
     // Every volume in and the probe never closes the member it announced:
     // the object refuses itself as unmapped once the job is quiet, in the
@@ -385,7 +385,7 @@ fn a_graph_job_reports_each_phase_as_its_tree_moves() {
         1,
     )
     .unwrap();
-    assert_eq!(job.phase(), RootPhase::Done);
+    assert_eq!(job.checked_phase(), RootPhase::Done);
     assert_eq!(
         job.writer().refused(NodeId::ROOT, MemberId(0)),
         Some(Why::Unmapped)
@@ -399,7 +399,7 @@ fn a_graph_job_reports_each_phase_as_its_tree_moves() {
             1,
         )
         .unwrap();
-    assert_eq!(plain.phase(), RootPhase::Done);
+    assert_eq!(plain.checked_phase(), RootPhase::Done);
 }
 
 #[test]

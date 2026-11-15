@@ -14,6 +14,10 @@ impl Pipeline {
         let old_client = std::mem::replace(&mut self.nntp, new_client);
         self.shared_state
             .set_nntp_pool(Arc::clone(self.nntp.pool()));
+        // Only now is the new pool the one in use: a server whose login
+        // identity or configured role it changes is asked again at once,
+        // by this pool and not by the one it replaces.
+        self.nntp.pool().activated();
         // Server indices and retention windows may have changed. The
         // servers each article was tried on are carried into the new
         // layout by server identity (stable id, host, port and account),
@@ -217,6 +221,12 @@ pub(in crate::pipeline) struct CancelledJobCleanup {
     post_processing_done: Option<tokio::sync::watch::Receiver<bool>>,
     working_dir: PathBuf,
     staging_dir: Option<PathBuf>,
+    // The destination folder a final move held for a full disk had claimed
+    // for this job and part filled.
+    destination: Option<PathBuf>,
+    // Whether a script named that folder is not known yet: the cleanup
+    // reads it before it removes the folder, and leaves a named one.
+    destination_unruled: bool,
 }
 
 // A cancel batch's archive outcome, carried back to the actor once the
@@ -271,7 +281,7 @@ impl Pipeline {
         // Taken: the rows are being archived, and these intents are acted on.
         self.shared_state.queue.write(|inner| {
             for &id in ids.iter() {
-                if let Some(row) = inner.job_mut(id) {
+                if let Some(mut row) = inner.job_mut(id) {
                     row.report.retiring = true;
                     row.report.seen_intent_seq = row.intents.seq;
                 }
@@ -347,6 +357,32 @@ impl Pipeline {
         keep_files: bool,
     ) {
         let job_id = cleanup.job_id;
+        // A job held for a full disk in its final move leaves the folder
+        // that move claimed for it, with what it had delivered there. A
+        // folder a script named is not the job's own, and stays.
+        // A job let go whose move had yet to start again leaves it too.
+        let let_go = self
+            .full_disk_moves
+            .iter()
+            .position(|(id, _)| *id == job_id)
+            .map(|at| self.full_disk_moves.swap_remove(at).1);
+        if let Some(crate::pipeline::full_disk::Stage::Moving(dest, _)) =
+            self.drop_full_disk_hold(job_id).or(let_go)
+        {
+            self.reserved_complete_destinations.remove(&job_id);
+            // Nothing is read from the database on this thread: what the
+            // scripts named is asked of memory, and where memory was never
+            // filled the cleanup reads it, off this thread, before it
+            // removes the folder.
+            match self.db.job_script_effects_in_hand(job_id.0) {
+                Some(effects) if effects.final_directory.is_some() => {}
+                Some(_) => cleanup.destination = Some(dest),
+                None => {
+                    cleanup.destination = Some(dest);
+                    cleanup.destination_unruled = true;
+                }
+            }
+        }
         if let Some(state) = self.purge_cancelled_job_runtime(job_id) {
             cleanup.working_dir = state.working_dir;
             cleanup.staging_dir = state.staging_dir;
@@ -361,8 +397,19 @@ impl Pipeline {
                 .jobs
                 .iter()
                 .any(|row| row.id == job_id && row.intents.delete_history_after_cancel);
+            // A move of the job's working folder still out holds the job
+            // too, kept files or not: until it is heard, its folder may come
+            // or go under a restart's feet. Its guard lets it go.
+            use crate::pipeline::queue::CleanupHolder;
             if !keep_files {
-                inner.pending_cleanup.insert(job_id);
+                inner.pending_cleanup.hold(job_id, CleanupHolder::Folders);
+            }
+            if self
+                .moving_jobs
+                .get(&job_id)
+                .is_some_and(|(_, watch)| watch.cancel())
+            {
+                inner.pending_cleanup.hold(job_id, CleanupHolder::Move);
             }
             inner.remove_job(job_id);
             let _ = self.event_tx.send(PipelineEvent::JobCancelled { job_id });
@@ -388,9 +435,11 @@ impl Pipeline {
                 // A move of the job's folder that is still out ends first:
                 // the folder has one remover at a time.
                 queue.wait_for_moves(job_id).await;
-                Self::cleanup_cancelled_job(cleanup_db, cleanup).await;
+                Self::cleanup_cancelled_job(cleanup_db, &queue, cleanup).await;
                 queue.write(|inner| {
-                    inner.pending_cleanup.remove(&job_id);
+                    inner
+                        .pending_cleanup
+                        .done(job_id, crate::pipeline::queue::CleanupHolder::Folders);
                     crate::pipeline::queue::Change::changed(())
                 });
             });
@@ -407,7 +456,7 @@ impl Pipeline {
         }
         self.shared_state.queue.write(|inner| {
             for &id in ids {
-                if let Some(row) = inner.job_mut(id) {
+                if let Some(mut row) = inner.job_mut(id) {
                     row.intents.cancelled = None;
                     row.intents.delete_history_after_cancel = false;
                     row.report.retiring = false;
@@ -545,6 +594,8 @@ impl Pipeline {
                 post_processing_done,
                 working_dir: state.working_dir.clone(),
                 staging_dir: state.staging_dir.clone(),
+                destination: None,
+                destination_unruled: false,
             },
         ))
     }
@@ -607,6 +658,8 @@ impl Pipeline {
                 post_processing_done: None,
                 working_dir,
                 staging_dir: None,
+                destination: None,
+                destination_unruled: false,
             },
         ))
     }
@@ -637,6 +690,10 @@ impl Pipeline {
         self.segment_terminal_states
             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
         self.given_up.remove(&job_id);
+        // A restore keeps the job id: neither the cause nor the refusing
+        // servers of this run may reach the next.
+        self.semantic_terminal_causes.remove(&job_id);
+        self.login_refusals.remove(&job_id);
         self.rate_limit_reservations
             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
         self.job_last_download_activity.remove(&job_id);
@@ -658,7 +715,11 @@ impl Pipeline {
         Some(state)
     }
 
-    async fn cleanup_cancelled_job(db: crate::Database, cleanup: CancelledJobCleanup) {
+    async fn cleanup_cancelled_job(
+        db: crate::Database,
+        queue: &crate::pipeline::queue::Queue,
+        cleanup: CancelledJobCleanup,
+    ) {
         let job_id = cleanup.job_id;
         // Let a cancelled post-processing script leave its
         // process group before its working directory is
@@ -676,6 +737,21 @@ impl Pipeline {
         .await
         {
             tracing::warn!(job_id = job_id.0, %error, "retaining cancelled job directory while queue scripts are unresolved");
+            return;
+        }
+        // A staging folder a disowned read made, which the job never named.
+        queue.remove_job_staging(job_id).await;
+        let own = !cleanup.destination_unruled || {
+            let db = db.clone();
+            tokio::task::spawn_blocking(move || db.job_script_effects(job_id.0))
+                .await
+                .is_ok_and(|effects| effects.is_ok_and(|effects| effects.final_directory.is_none()))
+        };
+        if let Some(destination) = cleanup.destination.filter(|_| own)
+            && let Err(error) = tokio::fs::remove_dir_all(&destination).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(dir = %destination.display(), %error, "failed to clean up the part-filled destination of a cancelled job");
         }
     }
 }

@@ -377,12 +377,14 @@ impl Pipeline {
         });
         for server_idx in servers {
             let spill_in_flight = self.spill_job_in_flight_on(server_idx);
-            let lane_mode = self.download_lane_mode_for_server(server_idx, pressure, true);
-            let want = self.download_refill_want(lane_mode);
             // The lane does not exist yet, so it holds nothing: `lane_id` is
             // taken before the ask so the share is measured against it, and
-            // the scheduler cannot find it saturated.
+            // the scheduler cannot find it saturated. It is taken before the
+            // mode too: on the trial a lapsed pin gets, one lane alone runs
+            // pipelined.
             let lane_id = Self::next_download_lane_id();
+            let lane_mode = self.download_lane_mode_for_lane(server_idx, pressure, true, lane_id);
+            let want = self.download_refill_want(lane_mode);
             let lane_share = crate::pipeline::download::scheduler::LaneShare {
                 lane_id,
                 depth: lane_mode.max_depth(),
@@ -693,6 +695,15 @@ impl Pipeline {
 
     fn dispatch_download_pass(&mut self, now: Instant) {
         self.download_dispatch_wake = false;
+        // The liveness stall's clock runs until something shows the stall is
+        // over: work in flight here, and below an operator pause, a handoff,
+        // nothing dispatch would serve, or a pass that leaves a connection
+        // running. A gate that only holds this pass back (the rate limit,
+        // byte pressure, a yield) leaves it running, so a stall behind such
+        // a gate is still reported once it has held a whole interval.
+        if self.articles_in_flight != 0 || self.active_download_connections != 0 {
+            self.download_dispatch_liveness_since = None;
+        }
         // Every early return below except an operator pause is a gate that
         // can lift with no event to announce it, so the pass is retried on
         // the idle tick until one gets as far as the eligible jobs.
@@ -704,6 +715,9 @@ impl Pipeline {
             || self.shared_state.schedule_replay_paused()
             || self.rate_limiter.should_wait()
         {
+            if self.shared_state.is_paused() || self.shared_state.schedule_replay_paused() {
+                self.download_dispatch_liveness_since = None;
+            }
             if self.articles_in_flight == 0 {
                 debug!(
                     global_paused = self.global_paused,
@@ -714,6 +728,7 @@ impl Pipeline {
             return;
         }
         if self.nntp_handoff_draining {
+            self.download_dispatch_liveness_since = None;
             return;
         }
         // The pass's seat ledger. Health probe batches are seated first: a
@@ -817,6 +832,15 @@ impl Pipeline {
                             status = ?s.status,
                             queue_len = s.articles.queued_download_len(),
                             "dispatch idle: waiting for scripts that run when a job is added"
+                        );
+                    } else if self.held_for_full_disk(*jid) {
+                        // A write found the disk full: a reading with room
+                        // releases it.
+                        debug!(
+                            job_id = jid.0,
+                            idx = i,
+                            status = ?s.status,
+                            "dispatch idle: waiting for room after a write found the disk full"
                         );
                     } else if matches!(
                         s.status,
@@ -925,7 +949,7 @@ impl Pipeline {
             // Nothing dispatch would serve: no stall to time, and a stall
             // timed before stays behind, not carried to the next job.
             self.download_dispatch_stall = None;
-            self.download_dispatch_idle_since = None;
+            self.download_dispatch_liveness_since = None;
             self.update_queue_metrics();
             return;
         }
@@ -973,7 +997,7 @@ impl Pipeline {
             }
             self.log_download_dispatch_liveness_stall(now, pressure, max, eligible_count);
         } else {
-            self.download_dispatch_idle_since = None;
+            self.download_dispatch_liveness_since = None;
         }
         self.log_download_retry_storm(now);
         self.log_download_lanes_under_cap(now, max);

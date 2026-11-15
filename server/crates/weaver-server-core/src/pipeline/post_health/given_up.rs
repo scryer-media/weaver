@@ -155,7 +155,14 @@ impl GivenUp {
         if end != Some(SegmentTerminalState::Abandoned) {
             file.lost += 1;
         }
-        if end.is_none_or(|end| end == SegmentTerminalState::Missing) {
+        if end.is_none_or(|end| {
+            matches!(
+                end,
+                SegmentTerminalState::Missing
+                    | SegmentTerminalState::Unservable
+                    | SegmentTerminalState::UnservableNotFound
+            )
+        }) {
             file.missing += 1;
             file.missing_bytes += bytes;
             let start = self
@@ -250,6 +257,22 @@ mod tests {
         }
     }
 
+    // An article no server can bring because the one that might refuses
+    // the login counts missing, whether or not the servers asked said so.
+    #[test]
+    fn an_article_only_a_refusing_server_could_bring_counts_missing() {
+        for end in [
+            SegmentTerminalState::Unservable,
+            SegmentTerminalState::UnservableNotFound,
+        ] {
+            let mut given_up = GivenUp::default();
+            given_up.give_up(segment(0, 0), Some(end), 40);
+            assert_eq!(given_up.missing_bytes(), 40, "{end:?}");
+            assert_eq!(given_up.file(0).missing, 1, "{end:?}");
+            assert_eq!(given_up.missing_files().collect::<Vec<_>>(), vec![0]);
+        }
+    }
+
     #[test]
     fn an_article_told_again_is_held_once_at_its_first_end() {
         let mut given_up = GivenUp::default();
@@ -257,7 +280,11 @@ mod tests {
         given_up.give_up(segment(0, 1), Some(SegmentTerminalState::Abandoned), 100);
         given_up.give_up(segment(0, 2), Some(SegmentTerminalState::Abandoned), 50);
         given_up.give_up(segment(0, 2), Some(SegmentTerminalState::Missing), 50);
-        given_up.give_up(segment(1, 0), Some(SegmentTerminalState::Unservable), 10);
+        given_up.give_up(
+            segment(1, 0),
+            Some(SegmentTerminalState::RetriesExhausted),
+            10,
+        );
         assert_eq!(given_up.bytes(), 160);
         assert_eq!(given_up.missing_bytes(), 100);
         assert_eq!(

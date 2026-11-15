@@ -1225,11 +1225,11 @@ fn whole(volume: u32, weight: u32) -> Seek {
 async fn the_job_reports_extracting_while_a_run_is_live_and_done_after() {
     let mut echoing = echoing(1);
     echoing.deliver(0);
-    assert_eq!(echoing.job.phase(), RootPhase::Extracting);
+    assert_eq!(echoing.job.checked_phase(), RootPhase::Extracting);
     loop {
         let said = echoing.mail.recv().await.unwrap();
         let ended = matches!(said.heard, Heard::Ended);
-        assert_eq!(echoing.job.phase(), RootPhase::Extracting);
+        assert_eq!(echoing.job.checked_phase(), RootPhase::Extracting);
         echoing
             .job
             .run_said(said, &mut RepairSlots::default(), 1)
@@ -1238,7 +1238,7 @@ async fn the_job_reports_extracting_while_a_run_is_live_and_done_after() {
             break;
         }
     }
-    assert_eq!(echoing.job.phase(), RootPhase::Done);
+    assert_eq!(echoing.job.checked_phase(), RootPhase::Done);
     assert_eq!(echoing.echoed(0), body(0));
 }
 
@@ -1260,7 +1260,7 @@ async fn first_copy_stands(ended: bool) {
     echoing.deliver(0);
     if ended {
         while !echoing.hear().await {}
-        assert_eq!(echoing.job.phase(), RootPhase::Done);
+        assert_eq!(echoing.job.checked_phase(), RootPhase::Done);
     } else {
         echoing.until_closed(0).await;
     }
@@ -1277,7 +1277,7 @@ async fn first_copy_stands(ended: bool) {
     }
     assert!(!echoing.job.runs().live(), "no run reads the second copy");
     assert_eq!(echoing.echoed(0), body(0));
-    assert_eq!(echoing.job.phase(), RootPhase::Done);
+    assert_eq!(echoing.job.checked_phase(), RootPhase::Done);
 }
 
 // Two clean copies of one volume that differ, in either order, in two jobs:
@@ -1299,7 +1299,7 @@ async fn differing_duplicate_copies_give_one_output_in_either_order() {
         echoing.deliver(0);
         while !echoing.hear().await {}
         assert_eq!(echoing.echoed(0), first[HEADER..], "flipped: {flipped}");
-        assert_eq!(echoing.job.phase(), RootPhase::Done);
+        assert_eq!(echoing.job.checked_phase(), RootPhase::Done);
     }
 }
 
@@ -1401,7 +1401,7 @@ async fn the_engine_bids_for_the_volumes_after_the_one_its_run_reached() {
     for member in 0..3 {
         assert_eq!(echoing.echoed(member), body(member));
     }
-    assert_eq!(echoing.job.phase(), RootPhase::Done);
+    assert_eq!(echoing.job.checked_phase(), RootPhase::Done);
 }
 
 // The job reserves the engine's declared window and the overhead before
@@ -1523,7 +1523,7 @@ async fn two_runs_that_do_not_fit_together_run_one_after_the_other() {
     assert_eq!(second.job.runs().reserved(engine), WINDOW + RUN_OVERHEAD);
     while !second.hear().await {}
     assert_eq!(second.echoed(0), body(0));
-    assert_eq!(second.job.phase(), RootPhase::Done);
+    assert_eq!(second.job.checked_phase(), RootPhase::Done);
     assert_eq!(pool.room().reserved, 0);
 }
 
@@ -2575,6 +2575,63 @@ async fn a_run_the_scratch_has_no_room_for_starts_again_in_ram_above_the_ceiling
     assert_eq!(windows.live(), (0, 0));
     assert!(!dir.path().join(weaver_graph::names::INTERNAL_DIR).exists());
     assert_eq!(pool.room().above, 0);
+}
+
+// Under the same policy on a machine that could never hold the window in
+// RAM, the run the scratch refused is not started again there, to be
+// refused as beyond the machine: its refusal is the job's to wait on, for
+// the window and the free space its disk keeps, as under the policy that
+// lets nothing go above the ceiling. A machine that could hold it names no
+// such wait.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn a_run_the_scratch_has_no_room_for_that_ram_could_never_hold_waits_for_the_scratch() {
+    for (machine, waits) in [(4u64 << 20, true), (64 << 20, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut envelopes = Envelopes::new(dir.path().join("envelopes"));
+        let windows = scratch_with_room(dir.path(), 0);
+        let pool = profile_pool();
+        let mut mail = RunMail::default();
+        let hardware = crate::pipeline::graph::hardware::Hardware::granting(
+            crate::pipeline::graph::hardware::Grant {
+                run: weaver_graph::Budget {
+                    memory_bytes: Some(CEILING),
+                    window_bytes: Some(CEILING),
+                    threads: 1,
+                    ..weaver_graph::Budget::default()
+                },
+                over_limit: crate::runtime::OverLimit::ScratchThenRam,
+                machine_bytes: Some(machine),
+                ..Default::default()
+            },
+        );
+        let mut runs = Runs::new(1, 1, mail.sender(), Arc::clone(&pool))
+            .on(hardware)
+            .lending(Arc::clone(&windows));
+        let node = NodeId(1);
+        assert_eq!(runs.ask(node, 1), vec![node]);
+        assert_eq!(runs.reserve_for(node, WIDE, LENDS), Reservation::Granted);
+        let (seen, saw) = std::sync::mpsc::channel();
+        runs.start(
+            node,
+            Asks::new(&[WIDE], &windows, &seen),
+            envelopes.shelf(node),
+        );
+        let said = mail.recv().await.unwrap();
+        let found = saw.recv().unwrap();
+        assert_eq!(found.lent, Some(vec![Err(std::io::ErrorKind::StorageFull)]));
+        assert_eq!(runs.window_needs(node), None, "nothing waits before it");
+        assert_eq!(runs.widen(node, Some(WIDE), None), !waits, "{machine}");
+        assert_eq!(runs.rerunning(node), !waits, "{machine}");
+        // One byte is the free space this scratch's disk keeps.
+        assert_eq!(
+            runs.window_needs(node),
+            waits.then_some(WIDE + 1),
+            "{machine}"
+        );
+        runs.ended(node, said.generation, 1);
+        assert_eq!(pool.room().above, 0);
+    }
 }
 
 // A machine of 32 cores and 64 GiB, which every stock profile is offered.

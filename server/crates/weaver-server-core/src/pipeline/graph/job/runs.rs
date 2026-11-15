@@ -234,6 +234,15 @@ impl GraphJob {
                 return Ok(());
             }
             Heard::Emit(emit) => {
+                // A window no folder had room for, asked by a run held to
+                // the ceiling: the job waits for that room as for any full
+                // disk, and runs again from its checkpoint once it shows.
+                if let Emit::Refuse(Why::TooLarge { .. }) = &emit
+                    && let Some(needs) = self.runs.window_needs(node)
+                {
+                    let quota = self.runs.window_quota();
+                    return Err(self.writer.window_found_no_room(needs, quota).into());
+                }
                 // A window the scratch refused a run held to the ceiling is
                 // refused with the window it was held to.
                 let emit = match emit {

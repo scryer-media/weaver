@@ -1338,7 +1338,7 @@ async fn an_archive_handed_to_its_engine_writes_what_the_engine_read() {
     }
     // The volumes are the engine's input, not files of the job.
     assert!(job.member_files().is_empty());
-    assert_eq!(job.phase(), RootPhase::Done);
+    assert_eq!(job.checked_phase(), RootPhase::Done);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -1595,7 +1595,10 @@ async fn an_engine_waits_at_a_damaged_article_until_its_repair_and_reads_it_once
         started,
         "never retracted"
     );
-    assert_eq!(pipeline.graph_jobs[&job_id].phase(), RootPhase::Done);
+    assert_eq!(
+        pipeline.graph_jobs[&job_id].checked_phase(),
+        RootPhase::Done
+    );
     retire_pipeline_database(pipeline).await;
 }
 
@@ -1628,7 +1631,10 @@ async fn a_repair_of_an_article_that_passed_its_checksum_retracts_what_the_engin
         .expect("the member read again has a file");
     assert_ne!(written, echoed);
     assert_eq!(read(&written), body);
-    assert_eq!(pipeline.graph_jobs[&job_id].phase(), RootPhase::Done);
+    assert_eq!(
+        pipeline.graph_jobs[&job_id].checked_phase(),
+        RootPhase::Done
+    );
     retire_pipeline_database(pipeline).await;
 }
 
