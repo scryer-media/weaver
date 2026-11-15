@@ -1067,6 +1067,7 @@ impl Leaf {
             // The move follows everything submitted for the file, and
             // everything submitted after follows the move.
             let (from, to, directory) = (self.path.clone(), path.clone(), self.directory);
+            let wanted = wants.clone();
             queued.let_go();
             queued.open = false;
             let moved = queued.to.run(Some(self.identity), from.clone(), move || {
@@ -1077,7 +1078,10 @@ impl Leaf {
                 if let Some(parent) = to.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                crate::runtime::fs::rename_path_exclusive(&from, &to)
+                crate::runtime::fs::rename_path_exclusive(&from, &to)?;
+                // The file sits at its new name and nothing records that yet.
+                crate::e2e_failpoint::fire_rename(&wanted);
+                Ok(())
             });
             queued.shape(moved);
         } else if had_file && path != self.path && self.directory {
@@ -1090,6 +1094,7 @@ impl Leaf {
             create_parent(&path, self.device)?;
             crate::runtime::fs::rename_path_exclusive(&self.path, &path)
                 .map_err(LeafError::on(&self.path, self.device))?;
+            crate::e2e_failpoint::fire_rename(&wants);
         }
         self.path = path;
         self.wants = None;
