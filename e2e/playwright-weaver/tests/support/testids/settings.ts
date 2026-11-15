@@ -118,6 +118,8 @@ export const settingsIds = {
   watchQueued: "watch-scan-queued",
   /** One problem line of the last scan, by its tone (error, warn, muted). */
   watchProblem: (tone: string) => `watch-scan-problem-${tone}`,
+  /** A proxy row's line naming the profile that finds its address, shown only when it is not System. */
+  proxyDnsProfile: (proxyId: number) => `proxy-dns-profile-${proxyId}`,
   // RSS: a feed row's poll button and state cell, a rule's action cell, the seen list's clear button.
   rssFeedPoll: "rss-feed-poll",
   rssFeedState: "rss-feed-state",

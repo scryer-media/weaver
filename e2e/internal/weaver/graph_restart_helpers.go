@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -468,11 +469,14 @@ type schemaRewind struct {
 // reads from the shape, and the statements that undo the step on a database
 // of that shape. Refuse, when set, reads the database before anything is
 // planned and names a state the reverse cannot undo, so the rewind stops
-// there instead of leaving the step's work in place.
+// there instead of leaving the step's work in place. Rewrite, when set, reads
+// the values the step changed and gives the statements that write them back;
+// they run after every refusal and before the plan.
 type rustStepReverse struct {
-	Tables []string
-	Plan   func(shape schemaShape) []string
-	Refuse func(db *stateConn) error
+	Tables  []string
+	Plan    func(shape schemaShape) []string
+	Refuse  func(db *stateConn) error
+	Rewrite func(db *stateConn) ([]string, error)
 }
 
 // rustStepReverses is every Rust migration step a rewind can undo, by hook.
@@ -498,6 +502,282 @@ var rustStepReverses = map[string]rustStepReverse{
 	// undo. A list past the limit is one the rewind cannot put back: it is
 	// refused, never passed through.
 	"trim_servers_to_limit_v92": {Plan: func(schemaShape) []string { return nil }, Refuse: refuseServersPastLimitV92},
+	// Migration 94 moves the global download limit from its setting into
+	// network_bandwidth, and its SQL moves each egress's limit and quota into
+	// new columns. Both go back before the rewind drops the new table and
+	// columns. A database holding a value an older build cannot keep or
+	// reads otherwise is refused: see bandwidthStatesV94 and the schedule
+	// rules. A quota with no amount goes back as 0, which migration 53's
+	// column holds in its place. A schedule rule that lifts a limit with null
+	// goes back to 0, the only value the step turns into null.
+	"move_bandwidth_to_networking_v94": {Plan: reverseGlobalBandwidthV94, Refuse: refuseBandwidthV94, Rewrite: rewriteScheduleLimitsV94},
+	"egress_bandwidth_columns_v94":     {Tables: []string{"egress_interfaces"}, Plan: reverseEgressBandwidthV94},
+	// Migration 105 fills tracker_hosts from torrent_trackers, two tables
+	// made after the graph-engine migration that the rewind drops.
+	"fill_tracker_hosts_v105": {Plan: func(schemaShape) []string { return nil }},
+	// Migration 112 deletes a torrent setting. Torrents came with migration
+	// 93, so a database from before it never held the key.
+	"forget_saved_mapped_ports_v112": {Plan: func(schemaShape) []string { return nil }},
+	// Migration 121 turns each proxy's DNS setting into server lists and
+	// profiles, and takes it off the proxy. A proxy that kept the default
+	// gets no row, and only keys meaning that default leave its config. A
+	// list or profile is a setting the rewind cannot write back onto the
+	// proxies, so a database holding one is refused.
+	"dns_profiles_from_proxies_v121": {Plan: func(schemaShape) []string { return nil }, Refuse: refuseDNSProfilesV121},
+}
+
+// migrationStatement is one SQL statement of one migration, its whitespace
+// collapsed.
+type migrationStatement struct {
+	Version   int
+	Statement string
+}
+
+// sqlStepReverses names the reverse in rustStepReverses that undoes each SQL
+// statement on a table that was there before its migration, other than a
+// created table, index or added column. Each statement is listed whole, so
+// one the reverse was not written for is an error, not passed through.
+var sqlStepReverses = map[migrationStatement]string{
+	{94, "UPDATE egress_interfaces SET download_bps = NULLIF(max_download_speed, 0), quota_download_bytes = download_quota_limit_bytes, quota_download_enabled = download_quota_enabled"}: "egress_bandwidth_columns_v94",
+	{94, "ALTER TABLE egress_interfaces RENAME COLUMN download_quota_period TO quota_period"}:                                                                                             "egress_bandwidth_columns_v94",
+	{94, "ALTER TABLE egress_interfaces RENAME COLUMN download_quota_reset_time_minutes_local TO quota_reset_time_minutes_local"}:                                                         "egress_bandwidth_columns_v94",
+	{94, "ALTER TABLE egress_interfaces RENAME COLUMN download_quota_weekly_reset_weekday TO quota_weekly_reset_weekday"}:                                                                 "egress_bandwidth_columns_v94",
+	{94, "ALTER TABLE egress_interfaces RENAME COLUMN download_quota_monthly_reset_day TO quota_monthly_reset_day"}:                                                                       "egress_bandwidth_columns_v94",
+	{94, "ALTER TABLE egress_interfaces DROP COLUMN max_download_speed"}:                                                                                                                  "egress_bandwidth_columns_v94",
+	{94, "ALTER TABLE egress_interfaces DROP COLUMN download_quota_enabled"}:                                                                                                              "egress_bandwidth_columns_v94",
+	{94, "ALTER TABLE egress_interfaces DROP COLUMN download_quota_limit_bytes"}:                                                                                                          "egress_bandwidth_columns_v94",
+	{112, "DELETE FROM settings WHERE key = 'torrent.mapped_ports'"}:                                                                                                                      "forget_saved_mapped_ports_v112",
+}
+
+// collapseSQL is a statement with each run of whitespace one space.
+func collapseSQL(statement string) string {
+	return strings.Join(strings.Fields(statement), " ")
+}
+
+// egressColumnsV94 are the egress columns migration 94 renames, older name first.
+var egressColumnsV94 = [][2]string{
+	{"download_quota_period", "quota_period"},
+	{"download_quota_reset_time_minutes_local", "quota_reset_time_minutes_local"},
+	{"download_quota_weekly_reset_weekday", "quota_weekly_reset_weekday"},
+	{"download_quota_monthly_reset_day", "quota_monthly_reset_day"},
+}
+
+// droppedEgressColumnsV94 are the egress columns migration 94 drops, as
+// migration 53 made them; a column added to a table holding rows needs its
+// default.
+var droppedEgressColumnsV94 = [][2]string{
+	{"max_download_speed", "BIGINT NOT NULL DEFAULT 0 CHECK (max_download_speed >= 0)"},
+	{"download_quota_enabled", "BOOLEAN NOT NULL DEFAULT FALSE"},
+	{"download_quota_limit_bytes", "BIGINT NOT NULL DEFAULT 0 CHECK (download_quota_limit_bytes >= 0)"},
+}
+
+func reverseGlobalBandwidthV94(shape schemaShape) []string {
+	if !shape.Tables["network_bandwidth"] {
+		return nil
+	}
+	return []string{
+		`INSERT INTO settings (key, value) SELECT 'max_download_speed', CAST(download_bps AS TEXT) FROM network_bandwidth WHERE id = 1 AND download_bps IS NOT NULL ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
+	}
+}
+
+func reverseEgressBandwidthV94(shape schemaShape) []string {
+	columns := shape.Columns["egress_interfaces"]
+	if columns == nil {
+		return nil
+	}
+	var statements []string
+	for _, rename := range egressColumnsV94 {
+		if columns[rename[1]] && !columns[rename[0]] {
+			statements = append(statements, fmt.Sprintf(`ALTER TABLE egress_interfaces RENAME COLUMN %s TO %s`, rename[1], rename[0]))
+		}
+	}
+	for _, add := range droppedEgressColumnsV94 {
+		if !columns[add[0]] {
+			statements = append(statements, fmt.Sprintf(`ALTER TABLE egress_interfaces ADD COLUMN %s %s`, add[0], add[1]))
+		}
+	}
+	if columns["download_bps"] {
+		statements = append(statements, `UPDATE egress_interfaces SET max_download_speed = COALESCE(download_bps, 0), download_quota_enabled = quota_download_enabled, download_quota_limit_bytes = COALESCE(quota_download_bytes, 0)`)
+	}
+	return statements
+}
+
+// bandwidthStateV94 is a value an older build has no place for, or spells
+// another way: where it is kept, the rows holding it, and what it is.
+type bandwidthStateV94 struct {
+	Table, Column, Where, Says string
+}
+
+// bandwidthStatesV94 is every bandwidth value from migration 94 on that the
+// rewind cannot put back. Upload limits, upload quotas and upload counters
+// came with 94, and the usenet split with 95: an older build drops them. A
+// limit of 0 lets nothing through since 94 and meant no limit before it.
+var bandwidthStatesV94 = []bandwidthStateV94{
+	{"network_bandwidth", "download_bps", "download_bps = 0", "the global download limit is 0, which lets nothing through since migration 94 and meant no limit before it"},
+	{"network_bandwidth", "upload_bps", "upload_bps IS NOT NULL", "the global upload limit is set"},
+	{"network_bandwidth", "usenet_split_pct", "usenet_split_pct IS NOT NULL", "the global download limit is split between usenet and torrents"},
+	{"egress_interfaces", "download_bps", "download_bps = 0", "egresses have a download limit of 0, which lets nothing through since migration 94 and meant no limit before it"},
+	{"egress_interfaces", "upload_bps", "upload_bps IS NOT NULL", "egresses have an upload limit"},
+	{"egress_interfaces", "quota_upload_soft_bytes", "quota_upload_soft_bytes IS NOT NULL", "egresses have an upload quota"},
+	{"egress_interfaces", "quota_upload_hard_bytes", "quota_upload_hard_bytes IS NOT NULL", "egresses have a hard upload quota"},
+	{"egress_interfaces", "quota_upload_trickle_bps", "quota_upload_trickle_bps <> 2048", "egresses have an upload trickle other than the default"},
+	{"egress_download_usage", "upload_lifetime_bytes", "upload_lifetime_bytes <> 0", "egresses have counted uploads"},
+	{"egress_download_usage", "upload_quota_baseline_bytes", "upload_quota_baseline_bytes <> 0", "egresses have an upload quota baseline"},
+}
+
+func refuseBandwidthV94(db *stateConn) error {
+	tables, err := existingTables(db)
+	if err != nil {
+		return err
+	}
+	columns := map[string]map[string]bool{}
+	for _, state := range bandwidthStatesV94 {
+		if !tables[state.Table] {
+			continue
+		}
+		if columns[state.Table] == nil {
+			if columns[state.Table], err = tableColumns(db, state.Table); err != nil {
+				return err
+			}
+		}
+		if !columns[state.Table][state.Column] {
+			continue
+		}
+		var count int
+		if err := db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE %s`, state.Table, state.Where)).Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 {
+			return fmt.Errorf("%d rows of %s: %s; the rewind cannot put it back", count, state.Table, state.Says)
+		}
+	}
+	raw, found, err := savedSchedules(db)
+	if err != nil || !found {
+		return err
+	}
+	return refuseScheduleLimitsV94(raw)
+}
+
+// savedSchedules is the saved schedules setting, and whether it is saved.
+func savedSchedules(db *stateConn) (string, bool, error) {
+	var raw string
+	switch err := db.QueryRow(`SELECT value FROM settings WHERE key = 'schedules'`).Scan(&raw); {
+	case errors.Is(err, sql.ErrNoRows):
+		return "", false, nil
+	case err != nil:
+		return "", false, err
+	}
+	return raw, true, nil
+}
+
+// scheduleActionsSinceV94 are the schedule actions that came with migrations
+// 94 and 95, which an older build cannot read.
+var scheduleActionsSinceV94 = map[string]string{
+	"bandwidth_split": "shares the download limit between usenet and torrents, which came with migration 95",
+}
+
+// refuseScheduleLimitsV94 refuses a saved schedule a rule of which an older
+// build cannot read or reads otherwise. Since 94, 0 lets nothing through;
+// before it 0 lifted the limit. An upload limit came with 94, and the split
+// action with 95. Schedules that cannot be read are left to the replayed
+// step, which leaves them as they are.
+func refuseScheduleLimitsV94(raw string) error {
+	var rules []struct {
+		Action struct {
+			Type   string                       `json:"type"`
+			Limits []map[string]json.RawMessage `json:"limits"`
+		} `json:"action"`
+	}
+	if json.Unmarshal([]byte(raw), &rules) != nil {
+		return nil
+	}
+	for _, rule := range rules {
+		if says, newer := scheduleActionsSinceV94[rule.Action.Type]; newer {
+			return fmt.Errorf("a schedule rule %s; the rewind cannot put it back", says)
+		}
+		if rule.Action.Type != "speed_limit" {
+			continue
+		}
+		for _, limit := range rule.Action.Limits {
+			if string(limit["bytes_per_sec"]) == "0" {
+				return fmt.Errorf("a schedule rule lets nothing through with 0, which before migration 94 lifted the limit; the rewind cannot put it back")
+			}
+			if upload, set := limit["upload_bytes_per_sec"]; set && string(upload) != "null" {
+				return fmt.Errorf("a schedule rule sets an upload limit, which came with migration 94; the rewind cannot put it back")
+			}
+		}
+	}
+	return nil
+}
+
+// rewriteScheduleLimitsV94 writes each speed rule's null limit back as 0, how
+// a build before 94 lifts a limit. The replayed step turns each 0 into null
+// again, and no other value, so the round trip is exact.
+func rewriteScheduleLimitsV94(db *stateConn) ([]string, error) {
+	raw, found, err := savedSchedules(db)
+	if err != nil || !found {
+		return nil, err
+	}
+	rewritten, changed := schedulesWithZeroLimits(raw)
+	if !changed {
+		return nil, nil
+	}
+	return []string{fmt.Sprintf(`UPDATE settings SET value = '%s' WHERE key = 'schedules'`, strings.ReplaceAll(rewritten, "'", "''"))}, nil
+}
+
+// schedulesWithZeroLimits is the saved schedules with each speed rule's null
+// limit written as 0, and whether any was. Schedules that cannot be read are
+// left as they are.
+func schedulesWithZeroLimits(raw string) (string, bool) {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	var rules []map[string]any
+	if decoder.Decode(&rules) != nil {
+		return raw, false
+	}
+	changed := false
+	for _, rule := range rules {
+		action, _ := rule["action"].(map[string]any)
+		if action == nil || action["type"] != "speed_limit" {
+			continue
+		}
+		limits, _ := action["limits"].([]any)
+		for _, entry := range limits {
+			limit, _ := entry.(map[string]any)
+			if download, set := limit["bytes_per_sec"]; set && download == nil {
+				limit["bytes_per_sec"] = json.Number("0")
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return raw, false
+	}
+	rewritten, err := json.Marshal(rules)
+	if err != nil {
+		return raw, false
+	}
+	return string(rewritten), true
+}
+
+func refuseDNSProfilesV121(db *stateConn) error {
+	tables, err := existingTables(db)
+	if err != nil {
+		return err
+	}
+	for _, table := range []string{"dns_server_lists", "dns_profiles"} {
+		if !tables[table] {
+			continue
+		}
+		var count int
+		if err := db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM %s`, table)).Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 {
+			return fmt.Errorf("the database stores %d rows in %s, DNS settings the rewind cannot write back onto the proxies they came from", count, table)
+		}
+	}
+	return nil
 }
 
 // serverLimitV92 is the server limit migration 92 trims a stored list to.
@@ -598,6 +878,28 @@ func (rewind schemaRewind) plan(shape schemaShape) []string {
 	return statements
 }
 
+// tableColumns is the set of a table's column names.
+func tableColumns(db *stateConn, table string) (map[string]bool, error) {
+	query := fmt.Sprintf(`SELECT name FROM pragma_table_info('%s')`, table)
+	if db.datastore == weaverDatastorePostgres {
+		query = fmt.Sprintf(`SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '%s'`, table)
+	}
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	columns := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		columns[name] = true
+	}
+	return columns, rows.Err()
+}
+
 // readSchemaShape reads the shape of the tables the rewind touches.
 func readSchemaShape(db *stateConn, rewind schemaRewind) (schemaShape, error) {
 	tables, err := existingTables(db)
@@ -621,24 +923,10 @@ func readSchemaShape(db *stateConn, rewind schemaRewind) (schemaShape, error) {
 		if !tables[table] {
 			continue
 		}
-		columns := map[string]bool{}
-		columnQuery := fmt.Sprintf(`SELECT name FROM pragma_table_info('%s')`, table)
-		if db.datastore == weaverDatastorePostgres {
-			columnQuery = fmt.Sprintf(`SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '%s'`, table)
-		}
-		rows, err := db.Query(columnQuery)
+		columns, err := tableColumns(db, table)
 		if err != nil {
 			return schemaShape{}, err
 		}
-		for rows.Next() {
-			var name string
-			if err := rows.Scan(&name); err != nil {
-				rows.Close()
-				return schemaShape{}, err
-			}
-			columns[name] = true
-		}
-		rows.Close()
 		shape.Columns[table] = columns
 		indexes := map[string]string{}
 		shape.Indexes[table] = indexes
@@ -647,7 +935,7 @@ func readSchemaShape(db *stateConn, rewind schemaRewind) (schemaShape, error) {
 		if db.datastore == weaverDatastorePostgres {
 			continue
 		}
-		rows, err = db.Query(`SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL`, table)
+		rows, err := db.Query(`SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL`, table)
 		if err != nil {
 			return schemaShape{}, err
 		}
@@ -675,11 +963,21 @@ func applySchemaRewind(dbPath string, rewind schemaRewind, plant []string) error
 				}
 			}
 		}
+		var rewrites []string
+		for _, hook := range rewind.Reverses {
+			if rewrite := rustStepReverses[hook].Rewrite; rewrite != nil {
+				statements, err := rewrite(db)
+				if err != nil {
+					return fmt.Errorf("reverse of %s: %w", hook, err)
+				}
+				rewrites = append(rewrites, statements...)
+			}
+		}
 		shape, err := readSchemaShape(db, rewind)
 		if err != nil {
 			return err
 		}
-		for _, statement := range append(rewind.plan(shape), plant...) {
+		for _, statement := range append(append(rewrites, rewind.plan(shape)...), plant...) {
 			if _, err := db.Exec(statement); err != nil {
 				return fmt.Errorf("%s: %w", statement, err)
 			}
@@ -763,11 +1061,13 @@ func weaverMigrationsDir() string {
 }
 
 // migrationStep is one step of a migration as the manifest lists it: its kind
-// and, for an SQL step, its file relative to the migration folder's parent.
+// and, for an SQL step, its file relative to the migration folder's parent
+// and the engine it runs on, when it names one.
 type migrationStep struct {
 	Kind   string
 	File   string
 	HookID string
+	Engine string
 }
 
 // migrationEntry is one migration the manifest lists, with its steps.
@@ -783,11 +1083,18 @@ var (
 	manifestFileLine      = regexp.MustCompile(`^file\s*=\s*"([^"]+)"$`)
 	manifestKindLine      = regexp.MustCompile(`^kind\s*=\s*"([^"]+)"$`)
 	manifestHookLine      = regexp.MustCompile(`^hook_id\s*=\s*"([^"]+)"$`)
+	manifestEngineLine    = regexp.MustCompile(`^engine\s*=\s*"([^"]+)"$`)
 	sqlLineComment        = regexp.MustCompile(`--[^\n]*`)
 	sqlCreateTable        = regexp.MustCompile(`(?is)^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s*\(`)
 	sqlCreateIndex        = regexp.MustCompile(`(?is)^CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s+ON\b`)
 	sqlDropIndex          = regexp.MustCompile(`(?is)^DROP\s+INDEX\s+(?:IF\s+EXISTS\s+)?"?([A-Za-z_][A-Za-z0-9_]*)"?\s*$`)
+	sqlWriteTarget        = regexp.MustCompile(`(?is)^(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|DROP\s+TABLE(?:\s+IF\s+EXISTS)?|ALTER\s+TABLE)\s+(\w+)\b`)
+	sqlRenameTable        = regexp.MustCompile(`(?is)^ALTER\s+TABLE\s+\w+\s+RENAME\s+TO\s+(\w+)\s*$`)
 	sqlAddColumn          = regexp.MustCompile(`(?is)^ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\b`)
+	sqlDropTable          = regexp.MustCompile(`(?is)^DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(\w+)\s*$`)
+	sqlDropColumn         = regexp.MustCompile(`(?is)^ALTER\s+TABLE\s+(\w+)\s+DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?(\w+)\s*$`)
+	sqlRenameTableFrom    = regexp.MustCompile(`(?is)^ALTER\s+TABLE\s+(\w+)\s+RENAME\s+TO\s+(\w+)\s*$`)
+	sqlRenameColumn       = regexp.MustCompile(`(?is)^ALTER\s+TABLE\s+(\w+)\s+RENAME\s+COLUMN\s+(\w+)\s+TO\s+(\w+)\s*$`)
 )
 
 // readMigrationManifest is every migration the manifest in dir lists, in its
@@ -827,6 +1134,8 @@ func readMigrationManifest(dir string) ([]migrationEntry, error) {
 			step.File = match[1]
 		} else if match := manifestHookLine.FindStringSubmatch(line); match != nil {
 			step.HookID = match[1]
+		} else if match := manifestEngineLine.FindStringSubmatch(line); match != nil {
+			step.Engine = match[1]
 		}
 	}
 	if len(entries) == 0 {
@@ -876,12 +1185,24 @@ func readLaterMigrations(dir string, after int) (laterMigrations, error) {
 	if err != nil {
 		return laterMigrations{}, err
 	}
+	earlier, err := readEarlierObjects(dir, entries, after)
+	if err != nil {
+		return laterMigrations{}, err
+	}
 	var out laterMigrations
 	seenTable := map[string]bool{}
 	seenColumn := map[tableColumn]bool{}
 	for _, entry := range entries {
 		if entry.Version <= after {
 			continue
+		}
+		// The rewind drops what a later migration creates. One that names, IF
+		// NOT EXISTS, a table, index or column an earlier migration made would
+		// have it dropped from under the older build.
+		if made, found, err := earlierObjectRemade(dir, entry, earlier); err != nil {
+			return laterMigrations{}, err
+		} else if found {
+			return laterMigrations{}, fmt.Errorf("migration %d creates %s, which a migration at or before %d made already; the rewind would drop it", entry.Version, made, after)
 		}
 		for _, step := range entry.Steps {
 			if step.Kind == "rust" {
@@ -928,11 +1249,134 @@ func readLaterMigrations(dir string, after int) (laterMigrations, error) {
 					}
 					continue
 				}
+				if write := sqlWriteTarget.FindStringSubmatch(statement); write != nil {
+					// A table one of these migrations made goes with the
+					// rewind, and what was written to it with it; a table it
+					// is renamed to goes too.
+					if seenTable[write[1]] {
+						if rename := sqlRenameTable.FindStringSubmatch(statement); rename != nil && !seenTable[rename[1]] {
+							seenTable[rename[1]] = true
+							out.Tables = append(out.Tables, rename[1])
+						}
+						continue
+					}
+					if reverse, known := sqlStepReverses[migrationStatement{entry.Version, collapseSQL(statement)}]; known {
+						out.Hooks = appendNew(out.Hooks, reverse)
+						continue
+					}
+				}
 				return laterMigrations{}, fmt.Errorf("migration %d has a statement the rewind cannot undo: %s", entry.Version, statement)
 			}
 		}
 	}
+	// A table is dropped before the tables it references, which were made
+	// before it.
+	slices.Reverse(out.Tables)
 	return out, nil
+}
+
+// migrationStatements is each SQL statement of a step, its comments removed.
+func migrationStatements(dir string, version int, step migrationStep) ([]string, error) {
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(dir), filepath.FromSlash(step.File)))
+	if err != nil {
+		return nil, fmt.Errorf("migration %d: %w", version, err)
+	}
+	var statements []string
+	for _, statement := range strings.Split(sqlLineComment.ReplaceAllString(string(data), ""), ";") {
+		if statement = strings.TrimSpace(statement); statement != "" {
+			statements = append(statements, statement)
+		}
+	}
+	return statements, nil
+}
+
+// createdObject names the table, index or column a statement makes, or "".
+func createdObject(statement string) string {
+	if create := sqlCreateTable.FindStringSubmatch(statement); create != nil {
+		return "table " + create[1]
+	}
+	if index := sqlCreateIndex.FindStringSubmatch(statement); index != nil {
+		return "index " + index[1]
+	}
+	if add := sqlAddColumn.FindStringSubmatch(statement); add != nil {
+		return "column " + add[1] + "." + add[2]
+	}
+	return ""
+}
+
+// droppedObject names the table, index or column a statement drops, or "".
+func droppedObject(statement string) string {
+	if drop := sqlDropTable.FindStringSubmatch(statement); drop != nil {
+		return "table " + drop[1]
+	}
+	if drop := sqlDropIndex.FindStringSubmatch(statement); drop != nil {
+		return "index " + drop[1]
+	}
+	if drop := sqlDropColumn.FindStringSubmatch(statement); drop != nil {
+		return "column " + drop[1] + "." + drop[2]
+	}
+	return ""
+}
+
+// readEarlierObjects is every table, index and column the SQL of the
+// migrations at or before the given version leaves in place.
+func readEarlierObjects(dir string, entries []migrationEntry, after int) (map[string]bool, error) {
+	objects := map[string]bool{}
+	for _, entry := range entries {
+		if entry.Version > after {
+			continue
+		}
+		for _, step := range entry.Steps {
+			if step.Kind != "sql" {
+				continue
+			}
+			statements, err := migrationStatements(dir, entry.Version, step)
+			if err != nil {
+				return nil, err
+			}
+			for _, statement := range statements {
+				if made := createdObject(statement); made != "" {
+					objects[made] = true
+				} else if dropped := droppedObject(statement); dropped != "" {
+					delete(objects, dropped)
+					if table, ok := strings.CutPrefix(dropped, "table "); ok {
+						for object := range objects {
+							if strings.HasPrefix(object, "column "+table+".") {
+								delete(objects, object)
+							}
+						}
+					}
+				} else if rename := sqlRenameTableFrom.FindStringSubmatch(statement); rename != nil {
+					delete(objects, "table "+rename[1])
+					objects["table "+rename[2]] = true
+				} else if rename := sqlRenameColumn.FindStringSubmatch(statement); rename != nil {
+					delete(objects, "column "+rename[1]+"."+rename[2])
+					objects["column "+rename[1]+"."+rename[3]] = true
+				}
+			}
+		}
+	}
+	return objects, nil
+}
+
+// earlierObjectRemade is the first table, index or column a later migration
+// creates that an earlier one left in place.
+func earlierObjectRemade(dir string, entry migrationEntry, earlier map[string]bool) (string, bool, error) {
+	for _, step := range entry.Steps {
+		if step.Kind != "sql" {
+			continue
+		}
+		statements, err := migrationStatements(dir, entry.Version, step)
+		if err != nil {
+			return "", false, err
+		}
+		for _, statement := range statements {
+			if made := createdObject(statement); made != "" && earlier[made] {
+				return made, true, nil
+			}
+		}
+	}
+	return "", false, nil
 }
 
 // preGraphEngineRewind is a database written before the graph-engine
