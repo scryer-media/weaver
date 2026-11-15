@@ -1250,7 +1250,8 @@ impl StandIns {
             }
             // A WireGuard log line names the peer by the first characters of
             // its key (`wireguard AbCdEfGh…@host:port`), so that spelling is
-            // the key's too.
+            // the key's too. A key is replaced wherever it is spelled, even a
+            // prefix of letters only that a name would not be matched by.
             let spec = proxy.wireguard_spec().ok();
             let tunnel_key = spec.as_ref().map(|spec| spec.public_key());
             let peer_key_prefix = spec.as_ref().map(|spec| spec.peer_public_key_prefix());
@@ -1263,7 +1264,7 @@ impl StandIns {
             .into_iter()
             .flatten()
             {
-                table.name(key, &format!("{stand_in}/key"));
+                table.identity(key, &format!("{stand_in}/key"));
             }
         }
         for pool in &stored.pools {
