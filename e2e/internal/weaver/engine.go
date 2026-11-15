@@ -30,6 +30,12 @@ func graphLogEvents(raw string, jobID int, message string) []map[string]string {
 // under the graph's target, is not a debug-ring replay, and carries the message
 // followed by `job_id=<one of jobIDs>`, which the contract puts first.
 func graphLogEventsOfJobs(raw string, message string, jobIDs []int) []map[string]string {
+	return weaverLogEventsOfJobs(raw, graphLogTarget, message, jobIDs)
+}
+
+// weaverLogEventsOfJobs is the same for the lines of any target that carry
+// `job_id` first.
+func weaverLogEventsOfJobs(raw string, target string, message string, jobIDs []int) []map[string]string {
 	needle := message + " job_id="
 	wanted := make(map[string]bool, len(jobIDs))
 	for _, jobID := range jobIDs {
@@ -38,7 +44,7 @@ func graphLogEventsOfJobs(raw string, message string, jobIDs []int) []map[string
 	var events []map[string]string
 	for _, rawLine := range strings.Split(raw, "\n") {
 		line := cleanWeaverLogLine(rawLine)
-		if !strings.Contains(line, graphLogTarget) || isWeaverDebugRingReplay(line) {
+		if !strings.Contains(line, target) || isWeaverDebugRingReplay(line) {
 			continue
 		}
 		start := strings.Index(line, needle)

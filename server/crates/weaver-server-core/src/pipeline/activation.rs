@@ -1022,8 +1022,15 @@ impl Pipeline {
 
     // Stop the job's graph runtime. One with nothing out on a thread goes at
     // once; one with a run or a repair out is kept, apart from the graphs
-    // that serve jobs, until the last of its mail is heard.
+    // that serve jobs, until the last of its mail is heard. A cancelled job
+    // gives up its files: what its volumes' writers still hold of it is not
+    // run. A failed job does not, by whichever path it is stopped: it keeps
+    // what it delivered, so every file operation queued for it runs, a
+    // file's last bytes, a move to its name, a removal of what no longer
+    // belongs and the release of its handles, before its working directory
+    // is released.
     pub(in crate::pipeline) fn retire_graph_job(&mut self, job_id: JobId) {
+        let keep_files = self.pipeline_failure_stages.contains_key(&job_id);
         self.forget_graph_repair(job_id);
         self.disk_waiting.remove(&job_id);
         self.disk_idle.remove(&job_id);
@@ -1044,7 +1051,7 @@ impl Pipeline {
             graph.owe_mail(pending.stamp());
         }
         graph.request_stop();
-        if pending.control().cancelled() {
+        if pending.control().cancelled() && !keep_files {
             graph.abandon_disk();
         }
         // A job kept only for its last file operation hears when it returned.

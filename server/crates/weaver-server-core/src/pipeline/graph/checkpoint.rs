@@ -912,6 +912,28 @@ impl Pending {
         self.forget();
     }
 
+    // The job failed, so no later checkpoint corrects the waiting changes:
+    // they are dropped as a failed write's are, and whoever waits for their
+    // commit hears it failed.
+    pub(in crate::pipeline) fn job_failed(&self) {
+        self.forget();
+    }
+
+    // No checkpoint of the job is queued from now on, though the changes
+    // waiting are kept for a cancel that is handed back. A move waiting on
+    // their commit hears now that it will not come: a change still waiting
+    // for a volume's writer is never queued once cancelled, and a stopped
+    // graph waiting on that word, as one held for a full disk is, would
+    // never go. A cancel handed back takes its checkpoint again and waits
+    // on that one.
+    pub(in crate::pipeline) fn cancel(&self) {
+        let mut slot = self.slot();
+        slot.control.cancel();
+        if let Some(owed) = slot.owed.take() {
+            owed.send(None);
+        }
+    }
+
     // Whether no checkpoint is taken of the job any more.
     pub(in crate::pipeline) fn given_up(&self) -> bool {
         self.slot().control.cancelled()
@@ -1086,7 +1108,22 @@ impl Pipeline {
             .get(&job_id)
             .or_else(|| self.retiring_graph_jobs.get(&job_id))
         {
-            graph.pending().control().cancel();
+            graph.pending().cancel();
+        }
+    }
+
+    // The job failed: no checkpoint of it is taken again. The changes still
+    // waiting are dropped as a failed write's are, and a move waiting on
+    // their commit hears now that it will not come. Cancelling alone would
+    // leave a change that waited for a volume's writer unqueued for good,
+    // and the job's retirement waiting on that word for ever.
+    pub(in crate::pipeline) fn give_up_failed_graph_checkpoints(&self, job_id: JobId) {
+        if let Some(graph) = self
+            .graph_jobs
+            .get(&job_id)
+            .or_else(|| self.retiring_graph_jobs.get(&job_id))
+        {
+            graph.pending().job_failed();
         }
     }
 
