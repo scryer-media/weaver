@@ -916,3 +916,96 @@ async fn a_folder_named_during_a_look_is_placed_by_that_look() {
     assert_eq!(place.disk, Disk::Root(StorageRoot::Complete));
     service.stop().await;
 }
+
+#[test]
+fn the_disk_warning_names_the_volume_and_the_waiting() {
+    assert_eq!(
+        disk_warning(Path::new("/data/complete"), &["a", "b"]),
+        "Disk full on /data/complete: waiting a, b"
+    );
+}
+
+// A full disk puts the session in upload mode: the torrent shows the disk as
+// full and the file selection stays as it was (libtorrent
+// `torrent::handle_disk_error` enters upload mode and leaves the file
+// priorities alone).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_disk_leaves_the_selection_as_it_was() {
+    use crate::operations::disk::{Capacity, CapacityReading};
+    use crate::torrents::net::{LegKind, LegSockets};
+    use crate::torrents::status::DISK_FULL;
+
+    let data: Vec<u8> = (0..65_536u32).map(|at| (at % 251) as u8).collect();
+    let files = [("set/a.bin", data.as_slice())];
+    let plain = metainfo("set", &files, 16_384, false);
+
+    let seeds = tempfile::tempdir().unwrap();
+    let seeding = seeder(seeds.path(), &plain, &files).await;
+    let std::net::SocketAddr::V4(peer) = seeding.listen_addr().unwrap() else {
+        panic!("the seeder listens on IPv4 loopback");
+    };
+    let (bytes, url) = (plain.to_vec(), tracker(peer).await);
+
+    let reading = CapacityReading {
+        available_bytes: 0,
+        total_bytes: 1 << 30,
+        sampled_at: std::time::Instant::now(),
+        stale: false,
+    };
+    let mut limits = ExtractionLimits::unbounded();
+    limits.min_free_bytes = 100;
+    let env = JobEnv {
+        free_disk: CapacityReader::from_fn(move || Capacity::Known(reading)),
+        limits: Arc::new(limits),
+        ..JobEnv::unbounded()
+    };
+    let rig = rig_with(set_clock(), env);
+    let loopback = Arc::new(weaver_tunnel::pipe::Revocable::new(Arc::new(
+        weaver_tunnel::pipe::Egress::new(
+            4,
+            weaver_tunnel::egress::SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()),
+            // No connect deadline: the test waits on what it checks.
+            std::time::Duration::MAX,
+        ),
+    )));
+    rig.routes.set_leg(
+        LegKind::Ladder,
+        Arc::new(LegSockets::new(loopback, &LegKind::Ladder)),
+    );
+    let handle = queue();
+    let queue = handle.state().clone();
+    rig.service.publish_to(handle);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    tracked(&rig.service, job_id, &url).await;
+
+    // The first piece finds no room and the session enters upload mode.
+    let torrent = handle_of(&rig.service, job_id).await;
+    torrent.wait_until_initialized().await.unwrap();
+    torrent.live().unwrap().wait_for_upload_mode(true).await;
+
+    rig.service.tick().await;
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(view.state, TorrentState::Stalled);
+    assert_eq!(view.detail.as_deref(), Some(DISK_FULL));
+    assert_eq!(view.completed_at_ms, None);
+    assert_eq!(torrent.file_priorities(), [FilePriority::Normal]);
+    let warnings = rig.service.warnings().await;
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains(rig.dir.path().join("complete").to_str().unwrap()));
+    assert!(warnings[0].contains("set"));
+    assert_eq!(
+        queue
+            .get_job(job_id)
+            .unwrap()
+            .download_wait_reason
+            .as_deref(),
+        Some(DISK_FULL)
+    );
+    rig.service.stop().await;
+    seeding.stop().await;
+}
