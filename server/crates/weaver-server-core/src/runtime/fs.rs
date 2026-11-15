@@ -150,13 +150,8 @@ fn rename_exclusive_with_link(
         Err(error) => return Err(error),
     }
     let source = std::fs::symlink_metadata(src)?;
-    // Some mounts reject the operation before checking whether the target
-    // exists. Resolve aliases and interrupted links before trying a copy;
-    // the copy itself still creates exclusively against a later collision.
-    match std::fs::symlink_metadata(dst) {
-        Ok(_) => return finish_or_refuse(src, dst),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+    if let Some(settled) = settled_before_copy(src, dst) {
+        return settled;
     }
     if source.is_file() {
         return copy_file_no_overwrite_then_remove_source(src, dst);
@@ -237,17 +232,50 @@ pub(crate) fn paths_equivalent_for_placement(left: &Path, right: &Path) -> bool 
     path_equivalence_key(left) == path_equivalence_key(right)
 }
 
+// Where a move by name alone left an entry.
+#[derive(Debug)]
+pub(crate) enum Placement {
+    // At its destination.
+    Placed,
+    // Still at its source, the destination free when this was said: the
+    // mount could not place it by name (a link or rename across devices,
+    // or one it refuses), and only a copy can. The error says why. The
+    // caller makes that copy where it may take its time, exclusively
+    // created, never over an entry that appears meanwhile.
+    Copy(io::Error),
+}
+
+// Moves a file and never replaces an existing target, copying it when the
+// mount cannot move it by name. A caller that must not spend a copy's time
+// where it stands uses `place_no_overwrite` and copies elsewhere.
 pub(crate) fn rename_no_overwrite(src: &Path, dst: &Path) -> io::Result<()> {
+    match place_no_overwrite(src, dst)? {
+        Placement::Placed => Ok(()),
+        Placement::Copy(_) => copy_file_no_overwrite_then_remove_source(src, dst),
+    }
+}
+
+// `rename_no_overwrite` up to the copy: only metadata changes, a link and
+// an unlink, a rename of the same entry or a symlink made again.
+pub(crate) fn place_no_overwrite(src: &Path, dst: &Path) -> io::Result<Placement> {
+    place_no_overwrite_with_link(src, dst, |src, dst| std::fs::hard_link(src, dst))
+}
+
+pub(crate) fn place_no_overwrite_with_link(
+    src: &Path,
+    dst: &Path,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<Placement> {
     if paths_equivalent_for_placement(src, dst) {
         if src == dst {
-            return Ok(());
+            return Ok(Placement::Placed);
         }
-        return rename_equivalent_path(src, dst);
+        return rename_equivalent_path(src, dst).map(|()| Placement::Placed);
     }
 
     let metadata = std::fs::symlink_metadata(src)?;
     if metadata.file_type().is_symlink() {
-        return move_symlink_no_overwrite(src, dst);
+        return move_symlink_no_overwrite(src, dst).map(|()| Placement::Placed);
     }
 
     if metadata.is_dir() {
@@ -264,16 +292,51 @@ pub(crate) fn rename_no_overwrite(src: &Path, dst: &Path) -> io::Result<()> {
         ));
     }
 
-    match std::fs::hard_link(src, dst) {
+    match link(src, dst) {
         Ok(()) => {
             std::fs::remove_file(src)?;
-            Ok(())
+            Ok(Placement::Placed)
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!("destination already exists: {}", dst.display()),
         )),
-        Err(_) => copy_file_no_overwrite_then_remove_source(src, dst),
+        Err(error) => match settled_before_copy(src, dst) {
+            Some(settled) => settled.map(|()| Placement::Placed).map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("destination already exists: {}", dst.display()),
+                    )
+                } else {
+                    error
+                }
+            }),
+            None => Ok(Placement::Copy(error)),
+        },
+    }
+}
+
+// Some mounts reject a link or rename before checking whether the target
+// exists. A target that is there is settled before any copy: another
+// spelling or link of the source, which finishes the move without taking
+// its only name, or another entry, which refuses it. None when the target
+// is free. The copy itself still creates exclusively against a later
+// collision.
+fn settled_before_copy(src: &Path, dst: &Path) -> Option<io::Result<()>> {
+    match std::fs::symlink_metadata(dst) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => return Some(Err(error)),
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        Some(finish_or_refuse(src, dst))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = src;
+        Some(Err(io::Error::from(io::ErrorKind::AlreadyExists)))
     }
 }
 
