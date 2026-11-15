@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use super::trust::through_cache;
+use super::trust::{counted, sessions, since, through_naming};
 use super::ttl::{ASKED, Answer, failure, respond, rr, soa, v4, wire};
 use super::*;
-use crate::resolution::ResolutionCache;
+use crate::pipe::Naming;
 use crate::resolution::record::{LookupError, Recording};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
 use std::pin::Pin;
@@ -20,6 +20,8 @@ use tokio_rustls::{
         pki_types::{CertificateDer, PrivatePkcs8KeyDer},
     },
 };
+
+mod dnssec;
 
 // A certificate authority the tests trust, or one they do not.
 struct Authority {
@@ -150,11 +152,24 @@ enum Speaks {
     },
     // HTTP/2. `respond` makes the response from the reply. With
     // `goaway_after`, the request after that many is met with a GOAWAY and
-    // the connection closed.
+    // the connection closed. `misstep` is what each stream does first.
     H2 {
         respond: Arc<H2Respond>,
         goaway_after: Option<usize>,
+        misstep: H2Misstep,
     },
+}
+
+// What an HTTP/2 fixture server does with each request before answering.
+#[derive(Clone, Copy)]
+enum H2Misstep {
+    None,
+    // Resets each stream after the first `after` instead of answering.
+    Reset { after: usize },
+    // Sends this many interim (103) responses first.
+    Interims(usize),
+    // Tries to push a response first, and logs what came of it.
+    Push,
 }
 
 type H2Respond = dyn Fn(Vec<u8>) -> hyper::Response<Vec<u8>> + Send + Sync;
@@ -168,6 +183,8 @@ struct Log {
     // Queries answered on each connection, in dial order.
     queries: Vec<Arc<AtomicUsize>>,
     requests: Vec<Seen>,
+    // What each HTTP/2 push the server tried came to.
+    pushes: Vec<Result<(), String>>,
 }
 
 // DNS servers, by address, in process: encrypted ones, plain ones, and
@@ -183,6 +200,57 @@ struct Servers {
     speaks: Speaks,
     answer: Arc<Answer>,
     log: Arc<Mutex<Log>>,
+    // The round trip each dial, and each reply the client waits on, costs
+    // on the paused clock, when set; and how many such waits there were.
+    rtt: Option<std::time::Duration>,
+    waits: Arc<AtomicUsize>,
+}
+
+// A client's end of a connection with a round trip's latency: a read that
+// follows a write waits one round trip first, so replies the client asked
+// for together arrive together.
+struct Latency {
+    inner: DuplexStream,
+    rtt: std::time::Duration,
+    wrote: bool,
+    wait: Option<Pin<Box<tokio::time::Sleep>>>,
+    waits: Arc<AtomicUsize>,
+}
+
+impl AsyncRead for Latency {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.wrote && self.wait.is_none() {
+            self.wait = Some(Box::pin(tokio::time::sleep(self.rtt)));
+            self.waits.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(wait) = self.wait.as_mut() {
+            std::task::ready!(wait.as_mut().poll(cx));
+            self.wait = None;
+            self.wrote = false;
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Latency {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.wrote = true;
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 impl Servers {
@@ -199,7 +267,17 @@ impl Servers {
             speaks,
             answer: Arc::new(answer),
             log: Default::default(),
+            rtt: None,
+            waits: Arc::default(),
         }
+    }
+    fn delayed(mut self, rtt: std::time::Duration) -> Self {
+        self.rtt = Some(rtt);
+        self
+    }
+    // The round trips waited on so far: one per dial, one per reply waited.
+    fn waits(&self) -> usize {
+        self.waits.load(Ordering::Relaxed)
     }
     fn at(mut self, ip: &str, config: Arc<ServerConfig>) -> Self {
         self.tls.push((ip.parse().unwrap(), config));
@@ -249,19 +327,33 @@ impl Carrier for Servers {
             log.sent.push(seen.clone());
             log.queries.push(queries.clone());
         }
+        let client: Box<dyn crate::TunnelStream> = match self.rtt {
+            Some(rtt) => {
+                self.waits.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(rtt).await;
+                Box::new(Latency {
+                    inner: client,
+                    rtt,
+                    wrote: false,
+                    wait: None,
+                    waits: self.waits.clone(),
+                })
+            }
+            None => Box::new(client),
+        };
         let asked = server.address.ip();
         let answer = self.answer.clone();
         let replies = self.replies.clone();
         if self.silent.contains(&asked) {
             self.held.lock().unwrap().push(inner);
-            return Ok(Box::new(client));
+            return Ok(client);
         }
         if self.plain.contains(&asked) {
             tokio::spawn(async move {
                 let mut stream = Tap { inner, seen };
                 framed_replies(&mut stream, asked, &*answer, None, None, &queries).await;
             });
-            return Ok(Box::new(client));
+            return Ok(client);
         }
         let Some((_, config)) = self.tls.iter().find(|(ip, _)| *ip == asked) else {
             return Err(TunnelError::Engine(format!("nothing listens at {asked}")));
@@ -289,6 +381,16 @@ impl Carrier for Servers {
                     let Some(seen) = read_request(&mut tls).await else {
                         return;
                     };
+                    // Past the last reply, the connection closes unanswered
+                    // and without saying so before.
+                    if replies.as_deref().is_some_and(|left| {
+                        left.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                            left.checked_sub(1)
+                        })
+                        .is_err()
+                    }) {
+                        return;
+                    }
                     queries.fetch_add(1, Ordering::Relaxed);
                     let body = seen.body.clone();
                     log.lock().unwrap().requests.push(seen);
@@ -315,10 +417,22 @@ impl Carrier for Servers {
                 Speaks::H2 {
                     respond,
                     goaway_after,
-                } => serve_h2(tls, asked, answer, respond, goaway_after, queries, log).await,
+                    misstep,
+                } => {
+                    serve_h2(
+                        tls,
+                        asked,
+                        answer,
+                        (respond, misstep),
+                        goaway_after,
+                        queries,
+                        log,
+                    )
+                    .await
+                }
             }
         });
-        Ok(Box::new(client))
+        Ok(client)
     }
 }
 
@@ -328,7 +442,7 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     asked: IpAddr,
     answer: Arc<Answer>,
-    respond: Arc<H2Respond>,
+    (respond, misstep): (Arc<H2Respond>, H2Misstep),
     goaway_after: Option<usize>,
     queries: Arc<AtomicUsize>,
     log: Arc<Mutex<Log>>,
@@ -367,6 +481,31 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
                     .collect(),
                 body: query.clone(),
             });
+            match misstep {
+                H2Misstep::None => {}
+                H2Misstep::Reset { after } if accepted > after => {
+                    return send.send_reset(h2::Reason::INTERNAL_ERROR);
+                }
+                H2Misstep::Reset { .. } => {}
+                H2Misstep::Interims(count) => {
+                    for _ in 0..count {
+                        let interim = hyper::Response::builder().status(103).body(()).unwrap();
+                        if send.send_informational(interim).is_err() {
+                            return;
+                        }
+                    }
+                }
+                H2Misstep::Push => {
+                    let pushed = hyper::Request::get("https://192.0.2.53/pushed")
+                        .body(())
+                        .unwrap();
+                    let pushed = send
+                        .push_request(pushed)
+                        .map(drop)
+                        .map_err(|error| error.to_string());
+                    log.lock().unwrap().pushes.push(pushed);
+                }
+            }
             let reply = answer(asked, u16_at(&query, query.len() - 4).unwrap(), &query);
             let (head, bytes) = respond(reply).into_parts();
             let Ok(mut stream) = send.send_response(hyper::Response::from_parts(head, ()), false)
@@ -674,7 +813,8 @@ async fn dot_fails_a_certificate_from_an_untrusted_issuer() {
     )
     .await;
     assert_eq!(resolution.error, tls_failed("192.0.2.53", "unknown issuer"));
-    assert_eq!(resolution.trust, Some(record::TrustOutcome::AsSent));
+    // No answer came to judge.
+    assert_eq!(resolution.trust, None);
 }
 
 #[tokio::test(start_paused = true)]
@@ -706,6 +846,7 @@ async fn a_server_failing_tls_is_passed_over_for_the_next() {
     );
     assert_eq!(resolution.error, None);
     assert_eq!(resolution.wire, Some(WireKind::Tls));
+    assert_eq!(resolution.answered_by, Some("192.0.2.54".parse().unwrap()));
     assert_eq!(
         servers.dials(),
         [
@@ -713,6 +854,27 @@ async fn a_server_failing_tls_is_passed_over_for_the_next() {
             "192.0.2.54:853".parse().unwrap()
         ]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_server_failing_https_is_passed_over_and_the_record_names_the_next() {
+    let trusted = Authority::new();
+    let stranger = Authority::new();
+    let servers = Servers::new(doh_fixture(plain_reply, false), answers)
+        .at("192.0.2.53", stranger.server(&["192.0.2.53"], b"http/1.1"))
+        .at("192.0.2.54", trusted.server(&["192.0.2.54"], b"http/1.1"));
+    let resolution = recorded(
+        &servers,
+        &trusted.wires(),
+        &[doh("192.0.2.53:443"), doh("192.0.2.54:443")],
+        Trust::AsSent,
+        "fixture.test",
+    )
+    .await;
+    assert_eq!(resolution.addresses, seven());
+    assert_eq!(resolution.wire, Some(WireKind::Https));
+    assert_eq!(resolution.answered_by, Some("192.0.2.54".parse().unwrap()));
+    assert_eq!(resolution.trust, Some(TrustOutcome::AsSent));
 }
 
 // Both families and an alias, three queries in all.
@@ -1382,14 +1544,13 @@ async fn a_naming_records_a_failed_lookup_under_require_ad_as_judged_by_nobody()
         ("192.0.2.53", LookupFailure::TlsFailed),
         ("192.0.2.54", LookupFailure::TimedOut),
     ] {
-        let listed = [dot(address, None)];
-        let cache = ResolutionCache::<DialError>::default();
-        let resolution = through_cache(&cache, &listed, Trust::RequireAd, "fixture.test", || {
-            resolve(&servers, &wires, &listed, Trust::RequireAd, "fixture.test")
-        })
-        .await;
+        let naming = Naming::proxy_servers(vec![dot(address, None)], Trust::RequireAd);
+        sessions(&naming).trust(&wires);
+        let before = counted();
+        let resolution = through_naming(&naming, &servers, "fixture.test").await;
         assert!(!resolution.cached);
         assert_eq!(resolution.trust, None, "{address}");
+        assert_eq!(since(&before), [], "{address}");
         assert_eq!(
             resolution.error.map(|error| error.failure),
             Some(failure),
@@ -1496,10 +1657,20 @@ fn h2_servers(
     goaway_after: Option<usize>,
     answer: impl Fn(IpAddr, u16, &[u8]) -> Vec<u8> + Send + Sync + 'static,
 ) -> (Servers, Wires) {
+    h2_servers_doing(respond, goaway_after, H2Misstep::None, answer)
+}
+
+fn h2_servers_doing(
+    respond: impl Fn(Vec<u8>) -> hyper::Response<Vec<u8>> + Send + Sync + 'static,
+    goaway_after: Option<usize>,
+    misstep: H2Misstep,
+    answer: impl Fn(IpAddr, u16, &[u8]) -> Vec<u8> + Send + Sync + 'static,
+) -> (Servers, Wires) {
     let authority = Authority::new();
     let speaks = Speaks::H2 {
         respond: Arc::new(respond),
         goaway_after,
+        misstep,
     };
     let servers =
         Servers::new(speaks, answer).at("192.0.2.53", authority.server(&["192.0.2.53"], b"h2"));
@@ -1617,4 +1788,193 @@ async fn doh_over_http_2_replies_are_held_to_the_ad_bit() {
     assert_eq!(resolution.addresses, seven());
     assert_eq!(resolution.trust, Some(record::TrustOutcome::Authenticated));
     assert_eq!(resolution.wire, Some(WireKind::Https));
+}
+
+// The query type of a DNS message: the two bytes after its question name.
+fn qtype_of(message: &[u8]) -> u16 {
+    let mut at = 12;
+    while message[at] != 0 {
+        at += 1 + message[at] as usize;
+    }
+    u16_at(message, at + 1).unwrap()
+}
+
+// A response whose header list is over the cap the client set, for the
+// families `over` says.
+fn padded(over: fn(u16) -> bool) -> impl Fn(Vec<u8>) -> hyper::Response<Vec<u8>> {
+    move |reply| {
+        let qtype = qtype_of(&reply);
+        let mut response = h2_message(reply);
+        if over(qtype) {
+            let padding = "a".repeat(9000).parse().unwrap();
+            response.headers_mut().insert("x-padding", padding);
+        }
+        response
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn doh_over_http_2_fails_a_header_list_over_the_cap_as_invalid_and_dials_no_more() {
+    // Only the IPv6 reply is over the cap: it rides the connection the IPv4
+    // query left open, and is not asked again on another.
+    let (servers, wires) = h2_servers(padded(|qtype| qtype == 28), None, answers);
+    let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
+    assert_eq!(resolution.addresses, seven());
+    assert_eq!(servers.dials().len(), 1);
+    assert_eq!(servers.answered(), [2]);
+
+    let (servers, wires) = h2_servers(padded(|_| true), None, answers);
+    let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
+    assert_eq!(resolution.error, invalid(), "{resolution:?}");
+    // One connection for each family, none redialled.
+    assert_eq!(servers.dials().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn doh_over_http_2_a_stream_the_server_resets_fails_without_saying_the_connection_closed() {
+    // The IPv6 stream is reset on the connection the IPv4 query used, and
+    // is not asked again on another.
+    let (servers, wires) =
+        h2_servers_doing(h2_message, None, H2Misstep::Reset { after: 1 }, answers);
+    let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
+    assert_eq!(resolution.addresses, seven());
+    assert_eq!(servers.dials().len(), 1);
+
+    let (servers, wires) =
+        h2_servers_doing(h2_message, None, H2Misstep::Reset { after: 0 }, answers);
+    let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
+    assert_eq!(
+        resolution.error,
+        Some(failure(
+            LookupFailure::NoReply,
+            "192.0.2.53: the server reset the query"
+        ))
+    );
+    assert_eq!(servers.dials().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn doh_over_http_2_takes_a_few_interim_responses_and_fails_an_endless_run_of_them() {
+    let (servers, wires) = h2_servers_doing(h2_message, None, H2Misstep::Interims(3), answers);
+    let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
+    assert_eq!(resolution.addresses, seven());
+    assert_eq!(resolution.error, None);
+
+    // Far more than one exchange may read, each a few bytes.
+    let (servers, wires) = h2_servers_doing(h2_message, None, H2Misstep::Interims(20_000), answers);
+    let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
+    assert_eq!(resolution.error, invalid(), "{resolution:?}");
+    assert_eq!(servers.dials().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn doh_over_http_2_accepts_no_server_push() {
+    let (servers, wires) = h2_servers_doing(h2_message, None, H2Misstep::Push, answers);
+    let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
+    assert_eq!(resolution.addresses, seven());
+    // The client's settings forbid a push, so the server could not send one.
+    let pushes = servers.log.lock().unwrap().pushes.clone();
+    assert_eq!(pushes.len(), 2);
+    for pushed in pushes {
+        let refused = pushed.expect_err("a push the client forbade");
+        assert!(refused.contains("disabled server push"), "{refused}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn doh_over_http_1_1_a_kept_connection_found_dead_is_replaced_once_and_no_more() {
+    // The first query is answered and the connection kept; every query
+    // after it is read and the connection closed without a reply.
+    let (servers, wires) = doh_servers(plain_reply);
+    let servers = servers.replying(1);
+    let resolution = doh_lookup(&servers, &wires, Trust::AsSent).await;
+    assert_eq!(resolution.addresses, seven());
+    // The IPv6 query found the kept connection dead, opened one more,
+    // found that closed too, and stopped there.
+    assert_eq!(servers.dials().len(), 2);
+    assert_eq!(servers.answered(), [1, 0]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_plain_server_after_an_https_one_is_never_asked() {
+    let stranger = Authority::new();
+    let servers = Servers::new(doh_fixture(plain_reply, false), answers)
+        // A certificate the client does not trust.
+        .at("192.0.2.53", stranger.server(&["192.0.2.53"], b"http/1.1"))
+        .plain_at("192.0.2.54");
+    let listed = [
+        doh("192.0.2.53:443"),
+        DnsServer::plain("192.0.2.54".parse().unwrap()),
+    ];
+    let resolution = recorded(
+        &servers,
+        &Authority::new().wires(),
+        &listed,
+        Trust::AsSent,
+        "fixture.test",
+    )
+    .await;
+    assert!(resolution.addresses.is_empty());
+    assert_eq!(
+        resolution.error.map(|error| error.failure),
+        Some(LookupFailure::TlsFailed)
+    );
+    assert!(
+        servers.dials().iter().all(|dial| dial.port() == 443),
+        "{:?}",
+        servers.dials()
+    );
+    assert!(!leaked(&servers));
+}
+
+// Through the naming's own path: a naming and its clones share one store of
+// TLS sessions, and two namings keep two.
+#[tokio::test(start_paused = true)]
+async fn tls_sessions_resume_through_a_naming_and_its_clones_and_never_across_two() {
+    for (speaks, alpn, listed) in [
+        (
+            Speaks::Dot { close_after: None },
+            &b"dot"[..],
+            dot("192.0.2.53", None),
+        ),
+        (
+            doh_fixture(plain_reply, false),
+            &b"http/1.1"[..],
+            doh("192.0.2.53:443"),
+        ),
+        (
+            Speaks::H2 {
+                respond: Arc::new(h2_message),
+                goaway_after: None,
+                misstep: H2Misstep::None,
+            },
+            &b"h2"[..],
+            doh("192.0.2.53:443"),
+        ),
+    ] {
+        let authority = Authority::new();
+        let servers =
+            Servers::new(speaks, answers).at("192.0.2.53", authority.server(&["192.0.2.53"], alpn));
+        let wires = authority.wires();
+        let first = Naming::proxy_servers(vec![listed.clone()], Trust::AsSent);
+        let clone = first.clone();
+        let second = Naming::proxy_servers(vec![listed.clone()], Trust::AsSent);
+        assert!(Arc::ptr_eq(sessions(&first), sessions(&clone)));
+        assert!(!Arc::ptr_eq(sessions(&first), sessions(&second)));
+        // A store trusts the test authority once: the clone's is the first's.
+        sessions(&first).trust(&wires);
+        sessions(&second).trust(&wires);
+        // A name apiece, so none is answered from what the naming holds.
+        for (naming, host) in [(&first, "a.test"), (&clone, "b.test"), (&second, "c.test")] {
+            let resolution = through_naming(naming, &servers, host).await;
+            assert_eq!(resolution.addresses, seven(), "{listed} {host}");
+        }
+        let sent = servers.sent();
+        assert_eq!(sent.len(), 3, "{listed}");
+        assert!(!offers_a_session(&sent[0]), "{listed}");
+        // The clone resumes the first naming's session.
+        assert!(offers_a_session(&sent[1]), "{listed}");
+        // The other naming offers nothing from the first.
+        assert!(!offers_a_session(&sent[2]), "{listed}");
+    }
 }

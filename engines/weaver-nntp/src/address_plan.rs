@@ -295,7 +295,7 @@ impl AddressDialer for TcpDialer {
     }
 
     fn forget(&self) {
-        weaver_tunnel::resolution::forget_host(&self.host);
+        self.egress.forget(&self.host);
     }
 }
 

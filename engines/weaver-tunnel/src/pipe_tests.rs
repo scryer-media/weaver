@@ -1745,6 +1745,7 @@ async fn a_recorded_dial_says_weavers_servers_resolved_the_name() {
             proxy: None,
             servers: vec![ROUTED_DNS.parse().unwrap()],
             wire: Some(crate::dns::WireKind::Plain),
+            answered_by: Some(ROUTED_DNS.parse().unwrap()),
             trust: Some(crate::resolution::record::TrustOutcome::AsSent),
             addresses: vec![PUBLIC.parse().unwrap()],
             cached: false,
@@ -3011,6 +3012,10 @@ fn a_tunnel_resolver_serves_only_plain_servers_on_port_53_taken_as_sent() {
         },
     };
     assert!(!tunnel_resolver_serves(&[https], Trust::AsSent));
+    // The tunnel's resolver asks only the first server it holds, so a list
+    // of two is asked by Weaver's client, each in turn.
+    let second = DnsServer::plain("10.0.0.3".parse().unwrap());
+    assert!(!tunnel_resolver_serves(&[plain, second], Trust::AsSent));
 }
 
 // A WireGuard hop whose naming its tunnel's own resolver cannot serve asks
@@ -3064,4 +3069,53 @@ async fn a_wireguard_hop_asks_servers_its_tunnel_cannot_serve_through_itself() {
             "{server}, {trust:?}"
         );
     }
+}
+
+// A direct leg's egress that names by `dns`, reached through a stage that
+// maps the listed server's address to the double.
+fn egress_naming_by(dns: &crate::test_support::dns::DnsServerDouble) -> Egress {
+    let carrier = Arc::new(Mapped {
+        to: dns.addr,
+        asked: Mutex::new(Vec::new()),
+    });
+    crate::test_support::loopback::egress(4, Duration::from_secs(30)).with_naming(Naming::servers(
+        vec![DnsServer::plain(ROUTED_DNS.parse().unwrap())],
+        Trust::AsSent,
+        carrier,
+    ))
+}
+
+// On a thread handed over to blocking work, a blocking lookup asks the
+// egress's listed servers on the runtime the thread belongs to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_blocking_lookup_on_a_blocking_thread_asks_the_listed_servers() {
+    let dns = dns_double(&[("news.invalid", PUBLIC)]).await;
+    let egress = Arc::new(egress_naming_by(&dns));
+    let found = tokio::task::spawn_blocking({
+        let egress = egress.clone();
+        move || blocking(|| egress.resolve_blocking("news.invalid"))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(found, vec![PUBLIC.parse::<IpAddr>().unwrap()]);
+    assert!(lookups(&dns, "news.invalid") > 0);
+}
+
+// Asked from a runtime worker, where waiting on the runtime would stall it,
+// a blocking lookup through listed servers fails at once and asks nobody;
+// a debug build stops on it.
+#[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    should_panic(
+        expected = "a blocking lookup through listed servers runs only inside `blocking`"
+    )
+)]
+async fn a_blocking_lookup_from_a_runtime_worker_fails_at_once() {
+    let dns = dns_double(&[("news.invalid", PUBLIC)]).await;
+    let egress = egress_naming_by(&dns);
+    let error = egress.resolve_blocking("news.invalid").unwrap_err();
+    assert!(error.to_string().contains("may not block"), "{error}");
+    assert_eq!(lookups(&dns, "news.invalid"), 0);
 }

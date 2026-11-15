@@ -43,6 +43,11 @@ const READ: usize = 4096;
 // the connection the protocol's initial window.
 const STREAM_WINDOW: u32 = REPLY_CAP as u32;
 const CONNECTION_WINDOW: u32 = 65_535;
+// Bytes one HTTP/2 exchange may read: the reply, its head, the interim
+// heads allowed over HTTP/1.1, and a read's worth of framing. hyper does not
+// pass HTTP/2 interim responses on to be counted, so this bounds them, and
+// any other frames the server sends meanwhile.
+const EXCHANGE_READ: usize = REPLY_CAP + HEAD_CAP * (INTERIM + 1) + READ;
 
 // One connection to the server. `read` counts the bytes the server sent, so
 // a failed HTTP/1.1 exchange can tell a connection found dead from a reply
@@ -170,14 +175,16 @@ impl Connection {
                 tasks,
                 running,
             } => {
+                let before = self.read.load(Ordering::Relaxed);
                 let outcome = {
                     let mut call = pin!(call(
                         async {
-                            // No response head came: the connection had gone
-                            // away or refused the stream, so the query was
-                            // never answered.
-                            send.ready().await.map_err(unsent)?;
-                            send.send_request(request).await.map_err(unsent)
+                            send.ready()
+                                .await
+                                .map_err(|error| failed_two(&error, false))?;
+                            send.send_request(request)
+                                .await
+                                .map_err(|error| failed_two(&error, false))
                         },
                         true,
                     ));
@@ -188,7 +195,7 @@ impl Connection {
                             *driver = None;
                         }
                         tasks.run(running, cx);
-                        if interims() {
+                        if self.read.load(Ordering::Relaxed) - before > EXCHANGE_READ {
                             return Poll::Ready(Err(Failed::Invalid));
                         }
                         call.as_mut().poll(cx)
@@ -198,6 +205,93 @@ impl Connection {
                 outcome.map(|(reply, open)| (reply, open && driver.is_some() && !send.is_closed()))
             }
         }
+    }
+
+    // Whether several queries can share the connection at once: HTTP/2
+    // streams, on the one connection, with no new one opened.
+    pub(super) fn multiplexes(&self) -> bool {
+        matches!(self.http, Http::Two { .. })
+    }
+
+    // The replies to `packets`, each on a stream of its own over this HTTP/2
+    // connection, all in flight together, and whether the connection may
+    // carry the next query. Each stream is read under the cap one exchange
+    // has.
+    pub(super) async fn exchange_all(
+        &mut self,
+        server: &DnsServer,
+        path: &str,
+        packets: &[Vec<u8>],
+    ) -> (Vec<Result<Vec<u8>, Failed>>, bool) {
+        let Http::Two {
+            send,
+            driver,
+            tasks,
+            running,
+        } = &mut self.http
+        else {
+            unreachable!("only an HTTP/2 connection carries queries together")
+        };
+        type Call = Pin<Box<dyn Future<Output = Result<(Vec<u8>, bool), Failed>> + Send>>;
+        let mut replies: Vec<Option<Result<Vec<u8>, Failed>>> = Vec::with_capacity(packets.len());
+        let mut calls: Vec<Option<Call>> = Vec::with_capacity(packets.len());
+        for packet in packets {
+            match request(server.address, path, packet, true) {
+                Ok(request) => {
+                    let mut send = send.clone();
+                    calls.push(Some(Box::pin(call(
+                        async move {
+                            send.ready()
+                                .await
+                                .map_err(|error| failed_two(&error, false))?;
+                            send.send_request(request)
+                                .await
+                                .map_err(|error| failed_two(&error, false))
+                        },
+                        true,
+                    ))));
+                    replies.push(None);
+                }
+                Err(failed) => {
+                    calls.push(None);
+                    replies.push(Some(Err(failed)));
+                }
+            }
+        }
+        let before = self.read.load(Ordering::Relaxed);
+        let bound = EXCHANGE_READ.saturating_mul(packets.len());
+        poll_fn(|cx| {
+            if let Some(connection) = driver.as_mut()
+                && connection.as_mut().poll(cx).is_ready()
+            {
+                *driver = None;
+            }
+            tasks.run(running, cx);
+            let over = self.read.load(Ordering::Relaxed) - before > bound;
+            for (slot, reply) in calls.iter_mut().zip(replies.iter_mut()) {
+                let Some(call) = slot else { continue };
+                if over {
+                    *reply = Some(Err(Failed::Invalid));
+                } else if let Poll::Ready(outcome) = call.as_mut().poll(cx) {
+                    *reply = Some(outcome.map(|(reply, _)| reply));
+                } else {
+                    continue;
+                }
+                *slot = None;
+            }
+            if calls.iter().all(Option::is_none) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        let open = driver.is_some() && !send.is_closed();
+        let replies = replies
+            .into_iter()
+            .map(|reply| reply.unwrap_or(Err(Failed::Invalid)))
+            .collect();
+        (replies, open)
     }
 }
 
@@ -215,7 +309,14 @@ async fn call(
     let mut body = response.into_body();
     let mut reply = Vec::with_capacity(length.unwrap_or(0));
     while let Some(frame) = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
-        let Ok(data) = frame.map_err(failed)?.into_data() else {
+        let frame = frame.map_err(|error| {
+            if two {
+                failed_two(&error, true)
+            } else {
+                failed(error)
+            }
+        })?;
+        let Ok(data) = frame.into_data() else {
             continue;
         };
         if data.len() > REPLY_CAP - reply.len() {
@@ -236,11 +337,29 @@ fn failed(error: hyper::Error) -> Failed {
     }
 }
 
-// The same, before any of an HTTP/2 response came.
-fn unsent(error: hyper::Error) -> Failed {
-    match failed(error) {
-        Failed::Cut => Failed::Closed,
-        failed => failed,
+// What a hyper error says of an HTTP/2 exchange, by the h2 error beneath
+// it; `begun` once the response head came. The connection gone (closed,
+// broken, or sent away by the server) leaves the query unanswered before
+// the head and the reply cut short after it. The server resetting the stream
+// says nothing of the connection. A response this side refused, such as a
+// header list over the cap or a protocol error on the stream, is invalid.
+fn failed_two(error: &hyper::Error, begun: bool) -> Failed {
+    let gone = if begun { Failed::Cut } else { Failed::Closed };
+    if error.is_parse() {
+        return Failed::Invalid;
+    }
+    // hyper passes an h2 IO error on as the IO error itself.
+    let cause = std::error::Error::source(error);
+    if error.is_closed()
+        || error.is_canceled()
+        || cause.is_some_and(|cause| cause.is::<std::io::Error>())
+    {
+        return gone;
+    }
+    match cause.and_then(|cause| cause.downcast_ref::<h2::Error>()) {
+        Some(h2) if h2.is_io() || (h2.is_go_away() && h2.is_remote()) => gone,
+        Some(h2) if h2.is_reset() && h2.is_remote() => Failed::Reset,
+        _ => Failed::Invalid,
     }
 }
 

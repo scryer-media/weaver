@@ -58,6 +58,10 @@ pub enum LookupFailure {
     // The server answered without marking the answer authenticated, and the
     // naming requires it.
     NotAuthenticated,
+    // The answer failed DNSSEC validation.
+    Bogus,
+    // The server returns no DNSSEC records, so nothing can be validated.
+    DnssecUnavailable,
     // The TLS handshake or certificate check with the server failed.
     TlsFailed,
     Other,
@@ -72,6 +76,8 @@ impl LookupFailure {
             Self::ServerFailure => "SERVER_FAILURE",
             Self::NoReply => "NO_REPLY",
             Self::NotAuthenticated => "NOT_AUTHENTICATED",
+            Self::Bogus => "BOGUS",
+            Self::DnssecUnavailable => "DNSSEC_UNAVAILABLE",
             Self::TlsFailed => "TLS_FAILED",
             Self::Other => "OTHER",
         }
@@ -94,16 +100,32 @@ pub enum TrustOutcome {
     Authenticated,
     // Refused, as the server did not mark it authenticated.
     Refused,
+    // Weaver checked its DNSSEC signatures and they held.
+    Validated,
+    // The zone is not signed, so there was nothing to check.
+    Unsigned,
+    // Refused, as its DNSSEC signatures failed Weaver's check.
+    Bogus,
 }
 
 impl TrustOutcome {
-    pub const ALL: [Self; 3] = [Self::AsSent, Self::Authenticated, Self::Refused];
+    pub const ALL: [Self; 6] = [
+        Self::AsSent,
+        Self::Authenticated,
+        Self::Refused,
+        Self::Validated,
+        Self::Unsigned,
+        Self::Bogus,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::AsSent => "as_sent",
             Self::Authenticated => "authenticated",
             Self::Refused => "refused",
+            Self::Validated => "validated",
+            Self::Unsigned => "unsigned",
+            Self::Bogus => "bogus",
         }
     }
 }
@@ -121,8 +143,12 @@ pub struct HostResolution {
     // The wire of the server that answered, or when that is not known the
     // first listed server's. None when no servers were asked.
     pub wire: Option<WireKind>,
+    // The listed server whose answer was used. None when no server
+    // answered, or none was asked. When every server said the name has no
+    // address, the first is named.
+    pub answered_by: Option<IpAddr>,
     // How the servers' answer was judged. None when no servers were asked,
-    // or when the servers must authenticate and no answer came to judge.
+    // or when no answer came to judge, whatever the naming's trust.
     pub trust: Option<TrustOutcome>,
     // What the name resolved to; none when a proxy resolved it.
     pub addresses: Vec<IpAddr>,
@@ -131,6 +157,22 @@ pub struct HostResolution {
     // The address connected to, when Weaver knows it.
     pub connected: Option<IpAddr>,
     pub error: Option<LookupError>,
+}
+
+// The listed server an answer came from, and the wire it was asked over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Answerer {
+    pub(crate) address: IpAddr,
+    pub(crate) wire: WireKind,
+}
+
+impl Answerer {
+    pub(crate) fn of(server: &DnsServer) -> Self {
+        Self {
+            address: server.address.ip(),
+            wire: server.wire.kind(),
+        }
+    }
 }
 
 // Who a name is asked of.
@@ -176,8 +218,8 @@ struct Entry {
     cached: Option<bool>,
     answer: Option<Result<Vec<IpAddr>, LookupError>>,
     connected: Option<IpAddr>,
-    // The wire of the server whose answer was used.
-    wire: Option<WireKind>,
+    // The server whose answer was used.
+    from: Option<Answerer>,
     // How the servers' answer was judged, by the lookup that asked them.
     judged: Option<TrustOutcome>,
 }
@@ -228,7 +270,7 @@ impl Recording {
                 entry.answer = note.answer;
             }
             entry.connected = entry.connected.or(note.connected);
-            entry.wire = entry.wire.or(note.wire);
+            entry.from = entry.from.or(note.from);
             entry.judged = entry.judged.or(note.judged);
         }
         let taken = std::mem::take(&mut *other.bound.lock().expect("resolution recording"));
@@ -262,6 +304,7 @@ impl Recording {
                 proxy: None,
                 servers: Vec::new(),
                 wire: None,
+                answered_by: None,
                 trust: None,
                 addresses: vec![ip],
                 cached: false,
@@ -291,17 +334,14 @@ impl Recording {
                     .find(|bound| bound.peer.port() == port && addresses.contains(&bound.peer.ip()))
                     .map(|bound| bound.peer.ip())
             });
-            let trust = asker.trust.and_then(|trust| match trust {
-                Trust::AsSent => Some(TrustOutcome::AsSent),
-                Trust::RequireAd => entry.judged.or_else(|| required(entry)),
-            });
             return Some(HostResolution {
                 host: host.to_owned(),
                 by: asker.by,
                 proxy: asker.proxy,
                 servers: asker.servers.clone(),
-                wire: entry.wire.or(asker.wire),
-                trust,
+                wire: entry.from.map(|from| from.wire).or(asker.wire),
+                answered_by: entry.from.map(|from| from.address),
+                trust: asker.trust.and(entry.judged),
                 addresses,
                 cached: entry.cached.unwrap_or(false),
                 connected,
@@ -322,6 +362,7 @@ impl Recording {
                 proxy: None,
                 servers: Vec::new(),
                 wire: None,
+                answered_by: None,
                 trust: None,
                 addresses: vec![bound.peer.ip()],
                 cached: false,
@@ -336,34 +377,13 @@ impl Recording {
             proxy: None,
             servers: Vec::new(),
             wire: None,
+            answered_by: None,
             trust: None,
             addresses: Vec::new(),
             cached: false,
             connected: None,
             error: Some(error),
         })
-    }
-}
-
-// How an answer under `RequireAd` was judged when this dial's own lookup
-// did not say: it came through the cache, held or from a lookup another
-// caller made. A naming's cache holds and shares only answers judged by its
-// own trust, which never changes, so an answer from it was authenticated. A
-// lookup that failed for want of one was refused. Any other failure had
-// nothing to judge.
-fn required(entry: &Entry) -> Option<TrustOutcome> {
-    entry.cached?;
-    match &entry.answer {
-        Some(Ok(_)) => Some(TrustOutcome::Authenticated),
-        Some(Err(error)) => match error.failure {
-            // A negative answer is an answer.
-            LookupFailure::NoSuchName | LookupFailure::NoAddress => {
-                Some(TrustOutcome::Authenticated)
-            }
-            LookupFailure::NotAuthenticated => Some(TrustOutcome::Refused),
-            _ => None,
-        },
-        None => None,
     }
 }
 
@@ -387,10 +407,9 @@ fn endpoint_failure(text: &str) -> Option<LookupError> {
 // The phrases each failure is said with: this machine's resolver on each
 // system, Weaver's own lookups, and the tunnel engines'. Matched without
 // regard to case, in this order.
-const NO_SUCH_NAME: [&str; 6] = [
+const NO_SUCH_NAME: [&str; 5] = [
     "not known",
     "no such host",
-    "does not know this name",
     "does not resolve",
     "nxdomain",
     "(os error 11001)",
@@ -415,15 +434,13 @@ const SERVER_FAILURE: [&str; 7] = [
     "(os error 11003)",
 ];
 const TIMED_OUT: [&str; 3] = ["timed out", "in time", "deadline exceeded"];
-const NOT_AUTHENTICATED: &str = "marked authenticated";
 
 // Why a lookup failed, by what its resolver said.
 pub(crate) fn classify(text: &str) -> LookupFailure {
     let text = text.to_ascii_lowercase();
     let said = |phrases: &[&str]| phrases.iter().any(|phrase| text.contains(phrase));
-    if text.contains(NOT_AUTHENTICATED) {
-        LookupFailure::NotAuthenticated
-    } else if said(&NO_SUCH_NAME) {
+    // Never NotAuthenticated: only the DNS client's own failure says that.
+    if said(&NO_SUCH_NAME) {
         LookupFailure::NoSuchName
     } else if said(&NO_ADDRESS) {
         LookupFailure::NoAddress
@@ -464,11 +481,11 @@ pub(crate) fn cached(host: &str, held: bool) {
     });
 }
 
-// The servers asked for `host` came to an answer judged `trust`, from a
-// server on `wire` when one answered.
-pub(crate) fn answered(host: &str, wire: Option<WireKind>, trust: TrustOutcome) {
+// The servers asked for `host` came to an answer judged `trust`, from
+// `from` when a server answered.
+pub(crate) fn answered(host: &str, from: Option<Answerer>, trust: TrustOutcome) {
     note(host, |entry| {
-        entry.wire = entry.wire.or(wire);
+        entry.from = entry.from.or(from);
         entry.judged.get_or_insert(trust);
     });
 }
@@ -488,6 +505,25 @@ pub(crate) fn failed(host: &str, failure: LookupFailure, detail: impl FnOnce() -
             })
         });
     });
+}
+
+// What a WireGuard tunnel's own resolver says for every answer without an
+// address: the name does not exist, the server failed or refused, the name
+// has no address of the families asked, or no server replied in time.
+const TUNNEL_NO_ADDRESS: &str = "does not know this name";
+pub(crate) const TUNNEL_NO_ADDRESS_SAID: &str = "the tunnel's DNS servers gave no address; \
+     the tunnel does not say whether the name does not exist, a server failed, or none replied";
+
+// `host`'s lookup through a WireGuard tunnel's own resolver failed, saying
+// `detail`.
+pub(crate) fn tunnel_failed(host: &str, detail: &str) {
+    if detail.to_ascii_lowercase().contains(TUNNEL_NO_ADDRESS) {
+        failed(host, LookupFailure::Other, || {
+            TUNNEL_NO_ADDRESS_SAID.to_owned()
+        });
+    } else {
+        failed_saying(host, &detail);
+    }
 }
 
 // `host`'s lookup failed, saying `error`.

@@ -202,10 +202,26 @@ pub fn record_dns_wire(wire: WireKind) {
     DNS_WIRES[wire as usize].fetch_add(1, Ordering::Relaxed);
 }
 
-// How a lookup of routed DNS was judged: an answer taken as sent or
-// authenticated, or one refused for want of the AD bit.
+// How a lookup of routed DNS was judged: an answer taken as sent,
+// authenticated, validated or unsigned, or one refused for want of the AD
+// bit or for failing the DNSSEC check. Once per lookup; and bogus once more
+// for each address family that failed the check in a lookup the other
+// family answered.
 pub fn record_dns_trust(outcome: TrustOutcome) {
     DNS_TRUST[outcome as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+// Queries sent to listed servers to check DNSSEC signatures, the address
+// queries among them: each counted as it goes out, whether or not a reply
+// comes, and again when it is sent again.
+static DNSSEC_QUERIES: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_dnssec_queries(sent: u64) {
+    DNSSEC_QUERIES.fetch_add(sent, Ordering::Relaxed);
+}
+
+pub fn dnssec_queries() -> u64 {
+    DNSSEC_QUERIES.load(Ordering::Relaxed)
 }
 
 // A rung of a ladder was set aside after its path failed.
@@ -293,6 +309,8 @@ pub struct DnsMetricsSnapshot {
     pub wires: Vec<(WireKind, u64)>,
     // Lookups by how their answer was judged.
     pub trust: Vec<(TrustOutcome, u64)>,
+    // Queries sent to check DNSSEC signatures.
+    pub dnssec_queries: u64,
 }
 
 pub fn dns_snapshot() -> DnsMetricsSnapshot {
@@ -306,6 +324,7 @@ pub fn dns_snapshot() -> DnsMetricsSnapshot {
             .into_iter()
             .map(|outcome| (outcome, load(&DNS_TRUST[outcome as usize])))
             .collect(),
+        dnssec_queries: dnssec_queries(),
     }
 }
 

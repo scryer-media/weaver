@@ -5,9 +5,13 @@
 // opens a stream per query. DNS over TLS (RFC 7858) and over HTTPS (RFC
 // 8484) wrap the stream the stage dials in TLS, and keep that one
 // connection for the lookup's queries while the server keeps it open.
-use super::{Carrier, DnsServer, Failed, Wire};
+use super::{Carrier, DnsServer, Failed, Wire, dnssec::Dnssec};
 use crate::TunnelStream;
+use std::future::{Future, poll_fn};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
+use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_rustls::{
     TlsConnector,
@@ -76,13 +80,26 @@ pub(super) static WIRES: LazyLock<Wires> = LazyLock::new(|| {
 // The TLS sessions one naming resumes. A ticket from a server asked on one
 // route is never offered to it on another, which would tie the two routes
 // together in the clear ClientHello. Built on first use, kept with the
-// naming's answers, and dropped with them when the hop is rebuilt.
+// naming's answers, and dropped with them when the hop is rebuilt. The
+// naming's DNSSEC validator lives beside them, for the same span.
 #[derive(Default)]
-pub struct DnsSessions(OnceLock<Wires>);
+pub struct DnsSessions {
+    wires: OnceLock<Wires>,
+    dnssec: Dnssec,
+}
 
 impl DnsSessions {
     pub(super) fn wires(&self) -> &Wires {
-        self.0.get_or_init(|| WIRES.apart())
+        self.wires.get_or_init(|| WIRES.apart())
+    }
+    pub(super) fn dnssec(&self) -> &Dnssec {
+        &self.dnssec
+    }
+    // Trusts what `wires` trusts, for a test's own authority. Only once: a
+    // store set before panics, so two namings sharing one would show.
+    #[cfg(test)]
+    pub(super) fn trust(&self, wires: &Wires) {
+        assert!(self.wires.set(wires.apart()).is_ok(), "sessions set twice");
     }
 }
 
@@ -99,6 +116,8 @@ pub(super) struct Session<'a> {
     wires: &'a Wires,
     server: &'a DnsServer,
     link: Option<Link>,
+    // Each query sent is counted as a DNSSEC query.
+    counts: bool,
 }
 
 impl<'a> Session<'a> {
@@ -108,11 +127,22 @@ impl<'a> Session<'a> {
             wires,
             server,
             link: None,
+            counts: false,
         }
     }
 
     pub(super) fn server(&self) -> &DnsServer {
         self.server
+    }
+
+    // From now on every query this session sends checks DNSSEC, and is
+    // counted when it goes out.
+    pub(super) fn counting(&mut self) {
+        self.counts = true;
+    }
+
+    fn sent(&self, queries: usize) {
+        sent(self.counts, queries);
     }
 
     // Sends `packet` and returns the reply. `reached` is set once the
@@ -135,12 +165,14 @@ impl<'a> Session<'a> {
                 .await
                 .map_err(Failed::Unreached)?;
             *reached = true;
+            self.sent(1);
             return framed(&mut stream, packet).await;
         }
         // The link is out of its slot while in use, so a query cut off part
         // way leaves no half-used connection behind.
         if let Some(mut link) = self.link.take() {
             *reached = true;
+            self.sent(1);
             match link.exchange(self.server, packet).await {
                 Ok(reply) => return Ok(self.keep(link, reply)),
                 Err(Failed::Closed) => {}
@@ -148,8 +180,130 @@ impl<'a> Session<'a> {
             }
         }
         let mut link = self.connect(reached).await?;
+        self.sent(1);
         let reply = link.exchange(self.server, packet).await?;
         Ok(self.keep(link, reply))
+    }
+
+    // The reply to each of `packets`, in order, each packet's first two
+    // bytes its id. Plain DNS dials a stream per query and asks them all at
+    // once. DNS over TLS writes them all on the one kept connection, then
+    // reads the replies in whatever order they come, matched by id. Over
+    // HTTP/2 the first opens or rides the kept connection and the rest go
+    // out on it together, one stream each; a stream that found the
+    // connection gone is asked again as `ask` would. HTTP/1.1 asks them in
+    // turn on its kept connection. A server that cannot be reached, or fails
+    // TLS, fails the whole batch, as does a DNS over TLS reply whose id no
+    // query of the batch went out with.
+    pub(super) async fn ask_all(
+        &mut self,
+        packets: &[Vec<u8>],
+        reached: &mut bool,
+    ) -> Result<Vec<Result<Vec<u8>, Failed>>, Failed> {
+        match self.server.wire {
+            Wire::Plain => {
+                plain_all(self.provider, self.server, self.counts, packets, reached).await
+            }
+            Wire::Tls { .. } => self.pipelined(packets, reached).await,
+            Wire::Https { .. } => self.https_all(packets, reached).await,
+        }
+    }
+
+    async fn https_all(
+        &mut self,
+        packets: &[Vec<u8>],
+        reached: &mut bool,
+    ) -> Result<Vec<Result<Vec<u8>, Failed>>, Failed> {
+        let mut replies = Vec::with_capacity(packets.len());
+        let mut packets = packets.iter();
+        while let Some(packet) = packets.next() {
+            let together = packets.len() > 0
+                && matches!(&self.link, Some(Link::Https(connection)) if connection.multiplexes());
+            if !together {
+                replies.push(ends(self.ask(packet, reached).await)?);
+                continue;
+            }
+            let rest: Vec<Vec<u8>> = std::iter::once(packet)
+                .chain(packets.by_ref())
+                .cloned()
+                .collect();
+            let Some(Link::Https(mut connection)) = self.link.take() else {
+                unreachable!("checked above")
+            };
+            *reached = true;
+            let Wire::Https { path } = &self.server.wire else {
+                unreachable!("an HTTPS link is kept only for an HTTPS server")
+            };
+            self.sent(rest.len());
+            let (answered, open) = connection.exchange_all(self.server, path, &rest).await;
+            if open {
+                self.link = Some(Link::Https(connection));
+            }
+            for (packet, reply) in rest.iter().zip(answered) {
+                let reply = match reply {
+                    Err(Failed::Closed) => self.ask(packet, reached).await,
+                    reply => reply,
+                };
+                replies.push(ends(reply)?);
+            }
+        }
+        Ok(replies)
+    }
+
+    // DNS over TLS: the batch written at once on the kept connection, or a
+    // new one, and the replies read as they come. A connection that closes
+    // before every reply came is replaced for the rest, as `ask` replaces
+    // it: a kept one always, a new one only after it answered something. So
+    // a batch opens at most one connection per query, and one more.
+    async fn pipelined(
+        &mut self,
+        packets: &[Vec<u8>],
+        reached: &mut bool,
+    ) -> Result<Vec<Result<Vec<u8>, Failed>>, Failed> {
+        let mut replies: Vec<Option<Result<Vec<u8>, Failed>>> =
+            packets.iter().map(|_| None).collect();
+        loop {
+            let waiting: Vec<usize> = (0..packets.len())
+                .filter(|at| replies[*at].is_none())
+                .collect();
+            if waiting.is_empty() {
+                break;
+            }
+            let (mut stream, kept) = match self.link.take() {
+                Some(Link::Tls(stream)) => {
+                    *reached = true;
+                    (stream, true)
+                }
+                Some(Link::Https(_)) => {
+                    unreachable!("an HTTPS link is kept only for an HTTPS server")
+                }
+                None => match self.connect(reached).await? {
+                    Link::Tls(stream) => (stream, false),
+                    Link::Https(_) => unreachable!("a TLS server opens a TLS link"),
+                },
+            };
+            self.sent(waiting.len());
+            let (piped, answered) =
+                pipeline(stream.as_mut(), packets, &waiting, &mut replies).await;
+            let failed: fn() -> Failed = match piped {
+                Piped::Done => {
+                    self.link = Some(Link::Tls(stream));
+                    break;
+                }
+                Piped::Closed if kept || answered > 0 => continue,
+                Piped::Stranger => return Err(Failed::Invalid),
+                Piped::Closed => || Failed::Closed,
+                Piped::Cut => || Failed::Cut,
+                Piped::Invalid => || Failed::Invalid,
+            };
+            for reply in replies.iter_mut().filter(|reply| reply.is_none()) {
+                *reply = Some(Err(failed()));
+            }
+        }
+        Ok(replies
+            .into_iter()
+            .map(|reply| reply.unwrap_or(Err(Failed::Invalid)))
+            .collect())
     }
 
     fn keep(&mut self, link: Link, (reply, open): (Vec<u8>, bool)) -> Vec<u8> {
@@ -248,6 +402,134 @@ impl Link {
     }
 }
 
+// Counts `queries` sent to check DNSSEC, when `counts`.
+fn sent(counts: bool, queries: usize) {
+    if counts {
+        crate::metrics::record_dnssec_queries(queries as u64);
+    }
+}
+
+// A batch's failure for the server: one that cannot be reached, or fails
+// TLS, would fail every other query the same way.
+fn ends(reply: Result<Vec<u8>, Failed>) -> Result<Result<Vec<u8>, Failed>, Failed> {
+    match reply {
+        Err(failed @ (Failed::Unreached(_) | Failed::Tls(_))) => Err(failed),
+        reply => Ok(reply),
+    }
+}
+
+// Plain DNS: a stream dialled for each of `packets`, all at once, on the
+// same route to the same server, and each query asked on its own. `reached`
+// is set as soon as any dial is answered, so a batch cut off by the ceiling
+// still says so. The first dial that fails ends the batch.
+async fn plain_all(
+    provider: &dyn Carrier,
+    server: &DnsServer,
+    counts: bool,
+    packets: &[Vec<u8>],
+    reached: &mut bool,
+) -> Result<Vec<Result<Vec<u8>, Failed>>, Failed> {
+    type Call<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>, Failed>> + Send + 'a>>;
+    let dialled = AtomicBool::new(false);
+    let dialled = &dialled;
+    let mut calls: Vec<Call<'_>> = packets
+        .iter()
+        .map(|packet| {
+            Box::pin(async move {
+                let mut stream = provider.open(server).await.map_err(Failed::Unreached)?;
+                dialled.store(true, Ordering::Relaxed);
+                sent(counts, 1);
+                framed(&mut stream, packet).await
+            }) as Call<'_>
+        })
+        .collect();
+    let mut replies: Vec<Option<Result<Vec<u8>, Failed>>> = packets.iter().map(|_| None).collect();
+    poll_fn(|cx| {
+        for (call, reply) in calls.iter_mut().zip(replies.iter_mut()) {
+            if reply.is_none()
+                && let Poll::Ready(answered) = call.as_mut().poll(cx)
+            {
+                *reply = Some(answered);
+            }
+        }
+        if dialled.load(Ordering::Relaxed) {
+            *reached = true;
+        }
+        let ended = replies
+            .iter()
+            .any(|reply| matches!(reply, Some(Err(Failed::Unreached(_)))));
+        if ended || replies.iter().all(Option::is_some) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    drop(calls);
+    let mut answered = Vec::with_capacity(replies.len());
+    for reply in replies {
+        answered.push(ends(reply.unwrap_or(Err(Failed::Closed)))?);
+    }
+    Ok(answered)
+}
+
+// How a pipelined batch on one connection ended.
+enum Piped {
+    // Every reply came.
+    Done,
+    // The connection closed between replies, or before the batch went out.
+    Closed,
+    // The connection closed part way through a reply.
+    Cut,
+    // A reply's length was out of bounds.
+    Invalid,
+    // A reply came with an id no waiting query went out with.
+    Stranger,
+}
+
+// Writes the queries at `waiting` together, then reads one reply for each,
+// in any order, putting each in its query's slot of `replies` by id. Says
+// how it ended, and how many replies came.
+async fn pipeline<S>(
+    stream: &mut S,
+    packets: &[Vec<u8>],
+    waiting: &[usize],
+    replies: &mut [Option<Result<Vec<u8>, Failed>>],
+) -> (Piped, usize)
+where
+    S: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    let mut ids = std::collections::BTreeMap::new();
+    let mut framed = Vec::new();
+    for at in waiting {
+        let packet = &packets[*at];
+        if let Some(id) = packet.get(..2) {
+            ids.insert([id[0], id[1]], *at);
+        }
+        framed.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+        framed.extend_from_slice(packet);
+    }
+    if stream.write_all(&framed).await.is_err() || stream.flush().await.is_err() {
+        return (Piped::Closed, 0);
+    }
+    let mut answered = 0;
+    while answered < waiting.len() {
+        let bytes = match reply(stream).await {
+            Ok(bytes) => bytes,
+            Err(Failed::Closed) => return (Piped::Closed, answered),
+            Err(Failed::Cut) => return (Piped::Cut, answered),
+            Err(_) => return (Piped::Invalid, answered),
+        };
+        // Each id is taken once: a second reply to one query is a stranger.
+        let Some(at) = ids.remove(&[bytes[0], bytes[1]]) else {
+            return (Piped::Stranger, answered);
+        };
+        replies[at] = Some(Ok(bytes));
+        answered += 1;
+    }
+    (Piped::Done, answered)
+}
+
 // One query over a stream, with the two-byte length prefix of DNS over TCP.
 // A stream that ends before the first byte of the reply is closed; one that
 // ends part way cut the reply short.
@@ -263,6 +545,14 @@ where
         .await
         .map_err(|_| Failed::Closed)?;
     stream.flush().await.map_err(|_| Failed::Closed)?;
+    reply(stream).await
+}
+
+// One reply off a stream, by its two-byte length prefix, within the cap.
+async fn reply<S>(stream: &mut S) -> Result<Vec<u8>, Failed>
+where
+    S: AsyncRead + Unpin + ?Sized,
+{
     let mut prefix = [0; 2];
     match stream.read(&mut prefix[..1]).await {
         Ok(1) => {}

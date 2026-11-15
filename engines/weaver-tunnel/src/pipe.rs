@@ -26,6 +26,7 @@ pub use sockets::{SessionSockets, SocketClass, SocketPermit, SocketShares};
 #[path = "pipe_tests.rs"]
 mod tests;
 use std::{
+    cell::Cell,
     io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
@@ -42,13 +43,13 @@ use tokio::{
 use crate::{
     TunnelError, TunnelProvider, TunnelStream,
     bridge::ConnectionOutcome,
-    dns::{DnsServer, Trust},
+    dns::{DnsServer, Trust, WireKind},
     egress::SocketEgress,
     endpoint::{DatagramTransport, EndpointStream, EndpointTransport, UdpSocketFactory},
     fault::{self, ProxyFault},
     metrics::Resolver,
     resolution::{
-        Lookup, Replicate, ResolutionCache, Ttl,
+        Account, Lookup, Replicate, ResolutionCache, Ttl,
         record::{self, Asker, LookupFailure},
     },
     transport::{ConnectFailure, Reply, TransportProxy},
@@ -58,6 +59,25 @@ use crate::{
 pub(crate) const NO_ADDRESS_RESOLVED: &str = "no address resolved for the destination";
 pub(crate) const RESOLVE_TIMED_OUT: &str = "name resolution timed out";
 pub(crate) const NO_ROUTE_VIA: &str = "no route via ";
+
+thread_local! {
+    // Whether this thread was handed over to blocking work by `blocking`.
+    static MAY_BLOCK: Cell<bool> = const { Cell::new(false) };
+}
+
+// Run `work` on this thread, which the caller vouches may block: a runtime's
+// blocking thread, as `spawn_blocking` gives, never one of its workers.
+// `Egress::resolve_blocking` asks listed servers only inside it.
+pub fn blocking<R>(work: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MAY_BLOCK.with(|may| may.set(self.0));
+        }
+    }
+    let _restore = Restore(MAY_BLOCK.with(|may| may.replace(true)));
+    work()
+}
 
 #[derive(Clone, Debug)]
 pub enum Purpose {
@@ -168,7 +188,7 @@ impl Naming {
     }
     // What `host` resolves to for a dial through `hop`, the hop of proxy
     // `proxy`, or `Unresolved` when the proxy is handed the name.
-    async fn resolve(
+    pub(crate) async fn resolve(
         &self,
         hop: &dyn Dialer,
         proxy: u32,
@@ -186,10 +206,10 @@ impl Naming {
                 Asker::proxy_servers(proxy, servers, *trust)
             }
         });
-        // Each naming value holds its own answers, and its trust never
-        // changes, so every answer held under `RequireAd` was authenticated
-        // when it was stored. A lookup that was refused is an error, which
-        // the cache never holds.
+        // Each naming value holds its own answers. A lookup says how it was
+        // judged, and a caller that joins it or finds its answer held notes
+        // the same. A lookup that was refused is an error, which the cache
+        // never holds.
         let resolving = async {
             match self {
                 Self::Proxy => Ok(None),
@@ -201,7 +221,7 @@ impl Naming {
                     answers,
                     sessions,
                 } => answers
-                    .resolve(Resolver::Routed, host, || {
+                    .resolve_accounted(Resolver::Routed, host, || {
                         crate::dns::resolve_routed(egress.as_ref(), sessions, servers, *trust, host)
                     })
                     .await
@@ -213,7 +233,7 @@ impl Naming {
                     answers,
                     sessions,
                 } => answers
-                    .resolve(Resolver::Routed, host, || {
+                    .resolve_accounted(Resolver::Routed, host, || {
                         crate::dns::resolve_routed(hop, sessions, servers, *trust, host)
                     })
                     .await
@@ -271,9 +291,12 @@ fn routed(addresses: Vec<IpAddr>) -> Result<Vec<IpAddr>, DialError> {
 // Whether a WireGuard tunnel's own resolver can serve servers asked by
 // `trust`. It speaks only plain DNS to port 53 of the servers the tunnel
 // was built with, and passes on no AD bit, so any other wire, port or
-// trust is asked by Weaver's own client through the hop instead.
+// trust is asked by Weaver's own client through the hop instead. It also
+// asks only the first server it was built with, so a list of more than one
+// is asked by Weaver's client too, every server in its turn.
 fn tunnel_resolver_serves(servers: &[DnsServer], trust: Trust) -> bool {
     trust == Trust::AsSent
+        && servers.len() <= 1
         && servers
             .iter()
             .all(|server| *server == DnsServer::plain(server.address.ip()))
@@ -794,6 +817,9 @@ pub struct Egress {
     id: u32,
     binding: SocketEgress,
     timeout: Duration,
+    // How a name dialled straight out of this egress is resolved, with no
+    // proxy above it. None is the host's own DNS.
+    naming: Option<Naming>,
 }
 
 impl Egress {
@@ -804,7 +830,69 @@ impl Egress {
             id,
             binding,
             timeout,
+            naming: None,
         }
+    }
+    // This egress, resolving the names dialled straight out of it as
+    // `naming` says. Host is the host's own DNS.
+    pub fn with_naming(mut self, naming: Naming) -> Self {
+        self.naming = match naming {
+            Naming::Host => None,
+            naming => Some(naming),
+        };
+        self
+    }
+    // A naming that asks `servers` in order from this egress, by address, and
+    // judges their answers by `trust`. It holds its own answers and TLS
+    // sessions, so every egress given it shares them and no other does.
+    pub fn servers_naming(&self, servers: Vec<DnsServer>, trust: Trust) -> Naming {
+        let carrier = Self {
+            id: self.id,
+            binding: self.binding.clone(),
+            timeout: self.timeout,
+            naming: None,
+        };
+        Naming::servers(servers, trust, Arc::new(carrier))
+    }
+    // Whether the names dialled out of this egress go to listed servers
+    // rather than the host's own DNS.
+    pub fn names_by_servers(&self) -> bool {
+        self.naming.is_some()
+    }
+    // The naming that resolves names dialled straight out of this egress,
+    // when it lists servers; None is the host's own DNS. A hop above the
+    // egress that would ask the host is given this one, answers and all.
+    pub fn naming(&self) -> Option<&Naming> {
+        self.naming.as_ref()
+    }
+    // Drops what this egress's naming holds for `host`, after none of the
+    // addresses it gave could be reached.
+    pub fn forget(&self, host: &str) {
+        match &self.naming {
+            None => crate::resolution::forget_host(host),
+            Some(naming) => naming.forget(host),
+        }
+    }
+    // What this egress's naming resolves `host` to, as addresses it can
+    // reach, in the order the naming gives them.
+    async fn lookup(&self, host: &str) -> Result<Vec<IpAddr>, DialError> {
+        let addresses = match &self.naming {
+            None => host_dns::lookup(host)
+                .await
+                .map_err(DialError::Destination)?,
+            Some(naming) => match naming.resolve(self, 0, host, self.timeout).await? {
+                Resolution::Addresses(addresses) => addresses,
+                // A naming that hands the name on has no one to hand it to
+                // here: the lookup fails rather than going anywhere else.
+                Resolution::Unresolved => {
+                    return Err(DialError::Destination(io::Error::other(ResolutionFailed)));
+                }
+            },
+        };
+        Ok(addresses
+            .into_iter()
+            .filter(|ip| self.binding.supports_address(*ip))
+            .collect())
     }
     pub fn id(&self) -> u32 {
         self.id
@@ -834,14 +922,41 @@ impl Egress {
         }
         DialError::destination(error)
     }
-    // What the host's own DNS gives for `host` that this egress can reach,
-    // in the order it gives them, for a direct leg's blocking dialer: a
-    // direct leg's naming is always Host.
+    // What this egress's naming gives for `host` that the egress can reach,
+    // in the order it gives them, for a direct leg's blocking dialer.
+    //
+    // The caller must be on a thread that may block, inside `blocking`: a
+    // runtime's blocking thread, as `spawn_blocking` gives. Listed servers
+    // are asked by blocking that thread on the runtime it belongs to. Asked
+    // from anywhere else, a runtime's worker above all, where waiting on the
+    // runtime would stall it, the lookup fails at once, and a debug build
+    // stops on it. With no runtime the servers cannot be asked, and the
+    // lookup fails.
     pub fn resolve_blocking(&self, host: &str) -> io::Result<Vec<IpAddr>> {
-        Ok(host_dns::lookup_blocking(host)?
-            .into_iter()
-            .filter(|ip| self.binding.supports_address(*ip))
-            .collect())
+        if self.naming.is_none() {
+            return Ok(host_dns::lookup_blocking(host)?
+                .into_iter()
+                .filter(|ip| self.binding.supports_address(*ip))
+                .collect());
+        }
+        let may_block = MAY_BLOCK.with(Cell::get);
+        debug_assert!(
+            may_block,
+            "a blocking lookup through listed servers runs only inside `blocking`"
+        );
+        if !may_block {
+            return Err(io::Error::other(
+                "a blocking lookup through listed servers was asked from a thread that may not block",
+            ));
+        }
+        let runtime = tokio::runtime::Handle::try_current().map_err(io::Error::other)?;
+        let looked_up = runtime.block_on(self.lookup(host));
+        looked_up.map_err(|error| match error {
+            DialError::Destination(error)
+            | DialError::Egress(error)
+            | DialError::Refused(error) => error,
+            error => io::Error::other(error.to_string()),
+        })
     }
     #[expect(
         clippy::disallowed_methods,
@@ -887,15 +1002,17 @@ impl Dialer for Egress {
         let started = tokio::time::Instant::now();
         let attempt = async {
             let peers: Vec<_> = if target.addresses.is_empty() {
-                host_dns::lookup(&target.host)
-                    .await
-                    .map_err(DialError::Destination)?
+                self.lookup(&target.host).await?
             } else {
-                target.addresses.clone()
+                target
+                    .addresses
+                    .iter()
+                    .copied()
+                    .filter(|ip| self.binding.supports_address(*ip))
+                    .collect()
             };
             let peers: Vec<_> = peers
                 .into_iter()
-                .filter(|ip| self.binding.supports_address(*ip))
                 .map(|ip| SocketAddr::new(ip, target.port))
                 .collect();
             let mut last = DialError::Skipped("no compatible destination address".into());
@@ -906,6 +1023,7 @@ impl Dialer for Egress {
                     id: self.id,
                     binding: self.binding.clone(),
                     timeout: remaining / (peers.len() - index) as u32,
+                    naming: None,
                 };
                 match attempt.connect_address(*peer).await {
                     Ok(stream) => {
@@ -928,7 +1046,7 @@ impl Dialer for Egress {
         if let Err(error) = &result
             && unreached(target, error)
         {
-            crate::resolution::forget_host(&target.host);
+            self.forget(&target.host);
         }
         match (&target.purpose, result) {
             // Failure to reach a proxy endpoint is evidence about the route itself.
@@ -940,19 +1058,14 @@ impl Dialer for Egress {
         }
     }
     async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
-        let peers = tokio::time::timeout(self.timeout, host_dns::lookup(host))
+        let mut addresses = tokio::time::timeout(self.timeout, self.lookup(host))
             .await
             .map_err(|_| {
                 DialError::Destination(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("{RESOLVE_TIMED_OUT}: {host}"),
                 ))
-            })?
-            .map_err(DialError::Destination)?;
-        let mut addresses: Vec<_> = peers
-            .into_iter()
-            .filter(|ip| self.binding.supports_address(*ip))
-            .collect();
+            })??;
         addresses.sort();
         Ok(Resolution::Addresses(addresses))
     }
@@ -1570,39 +1683,62 @@ impl Dialer for SessionHop {
         if host.parse::<IpAddr>().is_err() {
             record::asking(host, || Asker::proxy_servers(self.id, servers, *trust));
         }
+        // The tunnel's resolver is given one server, asked in plain.
+        let from = servers.first().map(record::Answerer::of);
         answers
-            .resolve(Resolver::WireGuard, host, || async {
-                self.prepare_carrier().await?;
-                let (resolver, _activity, _capacity) = match identity::claim(self).await {
-                    Some(lent) => (lent.resolver, lent.activity, None),
-                    None => (
-                        provider.clone(),
-                        self.activity.clone().read_owned().await,
-                        self.capacity.acquire()?,
-                    ),
+            .resolve_accounted(Resolver::WireGuard, host, || async {
+                let found = async {
+                    self.prepare_carrier().await?;
+                    let (resolver, _activity, _capacity) = match identity::claim(self).await {
+                        Some(lent) => (lent.resolver, lent.activity, None),
+                        None => (
+                            provider.clone(),
+                            self.activity.clone().read_owned().await,
+                            self.capacity.acquire()?,
+                        ),
+                    };
+                    resolver
+                        .resolve_host(host)
+                        .await
+                        .inspect(|_| crate::metrics::record_resolution(Resolver::WireGuard, true))
+                        .inspect_err(|_| {
+                            crate::metrics::record_resolution(Resolver::WireGuard, false)
+                        })
+                        .inspect_err(|error| match error {
+                            // The tunnel's resolver asked, and says it found nothing.
+                            TunnelError::Dial { detail, .. } => record::tunnel_failed(host, detail),
+                            TunnelError::Configuration(said) => {
+                                record::failed(host, LookupFailure::Other, || said.clone())
+                            }
+                            // The tunnel never came up to ask.
+                            error => {
+                                record::failed(host, LookupFailure::NoReply, || error.to_string())
+                            }
+                        })
+                        // The tunnel's resolver gives no TTL.
+                        .map(|addresses| Lookup {
+                            addresses,
+                            ttl: Ttl::Unknown,
+                            nonexistent: false,
+                        })
+                        .map_err(|error| DialError::hop(self.id, error))
+                        .inspect_err(|error| self.failure.note(error, self.timeout))
+                }
+                .await;
+                // An address came from the listed servers, as sent: counted as
+                // Weaver's own client counts an answer.
+                let judged = found.is_ok().then_some(record::TrustOutcome::AsSent);
+                if let Some(judged) = judged {
+                    record::answered(host, from, judged);
+                    crate::metrics::record_dns_wire(WireKind::Plain);
+                    crate::metrics::record_dns_trust(judged);
+                }
+                let account = Account {
+                    judged,
+                    failure: None,
+                    from: judged.and(from),
                 };
-                resolver
-                    .resolve_host(host)
-                    .await
-                    .inspect(|_| crate::metrics::record_resolution(Resolver::WireGuard, true))
-                    .inspect_err(|_| crate::metrics::record_resolution(Resolver::WireGuard, false))
-                    .inspect_err(|error| match error {
-                        // The tunnel's resolver asked, and says why it found nothing.
-                        TunnelError::Dial { detail, .. } => record::failed_saying(host, detail),
-                        TunnelError::Configuration(said) => {
-                            record::failed(host, LookupFailure::Other, || said.clone())
-                        }
-                        // The tunnel never came up to ask.
-                        error => record::failed(host, LookupFailure::NoReply, || error.to_string()),
-                    })
-                    // The tunnel's resolver gives no TTL.
-                    .map(|addresses| Lookup {
-                        addresses,
-                        ttl: Ttl::Unknown,
-                        nonexistent: false,
-                    })
-                    .map_err(|error| DialError::hop(self.id, error))
-                    .inspect_err(|error| self.failure.note(error, self.timeout))
+                (found, account)
             })
             .await
             .inspect(|addresses| record::found(host, addresses))
