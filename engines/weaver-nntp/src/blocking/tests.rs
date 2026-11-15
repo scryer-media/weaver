@@ -2398,10 +2398,12 @@ fn a_refused_reauth_poisons_the_connection() {
     handle.join().unwrap();
 }
 
-// Without credentials there is nothing to log in again with: a 480 drops the
-// connection as it always has.
+// Without credentials there is nothing to log in again with, and no later
+// dial is asked for any: the server asks at the BODY. So a 480 here is the
+// server refusing the account, as on a sequential BODY, and the connection
+// is dropped. Told as an expired session it was asked again without end.
 #[test]
-fn a_480_on_an_anonymous_connection_poisons_it() {
+fn a_480_on_an_anonymous_connection_is_the_server_asking_for_a_login() {
     let (port, seen, handle) = spawn_reauth_server(
         vec![
             Scripted::Body(vec![0x51; 256]),
@@ -2419,7 +2421,14 @@ fn a_480_on_an_anonymous_connection_poisons_it() {
     let (first, _) = lane.ring_read_next().unwrap();
     assert_eq!(ring_payload(&first), vec![0x51; 256]);
     let (second, meta) = lane.ring_read_next().unwrap();
-    assert!(is_session_expired(&second), "got {:?}", second.result);
+    let Err(DecodedBodyError::Nntp(error)) = &second.result else {
+        panic!("got {:?}", second.result);
+    };
+    assert!(
+        matches!(error, NntpError::AuthenticationRequired),
+        "got {error:?}"
+    );
+    assert!(error.is_credentials_refusal());
     assert!(meta.connection_discarded);
     assert!(!lane.is_healthy());
     assert!(lane.ring_is_closed());
