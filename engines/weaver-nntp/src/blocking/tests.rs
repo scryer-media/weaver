@@ -1218,6 +1218,69 @@ fn blocking_starttls_s2n_reads_a_body_after_the_upgrade() {
     starttls_lane_reads_a_body_after_the_upgrade(NntpTlsBackend::S2n);
 }
 
+// The server test reads the suite the handshake settled on and how long the
+// setup's CAPABILITIES took to answer, off the connection downloads use.
+fn tls_connection_reports_its_cipher_suite_and_capabilities_round_trip(backend: NntpTlsBackend) {
+    let (config, handle, ca_path) = spawn_tls_nntp_server(Vec::new());
+    let mut conn = connect_with_backend(&config, backend);
+
+    let suite = conn
+        .negotiated_cipher_suite()
+        .expect("a TLS connection names its suite");
+    assert!(suite.contains("GCM") || suite.contains("CHACHA20"), "{suite}");
+    assert!(conn.capabilities_round_trip().is_some());
+    assert!(conn.capabilities().supports_pipelining());
+
+    conn.quit().unwrap();
+    handle.join().unwrap();
+    let _ = std::fs::remove_file(ca_path);
+}
+
+#[test]
+fn blocking_rustls_reports_its_cipher_suite_and_capabilities_round_trip() {
+    tls_connection_reports_its_cipher_suite_and_capabilities_round_trip(
+        NntpTlsBackend::ManualRustls,
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn blocking_s2n_reports_its_cipher_suite_and_capabilities_round_trip() {
+    let _guard = s2n_test_guard();
+    tls_connection_reports_its_cipher_suite_and_capabilities_round_trip(NntpTlsBackend::S2n);
+}
+
+// A known capability skips CAPABILITIES, so there is no round trip to report,
+// and a plaintext connection has no suite.
+#[test]
+fn blocking_connection_without_a_capabilities_exchange_reports_no_round_trip() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket.write_all(b"200 test server ready\r\n").unwrap();
+        let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line.trim_end(), "QUIT");
+        socket.write_all(b"205 closing\r\n").unwrap();
+    });
+    let config = ServerConfig {
+        host: "127.0.0.1".into(),
+        port,
+        tls: false,
+        pipelining: crate::connection::PipeliningCapability::Known(true),
+        ..ServerConfig::default()
+    };
+    let mut conn = BlockingNntpConnection::connect(&config).unwrap();
+
+    assert_eq!(conn.capabilities_round_trip(), None);
+    assert_eq!(conn.negotiated_cipher_suite(), None);
+
+    conn.quit().unwrap();
+    handle.join().unwrap();
+}
+
 // A server that refuses the upgrade must fail the connect rather than carry
 // on in plaintext: the credentials and the article both come after this
 // point, and the config asked for them to be encrypted.
