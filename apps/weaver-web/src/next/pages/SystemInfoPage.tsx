@@ -12,7 +12,7 @@ import type { MetricsSnapshot } from "@/lib/metrics";
 import { EmptyState, KeyValueRow, SectionHeader } from "../components/chrome";
 import { PrimaryButton, SecondaryButton } from "../components/controls";
 import { StorageUsage } from "../components/storage";
-import { EM_DASH, formatCount, formatDuration, formatSize } from "../data/format";
+import { EM_DASH, formatCount, formatDuration, formatRate, formatSize } from "../data/format";
 import { MetricsSnapshotContext, useMetricsSnapshot } from "../data/use-metrics-series";
 import { NextShell } from "../shell/NextShell";
 import { AttentionBlock, UptimeBlock } from "../shell/rail-blocks";
@@ -29,6 +29,18 @@ interface ConfiguredStorage {
   path: string;
   capacity: DiskCapacity | null;
   error: string | null;
+}
+
+/** One volume as the operating system presents it, with its write rate when the page was fetched. */
+interface VolumeWriteRate {
+  label: string;
+  storageKind: string;
+  /** Bytes per second; null until the volume has been measured. */
+  writeRateBytesPerSecond: number | null;
+  throughputBytesPerSecond: number | null;
+  bufferedBytes: number;
+  /** The most that may wait for the volume; null until the volume has a limit. */
+  bufferLimitBytes: number | null;
 }
 
 type KernelComponent =
@@ -91,6 +103,7 @@ interface SystemInfo {
     filesystem: string;
     startupRandomReadIops: number;
   };
+  volumes: VolumeWriteRate[];
   configuredStorage: ConfiguredStorage[];
 }
 
@@ -121,6 +134,21 @@ function reportText(info: SystemInfo, cacheBytes: number, cacheLimit: number): s
     `Container memory limit: ${info.memory.cgroupLimitBytes == null ? "not limited" : formatSize(info.memory.cgroupLimitBytes)}`,
     `Article cache in use: ${cacheInUse}`,
     `Primary storage: ${info.primaryStorage.filesystem} · ${info.primaryStorage.storageClass} · ${formatCount(info.primaryStorage.startupRandomReadIops)} IOPS`,
+    // A volume's label is a path, so the report leaves it out.
+    ...info.volumes.map(
+      (volume, index) =>
+        `Volume ${index + 1}: ${volume.storageKind} · ${
+          volume.writeRateBytesPerSecond == null
+            ? "write rate not measured"
+            : `takes ${formatRate(volume.writeRateBytesPerSecond)}`
+        } · ${
+          volume.throughputBytesPerSecond == null
+            ? "not writing"
+            : `writing ${formatRate(volume.throughputBytesPerSecond)}`
+        } · ${formatSize(volume.bufferedBytes)}${
+          volume.bufferLimitBytes == null ? "" : ` of ${formatSize(volume.bufferLimitBytes)}`
+        } buffered`,
+    ),
     ...info.compute.kernels.map((entry) => {
       const pin = entry.pinnedBy ? `, pinned by ${entry.pinnedBy}` : "";
       return `Kernel · ${KERNEL_LABEL[entry.component]?.report ?? entry.component}: ${entry.kernel} (${entry.library}${pin})`;
@@ -336,6 +364,37 @@ export function SystemInfoPage() {
                 label={t("next.system.randomRead")}
                 value={`${formatCount(info.primaryStorage.startupRandomReadIops)} IOPS`}
               />
+
+              <SectionHeader label={t("next.system.volumes")} note={t("next.system.volumesNote")} />
+              {info.volumes.length === 0 ? (
+                <div className="px-4 sm:px-6 py-5 text-[13px] text-wv-muted">{t("next.system.noVolumes")}</div>
+              ) : (
+                info.volumes.map((volume, index) => (
+                  <KeyValueRow
+                    key={`${index}:${volume.label}`}
+                    label={
+                      <span title={volume.label} className="font-wv-mono text-[12px]">
+                        {volume.label || t("next.system.storageFallback")}
+                      </span>
+                    }
+                    value={[
+                      volume.storageKind,
+                      volume.writeRateBytesPerSecond == null
+                        ? t("next.system.volumeNotMeasured")
+                        : t("next.system.volumeTakes", { rate: formatRate(volume.writeRateBytesPerSecond) }),
+                      volume.throughputBytesPerSecond == null
+                        ? t("next.system.volumeNotWriting")
+                        : t("next.system.volumeWriting", { rate: formatRate(volume.throughputBytesPerSecond) }),
+                      volume.bufferLimitBytes == null
+                        ? t("next.system.volumeBuffered", { size: formatSize(volume.bufferedBytes) })
+                        : t("next.system.volumeBufferedOf", {
+                            size: formatSize(volume.bufferedBytes),
+                            limit: formatSize(volume.bufferLimitBytes),
+                          }),
+                    ].join(" · ")}
+                  />
+                ))
+              )}
 
               <SectionHeader
                 label={t("next.system.configuredStorage")}

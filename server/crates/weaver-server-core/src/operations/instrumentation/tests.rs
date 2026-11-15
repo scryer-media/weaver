@@ -71,7 +71,6 @@ fn histogram_empty_snapshot_has_a_slot_per_bucket() {
 fn every_shipped_bound_set_fits_the_fixed_bucket_array_and_ascends() {
     for bounds in [
         ARTICLE_LATENCY_BOUNDS,
-        DISK_WRITE_DURATION_BOUNDS,
         DECODE_TASK_DURATION_BOUNDS,
         EXTRACT_MEMBER_DURATION_BOUNDS,
         JOB_DURATION_BOUNDS,
@@ -322,7 +321,7 @@ fn category_byte_counters_are_shared_per_category_and_none_maps_to_empty() {
 fn pipeline_histograms_report_none_until_a_stage_is_actually_timed() {
     let histograms = PipelineHistograms::new();
     let snapshot = histograms.snapshot();
-    assert_eq!(snapshot.disk_write_duration.count, 0);
+    assert_eq!(snapshot.turn_duration.count, 0);
     assert!(snapshot.decode_task_duration.is_none());
     assert!(snapshot.extract_member_duration.is_none());
 

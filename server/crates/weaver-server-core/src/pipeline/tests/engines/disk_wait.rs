@@ -1228,7 +1228,7 @@ async fn a_job_delivering_outside_the_complete_folder_waits_on_the_disk_its_writ
     assert!(!staging.starts_with(&pipeline.complete_dir));
     pipeline.retire_graph_job(JOB);
     pipeline.jobs.get_mut(&JOB).unwrap().staging_dir = Some(staging);
-    pipeline.admit_graph_job(JOB);
+    pipeline.admit_graph_job(JOB, &[]);
     let output = Arc::clone(
         pipeline
             .storage_capacity

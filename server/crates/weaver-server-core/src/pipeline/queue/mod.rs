@@ -26,7 +26,9 @@ pub(crate) use counters::COUNTER_SAMPLES;
 pub(crate) use history::FAILED_SWEEP_PAGE;
 #[cfg(test)]
 pub(crate) use history::SweepPlaces;
-pub(crate) use history::{clear_left_working_dirs, clear_restart_artifacts, remove_job_staging};
+pub(crate) use history::{
+    MoveOut, clear_left_working_dirs, clear_restart_artifacts, remove_job_staging,
+};
 
 /// The control plane's shared facts. A guard never leaves a synchronous
 /// closure, so callers copy inputs out before doing asynchronous work.
@@ -105,6 +107,17 @@ pub struct QueueInner {
     // take them out. Bounded by the failed jobs whose files are stuck.
     pub(crate) sweep_warned: std::collections::HashSet<JobId>,
     pub(crate) pending_cleanup: PendingCleanup,
+    // The jobs a move of a working folder is out for, counted: the move to
+    // the intermediate folder set now, and the removal of a folder such a
+    // move claimed for a job that left. Nothing else removes or makes the
+    // job's folders until its count is gone: see `MoveOut`.
+    pub(crate) moves_out: HashMap<JobId, usize>,
+    // How often a cleanup wait found a move out for the job it waits for.
+    #[cfg(test)]
+    pub(crate) waits_on_moves: usize,
+    // How many restarts went on to clear the job's folders.
+    #[cfg(test)]
+    pub(crate) restarts_clearing: usize,
     pub(crate) nntp: Option<(u64, weaver_nntp::client::NntpClient, usize)>,
     // The endpoint's request count and the pipeline's latest answer, tagged
     // with the request count it answers.
@@ -200,7 +213,6 @@ pub struct Globals {
     pub hardware_profile_in_force: Option<crate::jobs::handle::HardwareProfileInForce>,
     pub scheduled_hardware_profile: Option<crate::runtime::HardwareProfile>,
     pub random_read_iops: Option<f64>,
-    pub sequential_write_mbps: Option<f64>,
     pub runtime_paths: Option<RuntimePaths>,
     pub nntp_generation: u64,
     pub nntp_active: Option<crate::jobs::handle::NntpRuntimeActivation>,

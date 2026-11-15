@@ -766,6 +766,7 @@ fn spawn_owned_lane_worker(
         .name(format!("weaver-nntp-lane-{index}"))
         .spawn(move || {
             crate::runtime::affinity::pin_current_thread_for_hot_download_path();
+            crate::runtime::thread_release::start_lane_thread();
             run_owned_lane_worker(seat, rx, &thread_owner, start, intervals);
         });
     if let Err(error) = spawned {

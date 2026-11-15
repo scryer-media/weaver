@@ -210,6 +210,53 @@ async fn a_stall_behind_a_job_whose_articles_are_being_read_is_never_kicked() {
 }
 
 #[tokio::test]
+async fn a_job_held_by_a_volume_at_its_write_budget_is_never_kicked_or_released() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = stalled_pipeline(&temp_dir).await;
+    let job_id = JobId(40011);
+    insert_stalled_job(&mut pipeline, job_id, 3).await;
+    let volume = Arc::clone(
+        pipeline.graph_jobs[&job_id]
+            .disk()
+            .expect("the job writes through its volume's writer")
+            .working()
+            .volume(),
+    );
+    // The limit the volume's leases stop at, from the hard limit it was
+    // given as the job was admitted.
+    let budget = volume.lease_limit();
+    assert!(budget < u64::MAX);
+    let t0 = Instant::now();
+    assert_eq!(pipeline.earliest_explained_dispatch_wait(t0), None);
+
+    // The volume counts the budget: the job waits on the disk.
+    volume.count_for_test(budget);
+    assert_eq!(pipeline.earliest_explained_dispatch_wait(t0), Some(t0));
+    let kick_due = t0 + DOWNLOAD_DISPATCH_STALL_KICK_AFTER;
+    let release_due = kick_due + DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER;
+    let long_after = release_due + DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER;
+    for at in [t0, kick_due, release_due, long_after] {
+        pipeline.dispatch_downloads_at(at);
+        assert_eq!(pipeline.earliest_explained_dispatch_wait(at), Some(at));
+    }
+    assert_eq!(kicks(&pipeline), 0);
+    assert_eq!(releases(&pipeline), 0);
+    assert_eq!(
+        pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        3
+    );
+
+    // Below the budget the disk explains nothing any more.
+    volume.count_for_test(budget - 1);
+    assert_eq!(pipeline.earliest_explained_dispatch_wait(long_after), None);
+}
+
+#[tokio::test]
 async fn an_unexplained_stall_is_kicked_once_at_the_kick_window() {
     let temp_dir = tempfile::tempdir().unwrap();
     let mut pipeline = stalled_pipeline(&temp_dir).await;
@@ -491,8 +538,15 @@ async fn with_recovery_off_a_stall_is_only_logged() {
         .insert(job_id, t0);
 
     pipeline.dispatch_downloads_at(t0);
+    // One pass that opens nothing is not yet a stall.
     assert_eq!(pipeline.last_download_dispatch_stall_log_at, None);
     assert_eq!(pipeline.download_dispatch_liveness_since, Some(t0));
+    let logged_at = t0 + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL;
+    pipeline.dispatch_downloads_at(logged_at);
+    assert_eq!(
+        pipeline.last_download_dispatch_stall_log_at,
+        Some(logged_at)
+    );
     let kick_window = t0 + DOWNLOAD_DISPATCH_STALL_KICK_AFTER;
     pipeline.dispatch_downloads_at(kick_window);
     let past_release =
@@ -1631,6 +1685,74 @@ async fn the_liveness_stall_counts_promoted_recovery_and_not_parked() {
     assert_eq!(field(&heard[0], "download_queue_len"), Some("4"));
     assert_eq!(field(&heard[0], "dispatchable_queue_depth"), Some("6"));
     assert_eq!(pipeline.last_download_dispatch_stall_log_at, Some(t1));
+}
+
+// The passes right after a job is added or a restart installs its jobs open
+// nothing for a moment. That says nothing; a warning comes only once the
+// passes have opened nothing for the whole log interval. The slow-disk run
+// warned 0.1 ms after its restart installed the jobs, and downloaded three
+// seconds later.
+#[tokio::test]
+async fn passes_that_open_nothing_warn_only_once_they_have_lasted_the_log_interval() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = stalled_pipeline(&temp_dir).await;
+    pipeline.download_stall_recovery = false;
+    let job_id = JobId(40020);
+    insert_stalled_job(&mut pipeline, job_id, 3).await;
+    let lines = LivenessLines::default();
+    let _capture = tracing::subscriber::set_default(lines.clone());
+    let t0 = Instant::now();
+
+    pipeline.dispatch_downloads_at(t0);
+    let almost = t0 + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL - Duration::from_millis(1);
+    pipeline.dispatch_downloads_at(almost);
+    assert_eq!(lines.take(), Vec::<String>::new());
+    assert_eq!(pipeline.download_dispatch_liveness_since, Some(t0));
+
+    let lasted = t0 + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL;
+    pipeline.dispatch_downloads_at(lasted);
+    let heard = lines.take();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(field(&heard[0], "job_id"), Some("40020"), "{}", heard[0]);
+}
+
+// A job its volume holds at the hard limit waits on the disk. However long
+// that lasts, it is not warned of as a dispatch stall.
+#[tokio::test]
+async fn a_job_held_by_its_volume_is_not_warned_of_as_a_stall() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = stalled_pipeline(&temp_dir).await;
+    let job_id = JobId(40021);
+    insert_stalled_job(&mut pipeline, job_id, 3).await;
+    let volume = Arc::clone(
+        pipeline.graph_jobs[&job_id]
+            .disk()
+            .expect("the job writes through its volume's writer")
+            .working()
+            .volume(),
+    );
+    let budget = volume.lease_limit();
+    volume.count_for_test(budget);
+    let lines = LivenessLines::default();
+    let _capture = tracing::subscriber::set_default(lines.clone());
+    let t0 = Instant::now();
+
+    for at in [
+        t0,
+        t0 + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL,
+        t0 + DOWNLOAD_DISPATCH_STALL_KICK_AFTER,
+    ] {
+        pipeline.dispatch_downloads_at(at);
+    }
+    assert_eq!(lines.take(), Vec::<String>::new());
+
+    // Below the limit the same passes are a stall again, and warned of.
+    volume.count_for_test(budget - 1);
+    let later = t0 + DOWNLOAD_DISPATCH_STALL_KICK_AFTER + DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL;
+    pipeline.dispatch_downloads_at(later);
+    let heard = lines.take();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(field(&heard[0], "job_id"), Some("40021"), "{}", heard[0]);
 }
 
 // Queued work with nothing in flight is reported only once it has held for a

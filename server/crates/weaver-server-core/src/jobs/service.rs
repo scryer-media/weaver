@@ -1187,6 +1187,7 @@ impl Pipeline {
             mut spec,
             waiting_summaries,
             graph,
+            volumes,
             staging_dir: restored_staging_dir,
             nzb_password_candidates,
             finalization_open,
@@ -1216,13 +1217,18 @@ impl Pipeline {
         // articles are on disk, so the queue skips exactly those. A job with
         // no checkpoint has nothing that says what its files hold: it is
         // admitted afresh from its spec and fetches from the start.
-        let (graph_restore, skip, held_parts) = match graph {
+        let (graph_restore, skip, held_parts, in_hand_bytes) = match graph {
             Some(restored) => {
                 self.post_probes
                     .restore_verdict(job_id, restored.feed_verdict);
-                (Some(restored.job), restored.skip, restored.held)
+                (
+                    Some(restored.job),
+                    restored.skip,
+                    restored.held,
+                    restored.in_hand_bytes,
+                )
             }
-            None => (None, HashSet::new(), Vec::new()),
+            None => (None, HashSet::new(), Vec::new(), 0),
         };
         // The parts that arrived and wait to be placed are in hand too, but
         // not yet on the job's files.
@@ -1262,23 +1268,20 @@ impl Pipeline {
         let nothing_queued = queue_depth == 0;
         let status = Self::normalize_restored_status(status, nothing_queued);
 
-        // What the checkpoint settled is downloaded, and is the floor a
-        // restart resumes from.
-        let settled = &skip;
-        let downloaded_bytes: u64 = spec
-            .files
-            .iter()
-            .zip(0u32..)
-            .flat_map(|(file_spec, file_index)| {
-                file_spec.segments.iter().filter_map(move |seg| {
-                    let segment_id = SegmentId {
-                        file_id: NzbFileId { job_id, file_index },
-                        segment_number: seg.ordinal,
-                    };
-                    (delivering || settled.contains(&segment_id)).then_some(u64::from(seg.bytes))
-                })
-            })
-            .sum();
+        // What the checkpoint has in hand is downloaded, and is the floor a
+        // restart resumes from. It is the articles' decoded bytes, the units
+        // a run counts each arrival in; their encoded sizes in the post are
+        // about 3% more, which a stop and restart once added to the job.
+        // A job whose delivery began has every article in hand.
+        let downloaded_bytes: u64 = if delivering {
+            spec.files
+                .iter()
+                .flat_map(|file_spec| &file_spec.segments)
+                .map(|seg| u64::from(seg.bytes))
+                .sum()
+        } else {
+            in_hand_bytes
+        };
         let restored_download_floor_bytes = downloaded_bytes;
         let paused_resume_status = matches!(status, JobStatus::Paused)
             .then_some(paused_resume_status)
@@ -1435,7 +1438,14 @@ impl Pipeline {
         };
         self.jobs.insert(job_id, state);
         if !waits_its_turn {
-            self.activate_job_articles(job_id, &skip, graph_restore, repeated, held_parts);
+            self.activate_job_articles(
+                job_id,
+                &skip,
+                graph_restore,
+                repeated,
+                held_parts,
+                &volumes,
+            );
         }
         // A paused job holds nothing per article, restored as it was paused:
         // with nothing out, it parks at once.
@@ -1587,6 +1597,9 @@ pub(crate) struct RestoredFacts {
     // The summaries a job waiting its turn installs with, its lists unread.
     waiting_summaries: Option<FileSummaries>,
     graph: Option<crate::pipeline::graph::restore::GraphRestore>,
+    // The volumes of the job's directories, read off the loop, for a job
+    // its checkpoint does not rebuild: it is admitted afresh through them.
+    volumes: crate::pipeline::graph::disk::ReadVolumes,
     // The staging directory the job delivers into, when one is there.
     staging_dir: Option<PathBuf>,
     nzb_password_candidates: Option<Vec<crate::jobs::ArchivePasswordCandidate>>,
@@ -1984,6 +1997,7 @@ async fn read_restored(
         .await
         .unwrap_or(false)
         .then_some(staging_dir);
+    let mut volumes = Vec::new();
     let graph = if waiting_summaries.is_some() || delivering {
         None
     } else if let Some(graph) = graph {
@@ -1991,13 +2005,24 @@ async fn read_restored(
             .for_job(spec.password.clone(), &working_dir, staging_dir.as_deref())
             .lifted(&spec.metadata);
         let files = crate::pipeline::graph::restore::root_files(&spec);
-        match tokio::task::spawn_blocking(move || seat.restore(job_id, files))
-            .await
-            .map_err(|error| {
-                crate::pipeline::graph::restore::GraphRestoreError::Join(error.to_string())
-            })
-            .and_then(|restored| restored)
-        {
+        // The volumes are read first: a job with no checkpoint is admitted
+        // afresh on the loop, which reads nothing of the disk.
+        let read = tokio::task::spawn_blocking(move || {
+            let volumes = seat.read_volumes();
+            (volumes, seat.restore(job_id, files))
+        })
+        .await
+        .map_err(|error| {
+            crate::pipeline::graph::restore::GraphRestoreError::Join(error.to_string())
+        });
+        let restored = match read {
+            Ok((read, restored)) => {
+                volumes = read;
+                restored
+            }
+            Err(error) => Err(error),
+        };
+        match restored {
             Ok(restored) => Some(restored),
             Err(crate::pipeline::graph::restore::GraphRestoreError::NoCheckpoint(_)) => None,
             Err(error) => return Err(internal(error.to_string())),
@@ -2063,6 +2088,7 @@ async fn read_restored(
         spec,
         waiting_summaries,
         graph,
+        volumes,
         staging_dir,
         nzb_password_candidates,
         finalization_open,

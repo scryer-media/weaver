@@ -128,7 +128,6 @@ const pt: LocaleDictionary = {
   "metrics.commitPending": "Confirmação Pendente",
   "metrics.writeBufferedBytes": "Bytes em Buffer de Escrita",
   "metrics.writeBufferedSegments": "Segmentos em Buffer de Escrita",
-  "metrics.diskWriteLatency": "Latência de Escrita em Disco",
   "metrics.segmentsDownloaded": "Segmentos Baixados",
   "metrics.segmentsDecoded": "Segmentos Decodificados",
   "metrics.segmentsCommitted": "Segmentos Confirmados",

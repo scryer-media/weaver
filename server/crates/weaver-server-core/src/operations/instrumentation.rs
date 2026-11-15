@@ -495,11 +495,6 @@ pub const ARTICLE_LATENCY_BOUNDS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
 
-// Disk write batch duration, seconds.
-pub const DISK_WRITE_DURATION_BOUNDS: &[f64] = &[
-    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
-];
-
 // Decode task duration, seconds.
 pub const DECODE_TASK_DURATION_BOUNDS: &[f64] = &[
     0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
@@ -1205,7 +1200,6 @@ impl JobLifecycleMetrics {
 #[derive(Debug)]
 pub struct PipelineHistograms {
     pub turn_duration: AtomicHistogram,
-    pub disk_write_duration: AtomicHistogram,
     pub decode_task_duration: AtomicHistogram,
     pub extract_member_duration: AtomicHistogram,
     // Set once the corresponding histogram has a real feeding site. Until
@@ -1224,7 +1218,6 @@ impl Default for PipelineHistograms {
 impl PipelineHistograms {
     pub const fn new() -> Self {
         Self {
-            disk_write_duration: AtomicHistogram::new(DISK_WRITE_DURATION_BOUNDS),
             turn_duration: AtomicHistogram::new(&[0.0001, 0.001, 0.01, 0.1, 1.0, 10.0, 60.0]),
             decode_task_duration: AtomicHistogram::new(DECODE_TASK_DURATION_BOUNDS),
             extract_member_duration: AtomicHistogram::new(EXTRACT_MEMBER_DURATION_BOUNDS),
@@ -1242,7 +1235,6 @@ impl PipelineHistograms {
     pub fn snapshot(&self) -> PipelineHistogramsSnapshot {
         PipelineHistogramsSnapshot {
             turn_duration: self.turn_duration.snapshot(),
-            disk_write_duration: self.disk_write_duration.snapshot(),
             decode_task_duration: (self.decode_task_observed.load(Ordering::Relaxed) != 0)
                 .then(|| self.decode_task_duration.snapshot()),
             extract_member_duration: (self.extract_member_observed.load(Ordering::Relaxed) != 0)
@@ -1259,7 +1251,6 @@ impl PipelineHistograms {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PipelineHistogramsSnapshot {
     pub turn_duration: HistogramSnapshot,
-    pub disk_write_duration: HistogramSnapshot,
     pub decode_task_duration: Option<HistogramSnapshot>,
     pub extract_member_duration: Option<HistogramSnapshot>,
 }
@@ -1409,6 +1400,106 @@ pub struct DiskSpaceSnapshot {
     pub path: String,
     pub total_bytes: u64,
     pub available_bytes: u64,
+}
+
+// One volume's write figures, as its writer and the rate sampler left them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VolumeSnapshot {
+    // The mount path or drive root.
+    pub label: String,
+    // `ssd`, `platter`, `network` or `unknown`.
+    pub kind: &'static str,
+    pub device: Option<u64>,
+    pub written_bytes: u64,
+    // Time spent inside write calls.
+    pub write_nanos: u64,
+    // Write calls made, and how many of them did not start where the
+    // previous write to the same file ended.
+    pub write_calls: u64,
+    pub write_seeks: u64,
+    // Bytes per second inside write calls; zero until measured.
+    pub write_rate: u64,
+    // Bytes per second written to it over the last window, whether or not
+    // the volume was the limit; zero when nothing was written.
+    pub throughput: u64,
+    // Bytes waiting in memory for the volume's writer.
+    pub buffered_bytes: u64,
+    // Bytes that arrived for the jobs writing to the volume and are not
+    // handed to its writer yet: being decoded. The limits below are read
+    // against these and the buffered bytes together.
+    pub arrived_bytes: u64,
+    // What counts against the hard limit: the articles leased to lanes and
+    // not arrived, what arrived and is being decoded, and what waits for
+    // the writer. Never more than the hard limit, but for one article
+    // granted alone to a volume that counted nothing.
+    pub counted_bytes: u64,
+    // The most `counted_bytes` has been.
+    pub peak_bytes: u64,
+    // The volume's buffer limits, over the bytes it counts: the soft one
+    // is a reported figure, nothing is leased or queued past the hard one.
+    // Zero until the volume is sized.
+    pub buffer_soft_bytes: u64,
+    pub buffer_limit_bytes: u64,
+    // Times the volume's writer found nothing more to do after working.
+    pub idle_turns: u64,
+    // What the volume's writer did and what waiting on it cost.
+    pub writer: VolumeWriterSnapshot,
+}
+
+// The label of each kind of loop wait, in the order of
+// `VolumeWriterSnapshot::loop_waits_by_kind`.
+pub const LOOP_WAIT_KINDS: [&str; 3] = ["read", "settle", "budget"];
+
+// One volume's writer counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct VolumeWriterSnapshot {
+    // Batches the writer ran, and the operations in them it ran.
+    pub batches: u64,
+    pub operations: u64,
+    // Times the pipeline loop stood still for the writer, and for how long.
+    pub loop_waits: u64,
+    pub loop_wait_nanos: u64,
+    // The same, by what the loop waited for: a read after a file's writes,
+    // a file's operations to settle, and the volume's limit while the loop
+    // produced output itself (`LOOP_WAIT_KINDS`, in that order).
+    pub loop_waits_by_kind: [u64; 3],
+    pub loop_wait_nanos_by_kind: [u64; 3],
+    // Reads the pipeline loop made itself of the writer's files, after its
+    // wait, and how long they took, the open included.
+    pub loop_reads: u64,
+    pub loop_read_nanos: u64,
+    // Times a thread other than the loop (a check, a repair, a replay)
+    // stood for the writer, and for how long.
+    pub aside_waits: u64,
+    pub aside_wait_nanos: u64,
+    // Files the writer opened, and the time inside those opens.
+    pub opens: u64,
+    pub open_nanos: u64,
+    // The steps of those opens, each when it ran: create, sparse mark and
+    // length set at creation.
+    pub open_creates: u64,
+    pub open_create_nanos: u64,
+    pub open_marks: u64,
+    pub open_mark_nanos: u64,
+    pub open_sizes: u64,
+    pub open_size_nanos: u64,
+    // Lengths the writer set, at a close or a truncate, the time inside
+    // those calls, and closes already at their length that set nothing.
+    pub length_sets: u64,
+    pub length_set_nanos: u64,
+    pub length_sets_skipped: u64,
+    // Handles the writer dropped, and the time inside those drops.
+    pub closes: u64,
+    pub close_nanos: u64,
+    // Operations that came back with an error.
+    pub failed_operations: u64,
+    // Operations not run: their caller gave its files up, or an earlier
+    // operation of the same caller failed.
+    pub abandoned_operations: u64,
+    // Writer threads started for the volume, one after another.
+    pub threads: u64,
+    // Times the writer woke to mail after waiting for it.
+    pub woken: u64,
 }
 
 #[cfg(test)]
