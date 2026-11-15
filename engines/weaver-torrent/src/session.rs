@@ -889,6 +889,14 @@ pub struct AddTorrentOptions {
     /// in resume data). Not read without seed mode.
     #[serde(skip)]
     pub seed_verified: Option<BF>,
+    /// A refused write puts the torrent in upload mode until its owner
+    /// calls the live run's `leave_upload_mode`, with no timed retry: the
+    /// owner hears every write its storage refuses, watches the disk for
+    /// one refused for want of room, and stops the torrent for any other.
+    /// Off by default, which retries every refused write after ten minutes
+    /// (libtorrent `optimistic_disk_retry`).
+    #[serde(default)]
+    pub owner_wakes_full_disk: bool,
     /// Our identity under an SSL torrent's CA, presented to its peers and
     /// its HTTPS trackers (see [`Session::set_ssl_identity`]). An SSL
     /// torrent added without one connects to no peer and announces nowhere
@@ -950,6 +958,7 @@ impl Default for AddTorrentOptions {
             disable_pex: false,
             seed_mode: false,
             seed_verified: None,
+            owner_wakes_full_disk: false,
             ssl_identity: None,
             metadata_fetch: None,
             tracker_handover: None,
@@ -3619,6 +3628,7 @@ impl Session {
                     disable_dht: opts.disable_dht,
                     disable_lsd: opts.disable_lsd,
                     disable_pex: opts.disable_pex,
+                    owner_wakes_full_disk: opts.owner_wakes_full_disk,
                     seed: if opts.seed_mode {
                         SeedMode::over(
                             metadata.info.lengths().total_pieces(),

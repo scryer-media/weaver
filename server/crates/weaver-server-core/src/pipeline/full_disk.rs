@@ -42,6 +42,8 @@ use super::{ParkedBytes, Pipeline};
 use crate::jobs::ids::JobId;
 use crate::jobs::model::{FileSummaries, FileSummary, JobArticles, RunState};
 use crate::operations::StorageRoot;
+pub(crate) use crate::operations::room_wait::Wants;
+use crate::operations::room_wait::{Disk, Promised, RoomWait, Waiter};
 
 // The wait of the kept history archives: the folder read, how many
 // archives the writer said it keeps, the probe count as the wait began, and
@@ -58,46 +60,6 @@ pub(crate) struct ArchiveWait {
 // says nothing of what a write needs, and only keeps a retry that was
 // refused from being rung again by the noise of a busy disk.
 pub(in crate::pipeline) const ARCHIVE_RETRY_RISE: u64 = 16 << 20;
-
-// What a job waits for: room made on the disk its write failed on.
-// The disk a held job waits on: a root's, or the disk of a path that lies
-// on none of theirs.
-#[derive(Clone, PartialEq, Eq)]
-enum Disk {
-    Root(StorageRoot),
-    Path(PathBuf),
-}
-
-// Room promised to a job let go on the figure its step needs: the disk, and
-// how much of what it showed is the job's until its step ends.
-pub(crate) struct Promised {
-    disk: Disk,
-    bytes: u64,
-    // The device of that disk as the capacity layer held it at the promise,
-    // so a job held on a root and one held on a path of the same physical
-    // disk are judged against each other. `None` while it was not known:
-    // the promise then counts only for jobs held on the very same root or
-    // path.
-    device: Option<u64>,
-}
-
-impl Disk {
-    // The device the capacity layer holds for this disk already; nothing is
-    // looked at.
-    fn device(&self, capacity: &crate::operations::StorageCapacity) -> Option<u64> {
-        match self {
-            Self::Root(root) => capacity.root_slot_device(*root),
-            Self::Path(path) => capacity.held_path_device(path),
-        }
-    }
-}
-
-impl Promised {
-    // Whether the promise is on the disk `disk`, whose device is `device`.
-    fn on(&self, disk: &Disk, device: Option<u64>) -> bool {
-        self.disk == *disk || (device.is_some() && self.device == device)
-    }
-}
 
 // What the job was doing when its write failed, which is what it goes back
 // to when let go, the way a restart takes a job stored in that stage.
@@ -118,75 +80,12 @@ pub(crate) enum Stage {
     Restored,
 }
 
-// What the write that failed says of the room the job waits for.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Wants {
-    // What the step needs free to run again, when it removed what it had
-    // written as it failed, or never wrote it.
-    pub(crate) needs: Option<u64>,
-    // What was left to write of the file, spool or scratch whose write was
-    // refused, when the step names no `needs`: the least a reading has to
-    // show over the mark.
-    pub(crate) left: Option<u64>,
-    // The write was refused by a quota, not by the disk: the disk's free
-    // figure already shows room the job cannot use.
-    pub(crate) quota: bool,
-}
-
-impl Wants {
-    // The write that failed with `error` wants `needs` free to run again.
-    pub(crate) fn of(error: &std::io::Error, needs: Option<u64>) -> Self {
-        Self {
-            needs,
-            left: None,
-            quota: crate::operations::is_quota_exceeded(error),
-        }
-    }
-}
-
-impl From<Option<u64>> for Wants {
-    fn from(needs: Option<u64>) -> Self {
-        Self {
-            needs,
-            ..Self::default()
-        }
-    }
-}
-
+// A job held for a full disk: what it waits for, room made on the disk its
+// write failed on, judged by the one wait every kind of job shares
+// (operations/room_wait.rs), and what it goes back to when let go.
 pub(crate) struct FullDisk {
-    // The least a reading has to show over the mark, when the step names
-    // no `needs`: what was left of the file whose write was refused.
-    rise: Option<u64>,
-    // The hold began with a quota error: the free figure has to rise from
-    // the mark by what the step needs, since it showed that much already.
-    quota: bool,
-    disk: Disk,
+    wait: RoomWait,
     stage: Stage,
-    // The disk's count of the probes it had begun as the write failed: only
-    // a later probe's reading can show room made since.
-    since: u64,
-    // What the disk showed free when the write failed: the figure of its
-    // newest reading whose probe began no later than the failure, even a
-    // stale one. A reading has to show more than this to show room made.
-    // It is this wait's alone, and ends with it. `None` while the disk has
-    // shown nothing: the first reading since the failure then sets it.
-    mark: Option<u64>,
-    // What the hold itself gave back to the disk after the mark was taken:
-    // the spool files it swept. A reading shows them as room, and they are
-    // room the job fills again, so they count on top of the mark.
-    freed: u64,
-    // What the step that failed needs free to run again, when it removed
-    // what it had written as it failed. A reading then has to show this
-    // much, and the mark is not consulted.
-    needs: Option<u64>,
-    // A probe was running as the write failed: it began before the failure,
-    // so the figure it publishes takes the mark's place, once.
-    running: bool,
-    // How many times the root waited on had been pointed elsewhere, and the
-    // directory it was pointed at as the write failed: when the root is
-    // pointed elsewhere, the wait goes on reading that directory's disk.
-    moved: u64,
-    dir: PathBuf,
     // Room was made, or the user asked: the job goes on once it has parked.
     go: bool,
     // What the job's graph said was left to fetch, taken before it went:
@@ -208,31 +107,6 @@ impl Pipeline {
                 StorageRoot::Complete
             }
             _ => StorageRoot::Intermediate,
-        }
-    }
-
-    // What a hold is made with. No hold is let go by less than the write
-    // that was refused: a site that names neither what its step needs nor
-    // what was left of its write waits for the free figure to rise by the
-    // reserve. Refused by a quota with a `needs`, the mark is not what the
-    // disk showed before: a reading from then may have been taken while the
-    // step's own output was on disk, so the first reading whose probe began
-    // after the failure, and after the step gave its output back, sets it.
-    fn full_disk_terms(
-        &self,
-        wants: Wants,
-        shown: Option<u64>,
-        running: bool,
-    ) -> (Wants, Option<u64>, bool) {
-        let left = match (wants.needs, wants.left) {
-            (None, None) => Some(self.extraction_limits.min_free_bytes.max(1)),
-            (_, left) => left,
-        };
-        let wants = Wants { left, ..wants };
-        if wants.quota && wants.needs.is_some() {
-            (wants, None, false)
-        } else {
-            (wants, shown, running)
         }
     }
 
@@ -329,31 +203,18 @@ impl Pipeline {
         self.retire_graph_job(job_id);
         // What the disk showed free as the write failed is what a later
         // reading has to beat.
-        let look = self.storage_capacity.look(root);
-        self.storage_capacity.ledger(root).wait();
-        let (
-            Wants {
-                needs,
-                left: rise,
-                quota,
-            },
-            mark,
-            running,
-        ) = self.full_disk_terms(wants, look.shown, look.probe < look.begun);
+        let wait = RoomWait::begin(
+            &self.storage_capacity,
+            Disk::Root(root),
+            self.root_dir(root),
+            wants,
+            self.extraction_limits.min_free_bytes,
+        );
         self.full_disk.insert(
             job_id,
             FullDisk {
-                rise,
-                quota,
-                disk: Disk::Root(root),
+                wait,
                 stage: Stage::Graph,
-                since: look.begun,
-                mark,
-                freed: 0,
-                needs,
-                running,
-                moved: look.moved,
-                dir: self.root_dir(root),
                 go: false,
                 left,
                 named,
@@ -406,7 +267,7 @@ impl Pipeline {
         // What the sweep gives back is room the job fills again as it
         // fetches those parts: no reading counts it as room made.
         if let Some(hold) = self.full_disk.get_mut(&job_id) {
-            hold.freed = hold.freed.saturating_add(freed);
+            hold.wait.freed = hold.wait.freed.saturating_add(freed);
         }
         let sweep = tokio::task::spawn_blocking(move || {
             for path in stray {
@@ -441,109 +302,38 @@ impl Pipeline {
         let reserve = self.extraction_limits.min_free_bytes;
         let mut woken = Vec::new();
         // A promise to a job that left the pipeline ended with it.
-        if !self.full_disk_promised.is_empty() {
+        let promises = self.storage_capacity.promises();
+        {
             let jobs = &self.jobs;
-            self.full_disk_promised
-                .retain(|job_id, _| jobs.contains_key(job_id));
+            promises.retain(Waiter::Usenet, |job_id| jobs.contains_key(&job_id));
+        }
+        // A torrent's step let go on its figure ended: the jobs held on its
+        // disk count readings from then.
+        for (ended, begun) in promises.take_ended(Waiter::Usenet) {
+            for hold in self.full_disk.values_mut().filter(|hold| !hold.go) {
+                hold.wait
+                    .promise_ended(&self.storage_capacity, &ended, begun);
+            }
         }
         for (job_id, hold) in &mut self.full_disk {
             let capacity = &self.storage_capacity;
-            // The root waited on was pointed at another directory: the wait
-            // stays on the disk that failed, read from here as a path of
-            // its own. Its mark stands, and readings count from now.
-            let repointed = match &hold.disk {
-                Disk::Root(root) if capacity.look(*root).moved != hold.moved => Some(*root),
-                _ => None,
-            };
-            if let Some(root) = repointed {
-                capacity.ledger(root).unwait();
-                let look = capacity.hold_path(&hold.dir);
-                hold.disk = Disk::Path(hold.dir.clone());
-                hold.since = look.begun;
-                hold.running = false;
-                hold.moved = look.moved;
-            }
-            // What the disk shows now, and what is free on it to spend: for
-            // a root, less what is promised on it.
-            let (look, spendable) = match &hold.disk {
-                Disk::Root(root) => (
-                    Some(capacity.look(*root)),
-                    capacity
-                        .free(*root)
-                        .filter(|free| !free.stale)
-                        .map(|free| free.bytes),
-                ),
-                Disk::Path(path) => {
-                    let look = capacity.path_look(path);
-                    (look, look.and_then(|look| look.shown))
-                }
-            };
-            if let Some(look) = look {
-                // A probe running as the write failed began before it:
-                // what it published is the newest figure from before the
-                // failure, and takes the mark's place.
-                if hold.running && look.probe >= hold.since {
-                    if let Some(before) = look.figure_of(hold.since) {
-                        hold.mark = Some(before);
-                    }
-                    hold.running = false;
-                }
-                // A good reading whose probe began after the failure
-                // counts. With nothing shown before, it is the mark. One
-                // that shows more than the mark, with more than the
-                // reserve free to spend, shows room was made.
-                if look.probe > hold.since
-                    && look.good
-                    && let Some(shown) = look.shown
-                {
-                    let spends = spendable.is_some_and(|free| free > reserve);
-                    // What the reading has to show at least, and how much
-                    // of it is the job's once it is let go. The step gave
-                    // its output back as it failed: the room the step takes.
-                    // Refused by a quota, the disk showed that room already:
-                    // the figure has to rise by it from the mark. A step
-                    // that names no need waits for the figure to rise by
-                    // what was left of the file it was writing.
-                    // What the hold swept counts on top of the mark.
-                    let floor = match (hold.needs, hold.mark, hold.rise) {
-                        (Some(needs), _, _) if !hold.quota => Some((needs, needs)),
-                        (Some(bytes), Some(mark), _) | (None, Some(mark), Some(bytes)) => {
-                            Some((mark.saturating_add(hold.freed).saturating_add(bytes), bytes))
-                        }
-                        _ => None,
-                    };
-                    match (floor, hold.mark) {
-                        // On top of what is promised to the jobs let go
-                        // before it whose steps have not ended: a job let
-                        // go here is promised its figure at once, so the
-                        // next held job of this pass is judged against it.
-                        (Some((floor, bytes)), _) if !hold.go => {
-                            let device = hold.disk.device(capacity);
-                            let promised = self
-                                .full_disk_promised
-                                .values()
-                                .filter(|promised| promised.on(&hold.disk, device))
-                                .fold(0u64, |sum, promised| sum.saturating_add(promised.bytes));
-                            if shown >= floor.saturating_add(promised) && spends {
-                                hold.go = true;
-                                self.full_disk_promised.insert(
-                                    *job_id,
-                                    Promised {
-                                        disk: hold.disk.clone(),
-                                        bytes,
-                                        device,
-                                    },
-                                );
-                            }
-                        }
-                        (Some(_), _) => {}
-                        // Nothing was shown before to compare with: the
-                        // first reading that counts only sets the mark.
-                        (None, None) => hold.mark = Some(shown),
-                        // Every hold has a figure once it has a mark.
-                        (None, Some(_)) => {}
-                    }
-                }
+            // A job let go here is promised its figure at once, so the next
+            // held job of this pass is judged against it. So is a torrent
+            // let go on the same disk.
+            let room = hold.wait.judge(capacity, reserve, hold.go, |disk, device| {
+                capacity.promises().on(disk, device)
+            });
+            if let Some((bytes, device)) = room {
+                hold.go = true;
+                capacity.promises().insert(
+                    Waiter::Usenet,
+                    *job_id,
+                    Promised {
+                        disk: hold.wait.disk.clone(),
+                        bytes,
+                        device,
+                    },
+                );
             }
             // A move let go starts as a first move does, which waits while
             // post-processing is paused: the job stays held until then.
@@ -559,7 +349,14 @@ impl Pipeline {
             // its promise up, so the other jobs held on that disk are not
             // judged against room it is not taking: it is judged anew, by a
             // later reading, once it is resumed.
-            if paused && hold.go && self.full_disk_promised.remove(job_id).is_some() {
+            if paused
+                && hold.go
+                && self
+                    .storage_capacity
+                    .promises()
+                    .remove(Waiter::Usenet, *job_id)
+                    .is_some()
+            {
                 hold.go = false;
             }
             let parked = !paused
@@ -632,37 +429,22 @@ impl Pipeline {
             .known_root_of(path)
             .filter(|root| matches!(root, StorageRoot::Complete | StorageRoot::Intermediate))
             .map_or_else(|| Disk::Path(path.to_path_buf()), Disk::Root);
-        let (look, dir) = match &disk {
-            Disk::Root(root) => {
-                let look = self.storage_capacity.look(*root);
-                self.storage_capacity.ledger(*root).wait();
-                (look, self.root_dir(*root))
-            }
-            Disk::Path(path) => (self.storage_capacity.hold_path(path), path.clone()),
+        let dir = match &disk {
+            Disk::Root(root) => self.root_dir(*root),
+            Disk::Path(path) => path.clone(),
         };
-        let (
-            Wants {
-                needs,
-                left: rise,
-                quota,
-            },
-            mark,
-            running,
-        ) = self.full_disk_terms(wants, look.shown, look.probe < look.begun);
+        let wait = RoomWait::begin(
+            &self.storage_capacity,
+            disk,
+            dir,
+            wants,
+            self.extraction_limits.min_free_bytes,
+        );
         self.full_disk.insert(
             job_id,
             FullDisk {
-                rise,
-                quota,
-                disk,
+                wait,
                 stage,
-                since: look.begun,
-                mark,
-                freed: 0,
-                needs,
-                running,
-                moved: look.moved,
-                dir,
                 go: false,
                 left: None,
                 named: HashSet::new(),
@@ -904,10 +686,11 @@ impl Pipeline {
         if let Some(hold) = self.full_disk.get_mut(&job_id) {
             // Its step takes the room it needs all the same, so that much
             // is promised to it like any job let go on its figure.
-            if let (false, Some(bytes)) = (hold.go, hold.needs.or(hold.rise)) {
-                let disk = hold.disk.clone();
+            if let (false, Some(bytes)) = (hold.go, hold.wait.needs.or(hold.wait.rise)) {
+                let disk = hold.wait.disk.clone();
                 let device = disk.device(&self.storage_capacity);
-                self.full_disk_promised.insert(
+                self.storage_capacity.promises().insert(
+                    Waiter::Usenet,
                     job_id,
                     Promised {
                         disk,
@@ -926,50 +709,24 @@ impl Pipeline {
     // still held on that disk are judged on a reading taken from now, since
     // one from before shows room that step may have filled.
     pub(in crate::pipeline) fn end_full_disk_promise(&mut self, job_id: JobId) {
-        if self.full_disk_promised.is_empty() {
-            return;
-        }
-        let Some(ended) = self.full_disk_promised.remove(&job_id) else {
-            return;
-        };
-        let begun = match &ended.disk {
-            Disk::Root(root) => Some(self.storage_capacity.look(*root).begun),
-            Disk::Path(path) => self.storage_capacity.path_look(path).map(|look| look.begun),
-        };
-        let Some(begun) = begun else {
+        let capacity = &self.storage_capacity;
+        let Some((ended, begun)) = capacity.promises().end(capacity, Waiter::Usenet, job_id) else {
             return;
         };
         // A job held on the same device under another root or path counts
         // its own disk's probes: readings of it count from now.
-        let capacity = &self.storage_capacity;
         for hold in self.full_disk.values_mut() {
             if hold.go {
                 continue;
             }
-            let begun = if hold.disk == ended.disk {
-                Some(begun)
-            } else if ended.on(&hold.disk, hold.disk.device(capacity)) {
-                match &hold.disk {
-                    Disk::Root(root) => Some(capacity.look(*root).begun),
-                    Disk::Path(path) => capacity.path_look(path).map(|look| look.begun),
-                }
-            } else {
-                None
-            };
-            if let Some(begun) = begun {
-                hold.since = hold.since.max(begun);
-                hold.running = false;
-            }
+            hold.wait.promise_ended(capacity, &ended, begun);
         }
     }
 
     // What is promised on the disks to the jobs let go, in all.
     #[cfg(test)]
     pub(in crate::pipeline) fn full_disk_promised_bytes(&self) -> u64 {
-        self.full_disk_promised
-            .values()
-            .map(|promised| promised.bytes)
-            .sum()
+        self.storage_capacity.promises().bytes_of(Waiter::Usenet)
     }
 
     // The names in the destination whose copy the held move cut short.
@@ -984,13 +741,13 @@ impl Pipeline {
     // What a reading of the held job's disk has to show more than.
     #[cfg(test)]
     pub(in crate::pipeline) fn full_disk_mark(&self, job_id: JobId) -> Option<u64> {
-        self.full_disk.get(&job_id).and_then(|hold| hold.mark)
+        self.full_disk.get(&job_id).and_then(|hold| hold.wait.mark)
     }
 
     // What a reading of the held job's disk has to show at least.
     #[cfg(test)]
     pub(in crate::pipeline) fn full_disk_needs(&self, job_id: JobId) -> Option<u64> {
-        self.full_disk.get(&job_id).and_then(|hold| hold.needs)
+        self.full_disk.get(&job_id).and_then(|hold| hold.wait.needs)
     }
 
     // What a reading has to show over the mark, by what was left of the file
@@ -999,7 +756,7 @@ impl Pipeline {
     pub(in crate::pipeline) fn full_disk_rise(&self, job_id: JobId) -> (Option<u64>, bool) {
         self.full_disk
             .get(&job_id)
-            .map_or((None, false), |hold| (hold.rise, hold.quota))
+            .map_or((None, false), |hold| (hold.wait.rise, hold.wait.quota))
     }
 
     // Whether the held job waits on a path of its own, not on a root.
@@ -1007,7 +764,7 @@ impl Pipeline {
     pub(in crate::pipeline) fn full_disk_on_path(&self, job_id: JobId) -> bool {
         self.full_disk
             .get(&job_id)
-            .is_some_and(|hold| matches!(hold.disk, Disk::Path(_)))
+            .is_some_and(|hold| matches!(hold.wait.disk, Disk::Path(_)))
     }
 
     // The job no longer waits for room after a full disk: it went on, or
@@ -1017,10 +774,7 @@ impl Pipeline {
             return None;
         }
         let hold = self.full_disk.remove(&job_id)?;
-        match &hold.disk {
-            Disk::Root(root) => self.storage_capacity.ledger(*root).unwait(),
-            Disk::Path(path) => self.storage_capacity.release_path(path),
-        }
+        hold.wait.end(&self.storage_capacity);
         Some(hold.stage)
     }
 }

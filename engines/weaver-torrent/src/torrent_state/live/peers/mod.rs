@@ -1389,6 +1389,22 @@ impl PeerStates {
         self.with_peer_mut(addr, "connection_delivered", |peer| peer.delivered(self));
     }
 
+    /// Upload mode was left: every peer with no connection that is not
+    /// banned may be connected to at once, its failures in a row kept, and
+    /// the connect loop is woken (libtorrent `torrent::set_upload_mode`
+    /// clears every `torrent_peer::last_connected` to force a fast
+    /// reconnect after leaving upload mode). One walk of the list per leave.
+    pub fn reconnect_after_upload_mode(&self) {
+        for mut e in self.states.iter_mut() {
+            let ip = e.key().ip();
+            let peer = e.value_mut();
+            if !self.is_banned(ip) && peer.forget_last_close() {
+                self.reindex(peer);
+            }
+        }
+        self.candidates_changed.notify_one();
+    }
+
     /// We want the peers we let go again.
     pub fn requeue_not_needed(&self) {
         for mut peer in self.states.iter_mut() {

@@ -367,16 +367,6 @@ struct Extent {
 // that was promised may land before the ledger hears of it.
 const SLAB_BYTES: u64 = 64 * 1024 * 1024;
 
-// The room above `reserve` a good reading of `reader` leaves on its
-// ledger: every byte with no reserve, no reading, or a stale one, which
-// checks nothing.
-fn checked_room(ledger: &DiskLedger, reader: &CapacityReader, reserve: u64) -> u64 {
-    match ledger.free_with(|| reader.current()) {
-        Some(free) if reserve > 0 && !free.stale => free.bytes.saturating_sub(reserve),
-        _ => u64::MAX,
-    }
-}
-
 // What the job owes one device: the bytes its members took and have not
 // written yet, and how much of that the device's ledger holds promised for
 // it. While the job waits for room on the device, nothing it owes there is
@@ -476,10 +466,7 @@ impl Spend {
         let ledger = self.bind(reader);
         self.settle();
         let need = bytes - self.slab;
-        let room = checked_room(&ledger, reader, reserve);
-        if need <= room {
-            let extra = SLAB_BYTES.min(room - need);
-            ledger.promise(need + extra);
+        if let Some(extra) = ledger.book(reader, reserve, need, SLAB_BYTES) {
             self.slab = extra;
             return;
         }
@@ -520,9 +507,7 @@ impl Spend {
         let ledger = self.bind(reader);
         self.settle();
         let need = bytes - self.in_hand;
-        let room = checked_room(&ledger, reader, reserve);
-        if need <= room {
-            ledger.promise(need);
+        if ledger.book(reader, reserve, need, 0).is_some() {
             self.slab = self.slab.saturating_add(need);
             self.in_hand = 0;
             return true;
@@ -579,8 +564,19 @@ impl Spend {
         let Some(ledger) = &self.ledger else {
             return;
         };
-        if self.waiting.take().is_some() {
+        if self.waiting.is_some() {
             ledger.promise(self.needed());
+            self.rebooked();
+        }
+    }
+
+    // The job has room again, and all it owes was promised by the wake that
+    // judged it: what it holds says so, and it no longer waits.
+    fn rebooked(&mut self) {
+        let Some(ledger) = &self.ledger else {
+            return;
+        };
+        if self.waiting.take().is_some() {
             self.slab = self
                 .slab
                 .saturating_add(self.wanted)
@@ -1056,42 +1052,28 @@ impl Caps {
         }
         let reserve = self.limits.min_free_bytes;
         let readers = [output, working];
-        let mut rooms = [None::<(Arc<DiskLedger>, Option<u64>)>, None];
-        let mut good = true;
+        let mut ledgers = Vec::with_capacity(2);
         for (index, spend) in self.spend.iter_mut().enumerate() {
             if spend.waiting.is_none() {
                 continue;
             }
             let ledger = spend.bind(readers[index]);
             spend.settle();
-            let room = match ledger.free_with(|| readers[index].current()) {
-                None => None,
-                Some(free) if free.stale => {
-                    good = false;
-                    Some(0)
-                }
-                Some(free) => Some(free.bytes.saturating_sub(reserve)),
-            };
-            // A disk at or under its reserve wakes no one, though the job
-            // owes it nothing: what it writes next would not fit.
-            good &= room != Some(0);
-            rooms[index] = Some((ledger, room));
+            ledgers.push((index, ledger));
         }
-        let need = |index: usize| self.spend[index].needed();
-        let fits = match (&rooms[0], &rooms[1]) {
-            (Some((one, room)), Some((other, _))) if one.same_disk(other) => {
-                room.is_none_or(|room| need(0).saturating_add(need(1)) <= room)
-            }
-            _ => rooms.iter().enumerate().all(|(index, room)| {
-                room.as_ref()
-                    .is_none_or(|(_, room)| room.is_none_or(|room| need(index) <= room))
-            }),
-        };
-        if !good || !fits {
+        // Judged and promised by the one wake judgement every ledger
+        // waiter wakes by: a disk at or under its reserve wakes no one,
+        // though the job owes it nothing, since what it writes next would
+        // not fit; one filesystem under both is judged once, for both.
+        let parts: Vec<(&DiskLedger, &CapacityReader, u64)> = ledgers
+            .iter()
+            .map(|(index, ledger)| (&**ledger, readers[*index], self.spend[*index].needed()))
+            .collect();
+        if !DiskLedger::book_wake(&parts, reserve) {
             return false;
         }
         for spend in &mut self.spend {
-            spend.rebook();
+            spend.rebooked();
         }
         true
     }
