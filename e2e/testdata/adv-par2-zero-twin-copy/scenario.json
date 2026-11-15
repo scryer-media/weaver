@@ -9,12 +9,12 @@
     "outcome": "success",
     "minOutputFiles": 2,
     "requiredOutputs": [
-      "hollow.mkv",
+      "Hollow.Twin.Copy.mkv",
       "seed.mkv"
     ]
   },
   "expectedOutputBLAKE3": {
-    "hollow.mkv": "e66d34ca5a36dfa692903a66d66fd1d9c87bd553c32fbf7d3960542f4cda3257",
+    "Hollow.Twin.Copy.mkv": "e66d34ca5a36dfa692903a66d66fd1d9c87bd553c32fbf7d3960542f4cda3257",
     "seed.mkv": "b6fb73fc46938c981e2b0b4b1ef282adcfc89854d01bfe3972fdc4785b41b2c7"
   }
 }

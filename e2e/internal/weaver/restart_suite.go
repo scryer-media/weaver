@@ -299,7 +299,7 @@ func restartCases() []restartCase {
 		},
 		{
 			Name:        "credentials_refused_mid_job_settles",
-			Description: "The only server refuses the account mid-job; the queued articles are retired in one sweep and the job settles",
+			Description: "The only server refuses the account mid-job; the job waits on that server with nothing booked missing, and completes once the login is taken again",
 			Slugs:       []string{"single-mkv"},
 			Timeout:     10 * time.Minute,
 			Run:         runCredentialsRefusedMidJobSettles,

@@ -284,9 +284,10 @@ impl Delivery {
     }
 
     // What was withheld, worded by why its object refused it: the names
-    // one reason withheld, then the reason, for each reason in the order
-    // the walk met it. A password withheld something, and the error opens
-    // with the marker integrations read a password failure by. `None` when
+    // one reason withheld, sorted so the words never follow the order the
+    // objects refused in, then the reason, for each reason in the order the
+    // walk met it. A password withheld something, and the error opens with
+    // the marker integrations read a password failure by. `None` when
     // nothing was.
     pub(crate) fn withheld_error(&self) -> Option<String> {
         let marker = if self
@@ -305,6 +306,9 @@ impl Delivery {
                 Some((_, names)) => names.push(name),
                 None => reasons.push((reason, vec![name])),
             }
+        }
+        for (_, names) in &mut reasons {
+            names.sort_unstable();
         }
         (!reasons.is_empty()).then(|| {
             let reasons = reasons

@@ -3,9 +3,9 @@
 
 // A file cut into numbered pieces, the way a split 7z or a split stream is
 // posted: `name.001`, `name.002`, … The number is the name's last
-// extension, all digits. A piece's place counts from one: the split store
-// names `.001` its first piece, and `.10` or `.100` is never a first piece.
-// Case never matters.
+// extension, all digits. A piece's place counts from the set's first: the
+// split store names `.001` its first piece, or `.000` for a set numbered
+// from zero, and `.10` or `.100` is never a first piece. Case never matters.
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Piece {
@@ -20,6 +20,10 @@ impl Piece {
         (self.stem == first.stem)
             .then(|| self.number.checked_sub(first.number))
             .flatten()
+    }
+
+    pub(crate) fn number(&self) -> u32 {
+        self.number
     }
 
     // The piece of my set that carries `number`.

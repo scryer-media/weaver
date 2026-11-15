@@ -1054,8 +1054,12 @@ impl Object for RarStore {
 
     // A volume contributes to no member yet and can travel with all the
     // parse it owns. This is also the guard on a transfer the tree asks for.
+    // A volume tied to a held neighbour at the place it states stays
+    // with that neighbour: it is that set's, however its place was taken.
     fn carried(&self, volume: VolumeIndex) -> Option<&(dyn std::any::Any + Send + Sync)> {
-        if !self.unmapped.contains(&volume) {
+        if !self.unmapped.contains(&volume)
+            || (!self.giving.contains_key(&volume) && claim::tied(volume, &self.volumes))
+        {
             return None;
         }
         let held = self

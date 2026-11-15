@@ -305,12 +305,53 @@ fn move_path_with_safe_rename_or_copy_fallback(
     source_bytes: u64,
     phase_counters: Arc<PhaseCounters>,
 ) -> Result<(), (std::io::Error, std::io::Error)> {
+    move_path_through(None, src, dst, source_bytes, phase_counters)
+}
+
+// The writer of the volume a delivery lands on. Each rename into the
+// destination runs on that volume's thread, behind whatever else is queued
+// for the volume, and its own result comes back to the mover, which waits
+// for it on a thread of its own. A move that crosses devices is then
+// copied by the mover, never by the volume's thread.
+#[derive(Clone)]
+pub(crate) struct Renames(Arc<crate::operations::disk::writer::Submitter>);
+
+impl Renames {
+    pub(crate) fn through(to: Arc<crate::operations::disk::writer::Submitter>) -> Self {
+        Self(to)
+    }
+
+    fn rename(&self, src: &Path, dst: &Path) -> std::io::Result<()> {
+        let (answer, answered) = std::sync::mpsc::sync_channel(1);
+        let (from, to) = (src.to_path_buf(), dst.to_path_buf());
+        // The writer hears no failure: the mover judges the result, and a
+        // volume with no thread is none either.
+        self.0.ask(src.to_path_buf(), move || {
+            let _ = answer.send(rename_path_for_publication(&from, &to));
+        });
+        // A volume with no thread drops the rename unrun: it is made here.
+        answered
+            .recv()
+            .unwrap_or_else(|_| rename_path_for_publication(src, dst))
+    }
+}
+
+fn move_path_through(
+    renames: Option<&Renames>,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    source_bytes: u64,
+    phase_counters: Arc<PhaseCounters>,
+) -> Result<(), (std::io::Error, std::io::Error)> {
     move_path_with_safe_rename_or_copy_fallback_using(
         src,
         dst,
         source_bytes,
         phase_counters,
-        rename_path_for_publication,
+        |src, dst| match renames {
+            Some(renames) => renames.rename(src, dst),
+            None => rename_path_for_publication(src, dst),
+        },
         move_path_with_copy_fallback,
     )
 }
@@ -412,6 +453,7 @@ where
         let (from, to) = (entry.path(), working_dir.join(&name));
         let moved = if std::fs::symlink_metadata(&to).is_ok() {
             merge_delivered_dir(
+                None,
                 &from,
                 &to,
                 Arc::clone(&counters),
@@ -435,6 +477,7 @@ where
 // and gives way. A name whose copy finds no room now is added to
 // `cut_short`. Whether they were directories to join.
 fn merge_delivered_dir(
+    renames: Option<&Renames>,
     src: &std::path::Path,
     dst: &std::path::Path,
     phase_counters: Arc<PhaseCounters>,
@@ -459,7 +502,14 @@ fn merge_delivered_dir(
         let (from, to) = (entry.path(), dst.join(entry.file_name()));
         let retried = again.contains(&to);
         if !retried && std::fs::symlink_metadata(&to).is_ok() {
-            merge_delivered_dir(&from, &to, Arc::clone(&phase_counters), again, cut_short)?;
+            merge_delivered_dir(
+                renames,
+                &from,
+                &to,
+                Arc::clone(&phase_counters),
+                again,
+                cut_short,
+            )?;
             continue;
         }
         let bytes = std::fs::symlink_metadata(&from)
@@ -468,9 +518,9 @@ fn merge_delivered_dir(
             .map_or(0, |metadata| metadata.len());
         let counters = Arc::clone(&phase_counters);
         let moved = if retried {
-            move_delivered_entry(&from, &to, bytes, counters, true)
+            move_delivered_entry(renames, &from, &to, bytes, counters, true)
         } else {
-            move_path_with_safe_rename_or_copy_fallback(&from, &to, bytes, counters)
+            move_path_through(renames, &from, &to, bytes, counters)
         };
         moved.inspect_err(|(_, copy_err)| {
             if crate::operations::is_out_of_space(copy_err) {
@@ -525,6 +575,7 @@ async fn left_to_copy(src: &std::path::Path, copy_err: &std::io::Error) -> u64 {
 }
 
 fn move_delivered_entry(
+    renames: Option<&Renames>,
     src: &std::path::Path,
     dst: &std::path::Path,
     source_bytes: u64,
@@ -559,7 +610,7 @@ fn move_delivered_entry(
         && std::fs::symlink_metadata(dst).is_ok()
         && !runtime_fs::paths_equivalent_for_placement(src, dst);
     if !interrupted {
-        return move_path_with_safe_rename_or_copy_fallback(src, dst, source_bytes, phase_counters);
+        return move_path_through(renames, src, dst, source_bytes, phase_counters);
     }
     let not_cleared = |error: std::io::Error| {
         (
@@ -577,6 +628,7 @@ fn move_delivered_entry(
         for entry in std::fs::read_dir(src).map_err(not_cleared)? {
             let entry = entry.map_err(not_cleared)?;
             move_delivered_entry(
+                renames,
                 &entry.path(),
                 &dst.join(entry.file_name()),
                 0,
@@ -591,7 +643,7 @@ fn move_delivered_entry(
     } else {
         std::fs::remove_file(dst).map_err(not_cleared)?;
     }
-    move_path_with_safe_rename_or_copy_fallback(src, dst, source_bytes, phase_counters)
+    move_path_through(renames, src, dst, source_bytes, phase_counters)
 }
 
 async fn validate_script_move_destination(
@@ -751,6 +803,7 @@ async fn run_move_to_complete(
     naming: Option<DeliveryNamingPlan>,
     policy_source: DeliveryPolicySource,
     left_behind: HashSet<PathBuf>,
+    renames: Option<Renames>,
 ) -> Result<MoveToCompleteResult, MoveToCompleteFailure> {
     let claimed_dest = dest.clone();
     let result = run_move_to_claimed_destination(
@@ -762,6 +815,7 @@ async fn run_move_to_complete(
         naming,
         policy_source,
         left_behind,
+        renames,
     )
     .await;
     // A move that waits for room goes on into its claim, even an empty one.
@@ -789,6 +843,9 @@ async fn run_move_to_claimed_destination(
     // Consumed inputs that could not be removed: they stay in the working
     // directory and are neither scanned nor moved.
     left_behind: HashSet<PathBuf>,
+    // The writer of the destination's volume, which makes each rename into
+    // it. None for a move made where it is called.
+    renames: Option<Renames>,
 ) -> Result<MoveToCompleteResult, MoveToCompleteFailure> {
     // Whether the destination may already hold entries, and whether an
     // entry of the working directory replaces one of its name there: only
@@ -917,8 +974,16 @@ async fn run_move_to_claimed_destination(
             let src_fb = src.clone();
             let dst_fb = dst.clone();
             let counters = Arc::clone(&phase_counters);
+            let through = renames.clone();
             match crate::runtime::panic_trap::spawn_blocking(move || {
-                move_delivered_entry(&src_fb, &dst_fb, source_bytes, counters, resumed)
+                move_delivered_entry(
+                    through.as_ref(),
+                    &src_fb,
+                    &dst_fb,
+                    source_bytes,
+                    counters,
+                    resumed,
+                )
             })
             .await
             {
@@ -978,11 +1043,18 @@ async fn run_move_to_claimed_destination(
                 // keeps what it holds.
                 let counters = Arc::clone(&phase_counters);
                 let (src_fb, dst_fb) = (src.clone(), dst.clone());
+                let through = renames.clone();
                 let again = Arc::clone(&again);
                 let joined = crate::runtime::panic_trap::spawn_blocking(move || {
                     let mut cut_short = Vec::new();
-                    let joined =
-                        merge_delivered_dir(&src_fb, &dst_fb, counters, &again, &mut cut_short);
+                    let joined = merge_delivered_dir(
+                        through.as_ref(),
+                        &src_fb,
+                        &dst_fb,
+                        counters,
+                        &again,
+                        &mut cut_short,
+                    );
                     (joined, cut_short)
                 })
                 .await
@@ -1018,8 +1090,16 @@ async fn run_move_to_claimed_destination(
             let src_fb = src.clone();
             let dst_fb = dst.clone();
             let counters = Arc::clone(&phase_counters);
+            let through = renames.clone();
             match crate::runtime::panic_trap::spawn_blocking(move || {
-                move_delivered_entry(&src_fb, &dst_fb, source_bytes, counters, resumed)
+                move_delivered_entry(
+                    through.as_ref(),
+                    &src_fb,
+                    &dst_fb,
+                    source_bytes,
+                    counters,
+                    resumed,
+                )
             })
             .await
             {
@@ -1571,6 +1651,33 @@ impl Pipeline {
             .transpose()
             .map_err(str::to_owned)?
             .unwrap_or_default();
+        // Those closes, and every write before them, go through the volumes'
+        // writers. Nothing is removed or moved until the last of them has
+        // returned and none failed. The loop does not wait for that here:
+        // the delivery steps back, and starts again when the job's mail
+        // says the operations returned. One that failed says so in the
+        // same mail, after it returned: a refused name skips its member
+        // and the delivery is judged again, and anything else fails the
+        // job with its own error, once.
+        if let Some(barrier) = self
+            .graph_jobs
+            .get(&job_id)
+            .and_then(|graph| graph.disk_barrier())
+            && !barrier.passed_or_tell(job_id, &self.graph_runs.written())
+        {
+            self.moves_awaiting_disk.insert(job_id, barrier);
+            self.shared_state
+                .queue
+                .write(|inner| match inner.job_mut(job_id) {
+                    Some(mut row) => {
+                        row.report.moving = false;
+                        crate::pipeline::queue::Change::changed(())
+                    }
+                    None => crate::pipeline::queue::Change::unchanged(()),
+                });
+            return Ok(());
+        }
+        self.moves_awaiting_disk.remove(&job_id);
         #[cfg(test)]
         {
             let hook = BEFORE_SPENT_REMOVAL.lock().unwrap().take();
@@ -1997,6 +2104,10 @@ impl Pipeline {
             left_behind,
         } = final_move;
         let move_done_tx = self.move_done_tx.clone();
+        let (writers, capacity) = (
+            Arc::clone(&self.volume_writers),
+            Arc::clone(&self.storage_capacity),
+        );
         debug!(
             job_id = job_id.0,
             dest = %dest.display(),
@@ -2035,6 +2146,19 @@ impl Pipeline {
                 if let Some((db, context)) = script_validation {
                     validate_script_move_destination(db, context, &dest).await?;
                 }
+                // The destination's volume is found off the loop, and its
+                // writer makes the renames into it. With none found the
+                // mover makes them itself.
+                // The volume is asked by the directory the destination is
+                // made in, one of a few, so the volumes remember no path
+                // per job.
+                let landing = dest.parent().unwrap_or(&dest).to_path_buf();
+                let renames = crate::runtime::panic_trap::spawn_blocking(move || {
+                    let volume = capacity.read_volume(&landing);
+                    Renames::through(writers.submitter(&volume, job_id.0))
+                })
+                .await
+                .ok();
                 match into {
                     MoveInto::Claimed(dest) => {
                         run_move_to_complete(
@@ -2046,6 +2170,7 @@ impl Pipeline {
                             naming,
                             policy_source,
                             left_behind,
+                            renames,
                         )
                         .await
                     }
@@ -2059,6 +2184,7 @@ impl Pipeline {
                             naming,
                             policy_source,
                             left_behind,
+                            renames,
                         )
                         .await
                     }

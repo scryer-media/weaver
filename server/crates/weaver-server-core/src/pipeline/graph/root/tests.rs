@@ -143,6 +143,16 @@ pub(in crate::pipeline::graph) fn job_with(
     files: &[RootFile],
     wants: Vec<Seek>,
 ) -> (GraphJob, tempfile::TempDir, Arc<Mutex<Vec<Pull>>>) {
+    job_through(files, wants, |_| None)
+}
+
+// [`job_with`], its files written through what `disk` gives for the job's
+// directory, or by the job itself when it gives nothing.
+pub(in crate::pipeline::graph) fn job_through(
+    files: &[RootFile],
+    wants: Vec<Seek>,
+    disk: impl FnOnce(&std::path::Path) -> Option<crate::pipeline::graph::disk::JobDisk>,
+) -> (GraphJob, tempfile::TempDir, Arc<Mutex<Vec<Pull>>>) {
     let answers = Arc::new(Mutex::new(Vec::new()));
     let builder = Probes {
         wants,
@@ -160,7 +170,8 @@ pub(in crate::pipeline::graph) fn job_with(
         dir.path().to_path_buf(),
         accountant,
         CapacityReader::unknown(),
-    );
+    )
+    .writing_through(disk(dir.path()));
     let runs = Runs::new(
         1,
         1,

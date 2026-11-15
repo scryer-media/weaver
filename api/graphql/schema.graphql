@@ -1763,7 +1763,6 @@ type Metrics {
 	verifyActive: Int!
 	repairActive: Int!
 	extractActive: Int!
-	diskWriteLatencyUs: Int!
 	segmentsRetried: Int!
 	"""
 	Articles that downloaded but never decoded into place and were left
@@ -1788,6 +1787,12 @@ type Metrics {
 	recoveryQueueDepth: Int!
 	articlesPerSec: Float!
 	decodeRateMbps: Float!
+	"""
+	Once the time of the last disk write on the pipeline loop. The volume
+	writers write off the loop, so there is no such time: each volume's own
+	counters say what its disk took.
+	"""
+	diskWriteLatencyUs: Int! @deprecated(reason: "always 0 since the volume writers; removed in 0.17.0")
 	"""
 	Lifetime count of archive sets direct-store admitted. Together with
 	the two below this is the external answer to "did direct routing carry

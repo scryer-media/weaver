@@ -1319,6 +1319,9 @@ impl NntpConnection {
     pub async fn head_by_id(&mut self, message_id: &str) -> Result<MultiLineResponse> {
         let cmd = Command::Head(ArticleId::MessageId(message_id.to_string()));
         let result = self.send_multiline_command(&cmd).await;
+        if result.is_ok() {
+            self.note_answered();
+        }
         if result
             .as_ref()
             .err()
@@ -1353,7 +1356,10 @@ impl NntpConnection {
     // and pooled.
     fn classify_stat_response(&mut self, resp: &Response) -> Result<bool> {
         match resp.code.raw() {
-            223 => Ok(true),
+            223 => {
+                self.note_answered();
+                Ok(true)
+            }
             430 => Ok(false),
             code if crate::server_caps::is_command_unsupported(code) => {
                 if crate::server_caps::note_stat_unsupported(&self.host, self.port) {
@@ -1468,6 +1474,7 @@ impl NntpConnection {
             let resp = self.read_response().await?;
             match resp.code.raw() {
                 221 => {
+                    self.note_answered();
                     self.read_multiline_data().await?;
                     results.push(true);
                 }
@@ -1582,7 +1589,7 @@ impl NntpConnection {
             self.abort_active_body();
             return Err(NntpError::unexpected(initial.code, &initial.message));
         }
-        self.note_body_answered();
+        self.note_answered();
 
         self.codec.set_streaming_multiline(true);
         self.codec.set_raw_multiline(raw);
@@ -1820,7 +1827,7 @@ impl NntpConnection {
                 return Err(error);
             }
         };
-        self.note_body_answered();
+        self.note_answered();
         decoder.set_profile_cpu(profile_cpu);
         decoder.set_checkpoint_plan(self.checkpoint_plan.clone());
         let mut read_calls = 0u64;
@@ -2140,12 +2147,26 @@ impl NntpConnection {
                 .is_none_or(NntpTransport::idle_terminal)
     }
 
-    // The BODY was answered with its 2xx status line. See
+    // The demanded command was answered with its 2xx status line. See
     // [`crate::recovery::ConnectionHealth::answered`].
-    fn note_body_answered(&self) {
+    fn note_answered(&self) {
         if let Some(lease) = &self.health_lease {
             lease.0.answered();
         }
+    }
+
+    // See [`crate::recovery::ConnectionHealth::may_rest_idle`].
+    pub(crate) fn may_rest_idle(&self) -> bool {
+        self.health_lease
+            .as_ref()
+            .is_none_or(|lease| lease.0.may_rest_idle())
+    }
+
+    // Whether this connection is its server's unanswered recovery probe.
+    pub(crate) fn holds_recovery_probe(&self) -> bool {
+        self.health_lease
+            .as_ref()
+            .is_some_and(|lease| lease.0.probing())
     }
 
     pub(crate) fn accepts_new_work(&self) -> bool {

@@ -359,7 +359,6 @@ const MonitoringStrip = memo(function MonitoringStrip({
         value={buffered.value}
         unit={t("next.monitoring.buffered", { unit: buffered.unit })}
         valueClassName={(metrics?.writeBufferedBytes ?? 0) > 0 ? "text-wv-warn" : undefined}
-        note={`p99 ${formatLatency((metrics?.diskWriteLatencyUs ?? 0) / 1000)}`}
       />
     </div>
   );

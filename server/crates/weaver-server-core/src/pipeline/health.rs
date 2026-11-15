@@ -117,13 +117,17 @@ impl Pipeline {
         self.pipeline_failure_stages
             .entry(job_id)
             .or_insert(failure_stage);
-        self.cancel_graph_checkpoint_retries(job_id);
-        if self
+        self.give_up_failed_graph_checkpoints(job_id);
+        let live = self
             .graph_jobs
             .get(&job_id)
-            .is_some_and(|graph| graph.awaits_mail())
-        {
+            .is_some_and(|graph| graph.holds_retirement());
+        if live {
             self.retire_graph_job(job_id);
+        }
+        // A job stopped earlier whose graph is still kept, for its mail or
+        // for a volume's writer, fails when that retirement ends too.
+        if live || self.retiring_graph_jobs.contains_key(&job_id) {
             self.transition_postprocessing_status(
                 job_id,
                 JobStatus::Failed {
@@ -313,10 +317,13 @@ impl Pipeline {
         // refused, so the graph is the last holder of its files: it lets go
         // of every one before any is removed. A file unlinked while open
         // stays behind on an NFS or FUSE share, and the directory never
-        // empties.
-        if let Some(graph) = self.graph_jobs.get_mut(&job_id) {
+        // empties. A handle the graph lets go of is dropped by its volume's
+        // writer, so nothing is removed before the writer has returned the
+        // job's last operation.
+        let returned = self.graph_jobs.get_mut(&job_id).and_then(|graph| {
             graph.release_handles();
-        }
+            graph.disk().map(|disk| disk.barrier().returned_later())
+        });
         #[cfg(test)]
         {
             let hook = BEFORE_FAILED_RELEASE.lock().unwrap().take();
@@ -328,6 +335,9 @@ impl Pipeline {
         let done = self.failed_release_tx.clone();
         self.releasing_failed_jobs.insert(job_id);
         tokio::spawn(async move {
+            if let Some(returned) = returned {
+                returned.await;
+            }
             let dir = working_dir.clone();
             let released = tokio::task::spawn_blocking(move || {
                 crate::pipeline::completion::finalize::release_failed_delivery(

@@ -8,6 +8,7 @@ mod owner;
 mod placement;
 mod recovery_contracts;
 mod settle;
+mod stray;
 pub(crate) mod writer;
 
 use std::io::Cursor;

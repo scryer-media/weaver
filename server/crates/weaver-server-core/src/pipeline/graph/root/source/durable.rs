@@ -154,8 +154,25 @@ impl ArticleMap {
 
     // The post's encoded bytes of the articles `settled` names: what a
     // checkpoint taken now spares a restore fetching again.
+    #[cfg(test)]
     pub(crate) fn settled_bytes(&self) -> u64 {
         self.volumes.iter().map(|volume| volume.settled_bytes).sum()
+    }
+
+    // The decoded bytes of the articles in hand, in every volume: the units
+    // a run counts its downloaded bytes in, and the figure a restore takes
+    // as its floor (`arrived_bytes`). Each article counts once, whatever
+    // copies of it arrived. Kept as articles change state, so reading it
+    // walks nothing: the restart lead gate reads it for each article it
+    // admits.
+    pub(crate) fn in_hand_bytes(&self) -> u64 {
+        self.open.in_hand
+    }
+
+    // Count `bytes` more in hand, as articles a test does not model would.
+    #[cfg(test)]
+    pub(crate) fn add_in_hand_for_test(&mut self, bytes: u64) {
+        self.open.in_hand += bytes;
     }
 
     fn each(&self, mut keep: impl FnMut(State) -> bool) -> Vec<(VolumeIndex, u32)> {

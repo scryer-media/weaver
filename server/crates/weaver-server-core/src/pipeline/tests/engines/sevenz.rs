@@ -112,6 +112,20 @@ async fn a_stored_7z_split_into_three_volumes_delivers_its_members() {
     assert_fetched_once(&graph);
 }
 
+// The same split numbered from zero, `.7z.000` onward, is one set and
+// delivers the same members.
+#[tokio::test]
+async fn a_stored_7z_split_numbered_from_zero_delivers_its_members() {
+    let posts = split(&stored(None), 3)
+        .into_iter()
+        .zip(0..)
+        .map(|(post, number)| Post::plain(&format!("lantern.7z.{number:03}"), post.bytes))
+        .collect();
+    let graph = run(&Scenario::new(posts)).await;
+    assert_members(&graph);
+    assert_fetched_once(&graph);
+}
+
 // `lantern.7z.001` and `.002`: the numbered names found the joiner, which
 // writes both pieces into one file, and the 7z store founds beneath that
 // file and reads it as the one file it is. The members come out of it whole.

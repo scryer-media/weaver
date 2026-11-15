@@ -133,8 +133,10 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
 
     // Fixed units and dual-emitted renames.
     assert!(rendered.contains("weaver_pipeline_download_pressure_stall_seconds_total 1.5"));
-    assert!(rendered.contains("weaver_pipeline_disk_write_latency_microseconds 16"));
-    assert!(rendered.contains("weaver_pipeline_disk_write_latency_seconds 0.000016"));
+    // The old loop-side write timings are gone: each volume's own rows say
+    // what its disk took.
+    assert!(!rendered.contains("weaver_pipeline_disk_write_latency"));
+    assert!(!rendered.contains("weaver_pipeline_disk_write_duration"));
     assert!(rendered.contains("weaver_pipeline_download_lanes 3"));
     assert!(rendered.contains("weaver_pipeline_decode_rate_mebibytes_per_second 23.5"));
     assert!(rendered.contains("weaver_pipeline_decode_rate_bytes_per_second 24641536"));
@@ -256,6 +258,8 @@ fn renders_prometheus_download_observed_limiter_states() {
         download_lane_refill_parked_total: 0,
         download_lane_refill_deferred_total: 0,
         download_lane_refill_saturated_total: 0,
+        download_lane_room_held_total: 0,
+        download_lane_room_woken_total: 0,
         download_pipeline_trial_success_total: 0,
         download_pipeline_trial_failure_total: 0,
         download_pipeline_proof_pass_total: 0,
@@ -269,7 +273,6 @@ fn renders_prometheus_download_observed_limiter_states() {
         verify_active: 0,
         repair_active: 0,
         extract_active: 0,
-        disk_write_latency_us: 0,
         segments_retried: 0,
         segments_failed_permanent: 0,
         parked_infrastructure_work: 0,
@@ -585,6 +588,12 @@ fn rendered_label_sets_cover_every_snapshot_counter() {
     );
     assert_label_set(
         &rendered,
+        "weaver_pipeline_download_lane_room_waits_total",
+        "event",
+        &["held", "woken"],
+    );
+    assert_label_set(
+        &rendered,
         "weaver_pipeline_download_scheduler_handouts_total",
         "kind",
         &["hot", "spill", "probe"],
@@ -603,6 +612,7 @@ fn rendered_label_sets_cover_every_snapshot_counter() {
             "uu_cursor",
             "checkpoint",
             "activation",
+            "write_buffer",
         ],
     );
     assert_label_set(
@@ -825,7 +835,7 @@ fn renders_collected_instrumentation_snapshots() {
         "weaver_server_article_latency_seconds",
         "weaver_job_duration_seconds",
         "weaver_job_stage_duration_seconds",
-        "weaver_pipeline_disk_write_duration_seconds",
+        "weaver_pipeline_turn_duration_seconds",
         "weaver_pipeline_decode_task_duration_seconds",
         "weaver_pipeline_extract_member_duration_seconds",
         "weaver_db_op_duration_seconds",
@@ -925,6 +935,93 @@ fn renders_collected_instrumentation_snapshots() {
         "weaver_disk_available_bytes{role=\"complete\",path=\"/var/lib/weaver/complete\"} 50000"
     ));
 
+    // Volumes: a measured one carries its rate, an unmeasured one does not.
+    assert!(rendered.contains("weaver_volume_written_bytes_total{volume=\"/mnt/nas\"} 8000000"));
+    assert!(rendered.contains("weaver_volume_write_seconds_total{volume=\"/mnt/nas\"} 2.5"));
+    assert!(
+        rendered.contains("weaver_volume_write_rate_bytes_per_second{volume=\"/mnt/nas\"} 3200000")
+    );
+    assert!(rendered.contains("weaver_volume_buffered_bytes{volume=\"/mnt/nas\"} 65536"));
+    assert!(rendered.contains("weaver_volume_arrived_bytes{volume=\"/mnt/nas\"} 4096"));
+    assert!(rendered.contains("weaver_volume_counted_bytes{volume=\"/mnt/nas\"} 69632"));
+    assert!(rendered.contains("weaver_volume_counted_peak_bytes{volume=\"/mnt/nas\"} 900000"));
+    // A sized volume carries its limits; one not sized yet carries neither.
+    assert!(rendered.contains("weaver_volume_buffer_limit_bytes{volume=\"/mnt/nas\"} 1000000"));
+    assert!(rendered.contains("weaver_volume_buffer_soft_limit_bytes{volume=\"/mnt/nas\"} 700000"));
+    assert!(!rendered.contains("weaver_volume_buffer_limit_bytes{volume=\"/mnt/scratch\"}"));
+    assert!(!rendered.contains("weaver_volume_buffer_soft_limit_bytes{volume=\"/mnt/scratch\"}"));
+    assert!(rendered.contains("weaver_volume_write_calls_total{volume=\"/mnt/nas\"} 120"));
+    assert!(rendered.contains("weaver_volume_write_seeks_total{volume=\"/mnt/nas\"} 9"));
+    assert!(rendered.contains("weaver_volume_write_seeks_total{volume=\"/mnt/scratch\"} 0"));
+    for (row, value) in [
+        ("weaver_volume_writer_batches_total", "40"),
+        ("weaver_volume_writer_operations_total", "130"),
+        ("weaver_volume_writer_failed_operations_total", "2"),
+        ("weaver_volume_writer_abandoned_operations_total", "5"),
+        ("weaver_volume_writer_threads_total", "1"),
+        ("weaver_volume_writer_woken_total", "4"),
+        ("weaver_volume_loop_reads_total", "6"),
+        ("weaver_volume_loop_read_seconds_total", "0.75"),
+        ("weaver_volume_aside_waits_total", "4"),
+        ("weaver_volume_aside_wait_seconds_total", "2"),
+        ("weaver_volume_writer_opens_total", "11"),
+        ("weaver_volume_writer_open_seconds_total", "0.5"),
+        ("weaver_volume_writer_open_creates_total", "11"),
+        ("weaver_volume_writer_open_create_seconds_total", "0.25"),
+        ("weaver_volume_writer_open_sparse_marks_total", "10"),
+        (
+            "weaver_volume_writer_open_sparse_mark_seconds_total",
+            "0.125",
+        ),
+        ("weaver_volume_writer_open_length_sets_total", "4"),
+        (
+            "weaver_volume_writer_open_length_set_seconds_total",
+            "0.075",
+        ),
+        ("weaver_volume_writer_length_sets_total", "3"),
+        ("weaver_volume_writer_length_set_seconds_total", "1.25"),
+        ("weaver_volume_writer_length_sets_skipped_total", "8"),
+        ("weaver_volume_writer_closes_total", "10"),
+        ("weaver_volume_writer_close_seconds_total", "0.25"),
+    ] {
+        let line = format!("{row}{{volume=\"/mnt/nas\"}} {value}");
+        assert!(rendered.contains(&line), "{line}");
+    }
+    // The loop's waits on a volume, by what it waited for.
+    for (kind, waits, seconds) in [
+        ("read", "1", "0.25"),
+        ("settle", "2", "1.25"),
+        ("budget", "0", "0"),
+    ] {
+        let line = format!(
+            "weaver_volume_loop_waits_total{{volume=\"/mnt/nas\",kind=\"{kind}\"}} {waits}"
+        );
+        assert!(rendered.contains(&line), "{line}");
+        let line = format!(
+            "weaver_volume_loop_wait_seconds_total{{volume=\"/mnt/nas\",kind=\"{kind}\"}} {seconds}"
+        );
+        assert!(rendered.contains(&line), "{line}");
+    }
+    assert!(
+        rendered
+            .contains("weaver_volume_loop_waits_total{volume=\"/mnt/scratch\",kind=\"settle\"} 0")
+    );
+    assert!(rendered.contains("weaver_volume_written_bytes_total{volume=\"/mnt/scratch\"} 0"));
+    assert!(
+        !rendered.contains("weaver_volume_write_rate_bytes_per_second{volume=\"/mnt/scratch\"}")
+    );
+    // What is being written now sits beside what the volume takes, and is
+    // absent for a volume nothing is written to.
+    assert!(
+        rendered.contains(
+            "weaver_volume_write_throughput_bytes_per_second{volume=\"/mnt/nas\"} 1100000"
+        )
+    );
+    assert!(
+        !rendered
+            .contains("weaver_volume_write_throughput_bytes_per_second{volume=\"/mnt/scratch\"}")
+    );
+
     // HTTP.
     assert!(rendered.contains(
         "weaver_http_requests_total{route=\"/graphql\",method=\"POST\",status=\"200\"} 42"
@@ -953,7 +1050,7 @@ fn absent_instrumentation_omits_its_families() {
         "weaver_server_article_latency_seconds",
         "weaver_jobs_submitted_total",
         "weaver_job_duration_seconds",
-        "weaver_pipeline_disk_write_duration_seconds",
+        "weaver_pipeline_turn_duration_seconds",
         "weaver_db_runtime_info",
         "weaver_db_wal_checkpoint_passes_total",
         "weaver_db_wal_bytes",
@@ -961,6 +1058,7 @@ fn absent_instrumentation_omits_its_families() {
         "process_cpu_seconds_total",
         "process_start_time_seconds",
         "weaver_disk_total_bytes",
+        "weaver_volume_written_bytes_total",
         "weaver_http_requests_total",
     ] {
         assert!(!bare.contains(family), "{family} should be absent");
@@ -969,7 +1067,6 @@ fn absent_instrumentation_omits_its_families() {
     // Pipeline histograms present, but the two optional stages unmeasured.
     let pipeline = instr::PipelineHistogramsSnapshot {
         turn_duration: sample_histogram(),
-        disk_write_duration: sample_histogram(),
         decode_task_duration: None,
         extract_member_duration: None,
     };
@@ -982,7 +1079,7 @@ fn absent_instrumentation_omits_its_families() {
     let partial = metrics::render_prometheus_metrics_input(&input);
     assert_valid_prometheus_exposition(&partial);
 
-    assert!(partial.contains("weaver_pipeline_disk_write_duration_seconds_bucket"));
+    assert!(partial.contains("weaver_pipeline_turn_duration_seconds_bucket"));
     assert!(!partial.contains("weaver_pipeline_decode_task_duration_seconds"));
     assert!(!partial.contains("weaver_pipeline_extract_member_duration_seconds"));
 

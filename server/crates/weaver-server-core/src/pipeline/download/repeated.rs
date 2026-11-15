@@ -525,15 +525,16 @@ impl Pipeline {
                 let article_excludes = work.exclude_servers.union(lease.effective_exclude_servers);
                 let excludes = article_excludes.union(lease.dial_exclude_servers);
                 let guard_state = state.clone();
-                let guard_pool = Arc::clone(nntp.pool());
                 let guard_excludes = article_excludes;
                 let job_id = lease.job_id;
                 let generation = lease.runtime_generation;
                 let estimate = Pipeline::bandwidth_reservation_estimate(work.byte_estimate);
-                let guarded = nntp.with_work_guard(move |server| {
+                // Judged by the view of the policy the client hands it: see
+                // `weaver_nntp::client::WorkGuard`.
+                let guarded = nntp.with_work_guard(move |server, policy| {
                     super::owned_lane::job_work_is_current(&guard_state, job_id, generation)
                         && matches!(
-                            guard_pool.provider_policy().eligibility(
+                            policy.eligibility(
                                 server.0,
                                 guard_excludes,
                                 weaver_nntp::ServerSet::EMPTY,

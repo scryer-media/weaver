@@ -256,6 +256,8 @@ impl PrometheusMetricsExporter {
         let speed_tests = weaver_server_core::speed_test::speed_test_metrics_snapshot();
         // The samplers' last readings: a scrape never stats a filesystem, so a
         // slow mount cannot hold it.
+        // Each volume's write counters where they stand: atomic reads.
+        let volumes = disk_space.volume_snapshots();
         let disk_space = disk_space.snapshots();
 
         let server_metrics = self.handle.server_metrics_snapshot();
@@ -304,6 +306,7 @@ impl PrometheusMetricsExporter {
         input.wal_checkpoint = wal_checkpoint.as_ref();
         input.process = Some(&process);
         input.disk_space = &disk_space;
+        input.volumes = &volumes;
         input.http_metrics = Some(&http_metrics);
         render::render_prometheus_metrics_input(&input)
     }

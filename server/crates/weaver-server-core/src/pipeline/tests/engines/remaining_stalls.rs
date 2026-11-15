@@ -190,7 +190,7 @@ fn full_state(pipeline: &Pipeline) -> String {
         text.push_str(&format!("\nsettled_articles={settled:?}"));
         text.push_str(&format!("\nphase={:?} awaits_mail={} repair_out={} moves_waiting={} awaited={} checkpoint_stamp={} settled_bytes={} tally={:?} runs_live={} runs_inflight={} recovery={:?}",
             job.phase(), job.awaits_mail(), job.repair_out(), job.moves_waiting(), job.awaited(),
-            job.pending().stamp(), job.pending().settled_bytes(), job.pending().tally(),
+            job.pending().stamp(), job.pending().in_hand_bytes(), job.pending().tally(),
             job.runs().live(), job.runs().in_flight(), job.recovery_summary()));
         for node in std::iter::once(NodeId::ROOT).chain(job.tree().live()) {
             if let Some(namespace) = job.tree().namespace(node) {

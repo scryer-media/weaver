@@ -64,6 +64,7 @@ impl Pipeline {
         self.owned_download_lane_pool
             .resize(total_connections.max(1));
         self.tuner.set_connection_limit(total_connections);
+        self.size_volume_buffers();
         // Dispatch on the new pool only once the old one has let
         // go of its sockets. The provider counts both generations
         // against one allowance, so dialling into the overlap is
@@ -168,22 +169,26 @@ impl Pipeline {
         job_id: JobId,
         working_dir: &std::path::Path,
         staging_dir: Option<&std::path::Path>,
-    ) -> Result<(), crate::StateError> {
+    ) -> Result<bool, crate::StateError> {
         // Deletion scripts still need this cwd after archival. A cancelled
         // queue run must also leave its process group before files disappear.
         crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0).await?;
+        // Whether every folder is gone.
+        let mut removed = true;
         if let Err(error) = tokio::fs::remove_dir_all(working_dir).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
+            removed = false;
             tracing::warn!(dir = %working_dir.display(), %error, "failed to clean up cancelled job directory");
         }
         if let Some(staging) = staging_dir
             && let Err(error) = tokio::fs::remove_dir_all(staging).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
+            removed = false;
             tracing::warn!(dir = %staging.display(), %error, "failed to clean up cancelled job staging directory");
         }
-        Ok(())
+        Ok(removed)
     }
 
     // The pool replaced by generation `generation` has drained its sockets,
@@ -431,13 +436,23 @@ impl Pipeline {
             let cleanup_db = self.db.clone();
             let queue = queue.clone();
             tokio::spawn(async move {
-                Self::cleanup_cancelled_job(cleanup_db, &queue, cleanup).await;
+                // A move of the job's folder that is still out ends first:
+                // the folder has one remover at a time.
+                queue.wait_for_moves(job_id).await;
+                let removed = Self::cleanup_cancelled_job(cleanup_db, &queue, cleanup).await;
                 queue.write(|inner| {
                     inner
                         .pending_cleanup
                         .done(job_id, crate::pipeline::queue::CleanupHolder::Folders);
                     crate::pipeline::queue::Change::changed(())
                 });
+                // Said once per cancelled job, whether its folders went or
+                // one stayed, so a wait on the job's cleanup always ends.
+                if removed {
+                    info!(job_id = job_id.0, "cancelled job folders released");
+                } else {
+                    tracing::warn!(job_id = job_id.0, "cancelled job folders retained");
+                }
             });
         }
     }
@@ -715,7 +730,7 @@ impl Pipeline {
         db: crate::Database,
         queue: &crate::pipeline::queue::Queue,
         cleanup: CancelledJobCleanup,
-    ) {
+    ) -> bool {
         let job_id = cleanup.job_id;
         // Let a cancelled post-processing script leave its
         // process group before its working directory is
@@ -724,7 +739,7 @@ impl Pipeline {
         if let Some(mut post_processing_done) = cleanup.post_processing_done {
             while post_processing_done.changed().await.is_ok() {}
         }
-        if let Err(error) = Self::cleanup_cancelled_job_directories(
+        let mut removed = match Self::cleanup_cancelled_job_directories(
             &db,
             job_id,
             &cleanup.working_dir,
@@ -732,9 +747,12 @@ impl Pipeline {
         )
         .await
         {
-            tracing::warn!(job_id = job_id.0, %error, "retaining cancelled job directory while queue scripts are unresolved");
-            return;
-        }
+            Ok(removed) => removed,
+            Err(error) => {
+                tracing::warn!(job_id = job_id.0, %error, "retaining cancelled job directory while queue scripts are unresolved");
+                return false;
+            }
+        };
         // A staging folder a disowned read made, which the job never named.
         queue.remove_job_staging(job_id).await;
         let own = !cleanup.destination_unruled || {
@@ -747,7 +765,9 @@ impl Pipeline {
             && let Err(error) = tokio::fs::remove_dir_all(&destination).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
+            removed = false;
             tracing::warn!(dir = %destination.display(), %error, "failed to clean up the part-filled destination of a cancelled job");
         }
+        removed
     }
 }
