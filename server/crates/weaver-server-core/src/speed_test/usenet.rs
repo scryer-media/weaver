@@ -305,18 +305,26 @@ impl Worker {
         trace.result
     }
 
-    // Dial a connection for `groups`. A refusal the download lanes would
-    // hand back to the scheduler (a seat or the server's one recovery probe
-    // held elsewhere) is asked again when the server's health changes, and
-    // every short while for one no change clears, until the run stops or
-    // `DIAL_WAIT` has passed; the async acquire it replaces waited as long.
+    // Dial a connection for `groups`, waiting out a refusal the download
+    // lanes would hand back to the scheduler, as their scheduler does: a
+    // lost selection race is asked again at once; a seat or the server's
+    // one recovery probe held elsewhere is asked again when the server's
+    // health changes, or at the instant its hold lapses by itself, the two
+    // wakes the pipeline's dispatch waits on. All of it within `DIAL_WAIT`
+    // of the first ask, one deadline, and never past the run's stop; the
+    // async acquire it replaces waited as long.
     fn dial(
         &self,
         groups: &[String],
     ) -> Result<BlockingBodyLane, BlockingBodyLaneAcquireError> {
-        let mut changes = self.client.pool().server_health_changes();
-        let started = std::time::Instant::now();
+        let pool = self.client.pool();
+        let mut changes = pool.server_health_changes();
+        let give_up = std::time::Instant::now() + DIAL_WAIT;
         loop {
+            // Read before the ask as well as after it: a hold that lapses
+            // between the refusal and the read after it leaves the read
+            // empty, and the wait would hear nothing.
+            let held_until = pool.next_connection_hold_deadline();
             let dialled = acquire_owned_lane_through_contention(
                 || !self.stop.is_stopped(),
                 || {
@@ -324,31 +332,38 @@ impl Worker {
                         .try_acquire_blocking_body_lane(groups, ServerSet::EMPTY)
                 },
             );
-            match dialled {
+            let error = match dialled {
                 Err(error)
                     if error.should_requeue_owned_work()
                         && !self.stop.is_stopped()
-                        && started.elapsed() < DIAL_WAIT =>
+                        && std::time::Instant::now() < give_up =>
                 {
-                    let mut stop = self.stop.clone();
-                    self.runtime.block_on(async {
-                        tokio::select! {
-                            _ = changes.changed() => {}
-                            _ = stop.stopped() => {}
-                            _ = tokio::time::sleep(DIAL_REASK) => {}
-                        }
-                    });
+                    error
                 }
                 outcome => return outcome,
+            };
+            if matches!(error, BlockingBodyLaneAcquireError::SelectionContended) {
+                continue;
             }
+            let wake = held_until
+                .into_iter()
+                .chain(pool.next_connection_hold_deadline())
+                .min()
+                .map_or(give_up, |at| at.min(give_up));
+            let mut stop = self.stop.clone();
+            self.runtime.block_on(async {
+                tokio::select! {
+                    _ = changes.changed() => {}
+                    _ = stop.stopped() => {}
+                    _ = tokio::time::sleep_until(wake.into()) => {}
+                }
+            });
         }
     }
 }
 
-// How long a dial refused for capacity keeps asking, and how often it asks
-// when nothing it can hear changes.
+// How long a dial refused for capacity keeps asking.
 const DIAL_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
-const DIAL_REASK: std::time::Duration = std::time::Duration::from_millis(100);
 
 // What a failed dial reports for the article it was for. A refused login is
 // told as one, whichever code the server refused it with.
