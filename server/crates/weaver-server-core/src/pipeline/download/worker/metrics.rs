@@ -123,6 +123,13 @@ impl Pipeline {
                 waits.insert(job_id, now);
                 continue;
             }
+            // A job held by a volume at its hard limit waits on the disk,
+            // which has no deadline either: a slow or hung disk restarts
+            // the clock and never has the job's articles called unservable.
+            if self.volume_holds_budget(job_id) {
+                waits.insert(job_id, now);
+                continue;
+            }
             let job_wait = [
                 self.propagation_ready_at
                     .get(&job_id)
@@ -534,9 +541,11 @@ impl Pipeline {
             self.last_download_dispatch_stall_log_at = None;
             return;
         }
-        // One job ending and the next starting leaves work queued and nothing
-        // in flight for a moment. Only a condition that has held for a whole
-        // interval is reported.
+        // A pass that opens nothing is ordinary for a moment: right after a
+        // job is added or a restart installs its jobs, before the volume it
+        // writes to is sized, and between one job's or lane's end and the
+        // next. Only a condition that has held for a whole interval is
+        // reported.
         let since = *self.download_dispatch_liveness_since.get_or_insert(now);
         if now.saturating_duration_since(since) < DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL {
             return;
@@ -560,13 +569,41 @@ impl Pipeline {
             .unwrap_or_default();
         let stall_recovery = self.download_stall_recovery;
         let servers_available = self.dispatchable_server_count();
-        if let Some(job_id) = self.job_order.iter().copied().find(|job_id| {
-            self.nzb_admitted.contains(job_id)
-                && self
+        // A job its volume holds at the hard limit waits on the disk: that
+        // is the buffer doing its work, not a stall. The warning is for the first dispatchable job that is
+        // not so held; when every one is, the wait is said plainly once.
+        let mut held_on_disk = None;
+        let unheld = self.job_order.iter().copied().find(|job_id| {
+            if !self.nzb_admitted.contains(job_id)
+                || !self
                     .jobs
                     .get(job_id)
                     .is_some_and(Self::has_dispatchable_work)
-        }) {
+            {
+                return false;
+            }
+            let held = self
+                .volume_holds_budget(*job_id)
+                .then_some("the job's volume holds its buffer limit");
+            if let Some(reason) = held {
+                held_on_disk.get_or_insert((*job_id, reason));
+                return false;
+            }
+            true
+        });
+        if unheld.is_none()
+            && let Some((job_id, reason)) = held_on_disk
+        {
+            info!(
+                job_id = job_id.0,
+                dispatchable_queue_depth,
+                stalled_ms = now.saturating_duration_since(since).as_millis() as u64,
+                reason,
+                "download dispatch waits on the disk"
+            );
+            return;
+        }
+        if let Some(job_id) = unheld {
             let state = self
                 .jobs
                 .get(&job_id)

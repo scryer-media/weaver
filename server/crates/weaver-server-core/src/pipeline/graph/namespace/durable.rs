@@ -248,7 +248,8 @@ impl NamespaceWriter {
             if named > 0 {
                 self.files_mut(node).holds.keep_scratch_to(named);
             }
-            let scratch = Leaf::found(&self.working_dir, &scratch_name(node))?;
+            let scratch = Leaf::found(&self.working_dir, &scratch_name(node))?
+                .through(self.disk_under(&self.working_dir).as_ref());
             let written = scratch.len().unwrap_or(0);
             // The file's bytes are already on disk, so the disk reserve
             // judges them against the space they would leave if absent.
@@ -355,7 +356,8 @@ impl NamespaceWriter {
         {
             return Ok(());
         }
-        let spill = Leaf::found(&self.working_dir, &super::spill_name(node, member))?;
+        let spill = Leaf::found(&self.working_dir, &super::spill_name(node, member))?
+            .through(self.disk_under(&self.working_dir).as_ref());
         self.files_mut(node).spills.insert(member, spill);
         Ok(())
     }

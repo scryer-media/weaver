@@ -154,46 +154,55 @@ fn jwt_secret_decode_rejects_malformed_values() {
 }
 
 #[test]
-fn setup_codes_are_two_hyphenated_groups_of_three() {
+fn setup_codes_are_two_hyphenated_groups_of_four() {
     for _ in 0..64 {
         let code = generate_setup_code();
         assert!(is_setup_code(&code), "{code}");
-        assert_eq!(code.as_bytes()[3], b'-', "{code}");
+        assert_eq!(code.as_bytes()[SETUP_CODE_LENGTH / 2], b'-', "{code}");
         assert_eq!(normalize_setup_code(&code).len(), SETUP_CODE_LENGTH);
     }
-    assert!(!is_setup_code("K7PM2X"));
-    assert!(!is_setup_code("K7P-M2"));
-    assert!(!is_setup_code("K0P-M2X"));
+    assert!(!is_setup_code("K7PM2XQR"));
+    assert!(!is_setup_code("K7PM-2XQ"));
+    assert!(!is_setup_code("K0PM-2XQR"));
+    // The six-character shape an older Weaver printed is not a code.
+    assert!(!is_setup_code("K7P-M2X"));
 }
 
 #[test]
 fn setup_codes_compare_without_case_hyphen_or_spacing() {
-    assert_eq!(normalize_setup_code(" k7p-m2x "), "K7PM2X");
-    assert_eq!(normalize_setup_code("K7P M2X"), "K7PM2X");
-    assert_eq!(normalize_setup_code("K7PM2X"), "K7PM2X");
+    assert_eq!(normalize_setup_code(" k7pm-2xqr "), "K7PM2XQR");
+    assert_eq!(normalize_setup_code("K7PM 2XQR"), "K7PM2XQR");
+    assert_eq!(normalize_setup_code("K7PM2XQR"), "K7PM2XQR");
 }
 
 #[test]
 fn setup_code_is_found_in_a_banner_row_or_a_json_message() {
     assert_eq!(
-        find_setup_code(&format!("{SETUP_CODE_MARKER}K7P-M2X")),
-        Some("K7P-M2X")
+        find_setup_code(&format!("{SETUP_CODE_MARKER}K7PM-2XQR")),
+        Some("K7PM-2XQR")
     );
     assert_eq!(
-        find_setup_code(&format!("#   {SETUP_CODE_MARKER}K7P-M2X        #")),
-        Some("K7P-M2X")
+        find_setup_code(&format!("#   {SETUP_CODE_MARKER}K7PM-2XQR        #")),
+        Some("K7PM-2XQR")
     );
     assert_eq!(
         find_setup_code(&format!(
-            r#"{{"fields":{{"message":"{SETUP_CODE_MARKER}K7P-M2X. Enter it"}}}}"#
+            r#"{{"fields":{{"message":"{SETUP_CODE_MARKER}K7PM-2XQR. Enter it"}}}}"#
         )),
-        Some("K7P-M2X")
+        Some("K7PM-2XQR")
     );
     assert_eq!(
-        find_setup_code(&format!("{SETUP_CODE_MARKER}K7P-M2XY")),
+        find_setup_code(&format!("{SETUP_CODE_MARKER}K7PM-2XQRS")),
         None
     );
-    assert_eq!(find_setup_code(&format!("{SETUP_CODE_MARKER}K7PM2X")), None);
-    assert_eq!(find_setup_code(&format!("{SETUP_CODE_MARKER}K7P")), None);
+    assert_eq!(
+        find_setup_code(&format!("{SETUP_CODE_MARKER}K7PM2XQR")),
+        None
+    );
+    assert_eq!(find_setup_code(&format!("{SETUP_CODE_MARKER}K7PM")), None);
+    assert_eq!(
+        find_setup_code(&format!("{SETUP_CODE_MARKER}K7P-M2X")),
+        None
+    );
     assert_eq!(find_setup_code("unrelated setup code"), None);
 }

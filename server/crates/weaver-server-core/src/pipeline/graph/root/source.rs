@@ -110,6 +110,10 @@ struct Open {
     // since the feed last read them. `None` until the feed first reads
     // them, when every volume counts as changed, so nothing is filed.
     firsts: Option<BTreeSet<VolumeIndex>>,
+    // The decoded bytes of the articles in hand across every volume: the sum
+    // of their `arrived_decoded`, kept beside them so it is read without
+    // walking the volumes.
+    in_hand: u64,
     // The volumes and articles the readers looked at, for the tests that
     // hold them to the ones still open.
     #[cfg(test)]
@@ -294,6 +298,7 @@ impl Volume {
             State::Waiting | State::Lost { .. } => 0,
         };
         self.arrived_decoded = self.arrived_decoded - decoded(was) + decoded(state);
+        open.in_hand = open.in_hand - decoded(was) + decoded(state);
         self.articles[index].state = state;
         open.file(self.at, index, state);
         self.file_parkable(index);

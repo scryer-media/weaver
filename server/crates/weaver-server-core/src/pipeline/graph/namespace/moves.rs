@@ -37,7 +37,6 @@ use weaver_graph::names::{INTERNAL_DIR, key};
 use weaver_graph::{MemberId, NodeId, Tree};
 
 use super::{NamespaceWriter, WriteError};
-use crate::pipeline::graph::envelope::free_name;
 use crate::pipeline::graph::leaf::Leaf;
 
 // Where a restored member's file is: the one name of it the checkpoint
@@ -254,13 +253,21 @@ impl NamespaceWriter {
         held_off: bool,
         root: &Path,
     ) -> Leaf {
+        let to = self.disk_under(root);
         if !held_off && self.free_for_new(name, (node, member)) {
-            return Leaf::at(root, name);
+            return Leaf::at(root, name).through(to.as_ref());
         }
         #[cfg(test)]
         count(|tally| tally.waiting_opens += 1);
-        let waiting = waiting_name(root, node, member, name);
-        let mut leaf = Leaf::at(root, &waiting);
+        let waiting = waiting_name(
+            self.envelopes.given(),
+            to.as_ref(),
+            root,
+            node,
+            member,
+            name,
+        );
+        let mut leaf = Leaf::at(root, &waiting).through(to.as_ref());
         leaf.intend(name);
         self.moves.push(Waiting {
             node,
@@ -452,7 +459,9 @@ impl NamespaceWriter {
             );
             if !held {
                 for root in self.roots() {
-                    Leaf::at(root, &format!("{name}/")).remove()?;
+                    Leaf::at(root, &format!("{name}/"))
+                        .through(self.disk_under(root).as_ref())
+                        .remove()?;
                 }
             }
         }
@@ -590,7 +599,7 @@ impl NamespaceWriter {
             .restored_root(root, output_name, on_disk)?
             .to_path_buf();
         let at = restored_at(&root, output_name, on_disk)?;
-        let mut leaf = Leaf::found(&root, at)?;
+        let mut leaf = Leaf::found(&root, at)?.through(self.disk_under(&root).as_ref());
         let Some(sat) = on_disk else {
             return Ok(leaf);
         };
@@ -908,9 +917,17 @@ fn above(name: &str) -> impl Iterator<Item = String> + '_ {
 // Where a member's file waits for its name, under the directory finalize
 // never delivers: a name no file sits at, as one that goes may still sit at
 // the member's last. A directory member waits as a directory.
-fn waiting_name(dir: &std::path::Path, node: NodeId, member: MemberId, name: &str) -> String {
+fn waiting_name(
+    given: &crate::pipeline::graph::envelope::Given,
+    to: Option<&std::sync::Arc<crate::operations::disk::writer::Submitter>>,
+    dir: &std::path::Path,
+    node: NodeId,
+    member: MemberId,
+    name: &str,
+) -> String {
     let directory = if Leaf::is_directory(name) { "/" } else { "" };
-    let waiting = free_name(
+    let waiting = given.free(
+        to,
         dir,
         &format!("{INTERNAL_DIR}/graph-waiting-{}-{}", node.0, member.0),
     );

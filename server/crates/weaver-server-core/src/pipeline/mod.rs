@@ -343,6 +343,9 @@ pub(super) struct DownloadLaneOwner {
     server_idx: Option<usize>,
     connection: bool,
     outstanding: HashMap<SegmentId, DownloadWork>,
+    // The estimated bytes of `outstanding`, kept with it as articles enter
+    // and leave, so sizing a lane's share never walks what it holds.
+    outstanding_bytes: u64,
 }
 
 pub(super) struct DownloadBatchLease {
@@ -1991,7 +1994,9 @@ pub struct Pipeline {
     pub(super) write_buf_max_pending: usize,
     // Max in-memory raw article bytes queued or active for decode.
     pub(super) decode_backlog_budget_bytes: usize,
-    // Max in-memory decoded backlog before degrading to direct offset writes.
+    // Max in-memory decoded bytes parked outside the volume writers (UU
+    // and unanchored parks). What waits on a volume has that volume's own
+    // limits instead (`download::volume_pace`).
     pub(super) write_backlog_budget_bytes: usize,
     // Whether raw decode backlog is in a hard-pressure drain cycle.
     pub(super) download_decode_hard_pressure_latched: bool,
@@ -2036,6 +2041,9 @@ pub struct Pipeline {
     // the lane records hold (see `Pipeline::audit_lane_holdings`).
     #[cfg(test)]
     pub(super) audit_lane_holdings: bool,
+    // Where a test stops this pipeline's moves of working folders.
+    #[cfg(test)]
+    pub(super) move_gates: activation::MoveGates,
     // When each deferred job's articles become old enough to fetch.
     //
     // Absent means the question has not been asked yet or was answered
@@ -2064,7 +2072,10 @@ pub struct Pipeline {
     // Last time we logged a queued/no-active-download liveness stall.
     pub(super) last_download_dispatch_stall_log_at: Option<Instant>,
     // When the dispatch pass first found queued work and nothing in flight,
-    // in the run of such passes going on now; `None` outside one.
+    // in the run of such passes going on now; `None` outside one. The
+    // liveness line speaks only once such a run has lasted
+    // `DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL`, so the passes right after an
+    // add or a restart, before the job's volume is sized, say nothing.
     pub(super) download_dispatch_liveness_since: Option<Instant>,
     // The dispatch stall the watchdog is timing toward a kick or a release.
     pub(super) download_dispatch_stall: Option<download::DispatchStallWatch>,
@@ -2144,6 +2155,32 @@ pub struct Pipeline {
     // One background free-space sampler per configured root. Everything on
     // the pipeline that gates work on free space reads these readings.
     pub(super) storage_capacity: Arc<crate::operations::StorageCapacity>,
+    // The writer threads of the volumes graph jobs write to, what one says
+    // when dispatch should look again (a volume fell below the line it
+    // was stopped at, or an operation failed), and whether a job was
+    // refused dispatch because a volume held its budget of bytes.
+    pub(super) volume_writers: Arc<crate::operations::disk::writer::VolumeWriters>,
+    pub(super) volume_reports:
+        tokio::sync::mpsc::UnboundedReceiver<crate::operations::disk::writer::Report>,
+    pub(super) volume_budget_held: std::sync::atomic::AtomicBool,
+    // The clock the shutdown settle of the volume writers goes by, and how
+    // long a volume may stand still before it is left behind. The machine's
+    // clock outside tests; a test may put one it moves by hand here.
+    pub(super) shutdown_settle: crate::operations::disk::writer::SettleBound,
+    // What queues each volume's first write-rate probe on its writer, once.
+    pub(super) volume_probes: Arc<crate::pipeline::graph::disk::VolumeProbes>,
+    // The keeper of every volume's buffer limits.
+    pub(super) volume_buffers: Arc<download::volume_pace::VolumeBuffers>,
+    // For each job with released results waiting for the loop: the volume
+    // their bytes are counted on as arrived, and how many of them.
+    pub(super) volume_arrived_by_job:
+        HashMap<JobId, (Arc<crate::operations::disk::volume::Volume>, u64)>,
+    // For each job with articles leased to lanes: the volume they are
+    // reserved on (`Volume::reserve`), and how many bytes of them. Each
+    // article is reserved once, as it is leased, and given back once, as
+    // it leaves its lane's record however it ends (`note_lane_work_left`).
+    pub(super) volume_reserved_by_job:
+        HashMap<JobId, (Arc<crate::operations::disk::volume::Volume>, u64)>,
     // What decode windows took from each disk they go on, for every graph
     // job together.
     pub(super) window_ledgers: graph::window::WindowLedgers,
@@ -2154,6 +2191,9 @@ pub struct Pipeline {
     // Test-only free-space reading; `Some(None)` exercises a filesystem that
     // has never produced a reading.
     pub(super) uu_spool_available_bytes_for_test: Option<Option<u64>>,
+    #[cfg(test)]
+    // Test-only: a health probe batch waits for a seat on this server.
+    pub(super) probe_waits_on_for_test: Option<usize>,
     // Sequential-assembly state for uuencode files, created on the first
     // uuencode part of a file and dropped with that file's write buffer.
     pub(super) uu_files: scan_inputs::UuFiles,
@@ -2218,6 +2258,12 @@ pub struct Pipeline {
     pending_graph_terminals: HashMap<JobId, health::PendingGraphTerminal>,
     // Final moves admitted after the post-processing hold is lifted.
     pub(super) deferred_moves: HashSet<JobId>,
+    // Jobs whose delivery waits for a volume's writer, with the barrier it
+    // waits on: the last of their file operations to return, or a failed
+    // one's report. The mail that says the barrier returned, or the report,
+    // starts the delivery again; mail of the job's other file operations
+    // does not.
+    pub(super) moves_awaiting_disk: HashMap<JobId, crate::pipeline::graph::disk::JobBarrier>,
     // Complete destinations reserved for in-flight moves so concurrent jobs do not collide.
     pub(super) reserved_complete_destinations: HashMap<JobId, PathBuf>,
     // Shared state for control plane reads (API handlers read without channel round-trip).

@@ -133,7 +133,6 @@ const zh: LocaleDictionary = {
   "metrics.commitPending": "待提交",
   "metrics.writeBufferedBytes": "写缓冲字节",
   "metrics.writeBufferedSegments": "写缓冲分段",
-  "metrics.diskWriteLatency": "磁盘写入延迟",
   "metrics.segmentsDownloaded": "已下载分段",
   "metrics.segmentsDecoded": "已解码分段",
   "metrics.segmentsCommitted": "已提交分段",

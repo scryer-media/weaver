@@ -97,7 +97,8 @@ impl GraphError {
                 ExtractionError::from_io(message, source)
             }
             WriteError::Refused(failure) => ExtractionError::rejected(failure.clone()),
-            WriteError::UnknownMember { .. }
+            WriteError::LeftAtStop
+            | WriteError::UnknownMember { .. }
             | WriteError::StaleRecovery { .. }
             | WriteError::ProofUnreadable { .. } => ExtractionError::terminal(message),
         }
@@ -131,6 +132,9 @@ pub(crate) struct Storage {
     pub(crate) hardware: super::hardware::Hardware,
     // Where the job's writes publish what they take, in a pipeline.
     pub(crate) metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
+    // The volume writers the job's files are written through; `None` for a
+    // job that writes its files itself as each byte is placed.
+    pub(crate) disk: Option<super::disk::JobDisk>,
     // Weaver's data folder and the free space of its disk: where a decode
     // window goes when the working directory cannot hold it.
     pub(crate) data_dir: Option<(PathBuf, CapacityReader, super::window::ScratchLedger)>,
@@ -176,6 +180,12 @@ pub(crate) struct GraphJob {
     // A member's file waits to move on a checkpoint the database has not
     // said it committed, and the run mail will say when it has.
     mail_owed: Option<u64>,
+    // A repair the stop ended while a volume's writer still held operations
+    // of the job, kept until the stop has given that writer its time.
+    stopped_repair: Option<Box<crate::pipeline::graph::namespace::Returned>>,
+    // How many repairs the stop ended were kept and then taken back.
+    #[cfg(test)]
+    stopped_repairs_taken_back: u32,
     // The checkpoints committed through this stamp while a rewalk read its
     // volumes' files where they lay as it was lent: what they move or
     // remove waits for the last piece to be heard.
@@ -223,7 +233,8 @@ impl GraphJob {
         let windows = storage.windows(scope);
         let runs = Runs::new(scope, storage.slots, storage.mail, storage.decode)
             .on(storage.hardware)
-            .lending(windows);
+            .lending(windows)
+            .writing(storage.disk.clone());
         let writer = NamespaceWriter::new(
             scope,
             storage.working_dir,
@@ -231,6 +242,7 @@ impl GraphJob {
             storage.free_disk,
         )
         .delivering(storage.output)
+        .writing_through(storage.disk)
         .capped(storage.caps)
         .metered(storage.metrics);
         Self::new(
@@ -291,6 +303,9 @@ impl GraphJob {
             reported: None,
             pending: Pending::default(),
             mail_owed: None,
+            stopped_repair: None,
+            #[cfg(test)]
+            stopped_repairs_taken_back: 0,
             commit_held: None,
             notes: Vec::new(),
             fed: runs::Fed::default(),
@@ -461,6 +476,20 @@ impl GraphJob {
         self.runs.in_flight() || self.loans.out() || self.works.out() || self.mail_owed.is_some()
     }
 
+    // Whether a stopped job must be kept: mail of it is still to come, or a
+    // volume's writer still holds an operation on its files. Nothing may
+    // remove, move or hand on those files before both are over.
+    pub(in crate::pipeline) fn holds_retirement(&self) -> bool {
+        self.awaits_mail() || self.writer.disk().is_some_and(|disk| !disk.quiet())
+    }
+
+    // The job's files are given up: nothing still queued for them runs.
+    pub(in crate::pipeline) fn abandon_disk(&self) {
+        if let Some(disk) = self.writer.disk() {
+            disk.abandon();
+        }
+    }
+
     // The checkpoint `stamp` records every name the job's files want and
     // every name they left so far.
     pub(crate) fn recorded(&mut self, stamp: u64) {
@@ -532,6 +561,43 @@ impl GraphJob {
             self.committed(stamp)?;
         }
         Ok(())
+    }
+
+    // The file system refused the name of a file a volume's writer was to
+    // make: its member is skipped as damaged, as a refusal met while
+    // writing it would skip it.
+    //
+    // False when the refusal skips nothing and stands as a failure: the
+    // job has no such file, or an object reads the member.
+    pub(crate) fn name_refused(&mut self, file: u64) -> Result<bool, GraphError> {
+        let mut out = Vec::new();
+        let Some(node) = self.writer.name_refused(
+            &mut self.tree,
+            &mut *self.builder,
+            &self.root,
+            file,
+            &mut out,
+        )?
+        else {
+            return Ok(false);
+        };
+        // The object that made the member left it out: what it unpacked
+        // is short of what it holds, by bytes nothing brings. A run that
+        // meets such bytes refuses its object as it ends; this refusal may
+        // come after the run has, so the object is refused here, and its
+        // volumes are handed over as they stand.
+        if node != NodeId::ROOT {
+            self.writer.said(
+                &mut self.tree,
+                &mut *self.builder,
+                &self.root,
+                node,
+                weaver_graph::Emit::Refuse(weaver_graph::Why::Unrepairable),
+                &mut out,
+            )?;
+        }
+        self.heard(out)?;
+        Ok(true)
     }
 
     // Keep ownership until stopped workers report that they ended.
@@ -618,15 +684,55 @@ impl GraphJob {
         self.writer.learn_policy()
     }
 
+    // Everything the job has submitted to its volumes' writers so far;
+    // `None` for a job that writes its files itself.
+    pub(crate) fn disk_barrier(&self) -> Option<super::disk::JobBarrier> {
+        self.writer.disk().map(|disk| disk.barrier())
+    }
+
+    pub(crate) fn disk(&self) -> Option<&super::disk::JobDisk> {
+        self.writer.disk()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn move_disk_for_test(&mut self, disk: super::disk::JobDisk) {
+        self.writer.move_disk_for_test(disk);
+    }
+
     pub(crate) fn pending(&self) -> &Pending {
         &self.pending
     }
 
     // Seam for completion, status and health: where the job stands, read
-    // off the tree. Stable.
+    // off the tree. Stable. Payload still to fetch wins over everything
+    // else, so while it is there, which is every article but the last, the
+    // walks of the sets and members are not taken.
     pub(crate) fn phase(&self) -> RootPhase {
+        if self.payload_waiting() {
+            return RootPhase::Downloading;
+        }
+        let extracting = phase::extracting(&self.tree) || self.runs.live();
+        RootPhase::derive(false, self.activity(), extracting)
+    }
+
+    // The phase read the long way, every walk taken, for the tests that hold
+    // the short way to it.
+    #[cfg(test)]
+    fn full_phase(&self) -> RootPhase {
         let extracting = phase::extracting(&self.tree) || self.runs.live();
         RootPhase::derive(self.payload_waiting(), self.activity(), extracting)
+    }
+
+    // The phase, checked against the long way.
+    #[cfg(test)]
+    pub(crate) fn checked_phase(&self) -> RootPhase {
+        let phase = self.phase();
+        assert_eq!(
+            phase,
+            self.full_phase(),
+            "the short way reads another phase"
+        );
+        phase
     }
 
     // What the recovery sets are doing: repairing while a repair run is out
@@ -1028,14 +1134,19 @@ impl GraphJob {
         self.runs.wakeable()
     }
 
-    // Whether the job waits for room on a disk, and its place among the
-    // jobs that wait.
+    // The device a file at `path` lies on, as a write there would say.
+    pub(crate) fn device_of(&self, path: &std::path::Path) -> Device {
+        self.writer.device_of(path)
+    }
+
     // The ledger of the disk `device` is to this job: the one its writes
     // there spend from.
     pub(crate) fn disk_ledger(&self, device: Device) -> &crate::operations::disk::DiskLedger {
-        self.writer.disk(device).ledger()
+        self.writer.capacity(device).ledger()
     }
 
+    // Whether the job waits for room on a disk, and its place among the
+    // jobs that wait.
     pub(crate) fn disk_held(&self) -> bool {
         self.writer.disk_held()
     }
@@ -1072,6 +1183,11 @@ impl GraphJob {
     // and keeps the job waiting for a reading with room.
     pub(crate) fn disk_idle(&self) -> bool {
         self.writer.disk_held() && self.writer.owes_nothing() && !self.runs.live()
+    }
+
+    // What the job waits for room for, and the folder it waits on.
+    pub(crate) fn disk_wait(&self) -> Option<(super::limits::DiskWait, std::path::PathBuf)> {
+        self.writer.disk_wait()
     }
 
     // `limit` is the slot limit the pipeline reads now, which every step
@@ -1273,7 +1389,12 @@ impl GraphJob {
     }
 
     // The phase, when it changed since the last call.
+    // Under test every report is held to the long way, so each step of the
+    // pipeline tests checks the short way too.
     pub(crate) fn phase_change(&mut self) -> Option<RootPhase> {
+        #[cfg(test)]
+        let phase = self.checked_phase();
+        #[cfg(not(test))]
         let phase = self.phase();
         (self.reported != Some(phase)).then(|| {
             self.reported = Some(phase);

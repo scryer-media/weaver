@@ -99,6 +99,8 @@ fn build_metrics_history_returns_rollup_avg_and_peak_series() {
         })
         .unwrap();
     assert_eq!(gauge_peak.values, vec![9.0]);
+    // A retired slot keeps its place in a stored point and gives no series.
+    assert!(result.series.iter().all(|series| !series.metric.is_empty()));
 }
 
 #[test]

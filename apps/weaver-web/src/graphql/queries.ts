@@ -614,7 +614,6 @@ const METRICS_FIELDS = `
     verifyActive
     repairActive
     extractActive
-    diskWriteLatencyUs
     segmentsRetried
     segmentsFailedPermanent
     downloadFailuresArticleNotFound
@@ -1083,6 +1082,14 @@ export const SYSTEM_INFO_QUERY = gql`
         storageClass
         filesystem
         startupRandomReadIops
+      }
+      volumes {
+        label
+        storageKind
+        writeRateBytesPerSecond
+        throughputBytesPerSecond
+        bufferedBytes
+        bufferLimitBytes
       }
       configuredStorage {
         labels

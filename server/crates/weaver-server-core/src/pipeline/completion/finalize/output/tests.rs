@@ -323,6 +323,7 @@ async fn final_move_does_not_overwrite_existing_destination_file() {
         None,
         DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
         HashSet::new(),
+        None,
     )
     .await
     {
@@ -427,6 +428,7 @@ async fn final_move_refuses_symlink_entries_and_releases_its_empty_destination_c
         None,
         DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
         HashSet::new(),
+        None,
     )
     .await
     .unwrap_err();
@@ -467,6 +469,7 @@ async fn the_rename_pass_sees_staging_and_working_output_as_one_delivery() {
         }),
         DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
         HashSet::new(),
+        None,
     )
     .await
     .unwrap();
@@ -499,6 +502,7 @@ async fn a_disabled_rename_pass_places_the_obfuscated_names_untouched() {
         None,
         DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
         HashSet::new(),
+        None,
     )
     .await
     .unwrap();
@@ -528,6 +532,7 @@ async fn final_move_removes_the_working_directory_with_its_chunk_workspace() {
         None,
         DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
         HashSet::new(),
+        None,
     )
     .await
     .unwrap();
@@ -655,6 +660,7 @@ async fn final_move_publishes_the_staged_delivery_without_its_marker_and_joins_s
         None,
         DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
         HashSet::new(),
+        None,
     )
     .await
     .unwrap();
@@ -829,6 +835,7 @@ async fn deliver_one_file(pipeline: &Pipeline, job_id: JobId, category: Option<&
         None,
         DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
         HashSet::new(),
+        None,
     )
     .await
     .unwrap();

@@ -3010,6 +3010,7 @@ async fn released_result_books_its_own_job_after_its_lane_owner_is_gone() {
                     avoid_server: None,
                 },
             )]),
+            outstanding_bytes: 128,
         },
     );
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);

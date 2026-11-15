@@ -1917,13 +1917,13 @@ fn a_member_closes_exactly_when_covered_at_its_length() {
     let member = job.member("video.mkv", Some(9));
     job.send(member, 0, b"abc", Provenance::Fresh);
     assert!(job.is_open(NodeId::ROOT, member));
-    assert_eq!(
-        std::fs::metadata(job.dir.path().join("video.mkv"))
-            .unwrap()
-            .len(),
-        3,
-        "unwritten declared bytes must not allocate space on a non-sparse mount"
-    );
+    // The file starts at its declared length exactly where its filesystem
+    // makes a hole of the rest, and is as long as its bytes where not.
+    let length = std::fs::metadata(job.dir.path().join("video.mkv"))
+        .unwrap()
+        .len();
+    let sized = crate::pipeline::graph::sparse::sizes_files_in(job.dir.path());
+    assert_eq!(length, if sized { 9 } else { 3 });
     job.send(member, 6, b"end", Provenance::Fresh);
     assert!(job.is_open(NodeId::ROOT, member));
     job.send(member, 3, b"mid", Provenance::Fresh);
@@ -5355,4 +5355,63 @@ fn a_refused_name_reaches_the_owner_as_damage_once() {
     );
     assert!(job.root().get(member).unwrap().coverage.damaged(whole));
     assert_eq!(std::fs::read_dir(job.dir.path()).unwrap().count(), 0);
+}
+
+// A member whose name was refused, then recognised under a name the file
+// system takes and rebuilt there, is a file on disk: it is no longer
+// marked, and the delivery counts it whole. A member still under its
+// refused name stays marked and is no usable file.
+#[test]
+fn a_refused_name_recognised_and_rebuilt_is_a_usable_file() {
+    // The set rebuilds the member once it is known by the name it gave it.
+    let mut job = Job::new(PLENTY).with_set(Some(Fix {
+        name: "show.mkv",
+        read: ByteRange::new(0, 8),
+        fix: (0, b"abcdefgh"),
+    }));
+    // Parts of 300 bytes, past the 255 a part may hold.
+    let rebuilt = job.member(&format!("{}.mkv", "a".repeat(296)), Some(8));
+    let stays = job.member(&format!("{}.mkv", "b".repeat(296)), Some(4));
+    job.send(rebuilt, 0, b"abcdefgh", Provenance::Fresh);
+    job.send(stays, 0, b"wxyz", Provenance::Fresh);
+    assert!(job.writer.unnamable(NodeId::ROOT, rebuilt));
+    assert!(job.writer.unnamable(NodeId::ROOT, stays));
+    let mut build = job.build();
+    job.writer
+        .rename(&mut job.tree, &mut build, NodeId::ROOT, rebuilt, "show.mkv")
+        .expect("rename");
+    job.commit();
+    // A member the set does not cover, announced so the set binds again
+    // and finds the member under its new name.
+    let other = job.member("other.nfo", Some(4));
+    // A set proves only bytes it read, and the refused member has none.
+    job.par.lock().unwrap().proof = Some(ByteRange::new(0, 0));
+    let mut build = job.build();
+    let due = job.tree.recovery_nodes(NodeId::ROOT);
+    let outcomes: Vec<RepairOutcome> = job
+        .repair(&mut build, NodeId::ROOT, &due)
+        .into_iter()
+        .map(|(_, outcome)| outcome)
+        .collect();
+    assert_eq!(outcomes, vec![RepairOutcome::Repaired { slices: 1 }]);
+    assert_eq!(job.file("show.mkv"), b"abcdefgh");
+    assert!(job.root().get(rebuilt).unwrap().coverage.is_clean());
+    assert!(!job.writer.unnamable(NodeId::ROOT, rebuilt));
+    assert!(job.writer.unnamable(NodeId::ROOT, stays));
+    // Read as the job's ruling reads it: a refused name is no usable file.
+    let delivery = crate::pipeline::graph::status::Delivery::read(
+        &job.tree,
+        |member| member != other,
+        |_| false,
+        |_, _| false,
+        |node, member| job.writer.refused(node, member),
+        |node, member| job.writer.unnamable(node, member),
+        |_| crate::pipeline::graph::status::Unarrived::Short,
+    );
+    assert_eq!(delivery.whole, ["show.mkv"], "{delivery:?}");
+    assert_eq!(
+        delivery.status(None),
+        crate::jobs::model::JobStatus::Partial,
+        "{delivery:?}"
+    );
 }

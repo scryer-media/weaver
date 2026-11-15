@@ -130,6 +130,9 @@ fn main() {
         weaver_server_core::runtime::thread_release::install_job_completion_release(
             allocator::collect_after_job,
         );
+        weaver_server_core::runtime::thread_release::install_lane_thread_start(
+            allocator::bind_lane_thread,
+        );
     }
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();

@@ -21,9 +21,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use weaver_graph::{ByteRange, Coverage, Lost, VolumeIndex, Volumes};
 
+use crate::operations::disk::writer::Barrier;
 use crate::pipeline::graph::decoding::Decoding;
 use crate::pipeline::graph::envelope::{ReadFiles, Shelf, Shelved};
 use crate::pipeline::graph::leaf::read_exact_at;
+
+// The file a read is in, and the barrier its bytes wait on, if any.
+type ReadAt = (std::path::PathBuf, Option<Barrier>);
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Unreadable {
@@ -190,7 +194,7 @@ impl RunVolumes {
         &self,
         volume: VolumeIndex,
         range: ByteRange,
-    ) -> Result<(u64, Option<std::path::PathBuf>), Unreadable> {
+    ) -> Result<(u64, Option<ReadAt>), Unreadable> {
         let mut state = self.shelf.lock();
         loop {
             if state.generation != self.generation || self.stopped() {
@@ -210,13 +214,16 @@ impl RunVolumes {
             match kept {
                 Some(kept) if kept.coverage.verified(want) => {
                     kept.reached = kept.reached.max(want.end);
-                    return Ok((want.len(), Some(kept.path().to_path_buf())));
+                    return Ok((
+                        want.len(),
+                        Some((kept.path().to_path_buf(), kept.settled())),
+                    ));
                 }
                 Some(kept) if kept.settled => {
                     return match settled(&kept.coverage, want) {
                         Ok(len) => {
                             kept.reached = kept.reached.max(want.start + len);
-                            Ok((len, Some(kept.path().to_path_buf())))
+                            Ok((len, Some((kept.path().to_path_buf(), kept.settled()))))
                         }
                         Err(range) => Err(Unreadable::Lost(Lost { volume, range })),
                     };
@@ -324,9 +331,20 @@ impl Volumes for RunVolumes {
                     .insert((lost.volume.0, lost.range.start, lost.range.end));
             }
         })?;
-        let Some(path) = path else {
+        let Some((path, settled)) = path else {
             return Ok(0);
         };
+        // The coverage says the bytes were handed to the file; they are
+        // read once the volume's writer has put them there. The run reads
+        // on a thread of its own, which the loop never waits for.
+        if let Some(settled) = settled {
+            settled.wait_aside();
+            // A write of the volume failed: its file does not hold what
+            // the coverage says, and the failure fails the job.
+            if settled.unwritten() {
+                return Err(Unreadable::Stopped.into());
+            }
+        }
         let len = usize::try_from(len).expect("a read fits the buffer it fills");
         let mut files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
         // The owner can revoke access after wait_for returns. Check again

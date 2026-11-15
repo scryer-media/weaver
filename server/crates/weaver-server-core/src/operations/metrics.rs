@@ -79,10 +79,12 @@ pub enum SchedulerBlockClause {
     ProviderPriority,
     // The job's articles are still being read back from its stored NZB.
     Activation,
+    // A volume the job writes to holds its budget of bytes for its writer.
+    WriteBuffer,
 }
 
 impl SchedulerBlockClause {
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 10;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Propagation,
         Self::Retention,
@@ -93,6 +95,7 @@ impl SchedulerBlockClause {
         Self::Checkpoint,
         Self::ProviderPriority,
         Self::Activation,
+        Self::WriteBuffer,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -106,6 +109,7 @@ impl SchedulerBlockClause {
             Self::Checkpoint => "checkpoint",
             Self::ProviderPriority => "provider_priority",
             Self::Activation => "activation",
+            Self::WriteBuffer => "write_buffer",
         }
     }
 
@@ -437,6 +441,11 @@ pub struct PipelineMetrics {
     pub download_lane_refill_parked_total: AtomicU64,
     pub download_lane_refill_deferred_total: AtomicU64,
     pub download_lane_refill_saturated_total: AtomicU64,
+    // Refills held for their volume's room: saturated at its resume line,
+    // or idle while a volume held its job's budget. And those answered
+    // once the volume fell to its line or had room again.
+    pub download_lane_room_held_total: AtomicU64,
+    pub download_lane_room_woken_total: AtomicU64,
     pub download_pipeline_trial_success_total: AtomicU64,
     pub download_pipeline_trial_failure_total: AtomicU64,
     pub download_pipeline_proof_pass_total: AtomicU64,
@@ -465,7 +474,6 @@ pub struct PipelineMetrics {
     pub repair_active: AtomicUsize,
     pub extract_active: AtomicUsize,
     extraction_rejections: [AtomicU64; 9],
-    pub disk_write_latency_us: AtomicU64,
 
     // Retry tracking
     pub segments_retried: AtomicU64,
@@ -637,6 +645,8 @@ impl PipelineMetrics {
             download_lane_refill_parked_total: AtomicU64::new(0),
             download_lane_refill_deferred_total: AtomicU64::new(0),
             download_lane_refill_saturated_total: AtomicU64::new(0),
+            download_lane_room_held_total: AtomicU64::new(0),
+            download_lane_room_woken_total: AtomicU64::new(0),
             download_pipeline_trial_success_total: AtomicU64::new(0),
             download_pipeline_trial_failure_total: AtomicU64::new(0),
             download_pipeline_proof_pass_total: AtomicU64::new(0),
@@ -652,7 +662,6 @@ impl PipelineMetrics {
             repair_active: AtomicUsize::new(0),
             extract_active: AtomicUsize::new(0),
             extraction_rejections: std::array::from_fn(|_| AtomicU64::new(0)),
-            disk_write_latency_us: AtomicU64::new(0),
             segments_retried: AtomicU64::new(0),
             segments_failed_permanent: AtomicU64::new(0),
             parked_infrastructure_work: AtomicUsize::new(0),
@@ -879,6 +888,12 @@ impl PipelineMetrics {
             download_lane_refill_saturated_total: self
                 .download_lane_refill_saturated_total
                 .load(Ordering::Relaxed),
+            download_lane_room_held_total: self
+                .download_lane_room_held_total
+                .load(Ordering::Relaxed),
+            download_lane_room_woken_total: self
+                .download_lane_room_woken_total
+                .load(Ordering::Relaxed),
             download_pipeline_trial_success_total: self
                 .download_pipeline_trial_success_total
                 .load(Ordering::Relaxed),
@@ -902,7 +917,6 @@ impl PipelineMetrics {
             verify_active: self.verify_active.load(Ordering::Relaxed),
             repair_active: self.repair_active.load(Ordering::Relaxed),
             extract_active: self.extract_active.load(Ordering::Relaxed),
-            disk_write_latency_us: self.disk_write_latency_us.load(Ordering::Relaxed),
             segments_retried: self.segments_retried.load(Ordering::Relaxed),
             segments_failed_permanent: self.segments_failed_permanent.load(Ordering::Relaxed),
             parked_infrastructure_work: self.parked_infrastructure_work.load(Ordering::Relaxed),
@@ -1063,6 +1077,8 @@ pub struct MetricsSnapshot {
     pub download_lane_refill_parked_total: u64,
     pub download_lane_refill_deferred_total: u64,
     pub download_lane_refill_saturated_total: u64,
+    pub download_lane_room_held_total: u64,
+    pub download_lane_room_woken_total: u64,
     pub download_pipeline_trial_success_total: u64,
     pub download_pipeline_trial_failure_total: u64,
     pub download_pipeline_proof_pass_total: u64,
@@ -1076,7 +1092,6 @@ pub struct MetricsSnapshot {
     pub verify_active: usize,
     pub repair_active: usize,
     pub extract_active: usize,
-    pub disk_write_latency_us: u64,
     pub segments_retried: u64,
     pub segments_failed_permanent: u64,
     #[serde(default)]

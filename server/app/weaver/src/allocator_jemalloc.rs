@@ -30,6 +30,13 @@
 //   arena keeps its own cache of extents, which for buffers this large is
 //   paid in resident pages. Arenas are created lazily, so the cap costs
 //   nothing on a small host and bounds the caches on a large one.
+// - `lg_extent_max_active_fit:20` lets a freed run of any size serve a
+//   smaller request. Freed article buffers merge into runs of many
+//   megabytes, and by default a run more than 64 times the request is passed
+//   over and the request takes fresh pages instead. With the lane arena
+//   keeping its runs for reuse (see [`lane_arena`]), that left them beside
+//   new memory: at 30 connections the process held about 130 MB more than
+//   the lanes ever had live.
 //
 // On glibc Linux, `background_thread` also asks jemalloc for its purge
 // threads (at most four), so freed pages decay back to the system on their
@@ -54,12 +61,21 @@ use tikv_jemallocator::Jemalloc;
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "_rjem_malloc_conf")]
 pub static malloc_conf: &[u8] =
-    b"dirty_decay_ms:3000,muzzy_decay_ms:0,narenas:16,background_thread:true\0";
+    b"dirty_decay_ms:3000,muzzy_decay_ms:0,narenas:16,lg_extent_max_active_fit:20,background_thread:true\0";
 
+// Without purge threads, `oversize_threshold:0` is needed as well. By default,
+// when freed buffers merge into a free run of 8 MiB or more, jemalloc
+// gives the whole run back to the system at once, and decay never gets a
+// say. The disk writers free a burst of adjacent article buffers together, so
+// a burst's memory went back as soon as it was written, and the next burst
+// took page faults to get it again. With the threshold off, those pages
+// decay like any other, and the collections below still return them at job
+// end and at idle.
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-pub static malloc_conf: &[u8] = b"dirty_decay_ms:3000,muzzy_decay_ms:0,narenas:16\0";
+pub static malloc_conf: &[u8] =
+    b"dirty_decay_ms:3000,muzzy_decay_ms:0,narenas:16,lg_extent_max_active_fit:20,oversize_threshold:0\0";
 
 // jemalloc, configured by [`malloc_conf`].
 pub(crate) struct ConfiguredJemalloc;
@@ -109,6 +125,84 @@ pub(crate) fn collect_idle_thread() {
 // resident past the moment the job reports itself finished.
 pub(crate) fn collect_after_job() {
     purge_all_arenas();
+}
+
+// The arena every download lane allocates from, created on first use. `None`
+// when jemalloc refused to create or configure it; the lanes then stay on
+// the arenas jemalloc gives every thread, as before.
+static LANE_ARENA: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+
+// Creates the lane arena with decay off.
+//
+// A lane allocates an article buffer, the disk writer frees it once it is
+// written, and the lane allocates the next one into the pages that came
+// back. A full volume buffer stalls the lanes until it has drained well
+// below its limit, so the writer frees tens of megabytes while no lane
+// allocates. jemalloc's decay does not judge pages by their age: at each
+// step it keeps only as many dirty pages as its count has grown by, and
+// pages freed again after they were reused count as no growth. So each such
+// stretch went back to the system within one step, whatever the decay
+// time, and the lanes faulted it all in again as they ran on: about 20
+// thousand pages a 6 GB job, at 2 connections.
+//
+// Here decay is off, so a lane's freed pages stay for the next article.
+// What the arena holds is bounded by the most the lanes ever had live at
+// once, which the volume buffers already bound, and both collections above
+// purge it with every other arena: a parked lane and a finished job still
+// return it all.
+fn lane_arena() -> Option<u32> {
+    *LANE_ARENA.get_or_init(|| {
+        let mut arena: u32 = 0;
+        let mut len = std::mem::size_of::<u32>();
+        // SAFETY: `arenas.create` writes the new arena's index, a `u32`,
+        // into the output buffer whose length is given; no input.
+        let rc = unsafe {
+            tikv_jemalloc_sys::mallctl(
+                c"arenas.create".as_ptr(),
+                std::ptr::from_mut(&mut arena).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let name = std::ffi::CString::new(format!("arena.{arena}.dirty_decay_ms"))
+            .expect("no interior nul");
+        let mut never: isize = -1;
+        // SAFETY: `arena.<i>.dirty_decay_ms` is an `ssize_t`; the input
+        // pointer and length match it and nothing is read back.
+        let rc = unsafe {
+            tikv_jemalloc_sys::mallctl(
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::from_mut(&mut never).cast(),
+                std::mem::size_of::<isize>(),
+            )
+        };
+        (rc == 0).then_some(arena)
+    })
+}
+
+// Binds the calling download lane thread to the lane arena. Called once, as
+// the lane thread starts.
+pub(crate) fn bind_lane_thread() {
+    let Some(mut arena) = lane_arena() else {
+        return;
+    };
+    // SAFETY: `thread.arena` takes the arena index as a `u32`; the input
+    // pointer and length match it and nothing is read back.
+    unsafe {
+        tikv_jemalloc_sys::mallctl(
+            c"thread.arena".as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::from_mut(&mut arena).cast(),
+            std::mem::size_of::<u32>(),
+        );
+    }
 }
 
 // SQLite's allocations, served by jemalloc on macOS.
@@ -253,6 +347,13 @@ mod tests {
 
         assert_eq!(opt_ms(c"opt.dirty_decay_ms"), 3000);
         assert_eq!(opt_ms(c"opt.muzzy_decay_ms"), 0);
+        // `opt.lg_extent_max_active_fit` is a `size_t`, read here as the
+        // same eight bytes.
+        assert_eq!(opt_ms(c"opt.lg_extent_max_active_fit"), 20);
+        // Off where no purge thread runs: a merged free run of any size
+        // decays instead of going back to the system the moment it forms.
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        assert_eq!(opt_ms(c"opt.oversize_threshold"), 0);
     }
 
     // Reads a boolean `mallctl` value.
@@ -282,6 +383,79 @@ mod tests {
         // `background_thread` is whether jemalloc actually turned it on.
         assert!(read_bool(c"opt.background_thread"));
         assert!(read_bool(c"background_thread"));
+    }
+
+    // Reads a `u32` `mallctl` value, optionally writing a pointer first.
+    fn read_u32(name: &std::ffi::CStr, input: Option<*const u8>) -> u32 {
+        let mut value: u32 = u32::MAX;
+        let mut len = std::mem::size_of::<u32>();
+        let mut ptr = input.unwrap_or(std::ptr::null());
+        let (new, new_len) = match input {
+            Some(_) => (
+                std::ptr::from_mut(&mut ptr).cast(),
+                std::mem::size_of::<*const u8>(),
+            ),
+            None => (std::ptr::null_mut(), 0),
+        };
+        // SAFETY: every name read here is an `unsigned`; the one input,
+        // `arenas.lookup`, takes a pointer, and its length is given.
+        let rc = unsafe {
+            tikv_jemalloc_sys::mallctl(
+                name.as_ptr(),
+                std::ptr::from_mut(&mut value).cast(),
+                &mut len,
+                new,
+                new_len,
+            )
+        };
+        assert_eq!(rc, 0, "mallctl failed for {name:?}");
+        value
+    }
+
+    #[test]
+    fn a_lane_allocates_from_an_arena_that_keeps_its_pages_until_a_collection() {
+        let lane = std::thread::spawn(|| {
+            bind_lane_thread();
+            let bound = read_u32(c"thread.arena", None);
+            // An article-sized buffer, as a lane decodes into.
+            let buffer = vec![1u8; 768 * 1024];
+            let home = read_u32(c"arenas.lookup", Some(buffer.as_ptr()));
+            (bound, home, buffer)
+        });
+        let (bound, home, buffer) = lane.join().expect("the lane thread must not panic");
+        let arena = lane_arena().expect("jemalloc creates the lane arena");
+        assert_eq!(bound, arena);
+        assert_eq!(home, arena);
+        // Freed on another thread, as the disk writer does: the pages go
+        // back to the arena they came from.
+        drop(buffer);
+
+        // Decay is off for the lane arena only.
+        fn decay_ms(arena: u32) -> isize {
+            let name = std::ffi::CString::new(format!("arena.{arena}.dirty_decay_ms"))
+                .expect("no interior nul");
+            let mut value: isize = 0;
+            let mut len = std::mem::size_of::<isize>();
+            // SAFETY: `arena.<i>.dirty_decay_ms` is an `ssize_t`; the output
+            // buffer and its length match it, and no input is given.
+            let rc = unsafe {
+                tikv_jemalloc_sys::mallctl(
+                    name.as_ptr(),
+                    std::ptr::from_mut(&mut value).cast(),
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(rc, 0, "mallctl read failed");
+            value
+        }
+        assert_eq!(decay_ms(arena), -1);
+        assert_eq!(decay_ms(0), 3000);
+        // Both collections purge every arena below `arenas.narenas`, so the
+        // lane arena is one of them.
+        assert!(arena < read_u32(c"arenas.narenas", None));
+        collect_after_job();
     }
 
     #[test]

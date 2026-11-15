@@ -363,6 +363,7 @@ impl Pipeline {
         lease: DownloadBatchLease,
     ) {
         for work in lease.works {
+            self.release_lane_work(&work);
             self.enqueue_download_work(work);
         }
         self.update_queue_metrics();

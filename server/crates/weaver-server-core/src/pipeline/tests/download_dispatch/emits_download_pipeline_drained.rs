@@ -163,6 +163,10 @@ async fn hot_download_batch_lease_stays_large_for_fresh_job_when_restart_lead_wo
         }],
     };
     insert_active_job(&mut pipeline, job_id, spec).await;
+    // Segments the size of the restart lead are larger than the fixture's
+    // volume takes: the volume is given room for them, so the lease is held
+    // by the restart lead alone.
+    pipeline.volume_buffers.set_figure(64 << 30, u64::MAX);
     pipeline
         .pending_released_download_results_by_job
         .insert(job_id, 1);
@@ -228,6 +232,10 @@ async fn hot_download_batch_lease_caps_restored_job_for_restart_durable_lead() {
         }],
     };
     insert_active_job(&mut pipeline, job_id, spec).await;
+    // Segments the size of the restart lead are larger than the fixture's
+    // volume takes: the volume is given room for them, so the lease is held
+    // by the restart lead alone.
+    pipeline.volume_buffers.set_figure(64 << 30, u64::MAX);
     pipeline
         .jobs
         .get_mut(&job_id)
@@ -1554,6 +1562,7 @@ async fn a_lane_refill_is_answered_from_the_hot_job_while_a_same_priority_peer_w
                 server_idx: Some(index % 2),
                 connection: true,
                 outstanding: HashMap::new(),
+                outstanding_bytes: 0,
             },
         );
     }
