@@ -166,15 +166,24 @@ impl VolumeProbes {
             }
             seen.push(Arc::clone(volume));
         }
-        // The job's directory may not be made yet: the probe is given the
-        // nearest directory above it that is, found on the volume's thread.
         let (probe, probed, under) = (Arc::clone(probe), Arc::clone(volume), dir.to_path_buf());
         writers.volume_submitter(volume).when_idle(move || {
-            if let Some(dir) = under.ancestors().find(|dir| dir.is_dir()) {
+            if let Some(dir) = probed_dir(&under) {
                 let _ = probe(probed, dir.to_path_buf())();
             }
         });
     }
+}
+
+// Where the probe of the volume a job's folder `job_dir` lies on writes:
+// the nearest directory above that folder that is there, read on the
+// volume's thread. Never the job's folder itself, which the job lists,
+// moves and removes as its own, nor anything inside it. A job's folder is
+// one of the intermediate root, or of a destination's `.weaver-staging`,
+// so this is that root or that staging root, on the volume the job writes
+// to, and as writable as the job's folder had to be to be made there.
+fn probed_dir(job_dir: &Path) -> Option<&Path> {
+    job_dir.parent()?.ancestors().find(|dir| dir.is_dir())
 }
 
 // A test's say over how the pipelines it builds write: one thread per
