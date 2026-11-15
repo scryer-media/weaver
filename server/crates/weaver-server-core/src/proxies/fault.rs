@@ -83,7 +83,7 @@ mod tests {
         use base64::engine::general_purpose::STANDARD;
         use weaver_tunnel::TunnelError;
 
-        use crate::proxies::{ProxyKind, ProxyProfile, ProxySecrets, Resolver};
+        use crate::proxies::{ProxyKind, ProxyProfile, ProxySecrets};
 
         let private = STANDARD.encode([7u8; 32]);
         let preshared = STANDARD.encode([5u8; 32]);
@@ -94,8 +94,10 @@ mod tests {
             enabled: true,
             host: "fra.vpn.example".into(),
             port: 51820,
-            resolver: Resolver::Proxy,
-            dns_servers: vec!["10.2.0.1".parse().unwrap()],
+            dns: crate::proxies::ProxyDns::plain(
+                crate::proxies::DnsPath::ThroughProxy,
+                ["10.2.0.1".parse().unwrap()],
+            ),
             tunnel_addresses: vec!["10.2.0.2/32".into()],
             peer_public_key: Some(STANDARD.encode([9u8; 32])),
             mtu: 1420,
@@ -132,7 +134,8 @@ mod tests {
             refused(&|p| p.secrets.preshared_key = Some(format!("{preshared}x"))),
             refused(&|p| p.secrets.preshared_key = Some(preshared[..40].to_string())),
             refused(&|p| p.peer_public_key = Some(own_key.clone())),
-            refused(&|p| p.dns_servers.clear()),
+            refused(&|p| p.dns = crate::proxies::ProxyDns::proxy()),
+            refused(&|p| p.dns.servers.clear()),
         ];
         for refusal in &refusals {
             texts.push(format!("{refusal} {refusal:?}"));

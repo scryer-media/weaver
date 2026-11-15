@@ -29,13 +29,28 @@ macro_rules! select_egresses {
              quota_download_bytes, quota_download_enabled, quota_upload_soft_bytes, \
              quota_upload_trickle_bps, \
              quota_upload_hard_bytes, quota_period, quota_reset_time_minutes_local, \
-             quota_weekly_reset_weekday, quota_monthly_reset_day FROM egress_interfaces"
+             quota_weekly_reset_weekday, quota_monthly_reset_day, dns FROM egress_interfaces"
             $(, " ", $tail)?
         )
     };
 }
 
+/// A stored egress whose DNS cannot be read: its id, and why.
+pub type UnreadableEgress = (u32, String);
+
 fn egress_row(row: SqlRow) -> Result<EgressInterface, StateError> {
+    let (egress, dns) = egress_parts(&row)?;
+    Ok(EgressInterface {
+        dns: dns?,
+        ..egress
+    })
+}
+
+// A stored egress with the host answering, and its own DNS or why that
+// cannot be read. Every other fault in the row fails the read.
+fn egress_parts(
+    row: &SqlRow,
+) -> Result<(EgressInterface, Result<super::EgressDns, StateError>), StateError> {
     let value = row.opt_text("binding_value")?;
     let binding = match row.text("binding_kind")?.as_str() {
         "system" => EgressBinding::System,
@@ -55,12 +70,48 @@ fn egress_row(row: SqlRow) -> Result<EgressInterface, StateError> {
         name: row.text("name")?,
         binding,
         enabled: row.bool("enabled")?,
-        download_bps: opt_u64(&row, "download_bps")?,
-        upload_bps: opt_u64(&row, "upload_bps")?,
-        quota: quota_row(&row)?,
+        download_bps: opt_u64(row, "download_bps")?,
+        upload_bps: opt_u64(row, "upload_bps")?,
+        quota: quota_row(row)?,
+        dns: super::EgressDns::host(),
     };
     egress.validate().map_err(error)?;
-    Ok(egress)
+    let dns = stored_dns(row.opt_text("dns")?).and_then(|dns| {
+        dns.validate().map_err(error)?;
+        Ok(dns)
+    });
+    Ok((egress, dns))
+}
+
+// The most a stored egress DNS setting may hold: ten servers, each with the
+// longest TLS name and HTTPS path a save accepts, with room to spare.
+const MAX_STORED_EGRESS_DNS_BYTES: usize = 64 * 1024;
+
+// An egress's stored DNS. No value is the host, as every egress saved
+// before the setting existed has. A value that cannot be read, or that a
+// save would refuse, is a storage fault: a read of the egress fails, and
+// the routing configuration leaves that egress out, so its legs are down
+// rather than resolving by the host.
+pub(crate) fn stored_dns(stored: Option<String>) -> Result<super::EgressDns, StateError> {
+    match stored {
+        None => Ok(super::EgressDns::host()),
+        Some(json) if json.len() > MAX_STORED_EGRESS_DNS_BYTES => {
+            Err(error("stored egress DNS is too large"))
+        }
+        Some(json) => serde_json::from_str(&json).map_err(error),
+    }
+}
+
+// An egress's DNS as it is stored: nothing for the host.
+pub(crate) fn dns_arg(dns: &super::EgressDns) -> Result<SqlArg, StateError> {
+    if dns.is_host() {
+        return Ok(SqlArg::OptText(None));
+    }
+    let json = serde_json::to_string(dns).map_err(error)?;
+    if json.len() > MAX_STORED_EGRESS_DNS_BYTES {
+        return Err(error("egress DNS is too large to store"));
+    }
+    Ok(SqlArg::OptText(Some(json)))
 }
 
 fn opt_u64(row: &SqlRow, column: &str) -> Result<Option<u64>, StateError> {
@@ -283,6 +334,7 @@ pub(super) async fn validate_stored_network(
                     download_bps: None,
                     upload_bps: None,
                     quota: EgressQuota::default(),
+                    dns: super::EgressDns::host(),
                 });
         }
         if route.legacy_policy().is_none() {
@@ -415,6 +467,29 @@ impl Database {
         })
     }
 
+    /// Every egress the routing configuration can load, and each egress whose
+    /// stored DNS cannot be read, by id with the reason. Only the DNS is read
+    /// this way; any other fault in a row fails the read, as a listing does.
+    pub fn load_egress_interfaces(
+        &self,
+    ) -> Result<(Vec<EgressInterface>, Vec<UnreadableEgress>), StateError> {
+        let store = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let mut loaded = Vec::new();
+            let mut unreadable = Vec::new();
+            for row in
+                SqlRuntime::fetch_all(store.read_exec(), select_egresses!("ORDER BY id"), &[])
+                    .await?
+            {
+                match egress_parts(&row)? {
+                    (egress, Ok(dns)) => loaded.push(EgressInterface { dns, ..egress }),
+                    (egress, Err(fault)) => unreadable.push((egress.id, fault.to_string())),
+                }
+            }
+            Ok((loaded, unreadable))
+        })
+    }
+
     pub fn create_egress_interface(
         &self,
         egress: &EgressInterface,
@@ -446,7 +521,9 @@ impl Database {
                     } else if tx.fetch_optional("SELECT id FROM egress_interfaces WHERE id = {}", &[SqlArg::I64(i64::from(egress.id))]).await?.is_none() {
                         return Err(NetworkRefusal::EgressGone.into());
                     }
+                    egress.dns = std::mem::take(&mut egress.dns).normal();
                     egress.validate()?;
+                    let dns = dns_arg(&egress.dns)?;
                     let (kind, value) = match &egress.binding {
                         EgressBinding::System => ("system", None),
                         EgressBinding::Interface { name } => ("interface", Some(name.clone())),
@@ -454,13 +531,14 @@ impl Database {
                     };
                     let now = chrono::Utc::now().timestamp();
                     let quota = &egress.quota;
-                    tx.execute("INSERT INTO egress_interfaces (id, name, binding_kind, binding_value, enabled, download_bps, upload_bps, quota_download_bytes, quota_download_enabled, quota_upload_soft_bytes, quota_upload_trickle_bps, quota_upload_hard_bytes, quota_period, quota_reset_time_minutes_local, quota_weekly_reset_weekday, quota_monthly_reset_day, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) ON CONFLICT(id) DO UPDATE SET name = excluded.name, binding_kind = excluded.binding_kind, binding_value = excluded.binding_value, enabled = excluded.enabled, download_bps = excluded.download_bps, upload_bps = excluded.upload_bps, quota_download_bytes = COALESCE(excluded.quota_download_bytes, egress_interfaces.quota_download_bytes), quota_download_enabled = excluded.quota_download_enabled, quota_upload_soft_bytes = excluded.quota_upload_soft_bytes, quota_upload_trickle_bps = excluded.quota_upload_trickle_bps, quota_upload_hard_bytes = excluded.quota_upload_hard_bytes, quota_period = excluded.quota_period, quota_reset_time_minutes_local = excluded.quota_reset_time_minutes_local, quota_weekly_reset_weekday = excluded.quota_weekly_reset_weekday, quota_monthly_reset_day = excluded.quota_monthly_reset_day, updated_at = excluded.updated_at", &[
+                    tx.execute("INSERT INTO egress_interfaces (id, name, binding_kind, binding_value, enabled, download_bps, upload_bps, quota_download_bytes, quota_download_enabled, quota_upload_soft_bytes, quota_upload_trickle_bps, quota_upload_hard_bytes, quota_period, quota_reset_time_minutes_local, quota_weekly_reset_weekday, quota_monthly_reset_day, dns, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) ON CONFLICT(id) DO UPDATE SET name = excluded.name, binding_kind = excluded.binding_kind, binding_value = excluded.binding_value, enabled = excluded.enabled, download_bps = excluded.download_bps, upload_bps = excluded.upload_bps, quota_download_bytes = COALESCE(excluded.quota_download_bytes, egress_interfaces.quota_download_bytes), quota_download_enabled = excluded.quota_download_enabled, quota_upload_soft_bytes = excluded.quota_upload_soft_bytes, quota_upload_trickle_bps = excluded.quota_upload_trickle_bps, quota_upload_hard_bytes = excluded.quota_upload_hard_bytes, quota_period = excluded.quota_period, quota_reset_time_minutes_local = excluded.quota_reset_time_minutes_local, quota_weekly_reset_weekday = excluded.quota_weekly_reset_weekday, quota_monthly_reset_day = excluded.quota_monthly_reset_day, dns = excluded.dns, updated_at = excluded.updated_at", &[
                         SqlArg::I64(i64::from(egress.id)), SqlArg::Text(egress.name.clone()), SqlArg::Text(kind.into()), SqlArg::OptText(value),
                         SqlArg::Bool(egress.enabled), opt_arg(egress.download_bps), opt_arg(egress.upload_bps),
                         opt_arg(quota.download_bytes), SqlArg::Bool(quota.download_bytes.is_some()), opt_arg(quota.upload_soft_bytes), SqlArg::I64(quota.upload_trickle_bps as i64), opt_arg(quota.upload_hard_bytes),
                         SqlArg::Text(quota.period.as_str().into()),
                         SqlArg::I64(i64::from(quota.reset_time_minutes_local)), SqlArg::Text(quota_weekday_str(quota.weekly_reset_weekday).into()),
                         SqlArg::I64(i64::from(quota.monthly_reset_day)),
+                        dns,
                         SqlArg::I64(now), SqlArg::I64(now),
                     ]).await?;
                     Ok(egress)

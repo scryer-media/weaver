@@ -83,7 +83,6 @@ mod tests {
     use super::super::{apply_version_range, embedded_catalog, embedded_payload_bytes};
     use super::*;
     use crate::migration_assets::MigrationInstallKind;
-    use crate::proxies::{ProxyKind, ProxyProfile, Resolver};
 
     async fn below_schema_64() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -133,7 +132,9 @@ mod tests {
             .unwrap()
     }
 
-    async fn profile(pool: &SqlitePool, id: i64) -> ProxyProfile {
+    // The profile as schema 64 stored it. Later steps change its shape, so
+    // it is read as the JSON this step wrote.
+    async fn profile(pool: &SqlitePool, id: i64) -> Value {
         serde_json::from_str(&saved(pool, id).await).unwrap()
     }
 
@@ -155,17 +156,29 @@ mod tests {
         upgrade_to_64(&pool).await;
 
         let ssh = profile(&pool, 1).await;
-        assert_eq!((ssh.kind, ssh.resolver), (ProxyKind::Ssh, Resolver::Proxy));
-        assert!(ssh.dns_servers.is_empty());
-        let socks = profile(&pool, 2).await;
-        assert_eq!(socks.resolver, Resolver::Proxy);
         assert_eq!(
-            socks.dns_servers,
-            vec!["192.0.2.53".parse::<std::net::IpAddr>().unwrap()]
+            (&ssh["kind"], &ssh[RESOLVER]),
+            (&"Ssh".into(), &"Proxy".into())
         );
-        assert_eq!(socks.revision, 3);
-        assert_eq!(profile(&pool, 3).await.resolver, Resolver::Weaver);
-        assert_eq!(profile(&pool, 4).await.resolver, Resolver::Proxy);
+        assert_eq!(ssh["dns_servers"], serde_json::json!([]));
+        let socks = profile(&pool, 2).await;
+        assert_eq!(socks[RESOLVER], "Proxy");
+        assert_eq!(socks["dns_servers"], serde_json::json!(["192.0.2.53"]));
+        assert_eq!(socks["revision"], 3);
+        assert_eq!(profile(&pool, 3).await[RESOLVER], "Weaver");
+        assert_eq!(profile(&pool, 4).await[RESOLVER], "Proxy");
+
+        // What this step names, the later shape reads.
+        let mut conn = pool.acquire().await.unwrap();
+        super::super::proxy_dns_v121::spell_out_proxy_dns(&mut SqlConn::Sqlite(&mut conn))
+            .await
+            .unwrap();
+        drop(conn);
+        for id in 1..=4 {
+            let read: crate::proxies::ProxyProfile =
+                serde_json::from_str(&saved(&pool, id).await).unwrap();
+            assert_eq!(read.revision, 3);
+        }
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use super::*;
-use crate::proxies::{Resolver, RouteLeg, RoutingPolicy, TorrentScope};
+use crate::proxies::{RouteLeg, RoutingPolicy, TorrentScope};
 
 fn profile(id: u32, kind: ProxyKind) -> ProxyProfile {
     ProxyProfile {
@@ -14,8 +14,7 @@ fn profile(id: u32, kind: ProxyKind) -> ProxyProfile {
         enabled: true,
         host: "192.0.2.1".into(),
         port: 51820,
-        resolver: Resolver::Proxy,
-        dns_servers: vec![],
+        dns: crate::proxies::ProxyDns::proxy(),
         tunnel_addresses: vec![],
         peer_public_key: None,
         mtu: 1420,
@@ -562,7 +561,10 @@ fn saved_wireguard(id: u32) -> ProxyProfile {
             .encode(weaver_tunnel::test_support::test_key(seed))
     };
     ProxyProfile {
-        dns_servers: vec!["10.64.0.1".parse().unwrap()],
+        dns: crate::proxies::ProxyDns::plain(
+            crate::proxies::DnsPath::ThroughProxy,
+            ["10.64.0.1".parse().unwrap()],
+        ),
         tunnel_addresses: vec!["10.64.0.2/32".into()],
         peer_public_key: Some(key(2)),
         secrets: crate::proxies::ProxySecrets {

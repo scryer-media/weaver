@@ -3,8 +3,7 @@
 
 use super::*;
 use crate::proxies::{
-    Consumer, ProxyKind, ProxyProfile, ProxyRuntime, ProxySecrets, Resolver, RouteState,
-    RoutingPolicy,
+    Consumer, ProxyKind, ProxyProfile, ProxyRuntime, ProxySecrets, RouteState, RoutingPolicy,
 };
 use std::{
     collections::HashMap,
@@ -45,8 +44,10 @@ impl Fixture {
             enabled: true,
             host: "127.0.0.1".into(),
             port: 1,
-            resolver: Resolver::Proxy,
-            dns_servers: vec![DNS.parse().unwrap()],
+            dns: crate::proxies::ProxyDns::plain(
+                crate::proxies::DnsPath::ThroughProxy,
+                [DNS.parse().unwrap()],
+            ),
             tunnel_addresses: vec![],
             peer_public_key: None,
             mtu: 1280,
@@ -124,7 +125,10 @@ impl Fixture {
                 let spec = proxy.client_spec("rss");
                 use base64::Engine;
                 p.port = proxy.endpoint().port();
-                p.dns_servers = spec.dns_servers;
+                p.dns = crate::proxies::ProxyDns::plain(
+                    crate::proxies::DnsPath::ThroughProxy,
+                    spec.dns_servers,
+                );
                 p.tunnel_addresses = vec!["10.63.0.2/32".into()];
                 p.peer_public_key =
                     Some(base64::engine::general_purpose::STANDARD.encode(spec.peer_public_key));
@@ -310,7 +314,7 @@ async fn a_proxy_resolving_with_its_host_is_handed_the_feeds_name() {
         let temp = TempDir::new().unwrap();
         let (addr, captured, task) = origin().await;
         let mut fixture = Fixture::start(kind, addr).await;
-        fixture.profile.dns_servers.clear();
+        fixture.profile.dns = crate::proxies::ProxyDns::proxy();
         let (service, runtime, feed, _) =
             service(&temp, &fixture, "http://feed.invalid/redirect", false);
         let response = service
@@ -355,7 +359,7 @@ async fn a_proxy_resolving_with_its_host_is_never_handed_a_private_address() {
     let temp = TempDir::new().unwrap();
     let (addr, captured, task) = origin().await;
     let mut fixture = Fixture::start(ProxyKind::Socks5, addr).await;
-    fixture.profile.dns_servers.clear();
+    fixture.profile.dns = crate::proxies::ProxyDns::proxy();
     let (service, runtime, feed, _) =
         service(&temp, &fixture, &format!("http://{addr}/feed"), false);
     assert!(

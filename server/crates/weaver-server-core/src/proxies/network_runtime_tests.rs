@@ -12,8 +12,7 @@ fn proxy() -> ProxyProfile {
         enabled: true,
         host: "proxy.invalid".into(),
         port: 1080,
-        resolver: Resolver::Proxy,
-        dns_servers: vec![],
+        dns: crate::proxies::ProxyDns::proxy(),
         tunnel_addresses: vec![],
         peer_public_key: None,
         mtu: 1420,
@@ -897,6 +896,7 @@ fn metered_egress(limit_bytes: u64) -> EgressInterface {
             address: "127.0.0.1".parse().unwrap(),
         },
         enabled: true,
+        dns: Default::default(),
         download_bps: None,
         upload_bps: None,
         quota: crate::proxies::EgressQuota {
@@ -1194,6 +1194,7 @@ async fn a_route_seen_up_and_then_down_raises_route_down_once() {
         download_bps: None,
         upload_bps: None,
         quota: Default::default(),
+        dns: Default::default(),
     };
     config.egresses.insert(link.id, link);
     runtime.apply_configuration(config.clone()).unwrap();
@@ -1513,8 +1514,10 @@ fn wireguard_profile(
         kind: ProxyKind::WireGuard,
         host,
         port,
-        resolver: Resolver::Proxy,
-        dns_servers: spec.dns_servers.clone(),
+        dns: crate::proxies::ProxyDns::plain(
+            crate::proxies::DnsPath::ThroughProxy,
+            spec.dns_servers.clone(),
+        ),
         tunnel_addresses: vec![format!(
             "{}/32",
             weaver_tunnel::test_support::TEST_CLIENT_ADDRESS
@@ -2085,7 +2088,10 @@ fn idle_wireguard_profile(id: u32) -> ProxyProfile {
         kind: ProxyKind::WireGuard,
         host: "192.0.2.1".into(),
         port: 51820,
-        dns_servers: vec!["10.64.0.1".parse().unwrap()],
+        dns: crate::proxies::ProxyDns::plain(
+            crate::proxies::DnsPath::ThroughProxy,
+            ["10.64.0.1".parse().unwrap()],
+        ),
         tunnel_addresses: vec!["10.64.0.2/32".into()],
         peer_public_key: Some(key(2)),
         secrets: ProxySecrets {
@@ -2393,7 +2399,10 @@ fn same_identity_runtime() -> (Arc<NetworkRuntime>, Configuration, Arc<Mutex<Vec
                 host: "127.0.0.1".into(),
                 port: 9,
                 tunnel_addresses: vec!["10.0.0.2/32".into()],
-                dns_servers: vec![[10, 0, 0, 1].into()],
+                dns: crate::proxies::ProxyDns::plain(
+                    crate::proxies::DnsPath::ThroughProxy,
+                    [[10, 0, 0, 1].into()],
+                ),
                 peer_public_key: Some(key(2)),
                 secrets: ProxySecrets {
                     private_key: Some(key(1)),
@@ -2691,5 +2700,83 @@ async fn a_server_test_takes_probe_room_beside_servers_holding_all_of_usenet() {
     assert!(matches!(*error, DialError::AtCapacity(_)), "{error}");
     assert!(!taken(&events).contains(&"dial tunnel".to_owned()));
     drop((usenet, probes));
+    runtime.shutdown().await;
+}
+
+// One egress whose stored DNS cannot be read is left out of the routing
+// configuration: its legs are down, saying why, the other egresses load,
+// and nothing on it resolves by the host. A read of the egress itself still
+// fails, so the fault is not hidden.
+#[tokio::test]
+async fn an_egress_whose_stored_dns_cannot_be_read_is_left_out_and_its_legs_are_down() {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    let db = Database::open_in_memory().unwrap();
+    let egress = db
+        .create_egress_interface(&EgressInterface {
+            id: 0,
+            name: "WAN B".into(),
+            binding: EgressBinding::SourceAddress {
+                address: "192.0.2.2".parse().unwrap(),
+            },
+            enabled: true,
+            download_bps: None,
+            upload_bps: None,
+            quota: Default::default(),
+            dns: Default::default(),
+        })
+        .unwrap();
+    let consumer = Consumer::Server(1);
+    let route = Route {
+        legs: vec![RouteLeg {
+            egress_id: egress.id,
+            weight: 100,
+            path: LegPath::Direct,
+        }],
+        failover: Failover::default(),
+    };
+    let store = db.datastore();
+    let id = egress.id;
+    db.run_sql_blocking(async move {
+        SqlRuntime::run_in_transaction(&store, "unreadable_egress_dns", |tx| {
+            let route = route.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO proxy_routes (consumer, policy) VALUES ({}, {})",
+                    &[
+                        SqlArg::Text(consumer.key()),
+                        SqlArg::Text(serde_json::to_string(&route).unwrap()),
+                    ],
+                )
+                .await?;
+                tx.execute(
+                    "UPDATE egress_interfaces SET dns = {} WHERE id = {}",
+                    &[
+                        SqlArg::Text("{\"who\":\"Proxy\"".into()),
+                        SqlArg::I64(i64::from(id)),
+                    ],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+    })
+    .unwrap();
+
+    assert!(db.list_egress_interfaces().is_err());
+    let runtime = NetworkRuntime::new(db, tokio::runtime::Handle::current()).unwrap();
+    {
+        let config = runtime.configuration.read().unwrap();
+        assert!(config.egresses.contains_key(&SYSTEM_EGRESS_ID));
+        assert!(!config.egresses.contains_key(&id));
+        let warning = config.warnings.get(&(consumer.key(), 0)).unwrap();
+        assert!(
+            warning.starts_with(&format!(
+                "Egress {id}'s stored DNS setting cannot be read ("
+            )),
+            "{warning}"
+        );
+    }
+    assert!(runtime.egress_dialer(id, Duration::from_secs(1)).is_err());
     runtime.shutdown().await;
 }

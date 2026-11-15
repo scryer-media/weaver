@@ -30,10 +30,10 @@ use crate::StateError;
 use crate::bandwidth::TorrentRates;
 use crate::persistence::Database;
 use crate::proxies::{
-    Consumer, EgressBinding, EgressHealth, EgressInterface, EgressLimitChanges, FetchOptions,
-    LegPath, LegTenancy, MulticastInterfaces, NetworkRuntime, ProxyRuntime, ResolvedBy, Route,
-    RoutingPolicy, Rung, SYSTEM_EGRESS_ID, SessionOpening, TorrentLeg, TorrentScope, pool_of,
-    routed_fetch,
+    Consumer, EgressBinding, EgressDns, EgressHealth, EgressInterface, EgressLimitChanges,
+    FetchOptions, LegPath, LegTenancy, MulticastInterfaces, NetworkRuntime, ProxyRuntime,
+    ResolvedBy, Route, RoutingPolicy, Rung, SYSTEM_EGRESS_ID, SessionOpening, TorrentLeg,
+    TorrentScope, pool_of, routed_fetch,
 };
 use crate::settings::{BlocklistSource, TorrentConfig, TorrentEncryption, TorrentLimit};
 use crate::torrents::identity::IDENTITY;
@@ -154,6 +154,39 @@ impl RouteKey {
         Self(hex::encode(&Sha1::digest(&encoded)[..8]))
     }
 
+    /// [`of`](Self::of) for a leg on an egress whose names go to listed
+    /// DNS servers: a save of that DNS opens a new session. An egress the
+    /// host names keeps the key it always had.
+    pub fn of_named(
+        egress_id: u32,
+        binding: &EgressBinding,
+        path: &LegPath,
+        dns: &EgressDns,
+    ) -> Self {
+        if dns.is_host() {
+            return Self::of(egress_id, binding, path);
+        }
+        let encoded =
+            serde_json::to_vec(&(egress_id, binding, path, dns)).expect("route legs always encode");
+        Self(hex::encode(&Sha1::digest(&encoded)[..8]))
+    }
+
+    /// [`member`](Self::member) on an egress whose names go to listed DNS
+    /// servers.
+    pub fn member_named(
+        egress_id: u32,
+        binding: &EgressBinding,
+        member: u32,
+        dns: &EgressDns,
+    ) -> Self {
+        if dns.is_host() {
+            return Self::member(egress_id, binding, member);
+        }
+        let encoded = serde_json::to_vec(&("member", egress_id, binding, member, dns))
+            .expect("route legs always encode");
+        Self(hex::encode(&Sha1::digest(&encoded)[..8]))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -187,26 +220,31 @@ pub fn leg_unavailable(network: &NetworkRuntime, egress_id: u32) -> Option<Route
     }
 }
 
-/// Who resolves the names a session on `path` looks up: the host's DNS on a
-/// direct leg, the exit proxy's naming on a ladder, none on a pool exit, whose
-/// sessions each name through their own member, or a proxy that is not
-/// configured.
-pub fn names_on(network: &NetworkRuntime, path: &LegPath) -> Option<ResolvedBy> {
+/// Who resolves the names a session on `path` through `egress_id` looks up:
+/// the egress's DNS on a direct leg, the exit proxy's naming on a ladder, none
+/// on a pool exit, whose sessions each name through their own member, or a
+/// proxy that is not configured.
+pub fn names_on(network: &NetworkRuntime, egress_id: u32, path: &LegPath) -> Option<ResolvedBy> {
     let exit = match path {
-        LegPath::Direct => return Some(ResolvedBy::Host),
+        LegPath::Direct => {
+            return Some(
+                leg_egress(network, egress_id)
+                    .map_or(ResolvedBy::Host, |egress| egress.dns.resolved_by()),
+            );
+        }
         LegPath::Ladder { rungs, .. } => match rungs.last()? {
             Rung::Proxy { id } => *id,
             Rung::Chain { ids } => *ids.last()?,
             Rung::Pool { .. } => return None,
         },
     };
-    network.resolved_by(exit)
+    network.resolved_by(exit, egress_id)
 }
 
 /// The key of the session a route through `egress_id` and `path` opens.
 pub fn leg_key(network: &NetworkRuntime, egress_id: u32, path: &LegPath) -> RouteKey {
     match leg_egress(network, egress_id) {
-        Some(egress) => RouteKey::of(egress.id, &egress.binding, path),
+        Some(egress) => RouteKey::of_named(egress.id, &egress.binding, path, &egress.dns),
         None => RouteKey::of(egress_id, &EgressBinding::System, path),
     }
 }
@@ -215,7 +253,7 @@ pub fn leg_key(network: &NetworkRuntime, egress_id: u32, path: &LegPath) -> Rout
 /// `member`.
 pub fn member_key(network: &NetworkRuntime, egress_id: u32, member: u32) -> RouteKey {
     match leg_egress(network, egress_id) {
-        Some(egress) => RouteKey::member(egress.id, &egress.binding, member),
+        Some(egress) => RouteKey::member_named(egress.id, &egress.binding, member, &egress.dns),
         None => RouteKey::member(egress_id, &EgressBinding::System, member),
     }
 }
@@ -464,7 +502,7 @@ impl Routes for NetworkRoutes {
                                 down: unavailable.clone().or_else(|| {
                                     members_down.remove(&id).map(RouteFailure::leg_down)
                                 }),
-                                names: self.network().resolved_by(id),
+                                names: self.network().resolved_by(id, leg.egress_id),
                             })
                             .collect();
                         // Down while no member is up: for the first member's
@@ -489,7 +527,7 @@ impl Routes for NetworkRoutes {
             egress_id,
             kind: leg_kind(self.network(), leg.egress_id, &leg.path),
             key,
-            names: names_on(self.network(), &leg.path),
+            names: names_on(self.network(), leg.egress_id, &leg.path),
             policy,
             down,
             members,

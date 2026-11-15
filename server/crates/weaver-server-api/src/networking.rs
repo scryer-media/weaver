@@ -4,7 +4,7 @@
 use crate::{
     auth::{AdminGuard, ControlGuard, ReadGuard},
     observability::{refusal_error, spawn_blocking_db},
-    proxies::ProxyKind,
+    proxies::{EgressDnsGql, EgressDnsInput, ProxyKind},
 };
 use async_graphql::{
     Context, Enum, InputObject, Object, OneofObject, Result, SimpleObject, Subscription,
@@ -242,9 +242,19 @@ pub struct EgressInterfaceInput {
     pub download_bps: Option<u64>,
     /// Bytes per second; null is no limit.
     pub upload_bps: Option<u64>,
+    /// How names dialled straight out of the egress are resolved. Null or
+    /// absent keeps what an update's egress had saved, and is the host on
+    /// create; only an explicit `who: HOST` sets an update back to the
+    /// host.
+    pub dns: Option<EgressDnsInput>,
 }
 impl EgressInterfaceInput {
-    fn egress(self, id: u32, quota: core::EgressQuota) -> Result<core::EgressInterface> {
+    fn egress(
+        self,
+        id: u32,
+        quota: core::EgressQuota,
+        saved_dns: core::EgressDns,
+    ) -> Result<core::EgressInterface> {
         let binding = match self.binding_kind {
             EgressBindingKind::System => core::EgressBinding::System,
             EgressBindingKind::Interface => {
@@ -275,6 +285,10 @@ impl EgressInterfaceInput {
             download_bps: self.download_bps,
             upload_bps: self.upload_bps,
             quota,
+            dns: match self.dns {
+                Some(dns) => dns.dns()?,
+                None => saved_dns,
+            },
         };
         egress.validate().map_err(refusal_error)?;
         Ok(egress)
@@ -293,6 +307,8 @@ pub struct EgressInterfaceGql {
     pub download_bps: Option<u64>,
     pub upload_bps: Option<u64>,
     pub quota: EgressQuotaGql,
+    /// How names dialled straight out of the egress are resolved.
+    pub dns: EgressDnsGql,
     /// Null while this Weaver is not tracking usage.
     pub quota_usage: Option<EgressQuotaUsageGql>,
     pub health: String,
@@ -313,6 +329,7 @@ fn egress_gql(
         core::EgressHealth::Unknown => ("UNKNOWN", interfaces.error.clone()),
     };
     let quota_usage = network.egress_usage(e.id).map(Into::into);
+    let dns = EgressDnsGql::from(&e.dns);
     let addresses = interfaces
         .interfaces
         .iter()
@@ -353,6 +370,7 @@ fn egress_gql(
         download_bps: e.download_bps,
         upload_bps: e.upload_bps,
         quota: e.quota.into(),
+        dns,
         quota_usage,
         health: health.into(),
         reason,
@@ -759,6 +777,10 @@ pub enum LookupErrorCode {
     ServerFailure,
     NoReply,
     NotAuthenticated,
+    // The answer failed DNSSEC validation.
+    Bogus,
+    // The server returns no DNSSEC records, so nothing could be validated.
+    DnssecUnavailable,
     TlsFailed,
     Other,
 }
@@ -771,8 +793,36 @@ impl From<core::LookupFailure> for LookupErrorCode {
             core::LookupFailure::ServerFailure => Self::ServerFailure,
             core::LookupFailure::NoReply => Self::NoReply,
             core::LookupFailure::NotAuthenticated => Self::NotAuthenticated,
+            core::LookupFailure::Bogus => Self::Bogus,
+            core::LookupFailure::DnssecUnavailable => Self::DnssecUnavailable,
             core::LookupFailure::TlsFailed => Self::TlsFailed,
             core::LookupFailure::Other => Self::Other,
+        }
+    }
+}
+// What a lookup's answer from listed servers was taken as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+pub enum LookupTrust {
+    AsSent,
+    Authenticated,
+    // Refused, as the server did not mark it authenticated.
+    Refused,
+    // Weaver checked its DNSSEC signatures and they held.
+    Validated,
+    // The zone is not signed, so there was nothing to check.
+    Unsigned,
+    // Refused, as its DNSSEC signatures failed Weaver's check.
+    Bogus,
+}
+impl From<core::TrustOutcome> for LookupTrust {
+    fn from(value: core::TrustOutcome) -> Self {
+        match value {
+            core::TrustOutcome::AsSent => Self::AsSent,
+            core::TrustOutcome::Authenticated => Self::Authenticated,
+            core::TrustOutcome::Refused => Self::Refused,
+            core::TrustOutcome::Validated => Self::Validated,
+            core::TrustOutcome::Unsigned => Self::Unsigned,
+            core::TrustOutcome::Bogus => Self::Bogus,
         }
     }
 }
@@ -789,6 +839,12 @@ pub struct HostResolution {
     // The proxy that resolved it, or that Weaver asked through.
     pub proxy_id: Option<u32>,
     pub dns_servers: Vec<String>,
+    // The wire the servers were asked over, when servers were asked.
+    pub wire: Option<crate::proxies::ProxyDnsWire>,
+    // The listed server whose answer was used, when one answered.
+    pub answered_by: Option<String>,
+    // What the servers' answer was taken as, when one came to judge.
+    pub trust: Option<LookupTrust>,
     pub addresses: Vec<String>,
     // The answer was held from an earlier lookup.
     pub cached: bool,
@@ -802,6 +858,9 @@ impl From<core::HostResolution> for HostResolution {
             resolved_by: value.by.into(),
             proxy_id: value.proxy,
             dns_servers: value.servers.iter().map(ToString::to_string).collect(),
+            wire: value.wire.map(Into::into),
+            answered_by: value.answered_by.map(|ip| ip.to_string()),
+            trust: value.trust.map(Into::into),
             addresses: value.addresses.iter().map(ToString::to_string).collect(),
             cached: value.cached,
             connected_address: value.connected.map(|ip| ip.to_string()),
@@ -1510,7 +1569,7 @@ impl NetworkingMutation {
         let runtime = runtime(ctx)?;
         let _guard = runtime.mutations.lock().await;
         let db = ctx.data::<Database>()?.clone();
-        let egress = input.egress(1, Default::default())?;
+        let egress = input.egress(1, Default::default(), core::EgressDns::host())?;
         let saved = spawn_blocking_db("network.create_egress", move || {
             db.create_egress_interface(&egress)
         })
@@ -1532,7 +1591,7 @@ impl NetworkingMutation {
         let runtime = runtime(ctx)?;
         let _guard = runtime.mutations.lock().await;
         let db = ctx.data::<Database>()?.clone();
-        let saved_quota = {
+        let (saved_quota, saved_dns) = {
             let db = db.clone();
             spawn_blocking_db("network.update_egress.saved_quota", move || {
                 db.list_egress_interfaces()
@@ -1540,10 +1599,10 @@ impl NetworkingMutation {
             .await?
             .into_iter()
             .find(|egress| egress.id == id)
-            .map(|egress| egress.quota)
+            .map(|egress| (egress.quota, egress.dns))
             .unwrap_or_default()
         };
-        let egress = input.egress(id, saved_quota)?;
+        let egress = input.egress(id, saved_quota, saved_dns)?;
         let saved = spawn_blocking_db("network.update_egress", move || {
             db.update_egress_interface(&egress)
         })

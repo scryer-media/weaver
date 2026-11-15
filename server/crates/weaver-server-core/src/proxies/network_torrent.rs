@@ -1082,9 +1082,9 @@ mod tests {
     }
 
     // A runtime whose default torrent scope rides a ladder through a SOCKS5
-    // proxy named by `resolver`, asking no DNS servers of its own. The proxy
+    // proxy whose names `dns` answers, asking no DNS servers of its own. The proxy
     // is never dialled: only names are looked up on the leg.
-    fn ladder_runtime(resolver: crate::proxies::Resolver) -> (Arc<NetworkRuntime>, Configuration) {
+    fn ladder_runtime(dns: crate::proxies::ProxyDns) -> (Arc<NetworkRuntime>, Configuration) {
         let runtime = NetworkRuntime::new(
             crate::Database::open_in_memory().unwrap(),
             tokio::runtime::Handle::current(),
@@ -1101,8 +1101,7 @@ mod tests {
                 enabled: true,
                 host: "127.0.0.1".into(),
                 port: 1,
-                resolver,
-                dns_servers: vec![],
+                dns,
                 tunnel_addresses: vec![],
                 peer_public_key: None,
                 mtu: 1420,
@@ -1168,7 +1167,7 @@ mod tests {
     // naming holds, and both ride the one client built for that host.
     #[tokio::test]
     async fn two_announces_to_one_host_on_a_leg_resolve_once_and_share_a_client() {
-        let (runtime, _) = ladder_runtime(crate::proxies::Resolver::Weaver);
+        let (runtime, _) = ladder_runtime(crate::proxies::ProxyDns::host());
         let leg = runtime
             .torrent_leg(TorrentScope::Default, 0, 8, Duration::from_secs(30))
             .unwrap();
@@ -1198,7 +1197,7 @@ mod tests {
     // resolver is not asked on the proxied leg.
     #[tokio::test]
     async fn a_resolver_edit_from_weaver_to_proxy_reuses_no_answer_or_client() {
-        let (runtime, mut config) = ladder_runtime(crate::proxies::Resolver::Weaver);
+        let (runtime, mut config) = ladder_runtime(crate::proxies::ProxyDns::host());
         let timeout = Duration::from_secs(30);
         let old = runtime
             .torrent_leg(TorrentScope::Default, 0, 8, timeout)
@@ -1213,7 +1212,7 @@ mod tests {
         assert_eq!(held.unwrap().by, ResolvedBy::Host);
 
         let profile = config.profiles.get_mut(&1).unwrap();
-        profile.resolver = crate::proxies::Resolver::Proxy;
+        profile.dns = crate::proxies::ProxyDns::proxy();
         profile.revision += 1;
         runtime.apply_configuration(config).unwrap();
         assert!(old.stage.is_revoked());

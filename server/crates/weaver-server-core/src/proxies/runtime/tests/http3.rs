@@ -10,7 +10,7 @@ async fn http3_profile_test_never_falls_back_to_tcp_when_dns_is_missing() {
     let mut p = profile(1);
     p.kind = ProxyKind::Http3Connect;
     p.port = listener.local_addr().unwrap().port();
-    p.dns_servers.clear();
+    p.dns = ProxyDns::proxy();
     db.save_proxy_profile(&p).unwrap();
     let runtime = ProxyRuntime::new(db, tokio::runtime::Handle::current()).unwrap();
     let route = Route {

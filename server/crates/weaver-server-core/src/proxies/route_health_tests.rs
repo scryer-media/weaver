@@ -4,7 +4,7 @@
 use super::*;
 use std::time::{Duration, Instant};
 
-use crate::proxies::{ProxySecrets, Resolver, RouteLeg};
+use crate::proxies::{ProxySecrets, RouteLeg};
 
 fn interface(id: u32) -> EgressInterface {
     EgressInterface {
@@ -17,6 +17,7 @@ fn interface(id: u32) -> EgressInterface {
         download_bps: None,
         upload_bps: None,
         quota: Default::default(),
+        dns: Default::default(),
     }
 }
 
@@ -28,8 +29,7 @@ fn wireguard(id: u32, revision: u64) -> ProxyProfile {
         enabled: true,
         host: "vpn.invalid".into(),
         port: 51820,
-        resolver: Resolver::Weaver,
-        dns_servers: vec![],
+        dns: crate::proxies::ProxyDns::host(),
         tunnel_addresses: vec![],
         peer_public_key: None,
         mtu: 1420,

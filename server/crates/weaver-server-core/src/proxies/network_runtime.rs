@@ -12,7 +12,7 @@ use weaver_tunnel::{
     Http3TunnelProvider, SshTunnelProvider, TunnelProvider, WireGuardTunnelProvider,
     egress::SocketEgress,
     pipe::{
-        DialError, DialPath, Dialed, Dialer, Egress, Fallback, InnerTransport, Revocable,
+        DialError, DialPath, Dialed, Dialer, Egress, Fallback, InnerTransport, Naming, Revocable,
         SessionHop, SessionSockets, SocketShares, Target, TransportHop,
     },
     transport::{TransportKind, TransportProxy},
@@ -36,11 +36,15 @@ pub use torrent::{
 mod test_via;
 pub use test_via::{
     HostResolution, LookupError, LookupFailure, MAX_TEST_PATHS, P2pTest, PathTest, ResolvedBy,
-    TestSubject,
+    TestSubject, TrustOutcome,
 };
 
 // The health reason of an egress whose download quota is used up.
 pub const QUOTA_REACHED: &str = "Quota reached";
+
+// How long an egress's listed DNS server is given to accept a connection.
+// The lookup as a whole stays inside the dial or resolve that asked for it.
+const EGRESS_DNS_DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct Configuration {
@@ -55,10 +59,19 @@ struct Configuration {
     socket_cap: usize,
     // How the routes share each WireGuard session's sockets.
     socket_ledger: HashMap<SessionPath, TunnelSockets>,
+    // The naming of each egress whose names go to listed servers, shared by
+    // every leg and hop on it: its answers, TLS sessions and DNSSEC state
+    // belong to that egress's setting and to no other.
+    namings: HashMap<u32, Naming>,
 }
 impl Configuration {
     fn load(db: &Database) -> Result<Self, String> {
+        // An egress whose stored DNS cannot be read is left out: its legs are
+        // down, as a missing egress's are, and never resolve by the host.
+        let (egresses, unreadable) = db.load_egress_interfaces().map_err(|e| e.to_string())?;
+        let unreadable: HashMap<u32, String> = unreadable.into_iter().collect();
         let mut configuration = Self {
+            namings: HashMap::new(),
             warnings: HashMap::new(),
             socket_cap: super::wireguard_socket_cap(),
             socket_ledger: HashMap::new(),
@@ -68,12 +81,7 @@ impl Configuration {
                 .into_iter()
                 .map(Consumer::key)
                 .collect(),
-            egresses: db
-                .list_egress_interfaces()
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .map(|e| (e.id, e))
-                .collect(),
+            egresses: egresses.into_iter().map(|e| (e.id, e)).collect(),
             profiles: db
                 .list_proxy_profiles()
                 .map_err(|e| e.to_string())?
@@ -100,10 +108,16 @@ impl Configuration {
             .map(|server| (server.id, server.connections))
             .collect();
         configuration.socket_ledger = configuration.ledger(&connections);
+        configuration.name_egresses();
         let mut missing = Vec::new();
         for (consumer, policy) in &configuration.policies {
             for (position, leg) in policy.legs.iter().enumerate() {
-                if !configuration.egresses.contains_key(&leg.egress_id) {
+                if let Some(fault) = unreadable.get(&leg.egress_id) {
+                    missing.push((
+                        (consumer.clone(), position),
+                        format!("Egress {}'s stored DNS setting cannot be read ({fault}); this leg is Down until its egress is repaired.", leg.egress_id),
+                    ));
+                } else if !configuration.egresses.contains_key(&leg.egress_id) {
                     missing.push((
                         (consumer.clone(), position),
                         format!("Restored egress {} is missing; this leg is Down until its egress is repaired.", leg.egress_id),
@@ -117,6 +131,43 @@ impl Configuration {
         configuration.warn_over_budget();
         configuration.warn_peer_clamps(db.torrent_peer_limit().map_err(|e| e.to_string())?);
         Ok(configuration)
+    }
+    // A fresh naming for every egress whose names go to listed servers.
+    fn name_egresses(&mut self) {
+        self.namings = self
+            .egresses
+            .values()
+            .filter_map(|egress| {
+                let (servers, trust) = egress.dns.engine()?;
+                let carrier = NetworkRuntime::socket_egress(egress, EGRESS_DNS_DIAL_TIMEOUT, None);
+                Some((egress.id, carrier.servers_naming(servers, trust)))
+            })
+            .collect();
+    }
+    // What a leg or session on egress `id` adds to its signature for the
+    // egress's DNS: nothing when the host resolves, so every leg saved
+    // before the setting keeps its signature.
+    fn dns_signature(&self, id: u32) -> Result<Option<String>, String> {
+        match self.egresses.get(&id).map(|egress| &egress.dns) {
+            Some(dns) if !dns.is_host() => serde_json::to_string(dns)
+                .map(|json| Some(format!(":dns={json}")))
+                .map_err(|e| e.to_string()),
+            _ => Ok(None),
+        }
+    }
+    // Keeps `prior`'s naming for each egress saved with the same binding
+    // and DNS, so a save that does not touch an egress's DNS keeps what its
+    // servers answered and the sessions open to them.
+    fn keep_namings(&mut self, prior: &Self) {
+        for (id, naming) in &mut self.namings {
+            let unchanged = matches!(
+                (self.egresses.get(id), prior.egresses.get(id)),
+                (Some(next), Some(old)) if next.binding == old.binding && next.dns == old.dns
+            );
+            if let Some(kept) = prior.namings.get(id).filter(|_| unchanged) {
+                *naming = kept.clone();
+            }
+        }
     }
     // Hand route health the routes of every consumer that still exists.
     fn configure_health(&self, health: &RouteHealth) {
@@ -585,14 +636,14 @@ impl NetworkRuntime {
             .cloned()
     }
     /// Who resolves a destination's name dialled through proxy `id` as the
-    /// last hop, when the proxy is configured.
-    pub fn resolved_by(&self, id: u32) -> Option<ResolvedBy> {
-        self.configuration
-            .read()
-            .expect("network configuration")
-            .profiles
-            .get(&id)
-            .map(ProxyProfile::resolved_by)
+    /// last hop above egress `egress_id`, when the proxy is configured.
+    pub fn resolved_by(&self, id: u32, egress_id: u32) -> Option<ResolvedBy> {
+        let config = self.configuration.read().expect("network configuration");
+        let profile = config.profiles.get(&id)?;
+        Some(match config.egresses.get(&egress_id) {
+            Some(egress) => profile.resolved_on(&egress.dns),
+            None => profile.resolved_by(),
+        })
     }
     /// Egress `id` alone, with no proxy above it: what a direct leg's own
     /// sockets dial out of, and how they look names up.
@@ -738,8 +789,23 @@ impl NetworkRuntime {
             }
         }
     }
+    // Egress `id` as a route dials out of it, naming what it dials the way
+    // the egress's DNS says.
     fn bottom(config: &Configuration, id: u32, timeout: Duration) -> Result<Arc<Egress>, String> {
         let egress = config.egresses.get(&id).ok_or("egress does not exist")?;
+        Ok(Arc::new(Self::socket_egress(
+            egress,
+            timeout,
+            config.namings.get(&id).cloned(),
+        )))
+    }
+    // The saved egress's sockets, naming what they dial with `naming`, or
+    // with the host's DNS when there is none.
+    fn socket_egress(
+        egress: &EgressInterface,
+        timeout: Duration,
+        naming: Option<Naming>,
+    ) -> Egress {
         let binding = match &egress.binding {
             EgressBinding::System => SocketEgress::System,
             EgressBinding::Interface { name } => SocketEgress::Interface(name.clone()),
@@ -749,8 +815,11 @@ impl NetworkRuntime {
             clippy::disallowed_methods,
             reason = "the runtime builds a route's egress from the saved egress"
         )]
-        let egress = Egress::new(id, binding, timeout);
-        Ok(Arc::new(egress))
+        let socket = Egress::new(egress.id, binding, timeout);
+        match naming {
+            Some(naming) => socket.with_naming(naming),
+            None => socket,
+        }
     }
     fn hop(
         &self,
@@ -764,16 +833,17 @@ impl NetworkRuntime {
         if !profile.enabled {
             return Ok(Arc::new(Unavailable(format!("proxy {id} is disabled"))));
         }
-        // A canonical hop has the profile's timeout, independent of its first consumer.
+        // A canonical hop has the profile's timeout, independent of its first
+        // consumer, and names its endpoint the way the egress's DNS says.
         #[expect(
             clippy::disallowed_methods,
             reason = "a hop's egress is the leg's, with the profile's timeout"
         )]
-        let bottom = Arc::new(Egress::new(
-            bottom.id(),
-            bottom.binding().clone(),
-            profile.timeout(),
-        ));
+        let socket = Egress::new(bottom.id(), bottom.binding().clone(), profile.timeout());
+        let bottom = Arc::new(match config.namings.get(&bottom.id()) {
+            Some(naming) => socket.with_naming(naming.clone()),
+            None => socket,
+        });
         let inner: Arc<dyn Dialer> = if prefix.is_empty() {
             bottom.clone()
         } else {
@@ -788,6 +858,11 @@ impl NetworkRuntime {
             .map(|id| (*id, config.profiles.get(id).map(|p| p.revision)))
             .collect();
         let mut key = format!("{}:{:?}:{revisions:?}", bottom.id(), bottom.binding());
+        // A session whose endpoint the egress's own DNS servers name is
+        // rebuilt when that DNS changes; one the host names keeps its key.
+        if let Some(dns) = config.dns_signature(bottom.id())? {
+            key.push_str(&dns);
+        }
         // A WireGuard tunnel is built to the socket cap, so a new cap
         // rebuilds every session with a WireGuard hop up to it.
         if config.carries_wireguard(&ids) {
@@ -1125,6 +1200,11 @@ impl NetworkRuntime {
         if config.carries_wireguard(&hops) {
             signature.push_str(&format!(":sockets={}", config.socket_cap));
         }
+        // A save of the egress's DNS rebuilds every leg on it, and ends the
+        // connections opened with what the old setting named.
+        if let Some(dns) = config.dns_signature(leg.egress_id)? {
+            signature.push_str(&dns);
+        }
         Ok(LiveLeg {
             definition: leg.clone(),
             warning: config.warnings.get(&(consumer.key(), position)).cloned(),
@@ -1277,9 +1357,10 @@ impl NetworkRuntime {
                 })
             })
     }
-    fn apply_configuration(&self, next: Configuration) -> Result<(), String> {
+    fn apply_configuration(&self, mut next: Configuration) -> Result<(), String> {
         // Route lookups must see configuration and compiled paths from the same reload.
         let mut configuration = self.configuration.write().expect("network configuration");
+        next.keep_namings(&configuration);
         let mut staging = Self {
             db: self.db.clone(),
             handle: self.handle.clone(),

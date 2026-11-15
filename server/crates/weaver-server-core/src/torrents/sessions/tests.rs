@@ -433,8 +433,7 @@ pub(crate) fn loopback_proxy(port: u16) -> crate::proxies::ProxyProfile {
         enabled: true,
         host: "127.0.0.1".into(),
         port,
-        resolver: crate::proxies::Resolver::Proxy,
-        dns_servers: vec![],
+        dns: crate::proxies::ProxyDns::proxy(),
         tunnel_addresses: vec![],
         peer_public_key: None,
         mtu: 1280,
@@ -1157,7 +1156,10 @@ fn wireguard_proxy(
         kind: crate::proxies::ProxyKind::WireGuard,
         host: spec.endpoint_host.clone(),
         port: spec.endpoint_port,
-        dns_servers: spec.dns_servers.clone(),
+        dns: crate::proxies::ProxyDns::plain(
+            crate::proxies::DnsPath::ThroughProxy,
+            spec.dns_servers.clone(),
+        ),
         tunnel_addresses: vec![format!(
             "{}/32",
             weaver_tunnel::test_support::TEST_CLIENT_ADDRESS

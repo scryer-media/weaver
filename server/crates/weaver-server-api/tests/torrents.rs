@@ -1586,7 +1586,7 @@ fn announcing(name: &str, announce: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_routes_and_trackers_say_who_resolves_their_names() {
     use weaver_server_core::proxies::{
-        Consumer, ProxyKind, ProxyProfile, ProxyRuntime, ProxySecrets, Resolver, RouteLeg, Rung,
+        Consumer, ProxyKind, ProxyProfile, ProxyRuntime, ProxySecrets, RouteLeg, Rung,
     };
     use weaver_server_core::torrents::sessions::NetworkRoutes;
 
@@ -1601,8 +1601,7 @@ async fn the_routes_and_trackers_say_who_resolves_their_names() {
             enabled: true,
             host: "127.0.0.1".into(),
             port: 1,
-            resolver: Resolver::Proxy,
-            dns_servers: vec![],
+            dns: weaver_server_core::proxies::ProxyDns::proxy(),
             tunnel_addresses: vec![],
             peer_public_key: None,
             mtu: 1280,

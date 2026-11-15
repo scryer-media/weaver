@@ -8,7 +8,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::{NetworkRefusal, ProxyKind, ProxyProfile, RoutingPolicy};
+use super::{EgressDns, NetworkRefusal, ProxyKind, ProxyProfile, RoutingPolicy};
 
 pub const SYSTEM_EGRESS_ID: u32 = 0;
 pub const MAX_ROUTE_LEGS: usize = 8;
@@ -338,6 +338,9 @@ pub struct EgressInterface {
     pub upload_bps: Option<u64>,
     #[serde(default)]
     pub quota: EgressQuota,
+    // How a name dialled straight out of this egress is resolved.
+    #[serde(default)]
+    pub dns: EgressDns,
 }
 
 impl EgressInterface {
@@ -350,6 +353,7 @@ impl EgressInterface {
             download_bps: None,
             upload_bps: None,
             quota: EgressQuota::default(),
+            dns: EgressDns::host(),
         }
     }
 
@@ -375,6 +379,7 @@ impl EgressInterface {
         if let Some(fault) = self.quota.fault() {
             return Err(NetworkRefusal::EgressQuota(fault));
         }
+        self.dns.validate()?;
         if self.id == SYSTEM_EGRESS_ID {
             if self.binding != EgressBinding::System || self.name != "System" || !self.enabled {
                 return Err(NetworkRefusal::EgressSystemImmutable);

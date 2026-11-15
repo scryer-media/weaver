@@ -147,7 +147,7 @@ fn refusal(response: &async_graphql::Response) -> (String, String, serde_json::V
 
 // A feed to route, and a proxy to route it through.
 async fn feed_and_proxy(h: &TestHarness) -> (u64, u64) {
-    let result = h.execute(r#"mutation{saveProxyProfile(input:{name:"Gateway",kind:SOCKS5,resolver:PROXY,enabled:false,host:"127.0.0.1",port:1080,dnsServers:["192.0.2.53"]}){id}}"#).await;
+    let result = h.execute(r#"mutation{saveProxyProfile(input:{name:"Gateway",kind:SOCKS5,enabled:false,host:"127.0.0.1",port:1080,dns:{who:SERVERS,path:THROUGH_PROXY,trust:AS_SENT,servers:[{wire:PLAIN,address:"192.0.2.53"}]}}){id}}"#).await;
     assert_no_errors(&result);
     let proxy = response_data(&result)["saveProxyProfile"]["id"]
         .as_u64()
@@ -371,7 +371,7 @@ async fn pool_route_keeps_member_projection_and_prevents_pool_deletion() {
     let h = harness().await;
     let mut ids = Vec::new();
     for name in ["Primary", "Secondary"] {
-        let result=h.execute(&format!(r#"mutation{{saveProxyProfile(input:{{name:"{name}",kind:SOCKS5,resolver:PROXY,enabled:false,host:"127.0.0.1",port:1080,dnsServers:["192.0.2.53"]}}){{id}}}}"#)).await;
+        let result=h.execute(&format!(r#"mutation{{saveProxyProfile(input:{{name:"{name}",kind:SOCKS5,enabled:false,host:"127.0.0.1",port:1080,dns:{{who:SERVERS,path:THROUGH_PROXY,trust:AS_SENT,servers:[{{wire:PLAIN,address:"192.0.2.53"}}]}}}}){{id}}}}"#)).await;
         assert_no_errors(&result);
         ids.push(
             response_data(&result)["saveProxyProfile"]["id"]
@@ -664,7 +664,7 @@ async fn a_leg_through_a_disabled_proxy_reads_down_with_why() {
     let h = harness().await;
     let save = |id: &str, enabled: bool| {
         format!(
-            r#"mutation{{saveProxyProfile({id}input:{{name:"Gateway",kind:SOCKS5,resolver:PROXY,enabled:{enabled},host:"127.0.0.1",port:1080}}){{id}}}}"#
+            r#"mutation{{saveProxyProfile({id}input:{{name:"Gateway",kind:SOCKS5,enabled:{enabled},host:"127.0.0.1",port:1080}}){{id}}}}"#
         )
     };
     let response = h.execute(&save("", true)).await;
@@ -1113,5 +1113,117 @@ async fn download_block_names_the_egress_whose_quota_holds_downloads() {
     let block = &response_data(&response)["downloadBlock"];
     assert_eq!(block["kind"], "SERVER_QUOTA");
     assert_eq!(block["egressId"], serde_json::Value::Null);
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
+// The DNS servers named in a save of the System egress, `count` of them,
+// encrypted after a plain first.
+fn egress_dns(who: &str, trust: &str, count: usize) -> String {
+    let servers = (1..=count)
+        .map(|n| match n {
+            1 => r#"{wire:PLAIN,address:"192.0.2.1"}"#.to_owned(),
+            n if n % 2 == 0 => {
+                format!(r#"{{wire:TLS,address:"192.0.2.{n}",tlsName:"dns{n}.example"}}"#)
+            }
+            n => format!(r#"{{wire:HTTPS,address:"",url:"https://192.0.2.{n}/dns-query"}}"#),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{who:{who},trust:{trust},servers:[{servers}]}}")
+}
+
+const EGRESS_DNS_SHAPE: &str = "dns{who trust servers{wire address tlsName url}}";
+
+#[tokio::test]
+async fn an_egress_dns_is_saved_read_kept_by_an_update_and_refused_as_a_proxy_s_is() {
+    let h = harness().await;
+    // Every egress resolves by the host until told otherwise.
+    let response = h
+        .execute(&format!("{{egressInterfaces{{id {EGRESS_DNS_SHAPE}}}}}"))
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["egressInterfaces"][0]["dns"],
+        serde_json::json!({"who": "HOST", "trust": "AS_SENT", "servers": []})
+    );
+
+    // Ten servers, the most one setting lists, in the order they are asked.
+    let save = |dns: String| {
+        format!(
+            r#"mutation{{updateEgressInterface(id:0,input:{{name:"System",bindingKind:SYSTEM,dns:{dns}}}){{{EGRESS_DNS_SHAPE}}}}}"#
+        )
+    };
+    let response = h
+        .execute(&save(egress_dns("SERVERS", "VALIDATE", 10)))
+        .await;
+    assert_no_errors(&response);
+    let saved = response_data(&response)["updateEgressInterface"]["dns"].clone();
+    assert_eq!(saved["who"], "SERVERS");
+    assert_eq!(saved["trust"], "VALIDATE");
+    let servers = saved["servers"].as_array().unwrap();
+    assert_eq!(servers.len(), 10);
+    assert_eq!(
+        servers[0],
+        serde_json::json!({"wire": "PLAIN", "address": "192.0.2.1", "tlsName": null, "url": null})
+    );
+    assert_eq!(servers[1]["tlsName"], "dns2.example");
+    assert_eq!(servers[2]["url"], "https://192.0.2.3/dns-query");
+    let [system] = h.db.list_egress_interfaces().unwrap().try_into().unwrap();
+    assert_eq!(system.dns.servers.len(), 10);
+
+    // An update that does not name the DNS keeps it.
+    let response = h
+        .execute(&format!(
+            r#"mutation{{updateEgressInterface(id:0,input:{{name:"System",bindingKind:SYSTEM,downloadBps:1024}}){{downloadBps {EGRESS_DNS_SHAPE}}}}}"#
+        ))
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["updateEgressInterface"]["dns"],
+        saved
+    );
+
+    // Refused as a proxy's DNS is, and nothing is stored.
+    for (dns, code) in [
+        (egress_dns("SERVERS", "AS_SENT", 11), "PROXY_DNS_SERVER_COUNT"),
+        (egress_dns("SERVERS", "AS_SENT", 0), "PROXY_DNS_SERVERS_REQUIRED"),
+        (egress_dns("PROXY", "AS_SENT", 0), "EGRESS_DNS_WHO_INVALID"),
+        (
+            r#"{who:SERVERS,trust:AS_SENT,servers:[{wire:TLS,address:"192.0.2.2"},{wire:PLAIN,address:"192.0.2.1"}]}"#.to_owned(),
+            "PROXY_DNS_PLAIN_AFTER_ENCRYPTED",
+        ),
+        (
+            r#"{who:SERVERS,trust:AS_SENT,servers:[{wire:PLAIN,address:"192.0.2.1"},{wire:PLAIN,address:"192.0.2.1:53"}]}"#.to_owned(),
+            "PROXY_DNS_SERVER_DUPLICATE",
+        ),
+        (
+            r#"{who:SERVERS,trust:AS_SENT,servers:[{wire:PLAIN,address:"dns.example"}]}"#.to_owned(),
+            "PROXY_DNS_SERVER_INVALID",
+        ),
+    ] {
+        let response = h.execute(&save(dns.clone())).await;
+        assert_eq!(refusal(&response).1, code, "{dns}");
+        let [system] = h.db.list_egress_interfaces().unwrap().try_into().unwrap();
+        assert_eq!(system.dns.servers.len(), 10, "{dns}");
+    }
+
+    // A setting that names the host again drops the servers it listed.
+    let response = h.execute(&save(egress_dns("HOST", "VALIDATE", 3))).await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["updateEgressInterface"]["dns"],
+        serde_json::json!({"who": "HOST", "trust": "AS_SENT", "servers": []})
+    );
+    // A new egress resolves by the host unless its save says otherwise.
+    let response = h
+        .execute(&format!(
+            r#"mutation{{createEgressInterface(input:{{name:"Second path",bindingKind:SOURCE_ADDRESS,sourceAddress:"127.0.0.1"}}){{{EGRESS_DNS_SHAPE}}}}}"#
+        ))
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["createEgressInterface"]["dns"]["who"],
+        "HOST"
+    );
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }

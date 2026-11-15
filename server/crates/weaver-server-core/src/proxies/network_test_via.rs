@@ -10,7 +10,7 @@
 // the member it picks.
 use super::*;
 pub use weaver_tunnel::resolution::record::{
-    HostResolution, LookupError, LookupFailure, ResolvedBy,
+    HostResolution, LookupError, LookupFailure, ResolvedBy, TrustOutcome,
 };
 use weaver_tunnel::{fault, pipe::Purpose, resolution::record::Recording};
 
@@ -356,7 +356,7 @@ impl NetworkRuntime {
                 (
                     leg_kind(self, egress_id, &path),
                     leg_unavailable(self, egress_id),
-                    names_on(self, &path),
+                    names_on(self, egress_id, &path),
                 )
             };
             let beneath = self.carriers(&config, &carriers, &bottom);
@@ -715,7 +715,7 @@ fn last<'a>(
     if let Some(dns) = profile.proxy_dns_servers().first() {
         return Ok(dial(
             top,
-            probe(dns.to_string(), 53),
+            probe(dns.address.ip().to_string(), dns.address.port()),
             ProxyTestPass::Forwarded,
         ));
     }

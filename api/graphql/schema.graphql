@@ -900,6 +900,27 @@ enum EgressBindingKind {
 	SOURCE_ADDRESS
 }
 
+"""
+How a name dialled straight out of an egress, with no proxy above it,
+is resolved: by the host, or by the listed servers asked from the
+egress. Trust and servers mean something only when the servers answer.
+"""
+type EgressDns {
+	who: ProxyDnsWho!
+	trust: ProxyDnsTrust!
+	servers: [ProxyDnsServer!]!
+}
+
+"""
+An egress's DNS as a save sends it. Who is HOST or SERVERS; trust and
+servers are kept only when the servers answer.
+"""
+input EgressDnsInput {
+	who: ProxyDnsWho!
+	trust: ProxyDnsTrust!
+	servers: [ProxyDnsServerInput!]!
+}
+
 type EgressInterface {
 	id: Int!
 	name: String!
@@ -911,6 +932,10 @@ type EgressInterface {
 	downloadBps: Int
 	uploadBps: Int
 	quota: EgressQuota!
+	"""
+	How names dialled straight out of the egress are resolved.
+	"""
+	dns: EgressDns!
 	"""
 	Null while this Weaver is not tracking usage.
 	"""
@@ -933,6 +958,13 @@ input EgressInterfaceInput {
 	Bytes per second; null is no limit.
 	"""
 	uploadBps: Int
+	"""
+	How names dialled straight out of the egress are resolved. Null or
+	absent keeps what an update's egress had saved, and is the host on
+	create; only an explicit `who: HOST` sets an update back to the
+	host.
+	"""
+	dns: EgressDnsInput
 }
 
 """
@@ -1477,6 +1509,9 @@ type HostResolution {
 	resolvedBy: ResolvedBy!
 	proxyId: Int
 	dnsServers: [String!]!
+	wire: ProxyDnsWire
+	answeredBy: String
+	trust: LookupTrust
 	addresses: [String!]!
 	cached: Boolean!
 	connectedAddress: String
@@ -1930,8 +1965,19 @@ enum LookupErrorCode {
 	SERVER_FAILURE
 	NO_REPLY
 	NOT_AUTHENTICATED
+	BOGUS
+	DNSSEC_UNAVAILABLE
 	TLS_FAILED
 	OTHER
+}
+
+enum LookupTrust {
+	AS_SENT
+	AUTHENTICATED
+	REFUSED
+	VALIDATED
+	UNSIGNED
+	BOGUS
 }
 
 type MetadataEntry {
@@ -3169,6 +3215,116 @@ type ProviderHoldoff {
 	untilEpochMs: Int!
 }
 
+"""
+A proxy's DNS. Path, trust and servers mean something only when the
+servers answer.
+"""
+type ProxyDns {
+	who: ProxyDnsWho!
+	path: ProxyDnsPath!
+	trust: ProxyDnsTrust!
+	servers: [ProxyDnsServer!]!
+}
+
+"""
+A proxy's DNS as a save sends it. Path, trust and servers are kept only
+when the servers answer.
+"""
+input ProxyDnsInput {
+	who: ProxyDnsWho!
+	path: ProxyDnsPath!
+	trust: ProxyDnsTrust!
+	servers: [ProxyDnsServerInput!]!
+}
+
+"""
+Where the listed servers are asked from.
+"""
+enum ProxyDnsPath {
+	"""
+	From the route's egress, outside the proxy.
+	"""
+	DIRECT
+	THROUGH_PROXY
+}
+
+type ProxyDnsServer {
+	wire: ProxyDnsWire!
+	"""
+	The server's IP, with its port when that is not the wire's own.
+	"""
+	address: String!
+	"""
+	TLS: the name its certificate is checked against.
+	"""
+	tlsName: String
+	"""
+	HTTPS: the URL queries are posted to.
+	"""
+	url: String
+}
+
+input ProxyDnsServerInput {
+	wire: ProxyDnsWire!
+	"""
+	PLAIN and TLS: the server's IP, with a port when it is not the
+	wire's own (`192.0.2.53:5353`, `[2001:db8::53]:853`). HTTPS: unused.
+	"""
+	address: String!
+	"""
+	TLS: the name the certificate is checked against; absent checks it
+	against the address.
+	"""
+	tlsName: String
+	"""
+	HTTPS: the URL queries are posted to, `https://` and an IP.
+	"""
+	url: String
+}
+
+"""
+How the listed servers' answers are judged.
+"""
+enum ProxyDnsTrust {
+	AS_SENT
+	"""
+	An answer the server did not mark authenticated is refused.
+	"""
+	REQUIRE_AD
+	"""
+	Weaver checks the DNSSEC signatures itself: an unsigned name
+	resolves, one that fails the check does not.
+	"""
+	VALIDATE
+}
+
+"""
+Who answers a name dialled through a proxy.
+"""
+enum ProxyDnsWho {
+	"""
+	The host's own DNS.
+	"""
+	HOST
+	"""
+	The proxy is handed the name.
+	"""
+	PROXY
+	"""
+	The listed servers.
+	"""
+	SERVERS
+}
+
+"""
+How a query travels to one server.
+"""
+enum ProxyDnsWire {
+	PLAIN
+	TLS
+	HTTPS
+}
+
 enum ProxyKind {
 	HTTP_CONNECT
 	HTTP3_CONNECT
@@ -3199,8 +3355,7 @@ type ProxyProfile {
 	enabled: Boolean!
 	host: String!
 	port: Int!
-	resolver: ProxyResolver!
-	dnsServers: [String!]!
+	dns: ProxyDns!
 	tunnelAddresses: [String!]!
 	peerPublicKey: String
 	tunnelPublicKey: String
@@ -3229,8 +3384,7 @@ input ProxyProfileInput {
 	enabled: Boolean!
 	host: String!
 	port: Int!
-	resolver: ProxyResolver
-	dnsServers: [String!]! = []
+	dns: ProxyDnsInput
 	tunnelAddresses: [String!]! = []
 	peerPublicKey: String
 	mtu: Int! = 1280
@@ -3243,11 +3397,6 @@ input ProxyProfileInput {
 	privateKey: String
 	passphrase: String
 	presharedKey: String
-}
-
-enum ProxyResolver {
-	WEAVER
-	PROXY
 }
 
 type ProxyTestResult {

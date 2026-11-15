@@ -1382,6 +1382,7 @@ mod tests {
                 download_bps: None,
                 upload_bps: None,
                 quota: egress_quota(ServerDownloadQuotaPeriod::OneTime),
+                dns: Default::default(),
             })
             .unwrap();
         let server = quota_server(egress.id);
@@ -1426,6 +1427,7 @@ mod tests {
                 download_bps: None,
                 upload_bps: None,
                 quota: egress_quota(ServerDownloadQuotaPeriod::OneTime),
+                dns: Default::default(),
             })
             .unwrap();
         let server = quota_server(egress.id);
@@ -1471,6 +1473,7 @@ mod tests {
             download_bps: None,
             upload_bps: None,
             quota: egress_quota(ServerDownloadQuotaPeriod::OneTime),
+            dns: Default::default(),
         };
         registry
             .reconfigure_egresses(std::slice::from_ref(&egress))
@@ -1518,6 +1521,7 @@ mod tests {
             download_bps: None,
             upload_bps: None,
             quota: egress_quota(ServerDownloadQuotaPeriod::OneTime),
+            dns: Default::default(),
         };
         registry
             .reconfigure_egresses(std::slice::from_ref(&egress))
@@ -1555,6 +1559,7 @@ mod tests {
             download_bps: Some(0),
             upload_bps: None,
             quota: egress_quota(ServerDownloadQuotaPeriod::OneTime),
+            dns: Default::default(),
         };
         registry
             .reconfigure_egresses(std::slice::from_ref(&egress))
@@ -1598,6 +1603,7 @@ mod tests {
                 address: "127.0.0.1".parse().unwrap(),
             },
             enabled: true,
+            dns: Default::default(),
             download_bps: Some(1_000),
             upload_bps: Some(4_000),
             quota: crate::proxies::EgressQuota {

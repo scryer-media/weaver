@@ -1148,6 +1148,19 @@ fn sample_tunnel() -> weaver_server_core::proxies::network_metrics::tunnel::Tunn
     }
 }
 
+fn sample_dns() -> weaver_server_core::proxies::network_metrics::tunnel::DnsMetricsSnapshot {
+    use weaver_server_core::proxies::network_metrics::tunnel::DnsMetricsSnapshot;
+    use weaver_server_core::proxies::{TrustOutcome, WireKind};
+    DnsMetricsSnapshot {
+        wires: WireKind::ALL.into_iter().zip([7, 5, 3]).collect(),
+        trust: TrustOutcome::ALL
+            .into_iter()
+            .zip([9, 4, 2, 6, 8, 1])
+            .collect(),
+        dnssec_queries: 11,
+    }
+}
+
 fn sample_server_health() -> metrics::ServerHealthInfo {
     metrics::ServerHealthInfo {
         label: "news.example:563".into(),
@@ -1865,6 +1878,7 @@ fn fully_populated_render() -> String {
     let schedules = sample_schedules();
     let network = sample_network();
     let tunnel = sample_tunnel();
+    let dns = sample_dns();
     let speed_tests = sample_speed_tests();
     let torrents = sample_torrent_metrics();
     let collection = CollectionFixtures::new();
@@ -1882,6 +1896,7 @@ fn fully_populated_render() -> String {
     input.schedules = Some(&schedules);
     input.network = Some(&network);
     input.tunnel = Some(&tunnel);
+    input.dns = Some(&dns);
     input.speed_tests = Some(&speed_tests);
     input.torrents = Some(&torrents);
     // The fixture's seeding torrent has series of its own only under `All`.

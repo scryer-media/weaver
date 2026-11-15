@@ -27,6 +27,8 @@ pub enum NetworkRefusal {
     EgressGone,
     EgressNotFound,
     EgressSystemUndeletable,
+    // An egress's names are resolved by the host or by listed servers.
+    EgressDnsWhoInvalid,
     // Each in-use refusal names the route that holds the item.
     EgressInUse(Consumer),
 
@@ -86,9 +88,18 @@ pub enum NetworkRefusal {
     ProxyNameLength,
     ProxyEndpointInvalid,
     ProxyTimeoutRange,
+    // More tunnel addresses than a WireGuard proxy takes.
     ProxyAddressCount,
+    // More servers than a DNS setting lists.
+    ProxyDnsServerCount,
     ProxyDnsServerInvalid,
     ProxyWireGuardNeedsDnsServers,
+    ProxyDnsServersRequired,
+    ProxyDnsTlsNameInvalid,
+    ProxyDnsUrlInvalid,
+    ProxyDnsUrlHostname,
+    ProxyDnsPlainAfterEncrypted,
+    ProxyDnsServerDuplicate,
     ProxyCredentialTooLarge,
     ProxySshUsernameRequired,
     ProxySshKeyRequired,
@@ -220,6 +231,7 @@ impl NetworkRefusal {
             Self::BandwidthSplitRange => "BANDWIDTH_SPLIT_RANGE",
             Self::EgressGone | Self::EgressNotFound => "EGRESS_NOT_FOUND",
             Self::EgressSystemUndeletable => "EGRESS_SYSTEM_UNDELETABLE",
+            Self::EgressDnsWhoInvalid => "EGRESS_DNS_WHO_INVALID",
             Self::EgressInUse(_) => "EGRESS_IN_USE",
 
             Self::PoolNameLength => "POOL_NAME_LENGTH",
@@ -259,8 +271,15 @@ impl NetworkRefusal {
             Self::ProxyEndpointInvalid => "PROXY_ENDPOINT_INVALID",
             Self::ProxyTimeoutRange => "PROXY_TIMEOUT_RANGE",
             Self::ProxyAddressCount => "PROXY_ADDRESS_COUNT",
+            Self::ProxyDnsServerCount => "PROXY_DNS_SERVER_COUNT",
             Self::ProxyDnsServerInvalid => "PROXY_DNS_SERVER_INVALID",
             Self::ProxyWireGuardNeedsDnsServers => "PROXY_WIREGUARD_NEEDS_DNS_SERVERS",
+            Self::ProxyDnsServersRequired => "PROXY_DNS_SERVERS_REQUIRED",
+            Self::ProxyDnsTlsNameInvalid => "PROXY_DNS_TLS_NAME_INVALID",
+            Self::ProxyDnsUrlInvalid => "PROXY_DNS_URL_INVALID",
+            Self::ProxyDnsUrlHostname => "PROXY_DNS_URL_HOSTNAME",
+            Self::ProxyDnsPlainAfterEncrypted => "PROXY_DNS_PLAIN_AFTER_ENCRYPTED",
+            Self::ProxyDnsServerDuplicate => "PROXY_DNS_SERVER_DUPLICATE",
             Self::ProxyCredentialTooLarge => "PROXY_CREDENTIAL_TOO_LARGE",
             Self::ProxySshUsernameRequired => "PROXY_SSH_USERNAME_REQUIRED",
             Self::ProxySshKeyRequired => "PROXY_SSH_KEY_REQUIRED",
@@ -337,6 +356,8 @@ impl NetworkRefusal {
                 reason,
             } => serde_json::json!({ "serverId": server, "name": name, "reason": reason }),
             Self::TestPathCount { limit } => serde_json::json!({ "limit": limit }),
+            Self::ProxyAddressCount => serde_json::json!({ "limit": super::MAX_TUNNEL_ADDRESSES }),
+            Self::ProxyDnsServerCount => serde_json::json!({ "limit": super::MAX_DNS_SERVERS }),
             Self::EgressInUse(holder)
             | Self::PoolInUse(holder)
             | Self::PoolInUseEmpty(holder)
@@ -376,6 +397,9 @@ impl std::fmt::Display for NetworkRefusal {
             Self::EgressGone => "egress no longer exists",
             Self::EgressNotFound => "egress not found",
             Self::EgressSystemUndeletable => "the System egress cannot be deleted",
+            Self::EgressDnsWhoInvalid => {
+                "names dialled straight out of an egress are resolved by the host or by listed DNS servers"
+            }
             Self::EgressInUse(holder) => {
                 return write!(f, "egress is used by {}", RouteHolder(*holder));
             }
@@ -474,11 +498,38 @@ impl std::fmt::Display for NetworkRefusal {
             Self::ProxyNameLength => "proxy name must contain 1–128 characters",
             Self::ProxyEndpointInvalid => "proxy endpoint must have a valid host and port",
             Self::ProxyTimeoutRange => "proxy timeout must be between 1 and 300 seconds",
-            Self::ProxyAddressCount => "too many DNS servers or tunnel addresses",
+            Self::ProxyAddressCount => {
+                return write!(
+                    f,
+                    "a WireGuard proxy takes at most {} tunnel addresses",
+                    super::MAX_TUNNEL_ADDRESSES
+                );
+            }
+            Self::ProxyDnsServerCount => {
+                return write!(
+                    f,
+                    "a DNS setting lists at most {} servers",
+                    super::MAX_DNS_SERVERS
+                );
+            }
             Self::ProxyDnsServerInvalid => "DNS servers must be IP addresses",
             Self::ProxyWireGuardNeedsDnsServers => {
                 "a WireGuard proxy resolves names only through DNS servers"
             }
+            Self::ProxyDnsServersRequired => {
+                "a DNS setting whose listed servers answer needs at least one"
+            }
+            Self::ProxyDnsTlsNameInvalid => "a DNS server's TLS name must be a valid host name",
+            Self::ProxyDnsUrlInvalid => {
+                "a DNS over HTTPS server needs an https URL with an IP address and a path"
+            }
+            Self::ProxyDnsUrlHostname => {
+                "a DNS over HTTPS server is named by its IP address, not a host name"
+            }
+            Self::ProxyDnsPlainAfterEncrypted => {
+                "a plain DNS server cannot follow an encrypted one"
+            }
+            Self::ProxyDnsServerDuplicate => "a DNS server is listed only once",
             Self::ProxyCredentialTooLarge => "proxy credential is too large",
             Self::ProxySshUsernameRequired => "SSH requires a username",
             Self::ProxySshKeyRequired => "SSH requires an Ed25519 private key",

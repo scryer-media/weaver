@@ -389,6 +389,7 @@ async fn a_leg_moved_to_another_egress_takes_every_member_session_down() {
             download_bps: None,
             upload_bps: None,
             quota: Default::default(),
+            dns: Default::default(),
         })
         .unwrap();
     route_through(&db, TorrentScope::Default, egress.id, &pool_ladder(pool.id));

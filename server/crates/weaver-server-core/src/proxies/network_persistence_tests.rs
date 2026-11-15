@@ -2,9 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
-use crate::proxies::{
-    Consumer, Failover, ProxyKind, ProxySecrets, Resolver, RouteLeg, TorrentScope,
-};
+use crate::proxies::{Consumer, Failover, ProxyKind, ProxySecrets, RouteLeg, TorrentScope};
 
 // The code of the refusal a write was turned away with. A storage fault has
 // none, so a refusal that degrades into one fails here.
@@ -26,6 +24,7 @@ fn egress() -> EgressInterface {
         download_bps: Some(1_000_000),
         upload_bps: None,
         quota: Default::default(),
+        dns: Default::default(),
     }
 }
 
@@ -37,8 +36,10 @@ fn profile(id: u32) -> ProxyProfile {
         enabled: true,
         host: "proxy.example".into(),
         port: 1080,
-        resolver: Resolver::Proxy,
-        dns_servers: vec!["192.0.2.53".parse().unwrap()],
+        dns: crate::proxies::ProxyDns::plain(
+            crate::proxies::DnsPath::ThroughProxy,
+            ["192.0.2.53".parse().unwrap()],
+        ),
         tunnel_addresses: vec![],
         peer_public_key: None,
         mtu: 1280,

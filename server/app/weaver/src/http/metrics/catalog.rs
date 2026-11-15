@@ -502,6 +502,12 @@ metric_families! {
         "Host name lookups Weaver made, by resolver and result; answers taken from the cache are not counted.");
     NETWORK_DNS_CACHE = ("weaver_network_dns_cache_total", Counter, ["resolver", "outcome"],
         "Host names resolved, by resolver and whether a held answer served them, they joined a lookup already asking, or they asked.");
+    NETWORK_DNS_ANSWERS = ("weaver_network_dns_answers_total", Counter, ["wire"],
+        "Answers from listed DNS servers, by the wire the answering server was asked over.");
+    NETWORK_DNS_TRUST = ("weaver_network_dns_trust_total", Counter, ["outcome"],
+        "Lookups at listed DNS servers, by how their answer was judged: taken as sent, authenticated, refused, validated here, unsigned, or bogus. A lookup that still answered also adds one bogus for each address family (A or AAAA) whose answer failed the check.");
+    NETWORK_DNSSEC_QUERIES = ("weaver_network_dnssec_queries_total", Counter, [],
+        "DNS queries sent to check DNSSEC signatures.");
     NETWORK_RUNG_COOLDOWNS = ("weaver_network_rung_cooldowns_total", Counter, ["rung"],
         "Times a ladder rung entered a cooldown, by rung position.");
     NETWORK_RUNG_FALLBACKS = ("weaver_network_rung_fallbacks_total", Counter, ["rung"],

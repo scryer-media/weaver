@@ -642,6 +642,7 @@ mod tests {
                     address: "127.0.0.1".parse().unwrap(),
                 },
                 enabled: true,
+                dns: Default::default(),
                 download_bps: None,
                 upload_bps: None,
                 quota: super::super::EgressQuota {

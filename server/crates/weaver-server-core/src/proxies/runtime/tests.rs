@@ -16,8 +16,10 @@ fn profile(id: u32) -> ProxyProfile {
         enabled: true,
         host: "127.0.0.1".into(),
         port: 9,
-        resolver: Resolver::Proxy,
-        dns_servers: vec!["192.0.2.53".parse().unwrap()],
+        dns: crate::proxies::ProxyDns::plain(
+            crate::proxies::DnsPath::ThroughProxy,
+            ["192.0.2.53".parse().unwrap()],
+        ),
         tunnel_addresses: vec![],
         peer_public_key: None,
         mtu: 1280,
@@ -515,6 +517,7 @@ async fn a_reload_asked_for_during_another_reads_the_rows_again() {
             download_bps: None,
             upload_bps: None,
             quota: Default::default(),
+            dns: Default::default(),
         })
         .unwrap();
 

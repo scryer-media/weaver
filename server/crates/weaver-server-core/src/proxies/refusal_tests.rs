@@ -302,7 +302,12 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
         (
             R::ProxyAddressCount,
             "PROXY_ADDRESS_COUNT",
-            "too many DNS servers or tunnel addresses",
+            "a WireGuard proxy takes at most 8 tunnel addresses",
+        ),
+        (
+            R::ProxyDnsServerCount,
+            "PROXY_DNS_SERVER_COUNT",
+            "a DNS setting lists at most 10 servers",
         ),
         (
             R::ProxyDnsServerInvalid,
@@ -313,6 +318,41 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
             R::ProxyWireGuardNeedsDnsServers,
             "PROXY_WIREGUARD_NEEDS_DNS_SERVERS",
             "a WireGuard proxy resolves names only through DNS servers",
+        ),
+        (
+            R::ProxyDnsServersRequired,
+            "PROXY_DNS_SERVERS_REQUIRED",
+            "a DNS setting whose listed servers answer needs at least one",
+        ),
+        (
+            R::ProxyDnsTlsNameInvalid,
+            "PROXY_DNS_TLS_NAME_INVALID",
+            "a DNS server's TLS name must be a valid host name",
+        ),
+        (
+            R::ProxyDnsUrlInvalid,
+            "PROXY_DNS_URL_INVALID",
+            "a DNS over HTTPS server needs an https URL with an IP address and a path",
+        ),
+        (
+            R::ProxyDnsUrlHostname,
+            "PROXY_DNS_URL_HOSTNAME",
+            "a DNS over HTTPS server is named by its IP address, not a host name",
+        ),
+        (
+            R::ProxyDnsPlainAfterEncrypted,
+            "PROXY_DNS_PLAIN_AFTER_ENCRYPTED",
+            "a plain DNS server cannot follow an encrypted one",
+        ),
+        (
+            R::ProxyDnsServerDuplicate,
+            "PROXY_DNS_SERVER_DUPLICATE",
+            "a DNS server is listed only once",
+        ),
+        (
+            R::EgressDnsWhoInvalid,
+            "EGRESS_DNS_WHO_INVALID",
+            "names dialled straight out of an egress are resolved by the host or by listed DNS servers",
         ),
         (
             R::ProxyCredentialTooLarge,
@@ -561,9 +601,17 @@ fn slot(refusal: &R) -> usize {
         R::TorrentRouteExit(super::TorrentRouteFault::DirectFallback) => 87,
         R::TorrentRouteExit(super::TorrentRouteFault::Rungs) => 88,
         R::WireGuardSocketBudget { .. } => 89,
+        R::ProxyDnsServersRequired => 90,
+        R::ProxyDnsTlsNameInvalid => 91,
+        R::ProxyDnsUrlInvalid => 92,
+        R::ProxyDnsUrlHostname => 93,
+        R::ProxyDnsPlainAfterEncrypted => 94,
+        R::EgressDnsWhoInvalid => 95,
+        R::ProxyDnsServerDuplicate => 96,
+        R::ProxyDnsServerCount => 97,
     }
 }
-const SLOTS: usize = 90;
+const SLOTS: usize = 98;
 
 #[test]
 fn every_refusal_keeps_its_code_and_its_sentence() {
@@ -672,6 +720,8 @@ fn only_the_sentences_that_name_values_carry_them() {
                 })
             ),
             "TEST_PATH_COUNT" => assert_eq!(params, serde_json::json!({ "limit": 64 })),
+            "PROXY_ADDRESS_COUNT" => assert_eq!(params, serde_json::json!({ "limit": 8 })),
+            "PROXY_DNS_SERVER_COUNT" => assert_eq!(params, serde_json::json!({ "limit": 10 })),
             "EGRESS_IN_USE" => assert_eq!(
                 params,
                 serde_json::json!({ "consumer": "torrent:category:5" })

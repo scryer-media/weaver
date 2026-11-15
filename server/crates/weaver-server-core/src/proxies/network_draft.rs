@@ -54,7 +54,7 @@ impl DraftNetworkRoute {
         Ok((
             leg_kind(&self.isolated, leg.egress_id, &leg.path),
             leg_unavailable(&self.isolated, leg.egress_id),
-            names_on(&self.isolated, &leg.path),
+            names_on(&self.isolated, leg.egress_id, &leg.path),
         ))
     }
     pub fn runtime_handle(&self) -> &tokio::runtime::Handle {
@@ -223,15 +223,18 @@ impl TunnelProvider for ProbeProvider {
 }
 impl NetworkRuntime {
     pub(super) fn isolated_probe_runtime(&self) -> Arc<Self> {
+        let mut configuration = self
+            .configuration
+            .read()
+            .expect("network configuration")
+            .clone();
+        // A probe asks an egress's DNS servers itself rather than taking
+        // what the live routes were already told.
+        configuration.name_egresses();
         Arc::new(Self {
             db: self.db.clone(),
             handle: self.handle.clone(),
-            configuration: RwLock::new(
-                self.configuration
-                    .read()
-                    .expect("network configuration")
-                    .clone(),
-            ),
+            configuration: RwLock::new(configuration),
             sessions: Mutex::new(HashMap::new()),
             session_sockets: Arc::default(),
             borrowed_sessions: self.sessions.lock().expect("network sessions").clone(),

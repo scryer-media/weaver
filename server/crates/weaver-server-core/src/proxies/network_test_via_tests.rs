@@ -268,6 +268,7 @@ async fn nested_tunnel_fixture() -> (
 #[tokio::test]
 async fn a_proxy_reachable_only_through_a_tunnel_is_tested_through_that_tunnel() {
     let (runtime, route, [near, _far]) = nested_tunnel_fixture().await;
+    let before = weaver_tunnel::metrics::dns_snapshot();
     let tests = runtime
         .test_via(&route, TestSubject::Proxy(2), None)
         .await
@@ -290,6 +291,29 @@ async fn a_proxy_reachable_only_through_a_tunnel_is_tested_through_that_tunnel()
     assert_eq!(resolution.addresses, [IpAddr::V4(TEST_PEER_ADDRESS)]);
     assert_eq!(resolution.connected, Some(IpAddr::V4(TEST_PEER_ADDRESS)));
     assert_eq!(resolution.error, None);
+    // The tunnel's own resolver asked its one server in plain; the answer
+    // is recorded and counted as Weaver's own client records and counts one.
+    use weaver_tunnel::{dns::WireKind, resolution::record::TrustOutcome};
+    assert_eq!(resolution.wire, Some(WireKind::Plain));
+    assert_eq!(resolution.answered_by, resolution.servers.first().copied());
+    assert_eq!(resolution.trust, Some(TrustOutcome::AsSent));
+    let after = weaver_tunnel::metrics::dns_snapshot();
+    let moved = |counts: &[(TrustOutcome, u64)], then: &[(TrustOutcome, u64)]| {
+        counts
+            .iter()
+            .zip(then)
+            .find(|((outcome, _), _)| *outcome == TrustOutcome::AsSent)
+            .map(|((_, now), (_, then))| now - then)
+    };
+    assert_eq!(moved(&after.trust, &before.trust), Some(1));
+    let plain = |counts: &[(WireKind, u64)]| {
+        counts
+            .iter()
+            .find(|(wire, _)| *wire == WireKind::Plain)
+            .unwrap()
+            .1
+    };
+    assert_eq!(plain(&after.wires) - plain(&before.wires), 1);
 
     assert!(runtime.sessions.lock().unwrap().is_empty());
     runtime.shutdown().await;
@@ -328,9 +352,18 @@ async fn a_nested_tunnel_probe_reports_a_missing_target_name() {
     assert_eq!(resolution.by, ResolvedBy::ProxyServers);
     assert_eq!(resolution.proxy, Some(2));
     assert!(resolution.addresses.is_empty());
-    assert_eq!(
-        resolution.error.map(|error| error.failure),
-        Some(LookupFailure::NoSuchName)
+    // The tunnel's own resolver says the same of a name that does not
+    // exist, a server failure and silence, so no cause is named, and
+    // nothing was judged.
+    assert_eq!(resolution.trust, None);
+    assert_eq!(resolution.answered_by, None);
+    let error = resolution.error.unwrap();
+    assert_eq!(error.failure, LookupFailure::Other);
+    assert!(
+        error
+            .detail
+            .contains("does not say whether the name does not exist"),
+        "{error:?}"
     );
     // The test's sessions ended with it.
     assert!(runtime.sessions.lock().unwrap().is_empty());
@@ -405,18 +438,12 @@ const ROUTED_DNS: &str = "192.0.2.53";
 // What that server resolves `named.invalid` to.
 const NAMED: &str = "198.51.100.7";
 
-// A SOCKS5 proxy at `double`, resolving as `resolver` and `dns` say.
-fn socks_at(
-    id: u32,
-    double: &ProxyServerDouble,
-    resolver: crate::proxies::Resolver,
-    dns: &[&str],
-) -> ProxyProfile {
+// A SOCKS5 proxy at `double`, resolving as `dns` says.
+fn socks_at(id: u32, double: &ProxyServerDouble, dns: ProxyDns) -> ProxyProfile {
     ProxyProfile {
         id,
         port: double.addr.port(),
-        resolver,
-        dns_servers: dns.iter().map(|server| ip(server)).collect(),
+        dns,
         // Hop timeouts are not under test here.
         timeout_seconds: 300,
         ..socks(id, 0)
@@ -425,7 +452,7 @@ fn socks_at(
 
 #[tokio::test]
 async fn a_proxy_test_with_a_target_says_who_resolved_it() {
-    use crate::proxies::Resolver as Naming;
+    use crate::proxies::DnsPath;
     let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let to = target.local_addr().unwrap();
     let dns = DnsServerDouble::start(HashMap::from([(
@@ -446,9 +473,13 @@ async fn a_proxy_test_with_a_target_says_who_resolved_it() {
     .await;
     let runtime = runtime_with(
         vec![
-            socks_at(1, &double, Naming::Proxy, &[ROUTED_DNS]),
-            socks_at(2, &double, Naming::Proxy, &[]),
-            socks_at(3, &double, Naming::Weaver, &[]),
+            socks_at(
+                1,
+                &double,
+                ProxyDns::plain(DnsPath::ThroughProxy, [ip(ROUTED_DNS)]),
+            ),
+            socks_at(2, &double, ProxyDns::proxy()),
+            socks_at(3, &double, ProxyDns::host()),
         ],
         vec![],
         vec![],
@@ -467,6 +498,7 @@ async fn a_proxy_test_with_a_target_says_who_resolved_it() {
             proxy: Some(1),
             servers: vec![ip(ROUTED_DNS)],
             wire: Some(weaver_tunnel::dns::WireKind::Plain),
+            answered_by: Some(ip(ROUTED_DNS)),
             trust: Some(weaver_tunnel::resolution::record::TrustOutcome::AsSent),
             addresses: vec![ip(NAMED)],
             cached: false,
@@ -652,7 +684,6 @@ async fn a_test_through_a_route_that_cannot_carry_its_proxy_is_refused() {
 
 #[tokio::test]
 async fn a_pool_carries_the_target_through_the_member_it_picks() {
-    use crate::proxies::Resolver as Naming;
     let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let to = target.local_addr().unwrap();
     let double = ProxyServerDouble::start(
@@ -678,8 +709,8 @@ async fn a_pool_carries_the_target_through_the_member_it_picks() {
     };
     let runtime = runtime_with(
         vec![
-            socks_at(1, &double, Naming::Proxy, &[]),
-            socks_at(2, &refusing, Naming::Proxy, &[]),
+            socks_at(1, &double, ProxyDns::proxy()),
+            socks_at(2, &refusing, ProxyDns::proxy()),
         ],
         vec![pool(9, vec![2, 1]), pool(8, vec![2])],
         vec![],
@@ -830,5 +861,299 @@ async fn a_torrent_route_runs_the_test_torrent_over_each_path() {
     assert!(!exposure.inbound);
     assert!(exposure.udp_trackers && exposure.dht);
     fixture.stop().await;
+    runtime.shutdown().await;
+}
+
+// The System egress resolving names by the plain DNS servers at `servers`,
+// asked in order.
+fn egress_servers(servers: &[std::net::SocketAddr]) -> crate::proxies::EgressDns {
+    crate::proxies::EgressDns {
+        who: crate::proxies::DnsWho::Servers,
+        servers: servers
+            .iter()
+            .map(|address| crate::proxies::ProxyDnsServer {
+                address: *address,
+                wire: crate::proxies::ProxyDnsWire::Plain,
+            })
+            .collect(),
+        trust: crate::proxies::DnsTrust::AsSent,
+    }
+}
+
+// `runtime`'s configuration with the System egress resolving as `dns` says,
+// as a save of the egress loads it.
+fn system_dns(runtime: &NetworkRuntime, dns: crate::proxies::EgressDns) {
+    let mut config = runtime.configuration.read().unwrap().clone();
+    config
+        .egresses
+        .entry(SYSTEM_EGRESS_ID)
+        .or_insert_with(EgressInterface::system)
+        .dns = dns;
+    config.name_egresses();
+    runtime.apply_configuration(config).unwrap();
+}
+
+// A port nothing listens on: a server there refuses every connection.
+async fn refused_port() -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    listener.local_addr().unwrap()
+}
+
+// A direct route on an egress whose DNS lists servers asks them from the
+// egress, says so in the test, and never asks the host: a name only the
+// host knows does not resolve.
+#[tokio::test]
+async fn a_direct_test_on_an_egress_with_servers_asks_them_and_never_the_host() {
+    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let to = target.local_addr().unwrap();
+    let dns = DnsServerDouble::start(HashMap::from([(
+        "named.invalid".into(),
+        "127.0.0.1".parse().unwrap(),
+    )]))
+    .await;
+    let runtime = runtime_with(vec![], vec![], vec![]);
+    system_dns(&runtime, egress_servers(&[dns.addr]));
+    let route = draft(LegPath::Direct);
+
+    let (outcome, resolution) = resolved(
+        &runtime,
+        &route,
+        TestSubject::Route,
+        Some(("named.invalid", to.port())),
+    )
+    .await;
+    assert!(outcome.is_ok(), "{outcome:?}");
+    assert_eq!(
+        resolution,
+        HostResolution {
+            host: "named.invalid".into(),
+            by: ResolvedBy::Servers,
+            proxy: None,
+            servers: vec![ip("127.0.0.1")],
+            wire: Some(weaver_tunnel::dns::WireKind::Plain),
+            answered_by: Some(ip("127.0.0.1")),
+            trust: Some(weaver_tunnel::resolution::record::TrustOutcome::AsSent),
+            addresses: vec![ip("127.0.0.1")],
+            cached: false,
+            connected: Some(ip("127.0.0.1")),
+            error: None,
+        }
+    );
+    let _accepted = target.accept().await.unwrap();
+
+    // The host resolves `localhost`; the listed server does not know it.
+    let (outcome, resolution) = resolved(
+        &runtime,
+        &route,
+        TestSubject::Route,
+        Some(("localhost", to.port())),
+    )
+    .await;
+    assert_eq!(outcome, Err(ProxyFault::NameNotResolved));
+    assert_eq!(resolution.by, ResolvedBy::Servers);
+    assert!(resolution.addresses.is_empty());
+    assert!(
+        dns.queries
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|name| name == "localhost"),
+        "the listed server was asked"
+    );
+
+    // A torrent session's own sockets look names up the same way.
+    let egress = runtime
+        .egress_dialer(SYSTEM_EGRESS_ID, Duration::from_secs(300))
+        .unwrap();
+    assert!(matches!(
+        egress.resolve("named.invalid").await.unwrap(),
+        weaver_tunnel::pipe::Resolution::Addresses(addresses) if addresses == [ip("127.0.0.1")]
+    ));
+    assert!(egress.resolve("localhost").await.is_err());
+    assert_eq!(
+        crate::torrents::sessions::names_on(&runtime, SYSTEM_EGRESS_ID, &LegPath::Direct),
+        Some(ResolvedBy::Servers)
+    );
+    runtime.shutdown().await;
+}
+
+// When no listed server answers, the lookup fails: the host is not asked
+// in their place.
+#[tokio::test]
+async fn an_egress_whose_servers_do_not_answer_fails_closed() {
+    let refused = refused_port().await;
+    let runtime = runtime_with(vec![], vec![], vec![]);
+    system_dns(&runtime, egress_servers(&[refused]));
+    let egress = runtime
+        .egress_dialer(SYSTEM_EGRESS_ID, Duration::from_secs(300))
+        .unwrap();
+    assert!(egress.resolve("localhost").await.is_err());
+    let dialed = egress
+        .dial(&Target {
+            host: "localhost".into(),
+            port: 9,
+            purpose: weaver_tunnel::pipe::Purpose::Probe,
+            addresses: Vec::new(),
+        })
+        .await;
+    assert!(dialed.is_err());
+    runtime.shutdown().await;
+}
+
+// A save of the egress's DNS rebuilds the legs on it and ends what they
+// held, and the next lookup asks the new servers. A save that changes
+// nothing keeps the leg and what its servers answered.
+#[tokio::test]
+async fn a_save_of_an_egress_dns_cuts_its_legs_over_and_a_no_op_save_keeps_them() {
+    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let to = target.local_addr().unwrap();
+    let names = || HashMap::from([("named.invalid".into(), "127.0.0.1".parse().unwrap())]);
+    let first = DnsServerDouble::start(names()).await;
+    let second = DnsServerDouble::start(names()).await;
+    // Answers are held, so a kept naming asks no server again.
+    first.ttl.store(3600, std::sync::atomic::Ordering::Relaxed);
+    second.ttl.store(3600, std::sync::atomic::Ordering::Relaxed);
+    let feed = Consumer::Rss(1);
+    let runtime = runtime_with(
+        vec![],
+        vec![],
+        vec![(
+            feed,
+            RoutingPolicy {
+                legs: vec![RouteLeg {
+                    egress_id: SYSTEM_EGRESS_ID,
+                    weight: 100,
+                    path: LegPath::Direct,
+                }],
+                ..Default::default()
+            },
+        )],
+    );
+    system_dns(&runtime, egress_servers(&[first.addr]));
+    let named = Target {
+        host: "named.invalid".into(),
+        port: to.port(),
+        purpose: weaver_tunnel::pipe::Purpose::Probe,
+        addresses: Vec::new(),
+    };
+    let asked = |dns: &DnsServerDouble| dns.queries.lock().unwrap().len();
+    let route = runtime.route(feed, 1, Duration::from_secs(300)).unwrap();
+    let stage = || route.legs.read().unwrap()[0].stage.clone();
+    let before = stage();
+    route.weighted.dial(&named).await.unwrap();
+    let _accepted = target.accept().await.unwrap();
+    let held = asked(&first);
+    assert!(held > 0);
+
+    // The same setting saved again keeps the leg and its answers.
+    system_dns(&runtime, egress_servers(&[first.addr]));
+    assert!(Arc::ptr_eq(&before, &stage()));
+    route.weighted.dial(&named).await.unwrap();
+    let _accepted = target.accept().await.unwrap();
+    assert_eq!(asked(&first), held);
+
+    // Another server: the old leg is revoked and the new one asks it.
+    system_dns(&runtime, egress_servers(&[second.addr]));
+    assert!(before.is_revoked());
+    assert!(!Arc::ptr_eq(&before, &stage()));
+    route.weighted.dial(&named).await.unwrap();
+    let _accepted = target.accept().await.unwrap();
+    assert_eq!(asked(&first), held);
+    assert!(asked(&second) > 0);
+
+    // Back to the host: the leg is rebuilt again, and keeps the signature
+    // it had before the egress named servers.
+    let with_servers = stage();
+    system_dns(&runtime, crate::proxies::EgressDns::host());
+    assert!(with_servers.is_revoked());
+    assert!(!route.legs.read().unwrap()[0].signature.contains(":dns="));
+    runtime.shutdown().await;
+}
+
+// A proxy whose names the host answers, on an egress that lists servers,
+// has them answered by those servers, asked from the egress: the host is
+// not asked, and every record says the servers answered. Back on an egress
+// that asks the host, the proxy asks the host again.
+#[tokio::test]
+async fn a_proxy_at_the_host_on_an_egress_with_servers_asks_them_and_never_the_host() {
+    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let to = target.local_addr().unwrap();
+    let dns = DnsServerDouble::start(HashMap::from([(
+        "named.invalid".into(),
+        "127.0.0.1".parse().unwrap(),
+    )]))
+    .await;
+    let double = ProxyServerDouble::start(
+        weaver_tunnel::transport::TransportKind::Socks5,
+        None,
+        HashMap::from([(("127.0.0.1".into(), to.port()), to)]),
+    )
+    .await;
+    let runtime = runtime_with(vec![socks_at(3, &double, ProxyDns::host())], vec![], vec![]);
+    system_dns(&runtime, egress_servers(&[dns.addr]));
+    let route = draft(LegPath::Direct);
+    let through = ladder(vec![Rung::Proxy { id: 3 }]);
+
+    let (outcome, resolution) = resolved(
+        &runtime,
+        &route,
+        TestSubject::Proxy(3),
+        Some(("named.invalid", to.port())),
+    )
+    .await;
+    assert_eq!(outcome, Ok(ProxyTestPass::Forwarded));
+    assert_eq!(resolution.by, ResolvedBy::Servers);
+    assert_eq!(resolution.servers, vec![ip("127.0.0.1")]);
+    assert_eq!(resolution.addresses, vec![ip("127.0.0.1")]);
+    assert_eq!(resolution.connected, Some(ip("127.0.0.1")));
+    let _accepted = target.accept().await.unwrap();
+
+    // The host knows `localhost`; the egress's server does not, and it is
+    // the one asked.
+    let (outcome, resolution) = resolved(
+        &runtime,
+        &route,
+        TestSubject::Proxy(3),
+        Some(("localhost", to.port())),
+    )
+    .await;
+    assert_eq!(outcome, Err(ProxyFault::NameNotResolved));
+    assert_eq!(resolution.by, ResolvedBy::Servers);
+    assert!(resolution.addresses.is_empty());
+    assert!(
+        dns.queries
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|name| name == "localhost"),
+        "the egress's server was asked"
+    );
+    // A torrent route through the proxy shows the same.
+    assert_eq!(
+        crate::torrents::sessions::names_on(&runtime, SYSTEM_EGRESS_ID, &through),
+        Some(ResolvedBy::Servers)
+    );
+    assert_eq!(
+        runtime.resolved_by(3, SYSTEM_EGRESS_ID),
+        Some(ResolvedBy::Servers)
+    );
+
+    // On an egress that asks the host, the proxy at the host asks it.
+    system_dns(&runtime, crate::proxies::EgressDns::host());
+    let (outcome, resolution) = resolved(
+        &runtime,
+        &route,
+        TestSubject::Proxy(3),
+        Some(("localhost", to.port())),
+    )
+    .await;
+    assert_eq!(outcome, Ok(ProxyTestPass::Forwarded));
+    assert_eq!(resolution.by, ResolvedBy::Host);
+    assert!(resolution.addresses.contains(&ip("127.0.0.1")));
+    let _accepted = target.accept().await.unwrap();
+    assert_eq!(
+        crate::torrents::sessions::names_on(&runtime, SYSTEM_EGRESS_ID, &through),
+        Some(ResolvedBy::Host)
+    );
     runtime.shutdown().await;
 }
