@@ -25,8 +25,10 @@ pub trait PollSendToVectored {
 /// Whether a packet that tests the path's size may be fragmented on its way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fragmenting {
-    /// A size probe. It is never fragmented: its arrival must prove the
-    /// path carries it whole.
+    /// A size probe. It goes with don't-fragment, its one send alone, where
+    /// the sender can set it: its arrival must prove the path carries it
+    /// whole. libtorrent sets it for IPv4 peers only (udp_socket.cpp
+    /// v2.0.15:347-348); every other datagram keeps the socket's default.
     Never,
     /// A packet the stream gave up on as larger than the path. The path may
     /// fragment it, so it still arrives (libtorrent sends every packet but a
