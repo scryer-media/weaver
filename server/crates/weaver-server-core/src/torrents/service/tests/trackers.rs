@@ -516,6 +516,7 @@ async fn torrents_list_their_trackers_from_memory_after_one_boot_read() {
         let added = reads(&rig.db);
         rig.service.publish().await;
         rig.service.tick().await;
+        rig.service.restored().await;
         rig.service.reload_tracker_rules().await.unwrap();
         let listed = rig.service.torrents(None).await;
         let with_files = rig.service.torrents_with_files().await;
@@ -571,6 +572,7 @@ async fn torrents_list_their_trackers_from_memory_after_one_boot_read() {
         let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
         again.open().await.unwrap();
         again.tick().await;
+        again.restored().await;
         for &job_id in &jobs {
             handle_of(&again, job_id).await;
         }

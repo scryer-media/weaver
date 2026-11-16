@@ -7,10 +7,12 @@ use super::retire::{held_key, held_of, held_tops};
 use super::settings::TorrentSettings;
 use super::tick::Leveling;
 use super::{
-    PeerTerms, RESTORES_AT_ONCE, Signal, TorrentService, certificate_of, fetch_levels, files_dir,
-    held_by, identity_of, ignored_of, in_table_order, load_of, locked, placed, queued,
+    PeerTerms, RESTORES_AT_ONCE, Restores, Signal, TorrentService, certificate_of, fetch_levels,
+    files_dir, held_by, identity_of, ignored_of, in_table_order, load_of, locked, placed, queued,
     ratelimits_of, ssl_identity, state_error, tracker_tiers, unpacks,
 };
+use tokio::sync::watch;
+
 use crate::LoadError;
 use crate::jobs::JobId;
 use crate::jobs::model::{ArchivePasswordCandidate, ArchivePasswordSource};
@@ -565,9 +567,81 @@ impl TorrentService {
         torrent.private = parsed.private;
     }
 
+    // `restore_jobs` as a pass of its own, begun off the caller's path: the
+    // tick asks for it and goes on at once, so start-up, the tick and every
+    // request answer while the jobs come back. One pass runs at a time; one
+    // asked while a pass runs follows it, for a torrent a held restore or a
+    // resume left waiting meanwhile.
+    pub(super) fn start_restores(&self) {
+        let mut begin = false;
+        self.inner.restores.send_if_modified(|run| match run {
+            Restores::Idle => {
+                *run = Restores::Running;
+                begin = true;
+                true
+            }
+            Restores::Running => {
+                *run = Restores::Again;
+                true
+            }
+            Restores::Again => false,
+        });
+        if !begin {
+            return;
+        }
+        // Ended with the service part way, the pass is none again.
+        struct Ends<'a> {
+            restores: &'a watch::Sender<Restores>,
+            armed: bool,
+        }
+        impl Drop for Ends<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.restores.send_replace(Restores::Idle);
+                }
+            }
+        }
+        let service = self.clone();
+        self.keep(tokio::spawn(async move {
+            let mut ends = Ends {
+                restores: &service.inner.restores,
+                armed: true,
+            };
+            loop {
+                service.restore_jobs().await;
+                let mut again = false;
+                service.inner.restores.send_modify(|run| {
+                    again = *run == Restores::Again;
+                    *run = if again {
+                        Restores::Running
+                    } else {
+                        Restores::Idle
+                    };
+                });
+                if !again {
+                    ends.armed = false;
+                    return;
+                }
+            }
+        }));
+    }
+
+    // Once no restore pass runs: what a test waits on after a tick to read
+    // the jobs that tick restored.
+    #[cfg(test)]
+    pub(crate) async fn restored(&self) {
+        self.inner
+            .restores
+            .subscribe()
+            .wait_for(|run| *run == Restores::Idle)
+            .await
+            .expect("the service keeps its restore pass's sender");
+    }
+
     // The jobs of the torrents brought back at start with their records
-    // only, each restored from its checkpoint, RESTORES_AT_ONCE at a time. A
-    // torrent reads as it was kept until its job is back.
+    // only, each restored from its checkpoint, RESTORES_AT_ONCE at a time,
+    // in the order of their job ids. A torrent reads as it was kept, its
+    // restore shown, until its job is back.
     pub(super) async fn restore_jobs(&self) {
         let waiting: Vec<JobId> = self
             .inner
@@ -575,7 +649,7 @@ impl TorrentService {
             .lock()
             .await
             .values()
-            .filter(|torrent| torrent.store.is_none() && torrent.layout.is_some())
+            .filter(|torrent| torrent.awaits_restore())
             .map(|torrent| torrent.record.job_id)
             .collect();
         // RESTORES_AT_ONCE in flight, each torrent attached as soon as its
@@ -585,7 +659,10 @@ impl TorrentService {
         // into libtorrent's async_add_torrent).
         // The global archive passwords, read once for all of them and
         // outside the live lock.
-        let global = (!waiting.is_empty()).then(|| self.global_passwords());
+        if waiting.is_empty() {
+            return;
+        }
+        let global = Some(self.global_passwords());
         let mut restoring = tokio::task::JoinSet::new();
         for job_id in waiting {
             if restoring.len() >= RESTORES_AT_ONCE {
@@ -600,6 +677,10 @@ impl TorrentService {
             });
         }
         while restoring.join_next().await.is_some() {}
+        // Those back read as their sessions have them now, not at the next
+        // tick, as the tick reads them after a pass it waited on.
+        self.read_sessions().await;
+        self.publish().await;
     }
 
     // The job of a torrent that waits for one, restored on a blocking thread

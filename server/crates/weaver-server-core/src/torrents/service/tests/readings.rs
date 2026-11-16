@@ -293,8 +293,10 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
     // tick writes the ledger it changed, and a clean stop writes the ledger
     // as it stands.
     rig.service.tick().await;
+    rig.service.restored().await;
     clock.shift_unix_ms(30_000);
     rig.service.tick().await;
+    rig.service.restored().await;
     let kept = rig.service.inner.live.lock().await[&job_id].counters;
     assert_eq!(kept.active_duration_s, 30);
     rig.service.stop().await;
@@ -324,6 +326,7 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
     );
     assert_eq!(kept.pieces.map(|pieces| pieces.have), Some(4));
     again.tick().await;
+    again.restored().await;
     handle_of(&again, job_id)
         .await
         .wait_until_completed()
@@ -372,6 +375,7 @@ async fn a_torrents_active_time_reads_as_of_now_between_ticks() {
     let seeded = seeded().await;
     seeded.advance(1_000);
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     let at_tick = seeded.view().await;
     let kept = seeded.kept().await;
     assert_eq!(at_tick.active_seconds, 1);
@@ -402,6 +406,7 @@ async fn a_torrents_active_time_reads_as_of_now_between_ticks() {
     seeded.advance(3_000);
     let before = seeded.view().await;
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     let after = seeded.view().await;
     assert_eq!(before.active_seconds, at_tick.active_seconds + 10);
     assert_eq!(
@@ -424,6 +429,7 @@ async fn a_pause_credits_the_time_before_it_and_nothing_after() {
     let seeded = seeded().await;
     seeded.advance(1_000);
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     let at_tick = seeded.view().await;
     seeded.advance(7_000);
     seeded.rig.service.pause(seeded.job_id).await.unwrap();
@@ -439,6 +445,7 @@ async fn a_pause_credits_the_time_before_it_and_nothing_after() {
     assert_eq!(seeded.view().await.active_seconds, paused.active_seconds);
     seeded.advance(3_000);
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     assert_eq!(seeded.view().await.active_seconds, paused.active_seconds);
     let kept = seeded.kept().await;
     assert_eq!(
@@ -456,6 +463,7 @@ async fn a_pause_ends_the_seeding_run_and_keeps_the_whole() {
     let seeded = seeded().await;
     seeded.advance(10_000);
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     let whole = seeded.kept().await.finished_duration_s;
     assert_eq!(seeded.kept().await.consecutive_seeding_s, whole);
     let view = seeded.view().await;
@@ -470,6 +478,7 @@ async fn a_pause_ends_the_seeding_run_and_keeps_the_whole() {
     assert_eq!(seeded.kept().await.finished_duration_s, whole);
     seeded.advance(6_000);
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     let kept = seeded.kept().await;
     assert_eq!(
         (kept.finished_duration_s, kept.consecutive_seeding_s),
@@ -483,8 +492,10 @@ async fn a_pause_ends_the_seeding_run_and_keeps_the_whole() {
 
     seeded.rig.service.resume(seeded.job_id).await.unwrap();
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     seeded.advance(4_000);
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     let kept = seeded.kept().await;
     assert_eq!(
         (kept.finished_duration_s, kept.consecutive_seeding_s),
@@ -500,10 +511,12 @@ async fn a_route_going_down_ends_the_seeding_run() {
     let seeded = seeded().await;
     seeded.advance(10_000);
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     let whole = seeded.kept().await.finished_duration_s;
 
     seeded.rig.routes.set_down(Some("tunnel gone"));
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     let kept = seeded.kept().await;
     assert_eq!(
         (kept.finished_duration_s, kept.consecutive_seeding_s),
@@ -511,6 +524,7 @@ async fn a_route_going_down_ends_the_seeding_run() {
     );
     seeded.advance(5_000);
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     let kept = seeded.kept().await;
     assert_eq!(
         (kept.finished_duration_s, kept.consecutive_seeding_s),
@@ -558,6 +572,7 @@ async fn an_egress_upload_quota_throttles_its_seeds_and_never_pauses_them() {
         .await
         .unwrap();
     service.tick().await;
+    service.restored().await;
     let seeding = session_of(&service, seeded.job_id).await;
     let elsewhere = session_of(&service, other).await;
     assert!(!Arc::ptr_eq(&seeding, &elsewhere));
@@ -614,6 +629,7 @@ async fn a_restart_keeps_the_whole_and_starts_the_seeding_run_again() {
     let seeded = seeded().await;
     seeded.advance(10_000);
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     let whole = seeded.kept().await.finished_duration_s;
     assert_eq!(seeded.kept().await.consecutive_seeding_s, whole);
     seeded.rig.service.stop().await;
@@ -634,6 +650,7 @@ async fn a_restart_keeps_the_whole_and_starts_the_seeding_run_again() {
     );
     seeded.advance(3_000);
     again.tick().await;
+    again.restored().await;
     let kept = again.inner.live.lock().await[&seeded.job_id].counters;
     assert_eq!(
         (kept.finished_duration_s, kept.consecutive_seeding_s),
@@ -685,8 +702,10 @@ async fn a_torrent_that_wants_nothing_seeds_until_it_wants_a_file() {
     );
 
     rig.service.tick().await;
+    rig.service.restored().await;
     clock.shift_unix_ms(5_000);
     rig.service.tick().await;
+    rig.service.restored().await;
     let kept = rig.service.inner.live.lock().await[&job_id].counters;
     assert_eq!((kept.active_duration_s, kept.finished_duration_s), (5, 5));
 
@@ -701,6 +720,7 @@ async fn a_torrent_that_wants_nothing_seeds_until_it_wants_a_file() {
     );
     clock.shift_unix_ms(5_000);
     rig.service.tick().await;
+    rig.service.restored().await;
     let kept = rig.service.inner.live.lock().await[&job_id].counters;
     assert_eq!((kept.active_duration_s, kept.finished_duration_s), (10, 5));
     rig.service.stop().await;
@@ -713,6 +733,7 @@ async fn turning_torrents_off_keeps_the_time_they_ran_since_the_tick() {
     let seeded = seeded().await;
     seeded.advance(1_000);
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     let at_tick = seeded.view().await;
     seeded.advance(7_000);
     let mut settings = seeded.rig.service.settings();
@@ -745,13 +766,16 @@ async fn a_clock_stepped_back_credits_nothing_and_counts_on() {
     let seeded = seeded().await;
     seeded.advance(1_000);
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     let at_tick = seeded.view().await.active_seconds;
     seeded.advance(-60_000);
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     assert_eq!(seeded.kept().await.active_duration_s, at_tick);
     seeded.advance(7_000);
     assert_eq!(seeded.view().await.active_seconds, at_tick + 7);
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     assert_eq!(seeded.kept().await.active_duration_s, at_tick + 7);
     seeded.stop().await;
 }
@@ -762,15 +786,18 @@ async fn a_clock_stepped_back_credits_nothing_and_counts_on() {
 async fn ticks_lose_no_part_of_a_second() {
     let seeded = seeded().await;
     seeded.rig.service.tick().await;
+    seeded.rig.service.restored().await;
     let base = seeded.view().await.active_seconds;
     for ms in [2_400, 2_400] {
         seeded.advance(ms);
         seeded.rig.service.tick().await;
+        seeded.rig.service.restored().await;
     }
     assert_eq!(seeded.kept().await.active_duration_s, base + 4);
     for ms in [1_600, 1_600] {
         seeded.advance(ms);
         seeded.rig.service.tick().await;
+        seeded.rig.service.restored().await;
     }
     assert_eq!(seeded.kept().await.active_duration_s, base + 8);
     assert_eq!(seeded.view().await.active_seconds, base + 8);
@@ -904,10 +931,12 @@ async fn a_peers_sighting_of_a_complete_copy_dates_the_torrents() {
             .last_seen_complete_ms
     };
     rig.service.tick().await;
+    rig.service.restored().await;
     assert_eq!(seen(), None);
 
     let connection = claims_complete(&listener, 100).await;
     rig.service.tick().await;
+    rig.service.restored().await;
     let at = rig
         .service
         .torrent(job_id)
@@ -926,6 +955,7 @@ async fn a_peers_sighting_of_a_complete_copy_dates_the_torrents() {
     assert_eq!(rig.service.torrent(job_id).await.unwrap().peers, 0);
     drop(connection);
     rig.service.tick().await;
+    rig.service.restored().await;
     assert_eq!(seen(), Some(at));
     rig.service.stop().await;
 }

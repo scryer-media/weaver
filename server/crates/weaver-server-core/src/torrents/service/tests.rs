@@ -218,6 +218,9 @@ fn service_over(
 async fn reopen(service: &TorrentService) {
     service.open().await.unwrap();
     service.tick().await;
+    // The tick begins the restores off its path: the restart is through
+    // once they end.
+    service.restored().await;
 }
 
 fn set_clock() -> Arc<ManualClock> {
@@ -972,10 +975,10 @@ fn chain() -> (TorrentRecord, TrackerRule, TorrentSettings) {
         move_to: None,
         queue_position: 0,
         pool_member: None,
+        private: false,
     };
     let rule = TrackerRule {
         id: 1,
-        private: false,
         host_pattern: "tracker.test".into(),
         seeding: None,
         never_pause: false,

@@ -702,6 +702,15 @@ pub struct Written {
     pub checkpoints_read: u64,
 }
 
+// Where the restore pass stands: none runs, one runs, or one runs and
+// another is to follow it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Restores {
+    Idle,
+    Running,
+    Again,
+}
+
 struct Inner {
     db: Database,
     sessions: Sessions,
@@ -717,6 +726,10 @@ struct Inner {
     // both, so a restore whose awaiting task ends still holds them.
     restoring: std::sync::Mutex<HashMap<JobId, Arc<tokio::sync::Mutex<()>>>>,
     restore_permits: Arc<tokio::sync::Semaphore>,
+    // The pass that restores the jobs of the torrents brought back with
+    // their records alone, run off the tick: none, one running, or one
+    // running with another asked to follow it.
+    restores: watch::Sender<Restores>,
     // The torrents whose work crashed the daemon on its last run: each is
     // kept paused, its job not restored, until a resume takes its marker.
     crash_marks: Mutex<crate::runtime::panic_trap::CrashMarks>,
@@ -827,6 +840,7 @@ impl TorrentService {
                 live: tokio::sync::Mutex::new(BTreeMap::new()),
                 restoring: std::sync::Mutex::new(HashMap::new()),
                 restore_permits: Arc::new(tokio::sync::Semaphore::new(RESTORES_AT_ONCE)),
+                restores: watch::channel(Restores::Idle).0,
                 crash_marks: Mutex::default(),
                 signal: Arc::new(Signal::default()),
                 ticks: watch::channel(0).0,

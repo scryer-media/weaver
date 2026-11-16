@@ -508,6 +508,12 @@ impl Live {
         }
     }
 
+    // Whether it was brought back with its record alone and its job is yet
+    // to be restored from its checkpoint.
+    pub(super) fn awaits_restore(&self) -> bool {
+        self.store.is_none() && self.layout.is_some()
+    }
+
     // Everything the state is read from, with the session reporting
     // `engine`.
     pub(super) fn observed(&self, engine: Engine) -> Observed {
@@ -523,13 +529,20 @@ impl Live {
             Some(DiskHeld::Starting) => true,
             None => false,
         };
+        let engine = self
+            .run_error
+            .clone()
+            .or_else(|| self.copy_error.clone())
+            .or_else(|| self.restore_held.clone())
+            .map_or(engine, Engine::Error);
         Observed {
-            engine: self
-                .run_error
-                .clone()
-                .or_else(|| self.copy_error.clone())
-                .or_else(|| self.restore_held.clone())
-                .map_or(engine, Engine::Error),
+            // In no session while its job is yet to come back, it shows that
+            // it starts from what was saved, as qBittorrent shows a torrent
+            // whose resume data it is still loading (CheckingResumeData).
+            engine: match engine {
+                Engine::Absent if self.awaits_restore() => Engine::Starting,
+                engine => engine,
+            },
             has_metadata: self.layout.is_some(),
             fetch: self.fetching.as_ref().map(|fetch| *fetch.phase.borrow()),
             complete: self.complete(),

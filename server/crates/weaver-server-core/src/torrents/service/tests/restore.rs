@@ -17,6 +17,7 @@ async fn a_restart_restores_the_intent_not_the_state() {
     settings.torrent.enabled = false;
     rig.service.set_settings(settings).await;
     rig.service.tick().await;
+    rig.service.restored().await;
     assert_eq!(
         rig.service.torrent(job_id).await.unwrap().state,
         TorrentState::Stopped
@@ -50,6 +51,7 @@ async fn a_torrent_whose_files_are_all_gone_at_load_is_held_until_a_start_finds_
     held_for_its_files(&again, job_id, &dir).await;
     // A tick puts it in no session either.
     again.tick().await;
+    again.restored().await;
     held_for_its_files(&again, job_id, &dir).await;
 
     again.resume(job_id).await.unwrap();
@@ -410,6 +412,7 @@ async fn a_torrent_that_crashed_the_daemon_stays_paused_until_resumed() {
     again.resume(job_id).await.unwrap();
     assert!(read_marks(&marks).is_empty());
     again.tick().await;
+    again.restored().await;
     assert!(again.inner.live.lock().await[&job_id].attached.is_some());
     assert_eq!(again.torrent(job_id).await.unwrap().detail, None);
     again.stop().await;
@@ -631,6 +634,9 @@ async fn a_restart_starts_before_the_torrents_route_answers() {
     again.inner.sessions.turn(true).await;
     again.start().await.unwrap();
     asked.wait_for(|asked| *asked > before).await.unwrap();
+    // Its job is back, by the restore pass or by this call, which waits for
+    // the pass's restore of it; the route has still not answered.
+    again.restore_job(job_id).await;
     let view = again.torrent(job_id).await.unwrap();
     assert_eq!(view.state, TorrentState::Queued);
     assert!(again.inner.live.lock().await[&job_id].attached.is_none());
@@ -640,7 +646,11 @@ async fn a_restart_starts_before_the_torrents_route_answers() {
     );
 
     rig.routes.unanswered.send_replace(false);
-    ticks.wait_for(|ticks| *ticks >= 1).await.unwrap();
+    // A whole tick begun after the route answered, and the restore pass,
+    // put it in its session.
+    let from = *ticks.borrow_and_update();
+    ticks.wait_for(|ticks| *ticks >= from + 2).await.unwrap();
+    again.restored().await;
     assert!(again.inner.live.lock().await[&job_id].attached.is_some());
     assert!(again.torrent(job_id).await.unwrap().route.is_some());
     again.stop().await;
@@ -748,6 +758,7 @@ async fn resumes_with_its_pieces(fetched: PartlyFetched) {
         .await
         .unwrap();
     again.tick().await;
+    again.restored().await;
     let handle = handle_of(&again, job_id).await;
     handle.wait_until_completed().await.unwrap();
     assert_eq!(job_have(&again, job_id).await, 6);
@@ -775,6 +786,7 @@ async fn a_torrent_that_crashed_part_way_restarts_with_its_pieces() {
     let written = fetched.rig.service.written();
     let before = written.borrow().checkpoints;
     fetched.rig.service.tick().await;
+    fetched.rig.service.restored().await;
     assert!(written.borrow().checkpoints > before);
     // The process ends here: its sessions go with it, and nothing else is
     // written.
@@ -820,7 +832,10 @@ async fn a_restart_restores_a_torrents_job_at_the_tick_not_at_start() {
     assert_eq!(kept.files.len(), 2);
     assert_eq!(in_hand(&kept), checkpointed(sizes));
 
+    // The tick begins the restore off its path; the job is back once the
+    // restore pass ends.
     again.tick().await;
+    again.restored().await;
     assert_eq!(reads(), 1);
     assert!(again.inner.live.lock().await[&job_id].attached.is_some());
     assert_eq!(job_have(&again, job_id).await, 3);
@@ -910,6 +925,116 @@ async fn a_restored_torrent_attaches_as_soon_as_its_job_is_back() {
     seeding.stop().await;
 }
 
+// A torrent restarted, its job not yet restored, on a service whose every
+// restore permit `held` takes: a restore begun waits for one, so the job
+// comes back only once `held` is dropped.
+async fn restarted_held() -> (
+    Rig,
+    TorrentService,
+    JobId,
+    tokio::sync::OwnedSemaphorePermit,
+) {
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    rig.service.stop().await;
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    let held = Arc::clone(&again.inner.restore_permits)
+        .acquire_many_owned(crate::torrents::service::RESTORES_AT_ONCE as u32)
+        .await
+        .unwrap();
+    (rig, again, job_id, held)
+}
+
+// Restores run off the tick: with every restore held, the tick ends, a
+// second tick ends, and the list answers, showing the torrent from its
+// record as starting from what was saved (CheckingResumeData). Once the
+// restores go on, its job comes back, read once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tick_and_the_list_answer_while_restores_are_held() {
+    use crate::torrents::service::listing::{Pick, Shown, page};
+    let (_rig, again, job_id, held) = restarted_held().await;
+    let written = again.written();
+    let ticks = again.ticks();
+    again.tick().await;
+    again.tick().await;
+    assert_eq!(*ticks.borrow(), 2);
+    let listed = again
+        .picked(Pick::default(), page(0, 10), Shown::LISTED)
+        .await
+        .unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|view| (view.job_id, view.state))
+            .collect::<Vec<_>>(),
+        [(job_id, TorrentState::CheckingResumeData)]
+    );
+    assert_eq!(written.borrow().checkpoints_read, 0);
+    assert!(again.inner.live.lock().await[&job_id].store.is_none());
+
+    drop(held);
+    again.restored().await;
+    assert_eq!(written.borrow().checkpoints_read, 1);
+    assert!(again.inner.live.lock().await[&job_id].store.is_some());
+    assert_ne!(
+        again.torrent(job_id).await.unwrap().state,
+        TorrentState::CheckingResumeData
+    );
+    again.stop().await;
+}
+
+// A pause while the torrent's restore waits acts on its stored row at once,
+// and the job restored after it stays paused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pause_while_restoring_holds_once_the_job_is_back() {
+    let (rig, again, job_id, held) = restarted_held().await;
+    again.tick().await;
+    again.pause(job_id).await.unwrap();
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().intent(),
+        TorrentIntent::Paused
+    );
+    assert!(again.inner.live.lock().await[&job_id].store.is_none());
+
+    drop(held);
+    again.restored().await;
+    assert!(again.inner.live.lock().await[&job_id].store.is_some());
+    assert_eq!(
+        again.torrent(job_id).await.unwrap().state,
+        TorrentState::Paused
+    );
+    again.stop().await;
+}
+
+// A removal while the torrent's restore waits queues behind that restore:
+// the job is read once, by whichever restore takes the torrent first, and
+// the removal then removes the torrent and its rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_while_restoring_waits_for_the_restore() {
+    let (rig, again, job_id, held) = restarted_held().await;
+    let written = again.written();
+    again.tick().await;
+    let removing = {
+        let again = again.clone();
+        tokio::spawn(async move { again.remove(job_id, false, true).await })
+    };
+    drop(held);
+    removing.await.unwrap().unwrap();
+    again.restored().await;
+    assert_eq!(written.borrow().checkpoints_read, 1);
+    assert!(again.torrent(job_id).await.is_none());
+    assert_eq!(rig.db.get_torrent(job_id).unwrap(), None);
+    assert!(again.inner.restoring.lock().unwrap().is_empty());
+    again.stop().await;
+}
+
 // What a partly fetched torrent of files `sizes` has in hand: pieces 3, 4
 // and 5, the first file's last half piece and the second file whole, which
 // is all it wants.
@@ -920,7 +1045,8 @@ fn checkpointed(sizes: [u64; 2]) -> (Vec<u64>, u64, f64, Option<u32>) {
 }
 
 // A paused torrent restarts paused, showing what its checkpoint has in hand
-// before its job is back, and the same once it is.
+// before its job is back, and the same once it is. Until then it shows that
+// it starts from what was saved, as qBittorrent shows CheckingResumeData.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_paused_torrent_restarts_showing_what_it_has() {
     let PartlyFetched {
@@ -939,11 +1065,19 @@ async fn a_paused_torrent_restarts_showing_what_it_has() {
     again.open().await.unwrap();
     assert_eq!(written.borrow().checkpoints_read, 0);
     let kept = again.torrent(job_id).await.unwrap();
-    assert_eq!(kept.state, TorrentState::Paused);
+    assert_eq!(kept.state, TorrentState::CheckingResumeData);
     assert_eq!(in_hand(&kept), checkpointed(sizes));
 
     again.tick().await;
+    again.restored().await;
     assert_eq!(written.borrow().checkpoints_read, 1);
+    // Back in its session, it reads as paused once the session has started
+    // it from what it was given, at the tick after.
+    let _ = handle_of(&again, job_id)
+        .await
+        .wait_until_initialized()
+        .await;
+    again.tick().await;
     let ticked = again.torrent(job_id).await.unwrap();
     assert_eq!(ticked.state, TorrentState::Paused);
     assert_eq!(in_hand(&ticked), checkpointed(sizes));
@@ -966,8 +1100,10 @@ fn lifetime(view: &TorrentView) -> (u64, u64, u64) {
 async fn ticked(fetched: &PartlyFetched) -> (u64, u64, u64) {
     let service = &fetched.rig.service;
     service.tick().await;
+    service.restored().await;
     fetched.clock.shift_unix_ms(TICK.as_millis() as i64);
     service.tick().await;
+    service.restored().await;
     let shown = lifetime(&service.torrent(fetched.job_id).await.unwrap());
     assert!(shown.0 >= 3 * SPLIT_PIECE as u64, "{shown:?}");
     assert_eq!(shown.2, TICK.as_secs(), "{shown:?}");
@@ -1156,6 +1292,7 @@ async fn a_checkpoint_the_database_fails_to_read_holds_the_restore_until_it_read
     );
     assert!(fresh(&lines).is_empty(), "{:?}", fresh(&lines));
     again.tick().await;
+    again.restored().await;
     assert_eq!(held().len(), 1, "{:?}", held());
     {
         let live = again.inner.live.lock().await;
@@ -1174,6 +1311,7 @@ async fn a_checkpoint_the_database_fails_to_read_holds_the_restore_until_it_read
 
     rename("graph_nodes_away", "graph_nodes");
     again.tick().await;
+    again.restored().await;
     {
         let live = again.inner.live.lock().await;
         let torrent = &live[&job_id];
