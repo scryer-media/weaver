@@ -14,7 +14,13 @@ use weaver_nntp::{BlockingBodyLane, ServerConfig, ServerPoolConfig, ServerSet};
 const PAYLOAD_BYTES: usize = 2048 * 128;
 
 fn decoded_len(trace: DecodedBodyTrace) -> usize {
-    trace.result.unwrap().decoded.iter().map(|chunk| chunk.len()).sum()
+    trace
+        .result
+        .unwrap()
+        .decoded
+        .iter()
+        .map(|chunk| chunk.len())
+        .sum()
 }
 
 #[expect(

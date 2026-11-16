@@ -23,9 +23,7 @@ use crate::pool::{
     ServerId, ServerPoolConfig,
 };
 use crate::tls::TransportReadStats;
-use crate::transfer::{
-    ActiveTransferBudget, QuotaRejection,
-};
+use crate::transfer::{ActiveTransferBudget, QuotaRejection};
 
 // Configuration for the high-level NNTP client.
 pub struct NntpClientConfig {
@@ -1931,11 +1929,7 @@ impl NntpClient {
     // Connection acquisition and retry delay are bounded by a per-attempt
     // soft timeout. BODY payload reads use an inactivity budget that restarts
     // whenever bytes arrive or a transfer-policy wait ends.
-    async fn fetch_from_server(
-        &self,
-        server: ServerId,
-        message_id: &str,
-    ) -> Result<Bytes> {
+    async fn fetch_from_server(&self, server: ServerId, message_id: &str) -> Result<Bytes> {
         let mut attempts = 0u32;
 
         loop {

@@ -686,7 +686,15 @@ fn blocking_provider_rejection_parks_fresh_lanes_for_that_server_only() {
         assert_eq!(bytes, b"A");
     }
     assert_eq!(accepted.load(Ordering::SeqCst), accepted_after_rejection);
-    assert_eq!(client.pool().health().blocking_lock().server(0).failure_count, 0);
+    assert_eq!(
+        client
+            .pool()
+            .health()
+            .blocking_lock()
+            .server(0)
+            .failure_count,
+        0
+    );
 
     // A peer server that never rejected anything is unaffected.
     assert!(!client.pool().is_over_limit(ServerId(1)));
@@ -1362,10 +1370,12 @@ async fn blocking_soft_timeout_on_the_primary_does_not_unlock_a_healthy_lower_gr
         assert_eq!(order.first(), Some(&ServerId(0)), "reauth={reauth}");
         assert!(
             matches!(
-                client
-                    .pool()
-                    .provider_policy()
-                    .eligibility(1, ServerSet::EMPTY, ServerSet::EMPTY, 1),
+                client.pool().provider_policy().eligibility(
+                    1,
+                    ServerSet::EMPTY,
+                    ServerSet::EMPTY,
+                    1
+                ),
                 crate::provider_policy::ArticleEligibility::HigherPriority(_)
             ),
             "reauth={reauth}"
@@ -1955,7 +1965,11 @@ async fn decoded_quota_rejection_fails_over_to_another_fill_server() {
     });
 
     let trace = client
-        .fetch_body_decoded_with_groups_excluding_traced("<quota-failover@example.com>", &[], crate::ServerSet::EMPTY)
+        .fetch_body_decoded_with_groups_excluding_traced(
+            "<quota-failover@example.com>",
+            &[],
+            crate::ServerSet::EMPTY,
+        )
         .await;
     let decoded = trace.result.expect("second fill server should succeed");
     let decoded_bytes: Vec<u8> = decoded
@@ -2023,7 +2037,11 @@ async fn decoded_quota_rejection_does_not_unlock_backfill() {
     });
 
     let trace = client
-        .fetch_body_decoded_with_groups_excluding_traced("<backfill-locked@example.com>", &[], crate::ServerSet::EMPTY)
+        .fetch_body_decoded_with_groups_excluding_traced(
+            "<backfill-locked@example.com>",
+            &[],
+            crate::ServerSet::EMPTY,
+        )
         .await;
     assert!(matches!(
         trace.result,
@@ -2082,7 +2100,11 @@ async fn deliberate_rate_wait_does_not_trip_decoded_soft_timeout_or_health() {
 
     let started = Instant::now();
     let trace = client
-        .fetch_body_decoded_with_groups_excluding_traced("<rate-wait@example.com>", &[], crate::ServerSet::EMPTY)
+        .fetch_body_decoded_with_groups_excluding_traced(
+            "<rate-wait@example.com>",
+            &[],
+            crate::ServerSet::EMPTY,
+        )
         .await;
     assert!(started.elapsed() >= Duration::from_millis(100));
     let decoded = trace.result.expect("deliberate wait must not time out");
@@ -2131,7 +2153,11 @@ async fn delayed_body_initial_consumes_active_budget_without_unlocking_a_healthy
     });
 
     let trace = client
-        .fetch_body_decoded_with_groups_excluding_traced("<delayed@example.com>", &[], crate::ServerSet::EMPTY)
+        .fetch_body_decoded_with_groups_excluding_traced(
+            "<delayed@example.com>",
+            &[],
+            crate::ServerSet::EMPTY,
+        )
         .await;
 
     assert!(matches!(
@@ -2176,7 +2202,11 @@ async fn delayed_reauth_consumes_active_budget_without_unlocking_a_healthy_lower
     });
 
     let trace = client
-        .fetch_body_decoded_with_groups_excluding_traced("<reauth@example.com>", &[], crate::ServerSet::EMPTY)
+        .fetch_body_decoded_with_groups_excluding_traced(
+            "<reauth@example.com>",
+            &[],
+            crate::ServerSet::EMPTY,
+        )
         .await;
 
     assert!(matches!(
@@ -2231,7 +2261,10 @@ async fn raw_timeout_cleanup_preserves_rate_debt_without_waiting() {
 
     let result = client.fetch_body("<unterminated@example.com>").await;
 
-    assert!(matches!(result, Err(NntpError::SoftTimeout(_))), "{result:?}");
+    assert!(
+        matches!(result, Err(NntpError::SoftTimeout(_))),
+        "{result:?}"
+    );
     let snapshot = control.snapshot();
     assert!(snapshot.lifetime_body_bytes >= 64 * 1024);
     assert_eq!(snapshot.throttle_wait, Duration::ZERO);
@@ -2594,7 +2627,11 @@ async fn a_guarded_fetch_carries_the_due_probe_and_its_server_recovers() {
     });
 
     let trace = guarded
-        .fetch_body_decoded_with_groups_excluding_traced("<probe@example.com>", &[], ServerSet::EMPTY)
+        .fetch_body_decoded_with_groups_excluding_traced(
+            "<probe@example.com>",
+            &[],
+            ServerSet::EMPTY,
+        )
         .await;
 
     assert!(trace.result.is_ok(), "{:?}", trace.result.err());
@@ -2628,4 +2665,3 @@ async fn an_async_probe_put_down_unanswered_gives_the_probe_back() {
     );
     assert!(pool.requires_recovery(0), "nothing answered it");
 }
-

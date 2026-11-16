@@ -144,7 +144,8 @@ async fn blocking_fallback_uses_the_lower_group_only_for_the_missing_article() {
             .expect("the primary opens a lane");
         assert_eq!(primary.server_id(), ServerId(0));
         for id in 0..8 {
-            let trace = primary.fetch_decoded_sequential(&format!("<primary-{id}@example.invalid>"));
+            let trace =
+                primary.fetch_decoded_sequential(&format!("<primary-{id}@example.invalid>"));
             client.record_blocking_attempts(&trace.attempts);
             trace.result.expect("the primary has its own articles");
         }
@@ -168,14 +169,19 @@ async fn blocking_fallback_uses_the_lower_group_only_for_the_missing_article() {
         assert_eq!(again.first(), Some(&ServerId(0)));
         let trace = primary.fetch_decoded_sequential("<primary-again@example.invalid>");
         client.record_blocking_attempts(&trace.attempts);
-        trace.result.expect("the next article goes back to the primary");
+        trace
+            .result
+            .expect("the next article goes back to the primary");
         drop(primary);
     })
     .await
     .unwrap();
 
     let commands = work_commands(&fixture);
-    assert!(commands.iter().all(|(server, _)| *server != 2), "{commands:?}");
+    assert!(
+        commands.iter().all(|(server, _)| *server != 2),
+        "{commands:?}"
+    );
     let lower: Vec<_> = commands.iter().filter(|(server, _)| *server == 1).collect();
     assert_eq!(lower.len(), 1, "{commands:?}");
     assert!(lower[0].1.contains("fallback"), "{commands:?}");
@@ -253,7 +259,9 @@ async fn obsolete_work_leaves_no_attempt_and_no_health_mark() {
     assert!(
         matches!(
             trace.result,
-            Err(crate::client::DecodedBodyError::Nntp(NntpError::WorkObsolete))
+            Err(crate::client::DecodedBodyError::Nntp(
+                NntpError::WorkObsolete
+            ))
         ),
         "{:?}",
         trace.result
@@ -466,7 +474,9 @@ async fn blocking_outages_do_not_unlock_the_backfill() {
         assert_eq!(lane.server_id(), ServerId(1));
         let trace = lane.fetch_decoded_sequential("<ordinary-outage@example.invalid>");
         client.record_blocking_attempts(&trace.attempts);
-        trace.result.expect("the next fill group serves the article");
+        trace
+            .result
+            .expect("the next fill group serves the article");
         drop(lane);
         client
     })
@@ -500,7 +510,10 @@ async fn blocking_outages_do_not_unlock_the_backfill() {
     .await
     .unwrap();
     assert_eq!(fixture.dials[2].load(Ordering::SeqCst), 0);
-    assert!(work_commands(&fixture).iter().all(|(server, _)| *server != 2));
+    assert!(
+        work_commands(&fixture)
+            .iter()
+            .all(|(server, _)| *server != 2)
+    );
     fixture.close().await;
 }
-

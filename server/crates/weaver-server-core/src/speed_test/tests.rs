@@ -232,9 +232,7 @@ async fn a_server_that_answers_412_is_sent_a_group_only_after_it() {
         },
     )
     .await;
-    let listed: Vec<(String, u64)> = (0..3)
-        .map(|i| (format!("grp{i}@fixture"), 9_000))
-        .collect();
+    let listed: Vec<(String, u64)> = (0..3).map(|i| (format!("grp{i}@fixture"), 9_000)).collect();
     let listed: Vec<(&str, u64)> = listed.iter().map(|(id, b)| (id.as_str(), *b)).collect();
     let http = HttpFixture::start(nzb(&listed), 0, None).await;
     let server = add_server(&rig, &nntp, None).await;

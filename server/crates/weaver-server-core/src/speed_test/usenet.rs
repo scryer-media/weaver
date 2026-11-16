@@ -313,10 +313,7 @@ impl Worker {
     // wakes the pipeline's dispatch waits on. All of it within `DIAL_WAIT`
     // of the first ask, one deadline, and never past the run's stop; the
     // async acquire it replaces waited as long.
-    fn dial(
-        &self,
-        groups: &[String],
-    ) -> Result<BlockingBodyLane, BlockingBodyLaneAcquireError> {
+    fn dial(&self, groups: &[String]) -> Result<BlockingBodyLane, BlockingBodyLaneAcquireError> {
         let pool = self.client.pool();
         let mut changes = pool.server_health_changes();
         let give_up = std::time::Instant::now() + DIAL_WAIT;
@@ -369,9 +366,7 @@ const DIAL_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 // told as one, whichever code the server refused it with.
 fn dial_error(error: BlockingBodyLaneAcquireError) -> NntpError {
     match error {
-        BlockingBodyLaneAcquireError::CredentialsRefused { .. } => {
-            NntpError::AuthenticationFailed
-        }
+        BlockingBodyLaneAcquireError::CredentialsRefused { .. } => NntpError::AuthenticationFailed,
         BlockingBodyLaneAcquireError::ProviderCapacity(error)
         | BlockingBodyLaneAcquireError::Other(error) => error,
         BlockingBodyLaneAcquireError::ServerRecovering => NntpError::ServerRecovering,

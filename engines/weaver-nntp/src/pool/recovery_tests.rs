@@ -821,8 +821,12 @@ fn a_blocking_recovery_probe_is_shared_fresh_and_answered_by_its_430() {
     assert_eq!(pool.socket_budget_snapshot(0).physical, 1);
     assert!(
         !matches!(
-            pool.provider_policy()
-                .eligibility(0, crate::ServerSet::EMPTY, crate::ServerSet::EMPTY, 1),
+            pool.provider_policy().eligibility(
+                0,
+                crate::ServerSet::EMPTY,
+                crate::ServerSet::EMPTY,
+                1
+            ),
             ArticleEligibility::Eligible(_)
         ),
         "a new connection still finds the server held by its probe"

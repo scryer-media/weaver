@@ -1227,7 +1227,10 @@ fn tls_connection_reports_its_cipher_suite_and_capabilities_round_trip(backend: 
     let suite = conn
         .negotiated_cipher_suite()
         .expect("a TLS connection names its suite");
-    assert!(suite.contains("GCM") || suite.contains("CHACHA20"), "{suite}");
+    assert!(
+        suite.contains("GCM") || suite.contains("CHACHA20"),
+        "{suite}"
+    );
     assert!(conn.capabilities_round_trip().is_some());
     assert!(conn.capabilities().supports_pipelining());
 

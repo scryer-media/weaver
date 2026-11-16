@@ -123,8 +123,9 @@ async fn policy_save_closes_active_direct_sockets_before_reload_returns() {
     assert!(registry.check().is_err());
     assert_eq!(fixture.await.unwrap().unwrap(), 0);
     assert!(
-        tokio::task::spawn_blocking(move || weaver_nntp::BlockingNntpConnection::connect(&config)
-            .is_err())
+        tokio::task::spawn_blocking(
+            move || weaver_nntp::BlockingNntpConnection::connect(&config).is_err()
+        )
         .await
         .unwrap()
     );
