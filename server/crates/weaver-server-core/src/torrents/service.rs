@@ -380,12 +380,14 @@ fn tracker(tier: u32, url: &[u8]) -> Option<TrackerEntry> {
 // is no URL is left out, as a session leaves it out.
 fn tidy_trackers(trackers: Vec<TrackerEntry>) -> Vec<TrackerEntry> {
     let mut tidy: Vec<TrackerEntry> = Vec::with_capacity(trackers.len());
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(trackers.len());
     for entry in trackers {
         let url = entry.url.trim();
         if weaver_torrent::Url::parse(url).is_err() {
             continue;
         }
-        if tidy.iter().all(|known| known.url != url) {
+        if seen.insert(url.to_owned()) {
             tidy.push(TrackerEntry {
                 tier: entry.tier,
                 url: url.to_owned(),

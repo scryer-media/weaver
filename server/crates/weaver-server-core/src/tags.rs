@@ -251,11 +251,21 @@ async fn known_jobs_tx(tx: &mut SqlTx<'_>, ids: &[i64]) -> Result<Vec<i64>, Stat
     Ok(known.into_iter().collect())
 }
 
+// One statement's worth of tags at a time, each as a bind.
+fn tag_args(tags: &[String]) -> (String, Vec<SqlArg>) {
+    (
+        vec!["{}"; tags.len()].join(", "),
+        tags.iter().cloned().map(SqlArg::Text).collect(),
+    )
+}
+
 async fn make_tags_tx(tx: &mut SqlTx<'_>, tags: &[String]) -> Result<(), StateError> {
-    for tag in tags {
+    for chunk in tags.chunks(max_rows_for_tx(tx, 1)) {
+        let rows = vec!["({})"; chunk.len()].join(", ");
+        let (_, args) = tag_args(chunk);
         tx.execute(
-            "INSERT INTO tags (name) VALUES ({}) ON CONFLICT(name) DO NOTHING",
-            &[SqlArg::Text(tag.clone())],
+            &format!("INSERT INTO tags (name) VALUES {rows} ON CONFLICT(name) DO NOTHING"),
+            &args,
         )
         .await?;
     }
@@ -269,15 +279,25 @@ async fn put_tags_tx(tx: &mut SqlTx<'_>, ids: &[i64], tags: &[String]) -> Result
         return Ok(());
     }
     make_tags_tx(tx, tags).await?;
-    for &id in ids {
-        for tag in tags {
-            tx.execute(
-                "INSERT INTO job_tags (job_id, tag) VALUES ({}, {})
-                 ON CONFLICT(job_id, tag) DO NOTHING",
-                &[SqlArg::I64(id), SqlArg::Text(tag.clone())],
-            )
-            .await?;
+    let pairs: Vec<(i64, &String)> = ids
+        .iter()
+        .flat_map(|&id| tags.iter().map(move |tag| (id, tag)))
+        .collect();
+    for chunk in pairs.chunks(max_rows_for_tx(tx, 2)) {
+        let rows = vec!["({}, {})"; chunk.len()].join(", ");
+        let mut args = Vec::with_capacity(chunk.len() * 2);
+        for (id, tag) in chunk {
+            args.push(SqlArg::I64(*id));
+            args.push(SqlArg::Text((*tag).clone()));
         }
+        tx.execute(
+            &format!(
+                "INSERT INTO job_tags (job_id, tag) VALUES {rows}
+                 ON CONFLICT(job_id, tag) DO NOTHING"
+            ),
+            &args,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -288,29 +308,32 @@ async fn take_tags_tx(
     ids: &[i64],
     tags: Option<&[String]>,
 ) -> Result<(), StateError> {
-    for chunk in ids.chunks(max_rows_for_tx(tx, 1)) {
-        let (placeholders, mut args) = id_args(chunk);
-        match tags {
-            None => {
-                tx.execute(
-                    &format!("DELETE FROM job_tags WHERE job_id IN ({placeholders})"),
-                    &args,
-                )
-                .await?;
-            }
-            Some(tags) => {
-                for tag in tags {
-                    args.push(SqlArg::Text(tag.clone()));
-                    tx.execute(
-                        &format!(
-                            "DELETE FROM job_tags WHERE job_id IN ({placeholders}) AND tag = {{}}"
-                        ),
-                        &args,
-                    )
-                    .await?;
-                    args.pop();
-                }
-            }
+    let Some(tags) = tags else {
+        for chunk in ids.chunks(max_rows_for_tx(tx, 1)) {
+            let (placeholders, args) = id_args(chunk);
+            tx.execute(
+                &format!("DELETE FROM job_tags WHERE job_id IN ({placeholders})"),
+                &args,
+            )
+            .await?;
+        }
+        return Ok(());
+    };
+    // The ids and the tags of one statement share its binds.
+    let binds = max_rows_for_tx(tx, 1);
+    for tag_chunk in tags.chunks((binds / 2).max(1)) {
+        let (tag_placeholders, tag_binds) = tag_args(tag_chunk);
+        for chunk in ids.chunks((binds - tag_chunk.len()).max(1)) {
+            let (placeholders, mut args) = id_args(chunk);
+            args.extend(tag_binds.iter().cloned());
+            tx.execute(
+                &format!(
+                    "DELETE FROM job_tags WHERE job_id IN ({placeholders}) \
+                     AND tag IN ({tag_placeholders})"
+                ),
+                &args,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -340,11 +363,18 @@ impl Change {
         match self {
             Self::Make(tags) => make_tags_tx(tx, tags).await,
             Self::Delete(tags) => {
-                for tag in tags {
-                    let arg = [SqlArg::Text(tag.clone())];
-                    tx.execute("DELETE FROM job_tags WHERE tag = {}", &arg)
-                        .await?;
-                    tx.execute("DELETE FROM tags WHERE name = {}", &arg).await?;
+                for chunk in tags.chunks(max_rows_for_tx(tx, 1)) {
+                    let (placeholders, args) = tag_args(chunk);
+                    tx.execute(
+                        &format!("DELETE FROM job_tags WHERE tag IN ({placeholders})"),
+                        &args,
+                    )
+                    .await?;
+                    tx.execute(
+                        &format!("DELETE FROM tags WHERE name IN ({placeholders})"),
+                        &args,
+                    )
+                    .await?;
                 }
                 Ok(())
             }

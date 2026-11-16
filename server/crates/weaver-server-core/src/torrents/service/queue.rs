@@ -18,7 +18,7 @@ use crate::jobs::model::{FieldUpdate, JobUpdate, PRIORITY_ATTRIBUTE_KEY};
 use crate::torrents::admission::Refusal;
 use crate::torrents::metrics::FetchOutcome;
 use crate::torrents::{TorrentIntent, status};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Arc, PoisonError, Weak};
 
 // A snapshot of the download queue's end from the last pass, extended by
@@ -244,26 +244,9 @@ impl TorrentService {
             let mut order: Vec<&Live> =
                 live.values().filter(|torrent| !torrent.seeding()).collect();
             order.sort_by_key(|torrent| (torrent.record.queue_position, torrent.record.job_id));
-            let mut order: Vec<JobId> = order.iter().map(|torrent| torrent.record.job_id).collect();
-            let named: Vec<JobId> = order
-                .iter()
-                .copied()
-                .filter(|job_id| job_ids.contains(job_id))
-                .collect();
-            let first_first = match target {
-                QueueMoveTarget::Top => false,
-                QueueMoveTarget::Bottom => true,
-                QueueMoveTarget::Offset(offset) => offset < 0,
-            };
-            let moving: Box<dyn Iterator<Item = &JobId>> = if first_first {
-                Box::new(named.iter())
-            } else {
-                Box::new(named.iter().rev())
-            };
-            for &job_id in moving {
-                // Named and still downloading, so in the order.
-                let _ = crate::jobs::handle::splice_job_order(&mut order, job_id, target);
-            }
+            let order: Vec<JobId> = order.iter().map(|torrent| torrent.record.job_id).collect();
+            let named: HashSet<JobId> = job_ids.iter().copied().collect();
+            let order = moved_order(order, &named, target);
             // The torrents still downloading take the places they held among
             // themselves, in their new order; a seed keeps its own.
             let mut places: Vec<i64> = order
@@ -525,4 +508,68 @@ pub(super) fn scheduler_error(error: ActionError) -> SchedulerError {
 pub(super) fn top_priority(value: &str) -> bool {
     use crate::post_processing::scan::numeric_priority;
     numeric_priority(value) >= numeric_priority("HIGH")
+}
+
+// `order` with each torrent `named` moved to `target`, as one splice of each
+// after another gives it: for an offset up, each named torrent in queue
+// order moves that many places up, past any named torrent already there;
+// for one down, each in reverse queue order moves that many places down;
+// to the top, the named torrents in queue order, then the rest; to the
+// bottom, the rest, then the named torrents in queue order. One pass over
+// the order whatever the offset.
+pub(super) fn moved_order(
+    order: Vec<JobId>,
+    named: &HashSet<JobId>,
+    target: QueueMoveTarget,
+) -> Vec<JobId> {
+    let (mut moved, rest): (Vec<JobId>, Vec<JobId>) =
+        order.iter().partition(|job_id| named.contains(*job_id));
+    let offset = match target {
+        QueueMoveTarget::Top => {
+            moved.extend(rest);
+            return moved;
+        }
+        QueueMoveTarget::Bottom => {
+            let mut rest = rest;
+            rest.extend(moved);
+            return rest;
+        }
+        QueueMoveTarget::Offset(offset) => offset,
+    };
+    let places = usize::try_from(offset.unsigned_abs()).unwrap_or(usize::MAX);
+    if offset < 0 {
+        moved_up(order.into_iter(), named, places)
+    } else {
+        let mut down = moved_up(order.into_iter().rev(), named, places);
+        down.reverse();
+        down
+    }
+}
+
+// Each of `order` that is `named`, in turn, `places` places up, clamped at
+// the top. A torrent moved up `places` places lands just before the last
+// `places` torrents of those before it, which no later move reaches over:
+// they stay in `window`, and what leaves it is placed for good.
+fn moved_up(
+    order: impl Iterator<Item = JobId>,
+    named: &HashSet<JobId>,
+    places: usize,
+) -> Vec<JobId> {
+    let mut placed = Vec::new();
+    let mut window = VecDeque::new();
+    for job_id in order {
+        if !named.contains(&job_id) {
+            window.push_back(job_id);
+            if window.len() > places {
+                placed.extend(window.pop_front());
+            }
+        } else if window.len() < places {
+            // Fewer than `places` before it: to the top.
+            window.push_front(job_id);
+        } else {
+            placed.push(job_id);
+        }
+    }
+    placed.extend(window);
+    placed
 }

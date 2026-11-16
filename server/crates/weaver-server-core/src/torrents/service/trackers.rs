@@ -6,6 +6,7 @@ use super::{
 };
 use crate::jobs::JobId;
 use crate::torrents::{NamedBy, PeerInfo, TorrentTracker, TrackerEntry};
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -20,6 +21,35 @@ fn tracker_urls(trackers: &[TrackerEntry]) -> Result<(), ActionError> {
                 .map(drop)
                 .map_err(|error| ActionError::Invalid(format!("tracker {url}: {error}")))
         })
+}
+
+// `trackers` without those whose URL is one of `urls`, trimmed.
+pub(super) fn without_urls(mut trackers: Vec<TrackerEntry>, urls: &[String]) -> Vec<TrackerEntry> {
+    let gone: HashSet<&str> = urls.iter().map(|url| url.trim()).collect();
+    trackers.retain(|tracker| !gone.contains(tracker.url.as_str()));
+    trackers
+}
+
+// Each of `trackers` as whoever first named its URL in `listed`, and as the
+// operator when `listed` does not name it.
+pub(super) fn named_as_listed(
+    listed: &[TrackerEntry],
+    trackers: Vec<TrackerEntry>,
+) -> Vec<TrackerEntry> {
+    let mut named: HashMap<&str, NamedBy> = HashMap::with_capacity(listed.len());
+    for known in listed {
+        named.entry(known.url.as_str()).or_insert(known.named_by);
+    }
+    trackers
+        .into_iter()
+        .map(|tracker| TrackerEntry {
+            named_by: named
+                .get(tracker.url.as_str())
+                .copied()
+                .unwrap_or(NamedBy::Operator),
+            ..tracker
+        })
+        .collect()
 }
 
 impl TorrentService {
@@ -111,11 +141,8 @@ impl TorrentService {
 
     /// Stop listing each of `urls`.
     pub async fn remove_trackers(&self, job_id: JobId, urls: &[String]) -> Result<(), ActionError> {
-        self.edit_trackers(job_id, |mut trackers| {
-            trackers.retain(|tracker| !urls.iter().any(|url| url.trim() == tracker.url));
-            Ok(trackers)
-        })
-        .await
+        self.edit_trackers(job_id, |trackers| Ok(without_urls(trackers, urls)))
+            .await
     }
 
     // Write the trackers `edit` makes of the torrent's list and hand them
@@ -133,16 +160,7 @@ impl TorrentService {
             let listed = &torrent.trackers;
             let trackers = edit(listed.to_vec())?;
             tracker_urls(&trackers)?;
-            let trackers: Vec<TrackerEntry> = tidy_trackers(trackers)
-                .into_iter()
-                .map(|tracker| TrackerEntry {
-                    named_by: listed
-                        .iter()
-                        .find(|known| known.url == tracker.url)
-                        .map_or(NamedBy::Operator, |known| known.named_by),
-                    ..tracker
-                })
-                .collect();
+            let trackers = named_as_listed(listed, tidy_trackers(trackers));
             let stored = self
                 .inner
                 .db

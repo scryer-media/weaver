@@ -1325,3 +1325,136 @@ fn a_give_back_withdrawn_before_torrents_act_closes_nothing() {
         "withdrawn after the first session"
     );
 }
+
+use crate::jobs::handle::QueueMoveTarget;
+
+// A fixed run of numbers for the seeded orders below.
+fn numbers(seed: u64) -> impl Iterator<Item = u64> {
+    let mut state = seed;
+    std::iter::repeat_with(move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        state >> 33
+    })
+}
+
+const TARGETS: [QueueMoveTarget; 11] = [
+    QueueMoveTarget::Top,
+    QueueMoveTarget::Bottom,
+    QueueMoveTarget::Offset(0),
+    QueueMoveTarget::Offset(-1),
+    QueueMoveTarget::Offset(1),
+    QueueMoveTarget::Offset(-3),
+    QueueMoveTarget::Offset(7),
+    QueueMoveTarget::Offset(-250),
+    QueueMoveTarget::Offset(400),
+    QueueMoveTarget::Offset(i64::MIN),
+    QueueMoveTarget::Offset(i64::MAX),
+];
+
+// A move of many torrents ends where one splice of each after another
+// ended: every target, over queues with few, some and most torrents named.
+#[test]
+fn a_move_of_many_ends_where_the_splices_ended() {
+    use crate::torrents::service::queue::moved_order;
+    use std::collections::HashSet;
+    for (seed, length, share) in [
+        (1, 600, 2),
+        (2, 600, 50),
+        (3, 600, 95),
+        (4, 3, 50),
+        (5, 1, 100),
+    ] {
+        let order: Vec<JobId> = (0..length).map(JobId).collect();
+        let named: Vec<JobId> = order
+            .iter()
+            .copied()
+            .zip(numbers(seed))
+            .filter(|(_, number)| number % 100 < share)
+            .map(|(job_id, _)| job_id)
+            .collect();
+        let set: HashSet<JobId> = named.iter().copied().collect();
+        for target in TARGETS {
+            let first_first = match target {
+                QueueMoveTarget::Top => false,
+                QueueMoveTarget::Bottom => true,
+                QueueMoveTarget::Offset(offset) => offset < 0,
+            };
+            let mut spliced = order.clone();
+            let moving: Box<dyn Iterator<Item = &JobId>> = if first_first {
+                Box::new(named.iter())
+            } else {
+                Box::new(named.iter().rev())
+            };
+            for &job_id in moving {
+                crate::jobs::handle::splice_job_order(&mut spliced, job_id, target).unwrap();
+            }
+            assert_eq!(
+                moved_order(order.clone(), &set, target),
+                spliced,
+                "{length} torrents, {} named, {target:?}",
+                named.len()
+            );
+        }
+    }
+}
+
+// A batch of moves, one torrent each, ends where each splice followed by
+// a fresh read's order of torrents that share a place ended.
+#[test]
+fn a_batch_of_moves_ends_where_the_splices_and_reads_ended() {
+    use crate::torrents::service::batch::Spliced;
+    fn ties_by_job(order: &mut [JobId], places: &[i64]) {
+        let mut start = 0;
+        while start < places.len() {
+            let mut end = start + 1;
+            while end < places.len() && places[end] == places[start] {
+                end += 1;
+            }
+            if end - start > 1 {
+                order[start..end].sort_unstable();
+            }
+            start = end;
+        }
+    }
+    for (seed, length, tie_share) in [(11, 500, 0), (12, 500, 30), (13, 500, 90), (14, 2, 100)] {
+        // Places that rise, some shared by a run of torrents.
+        let mut place = 0;
+        let mut rows: Vec<(i64, JobId)> = (0..length)
+            .zip(numbers(seed))
+            .map(|(job, number)| {
+                if number % 100 >= tie_share {
+                    place += 1;
+                }
+                (place, JobId(number % 100_000 * 1_000 + job))
+            })
+            .collect();
+        rows.sort_unstable();
+        let places: Vec<i64> = rows.iter().map(|(place, _)| *place).collect();
+        let order: Vec<JobId> = rows.iter().map(|(_, job_id)| *job_id).collect();
+        let moves: Vec<(JobId, QueueMoveTarget)> = numbers(seed + 100)
+            .take(800)
+            .map(|number| {
+                let job_id = order[(number as usize) % order.len()];
+                (job_id, TARGETS[(number as usize / 7) % TARGETS.len()])
+            })
+            .chain([(JobId(u64::MAX), QueueMoveTarget::Top)])
+            .collect();
+        let mut by_splices = order.clone();
+        let mut spliced_then = Vec::new();
+        for &(job_id, target) in &moves {
+            let spliced = crate::jobs::handle::splice_job_order(&mut by_splices, job_id, target)
+                .unwrap_or(false);
+            ties_by_job(&mut by_splices, &places);
+            spliced_then.push(spliced);
+        }
+        let mut batch = Spliced::new(order.clone(), &places);
+        let spliced_now: Vec<bool> = moves
+            .iter()
+            .map(|&(job_id, target)| batch.splice(job_id, target))
+            .collect();
+        assert_eq!(spliced_now, spliced_then, "seed {seed}");
+        assert_eq!(batch.order, by_splices, "seed {seed}");
+    }
+}

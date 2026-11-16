@@ -36,8 +36,8 @@ use tokio::sync::oneshot;
 use weaver_torrent::core::InfoHashes;
 use weaver_torrent::tracker::Tracker;
 use weaver_torrent::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, Identity, Magnet, ResumePeers, Session,
-    TorrentVersion, torrent_from_bytes,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, FilePriority, Identity, Magnet, ResumePeers,
+    Session, TorrentVersion, torrent_from_bytes,
 };
 
 // The client a torrent under `rule` claims to be on every surface that
@@ -427,10 +427,11 @@ impl TorrentService {
                 // Answered without waiting on its route (libtorrent
                 // `session_impl::add_torrent` starts a magnet at once): the
                 // fetch opens the route's session by itself. A magnet with
-                // no trackers is refused here when the route's session runs
-                // and carries no DHT; one whose route is not open yet is
-                // told so by its fetch, once the route is.
+                // no trackers and no peers is refused here when the route's
+                // session runs and carries no DHT; one whose route is not
+                // open yet is told so by its fetch, once the route is.
                 if magnet.trackers.is_empty()
+                    && magnet.peers.is_empty()
                     && let Some(session) = self.inner.sessions.running_session(&plan).await
                     && session.get_dht().is_none()
                 {
@@ -829,12 +830,13 @@ impl TorrentService {
                 return self.held(job_id, Some(plan.key), held_by(error)).await;
             }
         };
-        // A magnet with no trackers finds its peers on the DHT alone: on a
-        // route that carries none it can never fetch.
+        // A magnet with no trackers and no peers of its own finds its peers
+        // on the DHT alone: on a route that carries none it can never fetch.
         let trackerless = tracker_tiers
             .as_ref()
             .is_none_or(|tiers| tiers.iter().all(Vec::is_empty))
-            && Magnet::parse(&uri).is_ok_and(|magnet| magnet.trackers.is_empty());
+            && Magnet::parse(&uri)
+                .is_ok_and(|magnet| magnet.trackers.is_empty() && magnet.peers.is_empty());
         if trackerless && session.get_dht().is_none() {
             if self.fetch_ended(job_id).await {
                 self.inner.counters.fetch(FetchOutcome::Failed);
@@ -883,7 +885,16 @@ impl TorrentService {
             identity,
             trackers,
         });
-        match self.resolved(job_id, listed.torrent_bytes, fetched).await {
+        // The levels the link's `so=` gave its files go with the metainfo.
+        match self
+            .resolved(
+                job_id,
+                listed.torrent_bytes,
+                &listed.file_priorities,
+                fetched,
+            )
+            .await
+        {
             Ok(()) => self.inner.counters.fetch(FetchOutcome::Resolved),
             Err(error) => {
                 self.inner.counters.fetch(FetchOutcome::Failed);
@@ -925,10 +936,14 @@ impl TorrentService {
         self.publish().await;
     }
 
+    // A magnet's metainfo is in hand: `selected` is each file's level as
+    // the link's `so=` gave it, by the metainfo's file index (libtorrent
+    // `parse_magnet_uri` keeps it as the add's file priorities).
     pub(super) async fn resolved(
         &self,
         job_id: JobId,
         bytes: Bytes,
+        selected: &[FilePriority],
         fetched: Option<Fetched>,
     ) -> Result<(), AddError> {
         let parsed = parse(&bytes)?;
@@ -1007,6 +1022,25 @@ impl TorrentService {
         // The table holds the merged list now, whatever the next write does.
         torrent.rule_id = self.rule_id(&trackers);
         torrent.trackers = in_table_order(trackers);
+        // The files the link left out are Ignored before the store is made
+        // over them, as the operator's own levels would be. Padding is no
+        // one's choice: it is stored as Normal.
+        let files = parsed.layout.files().map(|file| file.padding);
+        let levels: Vec<FilePriority> = files
+            .zip(
+                selected
+                    .iter()
+                    .copied()
+                    .chain(std::iter::repeat(FilePriority::Normal)),
+            )
+            .map(|(padding, level)| if padding { FilePriority::Normal } else { level })
+            .collect();
+        if levels.iter().any(|level| *level != FilePriority::Normal) {
+            self.inner
+                .db
+                .set_torrent_file_priorities(job_id, &levels)
+                .map_err(|error| AddError::State(state_error(error)))?;
+        }
         let made = self.give_metainfo(torrent, &parsed, &left_out);
         drop(live);
         if let Err(error) = made {

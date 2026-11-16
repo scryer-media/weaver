@@ -21,13 +21,14 @@ use weaver_torrent::ResumePeers;
 
 // A tracker row holds where the tracker sits in the announce list and who
 // named it; how announcing to it goes is read from the session.
-const TRACKER_INSERT: &str =
-    "INSERT INTO torrent_trackers (job_id, tier, url, named_by) VALUES ({}, {}, {}, {})";
+const TRACKER_INSERT: &str = "INSERT INTO torrent_trackers (job_id, tier, url, named_by) VALUES ";
+const TRACKER_ROW: &str = "({}, {}, {}, {})";
 // Every host a torrent has announced to stays known after the torrent is
 // gone, so a tracker rule can be picked from them. The URL is not kept: a
 // private tracker's carries the operator's passkey.
-const TRACKER_HOST_INSERT: &str =
-    "INSERT INTO tracker_hosts (host) VALUES ({}) ON CONFLICT (host) DO NOTHING";
+const TRACKER_HOST_INSERT: &str = "INSERT INTO tracker_hosts (host) VALUES ";
+const TRACKER_HOST_ROW: &str = "({})";
+const TRACKER_HOST_CONFLICT: &str = " ON CONFLICT (host) DO NOTHING";
 
 /// Seed mode as a pass over the torrents found it, written together by
 /// [`Database::write_torrent_seed_modes`].
@@ -98,22 +99,71 @@ async fn insert_trackers(
     job_id: i64,
     trackers: &[TrackerEntry],
 ) -> Result<(), StateError> {
-    for tracker in trackers {
-        let args = [
-            SqlArg::I64(job_id),
-            SqlArg::I64(i64::from(tracker.tier)),
-            SqlArg::Text(tracker.url.clone()),
-            SqlArg::Text(named_by_str(tracker.named_by).to_owned()),
-        ];
-        tx.execute(TRACKER_INSERT, &args).await?;
+    // As many rows a statement as its binds allow.
+    for chunk in trackers.chunks(crate::persistence::sql_runtime::max_rows_for_tx(tx, 4)) {
+        let sql = format!(
+            "{TRACKER_INSERT}{}",
+            vec![TRACKER_ROW; chunk.len()].join(", ")
+        );
+        let mut args = Vec::with_capacity(chunk.len() * 4);
+        for tracker in chunk {
+            args.extend([
+                SqlArg::I64(job_id),
+                SqlArg::I64(i64::from(tracker.tier)),
+                SqlArg::Text(tracker.url.clone()),
+                SqlArg::Text(named_by_str(tracker.named_by).to_owned()),
+            ]);
+        }
+        tx.execute(&sql, &args).await?;
     }
-    let hosts: std::collections::BTreeSet<String> = trackers
+    let hosts: Vec<String> = trackers
         .iter()
         .filter_map(|tracker| tracker_host(&tracker.url))
+        .collect::<std::collections::BTreeSet<String>>()
+        .into_iter()
         .collect();
-    for host in hosts {
-        tx.execute(TRACKER_HOST_INSERT, &[SqlArg::Text(host)])
-            .await?;
+    for chunk in hosts.chunks(crate::persistence::sql_runtime::max_rows_for_tx(tx, 1)) {
+        let sql = format!(
+            "{TRACKER_HOST_INSERT}{}{TRACKER_HOST_CONFLICT}",
+            vec![TRACKER_HOST_ROW; chunk.len()].join(", ")
+        );
+        let args: Vec<SqlArg> = chunk.iter().cloned().map(SqlArg::Text).collect();
+        tx.execute(&sql, &args).await?;
+    }
+    Ok(())
+}
+
+// One column of each torrent `rows` names, each row its id and the value,
+// as `UPDATE ... CASE` statements of as many rows as their binds allow.
+// A torrent named twice takes the value named last, as one statement per
+// row in turn left it.
+async fn update_column_tx(
+    tx: &mut SqlTx<'_>,
+    column: &str,
+    rows: &[(i64, SqlArg)],
+) -> Result<(), StateError> {
+    let mut seen = std::collections::HashSet::with_capacity(rows.len());
+    let mut last: Vec<&(i64, SqlArg)> = rows
+        .iter()
+        .rev()
+        .filter(|(id, _)| seen.insert(*id))
+        .collect();
+    last.reverse();
+    // Three binds a row: the CASE arm's id and value, and the id in the
+    // list.
+    for chunk in last.chunks(crate::persistence::sql_runtime::max_rows_for_tx(tx, 3)) {
+        let sql = format!(
+            "UPDATE torrents SET {column} = CASE job_id {}END WHERE job_id IN ({})",
+            "WHEN {} THEN {} ".repeat(chunk.len()),
+            vec!["{}"; chunk.len()].join(", ")
+        );
+        let mut args = Vec::with_capacity(chunk.len() * 3);
+        for (id, value) in chunk {
+            args.push(SqlArg::I64(*id));
+            args.push(value.clone());
+        }
+        args.extend(chunk.iter().map(|(id, _)| SqlArg::I64(*id)));
+        tx.execute(&sql, &args).await?;
     }
     Ok(())
 }
@@ -186,7 +236,7 @@ impl Database {
     }
 
     // The removal marks of a batch of torrents (`mark_torrent_retiring`),
-    // in one transaction: one statement per row.
+    // in one transaction of few statements.
     pub(crate) fn mark_torrents_retiring(&self, marks: &[(JobId, bool)]) -> Result<(), StateError> {
         #[cfg(test)]
         match MARK_REFUSED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -200,23 +250,18 @@ impl Database {
         let rows = marks
             .iter()
             .map(|&(job_id, delete_files)| {
-                Ok(vec![
+                Ok((
+                    stored(job_id.0)?,
                     SqlArg::Text(RetiringMark::of(delete_files).as_str().to_owned()),
-                    SqlArg::I64(stored(job_id.0)?),
-                ])
+                ))
             })
             .collect::<Result<Vec<_>, StateError>>()?;
+        let rows = std::sync::Arc::new(rows);
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "mark_torrents_retiring", |tx| {
-                let rows = rows.clone();
-                Box::pin(async move {
-                    for args in &rows {
-                        tx.execute("UPDATE torrents SET retiring = {} WHERE job_id = {}", args)
-                            .await?;
-                    }
-                    Ok(())
-                })
+                let rows = std::sync::Arc::clone(&rows);
+                Box::pin(async move { update_column_tx(tx, "retiring", &rows).await })
             })
             .await
         })
@@ -1976,33 +2021,26 @@ impl Database {
         &self,
         positions: &[(JobId, i64)],
     ) -> Result<(), StateError> {
+        if positions.is_empty() {
+            return Ok(());
+        }
         let rows = positions
             .iter()
-            .map(|&(job_id, position)| {
-                Ok(vec![SqlArg::I64(position), SqlArg::I64(stored(job_id.0)?)])
-            })
+            .map(|&(job_id, position)| Ok((stored(job_id.0)?, SqlArg::I64(position))))
             .collect::<Result<Vec<_>, StateError>>()?;
+        let rows = std::sync::Arc::new(rows);
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "set_torrent_queue_positions", |tx| {
-                let rows = rows.clone();
-                Box::pin(async move {
-                    for args in &rows {
-                        tx.execute(
-                            "UPDATE torrents SET queue_position = {} WHERE job_id = {}",
-                            args,
-                        )
-                        .await?;
-                    }
-                    Ok(())
-                })
+                let rows = std::sync::Arc::clone(&rows);
+                Box::pin(async move { update_column_tx(tx, "queue_position", &rows).await })
             })
             .await
         })
     }
 
     // The categories and the forced flags of a batch of torrents, each its
-    // one column and no other, in one transaction: one statement per row.
+    // one column and no other, in one transaction of few statements.
     pub(crate) fn set_torrent_categories_and_forced(
         &self,
         categories: &[(JobId, Option<u32>)],
@@ -2014,33 +2052,24 @@ impl Database {
         let categories = categories
             .iter()
             .map(|&(job_id, category_id)| {
-                Ok(vec![
+                Ok((
+                    stored(job_id.0)?,
                     SqlArg::OptI64(category_id.map(i64::from)),
-                    SqlArg::I64(stored(job_id.0)?),
-                ])
+                ))
             })
             .collect::<Result<Vec<_>, StateError>>()?;
         let forced = forced
             .iter()
-            .map(|&(job_id, forced)| Ok(vec![SqlArg::Bool(forced), SqlArg::I64(stored(job_id.0)?)]))
+            .map(|&(job_id, forced)| Ok((stored(job_id.0)?, SqlArg::Bool(forced))))
             .collect::<Result<Vec<_>, StateError>>()?;
+        let columns = std::sync::Arc::new((categories, forced));
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "set_torrent_categories_and_forced", |tx| {
-                let (categories, forced) = (categories.clone(), forced.clone());
+                let columns = std::sync::Arc::clone(&columns);
                 Box::pin(async move {
-                    for args in &categories {
-                        tx.execute(
-                            "UPDATE torrents SET category_id = {} WHERE job_id = {}",
-                            args,
-                        )
-                        .await?;
-                    }
-                    for args in &forced {
-                        tx.execute("UPDATE torrents SET forced = {} WHERE job_id = {}", args)
-                            .await?;
-                    }
-                    Ok(())
+                    update_column_tx(tx, "category_id", &columns.0).await?;
+                    update_column_tx(tx, "forced", &columns.1).await
                 })
             })
             .await

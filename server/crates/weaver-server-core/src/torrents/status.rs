@@ -4,6 +4,8 @@
 //! A torrent's state as consumers see it, read off what the session reports
 //! and what holds it back, and its seeding goal.
 
+use std::collections::HashMap;
+
 use weaver_torrent::{
     AnnounceErrorKind, FetchPhase, TorrentStats, TorrentStatsState, TrackerAnnounce,
 };
@@ -682,23 +684,23 @@ pub fn trackers(
             })
             .collect()
     } else {
-        // The run names a tracker by its parsed URL.
-        let tiers: Vec<(String, u32, NamedBy)> = listed
-            .into_iter()
-            .filter_map(|entry| {
-                let url = reqwest::Url::parse(&entry.url).ok()?.into();
-                Some((url, entry.tier, entry.named_by))
-            })
-            .collect();
+        // The run names a tracker by its parsed URL. A URL listed twice is
+        // in the tier, and as whoever, it was first listed in.
+        let mut tiers: HashMap<String, (u32, NamedBy)> = HashMap::with_capacity(listed.len());
+        for entry in listed {
+            if let Ok(url) = reqwest::Url::parse(&entry.url) {
+                tiers
+                    .entry(url.into())
+                    .or_insert((entry.tier, entry.named_by));
+            }
+        }
         announces
             .iter()
             .map(|announce| {
                 let (tier, named_by) = tiers
-                    .iter()
-                    .find(|(url, ..)| *url == announce.url)
-                    .map_or((0, NamedBy::Torrent), |(_, tier, named_by)| {
-                        (*tier, *named_by)
-                    });
+                    .get(announce.url.as_str())
+                    .copied()
+                    .unwrap_or((0, NamedBy::Torrent));
                 TorrentTracker {
                     named_by,
                     ..tracker_view(tier, announce)
@@ -1904,5 +1906,60 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    // Many trackers, some listed twice in two tiers and some the run names
+    // that the torrent does not list: each in the tier, and as whoever, the
+    // search of the listed trackers found it in.
+    #[test]
+    fn a_runs_trackers_take_the_tiers_the_search_gave() {
+        let listed: Vec<TrackerEntry> = (0..3_000u32)
+            .map(|index| TrackerEntry {
+                tier: (index * 7) % 5,
+                url: format!("http://host{}.invalid/announce", index / 2),
+                named_by: if index % 3 == 0 {
+                    NamedBy::Operator
+                } else {
+                    NamedBy::Torrent
+                },
+            })
+            .chain([TrackerEntry {
+                tier: 9,
+                url: "not a url".into(),
+                named_by: NamedBy::Operator,
+            }])
+            .collect();
+        let run: Vec<TrackerAnnounce> = (0..2_000u32)
+            .map(|index| TrackerAnnounce {
+                url: format!("http://host{index}.invalid/announce"),
+                ..Default::default()
+            })
+            .collect();
+        let tiers: Vec<(String, u32, NamedBy)> = listed
+            .iter()
+            .filter_map(|entry| {
+                let url = reqwest::Url::parse(&entry.url).ok()?.into();
+                Some((url, entry.tier, entry.named_by))
+            })
+            .collect();
+        let mut by_search: Vec<(u32, String, NamedBy)> = run
+            .iter()
+            .map(|announce| {
+                let (tier, named_by) = tiers
+                    .iter()
+                    .find(|(url, ..)| *url == announce.url)
+                    .map_or((0, NamedBy::Torrent), |(_, tier, named_by)| {
+                        (*tier, *named_by)
+                    });
+                (tier, announce.url.clone(), named_by)
+            })
+            .collect();
+        by_search.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        let shown: Vec<(u32, String, NamedBy)> = trackers(listed, &run, None)
+            .into_iter()
+            .map(|tracker| (tracker.tier, tracker.url, tracker.named_by))
+            .collect();
+        assert!(shown.iter().any(|tracker| tracker.0 == 4));
+        assert_eq!(shown, by_search);
     }
 }
