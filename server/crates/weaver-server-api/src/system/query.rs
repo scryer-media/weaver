@@ -705,7 +705,6 @@ pub(crate) fn server_socket_counts(pool: &NntpPool, idx: usize) -> (u32, u32) {
     let sockets = pool.socket_budget_snapshot(idx);
     let open = sockets.physical.saturating_sub(sockets.dialing);
     let busy = open
-        .saturating_sub(sockets.async_idle)
         .saturating_sub(sockets.owned_idle)
         .saturating_sub(sockets.closing);
     (open as u32, busy as u32)

@@ -5,6 +5,8 @@
 #[path = "pipe_revocable.rs"]
 mod revocable;
 pub use revocable::Revocable;
+#[path = "pipe_buffers.rs"]
+mod buffers;
 #[path = "pipe_datagram.rs"]
 mod datagram;
 #[path = "pipe_identity.rs"]
@@ -21,6 +23,7 @@ pub use inbound::{
     Inbound, InboundListener, LISTEN_BACKLOG, PortForwarding, PortMapping, gateway_of,
 };
 pub use sockets::{SessionSockets, SocketClass, SocketPermit, SocketShares};
+pub use buffers::{USENET_SEND_BYTES, set_usenet_receive_bytes, socket_buffers};
 
 #[cfg(test)]
 #[path = "pipe_tests.rs"]
@@ -1421,6 +1424,7 @@ impl Dialer for SessionHop {
             ),
         };
         let socket = self.take_socket(SocketClass::of(&target.purpose))?;
+        let buffers = socket_buffers(&target.purpose);
         let outcome = Arc::new(ConnectionOutcome::default());
         let mut connected = Err(DialError::Skipped("no destination".into()));
         let mut tried = target.host.as_str();
@@ -1434,7 +1438,7 @@ impl Dialer for SessionHop {
                 .saturating_sub(started.elapsed().saturating_sub(resolved));
             connected = tokio::time::timeout(
                 remaining / (destinations.len() - index) as u32,
-                provider.dial_observed(destination, target.port, outcome.clone()),
+                provider.dial_sized(destination, target.port, outcome.clone(), buffers),
             )
             .await
             .map_err(|_| DialError::Timeout {

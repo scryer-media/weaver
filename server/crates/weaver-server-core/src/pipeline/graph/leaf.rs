@@ -352,6 +352,36 @@ impl Leaf {
         }
     }
 
+    // The leaf for a file at `output_name` under `dir` that another leaf,
+    // through the writer `to`, hands it while that leaf may still have
+    // operations queued for the file. The writer tells files apart by the
+    // leaf that names them, and within one batch runs one leaf's operations
+    // before or after another's as their files' closes and opens say, so
+    // the first leaf's truncate or writes still queued could run after this
+    // one's writes and close and cut the file back. An operation that names
+    // no file stands between them: the writer runs it after everything
+    // submitted before it and before everything after, and every read of
+    // the file waits for it. `made`, when not zero, is such an operation
+    // already submitted, one that puts the file at its name; otherwise one
+    // that does nothing is submitted here.
+    pub(crate) fn handed(
+        dir: &Path,
+        output_name: &str,
+        on_disk: bool,
+        to: Option<&Arc<Submitter>>,
+        made: u64,
+    ) -> Self {
+        let leaf = Self::over(dir, output_name, on_disk).through(to);
+        let Some(to) = to else {
+            return leaf;
+        };
+        let fence = match made {
+            0 => to.run(None, leaf.path.clone(), || Ok(())),
+            made => made,
+        };
+        leaf.after(fence)
+    }
+
     // The leaf's file operations go to a volume's writer from here on.
     pub(crate) fn through(mut self, to: Option<&Arc<Submitter>>) -> Self {
         self.queued = to.map(|to| Queued::new(to, self.identity));
@@ -1067,6 +1097,7 @@ impl Leaf {
             // The move follows everything submitted for the file, and
             // everything submitted after follows the move.
             let (from, to, directory) = (self.path.clone(), path.clone(), self.directory);
+            let wanted = wants.clone();
             queued.let_go();
             queued.open = false;
             let moved = queued.to.run(Some(self.identity), from.clone(), move || {
@@ -1077,7 +1108,10 @@ impl Leaf {
                 if let Some(parent) = to.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                crate::runtime::fs::rename_path_exclusive(&from, &to)
+                crate::runtime::fs::rename_path_exclusive(&from, &to)?;
+                // The file sits at its new name and nothing records that yet.
+                crate::e2e_failpoint::fire_rename(&wanted);
+                Ok(())
             });
             queued.shape(moved);
         } else if had_file && path != self.path && self.directory {
@@ -1090,6 +1124,7 @@ impl Leaf {
             create_parent(&path, self.device)?;
             crate::runtime::fs::rename_path_exclusive(&self.path, &path)
                 .map_err(LeafError::on(&self.path, self.device))?;
+            crate::e2e_failpoint::fire_rename(&wants);
         }
         self.path = path;
         self.wants = None;
@@ -1613,6 +1648,50 @@ mod tests {
             [bytes(4096, 7), bytes(4096, 8)].concat()
         );
         assert_eq!(through.read_waits(), 0);
+    }
+
+    // A file handed from one leaf to another keeps what the second writes.
+    // An archive keeps its stream in a file it starts over and writes the
+    // head of; refused, it hands that file to its member, whose leaf writes
+    // the rest and closes it. With both leaves' operations in one batch the
+    // writer would run the closing leaf first and the first leaf's start
+    // over last, leaving the head alone. `kept` says which leaf wrote.
+    fn handed_over(handed: impl FnOnce(&Path, &Arc<Submitter>) -> Leaf) -> (Vec<u8>, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let through = through();
+        let all = bytes(67_584, 5);
+        let length = all.len() as u64;
+        let mut other = Leaf::at(dir.path(), "other.bin").through(Some(&through.to));
+        let hold = through.writers.hold(&through.volume);
+        other.write(0, &bytes(16, 1), None).unwrap();
+        hold.wait_held();
+        let mut first = Leaf::at(dir.path(), "bundle.tar").through(Some(&through.to));
+        first.truncate().unwrap();
+        first.write(0, &all[..512], None).unwrap();
+        let mut second = handed(dir.path(), &through.to);
+        second.write(512, &all[512..], Some(length)).unwrap();
+        second.close(length).unwrap();
+        first.release_handle();
+        hold.open();
+        through.writers.settle();
+        (std::fs::read(second.path()).unwrap(), all)
+    }
+
+    #[test]
+    fn a_file_handed_to_another_leaf_keeps_what_that_leaf_writes() {
+        let (kept, all) =
+            handed_over(|dir, to| Leaf::handed(dir, "bundle.tar", false, Some(to), 0));
+        assert_eq!(kept.len(), all.len());
+        assert!(kept == all, "every byte of the stream is kept");
+    }
+
+    // Without the operation between them the first leaf's start over runs
+    // after the second's close: this is the order `handed` exists to stop.
+    #[test]
+    fn two_leaves_over_one_file_are_not_ordered_by_the_writer() {
+        let (kept, all) = handed_over(|dir, to| Leaf::at(dir, "bundle.tar").through(Some(to)));
+        assert_eq!(kept.len(), 512);
+        assert!(kept != all);
     }
 
     // A read of bytes whose write is still out waits for that write, and

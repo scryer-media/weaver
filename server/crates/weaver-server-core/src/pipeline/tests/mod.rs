@@ -75,6 +75,7 @@ mod queue_window;
 mod restore_history;
 mod script_events;
 mod server_attribution;
+mod shared_articles;
 mod terminal_settlement;
 mod uu_assembly;
 mod yenc_compatibility;
@@ -1155,8 +1156,8 @@ fn build_test_rar4_end_header(more_volumes: bool) -> Vec<u8> {
 // shape whose headers state no per-volume number anywhere: RAR4's main header
 // has no number field (that is RAR5's), and these end records carry no
 // `VOLUME_NUMBER` flag (a numbered `ENDARC` is what modern `.partNN` writers
-// emit). Every volume of such a set parses as volume 0; only the filename
-// says which volume a file is.
+// emit). No volume of such a set states its number; only the filename says
+// which volume a file is.
 pub(in crate::pipeline::tests) fn single_member_rar4_old_numbering_set(
     base: &str,
     member_name: &str,
@@ -1202,6 +1203,48 @@ pub(in crate::pipeline::tests) fn single_member_rar4_old_numbering_set(
                 format!("{base}.r{:02}", volume - 1)
             };
             (filename, bytes)
+        })
+        .collect()
+}
+
+// [`single_member_rar4_old_numbering_set`], its end records as the RAR
+// versions that wrote such sets wrote them, and every header's CRC16 filled
+// in. Each end record states the CRC32 of the volume's bytes before it and
+// reserves seven zero bytes for a recovery volume (0x0004). With no
+// `number`, as RAR 3.1 to 3.3 write it: flags 0x4007, 0x4006 on the last
+// volume. With one, as RAR 3.4 on write it, the number after the CRC
+// (0x0008): flags 0x400f, 0x400e on the last, every volume stating that
+// same number.
+pub(in crate::pipeline::tests) fn single_member_rar4_old_numbering_set_ending(
+    base: &str,
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+    number: Option<u16>,
+) -> Vec<(String, Vec<u8>)> {
+    let bare_end = build_test_rar4_end_header(false).len();
+    single_member_rar4_old_numbering_set(base, member_name, payload, volume_count)
+        .into_iter()
+        .enumerate()
+        .map(|(volume, (name, mut bytes))| {
+            bytes.truncate(bytes.len() - bare_end);
+            let mut bytes = with_rar4_header_crcs(bytes);
+            let next = if volume + 1 == volume_count {
+                0
+            } else {
+                0x0001
+            };
+            let mut body = checksum::crc32(&bytes).to_le_bytes().to_vec();
+            let flags = match number {
+                None => 0x4006 | next,
+                Some(number) => {
+                    body.extend_from_slice(&number.to_le_bytes());
+                    0x400e | next
+                }
+            };
+            body.extend_from_slice(&[0; 7]);
+            bytes.extend_from_slice(&build_test_rar4_block(0x7b, flags, &body));
+            (name, with_rar4_header_crcs(bytes))
         })
         .collect()
 }

@@ -878,3 +878,68 @@ async fn deleting_the_entry_deletes_its_record() {
     assert_eq!(archived_rows(&pipeline, kept).len(), 1);
     retire_pipeline_database(pipeline).await;
 }
+
+// A script a later job gains while an earlier job's files go, as a mark
+// queues one, stops before that job's files go.
+#[tokio::test]
+async fn a_script_a_later_job_gains_during_the_removals_stops_before_its_files_go() {
+    use crate::history::delete_files::archive_removals::{self, Step};
+    use std::{cell::RefCell, rc::Rc};
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let first = JobId(40101);
+    let second = JobId(40102);
+    let first_output = owned_output_dir(&complete_dir, "Lantern", first);
+    let second_output = owned_output_dir(&complete_dir, "Harbour", second);
+    for (id, name, output) in [
+        (first, "Lantern", first_output.clone()),
+        (second, "Harbour", second_output.clone()),
+    ] {
+        pipeline
+            .db
+            .insert_job_history(&history_row_with_output_dir(id, name, "complete", output))
+            .unwrap();
+    }
+    let steps = Rc::new(RefCell::new(Vec::new()));
+    {
+        let steps = steps.clone();
+        let db = pipeline.db.clone();
+        let second_output = second_output.clone();
+        let mut held: Option<Box<dyn std::any::Any>> = None;
+        archive_removals::set(move |step| {
+            steps.borrow_mut().push(step);
+            match step {
+                // The second job's script starts as the first job's files go.
+                Step::Turn(id) if id == first => {
+                    held = Some(Box::new(
+                        crate::post_processing::events::hold_test_event_run(
+                            &db, second.0, "marked",
+                        ),
+                    ));
+                }
+                // Its files are still there while it runs; it ends here.
+                Step::Wait(id) if id == second => {
+                    assert!(second_output.exists());
+                    drop(held.take());
+                }
+                _ => {}
+            }
+        });
+    }
+
+    let outcome = archive_entries(&mut pipeline, &[first, second], NOW).await;
+
+    assert_eq!(
+        *steps.borrow(),
+        [Step::Turn(first), Step::Turn(second), Step::Wait(second)]
+    );
+    for (id, output) in [(first, &first_output), (second, &second_output)] {
+        assert_eq!(
+            outcome[&id],
+            ArchiveHistoryResult::new(Outcome::Archived, Some(NOW), None)
+        );
+        assert!(!output.exists());
+    }
+    retire_pipeline_database(pipeline).await;
+}

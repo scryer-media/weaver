@@ -309,6 +309,13 @@ func Run(args []string, programName string) {
 		os.Exit(1)
 	}
 
+	// Before anything another run could see: no build, container, overlay or
+	// temp root comes ahead of the full-run lock.
+	markInheritedFullRunLockCloseOnExec()
+	if commandTakesFullRunLock(args) {
+		mustTakeFullRunLock(fullRunLockCommand(args))
+	}
+
 	if args[0] == "full" && len(args) > 1 && args[1] == "real-usenet" {
 		if err := cmdRealUsenet(args[2:]); err != nil {
 			log.Fatal(err)

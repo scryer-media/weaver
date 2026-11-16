@@ -148,6 +148,11 @@ pub enum NntpError {
     #[error("pool is shut down")]
     PoolShutdown,
 
+    // The caller stopped a transfer before its answer had arrived. The
+    // server is not implicated; the socket is mid-response and is let go.
+    #[error("transfer stopped by its caller")]
+    Stopped,
+
     // An article fetch exceeded the soft timeout, triggering failover to the next server.
     //
     // This is a *live connection* condition: the command was sent (or the
@@ -169,13 +174,6 @@ pub enum NntpError {
     // queueing behind it would only have burned the caller's whole budget.
     #[error("{}", acquire_timeout_message(*.0))]
     AcquireTimeout(u64),
-
-    // The caller's work guard turned the work away before anything was sent:
-    // its job paused or changed, or the provider policy no longer lets this
-    // server serve it. It is neither a wait nor a verdict on the server, so
-    // it never reaches server health or a fetch attempt trace.
-    #[error("work is no longer current; nothing was sent")]
-    WorkObsolete,
 
     // A per-server BODY quota rejected admission before the command was sent.
     // This is scheduler policy, never a server health failure.

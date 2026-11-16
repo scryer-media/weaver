@@ -75,7 +75,7 @@ fn recall_filter_preserves_other_legs_and_path_metadata() {
     for slot in &slots {
         let tx = tx.clone();
         slot.idle(
-            SocketPhase::AsyncIdle,
+            SocketPhase::OwnedIdle,
             Arc::new(move |id| tx.send(id).unwrap()),
         );
     }
@@ -146,7 +146,7 @@ async fn subscribe_before_inspection_does_not_lose_return_or_release() {
     let budget = SocketBudget::new(1);
     let slot = budget.try_acquire().unwrap();
     let mut changed = budget.subscribe();
-    slot.idle(SocketPhase::AsyncIdle, Arc::new(|_| {}));
+    slot.idle(SocketPhase::OwnedIdle, Arc::new(|_| {}));
     changed.changed().await.unwrap();
     drop(slot);
     changed.changed().await.unwrap();
@@ -179,21 +179,6 @@ fn simultaneous_dials_cannot_overbook() {
 }
 
 #[test]
-fn explicit_replacement_is_separate_and_bounded() {
-    let budget = SocketBudget::new(1);
-    let ordinary = budget.try_acquire().unwrap();
-    assert!(budget.try_acquire().is_none());
-    let replacement = budget.try_acquire_replacement().unwrap();
-    assert_eq!(budget.snapshot().physical, 2);
-    assert_eq!(budget.snapshot().replacement, 1);
-    assert!(budget.try_acquire_replacement().is_none());
-    drop(ordinary);
-    assert!(budget.try_acquire().is_none());
-    drop(replacement);
-    assert!(budget.try_acquire().is_some());
-}
-
-#[test]
 fn retirement_is_visible_without_waiting_for_the_registry() {
     let budget = SocketBudget::new(2);
     let first = budget.try_acquire().unwrap();
@@ -214,30 +199,29 @@ fn retirement_is_visible_without_waiting_for_the_registry() {
 
 #[test]
 fn member_retirement_recalls_idle_and_drains_busy_at_boundary() {
-    for phase in [SocketPhase::AsyncIdle, SocketPhase::OwnedIdle] {
-        let budget = SocketBudget::new(2);
-        let idle = budget.try_acquire().unwrap();
-        let busy = budget.try_acquire().unwrap();
-        let outcome = Arc::new(weaver_tunnel::bridge::ConnectionOutcome::default());
-        idle.observe_outcome(Some(&outcome));
-        busy.observe_outcome(Some(&outcome));
-        busy.active();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let report = tx.clone();
-        idle.idle(phase, Arc::new(move |id| report.send(id).unwrap()));
-        outcome.retire();
-        assert_eq!(rx.try_recv().unwrap(), idle.id());
-        assert!(rx.try_recv().is_err());
-        assert!(!busy.claim_reuse());
-        assert_eq!(budget.snapshot().physical, 2);
-        busy.idle(phase, Arc::new(move |id| tx.send(id).unwrap()));
-        assert_eq!(rx.try_recv().unwrap(), busy.id());
-        assert_eq!(budget.snapshot().closing, 2);
-        outcome.retire();
-        assert!(rx.try_recv().is_err(), "retirement must be idempotent");
-        drop((idle, busy));
-        assert_eq!(budget.snapshot().physical, 0);
-    }
+    let phase = SocketPhase::OwnedIdle;
+    let budget = SocketBudget::new(2);
+    let idle = budget.try_acquire().unwrap();
+    let busy = budget.try_acquire().unwrap();
+    let outcome = Arc::new(weaver_tunnel::bridge::ConnectionOutcome::default());
+    idle.observe_outcome(Some(&outcome));
+    busy.observe_outcome(Some(&outcome));
+    busy.active();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let report = tx.clone();
+    idle.idle(phase, Arc::new(move |id| report.send(id).unwrap()));
+    outcome.retire();
+    assert_eq!(rx.try_recv().unwrap(), idle.id());
+    assert!(rx.try_recv().is_err());
+    assert!(!busy.claim_reuse());
+    assert_eq!(budget.snapshot().physical, 2);
+    busy.idle(phase, Arc::new(move |id| tx.send(id).unwrap()));
+    assert_eq!(rx.try_recv().unwrap(), busy.id());
+    assert_eq!(budget.snapshot().closing, 2);
+    outcome.retire();
+    assert!(rx.try_recv().is_err(), "retirement must be idempotent");
+    drop((idle, busy));
+    assert_eq!(budget.snapshot().physical, 0);
 }
 
 #[test]
@@ -280,7 +264,7 @@ fn retirement_before_socket_registration_is_not_lost() {
     assert!(!slot.claim_reuse());
     let (tx, rx) = std::sync::mpsc::channel();
     slot.idle(
-        SocketPhase::AsyncIdle,
+        SocketPhase::OwnedIdle,
         Arc::new(move |id| tx.send(id).unwrap()),
     );
     assert_eq!(rx.try_recv().unwrap(), slot.id());

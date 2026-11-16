@@ -111,14 +111,26 @@ pub(crate) async fn remove_job_staging(
     roots: &[std::path::PathBuf],
     id: JobId,
 ) -> Result<(), SchedulerError> {
+    remove_job_staging_checked(roots, id).await.map(|_| ())
+}
+
+// `remove_job_staging`, saying whether every root was searched: false when a
+// category folder was passed over, so the job's staging there is not known
+// to be gone.
+pub(crate) async fn remove_job_staging_checked(
+    roots: &[std::path::PathBuf],
+    id: JobId,
+) -> Result<bool, SchedulerError> {
+    let mut checked = true;
     for (index, root) in roots.iter().enumerate() {
         let staging = super::staging_dir_for(root, id);
         if index > 0 && !staging_dir_reachable(root.clone(), staging.clone(), id).await? {
+            checked = false;
             continue;
         }
         remove_staging_dir(staging, id).await?;
     }
-    Ok(())
+    Ok(checked)
 }
 
 // Whether the job's staging directory under a category's folder can be looked
@@ -779,6 +791,7 @@ impl Queue {
         }
         let db = resources.db.clone();
         let ids: Vec<JobId> = page.iter().map(|(id, _)| *id).collect();
+        let order: Vec<u64> = ids.iter().map(|id| id.0).collect();
         // Listed before the read below: a job admitted from here on is
         // unlisted by its admission, and its hold is then refused, so each
         // job is swept only while the page's reading of its row still
@@ -792,7 +805,10 @@ impl Queue {
             ids: ids.clone(),
         };
         // A job retried or deleted since the listing, and one whose scripts
-        // still run, are left for a later sweep, unstamped.
+        // still run, are left for a later sweep, unstamped. The count of
+        // script starts is taken before the read, so a script a job gains
+        // after it, such as one a mark queues, is seen before that job's turn.
+        let mut starts = resources.db.script_starts();
         let ready = tokio::task::spawn_blocking(move || {
             let still_failed = db.failed_jobs_finished_by(finished_by, &ids)?;
             let raw = ids.iter().map(|id| id.0).collect::<Vec<_>>();
@@ -804,7 +820,7 @@ impl Queue {
             )
         })
         .await;
-        let ready = match ready {
+        let mut ready = match ready {
             Ok(Ok(ready)) => ready,
             Ok(Err(error)) => {
                 tracing::warn!(error = %error, "could not list failed jobs for housekeeping");
@@ -823,7 +839,27 @@ impl Queue {
         // reading of the root that missed entries stamps no one: a folder
         // it could not read may be any job's.
         let mut swept = Vec::new();
-        for (id, recorded) in page {
+        for (turn, (id, recorded)) in page.into_iter().enumerate() {
+            #[cfg(test)]
+            between_sweeps::run(id);
+            // A job gained a script since the last read: the jobs still to
+            // go are read again, in one statement, and those with one are
+            // left, as at the page's read.
+            if resources.db.script_starts() != starts {
+                starts = resources.db.script_starts();
+                let db = resources.db.clone();
+                let rest = order[turn..].to_vec();
+                match tokio::task::spawn_blocking(move || db.jobs_with_live_script_events(&rest))
+                    .await
+                {
+                    Ok(Ok(live)) => ready.retain(|id| !live.contains(&id.0)),
+                    // Unknown: none of the rest is swept this time.
+                    _ => {
+                        tracing::warn!("could not list failed jobs' scripts for housekeeping");
+                        return false;
+                    }
+                }
+            }
             if !ready.contains(&id) {
                 continue;
             }
@@ -894,7 +930,8 @@ impl Queue {
         let root = resources.intermediate_dir.clone();
         let db = resources.db.clone();
         let unclaimed = match tokio::task::spawn_blocking(move || {
-            let known = db.recorded_job_ids()?;
+            let owners = marked.iter().map(|(owner, _)| owner.0).collect::<Vec<_>>();
+            let known = db.recorded_job_ids_among(&owners)?;
             Ok::<_, crate::StateError>(
                 marked
                     .into_iter()
@@ -949,8 +986,8 @@ impl Queue {
         // the same step, off the runtime.
         let db = resources.db.clone();
         let removed = tokio::task::spawn_blocking(move || {
-            let known = db.recorded_job_ids()?;
             let owners = held.iter().map(|(_, owner, _)| owner.0).collect::<Vec<_>>();
+            let known = db.recorded_job_ids_among(&owners)?;
             let scripts = db.jobs_with_live_script_events(&owners)?;
             for (_guard, owner, path) in held {
                 if !known.contains(&owner.0) && !scripts.contains(&owner.0) {
@@ -1192,6 +1229,38 @@ async fn settle_archive_history(
         .map_err(SchedulerError::State)
 }
 
+// What a test runs at the start of each job's turn of a failed-sweep page,
+// on the thread that sweeps it.
+#[cfg(test)]
+pub(crate) mod between_sweeps {
+    use std::cell::RefCell;
+
+    use crate::jobs::ids::JobId;
+
+    type Hook = Box<dyn FnMut(JobId)>;
+
+    thread_local! {
+        static RUN: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set(run: impl FnMut(JobId) + 'static) {
+        RUN.with(|slot| *slot.borrow_mut() = Some(Box::new(run)));
+    }
+
+    pub(super) fn run(id: JobId) {
+        let taken = RUN.with(|slot| slot.borrow_mut().take());
+        if let Some(mut run) = taken {
+            run(id);
+            RUN.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(run);
+                }
+            });
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod staging_root_tests {
     use super::*;
@@ -1215,6 +1284,51 @@ mod staging_root_tests {
         std::fs::set_permissions(&category, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         result.unwrap();
+        assert!(!staging.exists());
+    }
+
+    // A failed job whose staging could not be looked for under a category
+    // folder is not done with: the sweep says so, and the job stays
+    // unstamped for the next one. Searched again, it is done.
+    #[tokio::test]
+    async fn a_failed_job_with_a_category_folder_unsearched_is_not_done() {
+        let temp = tempfile::tempdir().unwrap();
+        let intermediate = temp.path().join("intermediate");
+        let complete = temp.path().join("complete");
+        let category = temp.path().join("locked");
+        let job_id = JobId(43);
+        std::fs::create_dir_all(&intermediate).unwrap();
+        std::fs::create_dir_all(&complete).unwrap();
+        let staging = crate::pipeline::queue::staging_dir_for(&category, job_id);
+        crate::jobs::working_dir::make_job_staging_dir(&staging, job_id).unwrap();
+        std::fs::set_permissions(&category, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let locked_out = std::fs::read_dir(&category).is_err();
+        let roots = [complete.clone(), category.clone()];
+
+        let swept = crate::history::delete_files::sweep_failed_job_files(
+            &intermediate,
+            &roots,
+            job_id,
+            None,
+            Vec::new(),
+        )
+        .await;
+        std::fs::set_permissions(&category, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A user the mode does not hold back (root) searches it anyway.
+        if locked_out {
+            assert!(!swept.unwrap());
+            assert!(staging.exists());
+        }
+        let swept = crate::history::delete_files::sweep_failed_job_files(
+            &intermediate,
+            &roots,
+            job_id,
+            None,
+            Vec::new(),
+        )
+        .await;
+        assert!(swept.unwrap());
         assert!(!staging.exists());
     }
 

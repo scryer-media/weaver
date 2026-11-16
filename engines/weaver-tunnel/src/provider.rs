@@ -41,6 +41,19 @@ pub trait TunnelProvider: Send + Sync {
         self.dial(host, port).await
     }
 
+    // As `dial_observed`, the stream's socket holding `buffers` when the
+    // tunnel keeps a socket of its own for it. A tunnel that does not keeps
+    // its own sizes.
+    async fn dial_sized(
+        &self,
+        host: &str,
+        port: u16,
+        outcome: std::sync::Arc<crate::bridge::ConnectionOutcome>,
+        _buffers: Option<crate::wireguard::TcpBuffers>,
+    ) -> Result<Box<dyn TunnelStream>, TunnelError> {
+        self.dial_observed(host, port, outcome).await
+    }
+
     // Short human description of where this tunnel goes, for health text and
     // tracing. Must not contain credentials.
     fn describe(&self) -> String;

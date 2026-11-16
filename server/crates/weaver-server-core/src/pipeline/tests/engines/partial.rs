@@ -27,7 +27,8 @@ use crate::pipeline::tests::direct_store::{multi_member_store_set, single_member
 use crate::pipeline::tests::{
     TEST_RAR5_SIG, build_test_rar_compressed_file_header, build_test_rar_directory_header,
     build_test_rar_end_header, build_test_rar_file_header, build_test_rar_file_header_with_extra,
-    build_test_rar_main_header, encode_test_rar_vint, test_rar_compression_info,
+    build_test_rar_main_header, encode_test_rar_vint, single_member_rar4_old_numbering_set,
+    test_rar_compression_info,
 };
 
 const SECRET: &str = "quill-ember-secret";
@@ -1539,7 +1540,7 @@ async fn a_job_of_three_members_all_withheld_fails() {
         &scenario,
         Graph {
             status: Some(Status::Failed(
-                "WEAVER_PASSWORD_REQUIRED: lantern.rar, quill.rar, ember.rar needs a password and none was given",
+                "WEAVER_PASSWORD_REQUIRED: ember.rar, lantern.rar, quill.rar needs a password and none was given",
             )),
             kind: Some("Password"),
             files: vec![],
@@ -1855,4 +1856,148 @@ async fn a_header_encrypted_solid_rar_under_a_starved_par2_delivers_the_members_
         .lost(1, 3)
         .password("moonlit-harbour");
     run_partial_with_whole(&scenario, &["part0.mkv"]).await;
+}
+
+// Another set's second volume posted as `archive.part03.rar` beside a four
+// volume set named `archive.partN.rar`: in every order the stray comes, the
+// set's own third volume takes its place, the member is delivered whole, and
+// the stray, a volume of a set whose first never came, makes the job
+// Partial.
+#[tokio::test]
+async fn a_stray_named_as_a_volume_never_keeps_that_volume_out_whatever_comes_first() {
+    let amber = payload(3600, 41);
+    let posts = || {
+        let mut posted: Vec<Post> = single_member_store_set("amber.mkv", &amber, 4)
+            .into_iter()
+            .enumerate()
+            .map(|(index, (_, bytes))| {
+                Post::plain(&format!("archive.part{}.rar", index + 1), bytes)
+            })
+            .collect();
+        let stray = single_member_store_set("cobalt.mkv", &payload(1800, 42), 2).remove(1);
+        posted.push(Post::plain("archive.part03.rar", stray.1));
+        posted
+    };
+    for order in [
+        [0, 1, 2, 3, 4],
+        [4, 0, 1, 2, 3],
+        [3, 4, 0, 1, 2],
+        [2, 4, 0, 1, 3],
+        [4, 2, 0, 1, 3],
+        [1, 2, 3, 4, 0],
+        [2, 3, 4, 0, 1],
+        [0, 4, 1, 2, 3],
+    ] {
+        let scenario = Scenario::new(posts()).together(&order);
+        let outcome = match try_run(&scenario).await {
+            Ok(outcome) => outcome,
+            Err(stall) => panic!(
+                "{order:?}: graph stalled at {:?}: {}",
+                stall.status, stall.state
+            ),
+        };
+        assert_eq!(
+            outcome.status,
+            Some(JobStatus::Partial),
+            "{order:?}: {:?}",
+            outcome.failure
+        );
+        let delivered: Vec<&Vec<u8>> = outcome
+            .files
+            .iter()
+            .filter(|(name, _)| name.ends_with("amber.mkv"))
+            .map(|(_, bytes)| bytes)
+            .collect();
+        assert_eq!(
+            delivered,
+            vec![&amber],
+            "{order:?}: {:?}",
+            outcome.files.keys()
+        );
+    }
+}
+
+// The same with RAR4 sets whose headers state no volume's number, posted
+// as `archive.partN.rar` and as `archive.rar`, `archive.r00`: names alone
+// number them, so the stray takes the third place by its name until the
+// set's own volumes beside it show it cannot sit there. Whatever comes
+// first, and restarted after every article, the set's own third volume
+// takes its place, the member is delivered whole, and the job is Partial.
+#[tokio::test]
+async fn a_rar4_stray_named_as_a_volume_never_keeps_that_volume_out_whatever_comes_first() {
+    let amber = payload(3600, 41);
+    let cobalt = payload(1800, 42);
+    let name = |old: bool, index: usize| match (old, index) {
+        (true, 0) => "archive.rar".to_owned(),
+        (true, index) => format!("archive.r{:02}", index - 1),
+        (false, index) => format!("archive.part{}.rar", index + 1),
+    };
+    let posts = |old: bool| {
+        // The stray is listed first, so its store is the first asked for
+        // every volume after it.
+        let stray =
+            single_member_rar4_old_numbering_set("cobalt", "cobalt.mkv", &cobalt, 2).remove(1);
+        let mut posted = vec![Post::plain(&name(old, 2), stray.1)];
+        posted.extend(
+            single_member_rar4_old_numbering_set("amber", "amber.mkv", &amber, 4)
+                .into_iter()
+                .enumerate()
+                .map(|(index, (_, bytes))| Post::plain(&name(old, index), bytes)),
+        );
+        posted
+    };
+    for old in [false, true] {
+        for order in [
+            [0, 1, 2, 3, 4],
+            [4, 0, 1, 2, 3],
+            [3, 4, 0, 1, 2],
+            [2, 4, 0, 1, 3],
+            [4, 2, 0, 1, 3],
+            [1, 2, 3, 4, 0],
+            [2, 3, 4, 0, 1],
+            [0, 4, 1, 2, 3],
+        ] {
+            let case = format!("old={old} order={order:?}");
+            let scenario = Scenario::new(posts(old)).together(&order);
+            let outcome = match try_run(&scenario).await {
+                Ok(outcome) => outcome,
+                Err(stall) => panic!(
+                    "{case}: graph stalled at {:?}: {}",
+                    stall.status, stall.state
+                ),
+            };
+            assert_eq!(
+                outcome.status,
+                Some(JobStatus::Partial),
+                "{case}: {:?}",
+                outcome.failure
+            );
+            let delivered = |files: &std::collections::BTreeMap<String, Vec<u8>>| {
+                files
+                    .iter()
+                    .filter(|(name, _)| name.ends_with(".mkv"))
+                    .map(|(name, bytes)| {
+                        (
+                            name.rsplit('/').next().unwrap_or(name).to_owned(),
+                            bytes.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                delivered(&outcome.files),
+                vec![("amber.mkv".to_owned(), amber.clone())],
+                "{case}: {:?}",
+                outcome.files.keys()
+            );
+            let restarted = run_restarting(&scenario, &mut |_| {}).await;
+            assert!(restarted.restarts > 0, "{case}: the run restarted");
+            assert_eq!(restarted.status, outcome.status, "{case}: the status");
+            assert_eq!(
+                delivered(&restarted.files),
+                delivered(&outcome.files),
+                "{case}: restarted, the files"
+            );
+        }
+    }
 }

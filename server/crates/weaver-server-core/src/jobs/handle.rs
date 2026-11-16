@@ -2654,6 +2654,19 @@ impl SchedulerHandle {
         Ok(())
     }
 
+    // Apply the working directory's storage class and filesystem, once
+    // known when start-up could not learn them in time.
+    pub fn update_storage_classification(
+        &self,
+        storage_class: crate::runtime::system_profile::StorageClass,
+        filesystem: crate::runtime::system_profile::FilesystemType,
+    ) {
+        self.state.queue.write_intent(|inner| {
+            inner.globals.storage_classification = Some((storage_class, filesystem));
+            Change::changed(())
+        });
+    }
+
     // Update the pipeline's runtime directories for future jobs.
     pub async fn update_runtime_paths(
         &self,

@@ -129,8 +129,8 @@ fn parse_startup_iops_override() {
 
 // A stored measurement stands in for the probe, so this reads the host's
 // facts without writing hundreds of megabytes to the test machine's disk.
-#[test]
-fn detect_returns_valid_profile() {
+#[tokio::test]
+async fn detect_returns_valid_profile() {
     let dir = tempfile::tempdir().unwrap();
     let stored = StoredDiskMeasurement {
         measured_at: unix_seconds(SystemTime::now()),
@@ -138,7 +138,7 @@ fn detect_returns_valid_profile() {
     };
     write_stored_disk_measurement(&dir.path().join(DISK_PROBE_RECORD), &stored).unwrap();
 
-    let profile = detect(dir.path());
+    let (profile, _) = detect(dir.path()).await;
     assert!(profile.cpu.logical_cores > 0);
     assert!(profile.cpu.physical_cores > 0);
     assert!(profile.memory.total_bytes > 0);
@@ -147,11 +147,23 @@ fn detect_returns_valid_profile() {
     }
 }
 
-#[test]
-fn startup_profile_defers_disk_measurement() {
-    let profile = detect_startup_profile(Path::new("/tmp"));
+#[tokio::test]
+async fn startup_profile_defers_disk_measurement() {
+    let (profile, _) = detect_startup_profile(Path::new("/tmp")).await;
     assert_eq!(profile.disk.random_read_iops, 0.0);
     assert_eq!(profile.disk.sequential_write_mbps, 0.0);
+}
+
+// The start-up profile's storage is the disk owner's classification of the
+// directory, the one a direct read finds when the look answers.
+#[tokio::test]
+async fn startup_profile_takes_storage_from_the_disk_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let (profile, _) = detect_startup_profile(dir.path()).await;
+    assert_eq!(
+        (profile.disk.storage_class, profile.disk.filesystem),
+        classify_storage(dir.path())
+    );
 }
 
 const DAY: u64 = 24 * 60 * 60;

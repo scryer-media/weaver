@@ -529,6 +529,7 @@ mod tests {
             "Silver Horizon 2024.mkv",
             "Silverhorizon.mkv",
             "Quiet_Harbour_2021.mkv",
+            "Hollow.Twin.Copy.mkv",
         ] {
             assert!(
                 !looks_obfuscated_for_delivery(name),

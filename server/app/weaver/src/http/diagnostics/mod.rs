@@ -278,7 +278,7 @@ async fn collect_components(
         ];
         let (host_spaces, host_classes) = tokio::join!(
             StorageCapacity::spaces(Some(disk_space.as_ref()), &host_asks),
-            disk_space.classifications(&host_paths),
+            StorageCapacity::classifications(Some(disk_space.as_ref()), &host_paths),
         );
         let host = tokio::task::spawn_blocking(move || {
             collect_host_facts(host_dirs, host_spaces, host_classes)

@@ -59,6 +59,10 @@ pub(super) struct VolumeFacts {
     named_blocks: Option<u64>,
     walked_blocks: u64,
     sets: BTreeSet<[u8; 16]>,
+    // The volume's length, once known. Facts written before it was kept
+    // hold none, and the volume learns it again from its next delivery.
+    #[serde(default)]
+    pub(super) length: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -273,6 +277,7 @@ pub(super) fn of(par2: &Par2) -> Facts {
             named_blocks: volume.named_blocks,
             walked_blocks: volume.walked_blocks,
             sets: volume.sets.clone(),
+            length: volume.length,
         })
         .collect();
     let sets = par2
@@ -325,6 +330,7 @@ pub(super) fn par2(facts: &Facts) -> Result<Par2, RestoreError> {
             walked_blocks: volume.walked_blocks,
             sets: volume.sets,
             name: None,
+            length: volume.length,
         })
         .collect();
     for set in kept.sets {

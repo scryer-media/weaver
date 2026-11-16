@@ -39,6 +39,49 @@ func TestWeaverReleaseStagesLandInTheFlowArtifacts(t *testing.T) {
 	}
 }
 
+func TestWeaverReleaseStageKilledBeforeItsEndKeepsItsTime(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("E2E_WEAVER_PLAYWRIGHT_ARTIFACTS_DIR", dir)
+
+	// A stage that ends supersedes its start line.
+	func() (err error) {
+		defer endWeaverReleaseStage("stack-up", weaverReleaseStageLifecycle,
+			beginWeaverReleaseStage("stack-up", weaverReleaseStageLifecycle), &err)
+		return nil
+	}()
+	// A Playwright stage whose process is killed leaves only its start line,
+	// as scheduling-tracks/postgres did when the gate was cancelled.
+	started := beginWeaverReleaseStage("playwright initial", weaverReleaseStagePlaywright)
+
+	stages, err := readWeaverReleaseStageTimings(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	killed := errors.New("signal: killed")
+	end := started.Add(24 * time.Minute)
+	stages = closeWeaverReleaseStages(stages, end, killed)
+	if len(stages) != 2 {
+		t.Fatalf("stages = %+v, want stack-up once and the killed Playwright stage", stages)
+	}
+	if stages[0].Stage != "stack-up" || stages[0].Open || stages[0].Error != "" {
+		t.Fatalf("ended stage = %+v", stages[0])
+	}
+	got := stages[1]
+	if got.Stage != "playwright initial" || got.Open || got.Kind != weaverReleaseStagePlaywright {
+		t.Fatalf("killed stage = %+v", got)
+	}
+	if want := (24 * time.Minute).Milliseconds(); got.DurationMS != want {
+		t.Fatalf("killed stage duration = %dms, want %dms", got.DurationMS, want)
+	}
+	if !strings.Contains(got.Error, "did not finish") || !strings.Contains(got.Error, killed.Error()) {
+		t.Fatalf("killed stage error = %q", got.Error)
+	}
+	playwright, lifecycle := splitWeaverReleaseFlowTime(25*time.Minute, stages)
+	if playwright != 24*time.Minute || lifecycle != time.Minute {
+		t.Fatalf("split = %s / %s, want the killed stage's 24m as Playwright", playwright, lifecycle)
+	}
+}
+
 func TestWeaverReleaseStagesOutsideAFlowRecordNothing(t *testing.T) {
 	t.Setenv("E2E_WEAVER_PLAYWRIGHT_ARTIFACTS_DIR", "")
 	ran := false

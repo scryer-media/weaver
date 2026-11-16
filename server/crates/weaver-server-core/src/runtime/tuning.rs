@@ -6,7 +6,7 @@ use std::env;
 use serde::{Deserialize, Serialize};
 
 use crate::runtime::hardware_profile::{HardwareProfile, ProfileTuning};
-use crate::runtime::system_profile::SystemProfile;
+use crate::runtime::system_profile::{FilesystemType, StorageClass, SystemProfile};
 
 // IOPS threshold for "fast" storage (SSD/NVMe). Above this, disk is not the
 // bottleneck and we can use all configured connections. Below this, we
@@ -137,6 +137,13 @@ impl RuntimeTuner {
     // active work. Extraction admission reads this value on each promotion.
     pub fn set_random_read_iops(&mut self, random_read_iops: f64) {
         self.profile.disk.random_read_iops = random_read_iops;
+    }
+
+    // Apply the working directory's storage class and filesystem, learned
+    // after start-up.
+    pub fn set_storage(&mut self, storage_class: StorageClass, filesystem: FilesystemType) {
+        self.profile.disk.storage_class = storage_class;
+        self.profile.disk.filesystem = filesystem;
     }
 
     // Apply the live write rate of the volume extractions write to, in MB/s.

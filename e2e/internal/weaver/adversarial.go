@@ -467,6 +467,11 @@ func runAdversarialSubmission(weaverURL string, tc adversarialCase, submission a
 	if err := awaitAdversarialJobArchived(jobID); err != nil {
 		return jobID, err
 	}
+	if tc.Spec.Outcome == "waits" {
+		if err := awaitAdversarialCancelCleanup(jobID, before.LogOffset); err != nil {
+			return jobID, err
+		}
+	}
 	settled, err := observeAdversarialSettled(weaverURL, jobID, before)
 	if err != nil {
 		return jobID, err
@@ -540,6 +545,39 @@ func awaitAdversarialDiskWait(jobID int, logOffset int64) error {
 				return err
 			}
 			return fmt.Errorf("job %d settled without waiting for disk room", jobID)
+		}
+		time.Sleep(adversarialPollInterval)
+	}
+}
+
+// The lines Weaver logs once per cancelled job, after its archive committed,
+// when the removal of its folders has ended: they went, or one stayed.
+const (
+	cancelCleanupLogTarget    = "weaver_server_core::pipeline::orchestrator"
+	cancelFoldersReleasedLine = "cancelled job folders released"
+	cancelFoldersRetainedLine = "cancelled job folders retained"
+)
+
+// awaitAdversarialCancelCleanup waits until Weaver has ended the removal of
+// a cancelled job's folders, which it starts only after the history row
+// commits. Every end of that removal logs a line for the job, so the wait
+// ends: released passes, retained fails. It has no deadline of its own and
+// fails at once if Weaver exits.
+func awaitAdversarialCancelCleanup(jobID int, logOffset int64) error {
+	for {
+		if dead, waitErr := managedWeaverDied(); dead {
+			return fmt.Errorf("Weaver exited before job %d's folders were released (%v):\n%s", jobID, waitErr, managedWeaverDeathReport())
+		}
+		window, err := adversarialReadFrom(localWeaverLogPath(), logOffset)
+		if err != nil {
+			return err
+		}
+		jobs := []int{jobID}
+		if len(weaverLogEventsOfJobs(window, cancelCleanupLogTarget, cancelFoldersReleasedLine, jobs)) > 0 {
+			return nil
+		}
+		if len(weaverLogEventsOfJobs(window, cancelCleanupLogTarget, cancelFoldersRetainedLine, jobs)) > 0 {
+			return fmt.Errorf("Weaver kept a folder of cancelled job %d", jobID)
 		}
 		time.Sleep(adversarialPollInterval)
 	}

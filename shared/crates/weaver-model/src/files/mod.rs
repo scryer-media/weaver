@@ -7,7 +7,7 @@ mod ext;
 mod sanitize;
 
 pub use archive_name::archive_base_name;
-pub use classify::FileRole;
+pub use classify::{FileRole, names_a_z_part};
 pub use ext::{FileExt, file_ext, is_executable_name};
 pub(crate) use sanitize::role_filename_view;
 pub use sanitize::{

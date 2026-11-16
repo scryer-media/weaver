@@ -67,3 +67,64 @@ fn a_malformed_extra_roots_file_is_refused() {
     assert!(error.contains("not usable"), "{error}");
     assert!(error.starts_with(EXTRA_ROOTS_ENV), "{error}");
 }
+
+#[derive(Debug)]
+struct Layer {
+    text: &'static str,
+    source: Option<Box<Layer>>,
+}
+
+impl std::fmt::Display for Layer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.text)
+    }
+}
+
+impl std::error::Error for Layer {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|layer| layer as &(dyn std::error::Error + 'static))
+    }
+}
+
+fn layers(texts: &[&'static str]) -> Layer {
+    let mut layer: Option<Box<Layer>> = None;
+    for text in texts.iter().rev() {
+        layer = Some(Box::new(Layer {
+            text,
+            source: layer,
+        }));
+    }
+    *layer.unwrap()
+}
+
+#[test]
+fn a_failed_get_names_its_cause() {
+    let url = reqwest::Url::parse("https://speed.example/file.bin").unwrap();
+    let error = layers(&[
+        "error sending request for url (https://speed.example/file.bin)",
+        "client error (Connect)",
+        "tcp connect error",
+        "Connection refused (os error 61)",
+    ]);
+    assert_eq!(
+        get_failed(&url, &error),
+        "GET https://speed.example/file.bin failed: error sending request for url \
+         (https://speed.example/file.bin): client error (Connect): tcp connect error: \
+         Connection refused (os error 61)"
+    );
+}
+
+#[test]
+fn a_failed_get_does_not_repeat_a_cause_it_already_names() {
+    let url = reqwest::Url::parse("https://speed.example/").unwrap();
+    let error = layers(&[
+        "request timed out: deadline has elapsed",
+        "deadline has elapsed",
+    ]);
+    assert_eq!(
+        get_failed(&url, &error),
+        "GET https://speed.example/ failed: request timed out: deadline has elapsed"
+    );
+}

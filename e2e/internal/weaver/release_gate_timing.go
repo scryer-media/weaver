@@ -42,9 +42,58 @@ type weaverReleaseStageTiming struct {
 	StartedAt  time.Time `json:"started_at"`
 	DurationMS int64     `json:"duration_ms"`
 	Error      string    `json:"error,omitempty"`
+	// Open marks the line a stage writes as it starts. The stage's own line
+	// supersedes it when the stage ends; a stage whose process is killed
+	// first leaves only this one.
+	Open bool `json:"open,omitempty"`
 }
 
 var weaverReleaseStageTimingsMu sync.Mutex
+
+// beginWeaverReleaseStage records that a stage has started and returns its
+// start, for endWeaverReleaseStage. A Playwright stage killed by the flow's
+// deadline or a cancel never reaches its end, and without this line its
+// minutes would count as lifecycle.
+func beginWeaverReleaseStage(stage, kind string) time.Time {
+	started := time.Now()
+	if dir := strings.TrimSpace(os.Getenv("E2E_WEAVER_PLAYWRIGHT_ARTIFACTS_DIR")); dir != "" {
+		appendWeaverReleaseStage(absolutePath(dir), weaverReleaseStageTiming{
+			Stage: stage, Kind: kind, StartedAt: started.UTC(), Open: true,
+		})
+	}
+	return started
+}
+
+// closeWeaverReleaseStages drops the start line of every stage that ended,
+// and ends the others at end, when the flow's process stopped, failed with
+// the flow's own error.
+func closeWeaverReleaseStages(stages []weaverReleaseStageTiming, end time.Time, cause error) []weaverReleaseStageTiming {
+	key := func(timing weaverReleaseStageTiming) string {
+		return timing.Stage + "\x00" + timing.StartedAt.UTC().Format(time.RFC3339Nano)
+	}
+	ended := make(map[string]bool, len(stages))
+	for _, timing := range stages {
+		if !timing.Open {
+			ended[key(timing)] = true
+		}
+	}
+	closed := make([]weaverReleaseStageTiming, 0, len(stages))
+	for _, timing := range stages {
+		if timing.Open {
+			if ended[key(timing)] {
+				continue
+			}
+			timing.Open = false
+			timing.DurationMS = max(0, end.Sub(timing.StartedAt).Milliseconds())
+			timing.Error = "the stage did not finish"
+			if cause != nil {
+				timing.Error += ": " + cause.Error()
+			}
+		}
+		closed = append(closed, timing)
+	}
+	return closed
+}
 
 // timeWeaverReleaseStage runs one stage of a flow and records how long it
 // took. Outside a gate flow (no artifacts directory) it only runs the stage.

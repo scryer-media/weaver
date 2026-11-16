@@ -483,6 +483,8 @@ impl RecoveryGate {
         let id = state.next_id;
         let probe = state.quarantine;
         if probe {
+            // Announced by the caller once the probe has what it dials with:
+            // see [`ConnectionHealthLease::announce`].
             state.probe = Some(id);
         }
         Some(ConnectionHealthLease(Arc::new(ConnectionHealth {
@@ -529,7 +531,9 @@ impl ConnectionHealth {
         true
     }
 
-    // The connection's demanded command was answered with a 2xx status line.
+    // The connection's demanded command was answered with a 2xx status line:
+    // a BODY's 222, or, on a connection that only asks whether articles
+    // exist, a STAT's 223 or a HEAD's 221. A 430 is no such answer.
     // For the quarantine's probe that answer is the server's recovery: the
     // gate lifts here, not when the transfer behind the answer finishes, so a
     // long BODY on a slow server does not hold every other connection back.
@@ -551,9 +555,34 @@ impl ConnectionHealth {
     pub(crate) fn probing(&self) -> bool {
         self.probe.load(Ordering::Acquire) && self.current()
     }
+
+    // Whether the connection may be kept idle: the one rule for every place
+    // a connection rests (an owned lane's cache, the seat of an existence
+    // probe). The gate holds every other connection to
+    // the server while its probe is out, so an unanswered probe kept idle
+    // would hold them with nothing on the wire to answer for. Such a probe
+    // is dropped instead, and dropping its lease gives the probe back.
+    pub(crate) fn may_rest_idle(&self) -> bool {
+        !self.probing()
+    }
 }
 
 pub(crate) struct ConnectionHealthLease(pub(crate) Arc<ConnectionHealth>);
+
+impl ConnectionHealthLease {
+    // The probe is out: every other connection is held until it answers, so
+    // the server takes no new work meanwhile. Say so, as the probe's answer
+    // and its giving back do, so the work waiting on this server is offered
+    // elsewhere at once. Asked once per admission, after the admission has
+    // everything else it needs, so a probe given back at once for want of a
+    // socket is heard of once, by its giving back. Nothing for a lease that
+    // is not a probe.
+    pub(crate) fn announce(&self) {
+        if self.0.probe.load(Ordering::Acquire) {
+            self.0.gate.publish();
+        }
+    }
+}
 
 impl Drop for ConnectionHealthLease {
     fn drop(&mut self) {

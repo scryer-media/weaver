@@ -1,45 +1,24 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// `weaver-nntp` — Async NNTP protocol client for the Weaver Usenet downloader.
+// `weaver-nntp` — NNTP protocol client for the Weaver Usenet downloader.
 //
-// This crate provides a single-connection NNTP client that supports:
+// One connection implementation carries every session: the blocking
+// connection in [`blocking`], which download lanes drive from their own
+// threads. The crate provides:
 //
 // - Implicit TLS (port 563) and STARTTLS upgrades
 // - AUTHINFO USER/PASS authentication (RFC 4643)
 // - Multi-line response handling with dot-unstuffing
-// - Article retrieval via BODY, HEAD, ARTICLE commands
-// - Streaming article body support
-// - Multi-server connection pooling with health checks
-// - High-level client with automatic failover
+// - Pipelined BODY fetches with inline yEnc decoding
+// - A multi-server pool that admits connections: permits, socket budget,
+//   reconnect delay, over-limit holdoff and recovery quarantine
+// - A client that ranks servers and hands out BODY lanes
 // - Structured error types
 //
-// # Usage
-//
-// ```rust,no_run
-// use weaver_nntp::client::{NntpClient, NntpClientConfig};
-// use weaver_nntp::connection::ServerConfig;
-//
-// # async fn example() -> weaver_nntp::error::Result<()> {
-// let config = NntpClientConfig::single(
-//     ServerConfig {
-//         host: "news.example.com".into(),
-//         port: 563,
-//         tls: true,
-//         username: Some("user".into()),
-//         password: Some("pass".into()),
-//         ..Default::default()
-//     },
-//     10, // max connections
-// );
-//
-// let client = NntpClient::new(config);
-// let body = client.fetch_body("<article-id@example.com>").await?;
-// println!("Got {} bytes", body.len());
-// client.shutdown().await;
-// # Ok(())
-// # }
-// ```
+// A caller builds an [`NntpClient`] from an [`client::NntpClientConfig`]
+// and takes a [`BlockingBodyLane`] with
+// [`NntpClient::try_acquire_blocking_body_lane`] on a blocking thread.
 
 mod address_plan;
 pub mod blocking;
@@ -78,16 +57,13 @@ pub use address_plan::{
 };
 pub use blocking::{BlockingBodyLane, BlockingLaneStats, BlockingNntpConnection};
 pub use client::{
-    BodyLaneBatchStats, BodyLaneLease, BodyLaneMode, BodyServerSelection, DecodedBody,
-    DecodedBodyError, DecodedBodyTrace, NntpClient,
+    BodyLaneMode, BodyServerSelection, DecodedBody, DecodedBodyError, DecodedBodyTrace, NntpClient,
 };
 pub use codec::StreamChunk;
-pub use connection::{NntpConnection, PipeliningCapability, ServerConfig};
+pub use connection::{PipeliningCapability, ServerConfig};
 pub use error::{NntpError, Result};
 pub use health::{CooldownReason, HealthConfig, HealthTracker, ServerHealth, ServerState};
-pub use pool::{
-    NntpPool, PoolConfig, PooledConnection, ServerId, ServerIdentity, ServerPoolConfig,
-};
+pub use pool::{NntpPool, PoolConfig, ServerId, ServerIdentity, ServerPoolConfig};
 pub use server_set::{MAX_PROVIDERS, ServerRemap, ServerSet};
 pub use tls::TlsCipherPreference;
 pub use types::{ArticleId, Capabilities, MultiLineResponse, Response, StatusCode};

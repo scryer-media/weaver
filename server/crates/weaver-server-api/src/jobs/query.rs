@@ -9,7 +9,9 @@ use crate::jobs::types::{
     DuplicateIdentitySnapshotInfo, DuplicateSummaryInfo, PreparedQueueFilter,
     load_duplicate_summaries_chunked, queue_table_item_from_job,
 };
-use crate::jobs::types::{JobOutputSource, encode_offset_cursor};
+use crate::jobs::types::{
+    JobOutputSource, OutputFilesCursor, decode_output_files_cursor, encode_output_files_cursor,
+};
 use crate::observability::with_timed_config_read;
 
 // The most rows `queueItems` and `jobs` return when the caller names a size.
@@ -306,8 +308,9 @@ impl JobsQuery {
         #[graphql(desc = "Files per page: 100 when absent, at most 1000.")] first: Option<u32>,
         #[graphql(desc = "The `nextCursor` of the page before.")] after: Option<String>,
     ) -> Result<Option<JobOutputResult>> {
-        let offset = decode_offset_cursor(after.as_deref())
+        let cursor = decode_output_files_cursor(after.as_deref())
             .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
+        let offset = cursor.offset;
         let limit = first
             .unwrap_or(JOB_OUTPUT_FILES_DEFAULT_FIRST)
             .min(JOB_OUTPUT_FILES_MAX_FIRST) as usize;
@@ -377,7 +380,7 @@ impl JobsQuery {
 
         let dir_path = PathBuf::from(&output_dir);
         let result =
-            tokio::task::spawn_blocking(move || list_output_files(&dir_path, offset, limit))
+            tokio::task::spawn_blocking(move || list_output_files(&dir_path, &cursor, limit))
                 .await
                 .map_err(|e| async_graphql::Error::new(e.to_string()))??;
         Ok(Some(result))
@@ -391,7 +394,12 @@ const JOB_OUTPUT_FILES_MAX_FIRST: u32 = 1000;
 
 fn next_output_cursor(offset: usize, limit: usize, total: u64) -> Option<String> {
     let next = offset.saturating_add(limit);
-    (limit > 0 && (next as u64) < total).then(|| encode_offset_cursor(next))
+    (limit > 0 && (next as u64) < total).then(|| {
+        encode_output_files_cursor(&OutputFilesCursor {
+            offset: next,
+            after: None,
+        })
+    })
 }
 
 #[async_graphql::ComplexObject]
@@ -433,15 +441,25 @@ impl JobOutputResult {
     }
 }
 
-// One page of the files on disk under `dir`, from `offset`, in file name
-// order, with the totals of every file. Symbolic links are skipped, as the
-// record an archive keeps skips them, so the list reads the same before
-// and after an archive.
+// One page of the files on disk under `dir`, after the file the cursor
+// names, in file name order, with the totals of every file. The walk keeps
+// only this page's files, however deep the page. A cursor that names only a
+// position past the first file is refused here: keeping every file before
+// it is the unbounded read paging exists to avoid. Symbolic links are
+// skipped, as the record an archive keeps skips them, so the list reads the
+// same before and after an archive.
 fn list_output_files(
     dir: &std::path::Path,
-    offset: usize,
+    cursor: &OutputFilesCursor,
     limit: usize,
 ) -> Result<JobOutputResult> {
+    let offset = cursor.offset;
+    if cursor.after.is_none() && offset > 0 {
+        return Err(graphql_error(
+            "CURSOR_INVALID",
+            "cursor does not name a file of this folder; list it again from the start",
+        ));
+    }
     let output_dir = dir.to_string_lossy().into_owned();
 
     if !dir.is_dir() {
@@ -455,15 +473,25 @@ fn list_output_files(
         });
     }
 
-    let listing = weaver_server_core::history::output_files::list_output_files(
+    let page = weaver_server_core::history::output_files::list_output_files_after(
         dir,
-        offset.saturating_add(limit),
+        cursor.after.as_ref(),
+        limit,
     )
     .map_err(|e| async_graphql::Error::new(format!("failed to read directory: {e}")))?;
+    // A next page exists when the walk found a file after this page's last,
+    // whatever moved before it since the first page.
+    let listing = page.listing;
+    let next = offset.saturating_add(listing.files.len());
+    let next_cursor = page.last.filter(|_| page.more).map(|last| {
+        encode_output_files_cursor(&OutputFilesCursor {
+            offset: next,
+            after: Some(last),
+        })
+    });
     let files = listing
         .files
         .into_iter()
-        .skip(offset)
         .map(|file| JobOutputFile {
             path: dir.join(&file.rel_path).to_string_lossy().into_owned(),
             name: file.name,
@@ -476,7 +504,7 @@ fn list_output_files(
         total_bytes: listing.total_bytes,
         total_count: listing.total_count,
         archived: false,
-        next_cursor: next_output_cursor(offset, limit, listing.total_count),
+        next_cursor,
         source: JobOutputSource::Disk(files),
     })
 }

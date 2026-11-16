@@ -56,7 +56,8 @@ impl GraphJob {
             | Heard::CheckpointBlocked { .. }
             | Heard::CheckpointDue { .. }
             | Heard::DiskReturned
-            | Heard::DiskFailed(_) => {}
+            | Heard::DiskFailed(_)
+            | Heard::GivingUp => {}
         }
         Ok(())
     }
@@ -194,6 +195,7 @@ impl GraphJob {
                     Ok(())
                 };
             }
+            Heard::GivingUp => return self.give_up_next(slots, limit),
             Heard::CheckpointBlocked { .. }
             | Heard::CheckpointDue { .. }
             | Heard::DiskReturned
@@ -413,6 +415,12 @@ impl GraphJob {
         mut admitted: Vec<NodeId>,
         pipeline_limit: usize,
     ) -> Result<(), GraphError> {
+        // A give-up with volumes left holds the tree half applied: nothing
+        // starts until its last volume is read back, which steps again with
+        // what was admitted meanwhile.
+        if self.hold_admitted(&mut admitted) {
+            return Ok(());
+        }
         loop {
             let limit = self.run_limit(pipeline_limit);
             let (engines, gone) = self.touched_engines();

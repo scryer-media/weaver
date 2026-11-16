@@ -105,6 +105,9 @@ pub(crate) enum Heard {
     // A volume's writer could not complete an operation on one of the
     // job's files. Addressed to the root, under no run's generation.
     DiskFailed(Box<crate::operations::disk::writer::Failure>),
+    // The job's give-up has another volume to read back, on a turn of its
+    // own. Addressed to the root, under no run's generation.
+    GivingUp,
 }
 
 // Where every graph job's runs speak, and where the database says a

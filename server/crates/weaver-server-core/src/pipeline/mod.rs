@@ -377,6 +377,9 @@ pub(super) struct DownloadBatchLease {
     // Byte pressure at lease time. Carried onto every observation this lease
     // produces so the depth explorer can discard distorted samples.
     pub(super) pressure_clear: bool,
+    // The job's repeated-article cache, when several of its files share an
+    // article: the lane answers those references from it.
+    pub(super) repeated: Option<Arc<download::repeated::RepeatedArticles>>,
     pub(super) works: Vec<DownloadWork>,
 }
 
@@ -691,10 +694,6 @@ impl DownloadFailure {
             // Never got a socket before the deadline: local lane capacity, not
             // a transport fault of the server.
             | NntpError::AcquireTimeout(_) => Some(DownloadFailureKind::CapacityUnavailable),
-            // The lease's own guard turned the work away before a command
-            // went out: nothing was requested, and nothing is known about the
-            // article or the server.
-            NntpError::WorkObsolete => Some(DownloadFailureKind::Unrequested),
             // A session that expired part-way through a batch costs the
             // connection, not the server and not the article: the 480 stood
             // where the article's status line would have, so the article is
@@ -806,8 +805,8 @@ impl DownloadError {
     //
     // `Unanswered` says nothing about the socket either. A 480 at the status
     // line is one complete line; the blocking lane drains the replies behind
-    // it and re-authenticates in place, and when that fails, or the session
-    // had no credentials, or the batch was abandoned, the lane reports the
+    // it and re-authenticates in place, and when that fails, or the batch
+    // was abandoned, the lane reports the
     // connection discarded (`connection_discarded`, `ring_is_closed`) and that
     // verdict drops it.
     //
@@ -1886,7 +1885,10 @@ pub struct Pipeline {
     // Jobs installed mid-move, whose move resumes once their install batch
     // is in place.
     pub(crate) moves_to_resume: Vec<JobId>,
-    // Channels for pipeline stage results.
+    // Channels for pipeline stage results. Every article now arrives as a
+    // download lane event; the sender is held so the receiver stays open,
+    // and tests still feed results through it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) download_done_tx: mpsc::Sender<DownloadResult>,
     pub(super) download_done_rx: mpsc::Receiver<DownloadResult>,
     pub(super) download_refill_tx: mpsc::Sender<DownloadLaneRefillRequest>,
@@ -1968,6 +1970,13 @@ pub struct Pipeline {
     pub(super) applied_holds: crate::jobs::HoldSet,
     pub(super) applied_random_read_iops: Option<f64>,
     pub(super) applied_sequential_write_mbps: Option<f64>,
+    pub(super) applied_storage_classification: Option<(
+        crate::runtime::system_profile::StorageClass,
+        crate::runtime::system_profile::FilesystemType,
+    )>,
+    // The memory tier's base size the backlog limits are sized on, kept to
+    // size them again when the storage class is learned after start-up.
+    pub(super) backlog_base_bytes: usize,
     // Estimated bytes charged to the speed limiter for in-flight downloads.
     pub(crate) rate_limit_reservations: HashMap<SegmentId, u64>,
     // The operator's global bandwidth limits.

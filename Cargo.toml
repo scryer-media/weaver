@@ -18,7 +18,7 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.16.15"
+version = "0.16.16"
 edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/scryer-media/weaver"
@@ -201,7 +201,12 @@ par3-rs = { version = "=0.8.2", default-features = false }
 # has been read, and an extraction merges the continuation headers it read.
 # 0.15.0 states a RAR5 member's hash-MAC flag, opens `rar rc`-rebuilt RAR4 -hp
 # volumes, and chains continuation volumes by split header, not by name.
-unrar-rs = { version = "0.16.1", default-features = false, features = ["crypto-aws-lc"] }
+# 0.16.2 reads the RAR4 end record's flags as RAR writes them: 0x0004 reserves
+# seven bytes, 0x0008 states the volume number. RAR 3.1 to 3.3 set the first
+# and state no number, and every such volume had read as number 0. 0.16.3
+# reads a RAR 3.0 recovery volume's name against its set's base name and
+# holds a caller's volume index to the volume limit.
+unrar-rs = { version = "0.16.3", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]

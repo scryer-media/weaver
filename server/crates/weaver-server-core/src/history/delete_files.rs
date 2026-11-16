@@ -335,6 +335,60 @@ async fn delete_owned_output_dir(dir: &std::path::Path, job_id: JobId, legacy_ok
 // Which of the recorded output folders more than one job records: a folder
 // whose marker predates job-named markers is removed only when no other
 // job records it. One read for the whole request.
+// Which jobs of a batch wait at the script-stop barrier: those with a
+// script queued, running or waiting to be admitted, read for the whole
+// batch at once. A script a job gains after that read, such as one a mark
+// queues while earlier jobs are removed, is seen before that job's turn:
+// the jobs still to go are read again, in one statement, whenever any job
+// gained a script since the last read.
+struct LiveScripts {
+    starts: u64,
+    live: std::collections::HashSet<u64>,
+}
+
+impl LiveScripts {
+    async fn read(db: &crate::Database, job_ids: Vec<u64>) -> Self {
+        let starts = db.script_starts();
+        let live = jobs_with_live_scripts(db, job_ids).await;
+        Self { starts, live }
+    }
+
+    // Whether `rest[0]` waits at its barrier; `rest` is that job and the
+    // ones after it.
+    async fn waits(&mut self, db: &crate::Database, rest: &[u64]) -> bool {
+        if db.script_starts() != self.starts {
+            *self = Self::read(db, rest.to_vec()).await;
+        }
+        rest.first()
+            .is_some_and(|job_id| self.live.contains(job_id))
+    }
+}
+
+// The jobs among `job_ids` with a script queued, running or waiting to be
+// admitted, in one read per bind-safe chunk. A read that fails counts every
+// job live, so each keeps its own barrier.
+async fn jobs_with_live_scripts(
+    db: &crate::Database,
+    job_ids: Vec<u64>,
+) -> std::collections::HashSet<u64> {
+    if job_ids.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    let read_db = db.clone();
+    let ids = job_ids.clone();
+    match tokio::task::spawn_blocking(move || read_db.jobs_with_live_script_events(&ids)).await {
+        Ok(Ok(live)) => live,
+        Ok(Err(error)) => {
+            warn!(%error, "could not list jobs with live scripts; each job waits at its own script-stop barrier");
+            job_ids.into_iter().collect()
+        }
+        Err(error) => {
+            warn!(%error, "the live-script listing task failed; each job waits at its own script-stop barrier");
+            job_ids.into_iter().collect()
+        }
+    }
+}
+
 async fn shared_output_dirs(
     db: &crate::Database,
     dirs: Vec<String>,
@@ -482,9 +536,7 @@ pub(crate) async fn delete_history_rows(
     BTreeSet<JobId>,
     Result<crate::HistoryDeleteBatchOutcome, crate::SchedulerError>,
 ) {
-    for id in &job_ids {
-        db.cancel_event_scripts(id.0);
-    }
+    db.cancel_event_scripts_of(&job_ids.iter().map(|id| id.0).collect());
     let mut output_dirs = BTreeMap::new();
     let mut refused = BTreeMap::new();
     let ids = job_ids.iter().copied().collect::<Vec<_>>();
@@ -628,23 +680,37 @@ pub(crate) async fn delete_history_rows(
     // after, so no wait leaves that read stale before the files go.
     let mut deleted = BTreeMap::new();
     let mut stopped = Vec::with_capacity(cleanup.len());
-    for (job_id, dirs) in cleanup {
-        match retry_script_stop_wait(job_id, || {
-            crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0)
-        })
-        .await
+    let order: Vec<u64> = cleanup.keys().map(|id: &JobId| id.0).collect();
+    let mut scripted = LiveScripts::read(db, order.clone()).await;
+    for (turn, (job_id, dirs)) in cleanup.into_iter().enumerate() {
+        if scripted.waits(db, &order[turn..]).await
+            && let Err(error) = retry_script_stop_wait(job_id, || {
+                crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0)
+            })
+            .await
         {
-            Ok(()) => stopped.push((job_id, dirs)),
-            Err(error) => {
-                deleted.insert(job_id, Err(crate::SchedulerError::State(error)));
-            }
+            deleted.insert(job_id, Err(crate::SchedulerError::State(error)));
+            continue;
         }
+        stopped.push((job_id, dirs));
     }
     let held = live_held(db, &listed_dirs).await;
     if let Err(error) = &held {
         warn!(%error, "could not read what live torrents hold; deleted torrents' files stay");
     }
-    for (job_id, dirs) in stopped {
+    // A script a job gained since its barrier above stops before the job's
+    // files go. Nothing is read again unless a script has started since.
+    let removal_order: Vec<u64> = stopped.iter().map(|(id, _)| id.0).collect();
+    for (turn, (job_id, dirs)) in stopped.into_iter().enumerate() {
+        if scripted.waits(db, &removal_order[turn..]).await
+            && let Err(error) = retry_script_stop_wait(job_id, || {
+                crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0)
+            })
+            .await
+        {
+            deleted.insert(job_id, Err(crate::SchedulerError::State(error)));
+            continue;
+        }
         match dirs.remove(intermediate_dir, job_id).await {
             Ok(RemovedWorkingDirs { left_in_place, .. }) => {
                 // A delete reports only what it left of the working
@@ -697,7 +763,8 @@ pub(crate) async fn delete_history_rows(
 // job's, or a delivery folder, it is not housekeeping's to remove and stays,
 // said once. Returns whether housekeeping has done all it ever will for the
 // job; false when its recorded folder carries its marker and is still there,
-// which the next sweep's scan finds.
+// which the next sweep's scan finds, and false when a category folder could
+// not be searched for its staging, which the next sweep tries again.
 pub(crate) async fn sweep_failed_job_files(
     intermediate_dir: &std::path::Path,
     staging_roots: &[PathBuf],
@@ -718,12 +785,12 @@ pub(crate) async fn sweep_failed_job_files(
         );
     }
     let staged = present_staging_dirs(staging_roots, job_id).await;
-    crate::pipeline::queue::remove_job_staging(staging_roots, job_id).await?;
+    let checked = crate::pipeline::queue::remove_job_staging_checked(staging_roots, job_id).await?;
     for staging in staged {
         info!(dir = %staging.display(), "removed a failed job's staging directory");
     }
     let Some(recorded) = recorded else {
-        return Ok(true);
+        return Ok(checked);
     };
     let (root, destinations) = (intermediate_dir.to_path_buf(), staging_roots.to_vec());
     tokio::task::spawn_blocking(move || {
@@ -756,6 +823,7 @@ pub(crate) async fn sweep_failed_job_files(
     .await
     .map_err(|error| crate::SchedulerError::Io(std::io::Error::other(error)))?
     .map_err(crate::SchedulerError::Io)
+    .map(|swept| swept && checked)
 }
 
 // Archiving history entries: their files are removed while the entries, and
@@ -771,7 +839,8 @@ pub(crate) async fn sweep_failed_job_files(
 // 3. per job, the script-stopped barrier, then the proof of its output
 //    directory and the listing of what it holds, before anything goes;
 // 4. one transaction keeping the record of every listed folder, unstamped;
-// 5. per job, the removal;
+// 5. per job, the script-stopped barrier again for a script the job gained
+//    since step 3, then the removal;
 // 6. one transaction stamping every entry whose files are gone as archived.
 //
 // Every id gets its own outcome whatever fails: a record that cannot be
@@ -876,9 +945,7 @@ pub(crate) async fn archive_history(
             }
         }
     }
-    for (job_id, _, _) in &planned {
-        db.cancel_event_scripts(job_id.0);
-    }
+    db.cancel_event_scripts_of(&planned.iter().map(|(id, _, _)| id.0).collect());
     let shared = shared_output_dirs(
         db,
         planned
@@ -892,11 +959,14 @@ pub(crate) async fn archive_history(
     // Proven and listed before anything of any job goes.
     let mut proven = Vec::with_capacity(planned.len());
     let mut records = Vec::new();
-    for (job_id, recorded, dirs) in planned {
-        if let Err(error) = retry_script_stop_wait(job_id, || {
-            crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0)
-        })
-        .await
+    let order: Vec<u64> = planned.iter().map(|(id, _, _)| id.0).collect();
+    let mut scripted = LiveScripts::read(db, order.clone()).await;
+    for (turn, (job_id, recorded, dirs)) in planned.into_iter().enumerate() {
+        if scripted.waits(db, &order[turn..]).await
+            && let Err(error) = retry_script_stop_wait(job_id, || {
+                crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0)
+            })
+            .await
         {
             outcomes.insert(
                 job_id,
@@ -996,8 +1066,28 @@ pub(crate) async fn archive_history(
     }
 
     let held = live_held(db, &listed_dirs).await;
+    // A script that started after a job's barrier in step 3, such as one a
+    // mark queued while later jobs were listed, stops before the job's files
+    // go. Nothing is read again unless a script has started since.
+    let removal_order: Vec<u64> = proven.iter().map(|(id, ..)| id.0).collect();
     let mut stamp = Vec::new();
-    for (job_id, recorded, dirs, output) in proven {
+    for (turn, (job_id, recorded, dirs, output)) in proven.into_iter().enumerate() {
+        #[cfg(test)]
+        archive_removals::run(archive_removals::Step::Turn(job_id));
+        if scripted.waits(db, &removal_order[turn..]).await
+            && let Err(error) = retry_script_stop_wait(job_id, || {
+                #[cfg(test)]
+                archive_removals::run(archive_removals::Step::Wait(job_id));
+                crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0)
+            })
+            .await
+        {
+            outcomes.insert(
+                job_id,
+                Archive::new(Outcome::Failed, None, Some(error.to_string())),
+            );
+            continue;
+        }
         let removal = remove_job_files(
             intermediate_dir,
             staging_roots,
@@ -1084,6 +1174,44 @@ pub(crate) async fn archive_history(
         }
     }
     Ok(outcomes)
+}
+
+// What a test runs at each job's turn of an archive's removals, and when
+// that turn waits for the job's scripts, on the thread that archives.
+#[cfg(test)]
+pub(crate) mod archive_removals {
+    use std::cell::RefCell;
+
+    use crate::jobs::ids::JobId;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Step {
+        Turn(JobId),
+        Wait(JobId),
+    }
+
+    type Hook = Box<dyn FnMut(Step)>;
+
+    thread_local! {
+        static RUN: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set(run: impl FnMut(Step) + 'static) {
+        RUN.with(|slot| *slot.borrow_mut() = Some(Box::new(run)));
+    }
+
+    pub(super) fn run(step: Step) {
+        let taken = RUN.with(|slot| slot.borrow_mut().take());
+        if let Some(mut run) = taken {
+            run(step);
+            RUN.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(run);
+                }
+            });
+        }
+    }
 }
 
 struct JobFilesRemoval {
@@ -1180,6 +1308,21 @@ mod tests {
             working_dir_on_record(intermediate, &working, &destinations),
             Some(working)
         );
+    }
+
+    // A job no script held when the batch was read, then given one before
+    // its turn, waits at its barrier: the jobs still to go are read again.
+    #[tokio::test]
+    async fn a_script_a_later_job_gains_after_the_batch_read_holds_its_barrier() {
+        let db = crate::Database::open_in_memory().unwrap();
+        let order = [61, 62, 63];
+        let mut scripted = LiveScripts::read(&db, order.to_vec()).await;
+        assert!(!scripted.waits(&db, &order[0..]).await);
+        // Job 62's script starts while job 61's files go.
+        let held = crate::post_processing::events::hold_test_event_run(&db, 62, "marked");
+        assert!(scripted.waits(&db, &order[1..]).await);
+        assert!(!scripted.waits(&db, &order[2..]).await);
+        drop(held);
     }
 
     #[tokio::test(start_paused = true)]
