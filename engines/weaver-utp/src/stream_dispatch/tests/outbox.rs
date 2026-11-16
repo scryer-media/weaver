@@ -263,6 +263,92 @@ async fn a_queued_packet_is_timed_from_its_send() {
     assert_eq!(t.vsock.rtte.retransmission_timeout(), rto);
 }
 
+// A sender that takes each data packet to send later, as a tunnel's does:
+// it keeps the packet's departure for the test to record.
+struct Holding(Arc<parking_lot::Mutex<Vec<crate::Departure>>>);
+
+impl crate::DatagramSend for Holding {
+    fn poll_send_to_vectored(
+        &mut self,
+        _: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+        _: std::net::SocketAddr,
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Ok(bufs.iter().map(|buf| buf.len()).sum()))
+    }
+
+    fn poll_send_data(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+        target: std::net::SocketAddr,
+        _: Option<Fragmenting>,
+        departure: &crate::DepartureSlot<'_>,
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let taken = self.poll_send_to_vectored(cx, bufs, target);
+        self.0.lock().push(departure.keep());
+        taken
+    }
+}
+
+// A data packet the stream's own sender takes to send later, as a tunnel's
+// sender does, is timed from when the sender handed it on, as libtorrent
+// stamps a packet just before its send and times it from then
+// (utp_stream.cpp v2.0.15:1789-1793, 2223): taken at t0 and handed on at
+// t1, its round trip runs from t1, and so does the retransmission timer it
+// started.
+#[tokio::test]
+async fn a_packet_its_sender_takes_to_send_later_is_timed_from_its_send() {
+    let mut t = crate::stream_dispatch::tests::make_test_vsock(nagle_off(), false);
+    let held = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    t.vsock.sender = Some(Box::new(Holding(held.clone())));
+    let ack = |ack_nr: u16| UtpHeader {
+        htype: State,
+        seq_nr: 1.into(),
+        ack_nr: ack_nr.into(),
+        wnd_size: 1024 * 1024,
+        ..Default::default()
+    };
+    t.send_msg(ack(100), "");
+    for _ in 0..100 {
+        t.vsock.rtte.sample(Duration::from_millis(40));
+    }
+    let rtt = t.vsock.rtte.roundtrip_time();
+    let rto = t.vsock.rtte.retransmission_timeout();
+    assert_eq!(rto, Duration::from_millis(500));
+    let timeouts = |t: &TestVsock| t._socket.stats().snapshot().timeouts;
+
+    // Taken at t0, not handed on yet.
+    t.write(1).await;
+    t.poll_once_assert_pending().await;
+    assert_eq!(held.lock().len(), 1);
+    let taken_at = t.env.now();
+    assert_eq!(t.vsock.timers.retransmit.poll_at(), Some(taken_at + rto));
+
+    // Past a timeout from t0 its timer has not started: no timeout.
+    t.env.increment_now(rto + Duration::from_millis(100));
+    t.poll_once_assert_pending().await;
+    assert_eq!(timeouts(&t), 0);
+    assert_eq!(t.vsock.timers.retransmit.poll_at(), Some(t.env.now() + rto));
+
+    // Handed on at t1; the timer runs from then.
+    t.env.increment_now(Duration::from_millis(100));
+    let handed_at = t.env.now();
+    held.lock().pop().unwrap().left(handed_at);
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.vsock.timers.retransmit.poll_at(), Some(handed_at + rto));
+
+    // Its ACK a round trip after t1: the sample is that round trip, not
+    // the 740 ms since t0.
+    t.env.increment_now(rtt);
+    t.send_msg(ack(101), "");
+    t.poll_once_assert_pending().await;
+    assert!(t.vsock.user_tx_segments.is_empty());
+    assert_eq!(timeouts(&t), 0);
+    assert_eq!(t.vsock.rtte.roundtrip_time(), rtt);
+    assert_eq!(t.vsock.rtte.retransmission_timeout(), rto);
+}
+
 #[derive(Default)]
 struct Wakes(AtomicUsize);
 

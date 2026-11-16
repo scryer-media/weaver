@@ -1363,8 +1363,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         on_packet_sent!(self, header)
     }
 
-    // The data packets queued for the socket's I/O task that it has sent
-    // since: each send is timed from when it left, as libtorrent times a
+    // The data packets queued for the socket's I/O task, or taken by the
+    // stream's own sender to send later, that have left since: each send
+    // is timed from when it left, as libtorrent times a
     // packet from its send (v2.0.15 utp_stream.cpp:1792, 2223), and a
     // retransmission timer one of them started runs from that send
     // (utp_stream.cpp:1866-1868). Constant work for each packet.

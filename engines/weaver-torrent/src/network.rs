@@ -29,7 +29,8 @@ pub use weaver_utp::{
 };
 
 pub use crate::core::net::{
-    BoxFuture, DatagramSend, DatagramSocket, Fragmenting, NoNames, Resolved, Resolver,
+    BoxFuture, DatagramSend, DatagramSocket, Departure, DepartureSlot, Fragmenting, NoNames,
+    RecordsDeparture, Resolved, Resolver,
 };
 pub use crate::type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite};
 pub use crate::vectored_traits::{

@@ -71,6 +71,12 @@ struct Recorded {
     waker: Option<Waker>,
 }
 
+impl crate::traits::RecordsDeparture for Departures {
+    fn record(&self, at: Option<Instant>) {
+        self.push(at);
+    }
+}
+
 impl Departures {
     pub(crate) fn push(&self, at: Option<Instant>) {
         self.push_run(at, 1);

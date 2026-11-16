@@ -4,9 +4,11 @@
 // Modified by the Weaver authors, 2026-11-13.
 
 use std::{
+    cell::Cell,
     future::Future,
     io::IoSlice,
     net::SocketAddr,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -71,6 +73,31 @@ pub trait DatagramSend: Send + Sync + Unpin {
         self.poll_send_to_vectored(cx, bufs, target)
     }
 
+    /// Sends one data packet, as [`Self::poll_send_to_vectored`], or as
+    /// [`Self::poll_send_to_vectored_fragmenting`] when `fragmenting` is
+    /// given. A sender that takes the packet to send it later, rather than
+    /// sending it now, keeps its departure from `departure`, only when it
+    /// takes the packet, and records on it when the packet left: the stream
+    /// then times the packet from that send, as libtorrent stamps a packet
+    /// as late as it can and times it from its send (utp_stream.cpp
+    /// v2.0.15:1789-1793, 2223).
+    fn poll_send_data(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+        target: SocketAddr,
+        fragmenting: Option<Fragmenting>,
+        departure: &DepartureSlot<'_>,
+    ) -> Poll<std::io::Result<usize>> {
+        let _ = departure;
+        match fragmenting {
+            None => self.poll_send_to_vectored(cx, bufs, target),
+            Some(fragmenting) => {
+                self.poll_send_to_vectored_fragmenting(cx, bufs, target, fragmenting)
+            }
+        }
+    }
+
     fn poll_send_to(
         &mut self,
         cx: &mut Context<'_>,
@@ -78,6 +105,74 @@ pub trait DatagramSend: Send + Sync + Unpin {
         target: SocketAddr,
     ) -> Poll<std::io::Result<usize>> {
         self.poll_send_to_vectored(cx, &[IoSlice::new(buf)], target)
+    }
+}
+
+/// Where the departures of a stream's data packets are recorded: the
+/// instant each left, or None for one that never did, in the order the
+/// packets were taken.
+pub trait RecordsDeparture: Send + Sync {
+    fn record(&self, at: Option<Instant>);
+}
+
+/// The departure of one data packet a sender took to send later. The
+/// sender records when the packet left with [`Departure::left`]; one dropped
+/// unrecorded counts as never sent.
+pub struct Departure(Option<Arc<dyn RecordsDeparture>>);
+
+impl Departure {
+    pub fn new(log: Arc<dyn RecordsDeparture>) -> Self {
+        Self(Some(log))
+    }
+
+    /// The packet left at `at`.
+    pub fn left(mut self, at: Instant) {
+        if let Some(log) = self.0.take() {
+            log.record(Some(at));
+        }
+    }
+}
+
+impl Drop for Departure {
+    fn drop(&mut self) {
+        if let Some(log) = self.0.take() {
+            log.record(None);
+        }
+    }
+}
+
+impl std::fmt::Debug for Departure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Departure")
+            .field("recorded", &self.0.is_none())
+            .finish()
+    }
+}
+
+/// The departure of the data packet a [`DatagramSend::poll_send_data`] is
+/// asked to send, for a sender that takes it to send later.
+pub struct DepartureSlot<'a> {
+    departures: &'a Arc<crate::outbox::Departures>,
+    kept: Cell<bool>,
+}
+
+impl<'a> DepartureSlot<'a> {
+    pub(crate) fn new(departures: &'a Arc<crate::outbox::Departures>) -> Self {
+        Self {
+            departures,
+            kept: Cell::new(false),
+        }
+    }
+
+    /// Keeps the departure of the packet being taken. Called only by a send
+    /// that takes the packet.
+    pub fn keep(&self) -> Departure {
+        self.kept.set(true);
+        Departure::new(self.departures.clone())
+    }
+
+    pub(crate) fn kept(&self) -> bool {
+        self.kept.get()
     }
 }
 
