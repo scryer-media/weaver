@@ -525,7 +525,7 @@ fn the_tables_pick_is_the_walk_of_every_record() {
             category_id: [None, Some(1), Some(2), Some(3), Some(9), Some(4)][job_id as usize % 6],
             // Three at each instant, added out of job order.
             added_at_ms: EPOCH_MS + ((SEEDED - job_id) / 3) as i64,
-            intent: TorrentIntent::Paused,
+            kept: KeptIntent::Intent(TorrentIntent::Paused),
             forced: false,
             completed_at_ms: None,
             storage_dir: None,
@@ -618,4 +618,74 @@ fn the_tables_pick_is_the_walk_of_every_record() {
     }
     assert_eq!(compared, 3 * 6 * 3 * 8);
     assert!(nonempty > compared / 3, "{nonempty} of {compared}");
+}
+
+// A torrent removed whose history row waits for room is retiring: it is in
+// no page and no count of the list, which pages over the live torrents as
+// though it were gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retiring_torrent_is_in_no_page_and_no_count() {
+    use crate::persistence::ArchiveNews;
+    let clock = set_clock();
+    let rig = rig(clock.clone());
+    rig.service.open().await.unwrap();
+    let (news, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    rig.db.hear_archive_news(move |said| {
+        let _ = news.send(said);
+    });
+    let mut jobs = Vec::new();
+    for at in 0..3_u8 {
+        clock
+            .0
+            .store(EPOCH_MS + i64::from(at) * 1000, Ordering::SeqCst);
+        let name = format!("r{at}");
+        let bytes = metainfo(
+            &name,
+            &[(&format!("{name}/a.bin"), &[at; 3000])],
+            1024,
+            false,
+        );
+        jobs.push(
+            rig.service
+                .add_opened(AddRequest {
+                    paused: true,
+                    ..request(AddSource::Metainfo(bytes))
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    settled(&rig.service, 3).await;
+    crate::persistence::connection::ARCHIVE_REFUSED
+        .lock()
+        .unwrap()
+        .push_back(crate::StateError::OutOfSpace(
+            "database or disk is full".into(),
+        ));
+    rig.service.remove(jobs[1], false, true).await.unwrap();
+    assert_eq!(heard.recv().await, Some(ArchiveNews::Kept(jobs[1])));
+    assert_eq!(
+        rig.db.torrent_rows().unwrap(),
+        (vec![jobs[0], jobs[2]], vec![jobs[1]])
+    );
+
+    let picked = rig
+        .service
+        .picked(Pick::default(), page(0, 10), Shown::LISTED)
+        .await
+        .unwrap();
+    assert_eq!(ids(&picked), [jobs[0], jobs[2]]);
+    let second = rig
+        .service
+        .picked(Pick::default(), page(1, 1), Shown::LISTED)
+        .await
+        .unwrap();
+    assert_eq!(ids(&second), [jobs[2]]);
+    assert_eq!(
+        rig.db
+            .count_torrent_list(&crate::torrents::queries::TorrentListFilter::default())
+            .unwrap(),
+        2
+    );
+    rig.service.stop().await;
 }

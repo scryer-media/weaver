@@ -245,9 +245,12 @@ test("the transfer section notes its route's reason in each locale, else the ser
       const key = reason.startsWith("TORRENT_ROUTE_") ? `next.refusal.${reason}` : `next.torrents.routeReason.${reason}`;
       assert.equal(transferNote(translate, torrent({ state: "STALLED", routeReason: reason })), dictionary[key], `${locale}: ${reason}`);
     }
+    assert.equal(transferNote(translate, torrent({ state: "STALLED", detail: "disk_space" })), dictionary["next.status.wait.disk_space"], locale);
   }
   assert.equal(transferNote(t, torrent({ state: "STALLED", routeReason: "SESSION_LIMIT" })), "Session limit reached");
   assert.equal(transferNote(t, torrent({ state: "STOPPED", detail: "disk gone" })), "disk gone");
+  // A torrent waiting for room on its disk reads as a usenet job does.
+  assert.equal(transferNote(t, torrent({ state: "STALLED", detail: "disk_space" })), "Low disk space");
   assert.equal(transferNote(t, torrent()), undefined);
 });
 

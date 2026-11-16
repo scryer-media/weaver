@@ -269,7 +269,13 @@ async fn disabling_outgoing_utp_keeps_its_incoming_listener() -> anyhow::Result<
         .connect((Ipv4Addr::LOCALHOST, 9).into(), Transports::Utp)
         .await;
     assert!(matches!(result, Err(Error::ConnectDisabled)));
-    assert_eq!(session.connector.stats().utp.snapshot().v4.attempts, 0);
+    assert_eq!(
+        session.connector.stats().kinds[crate::ConnectionKind::Utp]
+            .snapshot()
+            .v4
+            .attempts,
+        0
+    );
     assert_eq!(factory.tcp_attempts.load(Ordering::Relaxed), 0);
     session.stop().await;
     Ok(())
@@ -288,7 +294,13 @@ async fn legacy_and_enabled_outgoing_utp_reuse_the_incoming_socket() -> anyhow::
         let peer = crate::test_support::loopback_udp().await;
         let mut connect = Box::pin(session.connector.connect(peer.bind_addr(), Transports::Utp));
         assert!(connect.as_mut().now_or_never().is_none());
-        assert_eq!(session.connector.stats().utp.snapshot().v4.attempts, 1);
+        assert_eq!(
+            session.connector.stats().kinds[crate::ConnectionKind::Utp]
+                .snapshot()
+                .v4
+                .attempts,
+            1
+        );
         assert_eq!(factory.utp_attempts.load(Ordering::Relaxed), 1);
         assert_eq!(session.utp_sockets.len(), 1);
         assert_eq!(factory.tcp_attempts.load(Ordering::Relaxed), 0);

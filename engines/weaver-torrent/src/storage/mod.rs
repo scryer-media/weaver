@@ -61,6 +61,18 @@ pub fn write_refused(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Whether a refused write was refused for want of room: no space, or a
+/// quota. Room made on the disk lets such a write go on; a read-only or
+/// forbidding file system, or a file past its size limit, does not.
+pub fn wants_room(error: &anyhow::Error) -> bool {
+    use std::io::ErrorKind::*;
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| matches!(error.kind(), StorageFull | QuotaExceeded))
+    })
+}
+
 pub trait StorageFactory: Send + Sync + Any {
     type Storage: TorrentStorage;
 

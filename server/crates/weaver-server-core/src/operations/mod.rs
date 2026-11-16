@@ -11,6 +11,7 @@ pub mod maintenance;
 pub mod metrics;
 pub mod metrics_store;
 pub mod recovery;
+pub(crate) mod room_wait;
 pub mod usage_history;
 
 pub use async_ops::{
@@ -34,14 +35,13 @@ pub use health::{
 };
 pub use instrumentation::{
     ARTICLE_LATENCY_BOUNDS, AtomicHistogram, DB_OP_DURATION_BOUNDS, DECODE_TASK_DURATION_BOUNDS,
-    DISK_WRITE_DURATION_BOUNDS, DbRuntimeMetrics, DbRuntimeMetricsSnapshot, DiskSpaceSnapshot,
-    EXTRACT_MEMBER_DURATION_BOUNDS, HISTOGRAM_MAX_BUCKETS, HTTP_REQUEST_DURATION_BOUNDS,
-    HistogramSnapshot, HttpMetricsSnapshot, HttpRequestCount, JOB_DURATION_BOUNDS, JobFinishCount,
-    JobLifecycleMetrics, JobLifecycleMetricsSnapshot, JobResultKind, JobStageKind,
-    JobSubmissionCount, PipelineHistograms, PipelineHistogramsSnapshot, ProcessMetricsSnapshot,
-    STAGE_DURATION_BOUNDS, ServerArticleOutcomes, ServerAttemptCount, ServerAttemptOutcomeKind,
-    ServerCounters, ServerMetricsRegistry, ServerMetricsSnapshot, StageOutcomeKind,
-    VerificationOutcomeKind,
+    DbRuntimeMetrics, DbRuntimeMetricsSnapshot, DiskSpaceSnapshot, EXTRACT_MEMBER_DURATION_BOUNDS,
+    HISTOGRAM_MAX_BUCKETS, HTTP_REQUEST_DURATION_BOUNDS, HistogramSnapshot, HttpMetricsSnapshot,
+    HttpRequestCount, JOB_DURATION_BOUNDS, JobFinishCount, JobLifecycleMetrics,
+    JobLifecycleMetricsSnapshot, JobResultKind, JobStageKind, JobSubmissionCount,
+    PipelineHistograms, PipelineHistogramsSnapshot, ProcessMetricsSnapshot, STAGE_DURATION_BOUNDS,
+    ServerArticleOutcomes, ServerAttemptCount, ServerAttemptOutcomeKind, ServerCounters,
+    ServerMetricsRegistry, ServerMetricsSnapshot, StageOutcomeKind, VerificationOutcomeKind,
 };
 pub use logs::snapshot_service_logs;
 pub use maintenance::spawn_maintenance_worker;
@@ -49,9 +49,9 @@ pub use metrics_store::{
     COUNTER_METRIC_KEYS, CounterRollupValue, GAUGE_METRIC_KEYS, GaugeRollupValue, JOB_STATUS_KEYS,
     JobStatusCounts, MetricsHistoryCadence, MetricsHistoryChunkRow, MetricsHistoryQueryData,
     MetricsHistoryQueryResult, MetricsHistoryTier, MetricsHistoryWritePlan,
-    RAW_METRICS_RESOLUTION_SECS, RAW_METRICS_RETENTION_SECS, ROLLUP_1H_RESOLUTION_SECS,
-    ROLLUP_1H_RETENTION_SECS, ROLLUP_5M_RESOLUTION_SECS, ROLLUP_5M_RETENTION_SECS,
-    RawMetricsHistoryPoint, RollupMetricsHistoryPoint,
+    RAW_METRICS_RESOLUTION_SECS, RAW_METRICS_RETENTION_SECS, RETIRED_METRIC_KEY,
+    ROLLUP_1H_RESOLUTION_SECS, ROLLUP_1H_RETENTION_SECS, ROLLUP_5M_RESOLUTION_SECS,
+    ROLLUP_5M_RETENTION_SECS, RawMetricsHistoryPoint, RollupMetricsHistoryPoint,
 };
 pub use recovery::{RecoveredServerState, RestoreCandidate, recover_server_state};
 pub(crate) use recovery::{apply_password_override, read_stored_files, restore_request};

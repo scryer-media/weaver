@@ -6,6 +6,7 @@
 
 pub(crate) mod checkpoint;
 pub(crate) mod decoding;
+pub(crate) mod disk;
 pub(crate) mod engine;
 pub(crate) mod envelope;
 pub(crate) mod hardware;

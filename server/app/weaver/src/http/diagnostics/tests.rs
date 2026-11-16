@@ -271,6 +271,7 @@ fn plain_local() -> sanitize::LocalNames {
         home_dir: None,
         user: None,
         hostname: None,
+        volumes: Vec::new(),
     }
 }
 

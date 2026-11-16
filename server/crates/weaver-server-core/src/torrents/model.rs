@@ -177,6 +177,85 @@ impl TorrentIntent {
     }
 }
 
+/// What a torrent's kept state says: what the operator asked of it, or that
+/// a wind-down to the downloads alone stopped it. The second is stopped like
+/// any other, and resumes by itself when torrents are turned on again. It is
+/// kept in the same column as the intent, so it needs no column of its own,
+/// and any intent written later, as the operator's pause or resume, writes
+/// it away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeptIntent {
+    Intent(TorrentIntent),
+    WoundDown,
+}
+
+impl KeptIntent {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Intent(intent) => intent.as_str(),
+            Self::WoundDown => "wound_down",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "wound_down" => Some(Self::WoundDown),
+            _ => TorrentIntent::parse(value).map(Self::Intent),
+        }
+    }
+
+    /// The intent it is: stopped, for one a wind-down stopped.
+    pub const fn intent(self) -> TorrentIntent {
+        match self {
+            Self::Intent(intent) => intent,
+            Self::WoundDown => TorrentIntent::Stopped,
+        }
+    }
+}
+
+/// How a torrent's job ends, as its history row stores the status: complete,
+/// partial or failed as a delivery ends, or cancelled by a removal before it
+/// completed. History reads each back as the jobs model's stored status
+/// (`job_status_from_persisted_str`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryEnd {
+    Complete,
+    Partial,
+    Failed,
+    Cancelled,
+}
+
+impl HistoryEnd {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 4] =
+        [Self::Complete, Self::Partial, Self::Failed, Self::Cancelled];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|end| end.as_str() == value)
+    }
+
+    /// The end a delivery's status names (`Delivery::status`, which gives
+    /// complete, partial or failed and nothing else).
+    pub(crate) fn delivered(status: &crate::jobs::model::JobStatus) -> Self {
+        use crate::jobs::model::JobStatus;
+        match status {
+            JobStatus::Complete => Self::Complete,
+            JobStatus::Partial => Self::Partial,
+            _ => Self::Failed,
+        }
+    }
+}
+
 /// What was already on disk where a torrent's files go, before Weaver wrote
 /// any of them: a deletion of the torrent's files never removes these. Files
 /// are named as the metainfo names them; folders are relative to the
@@ -211,7 +290,10 @@ pub struct TorrentRecord {
     pub metainfo: Option<bytes::Bytes>,
     pub category_id: Option<u32>,
     pub added_at_ms: i64,
-    pub intent: TorrentIntent,
+    // What the operator asked of it, or that a wind-down to the downloads
+    // alone stopped it: then it resumes by itself when torrents are turned
+    // on again. Writing any intent ends a wind-down's stop.
+    pub kept: KeptIntent,
     pub forced: bool,
     pub completed_at_ms: Option<i64>,
     pub storage_dir: Option<String>,
@@ -255,6 +337,16 @@ pub struct TorrentRecord {
 }
 
 impl TorrentRecord {
+    /// What the operator asked of it: stopped, for one a wind-down stopped.
+    pub const fn intent(&self) -> TorrentIntent {
+        self.kept.intent()
+    }
+
+    /// Stopped by a wind-down to the downloads alone, not by the operator.
+    pub fn wound_down(&self) -> bool {
+        self.kept == KeptIntent::WoundDown
+    }
+
     // The hashes it goes by: a torrent sharing either is a duplicate of it.
     pub fn infohashes(&self) -> Vec<Infohash> {
         self.infohash_v1

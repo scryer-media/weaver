@@ -847,15 +847,43 @@ impl Pipeline {
             self.applied_random_read_iops = Some(iops);
             self.tuner.set_random_read_iops(iops);
         }
-        let write_mbps = self
-            .shared_state
-            .queue
-            .read(|inner| inner.globals.sequential_write_mbps);
-        if let Some(write_mbps) =
-            write_mbps.filter(|mbps| self.applied_sequential_write_mbps != Some(*mbps))
-        {
-            self.applied_sequential_write_mbps = Some(write_mbps);
-            self.tuner.set_sequential_write_mbps(write_mbps);
+        // An extraction writes what it unpacks under the intermediate
+        // directory, or, when the job's destination is on another device, in
+        // its staging directory on the destination's device. Admission is
+        // one limit for every job, so it reads the slowest live write rate
+        // among the volumes of the intermediate directory, the complete
+        // directory and each category's folder. A volume not measured yet
+        // says nothing; none measured is "no figure", applied as such.
+        //
+        // Nothing here looks at a disk or waits: while the settings are being
+        // written the figure in force stays until the next turn.
+        if let Ok(config) = self.config.try_read() {
+            let storage = &self.storage_capacity;
+            let folders: Vec<PathBuf> = config
+                .categories
+                .iter()
+                .map(|category| {
+                    crate::pipeline::queue::destination_root(
+                        &self.complete_dir,
+                        std::slice::from_ref(category),
+                        Some(&category.name),
+                    )
+                })
+                .collect();
+            drop(config);
+            // Each category's folder may be a mount of its own inside the
+            // complete directory: the disk owner is told the folders as
+            // they stand, and reads the device of one it had not heard of
+            // on a thread of its own.
+            storage.set_folders(&folders);
+            let write_mbps = storage.slowest_write_mbps(
+                &[self.intermediate_dir.as_path(), self.complete_dir.as_path()],
+                &folders,
+            );
+            if self.applied_sequential_write_mbps != Some(write_mbps) {
+                self.applied_sequential_write_mbps = Some(write_mbps);
+                self.tuner.set_sequential_write_mbps(write_mbps);
+            }
         }
         let globals = self.shared_state.queue.read(|inner| inner.globals.clone());
         self.apply_holds(globals.holds.clone()).await;

@@ -3,7 +3,7 @@
 
 use crate::StateError;
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, max_rows_for_tx};
 use crate::rss::record::{RssFeedRow, RssRuleRow, RssSeenItemRow};
 
 use super::repository::{encode_categories, encode_metadata};
@@ -267,7 +267,117 @@ impl Database {
         })
     }
 
+    /// Items held while torrents were off are taken up again: their rows
+    /// go, and each feed that held one is read whole at its next poll, not
+    /// answered "not modified", so the items are judged anew. Whether any
+    /// were held. Nothing is written when none were. Both statements, and the
+    /// read before them, are served by the partial index on held items: the
+    /// state is a literal, never a bound parameter.
+    pub fn release_rss_waiting_items(&self) -> Result<bool, StateError> {
+        let datastore = self.datastore();
+        let held = self.run_sql_blocking_read(async move {
+            let held = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT 1 AS held FROM rss_seen_items WHERE decision = 'waiting' LIMIT 1",
+                &[],
+            )
+            .await?;
+            Ok(held.is_some())
+        })?;
+        if !held {
+            return Ok(false);
+        }
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "release_rss_waiting_items", |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE rss_feeds SET etag = NULL, last_modified = NULL
+                          WHERE id IN (SELECT feed_id FROM rss_seen_items
+                                        WHERE decision = 'waiting')",
+                        &[],
+                    )
+                    .await?;
+                    tx.execute("DELETE FROM rss_seen_items WHERE decision = 'waiting'", &[])
+                        .await?;
+                    Ok(())
+                })
+            })
+            .await
+        })?;
+        Ok(true)
+    }
+
+    /// One feed poll's seen items and its success, in one transaction: the
+    /// items in multi-row statements of bind-sized chunks.
+    pub fn record_rss_feed_sync(
+        &self,
+        feed_id: u32,
+        items: &[RssSeenItemRow],
+        polled_at: i64,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let rows = items.iter().map(rss_seen_item_args).collect::<Vec<_>>();
+        let etag = etag.map(str::to_string);
+        let last_modified = last_modified.map(str::to_string);
+        let result = self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "record_rss_feed_sync", |tx| {
+                let rows = rows.clone();
+                let etag = etag.clone();
+                let last_modified = last_modified.clone();
+                Box::pin(async move {
+                    insert_rss_seen_rows(tx, &rows).await?;
+                    tx.execute(
+                        RSS_POLL_SUCCESS_SQL,
+                        &poll_success_args(feed_id, polled_at, etag, last_modified),
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+        });
+        if result.is_ok() {
+            self.invalidate_rss_schedules();
+        }
+        result
+    }
+
+    /// Seen items recorded without a poll's success: those of a poll cut
+    /// short, written together.
+    pub fn insert_rss_seen_items(&self, items: &[RssSeenItemRow]) -> Result<(), StateError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let datastore = self.datastore();
+        let rows = items.iter().map(rss_seen_item_args).collect::<Vec<_>>();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "insert_rss_seen_items", |tx| {
+                let rows = rows.clone();
+                Box::pin(async move { insert_rss_seen_rows(tx, &rows).await })
+            })
+            .await
+        })
+    }
+
+    /// Rows seen before `cutoff_ts` go. An indexed read first, so a pass
+    /// with none past retention writes nothing.
     pub fn purge_old_rss_seen_items(&self, cutoff_ts: i64) -> Result<u64, StateError> {
+        let datastore = self.datastore();
+        let due = self.run_sql_blocking_read(async move {
+            let due = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT 1 AS due FROM rss_seen_items WHERE seen_at < {} LIMIT 1",
+                &[SqlArg::I64(cutoff_ts)],
+            )
+            .await?;
+            Ok(due.is_some())
+        })?;
+        if !due {
+            return Ok(0);
+        }
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
@@ -292,17 +402,8 @@ impl Database {
         let result = self.run_sql_blocking(async move {
             SqlRuntime::execute(
                 datastore.write_exec(),
-                "UPDATE rss_feeds
-                    SET last_polled_at = {}, last_success_at = {}, last_error = NULL,
-                        consecutive_failures = 0, etag = {}, last_modified = {}
-                  WHERE id = {}",
-                &[
-                    SqlArg::I64(polled_at),
-                    SqlArg::I64(polled_at),
-                    SqlArg::OptText(etag),
-                    SqlArg::OptText(last_modified),
-                    SqlArg::I64(i64::from(feed_id)),
-                ],
+                RSS_POLL_SUCCESS_SQL,
+                &poll_success_args(feed_id, polled_at, etag, last_modified),
             )
             .await?;
             Ok(())
@@ -387,6 +488,59 @@ fn rss_rule_args(rule: &RssRuleRow) -> Result<Vec<SqlArg>, StateError> {
     ])
 }
 
+const RSS_POLL_SUCCESS_SQL: &str = "UPDATE rss_feeds
+    SET last_polled_at = {}, last_success_at = {}, last_error = NULL,
+        consecutive_failures = 0, etag = {}, last_modified = {}
+  WHERE id = {}";
+
+fn poll_success_args(
+    feed_id: u32,
+    polled_at: i64,
+    etag: Option<String>,
+    last_modified: Option<String>,
+) -> Vec<SqlArg> {
+    vec![
+        SqlArg::I64(polled_at),
+        SqlArg::I64(polled_at),
+        SqlArg::OptText(etag),
+        SqlArg::OptText(last_modified),
+        SqlArg::I64(i64::from(feed_id)),
+    ]
+}
+
+const RSS_SEEN_COLUMNS: usize = 10;
+
+// The seen rows, upserted as one statement per bind-sized chunk.
+async fn insert_rss_seen_rows(
+    tx: &mut crate::persistence::sql_runtime::SqlTx<'_>,
+    rows: &[Vec<SqlArg>],
+) -> Result<(), StateError> {
+    for chunk in rows.chunks(max_rows_for_tx(tx, RSS_SEEN_COLUMNS)) {
+        let values = vec!["({}, {}, {}, {}, {}, {}, {}, {}, {}, {})"; chunk.len()].join(", ");
+        let args = chunk.iter().flatten().cloned().collect::<Vec<_>>();
+        tx.execute(
+            &format!(
+                "INSERT INTO rss_seen_items
+                    (feed_id, item_id, item_title, published_at, size_bytes, decision, seen_at,
+                     job_id, item_url, error)
+                 VALUES {values}
+                 ON CONFLICT(feed_id, item_id) DO UPDATE SET
+                    item_title = excluded.item_title,
+                    published_at = excluded.published_at,
+                    size_bytes = excluded.size_bytes,
+                    decision = excluded.decision,
+                    seen_at = excluded.seen_at,
+                    job_id = excluded.job_id,
+                    item_url = excluded.item_url,
+                    error = excluded.error"
+            ),
+            &args,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 fn rss_seen_item_args(item: &RssSeenItemRow) -> Vec<SqlArg> {
     vec![
         SqlArg::I64(i64::from(item.feed_id)),
@@ -394,7 +548,7 @@ fn rss_seen_item_args(item: &RssSeenItemRow) -> Vec<SqlArg> {
         SqlArg::Text(item.item_title.clone()),
         SqlArg::OptI64(item.published_at),
         SqlArg::OptI64(item.size_bytes.map(|value| value as i64)),
-        SqlArg::Text(item.decision.clone()),
+        SqlArg::Text(item.decision.as_str().to_owned()),
         SqlArg::I64(item.seen_at),
         SqlArg::OptI64(item.job_id.map(|value| value as i64)),
         SqlArg::OptText(item.item_url.clone()),

@@ -746,6 +746,15 @@ pub enum PeerConnectionGql {
     Utp,
 }
 
+impl From<ConnectionKind> for PeerConnectionGql {
+    fn from(kind: ConnectionKind) -> Self {
+        match kind {
+            ConnectionKind::Tcp => Self::Tcp,
+            ConnectionKind::Utp => Self::Utp,
+        }
+    }
+}
+
 /// What of a peer connection is encrypted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
 #[graphql(name = "PeerEncryption")]
@@ -838,10 +847,7 @@ impl From<PeerInfo> for TorrentPeerGql {
             address: peer.addr.to_string(),
             client: peer.client,
             peer_id: peer.peer_id.as_string(),
-            connection: match peer.connection {
-                ConnectionKind::Tcp => PeerConnectionGql::Tcp,
-                ConnectionKind::Utp => PeerConnectionGql::Utp,
-            },
+            connection: peer.connection.into(),
             outgoing: peer.outgoing,
             encryption: match peer.encryption {
                 Encryption::None => PeerEncryptionGql::None,
@@ -902,5 +908,20 @@ mod tests {
             async_graphql::InputType::to_value(&state),
             async_graphql::Value::Enum(async_graphql::Name::new("FILES_MISSING"))
         );
+    }
+
+    // Each connection kind reads in GraphQL as its key in the kinds' name
+    // table, upper case: TCP, UTP.
+    #[test]
+    fn a_connection_kind_reads_as_its_key_upper_case() {
+        for &kind in ConnectionKind::ALL {
+            assert_eq!(
+                async_graphql::InputType::to_value(&PeerConnectionGql::from(kind)),
+                async_graphql::Value::Enum(async_graphql::Name::new(
+                    kind.names().key.to_ascii_uppercase()
+                )),
+                "{kind:?}"
+            );
+        }
     }
 }

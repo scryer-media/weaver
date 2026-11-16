@@ -45,6 +45,8 @@ fn exported_schema_has_no_trailing_whitespace() {
 fn no_output_field_returns_a_password() {
     let sdl = export_schema_sdl();
     let mut output = false;
+    // The type whose fields are read.
+    let mut owner = String::new();
     let mut doc = false;
     let mut offenders = Vec::new();
     for line in sdl.lines() {
@@ -57,6 +59,12 @@ fn no_output_field_returns_a_password() {
         }
         if line.starts_with("type ") || line.starts_with("interface ") {
             output = true;
+            owner = line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .trim_end_matches('{')
+                .to_owned();
             continue;
         }
         if line.starts_with("input ") || line.starts_with('}') {
@@ -71,10 +79,15 @@ fn no_output_field_returns_a_password() {
         }
         let name = field.split(['(', ':']).next().unwrap_or("").trim();
         let returns = field.rsplit(':').next().unwrap_or("").trim();
+        // How many passwords a tracker rule, or a tracker file's preview of
+        // one, holds: a number, never the passwords.
+        let password_count = name == "archivePasswordCount"
+            && matches!(owner.as_str(), "TrackerRule" | "TrackerFilePreview")
+            && matches!(returns, "Int" | "Int!");
         if name.to_ascii_lowercase().contains("password")
             && returns != "Boolean!"
             && returns != "ArchivePasswordOrigin"
-            && !(name.ends_with("PasswordCount") && matches!(returns, "Int" | "Int!"))
+            && !password_count
             && !matches!(
                 name,
                 "passwordFile" | "archivePasswordSettings" | "updateArchivePasswordSettings"

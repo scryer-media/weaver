@@ -168,6 +168,10 @@ pub(crate) fn collect_after_job() {
     unsafe { libmimalloc_sys::mi_collect(true) };
 }
 
+// Nothing to do as a download lane starts: every mimalloc thread already
+// allocates from a heap of its own.
+pub(crate) fn bind_lane_thread() {}
+
 unsafe impl GlobalAlloc for TunedMiMalloc {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {

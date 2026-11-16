@@ -22,7 +22,7 @@ use crate::persistence::encryption::{EncryptionKey, decrypt_value};
 use crate::persistence::sql_runtime::{SqlConn, StoreDatastore};
 use crate::schema_migrations::{
     egress_quotas_v53, history_retention_v89, history_search_key_v88, networking_bandwidth_v94,
-    proxy_dns_v121, proxy_resolver_v64, script_concurrency_v58, script_instances_v55,
+    proxy_dns_v124, proxy_resolver_v64, script_concurrency_v58, script_instances_v55,
     server_limit_v92, unwanted_extensions_v56,
 };
 use crate::security::RuntimeSecurityConfig;
@@ -1119,8 +1119,8 @@ async fn spell_out_older_proxy_dns(
     conn: &mut SqlConn<'_>,
     source_schema_version: i64,
 ) -> Result<(), StateError> {
-    if source_schema_version < proxy_dns_v121::SCHEMA_VERSION {
-        proxy_dns_v121::dns_profiles_from_proxies(conn).await?;
+    if source_schema_version < proxy_dns_v124::SCHEMA_VERSION {
+        proxy_dns_v124::dns_profiles_from_proxies(conn).await?;
     }
     Ok(())
 }
@@ -2412,7 +2412,7 @@ mod logical_reader_tests {
             Consumer, DnsTransit, DnsTrust, DnsWho, ListedServer, ListedWire, ProxyKind,
             ProxyProfile, ProxySecrets, ResolvedBy, RoutingPolicy,
         };
-        use crate::schema_migrations::proxy_dns_v121::SCHEMA_VERSION;
+        use crate::schema_migrations::proxy_dns_v124::SCHEMA_VERSION;
         // A restore checks a proxy without its keys, which a bundle keeps
         // apart, so the proxy here is one that needs none.
         let socks = ProxyProfile {
@@ -2437,7 +2437,7 @@ mod logical_reader_tests {
             .unwrap();
         let mut archive = source.export_logical_backup().unwrap();
         let tables = archive.staging.path().join("tables");
-        // The profile and route as the build before 121 saved them.
+        // The profile and route as the build before 124 saved them.
         let metadata = rewrite_table_objects(archive.staging.path(), "proxy_profiles", |row| {
             let mut config: JsonValue =
                 serde_json::from_str(row["config"].as_str().unwrap()).unwrap();

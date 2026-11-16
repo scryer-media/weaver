@@ -98,6 +98,13 @@ pub(crate) enum Heard {
     CheckpointDue {
         control: crate::persistence::checkpoint_write::CheckpointControl,
     },
+    // The volumes' writers returned everything the job had submitted when
+    // a checkpoint or the job's end began to wait for it. Addressed to the
+    // root, under no run's generation.
+    DiskReturned,
+    // A volume's writer could not complete an operation on one of the
+    // job's files. Addressed to the root, under no run's generation.
+    DiskFailed(Box<crate::operations::disk::writer::Failure>),
 }
 
 // Where every graph job's runs speak, and where the database says a
@@ -168,6 +175,26 @@ pub(crate) trait Hears: Send + Sync {
     // Every download paused or resumed: the job's extraction deadline
     // does not run while they are.
     fn hold_clock(&self, paused: bool);
+    // The ticket the job took from the disk ledger as it began to wait for
+    // room, which orders it among every job waiting, the pipeline's too.
+    // A job that never waits for room has none.
+    fn disk_ticket(&self) -> Option<u64> {
+        None
+    }
+    // A disk the job waits on has a new reading: whether it has room again,
+    // as `GraphJob::wake_disk` says for a job of the pipeline's. A job
+    // that cannot be asked now is asked by its own task, and keeps its
+    // place until then. A job that never waits for room has it.
+    fn wake_disk(&self) -> bool {
+        true
+    }
+    // What the job waits for room for, and the folder it waits on, as
+    // `GraphJob::disk_wait` says for a job of the pipeline's: read as its
+    // wait begins, so the pipeline says it once, as it says its own. A job
+    // that does not wait, or never waits for room, has none.
+    fn disk_wait(&self) -> Option<(super::limits::DiskWait, std::path::PathBuf)> {
+        None
+    }
 }
 
 // The jobs outside the pipeline whose runs speak on its mail, by scope,
@@ -177,7 +204,17 @@ pub(crate) trait Hears: Send + Sync {
 pub(crate) struct Outside(
     std::sync::Mutex<std::collections::HashMap<u64, Arc<dyn Hears>>>,
     std::sync::atomic::AtomicBool,
+    DiskWaits,
 );
+
+// The jobs outside the pipeline that wait for room on a disk, by scope, and
+// those that began to since the pipeline last looked; the pipeline's loop
+// is rung as one begins, so it listens for the next reading.
+#[derive(Default)]
+struct DiskWaits {
+    scopes: std::sync::Mutex<(std::collections::BTreeSet<u64>, Vec<u64>)>,
+    began: tokio::sync::Notify,
+}
 
 impl Outside {
     fn jobs(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<u64, Arc<dyn Hears>>> {
@@ -203,6 +240,76 @@ impl Outside {
 
     pub(crate) fn leave(&self, scope: u64) {
         self.jobs().remove(&scope);
+        self.disk_unheld(scope);
+    }
+
+    fn disk_scopes(
+        &self,
+    ) -> std::sync::MutexGuard<'_, (std::collections::BTreeSet<u64>, Vec<u64>)> {
+        self.2
+            .scopes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // The job `scope` began to wait for room on a disk: the pipeline wakes
+    // it with its own, in ticket order.
+    pub(crate) fn disk_held(&self, scope: u64) {
+        let mut scopes = self.disk_scopes();
+        if scopes.0.insert(scope) {
+            scopes.1.push(scope);
+            drop(scopes);
+            self.2.began.notify_one();
+        }
+    }
+
+    // The job `scope` no longer waits for room.
+    pub(crate) fn disk_unheld(&self, scope: u64) {
+        let mut scopes = self.disk_scopes();
+        if scopes.0.remove(&scope) {
+            scopes.1.retain(|began| *began != scope);
+        }
+    }
+
+    pub(crate) fn waits_for_disk(&self) -> bool {
+        !self.disk_scopes().0.is_empty()
+    }
+
+    // The jobs that began to wait since the last look, still waiting.
+    pub(crate) fn disk_waits_began(&self) -> Vec<u64> {
+        std::mem::take(&mut self.disk_scopes().1)
+    }
+
+    // What the job `scope` waits for room for, and the folder it waits on,
+    // if it is here and waits.
+    pub(crate) fn disk_wait_of(
+        &self,
+        scope: u64,
+    ) -> Option<(super::limits::DiskWait, std::path::PathBuf)> {
+        let hears = self.jobs().get(&scope).cloned()?;
+        hears.disk_wait()
+    }
+
+    // Rung once a job begins to wait while none of the pipeline's loop's
+    // listening was for a reading.
+    pub(crate) async fn disk_wait_began(&self) {
+        self.2.began.notified().await;
+    }
+
+    // Every job that waits for room, with its ticket.
+    pub(crate) fn disk_waiters(&self) -> Vec<(u64, u64, Arc<dyn Hears>)> {
+        let scopes: Vec<u64> = self.disk_scopes().0.iter().copied().collect();
+        if scopes.is_empty() {
+            return Vec::new();
+        }
+        let jobs = self.jobs();
+        scopes
+            .into_iter()
+            .filter_map(|scope| {
+                let hears = jobs.get(&scope)?;
+                Some((hears.disk_ticket().unwrap_or(0), scope, Arc::clone(hears)))
+            })
+            .collect()
     }
 
     // Hand `said` to the job it is addressed to, if that job is here.
@@ -378,6 +485,9 @@ pub(crate) struct Runs {
     // How many of `runs` have ended, so whether one is live is a count,
     // not a walk of them.
     ended: usize,
+    // The volumes the job's files are written through: a run waits on
+    // their budget, on its own thread, before it says more.
+    disk: Option<super::disk::JobDisk>,
 }
 
 impl Runs {
@@ -399,7 +509,16 @@ impl Runs {
             windows: None,
             held_back: BTreeSet::new(),
             ended: 0,
+            disk: None,
         }
+    }
+
+    // The runs, each waiting on the budget of the volumes of `disk` before
+    // it says more, so what a run unpacks is never queued for a slow
+    // volume faster than the volume takes it.
+    pub(crate) fn writing(mut self, disk: Option<super::disk::JobDisk>) -> Self {
+        self.disk = disk;
+        self
     }
 
     // The runs, lending their decoders windows from `windows`.
@@ -699,6 +818,7 @@ impl Runs {
             budget.window_reserved = true;
         }
         let (scope, mail, clock) = (self.scope, self.mail.clone(), self.clock.clone());
+        let disk = self.disk.clone();
         let said = move |heard| Said {
             scope,
             node,
@@ -727,6 +847,12 @@ impl Runs {
                 }
                 let _waiting = decoding.wait();
                 extracting_hook(&volumes);
+                // What the run said before is with the volumes' writers
+                // or on its way: no more is said while a volume holds
+                // its budget of it.
+                if let Some(disk) = &disk {
+                    disk.wait_below();
+                }
                 volumes.current() && mail.blocking_send(said(Heard::Emit(emit))).is_ok()
             };
             extraction.run(reader, &mut sink, budget);

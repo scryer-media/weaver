@@ -16,8 +16,8 @@ use weaver_server_core::bandwidth::schedule_metrics::{
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::operations::instrumentation::{
     DbRuntimeMetricsSnapshot, DiskSpaceSnapshot, HistogramSnapshot, HttpMetricsSnapshot,
-    JobLifecycleMetricsSnapshot, PipelineHistogramsSnapshot, ProcessMetricsSnapshot,
-    ServerMetricsSnapshot,
+    JobLifecycleMetricsSnapshot, LOOP_WAIT_KINDS, PipelineHistogramsSnapshot,
+    ProcessMetricsSnapshot, ServerMetricsSnapshot, VolumeSnapshot,
 };
 use weaver_server_core::operations::metrics_store::{JOB_STATUS_KEYS, JobStatusCounts};
 use weaver_server_core::persistence::WalCheckpointMetricsSnapshot;
@@ -109,6 +109,8 @@ pub(crate) struct PrometheusRenderInput<'a> {
     pub(crate) wal_checkpoint: Option<&'a WalCheckpointMetricsSnapshot>,
     pub(crate) process: Option<&'a ProcessMetricsSnapshot>,
     pub(crate) disk_space: &'a [DiskSpaceSnapshot],
+    // One row per volume the download side writes to.
+    pub(crate) volumes: &'a [VolumeSnapshot],
     pub(crate) http_metrics: Option<&'a HttpMetricsSnapshot>,
 }
 
@@ -158,6 +160,7 @@ impl<'a> PrometheusRenderInput<'a> {
             wal_checkpoint: None,
             process: None,
             disk_space: &[],
+            volumes: &[],
             http_metrics: None,
         }
     }
@@ -217,6 +220,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         wal_checkpoint,
         process,
         disk_space,
+        volumes,
         http_metrics,
     } = *input;
 
@@ -297,6 +301,8 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         render_process(&mut out, process, start_time_seconds);
     }
     render_disk_space(&mut out, disk_space);
+    render_volumes(&mut out, volumes);
+    render_volume_throughput(&mut out, volumes);
     if let Some(http) = http_metrics {
         render_http(&mut out, http);
     }
@@ -909,6 +915,12 @@ fn render_lanes(out: &mut Encoder, snapshot: &MetricsSnapshot) {
     ] {
         out.sample(&f::LANE_REFILLS, &[("result", result)], value);
     }
+    for (event, value) in [
+        ("held", snapshot.download_lane_room_held_total),
+        ("woken", snapshot.download_lane_room_woken_total),
+    ] {
+        out.sample(&f::LANE_ROOM_WAITS, &[("event", event)], value);
+    }
     for (kind, value) in [
         ("hot", snapshot.download_scheduler_handouts_total_hot),
         ("spill", snapshot.download_scheduler_handouts_total_spill),
@@ -994,16 +1006,6 @@ fn render_stalls_and_workers(out: &mut Encoder, snapshot: &MetricsSnapshot) {
     out.sample(&f::VERIFY_ACTIVE, &[], snapshot.verify_active);
     out.sample(&f::REPAIR_ACTIVE, &[], snapshot.repair_active);
     out.sample(&f::EXTRACT_ACTIVE, &[], snapshot.extract_active);
-    out.sample(
-        &f::DISK_WRITE_LATENCY_US,
-        &[],
-        snapshot.disk_write_latency_us,
-    );
-    out.sample_f64(
-        &f::DISK_WRITE_LATENCY_SECONDS,
-        &[],
-        snapshot.disk_write_latency_us as f64 / 1_000_000.0,
-    );
 }
 
 fn render_rates(out: &mut Encoder, snapshot: &MetricsSnapshot) {
@@ -1478,12 +1480,6 @@ fn render_job_lifecycle(out: &mut Encoder, lifecycle: &JobLifecycleMetricsSnapsh
 
 fn render_pipeline_histograms(out: &mut Encoder, histograms: &PipelineHistogramsSnapshot) {
     render_histogram(out, &f::TURN_DURATION, &[], &histograms.turn_duration);
-    render_histogram(
-        out,
-        &f::DISK_WRITE_DURATION,
-        &[],
-        &histograms.disk_write_duration,
-    );
     // These two stay absent until their stage has actually been timed: an
     // all-zero histogram would read as "measured, nothing happened" rather than
     // "not measured".
@@ -1567,6 +1563,134 @@ fn render_disk_space(out: &mut Encoder, disk_space: &[DiskSpaceSnapshot]) {
         let labels: &[(&str, &str)] = &[("role", disk.role), ("path", disk.path.as_str())];
         out.sample(&f::DISK_TOTAL_BYTES, labels, disk.total_bytes);
         out.sample(&f::DISK_AVAILABLE_BYTES, labels, disk.available_bytes);
+    }
+}
+
+fn render_volumes(out: &mut Encoder, volumes: &[VolumeSnapshot]) {
+    for volume in volumes {
+        let labels: &[(&str, &str)] = &[("volume", volume.label.as_str())];
+        out.sample(&f::VOLUME_WRITTEN_BYTES, labels, volume.written_bytes);
+        out.sample_f64(
+            &f::VOLUME_WRITE_SECONDS,
+            labels,
+            volume.write_nanos as f64 / 1e9,
+        );
+        out.sample(&f::VOLUME_WRITE_CALLS, labels, volume.write_calls);
+        out.sample(&f::VOLUME_WRITE_SEEKS, labels, volume.write_seeks);
+        // Zero is "not measured", which is told by the series being absent.
+        if volume.write_rate > 0 {
+            out.sample(&f::VOLUME_WRITE_RATE, labels, volume.write_rate);
+        }
+        out.sample(&f::VOLUME_BUFFERED_BYTES, labels, volume.buffered_bytes);
+        out.sample(&f::VOLUME_ARRIVED_BYTES, labels, volume.arrived_bytes);
+        out.sample(&f::VOLUME_COUNTED_BYTES, labels, volume.counted_bytes);
+        out.sample(&f::VOLUME_COUNTED_PEAK_BYTES, labels, volume.peak_bytes);
+        // Zero is "not sized yet", which is told by the series being absent.
+        if volume.buffer_limit_bytes > 0 {
+            out.sample(
+                &f::VOLUME_BUFFER_LIMIT_BYTES,
+                labels,
+                volume.buffer_limit_bytes,
+            );
+            out.sample(
+                &f::VOLUME_BUFFER_SOFT_LIMIT_BYTES,
+                labels,
+                volume.buffer_soft_bytes,
+            );
+        }
+        let writer = &volume.writer;
+        out.sample(&f::VOLUME_WRITER_BATCHES, labels, writer.batches);
+        out.sample(&f::VOLUME_WRITER_OPERATIONS, labels, writer.operations);
+        out.sample(
+            &f::VOLUME_WRITER_FAILED_OPERATIONS,
+            labels,
+            writer.failed_operations,
+        );
+        out.sample(
+            &f::VOLUME_WRITER_ABANDONED_OPERATIONS,
+            labels,
+            writer.abandoned_operations,
+        );
+        for (at, kind) in LOOP_WAIT_KINDS.iter().enumerate() {
+            let labels: &[(&str, &str)] = &[("volume", volume.label.as_str()), ("kind", kind)];
+            out.sample(&f::VOLUME_LOOP_WAITS, labels, writer.loop_waits_by_kind[at]);
+            out.sample_f64(
+                &f::VOLUME_LOOP_WAIT_SECONDS,
+                labels,
+                writer.loop_wait_nanos_by_kind[at] as f64 / 1e9,
+            );
+        }
+        out.sample(&f::VOLUME_LOOP_READS, labels, writer.loop_reads);
+        out.sample_f64(
+            &f::VOLUME_LOOP_READ_SECONDS,
+            labels,
+            writer.loop_read_nanos as f64 / 1e9,
+        );
+        out.sample(&f::VOLUME_ASIDE_WAITS, labels, writer.aside_waits);
+        out.sample_f64(
+            &f::VOLUME_ASIDE_WAIT_SECONDS,
+            labels,
+            writer.aside_wait_nanos as f64 / 1e9,
+        );
+        out.sample(&f::VOLUME_WRITER_OPENS, labels, writer.opens);
+        out.sample_f64(
+            &f::VOLUME_WRITER_OPEN_SECONDS,
+            labels,
+            writer.open_nanos as f64 / 1e9,
+        );
+        for (count, seconds, opens, nanos) in [
+            (
+                &f::VOLUME_WRITER_OPEN_CREATES,
+                &f::VOLUME_WRITER_OPEN_CREATE_SECONDS,
+                writer.open_creates,
+                writer.open_create_nanos,
+            ),
+            (
+                &f::VOLUME_WRITER_OPEN_SPARSE_MARKS,
+                &f::VOLUME_WRITER_OPEN_SPARSE_MARK_SECONDS,
+                writer.open_marks,
+                writer.open_mark_nanos,
+            ),
+            (
+                &f::VOLUME_WRITER_OPEN_LENGTH_SETS,
+                &f::VOLUME_WRITER_OPEN_LENGTH_SET_SECONDS,
+                writer.open_sizes,
+                writer.open_size_nanos,
+            ),
+        ] {
+            out.sample(count, labels, opens);
+            out.sample_f64(seconds, labels, nanos as f64 / 1e9);
+        }
+        out.sample(&f::VOLUME_WRITER_LENGTH_SETS, labels, writer.length_sets);
+        out.sample_f64(
+            &f::VOLUME_WRITER_LENGTH_SET_SECONDS,
+            labels,
+            writer.length_set_nanos as f64 / 1e9,
+        );
+        out.sample(
+            &f::VOLUME_WRITER_LENGTH_SETS_SKIPPED,
+            labels,
+            writer.length_sets_skipped,
+        );
+        out.sample(&f::VOLUME_WRITER_CLOSES, labels, writer.closes);
+        out.sample_f64(
+            &f::VOLUME_WRITER_CLOSE_SECONDS,
+            labels,
+            writer.close_nanos as f64 / 1e9,
+        );
+        out.sample(&f::VOLUME_WRITER_THREADS, labels, writer.threads);
+        out.sample(&f::VOLUME_WRITER_WOKEN, labels, writer.woken);
+    }
+}
+
+// What is being written to each volume now. A volume nothing is written to
+// has no figure, which is told by the series being absent.
+fn render_volume_throughput(out: &mut Encoder, volumes: &[VolumeSnapshot]) {
+    for volume in volumes {
+        if volume.throughput > 0 {
+            let labels: &[(&str, &str)] = &[("volume", volume.label.as_str())];
+            out.sample(&f::VOLUME_WRITE_THROUGHPUT, labels, volume.throughput);
+        }
     }
 }
 

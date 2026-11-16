@@ -26,7 +26,6 @@ use tracing::{debug, info, warn};
 pub fn detect(output_dir: &Path) -> SystemProfile {
     let mut profile = detect_startup_profile(output_dir);
     let measured = startup_disk_measurement(output_dir);
-    profile.disk.sequential_write_mbps = measured.sequential_write_mbps;
     profile.disk.random_read_iops = measured.random_read_iops;
     profile
 }
@@ -52,10 +51,11 @@ pub fn detect_cpu_and_memory() -> (CpuProfile, MemoryProfile) {
 
 // Collect the fast system facts needed to start the runtime.
 //
-// Random-read IOPS and sequential write throughput are intentionally left at
-// zero until [`startup_disk_measurement`] runs. Zero IOPS is conservative:
-// the tuner admits only one extraction until the measured values are
-// applied. Zero write throughput reads as "not measured".
+// Random-read IOPS are intentionally left at zero until
+// [`startup_disk_measurement`] runs. Zero IOPS is conservative: the tuner
+// admits only one extraction until the measured value is applied. Write
+// throughput is zero, "not measured", until the pipeline applies the live
+// write rate of the working directory's volume.
 pub fn detect_startup_profile(output_dir: &Path) -> SystemProfile {
     let (cpu, memory) = detect_cpu_and_memory();
     let (storage_class, filesystem) = detect_disk_info(output_dir);
@@ -548,20 +548,19 @@ fn parse_cgroup_memory_limit(value: &str) -> Option<u64> {
 // Disk
 // ---------------------------------------------------------------------------
 
-// What the startup disk probe measured: sequential write-through throughput
-// and random 4 KiB read IOPS on the data directory's filesystem. A zero
-// `sequential_write_mbps` means it was not measured.
+// What the startup disk probe measured: random 4 KiB read IOPS on the data
+// directory's filesystem. Write speed is not measured at startup: each
+// volume carries a live write rate instead.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DiskMeasurement {
-    pub sequential_write_mbps: f64,
     pub random_read_iops: f64,
 }
 
-// The measurement kept between starts, with the time it was taken.
+// The measurement kept between starts, with the time it was taken. A record
+// an earlier version stored also holds a write throughput; it is not read.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 struct StoredDiskMeasurement {
     measured_at: u64,
-    sequential_write_mbps: f64,
     random_read_iops: f64,
 }
 
@@ -574,18 +573,18 @@ const DISK_PROBE_FILE: &str = "weaver-disk-probe.txt";
 // A stored measurement older than this is taken again. The disk under a data
 // directory rarely changes, and the probe is the disk work a start can skip.
 const DISK_PROBE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-// Used when the probe cannot run at all: SSD-class reads, writes unmeasured.
+// Used when the probe cannot run at all: SSD-class reads.
 const DISK_PROBE_FALLBACK_IOPS: f64 = 10_000.0;
 
 // The write phase writes this buffer repeatedly, then the read phase reads
 // back from what it laid down.
-const PROBE_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const PROBE_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 // How many buffers each successive write chunk holds: 16, 64, 144, 256 MiB.
-// Growing chunks keep a fast disk from finishing inside timer noise while a
-// slow one stops after the first.
+// Growing chunks give a fast disk a file too large for the reads to cluster
+// in or for the drive's own cache to hold, while a slow one stops early.
 const PROBE_WRITE_REPEATS: [usize; 4] = [1, 4, 9, 16];
 // The write phase stops before the next chunk once this much write-and-sync
-// time has been measured.
+// time has passed.
 const PROBE_WRITE_BUDGET: Duration = Duration::from_secs(1);
 const PROBE_READ_SIZE: usize = 4096;
 const PROBE_READ_COUNT: usize = 200;
@@ -600,7 +599,6 @@ pub fn startup_disk_measurement(dir: &Path) -> DiskMeasurement {
     if let Some(pinned) = startup_iops_override() {
         debug!(iops = pinned, "disk probe skipped: WEAVER_STARTUP_IOPS");
         return DiskMeasurement {
-            sequential_write_mbps: 0.0,
             random_read_iops: pinned,
         };
     }
@@ -622,12 +620,10 @@ fn stored_or_measured_disk_profile(
     {
         info!(
             age_days = age / (24 * 60 * 60),
-            write_mbps = format!("{:.0}", stored.sequential_write_mbps),
             iops = format!("{:.0}", stored.random_read_iops),
             "using stored disk measurement"
         );
         return DiskMeasurement {
-            sequential_write_mbps: stored.sequential_write_mbps,
             random_read_iops: stored.random_read_iops,
         };
     }
@@ -637,22 +633,19 @@ fn stored_or_measured_disk_profile(
         // Nothing is stored, so the next start tries again.
         warn!(
             dir = %dir.display(),
-            "disk probe could not run; assuming fast reads and unmeasured writes"
+            "disk probe could not run; assuming fast reads"
         );
         return DiskMeasurement {
-            sequential_write_mbps: 0.0,
             random_read_iops: DISK_PROBE_FALLBACK_IOPS,
         };
     };
     info!(
-        write_mbps = format!("{:.0}", measured.sequential_write_mbps),
         iops = format!("{:.0}", measured.random_read_iops),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "measured disk"
     );
     let stored = StoredDiskMeasurement {
         measured_at: unix_seconds(now()),
-        sequential_write_mbps: measured.sequential_write_mbps,
         random_read_iops: measured.random_read_iops,
     };
     if let Err(error) = write_stored_disk_measurement(&record, &stored) {
@@ -674,11 +667,7 @@ fn unix_seconds(at: SystemTime) -> u64 {
 fn read_stored_disk_measurement(path: &Path) -> Option<StoredDiskMeasurement> {
     let bytes = std::fs::read(path).ok()?;
     let stored: StoredDiskMeasurement = serde_json::from_slice(&bytes).ok()?;
-    let usable = |value: f64| value.is_finite() && value >= 0.0;
-    (usable(stored.sequential_write_mbps)
-        && usable(stored.random_read_iops)
-        && stored.random_read_iops > 0.0)
-        .then_some(stored)
+    (stored.random_read_iops.is_finite() && stored.random_read_iops > 0.0).then_some(stored)
 }
 
 fn write_stored_disk_measurement(
@@ -703,7 +692,7 @@ fn parse_startup_iops(raw: Option<&str>) -> Option<f64> {
 }
 
 // Removes the probe's scratch file however the probe ends.
-struct ProbeFileGuard(PathBuf);
+pub(crate) struct ProbeFileGuard(pub(crate) PathBuf);
 
 impl Drop for ProbeFileGuard {
     fn drop(&mut self) {
@@ -711,21 +700,17 @@ impl Drop for ProbeFileGuard {
     }
 }
 
-// Measure sequential write-through throughput, then random 4 KiB reads on
-// the file the writes laid down, in the given directory.
+// Measure random 4 KiB reads on a file laid down in the given directory.
 //
-// The writes go through the cache to the device and the reads bypass it
-// where the platform allows, so neither figure is the page cache's. `None`
-// when the directory cannot hold the probe file or any I/O fails.
+// The file goes through the cache to the device and the reads bypass the
+// cache where the platform allows, so the figure is not the page cache's.
+// `None` when the directory cannot hold the probe file or any I/O fails.
 pub fn measure_disk_profile(dir: &Path) -> Option<DiskMeasurement> {
     let path = dir.join(DISK_PROBE_FILE);
     let _guard = ProbeFileGuard(path.clone());
-    let (written, sequential_write_mbps) = measure_sequential_write(&path)?;
+    let written = lay_down_probe_file(&path)?;
     let random_read_iops = measure_random_read(&path, written)?;
-    Some(DiskMeasurement {
-        sequential_write_mbps,
-        random_read_iops,
-    })
+    Some(DiskMeasurement { random_read_iops })
 }
 
 // Random bytes, so a compressing filesystem or drive firmware cannot shrink
@@ -742,35 +727,87 @@ fn probe_write_buffer() -> Vec<u8> {
     buffer
 }
 
-// Returns the bytes written and the throughput in MB/s (10^6 bytes).
-fn measure_sequential_write(path: &Path) -> Option<(u64, f64)> {
+// Writes the file the read phase reads from, through to the device, and
+// returns its length. The time each chunk takes only decides whether another
+// follows; the read measurement takes no write speed from it.
+fn lay_down_probe_file(path: &Path) -> Option<u64> {
+    synced_probe_write(path).map(|write| write.bytes)
+}
+
+// What a probe file took to write: its length, and the time spent writing
+// and syncing its chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProbeWrite {
+    pub(crate) bytes: u64,
+    pub(crate) elapsed: Duration,
+}
+
+// Write a probe file at `path` through to the device: growing chunks of
+// random bytes, each followed by a sync, until the chunk schedule ends or
+// the write time passes [`PROBE_WRITE_BUDGET`]. The file is left in place;
+// the caller removes it. `None` when the file cannot be made or a write
+// fails. The start-up read probe and the per-volume write probe both lay
+// their file down here. This blocks for about a second: never call it on
+// the pipeline loop or the async runtime.
+pub(crate) fn synced_probe_write(path: &Path) -> Option<ProbeWrite> {
+    synced_probe_write_until(path, &|| false).map(|(write, _)| write)
+}
+
+// The same write, which gives way between chunks once `give_way` answers
+// true: the first chunk is always written, and a probe that gave way says
+// so beside what it wrote.
+pub(crate) fn synced_probe_write_until(
+    path: &Path,
+    give_way: &dyn Fn() -> bool,
+) -> Option<(ProbeWrite, bool)> {
     use std::io::Write;
 
     let buffer = probe_write_buffer();
     let mut file = open_write_through(path).ok()?;
-    let mut written: u64 = 0;
-    let mut measured = Duration::ZERO;
+    probe_file_bytes_until(
+        |repeats| {
+            let started = Instant::now();
+            for _ in 0..repeats {
+                file.write_all(&buffer).ok()?;
+            }
+            file.sync_data().ok()?;
+            Some(started.elapsed())
+        },
+        give_way,
+    )
+}
+
+// How large the probe file grows: successive chunks of
+// [`PROBE_WRITE_REPEATS`] buffers, stopping before the next chunk once the
+// chunks written have taken [`PROBE_WRITE_BUDGET`]. `write_chunk` writes that
+// many buffers and answers how long it took, or `None` when it failed.
+#[cfg(test)]
+pub(crate) fn probe_file_bytes(
+    write_chunk: impl FnMut(usize) -> Option<Duration>,
+) -> Option<ProbeWrite> {
+    probe_file_bytes_until(write_chunk, &|| false).map(|(write, _)| write)
+}
+
+// The same schedule, stopping too before any chunk after the first once
+// `give_way` answers true. Answers whether it stopped for that, rather than
+// at the end of the schedule or of the budget.
+pub(crate) fn probe_file_bytes_until(
+    mut write_chunk: impl FnMut(usize) -> Option<Duration>,
+    give_way: &dyn Fn() -> bool,
+) -> Option<(ProbeWrite, bool)> {
+    let mut bytes: u64 = 0;
+    let mut elapsed = Duration::ZERO;
     for repeats in PROBE_WRITE_REPEATS {
-        if measured >= PROBE_WRITE_BUDGET {
+        if elapsed >= PROBE_WRITE_BUDGET {
             break;
         }
-        let started = Instant::now();
-        for _ in 0..repeats {
-            file.write_all(&buffer).ok()?;
+        if bytes > 0 && give_way() {
+            return Some((ProbeWrite { bytes, elapsed }, true));
         }
-        file.sync_data().ok()?;
-        measured += started.elapsed();
-        written += (repeats * PROBE_CHUNK_BYTES) as u64;
+        elapsed += write_chunk(repeats)?;
+        bytes += (repeats * PROBE_CHUNK_BYTES) as u64;
     }
-    let seconds = measured.as_secs_f64();
-    let mbps = if seconds > 0.0 {
-        written as f64 / seconds / 1_000_000.0
-    } else {
-        // Sub-resolution timing: as if it took a microsecond, faster than
-        // anything the tuner tells apart.
-        written as f64
-    };
-    Some((written, mbps))
+    Some((ProbeWrite { bytes, elapsed }, false))
 }
 
 #[cfg(unix)]
@@ -1069,44 +1106,47 @@ impl Drop for StartupDiskGateOpener {
     }
 }
 
+// The kind of storage comes from the one place that reads it for every
+// volume, the writer's included; only the filesystem's name is read here.
 fn detect_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
+    let storage_class = storage_class_of(crate::operations::disk::storage_kind(output_dir));
+
     #[cfg(target_os = "macos")]
-    {
-        macos_disk_info(output_dir)
-    }
+    let filesystem = macos_filesystem(output_dir);
 
     #[cfg(target_os = "linux")]
-    {
-        linux_disk_info(output_dir)
-    }
+    let filesystem = {
+        let target = std::fs::canonicalize(output_dir)
+            .or_else(|_| std::fs::canonicalize(output_dir.parent().unwrap_or(Path::new("/"))))
+            .unwrap_or_else(|_| Path::new("/").to_path_buf());
+        linux_filesystem_type(&target)
+    };
 
     #[cfg(windows)]
-    {
-        windows_disk_info(output_dir)
-    }
+    let filesystem = windows_filesystem(output_dir);
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-    {
-        let _ = output_dir;
-        (
-            StorageClass::Unknown,
-            FilesystemType::Unknown(String::new()),
-        )
+    let filesystem = FilesystemType::Unknown(String::new());
+
+    (storage_class, filesystem)
+}
+
+// The report's name for a kind of storage.
+fn storage_class_of(kind: crate::operations::disk::StorageKind) -> StorageClass {
+    use crate::operations::disk::StorageKind;
+    match kind {
+        StorageKind::Solid => StorageClass::Ssd,
+        StorageKind::Rotational => StorageClass::Hdd,
+        StorageKind::Network => StorageClass::Network,
+        StorageKind::Unknown => StorageClass::Unknown,
     }
 }
 
-// Windows: the volume behind the directory answers the filesystem name, the
-// drive type says whether it is a network share, and the storage device
-// behind the volume says whether it incurs a seek penalty (rotational).
+// Windows: the volume behind the directory answers the filesystem name.
 #[cfg(windows)]
-fn windows_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
+fn windows_filesystem(output_dir: &Path) -> FilesystemType {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    use windows_sys::Win32::Storage::FileSystem::{
-        GetDriveTypeW, GetVolumeInformationW, GetVolumePathNameW,
-    };
-    // `GetDriveTypeW` result for a network drive. The constant lives in a
-    // windows-sys module this crate does not otherwise pull in.
-    const DRIVE_REMOTE: u32 = 4;
+    use windows_sys::Win32::Storage::FileSystem::{GetVolumeInformationW, GetVolumePathNameW};
 
     let target = std::fs::canonicalize(output_dir)
         .or_else(|_| std::fs::canonicalize(output_dir.parent().unwrap_or(Path::new("."))))
@@ -1127,16 +1167,8 @@ fn windows_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
         )
     };
     if ok == 0 {
-        return (
-            StorageClass::Unknown,
-            FilesystemType::Unknown(String::new()),
-        );
+        return FilesystemType::Unknown(String::new());
     }
-    let root_len = volume_root
-        .iter()
-        .position(|&c| c == 0)
-        .unwrap_or(volume_root.len());
-    let root_wide = &volume_root[..root_len];
 
     let mut fs_name = [0u16; 64];
     // SAFETY: `volume_root` is NUL-terminated; the name buffer is sized as passed.
@@ -1152,130 +1184,22 @@ fn windows_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
             fs_name.len() as u32,
         )
     };
-    let filesystem = if ok == 0 {
-        FilesystemType::Unknown(String::new())
-    } else {
-        let len = fs_name
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(fs_name.len());
-        let name = std::ffi::OsString::from_wide(&fs_name[..len])
-            .to_string_lossy()
-            .into_owned();
-        parse_filesystem_type(&name)
-    };
-
-    // SAFETY: `volume_root` is NUL-terminated.
-    let drive_type = unsafe { GetDriveTypeW(volume_root.as_ptr()) };
-    if drive_type == DRIVE_REMOTE {
-        return (StorageClass::Network, filesystem);
+    if ok == 0 {
+        return FilesystemType::Unknown(String::new());
     }
-
-    let storage_class = storage_class_from_seek_penalty(windows_seek_penalty(root_wide));
-    (storage_class, filesystem)
+    let len = fs_name
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(fs_name.len());
+    let name = std::ffi::OsString::from_wide(&fs_name[..len])
+        .to_string_lossy()
+        .into_owned();
+    parse_filesystem_type(&name)
 }
 
-#[cfg(any(windows, test))]
-fn storage_class_from_seek_penalty(penalty: Option<bool>) -> StorageClass {
-    match penalty {
-        Some(true) => StorageClass::Hdd,
-        Some(false) => StorageClass::Ssd,
-        None => StorageClass::Unknown,
-    }
-}
-
-// Ask the storage device behind a volume root like `C:\` whether it incurs a
-// seek penalty. `None` when the volume has no drive letter (a mounted folder)
-// or the device does not answer the query.
-#[cfg(windows)]
-fn windows_seek_penalty(volume_root: &[u16]) -> Option<bool> {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    };
-    use windows_sys::Win32::System::IO::DeviceIoControl;
-    use windows_sys::Win32::System::Ioctl::{
-        DEVICE_SEEK_PENALTY_DESCRIPTOR, IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery,
-        STORAGE_PROPERTY_QUERY, StorageDeviceSeekPenaltyProperty,
-    };
-
-    // A root derived from a canonicalized path carries the verbatim prefix
-    // (`\\?\C:\`); the drive letter follows it.
-    let verbatim: Vec<u16> = "\\\\?\\".encode_utf16().collect();
-    let volume_root = volume_root
-        .strip_prefix(verbatim.as_slice())
-        .unwrap_or(volume_root);
-
-    // `X:\` → `\\.\X:`; anything without a drive letter is not addressable
-    // as a volume device this way.
-    let letter = match volume_root {
-        [letter, colon, ..]
-            if *colon == u16::from(b':')
-                && u8::try_from(*letter).is_ok_and(|c| c.is_ascii_alphabetic()) =>
-        {
-            *letter
-        }
-        _ => return None,
-    };
-    let device: Vec<u16> = "\\\\.\\"
-        .encode_utf16()
-        .chain([letter, u16::from(b':'), 0])
-        .collect();
-
-    // SAFETY: `device` is NUL-terminated; zero desired access is enough for
-    // a property query and needs no privilege.
-    let handle = unsafe {
-        CreateFileW(
-            device.as_ptr(),
-            0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return None;
-    }
-
-    let query = STORAGE_PROPERTY_QUERY {
-        PropertyId: StorageDeviceSeekPenaltyProperty,
-        QueryType: PropertyStandardQuery,
-        AdditionalParameters: [0],
-    };
-    let mut descriptor = DEVICE_SEEK_PENALTY_DESCRIPTOR {
-        Version: 0,
-        Size: 0,
-        IncursSeekPenalty: false,
-    };
-    let mut returned: u32 = 0;
-    // SAFETY: the in/out buffers are properly sized structs that outlive the call.
-    let ok = unsafe {
-        DeviceIoControl(
-            handle,
-            IOCTL_STORAGE_QUERY_PROPERTY,
-            (&query as *const STORAGE_PROPERTY_QUERY).cast(),
-            std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
-            (&mut descriptor as *mut DEVICE_SEEK_PENALTY_DESCRIPTOR).cast(),
-            std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
-            &mut returned,
-            std::ptr::null_mut(),
-        )
-    };
-    // SAFETY: `handle` came from a successful CreateFileW and is closed once.
-    unsafe {
-        CloseHandle(handle);
-    }
-    if ok == 0 || (returned as usize) < std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() {
-        return None;
-    }
-    Some(descriptor.IncursSeekPenalty)
-}
-
-// macOS: use `diskutil info` to detect storage class and filesystem.
+// macOS: `diskutil info` names the filesystem of the mount.
 #[cfg(target_os = "macos")]
-fn macos_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
+fn macos_filesystem(output_dir: &Path) -> FilesystemType {
     // Resolve the path to handle symlinks, then find its mount point.
     let target = std::fs::canonicalize(output_dir)
         .or_else(|_| std::fs::canonicalize(output_dir.parent().unwrap_or(Path::new("/"))))
@@ -1283,37 +1207,16 @@ fn macos_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
 
     let mount_point = find_mount_point_macos(&target);
 
-    let output = Command::new("diskutil")
+    let Ok(output) = Command::new("diskutil")
         .arg("info")
         .arg(&mount_point)
-        .output();
-
-    let text = match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
-        Err(_) => {
-            return (
-                StorageClass::Unknown,
-                FilesystemType::Unknown(String::new()),
-            );
-        }
+        .output()
+    else {
+        return FilesystemType::Unknown(String::new());
     };
+    let text = String::from_utf8_lossy(&output.stdout);
 
-    let storage_class = if text
-        .lines()
-        .any(|l| l.contains("Solid State:") && l.contains("Yes"))
-    {
-        StorageClass::Ssd
-    } else if text
-        .lines()
-        .any(|l| l.contains("Solid State:") && l.contains("No"))
-    {
-        StorageClass::Hdd
-    } else {
-        StorageClass::Unknown
-    };
-
-    let filesystem = text
-        .lines()
+    text.lines()
         .find(|l| {
             l.trim_start().starts_with("Type (Bundle):")
                 || l.trim_start().starts_with("File System Personality:")
@@ -1322,9 +1225,7 @@ fn macos_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
             let val = l.split(':').nth(1).unwrap_or("").trim();
             parse_filesystem_type(val)
         })
-        .unwrap_or(FilesystemType::Unknown(String::new()));
-
-    (storage_class, filesystem)
+        .unwrap_or(FilesystemType::Unknown(String::new()))
 }
 
 // Find the mount point for a given path on macOS using `df`.
@@ -1353,69 +1254,6 @@ fn find_mount_point_macos(path: &Path) -> String {
     }
 
     "/".to_string()
-}
-
-// Linux: check rotational flag and /proc/mounts for filesystem type.
-#[cfg(target_os = "linux")]
-fn linux_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
-    let target = std::fs::canonicalize(output_dir)
-        .or_else(|_| std::fs::canonicalize(output_dir.parent().unwrap_or(Path::new("/"))))
-        .unwrap_or_else(|_| Path::new("/").to_path_buf());
-
-    let storage_class = linux_storage_class(&target);
-    let filesystem = linux_filesystem_type(&target);
-
-    (storage_class, filesystem)
-}
-
-// Detect SSD vs HDD on Linux by reading the rotational flag.
-#[cfg(target_os = "linux")]
-fn linux_storage_class(path: &Path) -> StorageClass {
-    // Find the device for the path using df.
-    let device = match Command::new("df").arg("--output=source").arg(path).output() {
-        Ok(o) => {
-            let text = String::from_utf8_lossy(&o.stdout);
-            text.lines().nth(1).unwrap_or("").trim().to_string()
-        }
-        Err(_) => return StorageClass::Unknown,
-    };
-
-    // Extract the base block device name (e.g., /dev/sda1 -> sda, /dev/nvme0n1p1 -> nvme0n1).
-    let dev_name = device.strip_prefix("/dev/").unwrap_or(&device);
-
-    // Strip partition suffix to get the base device.
-    let base_device = strip_partition_suffix(dev_name);
-
-    let rotational_path = format!("/sys/block/{base_device}/queue/rotational");
-    match std::fs::read_to_string(&rotational_path) {
-        Ok(content) => match content.trim() {
-            "0" => StorageClass::Ssd,
-            "1" => StorageClass::Hdd,
-            _ => StorageClass::Unknown,
-        },
-        Err(_) => StorageClass::Unknown,
-    }
-}
-
-// Strip partition number suffix from a device name.
-// `sda1` -> `sda`, `nvme0n1p1` -> `nvme0n1`, `vda2` -> `vda`.
-#[cfg(target_os = "linux")]
-fn strip_partition_suffix(dev: &str) -> &str {
-    // NVMe: nvme0n1p1 -> nvme0n1
-    if let Some(idx) = dev.rfind('p')
-        && dev[..idx].ends_with(|c: char| c.is_ascii_digit())
-        && dev[idx + 1..].chars().all(|c| c.is_ascii_digit())
-        && !dev[idx + 1..].is_empty()
-    {
-        return &dev[..idx];
-    }
-
-    // Traditional: sda1 -> sda, vda2 -> vda
-    let end = dev
-        .rfind(|c: char| !c.is_ascii_digit())
-        .map(|i| i + 1)
-        .unwrap_or(dev.len());
-    &dev[..end]
 }
 
 // Detect filesystem type on Linux from /proc/mounts.

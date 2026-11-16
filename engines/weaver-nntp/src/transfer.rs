@@ -1054,6 +1054,12 @@ impl ServerTransferControl {
         self.quota_epoch.load(Ordering::Acquire)
     }
 
+    // Whether a quota is configured, read without the state lock: the epoch
+    // is published non-zero exactly while one is.
+    pub(crate) fn quota_configured(&self) -> bool {
+        self.current_quota_epoch() != 0
+    }
+
     fn reserve_rate(&self, bytes: u64) -> Option<RateTicket> {
         self.reserve_rate_with_clock(bytes, || self.rate_now_micros())
     }

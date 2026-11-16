@@ -3,6 +3,7 @@
 
 use crate::JobId;
 use crate::history::output_files::OutputFileListing;
+use crate::torrents::persistence::HistoryFile;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -368,15 +369,26 @@ async fn present_staging_dirs(staging_roots: &[PathBuf], job_id: JobId) -> Vec<P
     staged
 }
 
-// The marked working directories of `job_ids` under the intermediate root.
+// The marked working directories of `job_ids` under the intermediate root,
+// and which of them are live torrents. A job whose torrent row stands is
+// live: its folders are the torrent's, never a history row's to take, not
+// those it is marked in nor the one its row records. Which have one is read
+// in one batched lookup, before the scan.
 async fn scan_marked_dirs(
+    db: &crate::Database,
     intermediate_dir: &std::path::Path,
     job_ids: &BTreeSet<JobId>,
-) -> Result<BTreeMap<JobId, Vec<PathBuf>>, crate::SchedulerError> {
+) -> Result<(BTreeMap<JobId, Vec<PathBuf>>, BTreeSet<JobId>), crate::SchedulerError> {
     let root = intermediate_dir.to_path_buf();
-    let owners = job_ids.clone();
+    let mut owners = job_ids.clone();
+    let db = db.clone();
     match tokio::task::spawn_blocking(move || {
-        crate::jobs::working_dir::job_working_dirs(&root, &owners)
+        let ids = owners.iter().copied().collect::<Vec<_>>();
+        let live = db
+            .torrent_job_ids_among(&ids)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        owners.retain(|job_id| !live.contains(job_id));
+        crate::jobs::working_dir::job_working_dirs(&root, &owners).map(|marked| (marked, live))
     })
     .await
     {
@@ -386,6 +398,72 @@ async fn scan_marked_dirs(
             "failed to join working directory lookup task: {error}"
         ))),
     }
+}
+
+// The files the history rows of `job_ids` list, the jobs of torrents that
+// are no longer live: a torrent's job lists the files it wrote with its row,
+// as an NZB job marks its folders. Batched lookups, served by their keys; a
+// torrent's job that lists none has an empty list, and an NZB job none.
+async fn listed_files(
+    db: &crate::Database,
+    job_ids: Vec<JobId>,
+) -> Result<BTreeMap<JobId, Vec<HistoryFile>>, crate::SchedulerError> {
+    if job_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || db.torrent_history_lists(&job_ids))
+        .await
+        .map_err(|error| {
+            crate::SchedulerError::Internal(format!(
+                "failed to join history files lookup task: {error}"
+            ))
+        })?
+        .map_err(crate::SchedulerError::State)
+}
+
+// What the live torrents hold under the folders of the listed jobs of one
+// call, read once for all of them (`LiveHeld::under`). A read that fails leaves
+// every listed file of the call where it is.
+async fn live_held(
+    db: &crate::Database,
+    listed: &BTreeMap<JobId, (PathBuf, Vec<HistoryFile>)>,
+) -> Result<std::sync::Arc<crate::torrents::service::LiveHeld>, String> {
+    if listed.is_empty() {
+        return Ok(Default::default());
+    }
+    let dirs = listed
+        .values()
+        .map(|(dir, _)| dir.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let db = db.clone();
+    match tokio::task::spawn_blocking(move || crate::torrents::service::LiveHeld::under(&db, &dirs))
+        .await
+    {
+        Ok(Ok(held)) => Ok(std::sync::Arc::new(held)),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+// Removes the files a torrent's job listed under `dir`, the folder its row
+// records, while its marker names the job, leaving what a live torrent
+// holds (`remove_history_files`).
+async fn remove_listed_files(
+    job_id: JobId,
+    intermediate_dir: &std::path::Path,
+    dir: PathBuf,
+    files: Vec<HistoryFile>,
+    held: std::sync::Arc<crate::torrents::service::LiveHeld>,
+) -> std::io::Result<crate::torrents::service::ListedRemoval> {
+    let intermediate = intermediate_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        crate::torrents::service::remove_history_files(job_id, &intermediate, &dir, &files, &held)
+    })
+    .await
+    .map_err(std::io::Error::other)
 }
 
 // History deletion owns persistence and files independently of the pipeline.
@@ -434,15 +512,38 @@ pub(crate) async fn delete_history_rows(
     // still carries its marker: a delivered job's record names where it
     // delivered, and its working directory stays only for what it could not
     // remove.
-    let mut marked = match scan_marked_dirs(intermediate_dir, &job_ids).await {
-        Ok(marked) => marked,
+    let (mut marked, live) = match scan_marked_dirs(db, intermediate_dir, &job_ids).await {
+        Ok(scanned) => scanned,
         Err(error) => return (BTreeSet::new(), Err(error)),
     };
+    // Read before the rows go with them.
+    let mut listed = if delete_files {
+        let ids = job_ids
+            .iter()
+            .filter(|id| !live.contains(id))
+            .copied()
+            .collect();
+        match listed_files(db, ids).await {
+            Ok(listed) => listed,
+            Err(error) => return (BTreeSet::new(), Err(error)),
+        }
+    } else {
+        BTreeMap::new()
+    };
+    let mut listed_dirs = BTreeMap::new();
 
     let mut cleanup = BTreeMap::new();
     let mut delete_ids = Vec::with_capacity(job_ids.len());
     for job_id in job_ids {
-        let recorded = rows.get(&job_id).cloned().flatten().map(PathBuf::from);
+        let recorded = rows
+            .get(&job_id)
+            .cloned()
+            .flatten()
+            .filter(|_| !live.contains(&job_id))
+            .map(PathBuf::from);
+        // A job that lists its files is a torrent's: its folder is where its
+        // files are, theirs, and what goes of it is what it lists.
+        let (recorded, files) = take_listed(recorded, listed.remove(&job_id));
         let planned = JobCleanupDirs::plan(
             intermediate_dir,
             job_id,
@@ -465,6 +566,9 @@ pub(crate) async fn delete_history_rows(
             }
         } else {
             output_dirs.remove(&job_id);
+        }
+        if let Some(files) = files {
+            listed_dirs.insert(job_id, files);
         }
         cleanup.insert(job_id, dirs);
         delete_ids.push(job_id);
@@ -520,22 +624,50 @@ pub(crate) async fn delete_history_rows(
     // Every accepted id's record is gone now, including an id that had no
     // row. No pipeline state participates in a history deletion.
     let removed = delete_ids.iter().copied().collect::<BTreeSet<_>>();
+    // Every job's scripts stop first; what live torrents hold is read once
+    // after, so no wait leaves that read stale before the files go.
     let mut deleted = BTreeMap::new();
+    let mut stopped = Vec::with_capacity(cleanup.len());
     for (job_id, dirs) in cleanup {
-        if let Err(error) = retry_script_stop_wait(job_id, || {
+        match retry_script_stop_wait(job_id, || {
             crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0)
         })
         .await
         {
-            deleted.insert(job_id, Err(crate::SchedulerError::State(error)));
-            continue;
+            Ok(()) => stopped.push((job_id, dirs)),
+            Err(error) => {
+                deleted.insert(job_id, Err(crate::SchedulerError::State(error)));
+            }
         }
+    }
+    let held = live_held(db, &listed_dirs).await;
+    if let Err(error) = &held {
+        warn!(%error, "could not read what live torrents hold; deleted torrents' files stay");
+    }
+    for (job_id, dirs) in stopped {
         match dirs.remove(intermediate_dir, job_id).await {
             Ok(RemovedWorkingDirs { left_in_place, .. }) => {
                 // A delete reports only what it left of the working
                 // directories; the output directory's fate is logged.
                 if let Some(dir) = output_dirs.get(&job_id) {
                     delete_owned_output_dir(dir, job_id, legacy_ok(&shared, dir)).await;
+                }
+                if let Some((dir, files)) = listed_dirs.remove(&job_id)
+                    && let Ok(held) = &held
+                {
+                    match remove_listed_files(job_id, intermediate_dir, dir, files, held.clone())
+                        .await
+                    {
+                        Ok(listed) if !listed.not_managed.is_empty() => info!(
+                            job_id = job_id.0,
+                            left = ?listed.not_managed,
+                            "a deleted torrent's files stay where nothing proves Weaver may remove them"
+                        ),
+                        Ok(_) => {}
+                        Err(error) => {
+                            warn!(job_id = job_id.0, %error, "could not remove a torrent's listed files");
+                        }
+                    }
                 }
                 // What the staging directory still holds is the rest of the
                 // delivery the working directory held, and goes the way it
@@ -690,9 +822,33 @@ pub(crate) async fn archive_history(
     }
 
     let pending_ids = pending.keys().copied().collect::<BTreeSet<_>>();
-    let mut marked = scan_marked_dirs(intermediate_dir, &pending_ids).await?;
+    let (mut marked, live) = scan_marked_dirs(db, intermediate_dir, &pending_ids).await?;
+    let ids = pending_ids
+        .iter()
+        .filter(|id| !live.contains(id))
+        .copied()
+        .collect();
+    let mut listed = listed_files(db, ids).await?;
+    let mut listed_dirs = BTreeMap::new();
     let mut planned = Vec::with_capacity(pending.len());
     for (job_id, recorded) in pending {
+        // A torrent still live holds its files: its entry is not archived,
+        // and keeps no stamp, until the torrent goes.
+        if live.contains(&job_id) {
+            outcomes.insert(
+                job_id,
+                Archive::new(
+                    Outcome::NotManaged,
+                    None,
+                    Some("the torrent is still live and its files are its own; remove the torrent to remove them".to_owned()),
+                ),
+            );
+            continue;
+        }
+        let (recorded, files) = take_listed(recorded, listed.remove(&job_id));
+        if let Some(files) = files {
+            listed_dirs.insert(job_id, files);
+        }
         match JobCleanupDirs::plan(
             intermediate_dir,
             job_id,
@@ -839,6 +995,7 @@ pub(crate) async fn archive_history(
         }
     }
 
+    let held = live_held(db, &listed_dirs).await;
     let mut stamp = Vec::new();
     for (job_id, recorded, dirs, output) in proven {
         let removal = remove_job_files(
@@ -851,6 +1008,30 @@ pub(crate) async fn archive_history(
             &shared,
         )
         .await;
+        let removal = match (removal, listed_dirs.remove(&job_id)) {
+            (Ok(mut removal), Some((dir, files))) => match &held {
+                Ok(held) => {
+                    match remove_listed_files(job_id, intermediate_dir, dir, files, held.clone())
+                        .await
+                    {
+                        Ok(listed) => {
+                            removal.removed += listed.removed;
+                            for left in listed.not_managed {
+                                if !removal.not_managed.contains(&left) {
+                                    removal.not_managed.push(left);
+                                }
+                            }
+                            Ok(removal)
+                        }
+                        Err(error) => Err(crate::SchedulerError::Io(error)),
+                    }
+                }
+                Err(error) => Err(crate::SchedulerError::Internal(format!(
+                    "could not read what live torrents hold: {error}; nothing listed was removed"
+                ))),
+            },
+            (removal, _) => removal,
+        };
         let outcome = match removal {
             Err(error) => Archive::new(Outcome::Failed, None, Some(error.to_string())),
             Ok(JobFilesRemoval { not_managed, .. }) if !not_managed.is_empty() => Archive::new(
@@ -916,6 +1097,19 @@ struct JobFilesRemoval {
 // One job's part of an archive, once its directories are proven and
 // its scripts have stopped: its working directories, its recorded output
 // directory when proven the job's, and its staging directories.
+// A job's recorded folder and the files its row lists: with a list, the
+// folder is where those files are, and is no folder of the job's to prove or
+// take; only what the list names under it goes.
+fn take_listed(
+    recorded: Option<PathBuf>,
+    files: Option<Vec<HistoryFile>>,
+) -> (Option<PathBuf>, Option<(PathBuf, Vec<HistoryFile>)>) {
+    match (recorded, files) {
+        (Some(dir), Some(files)) => (None, Some((dir, files))),
+        (recorded, _) => (recorded, None),
+    }
+}
+
 async fn remove_job_files(
     intermediate_dir: &std::path::Path,
     staging_roots: &[PathBuf],

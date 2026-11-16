@@ -52,8 +52,10 @@ type adversarialSpec struct {
 	// Outcome is success, failed, either (success or failed, the contract of
 	// a lie the product may see through or refuse), partial (a hostile piece
 	// beside a whole honest file leaves the job short of that piece, with the
-	// honest file delivered exactly), or settles (any terminal status, a
-	// failure naming its verdict).
+	// honest file delivered exactly), settles (any terminal status, a
+	// failure naming its verdict), or waits (the job runs short of disk room,
+	// waits for it, says so once, and is not refused; the lane cancels it
+	// once the wait is said, so the case never sits in the wait).
 	Outcome string `json:"outcome"`
 	// ErrorContains is a substring of the failed job's history error.
 	ErrorContains string `json:"errorContains,omitempty"`
@@ -130,7 +132,9 @@ func adversarialGroups() []adversarialGroup {
 // adversarialReserveEnv leaves a gigabyte between the free space Weaver sees
 // and the reserve it must keep, so a few gigabytes of expansion cross the
 // reserve long before they fill the disk. The ratio floor is raised past the
-// bomb's expansion so the reserve, not the ratio, is what refuses it.
+// bomb's expansion so the reserve, not the ratio, is what holds it. A job
+// short of room always waits for it, however full the disk is, so the bomb
+// waits and is not refused.
 func adversarialReserveEnv() (map[string]string, error) {
 	intermediate := filepath.Join(localWeaverDir(), "intermediate")
 	if err := os.MkdirAll(intermediate, 0o755); err != nil {
@@ -348,12 +352,15 @@ func (spec adversarialSpec) validate() error {
 		return fmt.Errorf("adversarial group %q is not one of default, tight, reserve, ratio", spec.Group)
 	}
 	switch spec.Outcome {
-	case "success", "failed", "either", "partial", "settles":
+	case "success", "failed", "either", "partial", "settles", "waits":
 	default:
-		return fmt.Errorf("adversarial outcome %q is not one of success, failed, either, partial, settles", spec.Outcome)
+		return fmt.Errorf("adversarial outcome %q is not one of success, failed, either, partial, settles, waits", spec.Outcome)
 	}
 	if (spec.Outcome == "success" || spec.Outcome == "partial") && (spec.ErrorContains != "" || spec.FailureKind != "") {
 		return errors.New("a success case names no failure")
+	}
+	if spec.Outcome == "waits" && (spec.ErrorContains != "" || spec.FailureKind != "" || spec.RejectionMetric != "" || spec.BudgetRefusals != 0) {
+		return errors.New("a waiting case names no failure or refusal")
 	}
 	for _, path := range spec.EscapePaths {
 		if !filepath.IsAbs(path) {
@@ -449,6 +456,14 @@ func runAdversarialSubmission(weaverURL string, tc adversarialCase, submission a
 	if err != nil {
 		return 0, fmt.Errorf("submit: %w", err)
 	}
+	if tc.Spec.Outcome == "waits" {
+		if err := awaitAdversarialDiskWait(jobID, before.LogOffset); err != nil {
+			return jobID, err
+		}
+		if err := cancelJobGraphQL(weaverURL, jobID); err != nil {
+			return jobID, fmt.Errorf("cancel the waiting job: %w", err)
+		}
+	}
 	if err := awaitAdversarialJobArchived(jobID); err != nil {
 		return jobID, err
 	}
@@ -489,6 +504,42 @@ func awaitAdversarialJobArchived(jobID int) error {
 		}
 		if archived {
 			return nil
+		}
+		time.Sleep(adversarialPollInterval)
+	}
+}
+
+// awaitAdversarialDiskWait waits until Weaver says the job began to wait for
+// disk room, and fails at once if the job settles first or Weaver exits. It
+// has no deadline of its own: a wait that never begins is the hang the
+// runner's bound ends.
+func awaitAdversarialDiskWait(jobID int, logOffset int64) error {
+	dbPath := localWeaverDBPath()
+	said := func() (bool, error) {
+		window, err := adversarialReadFrom(localWeaverLogPath(), logOffset)
+		if err != nil {
+			return false, err
+		}
+		return len(graphLogEvents(window, jobID, adversarialDiskWaitMessage)) > 0, nil
+	}
+	for {
+		if dead, waitErr := managedWeaverDied(); dead {
+			return fmt.Errorf("Weaver exited before job %d waited for disk room (%v):\n%s", jobID, waitErr, managedWeaverDeathReport())
+		}
+		if waited, err := said(); err != nil || waited {
+			return err
+		}
+		archived, err := jobArchived(dbPath, jobID)
+		if err != nil {
+			return fmt.Errorf("read job %d archive state: %w", jobID, err)
+		}
+		if archived {
+			// The line is read once more: it is written before the job could
+			// settle after it.
+			if waited, err := said(); err != nil || waited {
+				return err
+			}
+			return fmt.Errorf("job %d settled without waiting for disk room", jobID)
 		}
 		time.Sleep(adversarialPollInterval)
 	}

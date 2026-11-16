@@ -427,7 +427,13 @@ export function useUploadNzb(options?: {
 
       try {
         const payload = await stageNzbUpload(entry.file, controller.signal);
-        if (payload.data?.stageNzbUpload?.kind === "TORRENT" && !graphqlErrorMessage(payload)) {
+        // A torrent is kept whole for submit, unless the server refused it
+        // here (torrents off): that refusal fails the row below.
+        if (
+          payload.data?.stageNzbUpload?.kind === "TORRENT" &&
+          !payload.data.stageNzbUpload.error &&
+          !graphqlErrorMessage(payload)
+        ) {
           if (isEntryCurrent(entry.localId, generation)) {
             setEntriesState((current) =>
               current.map((candidate) =>

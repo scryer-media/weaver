@@ -83,6 +83,9 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     // The record of the files a history entry's archive took travels with
     // the entry.
     table!("job_history_archived_files", Export, RequireEmpty),
+    // The files a torrent's history entry lists for its archive travel with
+    // the entry.
+    table!("job_history_files", Export, RequireEmpty),
     // Finished jobs' stored NZBs travel with their history; an active job's
     // goes with the rest of its active rows.
     table!("job_nzbs", Export, RequireEmpty),
@@ -135,6 +138,7 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("torrents", ResetOnRestore, RequireEmpty),
     table!("torrent_trackers", ResetOnRestore, RequireEmpty),
     table!("torrent_counters", ResetOnRestore, RequireEmpty),
+    table!("torrent_held_paths", ResetOnRestore, RequireEmpty),
     // The hosts torrents have announced to outlive the torrents, and a
     // restore brings them back with the tracker rules picked from them.
     table!("tracker_hosts", Export, Replace),
@@ -171,7 +175,8 @@ pub(crate) fn export_query(table: &str, columns: &[String]) -> String {
         | "job_events"
         | "job_tags"
         | "job_nzbs"
-        | "job_history_archived_files" => "job_id IN (SELECT job_id FROM job_history)",
+        | "job_history_archived_files"
+        | "job_history_files" => "job_id IN (SELECT job_id FROM job_history)",
         "duplicate_job_snapshots" => "lifecycle IN ('succeeded', 'failed', 'cancelled')",
         "job_fingerprints" | "duplicate_admission_claims" | "submission_idempotency" => {
             "job_id IN (

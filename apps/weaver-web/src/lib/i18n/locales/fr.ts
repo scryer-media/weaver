@@ -133,7 +133,6 @@ const fr: LocaleDictionary = {
   "metrics.commitPending": "Validation en attente",
   "metrics.writeBufferedBytes": "Octets en tampon d'écriture",
   "metrics.writeBufferedSegments": "Segments en tampon d'écriture",
-  "metrics.diskWriteLatency": "Latence d'écriture disque",
   "metrics.segmentsDownloaded": "Segments téléchargés",
   "metrics.segmentsDecoded": "Segments décodés",
   "metrics.segmentsCommitted": "Segments validés",

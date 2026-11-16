@@ -8,8 +8,9 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { cn, toBase64 } from "@/lib/utils";
 import { DetailBlock, EmptyState } from "../components/chrome";
 import { PrimaryButton, SecondaryButton, TextField } from "../components/controls";
-import { ANALYZER_ACCEPT, fileKind, isMagnet, maxBytes } from "../data/analyzer";
+import { ANALYZER_ACCEPT, ANALYZER_ACCEPT_NZB, fileKind, isMagnet, maxBytes } from "../data/analyzer";
 import { formatSize } from "../data/format";
+import { useTorrentAddsOffered } from "../data/use-torrents-shown";
 import { runtimeIds } from "../testids";
 import {
   copySupportReport,
@@ -42,6 +43,9 @@ function outcomeOf(
  */
 export function AnalyzerPage() {
   const t = useTranslate();
+  // While torrents are off the analyzer offers NZBs alone, even with torrent jobs left: no magnet
+  // link, no .torrent in the picker.
+  const torrentsOn = useTorrentAddsOffered();
   const [, analyzeNzb] = useMutation<AnalyzeNzbResponse>(ANALYZE_NZB_MUTATION);
   const [, analyzeTorrent] = useMutation<AnalyzeTorrentResponse>(ANALYZE_TORRENT_MUTATION);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -76,10 +80,16 @@ export function AnalyzerPage() {
     if (!file) {
       return;
     }
+    // The picker's filter is only a hint: while torrent things are hidden a
+    // dropped .torrent is ignored, as a dropped magnet is.
+    const head = await file.slice(0, 2).arrayBuffer().then((bytes) => new Uint8Array(bytes), () => null);
+    if (!torrentsOn && head !== null && fileKind(head) === "torrent") {
+      return;
+    }
     setSource({ name: file.name, size: file.size });
     const failed = t("next.analyzer.failed");
     await run(async () => {
-      const kind = fileKind(new Uint8Array(await file.slice(0, 2).arrayBuffer()));
+      const kind = fileKind(head ?? new Uint8Array(await file.slice(0, 2).arrayBuffer()));
       if (file.size > maxBytes(kind)) {
         return { error: t("next.analyzer.tooLarge", { size: formatSize(maxBytes(kind)) }) };
       }
@@ -105,7 +115,7 @@ export function AnalyzerPage() {
   return (
     <NextShell
       title={t("next.nav.analyzer")}
-      note={t("next.analyzer.note")}
+      note={t(torrentsOn ? "next.analyzer.note" : "next.analyzer.noteNzb")}
       controls={
         report === null ? undefined : (
           <>
@@ -135,7 +145,7 @@ export function AnalyzerPage() {
       }
     >
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
-        <DetailBlock title={t("next.analyzer.source")}>
+        <DetailBlock title={t(torrentsOn ? "next.analyzer.source" : "next.analyzer.sourceNzb")}>
           <button
             type="button"
             data-testid={runtimeIds.analyzerDrop}
@@ -151,7 +161,7 @@ export function AnalyzerPage() {
               setDragging(false);
               const file = event.dataTransfer.files[0];
               const text = event.dataTransfer.getData("text/plain");
-              if (file === undefined && isMagnet(text)) {
+              if (torrentsOn && file === undefined && isMagnet(text)) {
                 setMagnet(text.trim());
                 void analyzeMagnet(text);
               } else {
@@ -168,7 +178,7 @@ export function AnalyzerPage() {
             <input
               ref={inputRef}
               type="file"
-              accept={ANALYZER_ACCEPT}
+              accept={torrentsOn ? ANALYZER_ACCEPT : ANALYZER_ACCEPT_NZB}
               className="hidden"
               onChange={(event) => {
                 void analyzeFile(event.target.files?.[0]);
@@ -176,7 +186,9 @@ export function AnalyzerPage() {
               }}
             />
             <span className="font-medium text-wv-fg">
-              {busy ? t("next.analyzer.analyzing") : t("next.analyzer.dropZone")}
+              {busy
+                ? t("next.analyzer.analyzing")
+                : t(torrentsOn ? "next.analyzer.dropZone" : "next.analyzer.dropZoneNzb")}
             </span>
             {source === null ? null : (
               <span className="font-wv-mono text-[11px] text-wv-faint">
@@ -184,26 +196,28 @@ export function AnalyzerPage() {
               </span>
             )}
           </button>
-          <form
-            className="mt-3 flex gap-2"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void analyzeMagnet(magnet);
-            }}
-          >
-            <TextField
-              value={magnet}
-              onChange={setMagnet}
-              label={t("next.analyzer.magnet")}
-              placeholder="magnet:?xt=urn:btih:"
-              className="min-w-0 flex-1"
-              autoComplete="off"
-              testId={runtimeIds.analyzerMagnet}
-            />
-            <PrimaryButton type="submit" disabled={busy || !isMagnet(magnet)} testId={runtimeIds.analyzerAnalyze}>
-              {t("next.analyzer.analyze")}
-            </PrimaryButton>
-          </form>
+          {torrentsOn ? (
+            <form
+              className="mt-3 flex gap-2"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void analyzeMagnet(magnet);
+              }}
+            >
+              <TextField
+                value={magnet}
+                onChange={setMagnet}
+                label={t("next.analyzer.magnet")}
+                placeholder="magnet:?xt=urn:btih:"
+                className="min-w-0 flex-1"
+                autoComplete="off"
+                testId={runtimeIds.analyzerMagnet}
+              />
+              <PrimaryButton type="submit" disabled={busy || !isMagnet(magnet)} testId={runtimeIds.analyzerAnalyze}>
+                {t("next.analyzer.analyze")}
+              </PrimaryButton>
+            </form>
+          ) : null}
           {error === null ? null : (
             <div className="mt-4 border border-wv-danger-border bg-wv-button px-4 py-3 text-[12.5px] text-wv-error-text">
               {error}
@@ -211,7 +225,10 @@ export function AnalyzerPage() {
           )}
         </DetailBlock>
         {report === null ? (
-          <EmptyState title={t("next.analyzer.emptyTitle")} body={t("next.analyzer.emptyBody")} />
+          <EmptyState
+            title={t("next.analyzer.emptyTitle")}
+            body={t(torrentsOn ? "next.analyzer.emptyBody" : "next.analyzer.emptyBodyNzb")}
+          />
         ) : (
           <DetailBlock title={t("next.analyzer.report")} right={notice ?? undefined}>
             <pre data-testid={runtimeIds.analyzerReport} className="overflow-x-auto whitespace-pre font-wv-mono text-[12px] leading-[1.55] text-wv-fg">

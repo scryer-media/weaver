@@ -35,13 +35,17 @@ pub(crate) const JOB_HISTORY_SELECTS: [&str; 2] = [JOB_HISTORY_SELECT, JOB_HISTO
 
 // The failed-job sweep's page, first and following. The predicate is spelled
 // out literally so the partial unswept-failed index serves the filter and
-// the sort. The plan test reads these same texts.
+// the sort. A job whose torrent row stands is live, its folders its own,
+// and is passed: the torrent's key answers that for each row. The plan test
+// reads these same texts.
 pub(crate) const FAILED_SWEEP_FIRST_PAGE_SQL: &str = "SELECT job_id, completed_at, output_dir FROM job_history \
      WHERE status = 'failed' AND files_swept_at IS NULL AND completed_at <= {} \
+     AND NOT EXISTS (SELECT 1 FROM torrents WHERE torrents.job_id = job_history.job_id) \
      ORDER BY completed_at DESC, job_id DESC LIMIT {}";
 pub(crate) const FAILED_SWEEP_NEXT_PAGE_SQL: &str = "SELECT job_id, completed_at, output_dir FROM job_history \
      WHERE status = 'failed' AND files_swept_at IS NULL AND completed_at <= {} \
      AND (completed_at < {} OR (completed_at = {} AND job_id < {})) \
+     AND NOT EXISTS (SELECT 1 FROM torrents WHERE torrents.job_id = job_history.job_id) \
      ORDER BY completed_at DESC, job_id DESC LIMIT {}";
 
 impl Database {
@@ -266,9 +270,30 @@ impl Database {
         })
     }
 
+    // One page of the history rows, hidden ones too, whose status is
+    // `status`, newest first, as `(completed_at, job_id)`, at most `limit`
+    // of them. `after` is the last pair of the page before, so a page never
+    // repeats a row. A range of the status index, read in its order.
+    pub(crate) fn job_history_ids_by_status_page(
+        &self,
+        status: &str,
+        after: Option<(i64, u64)>,
+        limit: usize,
+    ) -> Result<Vec<(i64, u64)>, StateError> {
+        let datastore = self.datastore();
+        let (sql, args) = history_status_ids_sql(status, after, limit);
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
+            rows.into_iter()
+                .map(|row| Ok((row.i64("completed_at")?, row.i64("job_id")? as u64)))
+                .collect()
+        })
+    }
+
     // The ids of every history row, hidden ones too, whose status is one of
     // `statuses`, in the order `list_job_history` returns them by default:
-    // newest first.
+    // newest first. The unpaged read the pages replace.
+    #[cfg(test)]
     pub(crate) fn list_job_history_ids_by_status(
         &self,
         statuses: &[&str],
@@ -1122,6 +1147,29 @@ fn archived_history_files_sql(job_id: u64, from: u64, limit: usize) -> (String, 
     )
 }
 
+// The scheduled retention read: ids of one status only, newest first, a
+// range of the status index, paged on `(completed_at, job_id)`.
+fn history_status_ids_sql(
+    status: &str,
+    after: Option<(i64, u64)>,
+    limit: usize,
+) -> (String, Vec<SqlArg>) {
+    let mut sql = String::from("SELECT job_id, completed_at FROM job_history WHERE status = {}");
+    let mut args = vec![SqlArg::Text(status.to_owned())];
+    if let Some((completed_at, job_id)) = after {
+        // The upper bound keeps the read a range of the index.
+        sql.push_str(" AND completed_at <= {} AND (completed_at < {} OR job_id < {})");
+        args.extend([
+            SqlArg::I64(completed_at),
+            SqlArg::I64(completed_at),
+            SqlArg::I64(job_id as i64),
+        ]);
+    }
+    sql.push_str(" ORDER BY completed_at DESC, job_id DESC LIMIT {}");
+    args.push(SqlArg::I64(limit as i64));
+    (sql, args)
+}
+
 // The retention read: ids only, a range of a completed-at index, paged on
 // `(completed_at, job_id)`.
 fn history_completed_by_sql(
@@ -1208,6 +1256,36 @@ mod order_index_tests {
                 "{detail}"
             );
             assert!(!detail.contains("TEMP B-TREE"), "{detail}");
+        }
+    }
+
+    // The scheduled retention read of one status is a range of the status
+    // index, with and without its cursor, and sorts nothing.
+    #[test]
+    fn the_status_retention_read_is_served_by_the_status_index() {
+        let db = Database::open_in_memory().unwrap();
+        for status in ["failed", "complete"] {
+            for after in [None, Some((1_700_000_000, 9))] {
+                let (sql, args) = history_status_ids_sql(status, after, 1000);
+                let sql = format!("EXPLAIN QUERY PLAN {sql}");
+                let datastore = db.datastore();
+                let detail = db
+                    .run_sql_blocking_read(async move {
+                        let rows =
+                            SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
+                        rows.iter()
+                            .map(|row| row.text("detail"))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .unwrap()
+                    .join("; ");
+                println!("status retention plan, {status}, cursor {after:?}: {detail}");
+                assert!(
+                    detail.contains("USING COVERING INDEX idx_job_history_status_completed_job"),
+                    "{detail}"
+                );
+                assert!(!detail.contains("TEMP B-TREE"), "{detail}");
+            }
         }
     }
 

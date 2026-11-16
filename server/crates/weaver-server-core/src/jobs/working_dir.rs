@@ -112,6 +112,25 @@ pub fn claim_named_working_dir(root: &Path, path: &Path, job_id: JobId) -> std::
     Ok(existed)
 }
 
+// The directory under `root` a job names for itself, as a torrent's
+// unpacking does: the one already carrying its marker, the suffixed name
+// first, as a claim falls back to it; else `name`, unless another job's
+// marker holds it, and then the suffixed name. Asked again, it names the
+// same directory while that one is there, whatever became of the other: at
+// most two marker reads, no scan of the root.
+pub(crate) fn own_named_dir(root: &Path, name: &str, job_id: JobId) -> PathBuf {
+    let dir_name = sanitize_dirname(name);
+    let suffixed = suffixed_working_dir(root, &dir_name, job_id);
+    if matches!(working_dir_owner(root, &suffixed), Ok(Some(owner)) if owner == job_id) {
+        return suffixed;
+    }
+    let plain = root.join(&dir_name);
+    match working_dir_owner(root, &plain) {
+        Ok(Some(owner)) if owner != job_id => suffixed,
+        _ => plain,
+    }
+}
+
 fn create_working_dir(
     intermediate_dir: &Path,
     job_id: JobId,
@@ -908,6 +927,24 @@ pub fn remove_job_working_dir(
     }
 }
 
+// `remove_job_working_dir`, for a remover that may come after another of
+// the same directory: a directory that is gone is removed, and so owned.
+pub(crate) fn remove_job_working_dir_if_there(
+    root: &Path,
+    path: &Path,
+    job_id: JobId,
+) -> std::io::Result<HistoryWorkingDir> {
+    match remove_job_working_dir(root, path, job_id) {
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && matches!(std::fs::symlink_metadata(path), Err(gone) if gone.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(HistoryWorkingDir::Owned)
+        }
+        result => result,
+    }
+}
+
 // A failed job's working directory keeps only what the job delivered. The
 // graph's internals and the run's caches go: their checkpoint leaves with
 // the job, so nothing could read them again. A directory left holding nothing but its ownership
@@ -955,42 +992,104 @@ pub(crate) struct FollowedDir {
     // suffixed name: giving the claim up leaves it.
     existed: bool,
     // The directory the job had, when it was there: this job's own, holding
-    // nothing but its marker.
-    old: Option<(Dir, PathBuf)>,
+    // nothing but its marker. Only its path is kept: on Windows a folder held
+    // open cannot be removed by anyone else, and a cancel's cleanup may
+    // remove it while the row is written.
+    old: Option<PathBuf>,
 }
 
 impl FollowedDir {
     // The job's row names the new directory: the old one goes, if it still
     // holds nothing but the marker.
     pub(crate) fn leave_old(self) {
-        let Some((dir, path)) = self.old else {
+        let Some(path) = self.old else {
             return;
         };
-        let emptied = (|| {
-            for entry in dir.entries()? {
-                if entry?.file_name() != WORKING_DIR_MARKER {
-                    return Ok(false);
+        let Some(old_root) = path.parent() else {
+            return;
+        };
+        // Opened again by its path and judged as at the claim: gone
+        // meanwhile, or no longer the job's own with nothing but its marker,
+        // and it is left.
+        let emptied = match open_working_directory(old_root, &path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+            Ok(dir) => holds_only_its_marker(&dir, &path, self.job_id).and_then(|only| {
+                if only {
+                    dir.remove_open_dir_all().map(|()| true)
+                } else {
+                    Ok(false)
                 }
-            }
-            dir.remove_open_dir_all().map(|()| true)
-        })();
+            }),
+        };
         if let Err(error) = emptied {
             tracing::warn!(job_id = self.job_id.0, dir = %path.display(), %error, "could not remove the working directory a job moved out of");
         }
     }
 
     // The new directory is not the job's after all: what the claim made
-    // goes, and whatever the job had stays as it is.
+    // goes, and whatever the job had stays as it is. It goes while it holds
+    // nothing but its marker, or not even that, as a removal of it cut short
+    // leaves it: anything else in it is not the claim's to remove.
     pub(crate) fn abandon(self) {
         if self.existed {
             return;
         }
-        if let Err(error) = remove_job_working_dir(&self.root, &self.path, self.job_id)
+        let removed = (|| {
+            let dir = match open_working_directory(&self.root, &self.path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                result => result?,
+            };
+            let mut entries = 0;
+            for entry in dir.entries()? {
+                if entry?.file_name() != WORKING_DIR_MARKER {
+                    return Ok(());
+                }
+                entries += 1;
+            }
+            if entries == 0 {
+                // Judged under the claim lock, so a claim of the same name
+                // that has made the directory and not yet marked it is not
+                // taken for one cut short.
+                let _claims = claims();
+                if dir.entries()?.next().is_none() {
+                    return dir.remove_open_dir_all();
+                }
+                return Ok(());
+            }
+            if holds_only_its_marker(&dir, &self.path, self.job_id)? {
+                dir.remove_open_dir_all()?;
+            }
+            Ok::<_, std::io::Error>(())
+        })();
+        if let Err(error) = removed
             && error.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(job_id = self.job_id.0, dir = %self.path.display(), %error, "could not remove a working directory claimed for a job that did not take it");
         }
     }
+}
+
+// Whether the working directory `dir`, at `path`, is `job_id`'s own and holds
+// nothing but its marker. A marker that cannot be read proves nothing.
+fn holds_only_its_marker(dir: &Dir, path: &Path, job_id: JobId) -> std::io::Result<bool> {
+    let Ok(stored) = read_working_marker(dir) else {
+        return Ok(false);
+    };
+    if marker_job_id(&stored) != Some(job_id)
+        || !matches!(
+            match_marker(dir, path, &stored, job_id)?,
+            MarkerMatch::Current | MarkerMatch::Legacy
+        )
+    {
+        return Ok(false);
+    }
+    for entry in dir.entries()? {
+        if entry?.file_name() != WORKING_DIR_MARKER {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 // A job that never started works under the intermediate folder set now. Its
@@ -1024,24 +1123,12 @@ pub(crate) fn follow_intermediate_dir(
     let old = match open_working_directory(old_root, current) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
+        // The handle is dropped here, before the claim: see `FollowedDir::old`.
         Ok(dir) => {
-            let Ok(stored) = read_working_marker(&dir) else {
-                return Ok(None);
-            };
-            if marker_job_id(&stored) != Some(job_id)
-                || !matches!(
-                    match_marker(&dir, current, &stored, job_id)?,
-                    MarkerMatch::Current | MarkerMatch::Legacy
-                )
-            {
+            if !holds_only_its_marker(&dir, current, job_id)? {
                 return Ok(None);
             }
-            for entry in dir.entries()? {
-                if entry?.file_name() != WORKING_DIR_MARKER {
-                    return Ok(None);
-                }
-            }
-            Some((dir, current.to_path_buf()))
+            Some(current.to_path_buf())
         }
     };
     let claimed = if same_root {
@@ -1190,6 +1277,27 @@ pub(crate) fn mark_legacy_output_dir(dir: &Path) -> std::io::Result<()> {
             output_path_digest(&canonical)
         ),
     )
+}
+
+// Removes `dir` once it holds nothing but, at most, the marker naming
+// `job_id`: the folder a torrent's job made for its files, which goes once
+// they have, as an empty one did before it was marked. One holding anything
+// else, or another job's marker, stays. Whether it went.
+pub(crate) fn remove_emptied_output_dir(dir: &Path, job_id: JobId) -> std::io::Result<bool> {
+    let mut marker = false;
+    for entry in std::fs::read_dir(dir)? {
+        if entry?.file_name() != OUTPUT_DIR_MARKER || marker {
+            return Ok(false);
+        }
+        marker = true;
+    }
+    if marker {
+        if output_dir_owner(dir) != Some(OutputDirOwner::Job(job_id)) {
+            return Ok(false);
+        }
+        std::fs::remove_file(dir.join(OUTPUT_DIR_MARKER))?;
+    }
+    std::fs::remove_dir(dir).map(|()| true)
 }
 
 // Removes an output directory its marker proved Weaver's, the marker last:
@@ -1792,6 +1900,77 @@ mod tests {
         assert!(earlier.join("kept.bin").exists());
     }
 
+    // A claim given up after a removal of what it made was cut short, its
+    // marker gone and the folder left, still leaves no folder; one that
+    // holds anything but its marker is not the claim's to remove.
+    #[test]
+    fn a_claim_given_up_removes_its_folder_with_or_without_its_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let (old_root, root) = (temp.path().join("old"), temp.path().join("new"));
+        let old = claim_working_dir(&old_root, JobId(6), "job").unwrap().path;
+
+        let unmarked = follow_intermediate_dir(&root, &old, JobId(6), "job")
+            .unwrap()
+            .unwrap();
+        let path = unmarked.path.clone();
+        std::fs::remove_file(working_dir_marker_path(&path)).unwrap();
+        unmarked.abandon();
+        assert!(!path.exists(), "the unmarked folder the claim made is left");
+
+        let marked = follow_intermediate_dir(&root, &old, JobId(6), "job")
+            .unwrap()
+            .unwrap();
+        let path = marked.path.clone();
+        marked.abandon();
+        assert!(!path.exists(), "the marked folder the claim made is left");
+
+        let filled = follow_intermediate_dir(&root, &old, JobId(6), "job")
+            .unwrap()
+            .unwrap();
+        let path = filled.path.clone();
+        std::fs::write(path.join("other.bin"), b"other").unwrap();
+        filled.abandon();
+        assert!(path.join("other.bin").exists());
+    }
+
+    // While a move is out, the directory the job had is removed whole by
+    // whoever removes it, as a cancel does: the move holds no handle to it.
+    // Given up, the move leaves nothing of it; a move that keeps going and
+    // finds it gone removes nothing, and finds a directory made there since
+    // with another's marker not its to remove.
+    #[test]
+    fn a_move_that_is_out_holds_nothing_open_of_the_directory_it_leaves() {
+        let temp = tempfile::tempdir().unwrap();
+        let (old_root, root) = (temp.path().join("old"), temp.path().join("new"));
+        let old = claim_working_dir(&old_root, JobId(9), "job").unwrap().path;
+
+        let followed = follow_intermediate_dir(&root, &old, JobId(9), "job")
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(&old).unwrap();
+        assert!(!old.exists());
+        followed.abandon();
+        assert!(!old.exists());
+
+        let old = claim_working_dir(&old_root, JobId(9), "job").unwrap().path;
+        let followed = follow_intermediate_dir(&root, &old, JobId(9), "job")
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(&old).unwrap();
+        followed.leave_old();
+        assert!(!old.exists());
+
+        let old = claim_working_dir(&old_root, JobId(9), "job").unwrap().path;
+        let followed = follow_intermediate_dir(&root, &old, JobId(9), "job")
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(&old).unwrap();
+        let other = claim_working_dir(&old_root, JobId(10), "job").unwrap().path;
+        assert_eq!(other, old);
+        followed.leave_old();
+        assert!(is_job_working_dir(&old_root, &other, JobId(10)).unwrap());
+    }
+
     // A root that is not there cannot be read, and says so; a root that is
     // names each marked directory by its job and passes what is no
     // directory.
@@ -1866,5 +2045,64 @@ mod tests {
         assert!(!claim_named_working_dir(&root, &path, JobId(6)).unwrap());
         assert!(is_job_working_dir(&root, &path, JobId(6)).unwrap());
         assert!(claim_named_working_dir(&root, &path, JobId(6)).unwrap());
+    }
+
+    // An NZB job named "torrent-7" and torrent 7's unpacking each keep a
+    // folder of their own, whichever claims first, and neither's removal
+    // takes the other's.
+    #[test]
+    fn an_nzb_job_named_as_a_torrents_unpacking_and_the_torrent_keep_their_own_folders() {
+        let (nzb, torrent) = (JobId(9), JobId(7));
+        for nzb_first in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("intermediate");
+            let (nzb_dir, torrent_dir) = if nzb_first {
+                let nzb_dir = claim_working_dir(&root, nzb, "torrent-7").unwrap().path;
+                let torrent_dir = own_named_dir(&root, "torrent-7", torrent);
+                claim_named_working_dir(&root, &torrent_dir, torrent).unwrap();
+                (nzb_dir, torrent_dir)
+            } else {
+                let torrent_dir = own_named_dir(&root, "torrent-7", torrent);
+                claim_named_working_dir(&root, &torrent_dir, torrent).unwrap();
+                let nzb_dir = claim_working_dir(&root, nzb, "torrent-7").unwrap().path;
+                (nzb_dir, torrent_dir)
+            };
+            assert_ne!(nzb_dir, torrent_dir, "nzb first: {nzb_first}");
+            assert_eq!(
+                own_named_dir(&root, "torrent-7", torrent),
+                torrent_dir,
+                "asked again, the torrent names the same folder"
+            );
+            assert!(is_job_working_dir(&root, &nzb_dir, nzb).unwrap());
+            assert!(is_job_working_dir(&root, &torrent_dir, torrent).unwrap());
+            std::fs::write(nzb_dir.join("nzb.bin"), b"n").unwrap();
+            std::fs::write(torrent_dir.join("torrent.bin"), b"t").unwrap();
+
+            assert!(remove_job_working_dir(&root, &nzb_dir, torrent).is_err());
+            assert!(remove_job_working_dir(&root, &torrent_dir, nzb).is_err());
+            assert_eq!(
+                remove_job_working_dir(&root, &torrent_dir, torrent).unwrap(),
+                HistoryWorkingDir::Owned
+            );
+            assert!(!torrent_dir.exists());
+            assert!(nzb_dir.join("nzb.bin").exists(), "the NZB job's stays");
+        }
+    }
+
+    // A torrent's unpacking that took its suffixed folder because an NZB
+    // job held the plain name keeps naming that folder once the NZB job's
+    // is gone: the name is the one its marker is in, never recomputed back.
+    #[test]
+    fn a_torrents_suffixed_unpacking_folder_keeps_its_name_once_the_plain_one_is_free() {
+        let (nzb, torrent) = (JobId(9), JobId(7));
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("intermediate");
+        let nzb_dir = claim_working_dir(&root, nzb, "torrent-7").unwrap().path;
+        let torrent_dir = own_named_dir(&root, "torrent-7", torrent);
+        assert_ne!(torrent_dir, nzb_dir);
+        claim_named_working_dir(&root, &torrent_dir, torrent).unwrap();
+        remove_job_working_dir(&root, &nzb_dir, nzb).unwrap();
+        assert!(!nzb_dir.exists());
+        assert_eq!(own_named_dir(&root, "torrent-7", torrent), torrent_dir);
     }
 }

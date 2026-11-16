@@ -14,9 +14,19 @@ use crate::operations::instrumentation::DiskSpaceSnapshot;
 use crate::runtime::StartupDiskGate;
 use crate::runtime::system_profile::{FilesystemType, StorageClass};
 
+pub(crate) mod holes;
 mod storage_kind;
+pub(crate) mod volume;
+pub(crate) mod volume_label;
+mod volume_probe;
+pub(crate) mod volume_rate;
+mod volume_view;
+mod volumes;
+pub(crate) mod writer;
 
-pub(crate) use storage_kind::StorageKind;
+pub(crate) use storage_kind::{StorageKind, storage_kind};
+#[allow(unused_imports)]
+pub(crate) use volume_probe::{ProbeStore, probe_once};
 
 // Capacity for the filesystem backing a path.
 #[derive(Debug, Clone, Copy)]
@@ -263,6 +273,10 @@ fn nearest_device(path: &Path) -> Option<u64> {
     #[cfg(any(test, feature = "test-support"))]
     count_disk_look();
     #[cfg(test)]
+    if crate::runtime::fs::test_devices::refused(path) {
+        return None;
+    }
+    #[cfg(test)]
     if let Some(device) = crate::runtime::fs::test_devices::of(path) {
         return Some(device);
     }
@@ -294,30 +308,52 @@ fn directory_device(path: &Path) -> Option<u64> {
     metadata.is_dir().then(|| metadata.dev())
 }
 
+// The volume a directory lies on is told by the volume's GUID path, the name
+// the OS keeps for it wherever and however often it is mounted: two drive
+// letters or folders that mount one volume give one id, and two volumes
+// never share one, which a volume's serial number does not promise. A
+// network share has no GUID path, and is told by its share root instead.
 #[cfg(windows)]
 fn directory_device(path: &Path) -> Option<u64> {
-    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle,
-    };
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW;
+
     if !std::fs::metadata(path).ok()?.is_dir() {
         return None;
     }
-    let directory = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
-        .ok()?;
-    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
-    // SAFETY: the handle is open for the call and `info` is a valid slot.
-    let result =
-        unsafe { GetFileInformationByHandle(directory.as_raw_handle(), info.as_mut_ptr()) };
-    if result == 0 {
-        return None;
-    }
-    // SAFETY: the call succeeded, so it filled `info`.
-    let info = unsafe { info.assume_init() };
-    Some(u64::from(info.dwVolumeSerialNumber))
+    let root = storage_kind::volume_root(path)?;
+    // A GUID path is 49 units and its NUL.
+    let mut name = [0u16; 50];
+    // SAFETY: `root` holds the NUL-terminated volume path just written, and
+    // `name` is as long as the length passed; the return code is checked
+    // before `name` is read.
+    let found = unsafe {
+        GetVolumeNameForVolumeMountPointW(root.as_ptr(), name.as_mut_ptr(), name.len() as u32)
+    };
+    Some(if found != 0 {
+        volume_identity(&name)
+    } else {
+        volume_identity(&root)
+    })
+}
+
+// The device id of a volume from its name: the units before the first NUL,
+// letters of either case alike, as one stable number. The same name gives
+// the same id in every run.
+#[cfg(any(windows, test))]
+fn volume_identity(name: &[u16]) -> u64 {
+    // FNV-1a over each unit's two bytes.
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    name.iter()
+        .take_while(|unit| **unit != 0)
+        .map(|unit| match *unit {
+            upper @ 0x41..=0x5a => upper + 0x20,
+            unit => unit,
+        })
+        .flat_map(u16::to_le_bytes)
+        .fold(OFFSET, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+        })
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -738,6 +774,14 @@ struct Counts {
     device: [AtomicU64; LEDGERS],
     // How many times any of the ledgers rang those waiting for room.
     rings: AtomicU64,
+    // Rung with every ring for each listener waiting then: the pipeline
+    // hears `readings`, which keeps one ring for its next turn; a waiter
+    // outside it, such as a torrent waiting for room, listens here.
+    rung: tokio::sync::Notify,
+    // Held while a writer checks the room and books it, so two writers on
+    // the ledgers cannot pass one check. Nothing is read from the disk
+    // under it: only the cached reading and the counts.
+    booking: std::sync::Mutex<()>,
 }
 
 impl fmt::Debug for DiskLedger {
@@ -883,6 +927,90 @@ impl DiskLedger {
         })
     }
 
+    // `need` bytes are booked when the room above `reserve` that a good
+    // reading of `reader` leaves here holds them, with up to `extra` more
+    // beside them: checked and promised in one step, so no other writer
+    // books between the two. Returns how much of `extra` was booked; `None`
+    // books nothing. A volume with no reading, or a stale one, or no
+    // reserve, is not checked.
+    pub(crate) fn book(
+        &self,
+        reader: &CapacityReader,
+        reserve: u64,
+        need: u64,
+        extra: u64,
+    ) -> Option<u64> {
+        let _booking = self
+            .counts
+            .booking
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let room = checked_room(self, reader, reserve);
+        if need > room {
+            return None;
+        }
+        let extra = extra.min(room - need);
+        self.promise(need + extra);
+        Some(extra)
+    }
+
+    // `need` bytes are promised to a waiter a reading wakes, when the room
+    // it shows above `reserve` holds them: [`DiskLedger::book_wake`] on
+    // this ledger alone.
+    pub(crate) fn book_woken(&self, reader: &CapacityReader, reserve: u64, need: u64) -> bool {
+        Self::book_wake(&[(self, reader, need)], reserve)
+    }
+
+    // A waiter a reading wakes is promised what it needs on each ledger it
+    // waits on, `(ledger, reader, need)`, when every one has room for it
+    // above `reserve`: the one wake judgement every ledger waiter wakes by,
+    // a usenet job's and a torrent's alike, checked and promised in one
+    // step under the booking lock of each ledger, so no writer books
+    // between the two. A ledger at or under its reserve wakes no one,
+    // whatever it is owed. Ledgers on one disk are judged once, together,
+    // by the room the first of them shows; each is promised its own need,
+    // in the order given. Nothing is promised unless all fit.
+    pub(crate) fn book_wake(parts: &[(&DiskLedger, &CapacityReader, u64)], reserve: u64) -> bool {
+        let mut locks: Vec<&Counts> = parts.iter().map(|(ledger, ..)| &*ledger.counts).collect();
+        locks.sort_by_key(|counts| std::ptr::from_ref::<Counts>(counts) as usize);
+        locks.dedup_by(|one, other| std::ptr::eq(*one, *other));
+        let _booking: Vec<_> = locks
+            .iter()
+            .map(|counts| {
+                counts
+                    .booking
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            })
+            .collect();
+        let rooms: Vec<Option<u64>> = parts
+            .iter()
+            .map(|(ledger, reader, _)| waking_room(ledger, reader, reserve))
+            .collect();
+        if rooms.contains(&Some(0)) {
+            return false;
+        }
+        for (at, (ledger, ..)) in parts.iter().enumerate() {
+            if parts[..at]
+                .iter()
+                .any(|(first, ..)| first.same_disk(ledger))
+            {
+                continue;
+            }
+            let need = parts[at..]
+                .iter()
+                .filter(|(other, ..)| ledger.same_disk(other))
+                .fold(0u64, |sum, (.., need)| sum.saturating_add(*need));
+            if !super::room_wait::room_holds(rooms[at], need) {
+                return false;
+            }
+        }
+        for (ledger, _, need) in parts {
+            ledger.promise(*need);
+        }
+        true
+    }
+
     // `bytes` more are promised.
     pub(crate) fn promise(&self, bytes: u64) {
         if bytes > 0 {
@@ -935,6 +1063,12 @@ impl DiskLedger {
         self.counts.waiters[self.index].load(Ordering::Acquire) > 0
     }
 
+    // How many writers wait for room here.
+    #[cfg(test)]
+    pub(crate) fn waiters(&self) -> u64 {
+        self.counts.waiters[self.index].load(Ordering::Acquire)
+    }
+
     // A reading's key: its `sampled_at` as its distance from `base`, plus
     // one.
     fn key(&self, reading: CapacityReading) -> u64 {
@@ -985,6 +1119,7 @@ impl DiskLedger {
         if waited {
             self.counts.rings.fetch_add(1, Ordering::Release);
             self.readings.notify_one();
+            self.counts.rung.notify_waiters();
         }
     }
 
@@ -1035,6 +1170,34 @@ impl CapacityReader {
 
     pub fn current(&self) -> Capacity {
         (self.read)()
+    }
+}
+
+// The room above `reserve` a good reading of `reader` leaves on `ledger`:
+// every byte with no reserve, no reading, or a stale one, which checks
+// nothing. The one reserve sum every writer books by, through
+// [`DiskLedger::book`], usenet's and torrents' alike.
+fn checked_room(ledger: &DiskLedger, reader: &CapacityReader, reserve: u64) -> u64 {
+    match ledger.free_with(|| reader.current()) {
+        Some(free) if reserve > 0 && !free.stale => free.bytes.saturating_sub(reserve),
+        _ => u64::MAX,
+    }
+}
+
+// What a writer waiting here for room sees of a reading: the room above
+// `reserve` the ledger leaves, `None` with no reading, and none at all for
+// the last good reading held across a failed probe, which shows nothing
+// made. The one judgement every writer waiting on a ledger wakes by,
+// usenet's jobs and torrents alike.
+pub(crate) fn waking_room(
+    ledger: &DiskLedger,
+    reader: &CapacityReader,
+    reserve: u64,
+) -> Option<u64> {
+    match ledger.free_with(|| reader.current()) {
+        None => None,
+        Some(free) if free.stale => Some(0),
+        Some(free) => Some(free.bytes.saturating_sub(reserve)),
     }
 }
 
@@ -1138,6 +1301,18 @@ pub enum OnDemandSpace {
 // How long an on-demand look may take before its asker is told it did not
 // answer. A network mount that hangs must not hold a request.
 pub const ON_DEMAND_TIMEOUT: Duration = Duration::from_secs(3);
+
+// How long an on-demand look is waited for, by an owner and without one:
+// [`ON_DEMAND_TIMEOUT`]. Code built for tests, which builds every test
+// pipeline, waits a day instead: a test's answer must not depend on how
+// loaded the machine running it is, and the test runner bounds the test.
+fn on_demand_wait() -> Duration {
+    if cfg!(any(test, feature = "test-support")) {
+        Duration::from_secs(24 * 60 * 60)
+    } else {
+        ON_DEMAND_TIMEOUT
+    }
+}
 
 // Every folder asked after that is not a root's directory with a current
 // reading: each configured category's folder, a folder typed in, a job's
@@ -1331,10 +1506,12 @@ enum Unsettled {
     TimedOut,
 }
 
-// `path` when it exists, else the nearest folder above it that does.
+// `path` when it is a folder that exists, else the nearest folder above it
+// that does. A file on the way is passed over: Windows reads free space only
+// at a folder.
 fn nearest_existing_ancestor(path: &Path) -> PathBuf {
     path.ancestors()
-        .find(|candidate| !candidate.as_os_str().is_empty() && candidate.exists())
+        .find(|candidate| !candidate.as_os_str().is_empty() && candidate.is_dir())
         .unwrap_or(path)
         .to_path_buf()
 }
@@ -1371,13 +1548,15 @@ fn lock_paths(cache: &Mutex<PathCache>) -> std::sync::MutexGuard<'_, PathCache> 
 // path. Its device is read first and handed out at once, so an asker of the
 // device never waits on the free space; then the free space. Each part is
 // stored in `cache`, when there is one, as it returns, and handed to every
-// waiter. A look that panics closes the channel, and its waiters are told
-// it was lost.
+// waiter. The device's volume is made known in `volumes`, when given. A
+// look that panics closes the channel, and its waiters are told it was
+// lost.
 fn spawn_look(
     probe: SharedProbeFn,
     clock: Arc<Clock>,
     path: PathBuf,
     cache: Option<Arc<Mutex<PathCache>>>,
+    volumes: Option<Arc<volumes::Volumes>>,
 ) -> LookWatch {
     let (sender, receiver) = tokio::sync::watch::channel(LookProgress::default());
     drop(tokio::task::spawn_blocking(move || {
@@ -1385,6 +1564,11 @@ fn spawn_look(
             device: nearest_device(&path),
             at: clock.now(),
         };
+        // The device's volume is known before the device is: whoever is
+        // answered the device from memory finds its volume there too.
+        if let Some(volumes) = &volumes {
+            volumes.seen(device.device, &path);
+        }
         if let Some(cache) = &cache
             && let Some(entry) = lock_paths(cache).entries.get_mut(&path)
         {
@@ -1396,7 +1580,14 @@ fn spawn_look(
             && let Some(entry) = lock_paths(cache).entries.get_mut(&path)
         {
             entry.space = Some(Arc::clone(&space));
-            entry.flight = None;
+            // A look begun after this one's device read failed is out still.
+            if entry
+                .flight
+                .as_ref()
+                .is_some_and(|flight| flight.same_channel(&sender.subscribe()))
+            {
+                entry.flight = None;
+            }
         }
         sender.send_modify(|progress| progress.space = Some(space));
     }));
@@ -1699,6 +1890,7 @@ impl HeldPaths {
         }
         ledger.counts.rings.fetch_add(1, Ordering::Release);
         ledger.readings.notify_one();
+        ledger.counts.rung.notify_waiters();
     }
 }
 
@@ -1747,11 +1939,26 @@ pub struct StorageCapacity {
     readings: Arc<tokio::sync::Notify>,
     // Every other path asked after, looked at on demand.
     paths: Arc<Mutex<PathCache>>,
+    // The volumes asked after, one per device. Shared with the threads
+    // that read a device, which make its volume known as they do.
+    volumes: Arc<volumes::Volumes>,
     // The paths off the roots' disks that jobs wait for room on.
     held: Arc<HeldPaths>,
     interval: Duration,
     probe: SharedProbeFn,
     clock: Arc<Clock>,
+    // The room promised to waiters let go on a reading, of every kind,
+    // until their steps end.
+    promises: super::room_wait::RoomPromises,
+    // How many times anything looked up the root a path lies on, through
+    // this owner: a test's own count, whatever other tests look up.
+    #[cfg(test)]
+    root_looks: Arc<AtomicU64>,
+    // What the volume write rate sampler waits on, and is stopped by.
+    volume_rates: Arc<volume_rate::RateSignal>,
+    // How long an on-demand look may take (`ON_DEMAND_TIMEOUT`, unless a
+    // test pipeline set it).
+    on_demand_timeout_nanos: AtomicU64,
 }
 
 impl fmt::Debug for StorageCapacity {
@@ -1807,6 +2014,7 @@ impl StorageCapacity {
         let readings = Arc::new(tokio::sync::Notify::new());
         // The roots' ledgers count together where they share a filesystem.
         let counts = Arc::new(Counts::default());
+        let volumes = Arc::new(volumes::Volumes::default());
         let slots = StorageRoot::ALL.map(|root| {
             Arc::new_cyclic(|slot: &std::sync::Weak<RootSlot>| {
                 let slot = slot.clone();
@@ -1856,6 +2064,7 @@ impl StorageCapacity {
             let thread_slot = Arc::clone(slot);
             let thread_probe: SharedProbeFn = Arc::clone(&probe);
             let thread_gate = startup_disk_work.clone();
+            let thread_volumes = Arc::clone(&volumes);
             // The complete root's thread reads the held paths with it.
             let thread_held = (slot.root == StorageRoot::Complete).then(|| Arc::clone(&held));
             let spawned = std::thread::Builder::new()
@@ -1866,6 +2075,7 @@ impl StorageCapacity {
                         interval,
                         thread_probe,
                         &thread_gate,
+                        &thread_volumes,
                         thread_held.as_deref(),
                     )
                 });
@@ -1881,11 +2091,43 @@ impl StorageCapacity {
             slots,
             readings,
             paths: Arc::default(),
+            volumes,
             held,
             interval,
             probe,
             clock,
+            promises: super::room_wait::RoomPromises::default(),
+            #[cfg(test)]
+            root_looks: Arc::default(),
+            volume_rates: Arc::default(),
+            on_demand_timeout_nanos: AtomicU64::new(on_demand_wait().as_nanos() as u64),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_looks(&self) -> u64 {
+        self.root_looks.load(Ordering::Relaxed)
+    }
+
+    // The room promised to waiters let go on a reading, usenet's jobs and
+    // torrents alike, until their steps end.
+    pub(crate) fn promises(&self) -> &super::room_wait::RoomPromises {
+        &self.promises
+    }
+
+    // How long `spaces` waits for this owner's looks.
+    fn on_demand_timeout(&self) -> Duration {
+        Duration::from_nanos(self.on_demand_timeout_nanos.load(Ordering::Relaxed))
+    }
+
+    // Wait `timeout` for an on-demand look instead of `on_demand_wait`: for
+    // a test of the limit itself.
+    #[cfg(test)]
+    fn set_on_demand_timeout(&self, timeout: Duration) {
+        self.on_demand_timeout_nanos.store(
+            timeout.as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
     }
 
     // The free space of each asked path, in the order asked: a root's
@@ -1896,7 +2138,8 @@ impl StorageCapacity {
     // others still answer. Without an owner (no pipeline) each path gets a
     // look of its own that nothing keeps.
     pub async fn spaces(storage: Option<&Self>, asks: &[(PathBuf, Reach)]) -> Vec<OnDemandSpace> {
-        let deadline = tokio::time::Instant::now() + ON_DEMAND_TIMEOUT;
+        let deadline = tokio::time::Instant::now()
+            + storage.map_or_else(on_demand_wait, StorageCapacity::on_demand_timeout);
         let tickets: Vec<Ticket> = asks
             .iter()
             .map(|(path, reach)| match storage {
@@ -1907,6 +2150,7 @@ impl StorageCapacity {
                     Arc::new(probe_disk_space),
                     Arc::new(Clock::new()),
                     path.clone(),
+                    None,
                     None,
                 )),
             })
@@ -1943,7 +2187,7 @@ impl StorageCapacity {
     pub(crate) async fn same_filesystem(&self, a: &Path, b: &Path) -> bool {
         #[cfg(test)]
         SAME_FILESYSTEM_ASKS.fetch_add(1, Ordering::Relaxed);
-        let deadline = tokio::time::Instant::now() + ON_DEMAND_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + self.on_demand_timeout();
         let tickets = [a, b].map(|path| {
             self.root_device(path)
                 .map_or_else(|| self.begin(path, Want::Device), Ticket::Device)
@@ -2004,6 +2248,16 @@ impl StorageCapacity {
         })
     }
 
+    // What a root whose directory is `path` says of the device under it:
+    // `None` when no root lies there, and `Some(None)` while the root's
+    // device is not read, or could not be.
+    fn root_device_at(&self, path: &Path) -> Option<Option<u64>> {
+        self.slots.iter().find_map(|slot| {
+            let state = slot.lock();
+            (state.path == path).then_some(state.device.flatten())
+        })
+    }
+
     // The root whose disk `path` is known to lie on, from what is held
     // already: a root's own directory, or the device last read for `path`
     // itself, set against each root's device. Nothing is guessed from a
@@ -2018,13 +2272,69 @@ impl StorageCapacity {
                 .and_then(|entry| entry.device)
                 .and_then(|look| look.device)
         })?;
-        [
+        self.root_on(device).flatten()
+    }
+
+    // The root whose disk `path` lies on, looked up now: the device of
+    // `path` from a root's own latest look, a current read, or one made
+    // now, set against each root's device from its latest look. The answer
+    // is the look's own, never read back from the path cache, which may
+    // have dropped it since. `Some(None)` when `path` lies on no root's
+    // disk. `None` when that is not known: the device could not be read,
+    // the look was lost or did not answer within [`ON_DEMAND_TIMEOUT`], or
+    // it matches no root while a root has not been looked at since it was
+    // pointed where it is.
+    pub(crate) async fn root_of_path(&self, path: &Path) -> Option<Option<StorageRoot>> {
+        #[cfg(test)]
+        self.root_looks.fetch_add(1, Ordering::Relaxed);
+        let deadline = tokio::time::Instant::now() + ON_DEMAND_TIMEOUT;
+        let ticket = self
+            .root_device(path)
+            .map_or_else(|| self.begin(path, Want::Device), Ticket::Device);
+        let device = match ticket.settle(Want::Device, deadline).await {
+            Ok(settled) => settled.device(),
+            Err(Unsettled::Lost) => {
+                debug!(path = %path.display(), "the device look was lost; the disk stays unknown");
+                None
+            }
+            Err(Unsettled::TimedOut) => {
+                debug!(path = %path.display(), "the device look did not answer in time; the disk stays unknown");
+                None
+            }
+        }?;
+        self.root_on(device)
+    }
+
+    // The root on `device`, by each root's device from its latest look:
+    // `Some(None)` when it is none of theirs, `None` when no root matches
+    // and one has not been looked at since it was pointed where it is.
+    fn root_on(&self, device: u64) -> Option<Option<StorageRoot>> {
+        let mut unlooked = false;
+        for root in [
             StorageRoot::Complete,
             StorageRoot::Intermediate,
             StorageRoot::Data,
-        ]
-        .into_iter()
-        .find(|root| self.slot(*root).lock().device.flatten() == Some(device))
+        ] {
+            match self.slot(root).lock().device {
+                Some(Some(at)) if at == device => return Some(Some(root)),
+                None => unlooked = true,
+                Some(_) => {}
+            }
+        }
+        (!unlooked).then_some(None)
+    }
+
+    // Whether some wait could be on `device`: a root's latest look found
+    // it, or a path a wait reads lies on it.
+    pub(crate) fn device_waited_on(&self, device: u64) -> bool {
+        StorageRoot::ALL
+            .into_iter()
+            .any(|root| self.root_slot_device(root) == Some(device))
+            || self
+                .held
+                .lock()
+                .iter()
+                .any(|held| held.device == Some(device))
     }
 
     // The entry for `path`, made when there is none. Past the cap, the
@@ -2072,9 +2382,16 @@ impl StorageCapacity {
             }
         }
         // A look that panicked closed its channel; the next ask starts
-        // another. One that returned is no longer out.
+        // another. One that returned is no longer out. A device ask does
+        // not share a look whose device read failed already, which is a
+        // failed reading answered from again: it looks anew.
         if let Some(flight) = &entry.flight
             && flight.has_changed().is_ok()
+            && !(matches!(want, Want::Device)
+                && flight
+                    .borrow()
+                    .device
+                    .is_some_and(|look| look.device.is_none()))
         {
             return Ticket::Wait(flight.clone());
         }
@@ -2083,6 +2400,9 @@ impl StorageCapacity {
             Arc::clone(&self.clock),
             path.to_path_buf(),
             Some(Arc::clone(&self.paths)),
+            // A device is asked after for a directory a job will write to;
+            // free space is asked of any folder a user names.
+            matches!(want, Want::Device).then(|| Arc::clone(&self.volumes)),
         );
         entry.flight = Some(flight.clone());
         Ticket::Wait(flight)
@@ -2093,7 +2413,7 @@ impl StorageCapacity {
     // whose look does not return within [`ON_DEMAND_TIMEOUT`], or is lost,
     // answers `None`, and the others still answer.
     pub async fn classifications(&self, paths: &[PathBuf]) -> Vec<Option<Classification>> {
-        let deadline = tokio::time::Instant::now() + ON_DEMAND_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + self.on_demand_timeout();
         let tickets: Vec<Result<Arc<ClassLook>, ClassWatch>> = paths
             .iter()
             .map(|path| {
@@ -2227,6 +2547,14 @@ impl StorageCapacity {
     // rang since, heard by a turn that does not wait on it.
     pub(crate) fn rings(&self) -> u64 {
         self.slots[0].ledger.counts.rings.load(Ordering::Acquire)
+    }
+
+    // Resolves at the next ring, for a listener outside the pipeline: every
+    // listener waiting hears each ring. A listener enables the future, then
+    // judges what it waits for, then awaits it, so a ring between the two
+    // is not missed.
+    pub(crate) fn rung(&self) -> tokio::sync::futures::Notified<'_> {
+        self.slots[0].ledger.counts.rung.notified()
     }
 
     fn slot(&self, root: StorageRoot) -> &Arc<RootSlot> {
@@ -2490,6 +2818,7 @@ impl Drop for StorageCapacity {
             slot.lock().stopped = true;
             slot.wake.notify_all();
         }
+        self.volume_rates.stop();
     }
 }
 
@@ -2498,6 +2827,7 @@ fn run_root_sampler(
     interval: Duration,
     probe: SharedProbeFn,
     startup_disk_work: &StartupDiskGate,
+    volumes: &volumes::Volumes,
     held: Option<&HeldPaths>,
 ) {
     // Hold the first probe until the startup disk work is done. Stopping the
@@ -2539,6 +2869,11 @@ fn run_root_sampler(
         // The filesystem is found again before each probe, so a root moved
         // to another one counts with its new peers from its next reading.
         let device = nearest_device(&path);
+        // The volume of a root jobs write under is known before the root
+        // holds the device, so a job's directory finds both in memory.
+        if slot.root != StorageRoot::Data {
+            volumes.seen(device, &path);
+        }
         slot.ledger.on_device(device);
         // The kind of storage is read once for each directory the root is
         // pointed at, here, so no one else has to look for it.
@@ -2591,6 +2926,37 @@ fn run_root_sampler(
 
 #[cfg(test)]
 mod tests {
+    // A volume's id comes from its name alone: the same name gives the same
+    // id whatever follows its NUL and whatever the case of its letters, and
+    // another volume's name gives another.
+    #[test]
+    fn a_volume_name_gives_one_id_and_another_name_another() {
+        fn wide(name: &str) -> Vec<u16> {
+            name.encode_utf16().collect()
+        }
+        let guid = r"\\?\Volume{4c1b02c1-d990-11dc-99ae-806e6f6e6963}\";
+        let mut buffered = wide(guid);
+        buffered.extend([0, 0x58, 0x59]);
+        let id = volume_identity(&wide(guid));
+        assert_eq!(id, volume_identity(&buffered));
+        assert_eq!(id, volume_identity(&wide(&guid.to_uppercase())));
+        assert_ne!(
+            id,
+            volume_identity(&wide(r"\\?\Volume{4c1b02c1-d990-11dc-99ae-806e6f6e6964}\"))
+        );
+        // A share is told by its root.
+        assert_eq!(
+            volume_identity(&wide(r"\\NAS\Media\")),
+            volume_identity(&wide(r"\\nas\media\"))
+        );
+        assert_ne!(
+            volume_identity(&wide(r"\\nas\media\")),
+            volume_identity(&wide(r"\\nas\backup\"))
+        );
+        // The id is the same in every run: it is kept beside readings.
+        assert_eq!(volume_identity(&wide("a")), 0x089b_e207_b544_f1e4);
+    }
+
     // Two roots found on one filesystem count together, and go on doing so
     // across a failed look: only a filesystem found otherwise, or a new
     // directory, parts them.
@@ -3430,6 +3796,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let (probe, mut entered, release) = holding_probe(calls.clone(), "/folders/slow");
         let storage = Arc::new(StorageCapacity::with_probe(roots(), NEVER, probe));
+        storage.set_on_demand_timeout(ON_DEMAND_TIMEOUT);
         let both = tokio::spawn({
             let storage = Arc::clone(&storage);
             async move { ask(&storage, &["/folders/slow", "/folders/fast"]).await }
@@ -3643,6 +4010,7 @@ mod tests {
             NEVER,
             counting_probe(calls),
         ));
+        storage.set_on_demand_timeout(ON_DEMAND_TIMEOUT);
         for root in StorageRoot::ALL {
             storage.wait_for_probes(root, 1);
         }
@@ -3772,7 +4140,11 @@ mod tests {
         let file = dir.path().join("file");
         std::fs::write(&file, b"x").unwrap();
         let through = file.join("sub");
-        let error = probe_disk_space(&through).expect_err("a path through a file");
+        probe_disk_space(&through).expect_err("a path through a file");
+        // More than a folder not made yet: the climb over missing folders
+        // ends at the file, and does not answer for the path. Either way
+        // the folder above answers for the look.
+        let error = probe_nearest_disk_space(&through).expect_err("no folder to climb to");
         assert!(!error.is_not_found(), "{error}");
         let storage = StorageCapacity::with_probe(roots(), NEVER, Arc::new(probe_disk_space));
         let OnDemandSpace::Read(space) =

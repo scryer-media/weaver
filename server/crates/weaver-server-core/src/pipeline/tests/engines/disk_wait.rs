@@ -406,6 +406,77 @@ async fn a_shutdown_is_not_held_by_a_job_waiting_for_room() {
     assert!(pipeline.waits_for_disk_room(), "nothing woke the job");
 }
 
+// A job that waits for room the disk could make is said to wait once, as
+// the wait begins: turns with nothing changed and readings short of room
+// say nothing more, and once room comes it completes.
+#[tokio::test]
+async fn a_wait_for_room_is_said_once_as_it_begins() {
+    let said = || crate::pipeline::graph::root::DISK_WAITS_SAID.with(std::cell::Cell::get);
+    let room = Arc::new(AtomicU64::new(0));
+    let scenario = on_disk(&room);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let before = said();
+    until_waiting(&mut pipeline, &scenario).await;
+    assert_eq!(said(), before + 1, "said as it began");
+
+    for _ in 0..3 {
+        pipeline.reconcile_disk_waits();
+        reading_of(&mut pipeline, &room, 0).await;
+    }
+    assert!(pipeline.graph_disk_held(JOB));
+    assert_eq!(said(), before + 1, "said once, not per turn or reading");
+
+    room_freed(&mut pipeline, &room).await;
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    assert_released(&pipeline, &working(&pipeline));
+}
+
+// A disk whose whole size is its reserve could never hold what the job
+// writes, as its reading tells it: the job is not failed for that. It waits,
+// as any job short of room does, is said to once, and completes when a
+// reading shows room.
+#[tokio::test]
+async fn a_job_on_a_disk_no_larger_than_its_reserve_waits_and_is_never_failed() {
+    let said = || crate::pipeline::graph::root::DISK_WAITS_SAID.with(std::cell::Cell::get);
+    let room = Arc::new(AtomicU64::new(0));
+    let scenario = on_disk_keeping(
+        &room,
+        vec![Post::plain(
+            "ember.bin.xz",
+            xz(&payload(3 * ARTICLE + 7, 91)),
+        )],
+        RESERVE * 8,
+    );
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let before = said();
+    drive(&mut pipeline, &scenario, JOB, |pipeline| {
+        pipeline.graph_disk_held(JOB)
+    })
+    .await;
+    pipeline.reconcile_disk_waits();
+    assert!(pipeline.disk_waiting.contains(&JOB), "it waits");
+    assert_eq!(said(), before + 1, "said once, as it began");
+    assert!(
+        !matches!(
+            job_status_for_assert(&pipeline, JOB),
+            Some(JobStatus::Failed { .. })
+        ),
+        "nothing fails it"
+    );
+
+    room_freed(&mut pipeline, &room).await;
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    assert_eq!(said(), before + 1);
+}
+
 // A job that waits for room when the pipeline goes down is restored by the
 // next one, which reads the disk afresh: with room there, it completes.
 #[tokio::test]
@@ -1157,7 +1228,7 @@ async fn a_job_delivering_outside_the_complete_folder_waits_on_the_disk_its_writ
     assert!(!staging.starts_with(&pipeline.complete_dir));
     pipeline.retire_graph_job(JOB);
     pipeline.jobs.get_mut(&JOB).unwrap().staging_dir = Some(staging);
-    pipeline.admit_graph_job(JOB);
+    pipeline.admit_graph_job(JOB, &[]);
     let output = Arc::clone(
         pipeline
             .storage_capacity
@@ -3480,6 +3551,100 @@ async fn a_job_held_on_a_root_and_one_on_a_path_of_its_disk_are_promised_the_sam
     assert_eq!(pipeline.full_disk_promised_bytes(), 120 * UNIT);
 }
 
+// A usenet job and a torrent held on one disk, each for 60 of the 100 a
+// reading then shows, are promised that room once: both are judged beside
+// the promises of either kind. Whichever goes, the other waits; once the
+// step of the one that went ends, the other counts readings from then,
+// and the next lets it go.
+#[tokio::test]
+async fn a_usenet_job_and_a_torrent_held_on_one_disk_are_promised_the_same_room_once() {
+    use crate::operations::room_wait::{Disk, Promised, RoomWait, Waiter, Wants};
+    use crate::pipeline::full_disk::Stage;
+    const UNIT: u64 = 1 << 20;
+    const TORRENT: JobId = JobId(93_013);
+    let room = Arc::new(AtomicU64::new(0));
+    let scenario = on_disk_keeping(
+        &room,
+        vec![Post::plain("harbor.bin", payload(ARTICLE, 7))],
+        KEPT,
+    );
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
+    add_second(&mut pipeline).await;
+    let capacity = Arc::clone(&pipeline.storage_capacity);
+    let reserve = pipeline.extraction_limits.min_free_bytes;
+    // The torrent's wait, judged as the torrent service judges it.
+    let judge = |wait: &mut RoomWait| {
+        let shown = wait.judge(&capacity, reserve, false, |disk, device| {
+            capacity.promises().on(disk, device)
+        });
+        if let Some((bytes, device)) = shown {
+            capacity.promises().insert(
+                Waiter::Torrent,
+                TORRENT,
+                Promised {
+                    disk: wait.disk.clone(),
+                    bytes,
+                    device,
+                },
+            );
+        }
+        shown.is_some()
+    };
+    let mut torrent = RoomWait::begin(
+        &capacity,
+        Disk::Root(StorageRoot::Complete),
+        complete_dir.clone(),
+        Wants::from(Some(60 * UNIT)),
+        reserve,
+    );
+    pipeline.hold_move_for_full_disk(
+        JOB,
+        Stage::Claim(Default::default()),
+        &complete_dir,
+        "no room",
+        Some(60 * UNIT),
+    );
+
+    // The usenet job is judged first and goes; the torrent waits beside it.
+    hears(&mut pipeline, &room, StorageRoot::Complete, 100 * UNIT);
+    assert!(!pipeline.held_for_full_disk(JOB));
+    assert!(
+        !judge(&mut torrent),
+        "the torrent waits beside the job's promise"
+    );
+
+    // The job's step ends: the next reading lets the torrent go.
+    pipeline.end_full_disk_promise(JOB);
+    for (ended, begun) in capacity.promises().take_ended(Waiter::Torrent) {
+        torrent.promise_ended(&capacity, &ended, begun);
+    }
+    hears(&mut pipeline, &room, StorageRoot::Complete, 100 * UNIT);
+    assert!(judge(&mut torrent), "the torrent goes");
+    torrent.end(&capacity);
+
+    // A usenet job held now waits beside the torrent's promise, until the
+    // torrent's piece lands and ends it.
+    pipeline.hold_move_for_full_disk(
+        SECOND,
+        Stage::Claim(Default::default()),
+        &complete_dir,
+        "no room",
+        Some(60 * UNIT),
+    );
+    hears(&mut pipeline, &room, StorageRoot::Complete, 100 * UNIT);
+    assert!(
+        pipeline.held_for_full_disk(SECOND),
+        "the job waits beside the torrent"
+    );
+    capacity
+        .promises()
+        .end(&capacity, Waiter::Torrent, TORRENT)
+        .unwrap();
+    hears(&mut pipeline, &room, StorageRoot::Complete, 100 * UNIT);
+    assert!(!pipeline.held_for_full_disk(SECOND), "the job goes");
+    assert_eq!(pipeline.full_disk_promised_bytes(), 60 * UNIT);
+}
+
 // The user's resume lets a held job go, whatever the readings say: one
 // that was paused while held goes at that one resume, and one a quota
 // holds, not paused, goes too.
@@ -4012,4 +4177,127 @@ async fn an_archive_written_the_first_time_holds_no_path() {
     hears(&mut pipeline, &room, StorageRoot::Complete, 4 * PLENTY);
     writer_heard(&mut pipeline).await;
     assert_eq!(archives_written(), 1);
+}
+
+// A job outside the pipeline, as a torrent's unpacking, that waits for room
+// on a disk the pipeline's job waits on too. One reading wakes them all in
+// the order they took their tickets from the disk's ledger: one that began
+// to wait before the pipeline's job is asked while all three wait, and one
+// that began after is asked once the pipeline's job no longer waits, alone.
+// A job outside that begins to wait rings the pipeline's loop.
+#[tokio::test]
+async fn a_job_outside_the_pipeline_and_a_pipeline_job_waiting_wake_in_ticket_order() {
+    use crate::pipeline::graph::engine::{Hears, Outside};
+
+    struct Waits {
+        scope: u64,
+        ticket: u64,
+        ledger: Arc<DiskLedger>,
+        outside: std::sync::Weak<Outside>,
+        asked: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+    }
+    impl Hears for Waits {
+        fn said(&self, _said: crate::pipeline::graph::engine::Said, _slots: usize) {}
+
+        fn hold_clock(&self, _paused: bool) {}
+
+        fn disk_ticket(&self) -> Option<u64> {
+            Some(self.ticket)
+        }
+
+        fn wake_disk(&self) -> bool {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((self.scope, self.ledger.waiters()));
+            if let Some(outside) = self.outside.upgrade() {
+                outside.disk_unheld(self.scope);
+            }
+            self.ledger.unwait();
+            true
+        }
+
+        fn disk_wait(
+            &self,
+        ) -> Option<(crate::pipeline::graph::limits::DiskWait, std::path::PathBuf)> {
+            Some((
+                crate::pipeline::graph::limits::DiskWait {
+                    device: crate::pipeline::graph::limits::Device::Working,
+                    owes: self.ticket,
+                    free: Some(0),
+                    reserve: 1,
+                },
+                std::path::PathBuf::from(format!("/waits/{}", self.scope)),
+            ))
+        }
+    }
+
+    let said = || crate::pipeline::graph::root::DISK_WAITS_SAID.with(std::cell::Cell::get);
+    let room = Arc::new(AtomicU64::new(0));
+    let scenario = on_disk(&room);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let ledger = working(&pipeline);
+    // One outside waiter takes its ticket before the pipeline's job, one
+    // after.
+    let early = ledger.wait();
+    until_waiting(&mut pipeline, &scenario).await;
+    let ticket = pipeline.graph_jobs[&JOB]
+        .disk_ticket()
+        .expect("the job took a ticket");
+    let late = ledger.wait();
+    assert!(early < ticket && ticket < late);
+    assert_eq!(ledger.waiters(), 3);
+
+    let outside = Arc::clone(&pipeline.graph_outside);
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (before, after) = (92_201, 92_202);
+    for (scope, ticket) in [(after, late), (before, early)] {
+        outside.join(
+            scope,
+            Arc::new(Waits {
+                scope,
+                ticket,
+                ledger: Arc::clone(&ledger),
+                outside: Arc::downgrade(&outside),
+                asked: Arc::clone(&asked),
+            }),
+        );
+    }
+    let began = outside.disk_wait_began();
+    outside.disk_held(after);
+    outside.disk_held(before);
+    began.await;
+    let before_said = said();
+    pipeline.reconcile_disk_waits();
+    assert!(
+        outside.disk_waits_began().is_empty(),
+        "the pipeline heard both begin"
+    );
+    assert_eq!(
+        said(),
+        before_said + 2,
+        "each wait said once, as the pipeline's own"
+    );
+    pipeline.reconcile_disk_waits();
+    assert_eq!(said(), before_said + 2, "a wait is said only as it begins");
+    assert!(pipeline.waits_for_disk_room());
+
+    // The one reading heard is one begun after the room came, so the pass
+    // it starts finds room for the pipeline's job.
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
+    let asked = asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 2, "each asked once: {asked:?}");
+    assert_eq!(
+        asked[0],
+        (before, 3),
+        "asked first, while the pipeline's job still waits"
+    );
+    assert_eq!(
+        asked[1],
+        (after, 1),
+        "asked after the pipeline's job no longer waits"
+    );
+    assert!(!pipeline.graph_disk_held(JOB), "the pipeline's job goes on");
+    assert!(!outside.waits_for_disk());
+    assert!(!pipeline.waits_for_disk_room());
 }

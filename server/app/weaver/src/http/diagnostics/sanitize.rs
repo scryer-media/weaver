@@ -122,6 +122,9 @@ pub(super) struct LocalNames {
     pub(super) home_dir: Option<PathBuf>,
     pub(super) user: Option<String>,
     pub(super) hostname: Option<String>,
+    // The label of every volume the disk owner holds: where each is
+    // mounted, which names the disk.
+    pub(super) volumes: Vec<String>,
 }
 
 impl LocalNames {
@@ -131,6 +134,7 @@ impl LocalNames {
         intermediate_dir: PathBuf,
         complete_dir: PathBuf,
         watch_dir: Option<PathBuf>,
+        volumes: Vec<String>,
     ) -> Self {
         let home_dir = std::env::home_dir();
         let user = ["USER", "USERNAME", "LOGNAME"]
@@ -153,7 +157,28 @@ impl LocalNames {
             home_dir,
             user,
             hostname: local_hostname(),
+            volumes,
         }
+    }
+
+    // Every volume label that names something, with its `<volume-N>`
+    // stand-in, the longest first: a label that holds a configured
+    // directory inside it is numbered and matched before any shorter one. A
+    // bare root or drive (`/`, `C:\`) names nothing and is left as it is.
+    fn volume_stand_ins(&self) -> Vec<(String, String)> {
+        let mut labels: Vec<String> = self
+            .volumes
+            .iter()
+            .map(|label| label.trim_end_matches(['/', '\\']).to_string())
+            .filter(|label| !label.is_empty() && !is_drive(label))
+            .collect();
+        labels.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        labels.dedup();
+        labels
+            .into_iter()
+            .enumerate()
+            .map(|(index, label)| (label, format!("<volume-{}>", index + 1)))
+            .collect()
     }
 
     // Every directory the host names, with its stand-in.
@@ -1075,6 +1100,12 @@ impl StandIns {
                 table.dir(&spelling, stand_in, content);
             }
         }
+        // Each volume's mount. A path is matched by the longest directory it
+        // starts with, so one under a configured directory keeps that
+        // directory's stand-in, and a label is replaced whole.
+        for (label, stand_in) in local.volume_stand_ins() {
+            table.dir(&label, &stand_in, true);
+        }
         let mut next_category = 1u64;
         for category in &stored.categories {
             let id = u64::from(category.id);
@@ -1254,8 +1285,8 @@ impl StandIns {
             }
             // A WireGuard log line names the peer by the first characters of
             // its key (`wireguard AbCdEfGh…@host:port`), so that spelling is
-            // the key's too. A key is matched in running text however plain
-            // it reads: base64 with no digit or separator is still a key.
+            // the key's too. A key is replaced wherever it is spelled, even a
+            // prefix of letters only that a name would not be matched by.
             let spec = proxy.wireguard_spec().ok();
             let tunnel_key = spec.as_ref().map(|spec| spec.public_key());
             let peer_key_prefix = spec.as_ref().map(|spec| spec.peer_public_key_prefix());
@@ -2389,6 +2420,7 @@ mod tests {
             home_dir: None,
             user: None,
             hostname: Some(hostname.to_string()),
+            volumes: Vec::new(),
         }
     }
 
@@ -2953,6 +2985,7 @@ mod json_log_spellings {
             home_dir: None,
             user: None,
             hostname: Some("host-name".to_string()),
+            volumes: Vec::new(),
         };
         let table = StandIns::build(&[], &local, &StoredNames::default()).expect("table");
         let path = r"D:\Media\WeaverData\complete\Some.Show";
@@ -2980,6 +3013,7 @@ mod json_log_spellings {
             home_dir: None,
             user: None,
             hostname: Some("host-name".to_string()),
+            volumes: Vec::new(),
         };
         let table = StandIns::build(&[], &local, &StoredNames::default()).expect("table");
         let path = r"D:\My Media\WeaverData\complete\Some.Show";
@@ -3170,6 +3204,116 @@ mod json_log_spellings {
         );
     }
 
+    // A volume's label names the disk it is mounted from. Wherever the
+    // package carries it (a diagnostics row, a metrics label, a log line)
+    // it reads `<volume-N>`.
+    #[test]
+    fn a_volume_label_is_replaced_everywhere_in_the_package() {
+        const LABEL: &str = "/Volumes/SecretDisk";
+        let local = LocalNames {
+            volumes: vec![LABEL.to_string(), "/".to_string()],
+            ..local_unix()
+        };
+        let mut components = vec![
+            Component::json(
+                "pipeline.json",
+                &serde_json::json!({
+                    "volumes": [
+                        {"label": LABEL, "storage_kind": "platter", "written_bytes_total": 5},
+                        {"label": "/", "storage_kind": "ssd", "written_bytes_total": 7},
+                    ],
+                }),
+            ),
+            Component::text(
+                "metrics-1.txt",
+                format!(
+                    "weaver_volume_written_bytes_total{{volume=\"{LABEL}\"}} 5\n\
+                     weaver_volume_written_bytes_total{{volume=\"/\"}} 7\n"
+                ),
+            ),
+            Component::text(
+                "weaver.log",
+                format!("INFO weaver: wrote path={LABEL}/Some.Release/file.mkv to {LABEL}.\n"),
+            ),
+        ];
+        sanitize_package(
+            &mut components,
+            &local,
+            &StoredNames::default(),
+            HashSet::new(),
+        )
+        .expect("a sanitized package");
+
+        let texts: Vec<String> = components
+            .iter()
+            .map(|component| {
+                String::from_utf8(component.outcome.clone().expect("a component")).expect("utf-8")
+            })
+            .collect();
+        for text in &texts {
+            assert!(!text.contains("SecretDisk"), "{text}");
+            assert!(!text.contains("Some.Release"), "{text}");
+        }
+        let rows: Value = serde_json::from_str(&texts[0]).expect("json");
+        assert_eq!(rows["volumes"][0]["label"], "<volume-1>");
+        // A bare root names nothing and stands.
+        assert_eq!(rows["volumes"][1]["label"], "/");
+        assert!(
+            texts[1].contains("weaver_volume_written_bytes_total{volume=\"<volume-1>\"} 5"),
+            "{}",
+            texts[1]
+        );
+        assert!(
+            texts[1].contains("weaver_volume_written_bytes_total{volume=\"/\"} 7"),
+            "{}",
+            texts[1]
+        );
+        assert!(texts[2].contains("path=<volume-1>/"), "{}", texts[2]);
+        assert!(texts[2].contains("to <volume-1>."), "{}", texts[2]);
+    }
+
+    // Labels are numbered longest first, and a label that holds a
+    // configured directory inside it is replaced whole, never as that
+    // directory with a tail left showing.
+    #[test]
+    fn a_volume_label_holding_a_configured_directory_is_replaced_whole() {
+        let local = LocalNames {
+            volumes: vec![
+                "/mnt/pool".to_string(),
+                "/srv/weaver-data/SecretPool".to_string(),
+                r"C:\".to_string(),
+            ],
+            ..local_unix()
+        };
+        assert_eq!(
+            local.volume_stand_ins(),
+            vec![
+                (
+                    "/srv/weaver-data/SecretPool".to_string(),
+                    "<volume-1>".to_string()
+                ),
+                ("/mnt/pool".to_string(), "<volume-2>".to_string()),
+            ]
+        );
+        let table = StandIns::build(&[], &local, &StoredNames::default()).expect("table");
+        assert_eq!(
+            table.sanitize_str("/srv/weaver-data/SecretPool /srv/weaver-data/x /srv/weaver-data"),
+            "<volume-1> <data>/x <data>"
+        );
+        assert_eq!(table.sanitize_str("at /mnt/pool."), "at <volume-2>.");
+        // A path under a configured directory keeps that directory's
+        // stand-in when the volume is mounted above it.
+        let above = LocalNames {
+            volumes: vec!["/srv".to_string()],
+            ..local_unix()
+        };
+        let table = StandIns::build(&[], &above, &StoredNames::default()).expect("table");
+        assert_eq!(
+            table.sanitize_str("/srv/weaver-data/complete /srv"),
+            "<complete> <volume-1>"
+        );
+    }
+
     fn local_unix() -> LocalNames {
         LocalNames {
             data_dir: PathBuf::from("/srv/weaver-data"),
@@ -3180,6 +3324,7 @@ mod json_log_spellings {
             home_dir: None,
             user: None,
             hostname: Some("host-name".to_string()),
+            volumes: Vec::new(),
         }
     }
 }

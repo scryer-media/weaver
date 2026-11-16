@@ -187,10 +187,7 @@ fn instrumentation_registries_are_reachable_from_the_shared_metrics_handle() {
     // snapshot, so MetricsSnapshot stays a fixed-size struct copy.
     assert!(m.server_metrics.snapshot().is_empty());
     assert!(m.job_lifecycle.snapshot().submitted.is_empty());
-    assert_eq!(
-        m.pipeline_histograms.snapshot().disk_write_duration.count,
-        0
-    );
+    assert_eq!(m.pipeline_histograms.snapshot().turn_duration.count, 0);
 }
 
 // `ALL` is what the Prometheus exporter iterates to build its label sets, so

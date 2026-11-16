@@ -658,8 +658,7 @@ impl PeerConnectionHandler for Handler {
                 "this peer does not support extended handshaking, which is a prerequisite to download metadata"
             )
         }
-        self.transport
-            .store(Transport::of(kind) as u8 + 1, Ordering::Relaxed);
+        self.transport.store(kind as u8 + 1, Ordering::Relaxed);
         Ok(())
     }
 

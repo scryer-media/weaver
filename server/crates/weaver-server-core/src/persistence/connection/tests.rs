@@ -2685,7 +2685,7 @@ async fn postgres_runtime_smoke_when_configured() {
         item_title: "Example".to_string(),
         published_at: Some(123),
         size_bytes: Some(456),
-        decision: "accepted".to_string(),
+        decision: crate::RssSeenDecision::Accepted,
         seen_at: 1000,
         job_id: Some(42),
         item_url: Some("https://example.com/item.nzb".to_string()),
@@ -3126,4 +3126,113 @@ fn sqlite_storage_facts_read_a_scratch_database() {
     assert!(facts.freelist_count.clone().unwrap() <= facts.page_count.clone().unwrap());
     assert_eq!(facts.journal_mode.as_deref(), Ok("wal"));
     db.close().unwrap();
+}
+
+// A torrent's job's history row and an NZB job's archive go through the one
+// owner of the archives the database has no room for: refused for want of
+// room, each is kept, in the order they came, and the listener is told of
+// each the same way; one pass writes both, in that order, and says so of
+// each. The torrent's waiter hears it was kept, then that it was written.
+#[tokio::test]
+async fn a_torrent_history_row_is_kept_and_written_as_an_nzb_archive_is() {
+    use super::ArchiveNews::{Kept, LetGo};
+    let no_room = || crate::StateError::OutOfSpace("database or disk is full".into());
+    let refuse = |error| super::ARCHIVE_REFUSED.lock().unwrap().push_back(error);
+    let db = Database::open_in_memory().unwrap();
+    let news = Arc::new(Mutex::new(Vec::new()));
+    db.hear_archive_news({
+        let news = Arc::clone(&news);
+        move |said| news.lock().unwrap().push(said)
+    });
+    let told = || std::mem::take(&mut *news.lock().unwrap());
+    let nzb = crate::jobs::ids::JobId(811);
+    let torrent = crate::jobs::ids::JobId(812);
+    db.create_active_job(&postgres_sample_job(nzb)).unwrap();
+    refuse(no_room());
+    let mut nzb_written = db
+        .try_queue_archive_job_with_terminal_cause(nzb, postgres_sample_history(nzb), None, None)
+        .unwrap();
+    refuse(no_room());
+    let mut row = postgres_sample_history(torrent);
+    row.protocol = crate::jobs::Protocol::Torrent;
+    let (mut torrent_written, torrent_kept) = db
+        .queue_torrent_history(torrent, row, true, Vec::new())
+        .unwrap();
+    torrent_kept.await.expect("the torrent's row is kept");
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(db.kept_archive_jobs(), [nzb, torrent]);
+    assert_eq!(told(), [Kept(nzb), Kept(torrent)]);
+    assert!(nzb_written.try_recv().is_err(), "nothing written");
+    assert!(torrent_written.try_recv().is_err(), "nothing written");
+
+    db.retry_kept_archives(0);
+    db.flush_write_queue().await.unwrap();
+    assert!(db.kept_archive_jobs().is_empty());
+    let let_go = |job_id| LetGo {
+        job_id,
+        written: true,
+    };
+    assert_eq!(told(), [let_go(nzb), let_go(torrent)]);
+    nzb_written.await.unwrap();
+    torrent_written.await.unwrap();
+    for job_id in [nzb, torrent] {
+        assert_eq!(
+            db.get_job_history(job_id.0).unwrap().unwrap().status,
+            "complete"
+        );
+    }
+}
+
+// A newer history row for a torrent's job takes the place of the one kept
+// for it: the kept one is let go unwritten, its waiter told it is lost, and
+// only the newer one is written, so room coming back never writes the older
+// over it. An NZB job's archive kept beside it is untouched.
+#[tokio::test]
+async fn a_newer_torrent_history_row_lets_go_the_one_kept() {
+    use super::ArchiveNews::{Kept, LetGo};
+    let no_room = || crate::StateError::OutOfSpace("database or disk is full".into());
+    let refuse = |error| super::ARCHIVE_REFUSED.lock().unwrap().push_back(error);
+    let db = Database::open_in_memory().unwrap();
+    let news = Arc::new(Mutex::new(Vec::new()));
+    db.hear_archive_news({
+        let news = Arc::clone(&news);
+        move |said| news.lock().unwrap().push(said)
+    });
+    let told = || std::mem::take(&mut *news.lock().unwrap());
+    let nzb = crate::jobs::ids::JobId(821);
+    let torrent = crate::jobs::ids::JobId(822);
+    db.create_active_job(&postgres_sample_job(nzb)).unwrap();
+    refuse(no_room());
+    let _nzb_written = db
+        .try_queue_archive_job_with_terminal_cause(nzb, postgres_sample_history(nzb), None, None)
+        .unwrap();
+    let mut first = postgres_sample_history(torrent);
+    first.protocol = crate::jobs::Protocol::Torrent;
+    first.status = "partial".to_string();
+    refuse(no_room());
+    let (older, _) = db
+        .queue_torrent_history(torrent, first.clone(), false, Vec::new())
+        .unwrap();
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(told(), [Kept(nzb), Kept(torrent)]);
+
+    let mut newer = first;
+    newer.status = "cancelled".to_string();
+    let (written, _) = db
+        .queue_torrent_history(torrent, newer, true, Vec::new())
+        .unwrap();
+    written.await.unwrap();
+    assert!(older.await.is_err(), "the older row is lost");
+    assert_eq!(
+        told(),
+        [LetGo {
+            job_id: torrent,
+            written: false
+        }]
+    );
+    assert_eq!(db.kept_archive_jobs(), [nzb]);
+    assert_eq!(
+        db.get_job_history(torrent.0).unwrap().unwrap().status,
+        "cancelled"
+    );
 }

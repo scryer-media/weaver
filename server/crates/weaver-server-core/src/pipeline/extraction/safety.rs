@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use tracing::info;
 
 use crate::operations::StorageCapacity;
-use crate::operations::disk::CapacityReading;
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -133,14 +132,6 @@ impl ExtractionLimits {
         } else {
             (self.max_job_bytes, ExtractionRejectionReason::JobBytes)
         }
-    }
-
-    // The free space writing `bytes` would leave on the volume `reading` is
-    // of, while that falls under the reserve. Only a fresh reading refuses:
-    // the next successful probe confirms or clears it.
-    pub(crate) fn short_of_reserve(&self, reading: &CapacityReading, bytes: u64) -> Option<u64> {
-        let remaining = reading.available_bytes.saturating_sub(bytes);
-        (remaining < self.min_free_bytes && !reading.stale).then_some(remaining)
     }
 }
 

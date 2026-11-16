@@ -231,7 +231,7 @@ impl RssSeenItem {
             item_title: item.item_title.clone(),
             published_at: item.published_at.map(|value| value as f64 * 1000.0),
             size_bytes: item.size_bytes,
-            decision: item.decision.clone(),
+            decision: item.decision.as_str().to_owned(),
             seen_at: item.seen_at as f64 * 1000.0,
             job_id: item.job_id,
             item_url: item.item_url.clone(),

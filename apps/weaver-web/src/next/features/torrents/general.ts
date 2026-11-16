@@ -20,6 +20,8 @@ const text = (value: string | null) => (value === null || value === "" ? EM_DASH
 /** Why the torrent is in its state: its route's reason while the route holds it, else the server's words. */
 export function transferNote(t: Translate, torrent: TorrentData): string | undefined {
   if (torrent.routeReason !== null) return routeReasonText(t, torrent.routeReason);
+  // A torrent waiting for room on its disk reads as a usenet job does.
+  if (torrent.detail === "disk_space") return t("next.status.wait.disk_space");
   return torrent.detail ?? undefined;
 }
 

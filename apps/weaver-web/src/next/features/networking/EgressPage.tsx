@@ -27,6 +27,8 @@ import {
   type SettingsBlock,
   type SettingsSectionModel,
 } from "../../pages/settings/framework";
+import { useVisibleInterval } from "../../data/timers";
+import { useTorrentsShown } from "../../data/use-torrents-shown";
 import { egressInput, liveAddresses, type NetworkingAction, type NetworkingData } from "./data";
 import {
   egressQuotaChanged,
@@ -73,16 +75,17 @@ function useGlobalBandwidth(busy: boolean, message: string | null, failed: boole
   const [{ data, fetching }, reexecute] = useQuery<{ networking: { bandwidth: Bandwidth } }>({
     query: BANDWIDTH_QUERY,
   });
+  // The split shares the download limit between usenet and torrents, so it
+  // shows, and its rates are read, only while torrents are on.
+  const torrentsOn = useTorrentsShown();
   const [{ data: splitData }, refreshSplit] = useQuery<{ networking: { bandwidthSplit: BandwidthSplitState } }>({
     query: BANDWIDTH_SPLIT_QUERY,
+    pause: !torrentsOn,
   });
   const [updateState, setBandwidth] = useMutation(SET_BANDWIDTH);
   const [status, setStatus] = useState<string | null>(null);
 
-  useEffect(() => {
-    const timer = window.setInterval(() => refreshSplit({ requestPolicy: "network-only" }), SPLIT_REFRESH_MS);
-    return () => window.clearInterval(timer);
-  }, [refreshSplit]);
+  useVisibleInterval(() => refreshSplit({ requestPolicy: "network-only" }), torrentsOn ? SPLIT_REFRESH_MS : null);
   const [error, setError] = useState<string | null>(null);
 
   // A write to an egress takes the status line over from the limits' last save.
@@ -134,7 +137,7 @@ function useGlobalBandwidth(busy: boolean, message: string | null, failed: boole
         draft.markSaved();
         setStatus(t("next.settings.saved"));
         void reexecute({ requestPolicy: "network-only" });
-        refreshSplit({ requestPolicy: "network-only" });
+        if (torrentsOn) refreshSplit({ requestPolicy: "network-only" });
       });
     },
   });
@@ -186,8 +189,8 @@ function useGlobalBandwidth(busy: boolean, message: string | null, failed: boole
         title: t("next.bandwidth.limits"),
         fields: [
           limit("downloadBps", t("next.bandwidth.downloadLimit")),
-          split,
-          limit("uploadBps", t("next.bandwidth.uploadLimit")),
+          // Only torrents upload: a hidden upload limit is saved as it was.
+          ...(torrentsOn ? [split, limit("uploadBps", t("next.bandwidth.uploadLimit"))] : []),
         ],
       }
     : null;
@@ -198,14 +201,14 @@ function useGlobalBandwidth(busy: boolean, message: string | null, failed: boole
 /** The egress table's limit cell: one line per direction. */
 function LimitCell({ egress }: { egress: Egress }) {
   const t = useTranslate();
+  const torrentsOn = useTorrentsShown();
+  const lines = [
+    ["↓", egress.downloadBps, "next.quota.download"],
+    ["↑", egress.uploadBps, "next.quota.upload"],
+  ] as const;
   return (
     <div className="flex min-w-0 flex-col gap-[3px]">
-      {(
-        [
-          ["↓", egress.downloadBps, "next.quota.download"],
-          ["↑", egress.uploadBps, "next.quota.upload"],
-        ] as const
-      ).map(([arrow, value, label]) => (
+      {(torrentsOn ? lines : lines.slice(0, 1)).map(([arrow, value, label]) => (
         <Cell key={arrow} mono className={value === null ? "text-wv-muted" : undefined} title={t(label)}>
           {`${arrow} ${formatLimit(t, value)}`}
         </Cell>
@@ -346,6 +349,9 @@ export function EgressEditor({
   onClose: () => void;
 }) {
   const t = useTranslate();
+  // Only torrents upload: the upload limit shows with torrent things, and a
+  // hidden one is saved as it was.
+  const torrentsOn = useTorrentsShown();
   const [editing, setEditing] = useState(egress);
   const [quota, setQuota] = useState(() => egressQuotaDraft(egress.quota));
   const [error, setError] = useState<string | null>(null);
@@ -505,21 +511,25 @@ export function EgressEditor({
         ),
       },
     },
-    {
-      id: "uploadLimit",
-      label: t("next.networking.egress.uploadLimit"),
-      keywords: "speed limit throttle rate",
-      control: {
-        kind: "custom",
-        control: (
-          <LimitControl
-            label={t("next.networking.egress.uploadLimit")}
-            value={editing.uploadBps}
-            onChange={(uploadBps) => patch({ uploadBps })}
-          />
-        ),
-      },
-    },
+    ...(torrentsOn
+      ? [
+          {
+            id: "uploadLimit",
+            label: t("next.networking.egress.uploadLimit"),
+            keywords: "speed limit throttle rate",
+            control: {
+              kind: "custom" as const,
+              control: (
+                <LimitControl
+                  label={t("next.networking.egress.uploadLimit")}
+                  value={editing.uploadBps}
+                  onChange={(uploadBps) => patch({ uploadBps })}
+                />
+              ),
+            },
+          },
+        ]
+      : []),
     {
       id: "enabled",
       label: t("next.networking.egress.enabled"),

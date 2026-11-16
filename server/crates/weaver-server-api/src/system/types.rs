@@ -229,7 +229,6 @@ pub struct Metrics {
     pub verify_active: u32,
     pub repair_active: u32,
     pub extract_active: u32,
-    pub disk_write_latency_us: u64,
     pub segments_retried: u64,
     /// Articles that downloaded but never decoded into place and were left
     /// to repair; articles no server had are in `articlesNotFound`.
@@ -250,11 +249,21 @@ pub struct Metrics {
     pub decode_rate_mbps: f64,
 }
 
-// The direct-store set counters, kept in the schema at 0 for the clients that
-// still read them: the graph engine routes no set directly.
+// Fields kept in the schema at 0 for the clients that still read them: the
+// loop's disk write time, which the volume writers left nothing to measure,
+// and the direct-store set counters, as the graph engine routes no set
+// directly.
 // TODO(0.17.0): remove
 #[ComplexObject]
 impl Metrics {
+    /// Once the time of the last disk write on the pipeline loop. The volume
+    /// writers write off the loop, so there is no such time: each volume's own
+    /// counters say what its disk took.
+    #[graphql(deprecation = "always 0 since the volume writers; removed in 0.17.0")]
+    async fn disk_write_latency_us(&self) -> u64 {
+        0
+    }
+
     /// Lifetime count of archive sets direct-store admitted. Together with
     /// the two below this is the external answer to "did direct routing carry
     /// this work, or quietly fall back?" — output bytes are identical either
@@ -382,7 +391,6 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             verify_active: m.verify_active as u32,
             repair_active: m.repair_active as u32,
             extract_active: m.extract_active as u32,
-            disk_write_latency_us: m.disk_write_latency_us,
             segments_retried: m.segments_retried,
             segments_failed_permanent: m.segments_failed_permanent,
             download_failures_article_not_found: m.download_failures_article_not_found,
@@ -415,6 +423,48 @@ pub struct SystemMetricsSnapshot {
     /// connection meter can follow the pool instead of waiting for the next
     /// `serverHealth` read.
     pub provider_connections: Vec<ProviderConnections>,
+    /// Whether torrents are on and whether there are torrents, so the web
+    /// shows torrent controls while either holds.
+    pub torrents: TorrentPresence,
+}
+
+/// Whether torrents are on, and the torrents there are.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct TorrentPresence {
+    /// The settings turn torrents on.
+    pub enabled: bool,
+    /// There is a torrent job, in any state.
+    pub jobs: bool,
+    /// A torrent job is not paused or stopped.
+    pub running: bool,
+    /// Torrents are off and the torrents still running are let finish.
+    pub winding_down: bool,
+    /// While winding down, how the torrents still running end; null
+    /// otherwise.
+    pub wind_down: Option<crate::settings::types::TorrentDisableModeGql>,
+}
+
+impl TorrentPresence {
+    pub(crate) fn of(
+        enabled: bool,
+        torrents: Option<&weaver_server_core::torrents::service::TorrentService>,
+    ) -> Self {
+        let presence = torrents
+            .map(|torrents| torrents.presence())
+            .unwrap_or_default();
+        // A wind-down taken for a save still on its way is not one yet.
+        let wind_down = torrents
+            .and_then(|torrents| torrents.wind_down())
+            .filter(|_| !enabled)
+            .map(crate::settings::types::TorrentDisableModeGql::of_wind_down);
+        Self {
+            enabled,
+            jobs: presence.jobs,
+            running: presence.running,
+            winding_down: wind_down.is_some(),
+            wind_down,
+        }
+    }
 }
 
 /// How many of a server's connections are in use at one instant.
@@ -1259,7 +1309,30 @@ pub struct ConfiguredStorage {
     pub error: Option<String>,
 }
 
+/// One volume as the operating system presents it: what it takes and what
+/// is being written to it now.
 #[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct StorageVolumeWriteRate {
+    /// The mount path or drive root.
+    pub label: String,
+    /// "ssd", "platter", "network" or "unknown".
+    pub storage_kind: String,
+    /// What the volume takes, in bytes per second; null until measured.
+    pub write_rate_bytes_per_second: Option<u64>,
+    /// What Weaver wrote to the volume over the last window, in bytes per
+    /// second, whether or not the volume was the limit; null when nothing
+    /// was written.
+    pub throughput_bytes_per_second: Option<u64>,
+    /// Bytes waiting in memory to be written to the volume.
+    pub buffered_bytes: u64,
+    /// The most bytes Weaver lets wait in memory for the volume before it
+    /// stops fetching for the jobs that write to it; null until the volume
+    /// has been given a limit.
+    pub buffer_limit_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+#[graphql(complex)]
 pub struct SystemInfo {
     pub version: String,
     pub uptime_seconds: f64,
@@ -1271,6 +1344,37 @@ pub struct SystemInfo {
     pub memory: SystemMemoryInfo,
     pub primary_storage: SystemStorageProfile,
     pub configured_storage: Vec<ConfiguredStorage>,
+}
+
+#[ComplexObject]
+impl SystemInfo {
+    /// Every volume Weaver writes to, each with what it takes and what is
+    /// being written to it. Read
+    /// from what the disk owner holds; asks no disk.
+    async fn volumes(
+        &self,
+        ctx: &Context<'_>,
+    ) -> async_graphql::Result<Vec<StorageVolumeWriteRate>> {
+        let storage = ctx
+            .data::<weaver_server_core::SharedPipelineState>()?
+            .storage_capacity();
+        Ok(storage
+            .map(|storage| storage.volume_snapshots())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|volume| StorageVolumeWriteRate {
+                label: volume.label,
+                storage_kind: volume.kind.to_string(),
+                // Zero is "not measured" and "nothing written".
+                write_rate_bytes_per_second: (volume.write_rate > 0).then_some(volume.write_rate),
+                throughput_bytes_per_second: (volume.throughput > 0).then_some(volume.throughput),
+                buffered_bytes: volume.buffered_bytes,
+                // Zero is "not sized yet".
+                buffer_limit_bytes: (volume.buffer_limit_bytes > 0)
+                    .then_some(volume.buffer_limit_bytes),
+            })
+            .collect())
+    }
 }
 
 /// Whether this deployment can restart Weaver from the browser.

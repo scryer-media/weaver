@@ -93,7 +93,7 @@ metric_families! {
     BYTES_DECODED = ("weaver_pipeline_bytes_decoded_total", Counter, [],
         "Total bytes decoded by the pipeline.");
     BYTES_COMMITTED = ("weaver_pipeline_bytes_committed_total", Counter, [],
-        "Total bytes committed to disk by the pipeline.");
+        "Total decoded bytes the pipeline accepted and handed to the volume writers. Counted at hand-off, before the bytes reach disk: the written-bytes counter of each volume counts what was written.");
     SEGMENTS_DOWNLOADED = ("weaver_pipeline_segments_downloaded_total", Counter, [],
         "Total segments downloaded.");
     SEGMENTS_DECODED = ("weaver_pipeline_segments_decoded_total", Counter, [],
@@ -183,6 +183,8 @@ metric_families! {
         "Article work items leased to download lanes.");
     LANE_REFILLS = ("weaver_pipeline_download_lane_refills_total", Counter, ["result"],
         "Lane refill scheduler decisions.");
+    LANE_ROOM_WAITS = ("weaver_pipeline_download_lane_room_waits_total", Counter, ["event"],
+        "Lane refills held for their volume's room, at its resume line or at its budget (held), and answered once it had room (woken).");
     SCHEDULER_HANDOUTS = ("weaver_pipeline_download_scheduler_handouts_total", Counter, ["kind"],
         "Article handouts cut by the per-server scheduler, by kind.");
     SCHEDULER_IDLE_WITH_SERVABLE = ("weaver_pipeline_download_scheduler_idle_with_servable_total", Counter, [],
@@ -223,11 +225,6 @@ metric_families! {
     VERIFY_ACTIVE = ("weaver_pipeline_verify_active", Gauge, [], "Active verification workers.");
     REPAIR_ACTIVE = ("weaver_pipeline_repair_active", Gauge, [], "Active repair workers.");
     EXTRACT_ACTIVE = ("weaver_pipeline_extract_active", Gauge, [], "Active extraction workers.");
-    DISK_WRITE_LATENCY_US = ("weaver_pipeline_disk_write_latency_microseconds", Gauge, [],
-        "Disk write latency in microseconds.",
-        deprecated_by = "weaver_pipeline_disk_write_latency_seconds");
-    DISK_WRITE_LATENCY_SECONDS = ("weaver_pipeline_disk_write_latency_seconds", Gauge, [],
-        "Disk write latency.");
 
     // ---- rates -------------------------------------------------------------
     CURRENT_DOWNLOAD_SPEED = ("weaver_pipeline_current_download_speed_bytes_per_second", Gauge, [],
@@ -916,8 +913,6 @@ metric_families! {
     // ---- pipeline stage histograms ----------------------------------------------------
     TURN_DURATION = ("weaver_pipeline_turn_duration_seconds", Histogram, [],
         "Pipeline turn duration, including awaited work and excluding the idle event wait.");
-    DISK_WRITE_DURATION = ("weaver_pipeline_disk_write_duration_seconds", Histogram, [],
-        "Time spent in individual disk write calls.");
     DECODE_TASK_DURATION = ("weaver_pipeline_decode_task_duration_seconds", Histogram, [],
         "Time spent decoding one article. Conditional: emitted only once the decode path has recorded a measurement.");
     EXTRACT_MEMBER_DURATION = ("weaver_pipeline_extract_member_duration_seconds", Histogram, [],
@@ -980,6 +975,84 @@ metric_families! {
         "Total capacity of the filesystem backing a configured directory role.");
     DISK_AVAILABLE_BYTES = ("weaver_disk_available_bytes", Gauge, ["role", "path"],
         "Space available to this process on the filesystem backing a configured directory role.");
+
+    // ---- volume writes -------------------------------------------------------------------------
+    // One series per volume the download side writes to, labelled by its
+    // mount path or drive root. Each is an atomic read at scrape time.
+    VOLUME_WRITTEN_BYTES = ("weaver_volume_written_bytes_total", Counter, ["volume"],
+        "Bytes written to a volume by its writer.");
+    VOLUME_WRITE_SECONDS = ("weaver_volume_write_seconds_total", Counter, ["volume"],
+        "Time a volume's writer has spent inside write calls.");
+    VOLUME_WRITE_CALLS = ("weaver_volume_write_calls_total", Counter, ["volume"],
+        "Write calls a volume's writer has made.");
+    VOLUME_WRITE_SEEKS = ("weaver_volume_write_seeks_total", Counter, ["volume"],
+        "Write calls to a volume that did not start where the previous write to the same file ended.");
+    VOLUME_WRITE_RATE = ("weaver_volume_write_rate_bytes_per_second", Gauge, ["volume"],
+        "What a volume takes: the figure of a start-up probe, or its bytes over wall time across the most recent 30 seconds of sampled spans in which its writer never ran out of work. Conditional: emitted only once the volume has been measured.");
+    VOLUME_WRITE_THROUGHPUT = ("weaver_volume_write_throughput_bytes_per_second", Gauge, ["volume"],
+        "Bytes per second of wall time written to a volume over the last window, whether or not the volume was the limit. Conditional: emitted only while the volume is being written to.");
+    VOLUME_BUFFERED_BYTES = ("weaver_volume_buffered_bytes", Gauge, ["volume"],
+        "Bytes waiting in memory for a volume's writer.");
+    VOLUME_ARRIVED_BYTES = ("weaver_volume_arrived_bytes", Gauge, ["volume"],
+        "Bytes that arrived for the jobs writing to a volume and are not handed to its writer yet: being decoded.");
+    VOLUME_COUNTED_BYTES = ("weaver_volume_counted_bytes", Gauge, ["volume"],
+        "Bytes counted against a volume's buffer limit: articles leased to connections for the jobs writing to it and not arrived, at the size the post gives them, what arrived and is being decoded, and what waits for its writer. Never above `weaver_volume_buffer_limit_bytes`, but for one article granted alone to a volume that counted nothing.");
+    VOLUME_COUNTED_PEAK_BYTES = ("weaver_volume_counted_peak_bytes", Gauge, ["volume"],
+        "The most bytes `weaver_volume_counted_bytes` has been since start.");
+    VOLUME_BUFFER_LIMIT_BYTES = ("weaver_volume_buffer_limit_bytes", Gauge, ["volume"],
+        "The most bytes a volume may count (`weaver_volume_counted_bytes`): nothing is leased or queued for it past this many. Conditional: emitted only once the volume has been given its limits.");
+    VOLUME_BUFFER_SOFT_LIMIT_BYTES = ("weaver_volume_buffer_soft_limit_bytes", Gauge, ["volume"],
+        "Seven tenths of `weaver_volume_buffer_limit_bytes`: a reported figure; fetching does not change at it. Conditional: emitted only once the volume has been given its limits.");
+    VOLUME_WRITER_BATCHES = ("weaver_volume_writer_batches_total", Counter, ["volume"],
+        "Batches of queued operations a volume's writer has run.");
+    VOLUME_WRITER_OPERATIONS = ("weaver_volume_writer_operations_total", Counter, ["volume"],
+        "Operations a volume's writer has run: writes, closes, renames, removes and the rest.");
+    VOLUME_WRITER_FAILED_OPERATIONS = ("weaver_volume_writer_failed_operations_total", Counter, ["volume"],
+        "Operations a volume's writer ran that came back with an error.");
+    VOLUME_WRITER_ABANDONED_OPERATIONS = ("weaver_volume_writer_abandoned_operations_total", Counter, ["volume"],
+        "Operations queued for a volume's writer and never run: their job gave its files up, or an earlier operation of the same job failed.");
+    VOLUME_LOOP_WAITS = ("weaver_volume_loop_waits_total", Counter, ["volume", "kind"],
+        "Times the pipeline loop itself stood still until a volume's writer had caught up, by what it waited for: `read` (a file's bytes after its writes), `settle` (a file's operations to return, for its length or its delivery) or `budget` (the volume's limit, while the loop produced a repair's or a replay's output). Waits of other threads, and of a shutdown, are not counted.");
+    VOLUME_LOOP_WAIT_SECONDS = ("weaver_volume_loop_wait_seconds_total", Counter, ["volume", "kind"],
+        "Time the pipeline loop itself has stood still waiting for a volume's writer, by what it waited for (see `weaver_volume_loop_waits_total`). Waits of other threads, and of a shutdown, are not counted.");
+    VOLUME_LOOP_READS = ("weaver_volume_loop_reads_total", Counter, ["volume"],
+        "Reads the pipeline loop made itself of a file a volume's writer writes, once the file's writes before them had returned.");
+    VOLUME_LOOP_READ_SECONDS = ("weaver_volume_loop_read_seconds_total", Counter, ["volume"],
+        "Time the pipeline loop spent in its own reads of a volume writer's files (see `weaver_volume_loop_reads_total`), the opening of the file included; the wait before each is in `weaver_volume_loop_wait_seconds_total`.");
+    VOLUME_ASIDE_WAITS = ("weaver_volume_aside_waits_total", Counter, ["volume"],
+        "Times a thread other than the pipeline loop (a check, a repair, a replay) stood until a volume's writer had returned the operations of the file it was to read.");
+    VOLUME_ASIDE_WAIT_SECONDS = ("weaver_volume_aside_wait_seconds_total", Counter, ["volume"],
+        "Time threads other than the pipeline loop stood waiting for a volume's writer (see `weaver_volume_aside_waits_total`).");
+    VOLUME_WRITER_OPENS = ("weaver_volume_writer_opens_total", Counter, ["volume"],
+        "Files a volume's writer opened, failed opens included.");
+    VOLUME_WRITER_OPEN_SECONDS = ("weaver_volume_writer_open_seconds_total", Counter, ["volume"],
+        "Time a volume's writer spent opening files (see `weaver_volume_writer_opens_total`): the making of the file, its sparse mark and, where files are sized when made, its length.");
+    VOLUME_WRITER_OPEN_CREATES = ("weaver_volume_writer_open_creates_total", Counter, ["volume"],
+        "Opens of a volume's writer whose create step was timed: the open or making of the file, with the folders made for it.");
+    VOLUME_WRITER_OPEN_CREATE_SECONDS = ("weaver_volume_writer_open_create_seconds_total", Counter, ["volume"],
+        "Time a volume's writer spent in the create step of its opens (see `weaver_volume_writer_open_creates_total`).");
+    VOLUME_WRITER_OPEN_SPARSE_MARKS = ("weaver_volume_writer_open_sparse_marks_total", Counter, ["volume"],
+        "Opens of a volume's writer that marked the file sparse.");
+    VOLUME_WRITER_OPEN_SPARSE_MARK_SECONDS = ("weaver_volume_writer_open_sparse_mark_seconds_total", Counter, ["volume"],
+        "Time a volume's writer spent marking opened files sparse (see `weaver_volume_writer_open_sparse_marks_total`).");
+    VOLUME_WRITER_OPEN_LENGTH_SETS = ("weaver_volume_writer_open_length_sets_total", Counter, ["volume"],
+        "Opens of a volume's writer that looked at the file to size it at creation, sized or not.");
+    VOLUME_WRITER_OPEN_LENGTH_SET_SECONDS = ("weaver_volume_writer_open_length_set_seconds_total", Counter, ["volume"],
+        "Time a volume's writer spent sizing files at creation, the look at the file before it included (see `weaver_volume_writer_open_length_sets_total`).");
+    VOLUME_WRITER_LENGTH_SETS = ("weaver_volume_writer_length_sets_total", Counter, ["volume"],
+        "Lengths a volume's writer set on files, at a close or a truncate.");
+    VOLUME_WRITER_LENGTH_SET_SECONDS = ("weaver_volume_writer_length_set_seconds_total", Counter, ["volume"],
+        "Time a volume's writer spent setting the lengths of files (see `weaver_volume_writer_length_sets_total`).");
+    VOLUME_WRITER_LENGTH_SETS_SKIPPED = ("weaver_volume_writer_length_sets_skipped_total", Counter, ["volume"],
+        "Closes a volume's writer found already at their final length, which set no length.");
+    VOLUME_WRITER_CLOSES = ("weaver_volume_writer_closes_total", Counter, ["volume"],
+        "File handles a volume's writer dropped.");
+    VOLUME_WRITER_CLOSE_SECONDS = ("weaver_volume_writer_close_seconds_total", Counter, ["volume"],
+        "Time a volume's writer spent dropping file handles (see `weaver_volume_writer_closes_total`).");
+    VOLUME_WRITER_THREADS = ("weaver_volume_writer_threads_total", Counter, ["volume"],
+        "Writer threads started for a volume, one after another: a volume's thread ends when nothing writes to it and starts again at the next write.");
+    VOLUME_WRITER_WOKEN = ("weaver_volume_writer_woken_total", Counter, ["volume"],
+        "Times a volume's writer woke to new operations after it had run out of them and waited.");
 
     // ---- PAR3 recovery -----------------------------------------------------------------------------
     // Every series here is fed from `MetricsSnapshot::par3`, which is a plain

@@ -9,6 +9,8 @@ mod hardware_profile;
 mod history;
 mod report;
 mod runtime;
+#[cfg(test)]
+pub(in crate::pipeline) use runtime::volume_buffer_figure;
 mod scripts;
 mod state;
 

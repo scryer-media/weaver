@@ -21,7 +21,7 @@ use crate::rss::model::{compile_rules, evaluate_item, parse_feed_items};
 use crate::security::RuntimeSecurityConfig;
 use crate::settings::SharedConfig;
 use crate::torrents::service::{AddError, AddRequest, AddSource, TorrentService};
-use crate::{Database, RssFeedRow, RssRuleRow, RssSeenItemRow};
+use crate::{Database, RssFeedRow, RssRuleRow, RssSeenDecision, RssSeenItemRow};
 
 const MAX_RSS_REDIRECTS: usize = 10;
 pub(super) const MAX_RSS_FEED_BODY_BYTES: u64 = 16 * 1024 * 1024;
@@ -67,10 +67,13 @@ pub enum RssServiceError {
     Http(String),
 }
 
-// Why an accepted item made no job: one already holds it, or it failed.
+// Why an accepted item made no job: one already holds it, it is a torrent
+// while torrents are off, or it failed.
 #[derive(Debug)]
 pub(super) enum NotAdded {
     Ignored(String),
+    // Held, not seen: judged anew once torrents are on.
+    Waiting,
     Failed(String),
 }
 
@@ -117,6 +120,14 @@ impl RssService {
     /// Send the torrents the feeds accept from now on to `torrents`.
     pub fn use_torrents(&self, torrents: TorrentService) {
         let _ = self.inner.torrents.set(torrents);
+    }
+
+    // Whether the torrent client takes a new torrent now.
+    pub(super) fn torrents_take_new(&self) -> bool {
+        self.inner
+            .torrents
+            .get()
+            .is_some_and(TorrentService::takes_new)
     }
 
     pub fn is_scheduled_paused(&self) -> bool {
@@ -194,6 +205,17 @@ impl RssService {
 
         let fetched = match classify(download_url.as_bytes()) {
             Kind::Magnet(uri) => Ok(AddSource::Magnet(uri)),
+            // A link the feed says is a torrent waits unfetched while
+            // torrents take no new ones; it is fetched once they do.
+            _ if item.declared_torrent
+                && self
+                    .inner
+                    .torrents
+                    .get()
+                    .is_some_and(|torrents| !torrents.takes_new()) =>
+            {
+                return Err(NotAdded::Waiting);
+            }
             _ => {
                 let response = tokio::select! {
                     biased;
@@ -302,6 +324,10 @@ impl RssService {
         match torrents.add(request).await {
             Ok(job_id) => Ok(job_id.0),
             Err(AddError::Duplicate(_)) => Err(NotAdded::Ignored("already added".into())),
+            Err(AddError::Off) => Err(NotAdded::Waiting),
+            Err(AddError::Refused(crate::torrents::admission::Refusal::Removing(_))) => Err(
+                NotAdded::Ignored("the torrent is still being removed".into()),
+            ),
             Err(error) => Err(error.to_string().into()),
         }
     }
@@ -359,32 +385,29 @@ impl RssService {
         .map_err(RssServiceError::Http)
     }
 
-    pub(super) fn record_seen(
-        &self,
+    // The seen row of `item`, written with the rest of its poll's.
+    pub(super) fn seen_row(
         feed_id: u32,
         item: &FeedItem,
-        decision: &str,
+        decision: RssSeenDecision,
         job_id: Option<u64>,
         error: Option<&str>,
-    ) -> Result<(), RssServiceError> {
-        self.inner
-            .db
-            .insert_rss_seen_item(&RssSeenItemRow {
-                feed_id,
-                item_id: item.item_id.clone(),
-                item_title: item.title.clone(),
-                published_at: item.published_at,
-                size_bytes: item.size_bytes,
-                decision: decision.to_string(),
-                seen_at: crate::rss::model::unix_now_secs(),
-                job_id,
-                item_url: item
-                    .download_url
-                    .clone()
-                    .or_else(|| item.display_url.clone()),
-                error: error.map(str::to_string),
-            })
-            .map_err(|e| RssServiceError::Http(e.to_string()))
+    ) -> RssSeenItemRow {
+        RssSeenItemRow {
+            feed_id,
+            item_id: item.item_id.clone(),
+            item_title: item.title.clone(),
+            published_at: item.published_at,
+            size_bytes: item.size_bytes,
+            decision,
+            seen_at: crate::rss::model::unix_now_secs(),
+            job_id,
+            item_url: item
+                .download_url
+                .clone()
+                .or_else(|| item.display_url.clone()),
+            error: error.map(str::to_string),
+        }
     }
 }
 

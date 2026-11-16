@@ -20,12 +20,6 @@ counted! {
     }
 }
 
-impl TrackerKind {
-    pub fn of(udp: bool) -> Self {
-        if udp { Self::Udp } else { Self::Http }
-    }
-}
-
 counted! {
     /// The event an announce carried.
     AnnounceEvent {

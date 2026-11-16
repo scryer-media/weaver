@@ -86,8 +86,8 @@ func AdversarialRecipes() []Recipe {
 		},
 		{
 			Slug: "adv-zip-bomb-reserve", Family: "adversarial", ByteReproducible: true,
-			Notes: "One deflated member of 3 GiB of zeros. The lane runs it with the free-space reserve set just under what the disk holds, " +
-				"so the disk reserve is what refuses it.",
+			Notes: "One deflated member of 3 GiB of zeros. The lane runs it with the free-space reserve set just under what the disk holds free, " +
+				"so the job runs short of room and waits for it, and is not refused.",
 			Build: writeAdversarialZipBomb("reserve.zip", "zeros.bin", 3<<30),
 		},
 		{

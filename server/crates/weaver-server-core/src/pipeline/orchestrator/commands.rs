@@ -64,6 +64,7 @@ impl Pipeline {
         self.owned_download_lane_pool
             .resize(total_connections.max(1));
         self.tuner.set_connection_limit(total_connections);
+        self.size_volume_buffers();
         // Dispatch on the new pool only once the old one has let
         // go of its sockets. The provider counts both generations
         // against one allowance, so dialling into the overlap is
@@ -431,6 +432,9 @@ impl Pipeline {
             let cleanup_db = self.db.clone();
             let queue = queue.clone();
             tokio::spawn(async move {
+                // A move of the job's folder that is still out ends first:
+                // the folder has one remover at a time.
+                queue.wait_for_moves(job_id).await;
                 Self::cleanup_cancelled_job(cleanup_db, &queue, cleanup).await;
                 queue.write(|inner| {
                     inner

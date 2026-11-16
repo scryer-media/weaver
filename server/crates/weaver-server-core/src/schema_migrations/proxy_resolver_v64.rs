@@ -176,7 +176,7 @@ mod tests {
             &embedded_payload_bytes().unwrap(),
             MigrationInstallKind::Upgrade,
             SCHEMA_VERSION + 1,
-            super::super::proxy_dns_v121::SCHEMA_VERSION,
+            super::super::proxy_dns_v124::SCHEMA_VERSION,
         )
         .await
         .unwrap();

@@ -38,7 +38,7 @@ use weaver_server_core::jobs::{
 };
 use weaver_server_core::post_processing::hooks::UrlStatus;
 use weaver_server_core::settings::SharedConfig;
-use weaver_server_core::torrents::service::{AddRequest, AddSource};
+use weaver_server_core::torrents::service::{AddRequest, AddSource, TorrentService};
 use weaver_server_core::{
     Database, FieldUpdate, JobUpdate, QueueMoveTarget, SchedulerError, SchedulerHandle,
 };
@@ -212,11 +212,20 @@ impl JobsMutation {
                 ));
             }
         };
-        // A torrent is not staged: it is added whole, through `submit`.
+        // A torrent is not staged: it is added whole, through `submit`. While
+        // torrents take no new ones it is refused here, for every client, so
+        // its row says so before anything is submitted.
         if classify(&upload.content).is_torrent() {
+            let refusal = match ctx.data_opt::<TorrentService>() {
+                None => Some("the torrent client is not running".to_string()),
+                Some(torrents) if !torrents.takes_new() => {
+                    Some(weaver_server_core::torrents::status::TORRENTS_OFF.to_string())
+                }
+                Some(_) => None,
+            };
             return Ok(StagedNzbUploadResult {
                 kind: SubmissionKind::Torrent,
-                error: None,
+                error: refusal,
                 ..rejected_stage_upload_result(filename, String::new())
             });
         }

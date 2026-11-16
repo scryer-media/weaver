@@ -13,7 +13,6 @@ use super::logical::{
 use super::manifest::{BackupManifest, BackupServiceError, RestoreOptions};
 use crate::Database;
 use crate::settings::Config;
-#[cfg(test)]
 use crate::{
     JobInfo, JobStatus, job_status_from_persisted_str, runtime_lanes_from_status_snapshot,
 };
@@ -763,8 +762,9 @@ fn rewrite_first_matching_prefix(path: &str, roots: &[PathRemap]) -> Option<Path
         .find_map(|remap| rewrite_stored_prefix(path, &remap.source, &remap.target))
 }
 
-#[cfg(test)]
-fn job_info_from_history(row: crate::JobHistoryRow) -> JobInfo {
+// A history row as the queue shows a finished job: for a test of a
+// restore, and for a torrent a removal left retiring, written at a start.
+pub(crate) fn job_info_from_history(row: crate::JobHistoryRow) -> JobInfo {
     let status = job_status_from_persisted_str(&row.status, row.error_message.as_deref());
     let (download_state, post_state, run_state) = runtime_lanes_from_status_snapshot(&status);
 

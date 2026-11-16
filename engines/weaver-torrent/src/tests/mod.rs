@@ -27,3 +27,4 @@ mod e2e_utp_interop;
 pub mod embedder_util;
 mod idle_wakes;
 pub mod test_util;
+mod torrent_naming;

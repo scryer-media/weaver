@@ -23,7 +23,7 @@ pub(crate) mod store;
 pub(crate) mod tee;
 
 pub use model::{
-    ContentLayout, FilePriority, Infohash, TorrentCounters, TorrentFile, TorrentInsert,
+    ContentLayout, FilePriority, Infohash, KeptIntent, TorrentCounters, TorrentFile, TorrentInsert,
     TorrentIntent, TorrentRecord, TorrentSource, TorrentState, TorrentTracker, TrackerEntry,
     TrackerStatus,
 };

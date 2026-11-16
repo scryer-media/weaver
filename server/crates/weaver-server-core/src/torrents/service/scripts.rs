@@ -95,6 +95,36 @@ pub(super) enum Ending {
     Goal,
 }
 
+// Why a seed stopped seeding before its goals were met, as its scripts
+// hear it in `WEAVER_SEEDING_STOPPED_REASON`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StoppedSeeding {
+    // It failed, or unpacking refused its output.
+    Failed,
+    Paused,
+    Removed,
+}
+
+impl StoppedSeeding {
+    #[cfg(test)]
+    const ALL: [Self; 3] = [Self::Failed, Self::Paused, Self::Removed];
+
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Failed => "failed",
+            Self::Paused => "paused",
+            Self::Removed => "removed",
+        }
+    }
+
+    #[cfg(test)]
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|reason| reason.as_str() == value)
+    }
+}
+
 impl TorrentService {
     // Queue `event` for the scripts of `torrent`'s job, with `env` beside
     // the job's own variables. Nothing waits for it: a script never holds a
@@ -137,14 +167,18 @@ impl TorrentService {
 
     // SEEDING_STOPPED for `torrent`, ended for `reason` before its goals
     // were met; none for a torrent that does not seed now.
-    pub(super) fn seeding_stopped(&self, torrent: &Live, reason: &str) -> Option<EventContext> {
+    pub(super) fn seeding_stopped(
+        &self,
+        torrent: &Live,
+        reason: StoppedSeeding,
+    ) -> Option<EventContext> {
         if !(torrent.seeding() && torrent.resumed()) {
             return None;
         }
         self.script_event(
             torrent,
             QueueEvent::SeedingStopped,
-            &[(vars::SEEDING_STOPPED_REASON, reason)],
+            &[(vars::SEEDING_STOPPED_REASON, reason.as_str())],
         )
     }
 
@@ -152,5 +186,23 @@ impl TorrentService {
         if let Some(context) = context {
             drop(self.inner.db.admit_queue_script_event(context, false));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StoppedSeeding;
+
+    // Each reason reads back as itself, and its text stays what scripts
+    // have always been handed.
+    #[test]
+    fn a_seeding_stop_keeps_the_reason_its_scripts_read() {
+        for reason in StoppedSeeding::ALL {
+            assert_eq!(StoppedSeeding::parse(reason.as_str()), Some(reason));
+        }
+        assert_eq!(
+            StoppedSeeding::ALL.map(StoppedSeeding::as_str),
+            ["failed", "paused", "removed"]
+        );
     }
 }

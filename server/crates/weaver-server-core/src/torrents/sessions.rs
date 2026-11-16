@@ -113,7 +113,7 @@ impl RouteFailure {
             TorrentRouteReason::LegMissing => "the route's egress is missing",
             TorrentRouteReason::LegRevoked => "the route's leg was revoked",
             TorrentRouteReason::QuotaSilenced => "quota reached",
-            TorrentRouteReason::TorrentsDisabled => crate::torrents::status::OFF,
+            TorrentRouteReason::TorrentsDisabled => crate::torrents::status::TORRENTS_OFF,
             TorrentRouteReason::RouteBroken(fault) => fault.message(),
             TorrentRouteReason::LegOpenFailed => "the route's leg could not be opened",
             TorrentRouteReason::StateDirectoryFailed => {
@@ -1642,7 +1642,7 @@ impl Sessions {
     > {
         let torrent = self.config();
         let dir = self.env.root_of(&torrent).join(plan.key.as_str());
-        std::fs::create_dir_all(&dir).map_err(|error| {
+        tokio::fs::create_dir_all(&dir).await.map_err(|error| {
             RouteFailure::with_detail(TorrentRouteReason::StateDirectoryFailed, error.to_string())
         })?;
         // A session closing because its route's path changed lets its leg

@@ -24,7 +24,7 @@ pub(crate) mod history_search_key_v88;
 mod history_swept_v91;
 pub(crate) mod networking_bandwidth_v94;
 pub(crate) mod nzb_tables_v85;
-pub(crate) mod proxy_dns_v121;
+pub(crate) mod proxy_dns_v124;
 pub(crate) mod proxy_resolver_v64;
 mod schedule_tracks_v55;
 pub(crate) mod script_concurrency_v58;
@@ -42,7 +42,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 121;
+const CURRENT_SCHEMA_VERSION: i64 = 124;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -915,8 +915,8 @@ async fn run_rust_hook(
         tracker_hosts_v105::HOOK_ID => {
             tracker_hosts_v105::fill_tracker_hosts(&mut SqlConn::Sqlite(tx)).await
         }
-        proxy_dns_v121::HOOK_ID => {
-            proxy_dns_v121::dns_profiles_from_proxies(&mut SqlConn::Sqlite(tx)).await
+        proxy_dns_v124::HOOK_ID => {
+            proxy_dns_v124::dns_profiles_from_proxies(&mut SqlConn::Sqlite(tx)).await
         }
         other => Err(StateError::Database(format!(
             "unknown migration hook id '{other}'"
@@ -1492,7 +1492,7 @@ mod tests {
         run_embedded_migrations_on_path_blocking(&db_path).unwrap();
 
         let pool = open_test_pool(&db_path).await;
-        assert_eq!(CURRENT_SCHEMA_VERSION, 121);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 124);
         assert_eq!(
             max_recorded_migration_version(&pool).await.unwrap(),
             Some(CURRENT_SCHEMA_VERSION)
@@ -2055,7 +2055,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             indexes,
-            ["idx_torrents_added", "idx_torrents_category_added"]
+            [
+                "idx_torrents_added",
+                "idx_torrents_category_added",
+                "idx_torrents_retiring"
+            ]
         );
         let page: Vec<i64> = sqlx::query_scalar(
             "SELECT job_id FROM torrents ORDER BY added_at_ms, job_id LIMIT 10 OFFSET 0",
@@ -2442,6 +2446,188 @@ mod tests {
                 .unwrap();
         assert_eq!(keys, vec!["torrent.session_slots".to_string()]);
         pool.close().await;
+    }
+
+    // A database at 120 upgrades to the current schema: each torrent it
+    // holds stays live, with no history row kept on it, and the start finds
+    // the torrents a removal left retiring by their index.
+    #[tokio::test]
+    async fn sqlite_migration_120_torrents_upgrade_with_no_kept_history_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("v120.db");
+        let pool = open_test_pool(&db_path).await;
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(120), true)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO torrents (job_id, infohash_v1, name, source, added_at_ms, state)
+             VALUES (7, ?, 'kept', 'magnet', 1, 'queued')",
+        )
+        .bind(vec![7_u8; 20])
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        let rows: Vec<(i64, Option<String>)> =
+            sqlx::query_as("SELECT job_id, retiring FROM torrents")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, vec![(7, None)]);
+        let detail: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+            "EXPLAIN QUERY PLAN SELECT job_id, retiring FROM torrents WHERE retiring IS NOT NULL",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            detail
+                .iter()
+                .any(|(_, _, _, step)| step.contains("idx_torrents_retiring")),
+            "{detail:?}"
+        );
+        pool.close().await;
+        let db = crate::Database::open(&db_path).unwrap();
+        db.validate_backup_catalog().unwrap();
+    }
+
+    // A database at 122 upgrades to the current schema with the RSS items
+    // held while torrents are off found by their index, never by a scan of
+    // every seen item.
+    #[tokio::test]
+    async fn sqlite_migration_123_finds_rss_items_held_by_their_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("v122.db");
+        let pool = open_test_pool(&db_path).await;
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(122), true)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        for query in [
+            "EXPLAIN QUERY PLAN SELECT 1 FROM rss_seen_items WHERE decision = 'waiting' LIMIT 1",
+            "EXPLAIN QUERY PLAN SELECT feed_id FROM rss_seen_items WHERE decision = 'waiting'",
+        ] {
+            let detail: Vec<(i64, i64, i64, String)> =
+                sqlx::query_as(query).fetch_all(&pool).await.unwrap();
+            assert!(
+                detail
+                    .iter()
+                    .any(|(_, _, _, step)| step.contains("idx_rss_seen_waiting")),
+                "{query}: {detail:?}"
+            );
+        }
+        pool.close().await;
+    }
+
+    // A database at 0.16.16's schema (92) or at 120 upgrades to the current
+    // one with the history files list there and empty: a history row it
+    // held lists no files, its archive goes by its marked folders as before,
+    // and a read of one job's list is served by the list's key.
+    #[tokio::test]
+    async fn sqlite_upgrades_from_0_16_16_and_120_add_an_empty_history_files_list() {
+        for from in [92, 120] {
+            let temp = tempfile::tempdir().unwrap();
+            let db_path = temp.path().join(format!("v{from}.db"));
+            let pool = open_test_pool(&db_path).await;
+            let catalog = embedded_catalog().unwrap();
+            let payload = embedded_payload_bytes().unwrap();
+            replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(from), true)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO job_history
+                    (job_id, name, status, total_bytes, downloaded_bytes,
+                     optional_recovery_bytes, optional_recovery_downloaded_bytes,
+                     failed_bytes, health, created_at, completed_at)
+                 VALUES (102, 'history', 'complete', 10, 10, 0, 0, 0, 1000, 1, 2)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+
+            run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+            let pool = open_test_pool(&db_path).await;
+            let version: i64 = sqlx::query_scalar("SELECT version FROM schema_version")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(version, CURRENT_SCHEMA_VERSION, "from {from}");
+            let listed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_history_files")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(listed, 0, "from {from}");
+            let detail: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+                "EXPLAIN QUERY PLAN SELECT job_id, path, whole FROM job_history_files WHERE job_id IN (102, 103)",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert!(
+                detail
+                    .iter()
+                    .any(|(_, _, _, step)| step.contains("sqlite_autoindex_job_history_files")),
+                "from {from}: {detail:?}"
+            );
+            // The paths live torrents hold under a folder history removes
+            // from are found by the path index, never a scan.
+            let detail: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+                "EXPLAIN QUERY PLAN SELECT DISTINCT h.path FROM torrent_held_paths h \
+                 JOIN torrents t ON t.job_id = h.job_id WHERE t.retiring IS NULL AND \
+                 (h.path = '/d' OR (h.path >= '/d/' AND h.path < '/d0'))",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert!(
+                detail
+                    .iter()
+                    .any(|(_, _, _, step)| step.contains("idx_torrent_held_paths_path")),
+                "from {from}: {detail:?}"
+            );
+            let detail_above: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+                "EXPLAIN QUERY PLAN SELECT DISTINCT h.path FROM torrent_held_paths h \
+                 JOIN torrents t ON t.job_id = h.job_id WHERE t.retiring IS NULL AND \
+                 h.path IN ('/', '/e')",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert!(
+                detail_above
+                    .iter()
+                    .any(|(_, _, _, step)| step.contains("idx_torrent_held_paths_path")),
+                "from {from}: {detail_above:?}"
+            );
+            for step in detail.iter().chain(&detail_above) {
+                assert!(
+                    !step.3.starts_with("SCAN h") && !step.3.starts_with("SCAN torrent_held_paths"),
+                    "from {from}: {step:?}"
+                );
+            }
+            pool.close().await;
+            let db = crate::Database::open(&db_path).unwrap();
+            db.validate_backup_catalog().unwrap();
+            assert!(
+                db.job_history_files(&[crate::JobId(102)])
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[tokio::test]

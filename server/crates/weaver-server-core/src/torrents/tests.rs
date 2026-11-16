@@ -5,8 +5,8 @@ use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::settings::{Leaf, SeedingAction, SeedingGoalMode, SeedingPolicy};
 use crate::torrents::{
-    FilePriority, Infohash, NamedBy, TorrentCounters, TorrentInsert, TorrentIntent, TorrentRecord,
-    TorrentSource, TrackerEntry,
+    FilePriority, Infohash, KeptIntent, NamedBy, TorrentCounters, TorrentInsert, TorrentIntent,
+    TorrentRecord, TorrentSource, TrackerEntry,
 };
 
 fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRecord {
@@ -20,7 +20,7 @@ fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRe
         metainfo: None,
         category_id: None,
         added_at_ms: 1_000 + job_id as i64,
-        intent: TorrentIntent::Resumed,
+        kept: KeptIntent::Intent(TorrentIntent::Resumed),
         forced: false,
         completed_at_ms: None,
         storage_dir: None,
@@ -114,22 +114,30 @@ fn what_was_on_disk_before_a_torrent_is_kept_with_it() {
         files: vec!["kept/a.bin".to_owned()],
         dirs: vec![String::new(), "kept".to_owned()],
     };
-    db.insert_placed_torrent(&torrent(5, Some([5; 20]), None), &[], &found)
+    db.insert_placed_torrent(&torrent(5, Some([5; 20]), None), &[], &found, None)
         .unwrap();
-    assert_eq!(db.torrent_adopted(JobId(5)).unwrap(), found);
+    assert_eq!(db.torrent_adopted(JobId(5)).unwrap(), Some(found));
 
     db.insert_torrent(&torrent(6, Some([6; 20]), None), &[])
         .unwrap();
-    assert_eq!(db.torrent_adopted(JobId(6)).unwrap(), Adopted::default());
+    assert_eq!(
+        db.torrent_adopted(JobId(6)).unwrap(),
+        Some(Adopted::default())
+    );
     let all = Adopted {
         all_files: true,
         ..Adopted::default()
     };
     db.set_torrent_adopted(JobId(6), &all).unwrap();
-    assert_eq!(db.torrent_adopted(JobId(6)).unwrap(), all);
+    assert_eq!(db.torrent_adopted(JobId(6)).unwrap(), Some(all));
     db.set_torrent_adopted(JobId(6), &Adopted::default())
         .unwrap();
-    assert_eq!(db.torrent_adopted(JobId(6)).unwrap(), Adopted::default());
+    assert_eq!(
+        db.torrent_adopted(JobId(6)).unwrap(),
+        Some(Adopted::default())
+    );
+    db.forget_torrent_adopted(JobId(6)).unwrap();
+    assert_eq!(db.torrent_adopted(JobId(6)).unwrap(), None, "never written");
 }
 
 #[test]
@@ -179,14 +187,14 @@ fn intent_and_counters_update_in_place() {
             .unwrap()
     );
     let stored = db.get_torrent(JobId(3)).unwrap().unwrap();
-    assert_eq!(stored.intent, TorrentIntent::Paused);
+    assert_eq!(stored.intent(), TorrentIntent::Paused);
     assert_eq!(stored.completed_at_ms, Some(9_000));
     assert!(
         db.update_torrent_intent(JobId(3), TorrentIntent::Stopped)
             .unwrap()
     );
     let stored = db.get_torrent(JobId(3)).unwrap().unwrap();
-    assert_eq!(stored.intent, TorrentIntent::Stopped);
+    assert_eq!(stored.intent(), TorrentIntent::Stopped);
     assert_eq!(stored.completed_at_ms, Some(9_000));
 
     let counters = TorrentCounters {
@@ -324,7 +332,10 @@ fn the_hosts_a_torrent_announces_to_outlive_it() {
             "torrent 5",
             b"d4:infodee",
             "/data/t5",
-            &more
+            None,
+            &more,
+            &[],
+            &crate::torrents::model::Adopted::default()
         )
         .unwrap()
     );
@@ -520,4 +531,193 @@ fn a_stored_file_level_reads_back_as_the_level_it_was() {
     for value in ["2", "4", "x", "1-"] {
         assert_eq!(parse_file_priorities(value), None, "{value}");
     }
+}
+
+// The intents of more torrents than one statement can bind are written in
+// one call, each named torrent's and no other's.
+#[test]
+fn torrent_intents_past_the_bind_limit_are_written_together() {
+    let db = Database::open_in_memory().unwrap();
+    const TORRENTS: u64 = 2_000;
+    for job_id in 1..=TORRENTS {
+        let mut hash = [0u8; 20];
+        hash[..8].copy_from_slice(&job_id.to_be_bytes());
+        db.insert_torrent(&torrent(job_id, Some(hash), None), &[])
+            .unwrap();
+    }
+    // The first half stopped by a wind-down, the rest but the last by
+    // their goals, in one call.
+    let wound = (1..TORRENTS / 2).map(JobId).collect::<Vec<_>>();
+    let met = (TORRENTS / 2..TORRENTS).map(JobId).collect::<Vec<_>>();
+    db.update_torrent_intents(&[
+        (KeptIntent::WoundDown, &wound),
+        (KeptIntent::Intent(TorrentIntent::Stopped), &met),
+    ])
+    .unwrap();
+    for job_id in 1..=TORRENTS {
+        let record = db.get_torrent(JobId(job_id)).unwrap().unwrap();
+        let want = if job_id < TORRENTS / 2 {
+            (TorrentIntent::Stopped, true)
+        } else if job_id < TORRENTS {
+            (TorrentIntent::Stopped, false)
+        } else {
+            (TorrentIntent::Resumed, false)
+        };
+        assert_eq!(
+            (record.intent(), record.wound_down()),
+            want,
+            "torrent {job_id}"
+        );
+    }
+    // A single intent written later writes the wind-down's mark away.
+    db.update_torrent_intent(JobId(1), TorrentIntent::Paused)
+        .unwrap();
+    let first = db.get_torrent(JobId(1)).unwrap().unwrap();
+    assert_eq!(
+        (first.intent(), first.wound_down()),
+        (TorrentIntent::Paused, false)
+    );
+    db.update_torrent_intents(&[(KeptIntent::Intent(TorrentIntent::Paused), &[])])
+        .unwrap();
+}
+
+// Every stored word of a torrent's row reads back as what wrote it, and
+// stays the word rows already hold: a rename here would strand them.
+#[test]
+fn each_stored_word_of_a_torrent_reads_back_and_keeps_its_text() {
+    use crate::torrents::model::{ContentLayout, HistoryEnd, parse_named_by};
+    use crate::torrents::persistence::RetiringMark;
+    use crate::torrents::{TorrentState, model::named_by_str};
+
+    let sources = [TorrentSource::Magnet, TorrentSource::Metainfo];
+    for source in sources {
+        assert_eq!(TorrentSource::parse(source.as_str()), Some(source));
+    }
+    assert_eq!(sources.map(TorrentSource::as_str), ["magnet", "metainfo"]);
+
+    let layouts = [
+        ContentLayout::Original,
+        ContentLayout::Subfolder,
+        ContentLayout::NoSubfolder,
+    ];
+    for layout in layouts {
+        assert_eq!(ContentLayout::parse(layout.as_str()), Some(layout));
+    }
+    assert_eq!(
+        layouts.map(ContentLayout::as_str),
+        ["Original", "Subfolder", "NoSubfolder"]
+    );
+
+    let states = [
+        TorrentState::Queued,
+        TorrentState::CheckingResumeData,
+        TorrentState::FetchingMetadata,
+        TorrentState::CheckingFiles,
+        TorrentState::Downloading,
+        TorrentState::Stalled,
+        TorrentState::Seeding,
+        TorrentState::Paused,
+        TorrentState::Stopped,
+        TorrentState::Moving,
+        TorrentState::NeedsCertificate,
+        TorrentState::FilesMissing,
+    ];
+    for state in states {
+        assert_eq!(TorrentState::parse(state.as_str()), Some(state));
+    }
+    assert_eq!(
+        states.map(TorrentState::as_str),
+        [
+            "queued",
+            "checking_resume_data",
+            "fetching_metadata",
+            "checking_files",
+            "downloading",
+            "stalled",
+            "seeding",
+            "paused",
+            "stopped",
+            "moving",
+            "needs_certificate",
+            "files_missing",
+        ]
+    );
+
+    let kept = [
+        KeptIntent::Intent(TorrentIntent::Resumed),
+        KeptIntent::Intent(TorrentIntent::Paused),
+        KeptIntent::Intent(TorrentIntent::Stopped),
+        KeptIntent::WoundDown,
+    ];
+    for kept in kept {
+        assert_eq!(KeptIntent::parse(kept.as_str()), Some(kept));
+        if let KeptIntent::Intent(intent) = kept {
+            assert_eq!(TorrentIntent::parse(intent.as_str()), Some(intent));
+        }
+    }
+    assert_eq!(
+        kept.map(KeptIntent::as_str),
+        ["resumed", "paused", "stopped", "wound_down"]
+    );
+    // A wind-down's stop is a stop; it is no intent of the operator's.
+    assert_eq!(KeptIntent::WoundDown.intent(), TorrentIntent::Stopped);
+    assert_eq!(TorrentIntent::parse("wound_down"), None);
+    assert_eq!(KeptIntent::parse("Stopped"), None);
+
+    for named_by in [NamedBy::Torrent, NamedBy::Operator] {
+        assert_eq!(parse_named_by(named_by_str(named_by)), Some(named_by));
+    }
+    assert_eq!(
+        [NamedBy::Torrent, NamedBy::Operator].map(named_by_str),
+        ["torrent", "operator"]
+    );
+
+    for mark in RetiringMark::ALL {
+        assert_eq!(RetiringMark::parse(mark.as_str()), Some(mark));
+    }
+    assert_eq!(
+        RetiringMark::ALL.map(RetiringMark::as_str),
+        ["kept", "deleted"]
+    );
+    assert_eq!(RetiringMark::of(true), RetiringMark::Deleted);
+    assert_eq!(RetiringMark::of(false), RetiringMark::Kept);
+    assert_eq!(RetiringMark::parse("delete"), None);
+
+    for end in HistoryEnd::ALL {
+        assert_eq!(HistoryEnd::parse(end.as_str()), Some(end));
+    }
+    assert_eq!(
+        HistoryEnd::ALL.map(HistoryEnd::as_str),
+        ["complete", "partial", "failed", "cancelled"]
+    );
+}
+
+// How a torrent's job ends is stored as the jobs model's own status words,
+// and reads back from history as the status it ended with.
+#[test]
+fn a_torrents_history_end_is_the_jobs_stored_status() {
+    use crate::jobs::model::{JobStatus, job_status_from_persisted_str};
+    use crate::torrents::model::HistoryEnd;
+
+    let failed = JobStatus::Failed {
+        error: "why".to_owned(),
+    };
+    for (status, end) in [
+        (JobStatus::Complete, HistoryEnd::Complete),
+        (JobStatus::Partial, HistoryEnd::Partial),
+        (failed.clone(), HistoryEnd::Failed),
+    ] {
+        assert_eq!(HistoryEnd::delivered(&status), end);
+        assert_eq!(end.as_str(), status.persisted_status());
+        assert_eq!(
+            job_status_from_persisted_str(end.as_str(), Some("why")),
+            status
+        );
+    }
+    assert_eq!(
+        job_status_from_persisted_str(HistoryEnd::Cancelled.as_str(), None),
+        JobStatus::Failed {
+            error: "cancelled".to_owned()
+        }
+    );
 }

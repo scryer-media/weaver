@@ -221,6 +221,57 @@ impl Delivery {
         walk.delivery
     }
 
+    // Files that came whole to disk with no tree to walk, such as a
+    // torrent's own files, `posted`, and what its unpacking placed beside
+    // them, `unpacked`, each by the name it is delivered under, read as the
+    // walk reads a whole leaf: one whose name makes it a piece of something
+    // else (`names_a_piece`), an archive volume, a split part or recovery
+    // data, is delivered as it stands and is no usable file; any other is
+    // whole. A posted file at the root, its name with no folder, that is
+    // furniture (`root_furniture`) is no file of the delivery, as the walk
+    // leaves a root member that is out; one in a folder, and an unpacked
+    // one, is payload, whatever it is named. A directory is no file.
+    // Its `status` is then every delivery's.
+    pub(crate) fn of_whole_files(
+        posted: impl IntoIterator<Item = String>,
+        unpacked: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let furniture = root_furniture();
+        let names = posted
+            .into_iter()
+            .filter(|name| name.contains(['/', '\\']) || !furniture(name))
+            .chain(unpacked);
+        let mut delivery = Self::default();
+        for name in names {
+            if Leaf::is_directory(&name) {
+                continue;
+            }
+            let whole = !crate::pipeline::post_health::names_a_piece(&name);
+            delivery.deliver(
+                Delivered {
+                    from: name.clone(),
+                    name,
+                    depth: 0,
+                    whole,
+                    crc32: None,
+                },
+                None,
+            );
+        }
+        delivery
+    }
+
+    // One file the delivery hands over: whole, never arrived under a name
+    // that says nothing (`unarrived`), or as it stands.
+    fn deliver(&mut self, file: Delivered, unarrived: Option<Unarrived>) {
+        match (file.whole, unarrived) {
+            (true, _) => self.whole.push(file.name.clone()),
+            (false, Some(Unarrived::Unnamed)) => self.unnamed.push(file.name.clone()),
+            (false, _) => self.damaged.push(file.name.clone()),
+        }
+        self.files.push(file);
+    }
+
     // How a job that has nothing left to wait for ends, from the rulings:
     // complete when nothing it hands over is short or withheld and no
     // recovery set ruled it cannot rebuild what it covers, partial when some
@@ -345,6 +396,15 @@ struct Walk<'t, F, R> {
     delivery: Delivery,
 }
 
+// Whether a file posted at the root of a job, by its name, is furniture
+// beside the payload (an `.nfo`, an `.sfv` and their relatives, by the
+// extension list in force, read once here): the rule an NZB job's walk drops
+// root members by, and the one a torrent's own files are read by too.
+pub(crate) fn root_furniture() -> impl Fn(&str) -> bool {
+    let ignore = crate::pipeline::completion::finalize::check::configured_par2_ignore_extensions();
+    move |name| crate::pipeline::completion::finalize::check::par2_damage_ignorable(name, &ignore)
+}
+
 impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
     // `short` says a volume the member was unpacked from is short where a
     // failed repair covers it. Furniture is a file of the post: a member an
@@ -409,19 +469,16 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
                 || (!(self.piece)(node, member.id)
                     && !self.unopened(node, member)
                     && self.tree.refused_by(node, member.id).is_none()));
-        let delivery = &mut self.delivery;
-        match (whole, unarrived) {
-            (true, _) => delivery.whole.push(name.clone()),
-            (false, Some(Unarrived::Unnamed)) => delivery.unnamed.push(name.clone()),
-            (false, _) => delivery.damaged.push(name.clone()),
-        }
-        delivery.files.push(Delivered {
-            name,
-            from: member.name.clone(),
-            depth: self.tree.depth(node),
-            whole,
-            crc32: member.crc32,
-        });
+        self.delivery.deliver(
+            Delivered {
+                name,
+                from: member.name.clone(),
+                depth: self.tree.depth(node),
+                whole,
+                crc32: member.crc32,
+            },
+            unarrived,
+        );
     }
 
     fn namespace(&mut self, node: NodeId, short: bool) {

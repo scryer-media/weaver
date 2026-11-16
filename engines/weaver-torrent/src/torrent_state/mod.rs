@@ -169,6 +169,8 @@ pub(crate) struct ManagedTorrentOptions {
     pub disable_lsd: bool,
     /// [`AddTorrentOptions::disable_pex`](crate::AddTorrentOptions::disable_pex).
     pub disable_pex: bool,
+    /// [`AddTorrentOptions::owner_wakes_full_disk`](crate::AddTorrentOptions::owner_wakes_full_disk).
+    pub owner_wakes_full_disk: bool,
     /// [`AddTorrentOptions::seed_mode`](crate::AddTorrentOptions::seed_mode),
     /// while it lasts. Every run checks through this one record, so a piece
     /// checked once is not checked again after a pause.

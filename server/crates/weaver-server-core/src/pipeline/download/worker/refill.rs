@@ -35,6 +35,14 @@ pub(crate) struct HeldDownloadRefill {
     // is answered again once the lane has fetched down to the wake's count.
     // Such a lane is fetching, not idle, so its hold has no deadline.
     wake: Option<SaturationWake>,
+    // For a lane held for its volume's room: since when it has held
+    // nothing. From then on it is an idle lane, held by the idle rules
+    // (`idle_hold_stands`), with its volume's line as one more wake.
+    idle_since: Option<Instant>,
+    // An idle lane held while a volume held its job's budget
+    // (`Pipeline::volume_holds_budget`): counted as held for room, and as
+    // woken when it is answered once the volumes have room.
+    for_room: bool,
 }
 
 impl Pipeline {
@@ -156,17 +164,82 @@ impl Pipeline {
             return;
         }
         let now = Instant::now();
+        // Whether every idle hold would hear the same answer again. Asked
+        // once for the pass, and only when a hold is idle.
+        let volumes_refuse = self
+            .held_download_refills
+            .iter()
+            .any(|held| held.wake.is_none())
+            && self.volumes_hold_every_job(false);
+        // Whether every job waits for a volume's room, asked once for the
+        // pass and only when a lane held for room holds nothing.
+        let mut every_job_waits_for_room = None;
         let held = std::mem::take(&mut self.held_download_refills);
         for HeldDownloadRefill {
             request,
             since,
             wake,
+            mut idle_since,
+            for_room,
         } in held
         {
-            let Some(SaturationWake { of, below }) = wake else {
+            let Some(SaturationWake { of, below, room }) = wake else {
+                if volumes_refuse && self.idle_hold_stands(&request, since, now) {
+                    self.held_download_refills.push(HeldDownloadRefill {
+                        request,
+                        since,
+                        wake,
+                        idle_since,
+                        for_room,
+                    });
+                    continue;
+                }
+                if for_room && !volumes_refuse {
+                    self.metrics
+                        .download_lane_room_woken_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 self.answer_download_lane_refill(request, now, Some(since));
                 continue;
             };
+            // A lane held for its volume's room is not asked again while
+            // the volume is above its resume line: its wake at that line is
+            // asked for again (a load, when it stands) and rings dispatch
+            // when the volume falls there. While it still holds articles it
+            // is fetching and stands. Once it holds nothing it is an idle
+            // lane like any other: it stands only while every job waits for
+            // a volume and the idle rules let it, so a probe, a pool change,
+            // the idle window or a job with work elsewhere answers it. A job
+            // that is gone, or writes to no sized volume, holds nothing.
+            if room {
+                let job_id = of.expect("a room wake names its job");
+                let above = self.ask_room_wake(job_id);
+                let stands = !request.response_tx.is_closed()
+                    && above
+                    && (self.download_lane_holdings(request.lane_id) > 0 || {
+                        let idle = *idle_since.get_or_insert(now);
+                        *every_job_waits_for_room
+                            .get_or_insert_with(|| self.volumes_hold_every_job(true))
+                            && self.idle_hold_stands(&request, idle, now)
+                    });
+                if stands {
+                    self.held_download_refills.push(HeldDownloadRefill {
+                        request,
+                        since,
+                        wake,
+                        idle_since,
+                        for_room: false,
+                    });
+                    continue;
+                }
+                if !above {
+                    self.metrics
+                        .download_lane_room_woken_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                self.answer_download_lane_refill(request, now, idle_since);
+                continue;
+            }
             // A lane still saturated costs one owner lookup per pass, not a
             // walk of the queues. Only the articles the wake names count, so
             // a lane at its share of one job is not held past that by the
@@ -181,6 +254,8 @@ impl Pipeline {
                     request,
                     since,
                     wake,
+                    idle_since,
+                    for_room: false,
                 });
                 continue;
             }
@@ -188,6 +263,46 @@ impl Pipeline {
             // idle hold that starts here starts its own window.
             self.answer_download_lane_refill(request, now, None);
         }
+    }
+
+    // Whether no job can be handed an article until a volume has room:
+    // the link is open, and each job dispatch could draw from writes to a
+    // volume that holds its hard limit of unwritten bytes, or, with
+    // `room`, one above its resume line, where a lane holding nothing was
+    // held for room. Every such lane's ask is answered the same way then,
+    // whichever job it is put to, and the wake each such volume was asked
+    // for here wakes dispatch when the answer can change. Until then a pass
+    // asks the volumes once, not every job for every held lane. A job on a
+    // volume with room answers false, and the held lanes are asked again.
+    fn volumes_hold_every_job(&mut self, room: bool) -> bool {
+        let pressure = self.refresh_download_pressure();
+        if self.download_scheduler_link_gate(pressure).is_some() {
+            return false;
+        }
+        let eligible = self.download_scheduler_eligible_jobs();
+        // Every job is asked, so every stopped volume has its wake.
+        let mut all = !eligible.is_empty();
+        for job_id in &eligible {
+            all &= self.volume_refuses_job(*job_id) || (room && self.ask_room_wake(*job_id));
+        }
+        all
+    }
+
+    // Whether an idle hold is left as it is while the volumes refuse every
+    // job: its ask would be put to the scheduler, be refused there and be
+    // held again. A hold whose lane is gone, whose window ran out, or whose
+    // lane a probe batch waits for is answered as on any pass.
+    fn idle_hold_stands(
+        &self,
+        request: &DownloadLaneRefillRequest,
+        since: Instant,
+        now: Instant,
+    ) -> bool {
+        !request.response_tx.is_closed()
+            && request.runtime_generation == self.pool_generation
+            && self.download_lane_is_live(request.lane_id)
+            && now.saturating_duration_since(since) < DOWNLOAD_REFILL_IDLE_HOLD
+            && !self.probe_waits_for_seat_on(request.server_idx)
     }
 
     // Articles `lane_id` has been handed and not yet produced a result for.
@@ -198,6 +313,15 @@ impl Pipeline {
     }
 
     // [`Self::download_lane_holdings`], counting only `job_id`'s articles.
+    // The articles a lane holds, of every job, and their estimated bytes.
+    pub(in crate::pipeline) fn download_lane_held_bytes(&self, lane_id: u64) -> (usize, u64) {
+        self.download_lane_owners
+            .get(&lane_id)
+            .map_or((0, 0), |owner| {
+                (owner.outstanding.len(), owner.outstanding_bytes)
+            })
+    }
+
     pub(in crate::pipeline) fn download_lane_holdings_of_job(
         &self,
         lane_id: u64,
@@ -285,15 +409,27 @@ impl Pipeline {
                 // The lane keeps fetching what it holds with this ask
                 // outstanding. It blocks on the answer only once its pipe is
                 // dry, or on a park after returning every article it still
-                // holds — either way it is below any wake count by then and
-                // the hold has been answered.
+                // holds. A count wake is below anything it holds by then and
+                // has been answered. A room wake is not: a lane is held for
+                // room when not one more article fits below its volume's
+                // lease limit, and once it holds nothing it is held as an
+                // idle lane is (`service_held_download_refills`): its wait
+                // is bounded by the idle window and ends for a probe, a pool
+                // change or a job with work on a volume that has room.
                 self.metrics
                     .download_lane_refill_saturated_total
                     .fetch_add(1, Ordering::Relaxed);
+                if wake.room {
+                    self.metrics
+                        .download_lane_room_held_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 self.held_download_refills.push(HeldDownloadRefill {
                     request,
                     since: held_since.unwrap_or(now),
                     wake: Some(wake),
+                    idle_since: None,
+                    for_room: false,
                 });
                 return;
             }
@@ -392,7 +528,21 @@ impl Pipeline {
         let mut works = works.into_iter();
         for work in works.by_ref() {
             match self.reserve_download_work_for_dispatch(job_id, work) {
-                Ok(Some(work)) => reserved.push(work),
+                // The article is reserved on its job's volume, or goes back
+                // with the rest of the handout: a lease holds only what fits
+                // in the room the volume has left.
+                Ok(Some(work)) if self.reserve_lane_work(&work) => reserved.push(work),
+                Ok(Some(work)) => {
+                    self.enqueue_download_work(work);
+                    // Nothing fit: dispatch looks again once the volume has
+                    // fallen to where the article fits.
+                    if reserved.is_empty() {
+                        self.volume_budget_held
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        self.ask_room_wake(job_id);
+                    }
+                    break;
+                }
                 // The helper has already returned the refused article; the
                 // rest of the handout follows it below so the batch keeps
                 // the scheduler's order.
@@ -462,11 +612,44 @@ impl Pipeline {
             self.park_download_lane_refill(request, LaneParkReason::NoWork, held_since, now);
             return;
         }
+        // Held while a volume holds its job's budget: a hold for room.
+        let for_room = self
+            .volume_budget_held
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if for_room {
+            self.metrics
+                .download_lane_room_held_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.held_download_refills.push(HeldDownloadRefill {
             request,
             since,
             wake: None,
+            idle_since: None,
+            for_room,
         });
+    }
+
+    // Move every held refill's clock back by the idle window, as if each
+    // had waited that much longer.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn age_held_download_refills_past_idle_window_for_test(&mut self) {
+        let by = DOWNLOAD_REFILL_IDLE_HOLD;
+        for held in &mut self.held_download_refills {
+            held.since -= by;
+            if let Some(idle) = &mut held.idle_since {
+                *idle -= by;
+            }
+        }
+    }
+
+    // Whether a held refill waits for its volume's room.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn room_held_download_refills_for_test(&self) -> usize {
+        self.held_download_refills
+            .iter()
+            .filter(|held| held.wake.is_some_and(|wake| wake.room))
+            .count()
     }
 
     // Cut one lease for `server_idx` the way a dispatch pass would: one

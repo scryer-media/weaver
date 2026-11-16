@@ -297,7 +297,11 @@ async fn a_torrent_that_meets_its_goals_raises_seeding_finished_once() {
             .is_empty()
     );
     assert_eq!(
-        rig.db.get_torrent(views[0].job_id).unwrap().unwrap().intent,
+        rig.db
+            .get_torrent(views[0].job_id)
+            .unwrap()
+            .unwrap()
+            .intent(),
         TorrentIntent::Stopped
     );
     assert!(rig.db.get_torrent(views[1].job_id).unwrap().is_none());

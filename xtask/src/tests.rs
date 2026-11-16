@@ -859,8 +859,8 @@ fn release_hygiene_allows_repo_local_paths() {
 
 #[test]
 fn setup_code_is_read_only_from_the_current_run() {
-    let stale = "AAA-AAA";
-    let current = "K7P-M2X";
+    let stale = "AAAA-AAAA";
+    let current = "K7PM-2XQR";
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("backend.log");
     let bootstrap = format!("{SETUP_CODE_PREFIX}{stale}\n");
@@ -883,29 +883,33 @@ fn setup_code_is_read_only_from_the_current_run() {
 #[test]
 fn setup_code_line_must_carry_a_whole_code() {
     assert_eq!(
-        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7P-M2X\r")),
-        Some("K7P-M2X")
+        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7PM-2XQR\r")),
+        Some("K7PM-2XQR")
     );
     assert_eq!(
-        parse_setup_code_line(&format!("#   {SETUP_CODE_PREFIX}K7P-M2X      #")),
-        Some("K7P-M2X")
+        parse_setup_code_line(&format!("#   {SETUP_CODE_PREFIX}K7PM-2XQR      #")),
+        Some("K7PM-2XQR")
     );
     assert_eq!(
         parse_setup_code_line(&format!(
-            r#"{{"fields":{{"message":"ACTION REQUIRED: {SETUP_CODE_PREFIX}K7P-M2X. Open"}}}}"#
+            r#"{{"fields":{{"message":"ACTION REQUIRED: {SETUP_CODE_PREFIX}K7PM-2XQR. Open"}}}}"#
         )),
-        Some("K7P-M2X")
+        Some("K7PM-2XQR")
     );
     assert_eq!(
-        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7P")),
+        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7PM")),
         None
     );
     assert_eq!(
-        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7PM2X")),
+        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7PM2XQR")),
         None
     );
     assert_eq!(
-        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7P-M2XY")),
+        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7PM-2XQRS")),
+        None
+    );
+    assert_eq!(
+        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7PM-2X-QR")),
         None
     );
     assert_eq!(parse_setup_code_line("INFO listening"), None);

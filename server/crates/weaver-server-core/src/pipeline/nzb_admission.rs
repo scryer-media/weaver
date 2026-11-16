@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::operations::room_wait::ever_downloaded;
 use crate::pipeline::download::LoginRefusalView;
 use crate::pipeline::queue::Change;
 
@@ -108,58 +109,40 @@ impl Pipeline {
             pending,
             cancelled_or_retiring: row.intents.cancelled.is_some() || row.report.retiring,
             intake: row.admission.is_some(),
-            started: row.report.job.downloaded_bytes > 0
-                || installed.is_some_and(|state| state.downloaded_bytes > 0),
+            started: ever_downloaded(row.report.job.downloaded_bytes)
+                || installed.is_some_and(|state| ever_downloaded(state.downloaded_bytes)),
         }
     }
 
-    // Whether the working disk has no room over its reserve for a job that
-    // never downloaded to start: once it has not, none starts until a good
-    // reading shows room, or the disk has no reading. A disk with no
-    // reading, or only the last good one held across a failed probe, or no
-    // reserve, is not checked: only a good reading begins the hold. A hold
-    // begun lasts across a stale reading, as a job's wait for room does.
+    // The start check on the working disk, for a job that never downloaded:
+    // the owner every kind of job starts by.
+    fn working_disk_check(&self) -> crate::operations::room_wait::StartCheck {
+        crate::operations::room_wait::StartCheck {
+            root: crate::operations::StorageRoot::Intermediate,
+            reserve: self.extraction_limits.min_free_bytes,
+        }
+    }
+
+    // Whether a job that never downloaded is kept from starting for the
+    // working disk; a good reading with no room over the reserve begins the
+    // hold.
     fn admission_disk_short(&mut self) -> bool {
-        if self.admission_disk_held {
-            return true;
-        }
-        let short = self.working_disk_short();
-        if short {
-            self.admission_disk_held = true;
-            self.storage_capacity
-                .ledger(crate::operations::StorageRoot::Intermediate)
-                .wait();
-        }
-        short
+        let check = self.working_disk_check();
+        check.hold(&self.storage_capacity, &mut self.admission_disk_held)
     }
 
     // Whether the working disk's cached reading is a good one with no room
     // over the reserve. It reads the cache and begins nothing.
     fn working_disk_short(&self) -> bool {
-        let reserve = self.extraction_limits.min_free_bytes;
-        reserve > 0
-            && self
-                .storage_capacity
-                .free(crate::operations::StorageRoot::Intermediate)
-                .is_some_and(|free| !free.stale && free.bytes <= reserve)
+        self.working_disk_check().short(&self.storage_capacity)
     }
 
     // A reading came while jobs are kept from starting for the working
     // disk: a good one with room over the reserve, or none at all, lets
     // them start, and the next walk starts them.
     pub(in crate::pipeline) fn release_admission_disk_hold(&mut self) {
-        if !self.admission_disk_held {
-            return;
-        }
-        let reserve = self.extraction_limits.min_free_bytes;
-        let root = crate::operations::StorageRoot::Intermediate;
-        let room = self
-            .storage_capacity
-            .free(root)
-            .is_none_or(|free| !free.stale && free.bytes > reserve);
-        if room {
-            self.admission_disk_held = false;
-            self.storage_capacity.ledger(root).unwait();
+        let check = self.working_disk_check();
+        if check.release(&self.storage_capacity, &mut self.admission_disk_held) {
             self.queue_walk_due = true;
         }
     }

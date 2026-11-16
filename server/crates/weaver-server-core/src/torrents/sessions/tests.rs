@@ -3505,6 +3505,84 @@ async fn each_torrent_on_a_shared_leg_names_by_its_own_route() {
     proxies.network.shutdown().await;
 }
 
+// A fetch for a torrent route, a .torrent URL's or a feed item's, names by
+// that route's profile, not by the leg it shares: on one leg, category 3's
+// fetch hands its names to the proxy and the default scope's asks the
+// host.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fetch_for_a_torrent_route_names_by_its_own_route() {
+    use crate::proxies::FetchPath;
+    use weaver_tunnel::pipe::Resolution;
+
+    let db = Database::open_in_memory().unwrap();
+    db.save_proxy_profile(&loopback_proxy(1)).unwrap();
+    let handed = db
+        .save_dns_profile(
+            crate::proxies::DnsProfile {
+                kind: crate::proxies::DnsProfileKind::Route,
+                id: 0,
+                name: "Proxy".into(),
+                who: crate::proxies::DnsWho::Proxy,
+                transit: None,
+                trust: crate::proxies::DnsTrust::AsSent,
+                server_list_id: None,
+                system_fallback: false,
+            },
+            true,
+        )
+        .unwrap();
+    // A fetch is routed only for a consumer that exists: category 3 with a
+    // torrent route of its own.
+    for id in 1..=3 {
+        db.insert_category(&crate::categories::CategoryConfig {
+            upload_cap: Default::default(),
+            seeding: None,
+            torrent_route: true,
+            unpack: None,
+            id,
+            name: format!("category {id}"),
+            dest_dir: None,
+            aliases: String::new(),
+        })
+        .unwrap();
+    }
+    let category = TorrentScope::Category(3);
+    let through = |profile: u32| RoutingPolicy {
+        legs: vec![RouteLeg {
+            egress_id: SYSTEM_EGRESS_ID,
+            weight: 100,
+            path: ladder(1),
+        }],
+        dns_profile_id: Some(profile),
+        ..Default::default()
+    };
+    db.save_proxy_routing_policy(
+        Consumer::Torrent(TorrentScope::Default),
+        &through(crate::proxies::SYSTEM_DNS_PROFILE_ID),
+    )
+    .unwrap();
+    db.save_proxy_routing_policy(Consumer::Torrent(category), &through(handed.id))
+        .unwrap();
+    let proxies =
+        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let legacy = proxies
+        .draft_route(RoutingPolicy::default(), Duration::from_secs(1))
+        .unwrap();
+    let resolves = async |scope: TorrentScope| {
+        let attempts = proxies
+            .network
+            .fetch_attempts(Consumer::Torrent(scope), legacy.clone())
+            .unwrap();
+        attempts[0].resolve("localhost").await.unwrap()
+    };
+    assert!(matches!(resolves(category).await, Resolution::Unresolved));
+    assert!(matches!(
+        resolves(TorrentScope::Default).await,
+        Resolution::Addresses(_)
+    ));
+    proxies.network.shutdown().await;
+}
+
 // A route's naming on a shared leg lasts while a torrent names by it, and
 // its bridge while a client built on it does: a torrent moved to another
 // route keeps the connection it has open. Once the last of both is gone,

@@ -246,7 +246,7 @@ pub async fn recover_server_state(
     // A live job's row may name its destination, not the working directory
     // it is moving out of or that holds what its move left: a directory
     // carrying a live job's marker is that job's all the same.
-    let live_jobs: HashSet<crate::jobs::ids::JobId> = active_jobs.keys().copied().collect();
+    let mut live_jobs: HashSet<crate::jobs::ids::JobId> = active_jobs.keys().copied().collect();
 
     // Split recovered jobs into finished (history) vs in-progress (to restore).
     let mut initial_history = Vec::new();
@@ -326,8 +326,50 @@ pub async fn recover_server_state(
     // read that fails stops the start, as the read of every row did.
     // A job's work that panicked would panic again as the job is restored,
     // so the markers the panic left are read before any job is.
-    // The torrents come back too, each with its own job.
-    let torrents: HashSet<crate::jobs::ids::JobId> = db.torrent_job_ids()?.into_iter().collect();
+    // A torrent a removal left retiring, its history not yet written as
+    // the last run stopped, finishes its removal now: the files it asked to
+    // go are deleted, by the rules a live removal keeps, and it is archived
+    // as a terminal NZB job's row is above: it does not come back.
+    // One that cannot be written, or all of them when they do not read,
+    // stays retiring: never live, its folders kept, finished and written by
+    // the torrent service through the kept archives.
+    let finishing = {
+        let (db, work) = (db.clone(), intermediate_dir.to_path_buf());
+        tokio::task::spawn_blocking(move || crate::torrents::service::finish_retiring(&db, &work))
+            .await
+    };
+    match finishing {
+        Ok(Ok(rows)) => {
+            let archived = db.archive_retiring_torrents(rows);
+            if !archived.written.is_empty() {
+                info!(
+                    job_ids = ?archived.written.iter().map(|job_id| job_id.0).collect::<Vec<_>>(),
+                    "archived torrents removed before their history could be written"
+                );
+            }
+        }
+        Ok(Err(error)) => {
+            warn!(
+                error = %error,
+                "could not read the torrents a removal left retiring; they stay retiring and are retried"
+            );
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                "could not finish the torrents a removal left retiring; they stay retiring and are retried"
+            );
+        }
+    }
+    // The torrents come back too, each with its own job; those still
+    // retiring do not.
+    let (torrents, retiring) = db.torrent_rows()?;
+    let torrents: HashSet<crate::jobs::ids::JobId> = torrents.into_iter().collect();
+    // A torrent's unpacking directory carries its marker as a job's does:
+    // it is live while the torrent's row is, retiring or not, read after
+    // the archive whatever it came to.
+    live_jobs.extend(torrents.iter().copied());
+    live_jobs.extend(retiring);
     let restoring: HashSet<crate::jobs::ids::JobId> =
         in_progress.iter().map(|(job_id, _)| *job_id).collect();
     let mut crashed = crate::runtime::panic_trap::boot_marks(data_dir, |job| {
@@ -477,10 +519,14 @@ pub async fn recover_server_state(
     }
     initial_history.truncate(FINISHED_JOBS_RUNTIME_CAP);
 
-    match cleanup_unreferenced_intermediate_dirs(
+    match cleanup_unlisted_intermediate_dirs(
         intermediate_dir,
         &referenced_intermediate_dirs,
         &live_jobs,
+        |unclaimed| {
+            db.listed_history_dirs(unclaimed)
+                .map_err(|error| std::io::Error::other(error.to_string()))
+        },
     ) {
         Ok(removed) if removed > 0 => {
             info!(
@@ -624,17 +670,38 @@ fn try_archive_unfinished_terminal_job(
 
 // A directory that still holds what it cannot give up stays for the next
 // start, and the others go all the same.
+#[cfg(test)]
 fn cleanup_unreferenced_intermediate_dirs(
     intermediate_dir: &Path,
     referenced_dirs: &HashSet<PathBuf>,
     live_jobs: &HashSet<crate::jobs::ids::JobId>,
 ) -> Result<usize, std::io::Error> {
+    cleanup_unlisted_intermediate_dirs(intermediate_dir, referenced_dirs, live_jobs, |_| {
+        Ok(HashSet::new())
+    })
+}
+
+// As `cleanup_unreferenced_intermediate_dirs`, leaving too each unclaimed
+// directory its owner's history row lists (`listed`, asked once for every
+// unclaimed directory): a torrent's kept unpacking folder, which its row
+// records as an NZB job's row records the working folder it kept, and which
+// an archive of that row takes.
+fn cleanup_unlisted_intermediate_dirs(
+    intermediate_dir: &Path,
+    referenced_dirs: &HashSet<PathBuf>,
+    live_jobs: &HashSet<crate::jobs::ids::JobId>,
+    listed: impl FnOnce(
+        &[(crate::jobs::ids::JobId, PathBuf)],
+    ) -> Result<HashSet<PathBuf>, std::io::Error>,
+) -> Result<usize, std::io::Error> {
     use crate::jobs::working_dir::{remove_unclaimed_working_dir, unclaimed_working_dirs};
     let unclaimed = unclaimed_working_dirs(intermediate_dir, |owner, path| {
         live_jobs.contains(&owner) || referenced_dirs.contains(path)
     })?;
+    let listed = listed(&unclaimed)?;
     Ok(unclaimed
         .iter()
+        .filter(|(_, path)| !listed.contains(path))
         .filter(|(owner, path)| remove_unclaimed_working_dir(intermediate_dir, path, *owner))
         .count())
 }

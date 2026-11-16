@@ -19,9 +19,40 @@ use crate::torrents::{
     TrackerStatus,
 };
 
-pub const DISK_FULL: &str = "Waiting: disk full";
-pub const GOAL_MET: &str = "Seeding goal met";
-pub const OFF: &str = "torrents are off";
+/// What a torrent, or anything asked of one, is refused with while torrents
+/// are turned off.
+pub const TORRENTS_OFF: &str = "torrents are off";
+
+/// A reason the service gives a torrent's state in words of its own. The
+/// view carries it beside the words, so nothing reads it back from them; the
+/// API sends the words, the support bundle the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Stated {
+    /// A write found no room: it fetches nothing and keeps seeding.
+    DiskFull,
+    /// Stopped once its seeding goal was met.
+    GoalMet,
+}
+
+impl Stated {
+    pub const ALL: [Self; 2] = [Self::DiskFull, Self::GoalMet];
+
+    /// Its words, and its key in the support bundle.
+    const fn text(self) -> (&'static str, &'static str) {
+        match self {
+            Self::DiskFull => ("Waiting: disk full", "disk_full"),
+            Self::GoalMet => ("Seeding goal met", "goal_met"),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        self.text().0
+    }
+
+    pub const fn key(self) -> &'static str {
+        self.text().1
+    }
+}
 
 /// What the session says of a torrent.
 #[derive(Debug, Clone, PartialEq)]
@@ -146,17 +177,45 @@ impl Held {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Why {
     Said(String),
+    /// A reason the service states itself.
+    Stated(Stated),
     Route(TorrentRouteReason, Option<String>),
 }
 
+/// A torrent's reason taken apart for its view.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WhyParts {
+    /// The words, a stated reason's included, or the route's diagnostic.
+    pub detail: Option<String>,
+    pub stated: Option<Stated>,
+    pub route_reason: Option<TorrentRouteReason>,
+}
+
 impl Why {
-    /// The words or the route's diagnostic, and the route's reason.
-    pub fn split(why: Option<Self>) -> (Option<String>, Option<TorrentRouteReason>) {
+    pub fn split(why: Option<Self>) -> WhyParts {
         match why {
-            Some(Self::Said(text)) => (Some(text), None),
-            Some(Self::Route(reason, diagnostic)) => (diagnostic, Some(reason)),
-            None => (None, None),
+            Some(Self::Said(text)) => WhyParts {
+                detail: Some(text),
+                ..WhyParts::default()
+            },
+            Some(Self::Stated(stated)) => WhyParts {
+                detail: Some(stated.as_str().to_owned()),
+                stated: Some(stated),
+                route_reason: None,
+            },
+            Some(Self::Route(reason, diagnostic)) => WhyParts {
+                detail: diagnostic,
+                stated: None,
+                route_reason: Some(reason),
+            },
+            None => WhyParts::default(),
         }
+    }
+}
+
+impl From<Stated> for Why {
+    fn from(stated: Stated) -> Self {
+        Self::Stated(stated)
     }
 }
 
@@ -197,6 +256,9 @@ pub struct Observed {
     /// Not one of the files its pieces are in was there when it was loaded:
     /// it is held stopped until a start, a recheck or a move looks again.
     pub files_missing: bool,
+    /// It waits for room on its disk, as a usenet job held for disk space
+    /// does: in upload mode, seeding, until room is made.
+    pub disk_space: bool,
 }
 
 impl Observed {
@@ -239,8 +301,9 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
                 .restore_held
                 .clone()
                 .or_else(|| seen.failed.clone())
-                .or_else(|| seen.seeding().then(|| GOAL_MET.to_owned()));
-            return (TorrentState::Stopped, why.map(Why::Said));
+                .map(Why::Said)
+                .or_else(|| seen.seeding().then_some(Why::Stated(Stated::GoalMet)));
+            return (TorrentState::Stopped, why);
         }
         TorrentIntent::Resumed => {}
     }
@@ -270,6 +333,14 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
     if seen.queued {
         return (TorrentState::Queued, None);
     }
+    // Kept from starting for room on its disk, it waits in the queue and
+    // says so as a usenet job does. Waiting in upload mode is told below.
+    if seen.disk_space && !matches!(seen.engine, Engine::Live { .. }) {
+        return (
+            TorrentState::Queued,
+            detail(crate::jobs::handle::DISK_SPACE_WAIT_REASON),
+        );
+    }
     match &seen.engine {
         // In no session yet: it waits for one to take it.
         Engine::Absent => (TorrentState::Queued, None),
@@ -279,9 +350,16 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
         Engine::Live { .. } | Engine::Paused { .. } if seen.seeding() => {
             (TorrentState::Seeding, seen.failed.clone().map(Why::Said))
         }
+        // Waiting for room, it says so as a usenet job does.
         Engine::Live {
             upload_mode: true, ..
-        } => (TorrentState::Stalled, detail(DISK_FULL)),
+        } if seen.disk_space => (
+            TorrentState::Stalled,
+            detail(crate::jobs::handle::DISK_SPACE_WAIT_REASON),
+        ),
+        Engine::Live {
+            upload_mode: true, ..
+        } => (TorrentState::Stalled, Some(Stated::DiskFull.into())),
         Engine::Live { peers: 0, .. } => (TorrentState::Stalled, None),
         Engine::Live { .. } => (TorrentState::Downloading, None),
         Engine::Paused { .. } => (TorrentState::Paused, None),
@@ -669,7 +747,38 @@ mod tests {
             moving: false,
             restore_held: None,
             files_missing: false,
+            disk_space: false,
         }
+    }
+
+    // Each reason the service states reads back as itself, and its words
+    // and key stay what the API and the support bundle have always sent.
+    #[test]
+    fn a_stated_reason_keeps_its_words_and_key_beside_them() {
+        assert_eq!(
+            Stated::ALL.map(|stated| (stated.as_str(), stated.key())),
+            [
+                ("Waiting: disk full", "disk_full"),
+                ("Seeding goal met", "goal_met"),
+            ]
+        );
+        assert_eq!(TORRENTS_OFF, "torrents are off");
+        // The view carries the reason beside its words.
+        for stated in Stated::ALL {
+            assert_eq!(
+                Why::split(Some(stated.into())),
+                WhyParts {
+                    detail: Some(stated.as_str().to_owned()),
+                    stated: Some(stated),
+                    route_reason: None,
+                }
+            );
+        }
+        // Words that read like a stated reason are not one.
+        assert_eq!(
+            Why::split(Some(Stated::GoalMet.as_str().into())).stated,
+            None
+        );
     }
 
     // A torrent whose files were not there when it was loaded says so,
@@ -924,7 +1033,7 @@ mod tests {
                 complete: true,
                 ..seen(Engine::Checking)
             }),
-            (TorrentState::Stopped, Some(GOAL_MET.into()))
+            (TorrentState::Stopped, Some(Stated::GoalMet.into()))
         );
         for held in [
             Observed {
@@ -1012,7 +1121,34 @@ mod tests {
                 peers: 3,
                 upload_mode: true,
             })),
-            (TorrentState::Stalled, Some(DISK_FULL.into()))
+            (TorrentState::Stalled, Some(Stated::DiskFull.into()))
+        );
+        // Waiting for room on its disk, it says so as a usenet job held for
+        // disk space does.
+        assert_eq!(
+            project(&Observed {
+                disk_space: true,
+                ..seen(Engine::Live {
+                    finished: false,
+                    peers: 3,
+                    upload_mode: true,
+                })
+            }),
+            (
+                TorrentState::Stalled,
+                Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON.into())
+            )
+        );
+        // Kept from starting for room on its disk, it waits in the queue.
+        assert_eq!(
+            project(&Observed {
+                disk_space: true,
+                ..seen(Engine::Paused { finished: false })
+            }),
+            (
+                TorrentState::Queued,
+                Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON.into())
+            )
         );
         assert_eq!(
             project(&Observed {
@@ -1044,7 +1180,7 @@ mod tests {
                 intent: TorrentIntent::Stopped,
                 ..seen(live.clone())
             }),
-            (TorrentState::Stopped, Some(GOAL_MET.into()))
+            (TorrentState::Stopped, Some(Stated::GoalMet.into()))
         );
         // An engine error on a complete torrent is the error, never the goal.
         assert_eq!(
@@ -1095,7 +1231,7 @@ mod tests {
         };
         assert_eq!(
             project(&stopped(Engine::Paused { finished: true })),
-            (TorrentState::Stopped, Some(GOAL_MET.into()))
+            (TorrentState::Stopped, Some(Stated::GoalMet.into()))
         );
         assert_eq!(
             project(&stopped(Engine::Paused { finished: false })),

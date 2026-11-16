@@ -1690,22 +1690,73 @@ scope = "all"
 
 [[migration]]
 version = 121
-description = "saved DNS server lists and profiles; a route names the profile its names follow, a proxy the profile that finds its own address, and each saved proxy's DNS setting becomes a list and profiles"
+description = "a torrent being removed is marked kept or deleted, by whether its files go, and the next start finishes its removal"
 checksum_algo = "blake3"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0121_dns_profiles/sqlite.sql"
+file = "migrations/0121_torrent_retiring/sqlite.sql"
 engine = "sqlite"
 scope = "all"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0121_dns_profiles/postgres.sql"
+file = "migrations/0121_torrent_retiring/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 122
+description = "a torrent's history row lists the files it wrote, which an archive from history removes"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0122_job_history_files/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0122_job_history_files/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 123
+description = "an RSS item held while torrents are off is found by an index of its own"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0123_rss_waiting_items/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0123_rss_waiting_items/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 124
+description = "saved DNS server lists and profiles; a route names the profile its names follow, a proxy the profile that finds its own address, and each saved proxy's DNS setting becomes a list and profiles"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0124_dns_profiles/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0124_dns_profiles/postgres.sql"
 engine = "postgres"
 scope = "all"
 
 [[migration.steps]]
 kind = "rust"
-hook_id = "dns_profiles_from_proxies_v121"
+hook_id = "dns_profiles_from_proxies_v124"
 scope = "upgrade_only"

@@ -8,7 +8,7 @@ use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx, max_row
 use crate::settings::SeedingPolicy;
 use crate::torrents::model::{parse_file_priorities, parse_named_by};
 use crate::torrents::{
-    ContentLayout, FilePriority, Infohash, TorrentCounters, TorrentIntent, TorrentRecord,
+    ContentLayout, FilePriority, Infohash, KeptIntent, TorrentCounters, TorrentRecord,
     TorrentSource, TrackerEntry,
 };
 
@@ -59,7 +59,8 @@ fn opt_u32(row: &SqlRow, column: &str) -> Result<Option<u32>, StateError> {
 
 pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError> {
     let source = row.text("source")?;
-    let intent = row.text("state")?;
+    let state = row.text("state")?;
+    let kept = KeptIntent::parse(&state).ok_or_else(|| corrupt("intent", &state))?;
     let policy_override = SeedingPolicy::kept(
         row.opt_text("policy_override")?
             .map(|json| serde_json::from_str(&json).map_err(|error| corrupt("policy", error)))
@@ -79,7 +80,7 @@ pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError
         metainfo: row.opt_bytes("metainfo")?.map(bytes::Bytes::from),
         category_id: opt_u32(row, "category_id")?,
         added_at_ms: row.i64("added_at_ms")?,
-        intent: TorrentIntent::parse(&intent).ok_or_else(|| corrupt("intent", &intent))?,
+        kept,
         forced: row.bool("forced")?,
         completed_at_ms: row.opt_i64("completed_at_ms")?,
         storage_dir: row.opt_text("storage_dir")?,
@@ -280,13 +281,17 @@ fn arm_groups(
 // The statement that reads `group`'s torrents, `added_at_ms` and `job_id`,
 // in the order they were added, then its `LIMIT` and `OFFSET`; their binds
 // pushed onto `args`. Each arm walks its own index in that order and the
-// compound's `ORDER BY` merges them, so no arm is sorted.
+// compound's `ORDER BY` merges them, so no arm is sorted. A torrent a
+// removal left retiring is in no list, as in no other read of the live
+// torrents.
 fn ordered_arms(group: Vec<(String, Vec<SqlArg>)>, args: &mut Vec<SqlArg>) -> String {
     let selects: Vec<String> = group
         .into_iter()
         .map(|(predicate, binds)| {
             args.extend(binds);
-            format!("SELECT added_at_ms, job_id FROM torrents WHERE {predicate}")
+            format!(
+                "SELECT added_at_ms, job_id FROM torrents WHERE retiring IS NULL AND ({predicate})"
+            )
         })
         .collect();
     format!(
@@ -357,7 +362,9 @@ async fn named_torrents(
         let predicate = filter.predicate(Some(chunk), &mut args);
         let rows = SqlRuntime::fetch_all(
             datastore.read_exec(),
-            &format!("SELECT added_at_ms, job_id FROM torrents WHERE {predicate}"),
+            &format!(
+                "SELECT added_at_ms, job_id FROM torrents WHERE retiring IS NULL AND ({predicate})"
+            ),
             &args,
         )
         .await?;
@@ -429,17 +436,66 @@ impl Database {
         })
     }
 
-    // The job of every torrent, read alone, for a start that needs only
-    // which torrents it brings back.
+    // The job of every torrent a start brings back, read alone: never one a
+    // removal left retiring, which goes to history instead.
     pub fn torrent_job_ids(&self) -> Result<Vec<JobId>, StateError> {
+        Ok(self.torrent_rows()?.0)
+    }
+
+    // Every torrent row's job, those that come back live and those a
+    // removal left retiring, in one read.
+    pub(crate) fn torrent_rows(&self) -> Result<(Vec<JobId>, Vec<JobId>), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
-            let rows =
-                SqlRuntime::fetch_all(datastore.read_exec(), "SELECT job_id FROM torrents", &[])
-                    .await?;
-            rows.iter()
-                .map(|row| Ok(JobId(count(row, "job_id")?)))
-                .collect()
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT job_id, CASE WHEN retiring IS NULL THEN 0 ELSE 1 END AS retiring \
+                 FROM torrents",
+                &[],
+            )
+            .await?;
+            let (mut live, mut retiring) = (Vec::new(), Vec::new());
+            for row in &rows {
+                let job_id = JobId(count(row, "job_id")?);
+                if row.i64("retiring")? == 0 {
+                    live.push(job_id);
+                } else {
+                    retiring.push(job_id);
+                }
+            }
+            Ok((live, retiring))
+        })
+    }
+
+    // Which of `job_ids` have a torrent row: one statement per bind-sized
+    // chunk, each served by the torrents' key.
+    pub(crate) fn torrent_job_ids_among(
+        &self,
+        job_ids: &[JobId],
+    ) -> Result<std::collections::BTreeSet<JobId>, StateError> {
+        if job_ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let datastore = self.datastore();
+        let ids = job_ids.iter().map(|id| id.0 as i64).collect::<Vec<_>>();
+        self.run_sql_blocking_read(async move {
+            let mut torrents = std::collections::BTreeSet::new();
+            let rows_per =
+                crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 1);
+            for chunk in ids.chunks(rows_per) {
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let args = chunk.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!("SELECT job_id FROM torrents WHERE job_id IN ({placeholders})"),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    torrents.insert(JobId(count(&row, "job_id")?));
+                }
+            }
+            Ok(torrents)
         })
     }
 
@@ -509,7 +565,9 @@ impl Database {
                     .join(" OR ");
                 let row = SqlRuntime::fetch_optional(
                     datastore.read_exec(),
-                    &format!("SELECT COUNT(*) AS kept FROM torrents WHERE {predicate}"),
+                    &format!(
+                        "SELECT COUNT(*) AS kept FROM torrents WHERE retiring IS NULL AND ({predicate})"
+                    ),
                     &args,
                 )
                 .await?;
@@ -526,7 +584,10 @@ impl Database {
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                &format!("SELECT {TORRENT_COLUMNS} FROM torrents ORDER BY added_at_ms, job_id"),
+                &format!(
+                    "SELECT {TORRENT_COLUMNS} FROM torrents WHERE retiring IS NULL \
+                     ORDER BY added_at_ms, job_id"
+                ),
                 &[],
             )
             .await?;
@@ -548,7 +609,7 @@ impl Database {
                         datastore.read_exec(),
                         &format!(
                             "SELECT {TORRENT_COLUMNS} FROM torrents WHERE category_id = {{}}
-                              ORDER BY added_at_ms, job_id"
+                              AND retiring IS NULL ORDER BY added_at_ms, job_id"
                         ),
                         &[SqlArg::I64(i64::from(id))],
                     )
@@ -559,7 +620,7 @@ impl Database {
                         datastore.read_exec(),
                         &format!(
                             "SELECT {TORRENT_COLUMNS} FROM torrents WHERE category_id IS NULL
-                              ORDER BY added_at_ms, job_id"
+                              AND retiring IS NULL ORDER BY added_at_ms, job_id"
                         ),
                         &[],
                     )
@@ -663,7 +724,8 @@ impl Database {
         })
     }
 
-    // Every torrent, in the order they were added, each with its files'
+    // Every torrent a start brings back, never one a removal left
+    // retiring, in the order they were added, each with its files'
     // levels and the pieces it checked in seed mode: what a boot reads of
     // the torrents' rows, in one read. A row that does not read fails the
     // read, as [`Self::list_torrents`] does; a level or seed-mode column
@@ -675,8 +737,9 @@ impl Database {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 &format!(
-                    "SELECT {TORRENT_COLUMNS}, file_priorities, seed_verified \
-                       FROM torrents ORDER BY added_at_ms, job_id"
+                    "SELECT {TORRENT_COLUMNS}, file_priorities, seed_verified, held_set, \
+                            CASE WHEN held_set THEN NULL ELSE outputs END AS unheld_outputs \
+                       FROM torrents WHERE retiring IS NULL ORDER BY added_at_ms, job_id"
                 ),
                 &[],
             )
@@ -687,6 +750,10 @@ impl Database {
                         record: torrent_from_row(row)?,
                         levels: file_priorities_from_row(row),
                         seed_verified: row.opt_bytes("seed_verified"),
+                        held_set: row.bool("held_set")?,
+                        unheld_outputs: row
+                            .opt_text("unheld_outputs")?
+                            .map_or(Some(Vec::new()), |text| serde_json::from_str(&text).ok()),
                     })
                 })
                 .collect()
@@ -722,6 +789,11 @@ pub(crate) struct RestoredTorrent {
     pub(crate) record: TorrentRecord,
     pub(crate) levels: Result<Vec<FilePriority>, StateError>,
     pub(crate) seed_verified: Result<Option<Vec<u8>>, StateError>,
+    // Whether its held paths are its own; when not, what unpacking placed
+    // beside its files, read only for it, to write them from; None when
+    // that list does not read.
+    pub(crate) held_set: bool,
+    pub(crate) unheld_outputs: Option<Vec<String>>,
 }
 
 pub(crate) fn counters_from_row(row: &SqlRow) -> Result<TorrentCounters, StateError> {

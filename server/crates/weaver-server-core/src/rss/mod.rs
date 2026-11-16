@@ -10,5 +10,5 @@ mod record;
 pub mod repository;
 pub mod service;
 
-pub use record::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
+pub use record::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenDecision, RssSeenItemRow};
 pub use service::{RssFeedSyncReport, RssService, RssServiceError, RssSyncReport};

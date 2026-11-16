@@ -518,12 +518,12 @@ var rustStepReverses = map[string]rustStepReverse{
 	// Migration 112 deletes a torrent setting. Torrents came with migration
 	// 93, so a database from before it never held the key.
 	"forget_saved_mapped_ports_v112": {Plan: func(schemaShape) []string { return nil }},
-	// Migration 121 turns each proxy's DNS setting into server lists and
+	// Migration 124 turns each proxy's DNS setting into server lists and
 	// profiles, and takes it off the proxy. A proxy that kept the default
 	// gets no row, and only keys meaning that default leave its config. A
 	// list or profile is a setting the rewind cannot write back onto the
 	// proxies, so a database holding one is refused.
-	"dns_profiles_from_proxies_v121": {Plan: func(schemaShape) []string { return nil }, Refuse: refuseDNSProfilesV121},
+	"dns_profiles_from_proxies_v124": {Plan: func(schemaShape) []string { return nil }, Refuse: refuseDNSProfilesV124},
 }
 
 // migrationStatement is one SQL statement of one migration, its whitespace
@@ -760,7 +760,7 @@ func schedulesWithZeroLimits(raw string) (string, bool) {
 	return string(rewritten), true
 }
 
-func refuseDNSProfilesV121(db *stateConn) error {
+func refuseDNSProfilesV124(db *stateConn) error {
 	tables, err := existingTables(db)
 	if err != nil {
 		return err

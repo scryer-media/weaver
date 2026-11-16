@@ -27,9 +27,7 @@ pub(crate) async fn clear_restart_artifacts(
             &resources.staging_roots().await,
         );
         if working.is_some() {
-            use crate::jobs::working_dir::{
-                HistoryWorkingDir, prepare_history_working_dir, remove_job_working_dir,
-            };
+            use crate::jobs::working_dir::{HistoryWorkingDir, prepare_history_working_dir};
             if prepare_history_working_dir(&resources.intermediate_dir, working_dir, id).await?
                 != HistoryWorkingDir::Owned
             {
@@ -39,10 +37,11 @@ pub(crate) async fn clear_restart_artifacts(
             }
             let root = resources.intermediate_dir.clone();
             let path = working_dir.to_path_buf();
-            let removed =
-                tokio::task::spawn_blocking(move || remove_job_working_dir(&root, &path, id))
-                    .await
-                    .map_err(|error| SchedulerError::Internal(error.to_string()))??;
+            let removed = tokio::task::spawn_blocking(move || {
+                crate::jobs::working_dir::remove_job_working_dir_if_there(&root, &path, id)
+            })
+            .await
+            .map_err(|error| SchedulerError::Internal(error.to_string()))??;
             if removed != HistoryWorkingDir::Owned {
                 return Err(SchedulerError::Conflict(
                     "restart directory ownership changed".into(),
@@ -87,7 +86,7 @@ pub(crate) async fn clear_left_working_dirs(
         #[cfg(test)]
         crate::pipeline::activation::move_seams::after_listing(&root);
         for dir in marked.into_values().flatten().filter(|dir| *dir != keep) {
-            crate::jobs::working_dir::remove_job_working_dir(&root, &dir, id)?;
+            crate::jobs::working_dir::remove_job_working_dir_if_there(&root, &dir, id)?;
         }
         Ok::<_, std::io::Error>(())
     })
@@ -233,12 +232,87 @@ impl Drop for SweepListing {
     }
 }
 
+// A move of a job's working folder that is out: while any is, a cancel's
+// cleanup, a retry and a history operation of the job wait before they
+// remove or make the job's folders, so one folder never has two removers at
+// once. Let go however the move ends.
+pub(crate) struct MoveOut {
+    queue: Arc<Queue>,
+    id: JobId,
+}
+
+impl MoveOut {
+    pub(crate) fn take(queue: &Arc<Queue>, id: JobId) -> Self {
+        queue.write(|inner| {
+            *inner.moves_out.entry(id).or_default() += 1;
+            Change::unchanged(())
+        });
+        Self::counted(queue, id)
+    }
+
+    // One the caller counted in `moves_out` in a write of its own.
+    pub(crate) fn counted(queue: &Arc<Queue>, id: JobId) -> Self {
+        Self {
+            queue: Arc::clone(queue),
+            id,
+        }
+    }
+}
+
+impl Drop for MoveOut {
+    fn drop(&mut self) {
+        self.queue.write(|inner| {
+            if let std::collections::hash_map::Entry::Occupied(mut out) =
+                inner.moves_out.entry(self.id)
+            {
+                *out.get_mut() -= 1;
+                if *out.get() == 0 {
+                    out.remove();
+                }
+            }
+            // Rung, so a wait for the job's moves looks again.
+            Change::changed(())
+        });
+    }
+}
+
 impl Queue {
+    // Until no cleanup of a cancel, and no move, is out for any of `ids`.
     pub(super) async fn wait_for_cleanup(&self, ids: &BTreeSet<JobId>) {
         let mut revision = self.subscribe();
-        while self.read(|inner| ids.iter().any(|id| inner.pending_cleanup.contains(id))) {
+        #[cfg(test)]
+        let mut counted = false;
+        while self.read(|inner| {
+            ids.iter()
+                .any(|id| inner.pending_cleanup.contains(id) || inner.moves_out.contains_key(id))
+        }) {
             #[cfg(test)]
             crate::pipeline::activation::move_seams::cleanup_waited();
+            // Counted once, and rung for the test that waits on the count;
+            // that ring is marked seen and the wait looks again, so no
+            // other ring is missed.
+            #[cfg(test)]
+            if !counted {
+                counted = true;
+                self.write(|inner| {
+                    if ids.iter().any(|id| inner.moves_out.contains_key(id)) {
+                        inner.waits_on_moves += 1;
+                    }
+                    Change::changed(())
+                });
+                revision.borrow_and_update();
+                continue;
+            }
+            if revision.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    // Until no move is out for `id`.
+    pub(crate) async fn wait_for_moves(&self, id: JobId) {
+        let mut revision = self.subscribe();
+        while self.read(|inner| inner.moves_out.contains_key(&id)) {
             if revision.changed().await.is_err() {
                 return;
             }
@@ -289,6 +363,11 @@ impl Queue {
         tokio::spawn(async move {
             let _guard = guard;
             self.wait_for_cleanup(&BTreeSet::from([id])).await;
+            #[cfg(test)]
+            self.write(|inner| {
+                inner.restarts_clearing += 1;
+                Change::changed(())
+            });
             let db = resources.db.clone();
             let (spec, path, bytes, previous_dir, downloaded_bytes) =
                 tokio::task::spawn_blocking(move || {

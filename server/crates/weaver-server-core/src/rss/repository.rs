@@ -50,7 +50,7 @@ pub(crate) fn map_seen_item_row(row: SqlRow) -> Result<RssSeenItemRow, StateErro
         item_title: row.text("item_title")?,
         published_at: row.opt_i64("published_at")?,
         size_bytes: row.opt_i64("size_bytes")?.map(|value| value as u64),
-        decision: row.text("decision")?,
+        decision: crate::rss::RssSeenDecision::parse(&row.text("decision")?),
         seen_at: row.i64("seen_at")?,
         job_id: row.opt_i64("job_id")?.map(|value| value as u64),
         item_url: row.opt_text("item_url")?,

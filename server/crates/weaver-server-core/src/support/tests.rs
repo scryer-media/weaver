@@ -625,6 +625,7 @@ fn held_torrent(
         source: TorrentSource::Metainfo,
         state: TorrentState::Downloading,
         detail: None,
+        stated: None,
         route_reason: Some(TorrentRouteReason::LegDown),
         paused_by: None,
         category: Some(SENTINEL.into()),

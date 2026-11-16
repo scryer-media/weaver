@@ -30,8 +30,18 @@ pub struct FetchAttempt {
     // The addresses the fetch checked for each host, so a dial uses exactly
     // those instead of resolving again.
     addresses: Mutex<HashMap<String, Vec<IpAddr>>>,
+    // A torrent route's own names: torrent routes share their legs, and a
+    // fetch for one names by its route's profile, not the leg's.
+    names: Option<Arc<weaver_tunnel::pipe::NamesSlot>>,
 }
 impl FetchAttempt {
+    // The names the fetch's lookups and dials use.
+    fn names(&self) -> Option<weaver_tunnel::pipe::Names> {
+        match &self.names {
+            Some(slot) => slot.get(),
+            None => self.guard.names(),
+        }
+    }
     pub async fn cancelled(&self) {
         self.guard.cancelled().await;
     }
@@ -86,7 +96,7 @@ impl FetchPath for FetchAttempt {
         if self.guard.is_revoked() {
             return Err(DialError::Skipped("leg revoked".into()));
         }
-        weaver_tunnel::pipe::Names::scope(self.guard.names(), self.stage.resolve(host)).await
+        weaver_tunnel::pipe::Names::scope(self.names(), self.stage.resolve(host)).await
     }
     // Pins the checked addresses a direct dial of `host` uses.
     fn pin(&self, host: &str, addresses: Vec<IpAddr>) {
@@ -127,16 +137,16 @@ impl TunnelProvider for FetchAttempt {
             purpose: self.purpose.clone(),
             addresses,
         };
-        let mut dialed = self
-            .guard
-            .dial_using(self.stage.as_ref(), &target)
-            .await
-            .map_err(|error| {
-                let message = error.to_string();
-                *self.transport_error.lock().expect("fetch transport error") =
-                    Some(Arc::new(error));
-                TunnelError::Engine(message)
-            })?;
+        let mut dialed = weaver_tunnel::pipe::Names::scope(
+            self.names(),
+            self.guard.dial_using(self.stage.as_ref(), &target),
+        )
+        .await
+        .map_err(|error| {
+            let message = error.to_string();
+            *self.transport_error.lock().expect("fetch transport error") = Some(Arc::new(error));
+            TunnelError::Engine(message)
+        })?;
         dialed.path.rung = self.selected_proxy.map(|_| self.rung);
         self.route
             .weighted
@@ -280,6 +290,14 @@ impl NetworkRuntime {
                 continue;
             }
             let bottom = Self::bottom(&config, leg.definition.egress_id, Duration::from_secs(30))?;
+            let names = match consumer {
+                Consumer::Torrent(_) => {
+                    let owner = consumer.key();
+                    let profile = config.dns_profile_of(&owner);
+                    Some(self.names_slot(&config, owner, profile, leg.definition.egress_id))
+                }
+                _ => None,
+            };
             let (rungs, direct) = match &leg.definition.path {
                 LegPath::Direct => (Vec::new(), true),
                 LegPath::Ladder {
@@ -325,6 +343,7 @@ impl NetworkRuntime {
                         last_member: true,
                         last_attempt: false,
                         addresses: Mutex::default(),
+                        names: names.clone(),
                     });
                     blocked = true;
                     break;
@@ -387,6 +406,7 @@ impl NetworkRuntime {
                         last_member: member_index + 1 == count,
                         last_attempt: false,
                         addresses: Mutex::default(),
+                        names: names.clone(),
                     });
                 }
             }
@@ -417,6 +437,7 @@ impl NetworkRuntime {
                     last_member: true,
                     last_attempt: false,
                     addresses: Mutex::default(),
+                    names: names.clone(),
                 });
             }
             if let Some(last) = leg_attempts.last_mut() {

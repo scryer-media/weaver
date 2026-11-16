@@ -458,7 +458,9 @@ impl TorrentStore {
     // on disk.
     pub(crate) fn whole_names(&self) -> Vec<String> {
         let aside = self.aside();
-        let kept: Vec<usize> = self
+        // A set, so a torrent of many files and many kept pieces is not
+        // searched once per file.
+        let kept: std::collections::BTreeSet<usize> = self
             .side()
             .pieces()
             .into_iter()

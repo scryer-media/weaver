@@ -39,10 +39,11 @@ import {
 import type { JobDownloadRate } from "@/lib/live-job-download-rates";
 import { formatRate } from "./format";
 import { sameItems, shallowEqual, useSettled } from "./settled";
+import { torrentsStateFrom, type TorrentPresence, type TorrentsState } from "./torrents-shown";
 import { withLiveConnections, type ProviderConnections } from "./provider-connections";
 import { useHistoryLiveRefresh } from "./use-history-live-refresh";
 import { useLiveQueue, type LiveQueue } from "./use-live-queue";
-import { useVisibleInterval } from "./timers";
+import { usePageVisible, useVisibleInterval } from "./timers";
 
 /**
  * Everything the Next chrome needs, resolved once above the router.
@@ -116,6 +117,7 @@ interface LiveMetricsSnapshot {
   providerConnections?: ProviderConnections[];
   /** Per-job download rates on the same tick as the speed; only the push carries them. */
   jobDownloadRates?: JobDownloadRate[];
+  torrents?: TorrentPresence;
 }
 
 /** A category as it is configured, not as the queue happens to use it. */
@@ -135,6 +137,18 @@ export interface NextData {
   isPaused: boolean;
   /** Whether every torrent is held paused. */
   torrentsPaused: boolean;
+  /**
+   * Whether torrent things show. Read through `useTorrentsShown` or
+   * `TorrentsOnly`, never here, so every screen hides the same things the
+   * same way.
+   */
+  torrents: TorrentsState;
+  /**
+   * Whether torrents are on and the torrents there are; undefined until known.
+   * Screens read it through `useTorrentAddsOffered`; only the Torrents panel
+   * reads it here.
+   */
+  torrentPresence: TorrentPresence | undefined;
   /** When a timed pause resumes on its own, in epoch milliseconds; null when none is set. */
   resumeAt: number | null;
   /** The configured download limit in bytes per second; null is no limit, and 0 lets nothing through. */
@@ -190,6 +204,10 @@ const DEFAULT_DOWNLOAD_BLOCK: DownloadBlockState = {
 };
 
 const EMPTY_CATEGORIES: ConfiguredCategory[] = [];
+
+function sameTorrentPresence(left: TorrentPresence | undefined, right: TorrentPresence | undefined): boolean {
+  return left === right || (left !== undefined && right !== undefined && shallowEqual(left, right));
+}
 const EMPTY_PROVIDERS: ProviderHealth[] = [];
 const EMPTY_HOLDOFFS: ProviderHoldoff[] = [];
 
@@ -379,8 +397,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   const [{ data: providerData }, reexecuteProviders] = useQuery<{
     serverHealth: ProviderHealth[];
   }>({ query: SERVER_HEALTH_QUERY });
-
-  const [{ data: metricsQueryData }, reexecuteMetrics] = useQuery<LiveMetricsSnapshot>({
+  const [{ data: metricsQueryData, error: metricsQueryError }, reexecuteMetrics] = useQuery<LiveMetricsSnapshot>({
     query: LIVE_METRICS_QUERY,
   });
   const [{ data: metricsSubscriptionData, error: metricsSubscriptionError }] = useSubscription<{
@@ -434,6 +451,19 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
     }
     void reexecuteMetrics({ requestPolicy: "network-only" });
   }, [metricsSubscriptionError, reexecuteMetrics]);
+
+  // Whether torrent things show rides on the live metrics: read with them,
+  // pushed when it changes, and polled with them while the socket is down.
+  // A failed read is unknown, never off; it is read again once the tab is
+  // shown.
+  const torrentPresence = useSettled(snapshot?.torrents, sameTorrentPresence);
+  const torrents = torrentsStateFrom(torrentPresence);
+  const pageVisible = usePageVisible();
+  useEffect(() => {
+    if (pageVisible && torrentPresence === undefined && metricsQueryError) {
+      void reexecuteMetrics({ requestPolicy: "network-only" });
+    }
+  }, [pageVisible, torrentPresence, metricsQueryError, reexecuteMetrics]);
 
   const speed = snapshot?.metrics?.currentDownloadSpeed ?? 0;
   // Raised while rendering, so the published peak never trails the speed.
@@ -494,6 +524,8 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       peakSpeed,
       isPaused,
       torrentsPaused,
+      torrents,
+      torrentPresence,
       resumeAt,
       speedLimit,
       downloadBlock,
@@ -530,6 +562,8 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       refreshHistoryCount,
       speed,
       speedLimit,
+      torrents,
+      torrentPresence,
       torrentsPaused,
       update,
       version,

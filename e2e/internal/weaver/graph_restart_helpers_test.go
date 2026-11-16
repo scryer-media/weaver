@@ -368,11 +368,11 @@ func TestServerTrimReverseRefusesAListPastTheLimit(t *testing.T) {
 	}
 }
 
-// The reverses of migrations 94 and 121 refuse what an older build cannot
+// The reverses of migrations 94 and 124 refuse what an older build cannot
 // hold before the rewind changes anything, and pass a database without it.
 func TestBandwidthAndDNSReversesRefuseWhatAnOlderBuildCannotHold(t *testing.T) {
 	t.Setenv(weaverDatastoreEnv, string(weaverDatastoreSQLite))
-	rewind := schemaRewind{Reverses: []string{"move_bandwidth_to_networking_v94", "egress_bandwidth_columns_v94", "dns_profiles_from_proxies_v121"}, LedgerFrom: 94}
+	rewind := schemaRewind{Reverses: []string{"move_bandwidth_to_networking_v94", "egress_bandwidth_columns_v94", "dns_profiles_from_proxies_v124"}, LedgerFrom: 94}
 	for _, tc := range []struct {
 		name, plant, refusal string
 	}{
@@ -541,7 +541,7 @@ var testRustSteps = map[string][]string{
 	},
 	// These tests hold no torrents and no proxies.
 	"fill_tracker_hosts_v105":        nil,
-	"dns_profiles_from_proxies_v121": nil,
+	"dns_profiles_from_proxies_v124": nil,
 }
 
 func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
@@ -598,6 +598,8 @@ func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
 		`CREATE TABLE servers (id INTEGER PRIMARY KEY NOT NULL)`,
 		`INSERT INTO servers (id) VALUES (1), (2)`,
 		`CREATE TABLE categories (id INTEGER PRIMARY KEY NOT NULL)`,
+		// Migration 21's seen RSS items, which migration 123 indexes.
+		`CREATE TABLE rss_seen_items (feed_id INTEGER NOT NULL, decision TEXT)`,
 		`CREATE TABLE proxy_profiles (id INTEGER PRIMARY KEY NOT NULL, config TEXT NOT NULL)`,
 		`CREATE TABLE proxy_routes (consumer TEXT PRIMARY KEY NOT NULL, policy TEXT NOT NULL)`,
 		// Migration 53's egress tables, with a global limit and an egress

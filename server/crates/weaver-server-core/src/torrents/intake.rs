@@ -4,50 +4,287 @@
 // Verified pieces on their way to the store, under the disk budget. A piece
 // the budget refuses, or whose write finds no space, is refused to the
 // session as a write that found no room: the session puts the torrent in
-// upload mode, where it fetches nothing, keeps seeding, and tries again
-// later. Any other write the store could not make fails the torrent.
+// upload mode, where it fetches nothing and keeps seeding, and the owner
+// hears what the write wanted, to wait for room as any job does. Any other
+// write the store could not make fails the torrent, as it fails a usenet
+// job: the one classifier both use tells the two apart.
 
 use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use weaver_graph::holds::{HoldsAccountant, HoldsNamespace};
-use weaver_torrent::storage::write_refused;
 
-use crate::operations::disk::{CapacityDebits, CapacityReader};
+use crate::operations::disk::{
+    CapacityReader, DiskLedger, StorageRoot, is_out_of_space, is_quota_exceeded,
+};
+use crate::operations::room_wait::{Disk, Wants};
 use crate::pipeline::ExtractionLimits;
 use crate::torrents::storage::Pieces;
 
+// Where a torrent's pieces land: the disk the folder they are written to
+// lies on, by the choice a usenet job held for a full disk is placed by,
+// and the reading and ledger writes there book on. A disk off the roots'
+// has none: its writes are not booked, and wait only when the disk itself
+// refuses one.
+#[derive(Clone)]
+pub(crate) struct Place {
+    pub(crate) disk: Disk,
+    // The folder the disk was chosen for.
+    pub(crate) dir: PathBuf,
+    reader: Option<CapacityReader>,
+}
+
+impl Place {
+    pub(crate) fn new(disk: Disk, dir: PathBuf, reader: Option<CapacityReader>) -> Self {
+        Self { disk, dir, reader }
+    }
+
+    // The reading writes here book on, when they book.
+    pub(crate) fn reader(&self) -> Option<&CapacityReader> {
+        self.reader.as_ref()
+    }
+}
+
 // The disk budget the pieces are written under: the reserve the job's
-// limits keep free on the volume the reader samples, against what was
-// written since its last reading.
+// limits keep free on the disk the torrent's folder lies on, booked on the
+// ledger every writer on that disk shares, usenet's included, so two
+// writers never spend the same free space. Until the disk of the folder
+// the pieces go to is known, no piece is let through: each is refused as a
+// booking the ledger refused, and the torrent waits for its disk to be
+// known, then on its ledger.
 pub(crate) struct Room {
     limits: Arc<ExtractionLimits>,
-    free_disk: CapacityReader,
-    debits: Mutex<CapacityDebits>,
+    spot: Mutex<Spot>,
+    // Room a wake promised on the place's ledger for the write it let go:
+    // the next pieces spend it before they book, and what is left goes
+    // back when the place changes, the run ends or the room goes.
+    in_hand: AtomicU64,
+    // A wake judged by readings of the disk its write found full promised
+    // it room beside the other waiters': the next piece that lands ends
+    // that promise.
+    promised: AtomicBool,
+    // Its disk is being looked up.
+    placing: AtomicBool,
+}
+
+// The folder the pieces go to, when it is set, and the disk they land on
+// once known: a place for another folder is no place.
+struct Spot {
+    aim: Option<PathBuf>,
+    place: Option<Place>,
 }
 
 impl Room {
+    // A budget booked on `free_disk`, which reads the complete root: with
+    // no disks to look a folder up on.
     pub(crate) fn new(limits: Arc<ExtractionLimits>, free_disk: CapacityReader) -> Self {
+        Self::with(
+            limits,
+            None,
+            Some(Place::new(
+                Disk::Root(StorageRoot::Complete),
+                PathBuf::new(),
+                Some(free_disk),
+            )),
+        )
+    }
+
+    // A budget for pieces that go to `dir`, whose disk is not known yet.
+    pub(crate) fn aimed(limits: Arc<ExtractionLimits>, dir: PathBuf) -> Self {
+        Self::with(limits, Some(dir), None)
+    }
+
+    // A budget for pieces that land at `place`, known already.
+    pub(crate) fn placed(limits: Arc<ExtractionLimits>, place: Place) -> Self {
+        Self::with(limits, Some(place.dir.clone()), Some(place))
+    }
+
+    fn with(limits: Arc<ExtractionLimits>, aim: Option<PathBuf>, place: Option<Place>) -> Self {
         Self {
             limits,
-            free_disk,
-            debits: Mutex::new(CapacityDebits::default()),
+            spot: Mutex::new(Spot { aim, place }),
+            in_hand: AtomicU64::new(0),
+            promised: AtomicBool::new(false),
+            placing: AtomicBool::new(false),
         }
     }
 
-    // Whether `bytes` more fit, counted against the reading when they do. A
-    // volume never read is never refused.
-    fn admits(&self, bytes: u64) -> bool {
-        let mut debits = self.debits.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(reading) = debits.apply(self.free_disk.current()).reading() else {
-            return true;
-        };
-        if self.limits.short_of_reserve(&reading, bytes).is_some() {
+    // A look for its disk begins: whether none was out.
+    pub(crate) fn begin_placing(&self) -> bool {
+        !self.placing.swap(true, Ordering::AcqRel)
+    }
+
+    // The look for its disk ended without a place.
+    pub(crate) fn end_placing(&self) {
+        self.placing.store(false, Ordering::Release);
+    }
+
+    // The look for its disk ends once the place known is the one for the
+    // folder the pieces go to. While it is not, the look goes on, for the
+    // folder named: one look at a time, and the latest folder wins. A move
+    // that names a folder after this ends begins a look of its own.
+    pub(crate) fn finish_placing(&self) -> Result<(), PathBuf> {
+        let spot = self.locked();
+        match &spot.aim {
+            Some(aim) if spot.place.as_ref().is_none_or(|place| place.dir != *aim) => {
+                Err(aim.clone())
+            }
+            _ => {
+                self.placing.store(false, Ordering::Release);
+                Ok(())
+            }
+        }
+    }
+
+    // Whether a look for its disk is out.
+    #[cfg(test)]
+    pub(crate) fn placing(&self) -> bool {
+        self.placing.load(Ordering::Acquire)
+    }
+
+    fn locked(&self) -> std::sync::MutexGuard<'_, Spot> {
+        self.spot.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // Where the pieces land, once known.
+    pub(crate) fn place(&self) -> Option<Place> {
+        self.locked().place.clone()
+    }
+
+    // The pieces go to `dir` from now: a place known for another folder is
+    // dropped, with the room in hand on it. Whether the disk of `dir` is to
+    // be looked up.
+    pub(crate) fn aim(&self, dir: &Path) -> bool {
+        let mut spot = self.locked();
+        if spot.place.as_ref().is_some_and(|place| place.dir != dir) {
+            let left = spot.place.take();
+            self.give_in_hand(left.as_ref());
+        }
+        spot.aim = Some(dir.to_path_buf());
+        spot.place.is_none()
+    }
+
+    // The disk the pieces land on was found: `place`, for the folder they
+    // go to, from now. A place found for a folder they no longer go to is
+    // not taken. Room in hand on the disk they landed on goes back. Whether
+    // it was taken.
+    pub(crate) fn set_place(&self, place: Place) -> bool {
+        let mut spot = self.locked();
+        if spot.aim.as_ref().is_some_and(|aim| *aim != place.dir) {
             return false;
         }
-        debits.debit(bytes);
+        let left = spot.place.replace(place);
+        self.give_in_hand(left.as_ref());
         true
+    }
+
+    // What a wake handed this torrent on `place` goes back.
+    fn give_in_hand(&self, place: Option<&Place>) {
+        let given = self.in_hand.swap(0, Ordering::AcqRel);
+        if let Some(reader) = place.and_then(Place::reader) {
+            reader.ledger().release(given);
+        }
+    }
+
+    // A wake promised `bytes` on the place's ledger to this torrent.
+    pub(crate) fn hand(&self, bytes: u64) {
+        self.in_hand.fetch_add(bytes, Ordering::AcqRel);
+    }
+
+    // A wake promised this torrent room beside the other waiters': the next
+    // piece that lands ends it.
+    pub(crate) fn promise_room(&self) {
+        self.promised.store(true, Ordering::Release);
+    }
+
+    // What a wake handed this torrent and it did not spend goes back, and
+    // a promise beside the other waiters' is no longer pending: its run
+    // ended.
+    pub(crate) fn give_back(&self) {
+        self.promised.store(false, Ordering::Release);
+        let spot = self.locked();
+        self.give_in_hand(spot.place.as_ref());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_hand(&self) -> u64 {
+        self.in_hand.load(Ordering::Acquire)
+    }
+
+    // `bytes` more, booked when they fit over the reserve: from what a
+    // wake handed it first, else checked and promised on the ledger in one
+    // step. A disk off the roots', or one never read, is never refused; a
+    // disk not known yet refuses every piece. The booking goes back unless
+    // it is landed.
+    fn admits(&self, bytes: u64) -> Option<Booked> {
+        let spot = self.locked();
+        let place = spot.place.as_ref()?;
+        let Some(reader) = place.reader() else {
+            return Some(Booked::none());
+        };
+        let ledger = Arc::clone(reader.ledger());
+        let spent = self
+            .in_hand
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |have| {
+                have.checked_sub(bytes)
+            })
+            .is_ok();
+        if !spent
+            && ledger
+                .book(reader, self.limits.min_free_bytes, bytes, 0)
+                .is_none()
+        {
+            return None;
+        }
+        Some(Booked {
+            ledger: Some(ledger),
+            bytes,
+            landed: false,
+        })
+    }
+}
+
+impl Drop for Room {
+    fn drop(&mut self) {
+        self.give_back();
+    }
+}
+
+// Bytes booked for one piece: landed when its write returns, else given
+// back, whether the write failed or panicked.
+struct Booked {
+    ledger: Option<Arc<DiskLedger>>,
+    bytes: u64,
+    landed: bool,
+}
+
+impl Booked {
+    fn none() -> Self {
+        Self {
+            ledger: None,
+            bytes: 0,
+            landed: true,
+        }
+    }
+
+    fn landed(mut self) {
+        if let Some(ledger) = &self.ledger {
+            ledger.landed(self.bytes, 0);
+        }
+        self.landed = true;
+    }
+}
+
+impl Drop for Booked {
+    fn drop(&mut self) {
+        if !self.landed
+            && let Some(ledger) = &self.ledger
+        {
+            ledger.release(self.bytes);
+        }
     }
 }
 
@@ -68,6 +305,16 @@ pub(crate) enum Heard {
     // The store could not take a piece, and why: the torrent's failure. A
     // write that found no room is not one.
     Refused(String),
+    // A piece's write found the disk full, and what it wanted: the
+    // torrent waits in upload mode for a reading that shows room made.
+    NoRoom(Wants),
+    // The ledger had no room over the reserve for a piece of these bytes:
+    // the torrent waits in upload mode on the ledger, as a usenet job whose
+    // booking is refused does.
+    NotBooked(u64),
+    // A piece landed after a wake promised the torrent room beside the
+    // other waiters': that promise ends.
+    Landed,
     // A piece the session counted made one of the torrent's files whole.
     FileWhole,
 }
@@ -83,6 +330,11 @@ pub(crate) struct Intake {
 impl Intake {
     pub(crate) fn new(inner: Arc<dyn Pieces>, room: Room, hear: Hear) -> Self {
         Self { inner, room, hear }
+    }
+
+    // The disk budget its pieces are written under.
+    pub(crate) fn room(&self) -> &Room {
+        &self.room
     }
 
     // What the store said of a piece it was told of: a change is heard, and
@@ -106,24 +358,42 @@ impl Intake {
 impl Pieces for Intake {
     fn verified(&self, piece: u32, held: &Bytes) -> anyhow::Result<()> {
         let bytes = held.len() as u64;
-        if !self.room.admits(bytes) {
+        let Some(booked) = self.room.admits(bytes) else {
+            (self.hear)(Heard::NotBooked(bytes));
             return Err(
                 anyhow::Error::from(io::Error::from(io::ErrorKind::StorageFull)).context(format!(
                     "{bytes} bytes more would eat into the disk reserve"
                 )),
             );
-        }
-        match self.inner.verified(piece, held) {
+        };
+        // A write that fails or panics gives its booking back as it drops.
+        let error = match self.inner.verified(piece, held) {
             Ok(()) => {
+                booked.landed();
+                if self.room.promised.swap(false, Ordering::AcqRel) {
+                    (self.hear)(Heard::Landed);
+                }
                 (self.hear)(Heard::Changed);
-                Ok(())
+                return Ok(());
             }
-            Err(error) if write_refused(&error) => Err(error),
-            Err(error) => {
-                (self.hear)(Heard::Refused(format!("{error:#}")));
-                Err(error)
-            }
+            Err(error) => error,
+        };
+        drop(booked);
+        let causes = || {
+            error
+                .chain()
+                .filter_map(|cause| cause.downcast_ref::<io::Error>())
+        };
+        if causes().any(is_out_of_space) {
+            (self.hear)(Heard::NoRoom(Wants {
+                left: Some(bytes),
+                quota: causes().any(is_quota_exceeded),
+                needs: None,
+            }));
+        } else {
+            (self.hear)(Heard::Refused(format!("{error:#}")));
         }
+        Err(error)
     }
 
     fn failed(&self, piece: u32) -> anyhow::Result<bool> {
@@ -169,7 +439,10 @@ impl Pieces for Intake {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    use weaver_torrent::storage::write_refused;
 
     use super::*;
 
@@ -180,6 +453,9 @@ mod tests {
     struct Disk {
         full: AtomicBool,
         broken: AtomicBool,
+        // Refuses every write as a read-only file system would, or panics.
+        read_only: AtomicBool,
+        panics: AtomicBool,
         took: Mutex<Vec<(u32, u64)>>,
         failed: Mutex<Vec<u32>>,
         unchecked: Mutex<Vec<u32>>,
@@ -193,6 +469,13 @@ mod tests {
                         .context("writing a share"),
                 );
             }
+            if self.read_only.load(Ordering::SeqCst) {
+                return Err(anyhow::Error::from(io::Error::from(
+                    io::ErrorKind::ReadOnlyFilesystem,
+                ))
+                .context("writing a share"));
+            }
+            assert!(!self.panics.load(Ordering::SeqCst), "the write panicked");
             anyhow::ensure!(!self.broken.load(Ordering::SeqCst), "the tree is broken");
             let mut took = self.took.lock().unwrap();
             took.push((piece, held.len() as u64));
@@ -278,8 +561,12 @@ mod tests {
         ));
         assert_eq!(*disk.took.lock().unwrap(), [(0, 4), (1, 4)]);
         let said = said.lock().unwrap().clone();
-        assert_eq!(said[..2], [Heard::Changed, Heard::Changed]);
-        assert!(matches!(&said[2..], [Heard::Refused(why)] if why.contains("broken")));
+        let no_room = Heard::NoRoom(Wants {
+            left: Some(4),
+            ..Wants::default()
+        });
+        assert_eq!(said[..3], [Heard::Changed, no_room, Heard::Changed]);
+        assert!(matches!(&said[3..], [Heard::Refused(why)] if why.contains("broken")));
     }
 
     // A piece that failed its hash goes to the store, and its pieces
@@ -373,6 +660,193 @@ mod tests {
         }
         intake.verified(1, &piece(b"bbbb")).unwrap();
         assert_eq!(*disk.took.lock().unwrap(), [(0, 2), (1, 4)]);
-        assert_eq!(*said.lock().unwrap(), [Heard::Changed, Heard::Changed]);
+        assert_eq!(
+            *said.lock().unwrap(),
+            [Heard::Changed, Heard::NotBooked(4), Heard::Changed]
+        );
+    }
+
+    // Two writers on one volume book on the one ledger: what the first
+    // promised the second cannot spend, a write that failed gives its
+    // promise back, and one that landed counts against the reading.
+    #[test]
+    fn writers_on_one_volume_share_the_ledger() {
+        use crate::operations::disk::{Capacity, CapacityReading};
+
+        let reading = CapacityReading {
+            available_bytes: 110,
+            total_bytes: 1000,
+            sampled_at: std::time::Instant::now(),
+            stale: false,
+        };
+        let reader = CapacityReader::from_fn(move || Capacity::Known(reading));
+        let first = room(reader.clone());
+        let second = room(reader.clone());
+        // Ten bytes over the reserve: six promised to one leave four.
+        let six = first.admits(6).unwrap();
+        assert!(second.admits(5).is_none());
+        let four = second.admits(4).unwrap();
+        assert_eq!(reader.ledger().promised(), 10);
+        // A write that failed gives its room back for the other.
+        drop(four);
+        assert_eq!(reader.ledger().promised(), 6);
+        // One that landed is no longer promised but still spent against
+        // the reading it followed.
+        six.landed();
+        assert_eq!(reader.ledger().promised(), 0);
+        assert!(second.admits(5).is_none());
+        assert!(second.admits(4).is_some());
+    }
+
+    // A piece the store could not write gives back what it was promised.
+    #[test]
+    fn a_refused_write_gives_its_promise_back() {
+        use crate::operations::disk::{Capacity, CapacityReading};
+
+        let reading = CapacityReading {
+            available_bytes: 1000,
+            total_bytes: 1000,
+            sampled_at: std::time::Instant::now(),
+            stale: false,
+        };
+        let reader = CapacityReader::from_fn(move || Capacity::Known(reading));
+        let disk = Arc::new(Disk::default());
+        let (_, hear) = heard();
+        let intake = Intake::new(
+            Arc::clone(&disk) as Arc<dyn Pieces>,
+            room(reader.clone()),
+            hear,
+        );
+        disk.full.store(true, Ordering::SeqCst);
+        assert!(intake.verified(0, &piece(b"aaaa")).is_err());
+        assert_eq!(reader.ledger().promised(), 0);
+        disk.full.store(false, Ordering::SeqCst);
+        intake.verified(0, &piece(b"aaaa")).unwrap();
+        assert_eq!(reader.ledger().promised(), 0);
+    }
+
+    fn known(available_bytes: u64) -> CapacityReader {
+        use crate::operations::disk::{Capacity, CapacityReading};
+
+        let reading = CapacityReading {
+            available_bytes,
+            total_bytes: 1 << 40,
+            sampled_at: std::time::Instant::now(),
+            stale: false,
+        };
+        CapacityReader::from_fn(move || Capacity::Known(reading))
+    }
+
+    // A write the disk refuses for a reason other than room, read-only
+    // here, fails the torrent as it fails a usenet job: the one classifier
+    // both use says it is not one that room made would let go.
+    #[test]
+    fn a_write_refused_for_no_want_of_room_fails_the_torrent() {
+        let disk = Arc::new(Disk::default());
+        let (said, hear) = heard();
+        let reader = known(1000);
+        let intake = Intake::new(
+            Arc::clone(&disk) as Arc<dyn Pieces>,
+            room(reader.clone()),
+            hear,
+        );
+        disk.read_only.store(true, Ordering::SeqCst);
+        assert!(intake.verified(0, &piece(b"aaaa")).is_err());
+        assert!(
+            matches!(&said.lock().unwrap()[..], [Heard::Refused(why)] if why.contains("writing a share"))
+        );
+        assert_eq!(reader.ledger().promised(), 0);
+    }
+
+    // A write that panics gives its booking back as it unwinds: nothing
+    // stays promised for a piece that never landed.
+    #[test]
+    fn a_write_that_panics_gives_its_booking_back() {
+        let disk = Arc::new(Disk::default());
+        let (_, hear) = heard();
+        let reader = known(1000);
+        let intake = Intake::new(
+            Arc::clone(&disk) as Arc<dyn Pieces>,
+            room(reader.clone()),
+            hear,
+        );
+        disk.panics.store(true, Ordering::SeqCst);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            intake.verified(0, &piece(b"aaaa"))
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(reader.ledger().promised(), 0);
+    }
+
+    // What a wake handed the torrent is spent by its next pieces before
+    // they book, and what is left goes back when its run ends; a landed
+    // piece after a wake that promised it room says so, once.
+    #[test]
+    fn room_a_wake_hands_is_spent_first_and_given_back_after() {
+        let disk = Arc::new(Disk::default());
+        let (said, hear) = heard();
+        // Nothing over the reserve: only what was handed lets a piece go.
+        let reader = known(100);
+        let intake = Intake::new(
+            Arc::clone(&disk) as Arc<dyn Pieces>,
+            room(reader.clone()),
+            hear,
+        );
+        reader.ledger().promise(6);
+        intake.room().hand(6);
+        intake.room().promise_room();
+        intake.verified(0, &piece(b"aaaa")).unwrap();
+        assert_eq!(intake.room().in_hand(), 2);
+        assert_eq!(reader.ledger().promised(), 2);
+        assert!(write_refused(
+            &intake.verified(1, &piece(b"bbbb")).unwrap_err()
+        ));
+        intake.room().give_back();
+        assert_eq!(reader.ledger().promised(), 0);
+        assert_eq!(
+            *said.lock().unwrap(),
+            [Heard::Landed, Heard::Changed, Heard::NotBooked(4)]
+        );
+    }
+
+    // A piece of a torrent whose disk is not known yet is let through by
+    // nothing: it is refused as a booking, and nothing is written, so
+    // nothing lands unchecked. A place found for a folder the pieces no
+    // longer go to is not taken. Once its disk is known to lie off the
+    // roots', pieces book on no ledger and land.
+    #[test]
+    fn a_piece_waits_for_its_disk_to_be_known_and_books_nothing_off_the_roots() {
+        let disk = Arc::new(Disk::default());
+        let (said, hear) = heard();
+        let intake = Intake::new(
+            Arc::clone(&disk) as Arc<dyn Pieces>,
+            Room::aimed(
+                Arc::new(ExtractionLimits::unbounded()),
+                PathBuf::from("/elsewhere"),
+            ),
+            hear,
+        );
+        assert!(write_refused(
+            &intake.verified(0, &piece(b"aaaa")).unwrap_err()
+        ));
+        assert!(disk.took.lock().unwrap().is_empty());
+        assert_eq!(*said.lock().unwrap(), [Heard::NotBooked(4)]);
+        let off = |dir: &str| {
+            Place::new(
+                crate::operations::room_wait::Disk::Path(PathBuf::from(dir)),
+                PathBuf::from(dir),
+                None,
+            )
+        };
+        assert!(!intake.room().set_place(off("/before")));
+        assert!(intake.room().place().is_none());
+        let reader = known(100);
+        assert!(intake.room().set_place(off("/elsewhere")));
+        intake.verified(1, &piece(b"bbbb")).unwrap();
+        assert_eq!(reader.ledger().promised(), 0);
+        assert_eq!(*disk.took.lock().unwrap(), [(1, 4)]);
+        // Aimed at another folder, its place goes until that one is found.
+        assert!(intake.room().aim(Path::new("/moved")));
+        assert!(intake.room().place().is_none());
     }
 }

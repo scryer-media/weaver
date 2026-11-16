@@ -244,7 +244,7 @@ fn owed_rows(nested: bool, backwards: bool) {
             "work left due after article {ordinal}"
         );
     }
-    assert_eq!(job.phase(), RootPhase::Done, "the member delivered");
+    assert_eq!(job.checked_phase(), RootPhase::Done, "the member delivered");
 }
 
 #[test]
@@ -357,14 +357,14 @@ fn ciphertext_past_the_cap_waits_in_the_ledger_until_a_slot_comes() {
     assert!(!job.tree.working().is_empty(), "the keys' work waits");
     intake(&mut job, last);
     assert!(counting::queued_most_here() <= CAP);
-    assert_ne!(job.phase(), RootPhase::Done);
+    assert_ne!(job.checked_phase(), RootPhase::Done);
 
     // A slot: the work is done here, as while a checkpoint is owed.
     job.owe_checkpoint();
     job.lend(&mut slots, 1).unwrap();
     assert!(job.tree.working().is_empty(), "work left due");
     assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0, "left in the ledger");
-    assert_eq!(job.phase(), RootPhase::Done, "the member delivered");
+    assert_eq!(job.checked_phase(), RootPhase::Done, "the member delivered");
     assert!(super::super::loan_tests::holds(directory.path(), &plain));
     assert!(counting::queued_most_here() <= CAP);
     // Deciphered once, every byte: crossing the cap asks for nothing again.

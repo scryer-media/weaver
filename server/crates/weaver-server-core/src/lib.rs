@@ -80,14 +80,13 @@ pub use jobs::{
 };
 pub use operations::instrumentation::{
     ARTICLE_LATENCY_BOUNDS, AtomicHistogram, DB_OP_DURATION_BOUNDS, DECODE_TASK_DURATION_BOUNDS,
-    DISK_WRITE_DURATION_BOUNDS, DbRuntimeMetrics, DbRuntimeMetricsSnapshot, DiskSpaceSnapshot,
-    EXTRACT_MEMBER_DURATION_BOUNDS, HISTOGRAM_MAX_BUCKETS, HTTP_REQUEST_DURATION_BOUNDS,
-    HistogramSnapshot, HttpMetricsSnapshot, HttpRequestCount, JOB_DURATION_BOUNDS, JobFinishCount,
-    JobLifecycleMetrics, JobLifecycleMetricsSnapshot, JobResultKind, JobStageKind,
-    JobSubmissionCount, PipelineHistograms, PipelineHistogramsSnapshot, ProcessMetricsSnapshot,
-    STAGE_DURATION_BOUNDS, ServerArticleOutcomes, ServerAttemptCount, ServerAttemptOutcomeKind,
-    ServerCounters, ServerMetricsRegistry, ServerMetricsSnapshot, StageOutcomeKind,
-    VerificationOutcomeKind,
+    DbRuntimeMetrics, DbRuntimeMetricsSnapshot, DiskSpaceSnapshot, EXTRACT_MEMBER_DURATION_BOUNDS,
+    HISTOGRAM_MAX_BUCKETS, HTTP_REQUEST_DURATION_BOUNDS, HistogramSnapshot, HttpMetricsSnapshot,
+    HttpRequestCount, JOB_DURATION_BOUNDS, JobFinishCount, JobLifecycleMetrics,
+    JobLifecycleMetricsSnapshot, JobResultKind, JobStageKind, JobSubmissionCount,
+    PipelineHistograms, PipelineHistogramsSnapshot, ProcessMetricsSnapshot, STAGE_DURATION_BOUNDS,
+    ServerArticleOutcomes, ServerAttemptCount, ServerAttemptOutcomeKind, ServerCounters,
+    ServerMetricsRegistry, ServerMetricsSnapshot, StageOutcomeKind, VerificationOutcomeKind,
 };
 pub use operations::metrics::{
     DownloadPressureReason, DownloadPressureState, MetricsSnapshot, PAR3_MEMORY_CATEGORIES,
@@ -102,12 +101,12 @@ pub use operations::{
     HistoryDeleteOperationPayload, HistoryDeleteOperationRow, HistoryDeleteOperationSummary,
     HistoryDeleteRowState, HistoryDeleteTargetWork, HistoryOperationAction, JOB_STATUS_KEYS,
     MetricsHistoryChunkRow, MetricsHistoryQueryData, MetricsHistoryQueryResult, MetricsHistoryTier,
-    RawMetricsHistoryPoint, RollupMetricsHistoryPoint, StableStateExport,
+    RETIRED_METRIC_KEY, RawMetricsHistoryPoint, RollupMetricsHistoryPoint, StableStateExport,
 };
 pub use persistence::{Database, LoadError, Refusal, StateError};
 pub use pipeline::Pipeline;
 pub use pipeline::download::{DownloadQueue, DownloadWork};
-pub use rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
+pub use rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenDecision, RssSeenItemRow};
 pub use runtime::affinity::{
     install_tokio_worker_affinity, pin_current_thread_for_hot_download_path,
 };
