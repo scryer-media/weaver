@@ -1016,32 +1016,39 @@ async fn hear(tee: std::sync::Weak<Tee>, mut words: tokio::sync::mpsc::Unbounded
 // name is taken is placed under a numbered name; it is never dropped and
 // never replaces the file there. Do not ask again.
 //
-// So each output is planned under the first form of its name
+// So each output takes the first form of its name
 // (`weaver_graph::names::numbered`: "movie.mkv", "movie (1).mkv", ...) that
-// nothing holds and no other output was planned under. The plan's names go
-// on the torrent's row before anything is placed, and each is claimed only
-// at placing, by creating it new, so a file that came to hold one since is
-// passed over for the next form and nothing is ever written over. A name on
-// the row (`kept`) that holds an empty file is the claim a placing cut short
-// by a restart left: the output takes it again rather than a second
-// numbered name.
+// no other output keeps as its own and that it can create new here: a file
+// that holds a name is passed over for the next form, and nothing is ever
+// written over. Every name is claimed that way, by an empty file, before
+// any goes on the torrent's row, and the outputs move over their claims
+// only after: the row, and what the torrent holds, name no file this
+// torrent did not create. A name on the row (`kept`) that holds an empty
+// file is the claim a placing cut short by a restart left: the output takes
+// it again rather than a second numbered name. A claim a crash came after,
+// before the row kept it, stays an empty file on no row.
 pub(crate) struct Outputs {
-    // Each output's path under `work`, its path relative to `dir` before
-    // numbering, and the form of that path it was planned under.
-    moves: Vec<(PathBuf, PathBuf, usize)>,
-    // Each move's destination, relative to `dir`, as planned.
+    // Each output's path under `work`, and the place claimed for it.
+    moves: Vec<(PathBuf, PathBuf)>,
+    // Each claimed place, relative to `dir`, as the row keeps it.
     pub(crate) names: Vec<String>,
-    dir: PathBuf,
-    kept: HashSet<String>,
 }
 
-pub(crate) fn plan_outputs(
+// Why the outputs have no place: the claims made for them are gone, and
+// `dropped` are their names, for the row to let go of those it kept.
+#[derive(Debug)]
+pub(crate) struct Unclaimed {
+    pub(crate) error: super::relocate::MoveError,
+    pub(crate) dropped: Vec<String>,
+}
+
+pub(crate) fn claim_outputs(
     work: &Path,
     dir: &Path,
     listed: &HashSet<PathBuf>,
     spent: &HashSet<PathBuf>,
-    kept: HashSet<String>,
-) -> Outputs {
+    kept: &HashSet<String>,
+) -> Result<Outputs, Unclaimed> {
     let mut found = Vec::new();
     walk(work, Path::new(""), &mut found);
     let found: Vec<PathBuf> = found
@@ -1054,45 +1061,78 @@ pub(crate) fn plan_outputs(
         })
         .collect();
     // Every output's own name first, as each takes it when it is free, so
-    // a numbered form is never planned over a name another output keeps.
+    // a numbered form is never claimed over a name another output keeps.
     let mut planned: HashSet<String> = found
         .iter()
         .map(|relative| weaver_graph::names::key(&relative.to_string_lossy()))
         .collect();
-    let mut moves = Vec::with_capacity(found.len());
-    let mut names = Vec::with_capacity(found.len());
+    let mut outputs = Outputs {
+        moves: Vec::with_capacity(found.len()),
+        names: Vec::with_capacity(found.len()),
+    };
     for relative in found {
-        let wanted = relative.to_string_lossy().into_owned();
-        let mut n = 0;
-        let name = loop {
-            let name = weaver_graph::names::numbered(&wanted, n);
-            // Its own name, or a form no other output was planned under,
-            // that holds nothing or holds this torrent's own claim.
-            let mine = n == 0 || planned.insert(weaver_graph::names::key(&name));
-            if mine
-                && (ours(dir, &kept, &name) || std::fs::symlink_metadata(dir.join(&name)).is_err())
-            {
-                break name;
+        match claim(dir, kept, &mut planned, &relative) {
+            Ok((to, name)) => {
+                outputs.moves.push((work.join(relative), to));
+                outputs.names.push(name);
             }
-            n += 1;
-        };
-        moves.push((work.join(&relative), relative, n));
-        names.push(name);
+            Err(error) => {
+                outputs.unclaim();
+                return Err(Unclaimed {
+                    error,
+                    dropped: outputs.names,
+                });
+            }
+        }
     }
-    Outputs {
-        moves,
-        names,
-        dir: dir.to_path_buf(),
-        kept,
+    Ok(outputs)
+}
+
+// The first form of `relative` this torrent may place at, claimed: its own
+// claim a restart left, or a name made new for it here.
+fn claim(
+    dir: &Path,
+    kept: &HashSet<String>,
+    planned: &mut HashSet<String>,
+    relative: &Path,
+) -> Result<(PathBuf, String), super::relocate::MoveError> {
+    let wanted = relative.to_string_lossy();
+    if let Some(parent) = dir.join(relative).parent()
+        && let Err(source) = std::fs::create_dir_all(parent)
+    {
+        return Err(super::relocate::MoveError {
+            path: parent.to_path_buf(),
+            source,
+        });
+    }
+    let mut n = 0;
+    loop {
+        let name = weaver_graph::names::numbered(&wanted, n);
+        // Its own name, or a form no other output keeps or took.
+        if n == 0 || planned.insert(weaver_graph::names::key(&name)) {
+            let to = dir.join(&name);
+            if ours(&to, kept, &name) {
+                return Ok((to, name));
+            }
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&to)
+            {
+                Ok(_) => return Ok((to, name)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(source) => return Err(super::relocate::MoveError { path: to, source }),
+            }
+        }
+        n += 1;
     }
 }
 
-// Whether `name` holds the empty file a claim of this torrent's left: one
-// on its row, so this torrent's, that no placing filled.
-fn ours(dir: &Path, kept: &HashSet<String>, name: &str) -> bool {
+// Whether `to` holds the empty file a claim of this torrent's left: one
+// on its row as `name`, so this torrent's, that no placing filled.
+fn ours(to: &Path, kept: &HashSet<String>, name: &str) -> bool {
     kept.contains(name)
-        && std::fs::symlink_metadata(dir.join(name))
-            .is_ok_and(|meta| meta.is_file() && meta.len() == 0)
+        && std::fs::symlink_metadata(to).is_ok_and(|meta| meta.is_file() && meta.len() == 0)
 }
 
 // What placing came to.
@@ -1105,91 +1145,36 @@ pub(crate) struct Placed {
 }
 
 impl Outputs {
-    // Moved, every one or none: a move that failed puts back what it moved,
-    // and the names it claimed go with it. Each output's name is claimed by
-    // creating it new, its planned form first, so a file there is never
-    // written over; the claimed file is then replaced by the output.
+    // Moved, every one or none, each over the claim made for it: a move
+    // that failed puts back what it moved, and the claims go with it.
     pub(crate) fn place(&self, work: &Path) -> Placed {
-        let mut claimed = Vec::with_capacity(self.moves.len());
-        let mut failed = None;
-        for (from, relative, planned) in &self.moves {
-            // Gone since it was found: nothing to place.
-            if std::fs::symlink_metadata(from).is_err() {
-                continue;
-            }
-            match self.claim(relative, *planned) {
-                Ok((to, name)) => claimed.push((from.clone(), to, name)),
-                Err(error) => {
-                    failed = Some(error);
-                    break;
-                }
-            }
-        }
-        let moves: Vec<(PathBuf, PathBuf)> = claimed
-            .iter()
-            .map(|(from, to, _)| (from.clone(), to.clone()))
-            .collect();
-        if failed.is_none()
-            && let Err(error) =
-                super::relocate::move_files(work, &moves, super::relocate::Existing::Replace)
-        {
-            failed = Some(error);
-        }
-        if failed.is_none() {
+        let Err(error) =
+            super::relocate::move_files(work, &self.moves, super::relocate::Existing::Replace)
+        else {
             return Placed {
-                names: claimed.into_iter().map(|(_, _, name)| name).collect(),
-                failed,
+                names: self.names.clone(),
+                failed: None,
             };
-        }
-        // The claims no output filled go; what the move could not put back
-        // is there.
-        for (_, to, _) in &claimed {
-            if std::fs::symlink_metadata(to).is_ok_and(|meta| meta.is_file() && meta.len() == 0) {
-                let _ = std::fs::remove_file(to);
-            }
-        }
+        };
+        self.unclaim();
+        // What the move could not put back is there.
         Placed {
-            names: claimed
-                .into_iter()
-                .filter(|(_, to, _)| std::fs::symlink_metadata(to).is_ok())
-                .map(|(_, _, name)| name)
+            names: self
+                .moves
+                .iter()
+                .zip(&self.names)
+                .filter(|((_, to), _)| std::fs::symlink_metadata(to).is_ok())
+                .map(|(_, name)| name.clone())
                 .collect(),
-            failed,
+            failed: Some(error),
         }
     }
 
-    // The first form of `relative`, from `planned`, this torrent may place
-    // at: its own claim a restart left, or a name made new for it here.
-    fn claim(
-        &self,
-        relative: &Path,
-        planned: usize,
-    ) -> Result<(PathBuf, String), super::relocate::MoveError> {
-        let wanted = relative.to_string_lossy();
-        let to = self.dir.join(relative);
-        if let Some(parent) = to.parent()
-            && let Err(source) = std::fs::create_dir_all(parent)
-        {
-            return Err(super::relocate::MoveError {
-                path: parent.to_path_buf(),
-                source,
-            });
-        }
-        let mut n = planned;
-        loop {
-            let name = weaver_graph::names::numbered(&wanted, n);
-            let to = self.dir.join(&name);
-            if ours(&self.dir, &self.kept, &name) {
-                return Ok((to, name));
-            }
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&to)
-            {
-                Ok(_) => return Ok((to, name)),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
-                Err(source) => return Err(super::relocate::MoveError { path: to, source }),
+    // The claims no output filled go.
+    fn unclaim(&self) {
+        for (_, to) in &self.moves {
+            if std::fs::symlink_metadata(to).is_ok_and(|meta| meta.is_file() && meta.len() == 0) {
+                let _ = std::fs::remove_file(to);
             }
         }
     }

@@ -4,6 +4,8 @@
 use super::moves::Moving;
 use super::policy::goal_met;
 use super::retire::{held_tops, resolved};
+#[cfg(test)]
+use super::{OUTPUTS_HOLD, PLACE_PANICS, locked};
 use super::{TorrentService, hashes_of, report, short_status, unpacking_dir, unplaced};
 use crate::StateError;
 use crate::jobs::JobId;
@@ -14,7 +16,7 @@ use crate::torrents::metrics::TorrentEvent;
 use crate::torrents::model::HistoryEnd;
 use crate::torrents::relocate::Existing;
 use crate::torrents::store::TorrentStore;
-use crate::torrents::tee::{Tee, plan_outputs};
+use crate::torrents::tee::{Tee, Unclaimed, claim_outputs};
 use crate::torrents::{KeptIntent, TorrentIntent};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -78,8 +80,9 @@ impl TorrentService {
     }
 
     // Unpacking is over: what it made goes beside the torrent's files,
-    // never over one, and is kept on the torrent's row as its job's
-    // checkpoint goes. Its directory goes last, with what it spent. The
+    // never over one, each name claimed first and kept on the torrent's
+    // row before its file moves, and stays there as its job's checkpoint
+    // goes. Its directory goes last, with what it spent. The
     // torrent's files are claimed as a move claims them, so its directory
     // stays where it is with no lock its reads and writes wait on; while a
     // move has them, this waits for the move to end, which marks the
@@ -129,10 +132,10 @@ impl TorrentService {
         tee.stop_checkpoints();
         tee.forget();
         let work = tee.work().to_path_buf();
-        let (planned, tee, db) = (Arc::clone(store), Arc::clone(tee), self.inner.db.clone());
-        let planned = tokio::task::spawn_blocking(move || {
+        let (claiming, tee, db) = (Arc::clone(store), Arc::clone(tee), self.inner.db.clone());
+        let claimed = tokio::task::spawn_blocking(move || {
             let _job = JobScope::enter(job_id);
-            let files = planned.files();
+            let files = claiming.files();
             let listed: HashSet<PathBuf> = files.names().flatten().map(Path::to_path_buf).collect();
             let spent: HashSet<PathBuf> = spent.into_iter().collect();
             let dir = files.dir();
@@ -147,8 +150,8 @@ impl TorrentService {
                 })
                 .into_iter()
                 .collect();
-            let outputs = plan_outputs(tee.work(), &dir, &listed, &spent, kept);
-            // Held before they move, as the row keeps them.
+            let outputs = claim_outputs(tee.work(), &dir, &listed, &spent, &kept)?;
+            // Held from the names claimed, as the row keeps them.
             let held = held_tops(outputs.names.iter().map(String::as_str)).map_or_else(
                 || vec![resolved(&dir).to_string_lossy().into_owned()],
                 |tops| {
@@ -158,15 +161,22 @@ impl TorrentService {
                         .collect()
                 },
             );
-            (outputs, held)
+            Ok::<_, Unclaimed>((outputs, held))
         })
         .await;
-        let (outputs, held) = match planned {
-            Ok((outputs, held)) => (Arc::new(outputs), held),
-            Err(error) => {
+        // No claim stands: the row lets go of those it kept, and nothing
+        // moved.
+        let unclaimed = match claimed {
+            Ok(Ok((outputs, held))) => Ok((Arc::new(outputs), held)),
+            Ok(Err(unclaimed)) => Err((unclaimed.error.to_string(), unclaimed.dropped)),
+            Err(error) => Err((error.to_string(), Vec::new())),
+        };
+        let (outputs, held) = match unclaimed {
+            Ok(claimed) => claimed,
+            Err((error, dropped)) => {
                 tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files were not placed");
                 let recorded = self.queue_save(job_id, "finish_torrent_unpack", move |db| {
-                    db.finish_torrent_unpack(job_id, &[], &[])
+                    db.finish_torrent_unpack(job_id, &[], &dropped)
                 });
                 self.recorded(job_id, recorded.await);
                 self.unclaim_outputs(job_id).await;
@@ -176,8 +186,17 @@ impl TorrentService {
                 };
             }
         };
-        // Kept on the row before they move, so a crash between leaves no
-        // file of the torrent's that its delete does not know of.
+        #[cfg(test)]
+        let held_here = locked(&OUTPUTS_HOLD).take();
+        #[cfg(test)]
+        if let Some((reached, release)) = held_here {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+        // Each name is this torrent's by now, claimed by a file it made: the
+        // row and what the torrent holds keep them before any output moves,
+        // so a crash between leaves no file of the torrent's that its delete
+        // does not know of, and none of another's that it does.
         let names = outputs.names.clone();
         let kept = self.queue_save(job_id, "keep_torrent_outputs", move |db| {
             db.keep_torrent_outputs(job_id, &names, &held)
@@ -186,13 +205,17 @@ impl TorrentService {
         let (from, moving) = (work.clone(), Arc::clone(&outputs));
         let placed = tokio::task::spawn_blocking(move || {
             let _job = JobScope::enter(job_id);
+            #[cfg(test)]
+            assert!(
+                !PLACE_PANICS.swap(false, std::sync::atomic::Ordering::AcqRel),
+                "placing a torrent's unpacked files"
+            );
             moving.place(&from)
         })
         .await;
-        // The row keeps the names the files are at: a name a claim passed
-        // over goes from it, and so does every file a failed move put back.
-        // A placing whose end is not known leaves every planned one on it,
-        // for its delete.
+        // The row keeps the names the files are at: every file a failed
+        // move put back goes from it. A placing whose end is not known
+        // leaves every claimed one on it, for its delete.
         let (names, unplaced_names, failed) = match placed {
             Ok(placed) => {
                 let there: HashSet<&String> = placed.names.iter().collect();

@@ -615,16 +615,17 @@ mod numbered_outputs {
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
 
-    use super::super::plan_outputs;
+    use super::super::{Outputs, claim_outputs};
 
-    fn plan(work: &Path, dir: &Path, kept: &[&str]) -> super::super::Outputs {
-        plan_outputs(
+    fn claim(work: &Path, dir: &Path, kept: &[&str]) -> Outputs {
+        claim_outputs(
             work,
             dir,
             &HashSet::new(),
             &HashSet::new(),
-            kept.iter().map(|name| (*name).to_owned()).collect(),
+            &kept.iter().map(|name| (*name).to_owned()).collect(),
         )
+        .unwrap()
     }
 
     fn folders() -> (tempfile::TempDir, PathBuf, PathBuf) {
@@ -637,14 +638,14 @@ mod numbered_outputs {
 
     // An output's own name and a numbered form of another's never meet:
     // "movie (1).mkv" made by the archive keeps its name, and "movie.mkv",
-    // whose name a file holds, is planned past it.
+    // whose name a file holds, is claimed past it.
     #[test]
-    fn a_numbered_form_is_never_planned_over_another_outputs_name() {
+    fn a_numbered_form_is_never_claimed_over_another_outputs_name() {
         let (_root, work, dir) = folders();
         std::fs::write(dir.join("movie.mkv"), b"there").unwrap();
         std::fs::write(work.join("movie.mkv"), b"unpacked").unwrap();
         std::fs::write(work.join("movie (1).mkv"), b"also unpacked").unwrap();
-        let outputs = plan(&work, &dir, &[]);
+        let outputs = claim(&work, &dir, &[]);
         let mut names = outputs.names.clone();
         names.sort();
         assert_eq!(names, ["movie (1).mkv", "movie (2).mkv"]);
@@ -661,51 +662,47 @@ mod numbered_outputs {
         );
     }
 
-    // A file that comes to hold the planned name before placing is passed
-    // over, untouched, for the next form, and placing says the name it used.
+    // Two torrents unpack the same name into one folder at once: each
+    // claims before either places, the names each is given are files it
+    // made itself, and neither is given the other's. Each then places its
+    // own file over its own claim.
     #[test]
-    fn a_name_taken_after_planning_is_passed_over_at_placing() {
-        let (_root, work, dir) = folders();
-        std::fs::write(dir.join("movie.mkv"), b"there").unwrap();
-        std::fs::write(work.join("movie.mkv"), b"unpacked").unwrap();
-        let outputs = plan(&work, &dir, &[]);
-        assert_eq!(outputs.names, ["movie (1).mkv"]);
-        std::fs::write(dir.join("movie (1).mkv"), b"came since").unwrap();
-        let placed = outputs.place(&work);
-        assert!(placed.failed.is_none());
-        assert_eq!(placed.names, ["movie (2).mkv"]);
-        assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), b"there");
+    fn two_torrents_claiming_one_name_each_get_a_file_of_their_own() {
+        let (root, first_work, dir) = folders();
+        let second_work = root.path().join("second");
+        std::fs::create_dir_all(&second_work).unwrap();
+        std::fs::write(first_work.join("movie.mkv"), b"the first's").unwrap();
+        std::fs::write(second_work.join("movie.mkv"), b"the second's").unwrap();
+        let first = claim(&first_work, &dir, &[]);
+        let second = claim(&second_work, &dir, &[]);
+        assert_eq!(first.names, ["movie.mkv"]);
+        assert_eq!(second.names, ["movie (1).mkv"]);
+        // The second places first: the first's claim is not its to fill.
+        assert!(second.place(&second_work).failed.is_none());
+        assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), b"");
+        assert!(first.place(&first_work).failed.is_none());
         assert_eq!(
-            std::fs::read(dir.join("movie (1).mkv")).unwrap(),
-            b"came since"
+            std::fs::read(dir.join("movie.mkv")).unwrap(),
+            b"the first's"
         );
         assert_eq!(
-            std::fs::read(dir.join("movie (2).mkv")).unwrap(),
-            b"unpacked"
+            std::fs::read(dir.join("movie (1).mkv")).unwrap(),
+            b"the second's"
         );
     }
 
-    // A restart between planning and placing: the plan's names were kept on
-    // the row, and the first placing claimed its name (an empty file) and
-    // stopped there. The next plan reads the row and takes the same name, and
-    // its placing fills that claim: no second numbered copy. A restart before
-    // the claim was made plans the same name too.
+    // A restart after the claims were kept on the row and before the files
+    // moved: the next claiming reads the row and takes the same claim again,
+    // and its placing fills it. No second numbered copy.
     #[test]
-    fn a_restart_between_planning_and_placing_places_no_second_numbered_copy() {
+    fn a_restart_after_the_claim_was_kept_places_no_second_numbered_copy() {
         let (_root, work, dir) = folders();
         std::fs::write(dir.join("movie.mkv"), b"there").unwrap();
         std::fs::write(work.join("movie.mkv"), b"unpacked").unwrap();
-        let first = plan(&work, &dir, &[]);
+        let first = claim(&work, &dir, &[]);
         assert_eq!(first.names, ["movie (1).mkv"]);
-        // Kept on the row, nothing claimed yet.
-        assert_eq!(plan(&work, &dir, &["movie (1).mkv"]).names, first.names);
-        // Claimed, as placing claims it, and cut short there.
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(dir.join("movie (1).mkv"))
-            .unwrap();
-        let again = plan(&work, &dir, &["movie (1).mkv"]);
+        assert_eq!(std::fs::read(dir.join("movie (1).mkv")).unwrap(), b"");
+        let again = claim(&work, &dir, &["movie (1).mkv"]);
         assert_eq!(again.names, first.names);
         let placed = again.place(&work);
         assert!(placed.failed.is_none());
@@ -716,13 +713,70 @@ mod numbered_outputs {
             b"unpacked"
         );
         assert!(!dir.join("movie (2).mkv").exists());
-        // An empty file not on the row is not this torrent's: passed over.
+    }
+
+    // A stop after the claim and before the row kept it: the claim is an
+    // empty file on no row, which the next claiming takes for no one's and
+    // passes over. The output is placed once, under a name the row then
+    // keeps, and an empty file another torrent claimed is never taken.
+    #[test]
+    fn a_stop_between_the_claim_and_the_row_places_one_copy_and_takes_no_others_claim() {
+        let (root, work, dir) = folders();
         std::fs::write(work.join("movie.mkv"), b"unpacked").unwrap();
-        std::fs::write(dir.join("movie (2).mkv"), b"").unwrap();
+        let first = claim(&work, &dir, &[]);
+        assert_eq!(first.names, ["movie.mkv"]);
+        // Another torrent's claim, made meanwhile.
+        let other_work = root.path().join("other");
+        std::fs::create_dir_all(&other_work).unwrap();
+        std::fs::write(other_work.join("movie.mkv"), b"another's").unwrap();
+        let other = claim(&other_work, &dir, &[]);
+        assert_eq!(other.names, ["movie (1).mkv"]);
+        // The restart: nothing on the row.
+        let again = claim(&work, &dir, &[]);
+        assert_eq!(again.names, ["movie (2).mkv"]);
+        let placed = again.place(&work);
+        assert!(placed.failed.is_none());
+        assert_eq!(placed.names, ["movie (2).mkv"]);
+        assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), b"");
+        assert_eq!(std::fs::read(dir.join("movie (1).mkv")).unwrap(), b"");
         assert_eq!(
-            plan(&work, &dir, &["movie (1).mkv"]).names,
-            ["movie (3).mkv"]
+            std::fs::read(dir.join("movie (2).mkv")).unwrap(),
+            b"unpacked"
         );
+        assert!(other.place(&other_work).failed.is_none());
+        assert_eq!(
+            std::fs::read(dir.join("movie (1).mkv")).unwrap(),
+            b"another's"
+        );
+    }
+
+    // A claiming that fails partway leaves no claim it made, and says the
+    // names it let go of.
+    #[cfg(unix)]
+    #[test]
+    fn a_claiming_that_fails_leaves_no_claim() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_root, work, dir) = folders();
+        std::fs::write(work.join("movie.mkv"), b"unpacked").unwrap();
+        std::fs::create_dir_all(work.join("shut")).unwrap();
+        std::fs::write(work.join("shut/extra.mkv"), b"unpacked").unwrap();
+        std::fs::create_dir_all(dir.join("shut")).unwrap();
+        std::fs::set_permissions(dir.join("shut"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let unclaimed = claim_outputs(
+            &work,
+            &dir,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .err()
+        .unwrap();
+        std::fs::set_permissions(dir.join("shut"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(unclaimed.error.path, dir.join("shut/extra.mkv"));
+        assert!(unclaimed.dropped.iter().all(|name| name == "movie.mkv"));
+        assert!(!dir.join("movie.mkv").exists());
+        assert!(!dir.join("shut/extra.mkv").exists());
+        assert_eq!(std::fs::read(work.join("movie.mkv")).unwrap(), b"unpacked");
     }
 
     // Thousands of outputs whose names are all taken each take their own
@@ -735,7 +789,7 @@ mod numbered_outputs {
             std::fs::write(dir.join(format!("e{i}.mkv")), b"there").unwrap();
             std::fs::write(work.join(format!("e{i}.mkv")), b"unpacked").unwrap();
         }
-        let outputs = plan(&work, &dir, &[]);
+        let outputs = claim(&work, &dir, &[]);
         let names: HashSet<String> = outputs.names.iter().cloned().collect();
         let wanted: HashSet<String> = (0..count).map(|i| format!("e{i} (1).mkv")).collect();
         assert_eq!(names, wanted);
