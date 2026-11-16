@@ -198,6 +198,16 @@ impl V2Hashes {
         f.first_piece + start..f.first_piece + f.pieces.min(start + LAYER_CHUNK)
     }
 
+    /// The pieces of the torrent a run of a file's layer covers in each
+    /// file of its root, the first file first: the files share one layer,
+    /// so a peer with a piece of any of them can answer for the run.
+    pub fn root_chunk_pieces(&self, file: usize, chunk: u32) -> Vec<std::ops::Range<u32>> {
+        self.with_root(&self.files[file].root)
+            .map(|(i, _)| self.chunk_pieces(i, chunk))
+            .filter(|pieces| !pieces.is_empty())
+            .collect()
+    }
+
     /// The request for a run of a file's piece layer: the piece layer as
     /// base, the run's pieces padded to a power of two, proven to the
     /// file's root (libtorrent `hash_picker::pick_hashes`).

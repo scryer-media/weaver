@@ -73,8 +73,9 @@ enum Kind {
 /// hashes of a piece.
 struct Wanted {
     request: HashRequest,
-    /// The pieces a peer must have one of to be asked.
-    pieces: Range<u32>,
+    /// The pieces a peer must have one of to be asked: a run of a layer
+    /// covers pieces in every file of its root.
+    pieces: Vec<Range<u32>>,
     kind: Kind,
     /// The peers asked for it whose answer is still due.
     out: Vec<Out>,
@@ -223,7 +224,7 @@ impl LayerFetch {
             .flat_map(|v2| {
                 v2.missing_chunks().map(|(file, chunk)| Wanted {
                     request: v2.chunk_request(file, chunk),
-                    pieces: v2.chunk_pieces(file, chunk),
+                    pieces: v2.root_chunk_pieces(file, chunk),
                     kind: Kind::Layer,
                     out: Vec::new(),
                     rejected_by: Vec::new(),
@@ -293,7 +294,7 @@ impl LayerFetch {
                 wake = Some(wake.map_or(due, |at| at.min(due)));
                 continue;
             }
-            if !has_any(w.pieces.clone()) {
+            if !w.pieces.iter().any(|pieces| has_any(pieces.clone())) {
                 continue;
             }
             w.out.push(Out {
@@ -372,7 +373,7 @@ impl LayerFetch {
                 0,
                 Wanted {
                     request,
-                    pieces: piece.get()..piece.get() + 1,
+                    pieces: vec![piece.get()..piece.get() + 1],
                     kind: Kind::Blocks { piece, failed },
                     out: Vec::new(),
                     rejected_by: Vec::new(),
@@ -608,7 +609,7 @@ mod tests {
                 .iter()
                 .map(|(request, pieces)| Wanted {
                     request: *request,
-                    pieces: pieces.clone(),
+                    pieces: vec![pieces.clone()],
                     kind: Kind::Layer,
                     out: Vec::new(),
                     rejected_by: Vec::new(),
@@ -648,6 +649,43 @@ mod tests {
                 .get(&peer)
                 .is_some_and(|at| at.is_some_and(|at| at <= now))
         }
+    }
+
+    // Files of the same content share a root and one layer: a peer that
+    // has pieces of any of them is asked for its runs, not only one with
+    // pieces of the first.
+    #[test]
+    fn a_peer_with_pieces_of_any_file_of_a_root_is_asked_for_its_layer() {
+        use crate::core::{
+            torrent_metainfo::torrent_from_bytes,
+            v2_test_torrent::{TestTorrent, payload},
+        };
+        let data = payload(3 * 16384, 1);
+        let mut t = TestTorrent::new(vec![("a", data.clone()), ("b", data)], 16384);
+        t.layers = false;
+        let bytes = t.torrent_bytes();
+        let meta = torrent_from_bytes(&bytes).unwrap();
+        let info = meta.info.data.clone().validate().unwrap();
+        let v2 = V2Hashes::new(&info, Vec::new()).unwrap();
+        let fetch = LayerFetch::new(Some(&v2));
+        let peer = PeerHandle::from(SocketAddr::from(([10, 0, 0, 1], 6881)));
+        // The peer has b's pieces, 3..6, and none of a's.
+        let pick = fetch.pick(
+            peer,
+            |pieces| pieces.start.max(3) < pieces.end.min(6),
+            Duration::from_secs(5),
+            Instant::now(),
+        );
+        let Pick::Send(sent) = pick else {
+            panic!("the peer with b's pieces was not asked");
+        };
+        assert_eq!(sent, vec![v2.chunk_request(0, 0)]);
+        // A peer with no piece of the root is not.
+        let other = PeerHandle::from(SocketAddr::from(([10, 0, 0, 2], 6881)));
+        assert!(matches!(
+            fetch.pick(other, |_| false, Duration::from_secs(5), Instant::now()),
+            Pick::Wait(_)
+        ));
     }
 
     // A run's pieces read a word at a time say what reading each piece's
